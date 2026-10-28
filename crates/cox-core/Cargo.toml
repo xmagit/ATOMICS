@@ -1,0 +1,18 @@
+[package]
+name = "cox-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+dirs = "7.0.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+similar = "3.2.1"
+toml = "1.1.8"
+
+[dev-dependencies]
+tempfile = "3.27.0"
