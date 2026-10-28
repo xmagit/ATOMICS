@@ -135,6 +135,7 @@ struct Pending {
     was_working: bool,
     codex: bool,
     screen_before: String,
+    paste_seen: bool,
     reply: Option<Sender<ControlOutcome>>,
 }
 

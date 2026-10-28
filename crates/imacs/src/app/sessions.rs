@@ -355,14 +355,13 @@ impl App {
             let screen = terminal.screen_text(200);
             let lines: Vec<&str> = screen.lines().collect();
             let input_box = lines.len().saturating_sub(6);
-            let composer_empty = pending.codex.then(|| codex_composer_empty(&screen)).flatten();
+            let composer_empty = pending.codex.then(|| codex_composer_empty(&screen, &pending.screen_before)).flatten();
             let in_transcript = if pending.codex {
-                (steer::message_in_transcript(&screen, &pending.text)
-                    && !steer::message_in_transcript(&pending.screen_before, &pending.text))
-                    // Allow the initial paste and delayed Enter to reach Codex before
-                    // treating an empty composer as a receipt. Queue previews may be
-                    // clipped, and a repeated message may already be in the transcript.
-                    || composer_empty == Some(true) && pending.sent.elapsed() >= DELIVERY_TIMEOUT
+                let marker = codex_composer(&screen).is_some_and(|line| line.contains("[Pasted "));
+                pending.paste_seen |=
+                    marker && !codex_composer(&pending.screen_before).is_some_and(|line| line.contains("[Pasted "));
+                codex_transcript_receipt(&screen, &pending.screen_before, &pending.text)
+                    || pending.paste_seen && !marker && composer_empty == Some(true)
             } else {
                 started || !snippet.trim().is_empty() && lines[..input_box].iter().any(|l| l.contains(snippet.trim()))
             };
@@ -378,17 +377,19 @@ impl App {
             }
             if terminal.exited() || pending.attempts >= DELIVERY_ATTEMPTS {
                 if let Some(reply) = pending.reply.take() {
-                    let _ = reply.send(ControlOutcome::Done(ControlResponse::error(
-                        "message not delivered: no receipt from the agent; check its terminal",
-                    )));
+                    let _ = reply.send(ControlOutcome::Done(ControlResponse::error(if pending.codex {
+                        "message delivery unconfirmed: no receipt from the agent; check its terminal"
+                    } else {
+                        "message not delivered: no receipt from the agent; check its terminal"
+                    })));
                 }
                 warnings.push(session.title.clone());
                 session.pending = None;
                 continue;
             }
             if pending.codex {
-                // The paste is sent exactly once. Retry only the submit key, even
-                // when a long paste has been collapsed or has left the composer.
+                // The paste is sent exactly once. Retry only the submit key,
+                // and only while the composer differs from its pre-paste line.
                 if composer_empty == Some(false) {
                     terminal.write(if screen.contains("tab to queue") { b"\t".to_vec() } else { b"\r".to_vec() });
                 }
@@ -509,6 +510,7 @@ impl App {
                     was_working,
                     codex,
                     screen_before,
+                    paste_seen: false,
                     reply: None,
                 });
             } else if session.is_agent() {
@@ -609,13 +611,56 @@ impl App {
     }
 }
 
-/// The last prompt belongs to the composer. Its text can be wrapped or collapsed
-/// to a paste marker, so check whether it is empty rather than matching the message.
-fn codex_composer_empty(screen: &str) -> Option<bool> {
+/// The last prompt belongs to the composer, unless a permission menu is open.
+fn codex_composer(screen: &str) -> Option<&str> {
     if imacs_core::approvals::menu_visible(screen) {
         return None;
     }
-    screen.lines().rev().find_map(|line| line.trim_start().strip_prefix(['›', '❯']).map(|text| text.trim().is_empty()))
+    screen.lines().rev().find_map(|line| line.trim_start().strip_prefix(['›', '❯']).map(str::trim))
+}
+
+/// Empty composers contain a rotating placeholder. Compare with the line captured
+/// before this paste instead of mistaking that placeholder for unsent text.
+fn codex_composer_empty(screen: &str, before: &str) -> Option<bool> {
+    Some(codex_composer(screen)? == codex_composer(before)?)
+}
+
+/// A first or last message line newly visible above the composer is a receipt.
+/// Count occurrences so sending the same message again needs new evidence too.
+fn codex_transcript_receipt(screen: &str, before: &str, text: &str) -> bool {
+    let transcript = |screen: &str| {
+        let lines: Vec<_> = screen.lines().collect();
+        let end = lines.iter().rposition(|line| line.trim_start().starts_with(['›', '❯'])).unwrap_or(0);
+        lines[..end].join("\n")
+    };
+    if imacs_core::approvals::menu_visible(screen) {
+        return false;
+    }
+    let current = transcript(screen);
+    let previous = transcript(before);
+    let compact = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    let current_compact = compact(&current);
+    let previous_compact = compact(&previous);
+    let mut lines = text.lines().filter(|line| !line.trim().is_empty());
+    let Some(first) = lines.next() else { return false };
+    [first, lines.next_back().unwrap_or(first)].into_iter().any(|line| {
+        let message = compact(line);
+        if current_compact.matches(&message).count() > previous_compact.matches(&message).count() {
+            return true;
+        }
+        // Codex clips queued messages to a bullet and an ellipsis. Only accept a
+        // newly visible preview with a substantial matching prefix.
+        current.lines().any(|preview| {
+            let Some(prefix) = preview.trim().strip_prefix('•').and_then(|s| s.trim().strip_suffix('…')) else {
+                return false;
+            };
+            let prefix = compact(prefix);
+            prefix.chars().count() >= 20
+                && message.starts_with(&prefix)
+                && current.lines().filter(|line| *line == preview).count()
+                    > previous.lines().filter(|line| *line == preview).count()
+        })
+    })
 }
 
 /// Longest first prompt passed on the command line to agents other than Claude.
@@ -652,6 +697,29 @@ fn compile_cache_env(cwd: &Path) -> Vec<(String, String)> {
 mod tests {
     use super::super::tests::{request, session, with_app};
     use super::*;
+
+    #[test]
+    fn codex_receipts_require_new_evidence_outside_the_composer() {
+        let before = "Working\n› Ask Codex to do anything";
+        assert_eq!(codex_composer_empty(before, before), Some(true));
+        let other = "Working\n› Explain this codebase";
+        assert_eq!(codex_composer_empty(other, other), Some(true));
+        assert_eq!(codex_composer_empty("Working\n› unsent input", before), Some(false));
+        assert_eq!(codex_composer_empty("Working", before), None);
+        let text = "First line of the message\nMiddle line\nLast line of the message";
+        assert!(!codex_transcript_receipt(&format!("Working\n› {text}"), before, text));
+        assert!(!codex_transcript_receipt(before, before, text));
+        for line in ["First line of the message", "Last line of the message"] {
+            let receipt = format!("• {line}\n› Ask Codex to do anything");
+            assert!(codex_transcript_receipt(&receipt, before, text));
+            assert!(!codex_transcript_receipt(&receipt, &receipt, text));
+            let repeated = format!("• {line}\n{receipt}");
+            assert!(codex_transcript_receipt(&repeated, &receipt, text));
+        }
+        let preview = "• First line of the messag…\n› Ask Codex to do anything";
+        assert!(codex_transcript_receipt(preview, before, text));
+        assert!(!codex_transcript_receipt(preview, preview, text));
+    }
 
     #[test]
     fn agents_share_the_job_pool_at_lower_priority() {
@@ -851,7 +919,7 @@ fi
                 busy_text: None,
             });
             let text = "Please check the first change and then the second change";
-            for mode in ["queue", "retry", "drop", "exit", "hook"] {
+            for mode in ["queue", "retry", "drop", "drop-paste", "drop-empty", "exit", "hook"] {
                 let terminal = Terminal::spawn(
                     ctx,
                     app.palette.clone(),
@@ -921,7 +989,14 @@ fi
                             )
                     );
                 } else {
-                    assert!(response.error.unwrap().contains("not delivered"));
+                    assert!(response.error.unwrap().contains("unconfirmed"));
+                }
+                if matches!(mode, "drop-paste" | "drop-empty") {
+                    let screen = app.sessions[0].terminal.as_ref().unwrap().screen_text(60);
+                    assert!(screen.contains("Pastes: 1"), "{screen}");
+                    assert!(screen.contains("Enters: 1"), "{screen}");
+                    assert!(screen.contains("Tabs: 0"), "{screen}");
+                    assert_eq!(response.result.get("sent"), None);
                 }
                 if mode == "hook" {
                     assert_eq!(app.sessions[0].pending.as_ref().unwrap().text, "second message");
@@ -944,9 +1019,9 @@ fi
                 kind: AgentKind::Generic,
                 busy_text: None,
             });
-            for mode in ["long", "preview", "repeat", "collapsed", "no-prompt"] {
+            for mode in ["long", "preview", "repeat", "marker", "collapsed", "no-prompt"] {
                 let text = if mode == "long" {
-                    "A long multiline message that cannot fit on screen.\n".repeat(100)
+                    "A long multiline message that cannot fit on screen.\n".repeat(100) + "The final line is visible."
                 } else {
                     "Please check the first change and then the second change".into()
                 };
@@ -970,9 +1045,15 @@ fi
                 app.sessions[0].terminal = Some(terminal);
                 let (tx, rx) = channel();
                 app.control(ctx, ControlRequest::Send { session: mode.into(), text, raw: false }, tx);
+                let mut paste_seen = false;
                 while !app.sessions[0].terminal.as_ref().unwrap().screen_text(60).contains("Enters: 1") {
                     assert!(Instant::now() < deadline, "{mode}: the original paste and Enter must reach the fixture");
+                    app.verify_deliveries();
+                    paste_seen |= app.sessions[0].pending.as_ref().is_some_and(|pending| pending.paste_seen);
                     std::thread::sleep(Duration::from_millis(10));
+                }
+                if mode == "marker" {
+                    assert!(paste_seen, "the marker must be observed");
                 }
                 let mut response = None;
                 for _ in 0..=DELIVERY_ATTEMPTS {
@@ -984,7 +1065,7 @@ fi
                         response = Some(result);
                         break;
                     }
-                    if matches!(mode, "preview" | "collapsed") {
+                    if mode == "collapsed" {
                         while !app.sessions[0].terminal.as_ref().unwrap().screen_text(60).contains("Queued") {
                             assert!(Instant::now() < deadline, "{mode}: the retry must submit with Tab");
                             std::thread::sleep(Duration::from_millis(10));
@@ -997,6 +1078,9 @@ fi
                 // a second paste after the original text has left the composer.
                 let screen = app.sessions[0].terminal.as_ref().unwrap().screen_text(60);
                 assert!(screen.contains("Pastes: 1"), "{mode}: {screen}");
+                assert!(screen.contains("Enters: 1"), "{mode}: {screen}");
+                assert!(screen.contains(if mode == "collapsed" { "Tabs: 1" } else { "Tabs: 0" }), "{mode}: {screen}");
+                assert!(rx.try_recv().is_err(), "{mode}: a send resolves only once");
                 app.sessions.clear();
             }
         });
