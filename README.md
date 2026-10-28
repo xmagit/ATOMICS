@@ -189,6 +189,12 @@ Dispatching tasks selects that plan’s fleet tab, showing only sessions linked 
 start. It returns from the board to the diff and minimizes a floating chief; a docked chief stays beside the fleet.
 Click the plan tab later to return to that overview, or choose All or a project tab to see other sessions.
 
+Accepting an integrated task closes its agent; tasks without a branch, including the final review, close on acceptance.
+Its completed tile fills an otherwise empty grid cell, showing the duration, last report, diff size, **diff** and
+**resume**. Live agents keep their tile sizes and priority. Idle agents waiting for review show when they reported.
+When every task is accepted, the plan tab shows ✓ and its board offers **Archive plan**. The chief stays running and
+worktrees remain for the existing **clean up…** flow. Set `[plan] close_done_agents = false` to keep agents running.
+
 ## Voice
 
 Press `cmd+shift+space` and speak; press it again to send. The recording from the default microphone is transcribed

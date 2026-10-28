@@ -125,6 +125,12 @@ pub struct Task {
     pub integrated: Option<String>,
     /// IMACS session working on it, once dispatched.
     pub session: Option<String>,
+    pub dispatched_at: Option<u64>,
+    pub finished_at: Option<u64>,
+    pub worktree: Option<std::path::PathBuf>,
+    pub resume_id: Option<String>,
+    pub additions: usize,
+    pub deletions: usize,
     pub report: Option<Report>,
     pub notes: Vec<String>,
 }
@@ -147,6 +153,20 @@ pub struct Report {
     pub status: String,
     pub summary: String,
     pub at: u64,
+}
+
+impl Task {
+    pub fn completion_line(&self) -> Option<String> {
+        let elapsed = self.finished_at?.saturating_sub(self.dispatched_at?);
+        Some(format!("Agent completed in {}m {}s", elapsed / 60, elapsed % 60))
+    }
+
+    pub fn reported_line(&self, now: u64) -> Option<String> {
+        if self.status != TaskStatus::Review {
+            return None;
+        }
+        self.report.as_ref().map(|report| format!("reported {} min ago", now.saturating_sub(report.at) / 60))
+    }
 }
 
 impl TaskStatus {
@@ -172,6 +192,36 @@ impl TaskStatus {
 pub const REVIEW_TASK: &str = "review";
 
 impl Plan {
+    /// Accepted work keeps its agent until its branch has reached this plan.
+    pub fn finish_tasks(&mut self, now: u64) -> bool {
+        let integration = self.integration_branch();
+        let mut changed = false;
+        for task in &mut self.tasks {
+            if task.status != TaskStatus::Done && task.finished_at.take().is_some() {
+                changed = true;
+            }
+            if task.status == TaskStatus::Done
+                && (task.branch.is_none() || task.integrated.as_deref() == Some(&integration))
+                && task.finished_at.is_none()
+            {
+                task.finished_at = Some(now);
+                changed = true;
+            }
+        }
+        if self.status == PlanStatus::Completed && self.tasks.iter().any(|t| t.status != TaskStatus::Done) {
+            self.status = PlanStatus::Open;
+            changed = true;
+        }
+        if self.is_open()
+            && !self.tasks.is_empty()
+            && self.tasks.iter().all(|t| t.status == TaskStatus::Done && t.finished_at.is_some())
+        {
+            self.status = PlanStatus::Completed;
+            changed = true;
+        }
+        changed
+    }
+
     pub fn is_open(&self) -> bool {
         !self.id.is_empty() && self.status == PlanStatus::Open
     }
@@ -229,6 +279,12 @@ impl Plan {
                 task.report = old.report.clone();
                 task.notes = old.notes.clone();
                 task.integrated = old.integrated.clone();
+                task.dispatched_at = old.dispatched_at;
+                task.finished_at = old.finished_at;
+                task.worktree = old.worktree.clone();
+                task.resume_id = old.resume_id.clone();
+                task.additions = old.additions;
+                task.deletions = old.deletions;
                 if old.status != TaskStatus::Planned {
                     // A dispatched task's work is on its branch.
                     task.repo = old.repo.clone().or(task.repo.take());
@@ -372,6 +428,72 @@ pub fn short_slug(title: &str) -> String {
 mod tests {
     use super::*;
     use crate::git;
+
+    #[test]
+    fn acceptance_waits_for_integration_and_final_review_before_completing_plan() {
+        let mut plan = Plan {
+            id: "ship".into(),
+            tasks: vec![
+                Task {
+                    id: "code".into(),
+                    branch: Some("code".into()),
+                    status: TaskStatus::Done,
+                    dispatched_at: Some(100),
+                    ..Task::default()
+                },
+                Task { id: REVIEW_TASK.into(), status: TaskStatus::Review, ..Task::default() },
+            ],
+            ..Plan::default()
+        };
+        assert!(!plan.finish_tasks(890));
+        assert!(plan.tasks[0].finished_at.is_none());
+        plan.tasks[0].integrated = Some("wrong-plan".into());
+        assert!(!plan.finish_tasks(890));
+        plan.tasks[0].integrated = Some(plan.integration_branch());
+        assert!(plan.finish_tasks(890));
+        assert_eq!(plan.tasks[0].completion_line().as_deref(), Some("Agent completed in 13m 10s"));
+        assert_eq!(plan.status, PlanStatus::Open);
+        plan.tasks[1].status = TaskStatus::Done;
+        assert!(plan.finish_tasks(1000));
+        assert_eq!(plan.status, PlanStatus::Completed);
+        assert_eq!(plan.tasks[0].finished_at, Some(890));
+        assert!(!plan.finish_tasks(2000));
+        let dir = tempfile::tempdir().unwrap();
+        plan.save_in(dir.path()).unwrap();
+        assert_eq!(load_plans(dir.path()).unwrap(), [plan.clone()]);
+        plan.tasks[0].status = TaskStatus::Running;
+        assert!(plan.finish_tasks(3000));
+        assert_eq!(plan.status, PlanStatus::Open);
+        assert!(plan.tasks[0].finished_at.is_none());
+    }
+
+    #[test]
+    fn durations_reports_and_completion_metadata_survive_plan_edits() {
+        let mut task = Task {
+            id: "code".into(),
+            dispatched_at: Some(100),
+            finished_at: Some(890),
+            worktree: Some("/work".into()),
+            resume_id: Some("resume".into()),
+            additions: 412,
+            deletions: 88,
+            report: Some(Report { at: 100, ..Report::default() }),
+            ..Task::default()
+        };
+        assert_eq!(task.reported_line(1600), None);
+        task.status = TaskStatus::Review;
+        assert_eq!(task.reported_line(1600).as_deref(), Some("reported 25 min ago"));
+        assert_eq!(task.reported_line(0).as_deref(), Some("reported 0 min ago"));
+        let mut plan = Plan { tasks: vec![task.clone()], ..Plan::default() };
+        plan.replace("new goal".into(), vec![Task { id: "code".into(), ..Task::default() }]);
+        assert_eq!(plan.tasks[0], task);
+        let old: Task = serde_json::from_str(r#"{"id":"old"}"#).unwrap();
+        assert!(old.dispatched_at.is_none() && old.finished_at.is_none());
+        assert_eq!(old.completion_line(), None);
+        let mut empty = Plan { id: "empty".into(), ..Plan::default() };
+        assert!(!empty.finish_tasks(1));
+        assert_eq!(empty.status, PlanStatus::Open);
+    }
 
     fn task(id: &str, deps: &[&str]) -> Task {
         Task {
