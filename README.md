@@ -284,8 +284,37 @@ share is the machine, and IMACS keeps that in check for every agent it starts (`
 - **A shared compiler cache.** When sccache is installed and you have no `rustc-wrapper` of your own, agents get
   `RUSTC_WRAPPER=sccache`, so dependencies compile once for all worktrees (with
   `SCCACHE_IGNORE_SERVER_IO_ERROR=1`, a sandboxed build that cannot reach the cache compiles locally instead).
+- **Automatic .NET budgets.** A worktree containing a `*.sln`, `*.slnx`, `*.csproj` or `global.json`, at its root or
+  below, gets a .NET launch environment; other worktrees get no .NET settings. Detection includes untracked files,
+  skips Git metadata and directory symlinks, and works when the agent starts in a worktree subdirectory. No project
+  files or SDK configuration are changed. `DOTNET_PROCESSOR_COUNT` limits the CPU count seen by MSBuild, Roslyn
+  and the test host; `MSBUILDDISABLENODEREUSE=1`, `DOTNET_CLI_USE_MSBUILD_SERVER=0` and
+  `UseSharedCompilation=false` prevent new persistent MSBuild and Roslyn servers. Existing servers belonging to
+  other sessions are left running. Unlike cargo's shared pool, this is a per-process budget.
 - **Tests at the end.** Every brief asks agents to use `cargo check` and the tests they touch while working, and to run
-  the full suite once, at the end, through `imacs queue`.
+  the full suite once, at the end, through `imacs queue`. For .NET suites use
+  `imacs queue --class test -- dotnet test`.
+
+The .NET defaults need no config changes. Override them under `[resources.dotnet]`:
+
+```toml
+[resources.dotnet]
+enabled = true
+# processor_count = 2  # default: resources.jobs / resources.test_slots / 2, rounded down, at least 1
+```
+
+With 18 cores, the default 16 jobs and 3 test slots give each .NET process 2 CPUs: each runnable project can have
+both an MSBuild node and a compiler process. A fixed `processor_count` takes precedence; zero is clamped to one.
+`enabled = false` leaves the inherited environment alone, and changes apply to
+new terminals. `resources.jobs = 0` disables the Rust pool and gives .NET a one-CPU default.
+
+These are cooperative limits, not an OS CPU quota: explicit `-m:N` can override MSBuild's processor-based default,
+and project properties can override properties imported from the environment. NUnit/xUnit's default workers
+follow the reported CPU count (NUnit has a minimum of two); assembly attributes, runner configuration and custom
+test code can choose their own parallelism. Keep those settings within the budget and queue whole test suites.
+IMACS does not inject VSTest-specific arguments into every project, since Microsoft.Testing.Platform interprets
+them differently. The [SDK 9 measurements and reproduction scripts](docs/dotnet-resource-budget.md) show the
+three-build peak falling from 25 .NET processes to 12 (5.18 s to 6.49 s on the shared 18-core machine).
 
 The `load` gauge in the top bar shows the 1-minute load per core (grey, then yellow from 0.7 and red from 1.0); hover
 for the pool size and the slots in use. If IMACS ever ends without a clean quit, the next start says so and

@@ -184,6 +184,7 @@ impl App {
             env.extend(jobserver.env());
         }
         env.extend(compile_cache_env(&cwd));
+        env.extend(crate::governor::toolchain_env(&cwd, &self.config.resources, self.governor.cores));
 
         let (program, mut args) = match agent.command.split_first() {
             Some((program, rest)) => (program.clone(), rest.to_vec()),
@@ -760,6 +761,38 @@ mod tests {
                 std::fs::read_to_string(dir.path().join("probe.nice")).unwrap().trim(),
                 (inherited_nice + 7).min(19).to_string()
             );
+            app.sessions.clear();
+        });
+    }
+
+    #[test]
+    fn dotnet_agents_get_the_budget_in_their_terminal() {
+        with_app("app::sessions::tests::dotnet_agents_get_the_budget_in_their_terminal", |app, ctx| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir(dir.path().join("src")).unwrap();
+            std::fs::write(dir.path().join("src/Example.csproj"), "").unwrap();
+            let out = dir.path().join("env");
+            app.config.resources.dotnet.processor_count = Some(2);
+            app.config.agents.push(imacs_core::config::AgentConfig {
+                name: "dotnet-probe".into(),
+                command: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    format!("env > {0}.tmp; mv {0}.tmp {0}; sleep 5", out.display()),
+                ],
+                kind: AgentKind::Generic,
+                busy_text: None,
+            });
+            app.start(ctx, "dotnet-probe", dir.path().into(), None, vec![], None).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !out.exists() {
+                assert!(Instant::now() < deadline, "the .NET probe never wrote its environment");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let env = std::fs::read_to_string(out).unwrap();
+            for (key, value) in app.config.resources.env(imacs_core::governor::Toolchain::Dotnet, app.governor.cores) {
+                assert!(env.lines().any(|line| line == format!("{key}={value}")), "{env}");
+            }
             app.sessions.clear();
         });
     }

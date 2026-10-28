@@ -94,6 +94,11 @@ close_done_agents = true
 # qa_slots = 1       # QA instances at once
 agent_nice = 10      # niceness agent terminals start at; 0 = normal priority
 
+[resources.dotnet]
+# Applied automatically when the worktree contains a .sln, .slnx, .csproj or global.json.
+enabled = true
+# processor_count = 2  # per-process CPUs; unset = resources.jobs / test_slots / 2, at least 1
+
 [editor]
 # Terminal editor for editor mode (cmd+e). Helix has LSP and inlay hints built in.
 command = ["hx"]
