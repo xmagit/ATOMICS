@@ -80,14 +80,20 @@ const PARENT_SESSION_VARS: &[&str] = &[
 
 fn main() -> eframe::Result {
     let cli = Cli::parse();
+    let mut migration_errors = Vec::new();
     if cli.command.is_none() {
         for var in PARENT_SESSION_VARS {
             // SAFETY: runs first thing in main, before any other thread exists.
             unsafe { std::env::remove_var(var) };
         }
-        for moved in imacs_core::paths::migrate_from_cox() {
-            eprintln!("imacs: moved {moved}");
+        let migration = imacs_core::paths::migrate_from_cox();
+        for moved in migration.moved {
+            eprintln!("imacs: {moved}");
         }
+        for error in &migration.errors {
+            eprintln!("imacs: {error}");
+        }
+        migration_errors = migration.errors;
     }
     match cli.command {
         Some(Command::Doctor) => std::process::exit(doctor::run()),
@@ -141,6 +147,7 @@ fn main() -> eframe::Result {
         open,
         screenshot: cli.screenshot,
         screenshot_delay: cli.screenshot_delay,
+        migration_errors,
     };
     let icon = load_icon();
     let native = eframe::NativeOptions {

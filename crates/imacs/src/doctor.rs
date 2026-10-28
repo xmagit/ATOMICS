@@ -3,7 +3,7 @@ use std::process::Command;
 
 use imacs_core::{config::Config, paths};
 
-use crate::setup::{find_program, global_hooks_installed, resolve_program};
+use crate::setup::{find_program, global_hooks_installed, legacy_hooks_installed, resolve_program};
 
 pub fn run() -> i32 {
     let git_version = Command::new(resolve_program("git"))
@@ -43,6 +43,12 @@ pub fn run() -> i32 {
     println!("{}", check_line(running, &label, "start IMACS or check IMACS_SOCKET / IMACS_HOME"));
 
     println!("{}", check_line(global_hooks_installed(), "global Claude hooks installed", "run `imacs install-hooks`"));
+    if legacy_hooks_installed() {
+        println!(
+            "{}",
+            check_line(false, "leftover cox hook handlers (warning)", "run `imacs install-hooks` to remove them")
+        );
+    }
 
     exit_code(git_ok, config.is_ok())
 }

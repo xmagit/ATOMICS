@@ -73,6 +73,13 @@ pub fn global_hooks_installed() -> bool {
     std::fs::read_to_string(claude_settings_path()).is_ok_and(|text| text.contains(&format!("{} hook", exe.display())))
 }
 
+pub fn legacy_hooks_installed() -> bool {
+    std::fs::read_to_string(claude_settings_path())
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .is_some_and(|settings| imacs_core::hook::has_cox_hooks(&settings))
+}
+
 pub fn install_global_hooks() -> anyhow::Result<PathBuf> {
     let path = claude_settings_path();
     let exe = std::env::current_exe()?;

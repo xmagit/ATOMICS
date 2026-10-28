@@ -43,6 +43,7 @@ pub struct Options {
     pub open: Vec<(String, PathBuf)>,
     pub screenshot: Option<PathBuf>,
     pub screenshot_delay: f32,
+    pub migration_errors: Vec<String>,
 }
 
 pub struct Session {
@@ -207,13 +208,13 @@ struct QuickOpen {
 /// Push-to-talk: recording from the microphone, then waiting for the transcript.
 enum Voice {
     Idle,
+    Opening(Arc<AtomicBool>),
     Recording(Recorder),
     Transcribing,
 }
 
 enum VoiceEvent {
-    /// No API key, found while still recording: the recording could never be sent.
-    NoKey(String),
+    Opened(Arc<AtomicBool>, Result<Recorder, String>),
     Transcript(Result<String, String>),
 }
 
@@ -418,6 +419,9 @@ impl App {
         };
         app.open_initial_projects(options.projects, options.workspace);
         app.apply_config();
+        if !options.migration_errors.is_empty() {
+            app.toast(options.migration_errors.join("\n"));
+        }
         app
     }
 
@@ -1152,7 +1156,7 @@ impl App {
                 let project = self.plan.tasks.iter().find_map(|t| t.repo.as_deref()).map(paths::expand).or_else(|| {
                     self.diff_target().and_then(|t| self.project_of(&t)).or_else(|| self.repos.first().cloned())
                 });
-                self.plan.project = project.and_then(|p| workspace::project_root(&p).ok());
+                self.plan.project = project.and_then(|p| self.project_of(&p));
                 if let Some(project) = self.plan.project.clone() {
                     self.set_view(Some(project));
                 }
@@ -1539,20 +1543,26 @@ impl App {
     /// Push-to-talk: the first press records, the second transcribes and sends.
     fn toggle_voice(&mut self) {
         match self.voice {
-            Voice::Idle => match Recorder::start() {
-                Ok(recorder) => {
-                    self.voice = Voice::Recording(recorder);
-                    // Looks for the key while the user speaks, so a missing one shows up right away.
-                    let (config, tx, ctx) = (self.config.voice.clone(), self.voice_tx.clone(), self.ctx.clone());
-                    std::thread::spawn(move || {
-                        if let Err(err) = config.api_key(env_var) {
-                            let _ = tx.send(VoiceEvent::NoKey(format!("{err:#}")));
-                            ctx.request_repaint();
-                        }
+            Voice::Idle => {
+                let cancelled = Arc::new(AtomicBool::new(false));
+                self.voice = Voice::Opening(cancelled.clone());
+                let (config, tx, ctx) = (self.config.voice.clone(), self.voice_tx.clone(), self.ctx.clone());
+                std::thread::spawn(move || {
+                    let recording = Recorder::start().and_then(|recorder| {
+                        config.api_key(env_var).map_err(|err| format!("{err:#}"))?;
+                        Ok(recorder)
                     });
-                }
-                Err(err) => self.toast(format!("Voice: {err}")),
-            },
+                    if !cancelled.load(Ordering::Relaxed) {
+                        let _ = tx.send(VoiceEvent::Opened(cancelled, recording));
+                        ctx.request_repaint();
+                    }
+                });
+            }
+            Voice::Opening(ref cancelled) => {
+                cancelled.store(true, Ordering::Relaxed);
+                self.voice = Voice::Idle;
+                self.toast("Voice: recording cancelled");
+            }
             Voice::Recording(_) => self.stop_voice(),
             Voice::Transcribing => self.toast("Voice: still transcribing the last recording"),
         }
@@ -1613,13 +1623,15 @@ impl App {
                     Err(err) => Some(err),
                 }
             }
-            VoiceTarget::Active => match self.active_index().filter(|&i| self.sessions[i].can_receive()) {
-                Some(index) if self.deliver(index, text) => {
-                    self.toast(format!("Sent to {}: {quoted}", self.sessions[index].title));
-                    None
+            VoiceTarget::Active => {
+                match self.active_index().filter(|&i| self.sessions[i].is_agent() && self.sessions[i].can_receive()) {
+                    Some(index) if self.deliver(index, text) => {
+                        self.toast(format!("Sent to {}: {quoted}", self.sessions[index].title));
+                        None
+                    }
+                    _ => Some("No active agent to send to".to_string()),
                 }
-                _ => Some("No active session to send to".to_string()),
-            },
+            }
         };
         if let Some(err) = failed {
             if !self.steer_text.trim().is_empty() {
@@ -1678,7 +1690,7 @@ impl App {
                                     let text = format!("● REC {}:{:02}", secs / 60, secs % 60);
                                     ui.label(RichText::new(text).color(p.error).strong().size(11.5));
                                 }
-                                Voice::Transcribing => {
+                                Voice::Opening(_) | Voice::Transcribing => {
                                     ui.add(egui::Spinner::new().size(12.0).color(p.accent));
                                 }
                                 Voice::Idle => {}
@@ -1689,6 +1701,7 @@ impl App {
                     .interact(Sense::click());
                 let keys = &self.config.keys;
                 let hover = match self.voice {
+                    Voice::Opening(_) => "Opening microphone: Esc cancels".to_string(),
                     Voice::Recording(_) => format!("Recording: {} sends, Esc cancels", keys.voice),
                     Voice::Transcribing => "Transcribing".to_string(),
                     Voice::Idle => format!("The chief agent ({}) · voice ({})", keys.toggle_chief, keys.voice),
@@ -2064,6 +2077,17 @@ impl App {
         let ready: Vec<Task> =
             self.plan.ready().into_iter().filter(|t| only.is_none_or(|id| t.id == id)).cloned().collect();
         if ready.is_empty() {
+            if let Some(task) = self.plan.tasks.iter().find(|task| {
+                only.is_none_or(|id| task.id == id)
+                    && task.status == TaskStatus::Planned
+                    && !self.plan.unintegrated_dependencies(task).is_empty()
+            }) {
+                return Err(format!(
+                    "Task {} needs integrated dependencies: {}. Use imacs_plan_integrate on them first.",
+                    task.id,
+                    self.plan.unintegrated_dependencies(task).join(", ")
+                ));
+            }
             return Err(match only {
                 Some(id) => format!("Task {id} is not ready (it must be planned with all dependencies done)."),
                 None => "No task is ready.".into(),
@@ -2105,6 +2129,7 @@ impl App {
             self.create_worktree(repo.clone(), branch.clone(), start, launch);
             if let Some(t) = self.plan.task_mut(&task.id) {
                 t.status = TaskStatus::Running;
+                t.integrated = None;
                 t.branch = Some(branch);
                 t.repo.get_or_insert_with(|| repo.to_string_lossy().into_owned());
             }
@@ -2173,6 +2198,9 @@ impl App {
                 (format!("conflicts with {into} in {files}; merge aborted"), ControlResponse::error(error))
             }
             Ok(Integration { committed, merge, worktree }) => {
+                if let Some(task) = self.plan.task_mut(&id) {
+                    task.integrated = Some(into.clone());
+                }
                 let merged = merge == Merge::Merged;
                 let note = match (committed, merged) {
                     (true, _) => format!("committed and merged into {into}"),
@@ -2503,11 +2531,17 @@ impl App {
         }
         while let Ok(event) = self.voice_rx.try_recv() {
             match event {
-                VoiceEvent::NoKey(err) if matches!(self.voice, Voice::Recording(_)) => {
-                    self.voice = Voice::Idle;
-                    self.toast(format!("Voice: {err}"));
+                VoiceEvent::Opened(cancelled, result) => {
+                    if matches!(&self.voice, Voice::Opening(current) if Arc::ptr_eq(current, &cancelled)) {
+                        match result {
+                            Ok(recorder) => self.voice = Voice::Recording(recorder),
+                            Err(err) => {
+                                self.voice = Voice::Idle;
+                                self.toast(format!("Voice: {err}"));
+                            }
+                        }
+                    }
                 }
-                VoiceEvent::NoKey(_) => {}
                 VoiceEvent::Transcript(result) => {
                     self.voice = Voice::Idle;
                     match result {
@@ -2777,9 +2811,12 @@ impl App {
         if pressed(&keys.voice) {
             self.toggle_voice();
         }
-        if matches!(self.voice, Voice::Recording(_))
+        if matches!(self.voice, Voice::Opening(_) | Voice::Recording(_))
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape))
         {
+            if let Voice::Opening(cancelled) = &self.voice {
+                cancelled.store(true, Ordering::Relaxed);
+            }
             self.voice = Voice::Idle;
             self.toast("Voice: recording cancelled");
         }
@@ -4416,3 +4453,164 @@ const CHIEF_ALLOWED_TOOLS: &[&str] = &[
     "mcp__imacs__imacs_focus",
     "mcp__imacs__imacs_open",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session(id: &str, kind: AgentKind, status: AgentStatus, cwd: &Path) -> Session {
+        Session {
+            id: id.into(),
+            agent: "test".into(),
+            kind,
+            terminal: None,
+            claude_id: Some(id.into()),
+            cwd: cwd.into(),
+            worktree: None,
+            title: id.into(),
+            status,
+            last_prompt: None,
+            last_message: None,
+            selected: false,
+            chief: false,
+            pending: None,
+        }
+    }
+
+    #[test]
+    fn review_followups() {
+        // App startup writes config and opens a socket. Isolate its environment
+        // in a child process without mutating the parallel test runner's HOME.
+        if std::env::var_os("IMACS_APP_TEST_CHILD").is_none() {
+            let dir = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "app::tests::review_followups", "--nocapture"])
+                .current_dir(dir.path())
+                .env("IMACS_APP_TEST_CHILD", "1")
+                .env("HOME", dir.path())
+                .env("IMACS_HOME", dir.path().join("state"))
+                .env("IMACS_CONFIG", dir.path().join("config.toml"))
+                .env("IMACS_SOCKET", dir.path().join("imacs.sock"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "stdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let ctx = egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = App::new(
+            &cc,
+            Options { migration_errors: vec!["Migration failed".into()], ..Options::default() },
+            &crate::load_icon(),
+        );
+        assert_eq!(app.toast.as_ref().unwrap().0, "Migration failed");
+        close_idle_leaves_shells_alone(&mut app);
+        voice_to_a_shell_stays_in_the_steer_bar(&mut app, &ctx);
+        plan_set_resolves_cached_worktree_projects(&mut app);
+        dispatch_requires_integrated_dependencies(&mut app);
+    }
+
+    fn close_idle_leaves_shells_alone(app: &mut App) {
+        let project = Path::new("/project");
+        app.repos = vec![project.into()];
+        app.sessions = vec![
+            session("shell", AgentKind::Shell, AgentStatus::Idle, project),
+            session("exited-shell", AgentKind::Shell, AgentStatus::Exited, project),
+            session("idle", AgentKind::Generic, AgentStatus::Idle, project),
+            session("exited", AgentKind::Claude, AgentStatus::Exited, project),
+            session("working", AgentKind::Generic, AgentStatus::Working, project),
+            session("done", AgentKind::Claude, AgentStatus::Done, project),
+            session("chief", AgentKind::Claude, AgentStatus::Idle, project),
+            session("in-plan", AgentKind::Claude, AgentStatus::Idle, project),
+            session("elsewhere", AgentKind::Claude, AgentStatus::Idle, Path::new("/other")),
+        ];
+        app.sessions[6].chief = true;
+        app.plan.tasks = vec![Task { session: Some("in-plan".into()), ..Task::default() }];
+        assert_eq!(app.close_idle(project), 2);
+        assert_eq!(
+            app.sessions.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            ["shell", "exited-shell", "working", "done", "chief", "in-plan", "elsewhere"]
+        );
+    }
+
+    fn voice_to_a_shell_stays_in_the_steer_bar(app: &mut App, ctx: &egui::Context) {
+        app.config.voice.target = VoiceTarget::Active;
+        app.active = Some("shell".into());
+        assert!(app.sessions[0].can_receive());
+        app.steer_text = "existing draft".into();
+        app.send_voice(ctx, "delete everything");
+        assert_eq!(app.steer_text, "existing draft\ndelete everything");
+        assert!(app.focus_steer);
+        assert!(app.sessions[0].pending.is_none());
+    }
+
+    fn plan_set_resolves_cached_worktree_projects(app: &mut App) {
+        let project = PathBuf::from("/project");
+        app.worktree_project.insert("/worktree".into(), project.clone());
+        let (tx, rx) = channel();
+        app.control(
+            &app.ctx.clone(),
+            ControlRequest::PlanSet {
+                goal: "ship".into(),
+                tasks: vec![Task { id: "a".into(), repo: Some("/worktree/src".into()), ..Task::default() }],
+                integration: None,
+            },
+            tx,
+        );
+        assert!(matches!(rx.recv().unwrap(), ControlOutcome::Done(response) if response.ok));
+        assert_eq!(app.plan.project, Some(project));
+    }
+
+    fn dispatch_requires_integrated_dependencies(app: &mut App) {
+        app.plan = Plan {
+            approved: true,
+            tasks: vec![
+                Task { id: "a".into(), status: TaskStatus::Done, ..Task::default() },
+                Task { id: "b".into(), depends_on: vec!["a".into()], ..Task::default() },
+            ],
+            ..Plan::default()
+        };
+        for only in [Some("b"), None] {
+            let error = app.dispatch(only).unwrap_err();
+            assert!(error.contains("imacs_plan_integrate"), "{error}");
+            assert!(error.contains("a"));
+            assert!(app.creating.is_empty());
+        }
+        let into = app.plan.integration_branch();
+        for result in [
+            Err("failed".into()),
+            Ok(Integration {
+                committed: false,
+                merge: Merge::Conflict(vec!["file".into()]),
+                worktree: "/integration".into(),
+            }),
+        ] {
+            app.finish_integration(Integrated {
+                task: "a".into(),
+                branch: "task-a".into(),
+                into: into.clone(),
+                result,
+                reply: None,
+            });
+            assert!(app.plan.tasks[0].integrated.is_none());
+            assert!(app.plan.ready().is_empty());
+        }
+        app.plan.tasks[0].status = TaskStatus::Done;
+        app.finish_integration(Integrated {
+            task: "a".into(),
+            branch: "task-a".into(),
+            into: into.clone(),
+            result: Ok(Integration { committed: true, merge: Merge::Merged, worktree: "/integration".into() }),
+            reply: None,
+        });
+        assert_eq!(app.plan.tasks[0].integrated, Some(into));
+        assert_eq!(app.plan.ready().iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["b"]);
+        let loaded = Plan::load(&paths::plan_file()).unwrap();
+        assert_eq!(loaded.tasks[0].integrated, app.plan.tasks[0].integrated);
+    }
+}

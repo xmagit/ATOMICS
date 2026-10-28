@@ -36,6 +36,8 @@ pub struct Task {
     pub repo: Option<String>,
     pub branch: Option<String>,
     pub status: TaskStatus,
+    /// Integration branch this task was successfully merged into.
+    pub integrated: Option<String>,
     /// IMACS session working on it, once dispatched.
     pub session: Option<String>,
     pub report: Option<Report>,
@@ -109,6 +111,7 @@ impl Plan {
                 task.session = old.session.clone();
                 task.report = old.report.clone();
                 task.notes = old.notes.clone();
+                task.integrated = old.integrated.clone();
                 if old.status != TaskStatus::Planned {
                     // A dispatched task's work is on its branch.
                     task.repo = old.repo.clone().or(task.repo.take());
@@ -180,7 +183,19 @@ impl Plan {
         self.tasks.iter_mut().find(|t| t.id == id)
     }
 
-    /// Planned tasks whose dependencies are all done, in plan order.
+    /// Dependencies whose work has not reached this plan's integration branch.
+    pub fn unintegrated_dependencies<'a>(&self, task: &'a Task) -> Vec<&'a str> {
+        let into = self.integration_branch();
+        task.depends_on
+            .iter()
+            .filter(|dep| {
+                !self.tasks.iter().any(|other| &other.id == *dep && other.integrated.as_deref() == Some(&into))
+            })
+            .map(String::as_str)
+            .collect()
+    }
+
+    /// Planned tasks whose dependencies are all done and integrated, in plan order.
     pub fn ready(&self) -> Vec<&Task> {
         self.tasks
             .iter()
@@ -188,6 +203,7 @@ impl Plan {
             .filter(|t| {
                 t.depends_on.iter().all(|dep| self.tasks.iter().any(|o| &o.id == dep && o.status == TaskStatus::Done))
             })
+            .filter(|t| self.unintegrated_dependencies(t).is_empty())
             .collect()
     }
 
@@ -263,7 +279,13 @@ mod tests {
         assert_eq!(plan.tasks.last().unwrap().id, REVIEW_TASK);
         plan.task_mut("a").unwrap().status = TaskStatus::Done;
         let ready: Vec<&str> = plan.ready().iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ready, ["c"], "done alone does not make the work available");
+        assert_eq!(plan.unintegrated_dependencies(&plan.tasks[1]), ["a"]);
+        plan.task_mut("a").unwrap().integrated = Some(plan.integration_branch());
+        let ready: Vec<&str> = plan.ready().iter().map(|t| t.id.as_str()).collect();
         assert_eq!(ready, ["b", "c"]);
+        plan.integration = Some("another-integration".into());
+        assert_eq!(plan.ready().iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["c"]);
     }
 
     #[test]
