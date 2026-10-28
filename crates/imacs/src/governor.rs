@@ -118,15 +118,18 @@ impl Drop for Jobserver {
 /// Whether a process that may hold a token runs. cargo itself only holds tokens while one of
 /// its compilers or build scripts runs, and a long `cargo run` must not block the refill.
 fn compilers_running() -> bool {
-    let Ok(output) = std::process::Command::new("ps").args(["-axo", "comm="]).output() else { return true };
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .any(|line| holds_tokens(line.rsplit('/').next().unwrap_or(line).trim()))
+    let Ok(output) = std::process::Command::new("ps").args(["-axo", "args="]).output() else { return true };
+    String::from_utf8_lossy(&output.stdout).lines().any(holds_tokens)
 }
 
-fn holds_tokens(program: &str) -> bool {
+/// From a process's command line: compilers and build scripts, and sccache compiling for cargo
+/// (with arguments; the cache server itself runs without any).
+fn holds_tokens(args: &str) -> bool {
+    let mut words = args.split_whitespace();
+    let Some(program) = words.next().map(|p| p.rsplit('/').next().unwrap_or(p)) else { return false };
     matches!(program, "rustc" | "clippy-driver" | "rustdoc" | "cc" | "c++" | "clang" | "clang++" | "ld" | "ld64")
         || program.starts_with("build-script-")
+        || (program == "sccache" && words.next().is_some())
 }
 
 pub struct Governor {
@@ -265,19 +268,19 @@ fn hold_slot(socket: &Path, class: SlotClass, label: &str) -> Result<Option<Unix
     let mut deadline: Option<Instant> = None;
     loop {
         match UnixStream::connect(socket) {
-            Ok(stream) => match wait_for_slot(stream, class, label) {
-                Ok(stream) => return Ok(Some(stream)),
-                Err(SlotError::Refused(reason)) => {
-                    eprintln!("imacs queue: IMACS cannot queue ({reason}); running without a slot");
-                    return Ok(None);
+            Ok(stream) => {
+                // IMACS is back: a later restart gets the full reconnect time again.
+                deadline = None;
+                match wait_for_slot(stream, class, label) {
+                    Ok(stream) => return Ok(Some(stream)),
+                    Err(SlotError::Refused(reason)) => {
+                        eprintln!("imacs queue: IMACS cannot queue ({reason}); running without a slot");
+                        return Ok(None);
+                    }
+                    // IMACS went away while this waited: wait for it to come back and queue again.
+                    Err(SlotError::Lost(err)) => eprintln!("imacs queue: {err:#}; reconnecting"),
                 }
-                Err(SlotError::Lost(err)) if deadline.is_some_and(|d| Instant::now() > d) => {
-                    eprintln!("imacs queue: {err:#}; running without a slot");
-                    return Ok(None);
-                }
-                // IMACS went away while this waited: wait for it to come back and queue again.
-                Err(SlotError::Lost(err)) => eprintln!("imacs queue: {err:#}; reconnecting"),
-            },
+            }
             Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
                 eprintln!(
                     "imacs queue: this sandbox blocks the IMACS socket ({err}); run this command outside \
@@ -389,11 +392,17 @@ mod tests {
 
     #[test]
     fn only_compilers_and_build_scripts_hold_tokens() {
-        for name in ["rustc", "clippy-driver", "cc", "ld", "build-script-build", "build-script-main"] {
-            assert!(holds_tokens(name), "{name}");
+        for args in [
+            "rustc --crate-name x",
+            "/opt/homebrew/bin/clippy-driver -",
+            "cc -c a.c",
+            "/x/target/debug/build/ring-1/build-script-build",
+            "/opt/homebrew/bin/sccache /opt/homebrew/bin/rustc --crate-name y",
+        ] {
+            assert!(holds_tokens(args), "{args}");
         }
-        for name in ["cargo", "imacs", "sleep", "cargo-watch", "bacon"] {
-            assert!(!holds_tokens(name), "{name}");
+        for args in ["cargo run", "imacs", "sleep 5", "cargo-watch -x test", "bacon", "/opt/homebrew/bin/sccache", ""] {
+            assert!(!holds_tokens(args), "{args}");
         }
     }
 
