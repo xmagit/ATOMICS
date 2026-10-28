@@ -45,7 +45,10 @@ pub fn ancestors() -> Vec<u32> {
 fn forward(request: &HookRequest, socket: std::path::PathBuf) -> Option<String> {
     let stream = UnixStream::connect(socket).ok()?;
     stream.set_write_timeout(Some(Duration::from_secs(1))).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(12))).ok()?;
+    let permission =
+        request.payload.get("hook_event_name").and_then(serde_json::Value::as_str) == Some("PermissionRequest");
+    let timeout = if permission { imacs_core::hook::PERMISSION_WAIT_SECONDS + 10 } else { 12 };
+    stream.set_read_timeout(Some(Duration::from_secs(timeout))).ok()?;
     let mut writer = &stream;
     writer.write_all(serde_json::to_string(request).ok()?.as_bytes()).ok()?;
     writer.write_all(b"\n").ok()?;
@@ -62,6 +65,31 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
     use std::process::{Command, Stdio};
+
+    #[test]
+    fn permission_forward_waits_for_a_review_longer_than_twelve_seconds() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("permission.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).unwrap();
+            std::thread::sleep(Duration::from_secs(13));
+            let _ = stream.write_all(b"{\"stdout\":\"reviewed\"}\n");
+        });
+        let reply = forward(
+            &HookRequest {
+                pane: Some("review".into()),
+                ancestors: vec![],
+                payload: serde_json::json!({"hook_event_name":"PermissionRequest", "session_id":"review"}),
+            },
+            socket,
+        );
+        server.join().unwrap();
+        assert_eq!(reply.as_deref(), Some("reviewed"));
+    }
 
     #[test]
     fn ancestry_runs_only_at_session_start_and_uses_path() {

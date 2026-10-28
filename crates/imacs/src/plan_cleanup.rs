@@ -213,6 +213,7 @@ mod tests {
                     &app.config.agents[0],
                     dir.path().join("busy"),
                     false,
+                    &app.ctx,
                 ));
                 app.plans = vec![plan];
                 app.selected_plan = 0;

@@ -164,6 +164,14 @@ fn inside(path: &Path, root: &Path) -> bool {
 
 /// Codex also prompts for edits and terminal input; their choices must never receive steering text.
 pub fn menu_visible(screen: &str) -> bool {
+    if let Some(prompt) = screen.lines().rev().find_map(|line| line.trim().strip_prefix(['›', '❯', '>']))
+        && !prompt
+            .trim()
+            .split_once('.')
+            .is_some_and(|(number, _)| !number.is_empty() && number.chars().all(|c| c.is_ascii_digit()))
+    {
+        return false;
+    }
     let compact: String = screen.chars().filter(|c| !c.is_whitespace()).flat_map(char::to_lowercase).collect();
     compact.contains("pressentertoconfirmoresctocancel")
         || screen.lines().any(|line| {
@@ -174,14 +182,27 @@ pub fn menu_visible(screen: &str) -> bool {
         })
 }
 
-/// Only answer a native menu whose numbered choices are actually visible.
+/// Match a visible native menu, or expand a hidden command before checking it.
 pub fn menu_key(screen: &str, command: Option<&str>, decision: Decision) -> Option<String> {
     let command = command?;
     let (_, menu) = screen.rsplit_once("Would you like to run the following command?")?;
-    let (_, shown) = menu.split_once('$')?;
+    if !menu_visible(menu) {
+        return None;
+    }
+    let Some(line) = menu.lines().find(|line| line.trim_start().starts_with('$')) else {
+        return (menu.contains("Reason:") && menu.contains("⌃a view all") && menu_visible(menu)).then(|| "\x01".into());
+    };
+    let shown = menu[menu.find(line)?..].trim_start().strip_prefix('$')?;
     let shown = shown.split("\n\n").next()?;
     let compact = |text: &str| text.chars().filter(|c| !c.is_whitespace()).collect::<String>();
-    if compact(shown) != compact(command) {
+    let (shown, command) = (compact(shown), compact(command));
+    let truncated_match = shown.rsplit_once("[…").is_some_and(|(prefix, marker)| {
+        let lines = marker.strip_suffix("lines]⌃aviewall").or_else(|| marker.strip_suffix("lines]"));
+        !prefix.is_empty()
+            && command.starts_with(prefix)
+            && lines.is_some_and(|lines| lines.parse::<usize>().is_ok_and(|lines| lines > 0))
+    });
+    if shown != command && !truncated_match {
         return None;
     }
     if decision == Decision::Deny && menu.contains("esc to cancel") {
@@ -332,6 +353,19 @@ mod tests {
             assert!(menu_key(screen, Some("touch fixture"), Decision::Allow).is_none());
         }
         assert!(!menu_visible("1. A normal numbered response\n› Ask Codex to do anything"));
+        assert!(!menu_visible(
+            "› 1. Yes, proceed\nPress enter to confirm or esc to cancel\nWorking (esc to interrupt)\n›"
+        ));
+    }
+
+    #[test]
+    fn fallback_expands_a_hidden_command_before_approving() {
+        let screen = "Would you like to run the following command?\n\nReason: A long explanation of why the command needs access\n  [… 9 lines] ⌃a view all\n\n› 1. Yes, proceed (y)\n  2. No, and tell Codex what to do differently (esc)";
+        for decision in [Decision::Allow, Decision::AllowAlways, Decision::Deny] {
+            assert_eq!(menu_key(screen, Some("touch fixture"), decision).as_deref(), Some("\x01"));
+        }
+        assert_eq!(menu_key(&screen.replace(" ⌃a view all", ""), Some("touch fixture"), Decision::Allow), None);
+        assert_eq!(menu_key(&format!("{screen}\nWorking\n›"), Some("touch fixture"), Decision::Allow), None);
     }
 
     #[test]
@@ -342,6 +376,7 @@ mod tests {
         assert_eq!(menu_key(screen, Some("touch fixture"), Decision::Deny).as_deref(), Some("3\r"));
         assert_eq!(menu_key("Agent is working", Some("touch fixture"), Decision::Allow), None);
         assert_eq!(menu_key(screen, Some("touch other"), Decision::Allow), None);
+        assert_eq!(menu_key(&format!("{screen}\nWorking\n›"), Some("touch fixture"), Decision::Allow), None);
         let old = format!("9. Yes, proceed (y)\n{screen}");
         assert_eq!(menu_key(&old, Some("touch fixture"), Decision::Allow).as_deref(), Some("1\r"));
         let no_choice =
@@ -349,5 +384,26 @@ mod tests {
         assert_eq!(menu_key(no_choice, Some("touch fixture"), Decision::Allow), None);
         let clipped = "Would you like to run the following command?\n\n  $ touch fixture\n\n› 1. Yes, proceed (y)\nPress enter to confirm or esc to cancel";
         assert_eq!(menu_key(clipped, Some("touch fixture"), Decision::Deny).as_deref(), Some("\x1b"));
+    }
+
+    #[test]
+    fn fallback_matches_truncated_heredoc_commands() {
+        let command = format!("python3 - <<'PY'\nfrom pathlib import Path\n{}PY", "print('fixture')\n".repeat(46));
+        let screen = "Would you like to run the following command?\n\n  $ python3 - <<'PY'\n  from pathlib import Path\n  [… 46 lines] ⌃a view all\n\n› 1. Yes, proceed (y)\n  2. No, and tell Codex what to do differently (esc)\nPress enter to confirm or esc to cancel";
+        for decision in [Decision::Allow, Decision::AllowAlways] {
+            assert_eq!(menu_key(screen, Some(&command), decision).as_deref(), Some("1\r"));
+        }
+        assert_eq!(menu_key(screen, Some(&command), Decision::Deny).as_deref(), Some("\x1b"));
+        assert_eq!(menu_key(screen, Some("python3 - <<'PY'\nimport os\nPY"), Decision::Allow), None);
+        let no_hint = screen.replace(" ⌃a view all", "");
+        assert_eq!(menu_key(&no_hint, Some(&command), Decision::Allow).as_deref(), Some("1\r"));
+        for marker in ["[… lines]", "[… many lines]", "[… 46 lines] unrelated text"] {
+            assert_eq!(
+                menu_key(&screen.replace("[… 46 lines] ⌃a view all", marker), Some(&command), Decision::Allow),
+                None
+            );
+        }
+        let no_prefix = screen.replace("python3 - <<'PY'\n  from pathlib import Path\n  ", "");
+        assert_eq!(menu_key(&no_prefix, Some(&command), Decision::Allow), None);
     }
 }
