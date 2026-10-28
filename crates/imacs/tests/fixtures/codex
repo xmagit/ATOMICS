@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Busy terminal fixture: drops Enter once, queues with Tab, or never accepts input."""
+"""Busy Codex with placeholders, clipped receipts, and dropped input."""
 import os
 import sys
 import tty
@@ -15,6 +15,8 @@ paste = False
 sequence = b""
 enters = 0
 pastes = 0
+tabs = 0
+placeholder = "" if mode == "drop-empty" else "Ask Codex to do anything"
 previous = "Please check the first change and then the second change"
 last_body = ""
 
@@ -25,13 +27,14 @@ def screen(body):
     sys.stdout.write(
         "\x1b[2J\x1b[H\x1b[?2004h" + body
         + "\r\nPastes: " + str(pastes) + "\r\nEnters: " + str(enters)
+        + "\r\nTabs: " + str(tabs)
     )
     sys.stdout.flush()
 
 
 menu = "Would you like to run the following command?\r\n\r\n  $ touch fixture\r\n\r\n› 1. Yes, proceed (y)\r\n  2. No, and tell Codex what to do differently (esc)\r\nPress enter to confirm or esc to cancel"
 hidden = "Would you like to run the following command?\r\n\r\nReason: A long explanation of why access is needed\r\n  [… 9 lines] ⌃a view all\r\n\r\n› 1. Yes, proceed (y)\r\n  2. No, and tell Codex what to do differently (esc)\r\nPress enter to confirm or esc to cancel"
-initial = "Working (esc to interrupt)\r\n› \r\n tab to queue"
+initial = "Working (esc to interrupt)\r\n› " + placeholder + "\r\n tab to queue"
 if mode == "repeat":
     initial = "• " + previous + "\r\n" + initial
 screen(hidden if mode == "hidden" else initial)
@@ -55,7 +58,10 @@ while True:
         elif sequence == b"\x1b[201~":
             paste = False
             sequence = b""
-            composer = "[Pasted content]" if mode in ("long", "collapsed") else text.decode()
+            composer = "[Pasted Content " + str(len(text)) + " chars]" if mode in ("long", "collapsed", "marker") else text.decode()
+            if mode in ("drop-paste", "drop-empty"):
+                text = b""
+                composer = placeholder
             footer = "" if mode == "retry" else "\r\n tab to queue"
             screen("Working (esc to interrupt)\r\n› " + composer + footer)
         continue
@@ -66,14 +72,21 @@ while True:
         if mode == "exit":
             sys.exit(0)
         if mode == "retry" and enters > 1:
-            screen("› " + text.decode() + "\r\nWorking (esc to interrupt)\r\n› ")
+            screen("› " + text.decode() + "\r\nWorking (esc to interrupt)\r\n› " + placeholder)
         elif mode == "long":
-            screen("Message accepted\r\nWorking (esc to interrupt)\r\n› ")
+            screen("• " + text.decode().splitlines()[-1] + "\r\nWorking (esc to interrupt)\r\n› " + placeholder)
+        elif mode == "marker":
+            screen("Message accepted\r\nWorking (esc to interrupt)\r\n› " + placeholder)
         elif mode == "repeat":
-            screen(initial)
+            screen("• " + previous + "\r\n• " + text.decode() + "\r\nWorking (esc to interrupt)\r\n› " + placeholder)
+        elif mode == "preview":
+            screen("• " + text[:24].decode() + "…\r\nQueued\r\n› " + placeholder)
         elif mode == "no-prompt":
             screen("Message accepted\r\nWorking (esc to interrupt)")
         screen(last_body)
-    elif char == b"\t" and mode in ("queue", "preview", "collapsed"):
-        preview = text[:24].decode() + "…" if mode == "preview" else text.decode()
-        screen("• " + preview + "\r\nQueued\r\n› \r\n esc to interrupt")
+    elif char == b"\t":
+        tabs += 1
+        if mode in ("queue", "collapsed"):
+            screen("• " + text.decode() + "\r\nQueued\r\n› " + placeholder + "\r\n esc to interrupt")
+        else:
+            screen(last_body)

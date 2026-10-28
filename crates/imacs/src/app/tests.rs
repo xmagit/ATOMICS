@@ -240,6 +240,7 @@ fn busy_text_is_only_a_fallback(app: &mut App, ctx: &egui::Context) {
         was_working: true,
         codex: false,
         screen_before: String::new(),
+        paste_seen: false,
         reply: None,
     });
     app.verify_deliveries();
