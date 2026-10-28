@@ -140,7 +140,14 @@ pub fn session_settings(imacs_exe: &Path, socket: &Path, pane: &str, codex: bool
             (event.to_string(), json!([{ "hooks": [{ "type": "command", "command": command, "timeout": if *event == "Interrupt" { 3 } else { 15 } }] }]))
         })
         .collect();
-    json!({ "hooks": hooks })
+    let mut settings = json!({ "hooks": hooks });
+    if !codex {
+        settings["statusLine"] = json!({
+            "type": "command",
+            "command": format!("{} statusline --socket {}", shell_quote(&imacs_exe.to_string_lossy()), shell_quote(&socket.to_string_lossy()))
+        });
+    }
+    settings
 }
 
 /// TOML CLI overrides use the same schema as hooks.json.
@@ -201,6 +208,7 @@ pub fn merge_into_settings(existing: &mut Value, imacs_exe: &Path) {
             handlers.len() == before || !handlers.is_empty()
         });
     }
+    hooks.as_object_mut().expect("object").retain(|_, groups| !groups.as_array().is_some_and(Vec::is_empty));
     for (event, groups) in ours["hooks"].as_object().expect("object") {
         let list = hooks.as_object_mut().expect("object").entry(event.clone()).or_insert_with(|| json!([]));
         let Some(list) = list.as_array_mut() else { continue };
@@ -260,6 +268,15 @@ mod tests {
             assert_eq!(shlex::split(command).unwrap(), expected);
             assert!(!command.contains("IMACS_SOCKET"));
             assert_eq!(settings["hooks"].get("PermissionRequest").is_some(), codex);
+            if codex {
+                assert!(settings.get("statusLine").is_none());
+            } else {
+                assert_eq!(settings["statusLine"]["type"], "command");
+                assert_eq!(
+                    shlex::split(settings["statusLine"]["command"].as_str().unwrap()).unwrap(),
+                    [exe.to_str().unwrap(), "statusline", "--socket", socket.to_str().unwrap()]
+                );
+            }
         }
         assert_eq!(session_settings(exe, socket, "pane-1", true), session_settings(exe, socket, "pane-2", true));
         assert_eq!(ancestor_pids(40, "PID PPID\n40 30\n30 20\n20 1\n99 20"), vec![30, 20]);
@@ -379,7 +396,7 @@ mod tests {
             ]})
         );
         assert_eq!(settings["hooks"]["Stop"].as_array().unwrap().len(), 2);
-        assert!(settings["hooks"]["PreToolUse"].as_array().unwrap().is_empty());
+        assert!(settings["hooks"].get("PreToolUse").is_none());
         assert_eq!(settings["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
         let once = settings.clone();
         merge_into_settings(&mut settings, exe);

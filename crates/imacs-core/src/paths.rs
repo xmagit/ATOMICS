@@ -66,12 +66,20 @@ fn move_directory(old: &Path, new: &Path) -> anyhow::Result<&'static str> {
         Err(err) => err,
     };
     // Copy beside the destination, so a failed copy never hides the old state on retry.
-    let staging = new.with_extension("migration");
-    if let Some(parent) = staging.parent() {
+    if let Some(parent) = new.parent() {
         std::fs::create_dir_all(parent).context(format!("rename failed ({rename_error}); creating copy parent"))?;
     }
-    std::fs::create_dir(&staging)
-        .context(format!("rename failed ({rename_error}); creating copy staging directory"))?;
+    let mut attempt = 0;
+    let staging = loop {
+        let candidate = new.with_extension(format!("migration-{}-{attempt}", std::process::id()));
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => break candidate,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => attempt += 1,
+            Err(err) => {
+                return Err(err).context(format!("rename failed ({rename_error}); creating copy staging directory"));
+            }
+        }
+    };
     let copied = copy_directory(old, &staging).and_then(|()| std::fs::rename(&staging, new));
     if let Err(err) = copied {
         let cleanup = std::fs::remove_dir_all(&staging);
@@ -196,6 +204,36 @@ mod tests {
         assert!(result.errors[0].contains("copy failed"));
         assert!(!imacs_home().with_extension("migration").exists());
         assert_eq!(std::fs::read_to_string(legacy.join("plan.json")).unwrap(), "old");
+    }
+
+    #[test]
+    fn stale_migration_staging_does_not_block_retry_or_get_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("cox");
+        let new = dir.path().join("missing-parent/.imacs");
+        std::fs::create_dir(&old).unwrap();
+        std::fs::write(old.join("plan.json"), "current").unwrap();
+        for staging in
+            [new.with_extension("migration"), new.with_extension(format!("migration-{}-0", std::process::id()))]
+        {
+            std::fs::create_dir_all(&staging).unwrap();
+            std::fs::write(staging.join("plan.json"), "stale").unwrap();
+        }
+        // Force the rename fallback while leaving both old staging directories in place.
+        std::os::unix::fs::symlink(dir.path().join("missing"), &new).unwrap();
+        for _ in 0..2 {
+            let error = format!("{:#}", move_directory(&old, &new).unwrap_err());
+            assert!(error.contains("copy failed"), "must get past stale staging: {error}");
+            assert_eq!(std::fs::read_to_string(old.join("plan.json")).unwrap(), "current");
+        }
+        std::fs::remove_file(&new).unwrap();
+        move_directory(&old, &new).unwrap();
+        assert_eq!(std::fs::read_to_string(new.join("plan.json")).unwrap(), "current");
+        for staging in
+            [new.with_extension("migration"), new.with_extension(format!("migration-{}-0", std::process::id()))]
+        {
+            assert_eq!(std::fs::read_to_string(staging.join("plan.json")).unwrap(), "stale");
+        }
     }
 
     #[test]

@@ -146,6 +146,9 @@ pub struct Task {
     pub status: TaskStatus,
     /// Integration branch this task was successfully merged into.
     pub integrated: Option<String>,
+    /// Latest background ancestry check; rechecked after loading.
+    #[serde(skip)]
+    pub integration_verified: bool,
     /// IMACS session working on it, once dispatched.
     pub session: Option<String>,
     pub dispatched_at: Option<u64>,
@@ -309,6 +312,7 @@ impl Plan {
                 task.resume_id = old.resume_id.clone();
                 task.additions = old.additions;
                 task.deletions = old.deletions;
+                task.integration_verified = old.integration_verified;
                 if old.status != TaskStatus::Planned {
                     // A dispatched task's work is on its branch.
                     task.repo = old.repo.clone().or(task.repo.take());
@@ -382,7 +386,9 @@ impl Plan {
         task.depends_on
             .iter()
             .filter(|dep| {
-                !self.tasks.iter().any(|other| &other.id == *dep && other.integrated.as_deref() == Some(&into))
+                !self.tasks.iter().any(|other| {
+                    &other.id == *dep && other.integrated.as_deref() == Some(&into) && other.integration_verified
+                })
             })
             .map(String::as_str)
             .collect()
@@ -418,6 +424,7 @@ impl Task {
     pub fn set_status(&mut self, status: TaskStatus) {
         if !matches!(status, TaskStatus::Review | TaskStatus::Done) {
             self.integrated = None;
+            self.integration_verified = false;
         }
         self.status = status;
     }
@@ -616,9 +623,15 @@ mod tests {
     #[test]
     fn leaving_review_or_done_clears_integration() {
         for status in TaskStatus::ALL {
-            let mut task = Task { status: TaskStatus::Done, integrated: Some("integration".into()), ..Task::default() };
+            let mut task = Task {
+                status: TaskStatus::Done,
+                integrated: Some("integration".into()),
+                integration_verified: true,
+                ..Task::default()
+            };
             task.set_status(status);
             assert_eq!(task.integrated.is_some(), matches!(status, TaskStatus::Review | TaskStatus::Done));
+            assert_eq!(task.integration_verified, matches!(status, TaskStatus::Review | TaskStatus::Done));
         }
     }
 
@@ -733,17 +746,14 @@ mod tests {
 
     #[test]
     fn fleet_includes_only_linked_sessions_in_any_task_state() {
-        let plan = Plan {
-            tasks: vec![
-                Task { session: Some("running".into()), status: TaskStatus::Running, ..Task::default() },
-                Task { session: Some("done".into()), status: TaskStatus::Done, ..Task::default() },
-                Task::default(),
-            ],
-            ..Plan::default()
-        };
-        let sessions = ["unrelated", "done", "chief", "running"];
-        let fleet: Vec<_> = sessions.into_iter().filter(|id| plan.contains_session(id)).collect();
-        assert_eq!(fleet, ["done", "running"]);
+        let mut plan = Plan::default();
+        for status in TaskStatus::ALL {
+            let linked = format!("linked-{}", status.label());
+            plan.tasks = vec![Task { session: Some(linked.clone()), status, ..Task::default() }, Task::default()];
+            assert!(plan.contains_session(&linked), "{status:?}");
+            assert!(!plan.contains_session("unrelated"));
+            assert!(!plan.contains_session(""), "an undispatched task must not match an empty session id");
+        }
     }
 
     #[test]
@@ -758,8 +768,13 @@ mod tests {
         assert_eq!(ready, ["c"], "done alone does not make the work available");
         assert_eq!(plan.unintegrated_dependencies(&plan.tasks[1]), ["a"]);
         plan.task_mut("a").unwrap().integrated = Some(plan.integration_branch());
+        assert!(plan.ready().iter().all(|t| t.id != "b"), "an unchecked marker is not ready");
+        plan.task_mut("a").unwrap().integration_verified = true;
         let ready: Vec<&str> = plan.ready().iter().map(|t| t.id.as_str()).collect();
         assert_eq!(ready, ["b", "c"]);
+        let loaded: Plan = serde_json::from_value(serde_json::to_value(&plan).unwrap()).unwrap();
+        assert!(!loaded.tasks[0].integration_verified, "freshness is never persisted across restarts");
+        assert_eq!(loaded.ready().iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["c"]);
         plan.integration = Some("another-integration".into());
         assert_eq!(plan.ready().iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["c"]);
     }
