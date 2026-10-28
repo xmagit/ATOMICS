@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use egui::{Color32, FontId, Key, Pos2, Rect, RichText, Sense, Stroke, Vec2, pos2, vec2};
@@ -25,7 +25,7 @@ use crate::voice::{MAX_RECORDING, Recorder};
 use imacs_core::approvals::{ApprovalRequest, Decision};
 use imacs_core::control::{ControlRequest, ControlResponse};
 use imacs_core::hook::HookReply;
-use imacs_core::plan::{self, Plan, Report, Task, TaskStatus, short_slug};
+use imacs_core::plan::{self, Plan, PlanStatus, Report, Task, TaskStatus, short_slug};
 use imacs_core::workspace::{self, Workspace};
 use serde_json::json;
 
@@ -67,7 +67,9 @@ pub struct Session {
     hooks_active: bool,
     approvals: Vec<PendingApproval>,
     allowed: Vec<ApprovalRequest>,
-    held: Vec<(String, bool)>,
+    held: Vec<String>,
+    approval_hold: bool,
+    menu_absent_since: Option<Instant>,
     pub selected: bool,
     /// The chief agent stays outside the agent fleet.
     pub chief: bool,
@@ -75,9 +77,27 @@ pub struct Session {
     pending: Option<Pending>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Delivery {
+    Sent,
+    Queued,
+    Held,
+    Unavailable,
+}
+
 struct PendingApproval {
     request: ApprovalRequest,
     reply: Option<Arc<ipc::ApprovalReply>>,
+}
+
+struct AgentLaunch {
+    id: String,
+    agent: imacs_core::config::AgentConfig,
+    cwd: PathBuf,
+    resume: Option<String>,
+    extra_args: Vec<String>,
+    prompt: Option<String>,
+    chief: bool,
 }
 
 struct Pending {
@@ -87,10 +107,41 @@ struct Pending {
     was_working: bool,
 }
 
+const APPROVAL_CHECK_INTERVAL: Duration = Duration::from_millis(250);
+const APPROVAL_MENU_GRACE: Duration = Duration::from_secs(1);
+
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(4);
 const DELIVERY_ATTEMPTS: u8 = 3;
 
 impl Session {
+    fn starting(id: String, agent: &imacs_core::config::AgentConfig, cwd: PathBuf, chief: bool) -> Self {
+        let worktree = git::worktree_of(&cwd);
+        let title =
+            if chief { "chief".into() } else { title_for(worktree.as_ref().and_then(|w| w.branch.as_deref()), &cwd) };
+        Self {
+            id,
+            agent: agent.name.clone(),
+            kind: agent.kind,
+            terminal: None,
+            claude_id: None,
+            cwd,
+            worktree,
+            title,
+            status: if agent.kind == AgentKind::Shell { AgentStatus::Idle } else { AgentStatus::Starting },
+            last_prompt: None,
+            last_message: None,
+            hooks_active: false,
+            approvals: Vec::new(),
+            allowed: Vec::new(),
+            held: Vec::new(),
+            approval_hold: false,
+            menu_absent_since: None,
+            selected: false,
+            chief,
+            pending: None,
+        }
+    }
+
     fn root(&self) -> PathBuf {
         self.worktree.as_ref().map(|w| w.root.clone()).unwrap_or_else(|| self.cwd.clone())
     }
@@ -260,6 +311,8 @@ pub struct App {
     palette: Arc<Palette>,
     highlighter: Arc<Highlighter>,
     sessions: Vec<Session>,
+    codex_versions: HashMap<String, Arc<OnceLock<bool>>>,
+    pending_codex: Vec<(AgentLaunch, Arc<OnceLock<bool>>)>,
     active: Option<String>,
     diff_open: bool,
     /// Worktree picked in the sidebar without an agent; the diff otherwise follows the active session.
@@ -271,6 +324,7 @@ pub struct App {
     control_rx: Receiver<ControlMessage>,
     hook_error: Option<String>,
     busy_checked: Instant,
+    approvals_checked: Instant,
     store: Store,
     dismissed: HashSet<String>,
     /// Main checkouts of the open projects (plus `repos` from the config).
@@ -298,6 +352,7 @@ pub struct App {
     waiters: Vec<Waiter>,
     plans: Vec<Plan>,
     selected_plan: usize,
+    changed_plans: HashSet<String>,
     expanded_tasks: HashSet<(String, String)>,
     /// The project tab on screen; `None` shows every project.
     view: Option<PathBuf>,
@@ -360,7 +415,9 @@ impl App {
         let launch_dir = std::env::current_dir().unwrap_or_else(|_| paths::home());
 
         let (mut plans, plan_error) = match plan::load_plans(&paths::imacs_home()) {
-            Ok(plans) => (plans, None),
+            Ok((plans, errors)) => {
+                (plans, (!errors.is_empty()).then(|| format!("Unreadable plan files:\n{}", errors.join("\n"))))
+            }
             Err(err) => (Vec::new(), Some(format!("Loading plans failed: {err:#}"))),
         };
         let selected_plan = plans.iter().position(Plan::is_open).unwrap_or_else(|| {
@@ -379,6 +436,8 @@ impl App {
             config_checked: Instant::now(),
             config_error,
             sessions: Vec::new(),
+            codex_versions: HashMap::new(),
+            pending_codex: Vec::new(),
             active: None,
             diff_open: true,
             diff_root: None,
@@ -389,6 +448,7 @@ impl App {
             control_rx,
             hook_error,
             busy_checked: Instant::now(),
+            approvals_checked: Instant::now() - APPROVAL_CHECK_INTERVAL,
             store: Store::load(&paths::store_file()),
             dismissed: HashSet::new(),
             repos: Vec::new(),
@@ -412,6 +472,7 @@ impl App {
             waiters: Vec::new(),
             plans,
             selected_plan,
+            changed_plans: HashSet::new(),
             expanded_tasks: HashSet::new(),
             view: None,
             plan_view: false,
@@ -930,6 +991,55 @@ impl App {
             return Err(format!("{} is not a folder", cwd.display()));
         }
         let id = uuid::Uuid::new_v4().to_string();
+        let codex = agent.kind == AgentKind::Generic
+            && agent
+                .command
+                .first()
+                .is_some_and(|program| Path::new(program).file_name().is_some_and(|name| name == "codex"));
+        let launch = AgentLaunch { id: id.clone(), agent, cwd, resume, extra_args, prompt, chief };
+        let version = if codex {
+            let program = resolve_program(&launch.agent.command[0]);
+            let ready = self.codex_version(ctx, program);
+            match ready.get().copied() {
+                Some(supported) => Some(supported),
+                None => {
+                    self.sessions.push(Session::starting(id.clone(), &launch.agent, launch.cwd.clone(), chief));
+                    self.pending_codex.push((launch, ready));
+                    self.activate(&id, false);
+                    return Ok(id);
+                }
+            }
+        } else {
+            None
+        };
+        self.launch_agent(ctx, launch, version)
+    }
+
+    fn codex_version(&mut self, ctx: &egui::Context, program: String) -> Arc<OnceLock<bool>> {
+        self.codex_versions
+            .entry(program.clone())
+            .or_insert_with(|| {
+                let ready = Arc::new(OnceLock::new());
+                let result = ready.clone();
+                let ctx = ctx.clone();
+                std::thread::spawn(move || {
+                    let supported = crate::setup::codex_supports_hooks(&program, Duration::from_secs(3));
+                    let _ = result.set(supported);
+                    ctx.request_repaint();
+                });
+                ready
+            })
+            .clone()
+    }
+
+    fn launch_agent(
+        &mut self,
+        ctx: &egui::Context,
+        launch: AgentLaunch,
+        codex: Option<bool>,
+    ) -> Result<String, String> {
+        let AgentLaunch { id, agent, cwd, resume, extra_args, prompt, chief } = launch;
+        let agent_name = agent.name.clone();
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
         let mut env: HashMap<String, String> =
             [("TERM", "xterm-256color".into()), ("COLORTERM", "truecolor".into()), ("TERM_PROGRAM", "imacs".into())]
@@ -945,14 +1055,6 @@ impl App {
             None => (shell, vec!["-l".to_string()]),
         };
         let mut claude_id = None;
-        let codex_hooks = agent.kind == AgentKind::Generic
-            && Path::new(&program).file_name().is_some_and(|name| name == "codex")
-            && std::process::Command::new(resolve_program(&program)).arg("--version").output().ok().is_some_and(
-                |output| {
-                    output.status.success()
-                        && imacs_core::hook::codex_supports_hooks(&String::from_utf8_lossy(&output.stdout))
-                },
-            );
         // Every agent IMACS starts can report back to the plan with `imacs_report`.
         let exe = std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| "imacs".into());
         let socket = paths::socket_path().to_string_lossy().into_owned();
@@ -989,9 +1091,9 @@ impl App {
                     "mcp__imacs__imacs_report".to_string(),
                 ]);
             }
-            AgentKind::Generic if agent.command.first().is_some_and(|c| c.ends_with("codex")) => {
+            AgentKind::Generic if codex.is_some() => {
                 let quoted = |text: &str| serde_json::to_string(text).unwrap_or_default();
-                if codex_hooks {
+                if codex == Some(true) {
                     if !args.iter().any(|arg| arg == "--no-daemon") {
                         args.push("--no-daemon".into());
                     }
@@ -1052,38 +1154,22 @@ impl App {
                 if let Some(id) = &claude_id {
                     self.dismissed.remove(id);
                 }
-                let worktree = git::worktree_of(&cwd);
-                let title = if chief {
-                    "chief".to_string()
+                let mut session = Session::starting(id.clone(), &agent, cwd, chief);
+                session.terminal = Some(terminal);
+                session.claude_id = claude_id;
+                let starting = self.sessions.iter().position(|session| session.id == id);
+                if let Some(index) = starting {
+                    session.selected = self.sessions[index].selected;
+                    self.sessions[index] = session;
                 } else {
-                    title_for(worktree.as_ref().and_then(|w| w.branch.as_deref()), &cwd)
-                };
-                self.sessions.push(Session {
-                    id: id.clone(),
-                    agent: agent.name.clone(),
-                    kind: agent.kind,
-                    terminal: Some(terminal),
-                    claude_id,
-                    cwd,
-                    worktree,
-                    title,
-                    status: if agent.kind == AgentKind::Shell { AgentStatus::Idle } else { AgentStatus::Starting },
-                    last_prompt: None,
-                    last_message: None,
-                    hooks_active: false,
-                    approvals: Vec::new(),
-                    allowed: Vec::new(),
-                    held: Vec::new(),
-                    selected: false,
-                    chief,
-                    pending: None,
-                });
+                    self.sessions.push(session);
+                }
                 if let Some(text) = shell_prompt
-                    && let Some(terminal) = self.sessions.last().and_then(|s| s.terminal.as_ref())
+                    && let Some(terminal) = self.sessions.iter().find(|s| s.id == id).and_then(|s| s.terminal.as_ref())
                 {
                     terminal.submit(&text);
                 }
-                if !chief {
+                if !chief && starting.is_none() {
                     self.activate(&id, false);
                 }
                 self.remember(&id);
@@ -1122,7 +1208,7 @@ impl App {
             "folder": s.cwd,
             "worktree": s.worktree.as_ref().map(|w| &w.root),
             "branch": s.branch(),
-            "outside_imacs": s.terminal.is_none(),
+            "outside_imacs": s.terminal.is_none() && s.status != AgentStatus::Starting,
             "claude_session_id": s.claude_id,
             "last_prompt": s.last_prompt,
             "approval": s.approvals.first().map(|p| &p.request),
@@ -1134,7 +1220,9 @@ impl App {
         let done = |response: ControlResponse| ControlOutcome::Done(response);
         let missing = |reference: &str| done(ControlResponse::error(format!("no session matches {reference:?}")));
         let target = match &request {
-            ControlRequest::PlanSet { plan: Some(id), .. } => Some(Some(id.as_str())),
+            ControlRequest::PlanSet { plan: Some(id), .. } | ControlRequest::PlanClose { plan: id, .. } => {
+                Some(Some(id.as_str()))
+            }
             ControlRequest::PlanUpdate { plan, .. }
             | ControlRequest::PlanDispatch { plan, .. }
             | ControlRequest::PlanIntegrate { plan, .. } => Some(plan.as_deref()),
@@ -1233,41 +1321,56 @@ impl App {
                 }
             },
             ControlRequest::PlanSet { plan, goal, tasks, integration } => {
-                self.selected_plan = if plan.is_some() {
+                let new = plan.is_none();
+                let index = if plan.is_some() {
                     target
                 } else {
                     let id = plan::unique_id(&goal, &self.plans, &paths::imacs_home());
                     self.plans.push(Plan { id, ..Plan::default() });
                     self.plans.len() - 1
                 };
-                self.plans[self.selected_plan].replace(goal, tasks);
+                self.plans[index].replace(goal, tasks);
                 if let Some(branch) = integration.filter(|b| !b.trim().is_empty()) {
-                    self.plans[self.selected_plan].integration = Some(branch.trim().to_string());
+                    self.plans[index].integration = Some(branch.trim().to_string());
                 }
-                let project = self.plans[self.selected_plan]
+                let project = self.plans[index]
                     .tasks
                     .iter()
                     .find_map(|t| t.repo.as_deref())
                     .map(paths::expand)
+                    .or_else(|| self.plans[index].project.clone())
                     .or_else(|| {
                         self.diff_target().and_then(|t| self.project_of(&t)).or_else(|| self.repos.first().cloned())
                     });
-                self.plans[self.selected_plan].project = project.and_then(|p| self.project_of(&p));
-                self.show_plan_fleet();
-                self.save_plan(self.selected_plan);
-                self.panel = PanelMode::Plan;
-                self.diff_open = true;
-                let unknown = self.plans[self.selected_plan].unknown_dependencies();
-                self.toast("New plan: review and approve it on the plan board");
+                self.plans[index].project = project.and_then(|p| self.project_of(&p));
+                self.save_plan(index);
+                if new || (self.plan_view && self.selected_plan == index) {
+                    self.selected_plan = index;
+                    self.show_plan_fleet();
+                    self.panel = PanelMode::Plan;
+                    self.diff_open = true;
+                } else {
+                    self.changed_plans.insert(self.plans[index].id.clone());
+                }
+                let unknown = self.plans[index].unknown_dependencies();
+                self.toast(if new {
+                    "New plan: review and approve it on the plan board"
+                } else {
+                    "Plan updated: review and approve it on its board"
+                });
                 done(ControlResponse::ok(json!({
-                    "plan": self.plans[self.selected_plan].id,
-                    "tasks": self.plans[self.selected_plan].tasks.len(),
+                    "plan": self.plans[index].id,
+                    "tasks": self.plans[index].tasks.len(),
                     "approved": false,
-                    "integration": self.plans[self.selected_plan].integration_branch(),
+                    "integration": self.plans[index].integration_branch(),
                     "unknown_dependencies": unknown,
                     "next": "The user reviews and approves the plan on the board; then call plan_dispatch.",
                 })))
             }
+            ControlRequest::PlanClose { plan: _, status } => match self.close_plan(target, status) {
+                Ok(()) => done(ControlResponse::ok(self.plan_json(target))),
+                Err(err) => done(ControlResponse::error(err)),
+            },
             ControlRequest::PlanGet { plan: None } => done(ControlResponse::ok(json!({
                 "plans": self.plans.iter().filter(|p| p.is_open()).map(Plan::summary).collect::<Vec<_>>()
             }))),
@@ -1281,7 +1384,7 @@ impl App {
                 Some(task) => {
                     if let Some(status) = &status {
                         match TaskStatus::parse(status) {
-                            Some(status) => task.status = status,
+                            Some(status) => task.set_status(status),
                             None => {
                                 let _ = reply.send(done(ControlResponse::error(format!("unknown status {status}"))));
                                 return;
@@ -1397,14 +1500,10 @@ impl App {
             }
             ControlRequest::Send { session, text, raw } => match self.find(&session) {
                 None => missing(&session),
-                Some(index) if raw && self.sessions[index].terminal.is_none() => {
-                    done(ControlResponse::error("raw keys need a session running inside IMACS"))
-                }
-                Some(index) if !self.sessions[index].approvals.is_empty() => {
-                    self.sessions[index].held.push((text, raw));
-                    done(ControlResponse::ok(
-                        json!({ "sent": false, "held": true, "held_until": "permission answered" }),
-                    ))
+                Some(index)
+                    if raw && (self.sessions[index].approval_hold || !self.sessions[index].approvals.is_empty()) =>
+                {
+                    done(ControlResponse::error("raw input is blocked while permission is pending; use imacs_approve"))
                 }
                 Some(index) if raw => match &self.sessions[index].terminal {
                     Some(terminal) => {
@@ -1413,14 +1512,15 @@ impl App {
                     }
                     None => done(ControlResponse::error("raw keys need a session running inside IMACS")),
                 },
-                Some(index) => {
-                    if self.deliver(index, &text) {
-                        let queued = self.sessions[index].terminal.is_none();
-                        done(ControlResponse::ok(json!({ "sent": true, "queued_until_next_hook": queued })))
-                    } else {
-                        done(ControlResponse::error("session cannot receive messages (exited?)"))
+                Some(index) => done(match self.deliver(index, &text) {
+                    Delivery::Held => {
+                        ControlResponse::ok(json!({"sent":false, "held":true, "held_until":"permission answered"}))
                     }
-                }
+                    Delivery::Sent | Delivery::Queued => ControlResponse::ok(
+                        json!({"sent":true, "queued_until_next_hook":self.sessions[index].terminal.is_none()}),
+                    ),
+                    Delivery::Unavailable => ControlResponse::error("session cannot receive messages (exited?)"),
+                }),
             },
             ControlRequest::Read { session, lines } => match self.find(&session) {
                 None => missing(&session),
@@ -1484,10 +1584,14 @@ impl App {
                     if count == 0 {
                         done(ControlResponse::error("no pending comments"))
                     } else {
-                        self.send_review(&root);
+                        let delivery = self.send_review(&root);
                         let left = self.diffs.get(&root).map(|d| d.comments.len()).unwrap_or(0);
                         if left == 0 {
-                            done(ControlResponse::ok(json!({ "sent_comments": count })))
+                            done(ControlResponse::ok(if delivery == Delivery::Held {
+                                json!({"held_comments":count, "held":true})
+                            } else {
+                                json!({ "sent_comments": count })
+                            }))
                         } else {
                             done(ControlResponse::error("could not deliver the review"))
                         }
@@ -1536,7 +1640,7 @@ impl App {
     fn verify_deliveries(&mut self) {
         let mut warnings = Vec::new();
         for session in &mut self.sessions {
-            if !session.approvals.is_empty() || !session.held.is_empty() {
+            if session.approval_hold || !session.approvals.is_empty() || !session.held.is_empty() {
                 continue;
             }
             let (Some(pending), Some(terminal)) = (session.pending.as_mut(), session.terminal.as_ref()) else {
@@ -1638,8 +1742,9 @@ impl App {
             self.plans.iter().enumerate().filter(|(_, p)| !p.id.is_empty() && p.status != plan::PlanStatus::Archived)
         {
             let name: String = plan.goal.chars().take(28).collect();
+            let marker = if self.changed_plans.contains(&plan.id) { " *" } else { "" };
             let glyph = if plan.status == plan::PlanStatus::Completed { "✓" } else { "●" };
-            let label = format!("{glyph} {name} · {}/{}", plan.count(TaskStatus::Done), plan.tasks.len());
+            let label = format!("{glyph} {name} · {}/{}{marker}", plan.count(TaskStatus::Done), plan.tasks.len());
             let attention = if self.sessions.iter().any(|s| plan.contains_session(&s.id) && s.status.needs_attention())
             {
                 "needs you"
@@ -1704,6 +1809,7 @@ impl App {
     }
 
     fn show_plan_fleet(&mut self) {
+        self.changed_plans.remove(&self.plans[self.selected_plan].id);
         self.ctx.request_repaint();
         self.view = self.plans[self.selected_plan].project.clone();
         self.plan_view = true;
@@ -1978,7 +2084,7 @@ impl App {
             }
             VoiceTarget::Active => {
                 match self.active_index().filter(|&i| self.sessions[i].is_agent() && self.sessions[i].can_receive()) {
-                    Some(index) if self.deliver(index, text) => {
+                    Some(index) if self.deliver(index, text) != Delivery::Unavailable => {
                         self.toast(format!("Sent to {}: {quoted}", self.sessions[index].title));
                         None
                     }
@@ -2155,6 +2261,7 @@ impl App {
         let ui = &mut child;
         let mut approve = false;
         let mut dispatch_all = false;
+        let mut close_status = None;
         let mut close = false;
         let mut archive = false;
         let ready = self.plans[self.selected_plan].ready().len();
@@ -2166,6 +2273,14 @@ impl App {
                 ui.label(RichText::new(format!("{done}/{total} done")).color(p.muted).size(12.0));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if self.plans[self.selected_plan].is_open() {
+                    if ui.small_button("Archive plan").clicked() {
+                        close_status = Some(PlanStatus::Archived);
+                    }
+                    if ui.small_button("Complete plan").clicked() {
+                        close_status = Some(PlanStatus::Completed);
+                    }
+                }
                 if ui.small_button("×").on_hover_text("Back to the diff").clicked() {
                     close = true;
                 }
@@ -2405,7 +2520,7 @@ impl App {
                     if let (Some(task), Some(status)) =
                         (self.plans[self.selected_plan].task_mut(&id), TaskStatus::parse(status))
                     {
-                        task.status = status;
+                        task.set_status(status);
                         changed = true;
                     }
                 }
@@ -2433,6 +2548,38 @@ impl App {
         if close {
             self.panel = PanelMode::Diff;
         }
+        if let Some(status) = close_status
+            && let Err(err) = self.close_plan(self.selected_plan, status)
+        {
+            self.toast(err);
+        }
+    }
+
+    fn close_plan(&mut self, index: usize, status: PlanStatus) -> Result<(), String> {
+        if status == PlanStatus::Open {
+            return Err("Choose completed or archived.".into());
+        }
+        let mut closed = self.plans[index].clone();
+        closed.status = status;
+        closed.save_in(&paths::imacs_home()).map_err(|err| format!("Closing plan failed: {err:#}"))?;
+        self.plans[index] = closed;
+        self.changed_plans.remove(&self.plans[index].id);
+        if self.selected_plan == index {
+            self.selected_plan = self.plans.iter().position(Plan::is_open).unwrap_or_else(|| {
+                self.plans.push(Plan::default());
+                self.plans.len() - 1
+            });
+            if self.plan_view {
+                if self.plans[self.selected_plan].is_open() {
+                    self.show_plan_fleet();
+                } else {
+                    self.set_view(None);
+                }
+                self.panel = PanelMode::Diff;
+            }
+        }
+        self.ctx.request_repaint();
+        Ok(())
     }
 
     fn save_plan(&self, index: usize) {
@@ -2470,6 +2617,34 @@ impl App {
     fn dispatch(&mut self, index: usize, only: Option<&str>) -> Result<Vec<String>, String> {
         if !self.plans[index].approved {
             return Err("The plan is not approved yet: the user approves it on the plan board.".into());
+        }
+        let into = self.plans[index].integration_branch();
+        let stale: Vec<String> = self.plans[index]
+            .tasks
+            .iter()
+            .filter(|t| t.integrated.as_deref() == Some(&into))
+            .filter(|task| {
+                !matches!(task.status, TaskStatus::Review | TaskStatus::Done)
+                    || !task.branch.as_deref().zip(self.task_repo(index, task)).is_some_and(|(branch, repo)| {
+                        git::git(
+                            &repo,
+                            &[
+                                "merge-base",
+                                "--is-ancestor",
+                                &format!("refs/heads/{branch}"),
+                                &format!("refs/heads/{into}"),
+                            ],
+                        )
+                        .is_ok()
+                    })
+            })
+            .map(|t| t.id.clone())
+            .collect();
+        for id in &stale {
+            self.plans[index].task_mut(id).expect("checked task").integrated = None;
+        }
+        if !stale.is_empty() {
+            self.save_plan(index);
         }
         let ready: Vec<Task> =
             self.plans[index].ready().into_iter().filter(|t| only.is_none_or(|id| t.id == id)).cloned().collect();
@@ -2524,16 +2699,18 @@ impl App {
             let start = self.plans[index].start_branch(&task);
             self.create_worktree(repo.clone(), branch.clone(), start, launch);
             if let Some(t) = self.plans[index].task_mut(&task.id) {
-                t.status = TaskStatus::Running;
-                t.integrated = None;
+                t.set_status(TaskStatus::Running);
                 t.branch = (t.id != plan::REVIEW_TASK).then_some(branch);
                 t.finished_at = None;
                 t.dispatched_at = Some(imacs_core::store::now());
                 t.repo.get_or_insert_with(|| repo.to_string_lossy().into_owned());
             }
             started.push(task.id);
-            self.selected_plan = index;
+        }
+        if self.plan_view && self.selected_plan == index {
             self.show_plan_fleet();
+        } else {
+            self.changed_plans.insert(self.plans[index].id.clone());
         }
         self.save_plan(index);
         Ok(started)
@@ -2575,9 +2752,6 @@ impl App {
         let plan = self.plans[index].id.clone();
         self.integrating.insert((plan.clone(), task.clone()));
         std::thread::spawn(move || {
-            // Integrations share the integration worktree: one at a time.
-            static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
-            let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
             let result =
                 git::integrate(&repo, &branch, &message, &into, &into_path, &base_ref).map_err(|e| format!("{e:#}"));
             let _ = tx.send(Integrated { plan, task, branch, into, result, reply });
@@ -2593,7 +2767,7 @@ impl App {
         let (note, response) = match result {
             Ok(Integration { merge: Merge::Conflict(files), .. }) => {
                 if let Some(task) = self.plans[index].task_mut(&id) {
-                    task.status = TaskStatus::Review;
+                    task.set_status(TaskStatus::Review);
                 }
                 let files = files.join(", ");
                 let error = format!(
@@ -2602,7 +2776,9 @@ impl App {
                 (format!("conflicts with {into} in {files}; merge aborted"), ControlResponse::error(error))
             }
             Ok(Integration { committed, merge, worktree }) => {
-                if let Some(task) = self.plans[index].task_mut(&id) {
+                if let Some(task) = self.plans[index].task_mut(&id)
+                    && matches!(task.status, TaskStatus::Review | TaskStatus::Done)
+                {
                     task.integrated = Some(into.clone());
                 }
                 let merged = merge == Merge::Merged;
@@ -2651,8 +2827,8 @@ impl App {
                 Some(Report { status: status.to_string(), summary: summary.to_string(), at: imacs_core::store::now() });
             if task.status != TaskStatus::Done {
                 match status {
-                    "done" => task.status = TaskStatus::Review,
-                    "blocked" | "question" => task.status = TaskStatus::Blocked,
+                    "done" => task.set_status(TaskStatus::Review),
+                    "blocked" | "question" => task.set_status(TaskStatus::Blocked),
                     _ => {}
                 }
             }
@@ -2695,7 +2871,7 @@ impl App {
                     None => false,
                 };
                 if gone {
-                    task.status = TaskStatus::Blocked;
+                    task.set_status(TaskStatus::Blocked);
                     task.notes.push("the agent exited before reporting".into());
                     changed = true;
                 }
@@ -2825,15 +3001,15 @@ impl App {
 
     /// Sends text to a session: typed into IMACS's own terminals, queued for the
     /// next hook of sessions running elsewhere.
-    fn deliver(&mut self, index: usize, text: &str) -> bool {
+    fn deliver(&mut self, index: usize, text: &str) -> Delivery {
         let session = &mut self.sessions[index];
-        if !session.approvals.is_empty() {
-            session.held.push((text.to_string(), false));
-            return true;
+        if session.approval_hold || !session.approvals.is_empty() {
+            session.held.push(text.to_string());
+            return Delivery::Held;
         }
         if let Some(terminal) = &session.terminal {
             if terminal.exited() {
-                return false;
+                return Delivery::Unavailable;
             }
             terminal.submit(text);
             let trackable = session.kind == AgentKind::Claude
@@ -2845,11 +3021,11 @@ impl App {
             } else if session.is_agent() {
                 session.status = AgentStatus::Working;
             }
-            return true;
+            return Delivery::Sent;
         }
-        let Some(claude_id) = session.claude_id.clone() else { return false };
+        let Some(claude_id) = session.claude_id.clone() else { return Delivery::Unavailable };
         self.hub.lock().unwrap().outbox.entry(claude_id).or_default().push(text.to_string());
-        true
+        Delivery::Queued
     }
 
     fn steer_targets(&self) -> Vec<usize> {
@@ -2878,26 +3054,34 @@ impl App {
         }
         let mut typed = 0;
         let mut queued = 0;
+        let mut held = 0;
         for i in targets {
-            let external = self.sessions[i].terminal.is_none();
-            if self.deliver(i, &text) {
-                if external { queued += 1 } else { typed += 1 }
+            match self.deliver(i, &text) {
+                Delivery::Sent => typed += 1,
+                Delivery::Queued => queued += 1,
+                Delivery::Held => held += 1,
+                Delivery::Unavailable => {}
             }
         }
         self.steer_text.clear();
-        let mut summary = format!("Sent to {typed} session{}", if typed == 1 { "" } else { "s" });
-        if queued > 0 {
-            summary.push_str(&format!(
-                ", queued for {queued} outside IMACS (delivered at their next tool call or turn end)"
-            ));
+        let mut parts = Vec::new();
+        if typed > 0 {
+            parts.push(format!("Sent to {typed} session{}", if typed == 1 { "" } else { "s" }));
         }
+        if queued > 0 {
+            parts.push(format!("Queued for {queued} outside IMACS"));
+        }
+        if held > 0 {
+            parts.push(format!("Held for {held} until permission is answered"));
+        }
+        let summary = if parts.is_empty() { "No session could receive the message".into() } else { parts.join(", ") };
         self.toast(summary);
     }
 
-    fn send_review(&mut self, root: &Path) {
+    fn send_review(&mut self, root: &Path) -> Delivery {
         let comments = self.diffs.get(root).map(|s| s.comments.clone()).unwrap_or_default();
         if comments.is_empty() {
-            return;
+            return Delivery::Unavailable;
         }
         let header = self.config.fill(&self.config.steer.review_header);
         let message = steer::compose_review(&header, &comments);
@@ -2907,16 +3091,19 @@ impl App {
             .or_else(|| self.sessions.iter().position(|s| s.root() == root && s.is_agent() && s.can_receive()));
         let Some(index) = target else {
             self.toast("No agent is working in this worktree");
-            return;
+            return Delivery::Unavailable;
         };
         let count = comments.len();
-        if self.deliver(index, &message) {
+        let delivery = self.deliver(index, &message);
+        if delivery != Delivery::Unavailable {
             if let Some(state) = self.diffs.get_mut(root) {
                 state.comments.clear();
             }
             let title = self.sessions[index].title.clone();
-            self.toast(format!("Sent {count} comment{} to {title}", if count == 1 { "" } else { "s" }));
+            let action = if delivery == Delivery::Held { "Held" } else { "Sent" };
+            self.toast(format!("{action} {count} comment{} to {title}", if count == 1 { "" } else { "s" }));
         }
+        delivery
     }
 
     // ── background events ─────────────────────────────────────────────────
@@ -2924,6 +3111,24 @@ impl App {
     fn pump(&mut self, ctx: &egui::Context) {
         for (agent, dir) in std::mem::take(&mut self.pending_open) {
             self.spawn(ctx, &agent, dir, None);
+        }
+        let pending = std::mem::take(&mut self.pending_codex);
+        for (launch, ready) in pending {
+            if self.find(&launch.id).is_none() {
+                continue;
+            }
+            if let Some(supported) = ready.get().copied() {
+                let id = launch.id.clone();
+                if let Err(error) = self.launch_agent(ctx, launch, Some(supported)) {
+                    if let Some(index) = self.find(&id) {
+                        self.sessions[index].status = AgentStatus::Exited;
+                        self.sessions[index].last_message = Some(error.clone());
+                    }
+                    self.toast(error);
+                }
+            } else {
+                self.pending_codex.push((launch, ready));
+            }
         }
         while let Ok(message) = self.hook_rx.try_recv() {
             self.on_hook(message);
@@ -2933,8 +3138,16 @@ impl App {
             if let Some(i) = self.creating.iter().position(|b| *b == branch) {
                 self.creating.remove(i);
             }
+            let background = launch
+                .task
+                .as_ref()
+                .is_some_and(|(plan, _)| !self.plan_view || self.plans[self.selected_plan].id != *plan);
+            let selection = (self.active.clone(), self.diff_root.clone(), self.focus_terminal.clone());
             let outcome =
                 result.and_then(|path| self.start(ctx, &launch.agent, path, None, launch.args, launch.prompt));
+            if background {
+                (self.active, self.diff_root, self.focus_terminal) = selection;
+            }
             if let Some((plan_id, task_id)) = &launch.task
                 && let Some(index) = self.plans.iter().position(|p| &p.id == plan_id)
                 && let Some(task) = self.plans[index].task_mut(task_id)
@@ -2945,7 +3158,7 @@ impl App {
                         task.worktree = self.sessions.iter().find(|s| &s.id == id).map(Session::root);
                     }
                     Err(err) => {
-                        task.status = TaskStatus::Blocked;
+                        task.set_status(TaskStatus::Blocked);
                         task.notes.push(format!("could not start: {err}"));
                     }
                 }
@@ -2964,6 +3177,10 @@ impl App {
         }
         while let Ok(integrated) = self.integrate_rx.try_recv() {
             self.finish_integration(integrated);
+        }
+        self.expire_approvals(Instant::now());
+        if self.sessions.iter().any(|session| session.approval_hold || !session.approvals.is_empty()) {
+            ctx.request_repaint_after(Duration::from_millis(400));
         }
         while let Ok(message) = self.control_rx.try_recv() {
             self.control(ctx, message.request, message.reply);
@@ -3220,6 +3437,8 @@ impl App {
                     approvals: Vec::new(),
                     allowed: Vec::new(),
                     held: Vec::new(),
+                    approval_hold: false,
+                    menu_absent_since: None,
                     selected: false,
                     chief: false,
                     pending: None,
@@ -3245,8 +3464,12 @@ impl App {
             {
                 return;
             }
+            session.approval_hold = true;
+            session.menu_absent_since = None;
             session.approvals.push(PendingApproval { request, reply: message.approval_reply });
             self.last_status.remove(&session.id);
+        } else if event.name == "PreToolUse" {
+            session.approvals.retain(|pending| pending.reply.as_ref().is_some_and(|reply| !reply.expired()));
         } else if event.name == "PostToolUse" {
             let completed = ApprovalRequest::from_event(&event);
             session.approvals.retain(|pending| !pending.request.same_command(&completed));
@@ -3281,19 +3504,17 @@ impl App {
         if matches!(event.name.as_str(), "SessionStart" | "UserPromptSubmit" | "Stop") {
             self.remember(&id);
         }
-        if self.sessions[index].approvals.is_empty()
-            && matches!(event.name.as_str(), "PostToolUse" | "Stop" | "Interrupt" | "UserPromptSubmit")
-        {
-            let held = std::mem::take(&mut self.sessions[index].held);
-            for (text, raw) in held {
-                if raw {
-                    if let Some(terminal) = &self.sessions[index].terminal {
-                        terminal.write(unescape(&text).into_bytes());
-                    }
-                } else {
-                    self.deliver(index, &text);
-                }
+        if matches!(event.name.as_str(), "PostToolUse" | "Stop" | "Interrupt" | "UserPromptSubmit") {
+            let session = &mut self.sessions[index];
+            if session.approvals.is_empty() && session.approval_hold {
+                let menu = session
+                    .terminal
+                    .as_ref()
+                    .is_some_and(|terminal| imacs_core::approvals::menu_visible(&terminal.screen_text(60)));
+                session.approval_hold = menu;
+                session.menu_absent_since = None;
             }
+            self.release_held(index);
         }
         if event.name == "PermissionRequest" {
             self.last_status.insert(id.clone(), AgentStatus::NeedsInput);
@@ -3318,7 +3539,59 @@ impl App {
         }
     }
 
+    fn release_held(&mut self, index: usize) {
+        if !self.sessions[index].approval_hold
+            && self.sessions[index].approvals.is_empty()
+            && !self.sessions[index].held.is_empty()
+        {
+            let text = std::mem::take(&mut self.sessions[index].held).join("\n\n");
+            self.deliver(index, &text);
+        }
+    }
+
+    fn expire_approvals(&mut self, now: Instant) {
+        if now.duration_since(self.approvals_checked) < APPROVAL_CHECK_INTERVAL {
+            return;
+        }
+        self.approvals_checked = now;
+        for index in 0..self.sessions.len() {
+            let session = &mut self.sessions[index];
+            if !session.approval_hold && session.approvals.is_empty() {
+                continue;
+            }
+            if session.approvals.iter().any(|pending| pending.reply.as_ref().is_some_and(|reply| !reply.expired())) {
+                session.menu_absent_since = None;
+                continue;
+            }
+            let menu = session
+                .terminal
+                .as_ref()
+                .is_some_and(|terminal| imacs_core::approvals::menu_visible(&terminal.screen_text(60)));
+            if menu {
+                session.approval_hold = true;
+                session.menu_absent_since = None;
+                continue;
+            }
+            let missing_since = session.menu_absent_since.get_or_insert(now);
+            if now.duration_since(*missing_since) < APPROVAL_MENU_GRACE {
+                continue;
+            }
+            session.approvals.clear();
+            session.approval_hold = false;
+            session.menu_absent_since = None;
+            if session.status == AgentStatus::NeedsInput {
+                session.status = if session.terminal.as_ref().is_some_and(Terminal::exited) {
+                    AgentStatus::Exited
+                } else {
+                    AgentStatus::Working
+                };
+            }
+            self.release_held(index);
+        }
+    }
+
     fn approve(&mut self, index: usize, decision: Decision, message: Option<&str>) -> Result<(), String> {
+        self.expire_approvals(Instant::now());
         let session = &mut self.sessions[index];
         let Some(pending) = session.approvals.first_mut() else { return Err("no pending permission request".into()) };
         let reply = HookReply { stdout: Some(decision.output(message)) };
@@ -4322,7 +4595,9 @@ impl App {
         let header = Header { title: &title, branch: branch.as_deref(), can_send, split };
         match diff_view::show(ui, rect, state, header, &palette, &font) {
             DiffAction::None => {}
-            DiffAction::SendReview => self.send_review(&root),
+            DiffAction::SendReview => {
+                self.send_review(&root);
+            }
             DiffAction::Refresh => state_refresh(self.diffs.entry(root).or_default()),
             DiffAction::Close => self.diff_open = false,
             DiffAction::Split(on) => self.diff_split = Some(if on { DiffSplit::Always } else { DiffSplit::Never }),
@@ -5192,6 +5467,7 @@ const CHIEF_ALLOWED_TOOLS: &[&str] = &[
     "mcp__imacs__imacs_read",
     "mcp__imacs__imacs_diff",
     "mcp__imacs__imacs_plan_get",
+    "mcp__imacs__imacs_plan_close",
     "mcp__imacs__imacs_plan_set",
     "mcp__imacs__imacs_plan_update",
     "mcp__imacs__imacs_plan_dispatch",
@@ -5223,6 +5499,8 @@ mod tests {
             approvals: Vec::new(),
             allowed: Vec::new(),
             held: Vec::new(),
+            approval_hold: false,
+            menu_absent_since: None,
             selected: false,
             chief: false,
             pending: None,
@@ -5232,17 +5510,17 @@ mod tests {
     fn with_app(name: &str, test: impl FnOnce(&mut App, &egui::Context)) {
         if std::env::var_os("IMACS_APP_TEST_CHILD").is_none() {
             let dir = tempfile::tempdir().unwrap();
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", name, "--nocapture"])
-                .current_dir(dir.path())
-                .env("IMACS_APP_TEST_CHILD", "1")
-                .env("HOME", dir.path())
-                .env("IMACS_HOME", dir.path().join("state"))
-                .env("IMACS_CONFIG", dir.path().join("config.toml"))
-                .env("IMACS_SOCKET", dir.path().join("imacs.sock"))
-                .env_remove("IMACS_PANE")
-                .output()
-                .unwrap();
+            let output = crate::test_support::output(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", name, "--nocapture"])
+                    .current_dir(dir.path())
+                    .env("IMACS_APP_TEST_CHILD", "1")
+                    .env("HOME", dir.path())
+                    .env("IMACS_HOME", dir.path().join("state"))
+                    .env("IMACS_CONFIG", dir.path().join("config.toml"))
+                    .env("IMACS_SOCKET", dir.path().join("imacs.sock"))
+                    .env_remove("IMACS_PANE"),
+            );
             assert!(
                 output.status.success(),
                 "stdout: {}\nstderr: {}",
@@ -5260,6 +5538,201 @@ mod tests {
         );
         assert_eq!(app.toast.as_ref().unwrap().0, "Migration failed");
         test(&mut app, &ctx);
+    }
+
+    #[test]
+    fn chief_approval_access_and_read_only_defaults_are_documented() {
+        assert!(CHIEF_ALLOWED_TOOLS.contains(&"mcp__imacs__imacs_approve"));
+        let readme = include_str!("../../../README.md");
+        assert!(readme.contains("pre-approved `imacs_approve`"));
+        assert!(readme.contains("`allow_always` for the rest"));
+        assert!(!readme.contains("or answer other agents'"));
+        assert!(readme.contains("outside Codex's sandbox"));
+    }
+
+    #[test]
+    fn codex_version_is_cached_per_program_without_blocking_launch() {
+        with_app("app::tests::codex_version_is_cached_per_program_without_blocking_launch", |app, ctx| {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let script = r#"#!/bin/sh
+dir=${0%/*}
+if [ "$1" = --version ]; then
+  printf 'checked\n' >> "$dir/checks"
+  attempts=0
+  while [ ! -e "$dir/ready" ]; do
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt 200 ] || exit 1
+    sleep 0.01
+  done
+  printf 'codex-cli 0.165.0\n'
+else
+  printf '%s\n' "$@" > "$dir/launch-args"
+fi
+"#;
+            for name in ["one", "two"] {
+                let folder = dir.path().join(name);
+                std::fs::create_dir(&folder).unwrap();
+                let program = folder.join("codex");
+                std::fs::write(
+                    &program,
+                    if name == "two" { script.replace("0.165.0", "0.164.0") } else { script.to_string() },
+                )
+                .unwrap();
+                std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+                app.config.agents.push(imacs_core::config::AgentConfig {
+                    name: name.into(),
+                    command: vec![program.to_string_lossy().into_owned()],
+                    kind: AgentKind::Generic,
+                    busy_text: None,
+                });
+            }
+            let probe_dir = dir.path().to_path_buf();
+            let release = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while ["one", "two"].iter().any(|name| !probe_dir.join(name).join("checks").exists()) {
+                    assert!(Instant::now() < deadline, "both asynchronous version probes must start");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                for name in ["one", "two"] {
+                    std::fs::write(probe_dir.join(name).join("ready"), "").unwrap();
+                }
+            });
+            let program = |name: &str| dir.path().join(name).join("codex").to_string_lossy().into_owned();
+            let one = app.codex_version(ctx, program("one"));
+            assert!(Arc::ptr_eq(&one, &app.codex_version(ctx, program("one"))));
+            let two = app.codex_version(ctx, program("two"));
+            release.join().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while one.get().is_none() || two.get().is_none() {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(one.get(), Some(&true));
+            assert_eq!(two.get(), Some(&false));
+            assert_eq!(app.codex_versions.len(), 2);
+            // A gated probe must finish before start() runs git: concurrent children can
+            // inherit pipe writers on macOS and otherwise keep git's output() waiting for EOF.
+            let mut ids = Vec::new();
+            for name in ["one", "one", "two"] {
+                ids.push(app.start(ctx, name, dir.path().into(), None, vec![], None).unwrap());
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while ids.iter().any(|id| !app.sessions[app.find(id).unwrap()].terminal.as_ref().unwrap().exited()) {
+                assert!(Instant::now() < deadline, "finite fake agents must exit before teardown");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                std::fs::read_to_string(dir.path().join("one/launch-args"))
+                    .unwrap()
+                    .contains("hooks.PermissionRequest")
+            );
+            assert!(
+                !std::fs::read_to_string(dir.path().join("two/launch-args"))
+                    .unwrap()
+                    .contains("hooks.PermissionRequest")
+            );
+            assert!(Arc::ptr_eq(&one, &app.codex_version(ctx, program("one"))));
+            for name in ["one", "two"] {
+                assert_eq!(std::fs::read_to_string(dir.path().join(name).join("checks")).unwrap().lines().count(), 1);
+            }
+            app.sessions.clear();
+        });
+    }
+
+    #[test]
+    fn expired_approvals_wait_for_menu_quiet_or_lifecycle() {
+        with_app("app::tests::expired_approvals_wait_for_menu_quiet_or_lifecycle", |app, ctx| {
+            let dir = tempfile::tempdir().unwrap();
+            app.sessions = vec![session("stale", AgentKind::Generic, AgentStatus::NeedsInput, dir.path())];
+            let permission = imacs_core::hook::HookEvent::from_payload(&json!({
+                "hook_event_name":"PermissionRequest", "session_id":"stale", "cwd":dir.path(),
+                "tool_name":"Bash", "tool_input":{"command":"touch fixture", "description":"test"}
+            }))
+            .unwrap();
+            let reply = Arc::new(ipc::ApprovalReply::default());
+            app.sessions[0].approval_hold = true;
+            app.sessions[0].approvals.push(PendingApproval {
+                request: ApprovalRequest::from_event(&permission),
+                reply: Some(reply.clone()),
+            });
+            let raw = request(app, json!({"cmd":"send", "session":"stale", "raw":true, "text":"y"}));
+            assert!(!raw.ok);
+            assert!(raw.error.unwrap().contains("imacs_approve"));
+            assert_eq!(app.deliver(0, "held plain message"), Delivery::Held);
+            let now = Instant::now();
+            app.approvals_checked = now - APPROVAL_CHECK_INTERVAL;
+            app.expire_approvals(now);
+            assert_eq!(app.sessions[0].approvals.len(), 1);
+            reply.wait(Duration::ZERO);
+            let first_check = now + APPROVAL_CHECK_INTERVAL;
+            app.expire_approvals(first_check);
+            assert_eq!(app.sessions[0].approvals.len(), 1, "an expired hook may precede its menu");
+            assert_eq!(app.sessions[0].held, ["held plain message"]);
+            let second_check = first_check + APPROVAL_CHECK_INTERVAL;
+            app.expire_approvals(second_check);
+            assert_eq!(app.sessions[0].approvals.len(), 1, "the menu quiet period must elapse");
+            app.sessions[0].menu_absent_since = Some(first_check - APPROVAL_MENU_GRACE);
+            app.expire_approvals(second_check);
+            assert_eq!(app.sessions[0].approvals.len(), 1, "screen checks must be throttled");
+            app.expire_approvals(second_check + APPROVAL_CHECK_INTERVAL);
+            assert!(app.sessions[0].approvals.is_empty());
+            assert!(app.sessions[0].held.is_empty());
+            assert_eq!(app.hub.lock().unwrap().outbox["stale"], ["held plain message"]);
+            let menu = "Allow these file edits?\n› 1. Yes, proceed\n  2. No\nPress enter to confirm or esc to cancel";
+            assert!(imacs_core::approvals::menu_key(menu, Some("touch fixture"), Decision::Allow).is_none());
+            let terminal = Terminal::spawn(
+                ctx,
+                app.palette.clone(),
+                "/bin/sh".into(),
+                vec!["-c".into(), "printf '%s' \"$1\"; exec sleep 10".into(), "fixture".into(), menu.into()],
+                dir.path(),
+                HashMap::new(),
+                100,
+            )
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !terminal.screen_text(60).contains("esc to cancel") {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            app.sessions[0].terminal = Some(terminal);
+            app.sessions[0].status = AgentStatus::NeedsInput;
+            app.sessions[0].approval_hold = true;
+            app.sessions[0].menu_absent_since = Some(Instant::now() - APPROVAL_MENU_GRACE);
+            app.sessions[0]
+                .approvals
+                .push(PendingApproval { request: ApprovalRequest::from_event(&permission), reply: Some(reply) });
+            assert_eq!(app.deliver(0, "held while editing"), Delivery::Held);
+            let before = app.sessions[0].terminal.as_ref().unwrap().screen_text(60);
+            app.approvals_checked = Instant::now() - APPROVAL_CHECK_INTERVAL;
+            app.expire_approvals(Instant::now());
+            assert_eq!(app.sessions[0].approvals.len(), 1);
+            assert!(app.sessions[0].menu_absent_since.is_none(), "a menu drawn late resets the quiet period");
+            assert_eq!(app.sessions[0].held, ["held while editing"]);
+            let event = imacs_core::hook::HookEvent::from_payload(&json!({"hook_event_name":"PreToolUse", "session_id":"stale", "cwd":dir.path(), "tool_name":"Bash", "tool_input":{"command":"cat fixture"}})).unwrap();
+            app.on_hook(HookMessage { pane: None, ancestors: vec![], event, delivered: 0, approval_reply: None });
+            assert!(app.sessions[0].approvals.is_empty());
+            assert_eq!(app.sessions[0].status, AgentStatus::Working);
+            assert!(app.sessions[0].approval_hold, "PreToolUse alone must not release input into a menu");
+            assert_eq!(app.deliver(0, "still held"), Delivery::Held);
+            app.approvals_checked = Instant::now() - APPROVAL_CHECK_INTERVAL;
+            app.expire_approvals(Instant::now());
+            assert_eq!(app.sessions[0].held.len(), 2);
+            assert_eq!(app.sessions[0].terminal.as_ref().unwrap().screen_text(60), before);
+            app.sessions[0].terminal = None;
+            let event = imacs_core::hook::HookEvent::from_payload(
+                &json!({"hook_event_name":"Interrupt", "session_id":"stale", "cwd":dir.path()}),
+            )
+            .unwrap();
+            app.on_hook(HookMessage { pane: None, ancestors: vec![], event, delivered: 0, approval_reply: None });
+            assert!(!app.sessions[0].approval_hold);
+            assert!(app.sessions[0].held.is_empty());
+            assert!(
+                app.hub.lock().unwrap().outbox["stale"].last().unwrap().contains("held while editing\n\nstill held")
+            );
+            app.sessions.clear();
+        });
     }
 
     #[test]
@@ -5615,6 +6088,234 @@ mod tests {
         }
     }
 
+    fn repository() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git::git(&repo, &["init", "-q", "-b", "main"]).unwrap();
+        git::git(&repo, &["config", "user.name", "Test"]).unwrap();
+        git::git(&repo, &["config", "user.email", "test@example.org"]).unwrap();
+        git::git(&repo, &["commit", "--allow-empty", "-qm", "initial"]).unwrap();
+        (dir, repo)
+    }
+
+    #[test]
+    fn plan_close_persists_status_and_restores_implicit_single_plan_selection() {
+        with_app("app::tests::plan_close_persists_status_and_restores_implicit_single_plan_selection", |app, _| {
+            let one =
+                request(app, json!({"cmd":"plan_set", "goal":"One", "tasks":[{"id":"a"}]})).result["plan"].clone();
+            let two =
+                request(app, json!({"cmd":"plan_set", "goal":"Two", "tasks":[{"id":"a"}]})).result["plan"].clone();
+            assert!(!request(app, json!({"cmd":"plan_close", "plan":two, "status":"open"})).ok);
+            let closed = request(app, json!({"cmd":"plan_close", "plan":two, "status":"completed"}));
+            assert!(closed.ok);
+            assert_eq!(closed.result["status"], "completed");
+            assert!(request(app, json!({"cmd":"plan_update", "id":"a", "status":"done"})).ok);
+            assert_eq!(app.plans[app.selected_plan].id, one.as_str().unwrap());
+            assert_eq!(request(app, json!({"cmd":"plan_get"})).result["plans"].as_array().unwrap().len(), 1);
+            assert!(request(app, json!({"cmd":"plan_close", "plan":one, "status":"archived"})).ok);
+            assert!(!app.plan_view);
+            assert!(app.plans.iter().all(|p| !p.is_open()));
+            let (loaded, errors) = plan::load_plans(&paths::imacs_home()).unwrap();
+            assert!(errors.is_empty());
+            assert_eq!(loaded.iter().find(|p| p.id == one.as_str().unwrap()).unwrap().status, PlanStatus::Archived);
+            assert_eq!(loaded.iter().find(|p| p.id == two.as_str().unwrap()).unwrap().status, PlanStatus::Completed);
+            assert!(CHIEF_ALLOWED_TOOLS.contains(&"mcp__imacs__imacs_plan_close"));
+        });
+    }
+
+    #[test]
+    fn startup_toast_lists_unreadable_plan_files_without_hiding_valid_plans() {
+        with_app("app::tests::startup_toast_lists_unreadable_plan_files_without_hiding_valid_plans", |app, ctx| {
+            request(app, json!({"cmd":"plan_set", "goal":"Valid", "tasks":[]}));
+            let folder = paths::imacs_home().join("plans");
+            std::fs::write(folder.join("broken.json"), "{").unwrap();
+            std::fs::create_dir(folder.join("unreadable.json")).unwrap();
+            let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+            let reopened = App::new(&cc, Options::default(), &crate::load_icon());
+            let toast = &reopened.toast.as_ref().unwrap().0;
+            assert!(toast.contains("broken.json") && toast.contains("unreadable.json"), "{toast}");
+            assert_eq!(reopened.plans.iter().filter(|p| p.is_open()).count(), 1);
+        });
+    }
+
+    #[test]
+    fn background_plan_updates_and_successful_dispatch_preserve_the_foreground_and_chief() {
+        with_app(
+            "app::tests::background_plan_updates_and_successful_dispatch_preserve_the_foreground_and_chief",
+            |app, ctx| {
+                let (dir, repo) = repository();
+                app.config.worktree_path = format!("{}/{{slug}}", dir.path().display());
+                app.config.agents.push(imacs_core::config::AgentConfig {
+                    name: "fixture".into(),
+                    command: vec!["/bin/cat".into()],
+                    kind: AgentKind::Shell,
+                    busy_text: None,
+                });
+                let first = request(app, json!({"cmd":"plan_set", "goal":"Background", "tasks":[{"id":"a", "repo":repo, "agent":"fixture"}]})).result["plan"].clone();
+                let one = app.selected_plan;
+                request(app, json!({"cmd":"plan_set", "goal":"Foreground", "tasks":[{"id":"a"}]}));
+                let two = app.selected_plan;
+                app.sessions.push(session("foreground", AgentKind::Generic, AgentStatus::Idle, &repo));
+                app.active = Some("foreground".into());
+                app.diff_root = Some(repo.clone());
+                app.focus_terminal = Some("foreground".into());
+                app.chief_open = true;
+                app.panel = PanelMode::Editor;
+                assert!(
+                    request(
+                        app,
+                        json!({"cmd":"plan_set", "plan":first, "goal":"Background revised", "tasks":[
+                {"id":"a", "repo":repo, "agent":"fixture"}]})
+                    )
+                    .ok
+                );
+                assert_eq!(app.selected_plan, two);
+                assert!(app.chief_open && app.panel == PanelMode::Editor);
+                assert_eq!(app.active.as_deref(), Some("foreground"));
+                assert_eq!(app.diff_root.as_ref(), Some(&repo));
+                assert!(app.changed_plans.contains(first.as_str().unwrap()));
+                assert!(app.toast.as_ref().unwrap().0.starts_with("Plan updated:"));
+                app.plans[one].approved = true;
+                assert!(request(app, json!({"cmd":"plan_dispatch", "plan":first, "id":"a"})).ok);
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !app.creating.is_empty() {
+                    assert!(Instant::now() < deadline);
+                    app.pump(ctx);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                assert!(app.plans[one].tasks[0].session.is_some());
+                assert_eq!(app.selected_plan, two);
+                assert!(app.chief_open && app.panel == PanelMode::Editor);
+                assert_eq!(app.active.as_deref(), Some("foreground"));
+                assert_eq!(app.diff_root.as_ref(), Some(&repo));
+                assert_eq!(app.focus_terminal.as_deref(), Some("foreground"));
+                assert!(app.changed_plans.contains(first.as_str().unwrap()));
+                app.selected_plan = one;
+                app.show_plan_fleet();
+                assert!(!app.changed_plans.contains(first.as_str().unwrap()));
+                assert!(
+                    request(
+                        app,
+                        json!({"cmd":"plan_set", "plan":first, "goal":"Selected update", "tasks":[{"id":"a"}]})
+                    )
+                    .ok
+                );
+                assert!(app.panel == PanelMode::Plan);
+                assert!(!app.chief_open);
+            },
+        );
+    }
+
+    #[test]
+    fn status_updates_clear_integration_and_dispatch_rejects_new_unmerged_commits() {
+        with_app("app::tests::status_updates_clear_integration_and_dispatch_rejects_new_unmerged_commits", |app, _| {
+            let (_dir, repo) = repository();
+            git::git(&repo, &["branch", "task-a"]).unwrap();
+            git::git(&repo, &["branch", "integration"]).unwrap();
+            let plan = request(
+                app,
+                json!({"cmd":"plan_set", "goal":"Freshness", "integration":"integration", "tasks":[
+                {"id":"a", "repo":repo, "branch":"task-a"}, {"id":"b", "repo":repo, "depends_on":["a"]}]}),
+            )
+            .result["plan"]
+                .clone();
+            let index = app.selected_plan;
+            app.plans[index].approved = true;
+            app.plans[index].tasks[0].status = TaskStatus::Done;
+            app.plans[index].tasks[0].integrated = Some("integration".into());
+            assert!(request(app, json!({"cmd":"plan_update", "plan":plan, "id":"a", "status":"running"})).ok);
+            assert!(app.plans[index].tasks[0].integrated.is_none());
+            app.finish_integration(Integrated {
+                plan: plan.as_str().unwrap().into(),
+                task: "a".into(),
+                branch: "task-a".into(),
+                into: "integration".into(),
+                reply: None,
+                result: Ok(Integration { committed: false, merge: Merge::UpToDate, worktree: repo.clone() }),
+            });
+            assert!(
+                app.plans[index].tasks[0].integrated.is_none(),
+                "a late integration must not mark a running task integrated"
+            );
+            assert!(request(app, json!({"cmd":"plan_update", "plan":plan, "id":"a", "status":"done"})).ok);
+            assert!(app.dispatch(index, Some("b")).unwrap_err().contains("integrated dependencies"));
+            app.plans[index].tasks[0].integrated = Some("integration".into());
+            git::git(&repo, &["switch", "task-a"]).unwrap();
+            git::git(&repo, &["commit", "--allow-empty", "-qm", "new work after integration"]).unwrap();
+            assert!(app.dispatch(index, Some("b")).unwrap_err().contains("integrated dependencies"));
+            assert!(app.plans[index].tasks[0].integrated.is_none());
+            assert!(app.creating.is_empty());
+            let saved = Plan::load(&paths::imacs_home().join("plans").join(format!("{}.json", plan.as_str().unwrap())))
+                .unwrap();
+            assert!(saved.tasks[0].integrated.is_none());
+            git::git(&repo, &["branch", "-f", "integration", "task-a"]).unwrap();
+            app.plans[index].tasks[0].integrated = Some("integration".into());
+            // A missing requested task does not invalidate a genuinely integrated dependency.
+            assert!(app.dispatch(index, Some("missing")).is_err());
+            assert_eq!(app.plans[index].tasks[0].integrated.as_deref(), Some("integration"));
+        });
+    }
+
+    #[test]
+    fn integrations_in_different_repositories_can_finish_independently() {
+        use std::os::unix::fs::PermissionsExt;
+        with_app("app::tests::integrations_in_different_repositories_can_finish_independently", |app, _| {
+            let (dir1, repo1) = repository();
+            let (_dir2, repo2) = repository();
+            let started = dir1.path().join("started");
+            let release = dir1.path().join("release");
+            let hook = repo1.join(".git/hooks/pre-commit");
+            std::fs::write(
+                &hook,
+                format!(
+                    "#!/bin/sh\ntouch '{}'\nwhile [ ! -f '{}' ]; do sleep 0.02; done\n",
+                    started.display(),
+                    release.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+            app.config.worktree_path = "{repo_parent}/{slug}".into();
+            let mut indices = Vec::new();
+            for (goal, repo) in [("One", &repo1), ("Two", &repo2)] {
+                git::git(repo, &["branch", "task"]).unwrap();
+                let worktree = repo.with_file_name("task-worktree");
+                git::git(repo, &["worktree", "add", worktree.to_str().unwrap(), "task"]).unwrap();
+                std::fs::write(worktree.join("work.txt"), goal).unwrap();
+                request(
+                    app,
+                    json!({"cmd":"plan_set", "goal":goal, "tasks":[{"id":"a", "repo":repo, "branch":"task"}]}),
+                );
+                let index = app.selected_plan;
+                app.plans[index].tasks[0].status = TaskStatus::Done;
+                indices.push(index);
+            }
+            app.integrate(indices[0], "a", None);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !started.exists() {
+                if Instant::now() >= deadline {
+                    std::fs::write(&release, "").unwrap();
+                    panic!("first integration did not reach its hook");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            app.integrate(indices[1], "a", None);
+            let other = app.integrate_rx.recv_timeout(Duration::from_secs(5));
+            std::fs::write(&release, "").unwrap();
+            let other = other.expect("a second repository must not wait for the first repository's integration");
+            assert_eq!(other.plan, app.plans[indices[1]].id);
+            assert!(other.result.is_ok());
+            app.finish_integration(other);
+            let first = app.integrate_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(first.plan, app.plans[indices[0]].id);
+            assert!(first.result.is_ok());
+            app.finish_integration(first);
+            assert!(app.plans[indices[0]].tasks[0].integrated.is_some());
+            assert!(app.plans[indices[1]].tasks[0].integrated.is_some());
+        });
+    }
+
     #[test]
     fn approvals_and_held_sends_stay_with_their_plan_across_tab_switches() {
         with_app("app::tests::approvals_and_held_sends_stay_with_their_plan_across_tab_switches", |app, ctx| {
@@ -5702,13 +6403,14 @@ mod tests {
             assert_eq!(event["task"], "a");
             assert_eq!(event["approval"]["command"], "touch permission-fixture");
             for (index, id) in [(0, "worker-one"), (1, "worker-two")] {
-                for (text, raw) in [(format!("steer-{id}"), false), (format!("raw-{id}\\r"), true)] {
-                    let response = request(app, json!({"cmd":"send", "session":id, "text":text, "raw":raw}));
-                    assert!(response.ok);
-                    assert_eq!(response.result["held"], true);
-                    assert_eq!(response.result["sent"], false);
-                }
-                assert_eq!(app.sessions[index].held.len(), 2);
+                let response = request(app, json!({"cmd":"send", "session":id, "text":format!("steer-{id}")}));
+                assert!(response.ok);
+                assert_eq!(response.result["held"], true);
+                assert_eq!(response.result["sent"], false);
+                let raw = request(app, json!({"cmd":"send", "session":id, "text":format!("raw-{id}\\r"), "raw":true}));
+                assert!(!raw.ok);
+                assert!(raw.error.unwrap().contains("imacs_approve"));
+                assert_eq!(app.sessions[index].held.len(), 1);
                 assert!(app.sessions[index].pending.is_none());
             }
             assert_eq!(app.selected_plan, two);
@@ -5720,17 +6422,18 @@ mod tests {
             assert!(app.sessions[0].approvals.is_empty());
             assert_eq!(app.sessions[1].approvals.len(), 1);
             assert_eq!(app.sessions[1].status, AgentStatus::NeedsInput);
-            assert_eq!(app.sessions[0].held.len(), 2, "approval alone must not flush sends into the permission menu");
+            assert_eq!(app.sessions[0].held.len(), 1, "approval alone must not flush sends into the permission menu");
             app.on_hook(hook("worker-one", "PostToolUse"));
             assert!(app.sessions[0].held.is_empty());
             assert_eq!(app.sessions[0].pending.as_ref().unwrap().text, "steer-worker-one");
-            assert_eq!(app.sessions[1].held.len(), 2);
+            assert_eq!(app.sessions[1].held.len(), 1);
             assert!(app.sessions[1].pending.is_none());
             let deadline = Instant::now() + Duration::from_secs(2);
-            while !app.sessions[0].terminal.as_ref().unwrap().screen_text(20).contains("raw-worker-one") {
-                assert!(Instant::now() < deadline, "first plan's raw input was not released");
+            while !app.sessions[0].terminal.as_ref().unwrap().screen_text(20).contains("steer-worker-one") {
+                assert!(Instant::now() < deadline, "first plan's plain message was not released");
                 std::thread::sleep(Duration::from_millis(10));
             }
+            assert!(!app.sessions[0].terminal.as_ref().unwrap().screen_text(20).contains("raw-worker-one"));
             assert!(!app.sessions[1].terminal.as_ref().unwrap().screen_text(20).contains("worker-one"));
             app.selected_plan = one;
             app.show_plan_fleet();
@@ -5745,7 +6448,7 @@ mod tests {
                 serde_json::from_str(&second_reply.wait(Duration::ZERO).stdout.unwrap()).unwrap();
             assert_eq!(output["hookSpecificOutput"]["decision"]["behavior"], "deny");
             assert_eq!(output["hookSpecificOutput"]["decision"]["message"], "Second plan denied");
-            assert_eq!(app.sessions[1].held.len(), 2);
+            assert_eq!(app.sessions[1].held.len(), 1);
             app.on_hook(hook("worker-two", "Interrupt"));
             assert!(app.sessions[1].held.is_empty());
             assert_eq!(app.sessions[1].pending.as_ref().unwrap().text, "steer-worker-two");
@@ -5873,7 +6576,7 @@ mod tests {
             assert!(request(app, json!({"cmd":"plan_set", "plan":first_id, "goal":"First goal", "tasks":[{"id":"a", "title":"Revised"}]})).ok);
             assert_eq!(app.plans[two], old);
             assert_eq!(app.plans[one].tasks[0].session.as_deref(), Some("one-agent"));
-            let loaded = plan::load_plans(&paths::imacs_home()).unwrap();
+            let loaded = plan::load_plans(&paths::imacs_home()).unwrap().0;
             assert_eq!(loaded.iter().find(|p| p.id == first_id).unwrap(), &app.plans[one]);
             assert_eq!(loaded.iter().find(|p| p.id == second_id).unwrap().tasks[0].title, "Second task");
         });
@@ -5901,7 +6604,7 @@ mod tests {
                     task.integrated = legacy.integration.clone();
                 }
                 legacy.save(&paths::plan_file()).unwrap();
-                app.plans = plan::load_plans(&paths::imacs_home()).unwrap();
+                app.plans = plan::load_plans(&paths::imacs_home()).unwrap().0;
                 app.selected_plan = 0;
                 let id = app.plans[0].id.clone();
                 let progress = app.plans[0].tasks.clone();
@@ -5942,7 +6645,7 @@ mod tests {
                     }
                     assert_eq!(app.plans[0], original);
                 }
-                let loaded = plan::load_plans(&paths::imacs_home()).unwrap();
+                let loaded = plan::load_plans(&paths::imacs_home()).unwrap().0;
                 assert_eq!(loaded.len(), 3);
                 assert_eq!(loaded.iter().find(|p| p.id == id).unwrap(), &original);
             },
@@ -6046,12 +6749,28 @@ mod tests {
                     assert!(!app.plans[two].approved);
                 }
             }
+            let text = frame(app, vec![]);
+            let archive = text.iter().find(|(t, _)| t == "Archive plan").unwrap().1;
+            frame(app, vec![egui::Event::PointerMoved(archive), button(archive, true)]);
+            frame(app, vec![button(archive, false)]);
+            assert_eq!(app.plans[two].status, PlanStatus::Archived);
+            assert_eq!(app.selected_plan, one);
+            let text = frame(app, vec![]);
+            assert!(!text.iter().any(|(t, _)| t.starts_with("● Beacon ·")));
+            app.toggle_plan();
+            let text = frame(app, vec![]);
+            let complete = text.iter().find(|(t, _)| t == "Complete plan").unwrap().1;
+            frame(app, vec![egui::Event::PointerMoved(complete), button(complete, true)]);
+            frame(app, vec![button(complete, false)]);
+            assert_eq!(app.plans[one].status, PlanStatus::Completed);
+            assert!(app.plans.iter().all(|p| !p.is_open()));
+            assert_eq!(app.sessions.len(), 2, "closing plans does not terminate their sessions");
         });
     }
 
     #[test]
-    fn dispatch_selects_its_plan_and_delayed_start_failure_returns_to_that_plan() {
-        with_app("app::tests::dispatch_selects_its_plan_and_delayed_start_failure_returns_to_that_plan", |app, ctx| {
+    fn background_dispatch_preserves_selection_and_routes_delayed_start_failure() {
+        with_app("app::tests::background_dispatch_preserves_selection_and_routes_delayed_start_failure", |app, ctx| {
             let dir = tempfile::tempdir().unwrap();
             let repo = dir.path().join("repo");
             std::fs::create_dir(&repo).unwrap();
@@ -6088,8 +6807,9 @@ mod tests {
             app.plans[one].approved = true;
             assert_eq!(app.dispatch(one, Some("a")).unwrap(), ["a"]);
             assert!(app.plans[one].tasks[0].dispatched_at.is_some());
-            assert_eq!(app.selected_plan, one);
+            assert_eq!(app.selected_plan, two);
             assert!(app.plan_view);
+            assert!(app.changed_plans.contains(&app.plans[one].id));
             app.selected_plan = two;
             app.show_plan_fleet();
             let deadline = Instant::now() + Duration::from_secs(10);
@@ -6166,7 +6886,7 @@ mod tests {
         app.on_hook(hook);
         assert!(rx.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
         assert!(app.sessions[0].approvals.is_empty());
-        let (hook, rx) = permission("cargo check", "Check code");
+        let (hook, rx) = permission("git status", "Check code");
         app.on_hook(hook);
         assert!(rx.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
         let (hook, rx) = permission("touch another-file", "Another request");
@@ -6254,17 +6974,35 @@ mod tests {
         });
         app.verify_deliveries();
         assert_eq!(app.sessions[0].pending.as_ref().unwrap().attempts, 1);
-        for (text, raw) in [("held steering message", false), ("y", true)] {
-            let (tx, rx) = channel();
-            app.control(ctx, ControlRequest::Send { session: "fallback".into(), text: text.into(), raw }, tx);
-            let ControlOutcome::Done(response) = rx.recv().unwrap() else { panic!("send response") };
-            assert_eq!(response.result["held"], true);
-            assert_eq!(response.result["sent"], false);
-        }
-        assert_eq!(app.sessions[0].held.len(), 2);
+        let response = request(app, json!({"cmd":"send", "session":"fallback", "text":"held steering message"}));
+        assert_eq!(response.result["held"], true);
+        assert_eq!(response.result["sent"], false);
+        let rejected = request(app, json!({"cmd":"send", "session":"fallback", "text":"y", "raw":true}));
+        assert!(!rejected.ok);
+        assert!(rejected.error.unwrap().contains("imacs_approve"));
+        assert_eq!(app.sessions[0].held, ["held steering message"]);
+        app.active = Some("fallback".into());
+        app.steer_text = "steer while waiting".into();
+        app.send_steer();
+        assert!(app.toast.as_ref().unwrap().0.starts_with("Held for 1"));
+        let root = app.sessions[0].root();
+        app.diffs.entry(root.clone()).or_default().comments.push(steer::ReviewComment {
+            path: "fixture.rs".into(),
+            line: Some(1),
+            removed: false,
+            excerpt: "line".into(),
+            body: "review while waiting".into(),
+        });
+        let review = request(app, json!({"cmd":"send_review", "session":"fallback"}));
+        assert_eq!(review.result["held"], true);
+        assert_eq!(review.result["held_comments"], 1);
+        assert!(review.result.get("sent_comments").is_none());
+        assert!(app.toast.as_ref().unwrap().0.starts_with("Held 1 comment"));
+        assert_eq!(app.sessions[0].held.len(), 3);
+
         assert_eq!(app.sessions[0].terminal.as_ref().unwrap().screen_text(12), before);
         app.approve(0, Decision::Allow, None).unwrap();
-        assert_eq!(app.sessions[0].held.len(), 2);
+        assert_eq!(app.sessions[0].held.len(), 3);
         assert_eq!(app.sessions[0].terminal.as_ref().unwrap().screen_text(12), before);
         let event = imacs_core::hook::HookEvent::from_payload(&json!({
             "hook_event_name":"PostToolUse", "session_id":"mapped-codex-session", "cwd":dir.path(),
@@ -6273,7 +7011,10 @@ mod tests {
         .unwrap();
         app.on_hook(HookMessage { pane: None, ancestors: vec![], event, delivered: 0, approval_reply: None });
         assert!(app.sessions[0].held.is_empty());
-        assert_eq!(app.sessions[0].pending.as_ref().unwrap().text, "held steering message");
+        let delivered = &app.sessions[0].pending.as_ref().unwrap().text;
+        assert!(delivered.contains("held steering message"));
+        assert!(delivered.contains("steer while waiting"));
+        assert!(delivered.contains("review while waiting"));
         app.sessions.clear();
     }
 

@@ -147,15 +147,15 @@ mod tests {
         const CHILD: &str = "IMACS_MIGRATION_TEST_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let dir = tempfile::tempdir().unwrap();
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "paths::tests::migration_with_temporary_home", "--nocapture"])
-                .env(CHILD, "1")
-                .env("HOME", dir.path())
-                .env_remove("IMACS_HOME")
-                .env_remove("IMACS_CONFIG")
-                .env_remove("XDG_CONFIG_HOME")
-                .output()
-                .unwrap();
+            let output = crate::test_support::output(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "paths::tests::migration_with_temporary_home", "--nocapture"])
+                    .env(CHILD, "1")
+                    .env("HOME", dir.path())
+                    .env_remove("IMACS_HOME")
+                    .env_remove("IMACS_CONFIG")
+                    .env_remove("XDG_CONFIG_HOME"),
+            );
             assert!(
                 output.status.success(),
                 "stdout: {}\nstderr: {}",

@@ -163,6 +163,13 @@ fn tools() -> Value {
             }
         },
         {
+            "name": "imacs_plan_close",
+            "description": "Close a plan as completed or archived. Its tab disappears; the plan and task history remain available through imacs_plan_get with its id.",
+            "inputSchema": { "type": "object", "properties": {
+                "plan": plan, "status": { "type": "string", "enum": ["completed", "archived"] }
+            }, "required": ["plan", "status"] }
+        },
+        {
             "name": "imacs_plan_get",
             "description": "Without plan, lists open plans with goal, done/total, approval and waiting tasks. With plan, returns the full plan with every task's status (planned, running, blocked, review, done), its agent session, the agent's last report, notes, whether the user approved it, and which tasks are ready to start.",
             "inputSchema": { "type": "object", "properties": { "plan": plan } }
@@ -212,7 +219,7 @@ fn tools() -> Value {
         },
         {
             "name": "imacs_send",
-            "description": "Send a message to an agent, as if the user typed it and pressed Enter. With raw=true the text is written as keystrokes instead (escapes: \\r Enter, \\e Escape, \\t Tab, \\xNN byte), for terminal controls. While a permission request is pending, input is held until the request finishes and the response says held=true. Use imacs_approve to answer permission menus.",
+            "description": "Send a message to an agent, as if the user typed it and pressed Enter. With raw=true the text is written as keystrokes instead (escapes: \\r Enter, \\e Escape, \\t Tab, \\xNN byte), for terminal controls. While a permission request is pending, plain messages are held until the request finishes and the response says held=true; raw input is rejected. Use imacs_approve to answer permission menus.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "session": session, "text": { "type": "string" }, "raw": { "type": "boolean" } },
@@ -297,20 +304,26 @@ fn call(params: &Value) -> Value {
     };
     match crate::ipc::request(&request) {
         Ok(response) if response.ok => {
-            let text = match response.result.get("diff").and_then(Value::as_str) {
-                Some(diff) => diff.to_string(),
-                None => match response.result.get("screen").and_then(Value::as_str) {
-                    Some(screen) => {
-                        format!("status: {}\n\n{screen}", response.result["status"].as_str().unwrap_or("?"))
-                    }
-                    None => serde_json::to_string_pretty(&response.result).unwrap_or_default(),
-                },
-            };
+            let text = response_text(name, &response.result);
             json!({ "content": [{ "type": "text", "text": text }], "isError": false })
         }
         Ok(response) => tool_error(response.error.unwrap_or_else(|| "failed".into())),
         Err(err) => tool_error(format!("{err:#}")),
     }
+}
+
+fn response_text(name: &str, result: &Value) -> String {
+    if name == "imacs_diff"
+        && let Some(diff) = result.get("diff").and_then(Value::as_str)
+    {
+        return diff.to_string();
+    }
+    if name == "imacs_read"
+        && let Some(screen) = result.get("screen").and_then(Value::as_str)
+    {
+        return format!("status: {}\n\n{screen}", result["status"].as_str().unwrap_or("?"));
+    }
+    serde_json::to_string_pretty(result).unwrap_or_default()
 }
 
 fn request_for_tool(name: &str, mut args: Value) -> Result<ControlRequest, String> {
@@ -327,6 +340,7 @@ fn request_for_tool(name: &str, mut args: Value) -> Result<ControlRequest, Strin
         "imacs_wait" => "wait",
         "imacs_plan_set" => "plan_set",
         "imacs_plan_get" => "plan_get",
+        "imacs_plan_close" => "plan_close",
         "imacs_plan_update" => "plan_update",
         "imacs_plan_dispatch" => "plan_dispatch",
         "imacs_plan_integrate" => "plan_integrate",
@@ -394,6 +408,15 @@ mod tests {
             }
             _ => assert_eq!(input, output),
         }
+    }
+
+    #[test]
+    fn result_preserves_approval_but_read_formats_the_screen() {
+        let result =
+            json!({"status":"needs you", "screen":"menu", "approval":{"command":"touch fixture", "reason":"test"}});
+        let output: Value = serde_json::from_str(&response_text("imacs_result", &result)).unwrap();
+        assert_eq!(output, result);
+        assert_eq!(response_text("imacs_read", &result), "status: needs you\n\nmenu");
     }
 
     #[test]

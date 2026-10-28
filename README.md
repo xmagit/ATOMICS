@@ -111,9 +111,11 @@ Automatic approval is configured in `config.toml`:
 
 ```toml
 [approvals]
-allow = ["cargo build", "cargo test", "cargo check", "cargo clippy", "cargo fmt",
-         "ls", "cat", "rg", "git status", "git diff", "git log"]
+allow = ["ls", "cat", "rg", "git status", "git diff", "git log"]
 ```
+
+The built-in allow list is read-only. Adding a cargo entry permits agent-written code, including
+build scripts and tests, to run outside Codex's sandbox. Add such entries only if you intend that access.
 
 These defaults allow simple command prefixes only when the working directory and file paths are
 inside the session worktree. Shell expansion, compound commands, redirections, paths escaping
@@ -127,9 +129,10 @@ visible menu choice; it returns an error if no matching menu is visible yet. For
 IMACS remembers the command and selects the one-time allow choice rather than creating a broader
 Codex prefix rule. A denial message can only be supplied while the hook is waiting.
 
-While a permission request is pending, `imacs_send` holds messages and raw input instead of typing
-into the menu, and returns `held: true`. It releases them after a lifecycle event confirms the
-request has finished, including when you answer directly in the terminal.
+While a permission request is pending, `imacs_send` holds plain messages and returns `held: true`.
+It releases these messages after a lifecycle event confirms the request has finished, or after the
+menu has been absent for one second. This also covers requests answered directly in the terminal.
+Raw input is rejected with an error pointing to `imacs_approve`.
 
 Agent terminals inherit no `IMACS_SOCKET`, `IMACS_PANE`, `IMACS_HOME` or `IMACS_CONFIG`.
 Codex hooks receive the socket as an argument and find their pane from process ancestry or
@@ -148,9 +151,9 @@ to reset it. Mode and width are remembered; `[chief] dock = "floating"` (or `"do
 `cmd+o` shows or hides either mode. On narrow windows the chief floats instead, then docks again when the window widens.
 `cmd+shift+space` dictates to it.
 
-The chief may read, plan, review and run the plan you approved without asking. Starting agents, typing into
-terminals and closing sessions still ask for permission, so it cannot run shell commands or answer other agents'
-prompts behind your back.
+The chief may read, plan, review and run the plan you approved without asking. It can also answer other
+agents' permission prompts through the pre-approved `imacs_approve`, including `allow_always` for the rest
+of a session. Starting agents, typing into terminals and closing sessions still ask for permission.
 
 ## Orchestration: several plans you approve, agents that report back
 
@@ -170,9 +173,13 @@ blocked or has a question. Reports land on the task card, move done tasks to rev
 `imacs_wait`, which then reads `imacs_result` and `imacs_diff`, reviews, steers, and accepts with `imacs_plan_update`.
 
 Plans are stored separately in `~/.imacs/plans/<id>.json`, with status `open`, `completed` or `archived`. The old
-`~/.imacs/plan.json` migrates once and is kept as `plan.json.migrated`. Only open plans get tabs. Select a tab to see
+`~/.imacs/plan.json` migrates once and is kept as `plan.json.migrated`; an old plan whose tasks are all done
+migrates as completed. Saves replace files atomically, and unreadable plan files are listed in the startup message.
+Only open plans get tabs. Select a tab to see
 that plan’s sessions; `cmd+b` opens its board. Other sessions remain under All and their project tabs. Each plan has
-its own approval and automatic final review. Start the next plan while another finishes; the chief is never closed.
+its own approval and automatic final review. Use `imacs_plan_close {plan, status: "completed" | "archived"}` or
+**Complete plan** / **Archive plan** on the board to close it. Its history remains available by id, and once only
+one plan is open, mutation tools can omit its id again. Start the next plan while another finishes; the chief is never closed.
 `imacs_wait` events include `plan` and `task` ids for sessions belonging to a task.
 
 Tasks come together on the plan's **integration branch** (`imacs/plan-<plan-id>` unless the plan names one; the board
@@ -182,11 +189,13 @@ branch into the integration branch. The merge happens in a worktree of its own n
 first use like any other worktree, so your main checkout is never touched. On a conflict the merge is aborted and the
 task stays in review with a note listing the conflicted files. Tasks without dependencies branch from `base_ref`;
 tasks with dependencies branch from the integration branch, so integrate accepted tasks before dispatching the tasks
-that build on them.
+that build on them. Returning a task to running clears its integration marker. Dispatch rechecks that each marked
+task branch tip is an ancestor of the integration branch, so new commits must be integrated too.
 
 Each open plan has a **short name · done/total** tab with a status dot (working, needs you, all done).
-Dispatching tasks selects that plan’s fleet tab, showing only sessions linked to the plan's tasks as they
-start. It returns from the board to the diff and minimizes a floating chief; a docked chief stays beside the fleet.
+Dispatching the selected plan returns from its board to its fleet and minimizes a floating chief; a docked chief
+stays beside the fleet. Updating or dispatching another plan marks its tab with `*` and preserves the selected
+view and chief. Creating a new plan selects its tab. Each fleet shows only sessions linked to that plan’s tasks.
 Click the plan tab later to return to that overview, or choose All or a project tab to see other sessions.
 
 Accepting an integrated task closes its agent; tasks without a branch, including the final review, close on acceptance.

@@ -74,7 +74,7 @@ kind = "shell"
 
 [approvals]
 # Simple command prefixes, within the session worktree. [] makes every request wait.
-allow = ["cargo build", "cargo test", "cargo check", "cargo clippy", "cargo fmt", "ls", "cat", "rg", "git status", "git diff", "git log"]
+allow = ["ls", "cat", "rg", "git status", "git diff", "git log"]
 
 [plan]
 # Close accepted, integrated agents automatically. Worktrees remain available.
@@ -184,6 +184,7 @@ requests. Never push, open pull requests or delete branches without the user's O
 
 Several plans may be open at once, each with its own tab, agents, approval, integration branch and final review. \
 Start the next plan while another finishes. The chief is never closed. Use imacs_plan_get without plan for summaries.
+Close finished plans with imacs_plan_close (plan id, status completed or archived); their history remains available by id.
 
 Keep briefs, notes and messages short: the user reads them on the board.";
 

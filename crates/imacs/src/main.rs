@@ -1,3 +1,7 @@
+#[cfg(test)]
+#[path = "../../../tests/support.rs"]
+mod test_support;
+
 mod app;
 mod diff_view;
 mod doctor;
@@ -51,7 +55,14 @@ enum Command {
     /// Add IMACS's hooks to ~/.claude/settings.json so every Claude session reports to IMACS
     InstallHooks,
     /// Print the hook settings IMACS passes to the agents it starts
-    HooksJson,
+    #[command(name = "print-hook-settings", alias = "hooks-json")]
+    HooksJson {
+        #[arg(long, default_value = "codex", value_parser = ["codex", "claude"])]
+        agent: String,
+        /// Pane ID used by Claude hooks; Codex hook definitions do not contain it
+        #[arg(long, default_value = "PANE_ID")]
+        pane: String,
+    },
     /// MCP server (stdio) that lets another agent start, read, review and steer agents in IMACS
     Mcp {
         /// Expose only `imacs_report`, for agents IMACS starts to report on their task
@@ -113,9 +124,18 @@ fn main() -> eframe::Result {
             }
             return Ok(());
         }
-        Some(Command::HooksJson) => {
+        Some(Command::HooksJson { agent, pane }) => {
             let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("imacs"));
-            println!("{}", serde_json::to_string_pretty(&imacs_core::hook::claude_settings(&exe)).unwrap_or_default());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&imacs_core::hook::session_settings(
+                    &exe,
+                    &imacs_core::paths::socket_path(),
+                    &pane,
+                    agent == "codex"
+                ))
+                .unwrap_or_default()
+            );
             return Ok(());
         }
         Some(Command::Mcp { agent }) => {
@@ -176,4 +196,24 @@ fn load_icon() -> egui::IconData {
     let info = reader.next_frame(&mut rgba).expect("embedded icon must decode");
     rgba.truncate(info.buffer_size());
     egui::IconData { rgba, width: info.width, height: info.height }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn print_hook_settings_selects_the_launch_settings() {
+        let cli = Cli::try_parse_from(["imacs", "print-hook-settings"]).unwrap();
+        let Some(Command::HooksJson { agent, pane }) = cli.command else { panic!("settings command") };
+        let settings = imacs_core::hook::session_settings(
+            std::path::Path::new("/imacs"),
+            std::path::Path::new("/socket"),
+            &pane,
+            agent == "codex",
+        );
+        assert!(settings["hooks"].get("PermissionRequest").is_some());
+        assert_eq!(settings["hooks"]["SessionStart"][0]["hooks"][0]["command"], "/imacs hook --socket /socket");
+        assert!(Cli::try_parse_from(["imacs", "hooks-json", "--agent", "claude"]).is_ok());
+    }
 }

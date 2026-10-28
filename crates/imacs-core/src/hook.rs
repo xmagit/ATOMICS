@@ -280,6 +280,36 @@ mod tests {
     }
 
     #[test]
+    fn parses_recorded_codex_0165_permission_completion_and_interrupt() {
+        let fixture: Value = serde_json::from_str(include_str!("../tests/fixtures/codex-0.165-hooks.json")).unwrap();
+        assert_eq!(fixture["recorded_codex_version"], "codex-cli 0.165.0");
+        let events: Vec<_> = fixture["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|payload| HookEvent::from_payload(payload).unwrap())
+            .collect();
+        assert_eq!(
+            events.iter().map(|event| event.name.as_str()).collect::<Vec<_>>(),
+            ["PermissionRequest", "PostToolUse", "Interrupt"]
+        );
+        assert_eq!(
+            events.iter().map(HookEvent::status).collect::<Vec<_>>(),
+            [Some(AgentStatus::NeedsInput), Some(AgentStatus::Working), Some(AgentStatus::Idle)]
+        );
+        assert!(events.iter().all(|event| event.session_id == events[0].session_id && event.cwd == events[0].cwd));
+        assert_eq!(events[0].tool_name.as_deref(), Some("Bash"));
+        let permission = crate::approvals::ApprovalRequest::from_event(&events[0]);
+        let completed = crate::approvals::ApprovalRequest::from_event(&events[1]);
+        assert!(permission.command.as_deref().unwrap().ends_with("/fixture-allowed"));
+        assert_eq!(permission.reason.as_deref(), Some("Record Codex 0.165 hook payload"));
+        assert!(completed.reason.is_none());
+        assert!(permission.same_command(&completed));
+        assert!(events[2].tool_name.is_none());
+        assert!(events[2].tool_input.is_null());
+    }
+
+    #[test]
     fn parses_cwd_changes_and_statuses() {
         let event = HookEvent::from_payload(&json!({
             "hook_event_name": "CwdChanged", "session_id": "s1",

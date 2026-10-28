@@ -65,22 +65,7 @@ pub struct ApprovalPolicy {
 impl Default for ApprovalPolicy {
     fn default() -> Self {
         Self {
-            allow: [
-                "cargo build",
-                "cargo test",
-                "cargo check",
-                "cargo clippy",
-                "cargo fmt",
-                "ls",
-                "cat",
-                "rg",
-                "git status",
-                "git diff",
-                "git log",
-            ]
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
+            allow: ["ls", "cat", "rg", "git status", "git diff", "git log"].into_iter().map(str::to_string).collect(),
         }
     }
 }
@@ -172,6 +157,18 @@ fn inside(path: &Path, root: &Path) -> bool {
     matches!((resolve(path), resolve(root)), (Some(path), Some(root)) if path.starts_with(&root))
 }
 
+/// Codex also prompts for edits and terminal input; their choices must never receive steering text.
+pub fn menu_visible(screen: &str) -> bool {
+    let compact: String = screen.chars().filter(|c| !c.is_whitespace()).flat_map(char::to_lowercase).collect();
+    compact.contains("pressentertoconfirmoresctocancel")
+        || screen.lines().any(|line| {
+            let line = line.trim();
+            let Some(choice) = line.strip_prefix(['›', '❯', '>']) else { return false };
+            let Some((number, _)) = choice.trim().split_once('.') else { return false };
+            !number.is_empty() && number.chars().all(|c| c.is_ascii_digit())
+        })
+}
+
 /// Only answer a native menu whose numbered choices are actually visible.
 pub fn menu_key(screen: &str, command: Option<&str>, decision: Decision) -> Option<String> {
     let command = command?;
@@ -189,7 +186,7 @@ pub fn menu_key(screen: &str, command: Option<&str>, decision: Decision) -> Opti
         Decision::Allow | Decision::AllowAlways => "yes, proceed",
         Decision::Deny => "no, and tell codex",
     };
-    screen.lines().find_map(|line| {
+    menu.lines().find_map(|line| {
         let line = line.trim().trim_start_matches(['›', '❯', ' ']);
         let (number, label) = line.split_once('.')?;
         (number.len() == 1
@@ -214,23 +211,23 @@ mod tests {
     }
 
     #[test]
-    fn default_policy_allows_worktree_builds_and_reads() {
+    fn default_policy_allows_only_worktree_reads() {
         let dir = tempfile::tempdir().unwrap();
-        for command in [
-            "cargo build",
-            "cargo test -p imacs-core",
-            "cargo check",
-            "cargo clippy --all-targets -- -D warnings",
-            "cargo fmt",
-            "ls -la",
-            "cat Cargo.toml",
-            "rg hook src",
-            "git status --short",
-            "git diff",
-            "git log -5",
-        ] {
+        for command in ["ls -la", "cat Cargo.toml", "rg hook src", "git status --short", "git diff", "git log -5"] {
             assert!(ApprovalPolicy::default().allows(&request(command, dir.path()), dir.path()), "{command}");
         }
+    }
+
+    #[test]
+    fn cargo_requires_an_explicit_policy_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        for command in ["cargo build", "cargo test", "cargo check", "cargo clippy", "cargo fmt"] {
+            assert!(!ApprovalPolicy::default().allows(&request(command, dir.path()), dir.path()));
+        }
+        assert!(
+            ApprovalPolicy { allow: vec!["cargo test".into()] }
+                .allows(&request("cargo test -p imacs-core", dir.path()), dir.path())
+        );
     }
 
     #[test]
@@ -300,6 +297,20 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_other_codex_menus_without_a_command_prompt() {
+        for screen in [
+            "Allow these edits?\n› 1. Yes, proceed\n  2. No",
+            "Terminal input required\nPress enter to confirm or esc to cancel",
+            "Permissions changed\nPress enter to confirm or\nesc to cancel",
+            "Different display\n❯ 2. Allow once",
+        ] {
+            assert!(menu_visible(screen), "{screen}");
+            assert!(menu_key(screen, Some("touch fixture"), Decision::Allow).is_none());
+        }
+        assert!(!menu_visible("1. A normal numbered response\n› Ask Codex to do anything"));
+    }
+
+    #[test]
     fn fallback_only_answers_visible_matching_menu_choices() {
         let screen = "Would you like to run the following command?\n\n  $ touch fixture\n\n› 1. Yes, proceed (y)\n  2. Yes, and don't ask again for commands that start with `touch`\n  3. No, and tell Codex what to do differently (esc)";
         assert_eq!(menu_key(screen, Some("touch fixture"), Decision::Allow).as_deref(), Some("1\r"));
@@ -307,6 +318,11 @@ mod tests {
         assert_eq!(menu_key(screen, Some("touch fixture"), Decision::Deny).as_deref(), Some("3\r"));
         assert_eq!(menu_key("Agent is working", Some("touch fixture"), Decision::Allow), None);
         assert_eq!(menu_key(screen, Some("touch other"), Decision::Allow), None);
+        let old = format!("9. Yes, proceed (y)\n{screen}");
+        assert_eq!(menu_key(&old, Some("touch fixture"), Decision::Allow).as_deref(), Some("1\r"));
+        let no_choice =
+            "1. Yes, proceed (y)\nWould you like to run the following command?\n\n$ touch fixture\n\nRendering menu";
+        assert_eq!(menu_key(no_choice, Some("touch fixture"), Decision::Allow), None);
         let clipped = "Would you like to run the following command?\n\n  $ touch fixture\n\n› 1. Yes, proceed (y)\nPress enter to confirm or esc to cancel";
         assert_eq!(menu_key(clipped, Some("touch fixture"), Decision::Deny).as_deref(), Some("\x1b"));
     }
