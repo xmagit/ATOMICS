@@ -222,7 +222,7 @@ impl TaskStatus {
 pub const REVIEW_TASK: &str = "review";
 
 impl Plan {
-    /// Accepted work keeps its agent until its branch has reached this plan.
+    /// Accepted work keeps its agent until integration; final review closes on acceptance.
     pub fn finish_tasks(&mut self, now: u64) -> bool {
         let integration = self.integration_branch();
         let mut changed = false;
@@ -234,7 +234,8 @@ impl Plan {
                 }
             }
             if task.status == TaskStatus::Done
-                && (task.branch.is_none()
+                && (task.id == REVIEW_TASK
+                    || task.branch.is_none()
                     || (task.integrated.as_deref() == Some(&integration) && task.integration_verified))
                 && task.finished_at.is_none()
             {
@@ -497,7 +498,12 @@ mod tests {
                     dispatched_at: Some(100),
                     ..Task::default()
                 },
-                Task { id: REVIEW_TASK.into(), status: TaskStatus::Review, ..Task::default() },
+                Task {
+                    id: REVIEW_TASK.into(),
+                    branch: Some("review".into()),
+                    status: TaskStatus::Review,
+                    ..Task::default()
+                },
             ],
             ..Plan::default()
         };

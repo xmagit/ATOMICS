@@ -1056,16 +1056,15 @@ fn task_result(
             ui.label(RichText::new(summary).color(color).size(12.0));
         }
         if task.finished_at.is_some() {
+            let available = task.worktree.as_ref().is_some_and(|path| path.is_dir());
             ui.label(RichText::new(format!("+{} −{}", task.additions, task.deletions)).color(p.muted).size(12.0));
             ui.horizontal(|ui| {
-                if ui.add_enabled(task.worktree.is_some(), egui::Button::new("diff").small()).clicked() {
+                if ui.add_enabled(available, egui::Button::new("diff").small()).clicked() {
                     action = Some("diff");
                 }
                 if ui
                     .add_enabled(
-                        status.is_none()
-                            && task.worktree.is_some()
-                            && (task.resume_id.is_some() || task.agent == "codex"),
+                        status.is_none() && available && (task.resume_id.is_some() || task.agent == "codex"),
                         egui::Button::new("resume").small(),
                     )
                     .clicked()

@@ -36,7 +36,7 @@ pub fn preview(plan: &Plan, base_ref: &str) -> Result<Vec<Entry>> {
     let integration = plan.integration_branch();
     let mut entries = Vec::new();
     for (repo, mut branches) in repos {
-        let base = git::resolve_base(&repo, base_ref.strip_prefix("origin/").unwrap_or(base_ref))?;
+        let base = git::resolve_base(&repo, base_ref)?;
         let exists = |branch: &str| {
             git::git(&repo, &["rev-parse", "--verify", &format!("refs/heads/{branch}^{{commit}}")]).is_ok()
         };
@@ -87,10 +87,11 @@ pub fn remove(plan: &Plan, base_ref: &str, entry: &Entry) -> Result<()> {
         bail!("{reason}");
     }
     ensure!(current == *entry, "branch or worktree changed since preview; reload before removing");
-    match &entry.worktree {
-        Some(path) => git::remove_worktree(&entry.repo, path, Some(&entry.branch), true),
-        None => git::git(&entry.repo, &["branch", "-d", "--", &entry.branch]).map(|_| ()),
+    if let Some(path) = &entry.worktree {
+        git::remove_worktree(&entry.repo, path, None, false)?;
     }
+    // Containment was checked against base, independently of HEAD or the branch's upstream.
+    git::git(&entry.repo, &["update-ref", "-d", &format!("refs/heads/{}", entry.branch), &entry.tip]).map(|_| ())
 }
 
 #[cfg(test)]
@@ -129,6 +130,7 @@ mod tests {
         commit(&task, "feature");
         git::merge(&into, "task").unwrap();
         git::merge(&repo, "imacs/plan-ship").unwrap();
+        git::git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]).unwrap();
         let plan = plan(&repo, &["task", "task"]);
         let rows = preview(&plan, "origin/main").unwrap();
         assert_eq!(rows.iter().map(|r| r.branch.as_str()).collect::<Vec<_>>(), ["task", "imacs/plan-ship"]);
@@ -141,6 +143,60 @@ mod tests {
         assert!(other.exists());
         assert_eq!(git::git(&repo, &["branch", "--format=%(refname:short)"]).unwrap(), "another-plan\nmain\n");
         assert!(preview(&plan, "main").unwrap().is_empty());
+    }
+
+    #[test]
+    fn cleanup_uses_remote_base_even_when_local_main_has_a_different_tip() {
+        let (_dir, repo) = git::tests::project();
+        let task = worktree(&repo, "task");
+        commit(&task, "feature");
+        git::git(&repo, &["remote", "add", "origin", task.to_str().unwrap()]).unwrap();
+        git::git(&repo, &["fetch", "origin", "task:refs/remotes/origin/main"]).unwrap();
+        let plan = plan(&repo, &["task"]);
+        assert!(preview(&plan, "main").unwrap()[0].keep.is_some(), "local main is still behind");
+        let row = preview(&plan, "origin/main").unwrap().remove(0);
+        assert!(row.keep.is_none(), "fetched remote main contains the task");
+        remove(&plan, "origin/main", &row).unwrap();
+        assert!(!task.exists());
+        assert!(git::git(&repo, &["show-ref", "--verify", "refs/heads/task"]).is_err());
+
+        let task = worktree(&repo, "local-only");
+        commit(&task, "unpublished");
+        git::merge(&repo, "local-only").unwrap();
+        let plan = self::plan(&repo, &["local-only"]);
+        assert!(preview(&plan, "main").unwrap()[0].keep.is_none());
+        let row = preview(&plan, "origin/main").unwrap().remove(0);
+        assert!(row.keep.is_some(), "local main must not authorize deletion of unpublished work");
+        assert!(remove(&plan, "origin/main", &row).is_err());
+        assert!(task.join("unpublished").exists());
+    }
+
+    #[test]
+    fn merged_branch_cleanup_does_not_depend_on_head_or_upstream() {
+        for has_worktree in [false, true] {
+            for stale_upstream in [false, true] {
+                let (_dir, repo) = git::tests::project();
+                git::git(&repo, &["branch", "unrelated"]).unwrap();
+                let task = worktree(&repo, "task");
+                commit(&task, "feature");
+                git::merge(&repo, "task").unwrap();
+                if stale_upstream {
+                    git::git(&repo, &["branch", "--set-upstream-to=unrelated", "task"]).unwrap();
+                } else {
+                    git::git(&repo, &["checkout", "unrelated"]).unwrap();
+                }
+                if !has_worktree {
+                    git::remove_worktree(&repo, &task, None, false).unwrap();
+                }
+                let plan = plan(&repo, &["task"]);
+                let row = preview(&plan, "main").unwrap().remove(0);
+                assert!(row.keep.is_none());
+                remove(&plan, "main", &row).unwrap();
+                assert!(!task.exists());
+                assert!(git::git(&repo, &["show-ref", "--verify", "refs/heads/task"]).is_err());
+                assert!(git::git(&repo, &["show-ref", "--verify", "refs/heads/unrelated"]).is_ok());
+            }
+        }
     }
 
     #[test]

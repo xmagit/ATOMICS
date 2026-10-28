@@ -27,7 +27,10 @@ impl App {
                     && if self.plan_view {
                         *index == self.selected_plan
                     } else {
-                        self.view.is_none() || plan.project == self.view
+                        match &self.view {
+                            None => plan.is_open(),
+                            Some(project) => plan.project.as_ref() == Some(project),
+                        }
                     }
             })
             .flat_map(|(index, plan)| {
@@ -361,7 +364,7 @@ pub(super) fn queue_note(pid: u32, running: &[Ticket], waiting: &[Ticket]) -> Op
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{session, with_app};
+    use super::super::tests::{repository, session, with_app};
     use super::*;
 
     #[test]
@@ -378,11 +381,125 @@ mod tests {
     }
 
     #[test]
+    fn all_view_only_shows_completed_tiles_from_open_plans() {
+        with_app("app::fleet::tests::all_view_only_shows_completed_tiles_from_open_plans", |app, _| {
+            let dir = tempfile::tempdir().unwrap();
+            app.sessions.clear();
+            app.plans = [PlanStatus::Open, PlanStatus::Completed, PlanStatus::Archived]
+                .into_iter()
+                .enumerate()
+                .map(|(index, status)| Plan {
+                    id: format!("plan-{index}"),
+                    status,
+                    project: Some(dir.path().into()),
+                    tasks: vec![Task {
+                        finished_at: Some(100),
+                        worktree: Some(dir.path().join("removed")),
+                        ..Task::default()
+                    }],
+                    ..Plan::default()
+                })
+                .collect();
+            app.plan_view = false;
+            app.view = None;
+            assert_eq!(app.completed_tasks(), [(0, 0)]);
+            app.view = Some(dir.path().into());
+            assert_eq!(app.completed_tasks(), [(0, 0), (1, 0)]);
+            app.plan_view = true;
+            app.selected_plan = 1;
+            assert_eq!(app.completed_tasks(), [(1, 0)], "completed plan history stays visible in its own view");
+            app.selected_plan = 2;
+            assert!(app.completed_tasks().is_empty());
+        });
+    }
+
+    #[test]
+    fn removed_worktrees_disable_completed_result_actions() {
+        with_app("app::fleet::tests::removed_worktrees_disable_completed_result_actions", |app, ctx| {
+            let (_dir, repo) = repository();
+            let worktree = repo.with_file_name("task");
+            git::add_worktree(&repo, &worktree, "task", "main").unwrap();
+            app.plans = vec![Plan {
+                id: "cleaned".into(),
+                status: PlanStatus::Completed,
+                project: Some(repo),
+                tasks: vec![Task {
+                    branch: Some("task".into()),
+                    finished_at: Some(100),
+                    worktree: Some(worktree.clone()),
+                    resume_id: Some("resume-id".into()),
+                    ..Task::default()
+                }],
+                ..Plan::default()
+            }];
+            app.selected_plan = 0;
+            let task = app.plans[0].tasks[0].clone();
+            let mut time = 0.0;
+            let mut render = |events| {
+                time += 0.05;
+                let mut action = None;
+                let output = ctx.run_ui(egui::RawInput { time: Some(time), events, ..Default::default() }, |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        action = task_result(ui, &task, None, false, &app.palette);
+                    });
+                });
+                let text: Vec<_> = output
+                    .shapes
+                    .iter()
+                    .filter_map(|s| match &s.shape {
+                        egui::epaint::Shape::Text(t) => {
+                            Some((t.galley.text().to_string(), t.pos + t.galley.rect.center().to_vec2()))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                output.drop_without_applying_deltas();
+                (text, action)
+            };
+            for available in [true, false] {
+                for label in ["diff", "resume"] {
+                    let (text, _) = render(vec![]);
+                    let pos = text.iter().find(|(t, _)| t == label).unwrap().1;
+                    for pressed in [true, false] {
+                        let (_, action) = render(vec![
+                            egui::Event::PointerMoved(pos),
+                            egui::Event::PointerButton {
+                                pos,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ]);
+                        if !pressed {
+                            assert_eq!(action, available.then_some(label));
+                        }
+                    }
+                }
+                if available {
+                    let rows = imacs_core::cleanup::preview(&app.plans[0], "main").unwrap();
+                    imacs_core::cleanup::remove(&app.plans[0], "main", &rows[0]).unwrap();
+                    assert!(!worktree.exists());
+                }
+            }
+            app.active = None;
+            app.diff_root = None;
+            let sessions = app.sessions.len();
+            for action in ["diff", "resume"] {
+                app.task_action(0, 0, action);
+                assert!(app.diff_target().is_none());
+                assert_eq!(app.sessions.len(), sessions);
+                assert_eq!(app.plans[0].status, PlanStatus::Completed);
+            }
+        });
+    }
+
+    #[test]
     fn completed_tiles_and_board_show_results_actions_and_idle_report_age() {
         with_app(
             "app::fleet::tests::completed_tiles_and_board_show_results_actions_and_idle_report_age",
             |app, ctx| {
-                let root = Path::new("/work");
+                let dir = tempfile::tempdir().unwrap();
+                let root = dir.path();
                 app.sessions =
                     (0..3).map(|i| session(&format!("live-{i}"), AgentKind::Claude, AgentStatus::Idle, root)).collect();
                 let index = app.selected_plan;

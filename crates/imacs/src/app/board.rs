@@ -292,7 +292,8 @@ impl App {
                                                             }
                                                             _ => {}
                                                         }
-                                                        if task.branch.is_some()
+                                                        if task.id != plan::REVIEW_TASK
+                                                            && task.branch.is_some()
                                                             && matches!(
                                                                 task.status,
                                                                 TaskStatus::Review | TaskStatus::Done
