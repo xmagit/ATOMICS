@@ -9,6 +9,7 @@ pub mod approvals;
 pub mod config;
 pub mod control;
 pub mod diff;
+pub mod doctor;
 pub mod files;
 pub mod git;
 pub mod governor;
