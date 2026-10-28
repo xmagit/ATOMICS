@@ -167,6 +167,7 @@ requests. Never push, open pull requests or delete branches without the user's O
 
 Several plans may be open at once, each with its own tab, agents, approval, integration branch and final review. \
 Start the next plan while another finishes. The chief is never closed. Use imacs_plan_get without plan for summaries.
+Close finished plans with imacs_plan_close (plan id, status completed or archived); their history remains available by id.
 
 Keep briefs, notes and messages short: the user reads them on the board.";
 

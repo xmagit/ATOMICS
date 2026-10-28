@@ -36,40 +36,63 @@ pub enum PlanStatus {
 
 /// Load valid plan files, including completed and archived plans, and migrate the
 /// former single plan once. File names are the stable ids, including older archives.
-pub fn load_plans(home: &Path) -> Result<Vec<Plan>> {
+pub fn load_plans(home: &Path) -> Result<(Vec<Plan>, Vec<String>)> {
+    let mut errors = Vec::new();
     let dir = home.join("plans");
     std::fs::create_dir_all(&dir)?;
     let legacy = home.join("plan.json");
     if legacy.exists() && !home.join("plan.json.migrated").exists() {
-        if let Some(mut plan) = Plan::load(&legacy) {
-            plan.integration = Some(plan.integration_branch());
-            plan.id = unique_id(&plan.goal, &[], home);
-            plan.status = PlanStatus::Open;
-            plan.save_in(home)?;
+        match Plan::load(&legacy) {
+            Ok(mut plan) => {
+                plan.integration = Some(plan.integration_branch());
+                plan.id = unique_id(&plan.goal, &[], home);
+                plan.status = if !plan.tasks.is_empty() && plan.count(TaskStatus::Done) == plan.tasks.len() {
+                    PlanStatus::Completed
+                } else {
+                    PlanStatus::Open
+                };
+                plan.save_in(home)?;
+                std::fs::rename(&legacy, home.join("plan.json.migrated"))?;
+            }
+            Err(err) => errors.push(format!("{}: {err:#}", legacy.display())),
         }
-        std::fs::rename(&legacy, home.join("plan.json.migrated"))?;
     }
     let mut plans = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
-        let path = entry?.path();
-        if path.extension().is_some_and(|ext| ext == "json")
-            && let Some(id) = path.file_stem().and_then(|s| s.to_str())
-            && valid_id(id)
-            && let Ok(text) = std::fs::read_to_string(&path)
-            && let Ok(value) = serde_json::from_str::<serde_json::Value>(&text)
-        {
-            let archived = value.get("status").is_none();
-            if let Ok(mut plan) = serde_json::from_value::<Plan>(value) {
+    for entry in std::fs::read_dir(&dir)? {
+        let path = match entry {
+            Ok(entry) => entry.path(),
+            Err(err) => {
+                errors.push(format!("{}: {err}", dir.display()));
+                continue;
+            }
+        };
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        let Some(id) = path.file_stem().and_then(|s| s.to_str()).filter(|id| valid_id(id)) else {
+            errors.push(format!("{}: invalid plan filename", path.display()));
+            continue;
+        };
+        let loaded = std::fs::read_to_string(&path)
+            .map_err(anyhow::Error::from)
+            .and_then(|text| Ok(serde_json::from_str::<serde_json::Value>(&text)?))
+            .and_then(|value| {
+                let archived = value.get("status").is_none();
+                let mut plan: Plan = serde_json::from_value(value)?;
                 plan.id = id.to_string();
                 if archived {
                     plan.status = PlanStatus::Archived;
                 }
-                plans.push(plan);
-            }
+                Ok(plan)
+            });
+        match loaded {
+            Ok(plan) => plans.push(plan),
+            Err(err) => errors.push(format!("{}: {err:#}", path.display())),
         }
     }
     plans.sort_by(|a, b| a.id.cmp(&b.id));
-    Ok(plans)
+    errors.sort();
+    Ok((plans, errors))
 }
 
 fn valid_id(id: &str) -> bool {
@@ -204,15 +227,17 @@ impl Plan {
         self.tasks.iter().any(|task| task.session.as_deref() == Some(id))
     }
 
-    pub fn load(path: &Path) -> Option<Plan> {
-        std::fs::read_to_string(path).ok().and_then(|text| serde_json::from_str(&text).ok())
+    pub fn load(path: &Path) -> Result<Plan> {
+        Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?)
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, serde_json::to_vec_pretty(self)?)?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
+        std::fs::rename(tmp, path)?;
         Ok(())
     }
 
@@ -335,6 +360,13 @@ impl Plan {
 }
 
 impl Task {
+    pub fn set_status(&mut self, status: TaskStatus) {
+        if !matches!(status, TaskStatus::Review | TaskStatus::Done) {
+            self.integrated = None;
+        }
+        self.status = status;
+    }
+
     /// The first message an agent gets: the task, how to know it is done, and how
     /// to report back.
     pub fn compose_brief(&self, goal: &str) -> String {
@@ -393,7 +425,7 @@ mod tests {
         old.save(&dir.path().join("plan.json")).unwrap();
         let archive = Plan { id: "ship-it".into(), status: PlanStatus::Archived, ..old.clone() };
         archive.save_in(dir.path()).unwrap();
-        let plans = load_plans(dir.path()).unwrap();
+        let plans = load_plans(dir.path()).unwrap().0;
         assert_eq!(plans.len(), 2);
         let migrated = plans.iter().find(|p| p.is_open()).unwrap();
         assert_eq!(migrated.id, "ship-it-2");
@@ -403,7 +435,62 @@ mod tests {
         assert_eq!(plans.iter().find(|p| p.id == "ship-it").unwrap(), &archive);
         assert!(!dir.path().join("plan.json").exists());
         assert!(dir.path().join("plan.json.migrated").exists());
-        assert_eq!(load_plans(dir.path()).unwrap(), plans);
+        assert_eq!(load_plans(dir.path()).unwrap().0, plans);
+    }
+
+    #[test]
+    fn completed_legacy_plans_migrate_closed_while_unfinished_and_empty_plans_stay_open() {
+        for statuses in [vec![TaskStatus::Done, TaskStatus::Done], vec![TaskStatus::Done, TaskStatus::Review], vec![]] {
+            let dir = tempfile::tempdir().unwrap();
+            let plan = Plan {
+                goal: "Legacy".into(),
+                tasks: statuses
+                    .iter()
+                    .enumerate()
+                    .map(|(i, status)| Task { id: format!("t{i}"), status: *status, ..Task::default() })
+                    .collect(),
+                ..Plan::default()
+            };
+            plan.save(&dir.path().join("plan.json")).unwrap();
+            let (loaded, errors) = load_plans(dir.path()).unwrap();
+            assert!(errors.is_empty());
+            let completed = !statuses.is_empty() && statuses.iter().all(|s| *s == TaskStatus::Done);
+            assert_eq!(loaded[0].status, if completed { PlanStatus::Completed } else { PlanStatus::Open });
+            assert_eq!(loaded[0].is_open(), !completed);
+        }
+    }
+
+    #[test]
+    fn saving_replaces_the_file_atomically_and_keeps_existing_data_on_failure() {
+        use std::io::Read;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plan.json");
+        let mut plan = Plan { goal: "Original".into(), ..Plan::default() };
+        plan.save(&path).unwrap();
+        let original = std::fs::read_to_string(&path).unwrap();
+        let mut reader = std::fs::File::open(&path).unwrap();
+        plan.goal = "Updated".into();
+        plan.save(&path).unwrap();
+        let mut snapshot = String::new();
+        reader.read_to_string(&mut snapshot).unwrap();
+        assert_eq!(snapshot, original, "existing readers keep a complete prior file");
+        assert_eq!(Plan::load(&path).unwrap(), plan);
+        let tmp = path.with_extension("json.tmp");
+        assert!(!tmp.exists());
+        std::fs::create_dir(&tmp).unwrap();
+        let saved = std::fs::read(&path).unwrap();
+        plan.goal = "Unwritable".into();
+        assert!(plan.save(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), saved);
+    }
+
+    #[test]
+    fn leaving_review_or_done_clears_integration() {
+        for status in TaskStatus::ALL {
+            let mut task = Task { status: TaskStatus::Done, integrated: Some("integration".into()), ..Task::default() };
+            task.set_status(status);
+            assert_eq!(task.integrated.is_some(), matches!(status, TaskStatus::Review | TaskStatus::Done));
+        }
     }
 
     #[test]
@@ -412,17 +499,17 @@ mod tests {
         let folder = dir.path().join("plans");
         std::fs::create_dir(&folder).unwrap();
         std::fs::write(folder.join("imacs-v0.3.json"), r#"{"goal":"Old plan", "tasks":[], "approved":true}"#).unwrap();
-        let plans = load_plans(dir.path()).unwrap();
+        let plans = load_plans(dir.path()).unwrap().0;
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].id, "imacs-v0.3");
         assert_eq!(plans[0].status, PlanStatus::Archived);
         assert!(!plans[0].is_open());
         plans[0].save_in(dir.path()).unwrap();
-        assert_eq!(load_plans(dir.path()).unwrap(), plans);
+        assert_eq!(load_plans(dir.path()).unwrap().0, plans);
     }
 
     #[test]
-    fn storage_keeps_plans_independent_and_ignores_unparseable_files() {
+    fn storage_keeps_plans_independent_and_reports_unreadable_files() {
         let dir = tempfile::tempdir().unwrap();
         let mut plans = Vec::new();
         for goal in ["API", "API", "UI"] {
@@ -440,7 +527,11 @@ mod tests {
         plans[1].save_in(dir.path()).unwrap();
         std::fs::write(dir.path().join("plans/broken.json"), "{no").unwrap();
         std::fs::write(dir.path().join("plans/note.txt"), "irrelevant").unwrap();
-        let loaded = load_plans(dir.path()).unwrap();
+        std::fs::create_dir(dir.path().join("plans/unreadable.json")).unwrap();
+        let (loaded, errors) = load_plans(dir.path()).unwrap();
+        assert_eq!(errors.len(), 2);
+        assert!(errors.iter().any(|e| e.contains("plans/broken.json")));
+        assert!(errors.iter().any(|e| e.contains("plans/unreadable.json")));
         assert_eq!(loaded, plans);
         assert_eq!(loaded.iter().filter(|p| p.is_open()).count(), 2);
         assert!(loaded[0].approved);
