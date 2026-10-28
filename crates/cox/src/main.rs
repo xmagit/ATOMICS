@@ -1,9 +1,11 @@
 mod app;
 mod diff_view;
+mod doctor;
 mod highlight;
 mod hook_client;
 mod ipc;
 mod mcp;
+mod setup;
 mod terminal;
 mod theme;
 
@@ -36,6 +38,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Check required tools, configuration and integrations
+    Doctor,
     /// Hook handler run by Claude Code (reads the event on stdin)
     Hook,
     /// Add cox's hooks to ~/.claude/settings.json so every Claude session reports to cox
@@ -82,12 +86,13 @@ fn main() -> eframe::Result {
         }
     }
     match cli.command {
+        Some(Command::Doctor) => std::process::exit(doctor::run()),
         Some(Command::Hook) => {
             hook_client::run();
             return Ok(());
         }
         Some(Command::InstallHooks) => {
-            match app::install_global_hooks() {
+            match setup::install_global_hooks() {
                 Ok(path) => println!("cox hooks added to {} (backup next to it)", path.display()),
                 Err(err) => eprintln!("installing hooks failed: {err:#}"),
             }
