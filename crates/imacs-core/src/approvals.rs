@@ -62,12 +62,15 @@ impl ApprovalRequest {
 #[serde(default)]
 pub struct ApprovalPolicy {
     pub allow: Vec<String>,
+    /// Exact NAME=value assignments, including an empty value after `=`.
+    pub env: Vec<String>,
 }
 
 impl Default for ApprovalPolicy {
     fn default() -> Self {
         Self {
             allow: ["ls", "cat", "rg", "git status", "git diff", "git log"].into_iter().map(str::to_string).collect(),
+            env: Vec::new(),
         }
     }
 }
@@ -79,26 +82,46 @@ impl ApprovalPolicy {
             return false;
         }
         let Some(command) = &request.command else { return false };
-        // Refuse shell expansion, compound commands and redirections, even when quoted.
-        if command.contains([
-            '\n', '\r', ';', '|', '&', '<', '>', '`', '$', '*', '?', '[', ']', '{', '}', '~', '(', ')', '\\',
-        ]) {
+        let Some(commands) = shell_commands(command) else { return false };
+        commands.iter().all(|words| self.allows_command(words, &request.cwd, root))
+    }
+
+    fn allows_command(&self, raw: &[&str], cwd: &Path, root: &Path) -> bool {
+        let Some(words): Option<Vec<String>> = raw.iter().map(|word| shlex::split(word)?.pop()).collect() else {
+            return false;
+        };
+        // Only an unquoted NAME= prefix is a shell assignment. `env` accepts quoted ones too.
+        let assignments = raw.iter().take_while(|word| assignment(word)).count();
+        if !words[..assignments].iter().all(|word| self.env.contains(word)) {
             return false;
         }
-        // `imacs queue` only waits for a slot: judge the command it runs.
-        if let Some(inner) = shlex::split(command).as_deref().and_then(crate::governor::queued_command) {
-            let Ok(inner) = shlex::try_join(inner.iter().map(String::as_str)) else { return false };
-            return self.allows(&ApprovalRequest { command: Some(inner), ..request.clone() }, root);
+        let mut words = &words[assignments..];
+        loop {
+            if words.first().map(String::as_str) == Some("env") {
+                words = &words[1..];
+                let assignments = words.iter().take_while(|word| assignment(word)).count();
+                if assignments == 0 || !words[..assignments].iter().all(|word| self.env.contains(word)) {
+                    return false;
+                }
+                words = &words[assignments..];
+            } else if let Some(inner) = crate::governor::queued_command(words) {
+                // Queue executes argv directly: a bare assignment here is not a shell prefix.
+                words = inner;
+            } else {
+                break;
+            }
         }
-        let Some(words) = shlex::split(command) else { return false };
+        let Some(words) = self.cargo_command(words, cwd) else { return false };
         if words.is_empty()
             || !self.allow.iter().any(|prefix| {
-                shlex::split(prefix).is_some_and(|prefix| !prefix.is_empty() && words.starts_with(&prefix))
+                shlex::split(prefix)
+                    .and_then(|prefix| self.cargo_command(&prefix, cwd))
+                    .is_some_and(|prefix| !prefix.is_empty() && words.starts_with(&prefix))
             })
         {
             return false;
         }
-        for word in &words {
+        for word in &words[1..] {
             // These read-tool flags can execute programs or write files.
             if [
                 "--pre",
@@ -113,6 +136,7 @@ impl ApprovalPolicy {
                 "--work-tree",
                 "--directory",
                 "--out-dir",
+                "--manifest-path",
                 "--target-dir",
                 "--follow",
                 "--dereference",
@@ -125,21 +149,155 @@ impl ApprovalPolicy {
                     .iter()
                     .any(|flag| !word.starts_with("--") && word.starts_with(flag) && word.len() > flag.len())
                 || matches!(word.as_str(), "-c" | "-C" | "-o")
+                || (words[0] == "cargo"
+                    && word.starts_with('-')
+                    && !word.starts_with("--")
+                    && word.contains(['Z', 'C']))
                 || (words[0] == "ls" && word.starts_with('-') && !word.starts_with("--") && word.contains('L'))
                 || (words[0] == "rg" && word.starts_with('-') && !word.starts_with("--") && word.contains('L'))
             {
                 return false;
             }
             let value = word.split_once('=').map_or(word.as_str(), |(_, value)| value);
-            if (value.contains('/') || value == "..") && !inside(&request.cwd.join(value), root) {
+            if (value.contains('/') || value == "..") && !inside(&cwd.join(value), root) {
                 return false;
             }
-            if !word.starts_with('-') && request.cwd.join(word).exists() && !inside(&request.cwd.join(word), root) {
+            if !word.starts_with('-') && cwd.join(word).exists() && !inside(&cwd.join(word), root) {
                 return false;
             }
         }
+        // Non-cargo programs still have to stay within the worktree themselves.
+        if words[0].contains('/') && !inside(&cwd.join(&words[0]), root) {
+            return false;
+        }
         true
     }
+
+    fn cargo_command(&self, words: &[String], cwd: &Path) -> Option<Vec<String>> {
+        let mut words = words;
+        if words.first().map(String::as_str) == Some("rustup") {
+            if words.get(1).map(String::as_str) != Some("run") || !toolchain(words.get(2)?) {
+                return None;
+            }
+            words = &words[3..];
+            if !self.is_cargo(words.first()?, cwd) {
+                return None;
+            }
+        }
+        let mut normalized = words.to_vec();
+        if let Some(program) = words.first()
+            && self.is_cargo(program, cwd)
+        {
+            normalized[0] = "cargo".into();
+            if let Some(version) = words.get(1).and_then(|word| word.strip_prefix('+')) {
+                if !toolchain(version) {
+                    return None;
+                }
+                normalized.remove(1);
+            }
+        }
+        Some(normalized)
+    }
+
+    fn is_cargo(&self, program: &str, cwd: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+
+        if program == "cargo" {
+            return true;
+        }
+        let path = Path::new(program);
+        // Rustup proxies share a real path but dispatch by basename (e.g. rustc vs cargo).
+        if !path.is_absolute() || path.file_name().is_none_or(|name| name != "cargo") {
+            return false;
+        }
+        let Ok(real) = path.canonicalize() else { return false };
+        let configured = self.allow.iter().filter_map(|prefix| shlex::split(prefix)?.into_iter().next());
+        if configured.filter(|program| Path::new(program).is_absolute()).any(|program| {
+            let path = Path::new(&program);
+            path.file_name().is_some_and(|name| name == "cargo") && path.canonicalize().is_ok_and(|p| p == real)
+        }) {
+            return true;
+        }
+        let Some(path) = std::env::var_os("PATH") else { return false };
+        std::env::split_paths(&path)
+            .map(|dir| cwd.join(dir).join("cargo"))
+            .find(|path| path.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
+            .and_then(|path| path.canonicalize().ok())
+            .is_some_and(|path| path == real)
+    }
+}
+
+#[cfg(feature = "native")]
+fn assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| {
+        name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
+#[cfg(feature = "native")]
+fn toolchain(word: &str) -> bool {
+    word.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && word.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// A deliberately small shell grammar: words with quotes, joined only by plain `&&` or `;`.
+/// Keep raw words so quoted assignment names cannot become shell environment prefixes.
+#[cfg(feature = "native")]
+fn shell_commands(command: &str) -> Option<Vec<Vec<&str>>> {
+    // Keep refusing expansions and redirections even inside quotes. Reject controls (including
+    // newlines) before parsing, so heredocs and line continuations cannot hide commands.
+    if command.chars().any(|c| {
+        (c.is_control() && c != '\t')
+            || matches!(c, '|' | '<' | '>' | '`' | '$' | '*' | '?' | '[' | ']' | '{' | '}' | '~' | '(' | ')' | '\\')
+    }) {
+        return None;
+    }
+    let mut commands = Vec::new();
+    let mut words = Vec::new();
+    let mut start = None;
+    let mut quote = None;
+    let mut chars = command.char_indices();
+    while let Some((index, c)) = chars.next() {
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(c, '\'' | '"') {
+            start.get_or_insert(index);
+            quote = Some(c);
+        } else if matches!(c, ' ' | '\t' | ';' | '&') {
+            if let Some(start) = start.take() {
+                words.push(&command[start..index]);
+            }
+            if matches!(c, ';' | '&') {
+                if c == '&' && chars.next().is_none_or(|(_, c)| c != '&') {
+                    return None;
+                }
+                if words.is_empty() {
+                    return None;
+                }
+                commands.push(std::mem::take(&mut words));
+            }
+        } else if c == '#' {
+            return None;
+        } else {
+            start.get_or_insert(index);
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if let Some(start) = start {
+        words.push(&command[start..]);
+    }
+    if words.is_empty() {
+        return None;
+    }
+    commands.push(words);
+    Some(commands)
 }
 
 #[cfg(feature = "native")]
@@ -258,20 +416,204 @@ mod tests {
     #[cfg(feature = "native")]
     fn cargo_requires_an_explicit_policy_entry() {
         let dir = tempfile::tempdir().unwrap();
-        for command in ["cargo build", "cargo test", "cargo check", "cargo clippy", "cargo fmt"] {
+        for command in [
+            "cargo build",
+            "cargo test",
+            "cargo check",
+            "cargo clippy",
+            "cargo fmt",
+            "cargo +stable test",
+            "rustup run stable cargo test",
+            "RUSTC_WRAPPER= cargo test",
+            "env RUSTC_WRAPPER= cargo test",
+            "ls && cargo test",
+        ] {
             assert!(!ApprovalPolicy::default().allows(&request(command, dir.path()), dir.path()));
         }
         assert!(
-            ApprovalPolicy { allow: vec!["cargo test".into()] }
+            ApprovalPolicy { allow: vec!["cargo test".into()], ..ApprovalPolicy::default() }
                 .allows(&request("cargo test -p imacs-core", dir.path()), dir.path())
         );
     }
 
     #[test]
     #[cfg(feature = "native")]
+    fn policy_judges_chains_env_and_toolchains_by_their_parts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut policy = ApprovalPolicy {
+            env: vec!["RUSTC_WRAPPER=".into(), "CARGO_TERM_COLOR=always".into()],
+            ..ApprovalPolicy::default()
+        };
+        policy.allow.extend(["cargo check", "cargo test", "cargo clippy", "cargo fmt"].map(str::to_string));
+        for (command, expected) in [
+            ("ls&&git status; cargo test -p imacs-core", true),
+            ("cargo check && cargo test && cargo fmt --check", true),
+            ("RUSTC_WRAPPER= cargo check", true),
+            ("RUSTC_WRAPPER='' cargo check", true),
+            ("RUSTC_WRAPPER= CARGO_TERM_COLOR=always cargo test", true),
+            ("env RUSTC_WRAPPER= cargo test", true),
+            ("env 'RUSTC_WRAPPER=' cargo test", true),
+            ("RUSTC_WRAPPER= env CARGO_TERM_COLOR=always cargo test", true),
+            ("cargo +stable check", true),
+            ("cargo +nightly-2026-10-01 clippy -- -D warnings", true),
+            ("rustup run stable cargo test -p imacs-core", true),
+            ("env RUSTC_WRAPPER= rustup run stable cargo test", true),
+            ("RUSTC_WRAPPER= cargo +stable test && env RUSTC_WRAPPER= cargo fmt --check", true),
+            ("imacs queue --class test -- env RUSTC_WRAPPER= cargo +stable test", true),
+            ("env RUSTC_WRAPPER= imacs queue --class=test -- rustup run stable cargo test", true),
+            ("imacs queue -- cargo test; git status", true),
+            ("rg 'a && b' src && git status", true),
+            ("rg \"a; b\" src; ls", true),
+            ("rg a'&&'b src", true),
+            ("cat 'file with spaces'", true),
+            ("\tgit status\t&&\tls", true),
+            ("", false),
+            (" ", false),
+            ("cargo check && rm file", false),
+            ("rm file; cargo check", false),
+            ("cargo test && cargo publish", false),
+            ("cargo test; unknown-program", false),
+            ("cargo test && env RUSTC=evil cargo check", false),
+            ("cargo test &&", false),
+            ("; cargo test", false),
+            ("cargo test;;ls", false),
+            ("cargo test &&& ls", false),
+            ("cargo test & ls", false),
+            ("cargo test || ls", false),
+            ("cargo test | cat", false),
+            ("cargo test > output", false),
+            ("cargo test 2>&1", false),
+            ("cargo test < input", false),
+            ("cargo test\nls", false),
+            ("cargo test\rls", false),
+            ("cargo test\0", false),
+            ("cat <<'EOF'\nls && rm file\nEOF", false),
+            ("cat <<'EOF' && ls", false),
+            ("cargo test # && rm file", false),
+            ("cargo test $(ls)", false),
+            ("cargo test `ls`", false),
+            ("cargo test $ARGS", false),
+            ("cat *", false),
+            ("cat file?", false),
+            ("cat [ab]", false),
+            ("cat {a,b}", false),
+            ("cat ~/file", false),
+            ("ls \\\n&& ls", false),
+            ("rg 'unterminated && ls", false),
+            ("rg \"unterminated; ls", false),
+            ("rg '&&' /etc/passwd", false),
+            ("rg '&&' src && rm file", false),
+            ("cat ../secret && ls", false),
+            ("ls; git diff --ext-diff", false),
+            ("RUSTC_WRAPPER=evil cargo test", false),
+            ("RUSTC_WRAPPER= evil", false),
+            ("RUSTC_WRAPPER=", false),
+            ("'RUSTC_WRAPPER=' cargo test", false),
+            ("RUSTC_WRAPPER''= cargo test", false),
+            ("RUSTC=arbitrary cargo test", false),
+            ("PATH=bin cargo test", false),
+            ("DYLD_INSERT_LIBRARIES=evil cargo test", false),
+            ("LD_PRELOAD=evil cargo test", false),
+            ("CARGO_TERM_COLOR=never cargo test", false),
+            ("env RUSTC_WRAPPER=evil cargo test", false),
+            ("env RUSTC_WRAPPER= LD_PRELOAD=evil cargo test", false),
+            ("env PATH=bin cargo test", false),
+            ("env -i RUSTC_WRAPPER= cargo test", false),
+            ("env -- RUSTC_WRAPPER= cargo test", false),
+            ("env RUSTC_WRAPPER=", false),
+            ("imacs queue -- RUSTC_WRAPPER= cargo test", false),
+            ("imacs queue --class qa -- env RUSTC_WRAPPER= sh -c cargo", false),
+            ("cargo +stable publish", false),
+            ("cargo + test", false),
+            ("cargo +../evil test", false),
+            ("rustup run ../evil cargo test", false),
+            ("rustup run --install cargo test", false),
+            ("rustup run stable rustc test", false),
+            ("rustup run stable sh -c cargo", false),
+            ("rustup run stable", false),
+            ("rustup default stable", false),
+            ("./cargo test", false),
+            ("/does-not-exist/cargo test", false),
+            ("cargo test --manifest-path ../Cargo.toml", false),
+            ("cargo +stable test --manifest-path=../Cargo.toml", false),
+            ("cargo test --manifest-path Cargo.toml", false),
+            ("env RUSTC_WRAPPER= cargo test --config build.rustc=evil", false),
+            ("cargo test --config=evil", false),
+            ("cargo test --target-dir ../target", false),
+            ("rustup run stable cargo test --target-dir=/tmp/target", false),
+            ("cargo test -Z unstable-options", false),
+            ("cargo test -Zunstable-options", false),
+            ("cargo test -vZunstable-options", false),
+            ("cargo test -C ../other", false),
+            ("cargo test -C../other", false),
+            ("cargo test -vCother", false),
+        ] {
+            assert_eq!(policy.allows(&request(command, dir.path()), dir.path()), expected, "{command:?}");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "native")]
+    fn policy_checks_real_cargo_paths() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        use std::process::Command;
+
+        // Isolate PATH in a child, without mutating the environment of parallel tests.
+        let Some(fixture) = std::env::var_os("IMACS_APPROVAL_PATH_FIXTURE") else {
+            let dir = tempfile::tempdir().unwrap();
+            for folder in ["first", "second", "configured", "linked", "worktree"] {
+                std::fs::create_dir(dir.path().join(folder)).unwrap();
+            }
+            for folder in ["first", "second", "configured"] {
+                let path = dir.path().join(folder).join("cargo");
+                std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            symlink(dir.path().join("first/cargo"), dir.path().join("linked/cargo")).unwrap();
+            symlink(dir.path().join("first/cargo"), dir.path().join("linked/rustc")).unwrap();
+            let output = crate::test_support::output(
+                Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "approvals::tests::policy_checks_real_cargo_paths", "--nocapture"])
+                    .env("IMACS_APPROVAL_PATH_FIXTURE", dir.path())
+                    .env("PATH", std::env::join_paths([dir.path().join("first"), dir.path().join("second")]).unwrap()),
+            );
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            return;
+        };
+        let fixture = PathBuf::from(fixture);
+        let root = fixture.join("worktree");
+        let configured = format!("{} test", fixture.join("configured/cargo").display());
+        let policy = ApprovalPolicy { allow: vec!["cargo test".into(), configured], ..ApprovalPolicy::default() };
+        for (folder, expected) in [("first", true), ("linked", true), ("second", false), ("configured", true)] {
+            let cargo = fixture.join(folder).join("cargo");
+            for command in [
+                format!("{} test", cargo.display()),
+                format!("{} +stable test", cargo.display()),
+                format!("rustup run stable {} test", cargo.display()),
+                format!("imacs queue --class test -- {} test && {} test", cargo.display(), cargo.display()),
+            ] {
+                assert_eq!(policy.allows(&request(&command, &root), &root), expected, "{command}");
+                assert!(!ApprovalPolicy::default().allows(&request(&command, &root), &root), "{command}");
+            }
+        }
+        for command in [
+            format!("{} test", fixture.join("linked/rustc").display()),
+            format!("{} test --config=evil", fixture.join("first/cargo").display()),
+            format!(
+                "{} test && {} test",
+                fixture.join("first/cargo").display(),
+                fixture.join("second/cargo").display()
+            ),
+        ] {
+            assert!(!policy.allows(&request(&command, &root), &root), "{command}");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "native")]
     fn queued_commands_are_judged_by_what_they_run() {
         let dir = tempfile::tempdir().unwrap();
-        let policy = ApprovalPolicy { allow: vec!["cargo test".into(), "ls".into()] };
+        let policy = ApprovalPolicy { allow: vec!["cargo test".into(), "ls".into()], ..ApprovalPolicy::default() };
         let allows = |command: &str| policy.allows(&request(command, dir.path()), dir.path());
         assert!(allows("imacs queue --class test -- cargo test -p imacs-core"));
         assert!(allows("imacs queue -- cargo test"));
@@ -315,7 +657,10 @@ mod tests {
             assert!(!ApprovalPolicy::default().allows(&request(command, dir.path()), dir.path()), "{command}");
         }
         assert!(!ApprovalPolicy::default().allows(&request("ls", Path::new("/")), dir.path()));
-        assert!(!ApprovalPolicy { allow: vec![] }.allows(&request("ls", dir.path()), dir.path()));
+        assert!(
+            !ApprovalPolicy { allow: vec![], ..ApprovalPolicy::default() }
+                .allows(&request("ls", dir.path()), dir.path())
+        );
         assert!(
             !ApprovalPolicy::default()
                 .allows(&ApprovalRequest { tool: "mcp__x__y".into(), ..request("ls", dir.path()) }, dir.path())
@@ -331,7 +676,7 @@ mod tests {
         for command in ["cat escape/secret", "ls escape", "cat escape/../secret"] {
             assert!(!ApprovalPolicy::default().allows(&request(command, root.path()), root.path()));
         }
-        let policy = ApprovalPolicy { allow: vec!["echo".into()] };
+        let policy = ApprovalPolicy { allow: vec!["echo".into()], ..ApprovalPolicy::default() };
         assert!(policy.allows(&request("echo hello", root.path()), root.path()));
         assert!(!policy.allows(&request("echolocation hello", root.path()), root.path()));
     }

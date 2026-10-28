@@ -128,14 +128,31 @@ Automatic approval is configured in `config.toml`:
 ```toml
 [approvals]
 allow = ["ls", "cat", "rg", "git status", "git diff", "git log"]
+env = ["RUSTC_WRAPPER="] # optional; defaults to []
 ```
 
 The built-in allow list is read-only. Adding a cargo entry permits agent-written code, including
 build scripts and tests, to run outside Codex's sandbox. Add such entries only if you intend that access.
 
-These defaults allow simple command prefixes only when the working directory and file paths are
-inside the session worktree. Shell expansion, compound commands, redirections, paths escaping
-through symlinks and read-tool options that execute programs or write files wait for approval.
+Command prefixes match parsed words, with the working directory and file arguments inside the
+session worktree. Plain `a && b` and `a; b` chains pass only when every command passes independently.
+Quoted `&&` and `;` are literal arguments, not chain separators.
+
+`env` lists exact `NAME=value` assignments allowed before a command, either directly or through
+`env` without options. `RUSTC_WRAPPER=` permits only an empty value; it does not permit a wrapper
+program. Unlisted assignments, including `PATH`, `LD_*`, `DYLD_*` and arbitrary `RUSTC` values,
+wait for the chief. Assignments alone do not authorize any program.
+
+An explicit `cargo test` entry also covers `cargo +stable test`, `rustup run stable cargo test`
+and absolute paths named `cargo` whose real path matches a configured absolute cargo or the first
+executable cargo on PATH. A different binary named cargo does not inherit that permission.
+`imacs queue` is judged by the command it executes, including these env and toolchain forms.
+
+Pipes, redirections, substitutions, globs, newlines, comments, unsupported shell syntax, paths
+escaping through symlinks and read-tool options that execute programs or write files still wait
+for approval. Expansion syntax remains refused even inside quotes. Cargo's `--manifest-path`,
+`--config`, `--target-dir`, `-Z` and `-C` options also wait, including joined forms, even with an
+explicit cargo entry. Unknown commands always wait for the chief.
 Set `allow = []` to make every permission request wait. This policy handles requests Codex raises;
 it does not add approval prompts to commands Codex already permits.
 
