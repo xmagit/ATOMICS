@@ -74,7 +74,7 @@ kind = "shell"
 
 [approvals]
 # Simple command prefixes, within the session worktree. [] makes every request wait.
-allow = ["cargo build", "cargo test", "cargo check", "cargo clippy", "cargo fmt", "ls", "cat", "rg", "git status", "git diff", "git log"]
+allow = ["ls", "cat", "rg", "git status", "git diff", "git log"]
 
 [editor]
 # Terminal editor for editor mode (cmd+e). Helix has LSP and inlay hints built in.

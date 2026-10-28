@@ -1,0 +1,43 @@
+{
+  "recorded_codex_version": "codex-cli 0.165.0",
+  "events": [
+    {
+      "session_id": "01a18328-ea77-7800-b599-21e668e1c089",
+      "turn_id": "01a18328-eab9-7f52-af32-20ecf1652276",
+      "transcript_path": "/private/tmp/imacs-codex-approvals-smoke/codex/sessions/2026/10/28/rollout-2026-10-28T16-37-39-01a18328-ea77-7800-b599-21e668e1c089.jsonl",
+      "cwd": "/private/tmp/imacs-codex-approvals-smoke/fixture-worktree",
+      "hook_event_name": "PermissionRequest",
+      "model": "gpt-6.1-sol",
+      "permission_mode": "default",
+      "tool_name": "Bash",
+      "tool_input": {
+        "command": "touch /private/tmp/imacs-codex-approvals-smoke/fixture-worktree/fixture-allowed",
+        "description": "Record Codex 0.165 hook payload"
+      }
+    },
+    {
+      "session_id": "01a18328-ea77-7800-b599-21e668e1c089",
+      "turn_id": "01a18328-eab9-7f52-af32-20ecf1652276",
+      "transcript_path": "/private/tmp/imacs-codex-approvals-smoke/codex/sessions/2026/10/28/rollout-2026-10-28T16-37-39-01a18328-ea77-7800-b599-21e668e1c089.jsonl",
+      "cwd": "/private/tmp/imacs-codex-approvals-smoke/fixture-worktree",
+      "hook_event_name": "PostToolUse",
+      "model": "gpt-6.1-sol",
+      "permission_mode": "default",
+      "tool_name": "Bash",
+      "tool_input": {
+        "command": "touch /private/tmp/imacs-codex-approvals-smoke/fixture-worktree/fixture-allowed"
+      },
+      "tool_response": "",
+      "tool_use_id": "exec-0923be7b-9673-468c-a1a8-034202e1b185"
+    },
+    {
+      "session_id": "01a18328-ea77-7800-b599-21e668e1c089",
+      "turn_id": "01a18328-eab9-7f52-af32-20ecf1652276",
+      "transcript_path": "/private/tmp/imacs-codex-approvals-smoke/codex/sessions/2026/10/28/rollout-2026-10-28T16-37-39-01a18328-ea77-7800-b599-21e668e1c089.jsonl",
+      "cwd": "/private/tmp/imacs-codex-approvals-smoke/fixture-worktree",
+      "hook_event_name": "Interrupt",
+      "model": "gpt-6.1-sol",
+      "permission_mode": "default"
+    }
+  ]
+}
