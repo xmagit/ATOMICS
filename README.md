@@ -111,9 +111,11 @@ Automatic approval is configured in `config.toml`:
 
 ```toml
 [approvals]
-allow = ["cargo build", "cargo test", "cargo check", "cargo clippy", "cargo fmt",
-         "ls", "cat", "rg", "git status", "git diff", "git log"]
+allow = ["ls", "cat", "rg", "git status", "git diff", "git log"]
 ```
+
+The built-in allow list is read-only. Adding a cargo entry permits agent-written code, including
+build scripts and tests, to run outside Codex's sandbox. Add such entries only if you intend that access.
 
 These defaults allow simple command prefixes only when the working directory and file paths are
 inside the session worktree. Shell expansion, compound commands, redirections, paths escaping
@@ -127,8 +129,8 @@ visible menu choice; it returns an error if no matching menu is visible yet. For
 IMACS remembers the command and selects the one-time allow choice rather than creating a broader
 Codex prefix rule. A denial message can only be supplied while the hook is waiting.
 
-While a permission request is pending, `imacs_send` holds messages and raw input instead of typing
-into the menu, and returns `held: true`. It releases them after a lifecycle event confirms the
+While a permission request is pending, `imacs_send` holds plain messages and returns `held: true`.
+Raw input is rejected with an error pointing to `imacs_approve`. It releases them after a lifecycle event confirms the
 request has finished, including when you answer directly in the terminal.
 
 Agent terminals inherit no `IMACS_SOCKET`, `IMACS_PANE`, `IMACS_HOME` or `IMACS_CONFIG`.
@@ -148,9 +150,9 @@ to reset it. Mode and width are remembered; `[chief] dock = "floating"` (or `"do
 `cmd+o` shows or hides either mode. On narrow windows the chief floats instead, then docks again when the window widens.
 `cmd+shift+space` dictates to it.
 
-The chief may read, plan, review and run the plan you approved without asking. Starting agents, typing into
-terminals and closing sessions still ask for permission, so it cannot run shell commands or answer other agents'
-prompts behind your back.
+The chief may read, plan, review and run the plan you approved without asking. It can also answer other
+agents' permission prompts through the pre-approved `imacs_approve`, including `allow_always` for the rest
+of a session. Starting agents, typing into terminals and closing sessions still ask for permission.
 
 ## Orchestration: several plans you approve, agents that report back
 

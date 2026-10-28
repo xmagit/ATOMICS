@@ -65,22 +65,7 @@ pub struct ApprovalPolicy {
 impl Default for ApprovalPolicy {
     fn default() -> Self {
         Self {
-            allow: [
-                "cargo build",
-                "cargo test",
-                "cargo check",
-                "cargo clippy",
-                "cargo fmt",
-                "ls",
-                "cat",
-                "rg",
-                "git status",
-                "git diff",
-                "git log",
-            ]
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
+            allow: ["ls", "cat", "rg", "git status", "git diff", "git log"].into_iter().map(str::to_string).collect(),
         }
     }
 }
@@ -189,7 +174,7 @@ pub fn menu_key(screen: &str, command: Option<&str>, decision: Decision) -> Opti
         Decision::Allow | Decision::AllowAlways => "yes, proceed",
         Decision::Deny => "no, and tell codex",
     };
-    screen.lines().find_map(|line| {
+    menu.lines().find_map(|line| {
         let line = line.trim().trim_start_matches(['›', '❯', ' ']);
         let (number, label) = line.split_once('.')?;
         (number.len() == 1
@@ -214,23 +199,23 @@ mod tests {
     }
 
     #[test]
-    fn default_policy_allows_worktree_builds_and_reads() {
+    fn default_policy_allows_only_worktree_reads() {
         let dir = tempfile::tempdir().unwrap();
-        for command in [
-            "cargo build",
-            "cargo test -p imacs-core",
-            "cargo check",
-            "cargo clippy --all-targets -- -D warnings",
-            "cargo fmt",
-            "ls -la",
-            "cat Cargo.toml",
-            "rg hook src",
-            "git status --short",
-            "git diff",
-            "git log -5",
-        ] {
+        for command in ["ls -la", "cat Cargo.toml", "rg hook src", "git status --short", "git diff", "git log -5"] {
             assert!(ApprovalPolicy::default().allows(&request(command, dir.path()), dir.path()), "{command}");
         }
+    }
+
+    #[test]
+    fn cargo_requires_an_explicit_policy_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        for command in ["cargo build", "cargo test", "cargo check", "cargo clippy", "cargo fmt"] {
+            assert!(!ApprovalPolicy::default().allows(&request(command, dir.path()), dir.path()));
+        }
+        assert!(
+            ApprovalPolicy { allow: vec!["cargo test".into()] }
+                .allows(&request("cargo test -p imacs-core", dir.path()), dir.path())
+        );
     }
 
     #[test]
@@ -307,6 +292,11 @@ mod tests {
         assert_eq!(menu_key(screen, Some("touch fixture"), Decision::Deny).as_deref(), Some("3\r"));
         assert_eq!(menu_key("Agent is working", Some("touch fixture"), Decision::Allow), None);
         assert_eq!(menu_key(screen, Some("touch other"), Decision::Allow), None);
+        let old = format!("9. Yes, proceed (y)\n{screen}");
+        assert_eq!(menu_key(&old, Some("touch fixture"), Decision::Allow).as_deref(), Some("1\r"));
+        let no_choice =
+            "1. Yes, proceed (y)\nWould you like to run the following command?\n\n$ touch fixture\n\nRendering menu";
+        assert_eq!(menu_key(no_choice, Some("touch fixture"), Decision::Allow), None);
         let clipped = "Would you like to run the following command?\n\n  $ touch fixture\n\n› 1. Yes, proceed (y)\nPress enter to confirm or esc to cancel";
         assert_eq!(menu_key(clipped, Some("touch fixture"), Decision::Deny).as_deref(), Some("\x1b"));
     }

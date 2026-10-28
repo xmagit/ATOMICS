@@ -45,6 +45,10 @@ enum ApprovalState {
 }
 
 impl ApprovalReply {
+    pub fn expired(&self) -> bool {
+        matches!(*self.state.lock().unwrap(), ApprovalState::Expired)
+    }
+
     pub fn answer(&self, reply: HookReply) -> bool {
         let mut state = self.state.lock().unwrap();
         if !matches!(*state, ApprovalState::Waiting) {
@@ -220,7 +224,9 @@ mod tests {
     #[test]
     fn permission_reply_expires_atomically_and_cannot_be_answered_twice() {
         let reply = ApprovalReply::default();
+        assert!(!reply.expired());
         assert!(reply.wait(Duration::ZERO).stdout.is_none());
+        assert!(reply.expired());
         assert!(!reply.answer(HookReply { stdout: Some("late".into()) }));
         let reply = Arc::new(ApprovalReply::default());
         let waiting = reply.clone();
