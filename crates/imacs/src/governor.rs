@@ -1,5 +1,5 @@
-//! The machine-wide limits behind every agent IMACS starts: one jobserver pool that all
-//! their compilers share, and slots that whole test runs and QA instances wait for.
+//! The machine-wide limits behind every agent IMACS starts: a Cargo jobserver,
+//! toolchain launch budgets, and slots for whole test runs and QA instances.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -9,8 +9,16 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use imacs_core::governor::{ResourceConfig, SlotClass, SlotQueue, Ticket};
+use imacs_core::governor::{ResourceConfig, SlotClass, SlotQueue, Ticket, Toolchain};
 use serde_json::{Value, json};
+
+/// Detect from the worktree root even when an agent starts in a subdirectory.
+pub fn toolchain_env(cwd: &Path, config: &ResourceConfig, cores: usize) -> Vec<(String, String)> {
+    let root = imacs_core::git::git(cwd, &["rev-parse", "--show-toplevel"])
+        .map(|root| std::path::PathBuf::from(root.trim()))
+        .unwrap_or_else(|_| cwd.to_path_buf());
+    Toolchain::detect(&root).into_iter().flat_map(|toolchain| config.env(toolchain, cores)).collect()
+}
 
 /// A GNU make jobserver in a named pipe. cargo takes a token per job, so agents that inherit
 /// it share `tokens` jobs between them, however many run.
@@ -345,6 +353,25 @@ pub fn load_average() -> Option<f64> {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn toolchain_env_detects_sibling_projects_from_a_worktree_subdirectory() {
+        let dir = tempfile::tempdir().unwrap();
+        let init = std::process::Command::new("git").args(["init", "-q"]).arg(dir.path()).status().unwrap();
+        assert!(init.success());
+        let nested = dir.path().join("scripts");
+        std::fs::create_dir(&nested).unwrap();
+        let config = ResourceConfig::default();
+        assert!(toolchain_env(&nested, &config, 18).is_empty());
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/Example.csproj"), "").unwrap();
+        assert_eq!(toolchain_env(&nested, &config, 18), config.env(Toolchain::Dotnet, 18));
+        let disabled = ResourceConfig {
+            dotnet: imacs_core::governor::DotnetConfig { enabled: false, ..Default::default() },
+            ..Default::default()
+        };
+        assert!(toolchain_env(&nested, &disabled, 18).is_empty());
+    }
 
     #[test]
     fn jobserver_pipe_holds_its_tokens_and_resets_leaks() {

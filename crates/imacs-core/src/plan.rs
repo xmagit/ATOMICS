@@ -458,7 +458,8 @@ impl Task {
         text.push_str(
             "\nThis machine is shared with other agents. While you work, compile with the build tool's check command \
              (for example `cargo check`) and run only the tests you touch. Run the full test suite once, at the end, \
-             through `imacs queue --class test -- <test command>`, and start QA app instances through \
+             through `imacs queue --class test -- <test command>` (for .NET, \
+             `imacs queue --class test -- dotnet test` for whole suites), and start QA app instances through \
              `imacs queue --class qa -- <command>`; both wait for a free slot, so give them a long timeout \
              (or run them in the background) instead of the default two minutes. In a sandbox that blocks the \
              IMACS socket, request to run them outside the sandbox.\n",
@@ -888,6 +889,7 @@ mod tests {
             text.starts_with("Task a: do a\nPart of: Better CLI\n\nAdd a --json flag.\n\nDone when:\n- tests pass\n")
         );
         assert!(text.contains("imacs_report"));
+        assert!(text.contains("imacs queue --class test -- dotnet test"));
     }
 
     #[test]
