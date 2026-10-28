@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Plan {
     pub goal: String,
+    /// The project (main checkout) the plan works on; its view shows the plan.
+    #[serde(default)]
+    pub project: Option<std::path::PathBuf>,
     pub tasks: Vec<Task>,
     /// Set by the user on the board. Nothing is dispatched before.
     pub approved: bool,
@@ -75,6 +78,9 @@ impl TaskStatus {
     }
 }
 
+/// Id of the review task every plan ends with.
+pub const REVIEW_TASK: &str = "review";
+
 impl Plan {
     pub fn load(path: &Path) -> Option<Plan> {
         std::fs::read_to_string(path).ok().and_then(|text| serde_json::from_str(&text).ok())
@@ -105,6 +111,41 @@ impl Plan {
         self.goal = goal;
         self.tasks = tasks;
         self.approved = false;
+        self.add_review_task();
+    }
+
+    /// Every plan ends with a fresh agent reviewing all of its work together, so
+    /// nothing reaches a pull request with only its author's (or the orchestrator's) eyes on it.
+    fn add_review_task(&mut self) {
+        let others: Vec<String> = self.tasks.iter().filter(|t| t.id != REVIEW_TASK).map(|t| t.id.clone()).collect();
+        if others.is_empty() {
+            self.tasks.retain(|t| t.id != REVIEW_TASK);
+            return;
+        }
+        let repo = self.tasks.iter().find_map(|t| t.repo.clone());
+        let existing = self.tasks.iter().position(|t| t.id == REVIEW_TASK);
+        let mut review = existing.map(|i| self.tasks.remove(i)).unwrap_or_else(|| Task {
+            id: REVIEW_TASK.into(),
+            title: "Final review of everything in this plan".into(),
+            agent: "claude".into(),
+            brief: "Review everything this plan changed before it is proposed as pull requests. You have not seen this \
+                    work before: be the skeptical senior reviewer. Check correctness, tests, error handling, consistency \
+                    with the surrounding code and the repository's conventions, and anything that would block a pull \
+                    request. Do not change code. Report findings ordered by severity, each with file:line and a concrete \
+                    fix, and end with a clear verdict: ready for pull requests or not."
+                .into(),
+            acceptance: vec![
+                "every branch of the plan reviewed".into(),
+                "findings ordered by severity, each with file:line and a fix".into(),
+                "an explicit verdict: ready for pull requests or not".into(),
+            ],
+            ..Task::default()
+        });
+        review.depends_on = others;
+        if review.repo.is_none() {
+            review.repo = repo;
+        }
+        self.tasks.push(review);
     }
 
     pub fn task_mut(&mut self, id: &str) -> Option<&mut Task> {
@@ -182,6 +223,7 @@ mod tests {
         plan.replace("ship it".into(), vec![task("a", &[]), task("b", &["a"]), task("c", &[])]);
         let ready: Vec<&str> = plan.ready().iter().map(|t| t.id.as_str()).collect();
         assert_eq!(ready, ["a", "c"]);
+        assert_eq!(plan.tasks.last().unwrap().id, REVIEW_TASK);
         plan.task_mut("a").unwrap().status = TaskStatus::Done;
         let ready: Vec<&str> = plan.ready().iter().map(|t| t.id.as_str()).collect();
         assert_eq!(ready, ["b", "c"]);
@@ -200,6 +242,21 @@ mod tests {
         assert_eq!(plan.tasks[0].session.as_deref(), Some("s1"));
         assert_eq!(plan.tasks[1].id, "t2");
         assert_eq!(plan.unknown_dependencies(), [("t2".to_string(), "zz".to_string())]);
+        assert_eq!(plan.tasks.len(), 3, "plus the review task");
+    }
+
+    #[test]
+    fn every_plan_ends_with_a_review_of_all_tasks() {
+        let mut plan = Plan::default();
+        plan.replace("g".into(), vec![task("a", &[]), task("b", &["a"])]);
+        let review = plan.tasks.last().unwrap();
+        assert_eq!(review.id, REVIEW_TASK);
+        assert_eq!(review.depends_on, ["a", "b"]);
+        plan.replace("g".into(), vec![task("a", &[])]);
+        assert_eq!(plan.tasks.iter().filter(|t| t.id == REVIEW_TASK).count(), 1);
+        assert_eq!(plan.tasks.last().unwrap().depends_on, ["a"]);
+        plan.replace("g".into(), Vec::new());
+        assert!(plan.tasks.is_empty());
     }
 
     #[test]

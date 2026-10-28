@@ -11,7 +11,7 @@ use cox_core::layout::{self, DiffPlacement, Layout};
 use cox_core::session::{AgentStatus, pick_tiled, title_for};
 use cox_core::store::{SessionRecord, Store};
 use cox_core::{paths, steer};
-use egui::{Color32, FontId, Key, Rect, RichText, Sense, Stroke, Vec2, pos2, vec2};
+use egui::{Color32, FontId, Key, Pos2, Rect, RichText, Sense, Stroke, Vec2, pos2, vec2};
 use notify_debouncer_mini::notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_mini::{DebounceEventResult, Debouncer, new_debouncer};
 
@@ -57,6 +57,8 @@ pub struct Session {
     pub last_prompt: Option<String>,
     pub last_message: Option<String>,
     pub selected: bool,
+    /// The chief agent: shown in its own window, not among the agents.
+    pub chief: bool,
     /// A message typed into the terminal that the agent has not visibly picked up yet.
     pending: Option<Pending>,
 }
@@ -246,6 +248,10 @@ pub struct App {
     waiters: Vec<Waiter>,
     plan: Plan,
     expanded_tasks: HashSet<String>,
+    /// The project tab on screen; `None` shows every project.
+    view: Option<PathBuf>,
+    /// The chief agent's window is open (otherwise it is the pill at the top).
+    chief_open: bool,
     worktree_tx: Sender<(String, Result<PathBuf, String>, Launch)>,
     worktree_rx: Receiver<(String, Result<PathBuf, String>, Launch)>,
     creating: Vec<String>,
@@ -340,6 +346,8 @@ impl App {
             waiters: Vec::new(),
             plan: Plan::load(&paths::plan_file()).unwrap_or_default(),
             expanded_tasks: HashSet::new(),
+            view: None,
+            chief_open: false,
             worktree_tx,
             worktree_rx,
             creating: Vec::new(),
@@ -412,8 +420,13 @@ impl App {
         self.creating.push(branch.clone());
         self.toast(format!("Creating worktree {}…", paths::display(&path)));
         std::thread::spawn(move || {
-            let result =
-                git::add_worktree(&repo, &path, &branch, &base_ref).map(|()| path).map_err(|e| format!("{e:#}"));
+            // A retried task finds its worktree from the first attempt.
+            let existing = git::worktree_of(&path).and_then(|w| w.branch).is_some_and(|b| b == branch);
+            let result = if existing {
+                Ok(path)
+            } else {
+                git::add_worktree(&repo, &path, &branch, &base_ref).map(|()| path).map_err(|e| format!("{e:#}"))
+            };
             let _ = tx.send((branch, result, launch));
             ctx.request_repaint();
         });
@@ -794,8 +807,39 @@ impl App {
         extra_args: Vec<String>,
         prompt: Option<String>,
     ) -> Result<String, String> {
-        let Some(agent) = self.config.agent(agent_name).cloned() else {
-            return Err(format!("No agent named {agent_name} in the config"));
+        self.start_as(ctx, agent_name, cwd, resume, extra_args, prompt, false)
+    }
+
+    /// Starts the chief agent in the main checkout of the project on screen.
+    fn start_chief(&mut self, ctx: &egui::Context) -> Result<String, String> {
+        let cwd = self.view.clone().or_else(|| self.repos.first().cloned()).unwrap_or_else(|| self.launch_dir.clone());
+        let args = self.config.chief.args.clone();
+        self.start_as(ctx, "chief", cwd, None, args, None, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_as(
+        &mut self,
+        ctx: &egui::Context,
+        agent_name: &str,
+        cwd: PathBuf,
+        resume: Option<String>,
+        extra_args: Vec<String>,
+        prompt: Option<String>,
+        chief: bool,
+    ) -> Result<String, String> {
+        let agent = if chief {
+            cox_core::config::AgentConfig {
+                name: "chief".into(),
+                command: self.config.chief.command.clone(),
+                kind: AgentKind::Claude,
+                busy_text: None,
+            }
+        } else {
+            let Some(agent) = self.config.agent(agent_name).cloned() else {
+                return Err(format!("No agent named {agent_name} in the config"));
+            };
+            agent
         };
         if !cwd.is_dir() {
             return Err(format!("{} is not a folder", cwd.display()));
@@ -825,6 +869,27 @@ impl App {
         let exe = std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| "cox".into());
         let socket = paths::socket_path().to_string_lossy().into_owned();
         match agent.kind {
+            AgentKind::Claude if chief => {
+                // The chief gets every cox tool and knows how to run a plan.
+                let config = json!({ "mcpServers": { "cox": {
+                    "command": exe, "args": ["mcp"], "env": { "COX_PANE": id, "COX_SOCKET": socket }
+                } } });
+                let projects: Vec<String> = self.repos.iter().map(|r| paths::display(r)).collect();
+                let prompt = self
+                    .config
+                    .chief
+                    .system_prompt
+                    .replace("{projects}", &projects.join(", "))
+                    .replace("{base_ref}", &self.config.base_ref);
+                args.extend([
+                    "--mcp-config".to_string(),
+                    config.to_string(),
+                    "--allowedTools".to_string(),
+                    "mcp__cox".to_string(),
+                    "--append-system-prompt".to_string(),
+                    prompt,
+                ]);
+            }
             AgentKind::Claude => {
                 let config = json!({ "mcpServers": { "cox": {
                     "command": exe, "args": ["mcp", "--agent"], "env": { "COX_PANE": id, "COX_SOCKET": socket }
@@ -868,6 +933,10 @@ impl App {
             claude_id = Some(session_id);
         }
         args.extend(extra_args);
+        let prompt = match prompt {
+            Some(text) if agent.kind != AgentKind::Claude && text.len() > LONG_PROMPT => Some(brief_file(&id, &text)?),
+            other => other,
+        };
         let shell_prompt = match (&prompt, agent.kind) {
             (Some(prompt), AgentKind::Shell) => Some(prompt.clone()),
             (Some(prompt), _) => {
@@ -880,7 +949,11 @@ impl App {
         match Terminal::spawn(ctx, self.palette.clone(), program, args, &cwd, env) {
             Ok(terminal) => {
                 let worktree = git::worktree_of(&cwd);
-                let title = title_for(worktree.as_ref().and_then(|w| w.branch.as_deref()), &cwd);
+                let title = if chief {
+                    "chief".to_string()
+                } else {
+                    title_for(worktree.as_ref().and_then(|w| w.branch.as_deref()), &cwd)
+                };
                 self.sessions.push(Session {
                     id: id.clone(),
                     agent: agent.name.clone(),
@@ -894,6 +967,7 @@ impl App {
                     last_prompt: None,
                     last_message: None,
                     selected: false,
+                    chief,
                     pending: None,
                 });
                 if let Some(text) = shell_prompt
@@ -901,7 +975,9 @@ impl App {
                 {
                     terminal.submit(&text);
                 }
-                self.activate(&id, false);
+                if !chief {
+                    self.activate(&id, false);
+                }
                 self.remember(&id);
                 Ok(id)
             }
@@ -1021,6 +1097,13 @@ impl App {
             },
             ControlRequest::PlanSet { goal, tasks } => {
                 self.plan.replace(goal, tasks);
+                let project = self.plan.tasks.iter().find_map(|t| t.repo.as_deref()).map(paths::expand).or_else(|| {
+                    self.diff_target().and_then(|t| self.project_of(&t)).or_else(|| self.repos.first().cloned())
+                });
+                self.plan.project = project.and_then(|p| workspace::project_root(&p).ok());
+                if let Some(project) = self.plan.project.clone() {
+                    self.set_view(Some(project));
+                }
                 self.save_plan();
                 self.panel = PanelMode::Plan;
                 self.diff_open = true;
@@ -1034,7 +1117,7 @@ impl App {
                 })))
             }
             ControlRequest::PlanGet => done(ControlResponse::ok(self.plan_json())),
-            ControlRequest::PlanUpdate { id, status, note } => match self.plan.task_mut(&id) {
+            ControlRequest::PlanUpdate { id, status, note, session } => match self.plan.task_mut(&id) {
                 None => done(ControlResponse::error(format!("no task {id}"))),
                 Some(task) => {
                     if let Some(status) = &status {
@@ -1048,6 +1131,15 @@ impl App {
                     }
                     if let Some(note) = note {
                         task.notes.push(note);
+                    }
+                    if let Some(reference) = session {
+                        let found = self
+                            .sessions
+                            .iter()
+                            .find(|s| s.id == reference || s.id.starts_with(&reference) || s.title == reference);
+                        if let (Some(found), Some(task)) = (found.map(|s| s.id.clone()), self.plan.task_mut(&id)) {
+                            task.session = Some(found);
+                        }
                     }
                     self.save_plan();
                     done(ControlResponse::ok(self.plan_json()))
@@ -1277,6 +1369,209 @@ impl App {
         }
         for title in warnings {
             self.toast(format!("{title} has not picked up your message; check its terminal"));
+        }
+    }
+
+    /// Sessions in the project tab on screen (the chief lives in its own window).
+    fn visible_sessions(&self) -> Vec<usize> {
+        (0..self.sessions.len())
+            .filter(|&i| !self.sessions[i].chief)
+            .filter(|&i| match &self.view {
+                None => true,
+                Some(project) => self.project_of(&self.sessions[i].root()).as_ref() == Some(project),
+            })
+            .collect()
+    }
+
+    /// One tab per open project plus "All"; a project tab shows only its agents,
+    /// explorer, diff and plan.
+    fn view_tabs(&mut self, ui: &mut egui::Ui) {
+        let p = self.palette.clone();
+        let mut pick: Option<Option<PathBuf>> = None;
+        let mut close_idle: Option<PathBuf> = None;
+        let agents = self.sessions.iter().filter(|s| !s.chief).count();
+        if ui.selectable_label(self.view.is_none(), RichText::new(format!("All · {agents}")).size(12.5)).clicked() {
+            pick = Some(None);
+        }
+        for root in self.repos.clone() {
+            let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let count =
+                self.sessions.iter().filter(|s| !s.chief && self.project_of(&s.root()).as_ref() == Some(&root)).count();
+            let mut label = format!("{name} · {count}");
+            if self.plan.project.as_ref() == Some(&root) && !self.plan.tasks.is_empty() {
+                label.push_str(&format!(" · plan {}/{}", self.plan.count(TaskStatus::Done), self.plan.tasks.len()));
+            }
+            let selected = self.view.as_ref() == Some(&root);
+            let text = RichText::new(label).size(12.5).color(if selected { p.accent } else { p.foreground });
+            let response = ui.selectable_label(selected, text);
+            if response.clicked() {
+                pick = Some(Some(root.clone()));
+            }
+            response.context_menu(|ui| {
+                if ui.button("Close idle sessions").on_hover_text("Idle or exited sessions no plan task uses").clicked()
+                {
+                    close_idle = Some(root.clone());
+                    ui.close();
+                }
+            });
+        }
+        if let Some(view) = pick {
+            self.set_view(view);
+        }
+        if let Some(root) = close_idle {
+            let closed = self.close_idle(&root);
+            self.toast(format!("Closed {closed} idle session{}", if closed == 1 { "" } else { "s" }));
+        }
+    }
+
+    fn set_view(&mut self, view: Option<PathBuf>) {
+        self.view = view.clone();
+        let Some(project) = view else { return };
+        let in_view = self.active_index().is_some_and(|i| {
+            !self.sessions[i].chief && self.project_of(&self.sessions[i].root()).as_ref() == Some(&project)
+        });
+        if !in_view {
+            match self.visible_sessions().first().map(|&i| self.sessions[i].id.clone()) {
+                Some(id) => self.activate(&id, false),
+                None => {
+                    self.active = None;
+                    self.diff_root = Some(project);
+                }
+            }
+        }
+    }
+
+    /// Closes the project's idle and exited sessions that no plan task is using.
+    fn close_idle(&mut self, project: &Path) -> usize {
+        let in_plan: HashSet<String> = self.plan.tasks.iter().filter_map(|t| t.session.clone()).collect();
+        let idle: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|s| !s.chief && matches!(s.status, AgentStatus::Idle | AgentStatus::Exited))
+            .filter(|s| !in_plan.contains(&s.id))
+            .filter(|s| self.project_of(&s.root()).as_deref() == Some(project))
+            .map(|s| s.id.clone())
+            .collect();
+        for id in &idle {
+            self.close(id);
+        }
+        idle.len()
+    }
+
+    fn toggle_chief(&mut self, ctx: &egui::Context) {
+        if !self.sessions.iter().any(|s| s.chief && s.terminal.as_ref().is_some_and(|t| !t.exited())) {
+            self.sessions.retain(|s| !s.chief);
+            if let Err(err) = self.start_chief(ctx) {
+                self.toast(err);
+                return;
+            }
+            self.chief_open = true;
+        } else {
+            self.chief_open = !self.chief_open;
+        }
+        if self.chief_open
+            && let Some(chief) = self.sessions.iter().find(|s| s.chief)
+        {
+            self.focus_terminal = Some(chief.id.clone());
+        }
+    }
+
+    /// The chief agent: a pill at the top center, and when open a big window in the
+    /// middle of the screen.
+    fn chief_ui(&mut self, ctx: &egui::Context) {
+        let p = self.palette.clone();
+        let chief = self.sessions.iter().position(|s| s.chief);
+        let status = chief.map(|i| self.sessions[i].status);
+        let mut toggle = false;
+        egui::Area::new(egui::Id::NULL.with("chief-pill"))
+            .anchor(egui::Align2::CENTER_TOP, vec2(0.0, 4.0))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                let stroke = if self.chief_open { p.accent } else { lerp(p.border, p.accent, 0.5) };
+                let response = egui::Frame::new()
+                    .fill(lerp(p.raised, p.accent, 0.08))
+                    .stroke(Stroke::new(1.0, stroke))
+                    .corner_radius(13)
+                    .inner_margin(egui::Margin::symmetric(14, 3))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let (icon, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
+                            orbit_icon(ui.painter(), icon, p.accent, p.foreground);
+                            ui.label(RichText::new("CHIEF").strong().color(p.accent).size(13.0));
+                            match status {
+                                Some(status) => {
+                                    let (dot, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
+                                    let time = ui.input(|i| i.time);
+                                    ui.painter().circle_filled(dot.center(), 3.5, status_dot(status, &p, time));
+                                    ui.label(RichText::new(status.label()).color(p.muted).size(11.5));
+                                }
+                                None => {
+                                    ui.label(RichText::new("start").color(p.muted).size(11.5));
+                                }
+                            }
+                            if !self.plan.tasks.is_empty() {
+                                let done = self.plan.count(TaskStatus::Done);
+                                ui.label(
+                                    RichText::new(format!("plan {done}/{}", self.plan.tasks.len()))
+                                        .color(p.muted)
+                                        .size(11.5),
+                                );
+                            }
+                        });
+                    })
+                    .response
+                    .interact(Sense::click());
+                if response.on_hover_text(format!("The chief agent ({})", self.config.keys.toggle_chief)).clicked() {
+                    toggle = true;
+                }
+            });
+        if toggle {
+            self.toggle_chief(ctx);
+        }
+
+        let Some(index) = self.sessions.iter().position(|s| s.chief) else { return };
+        if !self.chief_open {
+            return;
+        }
+        let screen = ctx.content_rect();
+        let metrics = {
+            let font = FontId::monospace(self.config.font.size);
+            let cell = ctx.fonts_mut(|f| vec2(f.glyph_width(&font, 'M'), f.row_height(&font)));
+            Metrics { font, cell: vec2(cell.x, cell.y.ceil()) }
+        };
+        let mut open = true;
+        let focus = self.focus_terminal.as_deref() == Some(self.sessions[index].id.as_str());
+        let session = &mut self.sessions[index];
+        egui::Window::new(RichText::new("◆ CHIEF AGENT").color(p.accent).strong())
+            .id(egui::Id::NULL.with("chief-window"))
+            .open(&mut open)
+            .collapsible(true)
+            .resizable(true)
+            .default_size(vec2(screen.width() * 0.5, screen.height() * 0.66))
+            .default_pos(screen.center())
+            .pivot(egui::Align2::CENTER_CENTER)
+            .frame(
+                egui::Frame::window(&ctx.global_style())
+                    .fill(p.background)
+                    .stroke(Stroke::new(1.5, p.accent.gamma_multiply(0.8))),
+            )
+            .show(ctx, |ui| {
+                let rect = ui.available_rect_before_wrap();
+                let rect = rect.with_max_y(rect.top() + rect.height().max(240.0));
+                ui.allocate_rect(rect, Sense::hover());
+                if let Some(terminal) = &mut session.terminal {
+                    let response =
+                        terminal.show(ui, rect, egui::Id::NULL.with(("chief-term", &session.id)), &metrics, &p);
+                    if focus {
+                        response.request_focus();
+                    }
+                }
+            });
+        if focus {
+            self.focus_terminal = None;
+        }
+        if !open {
+            self.chief_open = false;
         }
     }
 
@@ -1568,6 +1863,14 @@ impl App {
                 None => "No task is ready.".into(),
             });
         }
+        // A plan starting means focus: the project's idle sessions make way for its agents.
+        if let Some(project) = self.plan.project.clone() {
+            let closed = self.close_idle(&project);
+            if closed > 0 {
+                self.toast(format!("Closed {closed} idle session{} for the plan", if closed == 1 { "" } else { "s" }));
+            }
+            self.set_view(Some(project));
+        }
         let fallback_repo =
             self.diff_target().and_then(|t| self.project_of(&t)).or_else(|| self.repos.first().cloned());
         let mut started = Vec::new();
@@ -1577,9 +1880,19 @@ impl App {
             };
             let branch = task.branch.clone().unwrap_or_else(|| format!("cox/{}-{}", task.id, short_slug(&task.title)));
             let agent = if task.agent.trim().is_empty() { "claude".to_string() } else { task.agent.clone() };
+            let mut brief = task.compose_brief(&self.plan.goal);
+            if task.id == cox_core::plan::REVIEW_TASK {
+                // The reviewer reads every task's branch from the shared repository.
+                let base = &self.config.base_ref;
+                brief.push_str("\n\nBranches to review (all in this repository):\n");
+                for other in self.plan.tasks.iter().filter(|t| task.depends_on.contains(&t.id)) {
+                    let branch = other.branch.clone().unwrap_or_else(|| "(not dispatched)".into());
+                    brief.push_str(&format!("- {}: {} (git diff {base}...{branch})\n", other.id, other.title));
+                }
+            }
             let launch = Launch {
                 agent,
-                prompt: Some(task.compose_brief(&self.plan.goal)),
+                prompt: Some(brief),
                 args: task.args.clone(),
                 reply: None,
                 task: Some(task.id.clone()),
@@ -1788,7 +2101,9 @@ impl App {
         let indices = 0..self.sessions.len();
         match self.steer_target {
             SteerTarget::Active => self.active_index().into_iter().collect::<Vec<usize>>(),
-            SteerTarget::Agents => indices.filter(|&i| self.sessions[i].is_agent()).collect::<Vec<usize>>(),
+            SteerTarget::Agents => {
+                indices.filter(|&i| self.sessions[i].is_agent() && !self.sessions[i].chief).collect::<Vec<usize>>()
+            }
             SteerTarget::Selected => indices.filter(|&i| self.sessions[i].selected).collect::<Vec<usize>>(),
         }
         .into_iter()
@@ -2062,6 +2377,7 @@ impl App {
                     last_prompt: None,
                     last_message: None,
                     selected: false,
+                    chief: false,
                     pending: None,
                 });
                 if self.active.is_none() {
@@ -2190,6 +2506,9 @@ impl App {
         if pressed(&keys.toggle_plan) {
             self.toggle_plan();
         }
+        if pressed(&keys.toggle_chief) {
+            self.toggle_chief(ctx);
+        }
         if pressed(&keys.quick_open) && self.diff_target().is_some() {
             self.quick_open = Some(QuickOpen { query: String::new(), selected: 0, focus: true });
         }
@@ -2223,10 +2542,15 @@ impl App {
                 .enumerate()
         {
             let chord = egui::KeyboardShortcut::new(shortcut("cmd+a").map(|s| s.modifiers).unwrap_or_default(), key);
+            // cmd+N jumps to the Nth agent on screen and loads its diff.
+            let visible = self.visible_sessions();
             if ctx.input_mut(|i| i.consume_shortcut(&chord))
-                && let Some(id) = self.sessions.get(n).map(|s| s.id.clone())
+                && let Some(id) = visible.get(n).map(|&i| self.sessions[i].id.clone())
             {
-                self.activate(&id, false);
+                self.activate(&id, true);
+                if self.panel == PanelMode::Plan {
+                    self.panel = PanelMode::Diff;
+                }
             }
         }
     }
@@ -2260,6 +2584,8 @@ impl App {
             let agents = self.sessions.iter().filter(|s| s.is_agent()).count();
             let waiting = self.sessions.iter().filter(|s| s.status.needs_attention()).count();
             ui.label(RichText::new(format!("{agents} agent{}", if agents == 1 { "" } else { "s" })).color(p.muted));
+            ui.separator();
+            self.view_tabs(ui);
             if waiting > 0 {
                 let label = ui.add(
                     egui::Label::new(
@@ -2366,7 +2692,11 @@ impl App {
             section(ui, &p, "AGENTS");
             let mut clicked: Option<String> = None;
             let mut close: Option<String> = None;
-            for session in &mut self.sessions {
+            let visible = self.visible_sessions();
+            for (index, session) in self.sessions.iter_mut().enumerate() {
+                if !visible.contains(&index) {
+                    continue;
+                }
                 let active = self.active.as_deref() == Some(session.id.as_str());
                 let stats = self.diffs.get(&session.root()).and_then(|d| d.prepared.as_ref()).map(|p| (p.diff.additions(), p.diff.deletions()));
                 let row = session_row(ui, &p, session, active, stats);
@@ -2706,7 +3036,7 @@ impl App {
         self.resume.push(record);
     }
 
-    fn tab_strip(&mut self, ui: &mut egui::Ui, rect: Rect, tiled: &[usize]) {
+    fn tab_strip(&mut self, ui: &mut egui::Ui, rect: Rect, tiled: &[usize], visible: &[usize]) {
         let p = self.palette.clone();
         ui.painter().rect_filled(rect, 0.0, p.panel);
         let mut child = ui.new_child(
@@ -2718,7 +3048,8 @@ impl App {
         let mut clicked = None;
         egui::ScrollArea::horizontal().id_salt("tab-strip-scroll").show(&mut child, |ui| {
             ui.horizontal(|ui| {
-                for (i, s) in self.sessions.iter().enumerate() {
+                for &i in visible {
+                    let s = &self.sessions[i];
                     let active = self.active.as_deref() == Some(s.id.as_str());
                     let shown = tiled.contains(&i);
                     let color = if active {
@@ -3404,16 +3735,12 @@ impl eframe::App for App {
         let area = ui.available_rect_before_wrap();
         let diff_open = self.diff_open && (self.diff_target().is_some() || self.panel == PanelMode::Plan);
         let layout_config = layout::LayoutConfig { diff_width: self.split, ..self.config.layout.clone() };
-        let mut layout = layout::compute(area.width(), area.height(), self.sessions.len(), diff_open, &layout_config);
+        let visible = self.visible_sessions();
+        let mut layout = layout::compute(area.width(), area.height(), visible.len(), diff_open, &layout_config);
         if layout.tabs {
-            layout = layout::compute(
-                area.width(),
-                area.height() - TAB_HEIGHT,
-                self.sessions.len(),
-                diff_open,
-                &layout_config,
-            );
-            layout.tabs = self.sessions.len() > layout.tiled || layout.tiled == 0;
+            layout =
+                layout::compute(area.width(), area.height() - TAB_HEIGHT, visible.len(), diff_open, &layout_config);
+            layout.tabs = visible.len() > layout.tiled || layout.tiled == 0;
         }
 
         self.last_layout = Some(layout);
@@ -3427,13 +3754,15 @@ impl eframe::App for App {
 
         egui::CentralPanel::default().frame(egui::Frame::new().fill(p.background)).show(ui, |ui| {
             let mut rect = ui.max_rect();
-            let statuses: Vec<AgentStatus> = self.sessions.iter().map(|s| s.status).collect();
-            let tiled = pick_tiled(&statuses, self.active_index(), layout.tiled);
+            let statuses: Vec<AgentStatus> = visible.iter().map(|&i| self.sessions[i].status).collect();
+            let active = self.active_index().and_then(|a| visible.iter().position(|&i| i == a));
+            let tiled: Vec<usize> =
+                pick_tiled(&statuses, active, layout.tiled).into_iter().map(|k| visible[k]).collect();
             if layout.tabs {
-                self.tab_strip(ui, rect.with_max_y(rect.top() + TAB_HEIGHT), &tiled);
+                self.tab_strip(ui, rect.with_max_y(rect.top() + TAB_HEIGHT), &tiled, &visible);
                 rect.min.y += TAB_HEIGHT;
             }
-            if self.sessions.is_empty() && !diff_open {
+            if visible.is_empty() && !diff_open {
                 self.welcome(ui, rect);
                 return;
             }
@@ -3448,7 +3777,7 @@ impl eframe::App for App {
                 DiffPlacement::Hidden => (None, Some(rect)),
             };
             if let Some(term_rect) = term_rect {
-                if self.sessions.is_empty() {
+                if visible.is_empty() {
                     self.welcome(ui, term_rect);
                 } else {
                     self.tiles(ui, term_rect, &layout, &tiled);
@@ -3482,6 +3811,7 @@ impl eframe::App for App {
             }
         });
 
+        self.chief_ui(&ctx);
         self.dialogs(&ctx);
     }
 
@@ -3712,4 +4042,34 @@ fn short_slug(title: &str) -> String {
     let mut slug = lower.split('-').filter(|p| !p.is_empty()).collect::<Vec<_>>().join("-");
     slug.truncate(40);
     slug.trim_end_matches('-').to_string()
+}
+
+/// The chief's mark: a planet with a tilted orbit and a moon, after the atomisk.ai icon.
+fn orbit_icon(painter: &egui::Painter, rect: Rect, accent: Color32, light: Color32) {
+    let c = rect.center();
+    let r = rect.width() / 2.0;
+    painter.circle_filled(c, r * 0.32, light);
+    let tilt = -23f32.to_radians();
+    let points: Vec<Pos2> = (0..=48)
+        .map(|k| {
+            let t = k as f32 / 48.0 * std::f32::consts::TAU;
+            let (x, y) = (r * 0.95 * t.cos(), r * 0.38 * t.sin());
+            pos2(c.x + x * tilt.cos() - y * tilt.sin(), c.y + x * tilt.sin() + y * tilt.cos())
+        })
+        .collect();
+    painter.add(egui::Shape::line(points, Stroke::new(1.4, accent)));
+    let moon = pos2(c.x + r * 0.95 * tilt.cos(), c.y + r * 0.95 * tilt.sin());
+    painter.circle_filled(moon, r * 0.14, accent);
+}
+
+/// Longest first prompt passed on the command line to agents other than Claude.
+const LONG_PROMPT: usize = 700;
+
+/// Writes a long prompt to a brief file and returns the short prompt that points to it.
+fn brief_file(session: &str, text: &str) -> Result<String, String> {
+    let dir = paths::briefs_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    let path = dir.join(format!("{session}.md"));
+    std::fs::write(&path, text).map_err(|e| format!("writing {}: {e}", path.display()))?;
+    Ok(format!("Your task brief is in {}. Read it first and follow it exactly.", path.display()))
 }

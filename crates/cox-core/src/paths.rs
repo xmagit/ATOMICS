@@ -28,6 +28,12 @@ pub fn hook_settings_file() -> PathBuf {
     cox_home().join("claude-hooks.json")
 }
 
+/// Task briefs handed to agents as files (Codex is killed when its first prompt
+/// argument is about a kilobyte or longer).
+pub fn briefs_dir() -> PathBuf {
+    cox_home().join("briefs")
+}
+
 pub fn plan_file() -> PathBuf {
     cox_home().join("plan.json")
 }
