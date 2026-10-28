@@ -164,7 +164,7 @@ fn tools() -> Value {
         },
         {
             "name": "imacs_plan_close",
-            "description": "Close a plan as completed or archived. Its tab disappears; the plan and task history remain available through imacs_plan_get with its id.",
+            "description": "Close a plan as completed or archived. Completed tabs show ✓; archiving hides the tab. The plan and task history remain available through imacs_plan_get with its id.",
             "inputSchema": { "type": "object", "properties": {
                 "plan": plan, "status": { "type": "string", "enum": ["completed", "archived"] }
             }, "required": ["plan", "status"] }

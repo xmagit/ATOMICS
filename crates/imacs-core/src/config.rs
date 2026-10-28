@@ -76,6 +76,10 @@ kind = "shell"
 # Simple command prefixes, within the session worktree. [] makes every request wait.
 allow = ["ls", "cat", "rg", "git status", "git diff", "git log"]
 
+[plan]
+# Close accepted, integrated agents automatically. Worktrees remain available.
+close_done_agents = true
+
 [resources]
 # Heavy work shared by every agent IMACS starts. Compilers share one jobserver pool, and whole
 # test runs or QA instances wait for a slot through `imacs queue --class test|qa -- <command>`.
@@ -146,12 +150,25 @@ pub struct Config {
     pub theme: ThemeConfig,
     pub agents: Vec<AgentConfig>,
     pub approvals: crate::approvals::ApprovalPolicy,
+    pub plan: PlanConfig,
     pub resources: crate::governor::ResourceConfig,
     pub editor: EditorConfig,
     pub chief: ChiefConfig,
     pub steer: SteerConfig,
     pub voice: VoiceConfig,
     pub keys: KeyConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PlanConfig {
+    pub close_done_agents: bool,
+}
+
+impl Default for PlanConfig {
+    fn default() -> Self {
+        Self { close_done_agents: true }
+    }
 }
 
 /// How the chief agent works, given to it as an appended system prompt.
@@ -226,6 +243,22 @@ impl Default for EditorConfig {
             inlay_hints_keys: vec![":toggle lsp.display-inlay-hints\r".into()],
             startup_keys: vec![":theme base16_transparent\r".into()],
         }
+    }
+}
+
+impl EditorConfig {
+    pub fn open_steps(&self, path: &str, line: Option<u32>, fresh: bool) -> Vec<String> {
+        let mut steps = vec!["\x1b".into()];
+        if fresh {
+            steps.extend(self.startup_keys.clone());
+        }
+        steps.extend(
+            self.open_keys
+                .iter()
+                .filter(|step| (line.is_some() || !step.contains("{line}")) && (!fresh || step.contains("{line}")))
+                .map(|step| step.replace("{path}", path).replace("{line}", &line.unwrap_or(1).to_string())),
+        );
+        steps
     }
 }
 
@@ -433,6 +466,7 @@ impl Default for Config {
                 agent("shell", &[], AgentKind::Shell, None),
             ],
             approvals: crate::approvals::ApprovalPolicy::default(),
+            plan: PlanConfig::default(),
             resources: crate::governor::ResourceConfig::default(),
             editor: EditorConfig::default(),
             chief: ChiefConfig::default(),
@@ -561,6 +595,26 @@ impl Chord {
 mod tests {
     use super::*;
     use crate::layout::DiffSplit;
+
+    #[test]
+    fn automatic_agent_closing_defaults_on_and_can_be_disabled() {
+        let old: Config = toml::from_str("").unwrap();
+        assert!(old.plan.close_done_agents);
+        let disabled: Config = toml::from_str("[plan]\nclose_done_agents = false").unwrap();
+        assert!(!disabled.plan.close_done_agents);
+    }
+
+    #[test]
+    fn editor_open_steps_escape_insert_mode_before_open_and_fresh_line_jump() {
+        let config = EditorConfig::default();
+        assert_eq!(config.open_steps("README.md", Some(42), false), ["\x1b", ":open README.md\r", ":goto 42\r"]);
+        assert_eq!(config.open_steps("README.md", None, false), ["\x1b", ":open README.md\r"]);
+        assert_eq!(
+            config.open_steps("README.md", Some(42), true),
+            ["\x1b", ":theme base16_transparent\r", ":goto 42\r"]
+        );
+        assert_eq!(config.open_steps("README.md", None, true), ["\x1b", ":theme base16_transparent\r"]);
+    }
 
     #[test]
     fn default_config_file_matches_built_in_defaults() {

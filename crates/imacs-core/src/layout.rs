@@ -87,6 +87,8 @@ pub struct Layout {
     /// How many sessions get a tile. The rest are tabs.
     pub tiled: usize,
     pub tabs: bool,
+    /// Completed agents occupy only cells the live grid leaves empty.
+    pub completed: usize,
 }
 
 /// Width/height ratio a terminal tile looks best at.
@@ -98,6 +100,7 @@ pub fn compute(
     width: f32,
     height: f32,
     sessions: usize,
+    completed: usize,
     diff_open: bool,
     dock_width: f32,
     cfg: &LayoutConfig,
@@ -132,8 +135,8 @@ pub fn compute(
     }
     let (diff, term_width, term_height) = placed;
 
-    if sessions == 0 || diff == DiffPlacement::Full {
-        return Layout { sidebar, dock_width, diff, columns: 0, rows: 0, tiled: 0, tabs: sessions > 0 };
+    if sessions + completed == 0 || diff == DiffPlacement::Full {
+        return Layout { sidebar, dock_width, diff, columns: 0, rows: 0, tiled: 0, tabs: sessions > 0, completed: 0 };
     }
 
     // A diff stacked on top leaves room for exactly one agent below it.
@@ -145,8 +148,18 @@ pub fn compute(
         ),
     };
     let tiled = sessions.min(max_cols * max_rows);
-    let (columns, rows) = best_grid(tiled, max_cols, max_rows, term_width, term_height);
-    Layout { sidebar, dock_width, diff, columns, rows, tiled, tabs: sessions > tiled }
+    let grid_tiles = if sessions == 0 { completed.min(max_cols * max_rows) } else { tiled };
+    let (columns, rows) = best_grid(grid_tiles, max_cols, max_rows, term_width, term_height);
+    Layout {
+        sidebar,
+        dock_width,
+        diff,
+        columns,
+        rows,
+        tiled,
+        tabs: sessions > tiled,
+        completed: completed.min(columns * rows - tiled),
+    }
 }
 
 /// Returns where the diff goes and the space left for agent tiles.
@@ -201,8 +214,39 @@ mod tests {
     }
 
     #[test]
+    fn completed_tiles_only_fill_the_live_grids_empty_cells() {
+        let mut found_free = false;
+        for width in [700.0, 900.0, 1600.0, 3440.0, 5120.0] {
+            for live in 1..=20 {
+                for diff in [false, true] {
+                    let baseline = compute(width, 1000.0, live, 0, diff, 0.0, &cfg());
+                    let filled = compute(width, 1000.0, live, 30, diff, 0.0, &cfg());
+                    assert_eq!(Layout { completed: 0, ..filled }, baseline);
+                    assert_eq!(filled.completed, baseline.columns * baseline.rows - baseline.tiled);
+                    found_free |= filled.completed > 0;
+                    if baseline.tabs {
+                        assert_eq!(filled.completed, 0);
+                    }
+                }
+            }
+        }
+        assert!(found_free);
+    }
+
+    #[test]
+    fn completed_tiles_remain_without_live_agents_but_never_cover_a_full_diff() {
+        let layout = compute(1600.0, 1000.0, 0, 3, false, 0.0, &cfg());
+        assert_eq!(layout.completed, 3);
+        assert_eq!(layout.tiled, 0);
+        assert!(!layout.tabs);
+        let tiny = compute(700.0, 450.0, 0, 3, true, 0.0, &cfg());
+        assert_eq!(tiny.completed, 0);
+        assert_eq!(tiny.diff, DiffPlacement::Full);
+    }
+
+    #[test]
     fn ultrawide_tiles_everything_beside_the_diff() {
-        let layout = compute(3440.0, 1400.0, 4, true, 0.0, &cfg());
+        let layout = compute(3440.0, 1400.0, 4, 0, true, 0.0, &cfg());
         assert!(layout.sidebar);
         let DiffPlacement::Right { width } = layout.diff else { panic!("{layout:?}") };
         assert!(width >= 560.0);
@@ -213,7 +257,7 @@ mod tests {
 
     #[test]
     fn super_ultrawide_caps_the_diff_and_gives_agents_the_width() {
-        let layout = compute(5120.0, 1360.0, 10, true, 0.0, &cfg());
+        let layout = compute(5120.0, 1360.0, 10, 0, true, 0.0, &cfg());
         assert_eq!(layout.diff, DiffPlacement::Right { width: 1400.0 });
         assert_eq!((layout.tiled, layout.columns, layout.rows), (10, 5, 2));
         assert!(!layout.tabs);
@@ -222,16 +266,16 @@ mod tests {
     #[test]
     fn dragged_width_wins_but_leaves_room_for_an_agent() {
         let dragged = LayoutConfig { diff_width: Some(2600.0), ..cfg() };
-        let layout = compute(5120.0, 1360.0, 4, true, 0.0, &dragged);
+        let layout = compute(5120.0, 1360.0, 4, 0, true, 0.0, &dragged);
         assert_eq!(layout.diff, DiffPlacement::Right { width: 2600.0 });
         let too_wide = LayoutConfig { diff_width: Some(9000.0), ..cfg() };
-        let DiffPlacement::Right { width } = compute(3000.0, 1200.0, 2, true, 0.0, &too_wide).diff else { panic!() };
+        let DiffPlacement::Right { width } = compute(3000.0, 1200.0, 2, 0, true, 0.0, &too_wide).diff else { panic!() };
         assert_eq!(width, 3000.0 - 250.0 - 520.0);
     }
 
     #[test]
     fn laptop_keeps_diff_beside_and_overflows_into_tabs() {
-        let layout = compute(1512.0, 900.0, 5, true, 0.0, &cfg());
+        let layout = compute(1512.0, 900.0, 5, 0, true, 0.0, &cfg());
         assert!(layout.sidebar);
         assert!(matches!(layout.diff, DiffPlacement::Right { .. }));
         assert!(layout.tiled >= 1 && layout.tiled < 5);
@@ -240,7 +284,7 @@ mod tests {
 
     #[test]
     fn narrow_window_stacks_diff_over_one_agent() {
-        let layout = compute(900.0, 1000.0, 3, true, 0.0, &cfg());
+        let layout = compute(900.0, 1000.0, 3, 0, true, 0.0, &cfg());
         assert!(!layout.sidebar);
         assert!(matches!(layout.diff, DiffPlacement::Top { .. }));
         assert_eq!((layout.tiled, layout.columns, layout.rows), (1, 1, 1));
@@ -249,7 +293,7 @@ mod tests {
 
     #[test]
     fn tiny_window_shows_only_the_diff_with_tabs() {
-        let layout = compute(700.0, 450.0, 2, true, 0.0, &cfg());
+        let layout = compute(700.0, 450.0, 2, 0, true, 0.0, &cfg());
         assert_eq!(layout.diff, DiffPlacement::Full);
         assert_eq!(layout.tiled, 0);
         assert!(layout.tabs);
@@ -257,7 +301,7 @@ mod tests {
 
     #[test]
     fn closed_diff_gives_agents_the_whole_area() {
-        let layout = compute(2000.0, 1200.0, 6, false, 0.0, &cfg());
+        let layout = compute(2000.0, 1200.0, 6, 0, false, 0.0, &cfg());
         assert_eq!(layout.diff, DiffPlacement::Hidden);
         assert_eq!(layout.tiled, 6);
         assert_eq!(layout.columns * layout.rows, 6);
@@ -265,8 +309,8 @@ mod tests {
 
     #[test]
     fn dock_reduces_tile_space_and_preserves_diff() {
-        let floating = compute(5120.0, 1360.0, 20, true, 0.0, &cfg());
-        let docked = compute(5120.0, 1360.0, 20, true, 1655.8, &cfg());
+        let floating = compute(5120.0, 1360.0, 20, 0, true, 0.0, &cfg());
+        let docked = compute(5120.0, 1360.0, 20, 0, true, 1655.8, &cfg());
         assert_eq!(docked.dock_width, 1655.8);
         assert_eq!(docked.diff, floating.diff);
         assert!(docked.tiled < floating.tiled);
@@ -275,27 +319,27 @@ mod tests {
 
     #[test]
     fn narrow_windows_hide_dock_before_stacking_diff() {
-        let laptop = compute(1600.0, 1000.0, 4, true, 520.0, &cfg());
+        let laptop = compute(1600.0, 1000.0, 4, 0, true, 520.0, &cfg());
         assert!(!laptop.sidebar);
         assert_eq!(laptop.dock_width, 520.0);
         assert!(matches!(laptop.diff, DiffPlacement::Right { .. }));
-        let narrow = compute(1512.0, 900.0, 4, true, 520.0, &cfg());
+        let narrow = compute(1512.0, 900.0, 4, 0, true, 520.0, &cfg());
         assert_eq!(narrow.dock_width, 0.0);
         assert!(matches!(narrow.diff, DiffPlacement::Right { .. }));
-        let tiny = compute(700.0, 450.0, 4, true, 520.0, &cfg());
+        let tiny = compute(700.0, 450.0, 4, 0, true, 520.0, &cfg());
         assert_eq!(tiny.dock_width, 0.0);
         assert_eq!(tiny.diff, DiffPlacement::Full);
     }
 
     #[test]
     fn dock_width_clamps_and_closed_diff_reclaims_space() {
-        let clamped = compute(2000.0, 1000.0, 4, true, 9000.0, &cfg());
+        let clamped = compute(2000.0, 1000.0, 4, 0, true, 9000.0, &cfg());
         assert_eq!(clamped.dock_width, 670.0);
         assert_eq!(clamped.diff, DiffPlacement::Right { width: 560.0 });
-        let closed = compute(1200.0, 1000.0, 4, false, 520.0, &cfg());
+        let closed = compute(1200.0, 1000.0, 4, 0, false, 520.0, &cfg());
         assert_eq!(closed.dock_width, 520.0);
         assert_eq!(closed.diff, DiffPlacement::Hidden);
-        assert_eq!(compute(900.0, 1000.0, 4, false, 520.0, &cfg()).dock_width, 0.0);
+        assert_eq!(compute(900.0, 1000.0, 4, 0, false, 520.0, &cfg()).dock_width, 0.0);
     }
 
     #[test]
@@ -308,7 +352,7 @@ mod tests {
 
     #[test]
     fn sidebar_yields_to_keep_the_diff_beside_the_agent() {
-        let layout = compute(1300.0, 800.0, 1, true, 0.0, &cfg());
+        let layout = compute(1300.0, 800.0, 1, 0, true, 0.0, &cfg());
         assert!(!layout.sidebar);
         assert!(matches!(layout.diff, DiffPlacement::Right { .. }));
         assert_eq!(layout.tiled, 1);
