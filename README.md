@@ -1,9 +1,13 @@
+<img src="assets/icon.png" alt="atomisk.ai icon" width="96">
+
 # IMACS
 
 Emacs, but for agents: a lightweight, review-first workspace for coding agents, written in Rust. Run Claude Code,
 Codex and shells side by side, each in its own git worktree. Click any agent's title to see its worktree's diff
 against main, comment on lines, and send the review straight to the agent while it keeps working. Or let an
 orchestrating agent plan the work, hand out tasks and review the results while you approve and steer.
+
+An atomisk.ai project.
 
 The command is `cox`, after the coxswain: the one in the boat who doesn't row, but steers and calls the stroke.
 

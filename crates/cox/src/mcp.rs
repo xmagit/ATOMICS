@@ -34,7 +34,7 @@ pub fn run(agent: bool) {
                 Ok(json!({
                     "protocolVersion": version,
                     "capabilities": { "tools": {} },
-                    "serverInfo": { "name": "cox", "version": env!("CARGO_PKG_VERSION") },
+                    "serverInfo": { "name": "cox", "title": "IMACS", "version": env!("CARGO_PKG_VERSION") },
                     "instructions": if agent { AGENT_INSTRUCTIONS } else { INSTRUCTIONS },
                 }))
             }

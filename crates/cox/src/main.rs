@@ -133,14 +133,26 @@ fn main() -> eframe::Result {
         screenshot: cli.screenshot,
         screenshot_delay: cli.screenshot_delay,
     };
+    let icon = load_icon();
     let native = eframe::NativeOptions {
         // Without --size cox fills the screen: the layout is built to use all of it.
         viewport: egui::ViewportBuilder::default()
-            .with_title("cox")
+            .with_title("IMACS")
+            .with_app_id("cox")
+            .with_icon(icon.clone())
             .with_inner_size(size.unwrap_or([1600.0, 1000.0]))
             .with_maximized(size.is_none())
             .with_min_inner_size([480.0, 320.0]),
         ..Default::default()
     };
-    eframe::run_native("cox", native, Box::new(|cc| Ok(Box::new(app::App::new(cc, options)))))
+    eframe::run_native("IMACS", native, Box::new(|cc| Ok(Box::new(app::App::new(cc, options, &icon)))))
+}
+
+fn load_icon() -> egui::IconData {
+    let decoder = png::Decoder::new(std::io::Cursor::new(include_bytes!("../../../assets/icon.png")));
+    let mut reader = decoder.read_info().expect("embedded icon must be a valid PNG");
+    let mut rgba = vec![0; reader.output_buffer_size().expect("embedded icon must fit in memory")];
+    let info = reader.next_frame(&mut rgba).expect("embedded icon must decode");
+    rgba.truncate(info.buffer_size());
+    egui::IconData { rgba, width: info.width, height: info.height }
 }
