@@ -146,6 +146,9 @@ pub struct Task {
     pub status: TaskStatus,
     /// Integration branch this task was successfully merged into.
     pub integrated: Option<String>,
+    /// Latest background ancestry check; rechecked after loading.
+    #[serde(skip)]
+    pub integration_verified: bool,
     /// IMACS session working on it, once dispatched.
     pub session: Option<String>,
     pub report: Option<Report>,
@@ -254,6 +257,7 @@ impl Plan {
                 task.report = old.report.clone();
                 task.notes = old.notes.clone();
                 task.integrated = old.integrated.clone();
+                task.integration_verified = old.integration_verified;
                 if old.status != TaskStatus::Planned {
                     // A dispatched task's work is on its branch.
                     task.repo = old.repo.clone().or(task.repo.take());
@@ -327,7 +331,9 @@ impl Plan {
         task.depends_on
             .iter()
             .filter(|dep| {
-                !self.tasks.iter().any(|other| &other.id == *dep && other.integrated.as_deref() == Some(&into))
+                !self.tasks.iter().any(|other| {
+                    &other.id == *dep && other.integrated.as_deref() == Some(&into) && other.integration_verified
+                })
             })
             .map(String::as_str)
             .collect()
@@ -363,6 +369,7 @@ impl Task {
     pub fn set_status(&mut self, status: TaskStatus) {
         if !matches!(status, TaskStatus::Review | TaskStatus::Done) {
             self.integrated = None;
+            self.integration_verified = false;
         }
         self.status = status;
     }
@@ -629,6 +636,8 @@ mod tests {
         assert_eq!(ready, ["c"], "done alone does not make the work available");
         assert_eq!(plan.unintegrated_dependencies(&plan.tasks[1]), ["a"]);
         plan.task_mut("a").unwrap().integrated = Some(plan.integration_branch());
+        assert!(plan.ready().iter().all(|t| t.id != "b"), "an unchecked marker is not ready");
+        plan.task_mut("a").unwrap().integration_verified = true;
         let ready: Vec<&str> = plan.ready().iter().map(|t| t.id.as_str()).collect();
         assert_eq!(ready, ["b", "c"]);
         plan.integration = Some("another-integration".into());

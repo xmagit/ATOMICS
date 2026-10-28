@@ -191,6 +191,14 @@ struct Integrated {
     reply: Option<Sender<ControlOutcome>>,
 }
 
+struct CheckedIntegration {
+    revision: u64,
+    plan: String,
+    task: Task,
+    into: String,
+    valid: bool,
+}
+
 /// The worktree clean-up dialog for one project.
 struct Cleanup {
     repo: PathBuf,
@@ -358,6 +366,12 @@ pub struct App {
     integrate_rx: Receiver<Integrated>,
     /// Tasks being merged into the integration branch.
     integrating: HashSet<(String, String)>,
+    integration_check_tx: Sender<CheckedIntegration>,
+    integration_check_rx: Receiver<CheckedIntegration>,
+    integration_checks: HashSet<(String, String)>,
+    integration_checked_at: Option<Instant>,
+    integration_dirty: Arc<AtomicBool>,
+    integration_revision: u64,
     worktrees: Vec<WorktreeEntry>,
     worktrees_at: Option<Instant>,
     steer_text: String,
@@ -365,6 +379,7 @@ pub struct App {
     focus_steer: bool,
     focus_terminal: Option<String>,
     confirm_close: Option<String>,
+    confirm_plan_close: Option<(String, PlanStatus)>,
     new_dialog: Option<NewDialog>,
     quick_open: Option<QuickOpen>,
     last_layout: Option<Layout>,
@@ -403,6 +418,7 @@ impl App {
         let (watch_tx, watch_rx) = channel();
         let (worktree_tx, worktree_rx) = channel();
         let (integrate_tx, integrate_rx) = channel();
+        let (integration_check_tx, integration_check_rx) = channel();
         let (voice_tx, voice_rx) = channel();
         let launch_dir = std::env::current_dir().unwrap_or_else(|_| paths::home());
 
@@ -474,6 +490,12 @@ impl App {
             integrate_tx,
             integrate_rx,
             integrating: HashSet::new(),
+            integration_check_tx,
+            integration_check_rx,
+            integration_checks: HashSet::new(),
+            integration_checked_at: None,
+            integration_dirty: Arc::new(AtomicBool::new(false)),
+            integration_revision: 0,
             worktrees: Vec::new(),
             worktrees_at: None,
             steer_text: String::new(),
@@ -481,6 +503,7 @@ impl App {
             focus_steer: false,
             focus_terminal: None,
             confirm_close: None,
+            confirm_plan_close: None,
             new_dialog: None,
             quick_open: None,
             last_layout: None,
@@ -1745,6 +1768,23 @@ impl App {
                 plan_pick = Some(index);
             }
         }
+        let mut reopen = None;
+        if self.plans.iter().any(|p| !p.id.is_empty() && !p.is_open()) {
+            ui.menu_button("Closed plans", |ui| {
+                for (index, plan) in self.plans.iter().enumerate().filter(|(_, p)| !p.id.is_empty() && !p.is_open()) {
+                    let status = if plan.status == PlanStatus::Completed { "completed" } else { "archived" };
+                    if ui.button(format!("Reopen {} ({status})", plan.goal)).clicked() {
+                        reopen = Some(index);
+                        ui.close();
+                    }
+                }
+            });
+        }
+        if let Some(index) = reopen
+            && let Err(err) = self.reopen_plan(index)
+        {
+            self.toast(err);
+        }
         if let Some(index) = plan_pick {
             self.selected_plan = index;
             self.show_plan_fleet();
@@ -2117,6 +2157,9 @@ impl App {
         let mut close_status = None;
         let mut close = false;
         let ready = self.plans[self.selected_plan].ready().len();
+        if self.integration_checks.iter().any(|(plan, _)| plan == &self.plans[self.selected_plan].id) {
+            ui.label(RichText::new("Checking integration freshness…").color(p.muted));
+        }
         ui.horizontal(|ui| {
             ui.label(RichText::new("PLAN").color(p.accent).strong().size(13.0));
             let total = self.plans[self.selected_plan].tasks.len();
@@ -2390,10 +2433,8 @@ impl App {
         if close {
             self.panel = PanelMode::Diff;
         }
-        if let Some(status) = close_status
-            && let Err(err) = self.close_plan(self.selected_plan, status)
-        {
-            self.toast(err);
+        if let Some(status) = close_status {
+            self.confirm_plan_close = Some((self.plans[self.selected_plan].id.clone(), status));
         }
     }
 
@@ -2421,6 +2462,22 @@ impl App {
             }
         }
         self.ctx.request_repaint();
+        Ok(())
+    }
+
+    fn reopen_plan(&mut self, index: usize) -> Result<(), String> {
+        let mut plan = self.plans[index].clone();
+        plan.status = PlanStatus::Open;
+        for task in &mut plan.tasks {
+            task.integration_verified = false;
+        }
+        plan.save_in(&paths::imacs_home()).map_err(|err| format!("Reopening plan failed: {err:#}"))?;
+        self.plans[index] = plan;
+        self.integration_revision += 1;
+        self.selected_plan = index;
+        self.show_plan_fleet();
+        self.panel = PanelMode::Plan;
+        self.diff_open = true;
         Ok(())
     }
 
@@ -2454,40 +2511,87 @@ impl App {
             .or_else(|| self.repos.first().cloned())
     }
 
+    fn refresh_integrations(&mut self) {
+        if self.integration_dirty.swap(false, Ordering::Relaxed) {
+            self.integration_revision += 1;
+            for task in self.plans.iter_mut().flat_map(|p| &mut p.tasks) {
+                task.integration_verified = false;
+            }
+            self.integration_checked_at = None;
+        }
+        while let Ok(checked) = self.integration_check_rx.try_recv() {
+            self.integration_checks.remove(&(checked.plan.clone(), checked.task.id.clone()));
+            let Some(index) = self.plans.iter().position(|p| p.id == checked.plan && p.is_open()) else { continue };
+            if self.integration_revision != checked.revision || self.plans[index].integration_branch() != checked.into {
+                continue;
+            }
+            if let Some(task) = self.plans[index].task_mut(&checked.task.id)
+                && *task == checked.task
+            {
+                task.integration_verified = checked.valid;
+                if !checked.valid {
+                    task.integrated = None;
+                    self.save_plan(index);
+                }
+            }
+        }
+        let due = self.integration_checked_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(5));
+        let mut jobs = Vec::new();
+        for plan in self.plans.iter().filter(|p| p.is_open()) {
+            let into = plan.integration_branch();
+            for task in &plan.tasks {
+                if task.integrated.as_deref() != Some(&into) || (!due && task.integration_verified) {
+                    continue;
+                }
+                if self.integration_checks.insert((plan.id.clone(), task.id.clone())) {
+                    let repo = task
+                        .repo
+                        .as_deref()
+                        .map(paths::expand)
+                        .or_else(|| plan.project.clone())
+                        .or_else(|| {
+                            self.sessions.iter().find(|s| task.session.as_deref() == Some(&s.id)).map(Session::root)
+                        })
+                        .or_else(|| self.repos.first().cloned());
+                    jobs.push((plan.id.clone(), task.clone(), into.clone(), repo));
+                }
+            }
+        }
+        if !jobs.is_empty() {
+            self.integration_checked_at = Some(Instant::now());
+            let (tx, ctx, revision) = (self.integration_check_tx.clone(), self.ctx.clone(), self.integration_revision);
+            std::thread::spawn(move || {
+                for (plan, task, into, repo) in jobs {
+                    let valid = matches!(task.status, TaskStatus::Review | TaskStatus::Done)
+                        && task.branch.as_deref().zip(repo).is_some_and(|(branch, repo)| {
+                            git::git(
+                                &repo,
+                                &[
+                                    "merge-base",
+                                    "--is-ancestor",
+                                    &format!("refs/heads/{branch}"),
+                                    &format!("refs/heads/{into}"),
+                                ],
+                            )
+                            .is_ok()
+                        });
+                    let _ = tx.send(CheckedIntegration { revision, plan, task, into, valid });
+                    ctx.request_repaint();
+                }
+            });
+        }
+        if self.plans.iter().any(|p| p.is_open() && p.tasks.iter().any(|t| t.integrated.is_some())) {
+            self.ctx.request_repaint_after(Duration::from_secs(1));
+        }
+    }
+
     /// Starts `only`, or every ready task, each in a new worktree with its brief as
     /// the agent's first message.
     fn dispatch(&mut self, index: usize, only: Option<&str>) -> Result<Vec<String>, String> {
         if !self.plans[index].approved {
             return Err("The plan is not approved yet: the user approves it on the plan board.".into());
         }
-        let into = self.plans[index].integration_branch();
-        let stale: Vec<String> = self.plans[index]
-            .tasks
-            .iter()
-            .filter(|t| t.integrated.as_deref() == Some(&into))
-            .filter(|task| {
-                !matches!(task.status, TaskStatus::Review | TaskStatus::Done)
-                    || !task.branch.as_deref().zip(self.task_repo(index, task)).is_some_and(|(branch, repo)| {
-                        git::git(
-                            &repo,
-                            &[
-                                "merge-base",
-                                "--is-ancestor",
-                                &format!("refs/heads/{branch}"),
-                                &format!("refs/heads/{into}"),
-                            ],
-                        )
-                        .is_ok()
-                    })
-            })
-            .map(|t| t.id.clone())
-            .collect();
-        for id in &stale {
-            self.plans[index].task_mut(id).expect("checked task").integrated = None;
-        }
-        if !stale.is_empty() {
-            self.save_plan(index);
-        }
+        self.refresh_integrations();
         let ready: Vec<Task> =
             self.plans[index].ready().into_iter().filter(|t| only.is_none_or(|id| t.id == id)).cloned().collect();
         if ready.is_empty() {
@@ -2547,7 +2651,7 @@ impl App {
             }
             started.push(task.id);
         }
-        if self.plan_view && self.selected_plan == index {
+        if self.selected_plan == index && (self.plan_view || (self.panel == PanelMode::Plan && self.diff_open)) {
             self.show_plan_fleet();
         } else {
             self.changed_plans.insert(self.plans[index].id.clone());
@@ -2620,6 +2724,7 @@ impl App {
                     && matches!(task.status, TaskStatus::Review | TaskStatus::Done)
                 {
                     task.integrated = Some(into.clone());
+                    task.integration_verified = true;
                 }
                 let merged = merge == Merge::Merged;
                 let note = match (committed, merged) {
@@ -2945,6 +3050,7 @@ impl App {
     // ── background events ─────────────────────────────────────────────────
 
     fn pump(&mut self, ctx: &egui::Context) {
+        self.refresh_integrations();
         for (agent, dir) in std::mem::take(&mut self.pending_open) {
             self.spawn(ctx, &agent, dir, None);
         }
@@ -3411,6 +3517,7 @@ impl App {
             .map(Session::root)
             .chain(target.map(Path::to_path_buf))
             .collect();
+        wanted.extend(self.plans.iter().filter(|p| p.is_open()).filter_map(|p| p.project.clone()));
         wanted.sort();
         wanted.dedup();
         let current: Vec<PathBuf> = self.watched.lock().unwrap().iter().map(|(root, _)| root.clone()).collect();
@@ -3419,11 +3526,20 @@ impl App {
         }
         if self.watcher.is_none() {
             let (tx, ctx, watched) = (self.watch_tx.clone(), ctx.clone(), self.watched.clone());
+            let integration_dirty = self.integration_dirty.clone();
             let handler = move |result: DebounceEventResult| {
                 let Ok(events) = result else { return };
                 let watched = watched.lock().unwrap();
                 let mut changed: Vec<&PathBuf> = Vec::new();
                 for event in &events {
+                    if event.path.components().any(|c| c.as_os_str() == ".git")
+                        && (event.path.components().any(|c| c.as_os_str() == "refs")
+                            || event.path.file_name().is_some_and(|n| n == "HEAD" || n == "packed-refs"))
+                    {
+                        integration_dirty.store(true, Ordering::Relaxed);
+                        ctx.request_repaint();
+                        continue;
+                    }
                     // The innermost worktree, for worktrees inside another.
                     let Some((root, relative)) = watched
                         .iter()
@@ -4514,6 +4630,36 @@ impl App {
     fn dialogs(&mut self, ctx: &egui::Context) {
         self.quick_open_dialog(ctx);
         self.cleanup_dialog(ctx);
+        if let Some((id, status)) = self.confirm_plan_close.clone() {
+            if let Some(index) = self.plans.iter().position(|p| p.id == id && p.is_open()) {
+                let archive = status == PlanStatus::Archived;
+                let mut open = true;
+                egui::Window::new(if archive { "Archive plan?" } else { "Complete plan?" })
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                    .open(&mut open)
+                    .show(ctx, |ui| {
+                        ui.label(format!("Close “{}”? You can reopen it from Closed plans.", self.plans[index].goal));
+                        ui.horizontal(|ui| {
+                            if ui.button(if archive { "Confirm archive" } else { "Confirm complete" }).clicked() {
+                                if let Err(err) = self.close_plan(index, status) {
+                                    self.toast(err);
+                                }
+                                self.confirm_plan_close = None;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                self.confirm_plan_close = None;
+                            }
+                        });
+                    });
+                if !open {
+                    self.confirm_plan_close = None;
+                }
+            } else {
+                self.confirm_plan_close = None;
+            }
+        }
         if let Some(id) = self.confirm_close.clone() {
             let title = self.sessions.iter().find(|s| s.id == id).map(|s| s.title.clone());
             let Some(title) = title else {
