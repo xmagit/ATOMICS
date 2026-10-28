@@ -142,6 +142,7 @@ type CodexVersion = Arc<OnceLock<Option<bool>>>;
 
 const APPROVAL_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 const APPROVAL_MENU_GRACE: Duration = Duration::from_secs(1);
+const NEEDS_INPUT_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(4);
 const DELIVERY_ATTEMPTS: u8 = 3;
@@ -336,6 +337,7 @@ pub struct App {
     load: (Instant, Option<f64>),
     busy_checked: Instant,
     approvals_checked: Instant,
+    needs_input_checked: Instant,
     store: Store,
     dismissed: HashSet<String>,
     /// Main checkouts of the open projects (plus `repos` from the config).
@@ -498,6 +500,7 @@ impl App {
             load: (Instant::now() - Duration::from_secs(10), None),
             busy_checked: Instant::now(),
             approvals_checked: Instant::now() - APPROVAL_CHECK_INTERVAL,
+            needs_input_checked: Instant::now() - NEEDS_INPUT_CHECK_INTERVAL,
             store: Store::load(&paths::store_file()),
             dismissed: HashSet::new(),
             repos: Vec::new(),

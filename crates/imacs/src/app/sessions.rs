@@ -355,9 +355,14 @@ impl App {
             let screen = terminal.screen_text(200);
             let lines: Vec<&str> = screen.lines().collect();
             let input_box = lines.len().saturating_sub(6);
+            let composer_empty = pending.codex.then(|| codex_composer_empty(&screen)).flatten();
             let in_transcript = if pending.codex {
-                steer::message_in_transcript(&screen, &pending.text)
-                    && !steer::message_in_transcript(&pending.screen_before, &pending.text)
+                (steer::message_in_transcript(&screen, &pending.text)
+                    && !steer::message_in_transcript(&pending.screen_before, &pending.text))
+                    // Allow the initial paste and delayed Enter to reach Codex before
+                    // treating an empty composer as a receipt. Queue previews may be
+                    // clipped, and a repeated message may already be in the transcript.
+                    || composer_empty == Some(true) && pending.sent.elapsed() >= DELIVERY_TIMEOUT
             } else {
                 started || !snippet.trim().is_empty() && lines[..input_box].iter().any(|l| l.contains(snippet.trim()))
             };
@@ -381,21 +386,14 @@ impl App {
                 session.pending = None;
                 continue;
             }
-            let in_input_box = if pending.codex {
-                let input: String = screen
-                    .rsplit_once('›')
-                    .map_or("", |(_, input)| input)
-                    .chars()
-                    .filter(|c| !c.is_whitespace())
-                    .collect();
-                let text: String = pending.text.chars().filter(|c| !c.is_whitespace()).collect();
-                !text.is_empty() && input.contains(&text)
-            } else {
-                lines[input_box..].iter().any(|l| l.contains(snippet.trim()))
-            };
-            if in_input_box {
-                let queue = pending.codex && screen.contains("tab to queue");
-                terminal.write(if queue { b"\t".to_vec() } else { b"\r".to_vec() });
+            if pending.codex {
+                // The paste is sent exactly once. Retry only the submit key, even
+                // when a long paste has been collapsed or has left the composer.
+                if composer_empty == Some(false) {
+                    terminal.write(if screen.contains("tab to queue") { b"\t".to_vec() } else { b"\r".to_vec() });
+                }
+            } else if lines[input_box..].iter().any(|l| l.contains(snippet.trim())) {
+                terminal.write(b"\r".to_vec());
             } else {
                 terminal.submit(&pending.text);
             }
@@ -478,13 +476,13 @@ impl App {
     /// next hook of sessions running elsewhere.
     pub(super) fn deliver(&mut self, index: usize, text: &str) -> Delivery {
         let session = &mut self.sessions[index];
-        if session.approval_hold || !session.approvals.is_empty() {
+        if session.approval_hold
+            || !session.approvals.is_empty()
+            || session.pending.as_ref().is_some_and(|pending| pending.codex)
+        {
             session.activity.held_since.get_or_insert_with(imacs_core::store::now);
             session.held.push(text.to_string());
             return Delivery::Held;
-        }
-        if session.pending.as_ref().is_some_and(|pending| pending.codex) {
-            return Delivery::Unavailable;
         }
         if let Some(terminal) = &session.terminal {
             if terminal.exited() {
@@ -572,7 +570,7 @@ impl App {
             parts.push(format!("Queued for {queued} outside IMACS"));
         }
         if held > 0 {
-            parts.push(format!("Held for {held} until permission is answered"));
+            parts.push(format!("Held for {held} until the session is ready"));
         }
         let summary = if parts.is_empty() { "No session could receive the message".into() } else { parts.join(", ") };
         self.toast(summary);
@@ -609,6 +607,15 @@ impl App {
         }
         delivery
     }
+}
+
+/// The last prompt belongs to the composer. Its text can be wrapped or collapsed
+/// to a paste marker, so check whether it is empty rather than matching the message.
+fn codex_composer_empty(screen: &str) -> Option<bool> {
+    if imacs_core::approvals::menu_visible(screen) {
+        return None;
+    }
+    screen.lines().rev().find_map(|line| line.trim_start().strip_prefix(['›', '❯']).map(|text| text.trim().is_empty()))
 }
 
 /// Longest first prompt passed on the command line to agents other than Claude.
@@ -866,8 +873,9 @@ fi
                 let (tx, rx) = channel();
                 app.control(ctx, ControlRequest::Send { session: mode.into(), text: text.into(), raw: false }, tx);
                 assert!(rx.try_recv().is_err(), "an unverified send must not claim success");
-                let rejected = request(app, json!({"cmd":"send", "session":mode, "text":"second message"}));
-                assert!(!rejected.ok, "another send must not overwrite the pending receipt");
+                let held = request(app, json!({"cmd":"send", "session":mode, "text":"second message"}));
+                assert!(held.ok && held.result["held"] == true, "another send must wait for the pending receipt");
+                assert_eq!(app.sessions[0].pending.as_ref().unwrap().text, text);
                 // Let the initial paste and its delayed Enter reach the fake busy terminal.
                 std::thread::sleep(Duration::from_millis(250));
                 app.sessions[0].status = AgentStatus::Done;
@@ -915,9 +923,138 @@ fi
                 } else {
                     assert!(response.error.unwrap().contains("not delivered"));
                 }
-                assert!(app.sessions[0].pending.is_none());
+                if mode == "hook" {
+                    assert_eq!(app.sessions[0].pending.as_ref().unwrap().text, "second message");
+                    assert!(app.sessions[0].held.is_empty());
+                } else {
+                    assert!(app.sessions[0].pending.is_none());
+                }
                 app.sessions.clear();
             }
+        });
+    }
+
+    #[test]
+    fn codex_clipped_and_repeated_receipts_never_repaste() {
+        with_app("app::sessions::tests::codex_clipped_and_repeated_receipts_never_repaste", |app, ctx| {
+            let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex");
+            app.config.agents.push(imacs_core::config::AgentConfig {
+                name: "fake-codex".into(),
+                command: vec![fixture.to_string_lossy().into_owned()],
+                kind: AgentKind::Generic,
+                busy_text: None,
+            });
+            for mode in ["long", "preview", "repeat", "collapsed", "no-prompt"] {
+                let text = if mode == "long" {
+                    "A long multiline message that cannot fit on screen.\n".repeat(100)
+                } else {
+                    "Please check the first change and then the second change".into()
+                };
+                let terminal = Terminal::spawn(
+                    ctx,
+                    app.palette.clone(),
+                    fixture.to_string_lossy().into_owned(),
+                    vec!["--mode".into(), mode.into()],
+                    &app.launch_dir,
+                    HashMap::new(),
+                    100,
+                )
+                .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !terminal.screen_text(60).contains("tab to queue") {
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                app.sessions = vec![session(mode, AgentKind::Generic, AgentStatus::Working, &app.launch_dir)];
+                app.sessions[0].agent = "fake-codex".into();
+                app.sessions[0].terminal = Some(terminal);
+                let (tx, rx) = channel();
+                app.control(ctx, ControlRequest::Send { session: mode.into(), text, raw: false }, tx);
+                while !app.sessions[0].terminal.as_ref().unwrap().screen_text(60).contains("Enters: 1") {
+                    assert!(Instant::now() < deadline, "{mode}: the original paste and Enter must reach the fixture");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let mut response = None;
+                for _ in 0..=DELIVERY_ATTEMPTS {
+                    if let Some(pending) = &mut app.sessions[0].pending {
+                        pending.sent = Instant::now() - DELIVERY_TIMEOUT;
+                    }
+                    app.verify_deliveries();
+                    if let Ok(ControlOutcome::Done(result)) = rx.try_recv() {
+                        response = Some(result);
+                        break;
+                    }
+                    if matches!(mode, "preview" | "collapsed") {
+                        while !app.sessions[0].terminal.as_ref().unwrap().screen_text(60).contains("Queued") {
+                            assert!(Instant::now() < deadline, "{mode}: the retry must submit with Tab");
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                    }
+                }
+                let response = response.expect("a send must eventually resolve");
+                assert_eq!(response.ok, mode != "no-prompt", "{mode}: {response:?}");
+                // A missing prompt cannot confirm delivery, but must never cause
+                // a second paste after the original text has left the composer.
+                let screen = app.sessions[0].terminal.as_ref().unwrap().screen_text(60);
+                assert!(screen.contains("Pastes: 1"), "{mode}: {screen}");
+                app.sessions.clear();
+            }
+        });
+    }
+
+    #[test]
+    fn steering_during_a_pending_codex_send_is_held_and_released() {
+        with_app("app::sessions::tests::steering_during_a_pending_codex_send_is_held_and_released", |app, ctx| {
+            let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex");
+            app.config.agents.push(imacs_core::config::AgentConfig {
+                name: "fake-codex".into(),
+                command: vec![fixture.to_string_lossy().into_owned()],
+                kind: AgentKind::Generic,
+                busy_text: None,
+            });
+            app.sessions = vec![session("worker", AgentKind::Generic, AgentStatus::Working, &app.launch_dir)];
+            app.sessions[0].agent = "fake-codex".into();
+            app.sessions[0].terminal = Some(
+                Terminal::spawn(
+                    ctx,
+                    app.palette.clone(),
+                    fixture.to_string_lossy().into_owned(),
+                    vec![],
+                    &app.launch_dir,
+                    HashMap::new(),
+                    100,
+                )
+                .unwrap(),
+            );
+            assert_eq!(app.deliver(0, "first"), Delivery::Pending);
+            app.active = Some("worker".into());
+            app.steer_target = SteerTarget::Active;
+            app.steer_text = "second".into();
+            app.send_steer();
+            app.steer_text = "third".into();
+            app.send_steer();
+            assert!(app.steer_text.is_empty());
+            assert_eq!(app.sessions[0].pending.as_ref().unwrap().text, "first");
+            assert_eq!(app.sessions[0].held, ["second", "third"]);
+            assert!(app.sessions[0].activity.held_since.is_some());
+            app.release_held(0);
+            assert_eq!(app.sessions[0].held.len(), 2);
+            let event = imacs_core::hook::HookEvent::from_payload(&json!({
+                "hook_event_name":"UserPromptSubmit", "session_id":"worker", "prompt":"first"
+            }))
+            .unwrap();
+            app.on_hook(HookMessage {
+                pane: Some("worker".into()),
+                ancestors: vec![],
+                event,
+                delivered: 0,
+                approval_reply: None,
+            });
+            app.release_held(0);
+            assert!(app.sessions[0].held.is_empty());
+            assert!(app.sessions[0].activity.held_since.is_none());
+            assert_eq!(app.sessions[0].pending.as_ref().unwrap().text, "second\n\nthird");
+            app.sessions.clear();
         });
     }
 

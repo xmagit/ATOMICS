@@ -186,7 +186,7 @@ pub fn menu_visible(screen: &str) -> bool {
         })
 }
 
-/// Match a visible native menu, or expand a hidden command before checking it.
+/// Match a complete native menu command, expanding hidden or truncated commands first.
 pub fn menu_key(screen: &str, command: Option<&str>, decision: Decision) -> Option<String> {
     let command = command?;
     let (_, menu) = screen.rsplit_once("Would you like to run the following command?")?;
@@ -206,7 +206,10 @@ pub fn menu_key(screen: &str, command: Option<&str>, decision: Decision) -> Opti
             && command.starts_with(prefix)
             && lines.is_some_and(|lines| lines.parse::<usize>().is_ok_and(|lines| lines > 0))
     });
-    if shown != command && !truncated_match {
+    if truncated_match {
+        return menu.contains("⌃a view all").then(|| "\x01".into());
+    }
+    if shown != command {
         return None;
     }
     if decision == Decision::Deny && menu.contains("esc to cancel") {
@@ -398,16 +401,21 @@ mod tests {
     }
 
     #[test]
-    fn fallback_matches_truncated_heredoc_commands() {
+    fn fallback_expands_truncated_heredocs_and_requires_the_full_command() {
         let command = format!("python3 - <<'PY'\nfrom pathlib import Path\n{}PY", "print('fixture')\n".repeat(46));
         let screen = "Would you like to run the following command?\n\n  $ python3 - <<'PY'\n  from pathlib import Path\n  [… 46 lines] ⌃a view all\n\n› 1. Yes, proceed (y)\n  2. No, and tell Codex what to do differently (esc)\nPress enter to confirm or esc to cancel";
-        for decision in [Decision::Allow, Decision::AllowAlways] {
-            assert_eq!(menu_key(screen, Some(&command), decision).as_deref(), Some("1\r"));
+        for decision in [Decision::Allow, Decision::AllowAlways, Decision::Deny] {
+            assert_eq!(menu_key(screen, Some(&command), decision).as_deref(), Some("\x01"));
         }
-        assert_eq!(menu_key(screen, Some(&command), Decision::Deny).as_deref(), Some("\x1b"));
+        let different = command.replace("print('fixture')", "print('different command')");
+        assert_eq!(menu_key(screen, Some(&different), Decision::Allow).as_deref(), Some("\x01"));
+        let expanded =
+            screen.replace("python3 - <<'PY'\n  from pathlib import Path\n  [… 46 lines] ⌃a view all", &command);
+        assert_eq!(menu_key(&expanded, Some(&command), Decision::Allow).as_deref(), Some("1\r"));
+        assert_eq!(menu_key(&expanded, Some(&different), Decision::Allow), None);
         assert_eq!(menu_key(screen, Some("python3 - <<'PY'\nimport os\nPY"), Decision::Allow), None);
         let no_hint = screen.replace(" ⌃a view all", "");
-        assert_eq!(menu_key(&no_hint, Some(&command), Decision::Allow).as_deref(), Some("1\r"));
+        assert_eq!(menu_key(&no_hint, Some(&command), Decision::Allow), None);
         for marker in ["[… lines]", "[… many lines]", "[… 46 lines] unrelated text"] {
             assert_eq!(
                 menu_key(&screen.replace("[… 46 lines] ⌃a view all", marker), Some(&command), Decision::Allow),

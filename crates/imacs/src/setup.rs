@@ -149,13 +149,20 @@ mod tests {
         let started = Instant::now();
         assert_eq!(codex_supports_hooks(program.to_str().unwrap(), Duration::from_millis(100)), None);
         assert!(started.elapsed() < Duration::from_secs(5));
-        std::fs::write(&program, "#!/bin/sh\nprintf 'codex-cli 0.165.0\\n'\n").unwrap();
-        assert_eq!(codex_supports_hooks(program.to_str().unwrap(), Duration::from_secs(1)), Some(true));
         for script in ["#!/bin/sh\nexit 1\n", "#!/bin/sh\nprintf 'not a version\\n'\n"] {
             std::fs::write(&program, script).unwrap();
-            assert_eq!(codex_supports_hooks(program.to_str().unwrap(), Duration::from_secs(1)), None);
+            assert_eq!(codex_supports_hooks(program.to_str().unwrap(), Duration::from_secs(10)), None);
         }
         assert_eq!(codex_supports_hooks("/no/such/codex", Duration::from_secs(1)), None);
+    }
+
+    #[test]
+    fn successful_version_probe_tolerates_slow_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("codex");
+        std::fs::write(&program, "#!/bin/sh\nsleep 1.1\nprintf 'codex-cli 0.165.0\\n'\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(codex_supports_hooks(program.to_str().unwrap(), std::time::Duration::from_secs(10)), Some(true));
     }
 
     #[test]

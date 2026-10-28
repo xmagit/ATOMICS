@@ -331,7 +331,13 @@ impl App {
                         return;
                     }
                     Delivery::Held => {
-                        ControlResponse::ok(json!({"sent":false, "held":true, "held_until":"permission answered"}))
+                        let reason = if self.sessions[index].approval_hold || !self.sessions[index].approvals.is_empty()
+                        {
+                            "permission answered"
+                        } else {
+                            "previous delivery confirmed"
+                        };
+                        ControlResponse::ok(json!({"sent":false, "held":true, "held_until":reason}))
                     }
                     Delivery::Sent | Delivery::Queued => ControlResponse::ok(
                         json!({"sent":true, "queued_until_next_hook":self.sessions[index].terminal.is_none()}),
