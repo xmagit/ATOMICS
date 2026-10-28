@@ -72,6 +72,10 @@ name = "shell"
 command = []                # empty = your login shell
 kind = "shell"
 
+[approvals]
+# Simple command prefixes, within the session worktree. [] makes every request wait.
+allow = ["cargo build", "cargo test", "cargo check", "cargo clippy", "cargo fmt", "ls", "cat", "rg", "git status", "git diff", "git log"]
+
 [editor]
 # Terminal editor for editor mode (cmd+e). Helix has LSP and inlay hints built in.
 command = ["hx"]
@@ -133,6 +137,7 @@ pub struct Config {
     pub terminal: TerminalConfig,
     pub theme: ThemeConfig,
     pub agents: Vec<AgentConfig>,
+    pub approvals: crate::approvals::ApprovalPolicy,
     pub editor: EditorConfig,
     pub chief: ChiefConfig,
     pub steer: SteerConfig,
@@ -411,6 +416,7 @@ impl Default for Config {
                 agent("codex", &["codex"], AgentKind::Generic, Some("esc to interrupt")),
                 agent("shell", &[], AgentKind::Shell, None),
             ],
+            approvals: crate::approvals::ApprovalPolicy::default(),
             editor: EditorConfig::default(),
             chief: ChiefConfig::default(),
             steer: SteerConfig::default(),

@@ -96,6 +96,7 @@ impl Listener {
 }
 
 pub struct Terminal {
+    process_id: u32,
     term: Arc<FairMutex<Term<Listener>>>,
     sender: EventLoopSender,
     pub shared: Arc<Shared>,
@@ -108,7 +109,21 @@ pub struct Metrics {
     pub cell: Vec2,
 }
 
+/// Remove instance routing from every terminal, including inherited bundle settings.
+fn isolated_args(program: String, args: Vec<String>) -> Vec<String> {
+    ["-u", "IMACS_SOCKET", "-u", "IMACS_PANE", "-u", "IMACS_HOME", "-u", "IMACS_CONFIG"]
+        .into_iter()
+        .map(str::to_string)
+        .chain([program])
+        .chain(args)
+        .collect()
+}
+
 impl Terminal {
+    pub fn process_id(&self) -> u32 {
+        self.process_id
+    }
+
     pub fn spawn(
         ctx: &egui::Context,
         palette: Arc<Palette>,
@@ -119,13 +134,14 @@ impl Terminal {
         scrollback: usize,
     ) -> Result<Terminal> {
         let options = tty::Options {
-            shell: Some(tty::Shell::new(program, args)),
+            shell: Some(tty::Shell::new("/usr/bin/env".into(), isolated_args(program, args))),
             working_directory: Some(cwd.to_path_buf()),
             drain_on_exit: true,
             env,
         };
         let size = WindowSize { num_lines: 24, num_cols: 80, cell_width: 8, cell_height: 16 };
         let pty = tty::new(&options, size, 0)?;
+        let process_id = pty.child().id();
         let shared = Arc::new(Shared {
             title: Mutex::new(None),
             exited: AtomicBool::new(false),
@@ -143,7 +159,7 @@ impl Terminal {
         let sender = event_loop.channel();
         let _ = listener.sender.set(sender.clone());
         event_loop.spawn();
-        Ok(Terminal { term, sender, shared, grid: (80, 24), scroll_remainder: 0.0 })
+        Ok(Terminal { process_id, term, sender, shared, grid: (80, 24), scroll_remainder: 0.0 })
     }
 
     /// Lines kept above the screen; fewer drops the oldest at once.
@@ -618,5 +634,30 @@ mod tests {
         assert_eq!(key_bytes(Key::C, Modifiers::CTRL, false).unwrap(), [3]);
         assert_eq!(key_bytes(Key::C, none, false), None);
         assert_eq!(key_bytes(Key::Delete, none, false).unwrap(), b"\x1b[3~");
+    }
+}
+
+#[cfg(test)]
+mod isolation_tests {
+    use super::*;
+
+    #[test]
+    fn children_cannot_inherit_instance_routing() {
+        let args = isolated_args("/usr/bin/env".into(), Vec::new());
+        let output = std::process::Command::new("/usr/bin/env")
+            .args(args)
+            .env("IMACS_SOCKET", "/parent/socket")
+            .env("IMACS_PANE", "parent-pane")
+            .env("IMACS_HOME", "/parent/home")
+            .env("IMACS_CONFIG", "/parent/config")
+            .env("TERM_PROGRAM", "imacs")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let env = String::from_utf8(output.stdout).unwrap();
+        for key in ["IMACS_SOCKET", "IMACS_PANE", "IMACS_HOME", "IMACS_CONFIG"] {
+            assert!(!env.lines().any(|line| line.starts_with(&format!("{key}="))), "{env}");
+        }
+        assert!(env.contains("TERM_PROGRAM=imacs"));
     }
 }

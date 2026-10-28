@@ -31,6 +31,12 @@ pub enum ControlRequest {
         #[serde(default)]
         raw: bool,
     },
+    Approve {
+        session: String,
+        decision: crate::approvals::Decision,
+        #[serde(default)]
+        message: Option<String>,
+    },
     /// The visible terminal text, last `lines` lines.
     Read {
         session: String,

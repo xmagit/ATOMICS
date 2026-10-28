@@ -6,7 +6,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -24,8 +24,46 @@ pub struct Hub {
 
 pub struct HookMessage {
     pub pane: Option<String>,
+    pub ancestors: Vec<u32>,
     pub event: HookEvent,
     pub delivered: usize,
+    pub approval_reply: Option<Arc<ApprovalReply>>,
+}
+
+#[derive(Default)]
+pub struct ApprovalReply {
+    state: Mutex<ApprovalState>,
+    ready: Condvar,
+}
+
+#[derive(Default)]
+enum ApprovalState {
+    #[default]
+    Waiting,
+    Answered(HookReply),
+    Expired,
+}
+
+impl ApprovalReply {
+    pub fn answer(&self, reply: HookReply) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if !matches!(*state, ApprovalState::Waiting) {
+            return false;
+        }
+        *state = ApprovalState::Answered(reply);
+        self.ready.notify_one();
+        true
+    }
+
+    pub fn wait(&self, timeout: Duration) -> HookReply {
+        let state = self.state.lock().unwrap();
+        let (mut state, _) =
+            self.ready.wait_timeout_while(state, timeout, |state| matches!(state, ApprovalState::Waiting)).unwrap();
+        match std::mem::replace(&mut *state, ApprovalState::Expired) {
+            ApprovalState::Answered(reply) => reply,
+            _ => HookReply::default(),
+        }
+    }
 }
 
 /// What the app answers to a control request. Diffs are computed on the socket
@@ -113,12 +151,24 @@ fn handle(stream: UnixStream, hub: &Mutex<Hub>, channels: &Channels, ctx: &egui:
     let Some(event) = HookEvent::from_payload(&request.payload) else {
         bail!("hook payload without event name or session id");
     };
-    let (reply, delivered) = hub.lock().unwrap().reply(&event);
+    let (mut reply, delivered) = hub.lock().unwrap().reply(&event);
+    let permission = event.name == "PermissionRequest";
+    let approval_reply = permission.then(|| Arc::new(ApprovalReply::default()));
+    let _ = channels.hooks.send(HookMessage {
+        pane: request.pane,
+        ancestors: request.ancestors,
+        event,
+        delivered,
+        approval_reply: approval_reply.clone(),
+    });
+    ctx.request_repaint();
+    if let Some(approval_reply) = approval_reply {
+        // After this window, leave Codex's native prompt available to the user.
+        reply = approval_reply.wait(Duration::from_secs(10));
+    }
     let mut writer = &stream;
     writer.write_all(serde_json::to_string(&reply)?.as_bytes())?;
     writer.write_all(b"\n")?;
-    let _ = channels.hooks.send(HookMessage { pane: request.pane, event, delivered });
-    ctx.request_repaint();
     Ok(())
 }
 
@@ -165,6 +215,20 @@ mod tests {
 
     fn event(name: &str) -> HookEvent {
         HookEvent::from_payload(&json!({ "hook_event_name": name, "session_id": "s1", "cwd": "/w" })).unwrap()
+    }
+
+    #[test]
+    fn permission_reply_expires_atomically_and_cannot_be_answered_twice() {
+        let reply = ApprovalReply::default();
+        assert!(reply.wait(Duration::ZERO).stdout.is_none());
+        assert!(!reply.answer(HookReply { stdout: Some("late".into()) }));
+        let reply = Arc::new(ApprovalReply::default());
+        let waiting = reply.clone();
+        let thread = std::thread::spawn(move || waiting.wait(Duration::from_secs(1)));
+        assert!(reply.answer(HookReply { stdout: Some("allowed".into()) }));
+        assert!(!reply.answer(HookReply { stdout: Some("duplicate".into()) }));
+        assert_eq!(thread.join().unwrap().stdout.as_deref(), Some("allowed"));
+        assert!(!reply.answer(HookReply::default()));
     }
 
     #[test]

@@ -103,10 +103,6 @@ fn copy_directory(old: &Path, new: &Path) -> std::io::Result<()> {
     std::fs::set_permissions(new, std::fs::metadata(old)?.permissions())
 }
 
-pub fn hook_settings_file() -> PathBuf {
-    imacs_home().join("claude-hooks.json")
-}
-
 /// Task briefs handed to agents as files (Codex is killed when its first prompt
 /// argument is about a kilobyte or longer).
 pub fn briefs_dir() -> PathBuf {
