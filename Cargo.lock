@@ -1875,6 +1875,7 @@ dependencies = [
  "eframe",
  "egui",
  "imacs-core",
+ "libc",
  "notify-debouncer-mini",
  "png",
  "rfd",

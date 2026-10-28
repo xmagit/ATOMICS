@@ -20,13 +20,7 @@ pub fn run(socket: Option<std::path::PathBuf>, pane: Option<String>) {
     let ancestors = if pane.is_none()
         && payload.get("hook_event_name").and_then(serde_json::Value::as_str) == Some("SessionStart")
     {
-        std::process::Command::new("ps")
-            .args(["-axo", "pid=,ppid="])
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|output| imacs_core::hook::ancestor_pids(std::process::id(), &String::from_utf8_lossy(&output.stdout)))
-            .unwrap_or_default()
+        ancestors()
     } else {
         Vec::new()
     };
@@ -35,6 +29,17 @@ pub fn run(socket: Option<std::path::PathBuf>, pane: Option<String>) {
         print!("{stdout}");
         let _ = std::io::stdout().flush();
     }
+}
+
+/// The parent processes of this one, nearest first, so IMACS can tell which pane started it.
+pub fn ancestors() -> Vec<u32> {
+    std::process::Command::new("ps")
+        .args(["-axo", "pid=,ppid="])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| imacs_core::hook::ancestor_pids(std::process::id(), &String::from_utf8_lossy(&output.stdout)))
+        .unwrap_or_default()
 }
 
 fn forward(request: &HookRequest, socket: std::path::PathBuf) -> Option<String> {

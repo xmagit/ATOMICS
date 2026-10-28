@@ -86,6 +86,7 @@ pub struct Channels {
     pub hooks: Sender<HookMessage>,
     pub control: Sender<ControlMessage>,
     pub usage: Sender<crate::usage::Report>,
+    pub governor: Arc<crate::governor::Governor>,
 }
 
 impl Hub {
@@ -149,7 +150,11 @@ fn handle(stream: UnixStream, hub: &Mutex<Hub>, channels: &Channels, ctx: &egui:
                 ctx.request_repaint();
             }
         }
+        (&stream).write_all(b"\n")?;
         return Ok(());
+    }
+    if value.get("cmd").and_then(Value::as_str) == Some("queue") {
+        return channels.governor.serve(&stream, &value);
     }
     if value.get("cmd").is_some() {
         let response = match serde_json::from_value::<ControlRequest>(value) {
@@ -226,6 +231,7 @@ pub fn request(request: &ControlRequest) -> Result<ControlResponse> {
 mod tests {
     use super::*;
     use serde_json::{Value, json};
+    use std::io::Read;
 
     #[test]
     fn statusline_socket_routes_account_usage_without_a_session_or_lifecycle_event() {
@@ -233,6 +239,7 @@ mod tests {
         let (hooks, hook_rx) = std::sync::mpsc::channel();
         let (control, _) = std::sync::mpsc::channel();
         let (usage, usage_rx) = std::sync::mpsc::channel();
+        let governor = Arc::new(crate::governor::Governor::new(Default::default(), None));
         writeln!(
             client,
             "{}",
@@ -241,13 +248,21 @@ mod tests {
             }}})
         )
         .unwrap();
-        handle(server, &Mutex::new(Hub::default()), &Channels { hooks, control, usage }, &egui::Context::default())
-            .unwrap();
+        handle(
+            server,
+            &Mutex::new(Hub::default()),
+            &Channels { hooks, control, usage, governor },
+            &egui::Context::default(),
+        )
+        .unwrap();
         let crate::usage::Report::Claude(usage) = usage_rx.try_recv().unwrap() else { panic!("claude report") };
         assert_eq!(usage.session.unwrap().remaining, 78.0);
         assert!(usage.weekly.is_none());
         assert!(usage.observed_at > 0);
         assert!(hook_rx.try_recv().is_err(), "usage must not change agent status");
+        let mut acknowledged = [0];
+        client.read_exact(&mut acknowledged).unwrap();
+        assert_eq!(acknowledged, *b"\n");
     }
 
     #[test]
@@ -256,9 +271,15 @@ mod tests {
         let (hooks, _) = std::sync::mpsc::channel();
         let (control, _) = std::sync::mpsc::channel();
         let (usage, usage_rx) = std::sync::mpsc::channel();
+        let governor = Arc::new(crate::governor::Governor::new(Default::default(), None));
         writeln!(client, "{}", json!({"statusline":{"session_id":"new-session"}})).unwrap();
-        handle(server, &Mutex::new(Hub::default()), &Channels { hooks, control, usage }, &egui::Context::default())
-            .unwrap();
+        handle(
+            server,
+            &Mutex::new(Hub::default()),
+            &Channels { hooks, control, usage, governor },
+            &egui::Context::default(),
+        )
+        .unwrap();
         assert!(usage_rx.try_recv().is_err());
     }
 

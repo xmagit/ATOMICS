@@ -133,11 +133,15 @@ fn read_codex(sessions: &Path) -> Option<Usage> {
     let mut file = File::open(path).ok()?;
     let length = file.metadata().ok()?.len();
     let offset = length.saturating_sub(TAIL_BYTES);
-    file.seek(SeekFrom::Start(offset)).ok()?;
+    file.seek(SeekFrom::Start(offset.saturating_sub(1))).ok()?;
+    let mut preceding = *b"\n";
+    if offset > 0 {
+        file.read_exact(&mut preceding).ok()?;
+    }
     let mut bytes = Vec::new();
     file.take(TAIL_BYTES).read_to_end(&mut bytes).ok()?;
     let tail = String::from_utf8_lossy(&bytes);
-    let tail = if offset > 0 { tail.split_once('\n')?.1 } else { &tail };
+    let tail = if preceding[0] != b'\n' { tail.split_once('\n')?.1 } else { &tail };
     tail.lines().rev().find_map(Usage::codex)
 }
 
@@ -275,6 +279,83 @@ mod tests {
         std::fs::write(&newest, format!("{}\n{event}\n{{\"partial\":", "x".repeat(TAIL_BYTES as usize))).unwrap();
         assert_eq!(read_codex(dir.path()).unwrap().session.unwrap().remaining, 85.0);
         assert!(read_codex(&dir.path().join("missing")).is_none());
+    }
+
+    #[test]
+    fn log_reader_keeps_a_complete_event_at_the_tail_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join("2026/10/28");
+        std::fs::create_dir_all(&day).unwrap();
+        let event: serde_json::Value =
+            serde_json::from_str(include_str!("../../imacs-core/tests/fixtures/codex-token-count-weekly-only.json"))
+                .unwrap();
+        let event = event.to_string();
+        let tail = format!("{event}\n{}", " ".repeat(TAIL_BYTES as usize - event.len() - 1));
+        assert_eq!(tail.len(), TAIL_BYTES as usize);
+        let path = day.join("rollout-boundary.jsonl");
+        std::fs::write(&path, format!("ignored prefix\n{tail}")).unwrap();
+        assert_eq!(read_codex(dir.path()).unwrap().weekly.unwrap().remaining, 90.0);
+        std::fs::write(&path, format!("ignored prefix{tail}")).unwrap();
+        assert!(read_codex(dir.path()).is_none(), "a fragment at the boundary is not an event");
+    }
+
+    #[test]
+    fn populated_panel_renders_remaining_reset_age_and_proportional_bars() {
+        let ctx = egui::Context::default();
+        let (_, reports) = channel();
+        let (stop, _) = channel();
+        let now = now();
+        let window = |remaining| Some(Window { remaining, resets_at: now + 8040 });
+        let panel = UsagePanel {
+            claude: Usage { session: window(76.0), weekly: window(24.0), observed_at: now - 120, plan: None },
+            codex: Usage { session: window(9.0), weekly: window(100.0), observed_at: now - 7200, plan: None },
+            reports,
+            stop,
+        };
+        let p = Palette::from_config(&ThemeConfig::default());
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(250.0, 400.0))),
+                ..Default::default()
+            },
+            |ui| panel.show(ui, &p),
+        );
+        let text: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.job.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(text.contains(&"Session  76% · resets in 2h 14m"));
+        assert!(text.contains(&"Session  9% · resets in 2h 14m"));
+        for remaining in [24, 100] {
+            let weekly =
+                format!("Weekly  {remaining}% · {}", reset_label(panel.claude.weekly.as_ref().unwrap(), true, now));
+            assert!(text.contains(&weekly.as_str()));
+        }
+        assert!(text.contains(&"2m ago") && text.contains(&"2h ago"));
+        let bars: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Rect(rect) if rect.rect.height() == 3.0 => Some(rect),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(bars.len(), 8);
+        for (pair, (remaining, color)) in bars.as_chunks::<2>().0.iter().zip([
+            (76.0, p.success),
+            (24.0, p.warning),
+            (9.0, p.error),
+            (100.0, p.success),
+        ]) {
+            assert_eq!(pair[0].fill, p.border);
+            assert_eq!(pair[1].fill, color);
+            assert!((pair[1].rect.width() / pair[0].rect.width() * 100.0 - remaining).abs() < 0.001);
+        }
+        output.drop_without_applying_deltas();
     }
 
     #[test]

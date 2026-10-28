@@ -16,6 +16,7 @@ use notify_debouncer_mini::notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_mini::{DebounceEventResult, Debouncer, new_debouncer};
 
 use crate::diff_view::{self, DiffAction, DiffState, DiffWorker, ExplorerState, Header, WorkerResult};
+use crate::governor::{Governor, Jobserver};
 use crate::highlight::Highlighter;
 use crate::ipc::{self, Channels, ControlMessage, ControlOutcome, HookMessage, Hub};
 use crate::setup::{SHELL_PATH, env_var, global_hooks_installed, install_global_hooks, resolve_program};
@@ -24,6 +25,7 @@ use crate::theme::{Palette, lerp, shortcut};
 use crate::voice::{MAX_RECORDING, Recorder};
 use imacs_core::approvals::{ApprovalRequest, Decision};
 use imacs_core::control::{ControlRequest, ControlResponse};
+use imacs_core::governor::{SlotClass, Ticket};
 use imacs_core::hook::HookReply;
 use imacs_core::plan::{self, Plan, PlanStatus, Report, Task, TaskStatus, short_slug};
 use imacs_core::workspace::{self, Workspace};
@@ -324,6 +326,12 @@ pub struct App {
     usage: crate::usage::UsagePanel,
     control_rx: Receiver<ControlMessage>,
     hook_error: Option<String>,
+    /// Machine-wide limits for the agents' heavy work.
+    governor: Arc<Governor>,
+    /// Compiler job pool every agent inherits; None when this instance does not own the socket.
+    jobserver: Option<Arc<Jobserver>>,
+    /// One-minute load average, read at most every 2 seconds.
+    load: (Instant, Option<f64>),
     busy_checked: Instant,
     approvals_checked: Instant,
     store: Store,
@@ -407,9 +415,32 @@ impl App {
         let (hook_tx, hook_rx) = channel();
         let (control_tx, control_rx) = channel();
         let (usage, usage_tx) = crate::usage::UsagePanel::new(ctx.clone());
-        let channels = Channels { hooks: hook_tx, control: control_tx, usage: usage_tx };
+        let governor = Arc::new(Governor::new(config.resources.clone(), Some(ctx.clone())));
+        let channels = Channels { hooks: hook_tx, control: control_tx, usage: usage_tx, governor: governor.clone() };
         let hook_error =
             ipc::serve(&paths::socket_path(), hub.clone(), channels, ctx.clone()).err().map(|e| format!("{e:#}"));
+        // Only the instance that owns the socket owns the pool, so a second IMACS never replaces it.
+        let mut notices = Vec::new();
+        let jobserver = match hook_error {
+            Some(_) => None,
+            None => {
+                // Only the instance that owns the socket records its runs, so second instances stay out of the log.
+                notices.extend(crate::crash::started(&paths::imacs_home()));
+                let tokens = config.resources.jobs(governor.cores);
+                match (tokens > 0).then(|| Jobserver::create(&Jobserver::path_for(&paths::imacs_home()), tokens)) {
+                    None => None,
+                    Some(Ok(jobserver)) => {
+                        let jobserver = Arc::new(jobserver);
+                        jobserver.refill_when_idle();
+                        Some(jobserver)
+                    }
+                    Some(Err(err)) => {
+                        notices.push(format!("Compiler job pool unavailable: {err:#}"));
+                        None
+                    }
+                }
+            }
+        };
         let (watch_tx, watch_rx) = channel();
         let (worktree_tx, worktree_rx) = channel();
         let (integrate_tx, integrate_rx) = channel();
@@ -450,6 +481,9 @@ impl App {
             usage,
             control_rx,
             hook_error,
+            governor,
+            jobserver,
+            load: (Instant::now() - Duration::from_secs(10), None),
             busy_checked: Instant::now(),
             approvals_checked: Instant::now() - APPROVAL_CHECK_INTERVAL,
             store: Store::load(&paths::store_file()),
@@ -516,11 +550,11 @@ impl App {
         };
         app.open_initial_projects(options.projects, options.workspace);
         app.apply_config();
-        if !options.migration_errors.is_empty() {
-            app.toast(options.migration_errors.join("\n"));
-        }
-        if let Some(error) = plan_error {
-            app.toast(error);
+        // One toast for everything startup has to say, so no notice hides another.
+        notices.splice(0..0, options.migration_errors.iter().cloned());
+        notices.extend(plan_error);
+        if !notices.is_empty() {
+            app.toast(notices.join("\n"));
         }
         app
     }
@@ -894,6 +928,7 @@ impl App {
         hub.session_context = self.config.fill(&self.config.steer.session_context);
         hub.external_prefix = self.config.steer.external_prefix.clone();
         drop(hub);
+        self.governor.set_config(self.config.resources.clone());
         let mut repos = self.open_projects.clone();
         for repo in &self.config.repos {
             let root = workspace::project_root(&paths::expand(repo)).unwrap_or_else(|_| paths::expand(repo));
@@ -903,6 +938,51 @@ impl App {
         }
         self.repos = repos;
         self.worktrees_at = None;
+    }
+
+    /// Load per core with a colour, and the pool and queue on hover.
+    fn load_gauge(&mut self, ui: &mut egui::Ui) {
+        if self.load.0.elapsed() > Duration::from_secs(2) {
+            self.load = (Instant::now(), crate::governor::load_average());
+        }
+        let Some(load) = self.load.1 else { return };
+        let p = self.palette.clone();
+        let per_core = load / self.governor.cores as f64;
+        let color = if per_core >= 1.0 {
+            p.error
+        } else if per_core >= 0.7 {
+            p.warning
+        } else {
+            p.muted
+        };
+        let (running, waiting) = self.governor.snapshot();
+        let mut hover = format!("Load {load:.1} on {} cores", self.governor.cores);
+        match &self.jobserver {
+            Some(jobserver) => hover.push_str(&format!("\nCompilers of all agents share {} jobs", jobserver.tokens())),
+            None => hover.push_str("\nNo shared compiler job pool"),
+        }
+        for class in [SlotClass::Test, SlotClass::Qa] {
+            let busy = running.iter().filter(|t| t.class == class).count();
+            let queued = waiting.iter().filter(|t| t.class == class).count();
+            hover.push_str(&format!(
+                "\n{} slots: {busy}/{} in use, {queued} waiting",
+                class.name(),
+                self.governor.slots(class)
+            ));
+        }
+        ui.label(RichText::new(format!("load {load:.1}")).color(color).size(12.0)).on_hover_text(hover);
+    }
+
+    fn resources_json(&self) -> serde_json::Value {
+        let (running, waiting) = self.governor.snapshot();
+        json!({
+            "cores": self.governor.cores,
+            "load": crate::governor::load_average(),
+            "jobs": self.jobserver.as_ref().map(|j| j.tokens()),
+            "slots": { "test": self.governor.slots(SlotClass::Test), "qa": self.governor.slots(SlotClass::Qa) },
+            "running": running,
+            "waiting": waiting,
+        })
     }
 
     fn toast(&mut self, text: impl Into<String>) {
@@ -1052,6 +1132,17 @@ impl App {
         if let Some(path) = SHELL_PATH.as_ref() {
             env.insert("PATH".into(), path.clone());
         }
+        // `imacs queue` in an agent resolves to this IMACS, and its compilers share one job pool.
+        if let Some(dir) = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf)) {
+            let path = env.get("PATH").cloned().or_else(|| std::env::var("PATH").ok()).unwrap_or_default();
+            // An empty entry would put the current directory on PATH.
+            let path = if path.is_empty() { dir.display().to_string() } else { format!("{}:{path}", dir.display()) };
+            env.insert("PATH".into(), path);
+        }
+        if let Some(jobserver) = &self.jobserver {
+            env.extend(jobserver.env());
+        }
+        env.extend(compile_cache_env(&cwd));
 
         let (program, mut args) = match agent.command.split_first() {
             Some((program, rest)) => (program.clone(), rest.to_vec()),
@@ -1149,6 +1240,12 @@ impl App {
             _ => None,
         };
         let program = resolve_program(&program);
+        let nice = self.config.resources.agent_nice;
+        let (program, args) = if !chief && agent.kind != AgentKind::Shell && nice != 0 {
+            ("nice".to_string(), ["-n".to_string(), nice.to_string(), program].into_iter().chain(args).collect())
+        } else {
+            (program, args)
+        };
         match Terminal::spawn(ctx, self.palette.clone(), program, args, &cwd, env, self.config.terminal.scrollback) {
             Ok(terminal) => {
                 let mut session = Session::starting(id.clone(), &agent, cwd, chief);
@@ -1209,6 +1306,10 @@ impl App {
             "claude_session_id": s.claude_id,
             "last_prompt": s.last_prompt,
             "approval": s.approvals.first().map(|p| &p.request),
+            "queue": s.terminal.as_ref().and_then(|t| {
+                let (running, waiting) = self.governor.snapshot();
+                queue_note(t.process_id(), &running, &waiting)
+            }),
             "diff": stats,
         })
     }
@@ -1253,6 +1354,7 @@ impl App {
                 done(ControlResponse::ok(json!({
                     "active": self.active,
                     "plan_view": self.plan_view,
+                    "resources": self.resources_json(),
                     "visible": self.visible_sessions().iter().map(|&i| &self.sessions[i].id).collect::<Vec<_>>(),
                     "chief": { "open": self.chief_open, "dock": self.chief_dock(), "width": self.store.chief_width },
                     "window": [window.x, window.y],
@@ -3685,6 +3787,7 @@ impl App {
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.menu_button("Settings", |ui| self.settings_menu(ui));
+                self.load_gauge(ui);
                 ui.menu_button("Project", |ui| self.project_menu(ui));
                 let (done, total) = (
                     self.plans[self.selected_plan].count(TaskStatus::Done),
@@ -4170,6 +4273,7 @@ impl App {
         let mut resume: Option<usize> = None;
         let focus_request = self.focus_terminal.take();
         let now = ui.input(|i| i.time);
+        let (slots_running, slots_waiting) = self.governor.snapshot();
 
         for (slot, &index) in tiled.iter().enumerate() {
             let min = rect.min + vec2((slot % cols) as f32 * size.x, (slot / cols) as f32 * size.y);
@@ -4196,10 +4300,15 @@ impl App {
             let title_response =
                 ui.interact(title_rect, ui.scope_id().with(("tile-title", &session.id)), Sense::click());
             let title_color = if title_response.hovered() || active { p.accent } else { p.foreground };
-            let subtitle = match session.branch() {
+            let mut subtitle = match session.branch() {
                 Some(branch) => format!("{} · {} · {}", session.agent, branch, session.status.label()),
                 None => format!("{} · {}", session.agent, session.status.label()),
             };
+            if let Some(note) =
+                session.terminal.as_ref().and_then(|t| queue_note(t.process_id(), &slots_running, &slots_waiting))
+            {
+                subtitle.push_str(&format!(" · {note}"));
+            }
             let galley = ui.fonts_mut(|f| f.layout_no_wrap(session.title.clone(), p.ui(13.0), title_color));
             let title_width = galley.size().x;
             ui.painter().with_clip_rect(title_rect).galley(
@@ -4952,6 +5061,8 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self) {
+        // macOS never returns from the event loop after Cmd+Q, so the clean exit is recorded here.
+        crate::crash::exited(&paths::imacs_home());
         for editor in self.editors.values() {
             editor.shutdown();
         }
@@ -4960,7 +5071,10 @@ impl eframe::App for App {
                 terminal.shutdown();
             }
         }
-        let _ = std::fs::remove_file(paths::socket_path());
+        // A second instance never owned the socket; removing it would cut the first off.
+        if self.hook_error.is_none() {
+            let _ = std::fs::remove_file(paths::socket_path());
+        }
     }
 }
 
@@ -5242,6 +5356,34 @@ const CHIEF_ALLOWED_TOOLS: &[&str] = &[
     "mcp__imacs__imacs_open",
 ];
 
+/// RUSTC_WRAPPER for sccache when it is installed and neither the user nor the project under
+/// `cwd` chose a wrapper (an exported variable would override their cargo config).
+fn compile_cache_env(cwd: &Path) -> Vec<(String, String)> {
+    let user_config = std::env::var_os("CARGO_HOME").map(PathBuf::from).unwrap_or_else(|| paths::home().join(".cargo"));
+    let configs = cwd.ancestors().map(|dir| dir.join(".cargo")).chain([user_config]);
+    let wrapper_set = ["RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER"].iter().any(|var| std::env::var_os(var).is_some())
+        || configs.into_iter().any(|dir| {
+            ["config.toml", "config"]
+                .iter()
+                .any(|name| std::fs::read_to_string(dir.join(name)).is_ok_and(|text| text.contains("rustc-wrapper")))
+        });
+    let sccache = resolve_program("sccache");
+    if wrapper_set || !Path::new(&sccache).is_absolute() {
+        return Vec::new();
+    }
+    vec![("RUSTC_WRAPPER".into(), sccache), ("SCCACHE_IGNORE_SERVER_IO_ERROR".into(), "1".into())]
+}
+
+/// What the slot queue holds for the process tree under `pid`.
+fn queue_note(pid: u32, running: &[Ticket], waiting: &[Ticket]) -> Option<String> {
+    if let Some(ticket) = running.iter().find(|t| t.ancestors.contains(&pid)) {
+        return Some(format!("{} slot", ticket.class.name()));
+    }
+    let ticket = waiting.iter().find(|t| t.ancestors.contains(&pid))?;
+    let place = waiting.iter().filter(|t| t.class == ticket.class).position(|t| t.id == ticket.id)? + 1;
+    Some(format!("queued for a {} slot ({place} in line)", ticket.class.name()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5313,6 +5455,59 @@ mod tests {
         assert!(readme.contains("`allow_always` for the rest"));
         assert!(!readme.contains("or answer other agents'"));
         assert!(readme.contains("outside Codex's sandbox"));
+    }
+
+    #[test]
+    fn queue_notes_name_the_slot_or_the_place_in_line() {
+        let ticket =
+            |id, class, ancestors: &[u32]| Ticket { id, class, label: String::new(), ancestors: ancestors.to_vec() };
+        let running = [ticket(1, SlotClass::Test, &[10, 1])];
+        let waiting =
+            [ticket(2, SlotClass::Qa, &[30]), ticket(3, SlotClass::Test, &[40]), ticket(4, SlotClass::Test, &[50])];
+        assert_eq!(queue_note(10, &running, &waiting).as_deref(), Some("test slot"));
+        assert_eq!(queue_note(50, &running, &waiting).as_deref(), Some("queued for a test slot (2 in line)"));
+        assert_eq!(queue_note(30, &running, &waiting).as_deref(), Some("queued for a qa slot (1 in line)"));
+        assert_eq!(queue_note(99, &running, &waiting), None);
+    }
+
+    #[test]
+    fn agents_share_the_job_pool_at_lower_priority() {
+        with_app("app::tests::agents_share_the_job_pool_at_lower_priority", |app, ctx| {
+            let dir = tempfile::tempdir().unwrap();
+            let out = dir.path().join("probe");
+            let script = format!("ps -o nice= -p $$ > {0}.nice; env > {0}.tmp; mv {0}.tmp {0}; sleep 5", out.display());
+            app.config.agents.push(imacs_core::config::AgentConfig {
+                name: "probe".into(),
+                command: vec!["/bin/sh".into(), "-c".into(), script],
+                kind: AgentKind::Generic,
+                busy_text: None,
+            });
+            app.config.resources.agent_nice = 7;
+            // SAFETY: querying this process's priority has no preconditions.
+            let inherited_nice = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+            app.start(ctx, "probe", dir.path().into(), None, vec![], None).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !out.exists() {
+                assert!(Instant::now() < deadline, "the probe agent never wrote its environment");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let env = std::fs::read_to_string(&out).unwrap();
+            let pool = format!("-j --jobserver-auth=fifo:{}", Jobserver::path_for(&paths::imacs_home()).display());
+            assert!(env.lines().any(|line| line == format!("CARGO_MAKEFLAGS={pool}")), "{env}");
+            // MAKEFLAGS may be inherited from whatever started the tests; this pool must never be in it.
+            let pool_path = Jobserver::path_for(&paths::imacs_home()).display().to_string();
+            assert!(
+                !env.lines().any(|line| line.starts_with("MAKEFLAGS=") && line.contains(&pool_path)),
+                "plain make must not see the pool: {env}"
+            );
+            let exe_dir = std::env::current_exe().unwrap().parent().unwrap().display().to_string();
+            assert!(env.lines().any(|line| line.starts_with(&format!("PATH={exe_dir}:"))), "{env}");
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("probe.nice")).unwrap().trim(),
+                (inherited_nice + 7).min(19).to_string()
+            );
+            app.sessions.clear();
+        });
     }
 
     #[test]

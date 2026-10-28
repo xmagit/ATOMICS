@@ -3,8 +3,10 @@
 mod test_support;
 
 mod app;
+mod crash;
 mod diff_view;
 mod doctor;
+mod governor;
 mod highlight;
 mod hook_client;
 mod ipc;
@@ -78,6 +80,14 @@ enum Command {
     },
     /// Send one control request to the running IMACS, e.g. '{"cmd":"list"}'
     Ctl { json: String },
+    /// Run a heavy command, such as a full test run or a QA instance, once IMACS has a free slot
+    Queue {
+        #[arg(long, default_value = "test", value_parser = ["test", "qa"])]
+        class: String,
+        /// The command, after `--`
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
 }
 
 /// Markers of the Claude Code or Codex session IMACS may have been started from. Agents
@@ -153,6 +163,10 @@ fn main() -> eframe::Result {
             mcp::run(agent);
             return Ok(());
         }
+        Some(Command::Queue { class, command }) => {
+            let class = imacs_core::governor::SlotClass::parse(&class).unwrap_or(imacs_core::governor::SlotClass::Test);
+            std::process::exit(governor::run_queued(&imacs_core::paths::socket_path(), class, &command));
+        }
         Some(Command::Ctl { json }) => {
             let response = serde_json::from_str::<imacs_core::control::ControlRequest>(&json)
                 .map_err(anyhow::Error::from)
@@ -168,6 +182,7 @@ fn main() -> eframe::Result {
         }
         None => {}
     }
+    crash::install(&imacs_core::paths::imacs_home());
 
     let open = cli
         .open

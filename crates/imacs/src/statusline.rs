@@ -18,7 +18,12 @@ pub fn run(socket: PathBuf) {
     let Ok(payload) = serde_json::from_slice::<Value>(&input) else { return };
     if let Ok(mut stream) = UnixStream::connect(socket) {
         let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
-        let _ = writeln!(stream, "{}", json!({"statusline": payload}));
+        if stream.set_read_timeout(Some(Duration::from_secs(1))).is_ok()
+            && writeln!(stream, "{}", json!({"statusline": payload})).is_ok()
+        {
+            // Keep the socket open until IMACS has read the report.
+            let _ = stream.read(&mut [0]);
+        }
     }
     let config_dir = std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)

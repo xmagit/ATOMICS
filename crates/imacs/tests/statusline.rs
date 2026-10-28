@@ -43,7 +43,7 @@ fn statusline_forwards_live_input_and_preserves_user_stdout_even_without_imacs()
         )
         .unwrap();
         child.child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
-        let stream = loop {
+        let mut stream = loop {
             child.check_timeout().unwrap();
             match listener.accept() {
                 Ok((stream, _)) => break stream,
@@ -53,13 +53,15 @@ fn statusline_forwards_live_input_and_preserves_user_stdout_even_without_imacs()
                 Err(err) => panic!("statusline socket: {err}"),
             }
         };
+        stream.set_nonblocking(false).unwrap();
         stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let mut line = String::new();
-        BufReader::new(stream).read_line(&mut line).unwrap();
+        BufReader::new(&stream).read_line(&mut line).unwrap();
         assert_eq!(
             serde_json::from_str::<Value>(&line).unwrap()["statusline"],
             serde_json::from_str::<Value>(&input).unwrap()
         );
+        stream.write_all(b"\n").unwrap();
         let output = child.wait_output().unwrap();
         assert!(output.status.success());
         if custom {

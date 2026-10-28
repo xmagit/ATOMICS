@@ -96,7 +96,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn supplied_provider_samples_parse_without_requiring_unrelated_fields() {
+    fn documented_claude_and_captured_codex_samples_parse_without_unrelated_fields() {
         // https://code.claude.com/docs/en/statusline (rate_limits excerpt).
         let claude: Value = serde_json::from_str(include_str!("../tests/fixtures/claude-statusline.json")).unwrap();
         let claude = Usage::claude(&claude, 1);

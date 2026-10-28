@@ -11,6 +11,7 @@ pub mod control;
 pub mod diff;
 pub mod files;
 pub mod git;
+pub mod governor;
 pub mod hook;
 pub mod layout;
 pub mod paths;

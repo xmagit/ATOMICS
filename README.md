@@ -198,6 +198,38 @@ stays beside the fleet. Updating or dispatching another plan marks its tab with 
 view and chief. Creating a new plan selects its tab. Each fleet shows only sessions linked to that plan’s tasks.
 Click the plan tab later to return to that overview, or choose All or a project tab to see other sessions.
 
+## Running many agents
+
+Every agent works in its own worktree with its own `target/`, so its builds never wait on another's. What they
+share is the machine, and IMACS keeps that in check for every agent it starts (`[resources]` in the config):
+
+- **One compiler job pool.** IMACS owns a GNU make jobserver (a named pipe in a private folder under `/tmp`, which
+  Codex's sandbox can open) with `jobs` tokens, cores minus 2 by default, and hands it to every agent terminal as
+  `CARGO_MAKEFLAGS`. cargo takes a token per job, so ten agents building at once share those jobs instead of each
+  using every core. `MAKEFLAGS` is left alone, since `make` before GNU make 4.4 misreads a pipe jobserver. A job
+  killed while holding a token never returns it, so whenever no compiler or build script runs, IMACS resets the
+  pool to full. cargo passes the pool on to build scripts, and a build script that runs Apple's `make` 3.81 (some
+  `-sys` crates, vendored OpenSSL) stops with "invalid --jobserver-fds"; set `jobs = 0` to turn the pool off, or put
+  GNU make 4.4 first on PATH.
+- **A queue for heavy work.** `imacs queue --class test -- cargo test` waits for a free test slot (one per 6 cores
+  by default), runs the command and passes its exit code through. `--class qa` is for app instances started for
+  screenshots. The slot is released when the command ends or its process dies. Tiles show `queued for a test slot
+  (2 in line)`, and the approval policy judges a queued command by the command it runs (only a bare `imacs`
+  counts). Without a running IMACS the command runs right away; while IMACS restarts, waiting commands reconnect
+  and queue again instead of all running at once. A sandbox that blocks the IMACS socket (Codex's does) gets a
+  clear error and exit code 75: run the command outside the sandbox. Queued commands may wait, so give them a long
+  timeout.
+- **Lower priority.** Agent terminals start at niceness `agent_nice` (10), so IMACS and your desktop stay responsive.
+- **A shared compiler cache.** When sccache is installed and you have no `rustc-wrapper` of your own, agents get
+  `RUSTC_WRAPPER=sccache`, so dependencies compile once for all worktrees (with
+  `SCCACHE_IGNORE_SERVER_IO_ERROR=1`, a sandboxed build that cannot reach the cache compiles locally instead).
+- **Tests at the end.** Every brief asks agents to use `cargo check` and the tests they touch while working, and to run
+  the full suite once, at the end, through `imacs queue`.
+
+The `load` gauge in the top bar shows the 1-minute load per core (grey, then yellow from 0.7 and red from 1.0); hover
+for the pool size and the slots in use. If IMACS ever ends without a clean quit, the next start says so and
+`~/.imacs/crash.log` has the panic and its backtrace when there was one.
+
 ## Voice
 
 Press `cmd+shift+space` and speak; press it again to send. The recording from the default microphone is transcribed
