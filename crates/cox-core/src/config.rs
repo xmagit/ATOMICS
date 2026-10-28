@@ -79,6 +79,12 @@ inlay_hints_keys = [":toggle lsp.display-inlay-hints\r"]
 # Typed once when an editor starts. base16_transparent uses cox's own colors. [] to keep yours.
 startup_keys = [":theme base16_transparent\r"]
 
+[chief]
+# The chief agent: an orchestrator in the middle of the screen (cmd+o) with every cox tool.
+command = ["claude"]
+args = ["--model", "claude-opus-5-5"]
+# system_prompt = "..."   # built in: plan, wait for approval, dispatch, verify, integrate
+
 [steer]
 # Added to every Claude session started or seen by cox (SessionStart hook).
 session_context = "This session runs inside cox. The user reviews this worktree's diff against {base_ref} live and may send review comments or steering messages while you work. Messages that arrive mid-turn are delivered as hook context and come directly from the user."
@@ -96,6 +102,7 @@ close_session = "cmd+w"
 quick_open = "cmd+p"
 toggle_editor = "cmd+e"
 toggle_plan = "cmd+b"
+toggle_chief = "cmd+o"
 "##;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,8 +116,47 @@ pub struct Config {
     pub theme: ThemeConfig,
     pub agents: Vec<AgentConfig>,
     pub editor: EditorConfig,
+    pub chief: ChiefConfig,
     pub steer: SteerConfig,
     pub keys: KeyConfig,
+}
+
+/// How the chief agent works, given to it as an appended system prompt.
+/// `{projects}` and `{base_ref}` are filled in.
+pub const CHIEF_PROMPT: &str = "You are the chief agent of IMACS (cox): you orchestrate coding agents for the user, who watches \
+every agent, diff and the plan board in the same window. Open projects: {projects}. Diffs are taken against {base_ref}.
+
+How to work:
+1. Understand the goal and read the code you need. You run in the project's main checkout: read it, never edit it.
+2. Write the plan with cox_plan_set: small tasks, each with a brief (context, files, constraints), acceptance checks you \
+can verify, dependencies, the agent (claude for design-heavy work, codex for well-specified changes) and its args. \
+Ask the user to approve it on the plan board. Never dispatch before approval.
+3. cox_plan_dispatch, then loop on cox_wait (never sleep or poll). On reported or turn done, read cox_result and cox_diff.
+4. Verify every acceptance check yourself: run the build and tests in the task's worktree and read the diff. When \
+something is missing, steer with cox_comment + cox_send_review or cox_send and move the task back to running. Accept \
+with cox_plan_update (status done, a note saying what you verified).
+5. Integrate accepted work locally. Every plan ends with a review task: a fresh agent reviews all of the plan's work, \
+including yours. Send its blocking findings back to the tasks they concern, and only then ask the user to open the pull \
+requests. Never push, open pull requests or delete branches without the user's OK.
+
+Keep briefs, notes and messages short: the user reads them on the board.";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChiefConfig {
+    pub command: Vec<String>,
+    pub args: Vec<String>,
+    pub system_prompt: String,
+}
+
+impl Default for ChiefConfig {
+    fn default() -> Self {
+        Self {
+            command: vec!["claude".into()],
+            args: vec!["--model".into(), "claude-opus-5-5".into()],
+            system_prompt: CHIEF_PROMPT.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -212,6 +258,7 @@ pub struct KeyConfig {
     pub quick_open: String,
     pub toggle_editor: String,
     pub toggle_plan: String,
+    pub toggle_chief: String,
 }
 
 /// A parsed shortcut such as `cmd+shift+d`. `cmd` means Command on macOS and Ctrl elsewhere.
@@ -245,6 +292,7 @@ impl Default for Config {
                 agent("shell", &[], AgentKind::Shell, None),
             ],
             editor: EditorConfig::default(),
+            chief: ChiefConfig::default(),
             steer: SteerConfig::default(),
             keys: KeyConfig::default(),
         }
@@ -300,6 +348,7 @@ impl Default for KeyConfig {
             quick_open: "cmd+p".into(),
             toggle_editor: "cmd+e".into(),
             toggle_plan: "cmd+b".into(),
+            toggle_chief: "cmd+o".into(),
         }
     }
 }

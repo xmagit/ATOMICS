@@ -110,6 +110,9 @@ pub enum ControlRequest {
         status: Option<String>,
         #[serde(default)]
         note: Option<String>,
+        /// Links the task to another agent session (after restarting its agent).
+        #[serde(default)]
+        session: Option<String>,
     },
     /// Starts the given task, or every ready task, each in a new worktree.
     PlanDispatch {
