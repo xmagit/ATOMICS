@@ -40,6 +40,13 @@ fn frame(app: &mut App, ctx: &egui::Context, width: f32, time: f64, events: Vec<
 }
 
 fn populate(app: &mut App) {
+    let agent = imacs_core::config::AgentConfig {
+        name: "codex".into(),
+        command: vec![],
+        kind: AgentKind::Generic,
+        busy_text: None,
+    };
+    app.sessions = vec![Session::starting("existing-session".into(), &agent, app.launch_dir.clone(), false)];
     let tasks = TaskStatus::ALL
         .into_iter()
         .enumerate()

@@ -6,6 +6,8 @@
 mod test_support;
 
 pub mod approvals;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod cleanup;
 pub mod config;
 pub mod control;
 pub mod diff;
@@ -13,6 +15,7 @@ pub mod doctor;
 pub mod files;
 pub mod git;
 pub mod governor;
+pub mod heartbeat;
 pub mod hook;
 pub mod layout;
 pub mod paths;

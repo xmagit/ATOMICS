@@ -76,6 +76,10 @@ kind = "shell"
 # Simple command prefixes, within the session worktree. [] makes every request wait.
 allow = ["ls", "cat", "rg", "git status", "git diff", "git log"]
 
+[plan]
+# Close accepted, integrated agents automatically. Worktrees remain available.
+close_done_agents = true
+
 [resources]
 # Heavy work shared by every agent IMACS starts. Compilers share one jobserver pool, and whole
 # test runs or QA instances wait for a slot through `imacs queue --class test|qa -- <command>`.
@@ -97,6 +101,7 @@ startup_keys = [":theme base16_transparent\r"]
 
 [chief]
 # The chief agent (cmd+o), floating or docked beside the agents.
+heartbeat_secs = 300         # fleet checks, delivered through imacs_wait
 dock = "floating"   # "floating" or "docked"
 command = ["claude"]
 args = ["--model", "claude-opus-5-5"]
@@ -146,12 +151,25 @@ pub struct Config {
     pub theme: ThemeConfig,
     pub agents: Vec<AgentConfig>,
     pub approvals: crate::approvals::ApprovalPolicy,
+    pub plan: PlanConfig,
     pub resources: crate::governor::ResourceConfig,
     pub editor: EditorConfig,
     pub chief: ChiefConfig,
     pub steer: SteerConfig,
     pub voice: VoiceConfig,
     pub keys: KeyConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PlanConfig {
+    pub close_done_agents: bool,
+}
+
+impl Default for PlanConfig {
+    fn default() -> Self {
+        Self { close_done_agents: true }
+    }
 }
 
 /// How the chief agent works, given to it as an appended system prompt.
@@ -166,6 +184,7 @@ can verify, dependencies, the agent (claude for design-heavy work, codex for wel
 Without a plan id, imacs_plan_set creates a separate plan. Keep its returned id and pass plan to every plan tool. \
 Ask the user to approve it on its own plan board. Never dispatch before approval.
 3. imacs_plan_dispatch, then loop on imacs_wait (never sleep or poll). On reported or turn done, read imacs_result and imacs_diff.
+Include heartbeat in imacs_wait statuses. On a heartbeat with no findings, post one short line; otherwise act on the findings.
 When an event contains approval, use imacs_approve with its session id to answer that request, regardless of the selected plan tab.
 4. Verify every acceptance check yourself: run the build and tests in the task's worktree and read the diff. When \
 something is missing, steer with imacs_comment + imacs_send_review or imacs_send and move the task back to running. Accept \
@@ -192,6 +211,7 @@ pub enum ChiefDock {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ChiefConfig {
+    pub heartbeat_secs: u64,
     pub dock: ChiefDock,
     pub command: Vec<String>,
     pub args: Vec<String>,
@@ -201,6 +221,7 @@ pub struct ChiefConfig {
 impl Default for ChiefConfig {
     fn default() -> Self {
         Self {
+            heartbeat_secs: 300,
             dock: ChiefDock::Floating,
             command: vec!["claude".into()],
             args: vec!["--model".into(), "claude-opus-5-5".into()],
@@ -226,6 +247,22 @@ impl Default for EditorConfig {
             inlay_hints_keys: vec![":toggle lsp.display-inlay-hints\r".into()],
             startup_keys: vec![":theme base16_transparent\r".into()],
         }
+    }
+}
+
+impl EditorConfig {
+    pub fn open_steps(&self, path: &str, line: Option<u32>, fresh: bool) -> Vec<String> {
+        let mut steps = vec!["\x1b".into()];
+        if fresh {
+            steps.extend(self.startup_keys.clone());
+        }
+        steps.extend(
+            self.open_keys
+                .iter()
+                .filter(|step| (line.is_some() || !step.contains("{line}")) && (!fresh || step.contains("{line}")))
+                .map(|step| step.replace("{path}", path).replace("{line}", &line.unwrap_or(1).to_string())),
+        );
+        steps
     }
 }
 
@@ -433,6 +470,7 @@ impl Default for Config {
                 agent("shell", &[], AgentKind::Shell, None),
             ],
             approvals: crate::approvals::ApprovalPolicy::default(),
+            plan: PlanConfig::default(),
             resources: crate::governor::ResourceConfig::default(),
             editor: EditorConfig::default(),
             chief: ChiefConfig::default(),
@@ -563,6 +601,26 @@ mod tests {
     use crate::layout::DiffSplit;
 
     #[test]
+    fn automatic_agent_closing_defaults_on_and_can_be_disabled() {
+        let old: Config = toml::from_str("").unwrap();
+        assert!(old.plan.close_done_agents);
+        let disabled: Config = toml::from_str("[plan]\nclose_done_agents = false").unwrap();
+        assert!(!disabled.plan.close_done_agents);
+    }
+
+    #[test]
+    fn editor_open_steps_escape_insert_mode_before_open_and_fresh_line_jump() {
+        let config = EditorConfig::default();
+        assert_eq!(config.open_steps("README.md", Some(42), false), ["\x1b", ":open README.md\r", ":goto 42\r"]);
+        assert_eq!(config.open_steps("README.md", None, false), ["\x1b", ":open README.md\r"]);
+        assert_eq!(
+            config.open_steps("README.md", Some(42), true),
+            ["\x1b", ":theme base16_transparent\r", ":goto 42\r"]
+        );
+        assert_eq!(config.open_steps("README.md", None, true), ["\x1b", ":theme base16_transparent\r"]);
+    }
+
+    #[test]
     fn default_config_file_matches_built_in_defaults() {
         let parsed: Config = toml::from_str(DEFAULT_CONFIG).unwrap();
         let built_in = Config::default();
@@ -579,6 +637,14 @@ mod tests {
         assert_eq!(config.layout.sidebar_width, LayoutConfig::default().sidebar_width);
         assert_eq!(config.font.size, 13.0);
         assert_eq!(config.terminal.scrollback, 5000);
+    }
+
+    #[test]
+    fn heartbeat_interval_defaults_and_parses() {
+        assert_eq!(Config::default().chief.heartbeat_secs, 300);
+        let config: Config = toml::from_str("[chief]\nheartbeat_secs = 7").unwrap();
+        assert_eq!(config.chief.heartbeat_secs, 7);
+        assert!(CHIEF_PROMPT.contains("On a heartbeat with no findings, post one short line"));
     }
 
     #[test]

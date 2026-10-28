@@ -151,6 +151,12 @@ to reset it. Mode and width are remembered; `[chief] dock = "floating"` (or `"do
 `cmd+o` shows or hides either mode. On narrow windows the chief floats instead, then docks again when the window widens.
 `cmd+shift+space` dictates to it.
 
+Every `[chief] heartbeat_secs` (default 300 seconds), IMACS checks every open plan for missing or exited
+agents, agents idle or turn-done for over ten minutes without a report since that status began, pending approvals
+or Codex menus, messages held for over a minute, and working agents without an event for fifteen minutes. Include
+`heartbeat` in `imacs_wait` statuses to receive one fleet event with a `findings` list; an empty list means all good.
+The chief pill shows a compact age and a dot when that check found something; hover for the full local check time.
+
 The chief may read, plan, review and run the plan you approved without asking. It can also answer other
 agents' permission prompts through the pre-approved `imacs_approve`, including `allow_always` for the rest
 of a session. Starting agents, typing into terminals and closing sessions still ask for permission.
@@ -175,13 +181,19 @@ blocked or has a question. Reports land on the task card, move done tasks to rev
 Plans are stored separately in `~/.imacs/plans/<id>.json`, with status `open`, `completed` or `archived`. The old
 `~/.imacs/plan.json` migrates once and is kept as `plan.json.migrated`; an old plan whose tasks are all done
 migrates as completed. Saves replace files atomically, and unreadable plan files are listed in the startup message.
-Only open plans get tabs. Select a tab to see
+Open and completed plans get tabs; archived plans are hidden. Select a tab to see
 that plan’s sessions; `cmd+b` opens its board. Other sessions remain under All and their project tabs. Each plan has
 its own approval and automatic final review. Use `imacs_plan_close {plan, status: "completed" | "archived"}` or
 **Complete plan** / **Archive plan** on the board to close it after confirmation. Reopen either kind from
 **Closed plans** beside the plan tabs; approval and task history are preserved. Its history remains available by id, and once only
 one plan is open, mutation tools can omit its id again. Start the next plan while another finishes; the chief is never closed.
 `imacs_wait` events include `plan` and `task` ids for sessions belonging to a task.
+
+Open a completed plan’s ✓ tab and its board. **Clean up plan…** previews only its recorded
+task and integration branches and their worktrees. Once the integration branch or every task branch is contained
+in the configured base (usually main), select the entries to remove. Uncommitted changes, unmerged commits and
+worktrees used by agent sessions are kept with a reason. Removal rechecks the preview and never forces Git;
+branches without worktrees can be removed too. The saved plan history stays available.
 
 Tasks come together on the plan's **integration branch** (`imacs/plan-<plan-id>` unless the plan names one; the board
 shows it). `imacs_plan_integrate` (or **integrate** on a review or done card) commits whatever the task left uncommitted
@@ -198,6 +210,12 @@ Dispatching the selected plan returns from its board to its fleet and minimizes 
 stays beside the fleet. Updating or dispatching another plan marks its tab with `*` and preserves the selected
 view and chief. Creating a new plan selects its tab. Each fleet shows only sessions linked to that plan’s tasks.
 Click the plan tab later to return to that overview, or choose All or a project tab to see other sessions.
+
+Accepting an integrated task closes its agent; tasks without a branch, including the final review, close on acceptance.
+Its completed tile fills an otherwise empty grid cell, showing the duration, last report, diff size, **diff** and
+**resume**. Live agents keep their tile sizes and priority. Idle agents waiting for review show when they reported.
+When every task is accepted, the plan tab shows ✓ and its board offers **Archive plan**. The chief stays running and
+worktrees remain for the existing **clean up…** flow. Set `[plan] close_done_agents = false` to keep agents running.
 
 ## Running many agents
 
