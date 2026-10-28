@@ -15,9 +15,12 @@ pub mod approvals;
 pub mod config;
 pub mod control;
 pub mod diff;
+pub mod doctor;
 pub mod files;
 #[cfg(feature = "native")]
 pub mod git;
+pub mod governor;
+pub mod heartbeat;
 pub mod hook;
 pub mod layout;
 #[cfg(feature = "native")]
@@ -26,6 +29,7 @@ pub mod plan;
 pub mod session;
 pub mod steer;
 pub mod store;
+pub mod usage;
 #[cfg(feature = "native")]
 pub mod voice;
 pub mod workspace;

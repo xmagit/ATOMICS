@@ -150,8 +150,17 @@ pub struct Task {
     pub status: TaskStatus,
     /// Integration branch this task was successfully merged into.
     pub integrated: Option<String>,
+    /// Latest background ancestry check; rechecked after loading.
+    #[serde(skip)]
+    pub integration_verified: bool,
     /// IMACS session working on it, once dispatched.
     pub session: Option<String>,
+    pub dispatched_at: Option<u64>,
+    pub finished_at: Option<u64>,
+    pub worktree: Option<std::path::PathBuf>,
+    pub resume_id: Option<String>,
+    pub additions: usize,
+    pub deletions: usize,
     pub report: Option<Report>,
     pub notes: Vec<String>,
 }
@@ -174,6 +183,20 @@ pub struct Report {
     pub status: String,
     pub summary: String,
     pub at: u64,
+}
+
+impl Task {
+    pub fn completion_line(&self) -> Option<String> {
+        let elapsed = self.finished_at?.saturating_sub(self.dispatched_at?);
+        Some(format!("Agent completed in {}m {}s", elapsed / 60, elapsed % 60))
+    }
+
+    pub fn reported_line(&self, now: u64) -> Option<String> {
+        if self.status != TaskStatus::Review {
+            return None;
+        }
+        self.report.as_ref().map(|report| format!("reported {} min ago", now.saturating_sub(report.at) / 60))
+    }
 }
 
 impl TaskStatus {
@@ -199,6 +222,37 @@ impl TaskStatus {
 pub const REVIEW_TASK: &str = "review";
 
 impl Plan {
+    /// Accepted work keeps its agent until its branch has reached this plan.
+    pub fn finish_tasks(&mut self, now: u64) -> bool {
+        let integration = self.integration_branch();
+        let mut changed = false;
+        for task in &mut self.tasks {
+            if task.status != TaskStatus::Done && task.finished_at.take().is_some() {
+                changed = true;
+                if self.status == PlanStatus::Completed {
+                    self.status = PlanStatus::Open;
+                }
+            }
+            if task.status == TaskStatus::Done
+                && (task.branch.is_none()
+                    || (task.integrated.as_deref() == Some(&integration) && task.integration_verified))
+                && task.finished_at.is_none()
+            {
+                task.finished_at = Some(now);
+                changed = true;
+            }
+        }
+        if changed
+            && self.is_open()
+            && !self.tasks.is_empty()
+            && self.tasks.iter().all(|t| t.status == TaskStatus::Done && t.finished_at.is_some())
+        {
+            self.status = PlanStatus::Completed;
+            changed = true;
+        }
+        changed
+    }
+
     pub fn is_open(&self) -> bool {
         !self.id.is_empty() && self.status == PlanStatus::Open
     }
@@ -261,6 +315,13 @@ impl Plan {
                 task.report = old.report.clone();
                 task.notes = old.notes.clone();
                 task.integrated = old.integrated.clone();
+                task.dispatched_at = old.dispatched_at;
+                task.finished_at = old.finished_at;
+                task.worktree = old.worktree.clone();
+                task.resume_id = old.resume_id.clone();
+                task.additions = old.additions;
+                task.deletions = old.deletions;
+                task.integration_verified = old.integration_verified;
                 if old.status != TaskStatus::Planned {
                     // A dispatched task's work is on its branch.
                     task.repo = old.repo.clone().or(task.repo.take());
@@ -334,7 +395,9 @@ impl Plan {
         task.depends_on
             .iter()
             .filter(|dep| {
-                !self.tasks.iter().any(|other| &other.id == *dep && other.integrated.as_deref() == Some(&into))
+                !self.tasks.iter().any(|other| {
+                    &other.id == *dep && other.integrated.as_deref() == Some(&into) && other.integration_verified
+                })
             })
             .map(String::as_str)
             .collect()
@@ -370,6 +433,7 @@ impl Task {
     pub fn set_status(&mut self, status: TaskStatus) {
         if !matches!(status, TaskStatus::Review | TaskStatus::Done) {
             self.integrated = None;
+            self.integration_verified = false;
         }
         self.status = status;
     }
@@ -390,6 +454,14 @@ impl Task {
                 text.push_str(&format!("- {}\n", check.trim()));
             }
         }
+        text.push_str(
+            "\nThis machine is shared with other agents. While you work, compile with the build tool's check command \
+             (for example `cargo check`) and run only the tests you touch. Run the full test suite once, at the end, \
+             through `imacs queue --class test -- <test command>`, and start QA app instances through \
+             `imacs queue --class qa -- <command>`; both wait for a free slot, so give them a long timeout \
+             (or run them in the background) instead of the default two minutes. In a sandbox that blocks the \
+             IMACS socket, request to run them outside the sandbox.\n",
+        );
         text.push_str(
             "\nWork only in this worktree and do not commit unless the task says so. When you are done, \
              blocked, or have a question, call the imacs_report tool with status (done, blocked or question) \
@@ -412,6 +484,78 @@ mod tests {
     use super::*;
     #[cfg(feature = "native")]
     use crate::git;
+
+    #[test]
+    fn acceptance_waits_for_integration_and_final_review_before_completing_plan() {
+        let mut plan = Plan {
+            id: "ship".into(),
+            tasks: vec![
+                Task {
+                    id: "code".into(),
+                    branch: Some("code".into()),
+                    status: TaskStatus::Done,
+                    dispatched_at: Some(100),
+                    ..Task::default()
+                },
+                Task { id: REVIEW_TASK.into(), status: TaskStatus::Review, ..Task::default() },
+            ],
+            ..Plan::default()
+        };
+        assert!(!plan.finish_tasks(890));
+        assert!(plan.tasks[0].finished_at.is_none());
+        plan.tasks[0].integrated = Some("wrong-plan".into());
+        assert!(!plan.finish_tasks(890));
+        plan.tasks[0].integrated = Some(plan.integration_branch());
+        assert!(!plan.finish_tasks(890), "an unverified integration marker must not close an agent");
+        plan.tasks[0].integration_verified = true;
+        assert!(plan.finish_tasks(890));
+        assert_eq!(plan.tasks[0].completion_line().as_deref(), Some("Agent completed in 13m 10s"));
+        assert_eq!(plan.status, PlanStatus::Open);
+        plan.tasks[1].status = TaskStatus::Done;
+        assert!(plan.finish_tasks(1000));
+        assert_eq!(plan.status, PlanStatus::Completed);
+        assert_eq!(plan.tasks[0].finished_at, Some(890));
+        assert!(!plan.finish_tasks(2000));
+        plan.tasks[0].integration_verified = false;
+        let dir = tempfile::tempdir().unwrap();
+        plan.save_in(dir.path()).unwrap();
+        assert_eq!(load_plans(dir.path()).unwrap().0, [plan.clone()]);
+        plan.status = PlanStatus::Open;
+        assert!(!plan.finish_tasks(2500));
+        assert_eq!(plan.status, PlanStatus::Open, "an explicitly reopened plan stays open");
+        plan.tasks[0].status = TaskStatus::Running;
+        assert!(plan.finish_tasks(3000));
+        assert_eq!(plan.status, PlanStatus::Open);
+        assert!(plan.tasks[0].finished_at.is_none());
+    }
+
+    #[test]
+    fn durations_reports_and_completion_metadata_survive_plan_edits() {
+        let mut task = Task {
+            id: "code".into(),
+            dispatched_at: Some(100),
+            finished_at: Some(890),
+            worktree: Some("/work".into()),
+            resume_id: Some("resume".into()),
+            additions: 412,
+            deletions: 88,
+            report: Some(Report { at: 100, ..Report::default() }),
+            ..Task::default()
+        };
+        assert_eq!(task.reported_line(1600), None);
+        task.status = TaskStatus::Review;
+        assert_eq!(task.reported_line(1600).as_deref(), Some("reported 25 min ago"));
+        assert_eq!(task.reported_line(0).as_deref(), Some("reported 0 min ago"));
+        let mut plan = Plan { tasks: vec![task.clone()], ..Plan::default() };
+        plan.replace("new goal".into(), vec![Task { id: "code".into(), ..Task::default() }]);
+        assert_eq!(plan.tasks[0], task);
+        let old: Task = serde_json::from_str(r#"{"id":"old"}"#).unwrap();
+        assert!(old.dispatched_at.is_none() && old.finished_at.is_none());
+        assert_eq!(old.completion_line(), None);
+        let mut empty = Plan { id: "empty".into(), ..Plan::default() };
+        assert!(!empty.finish_tasks(1));
+        assert_eq!(empty.status, PlanStatus::Open);
+    }
 
     fn task(id: &str, deps: &[&str]) -> Task {
         Task {
@@ -498,9 +642,15 @@ mod tests {
     #[test]
     fn leaving_review_or_done_clears_integration() {
         for status in TaskStatus::ALL {
-            let mut task = Task { status: TaskStatus::Done, integrated: Some("integration".into()), ..Task::default() };
+            let mut task = Task {
+                status: TaskStatus::Done,
+                integrated: Some("integration".into()),
+                integration_verified: true,
+                ..Task::default()
+            };
             task.set_status(status);
             assert_eq!(task.integrated.is_some(), matches!(status, TaskStatus::Review | TaskStatus::Done));
+            assert_eq!(task.integration_verified, matches!(status, TaskStatus::Review | TaskStatus::Done));
         }
     }
 
@@ -617,17 +767,14 @@ mod tests {
 
     #[test]
     fn fleet_includes_only_linked_sessions_in_any_task_state() {
-        let plan = Plan {
-            tasks: vec![
-                Task { session: Some("running".into()), status: TaskStatus::Running, ..Task::default() },
-                Task { session: Some("done".into()), status: TaskStatus::Done, ..Task::default() },
-                Task::default(),
-            ],
-            ..Plan::default()
-        };
-        let sessions = ["unrelated", "done", "chief", "running"];
-        let fleet: Vec<_> = sessions.into_iter().filter(|id| plan.contains_session(id)).collect();
-        assert_eq!(fleet, ["done", "running"]);
+        let mut plan = Plan::default();
+        for status in TaskStatus::ALL {
+            let linked = format!("linked-{}", status.label());
+            plan.tasks = vec![Task { session: Some(linked.clone()), status, ..Task::default() }, Task::default()];
+            assert!(plan.contains_session(&linked), "{status:?}");
+            assert!(!plan.contains_session("unrelated"));
+            assert!(!plan.contains_session(""), "an undispatched task must not match an empty session id");
+        }
     }
 
     #[test]
@@ -642,8 +789,13 @@ mod tests {
         assert_eq!(ready, ["c"], "done alone does not make the work available");
         assert_eq!(plan.unintegrated_dependencies(&plan.tasks[1]), ["a"]);
         plan.task_mut("a").unwrap().integrated = Some(plan.integration_branch());
+        assert!(plan.ready().iter().all(|t| t.id != "b"), "an unchecked marker is not ready");
+        plan.task_mut("a").unwrap().integration_verified = true;
         let ready: Vec<&str> = plan.ready().iter().map(|t| t.id.as_str()).collect();
         assert_eq!(ready, ["b", "c"]);
+        let loaded: Plan = serde_json::from_value(serde_json::to_value(&plan).unwrap()).unwrap();
+        assert!(!loaded.tasks[0].integration_verified, "freshness is never persisted across restarts");
+        assert_eq!(loaded.ready().iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["c"]);
         plan.integration = Some("another-integration".into());
         assert_eq!(plan.ready().iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["c"]);
     }

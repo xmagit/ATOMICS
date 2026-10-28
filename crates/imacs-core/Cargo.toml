@@ -8,7 +8,7 @@ description.workspace = true
 
 [features]
 default = ["native"]
-native = ["dep:base64", "dep:dirs", "dep:ureq"]
+native = ["dep:base64", "dep:dirs", "dep:ureq", "time/std"]
 
 [dependencies]
 anyhow = "1.0.104"
@@ -19,6 +19,8 @@ serde_json = "1.0.154"
 shlex = "2.0.1"
 similar = "3.2.1"
 toml = "1.1.8"
+# Browser usage parsing needs no clock; keep time's SystemTime helpers native.
+time = { version = "0.3.55", default-features = false, features = ["parsing"] }
 ureq = { version = "3.5.0", default-features = false, features = ["rustls"], optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]

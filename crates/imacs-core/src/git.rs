@@ -469,40 +469,60 @@ pub(crate) mod tests {
 
     #[test]
     fn worktree_creation_is_serialized_across_checkouts_of_one_repository() {
+        use std::os::unix::fs::PermissionsExt;
         use std::sync::mpsc::channel;
-        use std::time::Duration;
+        use std::time::{Duration, Instant};
 
         let (_dir, repo) = project();
         let linked = repo.with_file_name("linked");
         add_worktree(&repo, &linked, "linked", "main").unwrap();
         let lock = worktree_lock(&repo).unwrap();
         assert!(Arc::ptr_eq(&lock, &worktree_lock(&linked).unwrap()));
-        let turn = lock.lock().unwrap();
-        let (ready_tx, ready_rx) = channel();
+        let started = repo.join(".git/creation-started");
+        let release = repo.join(".git/creation-release");
+        let hook = repo.join(".git/hooks/reference-transaction");
+        std::fs::write(&hook, format!(
+            "#!/bin/sh\n[ \"$1\" = prepared ] || exit 0\n: > '{}'\nattempts=0\nwhile [ ! -f '{}' ]; do\n  attempts=$((attempts + 1))\n  [ \"$attempts\" -lt 1000 ] || exit 1\n  sleep 0.01\ndone\n",
+            started.display(), release.display(),
+        )).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
         let (tx, rx) = channel();
         std::thread::scope(|scope| {
-            for (index, checkout) in [&repo, &linked].into_iter().enumerate() {
-                let (tx, ready_tx) = (tx.clone(), ready_tx.clone());
-                let repo = &repo;
-                scope.spawn(move || {
-                    ready_tx.send(()).unwrap();
-                    let result = add_worktree_from(
-                        checkout,
-                        &repo.with_file_name(format!("task-{index}")),
-                        &format!("task-{index}"),
+            let tx_first = tx.clone();
+            let repo_first = &repo;
+            scope.spawn(move || {
+                tx_first
+                    .send(add_worktree_from(
+                        &linked,
+                        &repo_first.with_file_name("task-0"),
+                        "task-0",
                         Some("integration"),
                         "main",
-                    );
-                    tx.send(result).unwrap();
-                });
+                    ))
+                    .unwrap();
+            });
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !started.exists() {
+                assert!(Instant::now() < deadline, "worktree creation did not reach the reference hook");
+                std::thread::sleep(Duration::from_millis(10));
             }
-            ready_rx.recv().unwrap();
-            ready_rx.recv().unwrap();
-            assert!(rx.recv_timeout(Duration::from_millis(150)).is_err(), "creation must wait for its repository");
+            // Creation itself holds the common lock while git is paused in the hook.
+            assert!(matches!(lock.try_lock(), Err(std::sync::TryLockError::WouldBlock)));
+            let repo_second = &repo;
+            scope.spawn(move || {
+                tx.send(add_worktree_from(
+                    repo_second,
+                    &repo_second.with_file_name("task-1"),
+                    "task-1",
+                    Some("integration"),
+                    "main",
+                ))
+                .unwrap();
+            });
             let (_other_dir, other) = project();
             assert!(!Arc::ptr_eq(&lock, &worktree_lock(&other).unwrap()));
             add_worktree(&other, &other.with_file_name("parallel"), "parallel", "main").unwrap();
-            drop(turn);
+            std::fs::write(&release, "").unwrap();
             for _ in 0..2 {
                 rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
             }

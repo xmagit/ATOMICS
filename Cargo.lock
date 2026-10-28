@@ -1901,6 +1901,7 @@ dependencies = [
  "eframe",
  "egui",
  "imacs-core",
+ "libc",
  "notify-debouncer-mini",
  "png",
  "rfd",
@@ -1923,6 +1924,7 @@ dependencies = [
  "shlex",
  "similar",
  "tempfile",
+ "time",
  "toml",
  "ureq",
 ]

@@ -151,6 +151,12 @@ to reset it. Mode and width are remembered; `[chief] dock = "floating"` (or `"do
 `cmd+o` shows or hides either mode. On narrow windows the chief floats instead, then docks again when the window widens.
 `cmd+shift+space` dictates to it.
 
+Every `[chief] heartbeat_secs` (default 300 seconds), IMACS checks every open plan for missing or exited
+agents, agents idle or turn-done for over ten minutes without a report since that status began, pending approvals
+or Codex menus, messages held for over a minute, and working agents without an event for fifteen minutes. Include
+`heartbeat` in `imacs_wait` statuses to receive one fleet event with a `findings` list; an empty list means all good.
+The chief pill shows a compact age and a dot when that check found something; hover for the full local check time.
+
 The chief may read, plan, review and run the plan you approved without asking. It can also answer other
 agents' permission prompts through the pre-approved `imacs_approve`, including `allow_always` for the rest
 of a session. Starting agents, typing into terminals and closing sessions still ask for permission.
@@ -175,10 +181,11 @@ blocked or has a question. Reports land on the task card, move done tasks to rev
 Plans are stored separately in `~/.imacs/plans/<id>.json`, with status `open`, `completed` or `archived`. The old
 `~/.imacs/plan.json` migrates once and is kept as `plan.json.migrated`; an old plan whose tasks are all done
 migrates as completed. Saves replace files atomically, and unreadable plan files are listed in the startup message.
-Only open plans get tabs. Select a tab to see
+Open and completed plans get tabs; archived plans are hidden. Select a tab to see
 that plan’s sessions; `cmd+b` opens its board. Other sessions remain under All and their project tabs. Each plan has
 its own approval and automatic final review. Use `imacs_plan_close {plan, status: "completed" | "archived"}` or
-**Complete plan** / **Archive plan** on the board to close it. Its history remains available by id, and once only
+**Complete plan** / **Archive plan** on the board to close it after confirmation. Reopen either kind from
+**Closed plans** beside the plan tabs; approval and task history are preserved. Its history remains available by id, and once only
 one plan is open, mutation tools can omit its id again. Start the next plan while another finishes; the chief is never closed.
 `imacs_wait` events include `plan` and `task` ids for sessions belonging to a task.
 
@@ -189,14 +196,52 @@ branch into the integration branch. The merge happens in a worktree of its own n
 first use like any other worktree, so your main checkout is never touched. On a conflict the merge is aborted and the
 task stays in review with a note listing the conflicted files. Tasks without dependencies branch from `base_ref`;
 tasks with dependencies branch from the integration branch, so integrate accepted tasks before dispatching the tasks
-that build on them. Returning a task to running clears its integration marker. Dispatch rechecks that each marked
-task branch tip is an ancestor of the integration branch, so new commits must be integrated too.
+that build on them. Returning a task to running clears its integration marker. Background checks verify that each marked task branch tip is an ancestor of the integration branch. The board
+and dispatch use the same verified readiness, so new commits must be integrated too.
 
 Each open plan has a **short name · done/total** tab with a status dot (working, needs you, all done).
 Dispatching the selected plan returns from its board to its fleet and minimizes a floating chief; a docked chief
 stays beside the fleet. Updating or dispatching another plan marks its tab with `*` and preserves the selected
 view and chief. Creating a new plan selects its tab. Each fleet shows only sessions linked to that plan’s tasks.
 Click the plan tab later to return to that overview, or choose All or a project tab to see other sessions.
+
+Accepting an integrated task closes its agent; tasks without a branch, including the final review, close on acceptance.
+Its completed tile fills an otherwise empty grid cell, showing the duration, last report, diff size, **diff** and
+**resume**. Live agents keep their tile sizes and priority. Idle agents waiting for review show when they reported.
+When every task is accepted, the plan tab shows ✓ and its board offers **Archive plan**. The chief stays running and
+worktrees remain for the existing **clean up…** flow. Set `[plan] close_done_agents = false` to keep agents running.
+
+## Running many agents
+
+Every agent works in its own worktree with its own `target/`, so its builds never wait on another's. What they
+share is the machine, and IMACS keeps that in check for every agent it starts (`[resources]` in the config):
+
+- **One compiler job pool.** IMACS owns a GNU make jobserver (a named pipe in a private folder under `/tmp`, which
+  Codex's sandbox can open) with `jobs` tokens, cores minus 2 by default, and hands it to every agent terminal as
+  `CARGO_MAKEFLAGS`. cargo takes a token per job, so ten agents building at once share those jobs instead of each
+  using every core. `MAKEFLAGS` is left alone, since `make` before GNU make 4.4 misreads a pipe jobserver. A job
+  killed while holding a token never returns it, so whenever no compiler or build script runs, IMACS resets the
+  pool to full. cargo passes the pool on to build scripts, and a build script that runs Apple's `make` 3.81 (some
+  `-sys` crates, vendored OpenSSL) stops with "invalid --jobserver-fds"; set `jobs = 0` to turn the pool off, or put
+  GNU make 4.4 first on PATH.
+- **A queue for heavy work.** `imacs queue --class test -- cargo test` waits for a free test slot (one per 6 cores
+  by default), runs the command and passes its exit code through. `--class qa` is for app instances started for
+  screenshots. The slot is released when the command ends or its process dies. Tiles show `queued for a test slot
+  (2 in line)`, and the approval policy judges a queued command by the command it runs (only a bare `imacs`
+  counts). Without a running IMACS the command runs right away; while IMACS restarts, waiting commands reconnect
+  and queue again instead of all running at once. A sandbox that blocks the IMACS socket (Codex's does) gets a
+  clear error and exit code 75: run the command outside the sandbox. Queued commands may wait, so give them a long
+  timeout.
+- **Lower priority.** Agent terminals start at niceness `agent_nice` (10), so IMACS and your desktop stay responsive.
+- **A shared compiler cache.** When sccache is installed and you have no `rustc-wrapper` of your own, agents get
+  `RUSTC_WRAPPER=sccache`, so dependencies compile once for all worktrees (with
+  `SCCACHE_IGNORE_SERVER_IO_ERROR=1`, a sandboxed build that cannot reach the cache compiles locally instead).
+- **Tests at the end.** Every brief asks agents to use `cargo check` and the tests they touch while working, and to run
+  the full suite once, at the end, through `imacs queue`.
+
+The `load` gauge in the top bar shows the 1-minute load per core (grey, then yellow from 0.7 and red from 1.0); hover
+for the pool size and the slots in use. If IMACS ever ends without a clean quit, the next start says so and
+`~/.imacs/crash.log` has the panic and its backtrace when there was one.
 
 ## Voice
 
