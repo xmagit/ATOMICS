@@ -499,7 +499,15 @@ impl App {
             .map(Session::root)
             .chain(target.map(Path::to_path_buf))
             .collect();
-        wanted.extend(self.plans.iter().filter(|p| p.is_open()).filter_map(|p| p.project.clone()));
+        for (index, plan) in self.plans.iter().enumerate().filter(|(_, p)| p.is_open()) {
+            wanted.extend(plan.project.clone());
+            wanted.extend(
+                plan.tasks
+                    .iter()
+                    .filter(|task| task.integrated.is_some())
+                    .filter_map(|task| self.task_repo(index, task)),
+            );
+        }
         wanted.sort();
         wanted.dedup();
         let current: Vec<PathBuf> = self.watched.lock().unwrap().iter().map(|(root, _)| root.clone()).collect();

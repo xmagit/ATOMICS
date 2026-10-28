@@ -30,10 +30,13 @@ pub fn run() -> i32 {
             None => format!("{program} not found on login-shell PATH (warning)"),
         };
         println!("{}", check_line(found.is_some(), &label, "install it or add it to your login-shell PATH"));
-    }
-
-    for line in codex_checks(codex_supports_hooks(&resolve_program("codex"), std::time::Duration::from_secs(2))) {
-        println!("{line}");
+        if program == "codex"
+            && let Some(path) = found
+        {
+            for line in codex_checks(codex_supports_hooks(&path.to_string_lossy(), std::time::Duration::from_secs(2))) {
+                println!("{line}");
+            }
+        }
     }
 
     let config_path = paths::config_file();
@@ -124,9 +127,14 @@ mod tests {
             ("printf 'codex-cli 0.165.0\\n'", "rg", false),
             ("printf 'codex-cli 0.164.0\\n'", "cargo test", true),
             ("exit 1", "cargo test", true),
+            ("missing", "cargo test", true),
         ] {
-            std::fs::write(&codex, format!("#!/bin/sh\n{probe}\n")).unwrap();
-            std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+            if probe == "missing" {
+                std::fs::remove_file(&codex).unwrap();
+            } else {
+                std::fs::write(&codex, format!("#!/bin/sh\n{probe}\n")).unwrap();
+                std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
             std::fs::write(&config, format!("base_ref = \"main\"\n[approvals]\nallow = [\"{allow}\"]\n")).unwrap();
             if bad_plan {
                 std::fs::write(state.join("plans/bad.json"), "bad JSON").unwrap();
@@ -152,15 +160,18 @@ mod tests {
             let stdout = String::from_utf8_lossy(&output.stdout);
             assert!(output.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
             let prefix = if bad_plan { '✗' } else { '✓' };
-            if probe == "exit 1" {
+            if probe == "missing" {
+                assert!(stdout.contains("codex not found on login-shell PATH"), "{stdout}");
+                assert!(!stdout.contains("Codex version") && !stdout.contains("Codex supports"), "{stdout}");
+            } else if probe == "exit 1" {
                 assert!(stdout.contains("✗ could not determine the Codex version"), "{stdout}");
                 assert!(!stdout.contains("install Codex"), "{stdout}");
             } else {
                 assert!(stdout.contains(&format!("{prefix} Codex supports IMACS hooks")), "{stdout}");
             }
             assert!(stdout.contains(&format!("{prefix} [approvals] allow list")), "{stdout}");
-            assert!(stdout.contains("IMACS Codex hook trust not verified"));
-            assert!(stdout.contains("/hooks"));
+            assert_eq!(stdout.contains("IMACS Codex hook trust not verified"), probe != "missing", "{stdout}");
+            assert_eq!(stdout.contains("/hooks"), probe != "missing", "{stdout}");
             assert!(stdout.contains(if bad_plan { "unreadable plan" } else { "plan files readable" }));
             let worktree_lines: Vec<_> = stdout.lines().filter(|line| line.contains("worktree")).collect();
             let expected = if bad_plan {

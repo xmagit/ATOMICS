@@ -1027,6 +1027,7 @@ fn task_result(
     task: &Task,
     status: Option<AgentStatus>,
     expanded: bool,
+    config: &Config,
     p: &Palette,
 ) -> Option<&'static str> {
     ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
@@ -1069,7 +1070,10 @@ fn task_result(
                 }
                 if ui
                     .add_enabled(
-                        status.is_none() && available && (task.resume_id.is_some() || task.agent == "codex"),
+                        status.is_none()
+                            && available
+                            && (task.resume_id.is_some()
+                                || config.agent(&task.agent).is_some_and(|agent| agent.is_codex())),
                         egui::Button::new("resume").small(),
                     )
                     .clicked()

@@ -213,7 +213,9 @@ impl App {
                                                         .as_ref()
                                                         .and_then(|s| sessions.get(s))
                                                         .map(|(_, s)| *s);
-                                                    if let Some(action) = task_result(ui, task, status, open, &p) {
+                                                    if let Some(action) =
+                                                        task_result(ui, task, status, open, &self.config, &p)
+                                                    {
                                                         actions.push((task.id.clone(), action));
                                                     }
                                                     if let Some(note) = task.notes.last() {
