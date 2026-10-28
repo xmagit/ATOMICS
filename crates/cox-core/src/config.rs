@@ -29,6 +29,7 @@ diff_min_width = 560.0
 diff_fraction = 0.55        # share of the main area the diff takes when side by side
 diff_max_width = 1400.0     # beyond this, extra width goes to agent columns (0 = no cap)
 diff_min_height = 260.0
+diff_split = "auto"         # old and new side by side: "auto" (diff area 1100+ wide), "always", "never"
 
 [font]
 size = 13.0
@@ -360,6 +361,7 @@ impl Chord {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::DiffSplit;
 
     #[test]
     fn default_config_file_matches_built_in_defaults() {
@@ -377,6 +379,13 @@ mod tests {
         assert_eq!(config.layout.min_tile_width, 400.0);
         assert_eq!(config.layout.sidebar_width, LayoutConfig::default().sidebar_width);
         assert_eq!(config.font.size, 13.0);
+    }
+
+    #[test]
+    fn diff_split_parses() {
+        let config: Config = toml::from_str("[layout]\ndiff_split = \"never\"").unwrap();
+        assert_eq!(config.layout.diff_split, DiffSplit::Never);
+        assert!(toml::from_str::<Config>("[layout]\ndiff_split = \"sometimes\"").is_err());
     }
 
     #[test]

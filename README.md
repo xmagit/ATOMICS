@@ -14,6 +14,10 @@ The command is `cox`, after the coxswain: the one in the boat who doesn't row, b
 - **The diff against main, always.** The diff panel follows the active agent. It covers committed, staged, unstaged and
   untracked changes against the merge-base with `base_ref`, so main moving on never shows up as the agent's work. It
   updates live, with syntax highlighting and word-level emphasis.
+- **Side by side when there is room.** A diff area at least 1100 points wide shows the old version left and the new one
+  right, each edited line beside what it replaced. `diff_split` under `[layout]` picks `auto`, `always` or `never`; the
+  **split** toggle in the diff header overrides it until cox quits. Comments and double-click-to-edit work the same in
+  both views.
 - **Projects and workspaces.** `cox <folder>` opens the repository it is in, always through its main checkout, so a
   folder inside any worktree opens the same project. The explorer shows the main checkout's tracked files, with the
   changes of the worktree under review laid over them, plus each project's worktrees. **Project › Open project…**

@@ -16,6 +16,7 @@ pub struct LayoutConfig {
     /// Widest the diff gets beside the agents; the rest goes to more agent columns. 0 = no cap.
     pub diff_max_width: f32,
     pub diff_min_height: f32,
+    pub diff_split: DiffSplit,
     /// Width set by dragging the divider; wins over fraction and cap.
     #[serde(skip)]
     pub diff_width: Option<f32>,
@@ -32,7 +33,31 @@ impl Default for LayoutConfig {
             diff_fraction: 0.55,
             diff_max_width: 1400.0,
             diff_min_height: 260.0,
+            diff_split: DiffSplit::Auto,
             diff_width: None,
+        }
+    }
+}
+
+/// When the diff shows the old and the new version side by side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DiffSplit {
+    /// When the diff area is at least `SPLIT_MIN_WIDTH` wide.
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+pub const SPLIT_MIN_WIDTH: f32 = 1100.0;
+
+impl DiffSplit {
+    pub fn split(self, diff_width: f32) -> bool {
+        match self {
+            DiffSplit::Auto => diff_width >= SPLIT_MIN_WIDTH,
+            DiffSplit::Always => true,
+            DiffSplit::Never => false,
         }
     }
 }
@@ -211,6 +236,14 @@ mod tests {
         assert_eq!(layout.diff, DiffPlacement::Hidden);
         assert_eq!(layout.tiled, 6);
         assert_eq!(layout.columns * layout.rows, 6);
+    }
+
+    #[test]
+    fn auto_split_needs_a_wide_diff() {
+        assert!(!DiffSplit::Auto.split(1099.0));
+        assert!(DiffSplit::Auto.split(1100.0));
+        assert!(DiffSplit::Always.split(400.0));
+        assert!(!DiffSplit::Never.split(3000.0));
     }
 
     #[test]

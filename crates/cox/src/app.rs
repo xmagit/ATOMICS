@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use cox_core::config::{AgentKind, Config};
 use cox_core::git::{self, Worktree, WorktreeEntry};
-use cox_core::layout::{self, DiffPlacement, Layout};
+use cox_core::layout::{self, DiffPlacement, DiffSplit, Layout};
 use cox_core::session::{AgentStatus, pick_tiled, title_for};
 use cox_core::store::{SessionRecord, Store};
 use cox_core::{paths, steer};
@@ -232,6 +232,8 @@ pub struct App {
     title: String,
     /// Diff/editor width set by dragging the divider.
     split: Option<f32>,
+    /// Side by side or unified, picked in the diff header; wins over the config until cox quits.
+    diff_split: Option<DiffSplit>,
     editor_file: HashMap<PathBuf, String>,
     cleanup: Option<Cleanup>,
     panel: PanelMode,
@@ -341,6 +343,7 @@ impl App {
             worktree_project: HashMap::new(),
             title: String::new(),
             split: None,
+            diff_split: None,
             editor_file: HashMap::new(),
             cleanup: None,
             panel: PanelMode::Diff,
@@ -2969,13 +2972,15 @@ impl App {
         let can_send = self.sessions.iter().any(|s| s.root() == root && s.is_agent() && s.can_receive());
         let font = FontId::monospace(self.config.font.diff_size);
         let palette = self.palette.clone();
+        let split = self.diff_split.unwrap_or(self.config.layout.diff_split);
         let state = self.diffs.entry(root.clone()).or_default();
-        let header = Header { title: &title, branch: branch.as_deref(), can_send };
+        let header = Header { title: &title, branch: branch.as_deref(), can_send, split };
         match diff_view::show(ui, rect, state, header, &palette, &font) {
             DiffAction::None => {}
             DiffAction::SendReview => self.send_review(&root),
             DiffAction::Refresh => state_refresh(self.diffs.entry(root).or_default()),
             DiffAction::Close => self.diff_open = false,
+            DiffAction::Split(on) => self.diff_split = Some(if on { DiffSplit::Always } else { DiffSplit::Never }),
             DiffAction::Edit { path, line } => {
                 let ctx = ui.ctx().clone();
                 self.edit(&ctx, &root, path.as_deref(), line);
