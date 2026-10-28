@@ -201,6 +201,7 @@ pub fn merge_into_settings(existing: &mut Value, imacs_exe: &Path) {
             handlers.len() == before || !handlers.is_empty()
         });
     }
+    hooks.as_object_mut().expect("object").retain(|_, groups| !groups.as_array().is_some_and(Vec::is_empty));
     for (event, groups) in ours["hooks"].as_object().expect("object") {
         let list = hooks.as_object_mut().expect("object").entry(event.clone()).or_insert_with(|| json!([]));
         let Some(list) = list.as_array_mut() else { continue };
@@ -379,7 +380,7 @@ mod tests {
             ]})
         );
         assert_eq!(settings["hooks"]["Stop"].as_array().unwrap().len(), 2);
-        assert!(settings["hooks"]["PreToolUse"].as_array().unwrap().is_empty());
+        assert!(settings["hooks"].get("PreToolUse").is_none());
         assert_eq!(settings["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
         let once = settings.clone();
         merge_into_settings(&mut settings, exe);

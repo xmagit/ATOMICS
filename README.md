@@ -178,7 +178,8 @@ migrates as completed. Saves replace files atomically, and unreadable plan files
 Only open plans get tabs. Select a tab to see
 that plan’s sessions; `cmd+b` opens its board. Other sessions remain under All and their project tabs. Each plan has
 its own approval and automatic final review. Use `imacs_plan_close {plan, status: "completed" | "archived"}` or
-**Complete plan** / **Archive plan** on the board to close it. Its history remains available by id, and once only
+**Complete plan** / **Archive plan** on the board to close it after confirmation. Reopen either kind from
+**Closed plans** beside the plan tabs; approval and task history are preserved. Its history remains available by id, and once only
 one plan is open, mutation tools can omit its id again. Start the next plan while another finishes; the chief is never closed.
 `imacs_wait` events include `plan` and `task` ids for sessions belonging to a task.
 
@@ -189,8 +190,8 @@ branch into the integration branch. The merge happens in a worktree of its own n
 first use like any other worktree, so your main checkout is never touched. On a conflict the merge is aborted and the
 task stays in review with a note listing the conflicted files. Tasks without dependencies branch from `base_ref`;
 tasks with dependencies branch from the integration branch, so integrate accepted tasks before dispatching the tasks
-that build on them. Returning a task to running clears its integration marker. Dispatch rechecks that each marked
-task branch tip is an ancestor of the integration branch, so new commits must be integrated too.
+that build on them. Returning a task to running clears its integration marker. Background checks verify that each marked task branch tip is an ancestor of the integration branch. The board
+and dispatch use the same verified readiness, so new commits must be integrated too.
 
 Each open plan has a **short name · done/total** tab with a status dot (working, needs you, all done).
 Dispatching the selected plan returns from its board to its fleet and minimizes a floating chief; a docked chief
