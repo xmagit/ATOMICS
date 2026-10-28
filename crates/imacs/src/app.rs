@@ -1902,10 +1902,8 @@ impl App {
                 });
             }
         }
-        if let Some(index) = archive
-            && let Err(err) = self.close_plan(index, PlanStatus::Archived)
-        {
-            self.toast(err);
+        if let Some(index) = archive {
+            self.confirm_plan_close = Some((self.plans[index].id.clone(), PlanStatus::Archived));
         }
         let mut reopen = None;
         if self.plans.iter().any(|p| !p.id.is_empty() && !p.is_open()) {
@@ -2397,7 +2395,6 @@ impl App {
         let mut dispatch_all = false;
         let mut close_status = None;
         let mut close = false;
-        let mut archive = false;
         let ready = self.plans[self.selected_plan].ready().len();
         if self.integration_checks.iter().any(|(plan, _)| plan == &self.plans[self.selected_plan].id) {
             ui.label(RichText::new("Checking integration freshness…").color(p.muted));
@@ -2425,7 +2422,9 @@ impl App {
                     return;
                 }
                 if self.plans[self.selected_plan].status == plan::PlanStatus::Completed {
-                    archive = ui.small_button("Archive plan").clicked();
+                    if ui.small_button("Archive plan").clicked() {
+                        close_status = Some(PlanStatus::Archived);
+                    }
                 } else if !self.plans[self.selected_plan].approved {
                     let button = egui::Button::new(RichText::new("Approve plan").color(Color32::WHITE))
                         .fill(p.accent.gamma_multiply(0.7));
@@ -2673,9 +2672,6 @@ impl App {
         if changed {
             self.finish_plan_agents();
             self.save_plan(self.selected_plan);
-        }
-        if archive && let Err(err) = self.close_plan(self.selected_plan, PlanStatus::Archived) {
-            self.toast(err);
         }
         if let Some(session) = open_session {
             self.activate(&session, true);
@@ -4979,7 +4975,9 @@ impl App {
         self.quick_open_dialog(ctx);
         self.cleanup_dialog(ctx);
         if let Some((id, status)) = self.confirm_plan_close.clone() {
-            if let Some(index) = self.plans.iter().position(|p| p.id == id && p.is_open()) {
+            if let Some(index) = self.plans.iter().position(|p| {
+                p.id == id && (p.is_open() || (status == PlanStatus::Archived && p.status == PlanStatus::Completed))
+            }) {
                 let archive = status == PlanStatus::Archived;
                 let mut open = true;
                 egui::Window::new(if archive { "Archive plan?" } else { "Complete plan?" })
@@ -5530,54 +5528,59 @@ fn task_result(
     expanded: bool,
     p: &Palette,
 ) -> Option<&'static str> {
-    let mut action = None;
-    if task.finished_at.is_some() {
-        ui.label(
-            RichText::new(task.completion_line().unwrap_or_else(|| "Agent completed".into()))
-                .color(p.success)
-                .size(12.0),
-        );
-    } else if matches!(status, Some(AgentStatus::Idle | AgentStatus::Done))
-        && let Some(line) = task.reported_line(imacs_core::store::now())
-    {
-        ui.label(RichText::new(line).color(p.muted).size(12.0));
-    }
-    if let Some(report) = &task.report {
-        let summary = if expanded {
-            report.summary.clone()
-        } else {
-            truncate(&report.summary.lines().take(3).collect::<Vec<_>>().join("\n"), 360)
-        };
-        let (summary, color) = if task.finished_at.is_some() {
-            (summary, p.foreground)
-        } else {
-            let color = match report.status.as_str() {
-                "done" => p.success,
-                "blocked" | "question" => p.warning,
-                _ => p.info,
+    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+        let mut action = None;
+        if task.finished_at.is_some() {
+            ui.label(
+                RichText::new(task.completion_line().unwrap_or_else(|| "Agent completed".into()))
+                    .color(p.success)
+                    .size(12.0),
+            );
+        } else if matches!(status, Some(AgentStatus::Idle | AgentStatus::Done))
+            && let Some(line) = task.reported_line(imacs_core::store::now())
+        {
+            ui.label(RichText::new(line).color(p.muted).size(12.0));
+        }
+        if let Some(report) = &task.report {
+            let summary = if expanded {
+                report.summary.clone()
+            } else {
+                truncate(&report.summary.lines().take(3).collect::<Vec<_>>().join("\n"), 360)
             };
-            (format!("{}: {summary}", report.status), color)
-        };
-        ui.label(RichText::new(summary).color(color).size(12.0));
-    }
-    if task.finished_at.is_some() {
-        ui.label(RichText::new(format!("+{} −{}", task.additions, task.deletions)).color(p.muted).size(12.0));
-        ui.horizontal(|ui| {
-            if ui.add_enabled(task.worktree.is_some(), egui::Button::new("diff").small()).clicked() {
-                action = Some("diff");
-            }
-            if ui
-                .add_enabled(
-                    status.is_none() && task.worktree.is_some() && (task.resume_id.is_some() || task.agent == "codex"),
-                    egui::Button::new("resume").small(),
-                )
-                .clicked()
-            {
-                action = Some("resume");
-            }
-        });
-    }
-    action
+            let (summary, color) = if task.finished_at.is_some() {
+                (summary, p.foreground)
+            } else {
+                let color = match report.status.as_str() {
+                    "done" => p.success,
+                    "blocked" | "question" => p.warning,
+                    _ => p.info,
+                };
+                (format!("{}: {summary}", report.status), color)
+            };
+            ui.label(RichText::new(summary).color(color).size(12.0));
+        }
+        if task.finished_at.is_some() {
+            ui.label(RichText::new(format!("+{} −{}", task.additions, task.deletions)).color(p.muted).size(12.0));
+            ui.horizontal(|ui| {
+                if ui.add_enabled(task.worktree.is_some(), egui::Button::new("diff").small()).clicked() {
+                    action = Some("diff");
+                }
+                if ui
+                    .add_enabled(
+                        status.is_none()
+                            && task.worktree.is_some()
+                            && (task.resume_id.is_some() || task.agent == "codex"),
+                        egui::Button::new("resume").small(),
+                    )
+                    .clicked()
+                {
+                    action = Some("resume");
+                }
+            });
+        }
+        action
+    })
+    .inner
 }
 
 fn task_color(status: TaskStatus, p: &Palette) -> Color32 {
@@ -6134,8 +6137,6 @@ fi
                         session: Some("worker".into()),
                         dispatched_at: Some(100),
                         report: Some(Report { summary: "Last report\nSecond line".into(), ..Report::default() }),
-                        additions: 412,
-                        deletions: 88,
                         ..Task::default()
                     },
                     Task {
@@ -6165,6 +6166,14 @@ fi
             app.plans[index].tasks[0].integrated = None;
             assert!(request(app, json!({"cmd":"plan_update", "plan":"lifecycle", "id":"code", "status":"done"})).ok);
             assert!(app.find("worker").is_some(), "acceptance alone must not close unintegrated work");
+            app.diffs.entry(root.into()).or_default().prepared = Some(Arc::new(diff_view::Prepared {
+                diff: imacs_core::diff::WorktreeDiff::default(),
+                highlights: vec![],
+                longest_line: 0,
+                additions: 412,
+                deletions: 88,
+                all_files: Arc::default(),
+            }));
             app.finish_integration(Integrated {
                 plan: "lifecycle".into(),
                 task: "code".into(),
@@ -6207,6 +6216,10 @@ fi
             assert_eq!((task.additions, task.deletions), (412, 88));
             assert_eq!(task.report.as_ref().unwrap().summary, "Final late report");
             assert_eq!(app.plans[index].status, plan::PlanStatus::Open);
+            assert_eq!(app.report(Some("reviewer"), "done", "Review passed"), Some("review".into()));
+            app.sync_plan();
+            assert!(app.find("reviewer").is_some(), "a branchless agent report must also wait for acceptance");
+            assert!(app.plans[index].tasks[1].finished_at.is_none());
             assert!(request(app, json!({"cmd":"plan_update", "plan":"lifecycle", "id":"review", "status":"done"})).ok);
             assert_eq!(app.plans[index].status, plan::PlanStatus::Completed);
             assert!(app.find("reviewer").is_none());
@@ -6215,6 +6228,9 @@ fi
             app.task_action(index, 0, "diff");
             assert_eq!(app.diff_target().as_deref(), Some(root));
             assert!(app.panel == PanelMode::Diff);
+            app.reopen_plan(index).unwrap();
+            app.sync_plan();
+            assert_eq!(app.plans[index].status, PlanStatus::Open, "reopening must survive a lifecycle sweep");
             app.close_plan(index, PlanStatus::Archived).unwrap();
             assert_eq!(app.plans[index].status, plan::PlanStatus::Archived);
             assert!(app.completed_tasks().is_empty());
@@ -6373,8 +6389,16 @@ fi
                                 app.tiles(ui, ui.max_rect(), &layout, &[0, 1, 2]);
                             }
                         });
+                        app.dialogs(ctx);
                     },
                 );
+                for shape in &output.shapes {
+                    if let egui::epaint::Shape::Text(text) = &shape.shape
+                        && text.galley.text().starts_with("Agent completed in")
+                    {
+                        assert!(!text.galley.job.justify, "completion text must keep normal word spacing");
+                    }
+                }
                 let text: Vec<_> = output
                     .shapes
                     .iter()
@@ -6423,6 +6447,25 @@ fi
             app.plans[index].status = plan::PlanStatus::Completed;
             let text = render(app, true, vec![]);
             let pos = text.iter().find(|(t, _)| t == "Archive plan").unwrap().1;
+            for pressed in [true, false] {
+                render(
+                    app,
+                    true,
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+            assert_eq!(app.plans[index].status, PlanStatus::Completed);
+            assert_eq!(app.confirm_plan_close, Some(("results".into(), PlanStatus::Archived)));
+            let text = render(app, true, vec![]);
+            let pos = text.iter().find(|(t, _)| t == "Confirm archive").unwrap().1;
             for pressed in [true, false] {
                 render(
                     app,
@@ -7310,6 +7353,30 @@ exec {} "$@"
                     assert!(!app.plans[two].approved);
                 }
             }
+            let completed = app.plans.iter().position(|p| p.goal == "Completed").unwrap();
+            let text = frame(app, vec![]);
+            let pos = text.iter().find(|(t, _)| t.starts_with("✓ Completed ·")).unwrap().1;
+            for pressed in [true, false] {
+                frame(
+                    app,
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Secondary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+            let text = frame(app, vec![]);
+            let pos = text.iter().rev().find(|(t, _)| t == "Archive plan").unwrap().1;
+            for pressed in [true, false] {
+                frame(app, vec![egui::Event::PointerMoved(pos), button(pos, pressed)]);
+            }
+            assert_eq!(app.plans[completed].status, PlanStatus::Completed);
+            assert_eq!(app.confirm_plan_close, Some((app.plans[completed].id.clone(), PlanStatus::Archived)));
             let mut click = |app: &mut App, label: &str| {
                 frame(app, vec![]);
                 let text = frame(app, vec![]);
@@ -7318,6 +7385,13 @@ exec {} "$@"
                 frame(app, vec![egui::Event::PointerMoved(pos), button(pos, true)]);
                 frame(app, vec![button(pos, false)]);
             };
+            click(app, "Cancel");
+            assert!(app.confirm_plan_close.is_none());
+            click(app, "Closed plans");
+            click(app, "Reopen Completed (completed)");
+            app.sync_plan();
+            assert!(app.plans[completed].is_open());
+            assert_eq!(app.selected_plan, completed);
             for (index, action, confirm, status, reopen) in [
                 (two, "Archive plan", "Confirm archive", PlanStatus::Archived, "Reopen Beacon (archived)"),
                 (one, "Complete plan", "Confirm complete", PlanStatus::Completed, "Reopen Atlas (completed)"),

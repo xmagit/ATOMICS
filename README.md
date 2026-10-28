@@ -175,7 +175,7 @@ blocked or has a question. Reports land on the task card, move done tasks to rev
 Plans are stored separately in `~/.imacs/plans/<id>.json`, with status `open`, `completed` or `archived`. The old
 `~/.imacs/plan.json` migrates once and is kept as `plan.json.migrated`; an old plan whose tasks are all done
 migrates as completed. Saves replace files atomically, and unreadable plan files are listed in the startup message.
-Only open plans get tabs. Select a tab to see
+Open and completed plans get tabs; archived plans are hidden. Select a tab to see
 that plan’s sessions; `cmd+b` opens its board. Other sessions remain under All and their project tabs. Each plan has
 its own approval and automatic final review. Use `imacs_plan_close {plan, status: "completed" | "archived"}` or
 **Complete plan** / **Archive plan** on the board to close it after confirmation. Reopen either kind from

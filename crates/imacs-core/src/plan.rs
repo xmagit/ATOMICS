@@ -230,14 +230,16 @@ impl Plan {
                 }
             }
             if task.status == TaskStatus::Done
-                && (task.branch.is_none() || task.integrated.as_deref() == Some(&integration))
+                && (task.branch.is_none()
+                    || (task.integrated.as_deref() == Some(&integration) && task.integration_verified))
                 && task.finished_at.is_none()
             {
                 task.finished_at = Some(now);
                 changed = true;
             }
         }
-        if self.is_open()
+        if changed
+            && self.is_open()
             && !self.tasks.is_empty()
             && self.tasks.iter().all(|t| t.status == TaskStatus::Done && t.finished_at.is_some())
         {
@@ -496,6 +498,8 @@ mod tests {
         plan.tasks[0].integrated = Some("wrong-plan".into());
         assert!(!plan.finish_tasks(890));
         plan.tasks[0].integrated = Some(plan.integration_branch());
+        assert!(!plan.finish_tasks(890), "an unverified integration marker must not close an agent");
+        plan.tasks[0].integration_verified = true;
         assert!(plan.finish_tasks(890));
         assert_eq!(plan.tasks[0].completion_line().as_deref(), Some("Agent completed in 13m 10s"));
         assert_eq!(plan.status, PlanStatus::Open);
@@ -504,9 +508,13 @@ mod tests {
         assert_eq!(plan.status, PlanStatus::Completed);
         assert_eq!(plan.tasks[0].finished_at, Some(890));
         assert!(!plan.finish_tasks(2000));
+        plan.tasks[0].integration_verified = false;
         let dir = tempfile::tempdir().unwrap();
         plan.save_in(dir.path()).unwrap();
         assert_eq!(load_plans(dir.path()).unwrap().0, [plan.clone()]);
+        plan.status = PlanStatus::Open;
+        assert!(!plan.finish_tasks(2500));
+        assert_eq!(plan.status, PlanStatus::Open, "an explicitly reopened plan stays open");
         plan.tasks[0].status = TaskStatus::Running;
         assert!(plan.finish_tasks(3000));
         assert_eq!(plan.status, PlanStatus::Open);
