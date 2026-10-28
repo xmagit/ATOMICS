@@ -32,6 +32,8 @@ use imacs_core::workspace::{self, Workspace};
 use serde_json::json;
 
 mod heartbeat;
+#[path = "plan_cleanup.rs"]
+mod plan_cleanup;
 
 const TAB_HEIGHT: f32 = 30.0;
 const TILE_HEADER: f32 = 26.0;
@@ -64,6 +66,7 @@ pub struct Session {
     pub claude_id: Option<String>,
     pub cwd: PathBuf,
     pub worktree: Option<Worktree>,
+    worktree_ready: Option<Receiver<Option<Worktree>>>,
     pub title: String,
     pub status: AgentStatus,
     pub last_prompt: Option<String>,
@@ -85,6 +88,7 @@ pub struct Session {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Delivery {
     Sent,
+    Pending,
     Queued,
     Held,
     Unavailable,
@@ -110,19 +114,35 @@ struct Pending {
     sent: Instant,
     attempts: u8,
     was_working: bool,
+    codex: bool,
+    screen_before: String,
+    reply: Option<Sender<ControlOutcome>>,
 }
+
+type CodexVersion = Arc<OnceLock<Option<bool>>>;
 
 const APPROVAL_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 const APPROVAL_MENU_GRACE: Duration = Duration::from_secs(1);
 
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(4);
 const DELIVERY_ATTEMPTS: u8 = 3;
+const CODEX_VERSION_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl Session {
-    fn starting(id: String, agent: &imacs_core::config::AgentConfig, cwd: PathBuf, chief: bool) -> Self {
-        let worktree = git::worktree_of(&cwd);
-        let title =
-            if chief { "chief".into() } else { title_for(worktree.as_ref().and_then(|w| w.branch.as_deref()), &cwd) };
+    fn starting(
+        id: String,
+        agent: &imacs_core::config::AgentConfig,
+        cwd: PathBuf,
+        chief: bool,
+        ctx: &egui::Context,
+    ) -> Self {
+        let (tx, rx) = channel();
+        let (dir, ctx) = (cwd.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(git::worktree_of(&dir));
+            ctx.request_repaint();
+        });
+        let title = if chief { "chief".into() } else { title_for(None, &cwd) };
         Self {
             id,
             agent: agent.name.clone(),
@@ -130,7 +150,8 @@ impl Session {
             terminal: None,
             claude_id: None,
             cwd,
-            worktree,
+            worktree: None,
+            worktree_ready: Some(rx),
             title,
             status: if agent.kind == AgentKind::Shell { AgentStatus::Idle } else { AgentStatus::Starting },
             last_prompt: None,
@@ -335,8 +356,8 @@ pub struct App {
     palette: Arc<Palette>,
     highlighter: Arc<Highlighter>,
     sessions: Vec<Session>,
-    codex_versions: HashMap<String, Arc<OnceLock<bool>>>,
-    pending_codex: Vec<(AgentLaunch, Arc<OnceLock<bool>>)>,
+    codex_versions: HashMap<String, CodexVersion>,
+    pending_codex: Vec<(AgentLaunch, CodexVersion)>,
     active: Option<String>,
     diff_open: bool,
     /// Worktree picked in the sidebar without an agent; the diff otherwise follows the active session.
@@ -373,6 +394,7 @@ pub struct App {
     diff_split: Option<DiffSplit>,
     editor_file: HashMap<PathBuf, String>,
     cleanup: Option<Cleanup>,
+    plan_cleanup: Option<plan_cleanup::PlanCleanup>,
     panel: PanelMode,
     editors: HashMap<PathBuf, Terminal>,
     focus_editor: bool,
@@ -530,6 +552,7 @@ impl App {
             diff_split: None,
             editor_file: HashMap::new(),
             cleanup: None,
+            plan_cleanup: None,
             panel: PanelMode::Diff,
             editors: HashMap::new(),
             focus_editor: false,
@@ -1123,9 +1146,14 @@ impl App {
             let program = resolve_program(&launch.agent.command[0]);
             let ready = self.codex_version(ctx, program);
             match ready.get().copied() {
-                Some(supported) => Some(supported),
+                Some(supported) => {
+                    if supported.is_none() {
+                        self.toast("Codex version probe failed; starting without hooks and retrying detection on the next start");
+                    }
+                    Some(supported.unwrap_or(false))
+                }
                 None => {
-                    self.sessions.push(Session::starting(id.clone(), &launch.agent, launch.cwd.clone(), chief));
+                    self.sessions.push(Session::starting(id.clone(), &launch.agent, launch.cwd.clone(), chief, ctx));
                     self.pending_codex.push((launch, ready));
                     self.activate(&id, false);
                     return Ok(id);
@@ -1137,7 +1165,10 @@ impl App {
         self.launch_agent(ctx, launch, version)
     }
 
-    fn codex_version(&mut self, ctx: &egui::Context, program: String) -> Arc<OnceLock<bool>> {
+    fn codex_version(&mut self, ctx: &egui::Context, program: String) -> CodexVersion {
+        if self.codex_versions.get(&program).is_some_and(|ready| ready.get() == Some(&None)) {
+            self.codex_versions.remove(&program);
+        }
         self.codex_versions
             .entry(program.clone())
             .or_insert_with(|| {
@@ -1145,7 +1176,7 @@ impl App {
                 let result = ready.clone();
                 let ctx = ctx.clone();
                 std::thread::spawn(move || {
-                    let supported = crate::setup::codex_supports_hooks(&program, Duration::from_secs(3));
+                    let supported = crate::setup::codex_supports_hooks(&program, CODEX_VERSION_TIMEOUT);
                     let _ = result.set(supported);
                     ctx.request_repaint();
                 });
@@ -1293,15 +1324,15 @@ impl App {
                 if let Some(id) = &claude_id {
                     self.dismissed.remove(id);
                 }
-                let mut session = Session::starting(id.clone(), &agent, cwd, chief);
-                session.terminal = Some(terminal);
-                session.claude_id = claude_id;
                 let starting = self.sessions.iter().position(|session| session.id == id);
-                if let Some(index) = starting {
-                    session.selected = self.sessions[index].selected;
-                    self.sessions[index] = session;
-                } else {
-                    self.sessions.push(session);
+                let index = starting.unwrap_or_else(|| {
+                    self.sessions.push(Session::starting(id.clone(), &agent, cwd, chief, ctx));
+                    self.sessions.len() - 1
+                });
+                self.sessions[index].terminal = Some(terminal);
+                self.sessions[index].claude_id = claude_id;
+                if chief {
+                    self.hub.lock().unwrap().chief_running = true;
                 }
                 if let Some(text) = shell_prompt
                     && let Some(terminal) = self.sessions.iter().find(|s| s.id == id).and_then(|s| s.terminal.as_ref())
@@ -1657,13 +1688,19 @@ impl App {
                     None => done(ControlResponse::error("raw keys need a session running inside IMACS")),
                 },
                 Some(index) => done(match self.deliver(index, &text) {
+                    Delivery::Pending => {
+                        self.sessions[index].pending.as_mut().expect("pending delivery").reply = Some(reply);
+                        return;
+                    }
                     Delivery::Held => {
                         ControlResponse::ok(json!({"sent":false, "held":true, "held_until":"permission answered"}))
                     }
                     Delivery::Sent | Delivery::Queued => ControlResponse::ok(
                         json!({"sent":true, "queued_until_next_hook":self.sessions[index].terminal.is_none()}),
                     ),
-                    Delivery::Unavailable => ControlResponse::error("session cannot receive messages (exited?)"),
+                    Delivery::Unavailable => {
+                        ControlResponse::error("message not delivered: session exited or another delivery is pending")
+                    }
                 }),
             },
             ControlRequest::Read { session, lines } => match self.find(&session) {
@@ -1733,6 +1770,8 @@ impl App {
                         if left == 0 {
                             done(ControlResponse::ok(if delivery == Delivery::Held {
                                 json!({"held_comments":count, "held":true})
+                            } else if delivery == Delivery::Pending {
+                                json!({"pending_comments":count, "sent":false})
                             } else {
                                 json!({ "sent_comments": count })
                             }))
@@ -1777,45 +1816,64 @@ impl App {
         let _ = reply.send(outcome);
     }
 
-    /// Typing into a TUI has no receipt: a message that lands while the agent is
-    /// wrapping up a turn can be dropped. A message counts as delivered once the
-    /// agent starts working on it or it shows in the transcript; otherwise press
-    /// Enter again (text stuck in the input box) or type it again.
+    /// Confirm terminal delivery before answering Codex sends; busy turns can drop input.
     fn verify_deliveries(&mut self) {
         let mut warnings = Vec::new();
         for session in &mut self.sessions {
-            if session.approval_hold || !session.approvals.is_empty() || !session.held.is_empty() {
+            if !session.terminal.as_ref().is_some_and(Terminal::exited)
+                && (session.approval_hold || !session.approvals.is_empty())
+            {
                 continue;
             }
             let (Some(pending), Some(terminal)) = (session.pending.as_mut(), session.terminal.as_ref()) else {
                 continue;
             };
-            if terminal.exited() {
-                session.pending = None;
-                continue;
-            }
             let started = !pending.was_working && session.status == AgentStatus::Working;
             let snippet: String = pending.text.lines().next().unwrap_or("").chars().take(24).collect();
             let screen = terminal.screen_text(200);
             let lines: Vec<&str> = screen.lines().collect();
             let input_box = lines.len().saturating_sub(6);
-            let in_transcript =
-                !snippet.trim().is_empty() && lines[..input_box].iter().any(|l| l.contains(snippet.trim()));
-            if started || in_transcript {
+            let in_transcript = if pending.codex {
+                steer::message_in_transcript(&screen, &pending.text)
+                    && !steer::message_in_transcript(&pending.screen_before, &pending.text)
+            } else {
+                started || !snippet.trim().is_empty() && lines[..input_box].iter().any(|l| l.contains(snippet.trim()))
+            };
+            if in_transcript {
+                if let Some(reply) = pending.reply.take() {
+                    let _ = reply.send(ControlOutcome::Done(ControlResponse::ok(json!({"sent":true}))));
+                }
                 session.pending = None;
                 continue;
             }
-            if pending.sent.elapsed() < DELIVERY_TIMEOUT {
+            if !terminal.exited() && pending.sent.elapsed() < DELIVERY_TIMEOUT {
                 continue;
             }
-            if pending.attempts >= DELIVERY_ATTEMPTS {
+            if terminal.exited() || pending.attempts >= DELIVERY_ATTEMPTS {
+                if let Some(reply) = pending.reply.take() {
+                    let _ = reply.send(ControlOutcome::Done(ControlResponse::error(
+                        "message not delivered: no receipt from the agent; check its terminal",
+                    )));
+                }
                 warnings.push(session.title.clone());
                 session.pending = None;
                 continue;
             }
-            let in_input_box = lines[input_box..].iter().any(|l| l.contains(snippet.trim()));
+            let in_input_box = if pending.codex {
+                let input: String = screen
+                    .rsplit_once('›')
+                    .map_or("", |(_, input)| input)
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+                    .collect();
+                let text: String = pending.text.chars().filter(|c| !c.is_whitespace()).collect();
+                !text.is_empty() && input.contains(&text)
+            } else {
+                lines[input_box..].iter().any(|l| l.contains(snippet.trim()))
+            };
             if in_input_box {
-                terminal.write(b"\r".to_vec());
+                let queue = pending.codex && screen.contains("tab to queue");
+                terminal.write(if queue { b"\t".to_vec() } else { b"\r".to_vec() });
             } else {
                 terminal.submit(&pending.text);
             }
@@ -2452,6 +2510,7 @@ impl App {
         let mut dispatch_all = false;
         let mut close_status = None;
         let mut close = false;
+        let mut clean_plan = false;
         let ready = self.plans[self.selected_plan].ready().len();
         if self.integration_checks.iter().any(|(plan, _)| plan == &self.plans[self.selected_plan].id) {
             ui.label(RichText::new("Checking integration freshness…").color(p.muted));
@@ -2464,6 +2523,9 @@ impl App {
                 ui.label(RichText::new(format!("{done}/{total} done")).color(p.muted).size(12.0));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if self.plans[self.selected_plan].status == PlanStatus::Completed {
+                    clean_plan = ui.small_button("Clean up plan…").clicked();
+                }
                 if self.plans[self.selected_plan].is_open() {
                     if ui.small_button("Archive plan").clicked() {
                         close_status = Some(PlanStatus::Archived);
@@ -2509,6 +2571,14 @@ impl App {
             ui.label(RichText::new(format!("integration branch: {integration}")).color(p.muted).size(11.5))
                 .on_hover_text("Integrated tasks are merged into it, and tasks with dependencies branch from it");
         }
+        if self.plans[self.selected_plan].status == PlanStatus::Completed {
+            ui.label(
+                RichText::new("Completed · preview cleanup to check what is merged and safe to remove.").color(p.muted),
+            );
+            if clean_plan {
+                self.open_plan_cleanup(self.selected_plan);
+            }
+        }
         for (task, dep) in self.plans[self.selected_plan].unknown_dependencies() {
             ui.label(RichText::new(format!("{task} depends on unknown task {dep}")).color(p.error).size(11.5));
         }
@@ -2535,156 +2605,209 @@ impl App {
         let plan_id = self.plans[self.selected_plan].id.clone();
         let tasks = &mut self.plans[self.selected_plan].tasks;
         if !tasks.is_empty() {
-            ui.columns(TaskStatus::ALL.len(), |columns| {
-                for (column, status) in columns.iter_mut().zip(TaskStatus::ALL) {
-                    let count = tasks.iter().filter(|t| t.status == status).count();
-                    let color = task_color(status, &p);
-                    column.label(
-                        RichText::new(format!("{} · {count}", status.label().to_uppercase()))
-                            .color(color)
-                            .strong()
-                            .size(11.0),
-                    );
-                    column.add_space(4.0);
-                    egui::ScrollArea::vertical()
-                        .id_salt(("plan-column", &plan_id, status.label()))
-                        .auto_shrink([false, false])
-                        .show(column, |ui| {
-                            for task in tasks.iter_mut().filter(|t| t.status == status) {
-                                let open = expanded.contains(&(plan_id.clone(), task.id.clone()));
-                                egui::Frame::new()
-                                    .fill(p.raised)
-                                    .stroke(Stroke::new(1.0, if open { color.gamma_multiply(0.6) } else { p.border }))
-                                    .corner_radius(3)
-                                    .inner_margin(egui::Margin::same(8))
-                                    .show(ui, |ui| {
-                                        ui.set_width(ui.available_width());
-                                        let title = ui.add(
-                                            egui::Label::new(RichText::new(&task.title).color(p.foreground).strong())
-                                                .sense(Sense::click()),
-                                        );
-                                        if title.clicked() {
-                                            actions.push((task.id.clone(), "toggle"));
-                                        }
-                                        let mut meta = format!(
-                                            "{} · {}",
-                                            task.id,
-                                            if task.agent.is_empty() { "claude" } else { &task.agent }
-                                        );
-                                        if let Some(model) = task
-                                            .args
-                                            .windows(2)
-                                            .find(|w| w[0] == "-m" || w[0] == "--model")
-                                            .map(|w| w[1].clone())
-                                        {
-                                            meta.push_str(&format!(" {model}"));
-                                        }
-                                        if let Some(branch) = &task.branch {
-                                            meta.push_str(&format!(" · {branch}"));
-                                        }
-                                        ui.label(RichText::new(meta).color(p.muted).size(11.0));
-                                        if !task.depends_on.is_empty() {
-                                            ui.label(
-                                                RichText::new(format!("after {}", task.depends_on.join(", ")))
-                                                    .color(p.muted)
-                                                    .size(11.0),
-                                            );
-                                        }
-                                        if let Some((title, agent_status)) =
-                                            task.session.as_ref().and_then(|s| sessions.get(s))
-                                        {
-                                            ui.label(
-                                                RichText::new(format!("● {title} · {}", agent_status.label()))
-                                                    .color(status_color(*agent_status, &p))
-                                                    .size(11.0),
-                                            );
-                                        }
-                                        let status =
-                                            task.session.as_ref().and_then(|s| sessions.get(s)).map(|(_, s)| *s);
-                                        if let Some(action) = task_result(ui, task, status, open, &p) {
-                                            actions.push((task.id.clone(), action));
-                                        }
-                                        if let Some(note) = task.notes.last() {
-                                            ui.label(RichText::new(note).color(p.muted).italics().size(11.0));
-                                        }
-                                        if open {
-                                            ui.add_space(4.0);
-                                            if editable && task.status == TaskStatus::Planned {
-                                                let edit = egui::TextEdit::multiline(&mut task.brief)
-                                                    .desired_rows(4)
-                                                    .desired_width(f32::INFINITY);
-                                                if ui.add(edit).changed() {
-                                                    actions.push((task.id.clone(), "edited"));
-                                                }
-                                            } else {
-                                                ui.label(RichText::new(&task.brief).color(p.foreground).size(12.0));
-                                            }
-                                            for check in &task.acceptance {
-                                                ui.label(RichText::new(format!("✓ {check}")).color(p.muted).size(11.5));
-                                            }
-                                        }
-                                        ui.horizontal_wrapped(|ui| {
-                                            if task.session.as_ref().is_some_and(|s| sessions.contains_key(s))
-                                                && ui.small_button("open").clicked()
-                                            {
-                                                open_session = task.session.clone();
-                                            }
-                                            match task.status {
-                                                TaskStatus::Planned if approved && ready_ids.contains(&task.id) => {
-                                                    if ui.small_button("start").clicked() {
-                                                        actions.push((task.id.clone(), "start"));
+            egui::ScrollArea::horizontal().id_salt(("plan-board", &plan_id)).auto_shrink([false, false]).show(
+                ui,
+                |ui| {
+                    let columns = TaskStatus::ALL.len();
+                    let spacing = ui.spacing().item_spacing.x * (columns - 1) as f32;
+                    ui.set_width(ui.available_width().max(280.0 * columns as f32 + spacing));
+                    ui.columns(TaskStatus::ALL.len(), |columns| {
+                        for (column, status) in columns.iter_mut().zip(TaskStatus::ALL) {
+                            let count = tasks.iter().filter(|t| t.status == status).count();
+                            let color = task_color(status, &p);
+                            column.label(
+                                RichText::new(format!("{} · {count}", status.label().to_uppercase()))
+                                    .color(color)
+                                    .strong()
+                                    .size(11.0),
+                            );
+                            column.add_space(4.0);
+                            egui::ScrollArea::vertical()
+                                .id_salt(("plan-column", &plan_id, status.label()))
+                                .auto_shrink([false, false])
+                                .show(column, |ui| {
+                                    for task in tasks.iter_mut().filter(|t| t.status == status) {
+                                        let open = expanded.contains(&(plan_id.clone(), task.id.clone()));
+                                        egui::Frame::new()
+                                            .fill(p.raised)
+                                            .stroke(Stroke::new(
+                                                1.0,
+                                                if open { color.gamma_multiply(0.6) } else { p.border },
+                                            ))
+                                            .corner_radius(3)
+                                            .inner_margin(egui::Margin::same(8))
+                                            .show(ui, |ui| {
+                                                // Columns justify their children; card text needs ordinary word spacing.
+                                                ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                                                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                                                    ui.set_width(ui.available_width());
+                                                    let title = ui.add(
+                                                        egui::Label::new(
+                                                            RichText::new(&task.title).color(p.foreground).strong(),
+                                                        )
+                                                        .sense(Sense::click()),
+                                                    );
+                                                    if title.clicked() {
+                                                        actions.push((task.id.clone(), "toggle"));
                                                     }
-                                                }
-                                                TaskStatus::Review => {
-                                                    if ui.small_button("accept").clicked() {
-                                                        actions.push((task.id.clone(), "done"));
-                                                    }
-                                                    if ui
-                                                        .small_button("send back")
-                                                        .on_hover_text("Back to running; steer it in the steer bar")
-                                                        .clicked()
+                                                    let mut meta = format!(
+                                                        "{} · {}",
+                                                        task.id,
+                                                        if task.agent.is_empty() { "claude" } else { &task.agent }
+                                                    );
+                                                    if let Some(model) = task
+                                                        .args
+                                                        .windows(2)
+                                                        .find(|w| w[0] == "-m" || w[0] == "--model")
+                                                        .map(|w| w[1].clone())
                                                     {
-                                                        actions.push((task.id.clone(), "running"));
+                                                        meta.push_str(&format!(" {model}"));
                                                     }
-                                                }
-                                                TaskStatus::Blocked => {
-                                                    if ui.small_button("unblock").clicked() {
-                                                        actions.push((task.id.clone(), "running"));
+                                                    ui.label(RichText::new(meta).color(p.muted).size(11.0));
+                                                    if let Some(branch) = &task.branch {
+                                                        ui.add(
+                                                            egui::Label::new(
+                                                                RichText::new(branch).color(p.muted).size(11.0),
+                                                            )
+                                                            .truncate(),
+                                                        );
                                                     }
-                                                }
-                                                TaskStatus::Done
-                                                    if task
+                                                    if !task.depends_on.is_empty() {
+                                                        ui.label(
+                                                            RichText::new(format!(
+                                                                "after {}",
+                                                                task.depends_on.join(", ")
+                                                            ))
+                                                            .color(p.muted)
+                                                            .size(11.0),
+                                                        );
+                                                    }
+                                                    if let Some((title, agent_status)) =
+                                                        task.session.as_ref().and_then(|s| sessions.get(s))
+                                                    {
+                                                        ui.label(
+                                                            RichText::new(format!(
+                                                                "● {title} · {}",
+                                                                agent_status.label()
+                                                            ))
+                                                            .color(status_color(*agent_status, &p))
+                                                            .size(11.0),
+                                                        );
+                                                    }
+                                                    let status = task
                                                         .session
                                                         .as_ref()
-                                                        .is_some_and(|s| sessions.contains_key(s))
-                                                        && ui.small_button("reopen").clicked() =>
-                                                {
-                                                    actions.push((task.id.clone(), "review"));
-                                                }
-                                                _ => {}
-                                            }
-                                            if task.branch.is_some()
-                                                && matches!(task.status, TaskStatus::Review | TaskStatus::Done)
-                                            {
-                                                let busy = integrating.contains(&(plan_id.clone(), task.id.clone()));
-                                                let label = if busy { "integrating…" } else { "integrate" };
-                                                if ui
-                                                    .add_enabled(!busy, egui::Button::new(label).small())
-                                                    .on_hover_text(format!(
-                                                        "Commit its changes and merge it into {integration}"
-                                                    ))
-                                                    .clicked()
-                                                {
-                                                    actions.push((task.id.clone(), "integrate"));
-                                                }
-                                            }
-                                        });
-                                    });
-                                ui.add_space(6.0);
-                            }
-                        });
-                }
-            });
+                                                        .and_then(|s| sessions.get(s))
+                                                        .map(|(_, s)| *s);
+                                                    if let Some(action) = task_result(ui, task, status, open, &p) {
+                                                        actions.push((task.id.clone(), action));
+                                                    }
+                                                    if let Some(note) = task.notes.last() {
+                                                        ui.label(
+                                                            RichText::new(note).color(p.muted).italics().size(11.0),
+                                                        );
+                                                    }
+                                                    if open {
+                                                        ui.add_space(4.0);
+                                                        if editable && task.status == TaskStatus::Planned {
+                                                            let edit = egui::TextEdit::multiline(&mut task.brief)
+                                                                .desired_rows(4)
+                                                                .desired_width(f32::INFINITY);
+                                                            if ui.add(edit).changed() {
+                                                                actions.push((task.id.clone(), "edited"));
+                                                            }
+                                                        } else {
+                                                            ui.label(
+                                                                RichText::new(&task.brief)
+                                                                    .color(p.foreground)
+                                                                    .size(12.0),
+                                                            );
+                                                        }
+                                                        for check in &task.acceptance {
+                                                            ui.label(
+                                                                RichText::new(format!("✓ {check}"))
+                                                                    .color(p.muted)
+                                                                    .size(11.5),
+                                                            );
+                                                        }
+                                                    }
+                                                    ui.horizontal_wrapped(|ui| {
+                                                        if task
+                                                            .session
+                                                            .as_ref()
+                                                            .is_some_and(|s| sessions.contains_key(s))
+                                                            && ui.small_button("open").clicked()
+                                                        {
+                                                            open_session = task.session.clone();
+                                                        }
+                                                        match task.status {
+                                                            TaskStatus::Planned
+                                                                if approved && ready_ids.contains(&task.id) =>
+                                                            {
+                                                                if ui.small_button("start").clicked() {
+                                                                    actions.push((task.id.clone(), "start"));
+                                                                }
+                                                            }
+                                                            TaskStatus::Review => {
+                                                                if ui.small_button("accept").clicked() {
+                                                                    actions.push((task.id.clone(), "done"));
+                                                                }
+                                                                if ui
+                                                                    .small_button("send back")
+                                                                    .on_hover_text(
+                                                                        "Back to running; steer it in the steer bar",
+                                                                    )
+                                                                    .clicked()
+                                                                {
+                                                                    actions.push((task.id.clone(), "running"));
+                                                                }
+                                                            }
+                                                            TaskStatus::Blocked => {
+                                                                if ui.small_button("unblock").clicked() {
+                                                                    actions.push((task.id.clone(), "running"));
+                                                                }
+                                                            }
+                                                            TaskStatus::Done
+                                                                if task
+                                                                    .session
+                                                                    .as_ref()
+                                                                    .is_some_and(|s| sessions.contains_key(s))
+                                                                    && ui.small_button("reopen").clicked() =>
+                                                            {
+                                                                actions.push((task.id.clone(), "review"));
+                                                            }
+                                                            _ => {}
+                                                        }
+                                                        if task.branch.is_some()
+                                                            && matches!(
+                                                                task.status,
+                                                                TaskStatus::Review | TaskStatus::Done
+                                                            )
+                                                        {
+                                                            let busy = integrating
+                                                                .contains(&(plan_id.clone(), task.id.clone()));
+                                                            let label =
+                                                                if busy { "integrating…" } else { "integrate" };
+                                                            if ui
+                                                                .add_enabled(!busy, egui::Button::new(label).small())
+                                                                .on_hover_text(format!(
+                                                                    "Commit its changes and merge it into {integration}"
+                                                                ))
+                                                                .clicked()
+                                                            {
+                                                                actions.push((task.id.clone(), "integrate"));
+                                                            }
+                                                        }
+                                                    });
+                                                });
+                                            });
+                                        ui.add_space(6.0);
+                                    }
+                                });
+                        }
+                    });
+                },
+            );
         }
 
         let mut changed = false;
@@ -2953,6 +3076,8 @@ impl App {
                 t.branch = (t.id != plan::REVIEW_TASK).then_some(branch);
                 t.finished_at = None;
                 t.dispatched_at = Some(imacs_core::store::now());
+                t.session = None;
+                t.report = None;
                 t.repo.get_or_insert_with(|| repo.to_string_lossy().into_owned());
             }
             started.push(task.id);
@@ -3147,6 +3272,11 @@ impl App {
 
     /// Records status changes as events and answers waiters they satisfy.
     fn record_events(&mut self) {
+        self.hub.lock().unwrap().chief_running = self.sessions.iter().any(|session| {
+            session.chief
+                && session.status != AgentStatus::Exited
+                && session.terminal.as_ref().is_some_and(|terminal| !terminal.exited())
+        });
         for session in &mut self.sessions {
             session.activity.observe(session.status);
             if self.last_status.get(&session.id) != Some(&session.status) {
@@ -3236,7 +3366,14 @@ impl App {
 
     fn close(&mut self, id: &str) {
         if let Some(i) = self.sessions.iter().position(|s| s.id == id) {
-            let session = self.sessions.remove(i);
+            let mut session = self.sessions.remove(i);
+            if session.chief {
+                self.hub.lock().unwrap().chief_running = false;
+            }
+            if let Some(reply) = session.pending.as_mut().and_then(|pending| pending.reply.take()) {
+                let _ =
+                    reply.send(ControlOutcome::Done(ControlResponse::error("message not delivered: session closed")));
+            }
             if session.terminal.is_none()
                 && let Some(cid) = session.claude_id
             {
@@ -3273,21 +3410,40 @@ impl App {
             session.held.push(text.to_string());
             return Delivery::Held;
         }
+        if session.pending.as_ref().is_some_and(|pending| pending.codex) {
+            return Delivery::Unavailable;
+        }
         if let Some(terminal) = &session.terminal {
             if terminal.exited() {
                 return Delivery::Unavailable;
             }
+            let codex = session.kind == AgentKind::Generic
+                && self.config.agent(&session.agent).is_some_and(|agent| {
+                    agent
+                        .command
+                        .first()
+                        .is_some_and(|program| Path::new(program).file_name().is_some_and(|p| p == "codex"))
+                });
+            let screen_before = if codex { terminal.screen_text(200) } else { String::new() };
             terminal.submit(text);
             let trackable = session.kind == AgentKind::Claude
+                || codex
                 || self.config.agent(&session.agent).is_some_and(|a| a.busy_text.is_some());
             if trackable {
                 let was_working = session.status == AgentStatus::Working;
-                session.pending =
-                    Some(Pending { text: text.to_string(), sent: Instant::now(), attempts: 1, was_working });
+                session.pending = Some(Pending {
+                    text: text.to_string(),
+                    sent: Instant::now(),
+                    attempts: 1,
+                    was_working,
+                    codex,
+                    screen_before,
+                    reply: None,
+                });
             } else if session.is_agent() {
                 session.status = AgentStatus::Working;
             }
-            return Delivery::Sent;
+            return if codex { Delivery::Pending } else { Delivery::Sent };
         }
         let Some(claude_id) = session.claude_id.clone() else { return Delivery::Unavailable };
         self.hub.lock().unwrap().outbox.entry(claude_id).or_default().push(text.to_string());
@@ -3321,9 +3477,11 @@ impl App {
         let mut typed = 0;
         let mut queued = 0;
         let mut held = 0;
+        let mut verifying = 0;
         for i in targets {
             match self.deliver(i, &text) {
                 Delivery::Sent => typed += 1,
+                Delivery::Pending => verifying += 1,
                 Delivery::Queued => queued += 1,
                 Delivery::Held => held += 1,
                 Delivery::Unavailable => {}
@@ -3331,6 +3489,9 @@ impl App {
         }
         self.steer_text.clear();
         let mut parts = Vec::new();
+        if verifying > 0 {
+            parts.push(format!("Verifying delivery to {verifying} session(s)"));
+        }
         if typed > 0 {
             parts.push(format!("Sent to {typed} session{}", if typed == 1 { "" } else { "s" }));
         }
@@ -3366,7 +3527,11 @@ impl App {
                 state.comments.clear();
             }
             let title = self.sessions[index].title.clone();
-            let action = if delivery == Delivery::Held { "Held" } else { "Sent" };
+            let action = match delivery {
+                Delivery::Held => "Held",
+                Delivery::Pending => "Sending",
+                _ => "Sent",
+            };
             self.toast(format!("{action} {count} comment{} to {title}", if count == 1 { "" } else { "s" }));
         }
         delivery
@@ -3377,6 +3542,17 @@ impl App {
     fn pump(&mut self, ctx: &egui::Context) {
         self.refresh_integrations();
         self.usage.drain();
+        for session in &mut self.sessions {
+            if let Some(ready) = &session.worktree_ready
+                && let Ok(worktree) = ready.try_recv()
+            {
+                session.worktree = worktree;
+                session.worktree_ready = None;
+                if !session.chief {
+                    session.title = title_for(session.branch(), &session.cwd);
+                }
+            }
+        }
         for (agent, dir) in std::mem::take(&mut self.pending_open) {
             self.spawn(ctx, &agent, dir, None);
         }
@@ -3387,7 +3563,12 @@ impl App {
             }
             if let Some(supported) = ready.get().copied() {
                 let id = launch.id.clone();
-                if let Err(error) = self.launch_agent(ctx, launch, Some(supported)) {
+                if supported.is_none() {
+                    self.toast(
+                        "Codex version probe failed; starting without hooks and retrying detection on the next start",
+                    );
+                }
+                if let Err(error) = self.launch_agent(ctx, launch, Some(supported.unwrap_or(false))) {
                     if let Some(index) = self.find(&id) {
                         self.sessions[index].status = AgentStatus::Exited;
                         self.sessions[index].last_message = Some(error.clone());
@@ -3447,7 +3628,11 @@ impl App {
             self.finish_integration(integrated);
         }
         self.expire_approvals(Instant::now());
-        if self.sessions.iter().any(|session| session.approval_hold || !session.approvals.is_empty()) {
+        if self.sessions.iter().any(|session| {
+            session.approval_hold
+                || !session.approvals.is_empty()
+                || session.status == AgentStatus::NeedsInput && session.terminal.is_some()
+        }) {
             ctx.request_repaint_after(Duration::from_millis(400));
         }
         while let Ok(message) = self.control_rx.try_recv() {
@@ -3486,6 +3671,12 @@ impl App {
         }
         self.track_busy();
         self.verify_deliveries();
+        for index in 0..self.sessions.len() {
+            self.release_held(index);
+        }
+        if self.sessions.iter().any(|session| session.pending.is_some()) {
+            ctx.request_repaint_after(PULSE_STEP);
+        }
         self.record_events();
         self.sync_plan();
         self.heartbeat();
@@ -3698,6 +3889,7 @@ impl App {
                     claude_id: Some(event.session_id.clone()),
                     cwd,
                     worktree,
+                    worktree_ready: None,
                     title,
                     status: AgentStatus::Idle,
                     last_prompt: None,
@@ -3721,6 +3913,9 @@ impl App {
         };
 
         let session = &mut self.sessions[index];
+        if event.name != "SessionStart" && session.claude_id.as_ref().is_some_and(|id| id != &event.session_id) {
+            return;
+        }
         session.claude_id = Some(event.session_id.clone());
         session.hooks_active = true;
         session.activity.last_event = imacs_core::store::now();
@@ -3740,7 +3935,11 @@ impl App {
             session.approvals.push(PendingApproval { request, reply: message.approval_reply });
             self.last_status.remove(&session.id);
         } else if event.name == "PreToolUse" {
-            session.approvals.retain(|pending| pending.reply.as_ref().is_some_and(|reply| !reply.expired()));
+            for pending in session.approvals.drain(..) {
+                if let Some(reply) = pending.reply {
+                    reply.answer(HookReply::default());
+                }
+            }
         } else if event.name == "PostToolUse" {
             let completed = ApprovalRequest::from_event(&event);
             session.approvals.retain(|pending| !pending.request.same_command(&completed));
@@ -3751,6 +3950,7 @@ impl App {
             && *cwd != session.cwd
         {
             session.cwd = cwd.clone();
+            session.worktree_ready = None;
             session.worktree = git::worktree_of(cwd);
             session.title = title_for(session.branch(), cwd);
         }
@@ -3758,7 +3958,18 @@ impl App {
             session.status = if session.approvals.is_empty() { status } else { AgentStatus::NeedsInput };
         }
         match event.name.as_str() {
-            "UserPromptSubmit" => session.last_prompt = event.prompt.clone(),
+            "UserPromptSubmit" => {
+                if let Some(pending) = &mut session.pending
+                    && pending.codex
+                    && event.prompt.as_deref() == Some(&pending.text)
+                {
+                    if let Some(reply) = pending.reply.take() {
+                        let _ = reply.send(ControlOutcome::Done(ControlResponse::ok(json!({"sent":true}))));
+                    }
+                    session.pending = None;
+                }
+                session.last_prompt = event.prompt.clone();
+            }
             "Stop" => session.last_message = event.last_assistant_message.clone(),
             _ => {}
         }
@@ -3815,6 +4026,7 @@ impl App {
     fn release_held(&mut self, index: usize) {
         if !self.sessions[index].approval_hold
             && self.sessions[index].approvals.is_empty()
+            && !self.sessions[index].pending.as_ref().is_some_and(|pending| pending.codex)
             && !self.sessions[index].held.is_empty()
         {
             self.sessions[index].activity.held_since = None;
@@ -3830,19 +4042,34 @@ impl App {
         self.approvals_checked = now;
         for index in 0..self.sessions.len() {
             let session = &mut self.sessions[index];
-            if !session.approval_hold && session.approvals.is_empty() {
+            let pending = session.approval_hold || !session.approvals.is_empty();
+            if !pending && session.status != AgentStatus::NeedsInput {
+                continue;
+            }
+            let screen = session.terminal.as_ref().map(|terminal| terminal.screen_text(60)).unwrap_or_default();
+            let menu = imacs_core::approvals::menu_visible(&screen);
+            if menu {
+                // A native menu means Codex has already stopped waiting for the hook.
+                for approval in &mut session.approvals {
+                    if let Some(reply) = approval.reply.take() {
+                        reply.answer(HookReply::default());
+                    }
+                }
+                session.approval_hold = true;
+                session.menu_absent_since = None;
                 continue;
             }
             if session.approvals.iter().any(|pending| pending.reply.as_ref().is_some_and(|reply| !reply.expired())) {
                 session.menu_absent_since = None;
                 continue;
             }
-            let menu = session
-                .terminal
-                .as_ref()
-                .is_some_and(|terminal| imacs_core::approvals::menu_visible(&terminal.screen_text(60)));
-            if menu {
-                session.approval_hold = true;
+            if !pending
+                && !self
+                    .config
+                    .agent(&session.agent)
+                    .and_then(|agent| agent.busy_text.as_ref())
+                    .is_some_and(|busy| screen.contains(busy))
+            {
                 session.menu_absent_since = None;
                 continue;
             }
@@ -3881,7 +4108,10 @@ impl App {
             ) else {
                 return Err("the permission menu is not visible; retry or answer in the terminal".into());
             };
-            terminal.write(key.into_bytes());
+            terminal.write(key.as_bytes().to_vec());
+            if key == "\x01" {
+                return Err("expanded the permission command; retry approval once it is visible".into());
+            }
         }
         let pending = session.approvals.remove(0);
         if decision == Decision::AllowAlways {
@@ -4630,6 +4860,7 @@ impl App {
         let mut activate: Option<(String, bool)> = None;
         let mut close: Option<String> = None;
         let mut resume: Option<usize> = None;
+        let mut approval = None;
         let focus_request = self.focus_terminal.take();
         let now = ui.input(|i| i.time);
         let (slots_running, slots_waiting) = self.governor.snapshot();
@@ -4712,17 +4943,27 @@ impl App {
 
             if let Some(pending) = session.approvals.first() {
                 let request = &pending.request;
-                let banner = body.with_max_y((body.top() + 76.0).min(body.bottom()));
+                let height = (body.height() - 220.0).clamp(110.0, 210.0).min(body.height());
+                let banner = body.with_max_y(body.top() + height);
                 ui.painter().rect_filled(banner, 0.0, p.panel);
                 let mut child = ui
                     .new_child(egui::UiBuilder::new().id_salt(("approval", &session.id)).max_rect(banner.shrink(6.0)));
-                let details = format!(
-                    "{}\n{}\n{}",
-                    request.command.as_deref().unwrap_or(&request.tool),
-                    request.cwd.display(),
-                    request.reason.as_deref().unwrap_or("Permission requested")
-                );
-                child.label(RichText::new(&details).color(p.warning).size(11.5)).on_hover_text(details);
+                child.set_clip_rect(banner);
+                child.label(RichText::new("Permission requested").color(p.warning).strong());
+                child.horizontal_wrapped(|ui| {
+                    for (label, decision) in
+                        [("Allow", Decision::Allow), ("Allow always", Decision::AllowAlways), ("Deny", Decision::Deny)]
+                    {
+                        if ui.button(label).clicked() {
+                            approval = Some((index, decision));
+                        }
+                    }
+                });
+                egui::ScrollArea::vertical().max_height(child.available_height()).show(&mut child, |ui| {
+                    ui.label(RichText::new(request.command.as_deref().unwrap_or(&request.tool)).monospace());
+                    ui.label(format!("cwd: {}", request.cwd.display()));
+                    ui.label(request.reason.as_deref().unwrap_or("Permission requested"));
+                });
                 body = body.with_min_y(banner.bottom());
             }
             let term_id = ui.scope_id().with(("term", &session.id));
@@ -4816,6 +5057,12 @@ impl App {
         }
         if let Some((plan, task, action)) = task_action {
             self.task_action(plan, task, action);
+        }
+
+        if let Some((index, decision)) = approval
+            && let Err(error) = self.approve(index, decision, None)
+        {
+            self.toast(error);
         }
 
         if let Some((id, open)) = activate {
@@ -5084,6 +5331,7 @@ impl App {
                 self.confirm_plan_close = None;
             }
         }
+        self.plan_cleanup_dialog(ctx);
         if let Some(id) = self.confirm_close.clone() {
             let title = self.sessions.iter().find(|s| s.id == id).map(|s| s.title.clone());
             let Some(title) = title else {
@@ -5880,6 +6128,7 @@ mod tests {
             claude_id: Some(id.into()),
             cwd: cwd.into(),
             worktree: None,
+            worktree_ready: None,
             title: id.into(),
             status,
             last_prompt: None,
@@ -6006,7 +6255,7 @@ if [ "$1" = --version ]; then
   attempts=0
   while [ ! -e "$dir/ready" ]; do
     attempts=$((attempts + 1))
-    [ "$attempts" -lt 200 ] || exit 1
+    [ "$attempts" -lt 1000 ] || exit 1
     sleep 0.01
   done
   printf 'codex-cli 0.165.0\n'
@@ -6038,6 +6287,7 @@ fi
                     assert!(Instant::now() < deadline, "both asynchronous version probes must start");
                     std::thread::sleep(Duration::from_millis(10));
                 }
+                std::thread::sleep(Duration::from_millis(3200));
                 for name in ["one", "two"] {
                     std::fs::write(probe_dir.join(name).join("ready"), "").unwrap();
                 }
@@ -6052,8 +6302,8 @@ fi
                 assert!(Instant::now() < deadline);
                 std::thread::sleep(Duration::from_millis(10));
             }
-            assert_eq!(one.get(), Some(&true));
-            assert_eq!(two.get(), Some(&false));
+            assert_eq!(one.get(), Some(&Some(true)));
+            assert_eq!(two.get(), Some(&Some(false)));
             assert_eq!(app.codex_versions.len(), 2);
             // A gated probe must finish before start() runs git: concurrent children can
             // inherit pipe writers on macOS and otherwise keep git's output() waiting for EOF.
@@ -6082,6 +6332,196 @@ fi
             }
             app.sessions.clear();
         });
+    }
+
+    #[test]
+    fn permission_banner_buttons_answer_hooks_and_chief_liveness_selects_the_wait() {
+        with_app(
+            "app::tests::permission_banner_buttons_answer_hooks_and_chief_liveness_selects_the_wait",
+            |app, ctx| {
+                let terminal = Terminal::spawn(
+                    ctx,
+                    app.palette.clone(),
+                    "/bin/sleep".into(),
+                    vec!["30".into()],
+                    &app.launch_dir,
+                    HashMap::new(),
+                    100,
+                )
+                .unwrap();
+                app.sessions = vec![session("worker", AgentKind::Generic, AgentStatus::NeedsInput, &app.launch_dir)];
+                app.sessions[0].terminal = Some(terminal);
+                app.record_events();
+                assert!(!app.hub.lock().unwrap().chief_running);
+                let mut time = 0.0;
+                let mut frame = |app: &mut App, events| {
+                    time += 0.05;
+                    let output = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1400.0, 900.0))),
+                            time: Some(time),
+                            events,
+                            ..Default::default()
+                        },
+                        |ui| {
+                            egui::CentralPanel::default().show(ui, |ui| {
+                                let layout = layout::compute(1400.0, 900.0, 1, 0, false, 0.0, &app.config.layout);
+                                app.tiles(ui, ui.max_rect(), &layout, &[0]);
+                            });
+                        },
+                    );
+                    let text: Vec<_> = output
+                        .shapes
+                        .iter()
+                        .filter_map(|shape| match &shape.shape {
+                            egui::epaint::Shape::Text(t) => {
+                                Some((t.galley.text().to_string(), t.pos + t.galley.rect.center().to_vec2()))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    output.drop_without_applying_deltas();
+                    text
+                };
+                for (label, decision) in
+                    [("Allow", Decision::Allow), ("Allow always", Decision::AllowAlways), ("Deny", Decision::Deny)]
+                {
+                    let reply = Arc::new(ipc::ApprovalReply::default());
+                    app.sessions[0].status = AgentStatus::NeedsInput;
+                    app.sessions[0].approval_hold = true;
+                    app.sessions[0].approvals.push(PendingApproval {
+                        request: ApprovalRequest {
+                            tool: "Bash".into(),
+                            command: Some("touch banner-fixture".into()),
+                            cwd: app.launch_dir.clone(),
+                            reason: Some("Verify permission controls".into()),
+                            input: json!({}),
+                        },
+                        reply: Some(reply.clone()),
+                    });
+                    let text = frame(app, vec![]);
+                    for expected in ["Permission requested", "touch banner-fixture", "Verify permission controls"] {
+                        assert!(text.iter().any(|(text, _)| text == expected), "{expected}");
+                    }
+                    assert!(text.iter().any(|(text, _)| text.starts_with("cwd: ")));
+                    let pos = text.iter().find(|(text, _)| text == label).unwrap().1;
+                    for pressed in [true, false] {
+                        frame(
+                            app,
+                            vec![
+                                egui::Event::PointerMoved(pos),
+                                egui::Event::PointerButton {
+                                    pos,
+                                    button: egui::PointerButton::Primary,
+                                    pressed,
+                                    modifiers: egui::Modifiers::NONE,
+                                },
+                            ],
+                        );
+                    }
+                    let result: serde_json::Value =
+                        serde_json::from_str(&reply.wait(Duration::ZERO).stdout.unwrap()).unwrap();
+                    assert_eq!(
+                        result["hookSpecificOutput"]["decision"]["behavior"],
+                        if decision == Decision::Deny { "deny" } else { "allow" }
+                    );
+                    assert!(app.sessions[0].approvals.is_empty());
+                    assert_eq!(app.sessions[0].status, AgentStatus::Working);
+                    assert!(!frame(app, vec![]).iter().any(|(text, _)| text == "Permission requested"));
+                }
+                assert_eq!(app.sessions[0].allowed.len(), 1);
+                app.sessions[0].chief = true;
+                app.record_events();
+                assert!(app.hub.lock().unwrap().chief_running);
+                app.sessions[0].status = AgentStatus::Exited;
+                app.record_events();
+                assert!(!app.hub.lock().unwrap().chief_running);
+                app.sessions[0].status = AgentStatus::Working;
+                app.record_events();
+                app.close("worker");
+                assert!(!app.hub.lock().unwrap().chief_running);
+            },
+        );
+    }
+
+    #[test]
+    fn hidden_permission_commands_expand_before_approval_and_running_clears_needs_input() {
+        with_app(
+            "app::tests::hidden_permission_commands_expand_before_approval_and_running_clears_needs_input",
+            |app, ctx| {
+                let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex");
+                app.config.agents.push(imacs_core::config::AgentConfig {
+                    name: "test".into(),
+                    command: vec![fixture.to_string_lossy().into_owned()],
+                    kind: AgentKind::Generic,
+                    busy_text: Some("esc to interrupt".into()),
+                });
+                let terminal = Terminal::spawn(
+                    ctx,
+                    app.palette.clone(),
+                    fixture.to_string_lossy().into_owned(),
+                    vec!["--mode".into(), "hidden".into()],
+                    &app.launch_dir,
+                    HashMap::new(),
+                    100,
+                )
+                .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !terminal.screen_text(60).contains("view all") {
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                app.sessions = vec![session("hidden", AgentKind::Generic, AgentStatus::NeedsInput, &app.launch_dir)];
+                app.sessions[0].terminal = Some(terminal);
+                app.sessions[0].hooks_active = true;
+                let reply = Arc::new(ipc::ApprovalReply::default());
+                let permission = imacs_core::hook::HookEvent::from_payload(&json!({
+                    "hook_event_name":"PermissionRequest", "session_id":"hidden", "tool_name":"Bash",
+                    "tool_input":{"command":"touch fixture"}
+                }))
+                .unwrap();
+                app.sessions[0].approval_hold = true;
+                app.sessions[0].approvals.push(PendingApproval {
+                    request: ApprovalRequest::from_event(&permission),
+                    reply: Some(reply.clone()),
+                });
+                assert!(app.approve(0, Decision::Allow, None).unwrap_err().contains("expanded"));
+                assert!(reply.expired() || reply.wait(Duration::ZERO).stdout.is_none());
+                assert_eq!(app.sessions[0].approvals.len(), 1);
+                while !app.sessions[0].terminal.as_ref().unwrap().screen_text(60).contains("$ touch fixture") {
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                app.approve(0, Decision::Allow, None).unwrap();
+                while !app.sessions[0].terminal.as_ref().unwrap().screen_text(60).contains("Approved") {
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                app.sessions[0].approval_hold = false;
+                app.sessions[0].status = AgentStatus::NeedsInput;
+                app.sessions[0].menu_absent_since = Some(Instant::now() - APPROVAL_MENU_GRACE);
+                app.approvals_checked = Instant::now() - APPROVAL_CHECK_INTERVAL;
+                app.expire_approvals(Instant::now());
+                assert_eq!(app.sessions[0].status, AgentStatus::Working);
+                assert!(app.sessions[0].approvals.is_empty());
+                assert!(!app.sessions[0].approval_hold);
+                let reply = Arc::new(ipc::ApprovalReply::default());
+                app.sessions[0].approvals.push(PendingApproval {
+                    request: ApprovalRequest::from_event(&permission),
+                    reply: Some(reply.clone()),
+                });
+                app.sessions[0].status = AgentStatus::NeedsInput;
+                let event = imacs_core::hook::HookEvent::from_payload(&json!({
+                    "hook_event_name":"PreToolUse", "session_id":"hidden", "tool_name":"Bash",
+                    "tool_input":{"command":"touch fixture"}
+                }))
+                .unwrap();
+                app.on_hook(HookMessage { pane: None, ancestors: vec![], event, delivered: 0, approval_reply: None });
+                assert_eq!(app.sessions[0].status, AgentStatus::Working);
+                assert!(app.sessions[0].approvals.is_empty());
+                assert!(reply.wait(Duration::ZERO).stdout.is_none());
+            },
+        );
     }
 
     #[test]
@@ -6585,6 +7025,272 @@ fi
         }
     }
 
+    #[test]
+    fn failed_codex_probes_are_retried_and_recovered_launches_get_hooks() {
+        with_app("app::tests::failed_codex_probes_are_retried_and_recovered_launches_get_hooks", |app, ctx| {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let program = dir.path().join("codex");
+            let name = program.to_string_lossy().into_owned();
+            app.config.agents.push(imacs_core::config::AgentConfig {
+                name: "flaky".into(),
+                command: vec![name.clone()],
+                kind: AgentKind::Generic,
+                busy_text: None,
+            });
+            for script in ["#!/bin/sh\nexec sleep 30\n", "#!/bin/sh\nexit 1\n"] {
+                std::fs::write(&program, script).unwrap();
+                std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+                let failed = Arc::new(OnceLock::new());
+                failed.set(crate::setup::codex_supports_hooks(&name, Duration::from_millis(100))).unwrap();
+                assert_eq!(failed.get(), Some(&None));
+                app.codex_versions.insert(name.clone(), failed.clone());
+                std::fs::write(
+                    &program,
+                    r#"#!/bin/sh
+if [ "$1" = --version ]; then
+  printf 'codex-cli 0.165.0\n'
+else
+  printf '%s\n' "$@" > launch-args
+fi
+"#,
+                )
+                .unwrap();
+                let id = app.start(ctx, "flaky", dir.path().into(), None, vec![], None).unwrap();
+                let retried = app.codex_versions[&name].clone();
+                assert!(!Arc::ptr_eq(&failed, &retried), "failed probes must not be reused as old versions");
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while app.sessions[app.find(&id).unwrap()].terminal.as_ref().is_none_or(|terminal| !terminal.exited()) {
+                    assert!(Instant::now() < deadline, "recovered fake agent must launch and exit");
+                    app.pump(ctx);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let args = std::fs::read_to_string(dir.path().join("launch-args")).unwrap();
+                assert!(args.contains("--no-daemon"));
+                assert!(args.contains("hooks.PermissionRequest"));
+                assert_eq!(retried.get(), Some(&Some(true)));
+                assert!(Arc::ptr_eq(&retried, &app.codex_version(ctx, name.clone())));
+            }
+        });
+    }
+
+    #[test]
+    fn busy_codex_sends_wait_for_receipts_retry_and_report_failure() {
+        with_app("app::tests::busy_codex_sends_wait_for_receipts_retry_and_report_failure", |app, ctx| {
+            let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex");
+            app.config.agents.push(imacs_core::config::AgentConfig {
+                name: "fake-codex".into(),
+                command: vec![fixture.to_string_lossy().into_owned()],
+                kind: AgentKind::Generic,
+                busy_text: None,
+            });
+            let text = "Please check the first change and then the second change";
+            for mode in ["queue", "retry", "drop", "exit", "hook"] {
+                let terminal = Terminal::spawn(
+                    ctx,
+                    app.palette.clone(),
+                    fixture.to_string_lossy().into_owned(),
+                    vec!["--mode".into(), mode.into()],
+                    &app.launch_dir,
+                    HashMap::new(),
+                    100,
+                )
+                .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !terminal.screen_text(60).contains("tab to queue") {
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                app.sessions = vec![session(mode, AgentKind::Generic, AgentStatus::Working, &app.launch_dir)];
+                app.sessions[0].agent = "fake-codex".into();
+                app.sessions[0].terminal = Some(terminal);
+                let (tx, rx) = channel();
+                app.control(ctx, ControlRequest::Send { session: mode.into(), text: text.into(), raw: false }, tx);
+                assert!(rx.try_recv().is_err(), "an unverified send must not claim success");
+                let rejected = request(app, json!({"cmd":"send", "session":mode, "text":"second message"}));
+                assert!(!rejected.ok, "another send must not overwrite the pending receipt");
+                // Let the initial paste and its delayed Enter reach the fake busy terminal.
+                std::thread::sleep(Duration::from_millis(250));
+                app.sessions[0].status = AgentStatus::Done;
+                app.verify_deliveries();
+                if mode != "exit" {
+                    assert!(rx.try_recv().is_err(), "composer text or a shared prefix is not a receipt");
+                }
+                if mode == "hook" {
+                    let event = imacs_core::hook::HookEvent::from_payload(&json!({
+                        "hook_event_name":"UserPromptSubmit", "session_id":mode, "prompt":text,
+                    }))
+                    .unwrap();
+                    app.on_hook(HookMessage {
+                        pane: Some(mode.into()),
+                        ancestors: vec![],
+                        event,
+                        delivered: 0,
+                        approval_reply: None,
+                    });
+                }
+                let mut response = None;
+                for _ in 0..DELIVERY_ATTEMPTS {
+                    if let Some(pending) = &mut app.sessions[0].pending {
+                        pending.sent = Instant::now() - DELIVERY_TIMEOUT;
+                    }
+                    app.verify_deliveries();
+                    std::thread::sleep(Duration::from_millis(200));
+                    app.verify_deliveries();
+                    if let Ok(ControlOutcome::Done(result)) = rx.try_recv() {
+                        response = Some(result);
+                        break;
+                    }
+                }
+                let response = response.expect("every send must receive a delivery result");
+                assert_eq!(response.ok, matches!(mode, "queue" | "retry" | "hook"), "{mode}: {response:?}");
+                if response.ok {
+                    assert_eq!(response.result["sent"], true);
+                    assert!(
+                        mode == "hook"
+                            || steer::message_in_transcript(
+                                &app.sessions[0].terminal.as_ref().unwrap().screen_text(60),
+                                text
+                            )
+                    );
+                } else {
+                    assert!(response.error.unwrap().contains("not delivered"));
+                }
+                assert!(app.sessions[0].pending.is_none());
+                app.sessions.clear();
+            }
+        });
+    }
+
+    #[test]
+    fn redispatch_and_late_exit_events_preserve_the_current_task_session() {
+        with_app("app::tests::redispatch_and_late_exit_events_preserve_the_current_task_session", |app, ctx| {
+            let (_dir, repo) = repository();
+            app.plans[0] = Plan {
+                id: "delivery".into(),
+                approved: true,
+                tasks: vec![Task {
+                    id: "task".into(),
+                    repo: Some(repo.to_string_lossy().into_owned()),
+                    session: Some("old".into()),
+                    report: Some(Report { status: "blocked".into(), summary: "old".into(), at: 0 }),
+                    status: TaskStatus::Planned,
+                    ..Task::default()
+                }],
+                ..Plan::default()
+            };
+            app.sessions = vec![session("old", AgentKind::Generic, AgentStatus::Exited, &repo)];
+            app.dispatch(0, Some("task")).unwrap();
+            assert!(app.plans[0].tasks[0].session.is_none());
+            assert!(app.plans[0].tasks[0].report.is_none());
+            app.sync_plan();
+            assert_eq!(app.plans[0].tasks[0].status, TaskStatus::Running);
+            app.sessions.push(session("new", AgentKind::Generic, AgentStatus::Working, &repo));
+            app.sessions[1].terminal = Some(
+                Terminal::spawn(
+                    ctx,
+                    app.palette.clone(),
+                    "/bin/sleep".into(),
+                    vec!["10".into()],
+                    &repo,
+                    HashMap::new(),
+                    100,
+                )
+                .unwrap(),
+            );
+            app.plans[0].tasks[0].session = Some("new".into());
+            let exit = |pane: &str, id: &str| HookMessage {
+                pane: Some(pane.into()),
+                ancestors: vec![],
+                delivered: 0,
+                approval_reply: None,
+                event: imacs_core::hook::HookEvent::from_payload(&json!({
+                    "hook_event_name":"SessionEnd", "session_id":id,
+                }))
+                .unwrap(),
+            };
+            app.on_hook(exit("new", "old"));
+            app.on_hook(exit("old", "old"));
+            let mut stale = exit("new", "retired");
+            stale.pane = None;
+            stale.ancestors = vec![app.sessions[1].terminal.as_ref().unwrap().process_id()];
+            app.on_hook(stale);
+            app.sync_plan();
+            assert_eq!(app.sessions[1].status, AgentStatus::Working);
+            assert_eq!(app.plans[0].tasks[0].status, TaskStatus::Running);
+            app.on_hook(exit("new", "new"));
+            app.sync_plan();
+            assert_eq!(app.plans[0].tasks[0].status, TaskStatus::Blocked);
+            assert_eq!(app.plans[0].tasks[0].notes, ["the agent exited before reporting"]);
+            // Finish the worktree job before its temporary repository is removed.
+            let (_, result, _) = app.worktree_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            result.unwrap();
+        });
+    }
+
+    #[test]
+    fn session_start_does_not_wait_for_git() {
+        if std::env::var_os("IMACS_START_GIT_TEST").is_some() {
+            let dir = std::env::current_dir().unwrap();
+            let agent = imacs_core::config::AgentConfig {
+                name: "test".into(),
+                command: vec![],
+                kind: AgentKind::Shell,
+                busy_text: None,
+            };
+            let ctx = egui::Context::default();
+            let session = Session::starting("start".into(), &agent, dir.clone(), false, &ctx);
+            assert!(!dir.join("timed-out").exists(), "session construction waited for git on the UI thread");
+            assert!(session.worktree.is_none());
+            std::fs::write(dir.join("ready"), "").unwrap();
+            let worktree = session.worktree_ready.unwrap().recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+            assert_eq!(worktree.branch.as_deref(), Some("feature"));
+            assert_eq!(worktree.root, dir);
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let git = dir.path().join("git");
+        std::fs::write(
+            &git,
+            r#"#!/bin/sh
+attempts=0
+while [ ! -e ready ]; do
+  attempts=$((attempts + 1))
+  if [ "$attempts" -gt 200 ]; then
+    /usr/bin/touch timed-out
+    exit 1
+  fi
+  /bin/sleep 0.01
+done
+case "$5" in
+  rev-parse) pwd ;;
+  symbolic-ref) printf 'feature\n' ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let output = crate::test_support::output(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "app::tests::session_start_does_not_wait_for_git", "--nocapture"])
+                .env("IMACS_START_GIT_TEST", "1")
+                .env("PATH", dir.path())
+                .env("HOME", dir.path())
+                .env("IMACS_HOME", dir.path().join("state"))
+                .env("IMACS_CONFIG", dir.path().join("config.toml"))
+                .env("IMACS_SOCKET", dir.path().join("imacs.sock"))
+                .env_remove("IMACS_PANE")
+                .current_dir(dir.path()),
+        );
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     fn repository() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
@@ -7015,6 +7721,7 @@ exec {} "$@"
                 app.plans[index].tasks[0].status = TaskStatus::Running;
                 indices.push(index);
                 let mut worker = session(id, AgentKind::Generic, AgentStatus::Working, dir.path());
+                worker.claude_id = Some(format!("codex-{id}"));
                 worker.terminal = Some(
                     Terminal::spawn(
                         ctx,
@@ -7563,6 +8270,7 @@ exec {} "$@"
     fn permission_hooks_wake_waiters_and_accept_decisions(app: &mut App, ctx: &egui::Context) {
         let dir = tempfile::tempdir().unwrap();
         app.sessions = vec![session("codex", AgentKind::Generic, AgentStatus::Working, dir.path())];
+        app.sessions[0].claude_id = Some("s1".into());
         let permission = |command: &str, reason: &str| {
             let response = Arc::new(ipc::ApprovalReply::default());
             (
@@ -7705,6 +8413,9 @@ exec {} "$@"
             sent: Instant::now() - DELIVERY_TIMEOUT,
             attempts: 1,
             was_working: true,
+            codex: false,
+            screen_before: String::new(),
+            reply: None,
         });
         app.verify_deliveries();
         assert_eq!(app.sessions[0].pending.as_ref().unwrap().attempts, 1);
@@ -7918,3 +8629,7 @@ mod chief_tests {
         assert_eq!(frame(vec![button(end, false)]), (None, true));
     }
 }
+
+#[cfg(test)]
+#[path = "board_tests.rs"]
+mod board_tests;

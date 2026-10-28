@@ -12,6 +12,8 @@ mod test_support;
 mod platform_tests;
 
 pub mod approvals;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod cleanup;
 pub mod config;
 pub mod control;
 pub mod diff;

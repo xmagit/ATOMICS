@@ -82,6 +82,8 @@ agents, Helix, a running IMACS or hooks do not affect the exit code. Tools are c
 
 Claude agents that IMACS starts get its hooks through `--settings`. Codex 0.165+ gets inline
 `-c hooks.<Event>=...` settings; older versions keep `busy_text` status tracking.
+Version detection runs in the background with a 30-second limit. Successful results are shared;
+failed or timed-out probes are retried on the next start.
 
 On the first Codex launch from an IMACS install, review and trust the IMACS hooks in Codex's
 startup prompt (or `/hooks`). Their definitions stay identical across panes, so this is a
@@ -123,16 +125,25 @@ through symlinks and read-tool options that execute programs or write files wait
 Set `allow = []` to make every permission request wait. This policy handles requests Codex raises;
 it does not add approval prompts to commands Codex already permits.
 
-IMACS waits up to ten seconds for a hook decision, then leaves Codex's native permission menu
+Pending permissions appear under the agent's header with the command, cwd, reason and **Allow**, **Allow always**
+and **Deny** buttons. They use the same handler as `imacs_approve` and remain available while the chief reviews.
+With a running chief, IMACS waits up to nine minutes for a hook decision, below Codex's ten-minute permission-hook
+timeout. Without a running chief it waits ten seconds, then leaves Codex's native permission menu
 available so you can answer in the terminal. After that, `imacs_approve` selects the matching
 visible menu choice; it returns an error if no matching menu is visible yet. For `allow_always`,
 IMACS remembers the command and selects the one-time allow choice rather than creating a broader
 Codex prefix rule. A denial message can only be supplied while the hook is waiting.
+Truncated commands match their visible prefix. If a long reason hides the command, `imacs_approve`
+expands it with Ctrl+A and asks for a retry so the command is checked before selecting a choice.
 
 While a permission request is pending, `imacs_send` holds plain messages and returns `held: true`.
 It releases these messages after a lifecycle event confirms the request has finished, or after the
 menu has been absent for one second. This also covers requests answered directly in the terminal.
 Raw input is rejected with an error pointing to `imacs_approve`.
+
+Codex sends wait for the complete message to appear in the transcript or visible queue, or for its
+prompt hook. IMACS retries unconfirmed input and returns an error if delivery cannot be confirmed;
+another message cannot replace a send still awaiting confirmation.
 
 Agent terminals inherit no `IMACS_SOCKET`, `IMACS_PANE`, `IMACS_HOME` or `IMACS_CONFIG`.
 Codex hooks receive the socket as an argument and find their pane from process ancestry or
@@ -188,6 +199,12 @@ its own approval and automatic final review. Use `imacs_plan_close {plan, status
 **Closed plans** beside the plan tabs; approval and task history are preserved. Its history remains available by id, and once only
 one plan is open, mutation tools can omit its id again. Start the next plan while another finishes; the chief is never closed.
 `imacs_wait` events include `plan` and `task` ids for sessions belonging to a task.
+
+Open a completed plan’s ✓ tab and its board. **Clean up plan…** previews only its recorded
+task and integration branches and their worktrees. Once the integration branch or every task branch is contained
+in the configured base (usually main), select the entries to remove. Uncommitted changes, unmerged commits and
+worktrees used by agent sessions are kept with a reason. Removal rechecks the preview and never forces Git;
+branches without worktrees can be removed too. The saved plan history stays available.
 
 Tasks come together on the plan's **integration branch** (`imacs/plan-<plan-id>` unless the plan names one; the board
 shows it). `imacs_plan_integrate` (or **integrate** on a review or done card) commits whatever the task left uncommitted

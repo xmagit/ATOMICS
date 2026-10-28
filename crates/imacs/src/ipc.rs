@@ -7,7 +7,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use imacs_core::control::{ControlRequest, ControlResponse, describe_diff};
@@ -16,6 +16,7 @@ use serde_json::Value;
 
 #[derive(Default)]
 pub struct Hub {
+    pub chief_running: bool,
     /// Messages waiting for sessions that run outside IMACS, by Claude session id.
     pub outbox: HashMap<String, Vec<String>>,
     pub session_context: String,
@@ -60,9 +61,20 @@ impl ApprovalReply {
     }
 
     pub fn wait(&self, timeout: Duration) -> HookReply {
-        let state = self.state.lock().unwrap();
-        let (mut state, _) =
-            self.ready.wait_timeout_while(state, timeout, |state| matches!(state, ApprovalState::Waiting)).unwrap();
+        self.wait_with_timeout(|| timeout)
+    }
+
+    fn wait_with_timeout(&self, timeout: impl Fn() -> Duration) -> HookReply {
+        let started = Instant::now();
+        let mut state = self.state.lock().unwrap();
+        while matches!(*state, ApprovalState::Waiting) {
+            let remaining = timeout().saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+            let (next, _) = self.ready.wait_timeout(state, remaining.min(Duration::from_millis(250))).unwrap();
+            state = next;
+        }
         match std::mem::replace(&mut *state, ApprovalState::Expired) {
             ApprovalState::Answered(reply) => reply,
             _ => HookReply::default(),
@@ -183,7 +195,15 @@ fn handle(stream: UnixStream, hub: &Mutex<Hub>, channels: &Channels, ctx: &egui:
     ctx.request_repaint();
     if let Some(approval_reply) = approval_reply {
         // After this window, leave Codex's native prompt available to the user.
-        reply = approval_reply.wait(Duration::from_secs(10));
+        reply = if hub.lock().unwrap().chief_running {
+            approval_reply.wait_with_timeout(|| {
+                let seconds =
+                    if hub.lock().unwrap().chief_running { imacs_core::hook::PERMISSION_WAIT_SECONDS } else { 10 };
+                Duration::from_secs(seconds)
+            })
+        } else {
+            approval_reply.wait(Duration::from_secs(10))
+        };
     }
     let mut writer = &stream;
     writer.write_all(serde_json::to_string(&reply)?.as_bytes())?;
@@ -301,6 +321,55 @@ mod tests {
         assert!(!reply.answer(HookReply { stdout: Some("duplicate".into()) }));
         assert_eq!(thread.join().unwrap().stdout.as_deref(), Some("allowed"));
         assert!(!reply.answer(HookReply::default()));
+    }
+
+    #[test]
+    fn permission_reply_wait_depends_on_a_running_chief() {
+        for (chief_running, chief_exits, seconds) in [(false, false, 11), (true, false, 13), (true, true, 11)] {
+            let (server, mut client) = UnixStream::pair().unwrap();
+            client.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+            let (hooks, received) = std::sync::mpsc::channel();
+            let (control, _) = std::sync::mpsc::channel();
+            let hub = Arc::new(Mutex::new(Hub { chief_running, ..Hub::default() }));
+            let server_hub = hub.clone();
+            let handler = std::thread::spawn(move || {
+                let governor = Arc::new(crate::governor::Governor::new(Default::default(), None));
+                handle(
+                    server,
+                    &server_hub,
+                    &Channels { hooks, control, governor, usage: std::sync::mpsc::channel().0 },
+                    &egui::Context::default(),
+                )
+                .unwrap();
+            });
+            writeln!(
+                client,
+                "{}",
+                json!({"pane":"review", "payload":{
+                    "hook_event_name":"PermissionRequest", "session_id":"review"
+                }})
+            )
+            .unwrap();
+            let pending = received.recv_timeout(Duration::from_secs(2)).unwrap().approval_reply.unwrap();
+            std::thread::sleep(Duration::from_secs(seconds));
+            if chief_exits {
+                hub.lock().unwrap().chief_running = false;
+            }
+            let answerable = chief_running && !chief_exits;
+            if answerable {
+                assert!(pending.answer(HookReply { stdout: Some("reviewed".into()) }));
+            }
+            let mut line = String::new();
+            BufReader::new(client).read_line(&mut line).unwrap();
+            if !answerable {
+                assert!(!pending.answer(HookReply { stdout: Some("late".into()) }));
+            }
+            assert_eq!(
+                serde_json::from_str::<HookReply>(&line).unwrap().stdout.as_deref(),
+                answerable.then_some("reviewed")
+            );
+            handler.join().unwrap();
+        }
     }
 
     #[test]
