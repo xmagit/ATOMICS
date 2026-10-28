@@ -222,6 +222,9 @@ impl Plan {
         for task in &mut self.tasks {
             if task.status != TaskStatus::Done && task.finished_at.take().is_some() {
                 changed = true;
+                if self.status == PlanStatus::Completed {
+                    self.status = PlanStatus::Open;
+                }
             }
             if task.status == TaskStatus::Done
                 && (task.branch.is_none() || task.integrated.as_deref() == Some(&integration))
@@ -230,10 +233,6 @@ impl Plan {
                 task.finished_at = Some(now);
                 changed = true;
             }
-        }
-        if self.status == PlanStatus::Completed && self.tasks.iter().any(|t| t.status != TaskStatus::Done) {
-            self.status = PlanStatus::Open;
-            changed = true;
         }
         if self.is_open()
             && !self.tasks.is_empty()
@@ -492,7 +491,7 @@ mod tests {
         assert!(!plan.finish_tasks(2000));
         let dir = tempfile::tempdir().unwrap();
         plan.save_in(dir.path()).unwrap();
-        assert_eq!(load_plans(dir.path()).unwrap(), [plan.clone()]);
+        assert_eq!(load_plans(dir.path()).unwrap().0, [plan.clone()]);
         plan.tasks[0].status = TaskStatus::Running;
         assert!(plan.finish_tasks(3000));
         assert_eq!(plan.status, PlanStatus::Open);

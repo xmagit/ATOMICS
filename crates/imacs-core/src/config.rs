@@ -238,8 +238,10 @@ impl Default for EditorConfig {
 
 impl EditorConfig {
     pub fn open_steps(&self, path: &str, line: Option<u32>, fresh: bool) -> Vec<String> {
-        let mut steps = if fresh { self.startup_keys.clone() } else { Vec::new() };
-        steps.push("\x1b".into());
+        let mut steps = vec!["\x1b".into()];
+        if fresh {
+            steps.extend(self.startup_keys.clone());
+        }
         steps.extend(
             self.open_keys
                 .iter()
@@ -598,9 +600,9 @@ mod tests {
         assert_eq!(config.open_steps("README.md", None, false), ["\x1b", ":open README.md\r"]);
         assert_eq!(
             config.open_steps("README.md", Some(42), true),
-            [":theme base16_transparent\r", "\x1b", ":goto 42\r"]
+            ["\x1b", ":theme base16_transparent\r", ":goto 42\r"]
         );
-        assert_eq!(config.open_steps("README.md", None, true), [":theme base16_transparent\r", "\x1b"]);
+        assert_eq!(config.open_steps("README.md", None, true), ["\x1b", ":theme base16_transparent\r"]);
     }
 
     #[test]

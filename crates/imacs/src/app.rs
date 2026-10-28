@@ -1774,8 +1774,10 @@ impl App {
                 });
             }
         }
-        if let Some(index) = archive {
-            self.archive_plan(index);
+        if let Some(index) = archive
+            && let Err(err) = self.close_plan(index, PlanStatus::Archived)
+        {
+            self.toast(err);
         }
         if let Some(index) = plan_pick {
             self.selected_plan = index;
@@ -1825,18 +1827,6 @@ impl App {
                 self.active = None;
                 self.diff_root = None;
             }
-        }
-    }
-
-    fn archive_plan(&mut self, index: usize) {
-        if self.plans[index].status != plan::PlanStatus::Completed {
-            return;
-        }
-        self.plans[index].status = plan::PlanStatus::Archived;
-        self.save_plan(index);
-        if self.selected_plan == index {
-            self.set_view(self.view.clone());
-            self.panel = PanelMode::Diff;
         }
     }
 
@@ -1922,17 +1912,16 @@ impl App {
                 self.diff_open = true;
                 self.panel = PanelMode::Diff;
             }
-            "resume" => {
+            "resume" if !self.sessions.iter().any(|s| task.session.as_deref() == Some(&s.id)) => {
                 let ctx = self.ctx.clone();
                 let agent = if task.agent.is_empty() { "claude" } else { &task.agent };
                 match self.start(&ctx, agent, root, Some(task.resume_id.unwrap_or_default()), task.args, None) {
                     Ok(session) => {
                         let task = &mut self.plans[index].tasks[task_index];
                         task.session = Some(session);
-                        task.status = TaskStatus::Running;
+                        task.set_status(TaskStatus::Running);
                         task.finished_at = None;
                         task.dispatched_at = Some(imacs_core::store::now());
-                        task.integrated = None;
                         self.plans[index].status = plan::PlanStatus::Open;
                         self.save_plan(index);
                     }
@@ -2406,10 +2395,9 @@ impl App {
                                                     .size(11.0),
                                             );
                                         }
-                                        let idle = task.session.as_ref().and_then(|s| sessions.get(s)).is_some_and(
-                                            |(_, status)| matches!(status, AgentStatus::Idle | AgentStatus::Done),
-                                        );
-                                        if let Some(action) = task_result(ui, task, idle, open, &p) {
+                                        let status =
+                                            task.session.as_ref().and_then(|s| sessions.get(s)).map(|(_, s)| *s);
+                                        if let Some(action) = task_result(ui, task, status, open, &p) {
                                             actions.push((task.id.clone(), action));
                                         }
                                         if let Some(note) = task.notes.last() {
@@ -2538,8 +2526,8 @@ impl App {
             self.finish_plan_agents();
             self.save_plan(self.selected_plan);
         }
-        if archive {
-            self.archive_plan(self.selected_plan);
+        if archive && let Err(err) = self.close_plan(self.selected_plan, PlanStatus::Archived) {
+            self.toast(err);
         }
         if let Some(session) = open_session {
             self.activate(&session, true);
@@ -4509,7 +4497,7 @@ impl App {
                 ui.new_child(egui::UiBuilder::new().id_salt(("completed", plan, task)).max_rect(tile.shrink(14.0)));
             let task_data = &self.plans[plan].tasks[task];
             child.label(RichText::new(&task_data.title).color(p.foreground).strong().size(13.0));
-            if let Some(action) = task_result(&mut child, task_data, false, false, &p) {
+            if let Some(action) = task_result(&mut child, task_data, None, false, &p) {
                 task_action = Some((plan, task, action));
             }
         }
@@ -5261,7 +5249,13 @@ fn status_dot(status: AgentStatus, p: &Palette, time: f64) -> Color32 {
     }
 }
 
-fn task_result(ui: &mut egui::Ui, task: &Task, idle: bool, expanded: bool, p: &Palette) -> Option<&'static str> {
+fn task_result(
+    ui: &mut egui::Ui,
+    task: &Task,
+    status: Option<AgentStatus>,
+    expanded: bool,
+    p: &Palette,
+) -> Option<&'static str> {
     let mut action = None;
     if task.finished_at.is_some() {
         ui.label(
@@ -5269,7 +5263,9 @@ fn task_result(ui: &mut egui::Ui, task: &Task, idle: bool, expanded: bool, p: &P
                 .color(p.success)
                 .size(12.0),
         );
-    } else if idle && let Some(line) = task.reported_line(imacs_core::store::now()) {
+    } else if matches!(status, Some(AgentStatus::Idle | AgentStatus::Done))
+        && let Some(line) = task.reported_line(imacs_core::store::now())
+    {
         ui.label(RichText::new(line).color(p.muted).size(12.0));
     }
     if let Some(report) = &task.report {
@@ -5278,7 +5274,17 @@ fn task_result(ui: &mut egui::Ui, task: &Task, idle: bool, expanded: bool, p: &P
         } else {
             truncate(&report.summary.lines().take(3).collect::<Vec<_>>().join("\n"), 360)
         };
-        ui.label(RichText::new(summary).color(p.foreground).size(12.0));
+        let (summary, color) = if task.finished_at.is_some() {
+            (summary, p.foreground)
+        } else {
+            let color = match report.status.as_str() {
+                "done" => p.success,
+                "blocked" | "question" => p.warning,
+                _ => p.info,
+            };
+            (format!("{}: {summary}", report.status), color)
+        };
+        ui.label(RichText::new(summary).color(color).size(12.0));
     }
     if task.finished_at.is_some() {
         ui.label(RichText::new(format!("+{} −{}", task.additions, task.deletions)).color(p.muted).size(12.0));
@@ -5288,7 +5294,7 @@ fn task_result(ui: &mut egui::Ui, task: &Task, idle: bool, expanded: bool, p: &P
             }
             if ui
                 .add_enabled(
-                    task.worktree.is_some() && (task.resume_id.is_some() || task.agent == "codex"),
+                    status.is_none() && task.worktree.is_some() && (task.resume_id.is_some() || task.agent == "codex"),
                     egui::Button::new("resume").small(),
                 )
                 .clicked()
@@ -5792,6 +5798,15 @@ fi
                 ..Plan::default()
             };
             let into = app.plans[index].integration_branch();
+            app.plans[index].tasks[0].status = TaskStatus::Running;
+            app.plans[index].tasks[0].integrated = Some(into.clone());
+            assert_eq!(app.report(Some("worker"), "done", "Last report\nSecond line"), Some("code".into()));
+            app.sync_plan();
+            assert_eq!(app.plans[index].tasks[0].status, TaskStatus::Review);
+            assert!(app.plans[index].tasks[0].finished_at.is_none());
+            assert!(app.completed_tasks().is_empty());
+            assert!(app.sessions[app.find("worker").unwrap()].terminal.as_ref().is_some_and(|t| !t.exited()));
+            app.plans[index].tasks[0].integrated = None;
             assert!(request(app, json!({"cmd":"plan_update", "plan":"lifecycle", "id":"code", "status":"done"})).ok);
             assert!(app.find("worker").is_some(), "acceptance alone must not close unintegrated work");
             app.finish_integration(Integrated {
@@ -5844,11 +5859,11 @@ fi
             app.task_action(index, 0, "diff");
             assert_eq!(app.diff_target().as_deref(), Some(root));
             assert!(app.panel == PanelMode::Diff);
-            app.archive_plan(index);
+            app.close_plan(index, PlanStatus::Archived).unwrap();
             assert_eq!(app.plans[index].status, plan::PlanStatus::Archived);
             assert!(app.completed_tasks().is_empty());
             assert_eq!(
-                plan::load_plans(&paths::imacs_home()).unwrap().iter().find(|p| p.id == "lifecycle").unwrap().status,
+                plan::load_plans(&paths::imacs_home()).unwrap().0.iter().find(|p| p.id == "lifecycle").unwrap().status,
                 plan::PlanStatus::Archived
             );
             assert!(root.exists());
@@ -5934,6 +5949,10 @@ fi
                 let session = task.session.clone().unwrap();
                 assert_eq!(app.sessions[app.find(&session).unwrap()].root(), dir.path());
                 assert!(app.completed_tasks().is_empty());
+                let count = app.sessions.len();
+                app.task_action(index, 0, "resume");
+                assert_eq!(app.sessions.len(), count, "a live session must never be resumed into a duplicate");
+                assert_eq!(app.plans[index].tasks[0].session.as_deref(), Some(session.as_str()));
                 app.close(&session);
             }
         });
@@ -6110,6 +6129,8 @@ fi
             let closed = request(app, json!({"cmd":"plan_close", "plan":two, "status":"completed"}));
             assert!(closed.ok);
             assert_eq!(closed.result["status"], "completed");
+            app.sync_plan();
+            assert_eq!(request(app, json!({"cmd":"plan_get", "plan":two})).result["status"], "completed");
             assert!(request(app, json!({"cmd":"plan_update", "id":"a", "status":"done"})).ok);
             assert_eq!(app.plans[app.selected_plan].id, one.as_str().unwrap());
             assert_eq!(request(app, json!({"cmd":"plan_get"})).result["plans"].as_array().unwrap().len(), 1);
@@ -6723,7 +6744,8 @@ fi
             };
             for (goal, index, visible) in [("Atlas", one, 0), ("Beacon", two, 1)] {
                 let text = frame(app, vec![]);
-                assert!(!text.iter().any(|(t, _)| t.contains("● Archived") || t.contains("● Completed")));
+                assert!(!text.iter().any(|(t, _)| t.contains("Archived")));
+                assert!(text.iter().any(|(t, _)| t.starts_with("✓ Completed ·")));
                 let pos = text.iter().find(|(t, _)| t.starts_with(&format!("● {goal} ·"))).unwrap().1;
                 frame(app, vec![egui::Event::PointerMoved(pos), button(pos, true)]);
                 frame(app, vec![button(pos, false)]);
