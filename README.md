@@ -59,6 +59,14 @@ IMACS --workspace daily               # opens a saved workspace
 IMACS --open claude:~/repos/app --open codex:~/repos/app-feature
 ```
 
+On macOS, `scripts/macos-app.sh` builds `~/Applications/IMACS.app` (release binary, the atomisk.ai icon, microphone
+permission text), so IMACS runs from the Dock or Spotlight and keeps running when terminals close:
+
+```sh
+scripts/macos-app.sh
+open -a IMACS --args --workspace cz3backend
+```
+
 The config is created on first start at `~/.config/imacs/config.toml`. It is commented and reloads while IMACS runs: agents
 and their commands, `base_ref`, layout breakpoints, fonts, colors, shortcuts, and the texts used for steering.
 
