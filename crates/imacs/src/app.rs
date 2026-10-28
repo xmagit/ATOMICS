@@ -68,6 +68,8 @@ pub struct Session {
     approvals: Vec<PendingApproval>,
     allowed: Vec<ApprovalRequest>,
     held: Vec<String>,
+    approval_hold: bool,
+    menu_absent_since: Option<Instant>,
     pub selected: bool,
     /// The chief agent stays outside the agent fleet.
     pub chief: bool,
@@ -105,6 +107,9 @@ struct Pending {
     was_working: bool,
 }
 
+const APPROVAL_CHECK_INTERVAL: Duration = Duration::from_millis(250);
+const APPROVAL_MENU_GRACE: Duration = Duration::from_secs(1);
+
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(4);
 const DELIVERY_ATTEMPTS: u8 = 3;
 
@@ -129,6 +134,8 @@ impl Session {
             approvals: Vec::new(),
             allowed: Vec::new(),
             held: Vec::new(),
+            approval_hold: false,
+            menu_absent_since: None,
             selected: false,
             chief,
             pending: None,
@@ -325,6 +332,7 @@ pub struct App {
     control_rx: Receiver<ControlMessage>,
     hook_error: Option<String>,
     busy_checked: Instant,
+    approvals_checked: Instant,
     store: Store,
     dismissed: HashSet<String>,
     /// Main checkouts of the open projects (plus `repos` from the config).
@@ -456,6 +464,7 @@ impl App {
             control_rx,
             hook_error,
             busy_checked: Instant::now(),
+            approvals_checked: Instant::now() - APPROVAL_CHECK_INTERVAL,
             store: Store::load(&paths::store_file()),
             dismissed: HashSet::new(),
             repos: Vec::new(),
@@ -1013,25 +1022,7 @@ impl App {
         let launch = AgentLaunch { id: id.clone(), agent, cwd, resume, extra_args, prompt, chief };
         let version = if codex {
             let program = resolve_program(&launch.agent.command[0]);
-            let ready = self
-                .codex_versions
-                .entry(program.clone())
-                .or_insert_with(|| {
-                    let ready = Arc::new(OnceLock::new());
-                    let result = ready.clone();
-                    let ctx = ctx.clone();
-                    std::thread::spawn(move || {
-                        let supported =
-                            std::process::Command::new(program).arg("--version").output().ok().is_some_and(|output| {
-                                output.status.success()
-                                    && imacs_core::hook::codex_supports_hooks(&String::from_utf8_lossy(&output.stdout))
-                            });
-                        let _ = result.set(supported);
-                        ctx.request_repaint();
-                    });
-                    ready
-                })
-                .clone();
+            let ready = self.codex_version(ctx, program);
             match ready.get().copied() {
                 Some(supported) => Some(supported),
                 None => {
@@ -1045,6 +1036,23 @@ impl App {
             None
         };
         self.launch_agent(ctx, launch, version)
+    }
+
+    fn codex_version(&mut self, ctx: &egui::Context, program: String) -> Arc<OnceLock<bool>> {
+        self.codex_versions
+            .entry(program.clone())
+            .or_insert_with(|| {
+                let ready = Arc::new(OnceLock::new());
+                let result = ready.clone();
+                let ctx = ctx.clone();
+                std::thread::spawn(move || {
+                    let supported = crate::setup::codex_supports_hooks(&program, Duration::from_secs(3));
+                    let _ = result.set(supported);
+                    ctx.request_repaint();
+                });
+                ready
+            })
+            .clone()
     }
 
     fn launch_agent(
@@ -1507,7 +1515,9 @@ impl App {
             }
             ControlRequest::Send { session, text, raw } => match self.find(&session) {
                 None => missing(&session),
-                Some(index) if raw && !self.sessions[index].approvals.is_empty() => {
+                Some(index)
+                    if raw && (self.sessions[index].approval_hold || !self.sessions[index].approvals.is_empty()) =>
+                {
                     done(ControlResponse::error("raw input is blocked while permission is pending; use imacs_approve"))
                 }
                 Some(index) if raw => match &self.sessions[index].terminal {
@@ -1645,7 +1655,7 @@ impl App {
     fn verify_deliveries(&mut self) {
         let mut warnings = Vec::new();
         for session in &mut self.sessions {
-            if !session.approvals.is_empty() || !session.held.is_empty() {
+            if session.approval_hold || !session.approvals.is_empty() || !session.held.is_empty() {
                 continue;
             }
             let (Some(pending), Some(terminal)) = (session.pending.as_mut(), session.terminal.as_ref()) else {
@@ -2944,7 +2954,7 @@ impl App {
     /// next hook of sessions running elsewhere.
     fn deliver(&mut self, index: usize, text: &str) -> Delivery {
         let session = &mut self.sessions[index];
-        if !session.approvals.is_empty() {
+        if session.approval_hold || !session.approvals.is_empty() {
             session.held.push(text.to_string());
             return Delivery::Held;
         }
@@ -3117,8 +3127,8 @@ impl App {
         while let Ok(integrated) = self.integrate_rx.try_recv() {
             self.finish_integration(integrated);
         }
-        self.expire_approvals();
-        if self.sessions.iter().any(|session| !session.approvals.is_empty()) {
+        self.expire_approvals(Instant::now());
+        if self.sessions.iter().any(|session| session.approval_hold || !session.approvals.is_empty()) {
             ctx.request_repaint_after(Duration::from_millis(400));
         }
         while let Ok(message) = self.control_rx.try_recv() {
@@ -3359,6 +3369,8 @@ impl App {
                     approvals: Vec::new(),
                     allowed: Vec::new(),
                     held: Vec::new(),
+                    approval_hold: false,
+                    menu_absent_since: None,
                     selected: false,
                     chief: false,
                     pending: None,
@@ -3384,6 +3396,8 @@ impl App {
             {
                 return;
             }
+            session.approval_hold = true;
+            session.menu_absent_since = None;
             session.approvals.push(PendingApproval { request, reply: message.approval_reply });
             self.last_status.remove(&session.id);
         } else if event.name == "PreToolUse" {
@@ -3422,7 +3436,16 @@ impl App {
         if matches!(event.name.as_str(), "SessionStart" | "UserPromptSubmit" | "Stop") {
             self.remember(&id);
         }
-        if matches!(event.name.as_str(), "PreToolUse" | "PostToolUse" | "Stop" | "Interrupt" | "UserPromptSubmit") {
+        if matches!(event.name.as_str(), "PostToolUse" | "Stop" | "Interrupt" | "UserPromptSubmit") {
+            let session = &mut self.sessions[index];
+            if session.approvals.is_empty() && session.approval_hold {
+                let menu = session
+                    .terminal
+                    .as_ref()
+                    .is_some_and(|terminal| imacs_core::approvals::menu_visible(&terminal.screen_text(60)));
+                session.approval_hold = menu;
+                session.menu_absent_since = None;
+            }
             self.release_held(index);
         }
         if event.name == "PermissionRequest" {
@@ -3449,39 +3472,58 @@ impl App {
     }
 
     fn release_held(&mut self, index: usize) {
-        if self.sessions[index].approvals.is_empty() && !self.sessions[index].held.is_empty() {
+        if !self.sessions[index].approval_hold
+            && self.sessions[index].approvals.is_empty()
+            && !self.sessions[index].held.is_empty()
+        {
             let text = std::mem::take(&mut self.sessions[index].held).join("\n\n");
             self.deliver(index, &text);
         }
     }
 
-    fn expire_approvals(&mut self) {
+    fn expire_approvals(&mut self, now: Instant) {
+        if now.duration_since(self.approvals_checked) < APPROVAL_CHECK_INTERVAL {
+            return;
+        }
+        self.approvals_checked = now;
         for index in 0..self.sessions.len() {
             let session = &mut self.sessions[index];
-            let screen = session.terminal.as_ref().map(|terminal| terminal.screen_text(60)).unwrap_or_default();
-            let before = session.approvals.len();
-            session.approvals.retain(|pending| {
-                pending.reply.as_ref().is_some_and(|reply| !reply.expired())
-                    || imacs_core::approvals::menu_key(&screen, pending.request.command.as_deref(), Decision::Allow)
-                        .is_some()
-                    || imacs_core::approvals::menu_key(&screen, pending.request.command.as_deref(), Decision::Deny)
-                        .is_some()
-            });
-            if session.approvals.len() != before && session.approvals.is_empty() {
-                if session.status == AgentStatus::NeedsInput {
-                    session.status = if session.terminal.as_ref().is_some_and(Terminal::exited) {
-                        AgentStatus::Exited
-                    } else {
-                        AgentStatus::Working
-                    };
-                }
-                self.release_held(index);
+            if !session.approval_hold && session.approvals.is_empty() {
+                continue;
             }
+            if session.approvals.iter().any(|pending| pending.reply.as_ref().is_some_and(|reply| !reply.expired())) {
+                session.menu_absent_since = None;
+                continue;
+            }
+            let menu = session
+                .terminal
+                .as_ref()
+                .is_some_and(|terminal| imacs_core::approvals::menu_visible(&terminal.screen_text(60)));
+            if menu {
+                session.approval_hold = true;
+                session.menu_absent_since = None;
+                continue;
+            }
+            let missing_since = session.menu_absent_since.get_or_insert(now);
+            if now.duration_since(*missing_since) < APPROVAL_MENU_GRACE {
+                continue;
+            }
+            session.approvals.clear();
+            session.approval_hold = false;
+            session.menu_absent_since = None;
+            if session.status == AgentStatus::NeedsInput {
+                session.status = if session.terminal.as_ref().is_some_and(Terminal::exited) {
+                    AgentStatus::Exited
+                } else {
+                    AgentStatus::Working
+                };
+            }
+            self.release_held(index);
         }
     }
 
     fn approve(&mut self, index: usize, decision: Decision, message: Option<&str>) -> Result<(), String> {
-        self.expire_approvals();
+        self.expire_approvals(Instant::now());
         let session = &mut self.sessions[index];
         let Some(pending) = session.approvals.first_mut() else { return Err("no pending permission request".into()) };
         let reply = HookReply { stdout: Some(decision.output(message)) };
@@ -5360,6 +5402,8 @@ mod tests {
             approvals: Vec::new(),
             allowed: Vec::new(),
             held: Vec::new(),
+            approval_hold: false,
+            menu_absent_since: None,
             selected: false,
             chief: false,
             pending: None,
@@ -5369,17 +5413,17 @@ mod tests {
     fn with_app(name: &str, test: impl FnOnce(&mut App, &egui::Context)) {
         if std::env::var_os("IMACS_APP_TEST_CHILD").is_none() {
             let dir = tempfile::tempdir().unwrap();
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", name, "--nocapture"])
-                .current_dir(dir.path())
-                .env("IMACS_APP_TEST_CHILD", "1")
-                .env("HOME", dir.path())
-                .env("IMACS_HOME", dir.path().join("state"))
-                .env("IMACS_CONFIG", dir.path().join("config.toml"))
-                .env("IMACS_SOCKET", dir.path().join("imacs.sock"))
-                .env_remove("IMACS_PANE")
-                .output()
-                .unwrap();
+            let output = crate::test_support::output(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", name, "--nocapture"])
+                    .current_dir(dir.path())
+                    .env("IMACS_APP_TEST_CHILD", "1")
+                    .env("HOME", dir.path())
+                    .env("IMACS_HOME", dir.path().join("state"))
+                    .env("IMACS_CONFIG", dir.path().join("config.toml"))
+                    .env("IMACS_SOCKET", dir.path().join("imacs.sock"))
+                    .env_remove("IMACS_PANE"),
+            );
             assert!(
                 output.status.success(),
                 "stdout: {}\nstderr: {}",
@@ -5414,7 +5458,21 @@ mod tests {
         with_app("app::tests::codex_version_is_cached_per_program_without_blocking_launch", |app, ctx| {
             use std::os::unix::fs::PermissionsExt;
             let dir = tempfile::tempdir().unwrap();
-            let script = "#!/bin/sh\nif [ \"$1\" = --version ]; then\n  printf 'checked\\n' >> \"$(dirname \"$0\")/checks\"\n  while [ ! -e \"$(dirname \"$0\")/ready\" ]; do sleep 0.01; done\n  printf 'codex-cli 0.165.0\\n'\nelse\n  printf '%s\\n' \"$@\" > \"$(dirname \"$0\")/launch-args\"\n  sleep 10\nfi\n";
+            let script = r#"#!/bin/sh
+dir=${0%/*}
+if [ "$1" = --version ]; then
+  printf 'checked\n' >> "$dir/checks"
+  attempts=0
+  while [ ! -e "$dir/ready" ]; do
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt 200 ] || exit 1
+    sleep 0.01
+  done
+  printf 'codex-cli 0.165.0\n'
+else
+  printf '%s\n' "$@" > "$dir/launch-args"
+fi
+"#;
             for name in ["one", "two"] {
                 let folder = dir.path().join(name);
                 std::fs::create_dir(&folder).unwrap();
@@ -5432,26 +5490,39 @@ mod tests {
                     busy_text: None,
                 });
             }
+            let probe_dir = dir.path().to_path_buf();
+            let release = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while ["one", "two"].iter().any(|name| !probe_dir.join(name).join("checks").exists()) {
+                    assert!(Instant::now() < deadline, "both asynchronous version probes must start");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                for name in ["one", "two"] {
+                    std::fs::write(probe_dir.join(name).join("ready"), "").unwrap();
+                }
+            });
+            let program = |name: &str| dir.path().join(name).join("codex").to_string_lossy().into_owned();
+            let one = app.codex_version(ctx, program("one"));
+            assert!(Arc::ptr_eq(&one, &app.codex_version(ctx, program("one"))));
+            let two = app.codex_version(ctx, program("two"));
+            release.join().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while one.get().is_none() || two.get().is_none() {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(one.get(), Some(&true));
+            assert_eq!(two.get(), Some(&false));
+            assert_eq!(app.codex_versions.len(), 2);
+            // A gated probe must finish before start() runs git: concurrent children can
+            // inherit pipe writers on macOS and otherwise keep git's output() waiting for EOF.
             let mut ids = Vec::new();
             for name in ["one", "one", "two"] {
                 ids.push(app.start(ctx, name, dir.path().into(), None, vec![], None).unwrap());
             }
-            // Version processes cannot finish until this test releases them.
-            assert!(ids.iter().all(|id| app.sessions[app.find(id).unwrap()].terminal.is_none()));
-            assert_eq!(app.codex_versions.len(), 2);
-            for name in ["one", "two"] {
-                std::fs::write(dir.path().join(name).join("ready"), "").unwrap();
-            }
             let deadline = Instant::now() + Duration::from_secs(5);
-            while !app.pending_codex.is_empty() {
-                assert!(Instant::now() < deadline);
-                app.pump(ctx);
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            assert!(ids.iter().all(|id| app.sessions[app.find(id).unwrap()].terminal.is_some()));
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while ["one", "two"].iter().any(|name| !dir.path().join(name).join("launch-args").exists()) {
-                assert!(Instant::now() < deadline);
+            while ids.iter().any(|id| !app.sessions[app.find(id).unwrap()].terminal.as_ref().unwrap().exited()) {
+                assert!(Instant::now() < deadline, "finite fake agents must exit before teardown");
                 std::thread::sleep(Duration::from_millis(10));
             }
             assert!(
@@ -5464,7 +5535,7 @@ mod tests {
                     .unwrap()
                     .contains("hooks.PermissionRequest")
             );
-            app.start(ctx, "one", dir.path().into(), None, vec![], None).unwrap();
+            assert!(Arc::ptr_eq(&one, &app.codex_version(ctx, program("one"))));
             for name in ["one", "two"] {
                 assert_eq!(std::fs::read_to_string(dir.path().join(name).join("checks")).unwrap().lines().count(), 1);
             }
@@ -5473,8 +5544,8 @@ mod tests {
     }
 
     #[test]
-    fn expired_approvals_release_messages_without_a_menu_or_on_pretooluse() {
-        with_app("app::tests::expired_approvals_release_messages_without_a_menu_or_on_pretooluse", |app, ctx| {
+    fn expired_approvals_wait_for_menu_quiet_or_lifecycle() {
+        with_app("app::tests::expired_approvals_wait_for_menu_quiet_or_lifecycle", |app, ctx| {
             let dir = tempfile::tempdir().unwrap();
             app.sessions = vec![session("stale", AgentKind::Generic, AgentStatus::NeedsInput, dir.path())];
             let permission = imacs_core::hook::HookEvent::from_payload(&json!({
@@ -5483,6 +5554,7 @@ mod tests {
             }))
             .unwrap();
             let reply = Arc::new(ipc::ApprovalReply::default());
+            app.sessions[0].approval_hold = true;
             app.sessions[0].approvals.push(PendingApproval {
                 request: ApprovalRequest::from_event(&permission),
                 reply: Some(reply.clone()),
@@ -5491,19 +5563,32 @@ mod tests {
             assert!(!raw.ok);
             assert!(raw.error.unwrap().contains("imacs_approve"));
             assert_eq!(app.deliver(0, "held plain message"), Delivery::Held);
-            app.expire_approvals();
+            let now = Instant::now();
+            app.approvals_checked = now - APPROVAL_CHECK_INTERVAL;
+            app.expire_approvals(now);
             assert_eq!(app.sessions[0].approvals.len(), 1);
             reply.wait(Duration::ZERO);
-            app.expire_approvals();
+            let first_check = now + APPROVAL_CHECK_INTERVAL;
+            app.expire_approvals(first_check);
+            assert_eq!(app.sessions[0].approvals.len(), 1, "an expired hook may precede its menu");
+            assert_eq!(app.sessions[0].held, ["held plain message"]);
+            let second_check = first_check + APPROVAL_CHECK_INTERVAL;
+            app.expire_approvals(second_check);
+            assert_eq!(app.sessions[0].approvals.len(), 1, "the menu quiet period must elapse");
+            app.sessions[0].menu_absent_since = Some(first_check - APPROVAL_MENU_GRACE);
+            app.expire_approvals(second_check);
+            assert_eq!(app.sessions[0].approvals.len(), 1, "screen checks must be throttled");
+            app.expire_approvals(second_check + APPROVAL_CHECK_INTERVAL);
             assert!(app.sessions[0].approvals.is_empty());
             assert!(app.sessions[0].held.is_empty());
             assert_eq!(app.hub.lock().unwrap().outbox["stale"], ["held plain message"]);
-            let menu = "Would you like to run the following command?\n\n$ touch fixture\n\n1. Yes, proceed (y)\nPress enter to confirm or esc to cancel";
+            let menu = "Allow these file edits?\n› 1. Yes, proceed\n  2. No\nPress enter to confirm or esc to cancel";
+            assert!(imacs_core::approvals::menu_key(menu, Some("touch fixture"), Decision::Allow).is_none());
             let terminal = Terminal::spawn(
                 ctx,
                 app.palette.clone(),
                 "/bin/sh".into(),
-                vec!["-c".into(), "printf '%s' \"$1\"; sleep 10".into(), "fixture".into(), menu.into()],
+                vec!["-c".into(), "printf '%s' \"$1\"; exec sleep 10".into(), "fixture".into(), menu.into()],
                 dir.path(),
                 HashMap::new(),
                 100,
@@ -5516,15 +5601,39 @@ mod tests {
             }
             app.sessions[0].terminal = Some(terminal);
             app.sessions[0].status = AgentStatus::NeedsInput;
+            app.sessions[0].approval_hold = true;
+            app.sessions[0].menu_absent_since = Some(Instant::now() - APPROVAL_MENU_GRACE);
             app.sessions[0]
                 .approvals
                 .push(PendingApproval { request: ApprovalRequest::from_event(&permission), reply: Some(reply) });
-            app.expire_approvals();
+            assert_eq!(app.deliver(0, "held while editing"), Delivery::Held);
+            let before = app.sessions[0].terminal.as_ref().unwrap().screen_text(60);
+            app.approvals_checked = Instant::now() - APPROVAL_CHECK_INTERVAL;
+            app.expire_approvals(Instant::now());
             assert_eq!(app.sessions[0].approvals.len(), 1);
+            assert!(app.sessions[0].menu_absent_since.is_none(), "a menu drawn late resets the quiet period");
+            assert_eq!(app.sessions[0].held, ["held while editing"]);
             let event = imacs_core::hook::HookEvent::from_payload(&json!({"hook_event_name":"PreToolUse", "session_id":"stale", "cwd":dir.path(), "tool_name":"Bash", "tool_input":{"command":"cat fixture"}})).unwrap();
             app.on_hook(HookMessage { pane: None, ancestors: vec![], event, delivered: 0, approval_reply: None });
             assert!(app.sessions[0].approvals.is_empty());
             assert_eq!(app.sessions[0].status, AgentStatus::Working);
+            assert!(app.sessions[0].approval_hold, "PreToolUse alone must not release input into a menu");
+            assert_eq!(app.deliver(0, "still held"), Delivery::Held);
+            app.approvals_checked = Instant::now() - APPROVAL_CHECK_INTERVAL;
+            app.expire_approvals(Instant::now());
+            assert_eq!(app.sessions[0].held.len(), 2);
+            assert_eq!(app.sessions[0].terminal.as_ref().unwrap().screen_text(60), before);
+            app.sessions[0].terminal = None;
+            let event = imacs_core::hook::HookEvent::from_payload(
+                &json!({"hook_event_name":"Interrupt", "session_id":"stale", "cwd":dir.path()}),
+            )
+            .unwrap();
+            app.on_hook(HookMessage { pane: None, ancestors: vec![], event, delivered: 0, approval_reply: None });
+            assert!(!app.sessions[0].approval_hold);
+            assert!(app.sessions[0].held.is_empty());
+            assert!(
+                app.hub.lock().unwrap().outbox["stale"].last().unwrap().contains("held while editing\n\nstill held")
+            );
             app.sessions.clear();
         });
     }
@@ -6353,7 +6462,7 @@ mod tests {
         app.on_hook(hook);
         assert!(rx.wait(Duration::ZERO).stdout.is_none());
         assert!(app.approve(0, Decision::Allow, None).is_err());
-        assert!(app.sessions[0].approvals.is_empty());
+        assert_eq!(app.sessions[0].approvals.len(), 1);
         let event = imacs_core::hook::HookEvent::from_payload(&json!({
             "hook_event_name":"PostToolUse", "session_id":"s1", "cwd":dir.path(),
             "tool_name":"Bash", "tool_input":{"command":"touch another-file"}

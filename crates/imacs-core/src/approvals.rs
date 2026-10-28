@@ -157,6 +157,18 @@ fn inside(path: &Path, root: &Path) -> bool {
     matches!((resolve(path), resolve(root)), (Some(path), Some(root)) if path.starts_with(&root))
 }
 
+/// Codex also prompts for edits and terminal input; their choices must never receive steering text.
+pub fn menu_visible(screen: &str) -> bool {
+    let compact: String = screen.chars().filter(|c| !c.is_whitespace()).flat_map(char::to_lowercase).collect();
+    compact.contains("pressentertoconfirmoresctocancel")
+        || screen.lines().any(|line| {
+            let line = line.trim();
+            let Some(choice) = line.strip_prefix(['›', '❯', '>']) else { return false };
+            let Some((number, _)) = choice.trim().split_once('.') else { return false };
+            !number.is_empty() && number.chars().all(|c| c.is_ascii_digit())
+        })
+}
+
 /// Only answer a native menu whose numbered choices are actually visible.
 pub fn menu_key(screen: &str, command: Option<&str>, decision: Decision) -> Option<String> {
     let command = command?;
@@ -282,6 +294,20 @@ mod tests {
             assert_eq!(output["hookSpecificOutput"]["decision"]["message"], "because");
             assert!(output["hookSpecificOutput"]["decision"].get("updatedPermissions").is_none());
         }
+    }
+
+    #[test]
+    fn recognizes_other_codex_menus_without_a_command_prompt() {
+        for screen in [
+            "Allow these edits?\n› 1. Yes, proceed\n  2. No",
+            "Terminal input required\nPress enter to confirm or esc to cancel",
+            "Permissions changed\nPress enter to confirm or\nesc to cancel",
+            "Different display\n❯ 2. Allow once",
+        ] {
+            assert!(menu_visible(screen), "{screen}");
+            assert!(menu_key(screen, Some("touch fixture"), Decision::Allow).is_none());
+        }
+        assert!(!menu_visible("1. A normal numbered response\n› Ask Codex to do anything"));
     }
 
     #[test]
