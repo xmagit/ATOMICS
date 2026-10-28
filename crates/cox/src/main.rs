@@ -8,6 +8,7 @@ mod mcp;
 mod setup;
 mod terminal;
 mod theme;
+mod voice;
 
 use std::path::PathBuf;
 

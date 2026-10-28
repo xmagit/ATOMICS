@@ -89,6 +89,33 @@ first message is the brief. Every agent cox starts gets a `cox_report` tool, pre
 blocked or has a question. Reports land on the task card, move done tasks to review, and wake the orchestrator's
 `cox_wait`, which then reads `cox_result` and `cox_diff`, reviews, steers, and accepts with `cox_plan_update`.
 
+## Voice
+
+Press `cmd+shift+space` and speak; press it again to send. The recording from the default microphone is transcribed
+and sent to the chief agent, which is started and opened if it isn't running. `Esc` cancels. The chief pill shows
+`● REC m:ss` while you speak and a spinner while the transcript is on its way. Recordings stop on their own after 5
+minutes. `target = "active"` under `[voice]` sends to the active agent instead.
+
+Pick a provider under `[voice]` in the config:
+
+- `provider = "openai"` (default): any OpenAI-compatible `/audio/transcriptions` endpoint, so OpenAI
+  (`gpt-4o-mini-transcribe`, key in `OPENAI_API_KEY`), Groq or a local Whisper server.
+- `provider = "openrouter"`: an audio-capable chat model on OpenRouter (`google/gemini-2.5-flash`, key in
+  `OPENROUTER_API_KEY`).
+
+```toml
+[voice]
+provider = "openai"
+base_url = "https://api.groq.com/openai/v1"
+model = "whisper-large-v3-turbo"
+api_key_env = "GROQ_API_KEY"
+```
+
+The key comes from the environment variable named by `api_key_env`. If cox doesn't have that variable (apps started
+from the Dock get a bare environment), it reads the variable from your login shell. `api_key` in the config also works
+but is discouraged. cox never logs or shows the key. macOS asks for microphone access the first time you record, for
+the terminal you started cox from or for cox itself when it runs as an app.
+
 ## Let an agent drive cox (MCP)
 
 ```sh
@@ -117,6 +144,7 @@ scripting and testing: `show_diff`, `resize` and `screenshot`.
 | `cmd+d` | show/hide the diff |
 | `cmd+j` | next agent that needs you |
 | `cmd+l` | steer bar |
+| `cmd+shift+space` | voice: record, press again to send to the chief, `Esc` cancels |
 | `cmd+t` | new session (existing folder or new worktree) |
 | `cmd+r` | refresh diff |
 | `cmd+w` | close session |
