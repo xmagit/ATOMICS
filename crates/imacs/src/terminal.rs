@@ -124,7 +124,7 @@ impl Terminal {
     pub fn submit(&self, text: &str) {
         let bracketed = self.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
         self.term.lock().scroll_display(Scroll::Bottom);
-        self.write(cox_core::steer::paste_bytes(text, bracketed));
+        self.write(imacs_core::steer::paste_bytes(text, bracketed));
         // Programs that debounce pastes would read an immediate Enter as part of it.
         let sender = self.sender.clone();
         std::thread::spawn(move || {
@@ -296,7 +296,7 @@ impl Terminal {
                         out.extend_from_slice(text.as_bytes());
                     }
                 }
-                egui::Event::Paste(text) => out.extend(cox_core::steer::paste_bytes(&text, bracketed)),
+                egui::Event::Paste(text) => out.extend(imacs_core::steer::paste_bytes(&text, bracketed)),
                 egui::Event::Copy => {
                     if let Some(text) = self.term.lock().selection_to_string() {
                         ui.ctx().copy_text(text);

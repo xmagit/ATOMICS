@@ -902,41 +902,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cox"
-version = "0.1.0"
-dependencies = [
- "alacritty_terminal",
- "anyhow",
- "clap",
- "cox-core",
- "cpal",
- "eframe",
- "egui",
- "notify-debouncer-mini",
- "png",
- "rfd",
- "serde_json",
- "syntect",
- "two-face",
- "uuid",
-]
-
-[[package]]
-name = "cox-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "dirs",
- "serde",
- "serde_json",
- "similar",
- "tempfile",
- "toml",
- "ureq",
-]
-
-[[package]]
 name = "cpal"
 version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1923,6 +1888,41 @@ checksum = "cb68373c0d6620ef8105e855e7745e18b0d00d3bdb07fb532e434244cdb9a714"
 dependencies = [
  "icu_normalizer",
  "icu_properties",
+]
+
+[[package]]
+name = "imacs"
+version = "0.1.0"
+dependencies = [
+ "alacritty_terminal",
+ "anyhow",
+ "clap",
+ "cpal",
+ "eframe",
+ "egui",
+ "imacs-core",
+ "notify-debouncer-mini",
+ "png",
+ "rfd",
+ "serde_json",
+ "syntect",
+ "two-face",
+ "uuid",
+]
+
+[[package]]
+name = "imacs-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "dirs",
+ "serde",
+ "serde_json",
+ "similar",
+ "tempfile",
+ "toml",
+ "ureq",
 ]
 
 [[package]]

@@ -3,8 +3,8 @@
 
 use std::ops::Range;
 
-use cox_core::diff::{FileDiff, LineKind};
 use egui::Color32;
+use imacs_core::diff::{FileDiff, LineKind};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::Theme;
 use syntect::parsing::SyntaxSet;

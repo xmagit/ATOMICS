@@ -1,4 +1,4 @@
-//! Remote control of a running cox over its socket: what `cox ctl` and the MCP
+//! Remote control of a running IMACS over its socket: what `imacs ctl` and the MCP
 //! server speak. One JSON object per line in each direction.
 
 use serde::{Deserialize, Serialize};
@@ -127,7 +127,7 @@ pub enum ControlRequest {
     PlanIntegrate {
         id: String,
     },
-    /// A sub-agent reporting on its task (sent by `cox mcp --agent`).
+    /// A sub-agent reporting on its task (sent by `imacs mcp --agent`).
     Report {
         pane: Option<String>,
         status: String,

@@ -1,7 +1,7 @@
 use std::os::unix::net::UnixStream;
 use std::process::Command;
 
-use cox_core::{config::Config, paths};
+use imacs_core::{config::Config, paths};
 
 use crate::setup::{find_program, global_hooks_installed, resolve_program};
 
@@ -32,14 +32,17 @@ pub fn run() -> i32 {
         Ok(_) => format!("config parses ({})", config_path.display()),
         Err(err) => format!("config failed: {err:#}"),
     };
-    println!("{}", check_line(config.is_ok(), &label, "create or fix this config; start cox to create a missing file"));
+    println!(
+        "{}",
+        check_line(config.is_ok(), &label, "create or fix this config; start IMACS to create a missing file")
+    );
 
     let socket_path = paths::socket_path();
     let running = UnixStream::connect(&socket_path).is_ok();
-    let label = format!("cox running ({})", socket_path.display());
-    println!("{}", check_line(running, &label, "start cox or check COX_SOCKET / COX_HOME"));
+    let label = format!("IMACS running ({})", socket_path.display());
+    println!("{}", check_line(running, &label, "start IMACS or check IMACS_SOCKET / IMACS_HOME"));
 
-    println!("{}", check_line(global_hooks_installed(), "global Claude hooks installed", "run `cox install-hooks`"));
+    println!("{}", check_line(global_hooks_installed(), "global Claude hooks installed", "run `imacs install-hooks`"));
 
     exit_code(git_ok, config.is_ok())
 }

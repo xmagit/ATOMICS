@@ -1,6 +1,6 @@
 //! The orchestrator's plan: a goal broken into tasks that agents work on in their
 //! own worktrees. The user approves the plan before anything is dispatched; agents
-//! report back with `cox_report`, and the plan board shows where everything is.
+//! report back with `imacs_report`, and the plan board shows where everything is.
 
 use std::path::Path;
 
@@ -16,7 +16,7 @@ pub struct Plan {
     pub tasks: Vec<Task>,
     /// Set by the user on the board. Nothing is dispatched before.
     pub approved: bool,
-    /// Branch the tasks are merged into; `cox/plan-<goal>` when unset.
+    /// Branch the tasks are merged into; `imacs/plan-<goal>` when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub integration: Option<String>,
 }
@@ -36,7 +36,7 @@ pub struct Task {
     pub repo: Option<String>,
     pub branch: Option<String>,
     pub status: TaskStatus,
-    /// cox session working on it, once dispatched.
+    /// IMACS session working on it, once dispatched.
     pub session: Option<String>,
     pub report: Option<Report>,
     pub notes: Vec<String>,
@@ -164,8 +164,8 @@ impl Plan {
         match &self.integration {
             Some(branch) => branch.clone(),
             None => match short_slug(&self.goal) {
-                slug if slug.is_empty() => "cox/plan".into(),
-                slug => format!("cox/plan-{slug}"),
+                slug if slug.is_empty() => "imacs/plan".into(),
+                slug => format!("imacs/plan-{slug}"),
             },
         }
     }
@@ -224,7 +224,7 @@ impl Task {
         }
         text.push_str(
             "\nWork only in this worktree and do not commit unless the task says so. When you are done, \
-             blocked, or have a question, call the cox_report tool with status (done, blocked or question) \
+             blocked, or have a question, call the imacs_report tool with status (done, blocked or question) \
              and a short summary: what changed and how you checked it.",
         );
         text
@@ -273,12 +273,12 @@ mod tests {
         plan.approved = true;
         plan.task_mut("a").unwrap().status = TaskStatus::Running;
         plan.task_mut("a").unwrap().session = Some("s1".into());
-        plan.task_mut("a").unwrap().branch = Some("cox/a-do-a".into());
+        plan.task_mut("a").unwrap().branch = Some("imacs/a-do-a".into());
         plan.replace("v2".into(), vec![task("a", &[]), task("", &["zz"])]);
         assert!(!plan.approved);
         assert_eq!(plan.tasks[0].status, TaskStatus::Running);
         assert_eq!(plan.tasks[0].session.as_deref(), Some("s1"));
-        assert_eq!(plan.tasks[0].branch.as_deref(), Some("cox/a-do-a"));
+        assert_eq!(plan.tasks[0].branch.as_deref(), Some("imacs/a-do-a"));
         assert_eq!(plan.tasks[1].id, "t2");
         assert_eq!(plan.unknown_dependencies(), [("t2".to_string(), "zz".to_string())]);
         assert_eq!(plan.tasks.len(), 3, "plus the review task");
@@ -301,16 +301,16 @@ mod tests {
     #[test]
     fn integration_branch_follows_the_goal() {
         let mut plan = Plan::default();
-        assert_eq!(plan.integration_branch(), "cox/plan");
+        assert_eq!(plan.integration_branch(), "imacs/plan");
         plan.replace("IMACS v0.2: brand, CI".into(), vec![task("a", &[]), task("b", &["a"])]);
-        assert_eq!(plan.integration_branch(), "cox/plan-imacs-v0-2-brand-ci");
+        assert_eq!(plan.integration_branch(), "imacs/plan-imacs-v0-2-brand-ci");
         assert_eq!(plan.start_branch(&plan.tasks[0]), None);
-        assert_eq!(plan.start_branch(&plan.tasks[1]).as_deref(), Some("cox/plan-imacs-v0-2-brand-ci"));
+        assert_eq!(plan.start_branch(&plan.tasks[1]).as_deref(), Some("imacs/plan-imacs-v0-2-brand-ci"));
         plan.integration = Some("feature/v0.2".into());
         plan.replace("IMACS v0.2: brand, CI".into(), vec![task("a", &[])]);
         assert_eq!(plan.integration_branch(), "feature/v0.2");
         plan.replace("Something else".into(), vec![task("a", &[])]);
-        assert_eq!(plan.integration_branch(), "cox/plan-something-else");
+        assert_eq!(plan.integration_branch(), "imacs/plan-something-else");
     }
 
     #[test]
@@ -321,12 +321,12 @@ mod tests {
         let worktree = |id: &str| repo.with_file_name(format!("app-{id}"));
         let dispatch = |t: &Task| {
             let start = plan.start_branch(t);
-            git::add_worktree_from(&repo, &worktree(&t.id), &format!("cox/{}", t.id), start.as_deref(), "main")
+            git::add_worktree_from(&repo, &worktree(&t.id), &format!("imacs/{}", t.id), start.as_deref(), "main")
         };
         dispatch(&plan.tasks[0]).unwrap();
         std::fs::write(worktree("a").join("api.rs"), "pub fn api() {}\n").unwrap();
         let into = plan.integration_branch();
-        git::integrate(&repo, "cox/a", "do a (a)", &into, &repo.with_file_name("app-plan"), "main").unwrap();
+        git::integrate(&repo, "imacs/a", "do a (a)", &into, &repo.with_file_name("app-plan"), "main").unwrap();
 
         dispatch(&plan.tasks[1]).unwrap();
         dispatch(&plan.tasks[2]).unwrap();
@@ -343,7 +343,7 @@ mod tests {
         assert!(
             text.starts_with("Task a: do a\nPart of: Better CLI\n\nAdd a --json flag.\n\nDone when:\n- tests pass\n")
         );
-        assert!(text.contains("cox_report"));
+        assert!(text.contains("imacs_report"));
     }
 
     #[test]

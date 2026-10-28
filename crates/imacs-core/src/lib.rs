@@ -1,5 +1,5 @@
-//! UI-independent core of cox: config, git diffs, responsive layout, the hook
-//! protocol shared by `cox hook` and the app, steering message composition, and voice transcription.
+//! UI-independent core of IMACS: config, git diffs, responsive layout, the hook
+//! protocol shared by `imacs hook` and the app, steering message composition, and voice transcription.
 
 pub mod config;
 pub mod control;

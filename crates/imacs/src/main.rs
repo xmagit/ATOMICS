@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "cox", about = "Review-first workspace for coding agents")]
+#[command(name = "imacs", about = "Review-first workspace for coding agents")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -43,21 +43,21 @@ enum Command {
     Doctor,
     /// Hook handler run by Claude Code (reads the event on stdin)
     Hook,
-    /// Add cox's hooks to ~/.claude/settings.json so every Claude session reports to cox
+    /// Add IMACS's hooks to ~/.claude/settings.json so every Claude session reports to IMACS
     InstallHooks,
-    /// Print the hook settings cox passes to the agents it starts
+    /// Print the hook settings IMACS passes to the agents it starts
     HooksJson,
-    /// MCP server (stdio) that lets another agent start, read, review and steer agents in cox
+    /// MCP server (stdio) that lets another agent start, read, review and steer agents in IMACS
     Mcp {
-        /// Expose only `cox_report`, for agents cox starts to report on their task
+        /// Expose only `imacs_report`, for agents IMACS starts to report on their task
         #[arg(long)]
         agent: bool,
     },
-    /// Send one control request to the running cox, e.g. '{"cmd":"list"}'
+    /// Send one control request to the running IMACS, e.g. '{"cmd":"list"}'
     Ctl { json: String },
 }
 
-/// Markers of the Claude Code or Codex session cox may have been started from. Agents
+/// Markers of the Claude Code or Codex session IMACS may have been started from. Agents
 /// that inherit them believe they are sub-processes (Claude then stops saving
 /// transcripts, so sessions cannot be resumed).
 const PARENT_SESSION_VARS: &[&str] = &[
@@ -85,6 +85,9 @@ fn main() -> eframe::Result {
             // SAFETY: runs first thing in main, before any other thread exists.
             unsafe { std::env::remove_var(var) };
         }
+        for moved in imacs_core::paths::migrate_from_cox() {
+            eprintln!("imacs: moved {moved}");
+        }
     }
     match cli.command {
         Some(Command::Doctor) => std::process::exit(doctor::run()),
@@ -94,14 +97,14 @@ fn main() -> eframe::Result {
         }
         Some(Command::InstallHooks) => {
             match setup::install_global_hooks() {
-                Ok(path) => println!("cox hooks added to {} (backup next to it)", path.display()),
+                Ok(path) => println!("IMACS hooks added to {} (backup next to it)", path.display()),
                 Err(err) => eprintln!("installing hooks failed: {err:#}"),
             }
             return Ok(());
         }
         Some(Command::HooksJson) => {
-            let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("cox"));
-            println!("{}", serde_json::to_string_pretty(&cox_core::hook::claude_settings(&exe)).unwrap_or_default());
+            let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("imacs"));
+            println!("{}", serde_json::to_string_pretty(&imacs_core::hook::claude_settings(&exe)).unwrap_or_default());
             return Ok(());
         }
         Some(Command::Mcp { agent }) => {
@@ -109,7 +112,7 @@ fn main() -> eframe::Result {
             return Ok(());
         }
         Some(Command::Ctl { json }) => {
-            let response = serde_json::from_str::<cox_core::control::ControlRequest>(&json)
+            let response = serde_json::from_str::<imacs_core::control::ControlRequest>(&json)
                 .map_err(anyhow::Error::from)
                 .and_then(|request| ipc::request(&request));
             match response {
@@ -128,12 +131,12 @@ fn main() -> eframe::Result {
         .open
         .iter()
         .filter_map(|spec| spec.split_once(':'))
-        .map(|(agent, dir)| (agent.to_string(), cox_core::paths::expand(dir)))
+        .map(|(agent, dir)| (agent.to_string(), imacs_core::paths::expand(dir)))
         .collect();
     let size: Option<[f32; 2]> =
         cli.size.as_deref().and_then(|s| s.split_once('x')).and_then(|(w, h)| Some([w.parse().ok()?, h.parse().ok()?]));
     let options = app::Options {
-        projects: cli.path.iter().map(|p| cox_core::paths::expand(&p.to_string_lossy())).collect(),
+        projects: cli.path.iter().map(|p| imacs_core::paths::expand(&p.to_string_lossy())).collect(),
         workspace: cli.workspace,
         open,
         screenshot: cli.screenshot,
@@ -141,10 +144,10 @@ fn main() -> eframe::Result {
     };
     let icon = load_icon();
     let native = eframe::NativeOptions {
-        // Without --size cox fills the screen: the layout is built to use all of it.
+        // Without --size IMACS fills the screen: the layout is built to use all of it.
         viewport: egui::ViewportBuilder::default()
             .with_title("IMACS")
-            .with_app_id("cox")
+            .with_app_id("imacs")
             .with_icon(icon.clone())
             .with_inner_size(size.unwrap_or([1600.0, 1000.0]))
             .with_maximized(size.is_none())

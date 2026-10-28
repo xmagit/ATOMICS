@@ -8,12 +8,12 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
-use cox_core::diff::{DiffLine, FileStatus, LineKind, SplitRow, WorktreeDiff, split_rows};
-use cox_core::files::{self, Dir};
-use cox_core::layout::DiffSplit;
-use cox_core::steer::ReviewComment;
 use egui::text::{LayoutJob, TextFormat};
 use egui::{Color32, FontId, Key, Pos2, Rect, RichText, Sense, Stroke, pos2, vec2};
+use imacs_core::diff::{DiffLine, FileStatus, LineKind, SplitRow, WorktreeDiff, split_rows};
+use imacs_core::files::{self, Dir};
+use imacs_core::layout::DiffSplit;
+use imacs_core::steer::ReviewComment;
 
 use crate::highlight::{Highlighter, Spans};
 use crate::theme::{Palette, lerp};
@@ -59,7 +59,7 @@ impl DiffWorker {
         let (tx, jobs) = channel::<Job>();
         let (results, rx) = channel();
         std::thread::Builder::new()
-            .name("cox-diff".into())
+            .name("imacs-diff".into())
             .spawn(move || {
                 while let Ok(first) = jobs.recv() {
                     // Coalesce bursts (an agent saving many files) into one job per worktree and file.
@@ -133,8 +133,8 @@ fn load_file(root: &std::path::Path, path: &str, highlighter: &Highlighter) -> a
 }
 
 fn prepare(root: &std::path::Path, base_ref: &str, highlighter: &Highlighter) -> anyhow::Result<Prepared> {
-    let diff = cox_core::git::diff_against_base(root, base_ref)?;
-    let all_files = cox_core::git::list_files(root).unwrap_or_default();
+    let diff = imacs_core::git::diff_against_base(root, base_ref)?;
+    let all_files = imacs_core::git::list_files(root).unwrap_or_default();
     let highlights = diff.files.iter().map(|f| highlighter.file(f)).collect();
     let longest_line = diff
         .files
@@ -461,7 +461,7 @@ pub fn show(
         }
         if ui
             .toggle_value(&mut split, "split")
-            .on_hover_text("Old and new side by side until cox quits (diff_split in the config sets the default)")
+            .on_hover_text("Old and new side by side until IMACS quits (diff_split in the config sets the default)")
             .changed()
         {
             action = DiffAction::Split(split);
@@ -1282,7 +1282,7 @@ pub fn changed_files(
 }
 
 /// The first line a file's change touches in the new version.
-fn first_change(file: &cox_core::diff::FileDiff) -> Option<u32> {
+fn first_change(file: &imacs_core::diff::FileDiff) -> Option<u32> {
     file.hunks
         .iter()
         .flat_map(|h| &h.lines)
@@ -1294,7 +1294,7 @@ fn first_change(file: &cox_core::diff::FileDiff) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cox_core::diff::FileDiff;
+    use imacs_core::diff::FileDiff;
 
     fn state_with(paths: &[&str]) -> DiffState {
         let files = paths.iter().map(|p| FileDiff::untracked(p.to_string(), "a\nb\n")).collect();

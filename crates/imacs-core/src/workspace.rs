@@ -1,6 +1,6 @@
 //! Projects and workspaces. A project is one git repository, always shown through
 //! its main checkout. A workspace is a named set of projects, saved as
-//! `~/.config/cox/workspaces/<name>.toml`.
+//! `~/.config/imacs/workspaces/<name>.toml`.
 
 use std::path::{Path, PathBuf};
 
@@ -17,7 +17,7 @@ pub struct Workspace {
 }
 
 pub fn workspaces_dir() -> PathBuf {
-    paths::config_file().parent().map(Path::to_path_buf).unwrap_or_else(paths::cox_home).join("workspaces")
+    paths::config_file().parent().map(Path::to_path_buf).unwrap_or_else(paths::imacs_home).join("workspaces")
 }
 
 /// The project a folder belongs to: the main checkout of its repository, so a

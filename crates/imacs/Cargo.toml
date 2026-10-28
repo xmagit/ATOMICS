@@ -1,5 +1,5 @@
 [package]
-name = "cox"
+name = "imacs"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,7 +10,7 @@ description.workspace = true
 alacritty_terminal = "0.26.0"
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
-cox-core = { version = "0.1.0", path = "../cox-core" }
+imacs-core = { version = "0.1.0", path = "../imacs-core" }
 cpal = "0.18.2"
 eframe = "0.37.0"
 egui = "0.37"

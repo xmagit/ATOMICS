@@ -11,7 +11,7 @@ orchestrating agent plan the work, hand out tasks and review the results while y
 
 An atomisk.ai project.
 
-The command is `cox`, after the coxswain: the one in the boat who doesn't row, but steers and calls the stroke.
+The command is `imacs`, after the coxswain: the one in the boat who doesn't row, but steers and calls the stroke.
 
 ## What it does
 
@@ -22,12 +22,12 @@ The command is `cox`, after the coxswain: the one in the boat who doesn't row, b
   updates live, with syntax highlighting and word-level emphasis.
 - **Side by side when there is room.** A diff area at least 1100 points wide shows the old version left and the new one
   right, each edited line beside what it replaced. `diff_split` under `[layout]` picks `auto`, `always` or `never`; the
-  **split** toggle in the diff header overrides it until cox quits. Comments and double-click-to-edit work the same in
+  **split** toggle in the diff header overrides it until IMACS quits. Comments and double-click-to-edit work the same in
   both views.
-- **Projects and workspaces.** `cox <folder>` opens the repository it is in, always through its main checkout, so a
+- **Projects and workspaces.** `imacs <folder>` opens the repository it is in, always through its main checkout, so a
   folder inside any worktree opens the same project. The explorer shows the main checkout's tracked files, with the
   changes of the worktree under review laid over them, plus each project's worktrees. **Project › Open project…**
-  adds more repositories; save the set as a workspace and reopen it with `cox --workspace <name>`.
+  adds more repositories; save the set as a workspace and reopen it with `imacs --workspace <name>`.
 - **Changed files beside the diff.** A "changed" column next to the diff/editor lists what the worktree changes. In
   diff mode a click jumps to the hunks; in editor mode it opens the file at its first change. Drag the divider
   between agents and the panel to resize it (double-click resets).
@@ -47,50 +47,50 @@ The command is `cox`, after the coxswain: the one in the boat who doesn't row, b
   screen (`busy_text`). What needs you is counted in the top bar; `cmd+j` jumps to it.
 - **Responsive.** On a wide screen, every agent gets a tile beside the diff (10 agents fit on a 5120 px ultrawide). As the window narrows, tiles collapse into
   tabs. Below that the diff stacks above the active agent, and at the smallest size the diff takes the whole area.
-- **Remote control and MCP.** Other agents can start, read, review and steer agents in cox (see below).
+- **Remote control and MCP.** Other agents can start, read, review and steer agents in IMACS (see below).
 
 ## Run
 
 ```sh
-cargo install --path crates/cox     # or: cargo run --release -p cox
-cox                                 # opens the repository you are in (or your last projects)
-cox ~/repos/app                     # opens that project
-cox --workspace daily               # opens a saved workspace
-cox --open claude:~/repos/app --open codex:~/repos/app-feature
+cargo install --path crates/imacs     # or: cargo run --release -p imacs
+IMACS                                 # opens the repository you are in (or your last projects)
+IMACS ~/repos/app                     # opens that project
+IMACS --workspace daily               # opens a saved workspace
+IMACS --open claude:~/repos/app --open codex:~/repos/app-feature
 ```
 
-The config is created on first start at `~/.config/cox/config.toml`. It is commented and reloads while cox runs: agents
+The config is created on first start at `~/.config/imacs/config.toml`. It is commented and reloads while IMACS runs: agents
 and their commands, `base_ref`, layout breakpoints, fonts, colors, shortcuts, and the texts used for steering.
 
 ## Troubleshooting
 
-Run `cox doctor` to check git, Claude Code, Codex, Helix, the config, the running cox socket and global Claude hooks.
+Run `imacs doctor` to check git, Claude Code, Codex, Helix, the config, the running IMACS socket and global Claude hooks.
 Each failed check includes a hint. Missing git or an unreadable or invalid config returns exit code 1; missing
-agents, Helix, a running cox or hooks do not affect the exit code. Tools are checked on your login-shell PATH.
+agents, Helix, a running IMACS or hooks do not affect the exit code. Tools are checked on your login-shell PATH.
 
 ## Claude sessions anywhere
 
-Agents that cox starts get its hooks through `--settings`. To make Claude sessions in any other terminal show up too
+Agents that IMACS starts get its hooks through `--settings`. To make Claude sessions in any other terminal show up too
 (status, diff, and messages delivered at their next tool call or turn end), add the hooks to your user settings:
 
 ```sh
-cox install-hooks      # merges into ~/.claude/settings.json, keeps a backup
+imacs install-hooks      # merges into ~/.claude/settings.json, keeps a backup
 ```
 
 ## Orchestration: a plan you approve, agents that report back
 
-An orchestrator (a Claude session with the cox MCP server) turns a goal into a plan with `cox_plan_set`: tasks with a
+An orchestrator (a Claude session with the IMACS MCP server) turns a goal into a plan with `imacs_plan_set`: tasks with a
 brief, acceptance checks, dependencies, and which agent and model should do them. The plan appears on the **plan
 board** (`cmd+b`, or **Plan** in the top bar) in columns for planned, running, blocked, review and done. Edit briefs,
 then **Approve plan**: nothing starts before that.
 
-`cox_plan_dispatch` (or **Dispatch ready** on the board) gives each ready task its own worktree and an agent whose
-first message is the brief. Every agent cox starts gets a `cox_report` tool, pre-approved, to say when it is done,
+`imacs_plan_dispatch` (or **Dispatch ready** on the board) gives each ready task its own worktree and an agent whose
+first message is the brief. Every agent IMACS starts gets a `imacs_report` tool, pre-approved, to say when it is done,
 blocked or has a question. Reports land on the task card, move done tasks to review, and wake the orchestrator's
-`cox_wait`, which then reads `cox_result` and `cox_diff`, reviews, steers, and accepts with `cox_plan_update`.
+`imacs_wait`, which then reads `imacs_result` and `imacs_diff`, reviews, steers, and accepts with `imacs_plan_update`.
 
-Tasks come together on the plan's **integration branch** (`cox/plan-<goal>` unless the plan names one; the board
-shows it). `cox_plan_integrate` (or **integrate** on a review or done card) commits whatever the task left uncommitted
+Tasks come together on the plan's **integration branch** (`imacs/plan-<goal>` unless the plan names one; the board
+shows it). `imacs_plan_integrate` (or **integrate** on a review or done card) commits whatever the task left uncommitted
 on its branch (as `<title> (<id>)`, with the repository's own git identity; ignored files stay out) and merges the
 branch into the integration branch. The merge happens in a worktree of its own next to the repository, created on
 first use like any other worktree, so your main checkout is never touched. On a conflict the merge is aborted and the
@@ -120,24 +120,24 @@ model = "whisper-large-v3-turbo"
 api_key_env = "GROQ_API_KEY"
 ```
 
-The key comes from the environment variable named by `api_key_env`. If cox doesn't have that variable (apps started
+The key comes from the environment variable named by `api_key_env`. If IMACS doesn't have that variable (apps started
 from the Dock get a bare environment), it reads the variable from your login shell. `api_key` in the config also works
-but is discouraged. cox never logs or shows the key. macOS asks for microphone access the first time you record, for
-the terminal you started cox from or for cox itself when it runs as an app.
+but is discouraged. IMACS never logs or shows the key. macOS asks for microphone access the first time you record, for
+the terminal you started IMACS from or for IMACS itself when it runs as an app.
 
-## Let an agent drive cox (MCP)
+## Let an agent drive IMACS (MCP)
 
 ```sh
-claude mcp add cox -s user -- cox mcp
-codex mcp add cox -- cox mcp
+claude mcp add IMACS -s user -- imacs mcp
+codex mcp add IMACS -- imacs mcp
 ```
 
-Tools: `cox_wait` (block until an agent finishes a turn or needs input; returns a cursor for the next call),
-`cox_result` (an agent's last prompt, final message and screen), `cox_list`, `cox_start` (in a folder, or a new worktree from `repo` + `branch`), `cox_send` (a message, or raw
-keys for menus), `cox_read` (screen text), `cox_diff`, `cox_comment` + `cox_send_review`, `cox_open` (show a file to the user), `cox_focus`, `cox_close`.
+Tools: `imacs_wait` (block until an agent finishes a turn or needs input; returns a cursor for the next call),
+`imacs_result` (an agent's last prompt, final message and screen), `imacs_list`, `imacs_start` (in a folder, or a new worktree from `repo` + `branch`), `imacs_send` (a message, or raw
+keys for menus), `imacs_read` (screen text), `imacs_diff`, `imacs_comment` + `imacs_send_review`, `imacs_open` (show a file to the user), `imacs_focus`, `imacs_close`.
 Comments an agent leaves show inline in the diff panel before they are sent, so you can see what it asks for.
 
-`cox ctl '<json>'` sends the same requests from a shell, e.g. `cox ctl '{"cmd":"list"}'`. A few extras exist for
+`imacs ctl '<json>'` sends the same requests from a shell, e.g. `imacs ctl '{"cmd":"list"}'`. A few extras exist for
 scripting and testing: `show_diff`, `resize` and `screenshot`.
 
 ## Shortcuts
@@ -161,8 +161,8 @@ scripting and testing: `show_diff`, `resize` and `screenshot`.
 
 ## Design
 
-Two crates. `cox-core` holds everything testable without a window: config, the git diff engine and parser, the
-responsive layout, the hook and control protocols, and review message composition. `cox` is the app.
+Two crates. `imacs-core` holds everything testable without a window: config, the git diff engine and parser, the
+responsive layout, the hook and control protocols, and review message composition. `imacs` is the app.
 
 | Concern | Choice | Why |
 |---|---|---|
@@ -172,7 +172,7 @@ responsive layout, the hook and control protocols, and review message compositio
 | Highlighting | syntect + bat's grammars (two-face) | Works line by line, which suits hunks that start mid-file |
 | Word diff | similar | Code-aware tokens, so `compute(1)` → `compute(2)` marks only the number |
 | Watching | notify (FSEvents/inotify) | Live diff for the worktree on screen; agents off screen refresh while they work |
-| IPC | Unix socket, JSON lines | One socket for hooks, `cox ctl` and `cox mcp`; no async runtime anywhere |
+| IPC | Unix socket, JSON lines | One socket for hooks, `imacs ctl` and `imacs mcp`; no async runtime anywhere |
 
-Agents run as children of the cox process, so closing cox stops them. Claude sessions can be resumed from the sidebar,
+Agents run as children of the IMACS process, so closing IMACS stops them. Claude sessions can be resumed from the sidebar,
 and Codex with `codex resume --last`.

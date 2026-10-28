@@ -1,5 +1,5 @@
-use cox_core::config::{Chord, ThemeConfig};
 use egui::{Color32, Key, KeyboardShortcut, Modifiers};
+use imacs_core::config::{Chord, ThemeConfig};
 
 /// Colors for terminals and the diff, from a `[theme]` preset plus overrides.
 pub struct Palette {
@@ -193,7 +193,7 @@ pub fn parse_hex(text: &str) -> Option<Color32> {
     Some(Color32::from_rgb((value >> 16) as u8, (value >> 8) as u8, value as u8))
 }
 
-/// The modifier reserved for cox's own shortcuts, so it never reaches a terminal:
+/// The modifier reserved for IMACS's own shortcuts, so it never reaches a terminal:
 /// Command on macOS, Ctrl+Shift elsewhere (plain Ctrl belongs to the shell).
 pub fn is_app_chord(m: &Modifiers) -> bool {
     if cfg!(target_os = "macos") { m.mac_cmd } else { m.ctrl && m.shift }

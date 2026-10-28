@@ -375,8 +375,8 @@ pub(crate) mod tests {
 
     fn init(p: &Path) {
         run(p, &["init", "-q", "-b", "main"]);
-        run(p, &["config", "user.email", "cox@test"]);
-        run(p, &["config", "user.name", "cox"]);
+        run(p, &["config", "user.email", "IMACS@test"]);
+        run(p, &["config", "user.name", "imacs"]);
         std::fs::write(p.join("a.txt"), "one\ntwo\nthree\n").unwrap();
         run(p, &["add", "."]);
         run(p, &["commit", "-q", "-m", "base"]);
@@ -401,18 +401,18 @@ pub(crate) mod tests {
     fn integrate_commits_the_task_and_merges_it_in_a_worktree_of_its_own() {
         let (_dir, repo) = project();
         let task = repo.with_file_name("app-t1");
-        add_worktree(&repo, &task, "cox/t1-feature", "main").unwrap();
+        add_worktree(&repo, &task, "imacs/t1-feature", "main").unwrap();
         std::fs::write(task.join(".gitignore"), "*.log\n").unwrap();
         std::fs::write(task.join("b.txt"), "feature\n").unwrap();
         std::fs::write(task.join("debug.log"), "noise\n").unwrap();
         let main = git(&repo, &["rev-parse", "main"]).unwrap();
 
-        let into = worktree_path("{repo_parent}/{repo}-{slug}", &repo, "cox/plan-ship");
-        let done = integrate(&repo, "cox/t1-feature", "Add b (t1)", "cox/plan-ship", &into, "origin/main").unwrap();
+        let into = worktree_path("{repo_parent}/{repo}-{slug}", &repo, "imacs/plan-ship");
+        let done = integrate(&repo, "imacs/t1-feature", "Add b (t1)", "imacs/plan-ship", &into, "origin/main").unwrap();
         assert_eq!(done, Integration { committed: true, merge: Merge::Merged, worktree: into.clone() });
-        assert_eq!(git(&task, &["log", "-1", "--format=%s by %an"]).unwrap().trim(), "Add b (t1) by cox");
+        assert_eq!(git(&task, &["log", "-1", "--format=%s by %an"]).unwrap().trim(), "Add b (t1) by imacs");
         assert!(git(&task, &["status", "--porcelain"]).unwrap().is_empty());
-        assert_eq!(worktree_of(&into).unwrap().branch.as_deref(), Some("cox/plan-ship"));
+        assert_eq!(worktree_of(&into).unwrap().branch.as_deref(), Some("imacs/plan-ship"));
         assert!(into.join("b.txt").exists());
         assert!(!into.join("debug.log").exists(), "ignored files are never committed");
 
@@ -421,7 +421,7 @@ pub(crate) mod tests {
         assert_eq!(git(&repo, &["rev-parse", "main"]).unwrap(), main);
         assert!(!repo.join("b.txt").exists());
 
-        let again = integrate(&repo, "cox/t1-feature", "Add b (t1)", "cox/plan-ship", &into, "main").unwrap();
+        let again = integrate(&repo, "imacs/t1-feature", "Add b (t1)", "imacs/plan-ship", &into, "main").unwrap();
         assert_eq!((again.committed, again.merge), (false, Merge::UpToDate));
     }
 

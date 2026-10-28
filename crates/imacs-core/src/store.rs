@@ -1,4 +1,4 @@
-//! Remembers Claude sessions cox has seen so they can be resumed after a restart.
+//! Remembers Claude sessions IMACS has seen so they can be resumed after a restart.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -21,7 +21,7 @@ pub struct SessionRecord {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Store {
     pub sessions: Vec<SessionRecord>,
-    /// Projects open when cox last ran.
+    /// Projects open when IMACS last ran.
     #[serde(default)]
     pub projects: Vec<PathBuf>,
     #[serde(default)]

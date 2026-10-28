@@ -147,7 +147,7 @@ pub fn transcribe(config: &VoiceConfig, key: &str, wav: &[u8]) -> Result<String>
     let result = match config.provider {
         VoiceProvider::Openai => {
             let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
-            let boundary = format!("cox-voice-{nanos:x}");
+            let boundary = format!("imacs-voice-{nanos:x}");
             agent
                 .post(format!("{}/audio/transcriptions", config.base_url()))
                 .header("Authorization", &auth)

@@ -5,13 +5,13 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use cox_core::config::{AgentKind, Config, VoiceTarget};
-use cox_core::git::{self, Integration, Merge, Worktree, WorktreeEntry};
-use cox_core::layout::{self, DiffPlacement, DiffSplit, Layout};
-use cox_core::session::{AgentStatus, pick_tiled, title_for};
-use cox_core::store::{SessionRecord, Store};
-use cox_core::{paths, steer};
 use egui::{Color32, FontId, Key, Pos2, Rect, RichText, Sense, Stroke, Vec2, pos2, vec2};
+use imacs_core::config::{AgentKind, Config, VoiceTarget};
+use imacs_core::git::{self, Integration, Merge, Worktree, WorktreeEntry};
+use imacs_core::layout::{self, DiffPlacement, DiffSplit, Layout};
+use imacs_core::session::{AgentStatus, pick_tiled, title_for};
+use imacs_core::store::{SessionRecord, Store};
+use imacs_core::{paths, steer};
 use notify_debouncer_mini::notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_mini::{DebounceEventResult, Debouncer, new_debouncer};
 
@@ -22,9 +22,9 @@ use crate::setup::{SHELL_PATH, env_var, global_hooks_installed, install_global_h
 use crate::terminal::{Metrics, Terminal};
 use crate::theme::{Palette, lerp, shortcut};
 use crate::voice::{MAX_RECORDING, Recorder};
-use cox_core::control::{ControlRequest, ControlResponse};
-use cox_core::plan::{Plan, Report, Task, TaskStatus, short_slug};
-use cox_core::workspace::{self, Workspace};
+use imacs_core::control::{ControlRequest, ControlResponse};
+use imacs_core::plan::{Plan, Report, Task, TaskStatus, short_slug};
+use imacs_core::workspace::{self, Workspace};
 use serde_json::json;
 
 const TAB_HEIGHT: f32 = 30.0;
@@ -37,7 +37,7 @@ const IGNORED_DIRS: &[&str] = &[".git", "node_modules", "target", "bin", "obj", 
 
 #[derive(Default)]
 pub struct Options {
-    /// Projects to open, from `cox <path>`; empty means the launch folder or the last session.
+    /// Projects to open, from `imacs <path>`; empty means the launch folder or the last session.
     pub projects: Vec<PathBuf>,
     pub workspace: Option<String>,
     pub open: Vec<(String, PathBuf)>,
@@ -168,7 +168,7 @@ struct StatusEvent {
     title: String,
     status: AgentStatus,
     at: u64,
-    /// Set for a `cox_report` from the agent: (status, summary, task).
+    /// Set for a `imacs_report` from the agent: (status, summary, task).
     report: Option<(String, String, Option<String>)>,
 }
 
@@ -259,7 +259,7 @@ pub struct App {
     title: String,
     /// Diff/editor width set by dragging the divider.
     split: Option<f32>,
-    /// Side by side or unified, picked in the diff header; wins over the config until cox quits.
+    /// Side by side or unified, picked in the diff header; wins over the config until IMACS quits.
     diff_split: Option<DiffSplit>,
     editor_file: HashMap<PathBuf, String>,
     cleanup: Option<Cleanup>,
@@ -319,9 +319,9 @@ impl App {
         apply_style(&ctx, &config);
 
         if let Ok(exe) = std::env::current_exe() {
-            let settings = cox_core::hook::claude_settings(&exe);
+            let settings = imacs_core::hook::claude_settings(&exe);
             let file = paths::hook_settings_file();
-            let _ = std::fs::create_dir_all(paths::cox_home());
+            let _ = std::fs::create_dir_all(paths::imacs_home());
             let _ = std::fs::write(&file, serde_json::to_vec_pretty(&settings).unwrap_or_default());
         }
 
@@ -421,7 +421,7 @@ impl App {
         app
     }
 
-    /// `cox <path>` or `--workspace`, else the repository cox was started in, else
+    /// `imacs <path>` or `--workspace`, else the repository IMACS was started in, else
     /// the projects from last time.
     fn open_initial_projects(&mut self, requested: Vec<PathBuf>, workspace: Option<String>) {
         let mut projects = requested;
@@ -874,7 +874,7 @@ impl App {
         chief: bool,
     ) -> Result<String, String> {
         let agent = if chief {
-            cox_core::config::AgentConfig {
+            imacs_core::config::AgentConfig {
                 name: "chief".into(),
                 command: self.config.chief.command.clone(),
                 kind: AgentKind::Claude,
@@ -892,11 +892,11 @@ impl App {
         let id = uuid::Uuid::new_v4().to_string();
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
         let mut env: HashMap<String, String> = [
-            ("COX_PANE", id.clone()),
-            ("COX_SOCKET", paths::socket_path().to_string_lossy().into_owned()),
+            ("IMACS_PANE", id.clone()),
+            ("IMACS_SOCKET", paths::socket_path().to_string_lossy().into_owned()),
             ("TERM", "xterm-256color".into()),
             ("COLORTERM", "truecolor".into()),
-            ("TERM_PROGRAM", "cox".into()),
+            ("TERM_PROGRAM", "imacs".into()),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
@@ -910,14 +910,14 @@ impl App {
             None => (shell, vec!["-l".to_string()]),
         };
         let mut claude_id = None;
-        // Every agent cox starts can report back to the plan with `cox_report`.
-        let exe = std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| "cox".into());
+        // Every agent IMACS starts can report back to the plan with `imacs_report`.
+        let exe = std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| "imacs".into());
         let socket = paths::socket_path().to_string_lossy().into_owned();
         match agent.kind {
             AgentKind::Claude if chief => {
-                // The chief gets every cox tool and knows how to run a plan.
-                let config = json!({ "mcpServers": { "cox": {
-                    "command": exe, "args": ["mcp"], "env": { "COX_PANE": id, "COX_SOCKET": socket }
+                // The chief gets every IMACS tool and knows how to run a plan.
+                let config = json!({ "mcpServers": { "imacs": {
+                    "command": exe, "args": ["mcp"], "env": { "IMACS_PANE": id, "IMACS_SOCKET": socket }
                 } } });
                 let projects: Vec<String> = self.repos.iter().map(|r| paths::display(r)).collect();
                 let prompt = self
@@ -930,33 +930,37 @@ impl App {
                     "--mcp-config".to_string(),
                     config.to_string(),
                     "--allowedTools".to_string(),
-                    "mcp__cox".to_string(),
+                    "mcp__imacs".to_string(),
                     "--append-system-prompt".to_string(),
                     prompt,
                 ]);
             }
             AgentKind::Claude => {
-                let config = json!({ "mcpServers": { "cox": {
-                    "command": exe, "args": ["mcp", "--agent"], "env": { "COX_PANE": id, "COX_SOCKET": socket }
+                let config = json!({ "mcpServers": { "imacs": {
+                    "command": exe, "args": ["mcp", "--agent"], "env": { "IMACS_PANE": id, "IMACS_SOCKET": socket }
                 } } });
                 args.extend([
                     "--mcp-config".to_string(),
                     config.to_string(),
                     "--allowedTools".to_string(),
-                    "mcp__cox__cox_report".to_string(),
+                    "mcp__imacs__imacs_report".to_string(),
                 ]);
             }
             AgentKind::Generic if agent.command.first().is_some_and(|c| c.ends_with("codex")) => {
                 let quoted = |text: &str| serde_json::to_string(text).unwrap_or_default();
                 args.extend([
                     "-c".to_string(),
-                    format!("mcp_servers.cox.command={}", quoted(&exe)),
+                    format!("mcp_servers.imacs.command={}", quoted(&exe)),
                     "-c".to_string(),
-                    "mcp_servers.cox.args=[\"mcp\", \"--agent\"]".to_string(),
+                    "mcp_servers.imacs.args=[\"mcp\", \"--agent\"]".to_string(),
                     "-c".to_string(),
-                    format!("mcp_servers.cox.env={{ COX_PANE = {}, COX_SOCKET = {} }}", quoted(&id), quoted(&socket)),
+                    format!(
+                        "mcp_servers.imacs.env={{ IMACS_PANE = {}, IMACS_SOCKET = {} }}",
+                        quoted(&id),
+                        quoted(&socket)
+                    ),
                     "-c".to_string(),
-                    "mcp_servers.cox.default_tools_approval_mode=\"approve\"".to_string(),
+                    "mcp_servers.imacs.default_tools_approval_mode=\"approve\"".to_string(),
                 ]);
             }
             _ => {}
@@ -1267,7 +1271,7 @@ impl App {
                         terminal.write(unescape(&text).into_bytes());
                         done(ControlResponse::ok(json!({ "sent": true })))
                     }
-                    None => done(ControlResponse::error("raw keys need a session running inside cox")),
+                    None => done(ControlResponse::error("raw keys need a session running inside IMACS")),
                 },
                 Some(index) => {
                     if self.deliver(index, &text) {
@@ -1319,7 +1323,7 @@ impl App {
                                 let number = if removed { l.old_no } else { l.new_no };
                                 line.is_some()
                                     && number == line
-                                    && (l.kind == cox_core::diff::LineKind::Removed) == removed
+                                    && (l.kind == imacs_core::diff::LineKind::Removed) == removed
                             })
                         })
                         .map(|l| l.text.clone())
@@ -1563,15 +1567,15 @@ impl App {
                 if samples.len() < rate as usize / 5 {
                     return Err("nothing recorded".to_string());
                 }
-                if cox_core::voice::is_silent(&samples) {
+                if imacs_core::voice::is_silent(&samples) {
                     return Err("the microphone recorded only silence (muted, or no microphone access in System \
                                 Settings › Privacy & Security?)"
                         .to_string());
                 }
-                let (samples, rate) = cox_core::voice::downsample(&samples, rate, cox_core::voice::SPEECH_RATE);
-                let wav = cox_core::voice::wav(&samples, rate);
+                let (samples, rate) = imacs_core::voice::downsample(&samples, rate, imacs_core::voice::SPEECH_RATE);
+                let wav = imacs_core::voice::wav(&samples, rate);
                 let key = config.api_key(env_var).map_err(|e| format!("{e:#}"))?;
-                cox_core::voice::transcribe(&config, &key, &wav).map_err(|e| format!("{e:#}"))
+                imacs_core::voice::transcribe(&config, &key, &wav).map_err(|e| format!("{e:#}"))
             });
             let _ = tx.send(VoiceEvent::Transcript(transcript));
             ctx.request_repaint();
@@ -1809,7 +1813,7 @@ impl App {
         if self.plan.tasks.is_empty() {
             ui.label(
                 RichText::new(
-                    "No plan yet. Ask an orchestrator (a Claude session with the cox MCP server) to plan a goal: \
+                    "No plan yet. Ask an orchestrator (a Claude session with the IMACS MCP server) to plan a goal: \
                      its tasks appear here for you to review, edit and approve before any agent starts.",
                 )
                 .color(p.muted),
@@ -2026,7 +2030,7 @@ impl App {
 
     fn save_plan(&self) {
         if let Err(err) = self.plan.save(&paths::plan_file()) {
-            eprintln!("cox: saving the plan failed: {err:#}");
+            eprintln!("IMACS: saving the plan failed: {err:#}");
         }
     }
 
@@ -2077,10 +2081,11 @@ impl App {
             let Some(repo) = self.task_repo(&task) else {
                 return Err("No project is open to branch from; give the task a repo.".into());
             };
-            let branch = task.branch.clone().unwrap_or_else(|| format!("cox/{}-{}", task.id, short_slug(&task.title)));
+            let branch =
+                task.branch.clone().unwrap_or_else(|| format!("imacs/{}-{}", task.id, short_slug(&task.title)));
             let agent = if task.agent.trim().is_empty() { "claude".to_string() } else { task.agent.clone() };
             let mut brief = task.compose_brief(&self.plan.goal);
-            if task.id == cox_core::plan::REVIEW_TASK {
+            if task.id == imacs_core::plan::REVIEW_TASK {
                 // The reviewer reads every task's branch from the shared repository.
                 let base = &self.config.base_ref;
                 brief.push_str("\n\nBranches to review (all in this repository):\n");
@@ -2199,7 +2204,7 @@ impl App {
         }
     }
 
-    /// A sub-agent's `cox_report`: attach it to its task, move the task along, and
+    /// A sub-agent's `imacs_report`: attach it to its task, move the task along, and
     /// wake anyone waiting.
     fn report(&mut self, pane: Option<&str>, status: &str, summary: &str) -> Option<String> {
         let session = pane.and_then(|p| self.sessions.iter().find(|s| s.id == p));
@@ -2209,7 +2214,7 @@ impl App {
             self.plan.tasks.iter().find(|t| t.session.as_deref() == Some(session_id.as_str())).map(|t| t.id.clone());
         if let Some(task) = task_id.as_deref().and_then(|id| self.plan.task_mut(id)) {
             task.report =
-                Some(Report { status: status.to_string(), summary: summary.to_string(), at: cox_core::store::now() });
+                Some(Report { status: status.to_string(), summary: summary.to_string(), at: imacs_core::store::now() });
             match status {
                 "done" => task.status = TaskStatus::Review,
                 "blocked" | "question" => task.status = TaskStatus::Blocked,
@@ -2223,7 +2228,7 @@ impl App {
             session: session_id,
             title: title.clone(),
             status: session.map(|s| s.status).unwrap_or(AgentStatus::Idle),
-            at: cox_core::store::now(),
+            at: imacs_core::store::now(),
             report: Some((status.to_string(), summary.to_string(), task_id.clone())),
         });
         self.serve_waiters();
@@ -2265,7 +2270,7 @@ impl App {
                     session: session.id.clone(),
                     title: session.title.clone(),
                     status: session.status,
-                    at: cox_core::store::now(),
+                    at: imacs_core::store::now(),
                     report: None,
                 });
             }
@@ -2359,11 +2364,11 @@ impl App {
             updated: 0,
         });
         if let Err(err) = self.store.save(&paths::store_file()) {
-            eprintln!("cox: saving sessions failed: {err:#}");
+            eprintln!("IMACS: saving sessions failed: {err:#}");
         }
     }
 
-    /// Sends text to a session: typed into cox's own terminals, queued for the
+    /// Sends text to a session: typed into IMACS's own terminals, queued for the
     /// next hook of sessions running elsewhere.
     fn deliver(&mut self, index: usize, text: &str) -> bool {
         let session = &mut self.sessions[index];
@@ -2424,7 +2429,7 @@ impl App {
         let mut summary = format!("Sent to {typed} session{}", if typed == 1 { "" } else { "s" });
         if queued > 0 {
             summary.push_str(&format!(
-                ", queued for {queued} outside cox (delivered at their next tool call or turn end)"
+                ", queued for {queued} outside IMACS (delivered at their next tool call or turn end)"
             ));
         }
         self.toast(summary);
@@ -2764,7 +2769,7 @@ impl App {
                     self.watcher = Some((root.to_path_buf(), debouncer));
                 }
             }
-            Err(err) => eprintln!("cox: file watcher failed: {err}"),
+            Err(err) => eprintln!("IMACS: file watcher failed: {err}"),
         }
     }
 
@@ -3337,7 +3342,7 @@ impl App {
         } else if ui
             .button("Install hooks for all Claude sessions")
             .on_hover_text(
-                "Adds `cox hook` to ~/.claude/settings.json so agents in any terminal show up here and can be steered",
+                "Adds `imacs hook` to ~/.claude/settings.json so agents in any terminal show up here and can be steered",
             )
             .clicked()
         {
@@ -3520,7 +3525,7 @@ impl App {
                         egui::UiBuilder::new().id_salt(("outside", &session.id)).max_rect(body.shrink(14.0)),
                     );
                     child.label(
-                        RichText::new(format!("Running outside cox in {}", paths::display(&session.cwd)))
+                        RichText::new(format!("Running outside IMACS in {}", paths::display(&session.cwd)))
                             .color(p.muted)
                             .size(12.0),
                     );
@@ -3666,7 +3671,7 @@ impl App {
         let mut args = rest.to_vec();
         args.push(path.unwrap_or(".").to_string());
         let mut env: HashMap<String, String> =
-            [("TERM", "xterm-256color"), ("COLORTERM", "truecolor"), ("TERM_PROGRAM", "cox")]
+            [("TERM", "xterm-256color"), ("COLORTERM", "truecolor"), ("TERM_PROGRAM", "imacs")]
                 .into_iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect();
@@ -3945,7 +3950,7 @@ impl App {
             .anchor(egui::Align2::CENTER_TOP, vec2(0.0, 70.0))
             .fixed_size(vec2(620.0, 0.0))
             .show(ctx, |ui| {
-                let matches = cox_core::files::best_matches(&dialog.query, &all, 14);
+                let matches = imacs_core::files::best_matches(&dialog.query, &all, 14);
                 let (down, up, enter, escape) = ui.input_mut(|i| {
                     (
                         i.consume_key(egui::Modifiers::NONE, Key::ArrowDown),
@@ -4029,7 +4034,7 @@ impl App {
             let (path, done, repaint) = (shot.path.clone(), shot.done.clone(), ctx.clone());
             ctx.request_screenshot(move |image| {
                 if let Err(err) = save_png(&path, &image) {
-                    eprintln!("cox: screenshot failed: {err:#}");
+                    eprintln!("IMACS: screenshot failed: {err:#}");
                 }
                 done.store(true, Ordering::Relaxed);
                 repaint.request_repaint();

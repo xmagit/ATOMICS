@@ -1,10 +1,10 @@
 //! The bridge between Claude Code hooks and the app.
 //!
-//! Claude Code runs `cox hook` for each configured event and pipes the event JSON
-//! to it. `cox hook` forwards that JSON, plus the `COX_PANE` it inherited when cox
+//! Claude Code runs `imacs hook` for each configured event and pipes the event JSON
+//! to it. `imacs hook` forwards that JSON, plus the `IMACS_PANE` it inherited when IMACS
 //! started the agent, to the app over a unix socket as one line, and prints
 //! whatever the app answers. The answer is how messages reach sessions that run
-//! outside cox: they are delivered as `additionalContext` on the next tool call,
+//! outside IMACS: they are delivered as `additionalContext` on the next tool call,
 //! prompt or turn end.
 
 use std::path::{Path, PathBuf};
@@ -14,14 +14,14 @@ use serde_json::{Value, json};
 
 use crate::session::AgentStatus;
 
-/// Events cox subscribes to. Each one either changes a session's status or is a
+/// Events IMACS subscribes to. Each one either changes a session's status or is a
 /// chance to deliver queued messages.
 pub const EVENTS: &[&str] =
     &["SessionStart", "UserPromptSubmit", "PostToolUse", "Notification", "Stop", "SessionEnd", "CwdChanged"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HookRequest {
-    /// `COX_PANE` of the process that ran the hook; absent for sessions started outside cox.
+    /// `IMACS_PANE` of the process that ran the hook; absent for sessions started outside IMACS.
     pub pane: Option<String>,
     pub payload: Value,
 }
@@ -32,7 +32,7 @@ pub struct HookReply {
     pub stdout: Option<String>,
 }
 
-/// The fields of a hook payload cox cares about.
+/// The fields of a hook payload IMACS cares about.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HookEvent {
     pub name: String,
@@ -99,20 +99,20 @@ pub fn context_output(event: &str, context: &str) -> String {
     .to_string()
 }
 
-/// Settings that point every cox event at `cox hook`. Passed to agents cox starts
+/// Settings that point every IMACS event at `imacs hook`. Passed to agents IMACS starts
 /// with `--settings`; identical handlers in other settings files run only once.
-pub fn claude_settings(cox_exe: &Path) -> Value {
-    let command = format!("{} hook", shell_quote(&cox_exe.to_string_lossy()));
+pub fn claude_settings(imacs_exe: &Path) -> Value {
+    let command = format!("{} hook", shell_quote(&imacs_exe.to_string_lossy()));
     let handler = json!([{ "hooks": [{ "type": "command", "command": command, "timeout": 10 }] }]);
     let hooks: serde_json::Map<String, Value> =
         EVENTS.iter().map(|event| (event.to_string(), handler.clone())).collect();
     json!({ "hooks": hooks })
 }
 
-/// Merges cox's hooks into an existing settings document (for `cox install-hooks`),
+/// Merges IMACS's hooks into an existing settings document (for `imacs install-hooks`),
 /// leaving every other handler alone and never adding the same one twice.
-pub fn merge_into_settings(existing: &mut Value, cox_exe: &Path) {
-    let ours = claude_settings(cox_exe);
+pub fn merge_into_settings(existing: &mut Value, imacs_exe: &Path) {
+    let ours = claude_settings(imacs_exe);
     if !existing.is_object() {
         *existing = json!({});
     }
@@ -172,11 +172,11 @@ mod tests {
 
     #[test]
     fn settings_cover_every_event_and_merge_idempotently() {
-        let exe = Path::new("/Applications/My Tools/cox");
+        let exe = Path::new("/Applications/My Tools/imacs");
         let settings = claude_settings(exe);
         for event in EVENTS {
             let command = settings["hooks"][event][0]["hooks"][0]["command"].as_str().unwrap();
-            assert_eq!(command, "'/Applications/My Tools/cox' hook");
+            assert_eq!(command, "'/Applications/My Tools/imacs' hook");
         }
 
         let mut existing = json!({ "model": "opus", "hooks": { "Stop": [{ "hooks": [{ "type": "command", "command": "say done" }] }] } });

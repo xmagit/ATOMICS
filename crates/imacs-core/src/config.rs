@@ -5,9 +5,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::layout::LayoutConfig;
 
-/// Written to `~/.config/cox/config.toml` on first start. Every key is optional;
+/// Written to `~/.config/imacs/config.toml` on first start. Every key is optional;
 /// anything left out falls back to the defaults below.
-pub const DEFAULT_CONFIG: &str = r##"# cox configuration. Saved changes are picked up while cox is running.
+pub const DEFAULT_CONFIG: &str = r##"# IMACS configuration. Saved changes are picked up while IMACS is running.
 
 # Every diff is taken against the merge-base of this ref and the worktree's HEAD,
 # so commits landing on main never show up as your agent's changes.
@@ -77,21 +77,21 @@ command = ["hx"]
 open_keys = [":open {path}\r", ":goto {line}\r"]
 # Neovim: [":lua vim.lsp.inlay_hint.enable(not vim.lsp.inlay_hint.is_enabled())\r"]
 inlay_hints_keys = [":toggle lsp.display-inlay-hints\r"]
-# Typed once when an editor starts. base16_transparent uses cox's own colors. [] to keep yours.
+# Typed once when an editor starts. base16_transparent uses IMACS's own colors. [] to keep yours.
 startup_keys = [":theme base16_transparent\r"]
 
 [chief]
-# The chief agent: an orchestrator in the middle of the screen (cmd+o) with every cox tool.
+# The chief agent: an orchestrator in the middle of the screen (cmd+o) with every IMACS tool.
 command = ["claude"]
 args = ["--model", "claude-opus-5-5"]
 # system_prompt = "..."   # built in: plan, wait for approval, dispatch, verify, integrate
 
 [steer]
-# Added to every Claude session started or seen by cox (SessionStart hook).
-session_context = "This session runs inside cox. The user reviews this worktree's diff against {base_ref} live and may send review comments or steering messages while you work. Messages that arrive mid-turn are delivered as hook context and come directly from the user."
+# Added to every Claude session started or seen by IMACS (SessionStart hook).
+session_context = "This session runs inside IMACS. The user reviews this worktree's diff against {base_ref} live and may send review comments or steering messages while you work. Messages that arrive mid-turn are delivered as hook context and come directly from the user."
 review_header = "Review comments on your changes (diff against {base_ref}):"
-# Messages to sessions running outside cox wait for that session's next tool call or turn end.
-external_prefix = "Message from the user, sent from cox while you were working:"
+# Messages to sessions running outside IMACS wait for that session's next tool call or turn end.
+external_prefix = "Message from the user, sent from IMACS while you were working:"
 
 [voice]
 # Push-to-talk (cmd+shift+space): press, speak, press again to send the transcript. Esc cancels.
@@ -137,18 +137,18 @@ pub struct Config {
 
 /// How the chief agent works, given to it as an appended system prompt.
 /// `{projects}` and `{base_ref}` are filled in.
-pub const CHIEF_PROMPT: &str = "You are the chief agent of IMACS (cox): you orchestrate coding agents for the user, who watches \
+pub const CHIEF_PROMPT: &str = "You are the chief agent of IMACS (IMACS): you orchestrate coding agents for the user, who watches \
 every agent, diff and the plan board in the same window. Open projects: {projects}. Diffs are taken against {base_ref}.
 
 How to work:
 1. Understand the goal and read the code you need. You run in the project's main checkout: read it, never edit it.
-2. Write the plan with cox_plan_set: small tasks, each with a brief (context, files, constraints), acceptance checks you \
+2. Write the plan with imacs_plan_set: small tasks, each with a brief (context, files, constraints), acceptance checks you \
 can verify, dependencies, the agent (claude for design-heavy work, codex for well-specified changes) and its args. \
 Ask the user to approve it on the plan board. Never dispatch before approval.
-3. cox_plan_dispatch, then loop on cox_wait (never sleep or poll). On reported or turn done, read cox_result and cox_diff.
+3. imacs_plan_dispatch, then loop on imacs_wait (never sleep or poll). On reported or turn done, read imacs_result and imacs_diff.
 4. Verify every acceptance check yourself: run the build and tests in the task's worktree and read the diff. When \
-something is missing, steer with cox_comment + cox_send_review or cox_send and move the task back to running. Accept \
-with cox_plan_update (status done, a note saying what you verified).
+something is missing, steer with imacs_comment + imacs_send_review or imacs_send and move the task back to running. Accept \
+with imacs_plan_update (status done, a note saying what you verified).
 5. Integrate accepted work locally. Every plan ends with a review task: a fresh agent reviews all of the plan's work, \
 including yours. Send its blocking findings back to the tasks they concern, and only then ask the user to open the pull \
 requests. Never push, open pull requests or delete branches without the user's OK.
@@ -428,9 +428,9 @@ impl Default for ThemeConfig {
 impl Default for SteerConfig {
     fn default() -> Self {
         Self {
-            session_context: "This session runs inside cox. The user reviews this worktree's diff against {base_ref} live and may send review comments or steering messages while you work. Messages that arrive mid-turn are delivered as hook context and come directly from the user.".into(),
+            session_context: "This session runs inside IMACS. The user reviews this worktree's diff against {base_ref} live and may send review comments or steering messages while you work. Messages that arrive mid-turn are delivered as hook context and come directly from the user.".into(),
             review_header: "Review comments on your changes (diff against {base_ref}):".into(),
-            external_prefix: "Message from the user, sent from cox while you were working:".into(),
+            external_prefix: "Message from the user, sent from IMACS while you were working:".into(),
         }
     }
 }
