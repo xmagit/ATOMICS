@@ -200,6 +200,7 @@ struct Screenshot {
 
 pub struct App {
     ctx: egui::Context,
+    icon: egui::TextureHandle,
     config: Config,
     config_path: PathBuf,
     config_stamp: Option<SystemTime>,
@@ -284,7 +285,7 @@ static SHELL_PATH: LazyLock<Option<String>> = LazyLock::new(|| {
 });
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>, options: Options) -> App {
+    pub fn new(cc: &eframe::CreationContext<'_>, options: Options, icon: &egui::IconData) -> App {
         std::thread::spawn(|| LazyLock::force(&SHELL_PATH));
         let config_path = paths::config_file();
         let (config, config_error) = match Config::load_or_create(&config_path) {
@@ -313,6 +314,7 @@ impl App {
 
         let mut app = App {
             ctx: ctx.clone(),
+            icon: ctx.load_texture("atomisk", egui::ColorImage::from(icon), egui::TextureOptions::LINEAR),
             palette: Arc::new(Palette::from_config(&config.theme)),
             highlighter: Arc::new(Highlighter::new(&Palette::from_config(&config.theme).syntax)),
             config_stamp: modified(&config_path),
@@ -2004,9 +2006,9 @@ impl App {
         let names: Vec<String> =
             self.repos.iter().filter_map(|r| r.file_name()).map(|n| n.to_string_lossy().into_owned()).collect();
         let title = match &self.workspace {
-            Some(ws) => format!("cox · {ws} · {}", names.join(", ")),
-            None if names.is_empty() => "cox".to_string(),
-            None => format!("cox · {}", names.join(", ")),
+            Some(ws) => format!("IMACS · {ws} · {}", names.join(", ")),
+            None if names.is_empty() => "IMACS".to_string(),
+            None => format!("IMACS · {}", names.join(", ")),
         };
         if title != self.title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
@@ -2268,7 +2270,8 @@ impl App {
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         let p = self.palette.clone();
         ui.horizontal_centered(|ui| {
-            ui.label(RichText::new("cox ›_").strong().size(14.0).color(p.accent).monospace());
+            ui.image((self.icon.id(), vec2(20.0, 20.0)));
+            ui.label(RichText::new("IMACS").strong().size(14.0).color(p.accent).monospace());
             let agents = self.sessions.iter().filter(|s| s.is_agent()).count();
             let waiting = self.sessions.iter().filter(|s| s.status.needs_attention()).count();
             ui.label(RichText::new(format!("{agents} agent{}", if agents == 1 { "" } else { "s" })).color(p.muted));
@@ -3122,8 +3125,9 @@ impl App {
                 .max_rect(Rect::from_center_size(rect.center(), vec2(rect.width().min(460.0), 260.0))),
         );
         child.vertical_centered(|ui| {
-            ui.label(RichText::new("cox").size(28.0).strong().color(p.accent));
-            ui.label(RichText::new("Review-first workspace for coding agents").color(p.muted));
+            ui.label(RichText::new("IMACS").size(28.0).strong().color(p.accent));
+            ui.label(RichText::new("Emacs, but for agents").color(p.muted));
+            ui.label(RichText::new("an atomisk.ai project").color(p.muted).size(12.0));
             ui.add_space(14.0);
             ui.horizontal(|ui| {
                 for agent in self.config.agents.clone() {
