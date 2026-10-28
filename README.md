@@ -151,6 +151,12 @@ to reset it. Mode and width are remembered; `[chief] dock = "floating"` (or `"do
 `cmd+o` shows or hides either mode. On narrow windows the chief floats instead, then docks again when the window widens.
 `cmd+shift+space` dictates to it.
 
+Every `[chief] heartbeat_secs` (default 300 seconds), IMACS checks every open plan for missing or exited
+agents, agents idle or turn-done for over ten minutes without a report since that status began, pending approvals
+or Codex menus, messages held for over a minute, and working agents without an event for fifteen minutes. Include
+`heartbeat` in `imacs_wait` statuses to receive one fleet event with a `findings` list; an empty list means all good.
+The chief pill shows a compact age and a dot when that check found something; hover for the full local check time.
+
 The chief may read, plan, review and run the plan you approved without asking. It can also answer other
 agents' permission prompts through the pre-approved `imacs_approve`, including `allow_always` for the rest
 of a session. Starting agents, typing into terminals and closing sessions still ask for permission.
