@@ -21,7 +21,6 @@ impl App {
             for task in self.plans.iter_mut().flat_map(|p| &mut p.tasks) {
                 task.integration_verified = false;
             }
-            self.integration_checked_at = None;
         }
         while let Ok(checked) = self.integration_check_rx.try_recv() {
             self.integration_checks.remove(&(checked.plan.clone(), checked.task.id.clone()));
@@ -32,22 +31,33 @@ impl App {
             if let Some(task) = self.plans[index].task_mut(&checked.task.id)
                 && *task == checked.task
             {
-                task.integration_verified = checked.valid;
-                if !checked.valid {
+                task.integration_verified = checked.valid == Some(true);
+                if checked.valid == Some(false) {
                     task.integrated = None;
+                }
+                self.integration_checked
+                    .insert((checked.plan, task.id.clone()), (checked.revision, checked.into, task.clone()));
+                if checked.valid == Some(false) {
                     self.save_plan(index);
                 }
             }
         }
-        let due = self.integration_checked_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(5));
         let mut jobs = Vec::new();
-        for plan in self.plans.iter().filter(|p| p.is_open()) {
+        for plan in self.plans.iter_mut().filter(|p| p.is_open()) {
             let into = plan.integration_branch();
-            for task in &plan.tasks {
-                if task.integrated.as_deref() != Some(&into) || (!due && task.integration_verified) {
+            for task in &mut plan.tasks {
+                let key = (plan.id.clone(), task.id.clone());
+                if task.integrated.as_deref() != Some(&into)
+                    || self.integration_checked.get(&key).is_some_and(|(revision, branch, checked)| {
+                        *revision == self.integration_revision && branch == &into && checked == task
+                    })
+                {
                     continue;
                 }
-                if self.integration_checks.insert((plan.id.clone(), task.id.clone())) {
+                if self.integration_checks.insert(key.clone()) {
+                    task.integration_verified = false;
+                    // Remember errors too: retry only when refs or the task change.
+                    self.integration_checked.insert(key, (self.integration_revision, into.clone(), task.clone()));
                     let repo = task
                         .repo
                         .as_deref()
@@ -62,30 +72,37 @@ impl App {
             }
         }
         if !jobs.is_empty() {
-            self.integration_checked_at = Some(Instant::now());
             let (tx, ctx, revision) = (self.integration_check_tx.clone(), self.ctx.clone(), self.integration_revision);
             std::thread::spawn(move || {
                 for (plan, task, into, repo) in jobs {
-                    let valid = matches!(task.status, TaskStatus::Review | TaskStatus::Done)
-                        && task.branch.as_deref().zip(repo).is_some_and(|(branch, repo)| {
-                            git::git(
-                                &repo,
-                                &[
+                    let valid = task
+                        .branch
+                        .as_deref()
+                        .zip(repo)
+                        .filter(|_| matches!(task.status, TaskStatus::Review | TaskStatus::Done))
+                        .and_then(|(branch, repo)| {
+                            let output = std::process::Command::new(resolve_program("git"))
+                                .arg("-C")
+                                .arg(repo)
+                                .args(["-c", "core.quotepath=off"])
+                                .args([
                                     "merge-base",
                                     "--is-ancestor",
                                     &format!("refs/heads/{branch}"),
                                     &format!("refs/heads/{into}"),
-                                ],
-                            )
-                            .is_ok()
+                                ])
+                                .output()
+                                .ok()?;
+                            match output.status.code() {
+                                Some(0) => Some(true),
+                                Some(1) => Some(false),
+                                _ => None,
+                            }
                         });
                     let _ = tx.send(CheckedIntegration { revision, plan, task, into, valid });
                     ctx.request_repaint();
                 }
             });
-        }
-        if self.plans.iter().any(|p| p.is_open() && p.tasks.iter().any(|t| t.integrated.is_some())) {
-            self.ctx.request_repaint_after(Duration::from_secs(1));
         }
     }
 
@@ -191,6 +208,88 @@ mod tests {
     use super::*;
 
     #[test]
+    fn idle_integrations_do_not_poll_git_or_request_repaints() {
+        with_app("app::integrations::tests::idle_integrations_do_not_poll_git_or_request_repaints", |app, _| {
+            let (_dir, repo) = repository();
+            git::git(&repo, &["branch", "task-a"]).unwrap();
+            git::git(&repo, &["branch", "integration"]).unwrap();
+            request(
+                app,
+                json!({"cmd":"plan_set", "goal":"Idle integration", "integration":"integration", "tasks":[
+                    {"id":"a", "repo":repo, "branch":"task-a"}]}),
+            );
+            let index = app.selected_plan;
+            app.plans[index].tasks[0].status = TaskStatus::Done;
+            app.plans[index].tasks[0].integrated = Some("integration".into());
+            // Isolate the integration refresh from other app repaint sources.
+            app.ctx = egui::Context::default();
+            app.refresh_integrations();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !app.plans[index].tasks[0].integration_verified {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+                app.refresh_integrations();
+            }
+            let ctx = app.ctx.clone();
+            for _ in 0..3 {
+                ctx.run_ui(Default::default(), |_| {}).drop_without_applying_deltas();
+            }
+            std::thread::sleep(Duration::from_millis(5100));
+            let output = ctx.run_ui(Default::default(), |_| app.refresh_integrations());
+            assert!(app.integration_checks.is_empty(), "idle refresh must not start another git check");
+            assert_eq!(output.viewport_output[&egui::ViewportId::ROOT].repaint_delay, Duration::MAX);
+            output.drop_without_applying_deltas();
+            assert!(app.integration_check_rx.try_recv().is_err(), "idle refresh must not run git");
+        });
+    }
+
+    #[test]
+    fn integration_git_errors_preserve_markers_until_refs_change() {
+        with_app("app::integrations::tests::integration_git_errors_preserve_markers_until_refs_change", |app, _| {
+            let (_dir, repo) = repository();
+            git::git(&repo, &["branch", "integration"]).unwrap();
+            request(
+                app,
+                json!({"cmd":"plan_set", "goal":"Unavailable ref", "integration":"integration", "tasks":[
+                    {"id":"a", "repo":repo, "branch":"task-a"}, {"id":"b", "depends_on":["a"]}]}),
+            );
+            let index = app.selected_plan;
+            app.plans[index].tasks[0].status = TaskStatus::Done;
+            app.plans[index].tasks[0].integrated = Some("integration".into());
+            app.save_plan(index);
+            // Loading a persisted marker must trigger a check, even without a ref event.
+            let path = paths::imacs_home().join("plans").join(format!("{}.json", app.plans[index].id));
+            app.plans[index] = Plan::load(&path).unwrap();
+            app.refresh_integrations();
+            assert!(!app.integration_checks.is_empty());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !app.integration_checks.is_empty() {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+                app.refresh_integrations();
+            }
+            assert_eq!(app.plans[index].tasks[0].integrated.as_deref(), Some("integration"));
+            assert!(!app.plans[index].tasks[0].integration_verified);
+            assert!(app.plans[index].ready().is_empty());
+            assert_eq!(Plan::load(&path).unwrap().tasks[0].integrated.as_deref(), Some("integration"));
+
+            git::git(&repo, &["branch", "task-a"]).unwrap();
+            app.refresh_integrations();
+            assert!(app.integration_checks.is_empty(), "a git error must wait for a ref change before retrying");
+            assert!(!app.plans[index].tasks[0].integration_verified);
+            app.integration_dirty.store(true, Ordering::Relaxed);
+            app.refresh_integrations();
+            while !app.integration_checks.is_empty() {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+                app.refresh_integrations();
+            }
+            assert!(app.plans[index].tasks[0].integration_verified);
+            assert_eq!(app.plans[index].ready().iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["b"]);
+        });
+    }
+
+    #[test]
     fn integration_checks_run_in_background_and_ignore_invalidated_results() {
         let name = "app::integrations::tests::integration_checks_run_in_background_and_ignore_invalidated_results";
         if std::env::var_os("IMACS_APP_TEST_CHILD").is_none() {
@@ -220,14 +319,20 @@ exec {} "$@"
             .unwrap();
             std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
             let path = format!("{}:{}", dir.path().display(), std::env::var("PATH").unwrap());
+            let shell = dir.path().join("shell");
+            std::fs::write(&shell, "#!/bin/sh\nprintf '__IMACS__%s__IMACS__' \"$IMACS_TEST_LOGIN_PATH\"\n").unwrap();
+            std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
             let output = crate::test_support::output(
                 std::process::Command::new(std::env::current_exe().unwrap())
                     .args(["--exact", name, "--nocapture"])
                     .current_dir(dir.path())
                     .env("IMACS_APP_TEST_CHILD", "1")
                     .env("HOME", dir.path())
-                    .env("PATH", path)
-                    .env("SHELL", "/bin/sh")
+                    // The bundled app must find the wrapper through the login shell,
+                    // even when its process PATH only exposes the system git.
+                    .env("PATH", "/usr/bin:/bin")
+                    .env("IMACS_TEST_LOGIN_PATH", path)
+                    .env("SHELL", shell)
                     .env("IMACS_HOME", dir.path().join("state"))
                     .env("IMACS_CONFIG", dir.path().join("config.toml"))
                     .env("IMACS_SOCKET", dir.path().join("imacs.sock")),
@@ -272,7 +377,7 @@ exec {} "$@"
                     plan: app.plans[index].id.clone(),
                     task: checked,
                     into: "integration".into(),
-                    valid: true,
+                    valid: Some(true),
                 })
                 .unwrap();
             app.refresh_integrations();

@@ -188,7 +188,8 @@ struct CheckedIntegration {
     plan: String,
     task: Task,
     into: String,
-    valid: bool,
+    /// `None` means git could not verify ancestry; keep the integration marker.
+    valid: Option<bool>,
 }
 
 /// The worktree clean-up dialog for one project.
@@ -381,7 +382,7 @@ pub struct App {
     integration_check_tx: Sender<CheckedIntegration>,
     integration_check_rx: Receiver<CheckedIntegration>,
     integration_checks: HashSet<(String, String)>,
-    integration_checked_at: Option<Instant>,
+    integration_checked: HashMap<(String, String), (u64, String, Task)>,
     integration_dirty: Arc<AtomicBool>,
     integration_revision: u64,
     worktrees: Vec<WorktreeEntry>,
@@ -536,7 +537,7 @@ impl App {
             integration_check_tx,
             integration_check_rx,
             integration_checks: HashSet::new(),
-            integration_checked_at: None,
+            integration_checked: HashMap::new(),
             integration_dirty: Arc::new(AtomicBool::new(false)),
             integration_revision: 0,
             worktrees: Vec::new(),
