@@ -171,9 +171,7 @@ fn main() -> eframe::Result {
         }
         None => {}
     }
-    let home = imacs_core::paths::imacs_home();
-    crash::install(&home);
-    let crash_notice = crash::started(&home);
+    crash::install(&imacs_core::paths::imacs_home());
 
     let open = cli
         .open
@@ -190,7 +188,6 @@ fn main() -> eframe::Result {
         screenshot: cli.screenshot,
         screenshot_delay: cli.screenshot_delay,
         migration_errors,
-        crash_notice,
     };
     let icon = load_icon();
     let native = eframe::NativeOptions {
@@ -204,9 +201,7 @@ fn main() -> eframe::Result {
             .with_min_inner_size([480.0, 320.0]),
         ..Default::default()
     };
-    let result = eframe::run_native("IMACS", native, Box::new(|cc| Ok(Box::new(app::App::new(cc, options, &icon)))));
-    crash::exited(&home);
-    result
+    eframe::run_native("IMACS", native, Box::new(|cc| Ok(Box::new(app::App::new(cc, options, &icon)))))
 }
 
 fn load_icon() -> egui::IconData {

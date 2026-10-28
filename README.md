@@ -203,14 +203,19 @@ Click the plan tab later to return to that overview, or choose All or a project 
 Every agent works in its own worktree with its own `target/`, so its builds never wait on another's. What they
 share is the machine, and IMACS keeps that in check for every agent it starts (`[resources]` in the config):
 
-- **One compiler job pool.** IMACS owns a GNU make jobserver (a named pipe in `~/.imacs`) with `jobs` tokens,
-  cores minus 2 by default, and hands it to every agent terminal (`MAKEFLAGS`, `CARGO_MAKEFLAGS`). cargo and rustc
-  take a token per job, so ten agents building at once share those jobs instead of each using every core.
+- **One compiler job pool.** IMACS owns a GNU make jobserver (a named pipe in a private folder under `/tmp`, which
+  Codex's sandbox can open) with `jobs` tokens, cores minus 2 by default, and hands it to every agent terminal as
+  `CARGO_MAKEFLAGS`. cargo takes a token per job, so ten agents building at once share those jobs instead of each
+  using every core. `MAKEFLAGS` is left alone, since `make` before GNU make 4.4 misreads a pipe jobserver. A job
+  killed while holding a token never returns it, so whenever no compiler runs, IMACS resets the pool to full.
 - **A queue for heavy work.** `imacs queue --class test -- cargo test` waits for a free test slot (one per 6 cores
   by default), runs the command and passes its exit code through. `--class qa` is for app instances started for
   screenshots. The slot is released when the command ends or its process dies. Tiles show `queued for a test slot
-  (2 in line)`, and the approval policy judges a queued command by the command it runs. Outside IMACS the command
-  runs right away.
+  (2 in line)`, and the approval policy judges a queued command by the command it runs (only a bare `imacs`
+  counts). Without a running IMACS the command runs right away; while IMACS restarts, waiting commands reconnect
+  and queue again instead of all running at once. A sandbox that blocks the IMACS socket (Codex's does) gets a
+  clear error and exit code 75: run the command outside the sandbox. Queued commands may wait, so give them a long
+  timeout.
 - **Lower priority.** Agent terminals start at niceness `agent_nice` (10), so IMACS and your desktop stay responsive.
 - **A shared compiler cache.** When sccache is installed and you have no `rustc-wrapper` of your own, agents get
   `RUSTC_WRAPPER=sccache`, so dependencies compile once for all worktrees (with

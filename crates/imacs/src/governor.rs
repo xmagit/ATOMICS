@@ -5,25 +5,28 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::{Condvar, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use imacs_core::governor::{ResourceConfig, SlotClass, SlotQueue, Ticket};
 use serde_json::{Value, json};
 
-/// A GNU make jobserver in a named pipe. cargo and rustc take a token per job, so agents
-/// that inherit it share `tokens` jobs between them, however many run.
+/// A GNU make jobserver in a named pipe. cargo takes a token per job, so agents that inherit
+/// it share `tokens` jobs between them, however many run.
 pub struct Jobserver {
     path: PathBuf,
+    tokens: usize,
     /// Held open so the pipe and its tokens live as long as IMACS.
-    _pipe: File,
+    pipe: File,
 }
 
 impl Jobserver {
     pub fn create(path: &Path, tokens: usize) -> Result<Jobserver> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
         }
         let _ = std::fs::remove_file(path);
         let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
@@ -33,27 +36,85 @@ impl Jobserver {
         }
         let mut pipe = OpenOptions::new().read(true).write(true).open(path)?;
         pipe.write_all(&vec![b'+'; tokens])?;
-        Ok(Jobserver { path: path.to_path_buf(), _pipe: pipe })
+        Ok(Jobserver { path: path.to_path_buf(), tokens, pipe })
     }
 
-    /// The variables that hand the pool to cargo (CARGO_MAKEFLAGS) and to make or rustc (MAKEFLAGS).
-    pub fn env(&self) -> [(String, String); 2] {
-        let flags = format!("-j --jobserver-auth=fifo:{}", self.path.display());
-        [("MAKEFLAGS".into(), flags.clone()), ("CARGO_MAKEFLAGS".into(), flags)]
+    /// Where the pool lives for an IMACS home: under /tmp, which Codex's sandbox can open,
+    /// in a folder private to this user and specific to the home.
+    pub fn path_for(home: &Path) -> PathBuf {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        home.hash(&mut hasher);
+        // SAFETY: getuid has no preconditions.
+        let uid = unsafe { libc::getuid() };
+        PathBuf::from(format!("/tmp/imacs-{uid}/{:016x}/jobserver.fifo", hasher.finish()))
     }
+
+    pub fn tokens(&self) -> usize {
+        self.tokens
+    }
+
+    /// Empties the pipe and puts exactly `tokens` back, so leaked tokens return and extra
+    /// ones go. Call it only while nothing holds a token. Returns how many it found.
+    fn reset(&self) -> std::io::Result<usize> {
+        use std::os::fd::AsRawFd;
+        let fd = self.pipe.as_raw_fd();
+        // SAFETY: fcntl on our own open descriptor; only O_NONBLOCK is added.
+        unsafe { libc::fcntl(fd, libc::F_SETFL, libc::fcntl(fd, libc::F_GETFL) | libc::O_NONBLOCK) };
+        let (mut found, mut buf) = (0, [0u8; 256]);
+        loop {
+            match (&self.pipe).read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => found += n,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(err) => return Err(err),
+            }
+        }
+        (&self.pipe).write_all(&vec![b'+'; self.tokens])?;
+        Ok(found)
+    }
+
+    /// Only CARGO_MAKEFLAGS: plain `make` misreads a fifo jobserver before GNU make 4.4.
+    pub fn env(&self) -> [(String, String); 1] {
+        [("CARGO_MAKEFLAGS".into(), format!("-j --jobserver-auth=fifo:{}", self.path.display()))]
+    }
+
+    /// A job killed while it held a token never gives it back. When no compiler runs anywhere,
+    /// every token belongs in the pipe, so the pool is reset to its full size.
+    pub fn refill_when_idle(self: &Arc<Self>) {
+        let jobserver = Arc::downgrade(self);
+        let _ = std::thread::Builder::new().name("imacs-jobserver".into()).spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_secs(10));
+                let Some(jobserver) = jobserver.upgrade() else { return };
+                if !compilers_running() {
+                    let _ = jobserver.reset();
+                }
+            }
+        });
+    }
+}
+
+fn compilers_running() -> bool {
+    let Ok(output) = std::process::Command::new("ps").args(["-axo", "comm="]).output() else { return true };
+    String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+        let name = line.rsplit('/').next().unwrap_or(line).trim();
+        matches!(name, "cargo" | "rustc" | "clippy-driver" | "rustdoc" | "cc" | "clang" | "ld")
+    })
 }
 
 pub struct Governor {
     queue: Mutex<SlotQueue>,
     changed: Condvar,
     config: Mutex<ResourceConfig>,
+    repaint: Option<egui::Context>,
     pub cores: usize,
 }
 
 impl Governor {
-    pub fn new(config: ResourceConfig) -> Governor {
+    pub fn new(config: ResourceConfig, repaint: Option<egui::Context>) -> Governor {
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        Governor { queue: Mutex::default(), changed: Condvar::new(), config: Mutex::new(config), cores }
+        Governor { queue: Mutex::default(), changed: Condvar::new(), config: Mutex::new(config), repaint, cores }
     }
 
     pub fn set_config(&self, config: ResourceConfig) {
@@ -69,6 +130,9 @@ impl Governor {
         let config = self.config.lock().unwrap().clone();
         self.queue.lock().unwrap().grant(|class| config.slots(class, self.cores));
         self.changed.notify_all();
+        if let Some(ctx) = &self.repaint {
+            ctx.request_repaint();
+        }
     }
 
     pub fn snapshot(&self) -> (Vec<Ticket>, Vec<Ticket>) {
@@ -116,8 +180,7 @@ impl Governor {
         }
         send(stream, &json!({ "granted": true }))?;
         stream.set_read_timeout(None)?;
-        let mut rest = Vec::new();
-        let _ = (&mut &*stream).read_to_end(&mut rest);
+        let _ = std::io::copy(&mut &*stream, &mut std::io::sink());
         Ok(())
     }
 }
@@ -140,6 +203,11 @@ fn hung_up(stream: &UnixStream) -> Result<bool> {
     })
 }
 
+/// Exit code for "cannot wait for a slot here": the command did not run.
+const NO_SLOT_HERE: i32 = 75;
+/// How long a client keeps reconnecting while IMACS restarts before it runs anyway.
+const RECONNECT_FOR: Duration = Duration::from_secs(120);
+
 /// `imacs queue`: waits for a slot in the running IMACS, then runs the command and exits
 /// with its status. Without a running IMACS the command runs right away.
 pub fn run_queued(socket: &Path, class: SlotClass, command: &[String]) -> i32 {
@@ -148,15 +216,9 @@ pub fn run_queued(socket: &Path, class: SlotClass, command: &[String]) -> i32 {
         return 2;
     };
     let label = command.join(" ");
-    let held = match UnixStream::connect(socket) {
-        Ok(stream) => match wait_for_slot(stream, class, &label) {
-            Ok(stream) => Some(stream),
-            Err(err) => {
-                eprintln!("imacs queue: {err:#}; running without a slot");
-                None
-            }
-        },
-        Err(_) => None,
+    let held = match hold_slot(socket, class, &label) {
+        Ok(held) => held,
+        Err(code) => return code,
     };
     let status = std::process::Command::new(program).args(args).status();
     drop(held);
@@ -169,6 +231,36 @@ pub fn run_queued(socket: &Path, class: SlotClass, command: &[String]) -> i32 {
             eprintln!("imacs queue: could not run {program}: {err}");
             127
         }
+    }
+}
+
+/// The held slot's connection, or None to run without one (no IMACS). Err is an exit code.
+fn hold_slot(socket: &Path, class: SlotClass, label: &str) -> Result<Option<UnixStream>, i32> {
+    let mut deadline = None;
+    loop {
+        match UnixStream::connect(socket) {
+            Ok(stream) => match wait_for_slot(stream, class, label) {
+                Ok(stream) => return Ok(Some(stream)),
+                // IMACS went away while this waited: wait for it to come back and queue again.
+                Err(err) => eprintln!("imacs queue: {err:#}; reconnecting"),
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!(
+                    "imacs queue: this sandbox blocks the IMACS socket ({err}); run this command outside \
+                     the sandbox so it can wait for a {} slot",
+                    class.name()
+                );
+                return Err(NO_SLOT_HERE);
+            }
+            Err(_) if deadline.is_none() && !socket.exists() => return Ok(None),
+            Err(err) if deadline.is_some_and(|d| Instant::now() > d) => {
+                eprintln!("imacs queue: IMACS did not come back ({err}); running without a slot");
+                return Ok(None);
+            }
+            Err(_) => {}
+        }
+        deadline.get_or_insert_with(|| Instant::now() + RECONNECT_FOR);
+        std::thread::sleep(Duration::from_secs(2));
     }
 }
 
@@ -206,20 +298,37 @@ pub fn load_average() -> Option<f64> {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
-    use std::sync::Arc;
-    use std::time::Instant;
 
     #[test]
-    fn jobserver_pipe_holds_its_tokens() {
+    fn jobserver_pipe_holds_its_tokens_and_resets_leaks() {
         let dir = tempfile::tempdir().unwrap();
-        let jobserver = Jobserver::create(&dir.path().join("jobs"), 3).unwrap();
-        let mut reader = OpenOptions::new().read(true).write(true).open(dir.path().join("jobs")).unwrap();
-        let mut tokens = [0u8; 3];
-        reader.read_exact(&mut tokens).unwrap();
-        assert_eq!(&tokens, b"+++");
-        let [(make, flags), (cargo, _)] = jobserver.env();
-        assert_eq!((make.as_str(), cargo.as_str()), ("MAKEFLAGS", "CARGO_MAKEFLAGS"));
-        assert!(flags.ends_with(&format!("fifo:{}", dir.path().join("jobs").display())));
+        let jobserver = Jobserver::create(&dir.path().join("pool/jobs"), 3).unwrap();
+        let mut client = OpenOptions::new().read(true).write(true).open(dir.path().join("pool/jobs")).unwrap();
+        // A client takes two tokens and dies without returning them.
+        let mut taken = [0u8; 2];
+        client.read_exact(&mut taken).unwrap();
+        assert_eq!(&taken, b"++");
+        assert_eq!(jobserver.reset().unwrap(), 1, "one token was left in the pipe");
+        assert_eq!(jobserver.reset().unwrap(), 3, "the reset put all three back");
+        let mut all = [0u8; 3];
+        client.read_exact(&mut all).unwrap();
+        assert_eq!(jobserver.tokens(), 3);
+        let [(name, flags)] = jobserver.env();
+        assert_eq!(name, "CARGO_MAKEFLAGS");
+        assert_eq!(flags, format!("-j --jobserver-auth=fifo:{}", dir.path().join("pool/jobs").display()));
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(dir.path().join("pool")).unwrap().permissions().mode() & 0o777, 0o700);
+    }
+
+    #[test]
+    fn pools_are_private_to_the_user_and_the_home() {
+        let a = Jobserver::path_for(Path::new("/Users/x/.imacs"));
+        let b = Jobserver::path_for(Path::new("/private/tmp/qa/state"));
+        assert_ne!(a, b);
+        // SAFETY: getuid has no preconditions.
+        let uid = unsafe { libc::getuid() };
+        assert!(a.starts_with(format!("/tmp/imacs-{uid}")), "{}", a.display());
+        assert_eq!(a, Jobserver::path_for(Path::new("/Users/x/.imacs")));
     }
 
     fn client(socket: &Path, class: &str) -> (UnixStream, BufReader<UnixStream>) {
@@ -235,16 +344,11 @@ mod tests {
         serde_json::from_str(&line).unwrap()
     }
 
-    #[test]
-    fn slots_are_held_until_the_client_hangs_up() {
-        let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("s");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let governor = Arc::new(Governor::new(ResourceConfig { test_slots: Some(1), ..ResourceConfig::default() }));
-        let server = governor.clone();
+    fn serve_on(socket: &Path, governor: Arc<Governor>) {
+        let listener = UnixListener::bind(socket).unwrap();
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
-                let governor = server.clone();
+                let governor = governor.clone();
                 std::thread::spawn(move || {
                     let mut line = String::new();
                     BufReader::new(&stream).read_line(&mut line).unwrap();
@@ -252,6 +356,15 @@ mod tests {
                 });
             }
         });
+    }
+
+    #[test]
+    fn slots_are_held_until_the_client_hangs_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s");
+        let governor =
+            Arc::new(Governor::new(ResourceConfig { test_slots: Some(1), ..ResourceConfig::default() }, None));
+        serve_on(&socket, governor.clone());
         let (first, mut first_reader) = client(&socket, "test");
         assert_eq!(next(&mut first_reader)["granted"], true);
         let (_second, mut second_reader) = client(&socket, "test");
@@ -278,6 +391,27 @@ mod tests {
         let missing = dir.path().join("missing.sock");
         assert_eq!(run_queued(&missing, SlotClass::Test, &["sh".into(), "-c".into(), "exit 7".into()]), 7);
         assert_eq!(run_queued(&missing, SlotClass::Test, &[]), 2);
+    }
+
+    #[test]
+    fn a_client_waiting_through_an_imacs_restart_queues_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s");
+        // A socket file with nobody listening: IMACS is restarting.
+        drop(UnixListener::bind(&socket).unwrap());
+        let restart = {
+            let socket = socket.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(3));
+                std::fs::remove_file(&socket).unwrap();
+                serve_on(&socket, Arc::new(Governor::new(ResourceConfig::default(), None)));
+            })
+        };
+        let started = Instant::now();
+        let held = hold_slot(&socket, SlotClass::Test, "cargo test").unwrap();
+        restart.join().unwrap();
+        assert!(held.is_some(), "the client must get a slot from the restarted IMACS");
+        assert!(started.elapsed() >= Duration::from_secs(3), "it must not run before IMACS is back");
     }
 
     #[test]

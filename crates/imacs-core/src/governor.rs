@@ -126,11 +126,10 @@ impl SlotQueue {
 }
 
 /// The command inside `imacs queue [--class <c>] -- <command>`, so policies judge what
-/// actually runs.
+/// actually runs. Only a bare `imacs` counts: IMACS puts its own binary first on agents' PATH,
+/// while a path could name any program called imacs.
 pub fn queued_command(words: &[String]) -> Option<&[String]> {
-    let program = words.first()?;
-    let named_imacs = std::path::Path::new(program).file_name().is_some_and(|name| name == "imacs");
-    if !named_imacs || words.get(1).map(String::as_str) != Some("queue") {
+    if words.first().map(String::as_str) != Some("imacs") || words.get(1).map(String::as_str) != Some("queue") {
         return None;
     }
     let separator = words.iter().position(|w| w == "--")?;
@@ -203,10 +202,9 @@ mod tests {
         let words = |text: &str| text.split(' ').map(str::to_string).collect::<Vec<_>>();
         let inner = |text: &str| queued_command(&words(text)).map(|w| w.join(" "));
         assert_eq!(inner("imacs queue -- cargo test"), Some("cargo test".into()));
-        assert_eq!(
-            inner("/Apps/IMACS.app/Contents/MacOS/imacs queue --class test -- cargo test -p x"),
-            Some("cargo test -p x".into())
-        );
+        assert_eq!(inner("imacs queue --class test -- cargo test -p x"), Some("cargo test -p x".into()));
+        assert_eq!(inner("/Apps/IMACS.app/Contents/MacOS/imacs queue -- cargo test"), None);
+        assert_eq!(inner("./imacs queue -- cargo test"), None);
         assert_eq!(inner("imacs queue --class=qa -- python3 qa.py"), Some("python3 qa.py".into()));
         assert_eq!(inner("imacs queue --class nope -- cargo test"), None);
         assert_eq!(inner("imacs queue --class=nope -- cargo test"), None);

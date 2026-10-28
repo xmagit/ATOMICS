@@ -4,7 +4,11 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Set once this instance recorded its start; only then does it record its exit.
+static RECORDED: AtomicBool = AtomicBool::new(false);
 
 /// The log is trimmed to its newest half once it grows past this.
 const MAX_BYTES: u64 = 256 * 1024;
@@ -21,10 +25,11 @@ fn append(home: &Path, line: &str) {
     let path = log_path(home);
     let _ = std::fs::create_dir_all(home);
     if std::fs::metadata(&path).is_ok_and(|meta| meta.len() > MAX_BYTES)
-        && let Ok(text) = std::fs::read_to_string(&path)
+        && let Ok(bytes) = std::fs::read(&path)
     {
-        let keep = &text[text.len() / 2..];
-        let keep = keep.find('\n').map_or(keep, |i| &keep[i + 1..]);
+        // Cut at a line end in the second half, never inside a character.
+        let half = &bytes[bytes.len() / 2..];
+        let keep = half.iter().position(|&b| b == b'\n').map_or(half, |i| &half[i + 1..]);
         let _ = std::fs::write(&path, keep);
     }
     if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
@@ -42,16 +47,24 @@ pub fn started(home: &Path) -> Option<String> {
             let mut words = line.split(' ').skip(1);
             words.next() == Some("exit") && words.next() == Some(pid)
         });
-        (!exited).then_some(pid.to_string())
+        // A start whose process still runs is another instance, not a crash.
+        let alive = pid.parse::<i32>().is_ok_and(|pid| {
+            // SAFETY: signal 0 only checks that the process exists.
+            pid != std::process::id() as i32 && unsafe { libc::kill(pid, 0) } == 0
+        });
+        (!exited && !alive).then_some(pid.to_string())
     });
     append(home, &format!("start {}", std::process::id()));
+    RECORDED.store(true, Ordering::Relaxed);
     unclean.map(|pid| {
         format!("IMACS (pid {pid}) ended unexpectedly last time; see {}", imacs_core::paths::display(&log_path(home)))
     })
 }
 
 pub fn exited(home: &Path) {
-    append(home, &format!("exit {}", std::process::id()));
+    if RECORDED.load(Ordering::Relaxed) {
+        append(home, &format!("exit {}", std::process::id()));
+    }
 }
 
 /// Logs panics with their thread and backtrace, then lets the default hook print them.
@@ -84,6 +97,18 @@ mod tests {
     }
 
     #[test]
+    fn a_start_of_a_process_that_still_runs_is_not_a_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut other = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        append(dir.path(), &format!("start {}", other.id()));
+        assert_eq!(started(dir.path()), None, "a running instance is not a crash");
+        other.kill().unwrap();
+        other.wait().unwrap();
+        append(dir.path(), &format!("start {}", other.id()));
+        assert!(started(dir.path()).is_some(), "once it is gone without an exit, it is reported");
+    }
+
+    #[test]
     fn panics_are_logged_with_their_thread() {
         // The hook is process-wide, so it is installed in a child process of its own.
         if let Some(home) = std::env::var_os("IMACS_CRASH_TEST_HOME") {
@@ -106,7 +131,8 @@ mod tests {
     #[test]
     fn the_log_is_trimmed_to_its_newest_half() {
         let dir = tempfile::tempdir().unwrap();
-        let line = "x".repeat(1024);
+        // Multi-byte characters everywhere, so a cut in the middle of one would panic.
+        let line = "é→".repeat(256);
         for _ in 0..300 {
             append(dir.path(), &line);
         }

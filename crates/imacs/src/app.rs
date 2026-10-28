@@ -52,8 +52,6 @@ pub struct Options {
     pub screenshot: Option<PathBuf>,
     pub screenshot_delay: f32,
     pub migration_errors: Vec<String>,
-    /// Set when the previous run never recorded a clean exit.
-    pub crash_notice: Option<String>,
 }
 
 pub struct Session {
@@ -330,7 +328,7 @@ pub struct App {
     /// Machine-wide limits for the agents' heavy work.
     governor: Arc<Governor>,
     /// Compiler job pool every agent inherits; None when this instance does not own the socket.
-    jobserver: Option<Jobserver>,
+    jobserver: Option<Arc<Jobserver>>,
     /// One-minute load average, read at most every 2 seconds.
     load: (Instant, Option<f64>),
     busy_checked: Instant,
@@ -415,20 +413,30 @@ impl App {
         let hub = Arc::new(Mutex::new(Hub::default()));
         let (hook_tx, hook_rx) = channel();
         let (control_tx, control_rx) = channel();
-        let governor = Arc::new(Governor::new(config.resources.clone()));
+        let governor = Arc::new(Governor::new(config.resources.clone(), Some(ctx.clone())));
         let channels = Channels { hooks: hook_tx, control: control_tx, governor: governor.clone() };
         let hook_error =
             ipc::serve(&paths::socket_path(), hub.clone(), channels, ctx.clone()).err().map(|e| format!("{e:#}"));
         // Only the instance that owns the socket owns the pool, so a second IMACS never replaces it.
-        let (jobserver, jobserver_error) = match hook_error {
-            Some(_) => (None, None),
-            None => match Jobserver::create(
-                &paths::imacs_home().join("jobserver.fifo"),
-                config.resources.jobs(governor.cores),
-            ) {
-                Ok(jobserver) => (Some(jobserver), None),
-                Err(err) => (None, Some(format!("Compiler job pool unavailable: {err:#}"))),
-            },
+        let mut notices = Vec::new();
+        let jobserver = match hook_error {
+            Some(_) => None,
+            None => {
+                // Only the instance that owns the socket records its runs, so second instances stay out of the log.
+                notices.extend(crate::crash::started(&paths::imacs_home()));
+                let path = Jobserver::path_for(&paths::imacs_home());
+                match Jobserver::create(&path, config.resources.jobs(governor.cores)) {
+                    Ok(jobserver) => {
+                        let jobserver = Arc::new(jobserver);
+                        jobserver.refill_when_idle();
+                        Some(jobserver)
+                    }
+                    Err(err) => {
+                        notices.push(format!("Compiler job pool unavailable: {err:#}"));
+                        None
+                    }
+                }
+            }
         };
         let (watch_tx, watch_rx) = channel();
         let (worktree_tx, worktree_rx) = channel();
@@ -538,17 +546,11 @@ impl App {
         };
         app.open_initial_projects(options.projects, options.workspace);
         app.apply_config();
-        if !options.migration_errors.is_empty() {
-            app.toast(options.migration_errors.join("\n"));
-        }
-        if let Some(error) = jobserver_error {
-            app.toast(error);
-        }
-        if let Some(notice) = options.crash_notice {
-            app.toast(notice);
-        }
-        if let Some(error) = plan_error {
-            app.toast(error);
+        // One toast for everything startup has to say, so no notice hides another.
+        notices.splice(0..0, options.migration_errors.iter().cloned());
+        notices.extend(plan_error);
+        if !notices.is_empty() {
+            app.toast(notices.join("\n"));
         }
         app
     }
@@ -952,10 +954,7 @@ impl App {
         let (running, waiting) = self.governor.snapshot();
         let mut hover = format!("Load {load:.1} on {} cores", self.governor.cores);
         match &self.jobserver {
-            Some(_) => hover.push_str(&format!(
-                "\nCompilers of all agents share {} jobs",
-                self.config.resources.jobs(self.governor.cores)
-            )),
+            Some(jobserver) => hover.push_str(&format!("\nCompilers of all agents share {} jobs", jobserver.tokens())),
             None => hover.push_str("\nNo shared compiler job pool"),
         }
         for class in [SlotClass::Test, SlotClass::Qa] {
@@ -975,7 +974,7 @@ impl App {
         json!({
             "cores": self.governor.cores,
             "load": crate::governor::load_average(),
-            "jobs": self.jobserver.as_ref().map(|_| self.config.resources.jobs(self.governor.cores)),
+            "jobs": self.jobserver.as_ref().map(|j| j.tokens()),
             "slots": { "test": self.governor.slots(SlotClass::Test), "qa": self.governor.slots(SlotClass::Qa) },
             "running": running,
             "waiting": waiting,
@@ -1132,12 +1131,14 @@ impl App {
         // `imacs queue` in an agent resolves to this IMACS, and its compilers share one job pool.
         if let Some(dir) = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf)) {
             let path = env.get("PATH").cloned().or_else(|| std::env::var("PATH").ok()).unwrap_or_default();
-            env.insert("PATH".into(), format!("{}:{path}", dir.display()));
+            // An empty entry would put the current directory on PATH.
+            let path = if path.is_empty() { dir.display().to_string() } else { format!("{}:{path}", dir.display()) };
+            env.insert("PATH".into(), path);
         }
         if let Some(jobserver) = &self.jobserver {
             env.extend(jobserver.env());
         }
-        env.extend(compile_cache_env());
+        env.extend(compile_cache_env(&cwd));
 
         let (program, mut args) = match agent.command.split_first() {
             Some((program, rest)) => (program.clone(), rest.to_vec()),
@@ -1237,10 +1238,7 @@ impl App {
         let program = resolve_program(&program);
         let nice = self.config.resources.agent_nice;
         let (program, args) = if !chief && agent.kind != AgentKind::Shell && nice != 0 {
-            (
-                "/usr/bin/nice".to_string(),
-                ["-n".to_string(), nice.to_string(), program].into_iter().chain(args).collect(),
-            )
+            ("nice".to_string(), ["-n".to_string(), nice.to_string(), program].into_iter().chain(args).collect())
         } else {
             (program, args)
         };
@@ -5055,6 +5053,8 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self) {
+        // macOS never returns from the event loop after Cmd+Q, so the clean exit is recorded here.
+        crate::crash::exited(&paths::imacs_home());
         for editor in self.editors.values() {
             editor.shutdown();
         }
@@ -5345,12 +5345,16 @@ const CHIEF_ALLOWED_TOOLS: &[&str] = &[
     "mcp__imacs__imacs_open",
 ];
 
-/// RUSTC_WRAPPER for sccache when it is installed and the user chose no wrapper.
-fn compile_cache_env() -> Vec<(String, String)> {
+/// RUSTC_WRAPPER for sccache when it is installed and neither the user nor the project under
+/// `cwd` chose a wrapper (an exported variable would override their cargo config).
+fn compile_cache_env(cwd: &Path) -> Vec<(String, String)> {
     let user_config = std::env::var_os("CARGO_HOME").map(PathBuf::from).unwrap_or_else(|| paths::home().join(".cargo"));
-    let wrapper_set = std::env::var_os("RUSTC_WRAPPER").is_some()
-        || ["config.toml", "config"].iter().any(|name| {
-            std::fs::read_to_string(user_config.join(name)).is_ok_and(|text| text.contains("rustc-wrapper"))
+    let configs = cwd.ancestors().map(|dir| dir.join(".cargo")).chain([user_config]);
+    let wrapper_set = ["RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER"].iter().any(|var| std::env::var_os(var).is_some())
+        || configs.into_iter().any(|dir| {
+            ["config.toml", "config"]
+                .iter()
+                .any(|name| std::fs::read_to_string(dir.join(name)).is_ok_and(|text| text.contains("rustc-wrapper")))
         });
     let sccache = resolve_program("sccache");
     if wrapper_set || !Path::new(&sccache).is_absolute() {
@@ -5474,9 +5478,14 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(20));
             }
             let env = std::fs::read_to_string(&out).unwrap();
-            let pool = format!("-j --jobserver-auth=fifo:{}", paths::imacs_home().join("jobserver.fifo").display());
-            assert!(env.contains(&format!("CARGO_MAKEFLAGS={pool}")), "{env}");
-            assert!(env.contains(&format!("MAKEFLAGS={pool}")), "{env}");
+            let pool = format!("-j --jobserver-auth=fifo:{}", Jobserver::path_for(&paths::imacs_home()).display());
+            assert!(env.lines().any(|line| line == format!("CARGO_MAKEFLAGS={pool}")), "{env}");
+            // MAKEFLAGS may be inherited from whatever started the tests; this pool must never be in it.
+            let pool_path = Jobserver::path_for(&paths::imacs_home()).display().to_string();
+            assert!(
+                !env.lines().any(|line| line.starts_with("MAKEFLAGS=") && line.contains(&pool_path)),
+                "plain make must not see the pool: {env}"
+            );
             let exe_dir = std::env::current_exe().unwrap().parent().unwrap().display().to_string();
             assert!(env.lines().any(|line| line.starts_with(&format!("PATH={exe_dir}:"))), "{env}");
             assert_eq!(std::fs::read_to_string(dir.path().join("probe.nice")).unwrap().trim(), "7");
