@@ -70,6 +70,9 @@ impl App {
         let Some(root) = task.worktree else {
             return;
         };
+        if !root.is_dir() {
+            return;
+        }
         match action {
             "diff" => {
                 self.active = None;
@@ -217,7 +220,7 @@ impl App {
             self.create_worktree(repo.clone(), branch.clone(), start, launch);
             if let Some(t) = self.plans[index].task_mut(&task.id) {
                 t.set_status(TaskStatus::Running);
-                t.branch = (t.id != plan::REVIEW_TASK).then_some(branch);
+                t.branch = Some(branch);
                 t.finished_at = None;
                 t.dispatched_at = Some(imacs_core::store::now());
                 t.session = None;
@@ -326,6 +329,71 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dispatched_review_records_branch_closes_on_acceptance_and_can_be_cleaned_up() {
+        with_app(
+            "app::plans::tests::dispatched_review_records_branch_closes_on_acceptance_and_can_be_cleaned_up",
+            |app, ctx| {
+                let (_dir, repo) = repository();
+                app.plans = vec![Plan {
+                    id: "review-cleanup".into(),
+                    project: Some(repo.clone()),
+                    approved: true,
+                    tasks: vec![Task { id: plan::REVIEW_TASK.into(), ..Task::default() }],
+                    ..Plan::default()
+                }];
+                app.selected_plan = 0;
+                app.dispatch(0, Some(plan::REVIEW_TASK)).unwrap();
+                let (branch, worktree, _) = app.worktree_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                let worktree = worktree.unwrap();
+                assert_eq!(app.plans[0].tasks[0].branch.as_deref(), Some(branch.as_str()));
+                assert_eq!(git::worktree_of(&worktree).unwrap().branch.as_deref(), Some(branch.as_str()));
+                assert_eq!(plan::load_plans(&paths::imacs_home()).unwrap().0[0].tasks[0].branch, Some(branch.clone()));
+                app.sessions = vec![session("reviewer", AgentKind::Claude, AgentStatus::Done, &worktree)];
+                app.plans[0].tasks[0].session = Some("reviewer".into());
+                app.plans[0].tasks[0].status = TaskStatus::Review;
+                for (id, can_integrate) in [("code", true), (plan::REVIEW_TASK, false)] {
+                    app.plans[0].tasks[0].id = id.into();
+                    let output = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1600.0, 1000.0))),
+                            ..Default::default()
+                        },
+                        |ui| {
+                            egui::CentralPanel::default().show(ui, |ui| app.plan_panel(ui, ui.max_rect()));
+                        },
+                    );
+                    assert_eq!(
+                        output.shapes.iter().any(|shape| {
+                            matches!(&shape.shape, egui::epaint::Shape::Text(text) if text.galley.text() == "integrate")
+                        }),
+                        can_integrate
+                    );
+                    output.drop_without_applying_deltas();
+                }
+                assert!(
+                    request(
+                        app,
+                        json!({
+                            "cmd":"plan_update", "plan":"review-cleanup", "id":"review", "status":"done"
+                        })
+                    )
+                    .ok
+                );
+                assert!(app.find("reviewer").is_none());
+                assert_eq!(app.plans[0].status, PlanStatus::Completed);
+                assert!(app.plans[0].tasks[0].integrated.is_none());
+                assert_eq!(app.plans[0].tasks[0].worktree.as_ref(), Some(&worktree));
+                let rows = imacs_core::cleanup::preview(&app.plans[0], "main").unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].branch, branch);
+                imacs_core::cleanup::remove(&app.plans[0], "main", &rows[0]).unwrap();
+                assert!(!worktree.exists());
+                assert!(git::git(&repo, &["show-ref", "--verify", &format!("refs/heads/{branch}")]).is_err());
+            },
+        );
+    }
+
+    #[test]
     fn accepted_agents_exit_keep_results_and_complete_without_closing_chief() {
         with_app(
             "app::plans::tests::accepted_agents_exit_keep_results_and_complete_without_closing_chief",
@@ -368,6 +436,7 @@ mod tests {
                         },
                         Task {
                             id: plan::REVIEW_TASK.into(),
+                            branch: Some("review".into()),
                             status: TaskStatus::Review,
                             session: Some("reviewer".into()),
                             ..Task::default()
@@ -447,7 +516,7 @@ mod tests {
                 assert_eq!(app.plans[index].status, plan::PlanStatus::Open);
                 assert_eq!(app.report(Some("reviewer"), "done", "Review passed"), Some("review".into()));
                 app.sync_plan();
-                assert!(app.find("reviewer").is_some(), "a branchless agent report must also wait for acceptance");
+                assert!(app.find("reviewer").is_some(), "the reviewer report must also wait for acceptance");
                 assert!(app.plans[index].tasks[1].finished_at.is_none());
                 assert!(
                     request(app, json!({"cmd":"plan_update", "plan":"lifecycle", "id":"review", "status":"done"})).ok
@@ -497,6 +566,8 @@ mod tests {
             app.config.plan.close_done_agents = true;
             app.finish_plan_agents();
             assert!(app.find("worker").is_none());
+            assert!(app.completed_tasks().is_empty());
+            app.plan_view = true;
             assert_eq!(app.completed_tasks(), [(app.selected_plan, 0)]);
         });
     }
