@@ -31,6 +31,10 @@ const TAB_HEIGHT: f32 = 30.0;
 const TILE_HEADER: f32 = 26.0;
 const WORKTREE_REFRESH: Duration = Duration::from_secs(30);
 const BACKGROUND_REFRESH: Duration = Duration::from_secs(5);
+const FALLBACK_REFRESH: Duration = Duration::from_secs(30);
+const PULSE_STEP: Duration = Duration::from_millis(250);
+/// Untracked content kept for a diff off screen; the rest is counted, not loaded.
+const OFF_SCREEN_UNTRACKED: u64 = 1024 * 1024;
 
 /// Folders whose churn (builds, dependencies, git internals) never changes the diff.
 const IGNORED_DIRS: &[&str] = &[".git", "node_modules", "target", "bin", "obj", ".idea", ".vs", "dist"];
@@ -294,7 +298,9 @@ pub struct App {
     new_dialog: Option<NewDialog>,
     quick_open: Option<QuickOpen>,
     last_layout: Option<Layout>,
-    watcher: Option<(PathBuf, Debouncer<RecommendedWatcher>)>,
+    watcher: Option<Debouncer<RecommendedWatcher>>,
+    /// Worktrees being watched, each with its path as the file system reports it.
+    watched: Arc<Mutex<Vec<(PathBuf, PathBuf)>>>,
     watch_tx: Sender<PathBuf>,
     watch_rx: Receiver<PathBuf>,
     toast: Option<(String, Instant)>,
@@ -400,6 +406,7 @@ impl App {
             quick_open: None,
             last_layout: None,
             watcher: None,
+            watched: Arc::default(),
             watch_tx,
             watch_rx,
             toast: None,
@@ -995,7 +1002,7 @@ impl App {
             _ => None,
         };
         let program = resolve_program(&program);
-        match Terminal::spawn(ctx, self.palette.clone(), program, args, &cwd, env) {
+        match Terminal::spawn(ctx, self.palette.clone(), program, args, &cwd, env, self.config.terminal.scrollback) {
             Ok(terminal) => {
                 let worktree = git::worktree_of(&cwd);
                 let title = if chief {
@@ -1052,7 +1059,7 @@ impl App {
         let s = &self.sessions[index];
         let stats = self.diffs.get(&s.root()).and_then(|d| d.prepared.as_ref()).map(|p| {
             json!({
-                "files": p.diff.files.len(), "additions": p.diff.additions(), "deletions": p.diff.deletions()
+                "files": p.diff.files.len(), "additions": p.additions, "deletions": p.deletions
             })
         });
         json!({
@@ -1313,11 +1320,9 @@ impl App {
                 None => missing(&session),
                 Some(index) => {
                     let root = self.sessions[index].root();
-                    let state = self.diffs.entry(root).or_default();
-                    let excerpt = state
-                        .prepared
-                        .as_ref()
-                        .and_then(|p| p.diff.files.iter().find(|f| f.path() == path))
+                    let state = self.diffs.entry(root.clone()).or_default();
+                    let file = state.prepared.as_ref().and_then(|p| p.diff.files.iter().find(|f| f.path() == path));
+                    let excerpt = file
                         .and_then(|f| {
                             f.hunks.iter().flat_map(|h| &h.lines).find(|l| {
                                 let number = if removed { l.old_no } else { l.new_no };
@@ -1327,6 +1332,12 @@ impl App {
                             })
                         })
                         .map(|l| l.text.clone())
+                        // Untracked content a diff off screen left out is read from the file.
+                        .or_else(|| {
+                            let n = line.filter(|_| !removed && file.is_some_and(|f| f.omitted > 0))?;
+                            let text = std::fs::read_to_string(root.join(&path)).ok()?;
+                            text.lines().nth((n as usize).checked_sub(1)?).map(str::to_string)
+                        })
                         .unwrap_or_default();
                     state.comments.push(steer::ReviewComment { path, line, removed, excerpt, body: text });
                     done(ControlResponse::ok(json!({ "pending_comments": state.comments.len() })))
@@ -2530,12 +2541,13 @@ impl App {
         self.verify_deliveries();
         self.record_events();
         self.sync_plan();
-        if !self.waiters.is_empty() {
-            ctx.request_repaint_after(Duration::from_millis(250));
+        // Events wake waiters as they come in; this only times them out.
+        if let Some(deadline) = self.waiters.iter().map(|w| w.deadline).min() {
+            ctx.request_repaint_after(deadline.saturating_duration_since(Instant::now()));
         }
         if self.sessions.iter().any(|s| s.status == AgentStatus::Working) {
-            // Keeps the status pulse of working agents moving.
-            ctx.request_repaint_after(Duration::from_millis(150));
+            // Keeps the status pulse of working agents moving, in a few steps a second.
+            ctx.request_repaint_after(PULSE_STEP);
         }
         while let Ok(result) = self.worker.rx.try_recv() {
             match result {
@@ -2589,6 +2601,13 @@ impl App {
                     Ok(config) => {
                         let syntax = Palette::from_config(&config.theme).syntax;
                         let theme_changed = syntax != self.palette.syntax;
+                        if config.terminal.scrollback != self.config.terminal.scrollback {
+                            let terminals =
+                                self.sessions.iter().filter_map(|s| s.terminal.as_ref()).chain(self.editors.values());
+                            for terminal in terminals {
+                                terminal.set_scrollback(config.terminal.scrollback);
+                            }
+                        }
                         self.config = config;
                         self.config_error = None;
                         self.palette = Arc::new(Palette::from_config(&self.config.theme));
@@ -2635,31 +2654,45 @@ impl App {
             self.title = title;
         }
 
-        if let Some(root) = self.diff_target() {
-            self.watch(ctx, &root);
-            let state = self.diffs.entry(root).or_default();
-            if state.prepared.is_none() && !state.loading && state.error.is_none() && state.dirty_since.is_none() {
+        let target = self.diff_target();
+        self.watch(ctx, target.as_deref());
+        if let Some(root) = &target {
+            let state = self.diffs.entry(root.clone()).or_default();
+            // A diff seen off screen may lack untracked content; on screen it gets all of it.
+            let missing = state.prepared.as_ref().is_none_or(|p| p.diff.partial);
+            if missing && !state.loading && state.error.is_none() && state.dirty_since.is_none() {
                 state.dirty_since = Some(Instant::now() - Duration::from_secs(1));
             }
         }
-        // Agents off screen keep their sidebar counts current while they work.
+        // File changes and hooks keep the diffs of agents off screen current; this
+        // catches what they miss while an agent works.
         for session in &self.sessions {
             let state = self.diffs.entry(session.root()).or_default();
-            let stale = state.last_request.is_none_or(|at| at.elapsed() > BACKGROUND_REFRESH);
+            let stale = state.last_request.is_none_or(|at| at.elapsed() > FALLBACK_REFRESH);
             if (session.status == AgentStatus::Working || state.prepared.is_none()) && stale && !state.loading {
                 state.mark_dirty();
             }
         }
-        let mut waiting = false;
+        let now = Instant::now();
+        let mut next: Option<Instant> = None;
         for (root, state) in &mut self.diffs {
-            if state.due() {
-                self.worker.request(root.clone(), self.config.base_ref.clone(), self.highlighter.clone());
-            } else if state.dirty_since.is_some() {
-                waiting = true;
+            // The diff on screen follows every change; the others at most every few seconds,
+            // with only some of their untracked content.
+            let on_screen = target.as_ref() == Some(root);
+            let (interval, budget) =
+                if on_screen { (Duration::ZERO, None) } else { (BACKGROUND_REFRESH, Some(OFF_SCREEN_UNTRACKED)) };
+            match state.due_at(interval) {
+                Some(at) if at <= now => {
+                    state.requested();
+                    let (base_ref, highlighter) = (self.config.base_ref.clone(), self.highlighter.clone());
+                    self.worker.request(root.clone(), base_ref, budget, highlighter);
+                }
+                Some(at) => next = Some(next.map_or(at, |next| next.min(at))),
+                None => {}
             }
         }
-        if waiting {
-            ctx.request_repaint_after(Duration::from_millis(120));
+        if let Some(at) = next {
+            ctx.request_repaint_after(at - now);
         }
         if let Some((_, at)) = &self.toast
             && at.elapsed() > Duration::from_secs(5)
@@ -2739,34 +2772,66 @@ impl App {
         }
     }
 
-    fn watch(&mut self, ctx: &egui::Context, root: &Path) {
-        if self.watcher.as_ref().is_some_and(|(r, _)| r == root) {
+    /// Watches the worktree of every agent and the one on screen, so their diffs follow
+    /// file changes without polling.
+    fn watch(&mut self, ctx: &egui::Context, target: Option<&Path>) {
+        let mut wanted: Vec<PathBuf> = self
+            .sessions
+            .iter()
+            .filter(|s| s.worktree.is_some())
+            .map(Session::root)
+            .chain(target.map(Path::to_path_buf))
+            .collect();
+        wanted.sort();
+        wanted.dedup();
+        let current: Vec<PathBuf> = self.watched.lock().unwrap().iter().map(|(root, _)| root.clone()).collect();
+        if current == wanted {
             return;
         }
-        self.watcher = None;
-        let (tx, ctx, watched) = (self.watch_tx.clone(), ctx.clone(), root.to_path_buf());
-        let handler = move |result: DebounceEventResult| {
-            let Ok(events) = result else { return };
-            let relevant = events.iter().any(|e| {
-                !e.path
-                    .strip_prefix(&watched)
-                    .unwrap_or(&e.path)
-                    .components()
-                    .any(|c| IGNORED_DIRS.iter().any(|d| c.as_os_str() == *d))
-            });
-            if relevant {
-                let _ = tx.send(watched.clone());
-                ctx.request_repaint();
-            }
-        };
-        match new_debouncer(Duration::from_millis(250), handler) {
-            Ok(mut debouncer) => {
-                if debouncer.watcher().watch(root, RecursiveMode::Recursive).is_ok() {
-                    self.watcher = Some((root.to_path_buf(), debouncer));
+        if self.watcher.is_none() {
+            let (tx, ctx, watched) = (self.watch_tx.clone(), ctx.clone(), self.watched.clone());
+            let handler = move |result: DebounceEventResult| {
+                let Ok(events) = result else { return };
+                let watched = watched.lock().unwrap();
+                let mut changed: Vec<&PathBuf> = Vec::new();
+                for event in &events {
+                    // The innermost worktree, for worktrees inside another.
+                    let Some((root, relative)) = watched
+                        .iter()
+                        .filter_map(|(root, real)| Some((root, event.path.strip_prefix(real).ok()?)))
+                        .min_by_key(|(_, relative)| relative.components().count())
+                    else {
+                        continue;
+                    };
+                    let ignored = relative.components().any(|c| IGNORED_DIRS.iter().any(|d| c.as_os_str() == *d));
+                    if !ignored && !changed.contains(&root) {
+                        changed.push(root);
+                    }
                 }
+                for root in &changed {
+                    let _ = tx.send((*root).clone());
+                }
+                if !changed.is_empty() {
+                    ctx.request_repaint();
+                }
+            };
+            match new_debouncer(Duration::from_millis(250), handler) {
+                Ok(debouncer) => self.watcher = Some(debouncer),
+                Err(err) => eprintln!("IMACS: file watcher failed: {err}"),
             }
-            Err(err) => eprintln!("IMACS: file watcher failed: {err}"),
         }
+        if let Some(debouncer) = &mut self.watcher {
+            let watcher = debouncer.watcher();
+            for root in current.iter().filter(|root| !wanted.contains(root)) {
+                let _ = watcher.unwatch(root);
+            }
+            for root in wanted.iter().filter(|root| !current.contains(root)) {
+                let _ = watcher.watch(root, RecursiveMode::Recursive);
+            }
+        }
+        // Events carry the path as the file system has it (/private/tmp for /tmp).
+        *self.watched.lock().unwrap() =
+            wanted.into_iter().map(|root| (root.clone(), std::fs::canonicalize(&root).unwrap_or(root))).collect();
     }
 
     // ── input ─────────────────────────────────────────────────────────────
@@ -3027,7 +3092,7 @@ impl App {
                     continue;
                 }
                 let active = self.active.as_deref() == Some(session.id.as_str());
-                let stats = self.diffs.get(&session.root()).and_then(|d| d.prepared.as_ref()).map(|p| (p.diff.additions(), p.diff.deletions()));
+                let stats = self.diffs.get(&session.root()).and_then(|d| d.prepared.as_ref()).map(|p| (p.additions, p.deletions));
                 let row = session_row(ui, &p, session, active, stats);
                 if row.clicked() {
                     clicked = Some(session.id.clone());
@@ -3674,7 +3739,8 @@ impl App {
         if let Some(shell_path) = SHELL_PATH.as_ref() {
             env.insert("PATH".into(), shell_path.clone());
         }
-        match Terminal::spawn(ctx, self.palette.clone(), resolve_program(program), args, root, env) {
+        let scrollback = self.config.terminal.scrollback;
+        match Terminal::spawn(ctx, self.palette.clone(), resolve_program(program), args, root, env, scrollback) {
             Ok(editor) => {
                 // The file is already open; only the theme and the jump to the line are left.
                 let mut steps = self.config.editor.startup_keys.clone();
@@ -3932,8 +3998,8 @@ impl App {
             self.quick_open = Some(dialog);
             return;
         };
-        let mut all = prepared.all_files.clone();
-        all.extend(prepared.diff.files.iter().map(|f| f.path().to_string()));
+        let mut all = prepared.all_files.to_vec();
+        all.extend(prepared.diff.files.iter().map(|f| Arc::from(f.path())));
         all.sort();
         all.dedup();
         let changed: HashSet<&str> = prepared.diff.files.iter().map(|f| f.path()).collect();

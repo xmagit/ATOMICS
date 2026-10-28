@@ -1,8 +1,6 @@
 //! Syntax highlighting for diff lines with syntect and bat's grammar set. syntect
 //! works line by line, which suits hunks that start mid-file.
 
-use std::ops::Range;
-
 use egui::Color32;
 use imacs_core::diff::{FileDiff, LineKind};
 use syntect::easy::HighlightLines;
@@ -10,7 +8,15 @@ use syntect::highlighting::Theme;
 use syntect::parsing::SyntaxSet;
 use two_face::theme::EmbeddedThemeName;
 
-pub type Spans = Vec<(Range<usize>, Color32)>;
+/// A colored byte range of a line. Small, since every line of a diff keeps a few.
+#[derive(Clone, Copy)]
+pub struct Span {
+    pub start: u32,
+    pub end: u32,
+    pub color: Color32,
+}
+
+pub type Spans = Vec<Span>;
 
 pub struct Highlighter {
     syntaxes: SyntaxSet,
@@ -85,7 +91,7 @@ impl Highlighter {
             let end = (pos + piece.len()).min(text.len() - 1);
             if end > pos {
                 let c = style.foreground;
-                spans.push((pos..end, Color32::from_rgb(c.r, c.g, c.b)));
+                spans.push(Span { start: pos as u32, end: end as u32, color: Color32::from_rgb(c.r, c.g, c.b) });
             }
             pos += piece.len();
         }

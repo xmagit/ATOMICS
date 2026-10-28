@@ -1,6 +1,7 @@
 //! Unified diff model and parser for `git diff` output, plus word-level emphasis
 //! for lines that were edited rather than replaced.
 
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
 
 use similar::{Algorithm, DiffOp, capture_diff_slices};
@@ -11,9 +12,11 @@ pub struct WorktreeDiff {
     /// Merge-base commit the diff is taken against.
     pub base: String,
     pub files: Vec<FileDiff>,
+    /// Some untracked files are counted but their content was left out.
+    pub partial: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FileStatus {
     Added,
     Deleted,
@@ -29,6 +32,8 @@ pub struct FileDiff {
     pub status: FileStatus,
     pub binary: bool,
     pub hunks: Vec<Hunk>,
+    /// Lines of an untracked file whose content was left out.
+    pub omitted: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -39,7 +44,7 @@ pub struct Hunk {
     pub lines: Vec<DiffLine>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LineKind {
     Context,
     Added,
@@ -75,7 +80,7 @@ impl FileDiff {
     }
 
     pub fn additions(&self) -> usize {
-        self.count(LineKind::Added)
+        self.count(LineKind::Added) + self.omitted
     }
 
     pub fn deletions(&self) -> usize {
@@ -84,6 +89,20 @@ impl FileDiff {
 
     fn count(&self, kind: LineKind) -> usize {
         self.hunks.iter().flat_map(|h| &h.lines).filter(|l| l.kind == kind).count()
+    }
+
+    /// Changes whenever anything shown for the file does, so work derived from its diff
+    /// (syntax highlighting) can be reused while it stays the same.
+    pub fn content_hash(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        (&self.old_path, &self.new_path, self.status, self.binary, self.omitted, self.hunks.len()).hash(&mut hasher);
+        for hunk in &self.hunks {
+            (&hunk.header, hunk.old_start, hunk.new_start, hunk.lines.len()).hash(&mut hasher);
+            for line in &hunk.lines {
+                (line.kind, &line.text).hash(&mut hasher);
+            }
+        }
+        hasher.finish()
     }
 
     /// A whole new file shown as one all-added hunk (for untracked files).
@@ -106,7 +125,13 @@ impl FileDiff {
             status: FileStatus::Untracked,
             binary: false,
             hunks: if lines.is_empty() { Vec::new() } else { vec![Hunk { header, old_start: 0, new_start: 1, lines }] },
+            omitted: 0,
         }
+    }
+
+    /// An untracked file counted but not shown.
+    pub fn untracked_omitted(path: String, lines: usize) -> FileDiff {
+        FileDiff { omitted: lines, ..FileDiff::untracked(path, "") }
     }
 }
 
@@ -125,6 +150,7 @@ pub fn parse_unified(text: &str) -> Vec<FileDiff> {
                 status: FileStatus::Modified,
                 binary: false,
                 hunks: Vec::new(),
+                omitted: 0,
             });
             continue;
         }
@@ -467,6 +493,18 @@ Binary files a/logo.png and b/logo.png differ
 
         assert!(files[4].binary);
         assert_eq!(files[4].path(), "logo.png");
+    }
+
+    #[test]
+    fn content_hash_follows_what_the_hunks_show() {
+        let hash = |text: &str| parse_unified(text)[0].content_hash();
+        assert_eq!(hash(SAMPLE), hash(SAMPLE));
+        assert_ne!(hash(SAMPLE), hash(&SAMPLE.replace("compute(2)", "compute(3)")));
+        assert_ne!(hash(SAMPLE), hash(&SAMPLE.replace("+    let value", "     let value")));
+        assert_ne!(hash(SAMPLE), hash(&SAMPLE.replace("src/lib.rs", "src/lib.py")));
+        assert_ne!(hash(SAMPLE), hash(&SAMPLE.replace("@@ -1,4 +1,5 @@", "@@ -2,4 +2,5 @@")));
+        let staged = FileDiff { status: FileStatus::Added, ..FileDiff::untracked("a.rs".into(), "fn a() {}\n") };
+        assert_ne!(staged.content_hash(), FileDiff::untracked("a.rs".into(), "fn a() {}\n").content_hash());
     }
 
     #[test]

@@ -35,6 +35,9 @@ diff_split = "auto"         # old and new side by side: "auto" (diff area 1100+ 
 size = 13.0
 diff_size = 12.5
 
+[terminal]
+scrollback = 5000           # lines each terminal keeps; a full 20000 on a wide terminal takes about 80 MB
+
 [theme]
 preset = "claude"           # "claude": near-black with Claude orange · "midnight": blue-gray
 # syntax = "Monokai Extended"   # any bat/two-face theme; each preset picks one
@@ -126,6 +129,7 @@ pub struct Config {
     pub worktree_path: String,
     pub layout: LayoutConfig,
     pub font: FontConfig,
+    pub terminal: TerminalConfig,
     pub theme: ThemeConfig,
     pub agents: Vec<AgentConfig>,
     pub editor: EditorConfig,
@@ -198,6 +202,12 @@ impl Default for EditorConfig {
 pub struct FontConfig {
     pub size: f32,
     pub diff_size: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TerminalConfig {
+    pub scrollback: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -383,6 +393,7 @@ impl Default for Config {
             worktree_path: "{repo_parent}/{repo}-{slug}".into(),
             layout: LayoutConfig::default(),
             font: FontConfig::default(),
+            terminal: TerminalConfig::default(),
             theme: ThemeConfig::default(),
             agents: vec![
                 agent("claude", &["claude"], AgentKind::Claude, None),
@@ -401,6 +412,12 @@ impl Default for Config {
 impl Default for FontConfig {
     fn default() -> Self {
         Self { size: 13.0, diff_size: 12.5 }
+    }
+}
+
+impl Default for TerminalConfig {
+    fn default() -> Self {
+        Self { scrollback: 5000 }
     }
 }
 
@@ -527,6 +544,7 @@ mod tests {
         assert_eq!(config.layout.min_tile_width, 400.0);
         assert_eq!(config.layout.sidebar_width, LayoutConfig::default().sidebar_width);
         assert_eq!(config.font.size, 13.0);
+        assert_eq!(config.terminal.scrollback, 5000);
     }
 
     #[test]

@@ -131,7 +131,7 @@ fn control(request: ControlRequest, app: &Sender<ControlMessage>, ctx: &egui::Co
     match outcome.recv_timeout(Duration::from_secs(300)) {
         Ok(ControlOutcome::Done(response)) => response,
         Ok(ControlOutcome::Diff { root, base_ref, patch, session }) => {
-            match imacs_core::git::diff_against_base(&root, &base_ref) {
+            match imacs_core::git::diff_against_base(&root, &base_ref, None) {
                 Ok(diff) => ControlResponse::ok(serde_json::json!({
                     "session": session,
                     "root": root,
