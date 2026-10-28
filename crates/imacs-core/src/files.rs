@@ -12,10 +12,11 @@ pub struct Dir {
 }
 
 /// Builds the tree from slash-separated paths, counting `changed` files per directory.
-pub fn build(paths: &[String], changed: &HashSet<&str>) -> Dir {
+pub fn build<P: AsRef<str>>(paths: &[P], changed: &HashSet<&str>) -> Dir {
     let mut root = Dir::default();
     for path in paths {
-        let is_changed = changed.contains(path.as_str());
+        let path = path.as_ref();
+        let is_changed = changed.contains(path);
         let mut dir = &mut root;
         if is_changed {
             dir.changed += 1;
@@ -89,8 +90,9 @@ pub fn fuzzy(query: &str, path: &str) -> Option<i64> {
 }
 
 /// The best `limit` matches for `query`, best first.
-pub fn best_matches<'a>(query: &str, paths: &'a [String], limit: usize) -> Vec<&'a str> {
-    let mut scored: Vec<(i64, &str)> = paths.iter().filter_map(|p| fuzzy(query, p).map(|s| (s, p.as_str()))).collect();
+pub fn best_matches<'a, P: AsRef<str>>(query: &str, paths: &'a [P], limit: usize) -> Vec<&'a str> {
+    let mut scored: Vec<(i64, &str)> =
+        paths.iter().map(AsRef::as_ref).filter_map(|p| fuzzy(query, p).map(|s| (s, p))).collect();
     scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
     scored.into_iter().take(limit).map(|(_, p)| p).collect()
 }

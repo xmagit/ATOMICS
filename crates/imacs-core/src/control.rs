@@ -263,6 +263,7 @@ mod tests {
             base_ref: "main".into(),
             base: "0123456789abcdef".into(),
             files: vec![FileDiff::untracked("a.py".into(), "print(1)\n")],
+            partial: false,
         };
         let text = describe_diff(&diff, true);
         assert!(text.starts_with("1 files changed, +1 -0 against main (merge-base 0123456789)"));

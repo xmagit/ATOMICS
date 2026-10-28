@@ -3,9 +3,9 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
@@ -28,7 +28,19 @@ pub struct Shared {
     pub exited: AtomicBool,
     pub bell: AtomicBool,
     size: Mutex<WindowSize>,
+    /// The pass that last drew the terminal, and whether it had keyboard focus then.
+    drawn: AtomicU64,
+    focused: AtomicBool,
+    typed: Mutex<Option<Instant>>,
 }
+
+/// How long output may wait to be drawn: in the focused terminal, in the others on
+/// screen, and off screen, where it only keeps the agent's status current.
+const FOCUSED_REPAINT: Duration = Duration::from_millis(100);
+const OUTPUT_REPAINT: Duration = Duration::from_millis(200);
+const HIDDEN_REPAINT: Duration = Duration::from_millis(500);
+/// Output this soon after a key press is its echo and is drawn at once.
+const ECHO_WINDOW: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 struct Listener {
@@ -46,9 +58,8 @@ impl EventListener for Listener {
             }
         };
         match event {
-            TermEvent::Wakeup | TermEvent::MouseCursorDirty | TermEvent::CursorBlinkingChange => {
-                self.ctx.request_repaint()
-            }
+            TermEvent::Wakeup => self.repaint(),
+            TermEvent::MouseCursorDirty | TermEvent::CursorBlinkingChange => self.ctx.request_repaint(),
             TermEvent::Title(title) => *self.shared.title.lock().unwrap() = Some(title),
             TermEvent::ResetTitle => *self.shared.title.lock().unwrap() = None,
             TermEvent::PtyWrite(text) => write(text),
@@ -61,6 +72,25 @@ impl EventListener for Listener {
                 self.ctx.request_repaint();
             }
             TermEvent::ClipboardLoad(..) => {}
+        }
+    }
+}
+
+impl Listener {
+    fn repaint(&self) {
+        let shared = &self.shared;
+        let on_screen = shared.drawn.load(Ordering::Relaxed) + 2 >= self.ctx.cumulative_pass_nr();
+        let focused = on_screen && shared.focused.load(Ordering::Relaxed);
+        let echo = focused && shared.typed.lock().unwrap().is_some_and(|at| at.elapsed() < ECHO_WINDOW);
+        if echo {
+            self.ctx.request_repaint();
+        } else {
+            let wait = match (on_screen, focused) {
+                (true, true) => FOCUSED_REPAINT,
+                (true, false) => OUTPUT_REPAINT,
+                (false, _) => HIDDEN_REPAINT,
+            };
+            self.ctx.request_repaint_after(wait);
         }
     }
 }
@@ -86,6 +116,7 @@ impl Terminal {
         args: Vec<String>,
         cwd: &Path,
         env: HashMap<String, String>,
+        scrollback: usize,
     ) -> Result<Terminal> {
         let options = tty::Options {
             shell: Some(tty::Shell::new(program, args)),
@@ -100,16 +131,24 @@ impl Terminal {
             exited: AtomicBool::new(false),
             bell: AtomicBool::new(false),
             size: Mutex::new(size),
+            drawn: AtomicU64::new(0),
+            focused: AtomicBool::new(false),
+            typed: Mutex::new(None),
         });
         let listener =
             Listener { ctx: ctx.clone(), sender: Arc::new(OnceLock::new()), shared: shared.clone(), palette };
-        let config = TermConfig { scrolling_history: 20_000, ..TermConfig::default() };
+        let config = TermConfig { scrolling_history: scrollback, ..TermConfig::default() };
         let term = Arc::new(FairMutex::new(Term::new(config, &TermSize::new(80, 24), listener.clone())));
         let event_loop = EventLoop::new(term.clone(), listener.clone(), pty, true, false)?;
         let sender = event_loop.channel();
         let _ = listener.sender.set(sender.clone());
         event_loop.spawn();
         Ok(Terminal { term, sender, shared, grid: (80, 24), scroll_remainder: 0.0 })
+    }
+
+    /// Lines kept above the screen; fewer drops the oldest at once.
+    pub fn set_scrollback(&self, lines: usize) {
+        self.term.lock().set_options(TermConfig { scrolling_history: lines, ..TermConfig::default() });
     }
 
     pub fn exited(&self) -> bool {
@@ -189,6 +228,8 @@ impl Terminal {
             response.request_focus();
         }
         let focused = response.has_focus();
+        self.shared.drawn.store(ui.ctx().cumulative_pass_nr(), Ordering::Relaxed);
+        self.shared.focused.store(focused, Ordering::Relaxed);
         if focused {
             ui.memory_mut(|m| {
                 m.set_focus_lock_filter(
@@ -311,6 +352,7 @@ impl Terminal {
             }
         }
         if !out.is_empty() {
+            *self.shared.typed.lock().unwrap() = Some(Instant::now());
             let mut term = self.term.lock();
             term.scroll_display(Scroll::Bottom);
             term.selection = None;

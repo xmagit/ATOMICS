@@ -69,7 +69,8 @@ open -a IMACS --args --workspace cz3backend
 ```
 
 The config is created on first start at `~/.config/imacs/config.toml`. It is commented and reloads while IMACS runs: agents
-and their commands, `base_ref`, layout breakpoints, fonts, colors, shortcuts, and the texts used for steering.
+and their commands, `base_ref`, layout breakpoints, fonts, colors, terminal scrollback, shortcuts, and the texts used for
+steering.
 
 ## Troubleshooting
 
@@ -198,9 +199,9 @@ responsive layout, the hook and control protocols, and review message compositio
 | UI | egui/eframe (wgpu) | Pure Rust, immediate mode: layout is plain code each frame, so responsive tiling is simple; idle when nothing changes |
 | Terminal | alacritty_terminal | Mature VT emulation and PTY event loop; Claude's and Codex's TUIs render correctly |
 | Git | `git` CLI | Exact porcelain semantics, and picks up `core.fsmonitor`/`untrackedCache` on large repositories |
-| Highlighting | syntect + bat's grammars (two-face) | Works line by line, which suits hunks that start mid-file |
+| Highlighting | syntect + bat's grammars (two-face), Oniguruma | Works line by line, which suits hunks that start mid-file; Oniguruma is ~3× faster and ~4× smaller than fancy-regex |
 | Word diff | similar | Code-aware tokens, so `compute(1)` → `compute(2)` marks only the number |
-| Watching | notify (FSEvents/inotify) | Live diff for the worktree on screen; agents off screen refresh while they work |
+| Watching | notify (FSEvents/inotify) | Live diff for the worktree on screen; diffs of agents off screen follow their file changes within seconds, no polling |
 | IPC | Unix socket, JSON lines | One socket for hooks, `imacs ctl` and `imacs mcp`; no async runtime anywhere |
 
 Agents run as children of the IMACS process, so closing IMACS stops them. Claude sessions can be resumed from the sidebar,

@@ -88,22 +88,25 @@ pub fn merge_base(root: &Path, base_ref: &str) -> Result<(String, String)> {
 const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 /// Everything this worktree changes relative to where it branched off `base_ref`:
-/// commits, staged and unstaged edits, and untracked files.
-pub fn diff_against_base(root: &Path, base_ref: &str) -> Result<WorktreeDiff> {
+/// commits, staged and unstaged edits, and untracked files. With `untracked_budget`,
+/// untracked content beyond that many bytes is counted but left out.
+pub fn diff_against_base(root: &Path, base_ref: &str, untracked_budget: Option<u64>) -> Result<WorktreeDiff> {
     let (resolved_ref, base) = merge_base(root, base_ref)?;
     let patch = git(
         root,
         &["diff", "--no-color", "--no-ext-diff", "--find-renames", "--src-prefix=a/", "--dst-prefix=b/", &base],
     )?;
     let mut files = parse_unified(&patch);
-    files.extend(untracked_files(root)?);
+    let (untracked, partial) = untracked_files(root, untracked_budget)?;
+    files.extend(untracked);
     files.sort_by(|a, b| a.path().cmp(b.path()));
-    Ok(WorktreeDiff { base_ref: resolved_ref, base, files })
+    Ok(WorktreeDiff { base_ref: resolved_ref, base, files, partial })
 }
 
-fn untracked_files(root: &Path) -> Result<Vec<FileDiff>> {
+fn untracked_files(root: &Path, budget: Option<u64>) -> Result<(Vec<FileDiff>, bool)> {
     let out = git(root, &["ls-files", "--others", "--exclude-standard", "-z"])?;
     let mut files = Vec::new();
+    let (mut kept, mut partial) = (0, false);
     for path in out.split('\0').filter(|p| !p.is_empty()).take(MAX_UNTRACKED_FILES) {
         let full = root.join(path);
         let Ok(meta) = std::fs::metadata(&full) else { continue };
@@ -113,7 +116,14 @@ fn untracked_files(root: &Path) -> Result<Vec<FileDiff>> {
         let content = if meta.len() <= MAX_UNTRACKED_BYTES { std::fs::read(&full).ok() } else { None };
         match content {
             Some(bytes) if !bytes[..bytes.len().min(8000)].contains(&0) => {
-                files.push(FileDiff::untracked(path.to_string(), &String::from_utf8_lossy(&bytes)));
+                let text = String::from_utf8_lossy(&bytes);
+                if budget.is_some_and(|budget| kept + meta.len() > budget) {
+                    files.push(FileDiff::untracked_omitted(path.to_string(), text.lines().count()));
+                    partial = true;
+                } else {
+                    kept += meta.len();
+                    files.push(FileDiff::untracked(path.to_string(), &text));
+                }
             }
             _ => {
                 let mut file = FileDiff::untracked(path.to_string(), "");
@@ -122,7 +132,7 @@ fn untracked_files(root: &Path) -> Result<Vec<FileDiff>> {
             }
         }
     }
-    Ok(files)
+    Ok((files, partial))
 }
 
 /// The tracked files of a worktree. Untracked files only appear through the diff,
@@ -133,6 +143,12 @@ pub fn list_files(root: &Path) -> Result<Vec<String>> {
     files.sort();
     files.dedup();
     Ok(files)
+}
+
+/// The index file of the worktree at `root`; linked worktrees have their own. It is
+/// rewritten whenever the tracked files change.
+pub fn index_file(root: &Path) -> Result<PathBuf> {
+    Ok(root.join(git(root, &["rev-parse", "--git-path", "index"])?.trim()))
 }
 
 /// What decides whether a worktree can go: uncommitted work, whether its branch is
@@ -481,18 +497,45 @@ pub(crate) mod tests {
         run(p, &["commit", "-q", "-m", "main moves"]);
         run(p, &["checkout", "-q", "feature"]);
 
-        let diff = diff_against_base(p, "main").unwrap();
+        let diff = diff_against_base(p, "main", None).unwrap();
         let paths: Vec<&str> = diff.files.iter().map(|f| f.path()).collect();
         assert_eq!(paths, ["a.txt", "b.txt", "c.txt"]);
         assert_eq!(diff.base_ref, "main");
         assert_eq!(diff.files[2].status, crate::diff::FileStatus::Untracked);
         assert_eq!((diff.additions(), diff.deletions()), (3, 1));
+        assert!(!diff.partial);
+    }
+
+    #[test]
+    fn untracked_content_beyond_the_budget_is_counted_but_left_out() {
+        let dir = repo();
+        let p = dir.path();
+        std::fs::write(p.join("b.txt"), "1\n2\n").unwrap();
+        std::fs::write(p.join("c.txt"), "1\n2\n3\n").unwrap();
+
+        let diff = diff_against_base(p, "main", Some(5)).unwrap();
+        assert!(diff.partial);
+        let (b, c) = (&diff.files[0], &diff.files[1]);
+        assert_eq!((b.hunks.len(), b.omitted), (1, 0));
+        assert_eq!((c.hunks.len(), c.omitted), (0, 3));
+        assert_eq!(diff.additions(), 5);
+        assert!(!diff_against_base(p, "main", None).unwrap().partial);
+    }
+
+    #[test]
+    fn index_file_is_per_worktree() {
+        let (_dir, repo) = project();
+        let worktree = repo.with_file_name("app-feature");
+        add_worktree(&repo, &worktree, "feature", "main").unwrap();
+        let (main, linked) = (index_file(&repo).unwrap(), index_file(&worktree).unwrap());
+        assert!(main.is_file() && linked.is_file());
+        assert_ne!(main, linked);
     }
 
     #[test]
     fn falls_back_when_base_ref_is_missing() {
         let dir = repo();
-        let diff = diff_against_base(dir.path(), "origin/does-not-exist").unwrap();
+        let diff = diff_against_base(dir.path(), "origin/does-not-exist", None).unwrap();
         assert_eq!(diff.base_ref, "main");
         assert!(diff.files.is_empty());
     }
@@ -517,7 +560,7 @@ pub(crate) mod tests {
         run(dir.path(), &["init", "-q", "-b", "main"]);
         assert_eq!(worktree_of(dir.path()).unwrap().branch.as_deref(), Some("main"));
         std::fs::write(dir.path().join("new.rs"), "fn main() {}\n").unwrap();
-        let diff = diff_against_base(dir.path(), "origin/main").unwrap();
+        let diff = diff_against_base(dir.path(), "origin/main", None).unwrap();
         assert_eq!(diff.base_ref, "(no commits)");
         assert_eq!(diff.files.len(), 1);
     }
