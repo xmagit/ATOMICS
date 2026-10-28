@@ -5,7 +5,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use cox_core::config::{AgentKind, Config};
+use cox_core::config::{AgentKind, Config, VoiceTarget};
 use cox_core::git::{self, Integration, Merge, Worktree, WorktreeEntry};
 use cox_core::layout::{self, DiffPlacement, DiffSplit, Layout};
 use cox_core::session::{AgentStatus, pick_tiled, title_for};
@@ -18,9 +18,10 @@ use notify_debouncer_mini::{DebounceEventResult, Debouncer, new_debouncer};
 use crate::diff_view::{self, DiffAction, DiffState, DiffWorker, ExplorerState, Header, WorkerResult};
 use crate::highlight::Highlighter;
 use crate::ipc::{self, Channels, ControlMessage, ControlOutcome, HookMessage, Hub};
-use crate::setup::{SHELL_PATH, global_hooks_installed, install_global_hooks, resolve_program};
+use crate::setup::{SHELL_PATH, env_var, global_hooks_installed, install_global_hooks, resolve_program};
 use crate::terminal::{Metrics, Terminal};
 use crate::theme::{Palette, lerp, shortcut};
+use crate::voice::{MAX_RECORDING, Recorder};
 use cox_core::control::{ControlRequest, ControlResponse};
 use cox_core::plan::{Plan, Report, Task, TaskStatus, short_slug};
 use cox_core::workspace::{self, Workspace};
@@ -203,6 +204,19 @@ struct QuickOpen {
     focus: bool,
 }
 
+/// Push-to-talk: recording from the microphone, then waiting for the transcript.
+enum Voice {
+    Idle,
+    Recording(Recorder),
+    Transcribing,
+}
+
+enum VoiceEvent {
+    /// No API key, found while still recording: the recording could never be sent.
+    NoKey(String),
+    Transcript(Result<String, String>),
+}
+
 struct Screenshot {
     path: PathBuf,
     at: f64,
@@ -284,6 +298,9 @@ pub struct App {
     watch_tx: Sender<PathBuf>,
     watch_rx: Receiver<PathBuf>,
     toast: Option<(String, Instant)>,
+    voice: Voice,
+    voice_tx: Sender<VoiceEvent>,
+    voice_rx: Receiver<VoiceEvent>,
     screenshot: Option<Screenshot>,
     pending_open: Vec<(String, PathBuf)>,
     resume: Vec<SessionRecord>,
@@ -317,6 +334,7 @@ impl App {
         let (watch_tx, watch_rx) = channel();
         let (worktree_tx, worktree_rx) = channel();
         let (integrate_tx, integrate_rx) = channel();
+        let (voice_tx, voice_rx) = channel();
         let launch_dir = std::env::current_dir().unwrap_or_else(|_| paths::home());
 
         let mut app = App {
@@ -385,6 +403,9 @@ impl App {
             watch_tx,
             watch_rx,
             toast: None,
+            voice: Voice::Idle,
+            voice_tx,
+            voice_rx,
             screenshot: options.screenshot.map(|path| Screenshot {
                 path,
                 at: options.screenshot_delay as f64,
@@ -835,10 +856,10 @@ impl App {
     }
 
     /// Starts the chief agent in the main checkout of the project on screen.
-    fn start_chief(&mut self, ctx: &egui::Context) -> Result<String, String> {
+    fn start_chief(&mut self, ctx: &egui::Context, prompt: Option<String>) -> Result<String, String> {
         let cwd = self.view.clone().or_else(|| self.repos.first().cloned()).unwrap_or_else(|| self.launch_dir.clone());
         let args = self.config.chief.args.clone();
-        self.start_as(ctx, "chief", cwd, None, args, None, true)
+        self.start_as(ctx, "chief", cwd, None, args, prompt, true)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1495,7 +1516,7 @@ impl App {
     fn toggle_chief(&mut self, ctx: &egui::Context) {
         if !self.sessions.iter().any(|s| s.chief && s.terminal.as_ref().is_some_and(|t| !t.exited())) {
             self.sessions.retain(|s| !s.chief);
-            if let Err(err) = self.start_chief(ctx) {
+            if let Err(err) = self.start_chief(ctx, None) {
                 self.toast(err);
                 return;
             }
@@ -1507,6 +1528,101 @@ impl App {
             && let Some(chief) = self.sessions.iter().find(|s| s.chief)
         {
             self.focus_terminal = Some(chief.id.clone());
+        }
+    }
+
+    /// Push-to-talk: the first press records, the second transcribes and sends.
+    fn toggle_voice(&mut self) {
+        match self.voice {
+            Voice::Idle => match Recorder::start() {
+                Ok(recorder) => {
+                    self.voice = Voice::Recording(recorder);
+                    // Looks for the key while the user speaks, so a missing one shows up right away.
+                    let (config, tx, ctx) = (self.config.voice.clone(), self.voice_tx.clone(), self.ctx.clone());
+                    std::thread::spawn(move || {
+                        if let Err(err) = config.api_key(env_var) {
+                            let _ = tx.send(VoiceEvent::NoKey(format!("{err:#}")));
+                            ctx.request_repaint();
+                        }
+                    });
+                }
+                Err(err) => self.toast(format!("Voice: {err}")),
+            },
+            Voice::Recording(_) => self.stop_voice(),
+            Voice::Transcribing => self.toast("Voice: still transcribing the last recording"),
+        }
+    }
+
+    /// Stops recording and transcribes on a background thread.
+    fn stop_voice(&mut self) {
+        let Voice::Recording(recorder) = std::mem::replace(&mut self.voice, Voice::Transcribing) else { return };
+        let recording = recorder.finish();
+        let (config, tx, ctx) = (self.config.voice.clone(), self.voice_tx.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            let transcript = recording.and_then(|(samples, rate)| {
+                if samples.len() < rate as usize / 5 {
+                    return Err("nothing recorded".to_string());
+                }
+                if cox_core::voice::is_silent(&samples) {
+                    return Err("the microphone recorded only silence (muted, or no microphone access in System \
+                                Settings › Privacy & Security?)"
+                        .to_string());
+                }
+                let (samples, rate) = cox_core::voice::downsample(&samples, rate, cox_core::voice::SPEECH_RATE);
+                let wav = cox_core::voice::wav(&samples, rate);
+                let key = config.api_key(env_var).map_err(|e| format!("{e:#}"))?;
+                cox_core::voice::transcribe(&config, &key, &wav).map_err(|e| format!("{e:#}"))
+            });
+            let _ = tx.send(VoiceEvent::Transcript(transcript));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Sends a transcript the way the steer bar does: to the chief (started and shown
+    /// if needed) or to the active agent. Text that cannot be sent lands in the steer bar.
+    fn send_voice(&mut self, ctx: &egui::Context, text: &str) {
+        if text.is_empty() {
+            self.toast("Voice: heard nothing");
+            return;
+        }
+        let quoted = format!("“{}”", truncate(text, 60));
+        let failed = match self.config.voice.target {
+            VoiceTarget::Chief => {
+                let started = match self.sessions.iter().position(|s| s.chief && s.can_receive()) {
+                    Some(index) => {
+                        self.deliver(index, text);
+                        Ok(())
+                    }
+                    None => {
+                        self.sessions.retain(|s| !s.chief);
+                        self.start_chief(ctx, Some(text.to_string())).map(|_| ())
+                    }
+                };
+                match started {
+                    Ok(()) => {
+                        self.chief_open = true;
+                        self.focus_terminal = self.sessions.iter().find(|s| s.chief).map(|s| s.id.clone());
+                        self.toast(format!("Sent to the chief: {quoted}"));
+                        None
+                    }
+                    Err(err) => Some(err),
+                }
+            }
+            VoiceTarget::Active => match self.active_index().filter(|&i| self.sessions[i].can_receive()) {
+                Some(index) if self.deliver(index, text) => {
+                    self.toast(format!("Sent to {}: {quoted}", self.sessions[index].title));
+                    None
+                }
+                _ => Some("No active session to send to".to_string()),
+            },
+        };
+        if let Some(err) = failed {
+            if !self.steer_text.trim().is_empty() {
+                self.steer_text.push('\n');
+            }
+            self.steer_text.push_str(text);
+            self.focus_steer = true;
+            self.toast(format!("{err}; the transcript is in the steer bar"));
         }
     }
 
@@ -1551,11 +1667,28 @@ impl App {
                                         .size(11.5),
                                 );
                             }
+                            match &self.voice {
+                                Voice::Recording(recorder) => {
+                                    let secs = recorder.elapsed().as_secs();
+                                    let text = format!("● REC {}:{:02}", secs / 60, secs % 60);
+                                    ui.label(RichText::new(text).color(p.error).strong().size(11.5));
+                                }
+                                Voice::Transcribing => {
+                                    ui.add(egui::Spinner::new().size(12.0).color(p.accent));
+                                }
+                                Voice::Idle => {}
+                            }
                         });
                     })
                     .response
                     .interact(Sense::click());
-                if response.on_hover_text(format!("The chief agent ({})", self.config.keys.toggle_chief)).clicked() {
+                let keys = &self.config.keys;
+                let hover = match self.voice {
+                    Voice::Recording(_) => format!("Recording: {} sends, Esc cancels", keys.voice),
+                    Voice::Transcribing => "Transcribing".to_string(),
+                    Voice::Idle => format!("The chief agent ({}) · voice ({})", keys.toggle_chief, keys.voice),
+                };
+                if response.on_hover_text(hover).clicked() {
                     toggle = true;
                 }
             });
@@ -2367,6 +2500,31 @@ impl App {
         while let Ok(message) = self.control_rx.try_recv() {
             self.control(ctx, message.request, message.reply);
         }
+        while let Ok(event) = self.voice_rx.try_recv() {
+            match event {
+                VoiceEvent::NoKey(err) if matches!(self.voice, Voice::Recording(_)) => {
+                    self.voice = Voice::Idle;
+                    self.toast(format!("Voice: {err}"));
+                }
+                VoiceEvent::NoKey(_) => {}
+                VoiceEvent::Transcript(result) => {
+                    self.voice = Voice::Idle;
+                    match result {
+                        Ok(text) => self.send_voice(ctx, &text),
+                        Err(err) => self.toast(format!("Voice: {err}")),
+                    }
+                }
+            }
+        }
+        if let Voice::Recording(recorder) = &self.voice {
+            if recorder.elapsed() >= MAX_RECORDING {
+                self.stop_voice();
+                self.toast("Voice: stopped after 5 minutes, transcribing");
+            } else {
+                // Keeps the recording clock moving.
+                ctx.request_repaint_after(Duration::from_millis(250));
+            }
+        }
         self.track_busy();
         self.verify_deliveries();
         self.record_events();
@@ -2615,6 +2773,15 @@ impl App {
     fn shortcuts(&mut self, ctx: &egui::Context) {
         let keys = self.config.keys.clone();
         let pressed = |text: &str| shortcut(text).is_some_and(|s| ctx.input_mut(|i| i.consume_shortcut(&s)));
+        if pressed(&keys.voice) {
+            self.toggle_voice();
+        }
+        if matches!(self.voice, Voice::Recording(_))
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape))
+        {
+            self.voice = Voice::Idle;
+            self.toast("Voice: recording cancelled");
+        }
         if pressed(&keys.toggle_diff) {
             self.diff_open = !self.diff_open;
         }
@@ -3188,6 +3355,7 @@ impl App {
             (&keys.next_attention, "next agent that needs you"),
             (&keys.focus_steer, "steer bar"),
             (&keys.new_session, "new session"),
+            (&keys.voice, "voice: record, send (Esc cancels)"),
         ] {
             ui.label(RichText::new(format!("{key}  {what}")).size(12.0).monospace());
         }

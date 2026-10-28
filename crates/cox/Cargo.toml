@@ -11,6 +11,7 @@ alacritty_terminal = "0.26.0"
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
 cox-core = { version = "0.1.0", path = "../cox-core" }
+cpal = "0.18.2"
 eframe = "0.37.0"
 egui = "0.37"
 notify-debouncer-mini = "0.7.0"

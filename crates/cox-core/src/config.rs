@@ -93,6 +93,17 @@ review_header = "Review comments on your changes (diff against {base_ref}):"
 # Messages to sessions running outside cox wait for that session's next tool call or turn end.
 external_prefix = "Message from the user, sent from cox while you were working:"
 
+[voice]
+# Push-to-talk (cmd+shift+space): press, speak, press again to send the transcript. Esc cancels.
+provider = "openai"         # "openai": any OpenAI-compatible /audio/transcriptions (OpenAI, Groq, a local Whisper server)
+                            # "openrouter": an audio-capable chat model on openrouter.ai
+target = "chief"            # "chief", or "active" for the active agent
+# Left out, these follow the provider:
+# base_url = "https://api.openai.com/v1"   # Groq: "https://api.groq.com/openai/v1"
+# model = "gpt-4o-mini-transcribe"         # openrouter: "google/gemini-2.5-flash"
+# api_key_env = "OPENAI_API_KEY"           # openrouter: "OPENROUTER_API_KEY"; also read from your login shell
+# api_key = "..."                          # discouraged: keep the key in the environment variable instead
+
 [keys]
 toggle_diff = "cmd+d"
 next_attention = "cmd+j"
@@ -104,6 +115,7 @@ quick_open = "cmd+p"
 toggle_editor = "cmd+e"
 toggle_plan = "cmd+b"
 toggle_chief = "cmd+o"
+voice = "cmd+shift+space"
 "##;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +131,7 @@ pub struct Config {
     pub editor: EditorConfig,
     pub chief: ChiefConfig,
     pub steer: SteerConfig,
+    pub voice: VoiceConfig,
     pub keys: KeyConfig,
 }
 
@@ -247,6 +260,89 @@ pub struct SteerConfig {
     pub external_prefix: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VoiceProvider {
+    /// `POST {base_url}/audio/transcriptions`: OpenAI, Groq, local Whisper servers.
+    #[default]
+    Openai,
+    /// An audio-capable chat model behind OpenRouter's chat completions.
+    Openrouter,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VoiceTarget {
+    #[default]
+    Chief,
+    Active,
+}
+
+/// Push-to-talk transcription. Unset fields fall back to the provider's defaults.
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VoiceConfig {
+    pub provider: VoiceProvider,
+    pub target: VoiceTarget,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+    /// Never serialized or printed.
+    #[serde(skip_serializing)]
+    pub api_key: Option<String>,
+}
+
+impl std::fmt::Debug for VoiceConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VoiceConfig")
+            .field("provider", &self.provider)
+            .field("target", &self.target)
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("api_key_env", &self.api_key_env)
+            .field("api_key", &self.api_key.as_ref().map(|_| "***"))
+            .finish()
+    }
+}
+
+impl VoiceConfig {
+    pub fn base_url(&self) -> &str {
+        let default = match self.provider {
+            VoiceProvider::Openai => "https://api.openai.com/v1",
+            VoiceProvider::Openrouter => "https://openrouter.ai/api/v1",
+        };
+        self.base_url.as_deref().filter(|u| !u.trim().is_empty()).unwrap_or(default).trim().trim_end_matches('/')
+    }
+
+    pub fn model(&self) -> &str {
+        let default = match self.provider {
+            VoiceProvider::Openai => "gpt-4o-mini-transcribe",
+            VoiceProvider::Openrouter => "google/gemini-2.5-flash",
+        };
+        self.model.as_deref().map(str::trim).filter(|m| !m.is_empty()).unwrap_or(default)
+    }
+
+    pub fn api_key_env(&self) -> &str {
+        let default = match self.provider {
+            VoiceProvider::Openai => "OPENAI_API_KEY",
+            VoiceProvider::Openrouter => "OPENROUTER_API_KEY",
+        };
+        self.api_key_env.as_deref().map(str::trim).filter(|v| !v.is_empty()).unwrap_or(default)
+    }
+
+    /// `api_key` from the config, else the environment variable as `env` looks it up.
+    pub fn api_key(&self, env: impl Fn(&str) -> Option<String>) -> Result<String> {
+        let key = match self.api_key.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+            Some(key) => Some(key.to_string()),
+            None => env(self.api_key_env()).map(|k| k.trim().to_string()).filter(|k| !k.is_empty()),
+        };
+        key.with_context(|| format!("{} is not set (see [voice] in the config)", self.api_key_env()))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct KeyConfig {
@@ -260,6 +356,7 @@ pub struct KeyConfig {
     pub toggle_editor: String,
     pub toggle_plan: String,
     pub toggle_chief: String,
+    pub voice: String,
 }
 
 /// A parsed shortcut such as `cmd+shift+d`. `cmd` means Command on macOS and Ctrl elsewhere.
@@ -295,6 +392,7 @@ impl Default for Config {
             editor: EditorConfig::default(),
             chief: ChiefConfig::default(),
             steer: SteerConfig::default(),
+            voice: VoiceConfig::default(),
             keys: KeyConfig::default(),
         }
     }
@@ -350,6 +448,7 @@ impl Default for KeyConfig {
             toggle_editor: "cmd+e".into(),
             toggle_plan: "cmd+b".into(),
             toggle_chief: "cmd+o".into(),
+            voice: "cmd+shift+space".into(),
         }
     }
 }
@@ -435,6 +534,36 @@ mod tests {
         let config: Config = toml::from_str("[layout]\ndiff_split = \"never\"").unwrap();
         assert_eq!(config.layout.diff_split, DiffSplit::Never);
         assert!(toml::from_str::<Config>("[layout]\ndiff_split = \"sometimes\"").is_err());
+    }
+
+    #[test]
+    fn voice_defaults_follow_the_provider() {
+        let config: Config = toml::from_str("[voice]\nprovider = \"openrouter\"\ntarget = \"active\"").unwrap();
+        assert_eq!(config.voice.target, VoiceTarget::Active);
+        assert_eq!(config.voice.base_url(), "https://openrouter.ai/api/v1");
+        assert_eq!(config.voice.model(), "google/gemini-2.5-flash");
+        assert_eq!(config.voice.api_key_env(), "OPENROUTER_API_KEY");
+        let groq: Config = toml::from_str(
+            "[voice]\nbase_url = \"https://api.groq.com/openai/v1/\"\nmodel = \"whisper-large-v3\"\napi_key_env = \"GROQ_API_KEY\"",
+        )
+        .unwrap();
+        assert_eq!(groq.voice.provider, VoiceProvider::Openai);
+        assert_eq!(groq.voice.base_url(), "https://api.groq.com/openai/v1");
+        assert_eq!(groq.voice.model(), "whisper-large-v3");
+        assert!(toml::from_str::<Config>("[voice]\nprovider = \"whisper\"").is_err());
+    }
+
+    #[test]
+    fn voice_api_key_lookup_and_redaction() {
+        let mut voice = VoiceConfig::default();
+        let env = |name: &str| (name == "OPENAI_API_KEY").then(|| " sk-from-env \n".to_string());
+        assert_eq!(voice.api_key(env).unwrap(), "sk-from-env");
+        let err = voice.api_key(|_| Some("  ".into())).unwrap_err().to_string();
+        assert!(err.contains("OPENAI_API_KEY is not set"), "{err}");
+        voice.api_key = Some("sk-in-config".into());
+        assert_eq!(voice.api_key(|_| None).unwrap(), "sk-in-config");
+        assert!(!format!("{voice:?}").contains("sk-in-config"));
+        assert!(!serde_json::to_string(&voice).unwrap().contains("sk-in-config"));
     }
 
     #[test]

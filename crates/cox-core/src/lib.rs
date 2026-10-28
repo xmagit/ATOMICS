@@ -1,5 +1,5 @@
 //! UI-independent core of cox: config, git diffs, responsive layout, the hook
-//! protocol shared by `cox hook` and the app, and steering message composition.
+//! protocol shared by `cox hook` and the app, steering message composition, and voice transcription.
 
 pub mod config;
 pub mod control;
@@ -13,4 +13,5 @@ pub mod plan;
 pub mod session;
 pub mod steer;
 pub mod store;
+pub mod voice;
 pub mod workspace;

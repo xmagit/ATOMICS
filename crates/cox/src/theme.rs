@@ -201,7 +201,12 @@ pub fn is_app_chord(m: &Modifiers) -> bool {
 
 pub fn shortcut(text: &str) -> Option<KeyboardShortcut> {
     let chord = Chord::parse(text)?;
-    let key = Key::from_name(&chord.key).or_else(|| Key::from_name(&chord.key.to_uppercase()))?;
+    let mut chars = chord.key.chars();
+    let capitalized: String =
+        chars.next().into_iter().flat_map(char::to_uppercase).chain(chars.flat_map(char::to_lowercase)).collect();
+    let key = Key::from_name(&chord.key)
+        .or_else(|| Key::from_name(&chord.key.to_uppercase()))
+        .or_else(|| Key::from_name(&capitalized))?;
     let mut modifiers = Modifiers::NONE;
     if chord.cmd {
         modifiers |= if cfg!(target_os = "macos") { Modifiers::MAC_CMD } else { Modifiers::CTRL | Modifiers::SHIFT };
@@ -241,6 +246,10 @@ mod tests {
     fn shortcuts_parse() {
         let s = shortcut("cmd+d").unwrap();
         assert_eq!(s.logical_key, Key::D);
+        let voice = shortcut("cmd+shift+space").unwrap();
+        assert_eq!(voice.logical_key, Key::Space);
+        assert!(voice.modifiers.shift);
+        assert_eq!(shortcut("cmd+Escape").unwrap().logical_key, Key::Escape);
         assert!(shortcut("cmd+notakey").is_none());
     }
 }
