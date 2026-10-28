@@ -198,6 +198,30 @@ stays beside the fleet. Updating or dispatching another plan marks its tab with 
 view and chief. Creating a new plan selects its tab. Each fleet shows only sessions linked to that plan’s tasks.
 Click the plan tab later to return to that overview, or choose All or a project tab to see other sessions.
 
+## Running many agents
+
+Every agent works in its own worktree with its own `target/`, so its builds never wait on another's. What they
+share is the machine, and IMACS keeps that in check for every agent it starts (`[resources]` in the config):
+
+- **One compiler job pool.** IMACS owns a GNU make jobserver (a named pipe in `~/.imacs`) with `jobs` tokens,
+  cores minus 2 by default, and hands it to every agent terminal (`MAKEFLAGS`, `CARGO_MAKEFLAGS`). cargo and rustc
+  take a token per job, so ten agents building at once share those jobs instead of each using every core.
+- **A queue for heavy work.** `imacs queue --class test -- cargo test` waits for a free test slot (one per 6 cores
+  by default), runs the command and passes its exit code through. `--class qa` is for app instances started for
+  screenshots. The slot is released when the command ends or its process dies. Tiles show `queued for a test slot
+  (2 in line)`, and the approval policy judges a queued command by the command it runs. Outside IMACS the command
+  runs right away.
+- **Lower priority.** Agent terminals start at niceness `agent_nice` (10), so IMACS and your desktop stay responsive.
+- **A shared compiler cache.** When sccache is installed and you have no `rustc-wrapper` of your own, agents get
+  `RUSTC_WRAPPER=sccache`, so dependencies compile once for all worktrees (with
+  `SCCACHE_IGNORE_SERVER_IO_ERROR=1`, a sandboxed build that cannot reach the cache compiles locally instead).
+- **Tests at the end.** Every brief asks agents to use `cargo check` and the tests they touch while working, and to run
+  the full suite once, at the end, through `imacs queue`.
+
+The `load` gauge in the top bar shows the 1-minute load per core (grey, then yellow from 0.7 and red from 1.0); hover
+for the pool size and the slots in use. If IMACS ever ends without a clean quit, the next start says so and
+`~/.imacs/crash.log` has the panic and its backtrace when there was one.
+
 ## Voice
 
 Press `cmd+shift+space` and speak; press it again to send. The recording from the default microphone is transcribed

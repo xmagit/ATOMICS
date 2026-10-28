@@ -76,6 +76,11 @@ impl ApprovalPolicy {
             return false;
         }
         let Some(command) = &request.command else { return false };
+        // `imacs queue` only waits for a slot: judge the command it runs.
+        if let Some(inner) = shlex::split(command).as_deref().and_then(crate::governor::queued_command) {
+            let Ok(inner) = shlex::try_join(inner.iter().map(String::as_str)) else { return false };
+            return self.allows(&ApprovalRequest { command: Some(inner), ..request.clone() }, root);
+        }
         // Refuse shell expansion, compound commands and redirections, even when quoted.
         if command.contains([
             '\n', '\r', ';', '|', '&', '<', '>', '`', '$', '*', '?', '[', ']', '{', '}', '~', '(', ')', '\\',
@@ -228,6 +233,20 @@ mod tests {
             ApprovalPolicy { allow: vec!["cargo test".into()] }
                 .allows(&request("cargo test -p imacs-core", dir.path()), dir.path())
         );
+    }
+
+    #[test]
+    fn queued_commands_are_judged_by_what_they_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = ApprovalPolicy { allow: vec!["cargo test".into(), "ls".into()] };
+        let allows = |command: &str| policy.allows(&request(command, dir.path()), dir.path());
+        assert!(allows("imacs queue --class test -- cargo test -p imacs-core"));
+        assert!(allows("/Applications/IMACS.app/Contents/MacOS/imacs queue -- cargo test"));
+        assert!(!allows("imacs queue --class test -- cargo publish"));
+        assert!(!allows("imacs queue -- rm -rf target"));
+        assert!(!allows("imacs queue -- cargo test; touch pwned"));
+        assert!(!allows("imacs queue --class test -- ls /etc"));
+        assert!(!allows("imacs queue --class bogus -- cargo test"));
     }
 
     #[test]
