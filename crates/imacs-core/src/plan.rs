@@ -2,6 +2,7 @@
 //! own worktrees. The user approves the plan before anything is dispatched; agents
 //! report back with `imacs_report`, and the plan board shows where everything is.
 
+#[cfg(feature = "native")]
 use std::path::Path;
 
 use anyhow::Result;
@@ -36,6 +37,7 @@ pub enum PlanStatus {
 
 /// Load valid plan files, including completed and archived plans, and migrate the
 /// former single plan once. File names are the stable ids, including older archives.
+#[cfg(feature = "native")]
 pub fn load_plans(home: &Path) -> Result<(Vec<Plan>, Vec<String>)> {
     let mut errors = Vec::new();
     let dir = home.join("plans");
@@ -95,10 +97,12 @@ pub fn load_plans(home: &Path) -> Result<(Vec<Plan>, Vec<String>)> {
     Ok((plans, errors))
 }
 
+#[cfg(feature = "native")]
 fn valid_id(id: &str) -> bool {
     !id.is_empty() && Path::new(id).file_name().and_then(|s| s.to_str()) == Some(id)
 }
 
+#[cfg(feature = "native")]
 pub fn unique_id(goal: &str, plans: &[Plan], home: &Path) -> String {
     let slug = short_slug(goal);
     let slug = if slug.is_empty() { "plan" } else { &slug };
@@ -199,6 +203,7 @@ impl Plan {
         !self.id.is_empty() && self.status == PlanStatus::Open
     }
 
+    #[cfg(feature = "native")]
     pub fn save_in(&self, home: &Path) -> Result<()> {
         anyhow::ensure!(valid_id(&self.id), "invalid plan id");
         self.save(&home.join("plans").join(format!("{}.json", self.id)))
@@ -227,10 +232,12 @@ impl Plan {
         self.tasks.iter().any(|task| task.session.as_deref() == Some(id))
     }
 
+    #[cfg(feature = "native")]
     pub fn load(path: &Path) -> Result<Plan> {
         Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?)
     }
 
+    #[cfg(feature = "native")]
     pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -403,6 +410,7 @@ pub fn short_slug(title: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "native")]
     use crate::git;
 
     fn task(id: &str, deps: &[&str]) -> Task {
@@ -416,6 +424,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "native")]
     fn migrates_once_without_overwriting_existing_or_archived_plans() {
         let dir = tempfile::tempdir().unwrap();
         let mut old = Plan::default();
@@ -439,6 +448,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "native")]
     fn completed_legacy_plans_migrate_closed_while_unfinished_and_empty_plans_stay_open() {
         for statuses in [vec![TaskStatus::Done, TaskStatus::Done], vec![TaskStatus::Done, TaskStatus::Review], vec![]] {
             let dir = tempfile::tempdir().unwrap();
@@ -461,6 +471,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "native")]
     fn saving_replaces_the_file_atomically_and_keeps_existing_data_on_failure() {
         use std::io::Read;
         let dir = tempfile::tempdir().unwrap();
@@ -494,6 +505,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "native")]
     fn older_archives_without_status_load_but_do_not_get_open_tabs() {
         let dir = tempfile::tempdir().unwrap();
         let folder = dir.path().join("plans");
@@ -509,6 +521,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "native")]
     fn storage_keeps_plans_independent_and_reports_unreadable_files() {
         let dir = tempfile::tempdir().unwrap();
         let mut plans = Vec::new();
@@ -683,6 +696,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "native")]
     fn dependents_branch_from_the_integration_branch() {
         let (_dir, repo) = crate::git::tests::project();
         let mut plan = Plan::default();

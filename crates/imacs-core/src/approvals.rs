@@ -1,4 +1,6 @@
-use std::path::{Component, Path, PathBuf};
+use std::path::PathBuf;
+#[cfg(feature = "native")]
+use std::path::{Component, Path};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -70,6 +72,7 @@ impl Default for ApprovalPolicy {
     }
 }
 
+#[cfg(feature = "native")]
 impl ApprovalPolicy {
     pub fn allows(&self, request: &ApprovalRequest, root: &Path) -> bool {
         if request.tool != "Bash" || !inside(&request.cwd, root) {
@@ -134,6 +137,7 @@ impl ApprovalPolicy {
     }
 }
 
+#[cfg(feature = "native")]
 fn inside(path: &Path, root: &Path) -> bool {
     fn resolve(path: &Path) -> Option<PathBuf> {
         if !path.is_absolute() {
@@ -199,7 +203,9 @@ pub fn menu_key(screen: &str, command: Option<&str>, decision: Decision) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
+    #[cfg(feature = "native")]
     fn request(command: &str, cwd: &Path) -> ApprovalRequest {
         ApprovalRequest {
             tool: "Bash".into(),
@@ -211,6 +217,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "native")]
     fn default_policy_allows_only_worktree_reads() {
         let dir = tempfile::tempdir().unwrap();
         for command in ["ls -la", "cat Cargo.toml", "rg hook src", "git status --short", "git diff", "git log -5"] {
@@ -219,6 +226,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "native")]
     fn cargo_requires_an_explicit_policy_entry() {
         let dir = tempfile::tempdir().unwrap();
         for command in ["cargo build", "cargo test", "cargo check", "cargo clippy", "cargo fmt"] {
@@ -231,6 +239,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "native")]
     fn policy_waits_for_writes_shell_syntax_external_paths_and_execution_flags() {
         let dir = tempfile::tempdir().unwrap();
         for command in [
@@ -265,6 +274,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "native")]
     fn policy_resolves_symlinks_and_custom_prefixes() {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();

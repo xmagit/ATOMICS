@@ -37,9 +37,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - name: Check formatting
         run: cargo fmt --check
+      - name: Check browser core
+        run: cargo check -p imacs-core --target wasm32-unknown-unknown --no-default-features
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: |

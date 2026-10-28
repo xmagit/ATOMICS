@@ -1,13 +1,16 @@
 //! Remembers Claude sessions IMACS has seen so they can be resumed after a restart.
 
 use std::path::{Path, PathBuf};
+#[cfg(feature = "native")]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::ChiefDock;
 
+#[cfg(feature = "native")]
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "native")]
 const MAX_RECORDS: usize = 60;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -35,10 +38,12 @@ pub struct Store {
 }
 
 impl Store {
+    #[cfg(feature = "native")]
     pub fn load(path: &Path) -> Store {
         std::fs::read_to_string(path).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default()
     }
 
+    #[cfg(feature = "native")]
     pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -50,6 +55,7 @@ impl Store {
     }
 
     /// Inserts or refreshes a record, newest first.
+    #[cfg(feature = "native")]
     pub fn upsert(&mut self, mut record: SessionRecord) {
         record.updated = now();
         if let Some(existing) = self.sessions.iter().find(|r| r.claude_session_id == record.claude_session_id)
@@ -72,11 +78,12 @@ impl Store {
     }
 }
 
+#[cfg(feature = "native")]
 pub fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "native"))]
 mod tests {
     use super::*;
 

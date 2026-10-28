@@ -1,3 +1,4 @@
+#[cfg(feature = "native")]
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -501,6 +502,7 @@ impl AgentConfig {
 
 impl Config {
     /// Loads the config, writing the commented default first if none exists.
+    #[cfg(feature = "native")]
     pub fn load_or_create(path: &Path) -> Result<Self> {
         if !path.exists() {
             if let Some(parent) = path.parent() {
@@ -511,6 +513,7 @@ impl Config {
         Self::load(path)
     }
 
+    #[cfg(feature = "native")]
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let mut config: Config = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
