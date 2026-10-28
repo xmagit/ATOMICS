@@ -11,7 +11,7 @@ The desktop application remains usable at every phase below.
 Paths in the next two lists are relative to `crates/imacs/src/`.
 These are existing files and types; the split describes responsibilities to extract from them.
 
-- `app.rs`: move the runtime parts of `App` and `Session` to the host: agent launch and resume,
+- `app.rs` and `app/*.rs`: move the runtime parts of `App` and `Session` to the host: agent launch and resume,
   session identity, status tracking, delivery retries, held messages, approvals, plans and persistence.
   `AgentLaunch`, `Pending`, `PendingApproval`, `StatusEvent` and `Waiter` belong with that runtime.
   Worktree creation, integration, cleanup, filesystem watching and their timers also belong there.
@@ -35,7 +35,7 @@ These are existing files and types; the split describes responsibilities to extr
 
 The client keeps these responsibilities:
 
-- `app.rs`: the UI portion of `App`, including tabs, dialogs, selection, chief docking, focus,
+- `app.rs` and `app/*.rs`: the UI portion of `App`, including tabs, dialogs, selection, chief docking, focus,
   steering drafts, board drawing and layout. Runtime actions become explicit commands.
 - `terminal.rs`: painting and `Metrics`, keyboard/pointer handling, selection and local clipboard use.
   The client renders a cell cache instead of locking an emulator or holding a PTY sender.
@@ -45,7 +45,8 @@ The client keeps these responsibilities:
 - `voice.rs`: native microphone capture through `Recorder` stays on the native client; the browser
   uses its microphone permission flow. Audio upload and transcription are optional negotiated features.
 
-Paths below are relative to `crates/imacs-core/src/`, which is UI-free but not yet browser-safe.
+Paths below are relative to `crates/imacs-core/src/`, which is UI-free and builds for wasm32 with `--no-default-features`.
+The default `native` feature enables filesystem, process and other native helpers.
 
 - Host: `git.rs` (`Worktree`, `WorktreeEntry`, `Integration`, `Merge`), filesystem operations in
   `workspace.rs` (`Workspace`), `paths.rs`, `store.rs` (`Store`, `SessionRecord`) and `plan.rs` persistence.

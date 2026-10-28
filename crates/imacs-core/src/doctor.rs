@@ -6,13 +6,20 @@ use crate::approvals::ApprovalPolicy;
 #[cfg(feature = "native")]
 use crate::{git, plan::Plan};
 
-pub fn codex_checks(supports_hooks: bool) -> [String; 2] {
+pub fn codex_checks(supports_hooks: Option<bool>) -> [String; 2] {
     [
-        check_line(
-            supports_hooks,
-            "Codex supports IMACS hooks (0.165+ required)",
-            "install Codex 0.165 or newer; check with `codex --version`",
-        ),
+        match supports_hooks {
+            Some(supported) => check_line(
+                supported,
+                "Codex supports IMACS hooks (0.165+ required)",
+                "install Codex 0.165 or newer; check with `codex --version`",
+            ),
+            None => check_line(
+                false,
+                "could not determine the Codex version (warning)",
+                "check that `codex --version` completes successfully and try again",
+            ),
+        },
         check_line(
             false,
             "IMACS Codex hook trust not verified (warning)",
@@ -127,7 +134,7 @@ mod tests {
     #[test]
     fn codex_version_passes_or_warns_and_trust_is_explicitly_unverified() {
         for supported in [true, false] {
-            let [version, trust] = codex_checks(supported);
+            let [version, trust] = codex_checks(Some(supported));
             assert_eq!(version.starts_with('✓'), supported);
             assert_eq!(version.contains("install Codex 0.165"), !supported);
             assert!(trust.starts_with('✗'));
@@ -138,6 +145,11 @@ mod tests {
             assert_eq!(version.lines().count(), 1);
             assert_eq!(trust.lines().count(), 1);
         }
+        let [version, trust] = codex_checks(None);
+        assert!(version.starts_with('✗'));
+        assert!(version.contains("could not determine the Codex version"));
+        assert!(!version.contains("install Codex"));
+        assert!(trust.contains("trust not verified"));
     }
 
     #[test]

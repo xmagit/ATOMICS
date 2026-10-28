@@ -60,10 +60,11 @@ impl UsagePanel {
                 });
             });
             for (label, weekly, window) in [("Session", false, &usage.session), ("Weekly", true, &usage.weekly)] {
+                let missing = missing_label(usage, window);
                 let window = window.as_ref().filter(|window| window.resets_at > now);
                 let text = match window {
                     Some(window) => format!("{label}  {:.0}% · {}", window.remaining, reset_label(window, weekly, now)),
-                    None => format!("{label}  {}", missing_label(usage)),
+                    None => format!("{label}  {missing}"),
                 };
                 ui.label(RichText::new(text).font(p.ui(10.5)).color(p.muted))
                     .on_hover_text("Limits are shared by this provider's account. Weekly reset days are UTC.");
@@ -88,12 +89,8 @@ impl Drop for UsagePanel {
     }
 }
 
-fn missing_label(usage: &Usage) -> &'static str {
-    if usage.session.is_none() && usage.weekly.is_none() && usage.plan.is_some() {
-        "not reported for this plan"
-    } else {
-        "no data yet"
-    }
+fn missing_label(usage: &Usage, window: &Option<Window>) -> &'static str {
+    if window.is_none() && usage.observed_at > 0 { "not reported by this account" } else { "no data yet" }
 }
 
 fn remaining_color(window: &Window, p: &Palette) -> Color32 {
@@ -247,13 +244,59 @@ mod tests {
             })
             .collect();
         assert!(text.contains(&"Claude") && text.contains(&"Codex"));
-        assert!(text.contains(&"Session  no data yet") && text.contains(&"Weekly  no data yet"));
+        assert_eq!(text.iter().filter(|text| **text == "Session  no data yet").count(), 2);
+        assert_eq!(text.iter().filter(|text| **text == "Weekly  no data yet").count(), 1);
+        assert_eq!(text.iter().filter(|text| **text == "Weekly  not reported by this account").count(), 1);
         assert!(text.contains(&"just now"));
         assert!(
             !text.iter().any(|text| text.contains('%')),
             "expired and missing windows must never appear as percentages"
         );
         output.drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn weekly_only_reports_replace_the_initial_session_placeholder() {
+        let ctx = egui::Context::default();
+        let (tx, reports) = channel();
+        let (stop, _) = channel();
+        let mut panel = UsagePanel { claude: Usage::default(), codex: Usage::default(), reports, stop };
+        let p = Palette::from_config(&ThemeConfig::default());
+        let mut usage =
+            Usage::codex(include_str!("../../imacs-core/tests/fixtures/codex-token-count-weekly-only.json")).unwrap();
+        usage.observed_at = now();
+        usage.weekly.as_mut().unwrap().resets_at = now() + 86400;
+        for reported in [false, true] {
+            if reported {
+                tx.send(Report::Codex(usage.clone())).unwrap();
+                // Missing windows must be explicit even when no plan name is supplied.
+                usage.plan = None;
+                tx.send(Report::Claude(usage.clone())).unwrap();
+                panel.drain();
+            }
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(250.0, 400.0))),
+                    ..Default::default()
+                },
+                |ui| panel.show(ui, &p),
+            );
+            let text: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text.galley.job.text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let session = if reported { "Session  not reported by this account" } else { "Session  no data yet" };
+            assert_eq!(text.iter().filter(|text| **text == session).count(), 2);
+            if reported {
+                assert!(!text.iter().any(|text| text.contains("no data yet")));
+                assert_eq!(text.iter().filter(|text| text.starts_with("Weekly  90% · resets ")).count(), 2);
+            }
+            output.drop_without_applying_deltas();
+        }
     }
 
     #[test]
@@ -364,10 +407,10 @@ mod tests {
         for (remaining, expected) in [(30.0, p.success), (29.9, p.warning), (10.0, p.warning), (9.9, p.error)] {
             assert_eq!(remaining_color(&Window { remaining, resets_at: 1 }, &p), expected);
         }
-        assert_eq!(missing_label(&Usage::default()), "no data yet");
+        assert_eq!(missing_label(&Usage::default(), &None), "no data yet");
         assert_eq!(
-            missing_label(&Usage { plan: Some("free".into()), ..Usage::default() }),
-            "not reported for this plan"
+            missing_label(&Usage { observed_at: 1, plan: Some("free".into()), ..Usage::default() }, &None),
+            "not reported by this account"
         );
     }
 }
