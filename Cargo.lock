@@ -1906,6 +1906,7 @@ dependencies = [
  "rfd",
  "serde_json",
  "syntect",
+ "tempfile",
  "two-face",
  "uuid",
 ]
@@ -1919,6 +1920,7 @@ dependencies = [
  "dirs",
  "serde",
  "serde_json",
+ "shlex",
  "similar",
  "tempfile",
  "toml",

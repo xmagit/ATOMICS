@@ -120,6 +120,14 @@ pub fn merge_into_settings(existing: &mut Value, imacs_exe: &Path) {
     if !hooks.is_object() {
         *hooks = json!({});
     }
+    for groups in hooks.as_object_mut().expect("object").values_mut().filter_map(Value::as_array_mut) {
+        groups.retain_mut(|group| {
+            let Some(handlers) = group.get_mut("hooks").and_then(Value::as_array_mut) else { return true };
+            let before = handlers.len();
+            handlers.retain(|handler| !is_cox_hook(handler));
+            handlers.len() == before || !handlers.is_empty()
+        });
+    }
     for (event, groups) in ours["hooks"].as_object().expect("object") {
         let list = hooks.as_object_mut().expect("object").entry(event.clone()).or_insert_with(|| json!([]));
         let Some(list) = list.as_array_mut() else { continue };
@@ -128,6 +136,29 @@ pub fn merge_into_settings(existing: &mut Value, imacs_exe: &Path) {
             list.push(group.clone());
         }
     }
+}
+
+/// Old handlers keep invoking a binary that no longer exists after the rename.
+pub fn has_cox_hooks(settings: &Value) -> bool {
+    settings
+        .get("hooks")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|events| events.values())
+        .filter_map(Value::as_array)
+        .flatten()
+        .filter_map(|group| group.get("hooks").and_then(Value::as_array))
+        .flatten()
+        .any(is_cox_hook)
+}
+
+fn is_cox_hook(handler: &Value) -> bool {
+    if handler.get("type").and_then(Value::as_str) != Some("command") {
+        return false;
+    }
+    let Some(words) = handler.get("command").and_then(Value::as_str).and_then(shlex::split) else { return false };
+    words.first().is_some_and(|exe| Path::new(exe).file_name().is_some_and(|name| name == "cox"))
+        && words.get(1).is_some_and(|arg| arg == "hook")
 }
 
 fn shell_quote(text: &str) -> String {
@@ -185,5 +216,48 @@ mod tests {
         assert_eq!(existing["model"], "opus");
         assert_eq!(existing["hooks"]["Stop"].as_array().unwrap().len(), 2);
         assert_eq!(existing["hooks"]["CwdChanged"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn merge_removes_legacy_handlers_and_preserves_other_hooks() {
+        let mut settings = json!({
+            "model": "opus",
+            "hooks": {
+                "Stop": [{"matcher": "*", "hooks": [
+                    {"type": "command", "command": "'/Applications/My Tools/cox' hook", "timeout": 10},
+                    {"type": "command", "command": "say done"}
+                ]}],
+                "PreToolUse": [{"hooks": [{"type": "command", "command": "cox hook"}]}],
+                "SessionStart": [{"hooks": [{"type": "command", "command": "/usr/local/bin/cox hook"}]}]
+            }
+        });
+        assert!(has_cox_hooks(&settings));
+        let exe = Path::new("/Applications/My Tools/imacs");
+        merge_into_settings(&mut settings, exe);
+        assert!(!has_cox_hooks(&settings));
+        assert_eq!(settings["model"], "opus");
+        assert_eq!(
+            settings["hooks"]["Stop"][0],
+            json!({"matcher": "*", "hooks": [
+                {"type": "command", "command": "say done"}
+            ]})
+        );
+        assert_eq!(settings["hooks"]["Stop"].as_array().unwrap().len(), 2);
+        assert!(settings["hooks"]["PreToolUse"].as_array().unwrap().is_empty());
+        assert_eq!(settings["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
+        let once = settings.clone();
+        merge_into_settings(&mut settings, exe);
+        assert_eq!(settings, once);
+    }
+
+    #[test]
+    fn legacy_detection_matches_the_executable_and_subcommand() {
+        for command in ["cox hook", "/tmp/cox hook", "'/path with spaces/cox' hook", "\"/tmp/cox\" hook"] {
+            assert!(is_cox_hook(&json!({"type": "command", "command": command})), "{command}");
+        }
+        for command in ["echo cox hook", "imacs hook", "my-cox hook", "cox doctor", "cox hook-status", "'cox hook'"] {
+            assert!(!is_cox_hook(&json!({"type": "command", "command": command})), "{command}");
+        }
+        assert!(!is_cox_hook(&json!({"type": "prompt", "command": "cox hook"})));
     }
 }

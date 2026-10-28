@@ -80,10 +80,9 @@ fn call_report(params: &Value) -> Value {
         return tool_error("only imacs_report is available here".into());
     }
     let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
-    let request = ControlRequest::Report {
-        pane: std::env::var("IMACS_PANE").ok(),
-        status: args.get("status").and_then(Value::as_str).unwrap_or("progress").to_string(),
-        summary: args.get("summary").and_then(Value::as_str).unwrap_or("").to_string(),
+    let request = match request_for_tool("imacs_report", args) {
+        Ok(request) => request,
+        Err(err) => return tool_error(err),
     };
     match crate::ipc::request(&request) {
         Ok(response) if response.ok => {
@@ -275,34 +274,10 @@ fn tools() -> Value {
 
 fn call(params: &Value) -> Value {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-    let mut args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
-    let cmd = match name {
-        "imacs_list" => "list",
-        "imacs_start" => "start",
-        "imacs_send" => "send",
-        "imacs_read" => "read",
-        "imacs_diff" => "diff",
-        "imacs_focus" => "activate",
-        "imacs_open" => "open",
-        "imacs_edit" => "edit",
-        "imacs_wait" => "wait",
-        "imacs_plan_set" => "plan_set",
-        "imacs_plan_get" => "plan_get",
-        "imacs_plan_update" => "plan_update",
-        "imacs_plan_dispatch" => "plan_dispatch",
-        "imacs_plan_integrate" => "plan_integrate",
-        "imacs_result" => "result",
-        "imacs_comment" => "comment",
-        "imacs_send_review" => "send_review",
-        "imacs_close" => "close",
-        _ => return tool_error(format!("unknown tool {name}")),
-    };
-    if let Some(map) = args.as_object_mut() {
-        map.insert("cmd".into(), json!(cmd));
-    }
-    let request: ControlRequest = match serde_json::from_value(args) {
+    let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let request = match request_for_tool(name, args) {
         Ok(request) => request,
-        Err(err) => return tool_error(format!("invalid arguments: {err}")),
+        Err(err) => return tool_error(err),
     };
     match crate::ipc::request(&request) {
         Ok(response) if response.ok => {
@@ -322,6 +297,100 @@ fn call(params: &Value) -> Value {
     }
 }
 
+fn request_for_tool(name: &str, mut args: Value) -> Result<ControlRequest, String> {
+    let cmd = match name {
+        "imacs_list" => "list",
+        "imacs_start" => "start",
+        "imacs_send" => "send",
+        "imacs_read" => "read",
+        "imacs_diff" => "diff",
+        "imacs_focus" => "activate",
+        "imacs_open" => "open",
+        "imacs_edit" => "edit",
+        "imacs_wait" => "wait",
+        "imacs_plan_set" => "plan_set",
+        "imacs_plan_get" => "plan_get",
+        "imacs_plan_update" => "plan_update",
+        "imacs_plan_dispatch" => "plan_dispatch",
+        "imacs_plan_integrate" => "plan_integrate",
+        "imacs_result" => "result",
+        "imacs_comment" => "comment",
+        "imacs_send_review" => "send_review",
+        "imacs_close" => "close",
+        "imacs_report" => "report",
+        _ => return Err(format!("unknown tool {name}")),
+    };
+    if let Some(map) = args.as_object_mut() {
+        map.insert("cmd".into(), json!(cmd));
+        if cmd == "report" {
+            map.insert("pane".into(), json!(std::env::var("IMACS_PANE").ok()));
+        }
+    }
+    serde_json::from_value(args).map_err(|err| format!("invalid arguments: {err}"))
+}
+
 fn tool_error(message: String) -> Value {
     json!({ "content": [{ "type": "text", "text": message }], "isError": true })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn example(schema: &Value, required_only: bool) -> Value {
+        if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+            return values[0].clone();
+        }
+        match schema["type"].as_str().unwrap() {
+            "object" => schema["properties"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .filter(|(key, _)| {
+                    !required_only || schema["required"].as_array().is_some_and(|keys| keys.contains(&json!(key)))
+                })
+                .map(|(key, value)| (key.clone(), example(value, required_only)))
+                .collect(),
+            "array" => json!([example(&schema["items"], required_only)]),
+            "string" => json!("example"),
+            "integer" => schema.get("minimum").cloned().unwrap_or(json!(1)),
+            "boolean" => json!(true),
+            other => panic!("unhandled schema type {other}"),
+        }
+    }
+
+    // ControlRequest permits extra fields, so deserialization alone would miss
+    // a property silently discarded because its schema name drifted.
+    fn assert_properties_survive(input: &Value, output: &Value) {
+        match input {
+            Value::Object(properties) => {
+                for (key, value) in properties {
+                    assert!(output.get(key).is_some(), "missing property {key}");
+                    assert_properties_survive(value, &output[key]);
+                }
+            }
+            Value::Array(values) => {
+                assert_eq!(values.len(), output.as_array().unwrap().len());
+                for (input, output) in values.iter().zip(output.as_array().unwrap()) {
+                    assert_properties_survive(input, output);
+                }
+            }
+            _ => assert_eq!(input, output),
+        }
+    }
+
+    #[test]
+    fn every_tool_schema_deserializes_into_its_control_request() {
+        for tool in tools().as_array().unwrap().iter().chain(agent_tools().as_array().unwrap()) {
+            let name = tool["name"].as_str().unwrap();
+            for required_only in [false, true] {
+                let args = example(&tool["inputSchema"], required_only);
+                let request = request_for_tool(name, args.clone()).unwrap_or_else(|err| panic!("{name}: {err}"));
+                let serialized = serde_json::to_value(request).unwrap();
+                let cmd = if name == "imacs_focus" { "activate" } else { name.strip_prefix("imacs_").unwrap() };
+                assert_eq!(serialized["cmd"], cmd, "{name}");
+                assert_properties_survive(&args, &serialized);
+            }
+        }
+    }
 }
