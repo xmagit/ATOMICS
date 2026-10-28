@@ -1,5 +1,7 @@
 # IMACS
 
+[![CI](https://github.com/xmagit/IMACS/actions/workflows/ci.yml/badge.svg)](https://github.com/xmagit/IMACS/actions/workflows/ci.yml)
+
 Emacs, but for agents: a lightweight, review-first workspace for coding agents, written in Rust. Run Claude Code,
 Codex and shells side by side, each in its own git worktree. Click any agent's title to see its worktree's diff
 against main, comment on lines, and send the review straight to the agent while it keeps working. Or let an
