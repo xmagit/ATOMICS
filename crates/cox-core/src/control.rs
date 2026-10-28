@@ -101,6 +101,9 @@ pub enum ControlRequest {
     PlanSet {
         goal: String,
         tasks: Vec<crate::plan::Task>,
+        /// Branch the tasks are merged into; kept while the goal stays the same.
+        #[serde(default)]
+        integration: Option<String>,
     },
     PlanGet,
     /// Changes a task's status or adds a note to it.
@@ -118,6 +121,11 @@ pub enum ControlRequest {
     PlanDispatch {
         #[serde(default)]
         id: Option<String>,
+    },
+    /// Commits a task's uncommitted work on its branch and merges the branch into the
+    /// plan's integration branch, in a worktree of its own.
+    PlanIntegrate {
+        id: String,
     },
     /// A sub-agent reporting on its task (sent by `cox mcp --agent`).
     Report {
@@ -237,6 +245,8 @@ mod tests {
         assert!(matches!(request, ControlRequest::Send { raw: false, .. }));
         let start: ControlRequest = serde_json::from_str(r#"{"cmd":"start","agent":"codex","folder":"/tmp"}"#).unwrap();
         assert!(matches!(start, ControlRequest::Start { args, .. } if args.is_empty()));
+        let integrate: ControlRequest = serde_json::from_str(r#"{"cmd":"plan_integrate","id":"t1"}"#).unwrap();
+        assert!(matches!(integrate, ControlRequest::PlanIntegrate { id } if id == "t1"));
     }
 
     #[test]

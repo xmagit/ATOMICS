@@ -6,7 +6,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use cox_core::config::{AgentKind, Config};
-use cox_core::git::{self, Worktree, WorktreeEntry};
+use cox_core::git::{self, Integration, Merge, Worktree, WorktreeEntry};
 use cox_core::layout::{self, DiffPlacement, DiffSplit, Layout};
 use cox_core::session::{AgentStatus, pick_tiled, title_for};
 use cox_core::store::{SessionRecord, Store};
@@ -22,7 +22,7 @@ use crate::setup::{SHELL_PATH, global_hooks_installed, install_global_hooks, res
 use crate::terminal::{Metrics, Terminal};
 use crate::theme::{Palette, lerp, shortcut};
 use cox_core::control::{ControlRequest, ControlResponse};
-use cox_core::plan::{Plan, Report, Task, TaskStatus};
+use cox_core::plan::{Plan, Report, Task, TaskStatus, short_slug};
 use cox_core::workspace::{self, Workspace};
 use serde_json::json;
 
@@ -118,6 +118,15 @@ struct Launch {
     reply: Option<Sender<ControlOutcome>>,
     /// Plan task this agent works on.
     task: Option<String>,
+}
+
+/// A finished plan integration, to note on its task and answer.
+struct Integrated {
+    task: String,
+    branch: String,
+    into: String,
+    result: Result<Integration, String>,
+    reply: Option<Sender<ControlOutcome>>,
 }
 
 /// The worktree clean-up dialog for one project.
@@ -257,6 +266,10 @@ pub struct App {
     worktree_tx: Sender<(String, Result<PathBuf, String>, Launch)>,
     worktree_rx: Receiver<(String, Result<PathBuf, String>, Launch)>,
     creating: Vec<String>,
+    integrate_tx: Sender<Integrated>,
+    integrate_rx: Receiver<Integrated>,
+    /// Tasks being merged into the integration branch.
+    integrating: HashSet<String>,
     worktrees: Vec<WorktreeEntry>,
     worktrees_at: Option<Instant>,
     steer_text: String,
@@ -303,6 +316,7 @@ impl App {
             ipc::serve(&paths::socket_path(), hub.clone(), channels, ctx.clone()).err().map(|e| format!("{e:#}"));
         let (watch_tx, watch_rx) = channel();
         let (worktree_tx, worktree_rx) = channel();
+        let (integrate_tx, integrate_rx) = channel();
         let launch_dir = std::env::current_dir().unwrap_or_else(|_| paths::home());
 
         let mut app = App {
@@ -354,6 +368,9 @@ impl App {
             worktree_tx,
             worktree_rx,
             creating: Vec::new(),
+            integrate_tx,
+            integrate_rx,
+            integrating: HashSet::new(),
             worktrees: Vec::new(),
             worktrees_at: None,
             steer_text: String::new(),
@@ -417,7 +434,9 @@ impl App {
         let _ = self.store.save(&paths::store_file());
     }
 
-    fn create_worktree(&mut self, repo: PathBuf, branch: String, launch: Launch) {
+    /// Checks out `branch` in a new worktree, from `start` (a plan's integration branch)
+    /// or base_ref, and starts `launch` in it.
+    fn create_worktree(&mut self, repo: PathBuf, branch: String, start: Option<String>, launch: Launch) {
         let path = git::worktree_path(&self.config.worktree_path, &repo, &branch);
         let (tx, base_ref, ctx) = (self.worktree_tx.clone(), self.config.base_ref.clone(), self.ctx.clone());
         self.creating.push(branch.clone());
@@ -428,7 +447,9 @@ impl App {
             let result = if existing {
                 Ok(path)
             } else {
-                git::add_worktree(&repo, &path, &branch, &base_ref).map(|()| path).map_err(|e| format!("{e:#}"))
+                git::add_worktree_from(&repo, &path, &branch, start.as_deref(), &base_ref)
+                    .map(|()| path)
+                    .map_err(|e| format!("{e:#}"))
             };
             let _ = tx.send((branch, result, launch));
             ctx.request_repaint();
@@ -1098,8 +1119,11 @@ impl App {
                     done(ControlResponse::ok(result))
                 }
             },
-            ControlRequest::PlanSet { goal, tasks } => {
+            ControlRequest::PlanSet { goal, tasks, integration } => {
                 self.plan.replace(goal, tasks);
+                if let Some(branch) = integration.filter(|b| !b.trim().is_empty()) {
+                    self.plan.integration = Some(branch.trim().to_string());
+                }
                 let project = self.plan.tasks.iter().find_map(|t| t.repo.as_deref()).map(paths::expand).or_else(|| {
                     self.diff_target().and_then(|t| self.project_of(&t)).or_else(|| self.repos.first().cloned())
                 });
@@ -1115,6 +1139,7 @@ impl App {
                 done(ControlResponse::ok(json!({
                     "tasks": self.plan.tasks.len(),
                     "approved": false,
+                    "integration": self.plan.integration_branch(),
                     "unknown_dependencies": unknown,
                     "next": "The user reviews and approves the plan on the board; then call plan_dispatch.",
                 })))
@@ -1152,6 +1177,11 @@ impl App {
                 Ok(started) => done(ControlResponse::ok(json!({ "started": started }))),
                 Err(err) => done(ControlResponse::error(err)),
             },
+            ControlRequest::PlanIntegrate { id } => {
+                // Committing and merging can take a while: answer once it is done.
+                self.integrate(&id, Some(reply));
+                return;
+            }
             ControlRequest::Report { pane, status, summary } => {
                 let task = self.report(pane.as_deref(), &status, &summary);
                 done(ControlResponse::ok(json!({ "recorded": true, "task": task })))
@@ -1193,6 +1223,7 @@ impl App {
                         self.create_worktree(
                             paths::expand(&repo),
                             branch,
+                            None,
                             Launch { agent, prompt, args, reply: Some(reply), task: None },
                         );
                         return;
@@ -1633,6 +1664,11 @@ impl App {
         if !self.plan.goal.is_empty() {
             ui.label(RichText::new(&self.plan.goal).color(p.foreground).size(13.0));
         }
+        let integration = self.plan.integration_branch();
+        if !self.plan.tasks.is_empty() {
+            ui.label(RichText::new(format!("integration branch: {integration}")).color(p.muted).size(11.5))
+                .on_hover_text("Integrated tasks are merged into it, and tasks with dependencies branch from it");
+        }
         for (task, dep) in self.plan.unknown_dependencies() {
             ui.label(RichText::new(format!("{task} depends on unknown task {dep}")).color(p.error).size(11.5));
         }
@@ -1655,6 +1691,7 @@ impl App {
         let sessions: HashMap<String, (String, AgentStatus)> =
             self.sessions.iter().map(|s| (s.id.clone(), (s.title.clone(), s.status))).collect();
         let expanded = &mut self.expanded_tasks;
+        let integrating = &self.integrating;
         let tasks = &mut self.plan.tasks;
         if !tasks.is_empty() {
             ui.columns(TaskStatus::ALL.len(), |columns| {
@@ -1789,6 +1826,19 @@ impl App {
                                                 }
                                                 _ => {}
                                             }
+                                            if matches!(task.status, TaskStatus::Review | TaskStatus::Done) {
+                                                let busy = integrating.contains(&task.id);
+                                                let label = if busy { "integrating…" } else { "integrate" };
+                                                if ui
+                                                    .add_enabled(!busy, egui::Button::new(label).small())
+                                                    .on_hover_text(format!(
+                                                        "Commit its changes and merge it into {integration}"
+                                                    ))
+                                                    .clicked()
+                                                {
+                                                    actions.push((task.id.clone(), "integrate"));
+                                                }
+                                            }
                                         });
                                     });
                                 ui.add_space(6.0);
@@ -1812,6 +1862,7 @@ impl App {
                         self.toast(err);
                     }
                 }
+                "integrate" => self.integrate(&id, None),
                 status => {
                     if let (Some(task), Some(status)) = (self.plan.task_mut(&id), TaskStatus::parse(status)) {
                         task.status = status;
@@ -1849,7 +1900,21 @@ impl App {
     fn plan_json(&self) -> serde_json::Value {
         let mut value = serde_json::to_value(&self.plan).unwrap_or_default();
         value["ready"] = json!(self.plan.ready().iter().map(|t| &t.id).collect::<Vec<_>>());
+        value["integration"] = json!(self.plan.integration_branch());
         value
+    }
+
+    /// The repository a task works in.
+    fn task_repo(&self, task: &Task) -> Option<PathBuf> {
+        task.repo
+            .as_deref()
+            .map(paths::expand)
+            .or_else(|| {
+                let session = task.session.as_ref().and_then(|id| self.sessions.iter().find(|s| &s.id == id))?;
+                self.project_of(&session.root())
+            })
+            .or_else(|| self.diff_target().and_then(|t| self.project_of(&t)))
+            .or_else(|| self.repos.first().cloned())
     }
 
     /// Starts `only`, or every ready task, each in a new worktree with its brief as
@@ -1874,11 +1939,9 @@ impl App {
             }
             self.set_view(Some(project));
         }
-        let fallback_repo =
-            self.diff_target().and_then(|t| self.project_of(&t)).or_else(|| self.repos.first().cloned());
         let mut started = Vec::new();
         for task in ready {
-            let Some(repo) = task.repo.as_deref().map(paths::expand).or_else(|| fallback_repo.clone()) else {
+            let Some(repo) = self.task_repo(&task) else {
                 return Err("No project is open to branch from; give the task a repo.".into());
             };
             let branch = task.branch.clone().unwrap_or_else(|| format!("cox/{}-{}", task.id, short_slug(&task.title)));
@@ -1888,6 +1951,10 @@ impl App {
                 // The reviewer reads every task's branch from the shared repository.
                 let base = &self.config.base_ref;
                 brief.push_str("\n\nBranches to review (all in this repository):\n");
+                let integration = self.plan.integration_branch();
+                brief.push_str(&format!(
+                    "- integration branch {integration} (git diff {base}...{integration}): all accepted work, review this first\n"
+                ));
                 for other in self.plan.tasks.iter().filter(|t| task.depends_on.contains(&t.id)) {
                     let branch = other.branch.clone().unwrap_or_else(|| "(not dispatched)".into());
                     brief.push_str(&format!("- {}: {} (git diff {base}...{branch})\n", other.id, other.title));
@@ -1900,15 +1967,103 @@ impl App {
                 reply: None,
                 task: Some(task.id.clone()),
             };
-            self.create_worktree(repo, branch.clone(), launch);
+            let start = self.plan.start_branch(&task);
+            self.create_worktree(repo.clone(), branch.clone(), start, launch);
             if let Some(t) = self.plan.task_mut(&task.id) {
                 t.status = TaskStatus::Running;
                 t.branch = Some(branch);
+                t.repo.get_or_insert_with(|| repo.to_string_lossy().into_owned());
             }
             started.push(task.id);
         }
         self.save_plan();
         Ok(started)
+    }
+
+    /// Commits a review or done task's work and merges its branch into the plan's
+    /// integration branch, off the UI thread; the outcome lands on the task.
+    fn integrate(&mut self, id: &str, reply: Option<Sender<ControlOutcome>>) {
+        let job = match self.plan.tasks.iter().find(|t| t.id == id) {
+            None => Err(format!("no task {id}")),
+            Some(task) if !matches!(task.status, TaskStatus::Review | TaskStatus::Done) => {
+                Err(format!("Task {id} is {}: only tasks in review or done can be integrated.", task.status.label()))
+            }
+            Some(_) if self.integrating.contains(id) => Err(format!("Task {id} is already being integrated.")),
+            Some(task) => match (task.branch.clone(), self.task_repo(task)) {
+                (None, _) => Err(format!("Task {id} has no branch yet: dispatch it first.")),
+                (_, None) => Err("No project is open to integrate into; give the task a repo.".into()),
+                (Some(branch), Some(repo)) => Ok((repo, branch, format!("{} ({})", task.title.trim(), task.id))),
+            },
+        };
+        let (repo, branch, message) = match job {
+            Ok(job) => job,
+            Err(err) => {
+                match reply {
+                    Some(reply) => {
+                        let _ = reply.send(ControlOutcome::Done(ControlResponse::error(err)));
+                    }
+                    None => self.toast(err),
+                }
+                return;
+            }
+        };
+        let into = self.plan.integration_branch();
+        let into_path = git::worktree_path(&self.config.worktree_path, &repo, &into);
+        let (tx, base_ref, ctx) = (self.integrate_tx.clone(), self.config.base_ref.clone(), self.ctx.clone());
+        let task = id.to_string();
+        self.integrating.insert(task.clone());
+        std::thread::spawn(move || {
+            // Integrations share the integration worktree: one at a time.
+            static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+            let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+            let result =
+                git::integrate(&repo, &branch, &message, &into, &into_path, &base_ref).map_err(|e| format!("{e:#}"));
+            let _ = tx.send(Integrated { task, branch, into, result, reply });
+            ctx.request_repaint();
+        });
+    }
+
+    fn finish_integration(&mut self, done: Integrated) {
+        let Integrated { task: id, branch, into, result, reply } = done;
+        self.integrating.remove(&id);
+        self.worktrees_at = None;
+        let (note, response) = match result {
+            Ok(Integration { merge: Merge::Conflict(files), .. }) => {
+                if let Some(task) = self.plan.task_mut(&id) {
+                    task.status = TaskStatus::Review;
+                }
+                let files = files.join(", ");
+                let error = format!(
+                    "Merging {branch} into {into} conflicts in {files}. The merge was aborted; task {id} stays in review."
+                );
+                (format!("conflicts with {into} in {files}; merge aborted"), ControlResponse::error(error))
+            }
+            Ok(Integration { committed, merge, worktree }) => {
+                let merged = merge == Merge::Merged;
+                let note = match (committed, merged) {
+                    (true, _) => format!("committed and merged into {into}"),
+                    (false, true) => format!("merged into {into}"),
+                    (false, false) => format!("already in {into}"),
+                };
+                let result = json!({
+                    "task": id,
+                    "integration": into,
+                    "worktree": worktree,
+                    "committed": committed,
+                    "merged": merged,
+                });
+                (note, ControlResponse::ok(result))
+            }
+            Err(err) => (format!("could not integrate: {err}"), ControlResponse::error(err)),
+        };
+        if let Some(task) = self.plan.task_mut(&id) {
+            task.notes.push(note.clone());
+            self.save_plan();
+        }
+        self.toast(format!("Task {id}: {note}"));
+        if let Some(reply) = reply {
+            let _ = reply.send(ControlOutcome::Done(response));
+        }
     }
 
     /// A sub-agent's `cox_report`: attach it to its task, move the task along, and
@@ -2205,6 +2360,9 @@ impl App {
             if let Some(reply) = launch.reply {
                 let _ = reply.send(ControlOutcome::Done(response));
             }
+        }
+        while let Ok(integrated) = self.integrate_rx.try_recv() {
+            self.finish_integration(integrated);
         }
         while let Ok(message) = self.control_rx.try_recv() {
             self.control(ctx, message.request, message.reply);
@@ -3586,7 +3744,7 @@ impl App {
                 });
             });
         if let Some((repo, branch, launch)) = create {
-            self.create_worktree(repo, branch, launch);
+            self.create_worktree(repo, branch, None, launch);
         }
         if let Some(target) = start {
             self.pending_open.push(target);
@@ -4039,14 +4197,6 @@ fn unescape(text: &str) -> String {
         }
     }
     out
-}
-
-/// A short branch-friendly version of a task title.
-fn short_slug(title: &str) -> String {
-    let lower: String = title.to_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
-    let mut slug = lower.split('-').filter(|p| !p.is_empty()).collect::<Vec<_>>().join("-");
-    slug.truncate(40);
-    slug.trim_end_matches('-').to_string()
 }
 
 /// The chief's mark: a planet with a tilted orbit and a moon, after the atomisk.ai icon.

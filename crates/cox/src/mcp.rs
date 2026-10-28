@@ -56,7 +56,7 @@ fn write(out: &mut impl Write, value: Value) {
     let _ = out.flush();
 }
 
-const INSTRUCTIONS: &str = "cox runs coding agents (Claude Code, Codex, shells) in terminals the user watches, each in its own git worktree, and shows every worktree's diff against main. As an orchestrator: write a plan with cox_plan_set and let the user approve it on the board, then cox_plan_dispatch. Loop on cox_wait instead of polling: agents report with cox_report (status reported) or finish turns. Then read cox_result and cox_diff, steer with cox_send or inline review comments (cox_comment + cox_send_review), and move tasks along with cox_plan_update. For one-off work, cox_start starts an agent directly. The user sees everything and can steer too, so keep briefs and reviews readable.";
+const INSTRUCTIONS: &str = "cox runs coding agents (Claude Code, Codex, shells) in terminals the user watches, each in its own git worktree, and shows every worktree's diff against main. As an orchestrator: write a plan with cox_plan_set and let the user approve it on the board, then cox_plan_dispatch. Loop on cox_wait instead of polling: agents report with cox_report (status reported) or finish turns. Then read cox_result and cox_diff, steer with cox_send or inline review comments (cox_comment + cox_send_review), and move tasks along with cox_plan_update. Merge each accepted task into the plan's integration branch with cox_plan_integrate before dispatching tasks that depend on it: those branch from the integration branch. For one-off work, cox_start starts an agent directly. The user sees everything and can steer too, so keep briefs and reviews readable.";
 
 const AGENT_INSTRUCTIONS: &str = "You run inside cox, where an orchestrator and the user follow your work. Call cox_report when you finish your task (status done), when you are blocked or need a decision (blocked or question), and optionally to report progress.";
 
@@ -120,11 +120,12 @@ fn tools() -> Value {
         },
         {
             "name": "cox_plan_set",
-            "description": "Write the plan for a goal as tasks. It appears on cox's plan board, where the user reviews, edits and approves it; nothing starts before approval. Each task: id (short, e.g. t1), title, brief (what to do, with context), acceptance (list of checks that mean done), depends_on (task ids), agent (claude or codex), args (e.g. [\"-m\", \"gpt-6.1-terra\"]), repo (project folder), branch. Re-sending a plan keeps the progress of tasks whose id stays.",
+            "description": "Write the plan for a goal as tasks. It appears on cox's plan board, where the user reviews, edits and approves it; nothing starts before approval. Each task: id (short, e.g. t1), title, brief (what to do, with context), acceptance (list of checks that mean done), depends_on (task ids), agent (claude or codex), args (e.g. [\"-m\", \"gpt-6.1-terra\"]), repo (project folder), branch. Re-sending a plan keeps the progress of tasks whose id stays. Tasks are merged into the integration branch (default cox/plan-<goal>, kept while the goal stays the same).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "goal": { "type": "string" },
+                    "integration": { "type": "string", "description": "Integration branch name, if not cox/plan-<goal>" },
                     "tasks": {
                         "type": "array",
                         "items": {
@@ -167,8 +168,13 @@ fn tools() -> Value {
         },
         {
             "name": "cox_plan_dispatch",
-            "description": "Start one task (id) or every ready task: each gets a new worktree and an agent whose first message is the task brief. Only works once the user approved the plan. Agents report back with cox_report, which wakes cox_wait.",
+            "description": "Start one task (id) or every ready task: each gets a new worktree (from the integration branch when it has dependencies, else from main) and an agent whose first message is the task brief. Only works once the user approved the plan. Agents report back with cox_report, which wakes cox_wait.",
             "inputSchema": { "type": "object", "properties": { "id": { "type": "string" } } }
+        },
+        {
+            "name": "cox_plan_integrate",
+            "description": "Merge a task (in review or done) into the plan's integration branch: uncommitted changes in its worktree are committed on its branch first (message '<title> (<id>)'), then the branch is merged in a separate integration worktree next to the repository. Tasks with dependencies branch from the integration branch, so integrate accepted tasks before dispatching their dependents. On a conflict the merge is aborted, and the task stays in review with a note listing the conflicted files.",
+            "inputSchema": { "type": "object", "properties": { "id": { "type": "string" } }, "required": ["id"] }
         },
         {
             "name": "cox_wait",
@@ -283,6 +289,7 @@ fn call(params: &Value) -> Value {
         "cox_plan_get" => "plan_get",
         "cox_plan_update" => "plan_update",
         "cox_plan_dispatch" => "plan_dispatch",
+        "cox_plan_integrate" => "plan_integrate",
         "cox_result" => "result",
         "cox_comment" => "comment",
         "cox_send_review" => "send_review",

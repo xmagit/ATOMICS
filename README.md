@@ -89,6 +89,15 @@ first message is the brief. Every agent cox starts gets a `cox_report` tool, pre
 blocked or has a question. Reports land on the task card, move done tasks to review, and wake the orchestrator's
 `cox_wait`, which then reads `cox_result` and `cox_diff`, reviews, steers, and accepts with `cox_plan_update`.
 
+Tasks come together on the plan's **integration branch** (`cox/plan-<goal>` unless the plan names one; the board
+shows it). `cox_plan_integrate` (or **integrate** on a review or done card) commits whatever the task left uncommitted
+on its branch (as `<title> (<id>)`, with the repository's own git identity; ignored files stay out) and merges the
+branch into the integration branch. The merge happens in a worktree of its own next to the repository, created on
+first use like any other worktree, so your main checkout is never touched. On a conflict the merge is aborted and the
+task stays in review with a note listing the conflicted files. Tasks without dependencies branch from `base_ref`;
+tasks with dependencies branch from the integration branch, so integrate accepted tasks before dispatching the tasks
+that build on them.
+
 ## Let an agent drive cox (MCP)
 
 ```sh
