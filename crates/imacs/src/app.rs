@@ -46,6 +46,7 @@ mod plans;
 mod projects;
 mod sessions;
 mod sidebar;
+mod topbar;
 mod voice;
 mod worktrees;
 
@@ -630,7 +631,8 @@ impl App {
                 self.governor.slots(class)
             ));
         }
-        ui.label(RichText::new(format!("load {load:.1}")).color(color).size(12.0)).on_hover_text(hover);
+        let response = ui.label(RichText::new(format!("load {load:.1}")).color(color).size(12.0)).on_hover_text(hover);
+        topbar::record_item(ui, "load", &response);
     }
 
     fn resources_json(&self) -> serde_json::Value {
@@ -684,68 +686,6 @@ impl App {
         let font = FontId::monospace(self.config.font.size);
         let cell = ui.fonts_mut(|f| vec2(f.glyph_width(&font, 'M'), f.row_height(&font)));
         Metrics { font, cell: vec2(cell.x, cell.y.ceil()) }
-    }
-
-    fn top_bar(&mut self, ui: &mut egui::Ui) {
-        let p = self.palette.clone();
-        ui.horizontal_centered(|ui| {
-            ui.image((self.icon.id(), vec2(20.0, 20.0)));
-            ui.label(RichText::new("IMACS").strong().size(14.0).color(p.accent).monospace());
-            let agents = self.sessions.iter().filter(|s| s.is_agent()).count();
-            let waiting = self.sessions.iter().filter(|s| s.status.needs_attention()).count();
-            ui.label(RichText::new(format!("{agents} agent{}", if agents == 1 { "" } else { "s" })).color(p.muted));
-            ui.separator();
-            self.view_tabs(ui);
-            if waiting > 0 {
-                let label = ui.add(
-                    egui::Label::new(
-                        RichText::new(format!("● {waiting} need{} you", if waiting == 1 { "s" } else { "" }))
-                            .color(p.warning),
-                    )
-                    .sense(Sense::click()),
-                );
-                if label.on_hover_text(format!("Jump with {}", self.config.keys.next_attention)).clicked()
-                    && let Some(i) = self.sessions.iter().position(|s| s.status.needs_attention())
-                {
-                    let id = self.sessions[i].id.clone();
-                    self.activate(&id, true);
-                }
-            }
-            if let Some((text, _)) = &self.toast {
-                ui.separator();
-                ui.label(RichText::new(text).color(p.foreground));
-            }
-            if let Some(err) = &self.config_error {
-                ui.label(RichText::new("config error").color(p.error)).on_hover_text(err);
-            }
-            if let Some(err) = &self.hook_error {
-                ui.label(RichText::new("hooks offline").color(p.error)).on_hover_text(err);
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.menu_button("Settings", |ui| self.settings_menu(ui));
-                self.load_gauge(ui);
-                ui.menu_button("Project", |ui| self.project_menu(ui));
-                let (done, total) = (
-                    self.plans[self.selected_plan].count(TaskStatus::Done),
-                    self.plans[self.selected_plan].tasks.len(),
-                );
-                let label = if total == 0 { "Plan".to_string() } else { format!("Plan {done}/{total}") };
-                let attention = self.plans[self.selected_plan].count(TaskStatus::Review)
-                    + self.plans[self.selected_plan].count(TaskStatus::Blocked);
-                let text = RichText::new(label).color(if attention > 0 { p.warning } else { p.foreground });
-                let open = self.panel == PanelMode::Plan && self.diff_open;
-                if ui.selectable_label(open, text).on_hover_text(&self.config.keys.toggle_plan).clicked() {
-                    self.toggle_plan();
-                }
-                if ui.button("+ New").on_hover_text(&self.config.keys.new_session).clicked() {
-                    self.open_new_dialog(None);
-                }
-                let diff_label = if self.diff_open { "Hide diff" } else { "Show diff" };
-                if ui.button(diff_label).on_hover_text(&self.config.keys.toggle_diff).clicked() {
-                    self.diff_open = !self.diff_open;
-                }
-            });
-        });
     }
 
     fn steer_bar(&mut self, ui: &mut egui::Ui) {

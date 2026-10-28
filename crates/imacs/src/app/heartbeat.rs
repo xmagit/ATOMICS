@@ -325,7 +325,7 @@ mod tests {
                             events,
                             ..Default::default()
                         },
-                        |ui| app.chief_ui(ui.ctx()),
+                        |ui| app.top_bar(ui),
                     )
                 };
                 frame(vec![]).drop_without_applying_deltas();

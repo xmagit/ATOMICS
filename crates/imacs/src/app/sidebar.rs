@@ -1,85 +1,202 @@
 use super::*;
 
+#[derive(Clone)]
+enum ViewTab {
+    All,
+    Project(PathBuf),
+    Plan(usize),
+}
+
 impl App {
-    /// One tab per open project plus "All"; a project tab shows only its agents,
-    /// explorer, diff and plan.
+    /// Tabs share a bounded navigation slot. First shorten labels, then move
+    /// excess tabs into a menu, keeping the selected tab in the visible row.
     pub(super) fn view_tabs(&mut self, ui: &mut egui::Ui) {
-        let p = self.palette.clone();
-        let mut pick: Option<Option<PathBuf>> = None;
-        let mut close_idle: Option<PathBuf> = None;
-        let agents = self.sessions.iter().filter(|s| !s.chief).count();
-        if ui
-            .selectable_label(
-                !self.plan_view && self.view.is_none(),
-                RichText::new(format!("All · {agents}")).size(12.5),
-            )
-            .clicked()
-        {
-            pick = Some(None);
-        }
-        for root in self.repos.clone() {
-            let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            let count =
-                self.sessions.iter().filter(|s| !s.chief && self.project_of(&s.root()).as_ref() == Some(&root)).count();
-            let label = format!("{name} · {count}");
-            let selected = !self.plan_view && self.view.as_ref() == Some(&root);
-            let text = RichText::new(label).size(12.5).color(if selected { p.accent } else { p.foreground });
-            let response = ui.selectable_label(selected, text);
-            if response.clicked() {
-                pick = Some(Some(root.clone()));
-            }
-            response.context_menu(|ui| {
-                if ui.button("Close idle sessions").on_hover_text("Idle or exited sessions no plan task uses").clicked()
-                {
-                    close_idle = Some(root.clone());
-                    ui.close();
+        let mut tabs = vec![ViewTab::All];
+        tabs.extend(self.repos.iter().cloned().map(ViewTab::Project));
+        tabs.extend(
+            self.plans
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| !p.id.is_empty() && p.status != PlanStatus::Archived)
+                .map(|(index, _)| ViewTab::Plan(index)),
+        );
+        let gap = ui.spacing().item_spacing.x;
+        let widths: Vec<f32> = tabs
+            .iter()
+            .map(|tab| {
+                super::topbar::measure(ui, |ui| {
+                    self.view_tab(ui, tab, None);
+                })
+            })
+            .collect();
+        let closed = self.plans.iter().any(|p| !p.id.is_empty() && !p.is_open());
+        let closed_width = if closed {
+            super::topbar::measure(ui, |ui| {
+                ui.menu_button("Closed plans", |_| {});
+            }) + gap
+        } else {
+            0.0
+        };
+        let menu_width = super::topbar::measure(ui, |ui| {
+            ui.menu_button("Tabs", |_| {});
+        });
+        let available = ui.available_width();
+        let pin_closed = closed && available >= closed_width + menu_width + gap + 90.0;
+        let budget = available - if pin_closed { closed_width } else { 0.0 };
+        let minimum: Vec<f32> = widths.iter().map(|w| w.min(90.0)).collect();
+        let total = |widths: &[f32]| widths.iter().sum::<f32>() + gap * widths.len().saturating_sub(1) as f32;
+        let overflow = total(&minimum) > budget || (closed && !pin_closed);
+        let mut visible: Vec<usize> = (0..tabs.len()).collect();
+        if overflow {
+            let mut used = menu_width;
+            visible.clear();
+            for (index, width) in minimum.iter().enumerate() {
+                if used + gap + width > budget {
+                    break;
                 }
-            });
-        }
-        let mut plan_pick = None;
-        let mut archive = None;
-        for (index, plan) in
-            self.plans.iter().enumerate().filter(|(_, p)| !p.id.is_empty() && p.status != plan::PlanStatus::Archived)
-        {
-            let name: String = plan.goal.chars().take(28).collect();
-            let marker = if self.changed_plans.contains(&plan.id) { " *" } else { "" };
-            let glyph = if plan.status == plan::PlanStatus::Completed { "✓" } else { "●" };
-            let label = format!("{glyph} {name} · {}/{}{marker}", plan.count(TaskStatus::Done), plan.tasks.len());
-            let attention = if self.sessions.iter().any(|s| plan.contains_session(&s.id) && s.status.needs_attention())
-            {
-                "needs you"
-            } else {
-                plan.attention()
-            };
-            let color = match attention {
-                "needs you" => p.warning,
-                "all done" => p.success,
-                _ => p.accent,
-            };
-            let response = ui
-                .selectable_label(
-                    self.plan_view && self.selected_plan == index,
-                    RichText::new(label).size(12.5).color(color),
-                )
-                .on_hover_text(format!("{}: {}", plan.goal, attention));
-            if response.clicked() {
-                plan_pick = Some(index);
+                used += gap + width;
+                visible.push(index);
             }
-            if plan.status == plan::PlanStatus::Completed {
+            if let Some(selected) = tabs.iter().position(|tab| self.view_tab_selected(tab))
+                && !visible.contains(&selected)
+                && let Some(last) = visible.last_mut()
+            {
+                // Preserve the selected tab when it fits the last visible slot.
+                if minimum[selected] <= minimum[*last] {
+                    *last = selected;
+                }
+            }
+        }
+        let visible_budget = budget - if overflow { menu_width + gap } else { 0.0 };
+        let natural: Vec<f32> = visible.iter().map(|&i| widths[i]).collect();
+        let shrink = (total(&natural) - visible_budget).max(0.0);
+        let capacity: f32 = visible.iter().map(|&i| widths[i] - minimum[i]).sum();
+        for &index in &visible {
+            let width = widths[index]
+                - if capacity > 0.0 { shrink.min(capacity) * (widths[index] - minimum[index]) / capacity } else { 0.0 };
+            self.view_tab(ui, &tabs[index], Some(width));
+        }
+        if overflow {
+            let response = ui
+                .menu_button("Tabs", |ui| {
+                    ui.set_max_width(500.0_f32.min(ui.ctx().content_rect().width() - 32.0));
+                    for (index, tab) in tabs.iter().enumerate() {
+                        if !visible.contains(&index) {
+                            self.view_tab(ui, tab, None);
+                        }
+                    }
+                    if closed && !pin_closed {
+                        self.closed_plans_menu(ui);
+                    }
+                })
+                .response;
+            super::topbar::record_item(ui, "Tabs", &response);
+        }
+        if pin_closed {
+            self.closed_plans_menu(ui);
+        }
+    }
+
+    fn view_tab_selected(&self, tab: &ViewTab) -> bool {
+        match tab {
+            ViewTab::All => !self.plan_view && self.view.is_none(),
+            ViewTab::Project(root) => !self.plan_view && self.view.as_ref() == Some(root),
+            ViewTab::Plan(index) => self.plan_view && self.selected_plan == *index,
+        }
+    }
+
+    fn view_tab(&mut self, ui: &mut egui::Ui, tab: &ViewTab, width: Option<f32>) {
+        let p = self.palette.clone();
+        let selected = self.view_tab_selected(tab);
+        let (label, hover, color) = match tab {
+            ViewTab::All => {
+                let agents = self.sessions.iter().filter(|s| !s.chief).count();
+                (format!("All · {agents}"), "All projects".into(), p.foreground)
+            }
+            ViewTab::Project(root) => {
+                let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let count = self
+                    .sessions
+                    .iter()
+                    .filter(|s| !s.chief && self.project_of(&s.root()).as_ref() == Some(root))
+                    .count();
+                (format!("{name} · {count}"), paths::display(root), if selected { p.accent } else { p.foreground })
+            }
+            ViewTab::Plan(index) => {
+                let plan = &self.plans[*index];
+                let name: String = plan.goal.chars().take(28).collect();
+                let marker = if self.changed_plans.contains(&plan.id) { " *" } else { "" };
+                let glyph = if plan.status == PlanStatus::Completed { "✓" } else { "●" };
+                let attention =
+                    if self.sessions.iter().any(|s| plan.contains_session(&s.id) && s.status.needs_attention()) {
+                        "needs you"
+                    } else {
+                        plan.attention()
+                    };
+                let color = match attention {
+                    "needs you" => p.warning,
+                    "all done" => p.success,
+                    _ => p.accent,
+                };
+                (
+                    format!("{glyph} {name} · {}/{}{marker}", plan.count(TaskStatus::Done), plan.tasks.len()),
+                    format!("{}: {}", plan.goal, attention),
+                    color,
+                )
+            }
+        };
+        let button = egui::Button::selectable(selected, RichText::new(&label).size(12.5).color(color)).truncate();
+        let response = match width {
+            Some(width) => ui.add_sized(vec2(width, ui.spacing().interact_size.y), button),
+            None => ui.add(button),
+        }
+        .on_hover_text(hover);
+        if width.is_some() {
+            super::topbar::record_item(ui, &label, &response);
+        }
+        if response.clicked() {
+            match tab {
+                ViewTab::All => self.set_view(None),
+                ViewTab::Project(root) => self.set_view(Some(root.clone())),
+                ViewTab::Plan(index) => {
+                    self.selected_plan = *index;
+                    self.show_plan_fleet();
+                }
+            }
+            if width.is_none() {
+                ui.close();
+            }
+        }
+        match tab {
+            ViewTab::Project(root) => {
                 response.context_menu(|ui| {
-                    if ui.button("Archive plan").clicked() {
-                        archive = Some(index);
+                    if ui
+                        .button("Close idle sessions")
+                        .on_hover_text("Idle or exited sessions no plan task uses")
+                        .clicked()
+                    {
+                        let closed = self.close_idle(root);
+                        self.toast(format!("Closed {closed} idle session{}", if closed == 1 { "" } else { "s" }));
                         ui.close();
                     }
                 });
             }
+            ViewTab::Plan(index) if self.plans[*index].status == PlanStatus::Completed => {
+                response.context_menu(|ui| {
+                    if ui.button("Archive plan").clicked() {
+                        self.confirm_plan_close = Some((self.plans[*index].id.clone(), PlanStatus::Archived));
+                        ui.close();
+                    }
+                });
+            }
+            _ => {}
         }
-        if let Some(index) = archive {
-            self.confirm_plan_close = Some((self.plans[index].id.clone(), PlanStatus::Archived));
-        }
+    }
+
+    fn closed_plans_menu(&mut self, ui: &mut egui::Ui) {
         let mut reopen = None;
-        if self.plans.iter().any(|p| !p.id.is_empty() && !p.is_open()) {
-            ui.menu_button("Closed plans", |ui| {
+        let response = ui
+            .menu_button("Closed plans", |ui| {
                 for (index, plan) in self.plans.iter().enumerate().filter(|(_, p)| !p.id.is_empty() && !p.is_open()) {
                     let status = if plan.status == PlanStatus::Completed { "completed" } else { "archived" };
                     if ui.button(format!("Reopen {} ({status})", plan.goal)).clicked() {
@@ -87,23 +204,13 @@ impl App {
                         ui.close();
                     }
                 }
-            });
-        }
+            })
+            .response;
+        super::topbar::record_item(ui, "Closed plans", &response);
         if let Some(index) = reopen
             && let Err(err) = self.reopen_plan(index)
         {
             self.toast(err);
-        }
-        if let Some(index) = plan_pick {
-            self.selected_plan = index;
-            self.show_plan_fleet();
-        }
-        if let Some(view) = pick {
-            self.set_view(view);
-        }
-        if let Some(root) = close_idle {
-            let closed = self.close_idle(&root);
-            self.toast(format!("Closed {closed} idle session{}", if closed == 1 { "" } else { "s" }));
         }
     }
 
