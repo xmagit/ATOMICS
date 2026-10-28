@@ -3610,15 +3610,22 @@ impl App {
         if let Some(debouncer) = &mut self.watcher {
             let watcher = debouncer.watcher();
             for root in current.iter().filter(|root| !wanted.contains(root)) {
-                let _ = watcher.unwatch(root);
+                if let Some((_, real)) = self.watched.lock().unwrap().iter().find(|(path, _)| path == root) {
+                    let _ = watcher.unwatch(real);
+                }
             }
+            self.watched.lock().unwrap().retain(|(root, _)| wanted.contains(root));
             for root in wanted.iter().filter(|root| !current.contains(root)) {
-                let _ = watcher.watch(root, RecursiveMode::Recursive);
+                let Ok(real) = std::fs::canonicalize(root) else { continue };
+                if watcher.watch(&real, RecursiveMode::Recursive).is_ok() {
+                    self.watched.lock().unwrap().push((root.clone(), real));
+                }
             }
+            self.watched.lock().unwrap().sort();
         }
-        // Events carry the path as the file system has it (/private/tmp for /tmp).
-        *self.watched.lock().unwrap() =
-            wanted.into_iter().map(|root| (root.clone(), std::fs::canonicalize(&root).unwrap_or(root))).collect();
+        if self.watched.lock().unwrap().len() != wanted.len() {
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
     }
 
     // ── input ─────────────────────────────────────────────────────────────
@@ -5696,6 +5703,78 @@ fi
     }
 
     #[test]
+    fn watcher_retries_missing_roots_and_receives_events_under_symlinked_parents() {
+        with_app(
+            "app::tests::watcher_retries_missing_roots_and_receives_events_under_symlinked_parents",
+            |app, ctx| {
+                let dir = tempfile::tempdir().unwrap();
+                let real = dir.path().join("real");
+                std::fs::create_dir(&real).unwrap();
+                let alias = dir.path().join("alias");
+                std::os::unix::fs::symlink(&real, &alias).unwrap();
+                let root = alias.join("worktree");
+                app.sessions.clear();
+                app.plans.clear();
+                app.watch(ctx, Some(&root));
+                assert!(app.watched.lock().unwrap().is_empty(), "a failed watch must remain pending");
+                std::fs::create_dir(&root).unwrap();
+                app.watch(ctx, Some(&root));
+                assert_eq!(*app.watched.lock().unwrap(), [(root.clone(), std::fs::canonicalize(&root).unwrap())]);
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    std::fs::write(root.join("changed.txt"), "changed").unwrap();
+                    if let Ok(changed) = app.watch_rx.recv_timeout(Duration::from_millis(100)) {
+                        assert_eq!(changed, root, "events must retain the application's worktree path");
+                        break;
+                    }
+                    assert!(Instant::now() < deadline, "no event for symlinked worktree");
+                }
+                app.watch(ctx, None);
+                assert!(app.watched.lock().unwrap().is_empty());
+            },
+        );
+    }
+
+    #[test]
+    fn dispatch_from_visible_board_returns_to_fleet_and_preserves_docked_chief() {
+        with_app("app::tests::dispatch_from_visible_board_returns_to_fleet_and_preserves_docked_chief", |app, ctx| {
+            let (dir, repo) = repository();
+            app.config.worktree_path = format!("{}/{{slug}}", dir.path().display());
+            app.config.agents.push(imacs_core::config::AgentConfig {
+                name: "fixture".into(),
+                command: vec!["/bin/cat".into()],
+                kind: AgentKind::Shell,
+                busy_text: None,
+            });
+            for dock in [ChiefDock::Floating, ChiefDock::Docked] {
+                request(
+                    app,
+                    json!({"cmd":"plan_set", "goal":format!("Board {dock:?}"), "tasks":[{"id":"a", "repo":repo, "agent":"fixture"}]}),
+                );
+                let index = app.selected_plan;
+                app.plans[index].approved = true;
+                app.plan_view = false;
+                app.panel = PanelMode::Plan;
+                app.diff_open = true;
+                app.chief_open = true;
+                app.store.chief_dock = Some(dock);
+                assert_eq!(app.dispatch(index, Some("a")).unwrap(), ["a"]);
+                assert!(app.plan_view && app.panel == PanelMode::Diff);
+                assert_eq!(app.chief_open, dock == ChiefDock::Docked);
+                assert!(!app.changed_plans.contains(&app.plans[index].id));
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !app.creating.is_empty() {
+                    assert!(Instant::now() < deadline);
+                    app.pump(ctx);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let session = app.plans[index].tasks[0].session.as_ref().unwrap();
+                assert_eq!(app.visible_sessions().iter().map(|&i| &app.sessions[i].id).collect::<Vec<_>>(), [session]);
+            }
+        });
+    }
+
+    #[test]
     fn startup_toast_lists_unreadable_plan_files_without_hiding_valid_plans() {
         with_app("app::tests::startup_toast_lists_unreadable_plan_files_without_hiding_valid_plans", |app, ctx| {
             request(app, json!({"cmd":"plan_set", "goal":"Valid", "tasks":[]}));
@@ -5779,6 +5858,103 @@ fi
     }
 
     #[test]
+    fn integration_checks_run_in_background_and_ignore_invalidated_results() {
+        let name = "app::tests::integration_checks_run_in_background_and_ignore_invalidated_results";
+        if std::env::var_os("IMACS_APP_TEST_CHILD").is_none() {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let real_git = crate::setup::resolve_program("git");
+            let real_git = format!("'{}'", real_git.replace('\'', "'\\''"));
+            let wrapper = dir.path().join("git");
+            std::fs::write(
+                &wrapper,
+                format!(
+                    r#"#!/bin/sh
+if [ "$5" = merge-base ]; then
+  : > "$HOME/started"
+  attempts=0
+  while [ ! -e "$HOME/release" ]; do
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt 1000 ] || exit 1
+    /bin/sleep 0.01
+  done
+fi
+exec {} "$@"
+"#,
+                    real_git
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let path = format!("{}:{}", dir.path().display(), std::env::var("PATH").unwrap());
+            let output = crate::test_support::output(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", name, "--nocapture"])
+                    .current_dir(dir.path())
+                    .env("IMACS_APP_TEST_CHILD", "1")
+                    .env("HOME", dir.path())
+                    .env("PATH", path)
+                    .env("SHELL", "/bin/sh")
+                    .env("IMACS_HOME", dir.path().join("state"))
+                    .env("IMACS_CONFIG", dir.path().join("config.toml"))
+                    .env("IMACS_SOCKET", dir.path().join("imacs.sock")),
+            );
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        with_app(name, |app, _| {
+            let (_dir, repo) = repository();
+            git::git(&repo, &["branch", "task-a"]).unwrap();
+            git::git(&repo, &["branch", "integration"]).unwrap();
+            request(
+                app,
+                json!({"cmd":"plan_set", "goal":"Background ancestry", "integration":"integration", "tasks":[
+                {"id":"a", "repo":repo, "branch":"task-a"}, {"id":"b", "repo":repo, "depends_on":["a"]}]}),
+            );
+            let index = app.selected_plan;
+            app.plans[index].approved = true;
+            app.plans[index].tasks[0].status = TaskStatus::Done;
+            app.plans[index].tasks[0].integrated = Some("integration".into());
+            app.refresh_integrations();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !paths::home().join("started").exists() {
+                assert!(Instant::now() < deadline, "background git did not start");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(app.plans[index].ready().is_empty());
+            assert_eq!(app.plan_json(index)["ready"], json!([]));
+            assert!(app.dispatch(index, Some("b")).is_err(), "dispatch must agree while git is blocked");
+            assert!(app.creating.is_empty());
+            let checked = app.plans[index].tasks[0].clone();
+            app.integration_dirty.store(true, Ordering::Relaxed);
+            app.refresh_integrations();
+            app.integration_check_tx
+                .send(CheckedIntegration {
+                    revision: app.integration_revision - 1,
+                    plan: app.plans[index].id.clone(),
+                    task: checked,
+                    into: "integration".into(),
+                    valid: true,
+                })
+                .unwrap();
+            app.refresh_integrations();
+            assert!(!app.plans[index].tasks[0].integration_verified, "a stale result must not restore readiness");
+            std::fs::write(paths::home().join("release"), "").unwrap();
+            while !app.plans[index].tasks[0].integration_verified {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+                app.refresh_integrations();
+            }
+            assert_eq!(app.plan_json(index)["ready"], json!(["b"]));
+        });
+    }
+
+    #[test]
     fn status_updates_clear_integration_and_dispatch_rejects_new_unmerged_commits() {
         with_app("app::tests::status_updates_clear_integration_and_dispatch_rejects_new_unmerged_commits", |app, _| {
             let (_dir, repo) = repository();
@@ -5815,6 +5991,12 @@ fi
             git::git(&repo, &["switch", "task-a"]).unwrap();
             git::git(&repo, &["commit", "--allow-empty", "-qm", "new work after integration"]).unwrap();
             assert!(app.dispatch(index, Some("b")).unwrap_err().contains("integrated dependencies"));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !app.integration_checks.is_empty() {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+                app.refresh_integrations();
+            }
             assert!(app.plans[index].tasks[0].integrated.is_none());
             assert!(app.creating.is_empty());
             let saved = Plan::load(&paths::imacs_home().join("plans").join(format!("{}.json", plan.as_str().unwrap())))
@@ -5824,7 +6006,14 @@ fi
             app.plans[index].tasks[0].integrated = Some("integration".into());
             // A missing requested task does not invalidate a genuinely integrated dependency.
             assert!(app.dispatch(index, Some("missing")).is_err());
+            assert!(app.plans[index].ready().is_empty());
+            while !app.integration_checks.is_empty() {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+                app.refresh_integrations();
+            }
             assert_eq!(app.plans[index].tasks[0].integrated.as_deref(), Some("integration"));
+            assert!(app.plans[index].ready().iter().any(|task| task.id == "b"));
         });
     }
 
@@ -6270,6 +6459,7 @@ fi
                                 app.plan_panel(ui, ui.max_rect());
                             }
                         });
+                        app.dialogs(ctx);
                     },
                 );
                 let text: Vec<_> = output
@@ -6319,21 +6509,41 @@ fi
                     assert!(!app.plans[two].approved);
                 }
             }
-            let text = frame(app, vec![]);
-            let archive = text.iter().find(|(t, _)| t == "Archive plan").unwrap().1;
-            frame(app, vec![egui::Event::PointerMoved(archive), button(archive, true)]);
-            frame(app, vec![button(archive, false)]);
-            assert_eq!(app.plans[two].status, PlanStatus::Archived);
-            assert_eq!(app.selected_plan, one);
-            let text = frame(app, vec![]);
-            assert!(!text.iter().any(|(t, _)| t.starts_with("● Beacon ·")));
-            app.toggle_plan();
-            let text = frame(app, vec![]);
-            let complete = text.iter().find(|(t, _)| t == "Complete plan").unwrap().1;
-            frame(app, vec![egui::Event::PointerMoved(complete), button(complete, true)]);
-            frame(app, vec![button(complete, false)]);
-            assert_eq!(app.plans[one].status, PlanStatus::Completed);
-            assert!(app.plans.iter().all(|p| !p.is_open()));
+            let mut click = |app: &mut App, label: &str| {
+                frame(app, vec![]);
+                let text = frame(app, vec![]);
+                let pos =
+                    text.iter().find(|(t, _)| t == label).unwrap_or_else(|| panic!("missing {label}: {text:?}")).1;
+                frame(app, vec![egui::Event::PointerMoved(pos), button(pos, true)]);
+                frame(app, vec![button(pos, false)]);
+            };
+            for (index, action, confirm, status, reopen) in [
+                (two, "Archive plan", "Confirm archive", PlanStatus::Archived, "Reopen Beacon (archived)"),
+                (one, "Complete plan", "Confirm complete", PlanStatus::Completed, "Reopen Atlas (completed)"),
+            ] {
+                app.selected_plan = index;
+                app.show_plan_fleet();
+                app.toggle_plan();
+                click(app, action);
+                assert_eq!(app.plans[index].status, PlanStatus::Open, "closing requires confirmation");
+                click(app, "Cancel");
+                assert!(app.confirm_plan_close.is_none());
+                assert_eq!(app.plans[index].status, PlanStatus::Open);
+                click(app, action);
+                click(app, confirm);
+                assert_eq!(app.plans[index].status, status);
+                click(app, "Closed plans");
+                click(app, reopen);
+                assert!(app.plans[index].is_open());
+                assert_eq!(app.selected_plan, index);
+                assert!(app.plan_view && app.panel == PanelMode::Plan);
+                let saved =
+                    Plan::load(&paths::imacs_home().join("plans").join(format!("{}.json", app.plans[index].id)))
+                        .unwrap();
+                assert_eq!(saved.status, PlanStatus::Open);
+                assert_eq!(saved.tasks, app.plans[index].tasks);
+                assert!(saved.approved);
+            }
             assert_eq!(app.sessions.len(), 2, "closing plans does not terminate their sessions");
         });
     }
