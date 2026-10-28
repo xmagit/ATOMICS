@@ -201,12 +201,12 @@ fn tools() -> Value {
         },
         {
             "name": "imacs_wait",
-            "description": "Block until an agent finishes a turn, needs input, or exits (or other `statuses`), then return those events with a `cursor`. Pass the cursor as `after` next time to only see newer events. Use this instead of polling. Plan-session events include plan and task ids; permission events also include the approval request. `sessions` empty means any; timeout_secs defaults to 120 (max 280).",
+            "description": "Block until an agent finishes a turn, needs input, or exits (or other `statuses`), then return those events with a `cursor`. Pass the cursor as `after` next time to only see newer events. Use this instead of polling. Heartbeat events contain fleet findings (an empty list means all good). Plan-session events include plan and task ids; permission events also include the approval request. `sessions` empty means any; timeout_secs defaults to 120 (max 280).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "sessions": { "type": "array", "items": { "type": "string" } },
-                    "statuses": { "type": "array", "items": { "type": "string", "enum": ["working", "turn done", "needs you", "idle", "exited"] } },
+                    "statuses": { "type": "array", "items": { "type": "string", "enum": ["working", "turn done", "needs you", "idle", "exited", "heartbeat"] } },
                     "after": { "type": "integer" },
                     "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 280 }
                 }
@@ -366,6 +366,20 @@ fn tool_error(message: String) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn wait_schema_accepts_heartbeat() {
+        let tools = super::tools();
+        let wait = tools.as_array().unwrap().iter().find(|t| t["name"] == "imacs_wait").unwrap();
+        assert!(
+            wait["inputSchema"]["properties"]["statuses"]["items"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("heartbeat"))
+        );
+        let request = super::request_for_tool("imacs_wait", serde_json::json!({"statuses":["heartbeat"]})).unwrap();
+        assert_eq!(serde_json::to_value(request).unwrap()["statuses"], serde_json::json!(["heartbeat"]));
+    }
+
     use super::*;
 
     fn example(schema: &Value, required_only: bool) -> Value {

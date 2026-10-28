@@ -31,6 +31,8 @@ use imacs_core::plan::{self, Plan, PlanStatus, Report, Task, TaskStatus, short_s
 use imacs_core::workspace::{self, Workspace};
 use serde_json::json;
 
+mod heartbeat;
+
 const TAB_HEIGHT: f32 = 30.0;
 const TILE_HEADER: f32 = 26.0;
 const WORKTREE_REFRESH: Duration = Duration::from_secs(30);
@@ -67,6 +69,7 @@ pub struct Session {
     pub last_prompt: Option<String>,
     pub last_message: Option<String>,
     hooks_active: bool,
+    activity: heartbeat::Activity,
     approvals: Vec<PendingApproval>,
     allowed: Vec<ApprovalRequest>,
     held: Vec<String>,
@@ -133,6 +136,7 @@ impl Session {
             last_prompt: None,
             last_message: None,
             hooks_active: false,
+            activity: heartbeat::Activity::default(),
             approvals: Vec::new(),
             allowed: Vec::new(),
             held: Vec::new(),
@@ -251,12 +255,19 @@ struct StatusEvent {
     /// Set for a `imacs_report` from the agent: (status, summary, task).
     report: Option<(String, String, Option<String>)>,
     approval: Option<ApprovalRequest>,
+    findings: Option<Vec<imacs_core::heartbeat::Finding>>,
 }
 
 impl StatusEvent {
     /// What `wait` matches on: the agent's status, or "reported".
     fn kind(&self) -> &str {
-        if self.report.is_some() { "reported" } else { self.status.label() }
+        if self.findings.is_some() {
+            "heartbeat"
+        } else if self.report.is_some() {
+            "reported"
+        } else {
+            self.status.label()
+        }
     }
 
     fn to_json(&self) -> serde_json::Value {
@@ -265,6 +276,9 @@ impl StatusEvent {
         value["task"] = json!(self.task);
         if let Some((status, summary, task)) = &self.report {
             value["report"] = json!({ "status": status, "summary": summary, "task": task });
+        }
+        if let Some(findings) = &self.findings {
+            value["findings"] = json!(findings);
         }
         if let Some(request) = &self.approval {
             value["approval"] = json!(request);
@@ -367,6 +381,7 @@ pub struct App {
     event_seq: u64,
     last_status: HashMap<String, AgentStatus>,
     waiters: Vec<Waiter>,
+    heartbeat: heartbeat::Heartbeat,
     plans: Vec<Plan>,
     selected_plan: usize,
     changed_plans: HashSet<String>,
@@ -523,6 +538,7 @@ impl App {
             event_seq: 0,
             last_status: HashMap::new(),
             waiters: Vec::new(),
+            heartbeat: heartbeat::Heartbeat::default(),
             plans,
             selected_plan,
             changed_plans: HashSet::new(),
@@ -2278,6 +2294,21 @@ impl App {
                                     .size(11.5),
                                 );
                             }
+                            if let Some((at, findings)) = &self.heartbeat.last {
+                                if !findings.is_empty() {
+                                    let (dot, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
+                                    ui.painter().circle_filled(dot.center(), 3.0, p.error);
+                                }
+                                let age = imacs_core::store::now().saturating_sub(*at);
+                                let age_text = match age {
+                                    0..60 => "now".into(),
+                                    60..3600 => format!("{}m", age / 60),
+                                    3600..86400 => format!("{}h", age / 3600),
+                                    _ => format!("{}d", age / 86400),
+                                };
+                                ui.ctx().request_repaint_after(Duration::from_secs(60 - age % 60));
+                                ui.label(RichText::new(format!("♥ {age_text}")).color(p.muted).size(11.5));
+                            }
                             match &self.voice {
                                 Voice::Recording(recorder) => {
                                     let secs = recorder.elapsed().as_secs();
@@ -2307,7 +2338,33 @@ impl App {
                         ui.close();
                     }
                 });
-                if response.on_hover_text(hover).clicked() {
+                if response
+                    .on_hover_ui(|ui| {
+                        ui.label(hover);
+                        if let Some((at, findings)) = &self.heartbeat.last {
+                            let timestamp = *at as libc::time_t;
+                            let mut local = std::mem::MaybeUninit::<libc::tm>::uninit();
+                            // SAFETY: both pointers are valid; a non-null result points to initialized local.
+                            let local = unsafe { libc::localtime_r(&timestamp, local.as_mut_ptr()).as_ref() };
+                            let time = local.map_or_else(
+                                || "unavailable".into(),
+                                |local| {
+                                    format!(
+                                        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                                        local.tm_year + 1900,
+                                        local.tm_mon + 1,
+                                        local.tm_mday,
+                                        local.tm_hour,
+                                        local.tm_min,
+                                        local.tm_sec
+                                    )
+                                },
+                            );
+                            ui.label(format!("Last heartbeat: {time} (local)\n{} findings", findings.len()));
+                        }
+                    })
+                    .clicked()
+                {
                     toggle = true;
                 }
             });
@@ -3007,7 +3064,11 @@ impl App {
     /// A sub-agent's `imacs_report`: attach it to its task, move the task along, and
     /// wake anyone waiting.
     fn report(&mut self, pane: Option<&str>, status: &str, summary: &str) -> Option<String> {
-        let session = pane.and_then(|p| self.sessions.iter().find(|s| s.id == p));
+        let found = pane.and_then(|p| self.sessions.iter().position(|s| s.id == p));
+        if let Some(found) = found {
+            self.sessions[found].activity.last_event = imacs_core::store::now();
+        }
+        let session = found.map(|found| &self.sessions[found]);
         let session_id = pane.unwrap_or_default().to_string();
         let title = session.map(|s| s.title.clone()).unwrap_or_else(|| "closed agent".into());
         let owner = self.plans.iter().enumerate().find_map(|(index, plan)| {
@@ -3039,6 +3100,7 @@ impl App {
             at: imacs_core::store::now(),
             report: Some((status.to_string(), summary.to_string(), task_id.clone())),
             approval: None,
+            findings: None,
         });
         self.serve_waiters();
         let what = task_id.as_deref().map(|t| format!("task {t}")).unwrap_or(title);
@@ -3054,6 +3116,7 @@ impl App {
                 continue;
             }
             let mut changed = false;
+            let plan_id = self.plans[index].id.clone();
             for task in &mut self.plans[index].tasks {
                 if task.status != TaskStatus::Running {
                     continue;
@@ -3065,6 +3128,12 @@ impl App {
                     None => false,
                 };
                 if gone {
+                    self.heartbeat.gone.push(imacs_core::heartbeat::Finding {
+                        plan: plan_id.clone(),
+                        task: task.id.clone(),
+                        session: task.session.clone(),
+                        kind: imacs_core::heartbeat::Kind::AgentGone,
+                    });
                     task.set_status(TaskStatus::Blocked);
                     task.notes.push("the agent exited before reporting".into());
                     changed = true;
@@ -3078,7 +3147,8 @@ impl App {
 
     /// Records status changes as events and answers waiters they satisfy.
     fn record_events(&mut self) {
-        for session in &self.sessions {
+        for session in &mut self.sessions {
+            session.activity.observe(session.status);
             if self.last_status.get(&session.id) != Some(&session.status) {
                 self.last_status.insert(session.id.clone(), session.status);
                 self.event_seq += 1;
@@ -3097,6 +3167,7 @@ impl App {
                     at: imacs_core::store::now(),
                     report: None,
                     approval: session.approvals.first().map(|pending| pending.request.clone()),
+                    findings: None,
                 });
             }
         }
@@ -3114,7 +3185,7 @@ impl App {
                 .events
                 .iter()
                 .filter(|e| e.seq > waiter.after)
-                .filter(|e| waiter.sessions.is_empty() || waiter.sessions.contains(&e.session))
+                .filter(|e| e.findings.is_some() || waiter.sessions.is_empty() || waiter.sessions.contains(&e.session))
                 .filter(|e| waiter.statuses.iter().any(|s| s == e.kind()))
                 .map(StatusEvent::to_json)
                 .collect();
@@ -3198,6 +3269,7 @@ impl App {
     fn deliver(&mut self, index: usize, text: &str) -> Delivery {
         let session = &mut self.sessions[index];
         if session.approval_hold || !session.approvals.is_empty() {
+            session.activity.held_since.get_or_insert_with(imacs_core::store::now);
             session.held.push(text.to_string());
             return Delivery::Held;
         }
@@ -3416,6 +3488,7 @@ impl App {
         self.verify_deliveries();
         self.record_events();
         self.sync_plan();
+        self.heartbeat();
         // Events wake waiters as they come in; this only times them out.
         if let Some(deadline) = self.waiters.iter().map(|w| w.deadline).min() {
             ctx.request_repaint_after(deadline.saturating_duration_since(Instant::now()));
@@ -3630,6 +3703,7 @@ impl App {
                     last_prompt: None,
                     last_message: None,
                     hooks_active: false,
+                    activity: heartbeat::Activity::default(),
                     approvals: Vec::new(),
                     allowed: Vec::new(),
                     held: Vec::new(),
@@ -3649,6 +3723,7 @@ impl App {
         let session = &mut self.sessions[index];
         session.claude_id = Some(event.session_id.clone());
         session.hooks_active = true;
+        session.activity.last_event = imacs_core::store::now();
         if event.name == "PermissionRequest" {
             let request = ApprovalRequest::from_event(&event);
             if (self.config.approvals.allows(&request, &session.root())
@@ -3687,6 +3762,7 @@ impl App {
             "Stop" => session.last_message = event.last_assistant_message.clone(),
             _ => {}
         }
+        session.activity.observe(session.status);
         let root = session.root();
         let (id, title) = (session.id.clone(), session.title.clone());
         if matches!(event.name.as_str(), "PostToolUse" | "Stop" | "UserPromptSubmit" | "CwdChanged")
@@ -3730,6 +3806,7 @@ impl App {
                 at: imacs_core::store::now(),
                 report: None,
                 approval: self.sessions[index].approvals.last().map(|pending| pending.request.clone()),
+                findings: None,
             });
             self.serve_waiters();
         }
@@ -3740,6 +3817,7 @@ impl App {
             && self.sessions[index].approvals.is_empty()
             && !self.sessions[index].held.is_empty()
         {
+            self.sessions[index].activity.held_since = None;
             let text = std::mem::take(&mut self.sessions[index].held).join("\n\n");
             self.deliver(index, &text);
         }
@@ -5793,7 +5871,7 @@ fn queue_note(pid: u32, running: &[Ticket], waiting: &[Ticket]) -> Option<String
 mod tests {
     use super::*;
 
-    fn session(id: &str, kind: AgentKind, status: AgentStatus, cwd: &Path) -> Session {
+    pub(super) fn session(id: &str, kind: AgentKind, status: AgentStatus, cwd: &Path) -> Session {
         Session {
             id: id.into(),
             agent: "test".into(),
@@ -5807,6 +5885,7 @@ mod tests {
             last_prompt: None,
             last_message: None,
             hooks_active: false,
+            activity: heartbeat::Activity::default(),
             approvals: Vec::new(),
             allowed: Vec::new(),
             held: Vec::new(),
@@ -5818,7 +5897,7 @@ mod tests {
         }
     }
 
-    fn with_app(name: &str, test: impl FnOnce(&mut App, &egui::Context)) {
+    pub(super) fn with_app(name: &str, test: impl FnOnce(&mut App, &egui::Context)) {
         if std::env::var_os("IMACS_APP_TEST_CHILD").is_none() {
             let dir = tempfile::tempdir().unwrap();
             let output = crate::test_support::output(

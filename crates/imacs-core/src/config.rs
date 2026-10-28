@@ -101,6 +101,7 @@ startup_keys = [":theme base16_transparent\r"]
 
 [chief]
 # The chief agent (cmd+o), floating or docked beside the agents.
+heartbeat_secs = 300         # fleet checks, delivered through imacs_wait
 dock = "floating"   # "floating" or "docked"
 command = ["claude"]
 args = ["--model", "claude-opus-5-5"]
@@ -183,6 +184,7 @@ can verify, dependencies, the agent (claude for design-heavy work, codex for wel
 Without a plan id, imacs_plan_set creates a separate plan. Keep its returned id and pass plan to every plan tool. \
 Ask the user to approve it on its own plan board. Never dispatch before approval.
 3. imacs_plan_dispatch, then loop on imacs_wait (never sleep or poll). On reported or turn done, read imacs_result and imacs_diff.
+Include heartbeat in imacs_wait statuses. On a heartbeat with no findings, post one short line; otherwise act on the findings.
 When an event contains approval, use imacs_approve with its session id to answer that request, regardless of the selected plan tab.
 4. Verify every acceptance check yourself: run the build and tests in the task's worktree and read the diff. When \
 something is missing, steer with imacs_comment + imacs_send_review or imacs_send and move the task back to running. Accept \
@@ -209,6 +211,7 @@ pub enum ChiefDock {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ChiefConfig {
+    pub heartbeat_secs: u64,
     pub dock: ChiefDock,
     pub command: Vec<String>,
     pub args: Vec<String>,
@@ -218,6 +221,7 @@ pub struct ChiefConfig {
 impl Default for ChiefConfig {
     fn default() -> Self {
         Self {
+            heartbeat_secs: 300,
             dock: ChiefDock::Floating,
             command: vec!["claude".into()],
             args: vec!["--model".into(), "claude-opus-5-5".into()],
@@ -633,6 +637,14 @@ mod tests {
         assert_eq!(config.layout.sidebar_width, LayoutConfig::default().sidebar_width);
         assert_eq!(config.font.size, 13.0);
         assert_eq!(config.terminal.scrollback, 5000);
+    }
+
+    #[test]
+    fn heartbeat_interval_defaults_and_parses() {
+        assert_eq!(Config::default().chief.heartbeat_secs, 300);
+        let config: Config = toml::from_str("[chief]\nheartbeat_secs = 7").unwrap();
+        assert_eq!(config.chief.heartbeat_secs, 7);
+        assert!(CHIEF_PROMPT.contains("On a heartbeat with no findings, post one short line"));
     }
 
     #[test]

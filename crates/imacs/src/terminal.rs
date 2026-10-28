@@ -205,25 +205,32 @@ impl Terminal {
 
     /// The visible screen as text, without trailing blank lines; the last `max_lines` of it.
     pub fn screen_text(&self, max_lines: usize) -> String {
-        let term = self.term.lock();
-        let grid = term.grid();
-        let mut lines: Vec<String> = (0..grid.screen_lines())
-            .map(|r| {
-                let row = &grid[Line(r as i32)];
-                let mut text: String = (0..grid.columns())
-                    .map(|c| &row[Column(c)])
-                    .filter(|cell| !cell.flags.contains(Flags::WIDE_CHAR_SPACER))
-                    .map(|cell| if cell.c == '\0' { ' ' } else { cell.c })
-                    .collect();
-                text.truncate(text.trim_end().len());
-                text
-            })
-            .collect();
-        while lines.last().is_some_and(|l| l.is_empty()) {
-            lines.pop();
+        self.screen_reader(max_lines)()
+    }
+
+    pub fn screen_reader(&self, max_lines: usize) -> impl FnOnce() -> String + Send + 'static {
+        let term = self.term.clone();
+        move || {
+            let term = term.lock();
+            let grid = term.grid();
+            let mut lines: Vec<String> = (0..grid.screen_lines())
+                .map(|r| {
+                    let row = &grid[Line(r as i32)];
+                    let mut text: String = (0..grid.columns())
+                        .map(|c| &row[Column(c)])
+                        .filter(|cell| !cell.flags.contains(Flags::WIDE_CHAR_SPACER))
+                        .map(|cell| if cell.c == '\0' { ' ' } else { cell.c })
+                        .collect();
+                    text.truncate(text.trim_end().len());
+                    text
+                })
+                .collect();
+            while lines.last().is_some_and(|l| l.is_empty()) {
+                lines.pop();
+            }
+            let skip = lines.len().saturating_sub(max_lines);
+            lines[skip..].join("\n")
         }
-        let skip = lines.len().saturating_sub(max_lines);
-        lines[skip..].join("\n")
     }
 
     pub fn shutdown(&self) {
@@ -621,6 +628,26 @@ impl Palette {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn screen_reader_defers_terminal_lock_to_worker() {
+        let ctx = egui::Context::default();
+        let palette = Arc::new(Palette::from_config(&imacs_core::config::ThemeConfig::default()));
+        let dir = tempfile::tempdir().unwrap();
+        let terminal =
+            Terminal::spawn(&ctx, palette, "/bin/cat".into(), vec![], dir.path(), HashMap::new(), 100).unwrap();
+        let guard = terminal.term.lock();
+        let read = terminal.screen_reader(3);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            tx.send(read()).unwrap();
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(20)).is_err());
+        drop(guard);
+        assert!(rx.recv_timeout(Duration::from_secs(2)).unwrap().is_empty());
+        worker.join().unwrap();
+        terminal.shutdown();
+    }
 
     #[test]
     fn keys_map_to_terminal_sequences() {
