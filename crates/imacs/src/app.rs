@@ -22,7 +22,9 @@ use crate::setup::{SHELL_PATH, env_var, global_hooks_installed, install_global_h
 use crate::terminal::{Metrics, Terminal};
 use crate::theme::{Palette, lerp, shortcut};
 use crate::voice::{MAX_RECORDING, Recorder};
+use imacs_core::approvals::{ApprovalRequest, Decision};
 use imacs_core::control::{ControlRequest, ControlResponse};
+use imacs_core::hook::HookReply;
 use imacs_core::plan::{Plan, Report, Task, TaskStatus, short_slug};
 use imacs_core::workspace::{self, Workspace};
 use serde_json::json;
@@ -62,11 +64,20 @@ pub struct Session {
     pub status: AgentStatus,
     pub last_prompt: Option<String>,
     pub last_message: Option<String>,
+    hooks_active: bool,
+    approvals: Vec<PendingApproval>,
+    allowed: Vec<ApprovalRequest>,
+    held: Vec<(String, bool)>,
     pub selected: bool,
     /// The chief agent stays outside the agent fleet.
     pub chief: bool,
     /// A message typed into the terminal that the agent has not visibly picked up yet.
     pending: Option<Pending>,
+}
+
+struct PendingApproval {
+    request: ApprovalRequest,
+    reply: Option<Arc<ipc::ApprovalReply>>,
 }
 
 struct Pending {
@@ -175,6 +186,7 @@ struct StatusEvent {
     at: u64,
     /// Set for a `imacs_report` from the agent: (status, summary, task).
     report: Option<(String, String, Option<String>)>,
+    approval: Option<ApprovalRequest>,
 }
 
 impl StatusEvent {
@@ -187,6 +199,9 @@ impl StatusEvent {
         let mut value = json!({ "seq": self.seq, "session": self.session, "title": self.title, "status": self.kind(), "at": self.at });
         if let Some((status, summary, task)) = &self.report {
             value["report"] = json!({ "status": status, "summary": summary, "task": task });
+        }
+        if let Some(request) = &self.approval {
+            value["approval"] = json!(request);
         }
         value
     }
@@ -325,13 +340,6 @@ impl App {
         };
         let ctx = cc.egui_ctx.clone();
         apply_style(&ctx, &config);
-
-        if let Ok(exe) = std::env::current_exe() {
-            let settings = imacs_core::hook::claude_settings(&exe);
-            let file = paths::hook_settings_file();
-            let _ = std::fs::create_dir_all(paths::imacs_home());
-            let _ = std::fs::write(&file, serde_json::to_vec_pretty(&settings).unwrap_or_default());
-        }
 
         let hub = Arc::new(Mutex::new(Hub::default()));
         let (hook_tx, hook_rx) = channel();
@@ -904,16 +912,11 @@ impl App {
         }
         let id = uuid::Uuid::new_v4().to_string();
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
-        let mut env: HashMap<String, String> = [
-            ("IMACS_PANE", id.clone()),
-            ("IMACS_SOCKET", paths::socket_path().to_string_lossy().into_owned()),
-            ("TERM", "xterm-256color".into()),
-            ("COLORTERM", "truecolor".into()),
-            ("TERM_PROGRAM", "imacs".into()),
-        ]
-        .into_iter()
-        .map(|(k, v)| (k.to_string(), v))
-        .collect();
+        let mut env: HashMap<String, String> =
+            [("TERM", "xterm-256color".into()), ("COLORTERM", "truecolor".into()), ("TERM_PROGRAM", "imacs".into())]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect();
         if let Some(path) = SHELL_PATH.as_ref() {
             env.insert("PATH".into(), path.clone());
         }
@@ -923,6 +926,14 @@ impl App {
             None => (shell, vec!["-l".to_string()]),
         };
         let mut claude_id = None;
+        let codex_hooks = agent.kind == AgentKind::Generic
+            && Path::new(&program).file_name().is_some_and(|name| name == "codex")
+            && std::process::Command::new(resolve_program(&program)).arg("--version").output().ok().is_some_and(
+                |output| {
+                    output.status.success()
+                        && imacs_core::hook::codex_supports_hooks(&String::from_utf8_lossy(&output.stdout))
+                },
+            );
         // Every agent IMACS starts can report back to the plan with `imacs_report`.
         let exe = std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| "imacs".into());
         let socket = paths::socket_path().to_string_lossy().into_owned();
@@ -961,6 +972,12 @@ impl App {
             }
             AgentKind::Generic if agent.command.first().is_some_and(|c| c.ends_with("codex")) => {
                 let quoted = |text: &str| serde_json::to_string(text).unwrap_or_default();
+                if codex_hooks {
+                    if !args.iter().any(|arg| arg == "--no-daemon") {
+                        args.push("--no-daemon".into());
+                    }
+                    args.extend(imacs_core::hook::codex_hook_args(Path::new(&exe), Path::new(&socket), &id));
+                }
                 args.extend([
                     "-c".to_string(),
                     format!("mcp_servers.imacs.command={}", quoted(&exe)),
@@ -980,7 +997,7 @@ impl App {
         }
         if agent.kind == AgentKind::Claude {
             args.push("--settings".into());
-            args.push(paths::hook_settings_file().to_string_lossy().into_owned());
+            args.push(imacs_core::hook::session_settings(Path::new(&exe), Path::new(&socket), &id, false).to_string());
             let session_id = match resume {
                 Some(id) => {
                     args.extend(["--resume".to_string(), id.clone()]);
@@ -1028,6 +1045,10 @@ impl App {
                     status: if agent.kind == AgentKind::Shell { AgentStatus::Idle } else { AgentStatus::Starting },
                     last_prompt: None,
                     last_message: None,
+                    hooks_active: false,
+                    approvals: Vec::new(),
+                    allowed: Vec::new(),
+                    held: Vec::new(),
                     selected: false,
                     chief,
                     pending: None,
@@ -1079,6 +1100,7 @@ impl App {
             "outside_imacs": s.terminal.is_none(),
             "claude_session_id": s.claude_id,
             "last_prompt": s.last_prompt,
+            "approval": s.approvals.first().map(|p| &p.request),
             "diff": stats,
         })
     }
@@ -1087,6 +1109,13 @@ impl App {
         let done = |response: ControlResponse| ControlOutcome::Done(response);
         let missing = |reference: &str| done(ControlResponse::error(format!("no session matches {reference:?}")));
         let outcome = match request {
+            ControlRequest::Approve { session, decision, message } => match self.find(&session) {
+                Some(index) => done(match self.approve(index, decision, message.as_deref()) {
+                    Ok(()) => ControlResponse::ok(json!({"answered": true})),
+                    Err(error) => ControlResponse::error(error),
+                }),
+                None => missing(&session),
+            },
             ControlRequest::List => {
                 let sessions: Vec<_> = (0..self.sessions.len()).map(|i| self.describe(i)).collect();
                 let (window, monitor) = ctx.input(|i| (i.content_rect().size(), i.viewport().monitor_size));
@@ -1303,6 +1332,15 @@ impl App {
             }
             ControlRequest::Send { session, text, raw } => match self.find(&session) {
                 None => missing(&session),
+                Some(index) if raw && self.sessions[index].terminal.is_none() => {
+                    done(ControlResponse::error("raw keys need a session running inside IMACS"))
+                }
+                Some(index) if !self.sessions[index].approvals.is_empty() => {
+                    self.sessions[index].held.push((text, raw));
+                    done(ControlResponse::ok(
+                        json!({ "sent": false, "held": true, "held_until": "permission answered" }),
+                    ))
+                }
                 Some(index) if raw => match &self.sessions[index].terminal {
                     Some(terminal) => {
                         terminal.write(unescape(&text).into_bytes());
@@ -1433,6 +1471,9 @@ impl App {
     fn verify_deliveries(&mut self) {
         let mut warnings = Vec::new();
         for session in &mut self.sessions {
+            if !session.approvals.is_empty() || !session.held.is_empty() {
+                continue;
+            }
             let (Some(pending), Some(terminal)) = (session.pending.as_mut(), session.terminal.as_ref()) else {
                 continue;
             };
@@ -2365,6 +2406,7 @@ impl App {
             status: session.map(|s| s.status).unwrap_or(AgentStatus::Idle),
             at: imacs_core::store::now(),
             report: Some((status.to_string(), summary.to_string(), task_id.clone())),
+            approval: None,
         });
         self.serve_waiters();
         let what = task_id.as_deref().map(|t| format!("task {t}")).unwrap_or(title);
@@ -2407,6 +2449,7 @@ impl App {
                     status: session.status,
                     at: imacs_core::store::now(),
                     report: None,
+                    approval: session.approvals.first().map(|pending| pending.request.clone()),
                 });
             }
         }
@@ -2454,7 +2497,7 @@ impl App {
         for session in &mut self.sessions {
             let Some(busy_text) = self.config.agent(&session.agent).and_then(|a| a.busy_text.clone()) else { continue };
             let Some(terminal) = &session.terminal else { continue };
-            if terminal.exited() || session.status == AgentStatus::NeedsInput {
+            if session.hooks_active || terminal.exited() || session.status == AgentStatus::NeedsInput {
                 continue;
             }
             let busy = terminal.screen_text(12).contains(&busy_text);
@@ -2507,6 +2550,10 @@ impl App {
     /// next hook of sessions running elsewhere.
     fn deliver(&mut self, index: usize, text: &str) -> bool {
         let session = &mut self.sessions[index];
+        if !session.approvals.is_empty() {
+            session.held.push((text.to_string(), false));
+            return true;
+        }
         if let Some(terminal) = &session.terminal {
             if terminal.exited() {
                 return false;
@@ -2840,9 +2887,17 @@ impl App {
         if self.dismissed.contains(&event.session_id) {
             return;
         }
-        let found =
-            message.pane.as_ref().and_then(|pane| self.sessions.iter().position(|s| &s.id == pane)).or_else(|| {
-                self.sessions.iter().position(|s| s.claude_id.as_deref() == Some(event.session_id.as_str()))
+        let found = message
+            .pane
+            .as_ref()
+            .and_then(|pane| self.sessions.iter().position(|s| &s.id == pane))
+            .or_else(|| self.sessions.iter().position(|s| s.claude_id.as_deref() == Some(event.session_id.as_str())))
+            .or_else(|| {
+                message.ancestors.iter().find_map(|pid| {
+                    self.sessions
+                        .iter()
+                        .position(|s| s.terminal.as_ref().is_some_and(|terminal| terminal.process_id() == *pid))
+                })
             });
         let index = match found {
             Some(index) => index,
@@ -2863,6 +2918,10 @@ impl App {
                     status: AgentStatus::Idle,
                     last_prompt: None,
                     last_message: None,
+                    hooks_active: false,
+                    approvals: Vec::new(),
+                    allowed: Vec::new(),
+                    held: Vec::new(),
                     selected: false,
                     chief: false,
                     pending: None,
@@ -2876,6 +2935,26 @@ impl App {
 
         let session = &mut self.sessions[index];
         session.claude_id = Some(event.session_id.clone());
+        session.hooks_active = true;
+        if event.name == "PermissionRequest" {
+            let request = ApprovalRequest::from_event(&event);
+            if (self.config.approvals.allows(&request, &session.root())
+                || session.allowed.iter().any(|allowed| allowed.same_command(&request)))
+                && message
+                    .approval_reply
+                    .as_ref()
+                    .is_some_and(|reply| reply.answer(HookReply { stdout: Some(Decision::Allow.output(None)) }))
+            {
+                return;
+            }
+            session.approvals.push(PendingApproval { request, reply: message.approval_reply });
+            self.last_status.remove(&session.id);
+        } else if event.name == "PostToolUse" {
+            let completed = ApprovalRequest::from_event(&event);
+            session.approvals.retain(|pending| !pending.request.same_command(&completed));
+        } else if matches!(event.name.as_str(), "Stop" | "SessionEnd" | "Interrupt" | "UserPromptSubmit") {
+            session.approvals.clear();
+        }
         if let Some(cwd) = &event.cwd
             && *cwd != session.cwd
         {
@@ -2884,7 +2963,7 @@ impl App {
             session.title = title_for(session.branch(), cwd);
         }
         if let Some(status) = event.status() {
-            session.status = status;
+            session.status = if session.approvals.is_empty() { status } else { AgentStatus::NeedsInput };
         }
         match event.name.as_str() {
             "UserPromptSubmit" => session.last_prompt = event.prompt.clone(),
@@ -2904,6 +2983,60 @@ impl App {
         if matches!(event.name.as_str(), "SessionStart" | "UserPromptSubmit" | "Stop") {
             self.remember(&id);
         }
+        if self.sessions[index].approvals.is_empty()
+            && matches!(event.name.as_str(), "PostToolUse" | "Stop" | "Interrupt" | "UserPromptSubmit")
+        {
+            let held = std::mem::take(&mut self.sessions[index].held);
+            for (text, raw) in held {
+                if raw {
+                    if let Some(terminal) = &self.sessions[index].terminal {
+                        terminal.write(unescape(&text).into_bytes());
+                    }
+                } else {
+                    self.deliver(index, &text);
+                }
+            }
+        }
+        if event.name == "PermissionRequest" {
+            self.last_status.insert(id.clone(), AgentStatus::NeedsInput);
+            self.event_seq += 1;
+            self.events.push(StatusEvent {
+                seq: self.event_seq,
+                session: id,
+                title,
+                status: AgentStatus::NeedsInput,
+                at: imacs_core::store::now(),
+                report: None,
+                approval: self.sessions[index].approvals.last().map(|pending| pending.request.clone()),
+            });
+            self.serve_waiters();
+        }
+    }
+
+    fn approve(&mut self, index: usize, decision: Decision, message: Option<&str>) -> Result<(), String> {
+        let session = &mut self.sessions[index];
+        let Some(pending) = session.approvals.first_mut() else { return Err("no pending permission request".into()) };
+        let reply = HookReply { stdout: Some(decision.output(message)) };
+        let answered = pending.reply.take().is_some_and(|sender| sender.answer(reply));
+        if !answered {
+            let Some(terminal) = &session.terminal else {
+                return Err("the permission hook has returned; answer in the agent terminal".into());
+            };
+            let Some(key) = imacs_core::approvals::menu_key(
+                &terminal.screen_text(60),
+                pending.request.command.as_deref(),
+                decision,
+            ) else {
+                return Err("the permission menu is not visible; retry or answer in the terminal".into());
+            };
+            terminal.write(key.into_bytes());
+        }
+        let pending = session.approvals.remove(0);
+        if decision == Decision::AllowAlways {
+            session.allowed.push(pending.request);
+        }
+        session.status = if session.approvals.is_empty() { AgentStatus::Working } else { AgentStatus::NeedsInput };
+        Ok(())
     }
 
     /// Watches the worktree of every agent and the one on screen, so their diffs follow
@@ -3630,7 +3763,7 @@ impl App {
             let session = &mut self.sessions[index];
 
             let header = tile.with_max_y(tile.top() + TILE_HEADER);
-            let body = tile.with_min_y(header.bottom());
+            let mut body = tile.with_min_y(header.bottom());
             ui.painter().rect_filled(header, 2.0, if active { lerp(p.raised, p.accent, 0.12) } else { p.raised });
             ui.painter().line_segment([header.left_bottom(), header.right_bottom()], Stroke::new(1.0, p.border));
             if active {
@@ -3685,6 +3818,21 @@ impl App {
             let edge = if active { p.accent.gamma_multiply(0.7) } else { p.border };
             ui.painter().rect_stroke(tile, 2.0, Stroke::new(1.0, edge), egui::StrokeKind::Outside);
 
+            if let Some(pending) = session.approvals.first() {
+                let request = &pending.request;
+                let banner = body.with_max_y((body.top() + 76.0).min(body.bottom()));
+                ui.painter().rect_filled(banner, 0.0, p.panel);
+                let mut child = ui
+                    .new_child(egui::UiBuilder::new().id_salt(("approval", &session.id)).max_rect(banner.shrink(6.0)));
+                let details = format!(
+                    "{}\n{}\n{}",
+                    request.command.as_deref().unwrap_or(&request.tool),
+                    request.cwd.display(),
+                    request.reason.as_deref().unwrap_or("Permission requested")
+                );
+                child.label(RichText::new(&details).color(p.warning).size(11.5)).on_hover_text(details);
+                body = body.with_min_y(banner.bottom());
+            }
             let term_id = ui.scope_id().with(("term", &session.id));
             match &mut session.terminal {
                 Some(terminal) => {
@@ -4661,6 +4809,7 @@ fn brief_file(session: &str, text: &str) -> Result<String, String> {
 const CHIEF_ALLOWED_TOOLS: &[&str] = &[
     "mcp__imacs__imacs_list",
     "mcp__imacs__imacs_wait",
+    "mcp__imacs__imacs_approve",
     "mcp__imacs__imacs_result",
     "mcp__imacs__imacs_read",
     "mcp__imacs__imacs_diff",
@@ -4692,6 +4841,10 @@ mod tests {
             status,
             last_prompt: None,
             last_message: None,
+            hooks_active: false,
+            approvals: Vec::new(),
+            allowed: Vec::new(),
+            held: Vec::new(),
             selected: false,
             chief: false,
             pending: None,
@@ -4730,10 +4883,183 @@ mod tests {
             &crate::load_icon(),
         );
         assert_eq!(app.toast.as_ref().unwrap().0, "Migration failed");
+        permission_hooks_wake_waiters_and_accept_decisions(&mut app, &ctx);
+        busy_text_is_only_a_fallback(&mut app, &ctx);
         close_idle_leaves_shells_alone(&mut app);
         voice_to_a_shell_stays_in_the_steer_bar(&mut app, &ctx);
         plan_set_resolves_cached_worktree_projects(&mut app);
         dispatch_requires_integrated_dependencies(&mut app);
+    }
+
+    fn permission_hooks_wake_waiters_and_accept_decisions(app: &mut App, ctx: &egui::Context) {
+        let dir = tempfile::tempdir().unwrap();
+        app.sessions = vec![session("codex", AgentKind::Generic, AgentStatus::Working, dir.path())];
+        let permission = |command: &str, reason: &str| {
+            let response = Arc::new(ipc::ApprovalReply::default());
+            (
+                HookMessage {
+                    pane: Some("codex".into()),
+                    ancestors: Vec::new(),
+                    event: imacs_core::hook::HookEvent::from_payload(&json!({
+                        "hook_event_name":"PermissionRequest", "session_id":"s1", "cwd":dir.path(),
+                        "tool_name":"Bash", "tool_input":{"command":command,"description":reason}
+                    }))
+                    .unwrap(),
+                    delivered: 0,
+                    approval_reply: Some(response.clone()),
+                },
+                response,
+            )
+        };
+        for decision in [Decision::Allow, Decision::Deny, Decision::AllowAlways] {
+            let (wait_tx, wait_rx) = channel();
+            app.control(
+                ctx,
+                ControlRequest::Wait {
+                    sessions: vec!["codex".into()],
+                    statuses: vec!["needs you".into()],
+                    after: Some(app.event_seq),
+                    timeout_secs: Some(30),
+                },
+                wait_tx,
+            );
+            assert!(wait_rx.try_recv().is_err());
+            let (hook, hook_rx) = permission("touch approval-file", "Create a file");
+            app.on_hook(hook);
+            assert_eq!(app.sessions[0].status, AgentStatus::NeedsInput);
+            assert!(app.sessions[0].hooks_active);
+            let ControlOutcome::Done(response) = wait_rx.recv().unwrap() else { panic!("wait response") };
+            assert_eq!(response.result["events"][0]["approval"]["command"], "touch approval-file");
+            assert_eq!(response.result["events"][0]["approval"]["reason"], "Create a file");
+            assert_eq!(response.result["events"][0]["approval"]["cwd"], json!(dir.path()));
+            let (tx, rx) = channel();
+            app.control(
+                ctx,
+                ControlRequest::Approve { session: "codex".into(), decision, message: Some("Reviewed".into()) },
+                tx,
+            );
+            assert!(matches!(rx.recv().unwrap(), ControlOutcome::Done(response) if response.ok));
+            let output: serde_json::Value =
+                serde_json::from_str(&hook_rx.wait(Duration::ZERO).stdout.unwrap()).unwrap();
+            assert_eq!(
+                output["hookSpecificOutput"]["decision"]["behavior"],
+                if decision == Decision::Deny { "deny" } else { "allow" }
+            );
+            assert!(app.sessions[0].approvals.is_empty());
+        }
+        let (hook, rx) = permission("touch approval-file", "A different reason");
+        app.on_hook(hook);
+        assert!(rx.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
+        assert!(app.sessions[0].approvals.is_empty());
+        let (hook, rx) = permission("cargo check", "Check code");
+        app.on_hook(hook);
+        assert!(rx.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
+        let (hook, rx) = permission("touch another-file", "Another request");
+        app.on_hook(hook);
+        assert!(rx.wait(Duration::ZERO).stdout.is_none());
+        assert!(app.approve(0, Decision::Allow, None).is_err());
+        assert_eq!(app.sessions[0].approvals.len(), 1);
+        let event = imacs_core::hook::HookEvent::from_payload(&json!({
+            "hook_event_name":"PostToolUse", "session_id":"s1", "cwd":dir.path(),
+            "tool_name":"Bash", "tool_input":{"command":"touch another-file"}
+        }))
+        .unwrap();
+        app.on_hook(HookMessage {
+            pane: Some("codex".into()),
+            ancestors: Vec::new(),
+            event,
+            delivered: 0,
+            approval_reply: None,
+        });
+        assert!(app.sessions[0].approvals.is_empty());
+        assert_eq!(app.sessions[0].status, AgentStatus::Working);
+        assert!(app.approve(0, Decision::Deny, None).is_err());
+        assert!(CHIEF_ALLOWED_TOOLS.contains(&"mcp__imacs__imacs_approve"));
+    }
+
+    fn busy_text_is_only_a_fallback(app: &mut App, ctx: &egui::Context) {
+        app.config.agents.push(imacs_core::config::AgentConfig {
+            name: "test".into(),
+            command: vec![],
+            kind: AgentKind::Generic,
+            busy_text: Some("esc to interrupt".into()),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let terminal = Terminal::spawn(
+            ctx,
+            app.palette.clone(),
+            "/bin/sh".into(),
+            vec!["-c".into(), "printf 'esc to interrupt'; sleep 10".into()],
+            dir.path(),
+            HashMap::new(),
+            100,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !terminal.screen_text(12).contains("esc to interrupt") {
+            assert!(Instant::now() < deadline, "terminal did not produce busy text");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let process_id = terminal.process_id();
+        app.sessions = vec![
+            session("fallback", AgentKind::Generic, AgentStatus::Idle, dir.path()),
+            session("same-cwd", AgentKind::Generic, AgentStatus::Idle, dir.path()),
+        ];
+        app.sessions[0].terminal = Some(terminal);
+        app.busy_checked = Instant::now() - Duration::from_secs(1);
+        app.track_busy();
+        assert_eq!(app.sessions[0].status, AgentStatus::Working);
+        let event = imacs_core::hook::HookEvent::from_payload(&json!({
+            "hook_event_name":"SessionStart", "session_id":"mapped-codex-session", "cwd":dir.path(),
+        }))
+        .unwrap();
+        app.on_hook(HookMessage { pane: None, ancestors: vec![process_id], event, delivered: 0, approval_reply: None });
+        assert_eq!(app.sessions.len(), 2);
+        assert_eq!(app.sessions[0].claude_id.as_deref(), Some("mapped-codex-session"));
+        assert_eq!(app.sessions[1].claude_id.as_deref(), Some("same-cwd"));
+        app.sessions[0].status = AgentStatus::Done;
+        app.busy_checked = Instant::now() - Duration::from_secs(1);
+        app.track_busy();
+        assert_eq!(app.sessions[0].status, AgentStatus::Done);
+        let event = imacs_core::hook::HookEvent::from_payload(&json!({
+            "hook_event_name":"PermissionRequest", "session_id":"mapped-codex-session", "cwd":dir.path(),
+            "tool_name":"Bash", "tool_input":{"command":"touch fixture", "description":"test"}
+        }))
+        .unwrap();
+        let response = Arc::new(ipc::ApprovalReply::default());
+        app.on_hook(HookMessage { pane: None, ancestors: vec![], event, delivered: 0, approval_reply: Some(response) });
+        assert_eq!(app.sessions.len(), 2);
+        assert_eq!(app.sessions[0].status, AgentStatus::NeedsInput);
+        let before = app.sessions[0].terminal.as_ref().unwrap().screen_text(12);
+        app.sessions[0].pending = Some(Pending {
+            text: "previous steering message".into(),
+            sent: Instant::now() - DELIVERY_TIMEOUT,
+            attempts: 1,
+            was_working: true,
+        });
+        app.verify_deliveries();
+        assert_eq!(app.sessions[0].pending.as_ref().unwrap().attempts, 1);
+        for (text, raw) in [("held steering message", false), ("y", true)] {
+            let (tx, rx) = channel();
+            app.control(ctx, ControlRequest::Send { session: "fallback".into(), text: text.into(), raw }, tx);
+            let ControlOutcome::Done(response) = rx.recv().unwrap() else { panic!("send response") };
+            assert_eq!(response.result["held"], true);
+            assert_eq!(response.result["sent"], false);
+        }
+        assert_eq!(app.sessions[0].held.len(), 2);
+        assert_eq!(app.sessions[0].terminal.as_ref().unwrap().screen_text(12), before);
+        app.approve(0, Decision::Allow, None).unwrap();
+        assert_eq!(app.sessions[0].held.len(), 2);
+        assert_eq!(app.sessions[0].terminal.as_ref().unwrap().screen_text(12), before);
+        let event = imacs_core::hook::HookEvent::from_payload(&json!({
+            "hook_event_name":"PostToolUse", "session_id":"mapped-codex-session", "cwd":dir.path(),
+            "tool_name":"Bash", "tool_input":{"command":"touch fixture"}
+        }))
+        .unwrap();
+        app.on_hook(HookMessage { pane: None, ancestors: vec![], event, delivered: 0, approval_reply: None });
+        assert!(app.sessions[0].held.is_empty());
+        assert_eq!(app.sessions[0].pending.as_ref().unwrap().text, "held steering message");
+        app.sessions.clear();
     }
 
     fn close_idle_leaves_shells_alone(app: &mut App) {

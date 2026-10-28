@@ -41,8 +41,13 @@ struct Cli {
 enum Command {
     /// Check required tools, configuration and integrations
     Doctor,
-    /// Hook handler run by Claude Code (reads the event on stdin)
-    Hook,
+    /// Hook handler for Claude Code and Codex (reads the event on stdin)
+    Hook {
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        #[arg(long)]
+        pane: Option<String>,
+    },
     /// Add IMACS's hooks to ~/.claude/settings.json so every Claude session reports to IMACS
     InstallHooks,
     /// Print the hook settings IMACS passes to the agents it starts
@@ -97,8 +102,8 @@ fn main() -> eframe::Result {
     }
     match cli.command {
         Some(Command::Doctor) => std::process::exit(doctor::run()),
-        Some(Command::Hook) => {
-            hook_client::run();
+        Some(Command::Hook { socket, pane }) => {
+            hook_client::run(socket, pane);
             return Ok(());
         }
         Some(Command::InstallHooks) => {

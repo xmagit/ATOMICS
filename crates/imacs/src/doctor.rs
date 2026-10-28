@@ -5,6 +5,8 @@ use imacs_core::{config::Config, paths};
 
 use crate::setup::{find_program, global_hooks_installed, legacy_hooks_installed, resolve_program};
 
+const CODEX_HOOK_TRUST_HINT: &str = "Codex 0.165+ hooks: review and trust IMACS hooks at first launch (or /hooks). This is a one-time step per install; changed hook definitions require review again. Repository hooks keep their own trust review.";
+
 pub fn run() -> i32 {
     let git_version = Command::new(resolve_program("git"))
         .arg("--version")
@@ -25,6 +27,8 @@ pub fn run() -> i32 {
         };
         println!("{}", check_line(found.is_some(), &label, "install it or add it to your login-shell PATH"));
     }
+
+    println!("ℹ {CODEX_HOOK_TRUST_HINT}");
 
     let config_path = paths::config_file();
     let config = Config::load(&config_path);
@@ -65,6 +69,13 @@ fn exit_code(git_ok: bool, config_ok: bool) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_guidance_explains_one_time_trust_without_bypassing_repository_review() {
+        assert!(CODEX_HOOK_TRUST_HINT.contains("one-time step per install"));
+        assert!(CODEX_HOOK_TRUST_HINT.contains("/hooks"));
+        assert!(CODEX_HOOK_TRUST_HINT.contains("Repository hooks keep their own trust review"));
+    }
 
     #[test]
     fn successful_check_omits_hint() {
