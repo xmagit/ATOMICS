@@ -70,7 +70,9 @@ impl App {
             }
         }
         let completed = self.plans.iter().any(|plan| plan.id == dialog.plan.id && plan.status == PlanStatus::Completed);
-        let roots: HashSet<_> = self.sessions.iter().map(Session::root).collect();
+        // Sessions resolve their worktree in the background, so compare real paths (/var is /private/var).
+        let real = |path: std::path::PathBuf| std::fs::canonicalize(&path).unwrap_or(path);
+        let roots: HashSet<_> = self.sessions.iter().map(|s| real(s.root())).collect();
         let mut open = true;
         let mut remove = false;
         let mut reload = false;
@@ -88,7 +90,7 @@ impl App {
                 }
                 egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
                     for (entry, selected) in &mut dialog.rows {
-                        let agent = entry.worktree.as_ref().is_some_and(|path| roots.contains(path));
+                        let agent = entry.worktree.clone().is_some_and(|path| roots.contains(&real(path)));
                         let reason = entry
                             .keep
                             .as_deref()

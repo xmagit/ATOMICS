@@ -46,7 +46,7 @@ fn populate(app: &mut App) {
         kind: AgentKind::Generic,
         busy_text: None,
     };
-    app.sessions = vec![Session::starting("existing-session".into(), &agent, app.launch_dir.clone(), false)];
+    app.sessions = vec![Session::starting("existing-session".into(), &agent, app.launch_dir.clone(), false, &app.ctx)];
     let tasks = TaskStatus::ALL
         .into_iter()
         .enumerate()
