@@ -15,6 +15,7 @@ serde_json = "1.0.154"
 shlex = "2.0.1"
 similar = "3.2.1"
 toml = "1.1.8"
+time = { version = "0.3.55", features = ["parsing"] }
 ureq = { version = "3.5.0", default-features = false, features = ["rustls"] }
 
 [dev-dependencies]

@@ -331,6 +331,7 @@ pub struct App {
     worker: DiffWorker,
     hub: Arc<Mutex<Hub>>,
     hook_rx: Receiver<HookMessage>,
+    usage: crate::usage::UsagePanel,
     control_rx: Receiver<ControlMessage>,
     hook_error: Option<String>,
     /// Machine-wide limits for the agents' heavy work.
@@ -428,8 +429,9 @@ impl App {
         let hub = Arc::new(Mutex::new(Hub::default()));
         let (hook_tx, hook_rx) = channel();
         let (control_tx, control_rx) = channel();
+        let (usage, usage_tx) = crate::usage::UsagePanel::new(ctx.clone());
         let governor = Arc::new(Governor::new(config.resources.clone(), Some(ctx.clone())));
-        let channels = Channels { hooks: hook_tx, control: control_tx, governor: governor.clone() };
+        let channels = Channels { hooks: hook_tx, control: control_tx, usage: usage_tx, governor: governor.clone() };
         let hook_error =
             ipc::serve(&paths::socket_path(), hub.clone(), channels, ctx.clone()).err().map(|e| format!("{e:#}"));
         // Only the instance that owns the socket owns the pool, so a second IMACS never replaces it.
@@ -492,6 +494,7 @@ impl App {
             worker: DiffWorker::new(ctx.clone()),
             hub,
             hook_rx,
+            usage,
             control_rx,
             hook_error,
             governor,
@@ -3163,6 +3166,7 @@ impl App {
 
     fn pump(&mut self, ctx: &egui::Context) {
         self.refresh_integrations();
+        self.usage.drain();
         for (agent, dir) in std::mem::take(&mut self.pending_open) {
             self.spawn(ctx, &agent, dir, None);
         }
@@ -3983,6 +3987,9 @@ impl App {
     fn sidebar(&mut self, ui: &mut egui::Ui) {
         let p = self.palette.clone();
         let files_root = self.diff_target();
+        section(ui, &p, "USAGE");
+        self.usage.show(ui, &p);
+        ui.separator();
         let total = ui.available_height();
         let sessions_height = if files_root.is_some() { (total * 0.46).max(150.0) } else { total };
         ui.add_space(6.0);
@@ -5567,6 +5574,7 @@ mod tests {
                     .args(["--exact", name, "--nocapture"])
                     .current_dir(dir.path())
                     .env("IMACS_APP_TEST_CHILD", "1")
+                    .env("CODEX_HOME", dir.path().join("codex"))
                     .env("HOME", dir.path())
                     .env("IMACS_HOME", dir.path().join("state"))
                     .env("IMACS_CONFIG", dir.path().join("config.toml"))
@@ -5628,6 +5636,8 @@ mod tests {
                 busy_text: None,
             });
             app.config.resources.agent_nice = 7;
+            // SAFETY: querying this process's priority has no preconditions.
+            let inherited_nice = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
             app.start(ctx, "probe", dir.path().into(), None, vec![], None).unwrap();
             let deadline = Instant::now() + Duration::from_secs(10);
             while !out.exists() {
@@ -5645,11 +5655,10 @@ mod tests {
             );
             let exe_dir = std::env::current_exe().unwrap().parent().unwrap().display().to_string();
             assert!(env.lines().any(|line| line.starts_with(&format!("PATH={exe_dir}:"))), "{env}");
-            // SAFETY: querying the current process priority has no preconditions.
-            let inherited_nice = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
-            let actual_nice: i32 =
-                std::fs::read_to_string(dir.path().join("probe.nice")).unwrap().trim().parse().unwrap();
-            assert_eq!(actual_nice, (inherited_nice + 7).min(19));
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("probe.nice")).unwrap().trim(),
+                (inherited_nice + 7).min(19).to_string()
+            );
             app.sessions.clear();
         });
     }

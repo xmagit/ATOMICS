@@ -1,0 +1,11 @@
+Sanitized samples supplied by the chief for the usage task.
+
+claude-statusline.json: documented Claude statusLine stdin shape from
+https://code.claude.com/docs/en/statusline; not a captured live Claude report.
+
+codex-token-count-weekly-only.json: rate_limits from a real Codex 0.165
+token_count event. The account reports its weekly window as primary, with
+secondary null; no session window is reported.
+
+codex-token-count-5h-and-weekly.json: derived from that event, with an added
+300-minute window to exercise both windows. This variant is synthetic.
