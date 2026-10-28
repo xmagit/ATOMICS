@@ -8,11 +8,12 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
-use cox_core::diff::{FileStatus, LineKind, WorktreeDiff};
+use cox_core::diff::{DiffLine, FileStatus, LineKind, SplitRow, WorktreeDiff, split_rows};
 use cox_core::files::{self, Dir};
+use cox_core::layout::DiffSplit;
 use cox_core::steer::ReviewComment;
 use egui::text::{LayoutJob, TextFormat};
-use egui::{Color32, FontId, Key, Rect, RichText, Sense, Stroke, pos2, vec2};
+use egui::{Color32, FontId, Key, Pos2, Rect, RichText, Sense, Stroke, pos2, vec2};
 
 use crate::highlight::{Highlighter, Spans};
 use crate::theme::{Palette, lerp};
@@ -158,6 +159,9 @@ pub struct DiffState {
     pub comments: Vec<ReviewComment>,
     editor: Option<Editor>,
     scroll_to: Option<f32>,
+    /// The line at the top of the diff and whether it was side by side, to keep the place
+    /// when that changes.
+    top: Option<((usize, usize, usize), bool)>,
     /// A whole file shown instead of the diff.
     pub viewing: Option<String>,
     pub file: Option<Arc<FileView>>,
@@ -234,6 +238,8 @@ pub enum DiffAction {
         path: Option<String>,
         line: Option<u32>,
     },
+    /// Side by side (true) or unified, picked with the header toggle.
+    Split(bool),
 }
 
 const DEBOUNCE: Duration = Duration::from_millis(350);
@@ -305,15 +311,37 @@ enum Row {
     Binary,
     Hunk(usize, usize),
     Line(usize, usize, usize),
+    /// Side by side: the old and the new line of one hunk row.
+    Pair(usize, usize, SplitRow),
     Comment(usize),
     Editor,
     FileLine(usize),
+}
+
+impl Row {
+    /// The line a diff row shows: the new side of a pair, unless that is blank.
+    fn line(&self) -> Option<(usize, usize, usize)> {
+        match *self {
+            Row::Line(fi, hi, li) => Some((fi, hi, li)),
+            Row::Pair(fi, hi, pair) => pair.new.or(pair.old).map(|li| (fi, hi, li)),
+            _ => None,
+        }
+    }
+
+    fn shows(&self, (fi, hi, li): (usize, usize, usize)) -> bool {
+        match *self {
+            Row::Line(f, h, l) => (f, h, l) == (fi, hi, li),
+            Row::Pair(f, h, pair) => (f, h) == (fi, hi) && (pair.old == Some(li) || pair.new == Some(li)),
+            _ => false,
+        }
+    }
 }
 
 pub struct Header<'a> {
     pub title: &'a str,
     pub branch: Option<&'a str>,
     pub can_send: bool,
+    pub split: DiffSplit,
 }
 
 pub fn show(
@@ -325,6 +353,7 @@ pub fn show(
     font: &FontId,
 ) -> DiffAction {
     let mut action = DiffAction::None;
+    let mut split = header.split.split(rect.width());
     ui.painter().rect_filled(rect, 0.0, palette.background);
     let mut panel = ui.new_child(egui::UiBuilder::new().id_salt("diff-panel").max_rect(rect.shrink2(vec2(10.0, 6.0))));
     let ui = &mut panel;
@@ -430,6 +459,13 @@ pub fn show(
                 }
             }
         }
+        if ui
+            .toggle_value(&mut split, "split")
+            .on_hover_text("Old and new side by side until cox quits (diff_split in the config sets the default)")
+            .changed()
+        {
+            action = DiffAction::Split(split);
+        }
     });
     ui.add_space(4.0);
 
@@ -460,8 +496,9 @@ pub fn show(
         }
         for (hi, hunk) in file.hunks.iter().enumerate() {
             rows.push(Row::Hunk(fi, hi));
-            for (li, line) in hunk.lines.iter().enumerate() {
-                rows.push(Row::Line(fi, hi, li));
+            // A line's comments and the open editor go right under it.
+            let annotate = |rows: &mut Vec<Row>, li: usize| {
+                let line = &hunk.lines[li];
                 let key = match line.kind {
                     LineKind::Removed => line.old_no.map(|n| (file.path(), n, true)),
                     _ => line.new_no.map(|n| (file.path(), n, false)),
@@ -472,6 +509,19 @@ pub fn show(
                 if state.editor.as_ref().is_some_and(|e| e.anchor == Anchor::Diff(fi, hi, li)) {
                     rows.push(Row::Editor);
                 }
+            };
+            if split {
+                for pair in split_rows(&hunk.lines) {
+                    rows.push(Row::Pair(fi, hi, pair));
+                    for li in pair.old.into_iter().chain(pair.new.filter(|&new| pair.old != Some(new))) {
+                        annotate(&mut rows, li);
+                    }
+                }
+            } else {
+                for li in 0..hunk.lines.len() {
+                    rows.push(Row::Line(fi, hi, li));
+                    annotate(&mut rows, li);
+                }
             }
         }
     }
@@ -479,11 +529,30 @@ pub fn show(
     let char_w = ui.fonts_mut(|f| f.glyph_width(font, '0'));
     let row_h = ui.fonts_mut(|f| f.row_height(font)) + 3.0;
     let gutter = char_w * 13.0;
-    let content_w = (gutter + char_w * (prepared.longest_line as f32 + 2.0)).max(ui.available_width());
+    let code_w = char_w * (prepared.longest_line as f32 + 2.0);
+    // Side by side, the line numbers stay put and the code of both halves scrolls together.
+    let view = ui.available_rect_before_wrap();
+    let mid = view.left() + (view.width() / 2.0).floor();
+    let side_gutter = char_w * 8.0;
+    let content_w = if split {
+        view.width() + (side_gutter + code_w - (mid - view.left())).max(0.0)
+    } else {
+        (gutter + code_w).max(view.width())
+    };
+    let head_x = if split { side_gutter } else { gutter };
+    let number = |n: Option<u32>| n.map(|n| format!("{n:>5}")).unwrap_or_default();
+    let spans = |fi: usize, hi: usize, li: usize| -> &[(std::ops::Range<usize>, Color32)] {
+        prepared.highlights.get(fi).and_then(|h| h.get(hi)).and_then(|h| h.get(li)).map(Vec::as_slice).unwrap_or(&[])
+    };
 
     let mut scroll = egui::ScrollArea::both().id_salt(("diff-rows", header.title)).auto_shrink([false, false]);
-    if let Some(file) = state.scroll_to.take() {
-        let row = file_rows.get(file as usize).copied().unwrap_or(0);
+    let jump = match state.scroll_to.take() {
+        Some(file) => Some(file_rows.get(file as usize).copied().unwrap_or(0)),
+        None => {
+            state.top.filter(|&(_, was)| was != split).and_then(|(line, _)| rows.iter().position(|r| r.shows(line)))
+        }
+    };
+    if let Some(row) = jump {
         scroll = scroll.vertical_scroll_offset(row as f32 * row_h);
     }
     let mut clicked_line: Option<(usize, usize, usize)> = None;
@@ -494,11 +563,19 @@ pub fn show(
     let mut cancel_editor = false;
 
     ui.spacing_mut().item_spacing.y = 0.0;
-    scroll.show_rows(ui, row_h, rows.len(), |ui, range| {
+    let shown = scroll.show_rows(ui, row_h, rows.len(), |ui, range| {
+        let top = rows[range.clone()].iter().find_map(Row::line);
         for row in &rows[range] {
             let (rect, response) = ui.allocate_exact_size(vec2(content_w, row_h), Sense::click());
             let painter = ui.painter();
             let text_pos = |x: f32| pos2(rect.left() + x, rect.top() + 1.5);
+            let side = |right: bool| {
+                if right {
+                    rect.with_min_x(mid).with_max_x(view.right())
+                } else {
+                    rect.with_min_x(view.left()).with_max_x(mid)
+                }
+            };
             match *row {
                 Row::File(fi) => {
                     let file = &diff.files[fi];
@@ -539,7 +616,7 @@ pub fn show(
                 }
                 Row::Binary => {
                     painter.text(
-                        text_pos(gutter),
+                        text_pos(head_x),
                         egui::Align2::LEFT_TOP,
                         "binary or large file",
                         font.clone(),
@@ -550,7 +627,7 @@ pub fn show(
                     let header = &diff.files[fi].hunks[hi].header;
                     painter.rect_filled(rect, 0.0, lerp(palette.background, palette.accent, 0.07));
                     painter.text(
-                        text_pos(gutter),
+                        text_pos(head_x),
                         egui::Align2::LEFT_TOP,
                         header,
                         font.clone(),
@@ -559,25 +636,9 @@ pub fn show(
                 }
                 Row::Line(fi, hi, li) => {
                     let line = &diff.files[fi].hunks[hi].lines[li];
-                    let (bg, emphasis, sign) = match line.kind {
-                        LineKind::Added => (palette.added, palette.added_emphasis, "+"),
-                        LineKind::Removed => (palette.removed, palette.removed_emphasis, "-"),
-                        _ => (palette.background, palette.background, " "),
-                    };
-                    if bg != palette.background {
-                        painter.rect_filled(rect, 0.0, bg);
-                    }
-                    if response.hovered() {
-                        painter.rect_filled(rect, 0.0, Color32::from_white_alpha(8));
-                        painter.text(
-                            text_pos(char_w * 11.0),
-                            egui::Align2::LEFT_TOP,
-                            "💬",
-                            font.clone(),
-                            palette.accent,
-                        );
-                    }
-                    let number = |n: Option<u32>| n.map(|n| format!("{n:>5}")).unwrap_or_default();
+                    let code_x = rect.left() + gutter;
+                    let hovered = response.hovered();
+                    paint_line(painter, rect, code_x, 0.0, char_w, line, spans(fi, hi, li), hovered, font, palette);
                     painter.text(
                         text_pos(0.0),
                         egui::Align2::LEFT_TOP,
@@ -592,49 +653,77 @@ pub fn show(
                         font.clone(),
                         palette.muted,
                     );
-                    if !response.hovered() {
-                        painter.text(
-                            text_pos(char_w * 11.5),
-                            egui::Align2::LEFT_TOP,
-                            sign,
-                            font.clone(),
-                            palette.muted,
-                        );
+                    if line.kind != LineKind::Note {
+                        if response.double_clicked() {
+                            edit_line = Some((diff.files[fi].path().to_string(), edit_target(line)));
+                        } else if response.clicked() {
+                            clicked_line = Some((fi, hi, li));
+                        }
                     }
-                    let spans = prepared.highlights.get(fi).and_then(|h| h.get(hi)).and_then(|h| h.get(li));
-                    let job = line_job(
-                        &line.text,
-                        spans.map(Vec::as_slice).unwrap_or(&[]),
-                        &line.emphasis,
-                        emphasis,
-                        font,
-                        palette,
-                    );
-                    let galley = ui.fonts_mut(|f| f.layout_job(job));
-                    ui.painter().galley(text_pos(gutter), galley, palette.foreground);
-                    if response.double_clicked() && line.kind != LineKind::Note {
-                        let target = if line.kind == LineKind::Removed { None } else { line.new_no };
-                        edit_line = Some((diff.files[fi].path().to_string(), target.or(line.old_no)));
-                    } else if response.clicked() && line.kind != LineKind::Note {
-                        clicked_line = Some((fi, hi, li));
+                }
+                Row::Pair(fi, hi, pair) => {
+                    let lines = &diff.files[fi].hunks[hi].lines;
+                    let shift = view.left() - rect.left();
+                    let hovered = response.hover_pos().map(|p| p.x >= mid);
+                    for (right, li) in [(false, pair.old), (true, pair.new)] {
+                        let cell = side(right);
+                        let Some(li) = li else {
+                            painter.rect_filled(cell, 0.0, palette.panel);
+                            continue;
+                        };
+                        let line = &lines[li];
+                        let code_x = cell.left() + side_gutter;
+                        let over = hovered == Some(right);
+                        paint_line(painter, cell, code_x, shift, char_w, line, spans(fi, hi, li), over, font, palette);
+                        let n = if right { line.new_no } else { line.old_no };
+                        let at = pos2(cell.left() + char_w * 0.5, rect.top() + 1.5);
+                        painter.text(at, egui::Align2::LEFT_TOP, number(n), font.clone(), palette.muted);
+                    }
+                    let clicked = response.interact_pointer_pos().map(|p| p.x >= mid);
+                    let target = clicked
+                        .and_then(|right| if right { pair.new } else { pair.old })
+                        .filter(|&li| lines[li].kind != LineKind::Note);
+                    if let Some(li) = target {
+                        if response.double_clicked() {
+                            edit_line = Some((diff.files[fi].path().to_string(), edit_target(&lines[li])));
+                        } else if response.clicked() {
+                            clicked_line = Some((fi, hi, li));
+                        }
                     }
                 }
                 Row::Comment(i) => {
-                    if comment_row(painter, rect, &response, gutter, char_w, &state.comments[i], font, palette) {
+                    let comment = &state.comments[i];
+                    let (cell, gutter) = if split { (side(!comment.removed), side_gutter) } else { (rect, gutter) };
+                    let over = |pos: Option<Pos2>| pos.is_some_and(|p| cell.x_range().contains(p.x));
+                    let hovered = over(response.hover_pos());
+                    comment_row(&painter.with_clip_rect(cell), cell, hovered, gutter, char_w, comment, font, palette);
+                    if response.clicked() && over(response.interact_pointer_pos()) {
                         delete = Some(i);
                     }
                 }
                 Row::Editor => {
                     if let Some(editor) = state.editor.as_mut() {
-                        let (commit, cancel) = editor_row(ui, rect, gutter, char_w, editor, font);
+                        let (cell, gutter) = match editor.anchor {
+                            Anchor::Diff(fi, hi, li) if split => {
+                                let removed = diff.files[fi].hunks[hi].lines[li].kind == LineKind::Removed;
+                                (side(!removed), side_gutter)
+                            }
+                            _ => (rect, gutter),
+                        };
+                        let (commit, cancel) = editor_row(ui, cell, gutter, char_w, editor, font);
                         commit_editor |= commit;
                         cancel_editor |= cancel;
                     }
                 }
                 Row::FileLine(_) => {}
             }
+            if split && matches!(row, Row::Pair(..) | Row::Comment(_) | Row::Editor) {
+                ui.painter().vline(mid, rect.y_range(), Stroke::new(1.0, palette.border));
+            }
         }
+        top
     });
+    state.top = shown.inner.map(|line| (line, split));
 
     if let Some(path) = toggle
         && !state.collapsed.remove(&path)
@@ -758,7 +847,9 @@ fn show_file(ui: &mut egui::Ui, state: &mut DiffState, path: &str, palette: &Pal
                         }
                     }
                     Row::Comment(i) => {
-                        if comment_row(painter, rect, &response, gutter, char_w, &state.comments[i], font, palette) {
+                        let comment = &state.comments[i];
+                        comment_row(painter, rect, response.hovered(), gutter, char_w, comment, font, palette);
+                        if response.clicked() {
                             delete = Some(i);
                         }
                     }
@@ -803,18 +894,18 @@ fn show_file(ui: &mut egui::Ui, state: &mut DiffState, path: &str, palette: &Pal
     None
 }
 
-/// Draws a pending comment under its line. Returns true when clicked (to delete it).
+/// Draws a pending comment under its line, with a × when hovered (a click deletes it).
 #[allow(clippy::too_many_arguments)]
 fn comment_row(
     painter: &egui::Painter,
     rect: Rect,
-    response: &egui::Response,
+    hovered: bool,
     gutter: f32,
     char_w: f32,
     comment: &ReviewComment,
     font: &FontId,
     palette: &Palette,
-) -> bool {
+) {
     let band = rect.with_min_x(rect.left() + gutter - char_w);
     painter.rect_filled(band, 3.0, lerp(palette.panel, palette.accent, 0.18));
     let text = format!("» {}", comment.body.replace('\n', " "));
@@ -825,11 +916,10 @@ fn comment_row(
         font.clone(),
         palette.foreground,
     );
-    if response.hovered() {
+    if hovered {
         let pos = pos2(rect.left() + gutter - char_w * 3.0, rect.top() + 1.5);
         painter.text(pos, egui::Align2::LEFT_TOP, "×", font.clone(), palette.error);
     }
-    response.clicked()
 }
 
 /// The inline comment input. Returns (commit, cancel).
@@ -1024,6 +1114,48 @@ fn status_badge(status: FileStatus, palette: &Palette) -> (&'static str, Color32
         FileStatus::Renamed => ("R", palette.warning),
         FileStatus::Modified => ("M", palette.info),
     }
+}
+
+/// Paints a diff line over `cell`: the background of its kind, the sign (💬 when hovered)
+/// left of `code_x`, and the highlighted code from `code_x`, scrolled left by `shift`
+/// and clipped to the code column.
+#[allow(clippy::too_many_arguments)]
+fn paint_line(
+    painter: &egui::Painter,
+    cell: Rect,
+    code_x: f32,
+    shift: f32,
+    char_w: f32,
+    line: &DiffLine,
+    spans: &[(std::ops::Range<usize>, Color32)],
+    hovered: bool,
+    font: &FontId,
+    palette: &Palette,
+) {
+    let (bg, emphasis, sign) = match line.kind {
+        LineKind::Added => (palette.added, palette.added_emphasis, "+"),
+        LineKind::Removed => (palette.removed, palette.removed_emphasis, "-"),
+        _ => (palette.background, palette.background, " "),
+    };
+    if bg != palette.background {
+        painter.rect_filled(cell, 0.0, bg);
+    }
+    let y = cell.top() + 1.5;
+    if hovered {
+        painter.rect_filled(cell, 0.0, Color32::from_white_alpha(8));
+        painter.text(pos2(code_x - char_w * 2.0, y), egui::Align2::LEFT_TOP, "💬", font.clone(), palette.accent);
+    } else {
+        painter.text(pos2(code_x - char_w * 1.5, y), egui::Align2::LEFT_TOP, sign, font.clone(), palette.muted);
+    }
+    let galley = painter.layout_job(line_job(&line.text, spans, &line.emphasis, emphasis, font, palette));
+    painter.with_clip_rect(cell.with_min_x(code_x - 1.0)).galley(pos2(code_x - shift, y), galley, palette.foreground);
+}
+
+/// Where double-clicking a line opens the editor: the line in the new version, or
+/// where a removed line used to be.
+fn edit_target(line: &DiffLine) -> Option<u32> {
+    let new = if line.kind == LineKind::Removed { None } else { line.new_no };
+    new.or(line.old_no)
 }
 
 /// Lays out one code line: syntax colors, plus a background on changed words.

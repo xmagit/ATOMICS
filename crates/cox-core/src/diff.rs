@@ -269,30 +269,55 @@ fn unquote(path: &str) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-/// Pairs each run of removed lines with the added lines that follow it and marks
-/// the changed words, so an edited line reads as an edit rather than a rewrite.
-pub fn emphasize(lines: &mut [DiffLine]) {
+/// One row of a hunk shown side by side: indices into its lines for the old (left)
+/// and the new (right) side. `None` is a blank cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SplitRow {
+    pub old: Option<usize>,
+    pub new: Option<usize>,
+}
+
+/// Lays a hunk out side by side: context on both sides, and each run of removed lines
+/// beside the added lines that follow it, paired in order. A `\ No newline` note stays
+/// on the side of the line it follows.
+pub fn split_rows(lines: &[DiffLine]) -> Vec<SplitRow> {
+    let mut rows = Vec::with_capacity(lines.len());
     let mut i = 0;
     while i < lines.len() {
-        if lines[i].kind != LineKind::Removed {
+        if matches!(lines[i].kind, LineKind::Context | LineKind::Note) {
+            rows.push(SplitRow { old: Some(i), new: Some(i) });
             i += 1;
             continue;
         }
-        let removed_start = i;
-        while i < lines.len() && lines[i].kind == LineKind::Removed {
-            i += 1;
+        let removed = run(lines, &mut i, LineKind::Removed);
+        let added = run(lines, &mut i, LineKind::Added);
+        for k in 0..removed.len().max(added.len()) {
+            rows.push(SplitRow { old: removed.clone().nth(k), new: added.clone().nth(k) });
         }
-        let added_start = i;
-        while i < lines.len() && lines[i].kind == LineKind::Added {
-            i += 1;
+    }
+    rows
+}
+
+/// Takes the lines of `kind` from `i` on, with the notes that follow them.
+fn run(lines: &[DiffLine], i: &mut usize, kind: LineKind) -> Range<usize> {
+    let start = *i;
+    while *i < lines.len() && (lines[*i].kind == kind || (*i > start && lines[*i].kind == LineKind::Note)) {
+        *i += 1;
+    }
+    start..*i
+}
+
+/// Marks the changed words of each removed line that `split_rows` pairs with an added
+/// line, so an edited line reads as an edit rather than a rewrite.
+pub fn emphasize(lines: &mut [DiffLine]) {
+    for row in split_rows(lines) {
+        let (Some(old), Some(new)) = (row.old, row.new) else { continue };
+        if lines[old].kind != LineKind::Removed || lines[new].kind != LineKind::Added {
+            continue;
         }
-        let pairs = (added_start - removed_start).min(i - added_start);
-        for k in 0..pairs {
-            let (old, new) = (removed_start + k, added_start + k);
-            if let Some((old_ranges, new_ranges)) = word_changes(&lines[old].text, &lines[new].text) {
-                lines[old].emphasis = old_ranges;
-                lines[new].emphasis = new_ranges;
-            }
+        if let Some((old_ranges, new_ranges)) = word_changes(&lines[old].text, &lines[new].text) {
+            lines[old].emphasis = old_ranges;
+            lines[new].emphasis = new_ranges;
         }
     }
 }
@@ -453,6 +478,88 @@ Binary files a/logo.png and b/logo.png differ
         assert_eq!(&removed.text[removed.emphasis[0].clone()], "1");
         assert_eq!(&added.text[added.emphasis[0].clone()], "2");
         assert!(lines[3].emphasis.is_empty());
+    }
+
+    /// Hunk lines from their unified-diff prefixes.
+    fn hunk(lines: &[&str]) -> Vec<DiffLine> {
+        lines
+            .iter()
+            .map(|line| {
+                let kind = match &line[..1] {
+                    "+" => LineKind::Added,
+                    "-" => LineKind::Removed,
+                    "\\" => LineKind::Note,
+                    _ => LineKind::Context,
+                };
+                DiffLine { kind, old_no: None, new_no: None, text: line[1..].to_string(), emphasis: Vec::new() }
+            })
+            .collect()
+    }
+
+    fn pairs(lines: &[&str]) -> Vec<(Option<usize>, Option<usize>)> {
+        split_rows(&hunk(lines)).into_iter().map(|row| (row.old, row.new)).collect()
+    }
+
+    #[test]
+    fn split_puts_pure_adds_on_the_right() {
+        assert_eq!(
+            pairs(&[" a", "+b", "+c", " d"]),
+            [(Some(0), Some(0)), (None, Some(1)), (None, Some(2)), (Some(3), Some(3))]
+        );
+    }
+
+    #[test]
+    fn split_puts_pure_removes_on_the_left() {
+        assert_eq!(pairs(&[" a", "-b", "-c"]), [(Some(0), Some(0)), (Some(1), None), (Some(2), None)]);
+    }
+
+    #[test]
+    fn split_pairs_edits_in_order() {
+        assert_eq!(pairs(&["-a", "-b", "+A", "+B"]), [(Some(0), Some(2)), (Some(1), Some(3))]);
+    }
+
+    #[test]
+    fn split_pads_uneven_runs_in_mixed_hunks() {
+        let lines = [" a", "-b", "-c", "-d", "+B", " e", "+f", "-g", "+G", "+h", " i"];
+        assert_eq!(
+            pairs(&lines),
+            [
+                (Some(0), Some(0)),
+                (Some(1), Some(4)),
+                (Some(2), None),
+                (Some(3), None),
+                (Some(5), Some(5)),
+                (None, Some(6)),
+                (Some(7), Some(8)),
+                (None, Some(9)),
+                (Some(10), Some(10)),
+            ]
+        );
+    }
+
+    #[test]
+    fn split_keeps_no_newline_notes_on_their_side() {
+        let edit = ["-a", "\\ No newline at end of file", "+b", "\\ No newline at end of file"];
+        assert_eq!(pairs(&edit), [(Some(0), Some(2)), (Some(1), Some(3))]);
+        let append = [" a", "-b", "\\ No newline at end of file", "+b", "+c"];
+        assert_eq!(pairs(&append), [(Some(0), Some(0)), (Some(1), Some(3)), (Some(2), Some(4))]);
+        let both = [" a", "\\ No newline at end of file"];
+        assert_eq!(pairs(&both), [(Some(0), Some(0)), (Some(1), Some(1))]);
+    }
+
+    #[test]
+    fn emphasis_follows_split_pairs() {
+        let mut lines = hunk(&["-x = 1;", "-gone", "+x = 2;", "+y = 3;"]);
+        emphasize(&mut lines);
+        assert_eq!(&lines[0].text[lines[0].emphasis[0].clone()], "1");
+        assert_eq!(&lines[2].text[lines[2].emphasis[0].clone()], "2");
+        // "gone" is paired with "y = 3;", too different to mark words in.
+        assert!(lines[1].emphasis.is_empty() && lines[3].emphasis.is_empty());
+
+        let mut last_line =
+            hunk(&["-x = 1;", "\\ No newline at end of file", "+x = 2;", "\\ No newline at end of file"]);
+        emphasize(&mut last_line);
+        assert_eq!(&last_line[2].text[last_line[2].emphasis[0].clone()], "2");
     }
 
     #[test]
