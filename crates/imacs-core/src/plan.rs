@@ -9,6 +9,10 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Plan {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub status: PlanStatus,
     pub goal: String,
     /// The project (main checkout) the plan works on; its view shows the plan.
     #[serde(default)]
@@ -16,9 +20,90 @@ pub struct Plan {
     pub tasks: Vec<Task>,
     /// Set by the user on the board. Nothing is dispatched before.
     pub approved: bool,
-    /// Branch the tasks are merged into; `imacs/plan-<goal>` when unset.
+    /// Branch the tasks are merged into; `imacs/plan-<plan-id>` when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub integration: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PlanStatus {
+    #[default]
+    Open,
+    Completed,
+    Archived,
+}
+
+/// Load valid plan files, including completed and archived plans, and migrate the
+/// former single plan once. File names are the stable ids, including older archives.
+pub fn load_plans(home: &Path) -> Result<Vec<Plan>> {
+    let dir = home.join("plans");
+    std::fs::create_dir_all(&dir)?;
+    let legacy = home.join("plan.json");
+    if legacy.exists() && !home.join("plan.json.migrated").exists() {
+        if let Some(mut plan) = Plan::load(&legacy) {
+            plan.integration = Some(plan.integration_branch());
+            plan.id = unique_id(&plan.goal, &[], home);
+            plan.status = PlanStatus::Open;
+            plan.save_in(home)?;
+        }
+        std::fs::rename(&legacy, home.join("plan.json.migrated"))?;
+    }
+    let mut plans = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.extension().is_some_and(|ext| ext == "json")
+            && let Some(id) = path.file_stem().and_then(|s| s.to_str())
+            && valid_id(id)
+            && let Ok(text) = std::fs::read_to_string(&path)
+            && let Ok(value) = serde_json::from_str::<serde_json::Value>(&text)
+        {
+            let archived = value.get("status").is_none();
+            if let Ok(mut plan) = serde_json::from_value::<Plan>(value) {
+                plan.id = id.to_string();
+                if archived {
+                    plan.status = PlanStatus::Archived;
+                }
+                plans.push(plan);
+            }
+        }
+    }
+    plans.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(plans)
+}
+
+fn valid_id(id: &str) -> bool {
+    !id.is_empty() && Path::new(id).file_name().and_then(|s| s.to_str()) == Some(id)
+}
+
+pub fn unique_id(goal: &str, plans: &[Plan], home: &Path) -> String {
+    let slug = short_slug(goal);
+    let slug = if slug.is_empty() { "plan" } else { &slug };
+    let mut id = slug.to_string();
+    let mut suffix = 2;
+    while plans.iter().any(|p| p.id == id) || home.join("plans").join(format!("{id}.json")).exists() {
+        id = format!("{slug}-{suffix}");
+        suffix += 1;
+    }
+    id
+}
+
+/// Mutating tools may omit the id only when exactly one plan is open.
+pub fn resolve_plan(plans: &[Plan], id: Option<&str>) -> Result<usize, String> {
+    let open: Vec<_> = plans.iter().enumerate().filter(|(_, p)| p.is_open()).collect();
+    if let Some(id) = id {
+        if let Some((index, _)) = open.iter().find(|(_, p)| p.id == id) {
+            return Ok(*index);
+        }
+    } else if let [(index, _)] = open.as_slice() {
+        return Ok(*index);
+    }
+    let names = open.iter().map(|(_, p)| format!("{} ({})", p.id, p.goal)).collect::<Vec<_>>().join(", ");
+    Err(format!(
+        "{} Open plans: {}",
+        if id.is_some() { "Unknown open plan." } else { "Pass a plan id." },
+        if names.is_empty() { "none" } else { &names }
+    ))
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +172,34 @@ impl TaskStatus {
 pub const REVIEW_TASK: &str = "review";
 
 impl Plan {
+    pub fn is_open(&self) -> bool {
+        !self.id.is_empty() && self.status == PlanStatus::Open
+    }
+
+    pub fn save_in(&self, home: &Path) -> Result<()> {
+        anyhow::ensure!(valid_id(&self.id), "invalid plan id");
+        self.save(&home.join("plans").join(format!("{}.json", self.id)))
+    }
+
+    pub fn summary(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id, "goal": self.goal, "done": self.count(TaskStatus::Done),
+            "total": self.tasks.len(), "approved": self.approved,
+            "waiting": self.tasks.iter().filter(|t| matches!(t.status, TaskStatus::Blocked | TaskStatus::Review))
+                .map(|t| &t.id).collect::<Vec<_>>()
+        })
+    }
+
+    pub fn attention(&self) -> &'static str {
+        if self.count(TaskStatus::Blocked) + self.count(TaskStatus::Review) > 0 || !self.approved {
+            "needs you"
+        } else if !self.tasks.is_empty() && self.count(TaskStatus::Done) == self.tasks.len() {
+            "all done"
+        } else {
+            "working"
+        }
+    }
+
     pub fn contains_session(&self, id: &str) -> bool {
         self.tasks.iter().any(|task| task.session.as_deref() == Some(id))
     }
@@ -103,8 +216,8 @@ impl Plan {
         Ok(())
     }
 
-    /// Replaces the plan, keeping progress of tasks that keep their id. A new plan
-    /// needs approval again.
+    /// Updates the plan, keeping progress of tasks that keep their id. The user
+    /// approves the updated plan again.
     pub fn replace(&mut self, goal: String, mut tasks: Vec<Task>) {
         for (i, task) in tasks.iter_mut().enumerate() {
             if task.id.trim().is_empty() {
@@ -122,10 +235,6 @@ impl Plan {
                     task.branch = old.branch.clone().or(task.branch.take());
                 }
             }
-        }
-        if goal != self.goal {
-            // A new goal is a new plan, with an integration branch of its own.
-            self.integration = None;
         }
         self.goal = goal;
         self.tasks = tasks;
@@ -170,7 +279,7 @@ impl Plan {
     pub fn integration_branch(&self) -> String {
         match &self.integration {
             Some(branch) => branch.clone(),
-            None => match short_slug(&self.goal) {
+            None => match if self.id.is_empty() { short_slug(&self.goal) } else { self.id.clone() } {
                 slug if slug.is_empty() => "imacs/plan".into(),
                 slug => format!("imacs/plan-{slug}"),
             },
@@ -275,6 +384,134 @@ mod tests {
     }
 
     #[test]
+    fn migrates_once_without_overwriting_existing_or_archived_plans() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut old = Plan::default();
+        old.replace("Ship it".into(), vec![task("a", &[])]);
+        old.approved = true;
+        old.tasks[0].session = Some("legacy-agent".into());
+        old.save(&dir.path().join("plan.json")).unwrap();
+        let archive = Plan { id: "ship-it".into(), status: PlanStatus::Archived, ..old.clone() };
+        archive.save_in(dir.path()).unwrap();
+        let plans = load_plans(dir.path()).unwrap();
+        assert_eq!(plans.len(), 2);
+        let migrated = plans.iter().find(|p| p.is_open()).unwrap();
+        assert_eq!(migrated.id, "ship-it-2");
+        assert!(migrated.approved);
+        assert_eq!(migrated.integration_branch(), old.integration_branch());
+        assert_eq!(migrated.tasks[0].session.as_deref(), Some("legacy-agent"));
+        assert_eq!(plans.iter().find(|p| p.id == "ship-it").unwrap(), &archive);
+        assert!(!dir.path().join("plan.json").exists());
+        assert!(dir.path().join("plan.json.migrated").exists());
+        assert_eq!(load_plans(dir.path()).unwrap(), plans);
+    }
+
+    #[test]
+    fn older_archives_without_status_load_but_do_not_get_open_tabs() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("plans");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("imacs-v0.3.json"), r#"{"goal":"Old plan", "tasks":[], "approved":true}"#).unwrap();
+        let plans = load_plans(dir.path()).unwrap();
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].id, "imacs-v0.3");
+        assert_eq!(plans[0].status, PlanStatus::Archived);
+        assert!(!plans[0].is_open());
+        plans[0].save_in(dir.path()).unwrap();
+        assert_eq!(load_plans(dir.path()).unwrap(), plans);
+    }
+
+    #[test]
+    fn storage_keeps_plans_independent_and_ignores_unparseable_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut plans = Vec::new();
+        for goal in ["API", "API", "UI"] {
+            let mut plan = Plan { id: unique_id(goal, &plans, dir.path()), ..Plan::default() };
+            plan.replace(goal.into(), vec![task("a", &[])]);
+            plan.save_in(dir.path()).unwrap();
+            plans.push(plan);
+        }
+        assert_eq!(plans.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["api", "api-2", "ui"]);
+        assert_ne!(plans[0].integration_branch(), plans[1].integration_branch());
+        plans[0].approved = true;
+        plans[0].tasks[0].status = TaskStatus::Done;
+        plans[0].save_in(dir.path()).unwrap();
+        plans[1].status = PlanStatus::Completed;
+        plans[1].save_in(dir.path()).unwrap();
+        std::fs::write(dir.path().join("plans/broken.json"), "{no").unwrap();
+        std::fs::write(dir.path().join("plans/note.txt"), "irrelevant").unwrap();
+        let loaded = load_plans(dir.path()).unwrap();
+        assert_eq!(loaded, plans);
+        assert_eq!(loaded.iter().filter(|p| p.is_open()).count(), 2);
+        assert!(loaded[0].approved);
+        assert!(!loaded[2].approved);
+        assert_eq!(loaded[2].tasks[0].status, TaskStatus::Planned);
+        let unsafe_plan = Plan { id: "../escape".into(), ..Plan::default() };
+        assert!(unsafe_plan.save_in(dir.path()).is_err());
+    }
+
+    #[test]
+    fn selection_requires_id_when_ambiguous_and_names_open_plans() {
+        let mut plans = vec![Plan { id: "one".into(), goal: "First goal".into(), ..Plan::default() }];
+        assert_eq!(resolve_plan(&plans, None), Ok(0));
+        plans.push(Plan { id: "two".into(), goal: "Second goal".into(), ..Plan::default() });
+        plans.push(Plan { id: "old".into(), status: PlanStatus::Archived, ..Plan::default() });
+        for id in [None, Some("missing"), Some("old")] {
+            let error = resolve_plan(&plans, id).unwrap_err();
+            assert!(error.contains("one (First goal)"));
+            assert!(error.contains("two (Second goal)"));
+            assert!(!error.contains("old ("));
+        }
+        assert_eq!(resolve_plan(&plans, Some("two")), Ok(1));
+    }
+
+    #[test]
+    fn summary_and_tab_attention_follow_only_this_plans_tasks() {
+        let mut plan = Plan { id: "one".into(), ..Plan::default() };
+        plan.replace("First".into(), vec![task("a", &[])]);
+        assert_eq!(plan.attention(), "needs you");
+        plan.approved = true;
+        assert_eq!(plan.attention(), "working");
+        plan.tasks[0].status = TaskStatus::Review;
+        assert_eq!(plan.attention(), "needs you");
+        assert_eq!(plan.summary()["waiting"], serde_json::json!(["a"]));
+        for task in &mut plan.tasks {
+            task.status = TaskStatus::Done;
+        }
+        assert_eq!(plan.attention(), "all done");
+        assert_eq!(plan.summary()["done"], 2);
+        assert_eq!(plan.summary()["total"], 2);
+    }
+
+    #[test]
+    fn rewording_goal_preserves_task_and_review_progress() {
+        let mut plan = Plan::default();
+        plan.replace("Old goal".into(), vec![task("a", &[])]);
+        plan.approved = true;
+        plan.integration = Some("existing-integration".into());
+        for task in &mut plan.tasks {
+            task.status = TaskStatus::Blocked;
+            task.session = Some("existing-agent".into());
+            task.branch = Some("existing-branch".into());
+            task.notes.push("existing note".into());
+            task.report = Some(Report { status: "blocked".into(), summary: "waiting".into(), at: 42 });
+            task.integrated = Some("existing-integration".into());
+        }
+        plan.replace("Reworded goal".into(), vec![task("a", &[]), task(REVIEW_TASK, &[])]);
+        assert_eq!(plan.goal, "Reworded goal");
+        assert!(!plan.approved);
+        assert_eq!(plan.integration.as_deref(), Some("existing-integration"));
+        for task in &plan.tasks {
+            assert_eq!(task.status, TaskStatus::Blocked);
+            assert_eq!(task.session.as_deref(), Some("existing-agent"));
+            assert_eq!(task.branch.as_deref(), Some("existing-branch"));
+            assert_eq!(task.notes, ["existing note"]);
+            assert_eq!(task.report, Some(Report { status: "blocked".into(), summary: "waiting".into(), at: 42 }));
+            assert_eq!(task.integrated.as_deref(), Some("existing-integration"));
+        }
+    }
+
+    #[test]
     fn fleet_includes_only_linked_sessions_in_any_task_state() {
         let plan = Plan {
             tasks: vec![
@@ -315,7 +552,7 @@ mod tests {
         plan.task_mut("a").unwrap().status = TaskStatus::Running;
         plan.task_mut("a").unwrap().session = Some("s1".into());
         plan.task_mut("a").unwrap().branch = Some("imacs/a-do-a".into());
-        plan.replace("v2".into(), vec![task("a", &[]), task("", &["zz"])]);
+        plan.replace("v1".into(), vec![task("a", &[]), task("", &["zz"])]);
         assert!(!plan.approved);
         assert_eq!(plan.tasks[0].status, TaskStatus::Running);
         assert_eq!(plan.tasks[0].session.as_deref(), Some("s1"));
@@ -340,7 +577,7 @@ mod tests {
     }
 
     #[test]
-    fn integration_branch_follows_the_goal() {
+    fn integration_branch_defaults_to_goal_and_preserves_explicit_override() {
         let mut plan = Plan::default();
         assert_eq!(plan.integration_branch(), "imacs/plan");
         plan.replace("IMACS v0.2: brand, CI".into(), vec![task("a", &[]), task("b", &["a"])]);
@@ -351,7 +588,7 @@ mod tests {
         plan.replace("IMACS v0.2: brand, CI".into(), vec![task("a", &[])]);
         assert_eq!(plan.integration_branch(), "feature/v0.2");
         plan.replace("Something else".into(), vec![task("a", &[])]);
-        assert_eq!(plan.integration_branch(), "imacs/plan-something-else");
+        assert_eq!(plan.integration_branch(), "feature/v0.2");
     }
 
     #[test]

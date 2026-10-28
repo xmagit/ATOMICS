@@ -1,8 +1,10 @@
 //! Git through the `git` CLI: exact porcelain semantics, and it picks up
 //! `core.fsmonitor`/`core.untrackedCache`, which matter on large repositories.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::{Context, Result, bail};
 
@@ -256,21 +258,37 @@ pub fn check_branch_name(repo: &Path, branch: &str, base_ref: &str) -> Result<()
 
 /// Creates `branch` from `base_ref` (or its fallback) in a new worktree at `path`.
 pub fn add_worktree(repo: &Path, path: &Path, branch: &str, base_ref: &str) -> Result<()> {
+    let lock = worktree_lock(repo)?;
+    let _turn = lock.lock().unwrap_or_else(|e| e.into_inner());
+    add_worktree_unlocked(repo, path, branch, base_ref)
+}
+
+fn worktree_lock(repo: &Path) -> Result<Arc<Mutex<()>>> {
+    static LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = LazyLock::new(Mutex::default);
+    let common = git(repo, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
+    let common = std::fs::canonicalize(common.trim())?;
+    let mut locks = LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    Ok(locks.entry(common).or_default().clone())
+}
+
+fn add_worktree_unlocked(repo: &Path, path: &Path, branch: &str, base_ref: &str) -> Result<()> {
     check_branch_name(repo, branch, base_ref)?;
     let base = resolve_base(repo, base_ref)?;
     let path_text = path.to_string_lossy();
-    git(repo, &["worktree", "add", "-b", branch, &path_text, &base]).map(|_| ())
+    git(repo, &["worktree", "add", "--no-track", "-b", branch, &path_text, &base]).map(|_| ())
 }
 
 /// Like `add_worktree`, but from `start` when given, which is created from
 /// `base_ref` first if it does not exist yet.
 pub fn add_worktree_from(repo: &Path, path: &Path, branch: &str, start: Option<&str>, base_ref: &str) -> Result<()> {
+    let lock = worktree_lock(repo)?;
+    let _turn = lock.lock().unwrap_or_else(|e| e.into_inner());
     match start {
         Some(start) => {
             ensure_branch(repo, start, base_ref)?;
-            add_worktree(repo, path, branch, start)
+            add_worktree_unlocked(repo, path, branch, start)
         }
-        None => add_worktree(repo, path, branch, base_ref),
+        None => add_worktree_unlocked(repo, path, branch, base_ref),
     }
 }
 
@@ -351,6 +369,8 @@ pub fn integrate(
     into_path: &Path,
     base_ref: &str,
 ) -> Result<Integration> {
+    let lock = worktree_lock(repo)?;
+    let _turn = lock.lock().unwrap_or_else(|e| e.into_inner());
     check_branch_name(repo, branch, base_ref)?;
     check_branch_name(repo, into, base_ref)?;
     if !branch_exists(repo, branch) {
@@ -428,6 +448,65 @@ pub(crate) mod tests {
         std::fs::create_dir(&repo).unwrap();
         init(&repo);
         (dir, repo)
+    }
+
+    #[test]
+    fn new_worktrees_never_track_the_remote_base() {
+        let (_dir, repo) = project();
+        git(&repo, &["remote", "add", "origin", "."]).unwrap();
+        git(&repo, &["fetch", "origin", "main"]).unwrap();
+        git(&repo, &["config", "branch.autoSetupMerge", "always"]).unwrap();
+        for (branch, start) in [("direct", None), ("from-base", None), ("dependent", Some("integration"))] {
+            let path = repo.with_file_name(branch);
+            if branch == "direct" {
+                add_worktree(&repo, &path, branch, "origin/main").unwrap();
+            } else {
+                add_worktree_from(&repo, &path, branch, start, "origin/main").unwrap();
+            }
+            assert!(git(&path, &["rev-parse", "--abbrev-ref", "@{upstream}"]).is_err(), "{branch}");
+        }
+    }
+
+    #[test]
+    fn worktree_creation_is_serialized_across_checkouts_of_one_repository() {
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+
+        let (_dir, repo) = project();
+        let linked = repo.with_file_name("linked");
+        add_worktree(&repo, &linked, "linked", "main").unwrap();
+        let lock = worktree_lock(&repo).unwrap();
+        assert!(Arc::ptr_eq(&lock, &worktree_lock(&linked).unwrap()));
+        let turn = lock.lock().unwrap();
+        let (ready_tx, ready_rx) = channel();
+        let (tx, rx) = channel();
+        std::thread::scope(|scope| {
+            for (index, checkout) in [&repo, &linked].into_iter().enumerate() {
+                let (tx, ready_tx) = (tx.clone(), ready_tx.clone());
+                let repo = &repo;
+                scope.spawn(move || {
+                    ready_tx.send(()).unwrap();
+                    let result = add_worktree_from(
+                        checkout,
+                        &repo.with_file_name(format!("task-{index}")),
+                        &format!("task-{index}"),
+                        Some("integration"),
+                        "main",
+                    );
+                    tx.send(result).unwrap();
+                });
+            }
+            ready_rx.recv().unwrap();
+            ready_rx.recv().unwrap();
+            assert!(rx.recv_timeout(Duration::from_millis(150)).is_err(), "creation must wait for its repository");
+            let (_other_dir, other) = project();
+            assert!(!Arc::ptr_eq(&lock, &worktree_lock(&other).unwrap()));
+            add_worktree(&other, &other.with_file_name("parallel"), "parallel", "main").unwrap();
+            drop(turn);
+            for _ in 0..2 {
+                rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+            }
+        });
     }
 
     #[test]

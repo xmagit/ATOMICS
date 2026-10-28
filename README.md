@@ -102,11 +102,16 @@ The chief may read, plan, review and run the plan you approved without asking. S
 terminals and closing sessions still ask for permission, so it cannot run shell commands or answer other agents'
 prompts behind your back.
 
-## Orchestration: a plan you approve, agents that report back
+## Orchestration: several plans you approve, agents that report back
 
 An orchestrator (a Claude session with the IMACS MCP server) turns a goal into a plan with `imacs_plan_set`: tasks with a
-brief, acceptance checks, dependencies, and which agent and model should do them. The plan appears on the **plan
-board** (`cmd+b`, or **Plan** in the top bar) in columns for planned, running, blocked, review and done. Edit briefs,
+brief, acceptance checks, dependencies, and which agent and model should do them. Without `plan`, this creates a new
+plan and returns its unique id; pass `plan: "<id>"` to update that plan and to get, update, dispatch or integrate its
+tasks. Rewording an existing plan’s goal preserves its task progress and integration branch.
+With several open plans, update/dispatch/integrate require the id and errors list the open plans.
+`imacs_plan_get` without `plan` lists open plans with their goal, done/total, approval and waiting tasks. Select a
+plan’s tab, then open its **plan board** with `cmd+b` or **Plan** in the top bar. It has columns for planned, running,
+blocked, review and done. Edit briefs,
 then **Approve plan**: nothing starts before that.
 
 `imacs_plan_dispatch` (or **Dispatch ready** on the board) gives each ready task its own worktree and an agent whose
@@ -114,7 +119,13 @@ first message is the brief. Every agent IMACS starts gets a `imacs_report` tool,
 blocked or has a question. Reports land on the task card, move done tasks to review, and wake the orchestrator's
 `imacs_wait`, which then reads `imacs_result` and `imacs_diff`, reviews, steers, and accepts with `imacs_plan_update`.
 
-Tasks come together on the plan's **integration branch** (`imacs/plan-<goal>` unless the plan names one; the board
+Plans are stored separately in `~/.imacs/plans/<id>.json`, with status `open`, `completed` or `archived`. The old
+`~/.imacs/plan.json` migrates once and is kept as `plan.json.migrated`. Only open plans get tabs. Select a tab to see
+that plan’s sessions; `cmd+b` opens its board. Other sessions remain under All and their project tabs. Each plan has
+its own approval and automatic final review. Start the next plan while another finishes; the chief is never closed.
+`imacs_wait` events include `plan` and `task` ids for sessions belonging to a task.
+
+Tasks come together on the plan's **integration branch** (`imacs/plan-<plan-id>` unless the plan names one; the board
 shows it). `imacs_plan_integrate` (or **integrate** on a review or done card) commits whatever the task left uncommitted
 on its branch (as `<title> (<id>)`, with the repository's own git identity; ignored files stay out) and merges the
 branch into the integration branch. The merge happens in a worktree of its own next to the repository, created on
@@ -123,7 +134,8 @@ task stays in review with a note listing the conflicted files. Tasks without dep
 tasks with dependencies branch from the integration branch, so integrate accepted tasks before dispatching the tasks
 that build on them.
 
-Dispatching tasks selects the **plan · done/total** fleet tab, showing only sessions linked to the plan's tasks as they
+Each open plan has a **short name · done/total** tab with a status dot (working, needs you, all done).
+Dispatching tasks selects that plan’s fleet tab, showing only sessions linked to the plan's tasks as they
 start. It returns from the board to the diff and minimizes a floating chief; a docked chief stays beside the fleet.
 Click the plan tab later to return to that overview, or choose All or a project tab to see other sessions.
 
