@@ -2,7 +2,9 @@
 
 use std::path::Path;
 
-use crate::{approvals::ApprovalPolicy, git, plan::Plan};
+use crate::approvals::ApprovalPolicy;
+#[cfg(feature = "native")]
+use crate::{git, plan::Plan};
 
 pub fn codex_checks(supports_hooks: bool) -> [String; 2] {
     [
@@ -42,6 +44,7 @@ pub fn approvals_check(policy: &ApprovalPolicy) -> String {
     )
 }
 
+#[cfg(feature = "native")]
 pub fn plans_check(home: &Path) -> Vec<String> {
     let dir = home.join("plans");
     let entries = match std::fs::read_dir(&dir) {
@@ -81,6 +84,7 @@ pub fn plans_check(home: &Path) -> Vec<String> {
     errors
 }
 
+#[cfg(feature = "native")]
 pub fn worktree_checks(repo: &Path, base_ref: &str) -> Vec<String> {
     match git::worktree_health(repo, base_ref) {
         Ok(health) => {
@@ -152,6 +156,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "native")]
     fn plan_checks_are_read_only_and_report_bad_json_and_unreadable_files() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -184,6 +189,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "native")]
     fn inaccessible_plans_directory_warns() {
         let home = tempfile::tempdir().unwrap();
         std::fs::write(home.path().join("plans"), "not a directory").unwrap();
@@ -195,6 +201,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "native")]
     fn only_merged_clean_worktrees_are_reported_for_cleanup() {
         let (dir, repo) = crate::git::tests::project();
         assert!(worktree_checks(&repo, "main")[0].starts_with('✓'));
@@ -220,6 +227,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "native")]
     fn worktree_scan_failure_warns_instead_of_claiming_no_cleanup_needed() {
         let dir = tempfile::tempdir().unwrap();
         let lines = worktree_checks(dir.path(), "main");

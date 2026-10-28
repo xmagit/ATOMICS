@@ -2,11 +2,15 @@
 //! its main checkout. A workspace is a named set of projects, saved as
 //! `~/.config/imacs/workspaces/<name>.toml`.
 
-use std::path::{Path, PathBuf};
+#[cfg(feature = "native")]
+use std::path::Path;
+use std::path::PathBuf;
 
+#[cfg(feature = "native")]
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "native")]
 use crate::{git, paths};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -16,12 +20,14 @@ pub struct Workspace {
     pub projects: Vec<PathBuf>,
 }
 
+#[cfg(feature = "native")]
 pub fn workspaces_dir() -> PathBuf {
     paths::config_file().parent().map(Path::to_path_buf).unwrap_or_else(paths::imacs_home).join("workspaces")
 }
 
 /// The project a folder belongs to: the main checkout of its repository, so a
 /// folder inside any worktree opens the same project.
+#[cfg(feature = "native")]
 pub fn project_root(dir: &Path) -> Result<PathBuf> {
     let worktree =
         git::worktree_of(dir).with_context(|| format!("{} is not inside a git repository", dir.display()))?;
@@ -29,6 +35,7 @@ pub fn project_root(dir: &Path) -> Result<PathBuf> {
     Ok(main.unwrap_or(worktree.root))
 }
 
+#[cfg(feature = "native")]
 impl Workspace {
     pub fn load(name: &str) -> Result<Workspace> {
         let file = workspaces_dir().join(format!("{}.toml", file_name(name)?));
@@ -66,6 +73,7 @@ impl Workspace {
     }
 }
 
+#[cfg(feature = "native")]
 fn file_name(name: &str) -> Result<String> {
     let clean = git::slug(name.trim());
     if clean.is_empty() {
@@ -74,7 +82,7 @@ fn file_name(name: &str) -> Result<String> {
     Ok(clean)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "native"))]
 mod tests {
     use super::*;
     use std::process::Command;
