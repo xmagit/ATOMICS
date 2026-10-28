@@ -4,6 +4,7 @@ use imacs_core::heartbeat::{self, Finding};
 pub(super) struct Activity {
     status: AgentStatus,
     pub status_since: u64,
+    pub working_since: Option<u64>,
     pub last_event: u64,
     pub held_since: Option<u64>,
 }
@@ -11,15 +12,26 @@ pub(super) struct Activity {
 impl Default for Activity {
     fn default() -> Self {
         let now = imacs_core::store::now();
-        Self { status: AgentStatus::Starting, status_since: now, last_event: now, held_since: None }
+        Self {
+            status: AgentStatus::Starting,
+            status_since: now,
+            working_since: None,
+            last_event: now,
+            held_since: None,
+        }
     }
 }
 
 impl Activity {
     pub fn observe(&mut self, status: AgentStatus) {
         if self.status != status {
-            self.status = status;
             self.status_since = imacs_core::store::now();
+            if status == AgentStatus::Working
+                && (self.working_since.is_none() || self.status != AgentStatus::NeedsInput)
+            {
+                self.working_since = Some(self.status_since);
+            }
+            self.status = status;
             self.last_event = self.status_since;
         }
     }
@@ -84,6 +96,7 @@ impl App {
                             s.status
                         },
                         status_since: s.activity.status_since,
+                        working_since: s.activity.working_since,
                         last_event: s.activity.last_event,
                         approval: !s.approvals.is_empty(),
                         held_since: s.activity.held_since,
@@ -137,6 +150,24 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
             app.heartbeat();
         }
+    }
+
+    #[test]
+    fn working_turn_start_survives_tools_approvals_and_idle_until_next_turn() {
+        let mut activity = Activity::default();
+        assert!(activity.working_since.is_none());
+        activity.observe(AgentStatus::Working);
+        assert_eq!(activity.working_since, Some(activity.status_since));
+        activity.working_since = Some(1);
+        for status in
+            [AgentStatus::Working, AgentStatus::NeedsInput, AgentStatus::Working, AgentStatus::Done, AgentStatus::Idle]
+        {
+            activity.observe(status);
+            assert_eq!(activity.working_since, Some(1));
+        }
+        activity.observe(AgentStatus::Working);
+        assert!(activity.working_since.unwrap() > 1);
+        assert_eq!(activity.working_since, Some(activity.status_since));
     }
 
     #[test]
