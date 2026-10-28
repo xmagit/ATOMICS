@@ -1,6 +1,20 @@
 use super::*;
 
 impl App {
+    pub(super) fn approval_poll_interval(&self) -> Option<Duration> {
+        if self.sessions.iter().any(|session| session.approval_hold || !session.approvals.is_empty()) {
+            Some(Duration::from_millis(400))
+        } else if self
+            .sessions
+            .iter()
+            .any(|session| session.status == AgentStatus::NeedsInput && session.terminal.is_some())
+        {
+            Some(NEEDS_INPUT_CHECK_INTERVAL)
+        } else {
+            None
+        }
+    }
+
     pub(super) fn release_held(&mut self, index: usize) {
         if !self.sessions[index].approval_hold
             && self.sessions[index].approvals.is_empty()
@@ -18,10 +32,14 @@ impl App {
             return;
         }
         self.approvals_checked = now;
+        let check_needs_input = now.duration_since(self.needs_input_checked) >= NEEDS_INPUT_CHECK_INTERVAL;
+        if check_needs_input {
+            self.needs_input_checked = now;
+        }
         for index in 0..self.sessions.len() {
             let session = &mut self.sessions[index];
             let pending = session.approval_hold || !session.approvals.is_empty();
-            if !pending && session.status != AgentStatus::NeedsInput {
+            if !pending && !(check_needs_input && session.status == AgentStatus::NeedsInput) {
                 continue;
             }
             let screen = session.terminal.as_ref().map(|terminal| terminal.screen_text(60)).unwrap_or_default();
@@ -272,6 +290,7 @@ mod tests {
                 app.sessions[0].status = AgentStatus::NeedsInput;
                 app.sessions[0].menu_absent_since = Some(Instant::now() - APPROVAL_MENU_GRACE);
                 app.approvals_checked = Instant::now() - APPROVAL_CHECK_INTERVAL;
+                app.needs_input_checked = Instant::now() - NEEDS_INPUT_CHECK_INTERVAL;
                 app.expire_approvals(Instant::now());
                 assert_eq!(app.sessions[0].status, AgentStatus::Working);
                 assert!(app.sessions[0].approvals.is_empty());
@@ -367,8 +386,8 @@ mod tests {
             assert_eq!(app.sessions[0].held, ["held while editing"]);
             let event = imacs_core::hook::HookEvent::from_payload(&json!({"hook_event_name":"PreToolUse", "session_id":"stale", "cwd":dir.path(), "tool_name":"Bash", "tool_input":{"command":"cat fixture"}})).unwrap();
             app.on_hook(HookMessage { pane: None, ancestors: vec![], event, delivered: 0, approval_reply: None });
-            assert!(app.sessions[0].approvals.is_empty());
-            assert_eq!(app.sessions[0].status, AgentStatus::Working);
+            assert_eq!(app.sessions[0].approvals.len(), 1, "an unrelated tool must leave the permission pending");
+            assert_eq!(app.sessions[0].status, AgentStatus::NeedsInput);
             assert!(app.sessions[0].approval_hold, "PreToolUse alone must not release input into a menu");
             assert_eq!(app.deliver(0, "still held"), Delivery::Held);
             app.approvals_checked = Instant::now() - APPROVAL_CHECK_INTERVAL;

@@ -14,16 +14,27 @@ text = b""
 paste = False
 sequence = b""
 enters = 0
+pastes = 0
+previous = "Please check the first change and then the second change"
+last_body = ""
 
 
 def screen(body):
-    sys.stdout.write("\x1b[2J\x1b[H\x1b[?2004h" + body)
+    global last_body
+    last_body = body
+    sys.stdout.write(
+        "\x1b[2J\x1b[H\x1b[?2004h" + body
+        + "\r\nPastes: " + str(pastes) + "\r\nEnters: " + str(enters)
+    )
     sys.stdout.flush()
 
 
 menu = "Would you like to run the following command?\r\n\r\n  $ touch fixture\r\n\r\n› 1. Yes, proceed (y)\r\n  2. No, and tell Codex what to do differently (esc)\r\nPress enter to confirm or esc to cancel"
 hidden = "Would you like to run the following command?\r\n\r\nReason: A long explanation of why access is needed\r\n  [… 9 lines] ⌃a view all\r\n\r\n› 1. Yes, proceed (y)\r\n  2. No, and tell Codex what to do differently (esc)\r\nPress enter to confirm or esc to cancel"
-screen(hidden if mode == "hidden" else "Working (esc to interrupt)\r\n› \r\n tab to queue")
+initial = "Working (esc to interrupt)\r\n› \r\n tab to queue"
+if mode == "repeat":
+    initial = "• " + previous + "\r\n" + initial
+screen(hidden if mode == "hidden" else initial)
 while True:
     char = os.read(sys.stdin.fileno(), 1)
     if not char:
@@ -37,13 +48,16 @@ while True:
     if sequence or char == b"\x1b":
         sequence += char
         if sequence == b"\x1b[200~":
+            pastes += 1
             paste = True
             text = b""
             sequence = b""
         elif sequence == b"\x1b[201~":
             paste = False
             sequence = b""
-            screen("Working (esc to interrupt)\r\n› " + text.decode() + "\r\n tab to queue")
+            composer = "[Pasted content]" if mode in ("long", "collapsed") else text.decode()
+            footer = "" if mode == "retry" else "\r\n tab to queue"
+            screen("Working (esc to interrupt)\r\n› " + composer + footer)
         continue
     if paste:
         text += char
@@ -53,7 +67,13 @@ while True:
             sys.exit(0)
         if mode == "retry" and enters > 1:
             screen("› " + text.decode() + "\r\nWorking (esc to interrupt)\r\n› ")
-        elif mode != "queue":
-            screen("Previous: " + text[:24].decode() + "\r\nTurn done\r\n› ")
-    elif char == b"\t" and mode == "queue":
-        screen("• " + text.decode() + "\r\nQueued\r\n› \r\n esc to interrupt")
+        elif mode == "long":
+            screen("Message accepted\r\nWorking (esc to interrupt)\r\n› ")
+        elif mode == "repeat":
+            screen(initial)
+        elif mode == "no-prompt":
+            screen("Message accepted\r\nWorking (esc to interrupt)")
+        screen(last_body)
+    elif char == b"\t" and mode in ("queue", "preview", "collapsed"):
+        preview = text[:24].decode() + "…" if mode == "preview" else text.decode()
+        screen("• " + preview + "\r\nQueued\r\n› \r\n esc to interrupt")

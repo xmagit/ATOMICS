@@ -92,12 +92,8 @@ impl App {
             self.finish_integration(integrated);
         }
         self.expire_approvals(Instant::now());
-        if self.sessions.iter().any(|session| {
-            session.approval_hold
-                || !session.approvals.is_empty()
-                || session.status == AgentStatus::NeedsInput && session.terminal.is_some()
-        }) {
-            ctx.request_repaint_after(Duration::from_millis(400));
+        if let Some(interval) = self.approval_poll_interval() {
+            ctx.request_repaint_after(interval);
         }
         while let Ok(message) = self.control_rx.try_recv() {
             self.control(ctx, message.request, message.reply);
@@ -399,11 +395,17 @@ impl App {
             session.approvals.push(PendingApproval { request, reply: message.approval_reply });
             self.last_status.remove(&session.id);
         } else if event.name == "PreToolUse" {
-            for pending in session.approvals.drain(..) {
-                if let Some(reply) = pending.reply {
-                    reply.answer(HookReply::default());
+            let running = ApprovalRequest::from_event(&event);
+            session.approvals.retain(|pending| {
+                if pending.request.same_command(&running) {
+                    if let Some(reply) = &pending.reply {
+                        reply.answer(HookReply::default());
+                    }
+                    false
+                } else {
+                    true
                 }
-            }
+            });
         } else if event.name == "PostToolUse" {
             let completed = ApprovalRequest::from_event(&event);
             session.approvals.retain(|pending| !pending.request.same_command(&completed));
@@ -569,8 +571,99 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{request, with_app};
+    use super::super::tests::{request, session, with_app};
     use super::*;
+
+    #[test]
+    fn needs_input_without_a_pending_menu_uses_slow_screen_checks() {
+        with_app("app::background::tests::needs_input_without_a_pending_menu_uses_slow_screen_checks", |app, ctx| {
+            let terminal = Terminal::spawn(
+                ctx,
+                app.palette.clone(),
+                "/bin/sh".into(),
+                vec!["-c".into(), "printf 'Working (esc to interrupt)'; exec sleep 30".into()],
+                &app.launch_dir,
+                HashMap::new(),
+                100,
+            )
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !terminal.screen_text(60).contains("esc to interrupt") {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            app.config.agents.push(imacs_core::config::AgentConfig {
+                name: "test".into(),
+                command: vec![],
+                kind: AgentKind::Generic,
+                busy_text: Some("esc to interrupt".into()),
+            });
+            app.sessions = vec![session("waiting", AgentKind::Generic, AgentStatus::NeedsInput, &app.launch_dir)];
+            app.sessions[0].terminal = Some(terminal);
+            let now = Instant::now();
+            app.approvals_checked = now - APPROVAL_CHECK_INTERVAL;
+            app.needs_input_checked = now;
+            assert_eq!(app.approval_poll_interval(), Some(NEEDS_INPUT_CHECK_INTERVAL));
+            app.expire_approvals(now);
+            assert!(app.sessions[0].menu_absent_since.is_none(), "a frame must not read an idle needs-input screen");
+            app.expire_approvals(now + NEEDS_INPUT_CHECK_INTERVAL);
+            assert!(
+                app.sessions[0].menu_absent_since.is_some(),
+                "the slow check still recovers missed lifecycle events"
+            );
+            app.sessions[0].approval_hold = true;
+            assert_eq!(app.approval_poll_interval(), Some(Duration::from_millis(400)));
+            app.expire_approvals(now + NEEDS_INPUT_CHECK_INTERVAL + APPROVAL_MENU_GRACE);
+            assert!(!app.sessions[0].approval_hold);
+            assert_eq!(app.sessions[0].status, AgentStatus::Working);
+            assert_eq!(app.approval_poll_interval(), None);
+            app.sessions.clear();
+        });
+    }
+
+    #[test]
+    fn pre_tool_use_retires_only_the_matching_approval() {
+        with_app("app::background::tests::pre_tool_use_retires_only_the_matching_approval", |app, _| {
+            app.sessions = vec![session("worker", AgentKind::Generic, AgentStatus::Working, &app.launch_dir)];
+            let hook = |name: &str, command: &str, tool: &str, cwd: &Path, reply| HookMessage {
+                pane: Some("worker".into()),
+                ancestors: vec![],
+                delivered: 0,
+                approval_reply: reply,
+                event: imacs_core::hook::HookEvent::from_payload(&json!({
+                    "hook_event_name":name, "session_id":"worker", "cwd":cwd,
+                    "tool_name":tool, "tool_input":{"command":command}
+                }))
+                .unwrap(),
+            };
+            let root = app.launch_dir.clone();
+            let matching = Arc::new(ipc::ApprovalReply::default());
+            let other = Arc::new(ipc::ApprovalReply::default());
+            for (command, reply) in [("touch first", matching.clone()), ("touch second", other.clone())] {
+                app.on_hook(hook("PermissionRequest", command, "Bash", &root, Some(reply)));
+            }
+            for (command, tool, cwd) in [
+                ("touch third", "Bash", root.clone()),
+                ("touch first", "Edit", root.clone()),
+                ("touch first", "Bash", root.join("elsewhere")),
+            ] {
+                app.on_hook(hook("PreToolUse", command, tool, &cwd, None));
+                assert_eq!(app.sessions[0].approvals.len(), 2);
+                assert!(!matching.expired() && !other.expired());
+                assert_eq!(app.sessions[0].status, AgentStatus::NeedsInput);
+            }
+            app.on_hook(hook("PreToolUse", "touch first", "Bash", &root, None));
+            assert_eq!(app.sessions[0].approvals.len(), 1);
+            assert_eq!(app.sessions[0].approvals[0].request.command.as_deref(), Some("touch second"));
+            assert!(!matching.answer(HookReply { stdout: Some("must already be answered".into()) }));
+            assert!(matching.wait(Duration::ZERO).stdout.is_none());
+            assert!(!other.expired(), "the other hook must still be waiting for its own decision");
+            assert_eq!(app.sessions[0].status, AgentStatus::NeedsInput);
+            app.approve(0, Decision::Deny, None).unwrap();
+            let output = other.wait(Duration::ZERO).stdout.unwrap();
+            assert!(output.contains("deny"));
+        });
+    }
 
     #[test]
     fn watcher_retries_missing_roots_and_receives_events_under_symlinked_parents() {
