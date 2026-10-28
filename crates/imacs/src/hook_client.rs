@@ -43,12 +43,20 @@ pub fn ancestors() -> Vec<u32> {
 }
 
 fn forward(request: &HookRequest, socket: std::path::PathBuf) -> Option<String> {
+    forward_with_wait_duration(request, socket, Duration::from_secs)
+}
+
+fn forward_with_wait_duration(
+    request: &HookRequest,
+    socket: std::path::PathBuf,
+    wait_duration: impl FnOnce(u64) -> Duration,
+) -> Option<String> {
     let stream = UnixStream::connect(socket).ok()?;
     stream.set_write_timeout(Some(Duration::from_secs(1))).ok()?;
     let permission =
         request.payload.get("hook_event_name").and_then(serde_json::Value::as_str) == Some("PermissionRequest");
     let timeout = if permission { imacs_core::hook::PERMISSION_WAIT_SECONDS + 10 } else { 12 };
-    stream.set_read_timeout(Some(Duration::from_secs(timeout))).ok()?;
+    stream.set_read_timeout(Some(wait_duration(timeout))).ok()?;
     let mut writer = &stream;
     writer.write_all(serde_json::to_string(request).ok()?.as_bytes()).ok()?;
     writer.write_all(b"\n").ok()?;
@@ -67,7 +75,8 @@ mod tests {
     use std::process::{Command, Stdio};
 
     #[test]
-    fn permission_forward_waits_for_a_review_longer_than_twelve_seconds() {
+    fn permission_forward_waits_beyond_the_ordinary_hook_timeout() {
+        let started = std::time::Instant::now();
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("permission.sock");
         let listener = UnixListener::bind(&socket).unwrap();
@@ -76,19 +85,50 @@ mod tests {
             stream.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
             let mut line = String::new();
             BufReader::new(&stream).read_line(&mut line).unwrap();
-            std::thread::sleep(Duration::from_secs(13));
+            std::thread::sleep(Duration::from_millis(65));
             let _ = stream.write_all(b"{\"stdout\":\"reviewed\"}\n");
         });
-        let reply = forward(
+        let reply = forward_with_wait_duration(
             &HookRequest {
                 pane: Some("review".into()),
                 ancestors: vec![],
                 payload: serde_json::json!({"hook_event_name":"PermissionRequest", "session_id":"review"}),
             },
             socket,
+            |seconds| Duration::from_millis(seconds * 5),
         );
         server.join().unwrap();
         assert_eq!(reply.as_deref(), Some("reviewed"));
+        assert!(started.elapsed() < Duration::from_secs(1), "scaled permission wait must stay fast");
+    }
+
+    #[test]
+    fn ordinary_hook_forward_expires_without_a_reply() {
+        let started = std::time::Instant::now();
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("ordinary.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).unwrap();
+            // EOF proves the client timed out and closed, rather than the server replying.
+            assert_eq!(stream.read(&mut [0]).unwrap(), 0);
+        });
+        let reply = forward_with_wait_duration(
+            &HookRequest {
+                pane: None,
+                ancestors: vec![],
+                payload: serde_json::json!({"hook_event_name":"PostToolUse", "session_id":"fixture"}),
+            },
+            socket,
+            |seconds| Duration::from_millis(seconds * 5),
+        );
+        assert!(reply.is_none());
+        server.join().unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(60));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

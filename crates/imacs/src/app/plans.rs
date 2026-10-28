@@ -159,6 +159,22 @@ impl App {
         value
     }
 
+    /// Mutation replies omit task briefs, reports and note history.
+    pub(super) fn plan_mutation_json(&self, index: usize, task: Option<&str>) -> serde_json::Value {
+        let plan = &self.plans[index];
+        json!({
+            "plan": plan.id,
+            "status": plan.status,
+            "task": task.and_then(|id| plan.tasks.iter().find(|t| t.id == id)).map(|t| json!({
+                "id": t.id,
+                "status": t.status,
+                "note": t.notes.last(),
+                "integrated": t.integrated,
+            })),
+            "ready": plan.ready().iter().map(|t| &t.id).collect::<Vec<_>>(),
+        })
+    }
+
     /// Starts `only`, or every ready task, each in a new worktree with its brief as
     /// the agent's first message.
     pub(super) fn dispatch(&mut self, index: usize, only: Option<&str>) -> Result<Vec<String>, String> {
@@ -703,6 +719,94 @@ mod tests {
             let (_, result, _) = app.worktree_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             result.unwrap();
         });
+    }
+
+    #[test]
+    fn plan_mutations_return_compact_replies_and_get_keeps_the_full_history() {
+        with_app(
+            "app::plans::tests::plan_mutations_return_compact_replies_and_get_keeps_the_full_history",
+            |app, _| {
+                let brief = "long brief ".repeat(8000);
+                let plan = request(
+                    app,
+                    json!({
+                        "cmd":"plan_set", "goal":"Compact replies", "tasks":[
+                            {"id":"a", "brief":brief},
+                            {"id":"b", "depends_on":["a"]}
+                        ]
+                    }),
+                )
+                .result["plan"]
+                    .clone();
+                let index = app.selected_plan;
+                app.plans[index].tasks[0].notes = vec!["old note".into(); 1000];
+                app.plans[index].tasks[0].report =
+                    Some(Report { status: "done".into(), summary: brief.clone(), at: 1 });
+                let update = request(
+                    app,
+                    json!({
+                        "cmd":"plan_update", "plan":plan, "id":"a", "status":"done", "note":"verified"
+                    }),
+                );
+                assert!(update.ok);
+                assert_eq!(
+                    update.result,
+                    json!({
+                        "plan":plan, "status":"open",
+                        "task":{"id":"a", "status":"done", "note":"verified", "integrated":null},
+                        "ready":[]
+                    })
+                );
+                assert!(update.result.to_string().len() < 1024);
+                let into = app.plans[index].integration_branch();
+                for (merge, committed, merged, note) in [
+                    (Merge::Merged, true, true, format!("committed and merged into {into}")),
+                    (Merge::UpToDate, false, false, format!("already in {into}")),
+                ] {
+                    let (reply, received) = channel();
+                    app.finish_integration(Integrated {
+                        plan: plan.as_str().unwrap().into(),
+                        task: "a".into(),
+                        branch: "task-a".into(),
+                        into: into.clone(),
+                        result: Ok(Integration { committed, merge, worktree: "/integration".into() }),
+                        reply: Some(reply),
+                    });
+                    let ControlOutcome::Done(integrated) = received.try_recv().unwrap() else {
+                        panic!("integration reply");
+                    };
+                    assert!(integrated.ok);
+                    assert_eq!(
+                        integrated.result,
+                        json!({
+                            "plan":plan, "status":"open",
+                            "task":{"id":"a", "status":"done", "note":note, "integrated":into},
+                            "ready":["b"],
+                            "integration":into, "worktree":"/integration", "committed":committed, "merged":merged
+                        })
+                    );
+                    assert!(integrated.result.to_string().len() < 1024);
+                }
+                let full = request(app, json!({"cmd":"plan_get", "plan":plan}));
+                assert!(full.ok);
+                assert_eq!(full.result["tasks"][0]["brief"], brief);
+                assert_eq!(full.result["tasks"][0]["report"]["summary"], brief);
+                assert_eq!(full.result["tasks"][0]["notes"].as_array().unwrap().len(), 1003);
+                assert_eq!(full.result["ready"], json!(["b"]));
+                let closed = request(app, json!({"cmd":"plan_close", "plan":plan, "status":"completed"}));
+                assert!(closed.ok);
+                assert_eq!(
+                    closed.result,
+                    json!({
+                        "plan":plan, "status":"completed", "task":null, "ready":["b"]
+                    })
+                );
+                assert!(closed.result.to_string().len() < 1024);
+                let full = request(app, json!({"cmd":"plan_get", "plan":plan}));
+                assert_eq!(full.result["status"], "completed");
+                assert_eq!(full.result["tasks"][0]["brief"], brief);
+            },
+        );
     }
 
     #[test]
