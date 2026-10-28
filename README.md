@@ -52,6 +52,12 @@ cox --open claude:~/repos/app --open codex:~/repos/app-feature
 The config is created on first start at `~/.config/cox/config.toml`. It is commented and reloads while cox runs: agents
 and their commands, `base_ref`, layout breakpoints, fonts, colors, shortcuts, and the texts used for steering.
 
+## Troubleshooting
+
+Run `cox doctor` to check git, Claude Code, Codex, Helix, the config, the running cox socket and global Claude hooks.
+Each failed check includes a hint. Missing git or an unreadable or invalid config returns exit code 1; missing
+agents, Helix, a running cox or hooks do not affect the exit code. Tools are checked on your login-shell PATH.
+
 ## Claude sessions anywhere
 
 Agents that cox starts get its hooks through `--settings`. To make Claude sessions in any other terminal show up too
