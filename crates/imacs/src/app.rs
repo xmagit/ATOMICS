@@ -2551,156 +2551,209 @@ impl App {
         let plan_id = self.plans[self.selected_plan].id.clone();
         let tasks = &mut self.plans[self.selected_plan].tasks;
         if !tasks.is_empty() {
-            ui.columns(TaskStatus::ALL.len(), |columns| {
-                for (column, status) in columns.iter_mut().zip(TaskStatus::ALL) {
-                    let count = tasks.iter().filter(|t| t.status == status).count();
-                    let color = task_color(status, &p);
-                    column.label(
-                        RichText::new(format!("{} · {count}", status.label().to_uppercase()))
-                            .color(color)
-                            .strong()
-                            .size(11.0),
-                    );
-                    column.add_space(4.0);
-                    egui::ScrollArea::vertical()
-                        .id_salt(("plan-column", &plan_id, status.label()))
-                        .auto_shrink([false, false])
-                        .show(column, |ui| {
-                            for task in tasks.iter_mut().filter(|t| t.status == status) {
-                                let open = expanded.contains(&(plan_id.clone(), task.id.clone()));
-                                egui::Frame::new()
-                                    .fill(p.raised)
-                                    .stroke(Stroke::new(1.0, if open { color.gamma_multiply(0.6) } else { p.border }))
-                                    .corner_radius(3)
-                                    .inner_margin(egui::Margin::same(8))
-                                    .show(ui, |ui| {
-                                        ui.set_width(ui.available_width());
-                                        let title = ui.add(
-                                            egui::Label::new(RichText::new(&task.title).color(p.foreground).strong())
-                                                .sense(Sense::click()),
-                                        );
-                                        if title.clicked() {
-                                            actions.push((task.id.clone(), "toggle"));
-                                        }
-                                        let mut meta = format!(
-                                            "{} · {}",
-                                            task.id,
-                                            if task.agent.is_empty() { "claude" } else { &task.agent }
-                                        );
-                                        if let Some(model) = task
-                                            .args
-                                            .windows(2)
-                                            .find(|w| w[0] == "-m" || w[0] == "--model")
-                                            .map(|w| w[1].clone())
-                                        {
-                                            meta.push_str(&format!(" {model}"));
-                                        }
-                                        if let Some(branch) = &task.branch {
-                                            meta.push_str(&format!(" · {branch}"));
-                                        }
-                                        ui.label(RichText::new(meta).color(p.muted).size(11.0));
-                                        if !task.depends_on.is_empty() {
-                                            ui.label(
-                                                RichText::new(format!("after {}", task.depends_on.join(", ")))
-                                                    .color(p.muted)
-                                                    .size(11.0),
-                                            );
-                                        }
-                                        if let Some((title, agent_status)) =
-                                            task.session.as_ref().and_then(|s| sessions.get(s))
-                                        {
-                                            ui.label(
-                                                RichText::new(format!("● {title} · {}", agent_status.label()))
-                                                    .color(status_color(*agent_status, &p))
-                                                    .size(11.0),
-                                            );
-                                        }
-                                        let status =
-                                            task.session.as_ref().and_then(|s| sessions.get(s)).map(|(_, s)| *s);
-                                        if let Some(action) = task_result(ui, task, status, open, &p) {
-                                            actions.push((task.id.clone(), action));
-                                        }
-                                        if let Some(note) = task.notes.last() {
-                                            ui.label(RichText::new(note).color(p.muted).italics().size(11.0));
-                                        }
-                                        if open {
-                                            ui.add_space(4.0);
-                                            if editable && task.status == TaskStatus::Planned {
-                                                let edit = egui::TextEdit::multiline(&mut task.brief)
-                                                    .desired_rows(4)
-                                                    .desired_width(f32::INFINITY);
-                                                if ui.add(edit).changed() {
-                                                    actions.push((task.id.clone(), "edited"));
-                                                }
-                                            } else {
-                                                ui.label(RichText::new(&task.brief).color(p.foreground).size(12.0));
-                                            }
-                                            for check in &task.acceptance {
-                                                ui.label(RichText::new(format!("✓ {check}")).color(p.muted).size(11.5));
-                                            }
-                                        }
-                                        ui.horizontal_wrapped(|ui| {
-                                            if task.session.as_ref().is_some_and(|s| sessions.contains_key(s))
-                                                && ui.small_button("open").clicked()
-                                            {
-                                                open_session = task.session.clone();
-                                            }
-                                            match task.status {
-                                                TaskStatus::Planned if approved && ready_ids.contains(&task.id) => {
-                                                    if ui.small_button("start").clicked() {
-                                                        actions.push((task.id.clone(), "start"));
+            egui::ScrollArea::horizontal().id_salt(("plan-board", &plan_id)).auto_shrink([false, false]).show(
+                ui,
+                |ui| {
+                    let columns = TaskStatus::ALL.len();
+                    let spacing = ui.spacing().item_spacing.x * (columns - 1) as f32;
+                    ui.set_width(ui.available_width().max(280.0 * columns as f32 + spacing));
+                    ui.columns(TaskStatus::ALL.len(), |columns| {
+                        for (column, status) in columns.iter_mut().zip(TaskStatus::ALL) {
+                            let count = tasks.iter().filter(|t| t.status == status).count();
+                            let color = task_color(status, &p);
+                            column.label(
+                                RichText::new(format!("{} · {count}", status.label().to_uppercase()))
+                                    .color(color)
+                                    .strong()
+                                    .size(11.0),
+                            );
+                            column.add_space(4.0);
+                            egui::ScrollArea::vertical()
+                                .id_salt(("plan-column", &plan_id, status.label()))
+                                .auto_shrink([false, false])
+                                .show(column, |ui| {
+                                    for task in tasks.iter_mut().filter(|t| t.status == status) {
+                                        let open = expanded.contains(&(plan_id.clone(), task.id.clone()));
+                                        egui::Frame::new()
+                                            .fill(p.raised)
+                                            .stroke(Stroke::new(
+                                                1.0,
+                                                if open { color.gamma_multiply(0.6) } else { p.border },
+                                            ))
+                                            .corner_radius(3)
+                                            .inner_margin(egui::Margin::same(8))
+                                            .show(ui, |ui| {
+                                                // Columns justify their children; card text needs ordinary word spacing.
+                                                ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                                                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                                                    ui.set_width(ui.available_width());
+                                                    let title = ui.add(
+                                                        egui::Label::new(
+                                                            RichText::new(&task.title).color(p.foreground).strong(),
+                                                        )
+                                                        .sense(Sense::click()),
+                                                    );
+                                                    if title.clicked() {
+                                                        actions.push((task.id.clone(), "toggle"));
                                                     }
-                                                }
-                                                TaskStatus::Review => {
-                                                    if ui.small_button("accept").clicked() {
-                                                        actions.push((task.id.clone(), "done"));
-                                                    }
-                                                    if ui
-                                                        .small_button("send back")
-                                                        .on_hover_text("Back to running; steer it in the steer bar")
-                                                        .clicked()
+                                                    let mut meta = format!(
+                                                        "{} · {}",
+                                                        task.id,
+                                                        if task.agent.is_empty() { "claude" } else { &task.agent }
+                                                    );
+                                                    if let Some(model) = task
+                                                        .args
+                                                        .windows(2)
+                                                        .find(|w| w[0] == "-m" || w[0] == "--model")
+                                                        .map(|w| w[1].clone())
                                                     {
-                                                        actions.push((task.id.clone(), "running"));
+                                                        meta.push_str(&format!(" {model}"));
                                                     }
-                                                }
-                                                TaskStatus::Blocked => {
-                                                    if ui.small_button("unblock").clicked() {
-                                                        actions.push((task.id.clone(), "running"));
+                                                    ui.label(RichText::new(meta).color(p.muted).size(11.0));
+                                                    if let Some(branch) = &task.branch {
+                                                        ui.add(
+                                                            egui::Label::new(
+                                                                RichText::new(branch).color(p.muted).size(11.0),
+                                                            )
+                                                            .truncate(),
+                                                        );
                                                     }
-                                                }
-                                                TaskStatus::Done
-                                                    if task
+                                                    if !task.depends_on.is_empty() {
+                                                        ui.label(
+                                                            RichText::new(format!(
+                                                                "after {}",
+                                                                task.depends_on.join(", ")
+                                                            ))
+                                                            .color(p.muted)
+                                                            .size(11.0),
+                                                        );
+                                                    }
+                                                    if let Some((title, agent_status)) =
+                                                        task.session.as_ref().and_then(|s| sessions.get(s))
+                                                    {
+                                                        ui.label(
+                                                            RichText::new(format!(
+                                                                "● {title} · {}",
+                                                                agent_status.label()
+                                                            ))
+                                                            .color(status_color(*agent_status, &p))
+                                                            .size(11.0),
+                                                        );
+                                                    }
+                                                    let status = task
                                                         .session
                                                         .as_ref()
-                                                        .is_some_and(|s| sessions.contains_key(s))
-                                                        && ui.small_button("reopen").clicked() =>
-                                                {
-                                                    actions.push((task.id.clone(), "review"));
-                                                }
-                                                _ => {}
-                                            }
-                                            if task.branch.is_some()
-                                                && matches!(task.status, TaskStatus::Review | TaskStatus::Done)
-                                            {
-                                                let busy = integrating.contains(&(plan_id.clone(), task.id.clone()));
-                                                let label = if busy { "integrating…" } else { "integrate" };
-                                                if ui
-                                                    .add_enabled(!busy, egui::Button::new(label).small())
-                                                    .on_hover_text(format!(
-                                                        "Commit its changes and merge it into {integration}"
-                                                    ))
-                                                    .clicked()
-                                                {
-                                                    actions.push((task.id.clone(), "integrate"));
-                                                }
-                                            }
-                                        });
-                                    });
-                                ui.add_space(6.0);
-                            }
-                        });
-                }
-            });
+                                                        .and_then(|s| sessions.get(s))
+                                                        .map(|(_, s)| *s);
+                                                    if let Some(action) = task_result(ui, task, status, open, &p) {
+                                                        actions.push((task.id.clone(), action));
+                                                    }
+                                                    if let Some(note) = task.notes.last() {
+                                                        ui.label(
+                                                            RichText::new(note).color(p.muted).italics().size(11.0),
+                                                        );
+                                                    }
+                                                    if open {
+                                                        ui.add_space(4.0);
+                                                        if editable && task.status == TaskStatus::Planned {
+                                                            let edit = egui::TextEdit::multiline(&mut task.brief)
+                                                                .desired_rows(4)
+                                                                .desired_width(f32::INFINITY);
+                                                            if ui.add(edit).changed() {
+                                                                actions.push((task.id.clone(), "edited"));
+                                                            }
+                                                        } else {
+                                                            ui.label(
+                                                                RichText::new(&task.brief)
+                                                                    .color(p.foreground)
+                                                                    .size(12.0),
+                                                            );
+                                                        }
+                                                        for check in &task.acceptance {
+                                                            ui.label(
+                                                                RichText::new(format!("✓ {check}"))
+                                                                    .color(p.muted)
+                                                                    .size(11.5),
+                                                            );
+                                                        }
+                                                    }
+                                                    ui.horizontal_wrapped(|ui| {
+                                                        if task
+                                                            .session
+                                                            .as_ref()
+                                                            .is_some_and(|s| sessions.contains_key(s))
+                                                            && ui.small_button("open").clicked()
+                                                        {
+                                                            open_session = task.session.clone();
+                                                        }
+                                                        match task.status {
+                                                            TaskStatus::Planned
+                                                                if approved && ready_ids.contains(&task.id) =>
+                                                            {
+                                                                if ui.small_button("start").clicked() {
+                                                                    actions.push((task.id.clone(), "start"));
+                                                                }
+                                                            }
+                                                            TaskStatus::Review => {
+                                                                if ui.small_button("accept").clicked() {
+                                                                    actions.push((task.id.clone(), "done"));
+                                                                }
+                                                                if ui
+                                                                    .small_button("send back")
+                                                                    .on_hover_text(
+                                                                        "Back to running; steer it in the steer bar",
+                                                                    )
+                                                                    .clicked()
+                                                                {
+                                                                    actions.push((task.id.clone(), "running"));
+                                                                }
+                                                            }
+                                                            TaskStatus::Blocked => {
+                                                                if ui.small_button("unblock").clicked() {
+                                                                    actions.push((task.id.clone(), "running"));
+                                                                }
+                                                            }
+                                                            TaskStatus::Done
+                                                                if task
+                                                                    .session
+                                                                    .as_ref()
+                                                                    .is_some_and(|s| sessions.contains_key(s))
+                                                                    && ui.small_button("reopen").clicked() =>
+                                                            {
+                                                                actions.push((task.id.clone(), "review"));
+                                                            }
+                                                            _ => {}
+                                                        }
+                                                        if task.branch.is_some()
+                                                            && matches!(
+                                                                task.status,
+                                                                TaskStatus::Review | TaskStatus::Done
+                                                            )
+                                                        {
+                                                            let busy = integrating
+                                                                .contains(&(plan_id.clone(), task.id.clone()));
+                                                            let label =
+                                                                if busy { "integrating…" } else { "integrate" };
+                                                            if ui
+                                                                .add_enabled(!busy, egui::Button::new(label).small())
+                                                                .on_hover_text(format!(
+                                                                    "Commit its changes and merge it into {integration}"
+                                                                ))
+                                                                .clicked()
+                                                            {
+                                                                actions.push((task.id.clone(), "integrate"));
+                                                            }
+                                                        }
+                                                    });
+                                                });
+                                            });
+                                        ui.add_space(6.0);
+                                    }
+                                });
+                        }
+                    });
+                },
+            );
         }
 
         let mut changed = false;
@@ -7935,3 +7988,7 @@ mod chief_tests {
         assert_eq!(frame(vec![button(end, false)]), (None, true));
     }
 }
+
+#[cfg(test)]
+#[path = "board_tests.rs"]
+mod board_tests;
