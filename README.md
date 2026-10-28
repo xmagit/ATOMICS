@@ -207,7 +207,10 @@ share is the machine, and IMACS keeps that in check for every agent it starts (`
   Codex's sandbox can open) with `jobs` tokens, cores minus 2 by default, and hands it to every agent terminal as
   `CARGO_MAKEFLAGS`. cargo takes a token per job, so ten agents building at once share those jobs instead of each
   using every core. `MAKEFLAGS` is left alone, since `make` before GNU make 4.4 misreads a pipe jobserver. A job
-  killed while holding a token never returns it, so whenever no compiler runs, IMACS resets the pool to full.
+  killed while holding a token never returns it, so whenever no compiler or build script runs, IMACS resets the
+  pool to full. cargo passes the pool on to build scripts, and a build script that runs Apple's `make` 3.81 (some
+  `-sys` crates, vendored OpenSSL) stops with "invalid --jobserver-fds"; set `jobs = 0` to turn the pool off, or put
+  GNU make 4.4 first on PATH.
 - **A queue for heavy work.** `imacs queue --class test -- cargo test` waits for a free test slot (one per 6 cores
   by default), runs the command and passes its exit code through. `--class qa` is for app instances started for
   screenshots. The slot is released when the command ends or its process dies. Tiles show `queued for a test slot

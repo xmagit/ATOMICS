@@ -33,7 +33,7 @@ impl SlotClass {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ResourceConfig {
-    /// Tokens in the jobserver shared by every agent's compilers; unset = cores minus 2.
+    /// Tokens in the jobserver shared by every agent's compilers; unset = cores minus 2, 0 = no pool.
     pub jobs: Option<usize>,
     /// Whole test runs at once (`imacs queue --class test`); unset = one per 6 cores.
     pub test_slots: Option<usize>,
@@ -50,8 +50,9 @@ impl Default for ResourceConfig {
 }
 
 impl ResourceConfig {
+    /// 0 means no shared pool.
     pub fn jobs(&self, cores: usize) -> usize {
-        self.jobs.unwrap_or(cores.saturating_sub(2)).max(1)
+        self.jobs.unwrap_or(cores.saturating_sub(2).max(1))
     }
 
     pub fn slots(&self, class: SlotClass, cores: usize) -> usize {
@@ -163,6 +164,7 @@ mod tests {
         assert_eq!(config.slots(SlotClass::Qa, 18), 1);
         let fixed = ResourceConfig { jobs: Some(6), test_slots: Some(0), qa_slots: Some(2), agent_nice: 0 };
         assert_eq!((fixed.jobs(18), fixed.slots(SlotClass::Test, 18), fixed.slots(SlotClass::Qa, 18)), (6, 1, 2));
+        assert_eq!(ResourceConfig { jobs: Some(0), ..ResourceConfig::default() }.jobs(18), 0, "0 turns the pool off");
     }
 
     #[test]

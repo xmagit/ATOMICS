@@ -424,14 +424,15 @@ impl App {
             None => {
                 // Only the instance that owns the socket records its runs, so second instances stay out of the log.
                 notices.extend(crate::crash::started(&paths::imacs_home()));
-                let path = Jobserver::path_for(&paths::imacs_home());
-                match Jobserver::create(&path, config.resources.jobs(governor.cores)) {
-                    Ok(jobserver) => {
+                let tokens = config.resources.jobs(governor.cores);
+                match (tokens > 0).then(|| Jobserver::create(&Jobserver::path_for(&paths::imacs_home()), tokens)) {
+                    None => None,
+                    Some(Ok(jobserver)) => {
                         let jobserver = Arc::new(jobserver);
                         jobserver.refill_when_idle();
                         Some(jobserver)
                     }
-                    Err(err) => {
+                    Some(Err(err)) => {
                         notices.push(format!("Compiler job pool unavailable: {err:#}"));
                         None
                     }
@@ -5063,7 +5064,10 @@ impl eframe::App for App {
                 terminal.shutdown();
             }
         }
-        let _ = std::fs::remove_file(paths::socket_path());
+        // A second instance never owned the socket; removing it would cut the first off.
+        if self.hook_error.is_none() {
+            let _ = std::fs::remove_file(paths::socket_path());
+        }
     }
 }
 

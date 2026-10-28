@@ -29,7 +29,7 @@ fn append(home: &Path, line: &str) {
     {
         // Cut at a line end in the second half, never inside a character.
         let half = &bytes[bytes.len() / 2..];
-        let keep = half.iter().position(|&b| b == b'\n').map_or(half, |i| &half[i + 1..]);
+        let keep = half.iter().position(|&b| b == b'\n').map_or(&[][..], |i| &half[i + 1..]);
         let _ = std::fs::write(&path, keep);
     }
     if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {

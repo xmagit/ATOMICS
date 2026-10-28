@@ -79,7 +79,7 @@ allow = ["ls", "cat", "rg", "git status", "git diff", "git log"]
 [resources]
 # Heavy work shared by every agent IMACS starts. Compilers share one jobserver pool, and whole
 # test runs or QA instances wait for a slot through `imacs queue --class test|qa -- <command>`.
-# jobs = 16          # jobserver tokens; unset = cores minus 2
+# jobs = 16          # jobserver tokens; unset = cores minus 2; 0 = no pool (build scripts that run Apple make)
 # test_slots = 3     # whole test runs at once; unset = one per 6 cores
 # qa_slots = 1       # QA instances at once
 agent_nice = 10      # niceness agent terminals start at; 0 = normal priority
