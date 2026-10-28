@@ -13,6 +13,9 @@ pub struct Plan {
     pub tasks: Vec<Task>,
     /// Set by the user on the board. Nothing is dispatched before.
     pub approved: bool,
+    /// Branch the tasks are merged into; `cox/plan-<goal>` when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,11 +103,36 @@ impl Plan {
                 task.session = old.session.clone();
                 task.report = old.report.clone();
                 task.notes = old.notes.clone();
+                if old.status != TaskStatus::Planned {
+                    // A dispatched task's work is on its branch.
+                    task.repo = old.repo.clone().or(task.repo.take());
+                    task.branch = old.branch.clone().or(task.branch.take());
+                }
             }
+        }
+        if goal != self.goal {
+            // A new goal is a new plan, with an integration branch of its own.
+            self.integration = None;
         }
         self.goal = goal;
         self.tasks = tasks;
         self.approved = false;
+    }
+
+    pub fn integration_branch(&self) -> String {
+        match &self.integration {
+            Some(branch) => branch.clone(),
+            None => match short_slug(&self.goal) {
+                slug if slug.is_empty() => "cox/plan".into(),
+                slug => format!("cox/plan-{slug}"),
+            },
+        }
+    }
+
+    /// Where a task's worktree branches from instead of base_ref: the integration
+    /// branch when it builds on other tasks, so it sees their integrated work.
+    pub fn start_branch(&self, task: &Task) -> Option<String> {
+        (!task.depends_on.is_empty()).then(|| self.integration_branch())
     }
 
     pub fn task_mut(&mut self, id: &str) -> Option<&mut Task> {
@@ -162,9 +190,18 @@ impl Task {
     }
 }
 
+/// A short branch-friendly version of a task title or goal.
+pub fn short_slug(title: &str) -> String {
+    let lower: String = title.to_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+    let mut slug = lower.split('-').filter(|p| !p.is_empty()).collect::<Vec<_>>().join("-");
+    slug.truncate(40);
+    slug.trim_end_matches('-').to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git;
 
     fn task(id: &str, deps: &[&str]) -> Task {
         Task {
@@ -194,12 +231,50 @@ mod tests {
         plan.approved = true;
         plan.task_mut("a").unwrap().status = TaskStatus::Running;
         plan.task_mut("a").unwrap().session = Some("s1".into());
+        plan.task_mut("a").unwrap().branch = Some("cox/a-do-a".into());
         plan.replace("v2".into(), vec![task("a", &[]), task("", &["zz"])]);
         assert!(!plan.approved);
         assert_eq!(plan.tasks[0].status, TaskStatus::Running);
         assert_eq!(plan.tasks[0].session.as_deref(), Some("s1"));
+        assert_eq!(plan.tasks[0].branch.as_deref(), Some("cox/a-do-a"));
         assert_eq!(plan.tasks[1].id, "t2");
         assert_eq!(plan.unknown_dependencies(), [("t2".to_string(), "zz".to_string())]);
+    }
+
+    #[test]
+    fn integration_branch_follows_the_goal() {
+        let mut plan = Plan::default();
+        assert_eq!(plan.integration_branch(), "cox/plan");
+        plan.replace("IMACS v0.2: brand, CI".into(), vec![task("a", &[]), task("b", &["a"])]);
+        assert_eq!(plan.integration_branch(), "cox/plan-imacs-v0-2-brand-ci");
+        assert_eq!(plan.start_branch(&plan.tasks[0]), None);
+        assert_eq!(plan.start_branch(&plan.tasks[1]).as_deref(), Some("cox/plan-imacs-v0-2-brand-ci"));
+        plan.integration = Some("feature/v0.2".into());
+        plan.replace("IMACS v0.2: brand, CI".into(), vec![task("a", &[])]);
+        assert_eq!(plan.integration_branch(), "feature/v0.2");
+        plan.replace("Something else".into(), vec![task("a", &[])]);
+        assert_eq!(plan.integration_branch(), "cox/plan-something-else");
+    }
+
+    #[test]
+    fn dependents_branch_from_the_integration_branch() {
+        let (_dir, repo) = crate::git::tests::project();
+        let mut plan = Plan::default();
+        plan.replace("Ship the API".into(), vec![task("a", &[]), task("b", &["a"]), task("c", &[])]);
+        let worktree = |id: &str| repo.with_file_name(format!("app-{id}"));
+        let dispatch = |t: &Task| {
+            let start = plan.start_branch(t);
+            git::add_worktree_from(&repo, &worktree(&t.id), &format!("cox/{}", t.id), start.as_deref(), "main")
+        };
+        dispatch(&plan.tasks[0]).unwrap();
+        std::fs::write(worktree("a").join("api.rs"), "pub fn api() {}\n").unwrap();
+        let into = plan.integration_branch();
+        git::integrate(&repo, "cox/a", "do a (a)", &into, &repo.with_file_name("app-plan"), "main").unwrap();
+
+        dispatch(&plan.tasks[1]).unwrap();
+        dispatch(&plan.tasks[2]).unwrap();
+        assert!(worktree("b").join("api.rs").exists(), "b builds on a's integrated work");
+        assert!(!worktree("c").join("api.rs").exists(), "c has no dependencies and starts from main");
     }
 
     #[test]

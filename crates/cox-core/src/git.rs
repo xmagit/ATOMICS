@@ -232,6 +232,119 @@ pub fn add_worktree(repo: &Path, path: &Path, branch: &str, base_ref: &str) -> R
     git(repo, &["worktree", "add", "-b", branch, &path_text, &base]).map(|_| ())
 }
 
+/// Like `add_worktree`, but from `start` when given, which is created from
+/// `base_ref` first if it does not exist yet.
+pub fn add_worktree_from(repo: &Path, path: &Path, branch: &str, start: Option<&str>, base_ref: &str) -> Result<()> {
+    match start {
+        Some(start) => {
+            ensure_branch(repo, start, base_ref)?;
+            add_worktree(repo, path, branch, start)
+        }
+        None => add_worktree(repo, path, branch, base_ref),
+    }
+}
+
+fn branch_exists(repo: &Path, branch: &str) -> bool {
+    git(repo, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_ok()
+}
+
+/// Creates `branch` from `base_ref` (or its fallback) unless it exists.
+pub fn ensure_branch(repo: &Path, branch: &str, base_ref: &str) -> Result<()> {
+    if branch_exists(repo, branch) {
+        return Ok(());
+    }
+    let base = resolve_base(repo, base_ref)?;
+    git(repo, &["branch", "--no-track", branch, &base]).map(|_| ())
+}
+
+/// Commits everything uncommitted in `worktree` (ignored files stay out) with the
+/// repository's own identity. False when there was nothing to commit.
+pub fn commit_all(worktree: &Path, message: &str) -> Result<bool> {
+    if git(worktree, &["status", "--porcelain"])?.trim().is_empty() {
+        return Ok(false);
+    }
+    git(worktree, &["add", "--all"])?;
+    git(worktree, &["commit", "-q", "-m", message])?;
+    Ok(true)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Merge {
+    Merged,
+    UpToDate,
+    /// The merge was aborted; these files conflicted.
+    Conflict(Vec<String>),
+}
+
+/// Merges `branch` into the branch checked out in `worktree`. A conflicting merge is
+/// aborted, which leaves the worktree as it was.
+pub fn merge(worktree: &Path, branch: &str) -> Result<Merge> {
+    if !git(worktree, &["status", "--porcelain", "--untracked-files=no"])?.trim().is_empty() {
+        bail!("{} has uncommitted changes", worktree.display());
+    }
+    let head = git(worktree, &["rev-parse", "HEAD"])?;
+    if let Err(err) = git(worktree, &["merge", "--no-ff", "--no-edit", branch]) {
+        let conflicts: Vec<String> = git(worktree, &["diff", "--name-only", "--diff-filter=U", "-z"])?
+            .split('\0')
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect();
+        if git(worktree, &["rev-parse", "--verify", "--quiet", "MERGE_HEAD"]).is_ok() {
+            git(worktree, &["merge", "--abort"])?;
+        }
+        if conflicts.is_empty() {
+            return Err(err);
+        }
+        return Ok(Merge::Conflict(conflicts));
+    }
+    Ok(if git(worktree, &["rev-parse", "HEAD"])? == head { Merge::UpToDate } else { Merge::Merged })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Integration {
+    /// Uncommitted work in the branch's worktree was committed first.
+    pub committed: bool,
+    pub merge: Merge,
+    /// Where `into` is checked out.
+    pub worktree: PathBuf,
+}
+
+/// Commits what is uncommitted in `branch`'s worktree and merges `branch` into `into`,
+/// in a worktree of its own at `into_path`. `into` and its worktree are created (from
+/// `base_ref`) when first needed. The main checkout is never touched.
+pub fn integrate(
+    repo: &Path,
+    branch: &str,
+    message: &str,
+    into: &str,
+    into_path: &Path,
+    base_ref: &str,
+) -> Result<Integration> {
+    if !branch_exists(repo, branch) {
+        bail!("branch {branch} does not exist in {}", repo.display());
+    }
+    let linked: Vec<WorktreeEntry> = list_worktrees(repo)?.into_iter().skip(1).collect();
+    let checked_out = |name: &str| linked.iter().find(|e| e.branch.as_deref() == Some(name));
+    let committed = match checked_out(branch).filter(|e| e.path.is_dir()) {
+        Some(entry) => commit_all(&entry.path, message)?,
+        None => false,
+    };
+    ensure_branch(repo, into, base_ref)?;
+    let worktree = match checked_out(into) {
+        Some(entry) if entry.path.is_dir() => entry.path.clone(),
+        stale => {
+            if stale.is_some() {
+                // Its folder was deleted: drop the registration so the branch can be checked out again.
+                git(repo, &["worktree", "prune"])?;
+            }
+            git(repo, &["worktree", "add", &into_path.to_string_lossy(), into])?;
+            into_path.to_path_buf()
+        }
+    };
+    let merge = merge(&worktree, branch)?;
+    Ok(Integration { committed, merge, worktree })
+}
+
 /// Folder-name friendly version of a branch name.
 pub fn slug(branch: &str) -> String {
     branch
@@ -252,7 +365,7 @@ pub fn worktree_path(template: &str, repo: &Path, branch: &str) -> PathBuf {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn run(dir: &Path, args: &[&str]) {
@@ -260,16 +373,77 @@ mod tests {
         assert!(status.success(), "git {args:?}");
     }
 
-    fn repo() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path();
+    fn init(p: &Path) {
         run(p, &["init", "-q", "-b", "main"]);
         run(p, &["config", "user.email", "cox@test"]);
         run(p, &["config", "user.name", "cox"]);
         std::fs::write(p.join("a.txt"), "one\ntwo\nthree\n").unwrap();
         run(p, &["add", "."]);
         run(p, &["commit", "-q", "-m", "base"]);
+    }
+
+    fn repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        init(dir.path());
         dir
+    }
+
+    /// A repository at `<tmp>/app`, so worktrees next to it are cleaned up with it.
+    pub(crate) fn project() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("app");
+        std::fs::create_dir(&repo).unwrap();
+        init(&repo);
+        (dir, repo)
+    }
+
+    #[test]
+    fn integrate_commits_the_task_and_merges_it_in_a_worktree_of_its_own() {
+        let (_dir, repo) = project();
+        let task = repo.with_file_name("app-t1");
+        add_worktree(&repo, &task, "cox/t1-feature", "main").unwrap();
+        std::fs::write(task.join(".gitignore"), "*.log\n").unwrap();
+        std::fs::write(task.join("b.txt"), "feature\n").unwrap();
+        std::fs::write(task.join("debug.log"), "noise\n").unwrap();
+        let main = git(&repo, &["rev-parse", "main"]).unwrap();
+
+        let into = worktree_path("{repo_parent}/{repo}-{slug}", &repo, "cox/plan-ship");
+        let done = integrate(&repo, "cox/t1-feature", "Add b (t1)", "cox/plan-ship", &into, "origin/main").unwrap();
+        assert_eq!(done, Integration { committed: true, merge: Merge::Merged, worktree: into.clone() });
+        assert_eq!(git(&task, &["log", "-1", "--format=%s by %an"]).unwrap().trim(), "Add b (t1) by cox");
+        assert!(git(&task, &["status", "--porcelain"]).unwrap().is_empty());
+        assert_eq!(worktree_of(&into).unwrap().branch.as_deref(), Some("cox/plan-ship"));
+        assert!(into.join("b.txt").exists());
+        assert!(!into.join("debug.log").exists(), "ignored files are never committed");
+
+        // The main checkout stays where it was.
+        assert_eq!(worktree_of(&repo).unwrap().branch.as_deref(), Some("main"));
+        assert_eq!(git(&repo, &["rev-parse", "main"]).unwrap(), main);
+        assert!(!repo.join("b.txt").exists());
+
+        let again = integrate(&repo, "cox/t1-feature", "Add b (t1)", "cox/plan-ship", &into, "main").unwrap();
+        assert_eq!((again.committed, again.merge), (false, Merge::UpToDate));
+    }
+
+    #[test]
+    fn conflicting_integration_is_aborted_and_lists_the_files() {
+        let (_dir, repo) = project();
+        for (branch, text) in [("one", "one\nTWO\nthree\n"), ("two", "one\n2\nthree\n")] {
+            let worktree = repo.with_file_name(format!("app-{branch}"));
+            add_worktree(&repo, &worktree, branch, "main").unwrap();
+            std::fs::write(worktree.join("a.txt"), text).unwrap();
+        }
+        let into = repo.with_file_name("app-plan");
+        assert_eq!(integrate(&repo, "one", "one (t1)", "plan", &into, "main").unwrap().merge, Merge::Merged);
+        let head = git(&into, &["rev-parse", "HEAD"]).unwrap();
+
+        let clash = integrate(&repo, "two", "two (t2)", "plan", &into, "main").unwrap();
+        assert_eq!(clash.merge, Merge::Conflict(vec!["a.txt".into()]));
+        assert!(clash.committed, "the task's work is kept on its branch");
+        assert_eq!(git(&into, &["rev-parse", "HEAD"]).unwrap(), head);
+        assert!(git(&into, &["status", "--porcelain"]).unwrap().is_empty());
+        assert!(git(&into, &["rev-parse", "--verify", "--quiet", "MERGE_HEAD"]).is_err());
+        assert_eq!(std::fs::read_to_string(into.join("a.txt")).unwrap(), "one\nTWO\nthree\n");
     }
 
     #[test]
