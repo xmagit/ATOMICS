@@ -6,7 +6,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use egui::{Color32, FontId, Key, Pos2, Rect, RichText, Sense, Stroke, Vec2, pos2, vec2};
-use imacs_core::config::{AgentKind, Config, VoiceTarget};
+use imacs_core::config::{AgentKind, ChiefDock, Config, VoiceTarget};
 use imacs_core::git::{self, Integration, Merge, Worktree, WorktreeEntry};
 use imacs_core::layout::{self, DiffPlacement, DiffSplit, Layout};
 use imacs_core::session::{AgentStatus, pick_tiled, title_for};
@@ -58,7 +58,7 @@ pub struct Session {
     pub last_prompt: Option<String>,
     pub last_message: Option<String>,
     pub selected: bool,
-    /// The chief agent: shown in its own window, not among the agents.
+    /// The chief agent stays outside the agent fleet.
     pub chief: bool,
     /// A message typed into the terminal that the agent has not visibly picked up yet.
     pending: Option<Pending>,
@@ -275,7 +275,8 @@ pub struct App {
     expanded_tasks: HashSet<String>,
     /// The project tab on screen; `None` shows every project.
     view: Option<PathBuf>,
-    /// The chief agent's window is open (otherwise it is the pill at the top).
+    plan_view: bool,
+    /// The chief is shown, either floating or docked (otherwise only the pill).
     chief_open: bool,
     worktree_tx: Sender<(String, Result<PathBuf, String>, Launch)>,
     worktree_rx: Receiver<(String, Result<PathBuf, String>, Launch)>,
@@ -382,6 +383,7 @@ impl App {
             plan: Plan::load(&paths::plan_file()).unwrap_or_default(),
             expanded_tasks: HashSet::new(),
             view: None,
+            plan_view: false,
             chief_open: false,
             worktree_tx,
             worktree_rx,
@@ -1078,10 +1080,13 @@ impl App {
                 let sessions: Vec<_> = (0..self.sessions.len()).map(|i| self.describe(i)).collect();
                 let (window, monitor) = ctx.input(|i| (i.content_rect().size(), i.viewport().monitor_size));
                 let layout = self.last_layout.map(|l| {
-                    json!({ "sidebar": l.sidebar, "diff": format!("{:?}", l.diff), "columns": l.columns, "rows": l.rows, "tiled": l.tiled, "tabs": l.tabs })
+                    json!({ "sidebar": l.sidebar, "dock_width": l.dock_width, "diff": format!("{:?}", l.diff), "columns": l.columns, "rows": l.rows, "tiled": l.tiled, "tabs": l.tabs })
                 });
                 done(ControlResponse::ok(json!({
                     "active": self.active,
+                    "plan_view": self.plan_view,
+                    "visible": self.visible_sessions().iter().map(|&i| &self.sessions[i].id).collect::<Vec<_>>(),
+                    "chief": { "open": self.chief_open, "dock": self.chief_dock(), "width": self.store.chief_width },
                     "window": [window.x, window.y],
                     "monitor": monitor.map(|m| [m.x, m.y]),
                     "layout": layout,
@@ -1236,6 +1241,27 @@ impl App {
                 self.diff_open = open;
                 done(ControlResponse::ok(json!({ "diff_open": open })))
             }
+            ControlRequest::ShowChief { open, dock, width } => {
+                if width.is_some_and(|w| !w.is_finite() || w < layout::MIN_DOCK_WIDTH) {
+                    done(ControlResponse::error("chief width must be at least 520 points"))
+                } else {
+                    if let Some(dock) = dock {
+                        self.set_chief_dock(dock);
+                    }
+                    if let Some(width) = width {
+                        self.store.chief_width = Some(width);
+                        self.save_chief_preferences();
+                    }
+                    if open && !self.chief_open {
+                        self.toggle_chief(ctx);
+                    } else if !open {
+                        self.chief_open = false;
+                    }
+                    done(ControlResponse::ok(
+                        json!({ "open": self.chief_open, "dock": self.chief_dock(), "width": self.store.chief_width }),
+                    ))
+                }
+            }
             ControlRequest::Resize { width, height } => {
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(vec2(width, height)));
                 done(ControlResponse::ok(json!({ "requested": [width, height] })))
@@ -1367,6 +1393,8 @@ impl App {
                 }
             },
             ControlRequest::Screenshot { path } => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaintWhileHidden);
                 let path = paths::expand(&path);
                 let reply = reply.clone();
                 ctx.request_screenshot(move |image| {
@@ -1431,13 +1459,19 @@ impl App {
         }
     }
 
-    /// Sessions in the project tab on screen (the chief lives in its own window).
+    /// Sessions in the selected project or plan view, excluding the chief.
     fn visible_sessions(&self) -> Vec<usize> {
         (0..self.sessions.len())
             .filter(|&i| !self.sessions[i].chief)
-            .filter(|&i| match &self.view {
-                None => true,
-                Some(project) => self.project_of(&self.sessions[i].root()).as_ref() == Some(project),
+            .filter(|&i| {
+                if self.plan_view {
+                    self.plan.contains_session(&self.sessions[i].id)
+                } else {
+                    match &self.view {
+                        None => true,
+                        Some(project) => self.project_of(&self.sessions[i].root()).as_ref() == Some(project),
+                    }
+                }
             })
             .collect()
     }
@@ -1449,7 +1483,13 @@ impl App {
         let mut pick: Option<Option<PathBuf>> = None;
         let mut close_idle: Option<PathBuf> = None;
         let agents = self.sessions.iter().filter(|s| !s.chief).count();
-        if ui.selectable_label(self.view.is_none(), RichText::new(format!("All · {agents}")).size(12.5)).clicked() {
+        if ui
+            .selectable_label(
+                !self.plan_view && self.view.is_none(),
+                RichText::new(format!("All · {agents}")).size(12.5),
+            )
+            .clicked()
+        {
             pick = Some(None);
         }
         for root in self.repos.clone() {
@@ -1460,7 +1500,7 @@ impl App {
             if self.plan.project.as_ref() == Some(&root) && !self.plan.tasks.is_empty() {
                 label.push_str(&format!(" · plan {}/{}", self.plan.count(TaskStatus::Done), self.plan.tasks.len()));
             }
-            let selected = self.view.as_ref() == Some(&root);
+            let selected = !self.plan_view && self.view.as_ref() == Some(&root);
             let text = RichText::new(label).size(12.5).color(if selected { p.accent } else { p.foreground });
             let response = ui.selectable_label(selected, text);
             if response.clicked() {
@@ -1474,6 +1514,12 @@ impl App {
                 }
             });
         }
+        if !self.plan.tasks.is_empty() {
+            let label = format!("plan · {}/{}", self.plan.count(TaskStatus::Done), self.plan.tasks.len());
+            if ui.selectable_label(self.plan_view, RichText::new(label).size(12.5)).clicked() {
+                self.show_plan_fleet();
+            }
+        }
         if let Some(view) = pick {
             self.set_view(view);
         }
@@ -1484,6 +1530,7 @@ impl App {
     }
 
     fn set_view(&mut self, view: Option<PathBuf>) {
+        self.plan_view = false;
         self.view = view.clone();
         let Some(project) = view else { return };
         let in_view = self.active_index().is_some_and(|i| {
@@ -1496,6 +1543,24 @@ impl App {
                     self.active = None;
                     self.diff_root = Some(project);
                 }
+            }
+        }
+    }
+
+    fn show_plan_fleet(&mut self) {
+        self.view = self.plan.project.clone();
+        self.plan_view = true;
+        self.panel = PanelMode::Diff;
+        if self.chief_dock() == ChiefDock::Floating || self.last_layout.is_some_and(|layout| layout.dock_width == 0.0) {
+            self.chief_open = false;
+        }
+        let visible = self.visible_sessions();
+        if !self.active_index().is_some_and(|i| visible.contains(&i)) {
+            if let Some(&i) = visible.first() {
+                self.activate(&self.sessions[i].id.clone(), false);
+            } else {
+                self.active = None;
+                self.diff_root = None;
             }
         }
     }
@@ -1516,6 +1581,25 @@ impl App {
             self.close(id);
         }
         idle.len()
+    }
+
+    fn chief_dock(&self) -> ChiefDock {
+        self.store.chief_dock.unwrap_or(self.config.chief.dock)
+    }
+
+    fn save_chief_preferences(&mut self) {
+        if let Err(err) = self.store.save(&paths::store_file()) {
+            self.toast(format!("Could not save chief preferences: {err:#}"));
+        }
+    }
+
+    fn set_chief_dock(&mut self, dock: ChiefDock) {
+        self.store.chief_dock = Some(dock);
+        self.save_chief_preferences();
+        if self.chief_open {
+            self.focus_terminal = self.sessions.iter().find(|s| s.chief).map(|s| s.id.clone());
+        }
+        self.ctx.request_repaint();
     }
 
     fn toggle_chief(&mut self, ctx: &egui::Context) {
@@ -1631,13 +1715,13 @@ impl App {
         }
     }
 
-    /// The chief agent: a pill at the top center, and when open a big window in the
-    /// middle of the screen.
+    /// The chief pill and floating window; the dock is part of the main layout.
     fn chief_ui(&mut self, ctx: &egui::Context) {
         let p = self.palette.clone();
         let chief = self.sessions.iter().position(|s| s.chief);
         let status = chief.map(|i| self.sessions[i].status);
         let mut toggle = false;
+        let mut dock = self.chief_dock();
         egui::Area::new(egui::Id::NULL.with("chief-pill"))
             .anchor(egui::Align2::CENTER_TOP, vec2(0.0, 4.0))
             .order(egui::Order::Foreground)
@@ -1693,31 +1777,31 @@ impl App {
                     Voice::Transcribing => "Transcribing".to_string(),
                     Voice::Idle => format!("The chief agent ({}) · voice ({})", keys.toggle_chief, keys.voice),
                 };
+                response.context_menu(|ui| {
+                    if ui.selectable_value(&mut dock, ChiefDock::Floating, "Float chief").clicked()
+                        || ui.selectable_value(&mut dock, ChiefDock::Docked, "Dock chief").clicked()
+                    {
+                        ui.close();
+                    }
+                });
                 if response.on_hover_text(hover).clicked() {
                     toggle = true;
                 }
             });
+        if dock != self.chief_dock() {
+            self.set_chief_dock(dock);
+        }
         if toggle {
             self.toggle_chief(ctx);
         }
 
-        let Some(index) = self.sessions.iter().position(|s| s.chief) else { return };
-        if !self.chief_open {
+        if !self.chief_open || self.last_layout.is_some_and(|layout| layout.dock_width > 0.0) {
             return;
         }
         let screen = ctx.content_rect();
-        let metrics = {
-            let font = FontId::monospace(self.config.font.size);
-            let cell = ctx.fonts_mut(|f| vec2(f.glyph_width(&font, 'M'), f.row_height(&font)));
-            Metrics { font, cell: vec2(cell.x, cell.y.ceil()) }
-        };
-        let mut open = true;
-        let focus = self.focus_terminal.as_deref() == Some(self.sessions[index].id.as_str());
-        let session = &mut self.sessions[index];
-        egui::Window::new(RichText::new("◆ CHIEF AGENT").color(p.accent).strong())
+        egui::Window::new("CHIEF AGENT")
             .id(egui::Id::NULL.with("chief-window"))
-            .open(&mut open)
-            .collapsible(true)
+            .title_bar(false)
             .resizable(true)
             .default_size(vec2(screen.width() * 0.5, screen.height() * 0.66))
             .default_pos(screen.center())
@@ -1727,23 +1811,41 @@ impl App {
                     .fill(p.background)
                     .stroke(Stroke::new(1.5, p.accent.gamma_multiply(0.8))),
             )
-            .show(ctx, |ui| {
-                let rect = ui.available_rect_before_wrap();
-                let rect = rect.with_max_y(rect.top() + rect.height().max(240.0));
-                ui.allocate_rect(rect, Sense::hover());
-                if let Some(terminal) = &mut session.terminal {
-                    let response =
-                        terminal.show(ui, rect, egui::Id::NULL.with(("chief-term", &session.id)), &metrics, &p);
-                    if focus {
-                        response.request_focus();
-                    }
+            .show(ctx, |ui| self.chief_content(ui));
+    }
+
+    fn chief_content(&mut self, ui: &mut egui::Ui) {
+        let Some(index) = self.sessions.iter().position(|s| s.chief) else { return };
+        let p = self.palette.clone();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("◆ CHIEF AGENT").color(p.accent).strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("minimize").on_hover_text(&self.config.keys.toggle_chief).clicked() {
+                    self.chief_open = false;
+                }
+                let dock = self.chief_dock();
+                let label = if dock == ChiefDock::Floating { "dock" } else { "float" };
+                if ui.small_button(label).clicked() {
+                    self.set_chief_dock(if dock == ChiefDock::Floating {
+                        ChiefDock::Docked
+                    } else {
+                        ChiefDock::Floating
+                    });
                 }
             });
-        if focus {
-            self.focus_terminal = None;
-        }
-        if !open {
-            self.chief_open = false;
+        });
+        ui.separator();
+        let metrics = self.metrics(ui);
+        let rect = ui.available_rect_before_wrap();
+        ui.allocate_rect(rect, Sense::hover());
+        let session = &mut self.sessions[index];
+        let focus = self.focus_terminal.as_deref() == Some(session.id.as_str());
+        if let Some(terminal) = &mut session.terminal {
+            let response = terminal.show(ui, rect, egui::Id::NULL.with(("chief-term", &session.id)), &metrics, &p);
+            if focus {
+                response.request_focus();
+                self.focus_terminal = None;
+            }
         }
     }
 
@@ -2069,9 +2171,6 @@ impl App {
                 None => "No task is ready.".into(),
             });
         }
-        if let Some(project) = self.plan.project.clone() {
-            self.set_view(Some(project));
-        }
         let mut started = Vec::new();
         for task in ready {
             let Some(repo) = self.task_repo(&task) else {
@@ -2109,6 +2208,7 @@ impl App {
                 t.repo.get_or_insert_with(|| repo.to_string_lossy().into_owned());
             }
             started.push(task.id);
+            self.show_plan_fleet();
         }
         self.save_plan();
         Ok(started)
@@ -4068,10 +4168,26 @@ impl eframe::App for App {
         let diff_open = self.diff_open && (self.diff_target().is_some() || self.panel == PanelMode::Plan);
         let layout_config = layout::LayoutConfig { diff_width: self.split, ..self.config.layout.clone() };
         let visible = self.visible_sessions();
-        let mut layout = layout::compute(area.width(), area.height(), visible.len(), diff_open, &layout_config);
+        let dock_width = if self.chief_open && self.chief_dock() == ChiefDock::Docked {
+            self.store.chief_width.filter(|w| w.is_finite()).unwrap_or_else(|| {
+                let sidebar =
+                    if area.width() >= layout_config.sidebar_min_window { layout_config.sidebar_width } else { 0.0 };
+                ((area.width() - sidebar) * 0.34).max(layout::MIN_DOCK_WIDTH)
+            })
+        } else {
+            0.0
+        };
+        let mut layout =
+            layout::compute(area.width(), area.height(), visible.len(), diff_open, dock_width, &layout_config);
         if layout.tabs {
-            layout =
-                layout::compute(area.width(), area.height() - TAB_HEIGHT, visible.len(), diff_open, &layout_config);
+            layout = layout::compute(
+                area.width(),
+                area.height() - TAB_HEIGHT,
+                visible.len(),
+                diff_open,
+                dock_width,
+                &layout_config,
+            );
             layout.tabs = visible.len() > layout.tiled || layout.tiled == 0;
         }
 
@@ -4083,6 +4199,20 @@ impl eframe::App for App {
                 .frame(egui::Frame::new().fill(p.panel).inner_margin(egui::Margin::symmetric(10, 4)))
                 .show(ui, |ui| self.sidebar(ui));
         }
+
+        let chief_rect = if layout.dock_width > 0.0 {
+            Some(
+                egui::Panel::left("chief-dock")
+                    .exact_size(layout.dock_width)
+                    .resizable(false)
+                    .frame(egui::Frame::new().fill(p.background).inner_margin(egui::Margin::same(6)))
+                    .show(ui, |ui| self.chief_content(ui))
+                    .response
+                    .rect,
+            )
+        } else {
+            None
+        };
 
         egui::CentralPanel::default().frame(egui::Frame::new().fill(p.background)).show(ui, |ui| {
             let mut rect = ui.max_rect();
@@ -4143,6 +4273,12 @@ impl eframe::App for App {
             }
         });
 
+        if let Some(rect) = chief_rect
+            && chief_divider(ui, rect, &mut self.store.chief_width, &p)
+        {
+            self.save_chief_preferences();
+        }
+
         self.chief_ui(&ctx);
         self.dialogs(&ctx);
     }
@@ -4158,6 +4294,25 @@ impl eframe::App for App {
         }
         let _ = std::fs::remove_file(paths::socket_path());
     }
+}
+
+fn chief_divider(ui: &mut egui::Ui, rect: Rect, width: &mut Option<f32>, p: &Palette) -> bool {
+    let handle = Rect::from_center_size(rect.right_center(), vec2(8.0, rect.height()));
+    let response = ui.interact(handle, egui::Id::NULL.with("chief-divider"), Sense::click_and_drag());
+    ui.painter().line_segment([rect.right_top(), rect.right_bottom()], Stroke::new(1.0, p.border));
+    if response.hovered() || response.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        ui.painter().rect_filled(handle.shrink2(vec2(3.0, 0.0)), 0.0, p.accent.gamma_multiply(0.6));
+    }
+    if (response.dragged() || response.drag_stopped())
+        && let Some(pointer) = response.interact_pointer_pos()
+    {
+        *width = Some((pointer.x - rect.left()).max(layout::MIN_DOCK_WIDTH));
+    }
+    if response.double_clicked() {
+        *width = None;
+    }
+    response.drag_stopped() || response.double_clicked()
 }
 
 fn state_refresh(state: &mut DiffState) {
@@ -4416,3 +4571,63 @@ const CHIEF_ALLOWED_TOOLS: &[&str] = &[
     "mcp__imacs__imacs_focus",
     "mcp__imacs__imacs_open",
 ];
+
+#[cfg(test)]
+mod chief_tests {
+    use super::*;
+
+    #[test]
+    fn divider_drags_and_double_click_resets() {
+        let ctx = egui::Context::default();
+        let palette = Palette::from_config(&imacs_core::config::ThemeConfig::default());
+        let mut width = Some(720.0);
+        let mut time = 0.0;
+        let mut frame = |events| {
+            time += 0.05;
+            let mut save = false;
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(2000.0, 1000.0))),
+                time: Some(time),
+                events,
+                ..Default::default()
+            };
+            let output = ctx.run_ui(input, |ui| {
+                egui::Panel::top("top").exact_size(34.0).show(ui, |_| {});
+                egui::Panel::left("sidebar").exact_size(250.0).resizable(false).show(ui, |_| {});
+                let rect = egui::Panel::left("chief-dock")
+                    .exact_size(width.unwrap_or(595.0))
+                    .resizable(false)
+                    .frame(egui::Frame::new().inner_margin(egui::Margin::same(6)))
+                    .show(ui, |ui| {
+                        ui.interact(ui.max_rect(), egui::Id::NULL.with("chief-term"), Sense::click_and_drag());
+                        ui.take_available_space();
+                    })
+                    .response
+                    .rect;
+                egui::CentralPanel::default().show(ui, |ui| {
+                    ui.interact(ui.max_rect(), egui::Id::NULL.with("agent-term"), Sense::click_and_drag());
+                });
+                save = chief_divider(ui, rect, &mut width, &palette);
+            });
+            output.drop_without_applying_deltas();
+            (width, save)
+        };
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let start = pos2(970.0, 400.0);
+        let end = pos2(1100.0, 400.0);
+        frame(vec![]);
+        frame(vec![egui::Event::PointerMoved(start), button(start, true)]);
+        assert_eq!(frame(vec![egui::Event::PointerMoved(end)]).0, Some(850.0));
+        assert!(frame(vec![button(end, false)]).1);
+        frame(vec![]);
+        frame(vec![button(end, true)]);
+        frame(vec![button(end, false)]);
+        frame(vec![button(end, true)]);
+        assert_eq!(frame(vec![button(end, false)]), (None, true));
+    }
+}

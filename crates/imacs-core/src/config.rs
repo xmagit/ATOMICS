@@ -81,7 +81,8 @@ inlay_hints_keys = [":toggle lsp.display-inlay-hints\r"]
 startup_keys = [":theme base16_transparent\r"]
 
 [chief]
-# The chief agent: an orchestrator in the middle of the screen (cmd+o) with every IMACS tool.
+# The chief agent (cmd+o), floating or docked beside the agents.
+dock = "floating"   # "floating" or "docked"
 command = ["claude"]
 args = ["--model", "claude-opus-5-5"]
 # system_prompt = "..."   # built in: plan, wait for approval, dispatch, verify, integrate
@@ -155,9 +156,18 @@ requests. Never push, open pull requests or delete branches without the user's O
 
 Keep briefs, notes and messages short: the user reads them on the board.";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChiefDock {
+    #[default]
+    Floating,
+    Docked,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ChiefConfig {
+    pub dock: ChiefDock,
     pub command: Vec<String>,
     pub args: Vec<String>,
     pub system_prompt: String,
@@ -166,6 +176,7 @@ pub struct ChiefConfig {
 impl Default for ChiefConfig {
     fn default() -> Self {
         Self {
+            dock: ChiefDock::Floating,
             command: vec!["claude".into()],
             args: vec!["--model".into(), "claude-opus-5-5".into()],
             system_prompt: CHIEF_PROMPT.into(),
@@ -527,6 +538,24 @@ mod tests {
         assert_eq!(config.layout.min_tile_width, 400.0);
         assert_eq!(config.layout.sidebar_width, LayoutConfig::default().sidebar_width);
         assert_eq!(config.font.size, 13.0);
+    }
+
+    #[test]
+    fn chief_dock_defaults_and_parses() {
+        assert_eq!(Config::default().chief.dock, ChiefDock::Floating);
+        let docked: Config = toml::from_str(
+            r#"[chief]
+dock = "docked""#,
+        )
+        .unwrap();
+        assert_eq!(docked.chief.dock, ChiefDock::Docked);
+        assert!(
+            toml::from_str::<Config>(
+                r#"[chief]
+dock = "other""#
+            )
+            .is_err()
+        );
     }
 
     #[test]

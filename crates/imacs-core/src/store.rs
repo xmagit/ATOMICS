@@ -3,6 +3,8 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::config::ChiefDock;
+
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +22,10 @@ pub struct SessionRecord {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Store {
+    #[serde(default)]
+    pub chief_dock: Option<ChiefDock>,
+    #[serde(default)]
+    pub chief_width: Option<f32>,
     pub sessions: Vec<SessionRecord>,
     /// Projects open when IMACS last ran.
     #[serde(default)]
@@ -83,6 +89,20 @@ mod tests {
             last_prompt: prompt.map(str::to_string),
             updated: 0,
         }
+    }
+
+    #[test]
+    fn chief_preferences_survive_restart_and_old_stores_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("sessions.json");
+        let store = Store { chief_dock: Some(ChiefDock::Docked), chief_width: Some(720.0), ..Store::default() };
+        store.save(&file).unwrap();
+        let loaded = Store::load(&file);
+        assert_eq!(loaded.chief_dock, store.chief_dock);
+        assert_eq!(loaded.chief_width, store.chief_width);
+        let old: Store = serde_json::from_str(r#"{"sessions":[]}"#).unwrap();
+        assert_eq!(old.chief_dock, None);
+        assert_eq!(old.chief_width, None);
     }
 
     #[test]
