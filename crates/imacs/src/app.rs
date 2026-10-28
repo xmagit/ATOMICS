@@ -32,6 +32,8 @@ use imacs_core::workspace::{self, Workspace};
 use serde_json::json;
 
 mod heartbeat;
+#[path = "plan_cleanup.rs"]
+mod plan_cleanup;
 
 const TAB_HEIGHT: f32 = 30.0;
 const TILE_HEADER: f32 = 26.0;
@@ -373,6 +375,7 @@ pub struct App {
     diff_split: Option<DiffSplit>,
     editor_file: HashMap<PathBuf, String>,
     cleanup: Option<Cleanup>,
+    plan_cleanup: Option<plan_cleanup::PlanCleanup>,
     panel: PanelMode,
     editors: HashMap<PathBuf, Terminal>,
     focus_editor: bool,
@@ -530,6 +533,7 @@ impl App {
             diff_split: None,
             editor_file: HashMap::new(),
             cleanup: None,
+            plan_cleanup: None,
             panel: PanelMode::Diff,
             editors: HashMap::new(),
             focus_editor: false,
@@ -2452,6 +2456,7 @@ impl App {
         let mut dispatch_all = false;
         let mut close_status = None;
         let mut close = false;
+        let mut clean_plan = false;
         let ready = self.plans[self.selected_plan].ready().len();
         if self.integration_checks.iter().any(|(plan, _)| plan == &self.plans[self.selected_plan].id) {
             ui.label(RichText::new("Checking integration freshness…").color(p.muted));
@@ -2464,6 +2469,9 @@ impl App {
                 ui.label(RichText::new(format!("{done}/{total} done")).color(p.muted).size(12.0));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if self.plans[self.selected_plan].status == PlanStatus::Completed {
+                    clean_plan = ui.small_button("Clean up plan…").clicked();
+                }
                 if self.plans[self.selected_plan].is_open() {
                     if ui.small_button("Archive plan").clicked() {
                         close_status = Some(PlanStatus::Archived);
@@ -2508,6 +2516,14 @@ impl App {
         if !self.plans[self.selected_plan].tasks.is_empty() {
             ui.label(RichText::new(format!("integration branch: {integration}")).color(p.muted).size(11.5))
                 .on_hover_text("Integrated tasks are merged into it, and tasks with dependencies branch from it");
+        }
+        if self.plans[self.selected_plan].status == PlanStatus::Completed {
+            ui.label(
+                RichText::new("Completed · preview cleanup to check what is merged and safe to remove.").color(p.muted),
+            );
+            if clean_plan {
+                self.open_plan_cleanup(self.selected_plan);
+            }
         }
         for (task, dep) in self.plans[self.selected_plan].unknown_dependencies() {
             ui.label(RichText::new(format!("{task} depends on unknown task {dep}")).color(p.error).size(11.5));
@@ -5084,6 +5100,7 @@ impl App {
                 self.confirm_plan_close = None;
             }
         }
+        self.plan_cleanup_dialog(ctx);
         if let Some(id) = self.confirm_close.clone() {
             let title = self.sessions.iter().find(|s| s.id == id).map(|s| s.title.clone());
             let Some(title) = title else {

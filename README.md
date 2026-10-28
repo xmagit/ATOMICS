@@ -189,6 +189,12 @@ its own approval and automatic final review. Use `imacs_plan_close {plan, status
 one plan is open, mutation tools can omit its id again. Start the next plan while another finishes; the chief is never closed.
 `imacs_wait` events include `plan` and `task` ids for sessions belonging to a task.
 
+Open a completed plan’s ✓ tab and its board. **Clean up plan…** previews only its recorded
+task and integration branches and their worktrees. Once the integration branch or every task branch is contained
+in the configured base (usually main), select the entries to remove. Uncommitted changes, unmerged commits and
+worktrees used by agent sessions are kept with a reason. Removal rechecks the preview and never forces Git;
+branches without worktrees can be removed too. The saved plan history stays available.
+
 Tasks come together on the plan's **integration branch** (`imacs/plan-<plan-id>` unless the plan names one; the board
 shows it). `imacs_plan_integrate` (or **integrate** on a review or done card) commits whatever the task left uncommitted
 on its branch (as `<title> (<id>)`, with the repository's own git identity; ignored files stay out) and merges the
