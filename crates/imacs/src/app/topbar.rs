@@ -1,0 +1,343 @@
+use super::*;
+
+/// Measure with the same fonts, padding and widgets that will actually be drawn.
+/// The disabled, invisible child cannot activate controls or take space from the bar.
+pub(super) fn measure(ui: &mut egui::Ui, contents: impl FnOnce(&mut egui::Ui)) -> f32 {
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt("topbar-measure")
+            .max_rect(Rect::from_min_size(ui.max_rect().min, vec2(100_000.0, ui.max_rect().height())))
+            .layout(egui::Layout::left_to_right(egui::Align::Center))
+            .sizing_pass()
+            .invisible(),
+    );
+    contents(&mut child);
+    child.min_rect().width().ceil()
+}
+
+/// A slot bounds both painting and layout. Popups retain their own clip rects.
+fn slot(ui: &mut egui::Ui, id: &str, rect: Rect, contents: impl FnOnce(&mut egui::Ui)) {
+    let mut child = ui.new_child(
+        egui::UiBuilder::new().id_salt(id).max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    child.set_clip_rect(ui.clip_rect().intersect(rect));
+    child.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+    contents(&mut child);
+}
+
+pub(super) fn record_item(_ui: &egui::Ui, _name: &str, _response: &egui::Response) {
+    #[cfg(test)]
+    if !_ui.is_sizing_pass() {
+        _ui.ctx().data_mut(|data| {
+            data.get_temp_mut_or_default::<Vec<(String, Rect)>>(egui::Id::NULL.with("topbar-items"))
+                .push((_name.into(), _response.rect));
+        });
+    }
+}
+
+impl App {
+    pub(super) fn top_bar(&mut self, ui: &mut egui::Ui) {
+        let rect = ui.available_rect_before_wrap();
+        let gap = ui.spacing().item_spacing.x;
+        let controls = measure(ui, |ui| self.top_bar_controls(ui, false));
+        let controls_with_load = measure(ui, |ui| self.top_bar_controls(ui, true));
+        let full_chief = measure(ui, |ui| self.chief_pill(ui, false));
+        let compact_chief = measure(ui, |ui| self.chief_pill(ui, true));
+        let full_brand = measure(ui, |ui| self.top_bar_brand(ui, true));
+        let compact_brand = measure(ui, |ui| self.top_bar_brand(ui, false));
+        let tabs = measure(ui, |ui| self.view_tabs(ui));
+        let min_tabs = measure(ui, |ui| {
+            ui.menu_button("Tabs", |_| {});
+        });
+
+        // Drop the gauge before compressing navigation. Keep all action buttons at
+        // their natural width; only the navigation and optional status may shrink.
+        let show_load = full_brand + tabs + full_chief + controls_with_load + gap * 3.0 <= rect.width();
+        let controls_width = if show_load { controls_with_load } else { controls };
+        let show_agents = full_brand + min_tabs + compact_chief + controls_width + gap * 3.0 <= rect.width();
+        let brand_width = if show_agents { full_brand } else { compact_brand };
+        let compact = brand_width + min_tabs + full_chief + controls_width + gap * 3.0 > rect.width();
+        let chief_width = if compact { compact_chief } else { full_chief };
+        let controls_left = rect.right() - controls_width;
+        let tabs_left = rect.left() + brand_width + gap;
+        // Keep the wide-screen center. Shift only when the brand/navigation or
+        // fixed actions cannot fit on their respective side of the pill.
+        let chief_left = (rect.center().x - chief_width / 2.0)
+            .max(tabs_left + min_tabs + gap)
+            .min(controls_left - gap - chief_width);
+        let navigation = Rect::from_x_y_ranges(tabs_left..=chief_left - gap, rect.y_range());
+        slot(ui, "brand", rect.with_max_x(rect.left() + brand_width), |ui| self.top_bar_brand(ui, show_agents));
+        slot(ui, "chief", rect.with_min_x(chief_left).with_max_x(chief_left + chief_width), |ui| {
+            self.chief_pill(ui, compact);
+        });
+        slot(ui, "actions", rect.with_min_x(controls_left), |ui| self.top_bar_controls(ui, show_load));
+        slot(ui, "navigation", navigation, |ui| {
+            self.view_tabs(ui);
+            self.top_bar_notice(ui);
+        });
+        ui.allocate_rect(rect, Sense::hover());
+    }
+
+    fn top_bar_brand(&self, ui: &mut egui::Ui, show_agents: bool) {
+        let response = ui.image((self.icon.id(), vec2(20.0, 20.0)));
+        record_item(ui, "icon", &response);
+        let response = ui.label(RichText::new("IMACS").strong().size(14.0).color(self.palette.accent).monospace());
+        record_item(ui, "brand", &response);
+        if show_agents {
+            let agents = self.sessions.iter().filter(|s| s.is_agent()).count();
+            let response = ui.label(
+                RichText::new(format!("{agents} agent{}", if agents == 1 { "" } else { "s" }))
+                    .color(self.palette.muted),
+            );
+            record_item(ui, "agents", &response);
+        }
+        ui.separator();
+    }
+
+    fn top_bar_controls(&mut self, ui: &mut egui::Ui, show_load: bool) {
+        let response = ui.button(if self.diff_open { "Hide diff" } else { "Show diff" });
+        record_item(ui, "diff", &response);
+        if response.on_hover_text(&self.config.keys.toggle_diff).clicked() {
+            self.diff_open = !self.diff_open;
+        }
+        let response = ui.button("+ New");
+        record_item(ui, "+ New", &response);
+        if response.on_hover_text(&self.config.keys.new_session).clicked() {
+            self.open_new_dialog(None);
+        }
+        let plan = &self.plans[self.selected_plan];
+        let (done, total) = (plan.count(TaskStatus::Done), plan.tasks.len());
+        let label = if total == 0 { "Plan".to_string() } else { format!("Plan {done}/{total}") };
+        let attention = plan.count(TaskStatus::Review) + plan.count(TaskStatus::Blocked);
+        let text =
+            RichText::new(label).color(if attention > 0 { self.palette.warning } else { self.palette.foreground });
+        let response = ui.selectable_label(self.panel == PanelMode::Plan && self.diff_open, text);
+        record_item(ui, "Plan", &response);
+        if response.on_hover_text(&self.config.keys.toggle_plan).clicked() {
+            self.toggle_plan();
+        }
+        let response = ui.menu_button("Project", |ui| self.project_menu(ui)).response;
+        record_item(ui, "Project", &response);
+        if show_load {
+            self.load_gauge(ui);
+        }
+        let response = ui.menu_button("Settings", |ui| self.settings_menu(ui)).response;
+        record_item(ui, "Settings", &response);
+    }
+
+    fn top_bar_notice(&mut self, ui: &mut egui::Ui) {
+        if ui.available_width() < 24.0 {
+            return;
+        }
+        let waiting = self.sessions.iter().filter(|s| s.status.needs_attention()).count();
+        let mut notices = Vec::new();
+        if waiting > 0 {
+            notices.push(format!("● {waiting} need{} you", if waiting == 1 { "s" } else { "" }));
+        }
+        if let Some((text, _)) = &self.toast {
+            notices.push(text.clone());
+        }
+        if let Some(err) = &self.config_error {
+            notices.push(format!("config error: {err}"));
+        }
+        if let Some(err) = &self.hook_error {
+            notices.push(format!("hooks offline: {err}"));
+        }
+        if notices.is_empty() {
+            return;
+        }
+        let text = notices.join(" · ");
+        let response = ui.add(
+            egui::Label::new(RichText::new(&text).color(if waiting > 0 {
+                self.palette.warning
+            } else {
+                self.palette.foreground
+            }))
+            .truncate()
+            .sense(Sense::click()),
+        );
+        record_item(ui, "notice", &response);
+        if response.on_hover_text(text).clicked()
+            && let Some(i) = self.sessions.iter().position(|s| s.status.needs_attention())
+        {
+            let id = self.sessions[i].id.clone();
+            self.activate(&id, true);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{session, with_app};
+    use super::*;
+
+    fn render(
+        app: &mut App,
+        ctx: &egui::Context,
+        width: f32,
+        events: Vec<egui::Event>,
+    ) -> (Vec<(String, Rect)>, egui::FullOutput) {
+        ctx.data_mut(|d| d.insert_temp(egui::Id::NULL.with("topbar-items"), Vec::<(String, Rect)>::new()));
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(width, 800.0))),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                egui::Panel::top("top")
+                    .exact_size(34.0)
+                    .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(10, 4)))
+                    .show(ui, |ui| app.top_bar(ui));
+            },
+        );
+        let items = ctx.data(|d| d.get_temp::<Vec<(String, Rect)>>(egui::Id::NULL.with("topbar-items")).unwrap());
+        (items, output)
+    }
+
+    fn fixture(app: &mut App, count: usize) {
+        app.repos = vec![PathBuf::from("/project/IMACS")];
+        app.plans = (0..count)
+            .map(|i| Plan {
+                id: format!("plan-{i}"),
+                goal: format!("Plan {i}: resource budgets and built-in approval rules"),
+                status: if i % 2 == 0 { PlanStatus::Open } else { PlanStatus::Completed },
+                tasks: vec![Task { id: "task".into(), title: "A task".into(), ..Task::default() }],
+                ..Plan::default()
+            })
+            .collect();
+        if count == 0 {
+            app.plans.push(Plan::default());
+        }
+        app.selected_plan = count.saturating_sub(1);
+        app.plan_view = true;
+        app.sessions = vec![session("chief", AgentKind::Generic, AgentStatus::NeedsInput, Path::new("/project/IMACS"))];
+        app.sessions[0].chief = true;
+        app.toast = Some((
+            "A very long notification that should never draw over the chief, tabs, or buttons\nMore details".repeat(4),
+            Instant::now(),
+        ));
+        app.config_error = Some("Invalid config fixture".into());
+        app.hook_error = Some("Offline hook fixture".into());
+        app.heartbeat.last = Some((imacs_core::store::now(), vec![]));
+        app.load = (Instant::now(), Some(123.4));
+    }
+
+    #[test]
+    fn top_bar_items_never_overlap() {
+        with_app("app::topbar::tests::top_bar_items_never_overlap", |app, ctx| {
+            for count in [0, 3, 6] {
+                fixture(app, count);
+                let mut action_widths = HashMap::new();
+                for dock in [ChiefDock::Floating, ChiefDock::Docked] {
+                    app.store.chief_dock = Some(dock);
+                    app.chief_open = true;
+                    for width in [700.0, 900.0, 1200.0, 1500.0, 2400.0, 5120.0] {
+                        let (items, output) = render(app, ctx, width, vec![]);
+                        let case = format!("width={width}, plans={count}, dock={dock:?}");
+                        let bounds = Rect::from_min_size(pos2(10.0, 0.0), vec2(width - 20.0, 34.0)).expand(0.5);
+                        for (i, (name, rect)) in items.iter().enumerate() {
+                            assert!(bounds.contains_rect(*rect), "{case}: {name} outside bar: {rect:?}; {items:?}");
+                            for (other, other_rect) in &items[i + 1..] {
+                                assert!(
+                                    !rect.shrink(0.1).intersects(*other_rect),
+                                    "{case}: {name} {rect:?} overlaps {other} {other_rect:?}"
+                                );
+                            }
+                        }
+                        for name in ["chief", "Settings", "Project", "Plan", "+ New", "diff"] {
+                            assert_eq!(items.iter().filter(|(n, _)| n == name).count(), 1, "{case}: {name}");
+                            if name != "chief" {
+                                let width = items.iter().find(|(n, _)| n == name).unwrap().1.width();
+                                let natural = action_widths.entry(name).or_insert(width);
+                                assert!((width - *natural).abs() < 0.5, "{case}: {name} shrank");
+                            }
+                        }
+                        // Check the rendered text too: distinct labels cannot paint
+                        // across each other, even inside compound items such as CHIEF.
+                        let mut text_rects = Vec::new();
+                        for shape in &output.shapes {
+                            if let egui::Shape::Text(text) = &shape.shape {
+                                let rect = text.galley.rect.translate(text.pos.to_vec2());
+                                assert!(
+                                    shape.clip_rect.expand(0.5).contains_rect(rect),
+                                    "{case}: text outside slot: {} {rect:?}, clip {:?}",
+                                    text.galley.text(),
+                                    shape.clip_rect
+                                );
+                                for (other, other_rect) in &text_rects {
+                                    assert!(
+                                        !rect.shrink(0.1).intersects(*other_rect),
+                                        "{case}: text {} overlaps {other}",
+                                        text.galley.text()
+                                    );
+                                }
+                                text_rects.push((text.galley.text(), rect));
+                            }
+                        }
+                        if width >= 2400.0 {
+                            let chief = items.iter().find(|(n, _)| n == "chief").unwrap().1;
+                            assert!((chief.center().x - width / 2.0).abs() < 1.0, "wide pill remains centered");
+                        }
+                        if width == 5120.0 {
+                            assert!(!items.iter().any(|(n, _)| n == "Tabs"));
+                            assert!(items.iter().any(|(n, _)| n == "load"));
+                        }
+                        output.drop_without_applying_deltas();
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn overflow_tabs_and_actions_remain_clickable() {
+        with_app("app::topbar::tests::overflow_tabs_and_actions_remain_clickable", |app, ctx| {
+            fixture(app, 6);
+            app.toast = None;
+            app.config_error = None;
+            app.hook_error = None;
+            let click = |app: &mut App, label: &str| {
+                let (items, output) = render(app, ctx, 700.0, vec![]);
+                let mut pos = items.iter().find(|(name, _)| name == label).map(|(_, r)| r.center());
+                if pos.is_none() {
+                    pos = output.shapes.iter().find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.text().starts_with(label) => {
+                            Some(text.pos + text.galley.rect.center().to_vec2())
+                        }
+                        _ => None,
+                    });
+                }
+                let pos = pos.unwrap_or_else(|| panic!("missing {label}: {items:?}"));
+                output.drop_without_applying_deltas();
+                for pressed in [true, false] {
+                    render(
+                        app,
+                        ctx,
+                        700.0,
+                        vec![
+                            egui::Event::PointerMoved(pos),
+                            egui::Event::PointerButton {
+                                pos,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                    )
+                    .1
+                    .drop_without_applying_deltas();
+                }
+            };
+            let was_open = app.diff_open;
+            click(app, "diff");
+            assert_ne!(app.diff_open, was_open);
+            click(app, "Tabs");
+            click(app, "● Plan 0:");
+            assert_eq!(app.selected_plan, 0);
+            assert!(app.plan_view);
+            click(app, "+ New");
+            assert!(app.new_dialog.is_some());
+        });
+    }
+}

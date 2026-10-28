@@ -45,131 +45,135 @@ impl App {
         }
     }
 
-    /// The chief pill and floating window; the dock is part of the main layout.
-    pub(super) fn chief_ui(&mut self, ctx: &egui::Context) {
+    /// Rendered inside the top bar, so its hit target never covers adjacent controls.
+    pub(super) fn chief_pill(&mut self, ui: &mut egui::Ui, compact: bool) {
+        let ctx = ui.ctx().clone();
         let p = self.palette.clone();
         let chief = self.sessions.iter().position(|s| s.chief);
         let status = chief.map(|i| self.sessions[i].status);
         let mut toggle = false;
         let mut dock = self.chief_dock();
-        egui::Area::new(egui::Id::NULL.with("chief-pill"))
-            .anchor(egui::Align2::CENTER_TOP, vec2(0.0, 4.0))
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                let stroke = if self.chief_open { p.accent } else { lerp(p.border, p.accent, 0.5) };
-                let response = egui::Frame::new()
-                    .fill(lerp(p.raised, p.accent, 0.08))
-                    .stroke(Stroke::new(1.0, stroke))
-                    .corner_radius(13)
-                    .inner_margin(egui::Margin::symmetric(14, 3))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            let (icon, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
-                            orbit_icon(ui.painter(), icon, p.accent, p.foreground);
-                            ui.label(RichText::new("CHIEF").strong().color(p.accent).size(13.0));
-                            match status {
-                                Some(status) => {
-                                    let (dot, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
-                                    let time = ui.input(|i| i.time);
-                                    ui.painter().circle_filled(dot.center(), 3.5, status_dot(status, &p, time));
-                                    ui.label(RichText::new(status.label()).color(p.muted).size(11.5));
-                                }
-                                None => {
-                                    ui.label(RichText::new("start").color(p.muted).size(11.5));
-                                }
+        let stroke = if self.chief_open { p.accent } else { lerp(p.border, p.accent, 0.5) };
+        let response = egui::Frame::new()
+            .fill(lerp(p.raised, p.accent, 0.08))
+            .stroke(Stroke::new(1.0, stroke))
+            .corner_radius(13)
+            .inner_margin(egui::Margin::symmetric(14, 3))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let (icon, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
+                    orbit_icon(ui.painter(), icon, p.accent, p.foreground);
+                    ui.label(RichText::new("CHIEF").strong().color(p.accent).size(13.0));
+                    match status {
+                        Some(status) => {
+                            let (dot, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
+                            let time = ui.input(|i| i.time);
+                            ui.painter().circle_filled(dot.center(), 3.5, status_dot(status, &p, time));
+                            if !compact {
+                                ui.label(RichText::new(status.label()).color(p.muted).size(11.5));
                             }
-                            if !self.plans[self.selected_plan].tasks.is_empty() {
-                                let done = self.plans[self.selected_plan].count(TaskStatus::Done);
-                                ui.label(
-                                    RichText::new(format!(
-                                        "plan {done}/{}",
-                                        self.plans[self.selected_plan].tasks.len()
-                                    ))
-                                    .color(p.muted)
-                                    .size(11.5),
-                                );
-                            }
-                            if let Some((at, findings)) = &self.heartbeat.last {
-                                if !findings.is_empty() {
-                                    let (dot, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
-                                    ui.painter().circle_filled(dot.center(), 3.0, p.error);
-                                }
-                                let age = imacs_core::store::now().saturating_sub(*at);
-                                let age_text = match age {
-                                    0..60 => "now".into(),
-                                    60..3600 => format!("{}m", age / 60),
-                                    3600..86400 => format!("{}h", age / 3600),
-                                    _ => format!("{}d", age / 86400),
-                                };
-                                ui.ctx().request_repaint_after(Duration::from_secs(60 - age % 60));
-                                ui.label(RichText::new(format!("♥ {age_text}")).color(p.muted).size(11.5));
-                            }
-                            match &self.voice {
-                                Voice::Recording(recorder) => {
-                                    let secs = recorder.elapsed().as_secs();
-                                    let text = format!("● REC {}:{:02}", secs / 60, secs % 60);
-                                    ui.label(RichText::new(text).color(p.error).strong().size(11.5));
-                                }
-                                Voice::Opening(_) | Voice::Transcribing => {
-                                    ui.add(egui::Spinner::new().size(12.0).color(p.accent));
-                                }
-                                Voice::Idle => {}
-                            }
-                        });
-                    })
-                    .response
-                    .interact(Sense::click());
-                let keys = &self.config.keys;
-                let hover = match self.voice {
-                    Voice::Opening(_) => "Opening microphone: Esc cancels".to_string(),
-                    Voice::Recording(_) => format!("Recording: {} sends, Esc cancels", keys.voice),
-                    Voice::Transcribing => "Transcribing".to_string(),
-                    Voice::Idle => format!("The chief agent ({}) · voice ({})", keys.toggle_chief, keys.voice),
-                };
-                response.context_menu(|ui| {
-                    if ui.selectable_value(&mut dock, ChiefDock::Floating, "Float chief").clicked()
-                        || ui.selectable_value(&mut dock, ChiefDock::Docked, "Dock chief").clicked()
-                    {
-                        ui.close();
+                        }
+                        None if !compact => {
+                            ui.label(RichText::new("start").color(p.muted).size(11.5));
+                        }
+                        None => {}
+                    }
+                    if !compact && !self.plans[self.selected_plan].tasks.is_empty() {
+                        let done = self.plans[self.selected_plan].count(TaskStatus::Done);
+                        ui.label(
+                            RichText::new(format!("plan {done}/{}", self.plans[self.selected_plan].tasks.len()))
+                                .color(p.muted)
+                                .size(11.5),
+                        );
+                    }
+                    if !compact && let Some((at, findings)) = &self.heartbeat.last {
+                        if !findings.is_empty() {
+                            let (dot, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
+                            ui.painter().circle_filled(dot.center(), 3.0, p.error);
+                        }
+                        let age = imacs_core::store::now().saturating_sub(*at);
+                        let age_text = match age {
+                            0..60 => "now".into(),
+                            60..3600 => format!("{}m", age / 60),
+                            3600..86400 => format!("{}h", age / 3600),
+                            _ => format!("{}d", age / 86400),
+                        };
+                        ui.ctx().request_repaint_after(Duration::from_secs(60 - age % 60));
+                        ui.label(RichText::new(format!("♥ {age_text}")).color(p.muted).size(11.5));
+                    }
+                    match &self.voice {
+                        Voice::Recording(recorder) => {
+                            let secs = recorder.elapsed().as_secs();
+                            let text = format!("● REC {}:{:02}", secs / 60, secs % 60);
+                            ui.label(RichText::new(text).color(p.error).strong().size(11.5));
+                        }
+                        Voice::Opening(_) | Voice::Transcribing => {
+                            ui.add(egui::Spinner::new().size(12.0).color(p.accent));
+                        }
+                        Voice::Idle => {}
                     }
                 });
-                if response
-                    .on_hover_ui(|ui| {
-                        ui.label(hover);
-                        if let Some((at, findings)) = &self.heartbeat.last {
-                            let timestamp = *at as libc::time_t;
-                            let mut local = std::mem::MaybeUninit::<libc::tm>::uninit();
-                            // SAFETY: both pointers are valid; a non-null result points to initialized local.
-                            let local = unsafe { libc::localtime_r(&timestamp, local.as_mut_ptr()).as_ref() };
-                            let time = local.map_or_else(
-                                || "unavailable".into(),
-                                |local| {
-                                    format!(
-                                        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                                        local.tm_year + 1900,
-                                        local.tm_mon + 1,
-                                        local.tm_mday,
-                                        local.tm_hour,
-                                        local.tm_min,
-                                        local.tm_sec
-                                    )
-                                },
-                            );
-                            ui.label(format!("Last heartbeat: {time} (local)\n{} findings", findings.len()));
-                        }
-                    })
-                    .clicked()
-                {
-                    toggle = true;
+            })
+            .response
+            .interact(Sense::click());
+        super::topbar::record_item(ui, "chief", &response);
+        let keys = &self.config.keys;
+        let hover = match self.voice {
+            Voice::Opening(_) => "Opening microphone: Esc cancels".to_string(),
+            Voice::Recording(_) => format!("Recording: {} sends, Esc cancels", keys.voice),
+            Voice::Transcribing => "Transcribing".to_string(),
+            Voice::Idle => format!("The chief agent ({}) · voice ({})", keys.toggle_chief, keys.voice),
+        };
+        response.context_menu(|ui| {
+            if ui.selectable_value(&mut dock, ChiefDock::Floating, "Float chief").clicked()
+                || ui.selectable_value(&mut dock, ChiefDock::Docked, "Dock chief").clicked()
+            {
+                ui.close();
+            }
+        });
+        if response
+            .on_hover_ui(|ui| {
+                ui.label(hover);
+                if let Some(status) = status {
+                    ui.label(status.label());
                 }
-            });
+                if let Some((at, findings)) = &self.heartbeat.last {
+                    let timestamp = *at as libc::time_t;
+                    let mut local = std::mem::MaybeUninit::<libc::tm>::uninit();
+                    // SAFETY: both pointers are valid; a non-null result points to initialized local.
+                    let local = unsafe { libc::localtime_r(&timestamp, local.as_mut_ptr()).as_ref() };
+                    let time = local.map_or_else(
+                        || "unavailable".into(),
+                        |local| {
+                            format!(
+                                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                                local.tm_year + 1900,
+                                local.tm_mon + 1,
+                                local.tm_mday,
+                                local.tm_hour,
+                                local.tm_min,
+                                local.tm_sec
+                            )
+                        },
+                    );
+                    ui.label(format!("Last heartbeat: {time} (local)\n{} findings", findings.len()));
+                }
+            })
+            .clicked()
+        {
+            toggle = true;
+        }
         if dock != self.chief_dock() {
             self.set_chief_dock(dock);
         }
         if toggle {
-            self.toggle_chief(ctx);
+            self.toggle_chief(&ctx);
         }
+    }
 
+    /// The floating window; the dock is part of the main layout.
+    pub(super) fn chief_ui(&mut self, ctx: &egui::Context) {
+        let p = self.palette.clone();
         if !self.chief_open || self.last_layout.is_some_and(|layout| layout.dock_width > 0.0) {
             return;
         }
