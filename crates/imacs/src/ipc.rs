@@ -85,6 +85,7 @@ pub struct ControlMessage {
 pub struct Channels {
     pub hooks: Sender<HookMessage>,
     pub control: Sender<ControlMessage>,
+    pub usage: Sender<crate::usage::Report>,
 }
 
 impl Hub {
@@ -141,6 +142,15 @@ fn handle(stream: UnixStream, hub: &Mutex<Hub>, channels: &Channels, ctx: &egui:
     let mut line = String::new();
     BufReader::new(&stream).read_line(&mut line)?;
     let value: Value = serde_json::from_str(&line)?;
+    if let Some(payload) = value.get("statusline") {
+        if payload["rate_limits"].is_object() {
+            let usage = imacs_core::usage::Usage::claude(payload, crate::usage::now());
+            if channels.usage.send(crate::usage::Report::Claude(usage)).is_ok() {
+                ctx.request_repaint();
+            }
+        }
+        return Ok(());
+    }
     if value.get("cmd").is_some() {
         let response = match serde_json::from_value::<ControlRequest>(value) {
             Ok(request) => control(request, &channels.control, ctx),
@@ -216,6 +226,41 @@ pub fn request(request: &ControlRequest) -> Result<ControlResponse> {
 mod tests {
     use super::*;
     use serde_json::{Value, json};
+
+    #[test]
+    fn statusline_socket_routes_account_usage_without_a_session_or_lifecycle_event() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let (hooks, hook_rx) = std::sync::mpsc::channel();
+        let (control, _) = std::sync::mpsc::channel();
+        let (usage, usage_rx) = std::sync::mpsc::channel();
+        writeln!(
+            client,
+            "{}",
+            json!({"statusline":{"rate_limits":{
+                "five_hour":{"used_percentage":22,"resets_at":4102444800_i64}
+            }}})
+        )
+        .unwrap();
+        handle(server, &Mutex::new(Hub::default()), &Channels { hooks, control, usage }, &egui::Context::default())
+            .unwrap();
+        let crate::usage::Report::Claude(usage) = usage_rx.try_recv().unwrap() else { panic!("claude report") };
+        assert_eq!(usage.session.unwrap().remaining, 78.0);
+        assert!(usage.weekly.is_none());
+        assert!(usage.observed_at > 0);
+        assert!(hook_rx.try_recv().is_err(), "usage must not change agent status");
+    }
+
+    #[test]
+    fn initial_claude_statusline_without_limits_does_not_erase_another_sessions_report() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let (hooks, _) = std::sync::mpsc::channel();
+        let (control, _) = std::sync::mpsc::channel();
+        let (usage, usage_rx) = std::sync::mpsc::channel();
+        writeln!(client, "{}", json!({"statusline":{"session_id":"new-session"}})).unwrap();
+        handle(server, &Mutex::new(Hub::default()), &Channels { hooks, control, usage }, &egui::Context::default())
+            .unwrap();
+        assert!(usage_rx.try_recv().is_err());
+    }
 
     fn event(name: &str) -> HookEvent {
         HookEvent::from_payload(&json!({ "hook_event_name": name, "session_id": "s1", "cwd": "/w" })).unwrap()

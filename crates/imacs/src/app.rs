@@ -321,6 +321,7 @@ pub struct App {
     worker: DiffWorker,
     hub: Arc<Mutex<Hub>>,
     hook_rx: Receiver<HookMessage>,
+    usage: crate::usage::UsagePanel,
     control_rx: Receiver<ControlMessage>,
     hook_error: Option<String>,
     busy_checked: Instant,
@@ -405,7 +406,8 @@ impl App {
         let hub = Arc::new(Mutex::new(Hub::default()));
         let (hook_tx, hook_rx) = channel();
         let (control_tx, control_rx) = channel();
-        let channels = Channels { hooks: hook_tx, control: control_tx };
+        let (usage, usage_tx) = crate::usage::UsagePanel::new(ctx.clone());
+        let channels = Channels { hooks: hook_tx, control: control_tx, usage: usage_tx };
         let hook_error =
             ipc::serve(&paths::socket_path(), hub.clone(), channels, ctx.clone()).err().map(|e| format!("{e:#}"));
         let (watch_tx, watch_rx) = channel();
@@ -445,6 +447,7 @@ impl App {
             worker: DiffWorker::new(ctx.clone()),
             hub,
             hook_rx,
+            usage,
             control_rx,
             hook_error,
             busy_checked: Instant::now(),
@@ -2955,6 +2958,7 @@ impl App {
     // ── background events ─────────────────────────────────────────────────
 
     fn pump(&mut self, ctx: &egui::Context) {
+        self.usage.drain();
         for (agent, dir) in std::mem::take(&mut self.pending_open) {
             self.spawn(ctx, &agent, dir, None);
         }
@@ -3757,6 +3761,9 @@ impl App {
     fn sidebar(&mut self, ui: &mut egui::Ui) {
         let p = self.palette.clone();
         let files_root = self.diff_target();
+        section(ui, &p, "USAGE");
+        self.usage.show(ui, &p);
+        ui.separator();
         let total = ui.available_height();
         let sessions_height = if files_root.is_some() { (total * 0.46).max(150.0) } else { total };
         ui.add_space(6.0);
@@ -5272,6 +5279,7 @@ mod tests {
                     .args(["--exact", name, "--nocapture"])
                     .current_dir(dir.path())
                     .env("IMACS_APP_TEST_CHILD", "1")
+                    .env("CODEX_HOME", dir.path().join("codex"))
                     .env("HOME", dir.path())
                     .env("IMACS_HOME", dir.path().join("state"))
                     .env("IMACS_CONFIG", dir.path().join("config.toml"))

@@ -10,8 +10,10 @@ mod hook_client;
 mod ipc;
 mod mcp;
 mod setup;
+mod statusline;
 mod terminal;
 mod theme;
+mod usage;
 mod voice;
 
 use std::path::PathBuf;
@@ -51,6 +53,11 @@ enum Command {
         socket: Option<PathBuf>,
         #[arg(long)]
         pane: Option<String>,
+    },
+    /// Forward Claude's status line data to IMACS, preserving the user's command
+    Statusline {
+        #[arg(long)]
+        socket: Option<PathBuf>,
     },
     /// Add IMACS's hooks to ~/.claude/settings.json so every Claude session reports to IMACS
     InstallHooks,
@@ -115,6 +122,10 @@ fn main() -> eframe::Result {
         Some(Command::Doctor) => std::process::exit(doctor::run()),
         Some(Command::Hook { socket, pane }) => {
             hook_client::run(socket, pane);
+            return Ok(());
+        }
+        Some(Command::Statusline { socket }) => {
+            statusline::run(socket.unwrap_or_else(imacs_core::paths::socket_path));
             return Ok(());
         }
         Some(Command::InstallHooks) => {

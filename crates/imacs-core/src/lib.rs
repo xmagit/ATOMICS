@@ -18,5 +18,6 @@ pub mod plan;
 pub mod session;
 pub mod steer;
 pub mod store;
+pub mod usage;
 pub mod voice;
 pub mod workspace;
