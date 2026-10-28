@@ -8,6 +8,7 @@ pub struct Session {
     pub id: String,
     pub status: AgentStatus,
     pub status_since: u64,
+    pub working_since: Option<u64>,
     pub last_event: u64,
     pub approval: bool,
     pub held_since: Option<u64>,
@@ -48,13 +49,17 @@ pub fn check(plans: &[Plan], sessions: &[Session], now: u64) -> Vec<Finding> {
                     kind,
                 });
             };
-            if task.status == TaskStatus::Running && session.is_none_or(|s| s.status == AgentStatus::Exited) {
+            if task.status == TaskStatus::Running
+                && task.session.is_some()
+                && session.is_none_or(|s| s.status == AgentStatus::Exited)
+            {
                 add(Kind::AgentGone);
             }
             let Some(session) = session.filter(|s| s.status != AgentStatus::Exited) else { continue };
-            if matches!(session.status, AgentStatus::Idle | AgentStatus::Done)
+            if task.status == TaskStatus::Running
+                && matches!(session.status, AgentStatus::Idle | AgentStatus::Done)
                 && now.saturating_sub(session.status_since) > 600
-                && task.report.as_ref().is_none_or(|report| report.at < session.status_since)
+                && session.working_since.is_some_and(|at| task.report.as_ref().is_none_or(|report| report.at < at))
             {
                 add(Kind::Unreported);
             }
@@ -102,6 +107,7 @@ mod tests {
                 id: "agent".into(),
                 status,
                 status_since: 100,
+                working_since: Some(50),
                 last_event: 100,
                 approval: false,
                 held_since: None,
@@ -116,10 +122,15 @@ mod tests {
         assert_eq!(check(&plans, &sessions, 100)[0].kind, Kind::AgentGone);
         sessions.clear();
         assert_eq!(check(&plans, &sessions, 100)[0].session.as_deref(), Some("agent"));
-        plans[0].tasks[0].session = None;
-        assert_eq!(check(&plans, &sessions, 100)[0].kind, Kind::AgentGone);
         plans[0].tasks[0].status = TaskStatus::Planned;
         assert!(check(&plans, &sessions, 100).is_empty());
+    }
+
+    #[test]
+    fn running_task_without_a_session_is_still_starting() {
+        let (mut plans, _) = fixture(AgentStatus::Starting);
+        plans[0].tasks[0].session = None;
+        assert!(check(&plans, &[], 1001).is_empty());
     }
 
     #[test]
@@ -134,17 +145,39 @@ mod tests {
     }
 
     #[test]
-    fn progress_report_before_idle_or_turn_done_still_needs_a_new_report() {
+    fn only_reports_before_the_last_working_turn_are_unreported() {
         for status in [AgentStatus::Idle, AgentStatus::Done] {
             let (mut plans, sessions) = fixture(status);
-            plans[0].tasks[0].report = Some(Report { status: "progress".into(), at: 99, ..Report::default() });
+            plans[0].tasks[0].report = Some(Report { status: "progress".into(), at: 49, ..Report::default() });
             assert!(check(&plans, &sessions, 700).is_empty());
             assert_eq!(check(&plans, &sessions, 701)[0].kind, Kind::Unreported);
-            for at in [100, 101] {
+            for at in [50, 99, 100, 101] {
                 plans[0].tasks[0].report.as_mut().unwrap().at = at;
                 assert!(check(&plans, &sessions, 701).is_empty());
             }
         }
+    }
+
+    #[test]
+    fn tasks_in_review_blocked_or_done_are_not_unreported_after_stop() {
+        for task_status in [TaskStatus::Review, TaskStatus::Blocked, TaskStatus::Done] {
+            for status in [AgentStatus::Idle, AgentStatus::Done] {
+                let (mut plans, sessions) = fixture(status);
+                plans[0].tasks[0].status = task_status;
+                plans[0].tasks[0].report = Some(Report { at: 99, ..Report::default() });
+                assert!(check(&plans, &sessions, 701).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn planned_tasks_and_agents_that_have_not_worked_are_not_unreported() {
+        let (mut plans, mut sessions) = fixture(AgentStatus::Idle);
+        plans[0].tasks[0].status = TaskStatus::Planned;
+        assert!(check(&plans, &sessions, 701).is_empty());
+        plans[0].tasks[0].status = TaskStatus::Running;
+        sessions[0].working_since = None;
+        assert!(check(&plans, &sessions, 701).is_empty());
     }
 
     #[test]
@@ -159,6 +192,21 @@ mod tests {
         assert!(check(&plans, &sessions, 100).is_empty());
         sessions[0].screen = "› 1. Normal numbered response".into();
         assert!(check(&plans, &sessions, 100).is_empty());
+    }
+
+    #[test]
+    fn review_and_blocked_tasks_still_report_session_findings() {
+        let (mut plans, mut sessions) = fixture(AgentStatus::Working);
+        sessions[0].approval = true;
+        sessions[0].held_since = Some(100);
+        for (status, report) in [(TaskStatus::Review, "done"), (TaskStatus::Blocked, "question")] {
+            plans[0].tasks[0].status = status;
+            plans[0].tasks[0].report = Some(Report { status: report.into(), at: 99, ..Report::default() });
+            let kinds: Vec<_> = check(&plans, &sessions, 1001).into_iter().map(|finding| finding.kind).collect();
+            assert_eq!(kinds, vec![Kind::Approval, Kind::HeldMessages, Kind::StuckWorking]);
+        }
+        plans[0].tasks[0].status = TaskStatus::Done;
+        assert!(check(&plans, &sessions, 1001).is_empty());
     }
 
     #[test]
