@@ -12,7 +12,7 @@ mod test_support;
 mod platform_tests;
 
 pub mod approvals;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(feature = "native")]
 pub mod cleanup;
 pub mod config;
 pub mod control;

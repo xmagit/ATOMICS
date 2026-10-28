@@ -517,9 +517,12 @@ mod tests {
         assert_eq!(plan.tasks[0].finished_at, Some(890));
         assert!(!plan.finish_tasks(2000));
         plan.tasks[0].integration_verified = false;
-        let dir = tempfile::tempdir().unwrap();
-        plan.save_in(dir.path()).unwrap();
-        assert_eq!(load_plans(dir.path()).unwrap().0, [plan.clone()]);
+        #[cfg(feature = "native")]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            plan.save_in(dir.path()).unwrap();
+            assert_eq!(load_plans(dir.path()).unwrap().0, [plan.clone()]);
+        }
         plan.status = PlanStatus::Open;
         assert!(!plan.finish_tasks(2500));
         assert_eq!(plan.status, PlanStatus::Open, "an explicitly reopened plan stays open");

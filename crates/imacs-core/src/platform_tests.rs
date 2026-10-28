@@ -23,6 +23,21 @@ fn native_dependencies_are_default_but_absent_from_browser_core() {
 }
 
 #[test]
+fn usage_parsing_keeps_clock_helpers_native() {
+    for (args, native) in [(vec![], true), (vec!["--target", "wasm32-unknown-unknown", "--no-default-features"], false)]
+    {
+        let mut args = args;
+        args.extend(["--format", "{p} {f}"]);
+        let tree = dependencies("imacs-core", &args);
+        let time = tree.lines().find(|line| line.starts_with("time v")).expect("usage parsing needs time");
+        let features: Vec<_> = time.split_whitespace().nth(2).unwrap().split(',').collect();
+        assert!(features.contains(&"parsing"));
+        assert_eq!(features.contains(&"std"), native, "{time}");
+        assert!(!features.contains(&"wasm-bindgen"), "usage parsing needs no JS clock");
+    }
+}
+
+#[test]
 fn highlighting_uses_only_the_target_regex_engine() {
     for (args, wanted, unwanted) in
         [(vec![], "onig", "fancy-regex"), (vec!["--target", "wasm32-unknown-unknown"], "fancy-regex", "onig")]

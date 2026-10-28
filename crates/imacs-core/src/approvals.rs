@@ -229,7 +229,6 @@ pub fn menu_key(screen: &str, command: Option<&str>, decision: Decision) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "native")]
     use std::path::Path;
 
     #[cfg(feature = "native")]
