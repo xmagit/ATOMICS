@@ -64,6 +64,46 @@ pub fn resolve_program(program: &str) -> String {
     find_program(program).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| program.to_string())
 }
 
+/// Keep the version probe bounded even when a wrapper hangs or another child inherits stdout.
+pub fn codex_supports_hooks(program: &str, timeout: std::time::Duration) -> bool {
+    use std::io::Read;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+
+    let Ok((mut stdout, writer)) = UnixStream::pair() else { return false };
+    if stdout.set_nonblocking(true).is_err() {
+        return false;
+    }
+    let Ok(mut child) = Command::new(program)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(OwnedFd::from(writer)))
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => {
+                let mut bytes = Vec::new();
+                let _ = (&mut stdout).take(1024).read_to_end(&mut bytes);
+                return imacs_core::hook::codex_supports_hooks(&String::from_utf8_lossy(&bytes));
+            }
+            Ok(Some(_)) => return false,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(10)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
 fn claude_settings_path() -> PathBuf {
     paths::home().join(".claude").join("settings.json")
 }
@@ -101,6 +141,21 @@ pub fn install_global_hooks() -> anyhow::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_probe_times_out_even_after_printing_a_valid_version() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("codex");
+        std::fs::write(&program, "#!/bin/sh\nprintf 'codex-cli 0.165.0\\n'\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let started = Instant::now();
+        assert!(!codex_supports_hooks(program.to_str().unwrap(), Duration::from_millis(100)));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        std::fs::write(&program, "#!/bin/sh\nprintf 'codex-cli 0.165.0\\n'\n").unwrap();
+        assert!(codex_supports_hooks(program.to_str().unwrap(), Duration::from_secs(1)));
+    }
 
     #[test]
     fn login_shell_output_is_read_between_the_markers() {

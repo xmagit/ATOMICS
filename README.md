@@ -130,8 +130,9 @@ IMACS remembers the command and selects the one-time allow choice rather than cr
 Codex prefix rule. A denial message can only be supplied while the hook is waiting.
 
 While a permission request is pending, `imacs_send` holds plain messages and returns `held: true`.
-Raw input is rejected with an error pointing to `imacs_approve`. It releases them after a lifecycle event confirms the
-request has finished, including when you answer directly in the terminal.
+It releases these messages after a lifecycle event confirms the request has finished, or after the
+menu has been absent for one second. This also covers requests answered directly in the terminal.
+Raw input is rejected with an error pointing to `imacs_approve`.
 
 Agent terminals inherit no `IMACS_SOCKET`, `IMACS_PANE`, `IMACS_HOME` or `IMACS_CONFIG`.
 Codex hooks receive the socket as an argument and find their pane from process ancestry or

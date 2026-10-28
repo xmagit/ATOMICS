@@ -644,15 +644,15 @@ mod isolation_tests {
     #[test]
     fn children_cannot_inherit_instance_routing() {
         let args = isolated_args("/usr/bin/env".into(), Vec::new());
-        let output = std::process::Command::new("/usr/bin/env")
-            .args(args)
-            .env("IMACS_SOCKET", "/parent/socket")
-            .env("IMACS_PANE", "parent-pane")
-            .env("IMACS_HOME", "/parent/home")
-            .env("IMACS_CONFIG", "/parent/config")
-            .env("TERM_PROGRAM", "imacs")
-            .output()
-            .unwrap();
+        let output = crate::test_support::output(
+            std::process::Command::new("/usr/bin/env")
+                .args(args)
+                .env("IMACS_SOCKET", "/parent/socket")
+                .env("IMACS_PANE", "parent-pane")
+                .env("IMACS_HOME", "/parent/home")
+                .env("IMACS_CONFIG", "/parent/config")
+                .env("TERM_PROGRAM", "imacs"),
+        );
         assert!(output.status.success());
         let env = String::from_utf8(output.stdout).unwrap();
         for key in ["IMACS_SOCKET", "IMACS_PANE", "IMACS_HOME", "IMACS_CONFIG"] {

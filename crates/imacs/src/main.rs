@@ -1,3 +1,7 @@
+#[cfg(test)]
+#[path = "../../../tests/support.rs"]
+mod test_support;
+
 mod app;
 mod diff_view;
 mod doctor;
