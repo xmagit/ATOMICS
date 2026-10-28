@@ -439,6 +439,14 @@ impl Task {
             }
         }
         text.push_str(
+            "\nThis machine is shared with other agents. While you work, compile with the build tool's check command \
+             (for example `cargo check`) and run only the tests you touch. Run the full test suite once, at the end, \
+             through `imacs queue --class test -- <test command>`, and start QA app instances through \
+             `imacs queue --class qa -- <command>`; both wait for a free slot, so give them a long timeout \
+             (or run them in the background) instead of the default two minutes. In a sandbox that blocks the \
+             IMACS socket, request to run them outside the sandbox.\n",
+        );
+        text.push_str(
             "\nWork only in this worktree and do not commit unless the task says so. When you are done, \
              blocked, or have a question, call the imacs_report tool with status (done, blocked or question) \
              and a short summary: what changed and how you checked it.",
