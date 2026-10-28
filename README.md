@@ -170,9 +170,13 @@ blocked or has a question. Reports land on the task card, move done tasks to rev
 `imacs_wait`, which then reads `imacs_result` and `imacs_diff`, reviews, steers, and accepts with `imacs_plan_update`.
 
 Plans are stored separately in `~/.imacs/plans/<id>.json`, with status `open`, `completed` or `archived`. The old
-`~/.imacs/plan.json` migrates once and is kept as `plan.json.migrated`. Only open plans get tabs. Select a tab to see
+`~/.imacs/plan.json` migrates once and is kept as `plan.json.migrated`; an old plan whose tasks are all done
+migrates as completed. Saves replace files atomically, and unreadable plan files are listed in the startup message.
+Only open plans get tabs. Select a tab to see
 that plan’s sessions; `cmd+b` opens its board. Other sessions remain under All and their project tabs. Each plan has
-its own approval and automatic final review. Start the next plan while another finishes; the chief is never closed.
+its own approval and automatic final review. Use `imacs_plan_close {plan, status: "completed" | "archived"}` or
+**Complete plan** / **Archive plan** on the board to close it. Its history remains available by id, and once only
+one plan is open, mutation tools can omit its id again. Start the next plan while another finishes; the chief is never closed.
 `imacs_wait` events include `plan` and `task` ids for sessions belonging to a task.
 
 Tasks come together on the plan's **integration branch** (`imacs/plan-<plan-id>` unless the plan names one; the board
@@ -182,11 +186,13 @@ branch into the integration branch. The merge happens in a worktree of its own n
 first use like any other worktree, so your main checkout is never touched. On a conflict the merge is aborted and the
 task stays in review with a note listing the conflicted files. Tasks without dependencies branch from `base_ref`;
 tasks with dependencies branch from the integration branch, so integrate accepted tasks before dispatching the tasks
-that build on them.
+that build on them. Returning a task to running clears its integration marker. Dispatch rechecks that each marked
+task branch tip is an ancestor of the integration branch, so new commits must be integrated too.
 
 Each open plan has a **short name · done/total** tab with a status dot (working, needs you, all done).
-Dispatching tasks selects that plan’s fleet tab, showing only sessions linked to the plan's tasks as they
-start. It returns from the board to the diff and minimizes a floating chief; a docked chief stays beside the fleet.
+Dispatching the selected plan returns from its board to its fleet and minimizes a floating chief; a docked chief
+stays beside the fleet. Updating or dispatching another plan marks its tab with `*` and preserves the selected
+view and chief. Creating a new plan selects its tab. Each fleet shows only sessions linked to that plan’s tasks.
 Click the plan tab later to return to that overview, or choose All or a project tab to see other sessions.
 
 ## Voice
