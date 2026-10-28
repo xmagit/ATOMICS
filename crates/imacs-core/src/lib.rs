@@ -1,6 +1,7 @@
 //! UI-independent core of IMACS: config, git diffs, responsive layout, the hook
 //! protocol shared by `imacs hook` and the app, steering message composition, and voice transcription.
 
+pub mod approvals;
 pub mod config;
 pub mod control;
 pub mod diff;

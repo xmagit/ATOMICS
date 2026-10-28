@@ -103,6 +103,19 @@ fn tools() -> Value {
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
+            "name": "imacs_approve",
+            "description": "Answer the oldest pending permission request for the specified session, regardless of the selected plan tab. allow_always remembers this exact command and directory until the session closes. If the hook has returned, answers only a visible matching native menu; retry if it is not visible yet.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session": session,
+                    "decision": { "type": "string", "enum": ["allow", "allow_always", "deny"] },
+                    "message": { "type": "string" }
+                },
+                "required": ["session", "decision"]
+            }
+        },
+        {
             "name": "imacs_start",
             "description": "Start an agent in IMACS. Give `folder` to run in an existing folder, or `repo` and `branch` to create a new git worktree for it. `prompt` is its first task; `args` are extra command-line arguments (for example [\"-m\", \"gpt-6.1-terra\"] for Codex).",
             "inputSchema": {
@@ -181,7 +194,7 @@ fn tools() -> Value {
         },
         {
             "name": "imacs_wait",
-            "description": "Block until an agent finishes a turn, needs input, or exits (or other `statuses`), then return those events with a `cursor`. Pass the cursor as `after` next time to only see newer events. Use this instead of polling. `sessions` empty means any; timeout_secs defaults to 120 (max 280).",
+            "description": "Block until an agent finishes a turn, needs input, or exits (or other `statuses`), then return those events with a `cursor`. Pass the cursor as `after` next time to only see newer events. Use this instead of polling. Plan-session events include plan and task ids; permission events also include the approval request. `sessions` empty means any; timeout_secs defaults to 120 (max 280).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -199,7 +212,7 @@ fn tools() -> Value {
         },
         {
             "name": "imacs_send",
-            "description": "Send a message to an agent, as if the user typed it and pressed Enter. With raw=true the text is written as keystrokes instead (escapes: \\r Enter, \\e Escape, \\t Tab, \\xNN byte), for answering menus and prompts.",
+            "description": "Send a message to an agent, as if the user typed it and pressed Enter. With raw=true the text is written as keystrokes instead (escapes: \\r Enter, \\e Escape, \\t Tab, \\xNN byte), for terminal controls. While a permission request is pending, input is held until the request finishes and the response says held=true. Use imacs_approve to answer permission menus.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "session": session, "text": { "type": "string" }, "raw": { "type": "boolean" } },
@@ -305,6 +318,7 @@ fn request_for_tool(name: &str, mut args: Value) -> Result<ControlRequest, Strin
         "imacs_list" => "list",
         "imacs_start" => "start",
         "imacs_send" => "send",
+        "imacs_approve" => "approve",
         "imacs_read" => "read",
         "imacs_diff" => "diff",
         "imacs_focus" => "activate",

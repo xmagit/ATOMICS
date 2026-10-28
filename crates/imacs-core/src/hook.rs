@@ -1,11 +1,6 @@
-//! The bridge between Claude Code hooks and the app.
-//!
-//! Claude Code runs `imacs hook` for each configured event and pipes the event JSON
-//! to it. `imacs hook` forwards that JSON, plus the `IMACS_PANE` it inherited when IMACS
-//! started the agent, to the app over a unix socket as one line, and prints
-//! whatever the app answers. The answer is how messages reach sessions that run
-//! outside IMACS: they are delivered as `additionalContext` on the next tool call,
-//! prompt or turn end.
+//! Lifecycle hooks bridge Claude Code and Codex to the app over a Unix socket.
+//! IMACS passes socket and pane arguments directly to the handler. Hook stdout
+//! delivers context or answers a permission request.
 
 use std::path::{Path, PathBuf};
 
@@ -21,14 +16,16 @@ pub const EVENTS: &[&str] =
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HookRequest {
-    /// `IMACS_PANE` of the process that ran the hook; absent for sessions started outside IMACS.
+    /// Explicit pane argument; absent for sessions started outside IMACS.
     pub pane: Option<String>,
+    #[serde(default)]
+    pub ancestors: Vec<u32>,
     pub payload: Value,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HookReply {
-    /// Printed verbatim to stdout for Claude Code to act on.
+    /// Printed verbatim to stdout for the agent to act on.
     pub stdout: Option<String>,
 }
 
@@ -42,6 +39,7 @@ pub struct HookEvent {
     pub notification_type: Option<String>,
     pub message: Option<String>,
     pub tool_name: Option<String>,
+    pub tool_input: Value,
     pub last_assistant_message: Option<String>,
     pub stop_hook_active: bool,
 }
@@ -61,6 +59,7 @@ impl HookEvent {
             notification_type: text("notification_type"),
             message: text("message"),
             tool_name: text("tool_name"),
+            tool_input: payload.get("tool_input").cloned().unwrap_or(Value::Null),
             last_assistant_message: text("last_assistant_message"),
             stop_hook_active: payload.get("stop_hook_active").and_then(Value::as_bool).unwrap_or(false),
         })
@@ -70,13 +69,15 @@ impl HookEvent {
     pub fn status(&self) -> Option<AgentStatus> {
         match self.name.as_str() {
             "SessionStart" => Some(AgentStatus::Idle),
-            "UserPromptSubmit" | "PostToolUse" => Some(AgentStatus::Working),
+            "UserPromptSubmit" | "PreToolUse" | "PostToolUse" => Some(AgentStatus::Working),
+            "PermissionRequest" => Some(AgentStatus::NeedsInput),
             "Notification" => match self.notification_type.as_deref() {
                 Some("permission_prompt") => Some(AgentStatus::NeedsInput),
                 _ => None,
             },
             "Stop" => Some(AgentStatus::Done),
             "SessionEnd" => Some(AgentStatus::Exited),
+            "Interrupt" => Some(AgentStatus::Idle),
             _ => None,
         }
     }
@@ -107,6 +108,78 @@ pub fn claude_settings(imacs_exe: &Path) -> Value {
     let hooks: serde_json::Map<String, Value> =
         EVENTS.iter().map(|event| (event.to_string(), handler.clone())).collect();
     json!({ "hooks": hooks })
+}
+
+/// Session-local handlers carry their destination without exporting it to the agent.
+pub fn session_settings(imacs_exe: &Path, socket: &Path, pane: &str, codex: bool) -> Value {
+    let mut command = format!(
+        "{} hook --socket {}",
+        shell_quote(&imacs_exe.to_string_lossy()),
+        shell_quote(&socket.to_string_lossy())
+    );
+    if !codex {
+        command.push_str(&format!(" --pane {}", shell_quote(pane)));
+    }
+    let events: &[&str] = if codex {
+        &[
+            "SessionStart",
+            "UserPromptSubmit",
+            "PreToolUse",
+            "PermissionRequest",
+            "PostToolUse",
+            "Stop",
+            "SessionEnd",
+            "Interrupt",
+        ]
+    } else {
+        EVENTS
+    };
+    let hooks: serde_json::Map<String, Value> = events
+        .iter()
+        .map(|event| {
+            (event.to_string(), json!([{ "hooks": [{ "type": "command", "command": command, "timeout": if *event == "Interrupt" { 3 } else { 15 } }] }]))
+        })
+        .collect();
+    json!({ "hooks": hooks })
+}
+
+/// TOML CLI overrides use the same schema as hooks.json.
+pub fn codex_hook_args(imacs_exe: &Path, socket: &Path, pane: &str) -> Vec<String> {
+    let settings = session_settings(imacs_exe, socket, pane, true);
+    let mut args = Vec::new();
+    for (event, groups) in settings["hooks"].as_object().expect("hooks") {
+        let groups: toml::Value = serde_json::from_value(groups.clone()).expect("hook groups");
+        args.extend(["-c".into(), format!("hooks.{event}={groups}")]);
+    }
+    args
+}
+
+/// Walk a ps PID/PPID table, nearest ancestor first. PID identity avoids ambiguous cwd matches.
+pub fn ancestor_pids(pid: u32, table: &str) -> Vec<u32> {
+    let parents: std::collections::HashMap<u32, u32> = table
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            Some((fields.next()?.parse().ok()?, fields.next()?.parse().ok()?))
+        })
+        .collect();
+    let mut ancestors = Vec::new();
+    let mut current = pid;
+    while let Some(&parent) = parents.get(&current) {
+        if parent <= 1 || parent == pid || ancestors.contains(&parent) {
+            break;
+        }
+        ancestors.push(parent);
+        current = parent;
+    }
+    ancestors
+}
+
+pub fn codex_supports_hooks(version: &str) -> bool {
+    let Some(version) = version.strip_prefix("codex-cli ") else { return false };
+    let mut parts = version.trim().split('.');
+    matches!((parts.next().and_then(|n| n.parse::<u32>().ok()), parts.next().and_then(|n| n.parse::<u32>().ok())),
+        (Some(major), Some(minor)) if major > 0 || minor >= 165)
 }
 
 /// Merges IMACS's hooks into an existing settings document (for `imacs install-hooks`),
@@ -172,6 +245,39 @@ fn shell_quote(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_hooks_route_explicitly_and_codex_overrides_are_valid_toml() {
+        let exe = Path::new("/Applications/My Tools/imacs");
+        let socket = Path::new("/tmp/own instance/socket");
+        for codex in [false, true] {
+            let settings = session_settings(exe, socket, "pane-1", codex);
+            let command = settings["hooks"]["SessionStart"][0]["hooks"][0]["command"].as_str().unwrap();
+            let mut expected = vec![exe.to_str().unwrap(), "hook", "--socket", socket.to_str().unwrap()];
+            if !codex {
+                expected.extend(["--pane", "pane-1"]);
+            }
+            assert_eq!(shlex::split(command).unwrap(), expected);
+            assert!(!command.contains("IMACS_SOCKET"));
+            assert_eq!(settings["hooks"].get("PermissionRequest").is_some(), codex);
+        }
+        assert_eq!(session_settings(exe, socket, "pane-1", true), session_settings(exe, socket, "pane-2", true));
+        assert_eq!(ancestor_pids(40, "PID PPID\n40 30\n30 20\n20 1\n99 20"), vec![30, 20]);
+        assert_eq!(ancestor_pids(40, "40 30\n30 40"), vec![30]);
+        assert!(ancestor_pids(40, "invalid").is_empty());
+        let args = codex_hook_args(exe, socket, "pane-1");
+        for pair in args.as_chunks::<2>().0 {
+            assert_eq!(pair[0], "-c");
+            let parsed: toml::Value = toml::from_str(&pair[1]).unwrap();
+            assert!(parsed["hooks"].is_table());
+        }
+        for version in ["codex-cli 0.165.0", "codex-cli 0.166.0-alpha.1", "codex-cli 1.0.0"] {
+            assert!(codex_supports_hooks(version));
+        }
+        for version in ["codex-cli 0.164.9", "codex-cli unknown", "unknown"] {
+            assert!(!codex_supports_hooks(version));
+        }
+    }
 
     #[test]
     fn parses_cwd_changes_and_statuses() {

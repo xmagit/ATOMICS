@@ -72,6 +72,10 @@ name = "shell"
 command = []                # empty = your login shell
 kind = "shell"
 
+[approvals]
+# Simple command prefixes, within the session worktree. [] makes every request wait.
+allow = ["cargo build", "cargo test", "cargo check", "cargo clippy", "cargo fmt", "ls", "cat", "rg", "git status", "git diff", "git log"]
+
 [editor]
 # Terminal editor for editor mode (cmd+e). Helix has LSP and inlay hints built in.
 command = ["hx"]
@@ -133,6 +137,7 @@ pub struct Config {
     pub terminal: TerminalConfig,
     pub theme: ThemeConfig,
     pub agents: Vec<AgentConfig>,
+    pub approvals: crate::approvals::ApprovalPolicy,
     pub editor: EditorConfig,
     pub chief: ChiefConfig,
     pub steer: SteerConfig,
@@ -152,6 +157,7 @@ can verify, dependencies, the agent (claude for design-heavy work, codex for wel
 Without a plan id, imacs_plan_set creates a separate plan. Keep its returned id and pass plan to every plan tool. \
 Ask the user to approve it on its own plan board. Never dispatch before approval.
 3. imacs_plan_dispatch, then loop on imacs_wait (never sleep or poll). On reported or turn done, read imacs_result and imacs_diff.
+When an event contains approval, use imacs_approve with its session id to answer that request, regardless of the selected plan tab.
 4. Verify every acceptance check yourself: run the build and tests in the task's worktree and read the diff. When \
 something is missing, steer with imacs_comment + imacs_send_review or imacs_send and move the task back to running. Accept \
 with imacs_plan_update (status done, a note saying what you verified).
@@ -415,6 +421,7 @@ impl Default for Config {
                 agent("codex", &["codex"], AgentKind::Generic, Some("esc to interrupt")),
                 agent("shell", &[], AgentKind::Shell, None),
             ],
+            approvals: crate::approvals::ApprovalPolicy::default(),
             editor: EditorConfig::default(),
             chief: ChiefConfig::default(),
             steer: SteerConfig::default(),

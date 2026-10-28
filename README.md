@@ -44,7 +44,7 @@ in `~/.config/imacs` (moved once from `~/.cox` and `~/.config/cox` by earlier ve
 - **Review is steering.** Click a diff line to comment. **Send review** delivers all comments to the agent as one message,
   each with its file:line and the quoted code.
 - **Steer one, some or all.** The bar at the bottom types into the active agent, every agent, or a selection.
-- **Status without asking.** Claude sessions report through hooks. Agents without hooks, like Codex, are read from their
+- **Status without asking.** Claude and Codex 0.165+ sessions report through hooks. Older Codex versions use their
   screen (`busy_text`). What needs you is counted in the top bar; `cmd+j` jumps to it.
 - **Responsive.** On a wide screen, every agent gets a tile beside the diff (10 agents fit on a 5120 px ultrawide). As the window narrows, tiles collapse into
   tabs. Below that the diff stacks above the active agent, and at the smallest size the diff takes the whole area.
@@ -80,12 +80,62 @@ agents, Helix, a running IMACS or hooks do not affect the exit code. Tools are c
 
 ## Claude sessions anywhere
 
-Agents that IMACS starts get its hooks through `--settings`. To make Claude sessions in any other terminal show up too
+Claude agents that IMACS starts get its hooks through `--settings`. Codex 0.165+ gets inline
+`-c hooks.<Event>=...` settings; older versions keep `busy_text` status tracking.
+
+On the first Codex launch from an IMACS install, review and trust the IMACS hooks in Codex's
+startup prompt (or `/hooks`). Their definitions stay identical across panes, so this is a
+one-time step until the install path, socket or hook definitions change. Repository hooks keep
+their own trust review; IMACS never bypasses hook trust. Codex sessions with hooks run with
+`--no-daemon`, so a hook's process ancestry identifies its terminal reliably. `SessionStart`
+maps the Codex session ID to that pane, including when several panes share a worktree.
+`imacs doctor` prints the trust instructions. To make Claude sessions in any other terminal show up too
 (status, diff, and messages delivered at their next tool call or turn end), add the hooks to your user settings:
 
 ```sh
 imacs install-hooks      # merges into ~/.claude/settings.json, keeps a backup
 ```
+
+## Permission approvals
+
+Codex permission hooks show **needs you**, the command, working directory and reason on the tile.
+`imacs_wait` wakes with that request in the event's `approval` field, plus `plan` and `task` ids when linked to a plan.
+`imacs_list` and `imacs_result` also include the oldest pending request. The chief can answer with
+`imacs_approve {session, decision: "allow" | "allow_always" | "deny", message?}`.
+`allow_always` remembers the exact command, tool and directory for this session only; it does not
+write a global rule. Approval decisions and held input target the specified session, even while another plan tab
+is selected. Input held by one plan’s session is released only when that session’s permission request finishes.
+`message` is passed to Codex with the hook decision.
+
+Automatic approval is configured in `config.toml`:
+
+```toml
+[approvals]
+allow = ["cargo build", "cargo test", "cargo check", "cargo clippy", "cargo fmt",
+         "ls", "cat", "rg", "git status", "git diff", "git log"]
+```
+
+These defaults allow simple command prefixes only when the working directory and file paths are
+inside the session worktree. Shell expansion, compound commands, redirections, paths escaping
+through symlinks and read-tool options that execute programs or write files wait for approval.
+Set `allow = []` to make every permission request wait. This policy handles requests Codex raises;
+it does not add approval prompts to commands Codex already permits.
+
+IMACS waits up to ten seconds for a hook decision, then leaves Codex's native permission menu
+available so you can answer in the terminal. After that, `imacs_approve` selects the matching
+visible menu choice; it returns an error if no matching menu is visible yet. For `allow_always`,
+IMACS remembers the command and selects the one-time allow choice rather than creating a broader
+Codex prefix rule. A denial message can only be supplied while the hook is waiting.
+
+While a permission request is pending, `imacs_send` holds messages and raw input instead of typing
+into the menu, and returns `held: true`. It releases them after a lifecycle event confirms the
+request has finished, including when you answer directly in the terminal.
+
+Agent terminals inherit no `IMACS_SOCKET`, `IMACS_PANE`, `IMACS_HOME` or `IMACS_CONFIG`.
+Codex hooks receive the socket as an argument and find their pane from process ancestry or
+the mapped Codex session ID; Claude hooks receive socket and pane arguments. MCP servers receive
+their own routing environment. An IMACS launched from an agent therefore uses its own defaults; explicitly set
+`IMACS_HOME`, `IMACS_SOCKET` and `IMACS_CONFIG` when launching a separate test instance.
 
 ## The chief agent
 
@@ -174,6 +224,7 @@ codex mcp add IMACS -- imacs mcp
 ```
 
 Tools: `imacs_wait` (block until an agent finishes a turn or needs input; returns a cursor for the next call),
+`imacs_approve` (allow, allow_always or deny a pending permission request),
 `imacs_result` (an agent's last prompt, final message and screen), `imacs_list`, `imacs_start` (in a folder, or a new worktree from `repo` + `branch`), `imacs_send` (a message, or raw
 keys for menus), `imacs_read` (screen text), `imacs_diff`, `imacs_comment` + `imacs_send_review`, `imacs_open` (show a file to the user), `imacs_focus`, `imacs_close`.
 Comments an agent leaves show inline in the diff panel before they are sent, so you can see what it asks for.
