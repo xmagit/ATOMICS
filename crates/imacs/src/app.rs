@@ -930,7 +930,7 @@ impl App {
                     "--mcp-config".to_string(),
                     config.to_string(),
                     "--allowedTools".to_string(),
-                    "mcp__imacs".to_string(),
+                    CHIEF_ALLOWED_TOOLS.join(","),
                     "--append-system-prompt".to_string(),
                     prompt,
                 ]);
@@ -1063,7 +1063,7 @@ impl App {
             "folder": s.cwd,
             "worktree": s.worktree.as_ref().map(|w| &w.root),
             "branch": s.branch(),
-            "outside_cox": s.terminal.is_none(),
+            "outside_imacs": s.terminal.is_none(),
             "claude_session_id": s.claude_id,
             "last_prompt": s.last_prompt,
             "diff": stats,
@@ -1500,13 +1500,14 @@ impl App {
         }
     }
 
-    /// Closes the project's idle and exited sessions that no plan task is using.
+    /// Closes the project's idle and exited agents that no plan task is using. Shells
+    /// are always idle to IMACS, so they are left alone.
     fn close_idle(&mut self, project: &Path) -> usize {
         let in_plan: HashSet<String> = self.plan.tasks.iter().filter_map(|t| t.session.clone()).collect();
         let idle: Vec<String> = self
             .sessions
             .iter()
-            .filter(|s| !s.chief && matches!(s.status, AgentStatus::Idle | AgentStatus::Exited))
+            .filter(|s| !s.chief && s.is_agent() && matches!(s.status, AgentStatus::Idle | AgentStatus::Exited))
             .filter(|s| !in_plan.contains(&s.id))
             .filter(|s| self.project_of(&s.root()).as_deref() == Some(project))
             .map(|s| s.id.clone())
@@ -2068,12 +2069,7 @@ impl App {
                 None => "No task is ready.".into(),
             });
         }
-        // A plan starting means focus: the project's idle sessions make way for its agents.
         if let Some(project) = self.plan.project.clone() {
-            let closed = self.close_idle(&project);
-            if closed > 0 {
-                self.toast(format!("Closed {closed} idle session{} for the plan", if closed == 1 { "" } else { "s" }));
-            }
             self.set_view(Some(project));
         }
         let mut started = Vec::new();
@@ -3065,7 +3061,7 @@ impl App {
                 .store
                 .sessions
                 .iter()
-                .filter(|r| !live_ids.contains(r.claude_session_id.as_str()) && r.cwd.is_dir())
+                .filter(|r| !live_ids.contains(r.claude_session_id.as_str()) && r.cwd.is_dir() && r.agent != "chief")
                 .filter(|r| self.project_of(&r.cwd).is_some())
                 .filter({
                     let mut seen = HashSet::new();
@@ -4401,3 +4397,22 @@ fn brief_file(session: &str, text: &str) -> Result<String, String> {
     std::fs::write(&path, text).map_err(|e| format!("writing {}: {e}", path.display()))?;
     Ok(format!("Your task brief is in {}. Read it first and follow it exactly.", path.display()))
 }
+
+/// Tools the chief may use without asking: reading, planning, reviewing, and running the
+/// plan the user approved. Starting agents, typing into terminals and closing sessions ask first.
+const CHIEF_ALLOWED_TOOLS: &[&str] = &[
+    "mcp__imacs__imacs_list",
+    "mcp__imacs__imacs_wait",
+    "mcp__imacs__imacs_result",
+    "mcp__imacs__imacs_read",
+    "mcp__imacs__imacs_diff",
+    "mcp__imacs__imacs_plan_get",
+    "mcp__imacs__imacs_plan_set",
+    "mcp__imacs__imacs_plan_update",
+    "mcp__imacs__imacs_plan_dispatch",
+    "mcp__imacs__imacs_plan_integrate",
+    "mcp__imacs__imacs_comment",
+    "mcp__imacs__imacs_send_review",
+    "mcp__imacs__imacs_focus",
+    "mcp__imacs__imacs_open",
+];

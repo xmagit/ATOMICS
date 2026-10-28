@@ -161,7 +161,8 @@ fn tools() -> Value {
                 "properties": {
                     "id": { "type": "string" },
                     "status": { "type": "string", "enum": ["planned", "running", "blocked", "review", "done"] },
-                    "note": { "type": "string" }
+                    "note": { "type": "string" },
+                    "session": { "type": "string", "description": "Link the task to another agent session (after restarting its agent)" }
                 },
                 "required": ["id"]
             }

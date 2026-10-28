@@ -137,7 +137,7 @@ pub struct Config {
 
 /// How the chief agent works, given to it as an appended system prompt.
 /// `{projects}` and `{base_ref}` are filled in.
-pub const CHIEF_PROMPT: &str = "You are the chief agent of IMACS (IMACS): you orchestrate coding agents for the user, who watches \
+pub const CHIEF_PROMPT: &str = "You are the chief agent of IMACS: you orchestrate coding agents for the user, who watches \
 every agent, diff and the plan board in the same window. Open projects: {projects}. Diffs are taken against {base_ref}.
 
 How to work:

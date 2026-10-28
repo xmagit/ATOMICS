@@ -225,8 +225,22 @@ pub fn resolve_base(repo: &Path, base_ref: &str) -> Result<String> {
     bail!("none of {base_ref}, main or master exists in {}", repo.display())
 }
 
+/// Refuses branch names IMACS must never create or merge into: invalid ones, ones git
+/// would read as options, and the base branch (main, master or `base_ref`'s branch).
+pub fn check_branch_name(repo: &Path, branch: &str, base_ref: &str) -> Result<()> {
+    if branch.starts_with('-') || git(repo, &["check-ref-format", "--branch", branch]).is_err() {
+        bail!("{branch:?} is not a valid branch name");
+    }
+    let base = base_ref.strip_prefix("origin/").unwrap_or(base_ref);
+    if ["main", "master", base].contains(&branch) {
+        bail!("{branch} is the base branch; tasks and plans use branches of their own");
+    }
+    Ok(())
+}
+
 /// Creates `branch` from `base_ref` (or its fallback) in a new worktree at `path`.
 pub fn add_worktree(repo: &Path, path: &Path, branch: &str, base_ref: &str) -> Result<()> {
+    check_branch_name(repo, branch, base_ref)?;
     let base = resolve_base(repo, base_ref)?;
     let path_text = path.to_string_lossy();
     git(repo, &["worktree", "add", "-b", branch, &path_text, &base]).map(|_| ())
@@ -250,6 +264,7 @@ fn branch_exists(repo: &Path, branch: &str) -> bool {
 
 /// Creates `branch` from `base_ref` (or its fallback) unless it exists.
 pub fn ensure_branch(repo: &Path, branch: &str, base_ref: &str) -> Result<()> {
+    check_branch_name(repo, branch, base_ref)?;
     if branch_exists(repo, branch) {
         return Ok(());
     }
@@ -320,6 +335,8 @@ pub fn integrate(
     into_path: &Path,
     base_ref: &str,
 ) -> Result<Integration> {
+    check_branch_name(repo, branch, base_ref)?;
+    check_branch_name(repo, into, base_ref)?;
     if !branch_exists(repo, branch) {
         bail!("branch {branch} does not exist in {}", repo.display());
     }
@@ -536,6 +553,20 @@ pub(crate) mod tests {
         add_worktree(p, &wt, "feature/x", "origin/main").unwrap();
         assert_eq!(worktree_of(&wt).unwrap().branch.as_deref(), Some("feature/x"));
         std::fs::remove_dir_all(&wt).ok();
+    }
+
+    #[test]
+    fn base_branches_and_option_like_names_are_refused() {
+        let dir = repo();
+        let p = dir.path();
+        for bad in ["main", "master", "-D", "has space", "a..b", "release"] {
+            let base_ref = if bad == "release" { "origin/release" } else { "origin/main" };
+            assert!(check_branch_name(p, bad, base_ref).is_err(), "{bad} must be refused");
+        }
+        assert!(check_branch_name(p, "imacs/plan-ship", "origin/main").is_ok());
+        let wt = p.parent().unwrap().join(format!("{}-bad", p.file_name().unwrap().to_string_lossy()));
+        assert!(add_worktree(p, &wt, "-D", "main").is_err());
+        assert!(!wt.exists());
     }
 
     #[test]

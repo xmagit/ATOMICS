@@ -13,14 +13,20 @@ pub static SHELL_PATH: LazyLock<Option<String>> = LazyLock::new(|| login_shell_v
 fn login_shell_var(name: &str) -> Option<String> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
     let out = std::process::Command::new(shell)
-        .args(["-l", "-i", "-c", &format!("printf '__IMACS__%s__IMACS__' \"${name}\"")])
+        .args(["-l", "-i", "-c", &format!("printf '{MARKER}%s{MARKER}' \"${name}\"")])
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .output()
         .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let start = text.find("__IMACS__")? + 7;
-    let end = text[start..].find("__IMACS__")? + start;
+    between_markers(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Brackets the value the login shell prints, so shell startup noise is ignored.
+const MARKER: &str = "__IMACS__";
+
+fn between_markers(text: &str) -> Option<String> {
+    let start = text.find(MARKER)? + MARKER.len();
+    let end = text[start..].find(MARKER)? + start;
     Some(text[start..end].to_string())
 }
 
@@ -88,6 +94,14 @@ pub fn install_global_hooks() -> anyhow::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn login_shell_output_is_read_between_the_markers() {
+        let noise = "Last login: today\n__IMACS__/opt/homebrew/bin:/usr/bin__IMACS__";
+        assert_eq!(between_markers(noise).as_deref(), Some("/opt/homebrew/bin:/usr/bin"));
+        assert_eq!(between_markers("__IMACS____IMACS__").as_deref(), Some(""));
+        assert_eq!(between_markers("no markers"), None);
+    }
 
     #[test]
     fn env_var_reads_imacs_first_and_passes_only_plain_names_to_the_shell() {

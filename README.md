@@ -11,7 +11,8 @@ orchestrating agent plan the work, hand out tasks and review the results while y
 
 An atomisk.ai project.
 
-The command is `imacs`, after the coxswain: the one in the boat who doesn't row, but steers and calls the stroke.
+The command is `imacs`. `scripts/macos-app.sh` builds IMACS.app for the Dock; state lives in `~/.imacs` and the config
+in `~/.config/imacs` (moved once from `~/.cox` and `~/.config/cox` by earlier versions).
 
 ## What it does
 
@@ -53,10 +54,10 @@ The command is `imacs`, after the coxswain: the one in the boat who doesn't row,
 
 ```sh
 cargo install --path crates/imacs     # or: cargo run --release -p imacs
-IMACS                                 # opens the repository you are in (or your last projects)
-IMACS ~/repos/app                     # opens that project
-IMACS --workspace daily               # opens a saved workspace
-IMACS --open claude:~/repos/app --open codex:~/repos/app-feature
+imacs                                 # opens the repository you are in (or your last projects)
+imacs ~/repos/app                     # opens that project
+imacs --workspace daily               # opens a saved workspace
+imacs --open claude:~/repos/app --open codex:~/repos/app-feature
 ```
 
 On macOS, `scripts/macos-app.sh` builds `~/Applications/IMACS.app` (release binary, the atomisk.ai icon, microphone
@@ -84,6 +85,17 @@ Agents that IMACS starts get its hooks through `--settings`. To make Claude sess
 ```sh
 imacs install-hooks      # merges into ~/.claude/settings.json, keeps a backup
 ```
+
+## The chief agent
+
+Click the **CHIEF** pill at the top (or `cmd+o`) to open the chief: Claude in a large window in the middle of the
+screen, started in the project's main checkout with every IMACS tool and a built-in way of working (plan, wait for your
+approval, dispatch, verify, end with a fresh reviewer, never push without asking). Close the window to minimize it to
+the pill. `cmd+shift+space` dictates to it.
+
+The chief may read, plan, review and run the plan you approved without asking. Starting agents, typing into
+terminals and closing sessions still ask for permission, so it cannot run shell commands or answer other agents'
+prompts behind your back.
 
 ## Orchestration: a plan you approve, agents that report back
 
