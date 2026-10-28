@@ -56,7 +56,7 @@ fn write(out: &mut impl Write, value: Value) {
     let _ = out.flush();
 }
 
-const INSTRUCTIONS: &str = "IMACS runs coding agents (Claude Code, Codex, shells) in terminals the user watches, each in its own git worktree, and shows every worktree's diff against main. As an orchestrator: write a plan with imacs_plan_set and let the user approve it on the board, then imacs_plan_dispatch. Loop on imacs_wait instead of polling: agents report with imacs_report (status reported) or finish turns. Then read imacs_result and imacs_diff, steer with imacs_send or inline review comments (imacs_comment + imacs_send_review), and move tasks along with imacs_plan_update. Merge each accepted task into the plan's integration branch with imacs_plan_integrate before dispatching tasks that depend on it: those branch from the integration branch. For one-off work, imacs_start starts an agent directly. The user sees everything and can steer too, so keep briefs and reviews readable.";
+const INSTRUCTIONS: &str = "IMACS runs coding agents (Claude Code, Codex, shells) in terminals the user watches, each in its own git worktree, and shows every worktree's diff against main. As an orchestrator: write a plan with imacs_plan_set and let the user approve it on the board, then imacs_plan_dispatch. Loop on imacs_wait instead of polling: agents report with imacs_report (status reported) or finish turns. Then read imacs_result and imacs_diff, steer with imacs_send or inline review comments (imacs_comment + imacs_send_review), and move tasks along with imacs_plan_update. Merge each accepted task into the plan's integration branch with imacs_plan_integrate before dispatching tasks that depend on it: those branch from the integration branch. For one-off work, imacs_start starts an agent directly. Several plans can run at once: retain each returned plan id and pass plan to every plan tool. Start the next plan while one finishes. The chief is never closed. The user sees everything and can steer too, so keep briefs and reviews readable.";
 
 const AGENT_INSTRUCTIONS: &str = "You run inside IMACS, where an orchestrator and the user follow your work. Call imacs_report when you finish your task (status done), when you are blocked or need a decision (blocked or question), and optionally to report progress.";
 
@@ -94,6 +94,7 @@ fn call_report(params: &Value) -> Value {
 }
 
 fn tools() -> Value {
+    let plan = json!({ "type": "string", "description": "Plan id from imacs_plan_set/get. Required for update/dispatch/integrate when several plans are open." });
     let session = json!({ "type": "string", "description": "Session id, unique id prefix, or title" });
     json!([
         {
@@ -103,7 +104,7 @@ fn tools() -> Value {
         },
         {
             "name": "imacs_approve",
-            "description": "Answer the oldest pending permission request for a session. allow_always remembers this exact command and directory until the session closes. If the hook has returned, answers only a visible matching native menu; retry if it is not visible yet.",
+            "description": "Answer the oldest pending permission request for the specified session, regardless of the selected plan tab. allow_always remembers this exact command and directory until the session closes. If the hook has returned, answers only a visible matching native menu; retry if it is not visible yet.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -132,12 +133,13 @@ fn tools() -> Value {
         },
         {
             "name": "imacs_plan_set",
-            "description": "Write the plan for a goal as tasks. It appears on IMACS's plan board, where the user reviews, edits and approves it; nothing starts before approval. Each task: id (short, e.g. t1), title, brief (what to do, with context), acceptance (list of checks that mean done), depends_on (task ids), agent (claude or codex), args (e.g. [\"-m\", \"gpt-6.1-terra\"]), repo (project folder), branch. Re-sending a plan keeps the progress of tasks whose id stays. Tasks are merged into the integration branch (default imacs/plan-<goal>, kept while the goal stays the same).",
+            "description": "Write the plan for a goal as tasks. It appears on IMACS's plan board, where the user reviews, edits and approves it; nothing starts before approval. Each task: id (short, e.g. t1), title, brief (what to do, with context), acceptance (list of checks that mean done), depends_on (task ids), agent (claude or codex), args (e.g. [\"-m\", \"gpt-6.1-terra\"]), repo (project folder), branch. Without plan, creates a separate new plan; pass its returned plan id to update it, keeping progress of tasks whose id stays, even when rewording the goal. Tasks are merged into the integration branch (default imacs/plan-<plan-id>, kept unless explicitly overridden).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "plan": plan,
                     "goal": { "type": "string" },
-                    "integration": { "type": "string", "description": "Integration branch name, if not imacs/plan-<goal>" },
+                    "integration": { "type": "string", "description": "Integration branch name, if not imacs/plan-<plan-id>" },
                     "tasks": {
                         "type": "array",
                         "items": {
@@ -162,8 +164,8 @@ fn tools() -> Value {
         },
         {
             "name": "imacs_plan_get",
-            "description": "The plan with every task's status (planned, running, blocked, review, done), its agent session, the agent's last report, notes, whether the user approved it, and which tasks are ready to start.",
-            "inputSchema": { "type": "object", "properties": {} }
+            "description": "Without plan, lists open plans with goal, done/total, approval and waiting tasks. With plan, returns the full plan with every task's status (planned, running, blocked, review, done), its agent session, the agent's last report, notes, whether the user approved it, and which tasks are ready to start.",
+            "inputSchema": { "type": "object", "properties": { "plan": plan } }
         },
         {
             "name": "imacs_plan_update",
@@ -171,6 +173,7 @@ fn tools() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "plan": plan,
                     "id": { "type": "string" },
                     "status": { "type": "string", "enum": ["planned", "running", "blocked", "review", "done"] },
                     "note": { "type": "string" },
@@ -182,16 +185,16 @@ fn tools() -> Value {
         {
             "name": "imacs_plan_dispatch",
             "description": "Start one task (id) or every ready task: each gets a new worktree (from the integration branch when it has dependencies, else from main) and an agent whose first message is the task brief. Only works once the user approved the plan. Agents report back with imacs_report, which wakes imacs_wait.",
-            "inputSchema": { "type": "object", "properties": { "id": { "type": "string" } } }
+            "inputSchema": { "type": "object", "properties": { "plan": plan, "id": { "type": "string" } } }
         },
         {
             "name": "imacs_plan_integrate",
             "description": "Merge a task (in review or done) into the plan's integration branch: uncommitted changes in its worktree are committed on its branch first (message '<title> (<id>)'), then the branch is merged in a separate integration worktree next to the repository. Tasks with dependencies branch from the integration branch, so integrate accepted tasks before dispatching their dependents. On a conflict the merge is aborted, and the task stays in review with a note listing the conflicted files.",
-            "inputSchema": { "type": "object", "properties": { "id": { "type": "string" } }, "required": ["id"] }
+            "inputSchema": { "type": "object", "properties": { "plan": plan, "id": { "type": "string" } }, "required": ["id"] }
         },
         {
             "name": "imacs_wait",
-            "description": "Block until an agent finishes a turn, needs input, or exits (or other `statuses`), then return those events with a `cursor`. Pass the cursor as `after` next time to only see newer events. Use this instead of polling. `sessions` empty means any; timeout_secs defaults to 120 (max 280).",
+            "description": "Block until an agent finishes a turn, needs input, or exits (or other `statuses`), then return those events with a `cursor`. Pass the cursor as `after` next time to only see newer events. Use this instead of polling. Plan-session events include plan and task ids; permission events also include the approval request. `sessions` empty means any; timeout_secs defaults to 120 (max 280).",
             "inputSchema": {
                 "type": "object",
                 "properties": {

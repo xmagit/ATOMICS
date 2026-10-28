@@ -102,18 +102,25 @@ pub enum ControlRequest {
     Result {
         session: String,
     },
-    /// Replaces the plan (tasks keep their progress when their id stays). The user
-    /// has to approve it on the board before anything is dispatched.
+    /// Creates a separate plan without an id, or updates that plan with one. Tasks
+    /// keep progress by task id, including when rewording the goal; the user approves before dispatch.
     PlanSet {
+        #[serde(default)]
+        plan: Option<String>,
         goal: String,
         tasks: Vec<crate::plan::Task>,
-        /// Branch the tasks are merged into; kept while the goal stays the same.
+        /// Branch the tasks are merged into; kept unless explicitly overridden.
         #[serde(default)]
         integration: Option<String>,
     },
-    PlanGet,
+    PlanGet {
+        #[serde(default)]
+        plan: Option<String>,
+    },
     /// Changes a task's status or adds a note to it.
     PlanUpdate {
+        #[serde(default)]
+        plan: Option<String>,
         id: String,
         #[serde(default)]
         status: Option<String>,
@@ -126,11 +133,15 @@ pub enum ControlRequest {
     /// Starts the given task, or every ready task, each in a new worktree.
     PlanDispatch {
         #[serde(default)]
+        plan: Option<String>,
+        #[serde(default)]
         id: Option<String>,
     },
     /// Commits a task's uncommitted work on its branch and merges the branch into the
     /// plan's integration branch, in a worktree of its own.
     PlanIntegrate {
+        #[serde(default)]
+        plan: Option<String>,
         id: String,
     },
     /// A sub-agent reporting on its task (sent by `imacs mcp --agent`).
@@ -260,7 +271,7 @@ mod tests {
         let start: ControlRequest = serde_json::from_str(r#"{"cmd":"start","agent":"codex","folder":"/tmp"}"#).unwrap();
         assert!(matches!(start, ControlRequest::Start { args, .. } if args.is_empty()));
         let integrate: ControlRequest = serde_json::from_str(r#"{"cmd":"plan_integrate","id":"t1"}"#).unwrap();
-        assert!(matches!(integrate, ControlRequest::PlanIntegrate { id } if id == "t1"));
+        assert!(matches!(integrate, ControlRequest::PlanIntegrate { id, plan: None } if id == "t1"));
     }
 
     #[test]
