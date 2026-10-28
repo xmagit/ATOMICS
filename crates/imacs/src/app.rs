@@ -25,7 +25,7 @@ use crate::voice::{MAX_RECORDING, Recorder};
 use imacs_core::approvals::{ApprovalRequest, Decision};
 use imacs_core::control::{ControlRequest, ControlResponse};
 use imacs_core::hook::HookReply;
-use imacs_core::plan::{self, Plan, Report, Task, TaskStatus, short_slug};
+use imacs_core::plan::{self, Plan, PlanStatus, Report, Task, TaskStatus, short_slug};
 use imacs_core::workspace::{self, Workspace};
 use serde_json::json;
 
@@ -344,6 +344,7 @@ pub struct App {
     waiters: Vec<Waiter>,
     plans: Vec<Plan>,
     selected_plan: usize,
+    changed_plans: HashSet<String>,
     expanded_tasks: HashSet<(String, String)>,
     /// The project tab on screen; `None` shows every project.
     view: Option<PathBuf>,
@@ -406,7 +407,9 @@ impl App {
         let launch_dir = std::env::current_dir().unwrap_or_else(|_| paths::home());
 
         let (mut plans, plan_error) = match plan::load_plans(&paths::imacs_home()) {
-            Ok(plans) => (plans, None),
+            Ok((plans, errors)) => {
+                (plans, (!errors.is_empty()).then(|| format!("Unreadable plan files:\n{}", errors.join("\n"))))
+            }
             Err(err) => (Vec::new(), Some(format!("Loading plans failed: {err:#}"))),
         };
         let selected_plan = plans.iter().position(Plan::is_open).unwrap_or_else(|| {
@@ -460,6 +463,7 @@ impl App {
             waiters: Vec::new(),
             plans,
             selected_plan,
+            changed_plans: HashSet::new(),
             expanded_tasks: HashSet::new(),
             view: None,
             plan_view: false,
@@ -1202,7 +1206,9 @@ impl App {
         let done = |response: ControlResponse| ControlOutcome::Done(response);
         let missing = |reference: &str| done(ControlResponse::error(format!("no session matches {reference:?}")));
         let target = match &request {
-            ControlRequest::PlanSet { plan: Some(id), .. } => Some(Some(id.as_str())),
+            ControlRequest::PlanSet { plan: Some(id), .. } | ControlRequest::PlanClose { plan: id, .. } => {
+                Some(Some(id.as_str()))
+            }
             ControlRequest::PlanUpdate { plan, .. }
             | ControlRequest::PlanDispatch { plan, .. }
             | ControlRequest::PlanIntegrate { plan, .. } => Some(plan.as_deref()),
@@ -1301,41 +1307,56 @@ impl App {
                 }
             },
             ControlRequest::PlanSet { plan, goal, tasks, integration } => {
-                self.selected_plan = if plan.is_some() {
+                let new = plan.is_none();
+                let index = if plan.is_some() {
                     target
                 } else {
                     let id = plan::unique_id(&goal, &self.plans, &paths::imacs_home());
                     self.plans.push(Plan { id, ..Plan::default() });
                     self.plans.len() - 1
                 };
-                self.plans[self.selected_plan].replace(goal, tasks);
+                self.plans[index].replace(goal, tasks);
                 if let Some(branch) = integration.filter(|b| !b.trim().is_empty()) {
-                    self.plans[self.selected_plan].integration = Some(branch.trim().to_string());
+                    self.plans[index].integration = Some(branch.trim().to_string());
                 }
-                let project = self.plans[self.selected_plan]
+                let project = self.plans[index]
                     .tasks
                     .iter()
                     .find_map(|t| t.repo.as_deref())
                     .map(paths::expand)
+                    .or_else(|| self.plans[index].project.clone())
                     .or_else(|| {
                         self.diff_target().and_then(|t| self.project_of(&t)).or_else(|| self.repos.first().cloned())
                     });
-                self.plans[self.selected_plan].project = project.and_then(|p| self.project_of(&p));
-                self.show_plan_fleet();
-                self.save_plan(self.selected_plan);
-                self.panel = PanelMode::Plan;
-                self.diff_open = true;
-                let unknown = self.plans[self.selected_plan].unknown_dependencies();
-                self.toast("New plan: review and approve it on the plan board");
+                self.plans[index].project = project.and_then(|p| self.project_of(&p));
+                self.save_plan(index);
+                if new || (self.plan_view && self.selected_plan == index) {
+                    self.selected_plan = index;
+                    self.show_plan_fleet();
+                    self.panel = PanelMode::Plan;
+                    self.diff_open = true;
+                } else {
+                    self.changed_plans.insert(self.plans[index].id.clone());
+                }
+                let unknown = self.plans[index].unknown_dependencies();
+                self.toast(if new {
+                    "New plan: review and approve it on the plan board"
+                } else {
+                    "Plan updated: review and approve it on its board"
+                });
                 done(ControlResponse::ok(json!({
-                    "plan": self.plans[self.selected_plan].id,
-                    "tasks": self.plans[self.selected_plan].tasks.len(),
+                    "plan": self.plans[index].id,
+                    "tasks": self.plans[index].tasks.len(),
                     "approved": false,
-                    "integration": self.plans[self.selected_plan].integration_branch(),
+                    "integration": self.plans[index].integration_branch(),
                     "unknown_dependencies": unknown,
                     "next": "The user reviews and approves the plan on the board; then call plan_dispatch.",
                 })))
             }
+            ControlRequest::PlanClose { plan: _, status } => match self.close_plan(target, status) {
+                Ok(()) => done(ControlResponse::ok(self.plan_json(target))),
+                Err(err) => done(ControlResponse::error(err)),
+            },
             ControlRequest::PlanGet { plan: None } => done(ControlResponse::ok(json!({
                 "plans": self.plans.iter().filter(|p| p.is_open()).map(Plan::summary).collect::<Vec<_>>()
             }))),
@@ -1349,7 +1370,7 @@ impl App {
                 Some(task) => {
                     if let Some(status) = &status {
                         match TaskStatus::parse(status) {
-                            Some(status) => task.status = status,
+                            Some(status) => task.set_status(status),
                             None => {
                                 let _ = reply.send(done(ControlResponse::error(format!("unknown status {status}"))));
                                 return;
@@ -1700,7 +1721,8 @@ impl App {
         let mut plan_pick = None;
         for (index, plan) in self.plans.iter().enumerate().filter(|(_, p)| p.is_open()) {
             let name: String = plan.goal.chars().take(28).collect();
-            let label = format!("● {name} · {}/{}", plan.count(TaskStatus::Done), plan.tasks.len());
+            let marker = if self.changed_plans.contains(&plan.id) { " *" } else { "" };
+            let label = format!("● {name} · {}/{}{marker}", plan.count(TaskStatus::Done), plan.tasks.len());
             let attention = if self.sessions.iter().any(|s| plan.contains_session(&s.id) && s.status.needs_attention())
             {
                 "needs you"
@@ -1755,6 +1777,7 @@ impl App {
     }
 
     fn show_plan_fleet(&mut self) {
+        self.changed_plans.remove(&self.plans[self.selected_plan].id);
         self.ctx.request_repaint();
         self.view = self.plans[self.selected_plan].project.clone();
         self.plan_view = true;
@@ -2091,6 +2114,7 @@ impl App {
         let ui = &mut child;
         let mut approve = false;
         let mut dispatch_all = false;
+        let mut close_status = None;
         let mut close = false;
         let ready = self.plans[self.selected_plan].ready().len();
         ui.horizontal(|ui| {
@@ -2101,6 +2125,14 @@ impl App {
                 ui.label(RichText::new(format!("{done}/{total} done")).color(p.muted).size(12.0));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if self.plans[self.selected_plan].is_open() {
+                    if ui.small_button("Archive plan").clicked() {
+                        close_status = Some(PlanStatus::Archived);
+                    }
+                    if ui.small_button("Complete plan").clicked() {
+                        close_status = Some(PlanStatus::Completed);
+                    }
+                }
                 if ui.small_button("×").on_hover_text("Back to the diff").clicked() {
                     close = true;
                 }
@@ -2334,7 +2366,7 @@ impl App {
                     if let (Some(task), Some(status)) =
                         (self.plans[self.selected_plan].task_mut(&id), TaskStatus::parse(status))
                     {
-                        task.status = status;
+                        task.set_status(status);
                         changed = true;
                     }
                 }
@@ -2358,6 +2390,38 @@ impl App {
         if close {
             self.panel = PanelMode::Diff;
         }
+        if let Some(status) = close_status
+            && let Err(err) = self.close_plan(self.selected_plan, status)
+        {
+            self.toast(err);
+        }
+    }
+
+    fn close_plan(&mut self, index: usize, status: PlanStatus) -> Result<(), String> {
+        if status == PlanStatus::Open {
+            return Err("Choose completed or archived.".into());
+        }
+        let mut closed = self.plans[index].clone();
+        closed.status = status;
+        closed.save_in(&paths::imacs_home()).map_err(|err| format!("Closing plan failed: {err:#}"))?;
+        self.plans[index] = closed;
+        self.changed_plans.remove(&self.plans[index].id);
+        if self.selected_plan == index {
+            self.selected_plan = self.plans.iter().position(Plan::is_open).unwrap_or_else(|| {
+                self.plans.push(Plan::default());
+                self.plans.len() - 1
+            });
+            if self.plan_view {
+                if self.plans[self.selected_plan].is_open() {
+                    self.show_plan_fleet();
+                } else {
+                    self.set_view(None);
+                }
+                self.panel = PanelMode::Diff;
+            }
+        }
+        self.ctx.request_repaint();
+        Ok(())
     }
 
     fn save_plan(&self, index: usize) {
@@ -2395,6 +2459,34 @@ impl App {
     fn dispatch(&mut self, index: usize, only: Option<&str>) -> Result<Vec<String>, String> {
         if !self.plans[index].approved {
             return Err("The plan is not approved yet: the user approves it on the plan board.".into());
+        }
+        let into = self.plans[index].integration_branch();
+        let stale: Vec<String> = self.plans[index]
+            .tasks
+            .iter()
+            .filter(|t| t.integrated.as_deref() == Some(&into))
+            .filter(|task| {
+                !matches!(task.status, TaskStatus::Review | TaskStatus::Done)
+                    || !task.branch.as_deref().zip(self.task_repo(index, task)).is_some_and(|(branch, repo)| {
+                        git::git(
+                            &repo,
+                            &[
+                                "merge-base",
+                                "--is-ancestor",
+                                &format!("refs/heads/{branch}"),
+                                &format!("refs/heads/{into}"),
+                            ],
+                        )
+                        .is_ok()
+                    })
+            })
+            .map(|t| t.id.clone())
+            .collect();
+        for id in &stale {
+            self.plans[index].task_mut(id).expect("checked task").integrated = None;
+        }
+        if !stale.is_empty() {
+            self.save_plan(index);
         }
         let ready: Vec<Task> =
             self.plans[index].ready().into_iter().filter(|t| only.is_none_or(|id| t.id == id)).cloned().collect();
@@ -2449,14 +2541,16 @@ impl App {
             let start = self.plans[index].start_branch(&task);
             self.create_worktree(repo.clone(), branch.clone(), start, launch);
             if let Some(t) = self.plans[index].task_mut(&task.id) {
-                t.status = TaskStatus::Running;
-                t.integrated = None;
+                t.set_status(TaskStatus::Running);
                 t.branch = Some(branch);
                 t.repo.get_or_insert_with(|| repo.to_string_lossy().into_owned());
             }
             started.push(task.id);
-            self.selected_plan = index;
+        }
+        if self.plan_view && self.selected_plan == index {
             self.show_plan_fleet();
+        } else {
+            self.changed_plans.insert(self.plans[index].id.clone());
         }
         self.save_plan(index);
         Ok(started)
@@ -2498,9 +2592,6 @@ impl App {
         let plan = self.plans[index].id.clone();
         self.integrating.insert((plan.clone(), task.clone()));
         std::thread::spawn(move || {
-            // Integrations share the integration worktree: one at a time.
-            static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
-            let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
             let result =
                 git::integrate(&repo, &branch, &message, &into, &into_path, &base_ref).map_err(|e| format!("{e:#}"));
             let _ = tx.send(Integrated { plan, task, branch, into, result, reply });
@@ -2516,7 +2607,7 @@ impl App {
         let (note, response) = match result {
             Ok(Integration { merge: Merge::Conflict(files), .. }) => {
                 if let Some(task) = self.plans[index].task_mut(&id) {
-                    task.status = TaskStatus::Review;
+                    task.set_status(TaskStatus::Review);
                 }
                 let files = files.join(", ");
                 let error = format!(
@@ -2525,7 +2616,9 @@ impl App {
                 (format!("conflicts with {into} in {files}; merge aborted"), ControlResponse::error(error))
             }
             Ok(Integration { committed, merge, worktree }) => {
-                if let Some(task) = self.plans[index].task_mut(&id) {
+                if let Some(task) = self.plans[index].task_mut(&id)
+                    && matches!(task.status, TaskStatus::Review | TaskStatus::Done)
+                {
                     task.integrated = Some(into.clone());
                 }
                 let merged = merge == Merge::Merged;
@@ -2572,8 +2665,8 @@ impl App {
             task.report =
                 Some(Report { status: status.to_string(), summary: summary.to_string(), at: imacs_core::store::now() });
             match status {
-                "done" => task.status = TaskStatus::Review,
-                "blocked" | "question" => task.status = TaskStatus::Blocked,
+                "done" => task.set_status(TaskStatus::Review),
+                "blocked" | "question" => task.set_status(TaskStatus::Blocked),
                 _ => {}
             }
             self.save_plan(*index);
@@ -2614,7 +2707,7 @@ impl App {
                     None => false,
                 };
                 if gone {
-                    task.status = TaskStatus::Blocked;
+                    task.set_status(TaskStatus::Blocked);
                     task.notes.push("the agent exited before reporting".into());
                     changed = true;
                 }
@@ -2881,8 +2974,16 @@ impl App {
             if let Some(i) = self.creating.iter().position(|b| *b == branch) {
                 self.creating.remove(i);
             }
+            let background = launch
+                .task
+                .as_ref()
+                .is_some_and(|(plan, _)| !self.plan_view || self.plans[self.selected_plan].id != *plan);
+            let selection = (self.active.clone(), self.diff_root.clone(), self.focus_terminal.clone());
             let outcome =
                 result.and_then(|path| self.start(ctx, &launch.agent, path, None, launch.args, launch.prompt));
+            if background {
+                (self.active, self.diff_root, self.focus_terminal) = selection;
+            }
             if let Some((plan_id, task_id)) = &launch.task
                 && let Some(index) = self.plans.iter().position(|p| &p.id == plan_id)
                 && let Some(task) = self.plans[index].task_mut(task_id)
@@ -2890,7 +2991,7 @@ impl App {
                 match &outcome {
                     Ok(id) => task.session = Some(id.clone()),
                     Err(err) => {
-                        task.status = TaskStatus::Blocked;
+                        task.set_status(TaskStatus::Blocked);
                         task.notes.push(format!("could not start: {err}"));
                     }
                 }
@@ -5081,6 +5182,7 @@ const CHIEF_ALLOWED_TOOLS: &[&str] = &[
     "mcp__imacs__imacs_read",
     "mcp__imacs__imacs_diff",
     "mcp__imacs__imacs_plan_get",
+    "mcp__imacs__imacs_plan_close",
     "mcp__imacs__imacs_plan_set",
     "mcp__imacs__imacs_plan_update",
     "mcp__imacs__imacs_plan_dispatch",
@@ -5300,6 +5402,234 @@ mod tests {
             ControlOutcome::Done(response) => response,
             _ => panic!("unexpected deferred response"),
         }
+    }
+
+    fn repository() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git::git(&repo, &["init", "-q", "-b", "main"]).unwrap();
+        git::git(&repo, &["config", "user.name", "Test"]).unwrap();
+        git::git(&repo, &["config", "user.email", "test@example.org"]).unwrap();
+        git::git(&repo, &["commit", "--allow-empty", "-qm", "initial"]).unwrap();
+        (dir, repo)
+    }
+
+    #[test]
+    fn plan_close_persists_status_and_restores_implicit_single_plan_selection() {
+        with_app("app::tests::plan_close_persists_status_and_restores_implicit_single_plan_selection", |app, _| {
+            let one =
+                request(app, json!({"cmd":"plan_set", "goal":"One", "tasks":[{"id":"a"}]})).result["plan"].clone();
+            let two =
+                request(app, json!({"cmd":"plan_set", "goal":"Two", "tasks":[{"id":"a"}]})).result["plan"].clone();
+            assert!(!request(app, json!({"cmd":"plan_close", "plan":two, "status":"open"})).ok);
+            let closed = request(app, json!({"cmd":"plan_close", "plan":two, "status":"completed"}));
+            assert!(closed.ok);
+            assert_eq!(closed.result["status"], "completed");
+            assert!(request(app, json!({"cmd":"plan_update", "id":"a", "status":"done"})).ok);
+            assert_eq!(app.plans[app.selected_plan].id, one.as_str().unwrap());
+            assert_eq!(request(app, json!({"cmd":"plan_get"})).result["plans"].as_array().unwrap().len(), 1);
+            assert!(request(app, json!({"cmd":"plan_close", "plan":one, "status":"archived"})).ok);
+            assert!(!app.plan_view);
+            assert!(app.plans.iter().all(|p| !p.is_open()));
+            let (loaded, errors) = plan::load_plans(&paths::imacs_home()).unwrap();
+            assert!(errors.is_empty());
+            assert_eq!(loaded.iter().find(|p| p.id == one.as_str().unwrap()).unwrap().status, PlanStatus::Archived);
+            assert_eq!(loaded.iter().find(|p| p.id == two.as_str().unwrap()).unwrap().status, PlanStatus::Completed);
+            assert!(CHIEF_ALLOWED_TOOLS.contains(&"mcp__imacs__imacs_plan_close"));
+        });
+    }
+
+    #[test]
+    fn startup_toast_lists_unreadable_plan_files_without_hiding_valid_plans() {
+        with_app("app::tests::startup_toast_lists_unreadable_plan_files_without_hiding_valid_plans", |app, ctx| {
+            request(app, json!({"cmd":"plan_set", "goal":"Valid", "tasks":[]}));
+            let folder = paths::imacs_home().join("plans");
+            std::fs::write(folder.join("broken.json"), "{").unwrap();
+            std::fs::create_dir(folder.join("unreadable.json")).unwrap();
+            let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+            let reopened = App::new(&cc, Options::default(), &crate::load_icon());
+            let toast = &reopened.toast.as_ref().unwrap().0;
+            assert!(toast.contains("broken.json") && toast.contains("unreadable.json"), "{toast}");
+            assert_eq!(reopened.plans.iter().filter(|p| p.is_open()).count(), 1);
+        });
+    }
+
+    #[test]
+    fn background_plan_updates_and_successful_dispatch_preserve_the_foreground_and_chief() {
+        with_app(
+            "app::tests::background_plan_updates_and_successful_dispatch_preserve_the_foreground_and_chief",
+            |app, ctx| {
+                let (dir, repo) = repository();
+                app.config.worktree_path = format!("{}/{{slug}}", dir.path().display());
+                app.config.agents.push(imacs_core::config::AgentConfig {
+                    name: "fixture".into(),
+                    command: vec!["/bin/cat".into()],
+                    kind: AgentKind::Shell,
+                    busy_text: None,
+                });
+                let first = request(app, json!({"cmd":"plan_set", "goal":"Background", "tasks":[{"id":"a", "repo":repo, "agent":"fixture"}]})).result["plan"].clone();
+                let one = app.selected_plan;
+                request(app, json!({"cmd":"plan_set", "goal":"Foreground", "tasks":[{"id":"a"}]}));
+                let two = app.selected_plan;
+                app.sessions.push(session("foreground", AgentKind::Generic, AgentStatus::Idle, &repo));
+                app.active = Some("foreground".into());
+                app.diff_root = Some(repo.clone());
+                app.focus_terminal = Some("foreground".into());
+                app.chief_open = true;
+                app.panel = PanelMode::Editor;
+                assert!(
+                    request(
+                        app,
+                        json!({"cmd":"plan_set", "plan":first, "goal":"Background revised", "tasks":[
+                {"id":"a", "repo":repo, "agent":"fixture"}]})
+                    )
+                    .ok
+                );
+                assert_eq!(app.selected_plan, two);
+                assert!(app.chief_open && app.panel == PanelMode::Editor);
+                assert_eq!(app.active.as_deref(), Some("foreground"));
+                assert_eq!(app.diff_root.as_ref(), Some(&repo));
+                assert!(app.changed_plans.contains(first.as_str().unwrap()));
+                assert!(app.toast.as_ref().unwrap().0.starts_with("Plan updated:"));
+                app.plans[one].approved = true;
+                assert!(request(app, json!({"cmd":"plan_dispatch", "plan":first, "id":"a"})).ok);
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !app.creating.is_empty() {
+                    assert!(Instant::now() < deadline);
+                    app.pump(ctx);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                assert!(app.plans[one].tasks[0].session.is_some());
+                assert_eq!(app.selected_plan, two);
+                assert!(app.chief_open && app.panel == PanelMode::Editor);
+                assert_eq!(app.active.as_deref(), Some("foreground"));
+                assert_eq!(app.diff_root.as_ref(), Some(&repo));
+                assert_eq!(app.focus_terminal.as_deref(), Some("foreground"));
+                assert!(app.changed_plans.contains(first.as_str().unwrap()));
+                app.selected_plan = one;
+                app.show_plan_fleet();
+                assert!(!app.changed_plans.contains(first.as_str().unwrap()));
+                assert!(
+                    request(
+                        app,
+                        json!({"cmd":"plan_set", "plan":first, "goal":"Selected update", "tasks":[{"id":"a"}]})
+                    )
+                    .ok
+                );
+                assert!(app.panel == PanelMode::Plan);
+                assert!(!app.chief_open);
+            },
+        );
+    }
+
+    #[test]
+    fn status_updates_clear_integration_and_dispatch_rejects_new_unmerged_commits() {
+        with_app("app::tests::status_updates_clear_integration_and_dispatch_rejects_new_unmerged_commits", |app, _| {
+            let (_dir, repo) = repository();
+            git::git(&repo, &["branch", "task-a"]).unwrap();
+            git::git(&repo, &["branch", "integration"]).unwrap();
+            let plan = request(
+                app,
+                json!({"cmd":"plan_set", "goal":"Freshness", "integration":"integration", "tasks":[
+                {"id":"a", "repo":repo, "branch":"task-a"}, {"id":"b", "repo":repo, "depends_on":["a"]}]}),
+            )
+            .result["plan"]
+                .clone();
+            let index = app.selected_plan;
+            app.plans[index].approved = true;
+            app.plans[index].tasks[0].status = TaskStatus::Done;
+            app.plans[index].tasks[0].integrated = Some("integration".into());
+            assert!(request(app, json!({"cmd":"plan_update", "plan":plan, "id":"a", "status":"running"})).ok);
+            assert!(app.plans[index].tasks[0].integrated.is_none());
+            app.finish_integration(Integrated {
+                plan: plan.as_str().unwrap().into(),
+                task: "a".into(),
+                branch: "task-a".into(),
+                into: "integration".into(),
+                reply: None,
+                result: Ok(Integration { committed: false, merge: Merge::UpToDate, worktree: repo.clone() }),
+            });
+            assert!(
+                app.plans[index].tasks[0].integrated.is_none(),
+                "a late integration must not mark a running task integrated"
+            );
+            assert!(request(app, json!({"cmd":"plan_update", "plan":plan, "id":"a", "status":"done"})).ok);
+            assert!(app.dispatch(index, Some("b")).unwrap_err().contains("integrated dependencies"));
+            app.plans[index].tasks[0].integrated = Some("integration".into());
+            git::git(&repo, &["switch", "task-a"]).unwrap();
+            git::git(&repo, &["commit", "--allow-empty", "-qm", "new work after integration"]).unwrap();
+            assert!(app.dispatch(index, Some("b")).unwrap_err().contains("integrated dependencies"));
+            assert!(app.plans[index].tasks[0].integrated.is_none());
+            assert!(app.creating.is_empty());
+            let saved = Plan::load(&paths::imacs_home().join("plans").join(format!("{}.json", plan.as_str().unwrap())))
+                .unwrap();
+            assert!(saved.tasks[0].integrated.is_none());
+            git::git(&repo, &["branch", "-f", "integration", "task-a"]).unwrap();
+            app.plans[index].tasks[0].integrated = Some("integration".into());
+            // A missing requested task does not invalidate a genuinely integrated dependency.
+            assert!(app.dispatch(index, Some("missing")).is_err());
+            assert_eq!(app.plans[index].tasks[0].integrated.as_deref(), Some("integration"));
+        });
+    }
+
+    #[test]
+    fn integrations_in_different_repositories_can_finish_independently() {
+        use std::os::unix::fs::PermissionsExt;
+        with_app("app::tests::integrations_in_different_repositories_can_finish_independently", |app, _| {
+            let (dir1, repo1) = repository();
+            let (_dir2, repo2) = repository();
+            let started = dir1.path().join("started");
+            let release = dir1.path().join("release");
+            let hook = repo1.join(".git/hooks/pre-commit");
+            std::fs::write(
+                &hook,
+                format!(
+                    "#!/bin/sh\ntouch '{}'\nwhile [ ! -f '{}' ]; do sleep 0.02; done\n",
+                    started.display(),
+                    release.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+            app.config.worktree_path = "{repo_parent}/{slug}".into();
+            let mut indices = Vec::new();
+            for (goal, repo) in [("One", &repo1), ("Two", &repo2)] {
+                git::git(repo, &["branch", "task"]).unwrap();
+                let worktree = repo.with_file_name("task-worktree");
+                git::git(repo, &["worktree", "add", worktree.to_str().unwrap(), "task"]).unwrap();
+                std::fs::write(worktree.join("work.txt"), goal).unwrap();
+                request(
+                    app,
+                    json!({"cmd":"plan_set", "goal":goal, "tasks":[{"id":"a", "repo":repo, "branch":"task"}]}),
+                );
+                let index = app.selected_plan;
+                app.plans[index].tasks[0].status = TaskStatus::Done;
+                indices.push(index);
+            }
+            app.integrate(indices[0], "a", None);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !started.exists() {
+                if Instant::now() >= deadline {
+                    std::fs::write(&release, "").unwrap();
+                    panic!("first integration did not reach its hook");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            app.integrate(indices[1], "a", None);
+            let other = app.integrate_rx.recv_timeout(Duration::from_secs(5));
+            std::fs::write(&release, "").unwrap();
+            let other = other.expect("a second repository must not wait for the first repository's integration");
+            assert_eq!(other.plan, app.plans[indices[1]].id);
+            assert!(other.result.is_ok());
+            app.finish_integration(other);
+            let first = app.integrate_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(first.plan, app.plans[indices[0]].id);
+            assert!(first.result.is_ok());
+            app.finish_integration(first);
+            assert!(app.plans[indices[0]].tasks[0].integrated.is_some());
+            assert!(app.plans[indices[1]].tasks[0].integrated.is_some());
+        });
     }
 
     #[test]
@@ -5561,7 +5891,7 @@ mod tests {
             assert!(request(app, json!({"cmd":"plan_set", "plan":first_id, "goal":"First goal", "tasks":[{"id":"a", "title":"Revised"}]})).ok);
             assert_eq!(app.plans[two], old);
             assert_eq!(app.plans[one].tasks[0].session.as_deref(), Some("one-agent"));
-            let loaded = plan::load_plans(&paths::imacs_home()).unwrap();
+            let loaded = plan::load_plans(&paths::imacs_home()).unwrap().0;
             assert_eq!(loaded.iter().find(|p| p.id == first_id).unwrap(), &app.plans[one]);
             assert_eq!(loaded.iter().find(|p| p.id == second_id).unwrap().tasks[0].title, "Second task");
         });
@@ -5589,7 +5919,7 @@ mod tests {
                     task.integrated = legacy.integration.clone();
                 }
                 legacy.save(&paths::plan_file()).unwrap();
-                app.plans = plan::load_plans(&paths::imacs_home()).unwrap();
+                app.plans = plan::load_plans(&paths::imacs_home()).unwrap().0;
                 app.selected_plan = 0;
                 let id = app.plans[0].id.clone();
                 let progress = app.plans[0].tasks.clone();
@@ -5630,7 +5960,7 @@ mod tests {
                     }
                     assert_eq!(app.plans[0], original);
                 }
-                let loaded = plan::load_plans(&paths::imacs_home()).unwrap();
+                let loaded = plan::load_plans(&paths::imacs_home()).unwrap().0;
                 assert_eq!(loaded.len(), 3);
                 assert_eq!(loaded.iter().find(|p| p.id == id).unwrap(), &original);
             },
@@ -5734,12 +6064,28 @@ mod tests {
                     assert!(!app.plans[two].approved);
                 }
             }
+            let text = frame(app, vec![]);
+            let archive = text.iter().find(|(t, _)| t == "Archive plan").unwrap().1;
+            frame(app, vec![egui::Event::PointerMoved(archive), button(archive, true)]);
+            frame(app, vec![button(archive, false)]);
+            assert_eq!(app.plans[two].status, PlanStatus::Archived);
+            assert_eq!(app.selected_plan, one);
+            let text = frame(app, vec![]);
+            assert!(!text.iter().any(|(t, _)| t.starts_with("● Beacon ·")));
+            app.toggle_plan();
+            let text = frame(app, vec![]);
+            let complete = text.iter().find(|(t, _)| t == "Complete plan").unwrap().1;
+            frame(app, vec![egui::Event::PointerMoved(complete), button(complete, true)]);
+            frame(app, vec![button(complete, false)]);
+            assert_eq!(app.plans[one].status, PlanStatus::Completed);
+            assert!(app.plans.iter().all(|p| !p.is_open()));
+            assert_eq!(app.sessions.len(), 2, "closing plans does not terminate their sessions");
         });
     }
 
     #[test]
-    fn dispatch_selects_its_plan_and_delayed_start_failure_returns_to_that_plan() {
-        with_app("app::tests::dispatch_selects_its_plan_and_delayed_start_failure_returns_to_that_plan", |app, ctx| {
+    fn background_dispatch_preserves_selection_and_routes_delayed_start_failure() {
+        with_app("app::tests::background_dispatch_preserves_selection_and_routes_delayed_start_failure", |app, ctx| {
             let dir = tempfile::tempdir().unwrap();
             let repo = dir.path().join("repo");
             std::fs::create_dir(&repo).unwrap();
@@ -5775,8 +6121,9 @@ mod tests {
             assert!(app.dispatch(one, Some("a")).unwrap_err().contains("not approved"));
             app.plans[one].approved = true;
             assert_eq!(app.dispatch(one, Some("a")).unwrap(), ["a"]);
-            assert_eq!(app.selected_plan, one);
+            assert_eq!(app.selected_plan, two);
             assert!(app.plan_view);
+            assert!(app.changed_plans.contains(&app.plans[one].id));
             app.selected_plan = two;
             app.show_plan_fleet();
             let deadline = Instant::now() + Duration::from_secs(10);

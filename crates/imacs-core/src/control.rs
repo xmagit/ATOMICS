@@ -113,6 +113,11 @@ pub enum ControlRequest {
         #[serde(default)]
         integration: Option<String>,
     },
+    /// Removes an open plan from the tabs, retaining its tasks and history.
+    PlanClose {
+        plan: String,
+        status: crate::plan::PlanStatus,
+    },
     PlanGet {
         #[serde(default)]
         plan: Option<String>,

@@ -163,6 +163,13 @@ fn tools() -> Value {
             }
         },
         {
+            "name": "imacs_plan_close",
+            "description": "Close a plan as completed or archived. Its tab disappears; the plan and task history remain available through imacs_plan_get with its id.",
+            "inputSchema": { "type": "object", "properties": {
+                "plan": plan, "status": { "type": "string", "enum": ["completed", "archived"] }
+            }, "required": ["plan", "status"] }
+        },
+        {
             "name": "imacs_plan_get",
             "description": "Without plan, lists open plans with goal, done/total, approval and waiting tasks. With plan, returns the full plan with every task's status (planned, running, blocked, review, done), its agent session, the agent's last report, notes, whether the user approved it, and which tasks are ready to start.",
             "inputSchema": { "type": "object", "properties": { "plan": plan } }
@@ -333,6 +340,7 @@ fn request_for_tool(name: &str, mut args: Value) -> Result<ControlRequest, Strin
         "imacs_wait" => "wait",
         "imacs_plan_set" => "plan_set",
         "imacs_plan_get" => "plan_get",
+        "imacs_plan_close" => "plan_close",
         "imacs_plan_update" => "plan_update",
         "imacs_plan_dispatch" => "plan_dispatch",
         "imacs_plan_integrate" => "plan_integrate",
