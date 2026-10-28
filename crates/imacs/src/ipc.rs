@@ -85,6 +85,7 @@ pub struct ControlMessage {
 pub struct Channels {
     pub hooks: Sender<HookMessage>,
     pub control: Sender<ControlMessage>,
+    pub governor: Arc<crate::governor::Governor>,
 }
 
 impl Hub {
@@ -141,6 +142,9 @@ fn handle(stream: UnixStream, hub: &Mutex<Hub>, channels: &Channels, ctx: &egui:
     let mut line = String::new();
     BufReader::new(&stream).read_line(&mut line)?;
     let value: Value = serde_json::from_str(&line)?;
+    if value.get("cmd").and_then(Value::as_str) == Some("queue") {
+        return channels.governor.serve(&stream, &value);
+    }
     if value.get("cmd").is_some() {
         let response = match serde_json::from_value::<ControlRequest>(value) {
             Ok(request) => control(request, &channels.control, ctx),

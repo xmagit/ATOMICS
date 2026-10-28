@@ -76,6 +76,14 @@ kind = "shell"
 # Simple command prefixes, within the session worktree. [] makes every request wait.
 allow = ["ls", "cat", "rg", "git status", "git diff", "git log"]
 
+[resources]
+# Heavy work shared by every agent IMACS starts. Compilers share one jobserver pool, and whole
+# test runs or QA instances wait for a slot through `imacs queue --class test|qa -- <command>`.
+# jobs = 16          # jobserver tokens; unset = cores minus 2; 0 = no pool (build scripts that run Apple make)
+# test_slots = 3     # whole test runs at once; unset = one per 6 cores
+# qa_slots = 1       # QA instances at once
+agent_nice = 10      # niceness agent terminals start at; 0 = normal priority
+
 [editor]
 # Terminal editor for editor mode (cmd+e). Helix has LSP and inlay hints built in.
 command = ["hx"]
@@ -138,6 +146,7 @@ pub struct Config {
     pub theme: ThemeConfig,
     pub agents: Vec<AgentConfig>,
     pub approvals: crate::approvals::ApprovalPolicy,
+    pub resources: crate::governor::ResourceConfig,
     pub editor: EditorConfig,
     pub chief: ChiefConfig,
     pub steer: SteerConfig,
@@ -168,6 +177,7 @@ requests. Never push, open pull requests or delete branches without the user's O
 Several plans may be open at once, each with its own tab, agents, approval, integration branch and final review. \
 Start the next plan while another finishes. The chief is never closed. Use imacs_plan_get without plan for summaries.
 Close finished plans with imacs_plan_close (plan id, status completed or archived); their history remains available by id.
+Agents share this machine: their compilers draw from one job pool, and full test runs and QA instances wait for a slot through `imacs queue`. Size the fleet to the machine, and keep briefs asking for targeted checks while working and one full test run at the end.
 
 Keep briefs, notes and messages short: the user reads them on the board.";
 
@@ -423,6 +433,7 @@ impl Default for Config {
                 agent("shell", &[], AgentKind::Shell, None),
             ],
             approvals: crate::approvals::ApprovalPolicy::default(),
+            resources: crate::governor::ResourceConfig::default(),
             editor: EditorConfig::default(),
             chief: ChiefConfig::default(),
             steer: SteerConfig::default(),
