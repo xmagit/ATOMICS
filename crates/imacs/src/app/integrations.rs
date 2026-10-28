@@ -111,6 +111,9 @@ impl App {
     pub(super) fn integrate(&mut self, index: usize, id: &str, reply: Option<Sender<ControlOutcome>>) {
         let job = match self.plans[index].tasks.iter().find(|t| t.id == id) {
             None => Err(format!("no task {id}")),
+            Some(_) if id == plan::REVIEW_TASK => {
+                Err("The review task cannot be integrated: it only reviews the plan's integration branch.".into())
+            }
             Some(task) if !matches!(task.status, TaskStatus::Review | TaskStatus::Done) => {
                 Err(format!("Task {id} is {}: only tasks in review or done can be integrated.", task.status.label()))
             }
@@ -206,6 +209,35 @@ impl App {
 mod tests {
     use super::super::tests::{repository, request, with_app};
     use super::*;
+
+    #[test]
+    fn review_task_cannot_be_integrated() {
+        with_app("app::integrations::tests::review_task_cannot_be_integrated", |app, _| {
+            let (_dir, repo) = repository();
+            request(app, json!({"cmd":"plan_set", "goal":"Review integration", "tasks":[{"id":"a", "repo":repo}]}));
+            let index = app.selected_plan;
+            let plan = app.plans[index].id.clone();
+            let into = app.plans[index].integration_branch();
+            git::git(&repo, &["branch", &into]).unwrap();
+            let review = repo.with_file_name("review");
+            git::add_worktree(&repo, &review, "review-branch", "main").unwrap();
+            std::fs::write(review.join("uncommitted"), "keep review changes").unwrap();
+            let before = git::git(&repo, &["rev-parse", &into, "review-branch"]).unwrap();
+            for status in [TaskStatus::Planned, TaskStatus::Review, TaskStatus::Done] {
+                let task = app.plans[index].task_mut(plan::REVIEW_TASK).unwrap();
+                task.status = status;
+                task.branch = Some("review-branch".into());
+                let response = request(app, json!({"cmd":"plan_integrate", "plan":plan, "id":plan::REVIEW_TASK}));
+                assert!(!response.ok);
+                assert!(response.error.unwrap().contains("The review task cannot be integrated"));
+                assert!(app.integrating.is_empty());
+                assert!(app.integrate_rx.try_recv().is_err());
+                assert!(app.plans[index].task_mut(plan::REVIEW_TASK).unwrap().integrated.is_none());
+            }
+            assert_eq!(git::git(&repo, &["rev-parse", &into, "review-branch"]).unwrap(), before);
+            assert_eq!(git::git(&review, &["status", "--porcelain"]).unwrap().trim(), "?? uncommitted");
+        });
+    }
 
     #[test]
     fn idle_integrations_do_not_poll_git_or_request_repaints() {

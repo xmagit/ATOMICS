@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use anyhow::{Result, bail, ensure};
 
 use crate::git;
-use crate::plan::{Plan, PlanStatus};
+use crate::plan::{Plan, PlanStatus, REVIEW_TASK, Task};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
@@ -19,13 +19,13 @@ pub struct Entry {
 
 pub fn preview(plan: &Plan, base_ref: &str) -> Result<Vec<Entry>> {
     ensure!(plan.status == PlanStatus::Completed, "Only completed plans can be cleaned up");
-    let mut repos: BTreeMap<PathBuf, BTreeSet<String>> = BTreeMap::new();
+    let mut repos: BTreeMap<PathBuf, Vec<&Task>> = BTreeMap::new();
     for task in &plan.tasks {
-        let Some(branch) = &task.branch else { continue };
+        let Some(_) = &task.branch else { continue };
         let repo = task.repo.as_deref().map(crate::paths::expand).or_else(|| plan.project.clone());
         let repo = repo.ok_or_else(|| anyhow::anyhow!("No recorded repository for task {}", task.id))?;
         let main = git::list_worktrees(&repo)?.into_iter().next().ok_or_else(|| anyhow::anyhow!("No main checkout"))?;
-        repos.entry(main.path).or_default().insert(branch.clone());
+        repos.entry(main.path).or_default().push(task);
     }
     if repos.is_empty()
         && let Some(repo) = &plan.project
@@ -35,16 +35,22 @@ pub fn preview(plan: &Plan, base_ref: &str) -> Result<Vec<Entry>> {
     }
     let integration = plan.integration_branch();
     let mut entries = Vec::new();
-    for (repo, mut branches) in repos {
+    for (repo, tasks) in repos {
         let base = git::resolve_base(&repo, base_ref)?;
         let exists = |branch: &str| {
             git::git(&repo, &["rev-parse", "--verify", &format!("refs/heads/{branch}^{{commit}}")]).is_ok()
         };
-        let merged = |branch: &str| {
-            git::git(&repo, &["merge-base", "--is-ancestor", &format!("refs/heads/{branch}"), &base]).is_ok()
+        let merged_into = |branch: &str, into: &str| {
+            git::git(&repo, &["merge-base", "--is-ancestor", &format!("refs/heads/{branch}"), into]).is_ok()
         };
-        let finished = (exists(&integration) && merged(&integration))
-            || (!branches.is_empty() && branches.iter().all(|branch| !exists(branch) || merged(branch)));
+        let mut branches: BTreeSet<_> = tasks.iter().filter_map(|t| t.branch.clone()).collect();
+        let finished = (exists(&integration) && merged_into(&integration, &base))
+            || (!branches.is_empty()
+                && tasks
+                    .iter()
+                    .filter(|t| t.id != REVIEW_TASK)
+                    .filter_map(|t| t.branch.as_deref())
+                    .all(|branch| !exists(branch) || merged_into(branch, &base)));
         branches.insert(integration.clone());
         let worktrees = git::list_worktrees(&repo)?;
         let health = git::worktree_health(&repo, &base)?;
@@ -52,13 +58,17 @@ pub fn preview(plan: &Plan, base_ref: &str) -> Result<Vec<Entry>> {
         // Keep the integration branch available until all task removals have rechecked it.
         branches.sort_by_key(|branch| branch == &integration);
         for branch in branches {
+            // Review starts from integration and carries no work of its own.
+            let review = tasks.iter().any(|t| t.id == REVIEW_TASK && t.branch.as_ref() == Some(&branch));
             let worktree = worktrees.iter().find(|w| w.branch.as_ref() == Some(&branch)).map(|w| w.path.clone());
             let h = health.iter().find(|h| h.branch.as_ref() == Some(&branch));
             let keep = if git::check_branch_name(&repo, &branch, &base).is_err() || worktree.as_ref() == Some(&repo) {
                 Some("main checkout or protected branch".into())
             } else if !finished {
                 Some(format!("plan has not been merged into {base}"))
-            } else if !merged(&branch) {
+            } else if !merged_into(&branch, &base)
+                && !(review && merged_into(&branch, &format!("refs/heads/{integration}")))
+            {
                 Some(format!("unmerged commits: branch is not contained in {base}"))
             } else if let Some(h) = h {
                 if h.missing {
@@ -90,14 +100,20 @@ pub fn remove(plan: &Plan, base_ref: &str, entry: &Entry) -> Result<()> {
     if let Some(path) = &entry.worktree {
         git::remove_worktree(&entry.repo, path, None, false)?;
     }
-    // Containment was checked against base, independently of HEAD or the branch's upstream.
-    git::git(&entry.repo, &["update-ref", "-d", &format!("refs/heads/{}", entry.branch), &entry.tip]).map(|_| ())
+    // Delete the checked tip, independently of HEAD or the branch's upstream.
+    git::git(&entry.repo, &["update-ref", "-d", &format!("refs/heads/{}", entry.branch), &entry.tip])?;
+    if let Err(err) =
+        git::git(&entry.repo, &["config", "--local", "--remove-section", &format!("branch.{}", entry.branch)])
+        && !err.to_string().contains("no such section")
+    {
+        return Err(err);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::Task;
 
     fn plan(repo: &std::path::Path, branches: &[&str]) -> Plan {
         Plan {
@@ -264,6 +280,82 @@ mod tests {
         remove(&plan, "main", &rows[0]).unwrap();
         assert!(!task.exists());
         assert!(into.join("integration-only").exists());
+    }
+
+    #[test]
+    fn review_cleanup_uses_base_or_integration_after_each_task_is_merged() {
+        for review_base in ["main", "imacs/plan-ship"] {
+            for review_has_work in [false, true] {
+                let (_dir, repo) = git::tests::project();
+                let one = worktree(&repo, "task-one");
+                let two = worktree(&repo, "task-two");
+                let into = worktree(&repo, "imacs/plan-ship");
+                commit(&one, "one");
+                commit(&two, "two");
+                for branch in ["task-one", "task-two"] {
+                    git::merge(&into, branch).unwrap();
+                    git::merge(&repo, branch).unwrap();
+                }
+                assert!(git::git(&repo, &["merge-base", "--is-ancestor", "imacs/plan-ship", "main"]).is_err());
+                let review = repo.with_file_name("review-ship");
+                git::add_worktree(&repo, &review, "review-ship", review_base).unwrap();
+                // Containment in integration also permits an older review tip.
+                commit(&into, "integration-only");
+                if review_has_work {
+                    commit(&review, "review-only");
+                }
+                let mut plan = plan(&repo, &["task-one", "task-two", "review-ship"]);
+                plan.tasks[2].id = REVIEW_TASK.into();
+                let rows = preview(&plan, "main").unwrap();
+                assert_eq!(rows.len(), 4);
+                for row in &rows {
+                    match row.branch.as_str() {
+                        "imacs/plan-ship" => assert!(row.keep.as_deref().unwrap().contains("unmerged commits")),
+                        "review-ship" if review_has_work => {
+                            assert!(row.keep.as_deref().unwrap().contains("unmerged commits"));
+                            assert!(remove(&plan, "main", row).is_err());
+                        }
+                        _ => {
+                            assert!(row.keep.is_none(), "{}: {:?}", row.branch, row.keep);
+                            remove(&plan, "main", row).unwrap();
+                        }
+                    }
+                }
+                assert!(!one.exists() && !two.exists());
+                assert_eq!(review.exists(), review_has_work);
+                assert!(into.join("integration-only").exists());
+            }
+        }
+    }
+
+    #[test]
+    fn removal_cleans_branch_config_and_allows_missing_sections() {
+        for has_worktree in [false, true] {
+            for has_config in [false, true] {
+                let (_dir, repo) = git::tests::project();
+                let task = worktree(&repo, "task/one.v2");
+                if !has_worktree {
+                    git::remove_worktree(&repo, &task, None, false).unwrap();
+                }
+                if has_config {
+                    git::git(&repo, &["config", "branch.task/one.v2.remote", "."]).unwrap();
+                    git::git(&repo, &["config", "branch.task/one.v2.merge", "refs/heads/main"]).unwrap();
+                    git::git(&repo, &["config", "branch.task/one.v2.description", "completed task"]).unwrap();
+                }
+                git::git(&repo, &["config", "branch.other.description", "keep me"]).unwrap();
+                let plan = plan(&repo, &["task/one.v2"]);
+                let row = preview(&plan, "main").unwrap().remove(0);
+                remove(&plan, "main", &row).unwrap();
+                assert!(!task.exists());
+                assert!(git::git(&repo, &["show-ref", "--verify", "refs/heads/task/one.v2"]).is_err());
+                let config = git::git(&repo, &["config", "--local", "--list"]).unwrap();
+                assert!(!config.contains("branch.task/one.v2."), "{config}");
+                assert!(
+                    !std::fs::read_to_string(repo.join(".git/config")).unwrap().contains("[branch \"task/one.v2\"]")
+                );
+                assert_eq!(git::git(&repo, &["config", "branch.other.description"]).unwrap().trim(), "keep me");
+            }
+        }
     }
 
     #[test]
