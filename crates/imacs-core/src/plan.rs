@@ -87,6 +87,10 @@ impl TaskStatus {
 pub const REVIEW_TASK: &str = "review";
 
 impl Plan {
+    pub fn contains_session(&self, id: &str) -> bool {
+        self.tasks.iter().any(|task| task.session.as_deref() == Some(id))
+    }
+
     pub fn load(path: &Path) -> Option<Plan> {
         std::fs::read_to_string(path).ok().and_then(|text| serde_json::from_str(&text).ok())
     }
@@ -268,6 +272,21 @@ mod tests {
             agent: "claude".into(),
             ..Task::default()
         }
+    }
+
+    #[test]
+    fn fleet_includes_only_linked_sessions_in_any_task_state() {
+        let plan = Plan {
+            tasks: vec![
+                Task { session: Some("running".into()), status: TaskStatus::Running, ..Task::default() },
+                Task { session: Some("done".into()), status: TaskStatus::Done, ..Task::default() },
+                Task::default(),
+            ],
+            ..Plan::default()
+        };
+        let sessions = ["unrelated", "done", "chief", "running"];
+        let fleet: Vec<_> = sessions.into_iter().filter(|id| plan.contains_session(id)).collect();
+        assert_eq!(fleet, ["done", "running"]);
     }
 
     #[test]

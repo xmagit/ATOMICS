@@ -91,7 +91,11 @@ imacs install-hooks      # merges into ~/.claude/settings.json, keeps a backup
 Click the **CHIEF** pill at the top (or `cmd+o`) to open the chief: Claude in a large window in the middle of the
 screen, started in the project's main checkout with every IMACS tool and a built-in way of working (plan, wait for your
 approval, dispatch, verify, end with a fresh reviewer, never push without asking). Close the window to minimize it to
-the pill. `cmd+shift+space` dictates to it.
+the pill. The **dock** / **float** button in its header switches between the floating window and a full-height column
+beside the agents; the pill's context menu offers both modes too. Drag the dock's right edge to resize it, or double-click
+to reset it. Mode and width are remembered; `[chief] dock = "floating"` (or `"docked"`) sets the initial mode.
+`cmd+o` shows or hides either mode. On narrow windows the chief floats instead, then docks again when the window widens.
+`cmd+shift+space` dictates to it.
 
 The chief may read, plan, review and run the plan you approved without asking. Starting agents, typing into
 terminals and closing sessions still ask for permission, so it cannot run shell commands or answer other agents'
@@ -117,6 +121,10 @@ first use like any other worktree, so your main checkout is never touched. On a 
 task stays in review with a note listing the conflicted files. Tasks without dependencies branch from `base_ref`;
 tasks with dependencies branch from the integration branch, so integrate accepted tasks before dispatching the tasks
 that build on them.
+
+Dispatching tasks selects the **plan · done/total** fleet tab, showing only sessions linked to the plan's tasks as they
+start. It returns from the board to the diff and minimizes a floating chief; a docked chief stays beside the fleet.
+Click the plan tab later to return to that overview, or choose All or a project tab to see other sessions.
 
 ## Voice
 
@@ -158,7 +166,8 @@ keys for menus), `imacs_read` (screen text), `imacs_diff`, `imacs_comment` + `im
 Comments an agent leaves show inline in the diff panel before they are sent, so you can see what it asks for.
 
 `imacs ctl '<json>'` sends the same requests from a shell, e.g. `imacs ctl '{"cmd":"list"}'`. A few extras exist for
-scripting and testing: `show_diff`, `resize` and `screenshot`.
+scripting and testing: `show_diff`, `show_chief`, `resize` and `screenshot`. For example,
+`imacs ctl '{"cmd":"show_chief","open":true,"dock":"docked","width":720}'` shows the dock and remembers its width.
 
 ## Shortcuts
 

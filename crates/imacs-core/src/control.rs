@@ -149,6 +149,14 @@ pub enum ControlRequest {
     ShowDiff {
         open: bool,
     },
+    /// Shows or hides the chief, optionally switching its presentation or width.
+    ShowChief {
+        open: bool,
+        #[serde(default)]
+        dock: Option<crate::config::ChiefDock>,
+        #[serde(default)]
+        width: Option<f32>,
+    },
     /// Resizes the window (in points), to try the responsive layout.
     Resize {
         width: f32,
