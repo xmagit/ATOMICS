@@ -201,7 +201,7 @@ fn main() -> eframe::Result {
         migration_errors,
     };
     let icon = load_icon();
-    let native = eframe::NativeOptions {
+    let mut native = eframe::NativeOptions {
         // Without --size IMACS fills the screen: the layout is built to use all of it.
         viewport: egui::ViewportBuilder::default()
             .with_title("IMACS")
@@ -212,6 +212,15 @@ fn main() -> eframe::Result {
             .with_min_inner_size([480.0, 320.0]),
         ..Default::default()
     };
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut native.wgpu_options.wgpu_setup {
+        let device_descriptor = setup.device_descriptor.clone();
+        setup.device_descriptor = std::sync::Arc::new(move |adapter| {
+            let mut descriptor = device_descriptor(adapter);
+            // eframe's 8192-pixel default is too small for wide or tall Retina windows.
+            descriptor.required_limits.max_texture_dimension_2d = adapter.limits().max_texture_dimension_2d;
+            descriptor
+        });
+    }
     eframe::run_native("IMACS", native, Box::new(|cc| Ok(Box::new(app::App::new(cc, options, &icon)))))
 }
 
