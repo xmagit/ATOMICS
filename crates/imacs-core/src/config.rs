@@ -544,6 +544,14 @@ impl Default for KeyConfig {
 }
 
 impl AgentConfig {
+    pub fn is_codex(&self) -> bool {
+        self.kind == AgentKind::Generic
+            && self
+                .command
+                .first()
+                .is_some_and(|program| std::path::Path::new(program).file_name().is_some_and(|name| name == "codex"))
+    }
+
     fn default_kind() -> AgentKind {
         AgentKind::Generic
     }
@@ -602,6 +610,26 @@ impl Chord {
 mod tests {
     use super::*;
     use crate::layout::DiffSplit;
+
+    #[test]
+    fn codex_detection_uses_the_program_and_agent_kind() {
+        for (name, command, kind, expected) in [
+            ("custom", vec!["codex"], AgentKind::Generic, true),
+            ("custom", vec!["/tools/codex"], AgentKind::Generic, true),
+            ("codex", vec!["other"], AgentKind::Generic, false),
+            ("codex", vec![], AgentKind::Generic, false),
+            ("codex", vec!["codex"], AgentKind::Shell, false),
+            ("codex", vec!["codex"], AgentKind::Claude, false),
+        ] {
+            let agent = AgentConfig {
+                name: name.into(),
+                command: command.into_iter().map(str::to_string).collect(),
+                kind,
+                busy_text: None,
+            };
+            assert_eq!(agent.is_codex(), expected, "{agent:?}");
+        }
+    }
 
     #[test]
     fn automatic_agent_closing_defaults_on_and_can_be_disabled() {

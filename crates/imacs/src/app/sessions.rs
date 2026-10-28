@@ -111,11 +111,7 @@ impl App {
             return Err(format!("{} is not a folder", cwd.display()));
         }
         let id = uuid::Uuid::new_v4().to_string();
-        let codex = agent.kind == AgentKind::Generic
-            && agent
-                .command
-                .first()
-                .is_some_and(|program| Path::new(program).file_name().is_some_and(|name| name == "codex"));
+        let codex = agent.is_codex();
         let launch = AgentLaunch { id: id.clone(), agent, cwd, resume, extra_args, prompt, chief };
         let version = if codex {
             let program = resolve_program(&launch.agent.command[0]);
@@ -489,13 +485,7 @@ impl App {
             if terminal.exited() {
                 return Delivery::Unavailable;
             }
-            let codex = session.kind == AgentKind::Generic
-                && self.config.agent(&session.agent).is_some_and(|agent| {
-                    agent
-                        .command
-                        .first()
-                        .is_some_and(|program| Path::new(program).file_name().is_some_and(|p| p == "codex"))
-                });
+            let codex = self.config.agent(&session.agent).is_some_and(|agent| agent.is_codex());
             let screen_before = if codex { terminal.screen_text(200) } else { String::new() };
             terminal.submit(text);
             let trackable = session.kind == AgentKind::Claude
@@ -645,7 +635,9 @@ fn codex_transcript_receipt(screen: &str, before: &str, text: &str) -> bool {
     let Some(first) = lines.next() else { return false };
     [first, lines.next_back().unwrap_or(first)].into_iter().any(|line| {
         let message = compact(line);
-        if current_compact.matches(&message).count() > previous_compact.matches(&message).count() {
+        if message.chars().count() >= 20
+            && current_compact.matches(&message).count() > previous_compact.matches(&message).count()
+        {
             return true;
         }
         // Codex clips queued messages to a bullet and an ellipsis. Only accept a
@@ -697,6 +689,17 @@ fn compile_cache_env(cwd: &Path) -> Vec<(String, String)> {
 mod tests {
     use super::super::tests::{request, session, with_app};
     use super::*;
+
+    #[test]
+    fn short_messages_cannot_be_confirmed_by_agent_output() {
+        let before = "Working\n› Ask Codex to do anything";
+        for (message, output) in
+            [("ok", "I looked at the code"), ("yes", "yes, I will check"), ("continue", "I will continue now")]
+        {
+            let screen = format!("• {output}\n› Ask Codex to do anything");
+            assert!(!codex_transcript_receipt(&screen, before, message), "{message}: {output}");
+        }
+    }
 
     #[test]
     fn codex_receipts_require_new_evidence_outside_the_composer() {

@@ -309,7 +309,7 @@ impl App {
                 ui.new_child(egui::UiBuilder::new().id_salt(("completed", plan, task)).max_rect(tile.shrink(14.0)));
             let task_data = &self.plans[plan].tasks[task];
             child.label(RichText::new(&task_data.title).color(p.foreground).strong().size(13.0));
-            if let Some(action) = task_result(&mut child, task_data, None, false, &p) {
+            if let Some(action) = task_result(&mut child, task_data, None, false, &self.config, &p) {
                 task_action = Some((plan, task, action));
             }
         }
@@ -414,6 +414,67 @@ mod tests {
     }
 
     #[test]
+    fn completed_task_resume_detects_codex_by_program_instead_of_agent_name() {
+        with_app(
+            "app::fleet::tests::completed_task_resume_detects_codex_by_program_instead_of_agent_name",
+            |app, ctx| {
+                let dir = tempfile::tempdir().unwrap();
+                for (name, program, expected) in
+                    [("custom-codex", "/tools/codex", true), ("codex", "/tools/other", false)]
+                {
+                    app.config.agents = vec![imacs_core::config::AgentConfig {
+                        name: name.into(),
+                        command: vec![program.into()],
+                        kind: AgentKind::Generic,
+                        busy_text: None,
+                    }];
+                    let task = Task {
+                        agent: name.into(),
+                        finished_at: Some(100),
+                        worktree: Some(dir.path().into()),
+                        ..Task::default()
+                    };
+                    let render = |events| {
+                        let mut action = None;
+                        let output = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
+                            egui::CentralPanel::default().show(ui, |ui| {
+                                action = task_result(ui, &task, None, false, &app.config, &app.palette);
+                            });
+                        });
+                        let pos = output
+                            .shapes
+                            .iter()
+                            .find_map(|shape| match &shape.shape {
+                                egui::epaint::Shape::Text(t) if t.galley.text() == "resume" => {
+                                    Some(t.pos + t.galley.rect.center().to_vec2())
+                                }
+                                _ => None,
+                            })
+                            .unwrap();
+                        output.drop_without_applying_deltas();
+                        (pos, action)
+                    };
+                    let (pos, _) = render(vec![]);
+                    for pressed in [true, false] {
+                        let (_, action) = render(vec![
+                            egui::Event::PointerMoved(pos),
+                            egui::Event::PointerButton {
+                                pos,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ]);
+                        if !pressed {
+                            assert_eq!(action, expected.then_some("resume"), "{name}: {program}");
+                        }
+                    }
+                }
+            },
+        );
+    }
+
+    #[test]
     fn removed_worktrees_disable_completed_result_actions() {
         with_app("app::fleet::tests::removed_worktrees_disable_completed_result_actions", |app, ctx| {
             let (_dir, repo) = repository();
@@ -440,7 +501,7 @@ mod tests {
                 let mut action = None;
                 let output = ctx.run_ui(egui::RawInput { time: Some(time), events, ..Default::default() }, |ui| {
                     egui::CentralPanel::default().show(ui, |ui| {
-                        action = task_result(ui, &task, None, false, &app.palette);
+                        action = task_result(ui, &task, None, false, &app.config, &app.palette);
                     });
                 });
                 let text: Vec<_> = output

@@ -59,7 +59,8 @@ pub fn check(plans: &[Plan], sessions: &[Session], now: u64) -> Vec<Finding> {
             if task.status == TaskStatus::Running
                 && matches!(session.status, AgentStatus::Idle | AgentStatus::Done)
                 && now.saturating_sub(session.status_since) > 600
-                && session.working_since.is_some_and(|at| task.report.as_ref().is_none_or(|report| report.at < at))
+                && session.working_since.is_some()
+                && task.report.as_ref().is_none_or(|report| report.at < session.status_since)
             {
                 add(Kind::Unreported);
             }
@@ -145,13 +146,17 @@ mod tests {
     }
 
     #[test]
-    fn only_reports_before_the_last_working_turn_are_unreported() {
+    fn progress_during_a_turn_does_not_hide_an_unreported_idle_agent() {
         for status in [AgentStatus::Idle, AgentStatus::Done] {
             let (mut plans, sessions) = fixture(status);
-            plans[0].tasks[0].report = Some(Report { status: "progress".into(), at: 49, ..Report::default() });
+            plans[0].tasks[0].report = Some(Report { status: "progress".into(), at: 75, ..Report::default() });
             assert!(check(&plans, &sessions, 700).is_empty());
             assert_eq!(check(&plans, &sessions, 701)[0].kind, Kind::Unreported);
-            for at in [50, 99, 100, 101] {
+            for at in [50, 99] {
+                plans[0].tasks[0].report.as_mut().unwrap().at = at;
+                assert_eq!(check(&plans, &sessions, 701)[0].kind, Kind::Unreported);
+            }
+            for at in [100, 101] {
                 plans[0].tasks[0].report.as_mut().unwrap().at = at;
                 assert!(check(&plans, &sessions, 701).is_empty());
             }

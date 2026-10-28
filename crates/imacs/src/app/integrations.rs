@@ -240,6 +240,53 @@ mod tests {
     }
 
     #[test]
+    fn integrated_tasks_in_other_repositories_are_rechecked_after_commits() {
+        with_app(
+            "app::integrations::tests::integrated_tasks_in_other_repositories_are_rechecked_after_commits",
+            |app, ctx| {
+                let (_project_dir, project) = repository();
+                let (_task_dir, repo) = repository();
+                git::git(&repo, &["branch", "task-a"]).unwrap();
+                git::git(&repo, &["branch", "integration"]).unwrap();
+                request(
+                    app,
+                    json!({"cmd":"plan_set", "goal":"Cross repository freshness",
+                "integration":"integration", "tasks":[{"id":"a", "repo":repo, "branch":"task-a"},
+                {"id":"b", "depends_on":["a"]}]}),
+                );
+                let index = app.selected_plan;
+                app.plans[index].project = Some(project);
+                app.plans[index].tasks[0].status = TaskStatus::Done;
+                app.plans[index].tasks[0].integrated = Some("integration".into());
+                app.sessions.clear();
+                app.active = None;
+                app.diff_root = None;
+                app.pump(ctx);
+                assert!(
+                    app.watched.lock().unwrap().iter().any(|(root, _)| root == &repo),
+                    "the task repository must be watched even without a live agent or visible diff"
+                );
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !app.plans[index].tasks[0].integration_verified {
+                    assert!(Instant::now() < deadline, "initial integration check did not finish");
+                    std::thread::sleep(Duration::from_millis(10));
+                    app.pump(ctx);
+                }
+                assert_eq!(app.plans[index].ready().iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["b"]);
+                git::git(&repo, &["switch", "task-a"]).unwrap();
+                git::git(&repo, &["commit", "--allow-empty", "-qm", "later task work"]).unwrap();
+                while app.plans[index].tasks[0].integrated.is_some() {
+                    assert!(Instant::now() < deadline, "a later commit in the task repository was not detected");
+                    std::thread::sleep(Duration::from_millis(25));
+                    app.pump(ctx);
+                }
+                assert!(!app.plans[index].tasks[0].integration_verified);
+                assert!(app.plans[index].ready().is_empty());
+            },
+        );
+    }
+
+    #[test]
     fn idle_integrations_do_not_poll_git_or_request_repaints() {
         with_app("app::integrations::tests::idle_integrations_do_not_poll_git_or_request_repaints", |app, _| {
             let (_dir, repo) = repository();

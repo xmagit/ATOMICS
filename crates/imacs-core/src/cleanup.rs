@@ -102,11 +102,10 @@ pub fn remove(plan: &Plan, base_ref: &str, entry: &Entry) -> Result<()> {
     }
     // Delete the checked tip, independently of HEAD or the branch's upstream.
     git::git(&entry.repo, &["update-ref", "-d", &format!("refs/heads/{}", entry.branch), &entry.tip])?;
-    if let Err(err) =
-        git::git(&entry.repo, &["config", "--local", "--remove-section", &format!("branch.{}", entry.branch)])
-        && !err.to_string().contains("no such section")
-    {
-        return Err(err);
+    let section = format!("branch.{}", entry.branch);
+    let keys = git::git(&entry.repo, &["config", "--local", "--list", "--name-only"])?;
+    if keys.lines().any(|key| key.rsplit_once('.').is_some_and(|(name, _)| name == section)) {
+        git::git(&entry.repo, &["config", "--local", "--remove-section", &section])?;
     }
     Ok(())
 }
@@ -134,6 +133,78 @@ mod tests {
     fn commit(repo: &std::path::Path, file: &str) {
         std::fs::write(repo.join(file), file).unwrap();
         git::commit_all(repo, file).unwrap();
+    }
+
+    #[test]
+    fn branch_config_cleanup_is_independent_of_git_language() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        const CHILD: &str = "IMACS_CLEANUP_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let dir = tempfile::tempdir().unwrap();
+            let real_git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+                .map(|path| path.join("git"))
+                .find(|path| path.is_file())
+                .unwrap();
+            let wrapper = dir.path().join("git");
+            std::fs::write(
+                &wrapper,
+                r#"#!/bin/sh
+if [ "$7" = --remove-section ]; then
+    "$IMACS_TEST_REAL_GIT" "$@" 2>/dev/null
+    result=$?
+    if [ "$result" -ne 0 ]; then
+        printf 'fatal: Abschnitt nicht vorhanden\n' >&2
+    fi
+    exit "$result"
+fi
+exec "$IMACS_TEST_REAL_GIT" "$@"
+"#,
+            )
+            .unwrap();
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let output = crate::test_support::output(
+                Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "cleanup::tests::branch_config_cleanup_is_independent_of_git_language",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env("IMACS_TEST_REAL_GIT", real_git)
+                    .env(
+                        "PATH",
+                        std::env::join_paths(
+                            std::iter::once(dir.path().to_path_buf())
+                                .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+                        )
+                        .unwrap(),
+                    ),
+            );
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        for configured in [false, true] {
+            let (_dir, repo) = git::tests::project();
+            git::git(&repo, &["branch", "task"]).unwrap();
+            // A different subsection whose name starts with the task's name must survive.
+            git::git(&repo, &["config", "branch.task.other.remote", "keep"]).unwrap();
+            if configured {
+                git::git(&repo, &["config", "branch.task.remote", "origin"]).unwrap();
+            }
+            let plan = plan(&repo, &["task"]);
+            let row = preview(&plan, "main").unwrap().remove(0);
+            remove(&plan, "main", &row).unwrap();
+            assert!(git::git(&repo, &["show-ref", "--verify", "refs/heads/task"]).is_err());
+            assert!(git::git(&repo, &["config", "--get", "branch.task.remote"]).is_err());
+            assert_eq!(git::git(&repo, &["config", "--get", "branch.task.other.remote"]).unwrap().trim(), "keep");
+        }
     }
 
     #[test]
