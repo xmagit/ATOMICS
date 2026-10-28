@@ -74,8 +74,13 @@ command = []                # empty = your login shell
 kind = "shell"
 
 [approvals]
-# Simple command prefixes, within the session worktree. [] makes every request wait.
+# Command prefixes within the session worktree; every part of an && or ; chain must pass.
+# Cargo toolchains and trusted absolute cargo paths use the same cargo prefix rules.
+# [] makes every request wait, including commands with env prefixes or queue wrappers.
 allow = ["ls", "cat", "rg", "git status", "git diff", "git log"]
+# Exact NAME=value assignments for shell prefixes and env (no options).
+# For example ["RUSTC_WRAPPER="] allows only that empty value, not a wrapper program.
+env = []
 
 [plan]
 # Close accepted, integrated agents automatically. Worktrees remain available.
@@ -629,6 +634,18 @@ mod tests {
             };
             assert_eq!(agent.is_codex(), expected, "{agent:?}");
         }
+    }
+
+    #[test]
+    fn approval_env_assignments_are_explicit_and_preserve_empty_values() {
+        let old: Config = toml::from_str("[approvals]\nallow = ['cargo test']").unwrap();
+        assert!(old.approvals.env.is_empty());
+        let config: Config =
+            toml::from_str("[approvals]\nenv = ['RUSTC_WRAPPER=', 'CARGO_TERM_COLOR=always']").unwrap();
+        assert_eq!(config.approvals.env, ["RUSTC_WRAPPER=", "CARGO_TERM_COLOR=always"]);
+        let saved = toml::to_string(&config).unwrap();
+        let loaded: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(loaded.approvals.env, config.approvals.env);
     }
 
     #[test]

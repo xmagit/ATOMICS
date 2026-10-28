@@ -156,14 +156,17 @@ mod tests {
     fn approval_list_warns_only_for_cargo_executables() {
         assert!(approvals_check(&ApprovalPolicy::default()).starts_with('✓'));
         for entry in ["cargo", "cargo test", " cargo clippy ", "'/tools with spaces/cargo' build"] {
-            let line = approvals_check(&ApprovalPolicy { allow: vec![entry.into()] });
+            let line = approvals_check(&ApprovalPolicy { allow: vec![entry.into()], ..ApprovalPolicy::default() });
             assert!(line.starts_with('✗'), "{entry}");
             assert!(line.contains("outside the sandbox"));
             assert!(line.contains("remove cargo entries"));
             assert_eq!(line.lines().count(), 1);
         }
         for entry in ["cargo-nextest", "echo cargo", "rg cargo"] {
-            assert!(approvals_check(&ApprovalPolicy { allow: vec![entry.into()] }).starts_with('✓'));
+            assert!(
+                approvals_check(&ApprovalPolicy { allow: vec![entry.into()], ..ApprovalPolicy::default() })
+                    .starts_with('✓')
+            );
         }
     }
 
