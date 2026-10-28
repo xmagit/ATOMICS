@@ -181,7 +181,7 @@ impl App {
                 })))
             }
             ControlRequest::PlanClose { plan: _, status } => match self.close_plan(target, status) {
-                Ok(()) => done(ControlResponse::ok(self.plan_json(target))),
+                Ok(()) => done(ControlResponse::ok(self.plan_mutation_json(target, None))),
                 Err(err) => done(ControlResponse::error(err)),
             },
             ControlRequest::PlanGet { plan: None } => done(ControlResponse::ok(json!({
@@ -221,7 +221,7 @@ impl App {
                     }
                     self.finish_plan_agents();
                     self.save_plan(target);
-                    done(ControlResponse::ok(self.plan_json(target)))
+                    done(ControlResponse::ok(self.plan_mutation_json(target, Some(&id))))
                 }
             },
             ControlRequest::PlanDispatch { plan: _, id } => match self.dispatch(target, id.as_deref()) {

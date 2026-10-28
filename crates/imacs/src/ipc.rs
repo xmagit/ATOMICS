@@ -151,6 +151,17 @@ pub fn serve(path: &Path, hub: Arc<Mutex<Hub>>, channels: Channels, ctx: egui::C
 }
 
 fn handle(stream: UnixStream, hub: &Mutex<Hub>, channels: &Channels, ctx: &egui::Context) -> Result<()> {
+    handle_with_wait_duration(stream, hub, channels, ctx, Duration::from_secs)
+}
+
+// Keep timeout selection identical when tests scale seconds down to milliseconds.
+fn handle_with_wait_duration(
+    stream: UnixStream,
+    hub: &Mutex<Hub>,
+    channels: &Channels,
+    ctx: &egui::Context,
+    wait_duration: impl Fn(u64) -> Duration,
+) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     let mut line = String::new();
     BufReader::new(&stream).read_line(&mut line)?;
@@ -199,10 +210,10 @@ fn handle(stream: UnixStream, hub: &Mutex<Hub>, channels: &Channels, ctx: &egui:
             approval_reply.wait_with_timeout(|| {
                 let seconds =
                     if hub.lock().unwrap().chief_running { imacs_core::hook::PERMISSION_WAIT_SECONDS } else { 10 };
-                Duration::from_secs(seconds)
+                wait_duration(seconds)
             })
         } else {
-            approval_reply.wait(Duration::from_secs(10))
+            approval_reply.wait(wait_duration(10))
         };
     }
     let mut writer = &stream;
@@ -325,7 +336,8 @@ mod tests {
 
     #[test]
     fn permission_reply_wait_depends_on_a_running_chief() {
-        for (chief_running, chief_exits, seconds) in [(false, false, 11), (true, false, 13), (true, true, 11)] {
+        let started = Instant::now();
+        for (chief_running, chief_exits) in [(false, false), (true, false), (true, true)] {
             let (server, mut client) = UnixStream::pair().unwrap();
             client.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
             let (hooks, received) = std::sync::mpsc::channel();
@@ -334,14 +346,16 @@ mod tests {
             let server_hub = hub.clone();
             let handler = std::thread::spawn(move || {
                 let governor = Arc::new(crate::governor::Governor::new(Default::default(), None));
-                handle(
+                handle_with_wait_duration(
                     server,
                     &server_hub,
                     &Channels { hooks, control, governor, usage: std::sync::mpsc::channel().0 },
                     &egui::Context::default(),
+                    |seconds| Duration::from_millis(seconds * 5),
                 )
                 .unwrap();
             });
+            let requested_at = Instant::now();
             writeln!(
                 client,
                 "{}",
@@ -351,7 +365,11 @@ mod tests {
             )
             .unwrap();
             let pending = received.recv_timeout(Duration::from_secs(2)).unwrap().approval_reply.unwrap();
-            std::thread::sleep(Duration::from_secs(seconds));
+            if chief_running {
+                // Beyond the ordinary 10 s fallback and the former 12 s client timeout.
+                std::thread::sleep(Duration::from_millis(65));
+                assert!(!pending.expired(), "a running chief must keep the approval open");
+            }
             if chief_exits {
                 hub.lock().unwrap().chief_running = false;
             }
@@ -362,6 +380,8 @@ mod tests {
             let mut line = String::new();
             BufReader::new(client).read_line(&mut line).unwrap();
             if !answerable {
+                assert!(requested_at.elapsed() >= Duration::from_millis(50), "fallback must wait its timeout");
+                assert!(pending.expired());
                 assert!(!pending.answer(HookReply { stdout: Some("late".into()) }));
             }
             assert_eq!(
@@ -370,6 +390,7 @@ mod tests {
             );
             handler.join().unwrap();
         }
+        assert!(started.elapsed() < Duration::from_secs(1), "scaled permission waits must stay fast");
     }
 
     #[test]

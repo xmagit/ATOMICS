@@ -164,7 +164,7 @@ fn tools() -> Value {
         },
         {
             "name": "imacs_plan_close",
-            "description": "Close a plan as completed or archived. Completed tabs show ✓; archiving hides the tab. The plan and task history remain available through imacs_plan_get with its id.",
+            "description": "Close a plan as completed or archived. Completed tabs show ✓; archiving hides the tab. Returns only plan id, status and ready task ids (task is null). Use imacs_plan_get with its id for the full plan and task history.",
             "inputSchema": { "type": "object", "properties": {
                 "plan": plan, "status": { "type": "string", "enum": ["completed", "archived"] }
             }, "required": ["plan", "status"] }
@@ -176,7 +176,7 @@ fn tools() -> Value {
         },
         {
             "name": "imacs_plan_update",
-            "description": "Change a task's status (e.g. review → done after you verified it, or back to running after sending feedback) and/or add a note the user sees on the board.",
+            "description": "Change a task's status (e.g. review → done after you verified it, or back to running after sending feedback) and/or add a note the user sees on the board. Returns only plan id/status, the changed task (id, status, latest note, integrated branch), and ready task ids. Use imacs_plan_get for the full plan.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -196,7 +196,7 @@ fn tools() -> Value {
         },
         {
             "name": "imacs_plan_integrate",
-            "description": "Merge a task (in review or done) into the plan's integration branch: uncommitted changes in its worktree are committed on its branch first (message '<title> (<id>)'), then the branch is merged in a separate integration worktree next to the repository. Tasks with dependencies branch from the integration branch, so integrate accepted tasks before dispatching their dependents. On a conflict the merge is aborted, and the task stays in review with a note listing the conflicted files.",
+            "description": "Merge a task (in review or done) into the plan's integration branch: uncommitted changes in its worktree are committed on its branch first (message '<title> (<id>)'), then the branch is merged in a separate integration worktree next to the repository. Tasks with dependencies branch from the integration branch, so integrate accepted tasks before dispatching their dependents. Returns only plan id/status, the changed task (id, status, latest note, integrated branch), the integration branch/worktree and committed/merged flags, and ready task ids. Use imacs_plan_get for the full plan. On a conflict the merge is aborted, and the task stays in review with a note listing the conflicted files.",
             "inputSchema": { "type": "object", "properties": { "plan": plan, "id": { "type": "string" } }, "required": ["id"] }
         },
         {

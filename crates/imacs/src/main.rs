@@ -2,6 +2,9 @@
 #[path = "../../../tests/support.rs"]
 mod test_support;
 
+#[cfg(test)]
+mod platform_tests;
+
 mod app;
 mod crash;
 mod diff_view;

@@ -41,7 +41,6 @@ mod fleet;
 mod heartbeat;
 mod input;
 mod integrations;
-#[path = "plan_cleanup.rs"]
 mod plan_cleanup;
 mod plans;
 mod projects;
@@ -1166,5 +1165,4 @@ fn apply_style(ctx: &egui::Context, config: &Config) {
 mod tests;
 
 #[cfg(test)]
-#[path = "board_tests.rs"]
 mod board_tests;

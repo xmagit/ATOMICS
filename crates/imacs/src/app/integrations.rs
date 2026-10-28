@@ -157,7 +157,7 @@ impl App {
         let Some(index) = self.plans.iter().position(|p| p.id == plan) else { return };
         self.integrating.remove(&(plan.clone(), id.clone()));
         self.worktrees_at = None;
-        let (note, response) = match result {
+        let (note, mut response) = match result {
             Ok(Integration { merge: Merge::Conflict(files), .. }) => {
                 if let Some(task) = self.plans[index].task_mut(&id) {
                     task.set_status(TaskStatus::Review);
@@ -182,8 +182,6 @@ impl App {
                     (false, false) => format!("already in {into}"),
                 };
                 let result = json!({
-                    "plan": plan,
-                    "task": id,
                     "integration": into,
                     "worktree": worktree,
                     "committed": committed,
@@ -200,6 +198,11 @@ impl App {
         self.finish_plan_agents();
         self.toast(format!("Task {id}: {note}"));
         if let Some(reply) = reply {
+            let mut summary = self.plan_mutation_json(index, Some(&id));
+            if let Some(result) = response.result.as_object() {
+                summary.as_object_mut().unwrap().extend(result.clone());
+            }
+            response.result = summary;
             let _ = reply.send(ControlOutcome::Done(response));
         }
     }

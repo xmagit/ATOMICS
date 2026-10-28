@@ -1,10 +1,10 @@
 use std::process::Command;
 
-fn dependencies(package: &str, args: &[&str]) -> String {
+fn dependencies(args: &[&str]) -> String {
     let output = crate::test_support::output(
         Command::new(env!("CARGO"))
             .current_dir(env!("CARGO_MANIFEST_DIR"))
-            .args(["tree", "--locked", "-p", package, "--edges", "normal,build", "--prefix", "none"])
+            .args(["tree", "--locked", "-p", "imacs-core", "--edges", "normal,build", "--prefix", "none"])
             .args(args),
     );
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
@@ -13,8 +13,8 @@ fn dependencies(package: &str, args: &[&str]) -> String {
 
 #[test]
 fn native_dependencies_are_default_but_absent_from_browser_core() {
-    let native = dependencies("imacs-core", &[]);
-    let browser = dependencies("imacs-core", &["--target", "wasm32-unknown-unknown", "--no-default-features"]);
+    let native = dependencies(&[]);
+    let browser = dependencies(&["--target", "wasm32-unknown-unknown", "--no-default-features"]);
     for package in ["ureq", "dirs", "base64", "rustls"] {
         let prefix = format!("{package} v");
         assert!(native.lines().any(|line| line.starts_with(&prefix)), "native: {package}");
@@ -28,22 +28,11 @@ fn usage_parsing_keeps_clock_helpers_native() {
     {
         let mut args = args;
         args.extend(["--format", "{p} {f}"]);
-        let tree = dependencies("imacs-core", &args);
+        let tree = dependencies(&args);
         let time = tree.lines().find(|line| line.starts_with("time v")).expect("usage parsing needs time");
         let features: Vec<_> = time.split_whitespace().nth(2).unwrap().split(',').collect();
         assert!(features.contains(&"parsing"));
         assert_eq!(features.contains(&"std"), native, "{time}");
         assert!(!features.contains(&"wasm-bindgen"), "usage parsing needs no JS clock");
-    }
-}
-
-#[test]
-fn highlighting_uses_only_the_target_regex_engine() {
-    for (args, wanted, unwanted) in
-        [(vec![], "onig", "fancy-regex"), (vec!["--target", "wasm32-unknown-unknown"], "fancy-regex", "onig")]
-    {
-        let tree = dependencies("imacs", &args);
-        assert!(tree.lines().any(|line| line.starts_with(&format!("{wanted} v"))), "missing {wanted}");
-        assert!(!tree.lines().any(|line| line.starts_with(&format!("{unwanted} v"))), "unexpected {unwanted}");
     }
 }
