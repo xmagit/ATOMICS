@@ -32,7 +32,9 @@ pub fn run() -> i32 {
         println!("{}", check_line(found.is_some(), &label, "install it or add it to your login-shell PATH"));
     }
 
-    for line in codex_checks(codex_supports_hooks(&resolve_program("codex"), std::time::Duration::from_secs(2))) {
+    for line in codex_checks(
+        codex_supports_hooks(&resolve_program("codex"), std::time::Duration::from_secs(2)).unwrap_or(false),
+    ) {
         println!("{line}");
     }
 

@@ -1,0 +1,59 @@
+#!/usr/bin/python3
+"""Busy terminal fixture: drops Enter once, queues with Tab, or never accepts input."""
+import os
+import sys
+import tty
+
+if "--version" in sys.argv:
+    print("codex-cli 0.164.0")
+    sys.exit(0)
+
+mode = sys.argv[sys.argv.index("--mode") + 1] if "--mode" in sys.argv else "queue"
+tty.setraw(sys.stdin.fileno())
+text = b""
+paste = False
+sequence = b""
+enters = 0
+
+
+def screen(body):
+    sys.stdout.write("\x1b[2J\x1b[H\x1b[?2004h" + body)
+    sys.stdout.flush()
+
+
+menu = "Would you like to run the following command?\r\n\r\n  $ touch fixture\r\n\r\n› 1. Yes, proceed (y)\r\n  2. No, and tell Codex what to do differently (esc)\r\nPress enter to confirm or esc to cancel"
+hidden = "Would you like to run the following command?\r\n\r\nReason: A long explanation of why access is needed\r\n  [… 9 lines] ⌃a view all\r\n\r\n› 1. Yes, proceed (y)\r\n  2. No, and tell Codex what to do differently (esc)\r\nPress enter to confirm or esc to cancel"
+screen(hidden if mode == "hidden" else "Working (esc to interrupt)\r\n› \r\n tab to queue")
+while True:
+    char = os.read(sys.stdin.fileno(), 1)
+    if not char:
+        break
+    if mode == "hidden":
+        if char == b"\x01":
+            screen(menu)
+        elif char == b"1":
+            screen("Approved\r\nWorking (esc to interrupt)\r\n› ")
+        continue
+    if sequence or char == b"\x1b":
+        sequence += char
+        if sequence == b"\x1b[200~":
+            paste = True
+            text = b""
+            sequence = b""
+        elif sequence == b"\x1b[201~":
+            paste = False
+            sequence = b""
+            screen("Working (esc to interrupt)\r\n› " + text.decode() + "\r\n tab to queue")
+        continue
+    if paste:
+        text += char
+    elif char == b"\r":
+        enters += 1
+        if mode == "exit":
+            sys.exit(0)
+        if mode == "retry" and enters > 1:
+            screen("› " + text.decode() + "\r\nWorking (esc to interrupt)\r\n› ")
+        elif mode != "queue":
+            screen("Previous: " + text[:24].decode() + "\r\nTurn done\r\n› ")
+    elif char == b"\t" and mode == "queue":
+        screen("• " + text.decode() + "\r\nQueued\r\n› \r\n esc to interrupt")

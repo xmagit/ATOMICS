@@ -44,6 +44,16 @@ pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
     }
 }
 
+/// A complete message above the terminal's last prompt, including Codex's visible queue.
+pub fn message_in_transcript(screen: &str, text: &str) -> bool {
+    let lines: Vec<_> = screen.lines().collect();
+    let end = lines.iter().rposition(|line| line.trim_start().starts_with(['›', '❯']));
+    let Some(end) = end else { return false };
+    let transcript: String = lines[..end].iter().flat_map(|line| line.chars().filter(|c| !c.is_whitespace())).collect();
+    let message: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    !message.is_empty() && transcript.contains(&message)
+}
+
 fn truncate(text: &str, max: usize) -> String {
     match text.char_indices().nth(max) {
         Some((cut, _)) => format!("{}…", &text[..cut]),
@@ -85,5 +95,15 @@ mod tests {
         assert_eq!(paste_bytes("a\nb", true), b"\x1b[200~a\nb\x1b[201~");
         assert_eq!(paste_bytes("x\x1b[201~y", true), b"\x1b[200~xy\x1b[201~");
         assert_eq!(paste_bytes("a\nb", false), b"a\rb");
+    }
+
+    #[test]
+    fn delivery_needs_the_complete_message_outside_the_composer() {
+        let text = "Please check the first change and then the second change";
+        assert!(!message_in_transcript(&format!("Working\n› {text}\n\n tab to queue"), text));
+        assert!(!message_in_transcript("Please check the first change\n› ", text));
+        assert!(!message_in_transcript("Working\n› \n", "\n "));
+        assert!(message_in_transcript("• Please check the first change and then\n  the second change\n› ", text));
+        assert!(message_in_transcript("› Please check the first change and then the second change\nWorking\n› ", text));
     }
 }

@@ -65,26 +65,22 @@ pub fn resolve_program(program: &str) -> String {
 }
 
 /// Keep the version probe bounded even when a wrapper hangs or another child inherits stdout.
-pub fn codex_supports_hooks(program: &str, timeout: std::time::Duration) -> bool {
+pub fn codex_supports_hooks(program: &str, timeout: std::time::Duration) -> Option<bool> {
     use std::io::Read;
     use std::os::fd::OwnedFd;
     use std::os::unix::net::UnixStream;
     use std::process::{Command, Stdio};
     use std::time::Instant;
 
-    let Ok((mut stdout, writer)) = UnixStream::pair() else { return false };
-    if stdout.set_nonblocking(true).is_err() {
-        return false;
-    }
-    let Ok(mut child) = Command::new(program)
+    let (mut stdout, writer) = UnixStream::pair().ok()?;
+    stdout.set_nonblocking(true).ok()?;
+    let mut child = Command::new(program)
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::from(OwnedFd::from(writer)))
         .stderr(Stdio::null())
         .spawn()
-    else {
-        return false;
-    };
+        .ok()?;
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
@@ -93,12 +89,12 @@ pub fn codex_supports_hooks(program: &str, timeout: std::time::Duration) -> bool
                 let _ = (&mut stdout).take(1024).read_to_end(&mut bytes);
                 return imacs_core::hook::codex_supports_hooks(&String::from_utf8_lossy(&bytes));
             }
-            Ok(Some(_)) => return false,
+            Ok(Some(_)) => return None,
             Ok(None) if Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(10)),
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return false;
+                return None;
             }
         }
     }
@@ -151,10 +147,15 @@ mod tests {
         std::fs::write(&program, "#!/bin/sh\nprintf 'codex-cli 0.165.0\\n'\nexec sleep 30\n").unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
         let started = Instant::now();
-        assert!(!codex_supports_hooks(program.to_str().unwrap(), Duration::from_millis(100)));
+        assert_eq!(codex_supports_hooks(program.to_str().unwrap(), Duration::from_millis(100)), None);
         assert!(started.elapsed() < Duration::from_secs(5));
         std::fs::write(&program, "#!/bin/sh\nprintf 'codex-cli 0.165.0\\n'\n").unwrap();
-        assert!(codex_supports_hooks(program.to_str().unwrap(), Duration::from_secs(1)));
+        assert_eq!(codex_supports_hooks(program.to_str().unwrap(), Duration::from_secs(1)), Some(true));
+        for script in ["#!/bin/sh\nexit 1\n", "#!/bin/sh\nprintf 'not a version\\n'\n"] {
+            std::fs::write(&program, script).unwrap();
+            assert_eq!(codex_supports_hooks(program.to_str().unwrap(), Duration::from_secs(1)), None);
+        }
+        assert_eq!(codex_supports_hooks("/no/such/codex", Duration::from_secs(1)), None);
     }
 
     #[test]

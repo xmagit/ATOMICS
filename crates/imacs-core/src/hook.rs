@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+pub const PERMISSION_WAIT_SECONDS: u64 = 540;
+
 use crate::session::AgentStatus;
 
 /// Events IMACS subscribes to. Each one either changes a session's status or is a
@@ -137,7 +139,12 @@ pub fn session_settings(imacs_exe: &Path, socket: &Path, pane: &str, codex: bool
     let hooks: serde_json::Map<String, Value> = events
         .iter()
         .map(|event| {
-            (event.to_string(), json!([{ "hooks": [{ "type": "command", "command": command, "timeout": if *event == "Interrupt" { 3 } else { 15 } }] }]))
+            let timeout = match *event {
+                "PermissionRequest" => PERMISSION_WAIT_SECONDS + 60,
+                "Interrupt" => 3,
+                _ => 15,
+            };
+            (event.to_string(), json!([{ "hooks": [{ "type": "command", "command": command, "timeout": timeout }] }]))
         })
         .collect();
     let mut settings = json!({ "hooks": hooks });
@@ -182,11 +189,12 @@ pub fn ancestor_pids(pid: u32, table: &str) -> Vec<u32> {
     ancestors
 }
 
-pub fn codex_supports_hooks(version: &str) -> bool {
-    let Some(version) = version.strip_prefix("codex-cli ") else { return false };
+pub fn codex_supports_hooks(version: &str) -> Option<bool> {
+    let version = version.strip_prefix("codex-cli ")?;
     let mut parts = version.trim().split('.');
-    matches!((parts.next().and_then(|n| n.parse::<u32>().ok()), parts.next().and_then(|n| n.parse::<u32>().ok())),
-        (Some(major), Some(minor)) if major > 0 || minor >= 165)
+    let major = parts.next()?.parse::<u32>().ok()?;
+    let minor = parts.next()?.parse::<u32>().ok()?;
+    Some(major > 0 || minor >= 165)
 }
 
 /// Merges IMACS's hooks into an existing settings document (for `imacs install-hooks`),
@@ -269,6 +277,7 @@ mod tests {
             assert!(!command.contains("IMACS_SOCKET"));
             assert_eq!(settings["hooks"].get("PermissionRequest").is_some(), codex);
             if codex {
+                assert_eq!(settings["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"], 600);
                 assert!(settings.get("statusLine").is_none());
             } else {
                 assert_eq!(settings["statusLine"]["type"], "command");
@@ -289,10 +298,11 @@ mod tests {
             assert!(parsed["hooks"].is_table());
         }
         for version in ["codex-cli 0.165.0", "codex-cli 0.166.0-alpha.1", "codex-cli 1.0.0"] {
-            assert!(codex_supports_hooks(version));
+            assert_eq!(codex_supports_hooks(version), Some(true));
         }
-        for version in ["codex-cli 0.164.9", "codex-cli unknown", "unknown"] {
-            assert!(!codex_supports_hooks(version));
+        assert_eq!(codex_supports_hooks("codex-cli 0.164.9"), Some(false));
+        for version in ["codex-cli unknown", "unknown"] {
+            assert_eq!(codex_supports_hooks(version), None);
         }
     }
 
