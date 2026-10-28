@@ -5645,7 +5645,11 @@ mod tests {
             );
             let exe_dir = std::env::current_exe().unwrap().parent().unwrap().display().to_string();
             assert!(env.lines().any(|line| line.starts_with(&format!("PATH={exe_dir}:"))), "{env}");
-            assert_eq!(std::fs::read_to_string(dir.path().join("probe.nice")).unwrap().trim(), "7");
+            // SAFETY: querying the current process priority has no preconditions.
+            let inherited_nice = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+            let actual_nice: i32 =
+                std::fs::read_to_string(dir.path().join("probe.nice")).unwrap().trim().parse().unwrap();
+            assert_eq!(actual_nice, (inherited_nice + 7).min(19));
             app.sessions.clear();
         });
     }
