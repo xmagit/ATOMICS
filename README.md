@@ -75,8 +75,22 @@ steering.
 ## Troubleshooting
 
 Run `imacs doctor` to check git, Claude Code, Codex, Helix, the config, the running IMACS socket and global Claude hooks.
+It also checks Codex hook support (0.165+), reports hook trust as unverified with `/hooks` instructions, reads plan files,
+warns about cargo entries in `[approvals].allow`, and lists merged worktrees safe to review for cleanup. It changes nothing.
 Each failed check includes a hint. Missing git or an unreadable or invalid config returns exit code 1; missing
 agents, Helix, a running IMACS or hooks do not affect the exit code. Tools are checked on your login-shell PATH.
+
+## Usage
+
+The sidebar's **USAGE** panel shows account-wide session and weekly limits remaining, reset times and report age.
+Claude reports through its statusLine; Codex is polled in the background every 60 seconds from the newest rollout
+under `$CODEX_HOME/sessions` (default `~/.codex/sessions`), reading only its last 16 KiB for a `token_count` rate-limit event.
+**no data yet** means no report has arrived or a reported window has expired. A window omitted by a received report
+shows **not reported by this account**. Limits are shared across sessions; weekly reset days are UTC.
+
+Claude sessions started by IMACS use `imacs statusline --socket <path>` automatically. It reads Claude's JSON from stdin,
+forwards usage to IMACS, then chains to your own `statusLine.command` with the same input and output. User, project and
+project-local settings keep their usual precedence. Without a custom command it prints a short usage line.
 
 ## Claude sessions anywhere
 
