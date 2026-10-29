@@ -55,6 +55,7 @@ fn expired_approval(state: &mut State) -> Arc<ipc::ApprovalReply> {
     let mut worker = session("worker", AgentKind::Claude, AgentStatus::NeedsInput, &state.launch_dir);
     worker.approval_hold = true;
     worker.approvals.push(PendingApproval {
+        id: uuid::Uuid::new_v4().to_string(),
         request: ApprovalRequest {
             tool: "Bash".into(),
             command: Some("touch pending".into()),
@@ -387,5 +388,127 @@ fn desktop_actions_launch_and_deliver_on_the_host_without_frames() {
                 .lines()
                 .any(|line| line.trim() == "desktop-action-delivered")
         });
+    });
+}
+
+#[test]
+fn blocked_project_picker_does_not_block_hooks_or_waits() {
+    with_state("app::host_tests::blocked_project_picker_does_not_block_hooks_or_waits", |mut state, ctx| {
+        let (_dir, repo) = repository();
+        state.sessions = vec![session("worker", AgentKind::Claude, AgentStatus::Working, &state.launch_dir)];
+        let client = Client::new(ctx, &mut Options::default(), &crate::load_icon());
+        let mut app = App { client, host: state.into_host(), replies: Vec::new() };
+        // The UI can keep this request pending across frames without invoking
+        // native code or draining the runtime's action queue under its guard.
+        for _ in 0..2 {
+            ctx.run_ui(egui::RawInput::default(), |_| {
+                let mut state = app.host.state();
+                Desktop { runtime: &mut state, client: &mut app.client }.pick_project();
+            })
+            .drop_without_applying_deltas();
+        }
+        let wait = app.host.command(ControlRequest::Wait {
+            sessions: vec!["worker".into()],
+            statuses: vec!["turn done".into()],
+            after: Some(0),
+            timeout_secs: Some(5),
+        });
+        command(&app.host, json!({"cmd":"list"}));
+        let (opened_tx, opened_rx) = channel();
+        let (done_tx, done_rx) = channel();
+        let worker = std::thread::spawn(move || {
+            opened_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            hook("Stop", None);
+            let reply = response(wait);
+            assert_eq!(reply.result["timed_out"], false);
+            assert_eq!(reply.result["events"][0]["status"], "turn done");
+            // This real deadline also has to fire while the fake picker blocks.
+            let reply = ipc::request(
+                &serde_json::from_value(json!({"cmd":"wait", "after":u64::MAX, "timeout_secs":1})).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(reply.result["timed_out"], true);
+            done_tx.send(()).unwrap();
+        });
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            app.ui_with_picker(ui, |_| {
+                opened_tx.send(()).unwrap();
+                done_rx.recv_timeout(Duration::from_secs(10)).expect("runtime stalled while folder picker was open");
+                Some(repo.clone())
+            });
+        })
+        .drop_without_applying_deltas();
+        worker.join().unwrap();
+        eventually(&app.host, |state| state.open_projects.contains(&repo.canonicalize().unwrap()));
+        assert!(app.client.project_picker.is_none());
+    });
+}
+
+#[test]
+fn delayed_file_open_keeps_the_hosts_resolved_target() {
+    with_state("app::host_tests::delayed_file_open_keeps_the_hosts_resolved_target", |mut state, ctx| {
+        let (_dir, repo) = repository();
+        let path = "review.txt";
+        std::fs::write(repo.join(path), "original\n").unwrap();
+        git::git(&repo, &["add", path]).unwrap();
+        git::git(&repo, &["commit", "-qm", "tracked file"]).unwrap();
+        std::fs::write(repo.join(path), "changed\n").unwrap();
+        state.config.base_ref = "main".into();
+        state.repos = vec![repo.clone()];
+        state.diff_root = Some(repo.clone());
+        let mut client = Client::new(ctx, &mut Options::default(), &crate::load_icon());
+        let host = state.into_host();
+        eventually(&host, |state| {
+            state.diffs.get(&repo).and_then(|d| d.prepared.as_ref()).is_some_and(|p| !p.diff.files.is_empty())
+        });
+        for whole_file in [false, true] {
+            {
+                let mut state = host.state();
+                let mut app = Desktop { runtime: &mut state, client: &mut client };
+                app.open_file(&repo, path);
+                // Do not drain the action or consume events across these frames.
+                for _ in 0..2 {
+                    ctx.run_ui(egui::RawInput::default(), |_| app.sync_diffs()).drop_without_applying_deltas();
+                }
+            }
+            eventually(&host, |state| {
+                state.client_events.iter().any(|event| matches!(event, ClientEvent::OpenFile { .. }))
+            });
+            assert_eq!(host.state().diffs[&repo].viewing.is_some(), whole_file);
+            let before = host.state().diffs[&repo].revision;
+            let contents = if whole_file { "changed again\n" } else { "original\n" };
+            std::fs::write(repo.join(path), contents).unwrap();
+            eventually(&host, |state| {
+                let data = &state.diffs[&repo];
+                data.revision > before && data.prepared.as_ref().is_some_and(|p| p.diff.files.is_empty() != whole_file)
+            });
+            if whole_file {
+                eventually(&host, |state| {
+                    state.diffs[&repo]
+                        .file
+                        .as_ref()
+                        .is_some_and(|file| file.lines.first().is_some_and(|line| line == "changed again"))
+                });
+            }
+            let mut state = host.state();
+            let mut app = Desktop { runtime: &mut state, client: &mut client };
+            for _ in 0..2 {
+                ctx.run_ui(egui::RawInput::default(), |_| app.sync_diffs()).drop_without_applying_deltas();
+            }
+            app.apply_client_events(ctx);
+            app.sync_diffs();
+            let view = &app.client.diff_views[&repo];
+            assert_eq!(
+                view.viewing, app.runtime.diffs[&repo].viewing,
+                "late events must not choose a different target"
+            );
+            assert_eq!(view.viewing.is_some(), whole_file);
+            assert_eq!(view.focused.as_deref(), Some(path));
+            if whole_file {
+                assert_eq!(view.file.as_ref().unwrap().lines[0], "changed again");
+            } else {
+                assert!(!view.loading);
+            }
+        }
     });
 }

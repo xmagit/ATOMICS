@@ -275,6 +275,23 @@ pub struct DiffData {
 }
 
 impl DiffData {
+    pub fn edit_comments(
+        &mut self,
+        before: Vec<imacs_core::steer::ReviewComment>,
+        mut after: Vec<imacs_core::steer::ReviewComment>,
+    ) {
+        // Apply only the client's additions and removals. Match occurrences so
+        // equal comments remain distinct, including comments accepted via ctl.
+        for comment in before {
+            if let Some(index) = after.iter().position(|other| other == &comment) {
+                after.remove(index);
+            } else if let Some(index) = self.comments.iter().position(|other| other == &comment) {
+                self.comments.remove(index);
+            }
+        }
+        self.comments.extend(after);
+    }
+
     pub fn mark_dirty(&mut self) {
         self.dirty_since.get_or_insert_with(Instant::now);
     }

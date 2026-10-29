@@ -87,10 +87,19 @@ impl State {
         }
     }
 
-    pub(super) fn approve(&mut self, index: usize, decision: Decision, message: Option<&str>) -> Result<(), String> {
+    pub(super) fn approve(
+        &mut self,
+        index: usize,
+        approval: &str,
+        decision: Decision,
+        message: Option<&str>,
+    ) -> Result<(), String> {
         self.expire_approvals(Instant::now());
         let session = &mut self.sessions[index];
         let Some(pending) = session.approvals.first_mut() else { return Err("no pending permission request".into()) };
+        if pending.id != approval {
+            return Err("stale permission decision: review the current request".into());
+        }
         let reply = HookReply { stdout: Some(decision.output(message)) };
         let answered = pending.reply.take().is_some_and(|sender| sender.answer(reply));
         if !answered {
@@ -122,6 +131,105 @@ impl State {
 mod tests {
     use super::super::tests::{request, session, with_app};
     use super::*;
+
+    #[test]
+    fn delayed_duplicate_decisions_cannot_approve_the_next_request() {
+        with_app("app::approvals::tests::delayed_duplicate_decisions_cannot_approve_the_next_request", |app, ctx| {
+            app.runtime.sessions =
+                vec![session("worker", AgentKind::Generic, AgentStatus::NeedsInput, &app.runtime.launch_dir)];
+            let reviewed = Arc::new(ipc::ApprovalReply::default());
+            let unreviewed = Arc::new(ipc::ApprovalReply::default());
+            for (id, reply) in [("reviewed", reviewed.clone()), ("unreviewed", unreviewed.clone())] {
+                app.runtime.sessions[0].approvals.push(PendingApproval {
+                    id: id.into(),
+                    request: ApprovalRequest {
+                        tool: "Bash".into(),
+                        command: Some(format!("touch {id}")),
+                        cwd: app.runtime.launch_dir.clone(),
+                        reason: None,
+                        input: json!({}),
+                    },
+                    reply: Some(reply),
+                });
+            }
+            let mut time = 0.0;
+            // Deliberately leave host actions AND client acknowledgements undrained.
+            let mut frame = |app: &mut Desktop<'_>, events| {
+                time += 0.05;
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1400.0, 900.0))),
+                        time: Some(time),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        egui::CentralPanel::default().show(ui, |ui| {
+                            let layout = layout::compute(1400.0, 900.0, 1, 0, false, 0.0, &app.runtime.config.layout);
+                            app.tiles(ui, ui.max_rect(), &layout, &[0]);
+                        });
+                    },
+                );
+                let text: Vec<_> = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::epaint::Shape::Text(t) => {
+                            Some((t.galley.text().to_string(), t.pos + t.galley.rect.center().to_vec2()))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                output.drop_without_applying_deltas();
+                text
+            };
+            let pos = frame(app, vec![]).into_iter().find(|(text, _)| text == "Allow").unwrap().1;
+            for _ in 0..2 {
+                for pressed in [true, false] {
+                    frame(
+                        app,
+                        vec![
+                            egui::Event::PointerMoved(pos),
+                            egui::Event::PointerButton {
+                                pos,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                    );
+                }
+            }
+            let text = frame(app, vec![]);
+            assert!(text.iter().any(|(text, _)| text == "Decision pending…"));
+            assert!(text.iter().any(|(text, _)| text == "touch reviewed"));
+            for label in ["Allow", "Allow always", "Deny"] {
+                assert_eq!(
+                    ctx.data(|data| data.get_temp::<bool>(egui::Id::unique(("approval-button", label)))),
+                    Some(false)
+                );
+            }
+            assert_eq!(app.runtime.sessions[0].approvals.len(), 2);
+            // Even a duplicate already in transit must be rejected by the host.
+            let (tx, rx) = std::sync::mpsc::channel();
+            app.post(move |state| {
+                tx.send(state.approve(0, "reviewed", Decision::Allow, None)).unwrap();
+            });
+            app.runtime.drain_actions();
+            assert!(rx.recv().unwrap().unwrap_err().contains("stale"));
+            assert!(reviewed.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
+            assert_eq!(app.runtime.sessions[0].approvals.len(), 1);
+            assert_eq!(app.runtime.sessions[0].approvals[0].id, "unreviewed");
+            assert!(unreviewed.answer(HookReply::default()), "the unseen request was already decided");
+            app.apply_client_events(ctx);
+            frame(app, vec![]);
+            assert!(app.client.approval_decisions.is_empty());
+            assert_eq!(
+                ctx.data(|data| data.get_temp::<bool>(egui::Id::unique(("approval-button", "Allow")))),
+                Some(true)
+            );
+        });
+    }
 
     #[test]
     fn permission_banner_buttons_answer_hooks_and_chief_liveness_selects_the_wait() {
@@ -182,6 +290,7 @@ mod tests {
                     app.runtime.sessions[0].status = AgentStatus::NeedsInput;
                     app.runtime.sessions[0].approval_hold = true;
                     app.runtime.sessions[0].approvals.push(PendingApproval {
+                        id: uuid::Uuid::new_v4().to_string(),
                         request: ApprovalRequest {
                             tool: "Bash".into(),
                             command: Some("touch banner-fixture".into()),
@@ -275,17 +384,43 @@ mod tests {
                 .unwrap();
                 app.runtime.sessions[0].approval_hold = true;
                 app.runtime.sessions[0].approvals.push(PendingApproval {
+                    id: uuid::Uuid::new_v4().to_string(),
                     request: ApprovalRequest::from_event(&permission),
                     reply: Some(reply.clone()),
                 });
-                assert!(app.runtime.approve(0, Decision::Allow, None).unwrap_err().contains("expanded"));
+                assert!(
+                    app.runtime
+                        .approve(
+                            0,
+                            &app.runtime.sessions[0]
+                                .approvals
+                                .first()
+                                .map(|pending| pending.id.clone())
+                                .unwrap_or_default(),
+                            Decision::Allow,
+                            None
+                        )
+                        .unwrap_err()
+                        .contains("expanded")
+                );
                 assert!(reply.expired() || reply.wait(Duration::ZERO).stdout.is_none());
                 assert_eq!(app.runtime.sessions[0].approvals.len(), 1);
                 while !app.runtime.sessions[0].terminal.as_ref().unwrap().screen_text(60).contains("$ touch fixture") {
                     assert!(Instant::now() < deadline);
                     std::thread::sleep(Duration::from_millis(10));
                 }
-                app.runtime.approve(0, Decision::Allow, None).unwrap();
+                app.runtime
+                    .approve(
+                        0,
+                        &app.runtime.sessions[0]
+                            .approvals
+                            .first()
+                            .map(|pending| pending.id.clone())
+                            .unwrap_or_default(),
+                        Decision::Allow,
+                        None,
+                    )
+                    .unwrap();
                 while !app.runtime.sessions[0].terminal.as_ref().unwrap().screen_text(60).contains("Approved") {
                     assert!(Instant::now() < deadline);
                     std::thread::sleep(Duration::from_millis(10));
@@ -301,6 +436,7 @@ mod tests {
                 assert!(!app.runtime.sessions[0].approval_hold);
                 let reply = Arc::new(ipc::ApprovalReply::default());
                 app.runtime.sessions[0].approvals.push(PendingApproval {
+                    id: uuid::Uuid::new_v4().to_string(),
                     request: ApprovalRequest::from_event(&permission),
                     reply: Some(reply.clone()),
                 });
@@ -337,6 +473,7 @@ mod tests {
             let reply = Arc::new(ipc::ApprovalReply::default());
             app.runtime.sessions[0].approval_hold = true;
             app.runtime.sessions[0].approvals.push(PendingApproval {
+                id: uuid::Uuid::new_v4().to_string(),
                 request: ApprovalRequest::from_event(&permission),
                 reply: Some(reply.clone()),
             });
@@ -384,9 +521,11 @@ mod tests {
             app.runtime.sessions[0].status = AgentStatus::NeedsInput;
             app.runtime.sessions[0].approval_hold = true;
             app.runtime.sessions[0].menu_absent_since = Some(Instant::now() - APPROVAL_MENU_GRACE);
-            app.runtime.sessions[0]
-                .approvals
-                .push(PendingApproval { request: ApprovalRequest::from_event(&permission), reply: Some(reply) });
+            app.runtime.sessions[0].approvals.push(PendingApproval {
+                id: uuid::Uuid::new_v4().to_string(),
+                request: ApprovalRequest::from_event(&permission),
+                reply: Some(reply),
+            });
             assert_eq!(app.runtime.deliver(0, "held while editing"), Delivery::Held);
             let before = app.runtime.sessions[0].terminal.as_ref().unwrap().screen_text(60);
             app.runtime.approvals_checked = Instant::now() - APPROVAL_CHECK_INTERVAL;

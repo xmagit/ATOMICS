@@ -165,7 +165,16 @@ fn permission_hooks_wake_waiters_and_accept_decisions(app: &mut Desktop<'_>, ctx
     let (hook, rx) = permission("touch another-file", "Another request");
     app.runtime.on_hook(hook);
     assert!(rx.wait(Duration::ZERO).stdout.is_none());
-    assert!(app.runtime.approve(0, Decision::Allow, None).is_err());
+    assert!(
+        app.runtime
+            .approve(
+                0,
+                &app.runtime.sessions[0].approvals.first().map(|pending| pending.id.clone()).unwrap_or_default(),
+                Decision::Allow,
+                None
+            )
+            .is_err()
+    );
     assert_eq!(app.runtime.sessions[0].approvals.len(), 1);
     let event = imacs_core::hook::HookEvent::from_payload(&json!({
         "hook_event_name":"PostToolUse", "session_id":"s1", "cwd":dir.path(),
@@ -181,7 +190,16 @@ fn permission_hooks_wake_waiters_and_accept_decisions(app: &mut Desktop<'_>, ctx
     });
     assert!(app.runtime.sessions[0].approvals.is_empty());
     assert_eq!(app.runtime.sessions[0].status, AgentStatus::Working);
-    assert!(app.runtime.approve(0, Decision::Deny, None).is_err());
+    assert!(
+        app.runtime
+            .approve(
+                0,
+                &app.runtime.sessions[0].approvals.first().map(|pending| pending.id.clone()).unwrap_or_default(),
+                Decision::Deny,
+                None
+            )
+            .is_err()
+    );
     assert!(CHIEF_ALLOWED_TOOLS.contains(&"mcp__imacs__imacs_approve"));
 }
 
@@ -291,7 +309,14 @@ fn busy_text_is_only_a_fallback(app: &mut Desktop<'_>, _ctx: &egui::Context) {
     assert_eq!(app.runtime.sessions[0].held.len(), 3);
 
     assert_eq!(app.runtime.sessions[0].terminal.as_ref().unwrap().screen_text(12), before);
-    app.runtime.approve(0, Decision::Allow, None).unwrap();
+    app.runtime
+        .approve(
+            0,
+            &app.runtime.sessions[0].approvals.first().map(|pending| pending.id.clone()).unwrap_or_default(),
+            Decision::Allow,
+            None,
+        )
+        .unwrap();
     assert_eq!(app.runtime.sessions[0].held.len(), 3);
     assert_eq!(app.runtime.sessions[0].terminal.as_ref().unwrap().screen_text(12), before);
     let event = imacs_core::hook::HookEvent::from_payload(&json!({

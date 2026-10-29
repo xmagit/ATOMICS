@@ -3,7 +3,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -23,6 +23,7 @@ pub struct Shared {
     pub exited: AtomicBool,
     pub bell: AtomicBool,
     pub changed: AtomicBool,
+    revision: AtomicU64,
     pub clipboard: Mutex<Option<String>>,
     wake: crate::host::Wake,
     size: Mutex<WindowSize>,
@@ -56,7 +57,10 @@ impl EventListener for Listener {
             TermEvent::Bell => self.shared.bell.store(true, Ordering::Relaxed),
             TermEvent::ChildExit(_) | TermEvent::Exit => self.shared.exited.store(true, Ordering::Release),
             TermEvent::ClipboardLoad(..) => return,
-            TermEvent::Wakeup | TermEvent::MouseCursorDirty | TermEvent::CursorBlinkingChange => {}
+            TermEvent::Wakeup => {
+                self.shared.revision.fetch_add(1, Ordering::Release);
+            }
+            TermEvent::MouseCursorDirty | TermEvent::CursorBlinkingChange => {}
         }
         self.shared.changed.store(true, Ordering::Release);
         self.shared.wake.notify();
@@ -82,6 +86,10 @@ pub(super) fn isolated_args(program: String, args: Vec<String>) -> Vec<String> {
 }
 
 impl Terminal {
+    pub(super) fn revision(&self) -> u64 {
+        self.shared.revision.load(Ordering::Acquire)
+    }
+
     pub fn shown(&self, focused: bool) {
         *self.shared.shown.lock().unwrap() = Some((Instant::now(), focused));
     }
@@ -134,6 +142,7 @@ impl Terminal {
             exited: AtomicBool::new(false),
             bell: AtomicBool::new(false),
             changed: AtomicBool::new(false),
+            revision: AtomicU64::new(0),
             clipboard: Mutex::new(None),
             wake,
             size: Mutex::new(size),
@@ -226,7 +235,10 @@ impl Terminal {
     }
 
     pub fn resize(&self, size: WindowSize) {
-        self.term.lock().resize(TermSize::new(size.num_cols as usize, size.num_lines as usize));
+        let mut term = self.term.lock();
+        term.resize(TermSize::new(size.num_cols as usize, size.num_lines as usize));
+        self.shared.revision.fetch_add(1, Ordering::Release);
+        drop(term);
         *self.shared.size.lock().unwrap() = size;
         let _ = self.sender.send(Msg::Resize(size));
     }
@@ -250,6 +262,7 @@ mod tests {
             exited: AtomicBool::new(false),
             bell: AtomicBool::new(false),
             changed: AtomicBool::new(false),
+            revision: AtomicU64::new(0),
             clipboard: Mutex::new(None),
             wake: wake.clone(),
             size: Mutex::new(WindowSize { num_lines: 24, num_cols: 80, cell_width: 8, cell_height: 16 }),

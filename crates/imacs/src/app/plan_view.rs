@@ -11,6 +11,14 @@ pub(super) enum PlanState {
 }
 
 impl PlanState {
+    pub(super) fn urgency(self) -> u8 {
+        match self {
+            Self::NeedsYou => 2,
+            Self::Running(_) => 1,
+            _ => 0,
+        }
+    }
+
     pub(super) fn color(self, palette: &Palette) -> Color32 {
         match self {
             Self::Running(_) => palette.accent,
@@ -341,6 +349,36 @@ mod tests {
                 assert_eq!(app.runtime.plans[3].tasks, tasks);
                 assert_eq!(app.runtime.sessions.len(), sessions);
                 assert_eq!(Plan::load(&paths::imacs_home().join("plans/one.json")).unwrap().status, PlanStatus::Open);
+            },
+        );
+    }
+
+    #[test]
+    fn closed_plan_selection_uses_the_workspace_without_agent_launchers() {
+        with_app(
+            "app::plan_view::tests::closed_plan_selection_uses_the_workspace_without_agent_launchers",
+            |app, ctx| {
+                fixture(app);
+                for index in [3, 5] {
+                    app.view_plan_history(index);
+                    let sessions = app.runtime.sessions.len();
+                    let output = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1400.0, 900.0))),
+                            ..Default::default()
+                        },
+                        |ui| app.paint(ui),
+                    );
+                    let labels = text(&output).iter().map(|text| text.galley.text()).collect::<Vec<_>>();
+                    assert!(labels.iter().any(|label| label.contains("read-only")));
+                    assert!(
+                        !labels.iter().any(|label| label.starts_with("Start ")),
+                        "history must not offer agent launchers: {labels:?}"
+                    );
+                    assert_eq!(app.runtime.sessions.len(), sessions);
+                    assert!(app.runtime.creating.is_empty());
+                    output.drop_without_applying_deltas();
+                }
             },
         );
     }

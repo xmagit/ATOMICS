@@ -214,6 +214,7 @@ impl Desktop<'_> {
 
             if let Some(pending) = session.approvals.first() {
                 let request = &pending.request;
+                let deciding = self.client.approval_decisions.contains(&(session.id.clone(), pending.id.clone()));
                 let height = (body.height() - 220.0).clamp(110.0, 210.0).min(body.height());
                 let banner = body.with_max_y(body.top() + height);
                 ui.painter().rect_filled(banner, 0.0, p.panel);
@@ -225,11 +226,19 @@ impl Desktop<'_> {
                     for (label, decision) in
                         [("Allow", Decision::Allow), ("Allow always", Decision::AllowAlways), ("Deny", Decision::Deny)]
                     {
-                        if ui.button(label).clicked() {
-                            approval = Some((index, decision));
+                        let response = ui.add_enabled(!deciding, egui::Button::new(label));
+                        #[cfg(test)]
+                        ui.ctx().data_mut(|data| {
+                            data.insert_temp(egui::Id::unique(("approval-button", label)), response.enabled());
+                        });
+                        if response.clicked() {
+                            approval = Some((index, pending.id.clone(), decision));
                         }
                     }
                 });
+                if deciding {
+                    child.label("Decision pending…");
+                }
                 egui::ScrollArea::vertical().max_height(child.available_height()).show(&mut child, |ui| {
                     ui.label(RichText::new(request.command.as_deref().unwrap_or(&request.tool)).monospace());
                     ui.label(format!("cwd: {}", request.cwd.display()));
@@ -343,12 +352,8 @@ impl Desktop<'_> {
             self.task_action(plan, task, action);
         }
 
-        if let Some((index, decision)) = approval {
-            self.post_session(index, move |state, index| {
-                if let Err(error) = state.approve(index, decision, None) {
-                    state.toast(error);
-                }
-            });
+        if let Some((index, approval, decision)) = approval {
+            self.approve_request(index, approval, decision);
         }
 
         if let Some((id, open)) = activate {

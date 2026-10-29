@@ -119,6 +119,7 @@ enum Delivery {
 }
 
 struct PendingApproval {
+    id: String,
     request: ApprovalRequest,
     reply: Option<Arc<ipc::ApprovalReply>>,
 }
@@ -403,10 +404,11 @@ pub(crate) struct State {
 
 /// Native effects delivered to the desktop; these never drive runtime progress.
 enum ClientEvent {
+    ApprovalDecided { session: String, approval: String },
     Cleanup { preselect: Option<PathBuf> },
     PlanCleanup,
     PlanCleanupPreview(Vec<(PathBuf, String)>),
-    OpenFile { root: PathBuf, path: String },
+    OpenFile { root: PathBuf, path: String, whole_file: bool },
     Edit { root: PathBuf, path: Option<String> },
     Screenshot { path: String, reply: Sender<ControlOutcome> },
     VoiceFailed { text: String, error: String },
@@ -416,6 +418,8 @@ enum ClientEvent {
 
 /// View data belongs to the desktop, never to the runtime scheduler.
 struct Client {
+    project_picker: Option<PathBuf>,
+    approval_decisions: HashSet<(String, String)>,
     focus_terminal: Option<String>,
     cleanup_open: bool,
     cleanup_selected: HashSet<PathBuf>,
@@ -452,6 +456,8 @@ impl Client {
     fn new(ctx: &egui::Context, options: &mut Options, icon: &egui::IconData) -> Self {
         let (voice_tx, voice_rx) = std::sync::mpsc::channel();
         Self {
+            project_picker: None,
+            approval_decisions: HashSet::new(),
             focus_terminal: None,
             cleanup_open: false,
             cleanup_selected: HashSet::new(),
@@ -516,6 +522,32 @@ pub struct App {
 }
 
 impl App {
+    fn ui_with_picker(&mut self, ui: &mut egui::Ui, pick: impl FnOnce(&Path) -> Option<PathBuf>) {
+        let mut state = self.host.state();
+        Desktop { runtime: &mut state, client: &mut self.client }.paint(ui);
+        if state.sessions.iter().any(|s| s.status == AgentStatus::Working)
+            || matches!(self.client.voice, Voice::Recording(_))
+        {
+            ui.ctx().request_repaint_after(PULSE_STEP);
+        }
+        let commands = std::mem::take(&mut state.client_commands);
+        let actions = state.action_tx.clone();
+        drop(state);
+        for command in commands {
+            self.replies.push(self.host.command(command));
+        }
+        if ui.input(|input| !input.events.is_empty()) {
+            self.host.wake();
+        }
+        // Native dialogs may block for minutes. The runtime must remain free
+        // to service hooks, approvals and waits throughout that time.
+        if let Some(start) = self.client.project_picker.take()
+            && let Some(root) = pick(&start)
+        {
+            let _ = actions.send(Box::new(move |state| state.open_project(&root)));
+        }
+    }
+
     pub fn new(cc: &eframe::CreationContext<'_>, mut options: Options, icon: &egui::IconData) -> Self {
         let client = Client::new(&cc.egui_ctx, &mut options, icon);
         let state = State::new(cc, options, icon);
@@ -540,21 +572,9 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let mut state = self.host.state();
-        Desktop { runtime: &mut state, client: &mut self.client }.paint(ui);
-        if state.sessions.iter().any(|s| s.status == AgentStatus::Working)
-            || matches!(self.client.voice, Voice::Recording(_))
-        {
-            ui.ctx().request_repaint_after(PULSE_STEP);
-        }
-        let commands = std::mem::take(&mut state.client_commands);
-        drop(state);
-        for command in commands {
-            self.replies.push(self.host.command(command));
-        }
-        if ui.input(|input| !input.events.is_empty()) {
-            self.host.wake();
-        }
+        self.ui_with_picker(ui, |start| {
+            rfd::FileDialog::new().set_title("Open project").set_directory(start).pick_folder()
+        });
     }
 
     fn on_exit(&mut self) {
@@ -984,6 +1004,9 @@ impl Desktop<'_> {
         }
         for event in std::mem::take(&mut self.runtime.client_events) {
             match event {
+                ClientEvent::ApprovalDecided { session, approval } => {
+                    self.client.approval_decisions.remove(&(session, approval));
+                }
                 ClientEvent::Cleanup { preselect } => {
                     self.client.cleanup_open = true;
                     self.client.cleanup_selected = preselect.into_iter().collect();
@@ -996,8 +1019,8 @@ impl Desktop<'_> {
                 ClientEvent::PlanCleanupPreview(selected) => {
                     self.client.plan_cleanup_selected = selected.into_iter().collect()
                 }
-                ClientEvent::OpenFile { root, path } => {
-                    self.client.diff_views.entry(root).or_default().open(&path);
+                ClientEvent::OpenFile { root, path, whole_file } => {
+                    self.client.diff_views.entry(root).or_default().open_resolved(&path, whole_file);
                 }
                 ClientEvent::Screenshot { path, reply } => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -1231,12 +1254,16 @@ impl Desktop<'_> {
             .show(ui, |ui| self.steer_bar(ui));
 
         let area = ui.available_rect_before_wrap();
-        let diff_open =
-            self.runtime.diff_open && (self.runtime.diff_target().is_some() || self.runtime.panel == PanelMode::Plan);
+        let history_board = self.runtime.plan_view
+            && self.runtime.panel == PanelMode::Plan
+            && self.runtime.plans[self.runtime.selected_plan].status != PlanStatus::Open;
+        let diff_open = !history_board
+            && self.runtime.diff_open
+            && (self.runtime.diff_target().is_some() || self.runtime.panel == PanelMode::Plan);
         let layout_config =
             layout::LayoutConfig { diff_width: self.client.split, ..self.runtime.config.layout.clone() };
-        let visible = self.runtime.visible_sessions();
-        let completed = self.runtime.completed_tasks().len();
+        let visible = if history_board { Vec::new() } else { self.runtime.visible_sessions() };
+        let completed = if history_board { 0 } else { self.runtime.completed_tasks().len() };
         let dock_width = if self.runtime.chief_open && self.runtime.chief_dock() == ChiefDock::Docked {
             self.runtime.store.chief_width.filter(|w| w.is_finite()).unwrap_or_else(|| {
                 let sidebar =
@@ -1293,6 +1320,10 @@ impl Desktop<'_> {
 
         egui::CentralPanel::default().frame(egui::Frame::new().fill(p.background)).show(ui, |ui| {
             let mut rect = ui.max_rect();
+            if history_board {
+                self.plan_panel(ui, rect);
+                return;
+            }
             let statuses: Vec<AgentStatus> = visible.iter().map(|&i| self.runtime.sessions[i].status).collect();
             let active = self.runtime.active_index().and_then(|a| visible.iter().position(|&i| i == a));
             let tiled: Vec<usize> =
