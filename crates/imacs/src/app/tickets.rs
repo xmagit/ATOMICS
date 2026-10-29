@@ -118,6 +118,13 @@ impl State {
         self.refresh_tickets(None, None);
     }
 
+    /// The board's sync button: read one plan's tickets again and retry its failed pushes.
+    pub(super) fn resync_tickets(&mut self, plan: &str) {
+        self.tickets.failed.retain(|key, _| key.0 != plan);
+        self.refresh_tickets(Some(plan), None);
+        self.push_ticket_states();
+    }
+
     pub(super) fn ticket_config(&self) -> Option<Arc<TicketConfig>> {
         self.tickets.config.clone()
     }
@@ -1328,6 +1335,124 @@ mod tests {
             settle(app);
             assert_eq!(comments(&state, &key).len(), 1, "no comments while they are off");
             assert_eq!(ticket(&state, &key)["state"], "Shipped", "states are still kept in step");
+        });
+    }
+
+    fn board_frame(app: &mut Desktop<'_>, ctx: &egui::Context, events: Vec<egui::Event>) -> egui::FullOutput {
+        let time = ctx.input(|i| i.time) + 0.1;
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1800.0, 1000.0))),
+                time: Some(time),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| app.plan_panel(ui, ui.max_rect()));
+            },
+        );
+        app.runtime.drain_actions();
+        output
+    }
+
+    fn texts(output: &egui::FullOutput) -> Vec<(String, Pos2)> {
+        output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => {
+                    Some((text.galley.text().to_string(), text.pos + text.galley.rect.center().to_vec2()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cards_and_the_plan_header_show_live_tickets_and_open_them() {
+        with_app("app::tickets::tests::cards_and_the_plan_header_show_live_tickets_and_open_them", |app, ctx| {
+            let dir = tempfile::tempdir().unwrap();
+            let state = tickets_fixture(dir.path(), "CARD");
+            configure(app, CARDS, &state, |_| {});
+            request(
+                app,
+                json!({"cmd":"plan_set", "goal":"Board view", "ticket":{"id":"b1"}, "tasks":[
+                    {"id":"a", "title":"Parser task", "ticket":{"id":"1"}},
+                    {"id":"b", "title":"Docs task", "ticket":{"id":"2"}}]}),
+            );
+            let index = app.runtime.selected_plan;
+            app.runtime.plan_view = true;
+            app.runtime.panel = PanelMode::Plan;
+            settle(app);
+            set_field(&state, "CARD-1", "state", "Doing");
+            app.runtime.ticket_heartbeat();
+            settle(app);
+            app.runtime.plans[index].tasks[1].status = TaskStatus::Blocked;
+            app.runtime.plans[index].tasks[1].ticket.as_mut().unwrap().error =
+                Some("setting the state to Stuck failed: card_move is broken today".into());
+            board_frame(app, ctx, vec![]).drop_without_applying_deltas();
+            let output = board_frame(app, ctx, vec![]);
+            let shown = texts(&output);
+            let labels: Vec<&str> = shown.iter().map(|(text, _)| text.as_str()).collect();
+            for expected in [
+                "cards board",
+                "b1",
+                "3 tickets · 1 without a task",
+                "sync",
+                "CARD-1 · Doing",
+                "CARD-2 · Todo",
+                "⚠ setting the state to Stuck failed: card_move is broken today",
+            ] {
+                assert!(labels.contains(&expected), "missing {expected:?} in {labels:?}");
+            }
+            // The card notices a ticket whose state means another status than the task's.
+            assert_eq!(
+                labels.iter().filter(|l| l.starts_with("ticket says")).collect::<Vec<_>>(),
+                [&"ticket says running"]
+            );
+            output.drop_without_applying_deltas();
+            app.runtime.plans[index].tasks[0].status = TaskStatus::Running;
+            let output = board_frame(app, ctx, vec![]);
+            let shown = texts(&output);
+            assert!(!shown.iter().any(|(text, _)| text.starts_with("ticket says")));
+            let chip = shown.iter().find(|(text, _)| text == "CARD-1 · Doing").unwrap().1;
+            output.drop_without_applying_deltas();
+            let button = |pressed| egui::Event::PointerButton {
+                pos: chip,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            board_frame(app, ctx, vec![egui::Event::PointerMoved(chip), button(true)]).drop_without_applying_deltas();
+            let released = board_frame(app, ctx, vec![button(false)]);
+            let opened: Vec<String> = released
+                .platform_output
+                .commands
+                .iter()
+                .filter_map(|command| match command {
+                    egui::OutputCommand::OpenUrl(open) => Some(open.url.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(opened, ["https://tickets.example/CARD-1"]);
+            released.drop_without_applying_deltas();
+
+            // The sync button reads the tickets again.
+            let reads = count(&state, "card_list");
+            let output = board_frame(app, ctx, vec![]);
+            let sync = texts(&output).into_iter().find(|(text, _)| text == "sync").unwrap().1;
+            output.drop_without_applying_deltas();
+            for pressed in [true, false] {
+                let event = egui::Event::PointerButton {
+                    pos: sync,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                };
+                board_frame(app, ctx, vec![egui::Event::PointerMoved(sync), event]).drop_without_applying_deltas();
+            }
+            settle(app);
+            assert_eq!(count(&state, "card_list"), reads + 1);
         });
     }
 
