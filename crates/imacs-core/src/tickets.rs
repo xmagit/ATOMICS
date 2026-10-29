@@ -199,9 +199,24 @@ pub struct McpServer {
     /// Streamable HTTP endpoint.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
-    /// Environment variable holding a bearer token for `url`.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Environment variable holding a bearer token for `url`. Trimmed when the config is
+    /// read (blank means none), so every reader looks up the same name.
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "variable_name")]
     pub token_env: Option<String>,
+}
+
+impl McpServer {
+    /// The variable a connection to this server authenticates with: `token_env`, for an
+    /// HTTP server. A stdio server gets no token from IMACS.
+    pub fn bearer_env(&self) -> Option<&str> {
+        let http = self.command.is_empty() && self.url.as_deref().is_some_and(|url| !url.trim().is_empty());
+        self.token_env.as_deref().filter(|_| http)
+    }
+}
+
+fn variable_name<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    let name: Option<String> = Option::deserialize(deserializer)?;
+    Ok(name.map(|name| name.trim().to_string()).filter(|name| !name.is_empty()))
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -574,12 +589,14 @@ impl Cleaner {
         &self.secrets
     }
 
-    /// A ticket field, webhook field or JSON property name.
+    /// A ticket field shown on a card, or a webhook field: cleaned, and bounded for display.
     pub fn field(&self, text: &str) -> String {
-        match self.masked(text) {
-            Some(masked) => bound(&masked, MAX_FIELD_CHARS),
-            None => WITHHELD_FIELD.into(),
-        }
+        bound(&self.text(text), MAX_FIELD_CHARS)
+    }
+
+    /// Text cleaned without a bound, for payloads such as agent reads that need it whole.
+    pub fn text(&self, text: &str) -> String {
+        self.masked(text).unwrap_or_else(|| WITHHELD_FIELD.into())
     }
 
     /// An error message: field rules, then bearer and basic credentials, `Authorization`
@@ -613,13 +630,14 @@ impl Cleaner {
     }
 
     /// A ticket read for an agent: every string and property name cleaned, with URL user
-    /// info and credential query values in its text masked in place.
+    /// info and credential query values in its text masked in place. Strings stay whole: the
+    /// card bound is for display, and an agent needs the end of a long description too.
     pub fn value(&self, value: Value) -> Value {
         match value {
-            Value::String(text) => Value::String(self.field(&redact_query(&redact_userinfo(&text), credential_param))),
+            Value::String(text) => Value::String(self.text(&redact_query(&redact_userinfo(&text), credential_param))),
             Value::Array(items) => Value::Array(items.into_iter().map(|item| self.value(item)).collect()),
             Value::Object(map) => {
-                Value::Object(map.into_iter().map(|(key, item)| (self.field(&key), self.value(item))).collect())
+                Value::Object(map.into_iter().map(|(key, item)| (self.text(&key), self.value(item))).collect())
             }
             other => other,
         }
@@ -1534,6 +1552,11 @@ mod tests {
         );
         assert_eq!(cleaner.with(["another-secret".to_string()]).field("another-secret"), "***");
         let long = format!("{} tail", "word ".repeat(MAX_FIELD_CHARS));
+        assert_eq!(
+            Cleaner::default().value(json!({"description": long})),
+            json!({"description": long}),
+            "agents get it whole"
+        );
         let bounded = Cleaner::default().field(&long);
         assert!(bounded.ends_with("word…") && bounded.chars().count() <= MAX_FIELD_CHARS + 1, "cut between words");
     }
@@ -1611,6 +1634,25 @@ mod tests {
                 updated_at: Some("t".into()),
                 ..TicketLink::default()
             }
+        );
+    }
+
+    #[test]
+    fn token_variable_names_are_trimmed_once_when_read() {
+        let server = |text: &str| toml::from_str::<TicketConfig>(text).unwrap().server;
+        let http = server("server = { url = \"https://t.example/mcp\", token_env = \"  TRACKER_TOKEN \" }");
+        assert_eq!(http.token_env.as_deref(), Some("TRACKER_TOKEN"));
+        assert_eq!(http.bearer_env(), Some("TRACKER_TOKEN"));
+        assert_eq!(server("server = { url = \"https://t.example/mcp\", token_env = \"  \" }").token_env, None);
+        let stdio = server("server = { command = [\"tracker-mcp\"], token_env = \"TRACKER_TOKEN\" }");
+        assert_eq!(stdio.bearer_env(), None, "IMACS gives a stdio server no token");
+        assert_eq!(
+            toml::from_str::<TicketConfig>(
+                &toml::to_string(&TicketConfig { server: http.clone(), ..TicketConfig::default() }).unwrap()
+            )
+            .unwrap()
+            .server,
+            http
         );
     }
 

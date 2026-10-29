@@ -72,7 +72,7 @@ pub fn spawn<T: Send + 'static>(done: crate::host::Sender<(T, Result<TicketOutpu
 struct Worker {
     /// The connection, with the server and token it was made with.
     client: Option<(McpServer, Option<String>, McpClient)>,
-    /// The current job's token, as its `token_env` resolves now.
+    /// The token the current job's connection should authenticate with, as it resolves now.
     token: Option<String>,
     /// The server that failed, when, and its cleaned error.
     down: Option<(McpServer, Instant, String)>,
@@ -88,7 +88,7 @@ impl Worker {
     /// ones. A connection made with another token is replaced, and the job is cleaned for
     /// that token too until the old connection is gone.
     fn prepare(&mut self, config: &TicketConfig) {
-        self.token = config.server.token_env.clone().and_then(|name| self.env(&name));
+        self.token = config.server.bearer_env().map(str::to_string).and_then(|name| self.env(&name));
         let secrets = tickets::secrets_of(config, |name| self.env(name));
         let mut cleaner = tickets::Cleaner::new(secrets);
         if let Some((_, used, _)) = &self.client
@@ -182,14 +182,18 @@ impl Worker {
         if self.client.as_ref().is_none_or(|(server, used, _)| *server != config.server || *used != self.token) {
             self.client = None;
             let timeout = Duration::from_secs(config.timeout_secs.max(1));
-            // The connection authenticates with exactly the token this job resolved.
+            // The connection authenticates with the token this job resolved, and the worker records
+            // the token the connection reports using, so the two can never quietly differ.
             let token = self.token.clone();
-            let token_env = config.server.token_env.clone();
+            let bearer = config.server.bearer_env().map(str::to_string);
             let env = |name: &str| {
-                if token_env.as_deref() == Some(name) { token.clone() } else { crate::setup::env_var(name) }
+                if bearer.as_deref() == Some(name) { token.clone() } else { crate::setup::env_var(name) }
             };
             match McpClient::connect(&config.server, timeout, env) {
-                Ok(client) => self.client = Some((config.server.clone(), self.token.clone(), client)),
+                Ok(client) => {
+                    let used = client.token().map(str::to_string);
+                    self.client = Some((config.server.clone(), used, client));
+                }
                 Err(err) => return Err(self.broken(&config.server, err)),
             }
         }
@@ -222,13 +226,14 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::mpsc::Receiver;
 
-    /// A streamable HTTP MCP server whose every tool call fails, echoing the bearer token
-    /// it was called with. Each request's Authorization header goes to the receiver.
+    /// A streamable HTTP MCP server whose every tool call fails, echoing the bearer token it
+    /// was called with and the one its previous call had. Each call's token goes to the receiver.
     fn echo_server() -> (String, Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/mcp", listener.local_addr().unwrap());
         let (tx, tokens) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
+            let mut previous: Option<String> = None;
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { break };
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
@@ -253,7 +258,10 @@ mod tests {
                     "initialize" => Some(json!({"protocolVersion": "2025-06-18", "capabilities": {}})),
                     "tools/call" => {
                         let _ = tx.send(token.clone());
-                        let text = format!("credential {token} rejected");
+                        let mut text = format!("credential {token} rejected");
+                        if let Some(previous) = previous.replace(token.clone()).filter(|p| *p != token) {
+                            text.push_str(&format!("; last time {previous}"));
+                        }
                         Some(json!({"isError": true, "content": [{"type": "text", "text": text}]}))
                     }
                     _ => None,
@@ -293,33 +301,36 @@ mod tests {
             );
             return;
         }
-        const OLD: &str = "oldkey-7c1d9e";
-        const NEW: &str = "newkey-2b3c4d";
-        let (url, tokens) = echo_server();
-        let mut config: TicketConfig = toml::from_str(
-            "system = \"echo\"\n[operations.comment]\ntool = \"note\"\narguments = { body = \"{body}\" }",
-        )
-        .unwrap();
-        config.server.url = Some(url);
-        config.server.token_env = Some("ECHO_TEST_TOKEN".into());
-        let config = Arc::new(config);
-        let (done, results) = crate::host::Wake::default().channel();
-        let jobs = spawn(done);
-        let comment = |n: u32| {
-            let op = TicketOp::Comment(TicketLink { id: "1".into(), ..TicketLink::default() }, "Hi".into());
-            jobs.send(TicketJob { config: config.clone(), op, tag: n }).unwrap();
-            let (tag, result) = results.recv_timeout(Duration::from_secs(10)).unwrap();
-            assert_eq!(tag, n);
-            result.err().unwrap()
-        };
-        // SAFETY: this process runs only this test, and the worker reads the variable only
-        // while a job runs; each job is awaited before the variable changes.
-        unsafe { std::env::set_var("ECHO_TEST_TOKEN", OLD) };
-        assert_eq!(comment(1), "note failed: credential *** rejected");
-        assert_eq!(tokens.recv().unwrap(), OLD);
-        unsafe { std::env::set_var("ECHO_TEST_TOKEN", NEW) };
-        let rotated = comment(2);
-        assert_eq!(tokens.recv().unwrap(), NEW, "the connection authenticates with the new token");
-        assert_eq!(rotated, "note failed: credential *** rejected");
+        // The token variable as written in a config, padded or not: the name is the same.
+        for (round, name) in ["ECHO_TEST_TOKEN", " ECHO_TEST_TOKEN "].into_iter().enumerate() {
+            let old = format!("oldkey-7c1d9e{round}");
+            let new = format!("newkey-2b3c4d{round}");
+            let (url, tokens) = echo_server();
+            let config: TicketConfig = toml::from_str(&format!(
+                "system = \"echo\"\nserver = {{ url = \"{url}\", token_env = \"{name}\" }}\n\
+                 [operations.comment]\ntool = \"note\"\narguments = {{ body = \"{{body}}\" }}"
+            ))
+            .unwrap();
+            let config = Arc::new(config);
+            let (done, results) = crate::host::Wake::default().channel();
+            let jobs = spawn(done);
+            let comment = |n: u32| {
+                let op = TicketOp::Comment(TicketLink { id: "1".into(), ..TicketLink::default() }, "Hi".into());
+                jobs.send(TicketJob { config: config.clone(), op, tag: n }).unwrap();
+                let (tag, result) = results.recv_timeout(Duration::from_secs(10)).unwrap();
+                assert_eq!(tag, n);
+                result.err().unwrap()
+            };
+            // SAFETY: this process runs only this test, and the worker reads the variable only
+            // while a job runs; each job is awaited before the variable changes.
+            unsafe { std::env::set_var("ECHO_TEST_TOKEN", &old) };
+            assert_eq!(comment(1), "note failed: credential *** rejected", "{name:?}");
+            assert_eq!(tokens.recv().unwrap(), old);
+            unsafe { std::env::set_var("ECHO_TEST_TOKEN", &new) };
+            let rotated = comment(2);
+            assert_eq!(tokens.recv().unwrap(), new, "{name:?}: the connection authenticates with the new token");
+            // The new connection's server echoes both tokens: the old one is cleaned too.
+            assert_eq!(rotated, "note failed: credential *** rejected; last time ***", "{name:?}");
+        }
     }
 }

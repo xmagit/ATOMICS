@@ -98,6 +98,14 @@ impl McpClient {
         Ok(client)
     }
 
+    /// The bearer token this connection authenticated with, if any.
+    pub fn token(&self) -> Option<&str> {
+        match &self.transport {
+            Transport::Http(server) => server.token.as_deref(),
+            Transport::Stdio(_) => None,
+        }
+    }
+
     /// Calls a tool and returns its result. A result flagged `isError` is an error.
     pub fn call_tool(&mut self, name: &str, arguments: Value) -> Result<Value, McpError> {
         let result = self.request("tools/call", json!({ "name": name, "arguments": arguments }))?;

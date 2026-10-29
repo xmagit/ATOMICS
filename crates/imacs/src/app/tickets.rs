@@ -2077,6 +2077,31 @@ mod tests {
     }
 
     #[test]
+    fn agents_read_long_descriptions_whole() {
+        with_app("app::tickets::tests::agents_read_long_descriptions_whole", |app, _| {
+            use crate::mcp_client::tests::example_profile;
+            let dir = tempfile::tempdir().unwrap();
+            let state = tickets_fixture(dir.path(), "ENG");
+            let description = format!("{}LAST LINE: ship it", "Step by step instructions for the agent.\n".repeat(80));
+            assert!(description.chars().count() > imacs_core::tickets::MAX_FIELD_CHARS);
+            edit_fake(&state, |fake| fake["tickets"][0]["description"] = json!(description));
+            app.runtime.config.tickets = example_profile("RELAY", &state);
+            app.runtime.apply_ticket_config();
+            request(
+                app,
+                json!({"cmd":"plan_set", "goal":"Long", "tasks":[{"id":"a", "title":"Own", "ticket":{"id":"1"}}]}),
+            );
+            let index = app.runtime.selected_plan;
+            settle(app);
+            app.runtime.plans[index].tasks[0].session = Some("agent-a".into());
+            app.runtime.sessions.push(session("agent-a", AgentKind::Generic, AgentStatus::Working, dir.path()));
+            let read = ticket_request(app, json!({"cmd":"agent_ticket_get", "pane":"agent-a"}));
+            assert!(read.ok, "{read:?}");
+            assert_eq!(read.result["ticket"]["description"], description, "agents get the whole description");
+        });
+    }
+
+    #[test]
     fn split_and_property_name_secrets_never_reach_plans_events_or_agents() {
         with_app(
             "app::tickets::tests::split_and_property_name_secrets_never_reach_plans_events_or_agents",
