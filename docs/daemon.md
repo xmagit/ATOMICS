@@ -281,7 +281,11 @@ verified on the GUI process with `ps eww`, passed shell input/output, fresh diff
 ctl plan persistence, heartbeat, fleet/board/chief screenshots and clean shutdown.
 The screenshot harness requests paints while obscured so the existing CLI
 screenshot delay can advance. Targeted application and terminal tests pass.
-The final workspace checks are recorded with the completing task report.
+Final validation passed `cargo fmt --all -- --check`,
+`cargo clippy --workspace --all-targets -- -D warnings`, and all 302 tests through
+`imacs queue --class test -- cargo test --workspace`. The separate narrow top bar
+follow-up also passed 480/550-point paint and click tests and isolated queued
+native screenshots at both widths.
 
 ### Remaining for phase 3
 
