@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
-/// `agent` serves only `imacs_report`: agents IMACS starts use it to report on their task.
+/// Task agents get reporting and session-scoped ticket tools, never the external server.
 pub fn run(agent: bool, chief: bool) {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -41,7 +41,7 @@ pub fn run(agent: bool, chief: bool) {
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({ "tools": available_tools(agent, chief) })),
             "tools/call" => Ok(if agent {
-                call_report(&params)
+                call_agent(&params)
             } else if !chief && params["name"] == "imacs_restart" {
                 tool_error("imacs_restart is only available to the chief".into())
             } else {
@@ -64,7 +64,7 @@ fn write(out: &mut impl Write, value: Value) {
 
 const INSTRUCTIONS: &str = "IMACS runs coding agents (Claude Code, Codex, shells) in terminals the user watches, each in its own git worktree, and shows every worktree's diff against main. As an orchestrator: write a plan with imacs_plan_set and let the user approve it on the board, then imacs_plan_dispatch. Loop on imacs_wait instead of polling: agents report with imacs_report (status reported) or finish turns. Then read imacs_result and imacs_diff, steer with imacs_send or inline review comments (imacs_comment + imacs_send_review), and move tasks along with imacs_plan_update. Merge each accepted task into the plan's integration branch with imacs_plan_integrate before dispatching tasks that depend on it: those branch from the integration branch. For one-off work, imacs_start starts an agent directly. Several plans can run at once: retain each returned plan id and pass plan to every plan tool. Start the next plan while one finishes. The chief is never closed. With a ticket system configured, plans and tasks carry ticket links (ticket in imacs_plan_set, or imacs_ticket_link): IMACS keeps their states in step, comments on them, and reports changes made in the ticket system as ticket events in imacs_wait. The user sees everything and can steer too, so keep briefs and reviews readable.";
 
-const AGENT_INSTRUCTIONS: &str = "You run inside IMACS, where an orchestrator and the user follow your work. Call imacs_report when you finish your task (status done), when you are blocked or need a decision (blocked or question), and optionally to report progress.";
+const AGENT_INSTRUCTIONS: &str = "You run inside IMACS, where an orchestrator and the user follow your work. Call imacs_report when you finish your task (status done), when you are blocked or need a decision (blocked or question), and optionally to report progress. IMACS posts your report to the linked ticket when configured; do not post a second copy. With tickets.comments = agents, imacs_agent_ticket_get reads your task's ticket (plan=true reads its board or plan ticket), and imacs_agent_ticket_comment adds a signed comment to your own task's ticket for questions or implementation details. These tools cannot choose another task or change ticket state.";
 
 fn agent_tools() -> Value {
     json!([{
@@ -78,6 +78,18 @@ fn agent_tools() -> Value {
             },
             "required": ["status", "summary"]
         }
+    }, {
+        "name": "imacs_agent_ticket_get",
+        "description": "Read your task's linked ticket through the configured get operation, including its details. Set plan=true to read the plan's board or ticket instead. Requires tickets.comments = agents. Your session determines the task; no other ticket can be selected.",
+        "inputSchema": { "type": "object", "properties": {
+            "plan": { "type": "boolean", "description": "Read the plan link instead of your task ticket (default false)" }
+        }, "additionalProperties": false }
+    }, {
+        "name": "imacs_agent_ticket_comment",
+        "description": "Add a signed comment to your own task's ticket through the configured comment operation. Requires tickets.comments = agents and a ticket linked to your task. Use imacs_report for reports; IMACS posts those automatically.",
+        "inputSchema": { "type": "object", "properties": {
+            "text": { "type": "string" }
+        }, "required": ["text"], "additionalProperties": false }
     }])
 }
 
@@ -92,18 +104,22 @@ fn available_tools(agent: bool, chief: bool) -> Value {
     tools
 }
 
-fn call_report(params: &Value) -> Value {
-    if params.get("name").and_then(Value::as_str) != Some("imacs_report") {
-        return tool_error("only imacs_report is available here".into());
+fn call_agent(params: &Value) -> Value {
+    let name = params["name"].as_str().unwrap_or_default();
+    if !agent_tools().as_array().unwrap().iter().any(|tool| tool["name"] == name) {
+        return tool_error("only reporting and scoped ticket read/comment tools are available here".into());
     }
     let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
-    let request = match request_for_tool("imacs_report", args) {
+    let request = match request_for_tool(name, args) {
         Ok(request) => request,
         Err(err) => return tool_error(err),
     };
     match crate::ipc::request(&request) {
-        Ok(response) if response.ok => {
+        Ok(response) if response.ok && name == "imacs_report" => {
             json!({ "content": [{ "type": "text", "text": "Reported. The orchestrator and the user can see it." }], "isError": false })
+        }
+        Ok(response) if response.ok => {
+            json!({ "content": [{"type":"text", "text": response.result.to_string()}], "isError":false })
         }
         Ok(response) => tool_error(response.error.unwrap_or_else(|| "failed".into())),
         Err(err) => tool_error(format!("{err:#}")),
@@ -423,6 +439,9 @@ fn response_text(name: &str, result: &Value) -> String {
 }
 
 fn request_for_tool(name: &str, mut args: Value) -> Result<ControlRequest, String> {
+    if name == "imacs_agent_ticket_get" || name == "imacs_agent_ticket_comment" {
+        return agent_ticket_request(name, args, std::env::var("IMACS_PANE").ok());
+    }
     let cmd = match name {
         "imacs_list" => "list",
         "imacs_restart" => "restart",
@@ -461,12 +480,56 @@ fn request_for_tool(name: &str, mut args: Value) -> Result<ControlRequest, Strin
     serde_json::from_value(args).map_err(|err| format!("invalid arguments: {err}"))
 }
 
+fn agent_ticket_request(name: &str, args: Value, pane: Option<String>) -> Result<ControlRequest, String> {
+    let allowed: &[&str] = match name {
+        "imacs_agent_ticket_get" => &["plan"],
+        "imacs_agent_ticket_comment" => &["text"],
+        _ => return Err(format!("unknown agent ticket tool {name}")),
+    };
+    let mut map = args.as_object().cloned().ok_or("arguments must be an object")?;
+    if let Some(key) = map.keys().find(|key| !allowed.contains(&key.as_str())) {
+        return Err(format!("unexpected agent ticket argument {key}"));
+    }
+    map.insert("cmd".into(), json!(name.strip_prefix("imacs_").unwrap()));
+    map.insert("pane".into(), json!(pane));
+    serde_json::from_value(Value::Object(map)).map_err(|err| format!("invalid arguments: {err}"))
+}
+
 fn tool_error(message: String) -> Value {
     json!({ "content": [{ "type": "text", "text": message }], "isError": true })
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn agent_ticket_arguments_cannot_choose_identity_or_operations() {
+        use super::*;
+        for name in ["imacs_agent_ticket_get", "imacs_agent_ticket_comment"] {
+            for key in ["pane", "session", "task", "id", "ticket", "operation", "cmd", "create", "state"] {
+                let mut args = if name.ends_with("comment") { json!({"text":"hello"}) } else { json!({}) };
+                args[key] = json!("someone-else");
+                assert!(agent_ticket_request(name, args, Some("own-session".into())).is_err(), "{name}: {key}");
+            }
+        }
+        assert!(agent_ticket_request("imacs_agent_ticket_comment", json!({"text":"x", "plan":true}), None).is_err());
+        assert!(matches!(
+            agent_ticket_request("imacs_agent_ticket_get", json!({"plan":true}), Some("own-session".into())).unwrap(),
+            imacs_core::control::ControlRequest::AgentTicketGet { pane: Some(id), plan: true } if id == "own-session"
+        ));
+        let names: Vec<_> =
+            agent_tools().as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
+        assert_eq!(names, ["imacs_report", "imacs_agent_ticket_get", "imacs_agent_ticket_comment"]);
+        for name in [
+            "imacs_ticket_comment",
+            "imacs_ticket_link",
+            "imacs_ticket_sync",
+            "imacs_ticket_event",
+            "imacs_plan_update",
+            "save_issue",
+        ] {
+            assert_eq!(call_agent(&json!({"name":name, "arguments":{}}))["isError"], true);
+        }
+    }
     #[test]
     fn restart_is_chief_only_and_maps_optional_force_and_reason() {
         for (agent, chief, available) in [(true, false, false), (false, false, false), (false, true, true)] {
@@ -480,7 +543,7 @@ mod tests {
         assert!(
             matches!(force, imacs_core::control::ControlRequest::Restart {force:true,reason:Some(reason)} if reason == "upgrade")
         );
-        assert_eq!(super::call_report(&serde_json::json!({"name":"imacs_restart"}))["isError"], true);
+        assert_eq!(super::call_agent(&serde_json::json!({"name":"imacs_restart"}))["isError"], true);
     }
     #[test]
     fn wait_schema_accepts_heartbeat() {

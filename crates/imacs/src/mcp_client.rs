@@ -117,6 +117,30 @@ impl McpClient {
         Ok(result)
     }
 
+    /// Lists all offered tools, following MCP pagination without calling any tool.
+    pub fn tool_names(&mut self) -> Result<Vec<String>, McpError> {
+        let mut names = Vec::new();
+        let mut cursors = std::collections::HashSet::new();
+        let mut params = json!({});
+        loop {
+            let page = self.request("tools/list", params)?;
+            let tools =
+                page["tools"].as_array().ok_or_else(|| McpError::Server("tools/list has no tools array".into()))?;
+            for tool in tools {
+                let name = tool["name"]
+                    .as_str()
+                    .ok_or_else(|| McpError::Server("tools/list has a tool without a name".into()))?;
+                names.push(name.to_string());
+            }
+            let Some(cursor) = page["nextCursor"].as_str().filter(|s| !s.is_empty()) else { break };
+            if !cursors.insert(cursor.to_string()) || cursors.len() > 100 {
+                return Err(McpError::Server("tools/list pagination did not finish".into()));
+            }
+            params = json!({"cursor": cursor});
+        }
+        Ok(names)
+    }
+
     fn request(&mut self, method: &str, params: Value) -> Result<Value, McpError> {
         self.next_id += 1;
         let id = self.next_id;
@@ -331,6 +355,24 @@ pub(crate) mod tests {
     use std::net::TcpListener;
     use std::path::PathBuf;
 
+    /// Exercise the shipped commented blocks rather than maintaining test-only profiles.
+    pub(crate) fn example_profile(name: &str, state: &std::path::Path) -> imacs_core::tickets::TicketConfig {
+        let template = imacs_core::config::DEFAULT_CONFIG;
+        let block = template
+            .split(&format!("# BEGIN {name} PROFILE\n"))
+            .nth(1)
+            .unwrap()
+            .split(&format!("# END {name} PROFILE"))
+            .next()
+            .unwrap();
+        let text =
+            block.lines().skip(1).map(|line| line.strip_prefix("# ").unwrap_or("")).collect::<Vec<_>>().join("\n");
+        let config: imacs_core::config::Config = toml::from_str(&text).unwrap();
+        let mut tickets = config.tickets;
+        tickets.server.command = vec![fake_server().display().to_string(), state.display().to_string()];
+        tickets
+    }
+
     /// The fake ticket server built from `examples/fake_ticket_server.rs`.
     pub(crate) fn fake_server() -> PathBuf {
         let exe = std::env::current_exe().unwrap();
@@ -350,7 +392,7 @@ pub(crate) mod tests {
                     && p.extension().is_none()
             })
             .unwrap_or_else(|| {
-                panic!("{} is missing: run the tests through cargo test, which builds examples", path.display())
+                panic!("{} is missing: run cargo build -p imacs --example fake_ticket_server first", path.display())
             })
     }
 

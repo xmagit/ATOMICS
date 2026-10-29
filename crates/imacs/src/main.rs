@@ -82,7 +82,7 @@ enum Command {
     },
     /// MCP server (stdio) that lets another agent start, read, review and steer agents in IMACS
     Mcp {
-        /// Expose only `imacs_report`, for agents IMACS starts to report on their task
+        /// Expose reporting and scoped ticket read/comment tools for task agents
         #[arg(long)]
         agent: bool,
         /// Enable chief-only tools (used by the built-in chief session)
@@ -140,7 +140,7 @@ fn main() -> eframe::Result {
         migration_errors = migration.errors;
     }
     match cli.command {
-        Some(Command::Doctor) => std::process::exit(doctor::run()),
+        Some(Command::Doctor) => std::process::exit(doctor::run(cli.workspace.as_deref())),
         Some(Command::Hook { socket, pane }) => {
             hook_client::run(socket, pane);
             return Ok(());

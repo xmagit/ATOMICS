@@ -17,6 +17,8 @@ const BACKOFF: Duration = Duration::from_secs(15);
 
 pub enum TicketOp {
     Get(TicketLink),
+    /// Read full ticket details for a scoped agent request, without refreshing other links.
+    Read(TicketLink),
     /// The tickets on a board.
     List(TicketLink),
     UpdateState(TicketLink, String),
@@ -30,6 +32,7 @@ pub enum TicketOp {
 
 pub enum TicketOutput {
     Ticket(TicketLink),
+    Read(Value),
     Tickets(Vec<TicketLink>),
     /// A push went through; the ticket as read right after, when `get` is configured.
     Pushed(Option<Result<TicketLink, String>>),
@@ -69,6 +72,7 @@ impl Worker {
     fn run(&mut self, config: &TicketConfig, op: TicketOp) -> Result<TicketOutput, String> {
         let system = config.system.as_str();
         match op {
+            TicketOp::Read(link) => self.call(config, "get", &Vars::new(system).ticket(&link)).map(TicketOutput::Read),
             TicketOp::Get(link) => {
                 let output = self.call(config, "get", &Vars::new(system).ticket(&link))?;
                 Ok(TicketOutput::Ticket(config.operation("get").expect("called").ticket(&output, system)?))

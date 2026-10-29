@@ -224,7 +224,7 @@ impl State {
                     "--mcp-config".to_string(),
                     config.to_string(),
                     "--allowedTools".to_string(),
-                    "mcp__imacs__imacs_report".to_string(),
+                    "mcp__imacs__imacs_report,mcp__imacs__imacs_agent_ticket_get,mcp__imacs__imacs_agent_ticket_comment".to_string(),
                 ]);
             }
             AgentKind::Generic if codex.is_some() => {
