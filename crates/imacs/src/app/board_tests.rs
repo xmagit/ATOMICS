@@ -46,6 +46,7 @@ fn populate(app: &mut Desktop<'_>) {
         command: vec![],
         kind: AgentKind::Generic,
         busy_text: None,
+        isolation: None,
     };
     app.runtime.sessions = vec![Session::starting(
         "existing-session".into(),

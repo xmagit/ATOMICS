@@ -98,6 +98,7 @@ impl State {
                 command: self.config.chief.command.clone(),
                 kind: AgentKind::Claude,
                 busy_text: None,
+                isolation: None,
             }
         } else {
             let Some(agent) = self.config.agent(agent_name).cloned() else {
@@ -771,6 +772,7 @@ mod tests {
                 command: vec!["/bin/sh".into(), "-c".into(), script],
                 kind: AgentKind::Generic,
                 busy_text: None,
+                isolation: None,
             });
             app.runtime.config.resources.agent_nice = 7;
             // SAFETY: querying this process's priority has no preconditions.
@@ -817,6 +819,7 @@ mod tests {
                 ],
                 kind: AgentKind::Generic,
                 busy_text: None,
+                isolation: None,
             });
             app.runtime.start(ctx, "dotnet-probe", dir.path().into(), None, vec![], None).unwrap();
             let deadline = Instant::now() + Duration::from_secs(10);
@@ -869,6 +872,7 @@ fi
                     command: vec![program.to_string_lossy().into_owned()],
                     kind: AgentKind::Generic,
                     busy_text: None,
+                    isolation: None,
                 });
             }
             let probe_dir = dir.path().to_path_buf();
@@ -958,6 +962,7 @@ fi
                     command: vec![name.clone()],
                     kind: AgentKind::Generic,
                     busy_text: None,
+                    isolation: None,
                 });
                 for script in ["#!/bin/sh\nexec sleep 30\n", "#!/bin/sh\nexit 1\n"] {
                     std::fs::write(&program, script).unwrap();
@@ -1009,6 +1014,7 @@ fi
                 command: vec![fixture.to_string_lossy().into_owned()],
                 kind: AgentKind::Generic,
                 busy_text: None,
+                isolation: None,
             });
             let text = "Please check the first change and then the second change";
             for mode in ["queue", "retry", "drop", "drop-paste", "drop-empty", "exit", "hook"] {
@@ -1115,6 +1121,7 @@ fi
                 command: vec![fixture.to_string_lossy().into_owned()],
                 kind: AgentKind::Generic,
                 busy_text: None,
+                isolation: None,
             });
             for mode in ["long", "preview", "repeat", "marker", "collapsed", "no-prompt"] {
                 let text = if mode == "long" {
@@ -1193,6 +1200,7 @@ fi
                 command: vec![fixture.to_string_lossy().into_owned()],
                 kind: AgentKind::Generic,
                 busy_text: None,
+                isolation: None,
             });
             app.runtime.sessions =
                 vec![session("worker", AgentKind::Generic, AgentStatus::Working, &app.runtime.launch_dir)];
@@ -1252,6 +1260,7 @@ fi
                 command: vec![],
                 kind: AgentKind::Shell,
                 busy_text: None,
+                isolation: None,
             };
             let session = Session::starting("start".into(), &agent, dir.clone(), false, &crate::host::Wake::default());
             assert!(!dir.join("timed-out").exists(), "session construction waited for git on the UI thread");

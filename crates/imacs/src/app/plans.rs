@@ -1185,6 +1185,7 @@ mod tests {
                     ],
                     kind,
                     busy_text: None,
+                    isolation: None,
                 }];
                 let index = app.runtime.selected_plan;
                 app.runtime.plans[index] = Plan {
@@ -1433,6 +1434,7 @@ mod tests {
                     command: vec!["/bin/cat".into()],
                     kind: AgentKind::Shell,
                     busy_text: None,
+                    isolation: None,
                 });
                 for dock in [ChiefDock::Floating, ChiefDock::Docked] {
                     request(
@@ -1478,6 +1480,7 @@ mod tests {
                     command: vec!["/bin/cat".into()],
                     kind: AgentKind::Shell,
                     busy_text: None,
+                    isolation: None,
                 });
                 let first = request(app, json!({"cmd":"plan_set", "goal":"Background", "tasks":[{"id":"a", "repo":repo, "agent":"fixture"}]})).result["plan"].clone();
                 let one = app.runtime.selected_plan;

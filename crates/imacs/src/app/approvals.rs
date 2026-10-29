@@ -356,6 +356,7 @@ mod tests {
                     command: vec![fixture.to_string_lossy().into_owned()],
                     kind: AgentKind::Generic,
                     busy_text: Some("esc to interrupt".into()),
+                    isolation: None,
                 });
                 let terminal = Terminal::spawn(
                     app.runtime.wake.clone(),
@@ -587,6 +588,7 @@ mod tests {
                     command: vec![],
                     kind: AgentKind::Generic,
                     busy_text: Some("esc to interrupt".into()),
+                    isolation: None,
                 });
                 let dir = tempfile::tempdir().unwrap();
                 let mut indices = Vec::new();

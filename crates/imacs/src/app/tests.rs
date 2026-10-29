@@ -311,6 +311,7 @@ fn busy_text_is_only_a_fallback(app: &mut Desktop<'_>, _ctx: &egui::Context) {
         command: vec![],
         kind: AgentKind::Generic,
         busy_text: Some("esc to interrupt".into()),
+        isolation: None,
     });
     let dir = tempfile::tempdir().unwrap();
     let terminal = Terminal::spawn(

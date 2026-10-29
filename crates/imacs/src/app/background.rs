@@ -683,6 +683,7 @@ mod tests {
                 command: vec![],
                 kind: AgentKind::Generic,
                 busy_text: Some("esc to interrupt".into()),
+                isolation: None,
             });
             app.runtime.sessions =
                 vec![session("waiting", AgentKind::Generic, AgentStatus::NeedsInput, &app.runtime.launch_dir)];

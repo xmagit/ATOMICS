@@ -331,6 +331,7 @@ mod tests {
                     ],
                     kind: AgentKind::Shell,
                     busy_text: None,
+                    isolation: None,
                 });
                 let supported = git::probe_cache_clone(&repo, repo.parent().unwrap()).unwrap();
                 for (branch, folders, expected) in [

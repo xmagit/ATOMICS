@@ -40,6 +40,8 @@ pub(super) struct Tickets {
     workspace_file: Option<(Option<PathBuf>, Option<u64>)>,
     workspace_config: Option<TicketConfig>,
     workspace_workflow: Option<imacs_core::workflow::Workflow>,
+    /// The workspace file's `[isolation]`, merged over the main and host config's as it is read.
+    workspace_isolation: Option<imacs_core::isolation::IsolationOverrides>,
     jobs: Option<std::sync::mpsc::Sender<TicketJob<Tag>>>,
     done_tx: crate::host::Sender<Done>,
     done_rx: Receiver<Done>,
@@ -82,6 +84,7 @@ impl Tickets {
             workspace_file: None,
             workspace_config: None,
             workspace_workflow: None,
+            workspace_isolation: None,
             jobs: None,
             done_tx,
             done_rx,
@@ -125,10 +128,18 @@ impl State {
                         Ok(config) => self.tickets.workspace_workflow = config,
                         Err(err) => self.toast(format!("Workspace workflow: {err}")),
                     }
+                    let isolation = workspace.isolation().and_then(|overrides| {
+                        overrides.map(|o| self.config.isolation.with_overrides(&o).map(|_| o)).transpose()
+                    });
+                    match isolation {
+                        Ok(table) => self.tickets.workspace_isolation = table,
+                        Err(err) => self.toast(format!("Workspace isolation: {}", err.message())),
+                    }
                 }
                 Ok(None) => {
                     self.tickets.workspace_config = None;
                     self.tickets.workspace_workflow = None;
+                    self.tickets.workspace_isolation = None;
                 }
                 // Broken settings keep their last good values.
                 Err(err) => self.toast(format!("Workspace tickets/workflow: {err}")),
@@ -159,6 +170,15 @@ impl State {
 
     pub(super) fn workflow(&self) -> &imacs_core::workflow::Workflow {
         self.tickets.workspace_workflow.as_ref().unwrap_or(&self.config.workflow)
+    }
+
+    /// The `[isolation]` in effect: the main and host config's, with the workspace file's merged in.
+    pub(super) fn effective_isolation(&self) -> imacs_core::isolation::IsolationConfig {
+        self.tickets
+            .workspace_isolation
+            .as_ref()
+            .and_then(|overrides| self.config.isolation.with_overrides(overrides).ok())
+            .unwrap_or_else(|| self.config.isolation.clone())
     }
 
     /// The `[tickets]` in effect, configured or not: the workspace file's, else the main config's.
@@ -2730,6 +2750,23 @@ mod tests {
                 app.runtime.apply_ticket_config();
                 assert_eq!(app.runtime.workflow().done, "accepted");
                 assert!(app.runtime.chief_prompt().contains("imacs_plan_stage"));
+
+                // [isolation] merges over the main config's key by key, and a broken one keeps the last good.
+                use imacs_core::isolation::IsolationMode;
+                app.runtime.config.isolation.mode = IsolationMode::Sandbox;
+                app.runtime.config.isolation.sandbox.memory = Some("8g".into());
+                std::fs::write(&file, "projects = []\n[isolation]\nmode = \"bare\"\n[isolation.sandbox]\ncpus = 2\n")
+                    .unwrap();
+                app.runtime.apply_ticket_config();
+                let effective = app.runtime.effective_config().isolation;
+                assert_eq!(effective.mode, IsolationMode::Bare);
+                assert_eq!((effective.sandbox.memory.as_deref(), effective.sandbox.cpus), (Some("8g"), Some(2)));
+                std::fs::write(&file, "projects = []\n[isolation]\nmode = \"open\"\n").unwrap();
+                app.runtime.apply_ticket_config();
+                assert_eq!(app.runtime.effective_isolation().mode, IsolationMode::Bare);
+                std::fs::write(&file, "projects = []\n").unwrap();
+                app.runtime.apply_ticket_config();
+                assert_eq!(app.runtime.effective_isolation(), app.runtime.config.isolation);
             },
         );
     }

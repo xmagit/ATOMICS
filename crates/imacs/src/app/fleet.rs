@@ -452,6 +452,7 @@ mod tests {
                         command: vec![program.into()],
                         kind: AgentKind::Generic,
                         busy_text: None,
+                        isolation: None,
                     }];
                     let task = Task {
                         agent: name.into(),
