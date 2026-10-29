@@ -221,7 +221,7 @@ impl TerminalView {
         focused: bool,
     ) {
         let painter = ui.painter_at(outer);
-        painter.rect_filled(outer, 0.0, palette.background);
+        painter.rect_filled(outer, 0.0, palette.terminal);
 
         let term = terminal.term.lock();
         self.sync_selection(terminal);
@@ -257,7 +257,7 @@ impl TerminalView {
                 bg = palette.selection;
             }
             let width = if c.flags.contains(Flags::WIDE_CHAR) { 2.0 } else { 1.0 };
-            if bg != palette.background {
+            if bg != palette.terminal {
                 painter.rect_filled(Rect::from_min_size(at(row, col), vec2(cell.x * width, cell.y)), 0.0, bg);
             }
             if c.flags.intersects(Flags::ALL_UNDERLINES) {
@@ -429,7 +429,7 @@ impl Palette {
     fn named(&self, name: NamedColor) -> Color32 {
         match name {
             NamedColor::Foreground | NamedColor::BrightForeground => self.foreground,
-            NamedColor::Background => self.background,
+            NamedColor::Background => self.terminal,
             NamedColor::Cursor => self.cursor,
             NamedColor::DimForeground => self.dim(self.foreground),
             other => {
@@ -452,12 +452,23 @@ impl Palette {
     fn indexed_rgb(&self, index: usize) -> Rgb {
         let color = match index {
             256 => self.foreground,
-            257 => self.background,
+            257 => self.terminal,
             258 => self.cursor,
             i => self.indexed(i),
         };
         Rgb { r: color.r(), g: color.g(), b: color.b() }
     }
+}
+
+/// A shell that prints `ready`, then for every key it reads sends `query` and shows the
+/// `reply_len`-byte answer on screen, with `^` for ESC and `!` for BEL.
+#[cfg(test)]
+pub(crate) fn color_query_args(query: &str, reply_len: usize) -> Vec<String> {
+    let script = format!(
+        "stty raw -echo; printf 'ready\\r\\n'; while dd bs=1 count=1 >/dev/null 2>&1; do printf '{query}'; \
+         r=$(dd bs=1 count={reply_len} 2>/dev/null); printf '%s\\r\\n' \"$r\" | tr '\\033\\007' '^!'; done"
+    );
+    vec!["-c".into(), script]
 }
 
 #[cfg(test)]

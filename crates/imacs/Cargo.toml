@@ -16,6 +16,8 @@ cpal = "0.18.2"
 # Keep both Linux window systems and embedded fallback fonts in desktop builds.
 eframe = { version = "0.37.0", features = ["wayland", "x11", "default_fonts"] }
 egui = "0.37"
+# Finds theme fonts by family name; eframe already builds it with these features.
+fontique = { version = "0.11.1", default-features = false, features = ["system", "fontconfig-dlopen"] }
 notify-debouncer-mini = "0.7.0"
 png = "0.18.1"
 rfd = "0.17.2"

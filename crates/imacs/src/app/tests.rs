@@ -110,6 +110,65 @@ fn config_reloads_when_host_overrides_are_created_changed_or_removed() {
 }
 
 #[test]
+fn themes_reload_live_and_terminals_answer_the_new_colors() {
+    with_state("app::tests::themes_reload_live_and_terminals_answer_the_new_colors", |mut state, ctx| {
+        let reload = |state: &mut State| {
+            state.config_checked = Instant::now() - Duration::from_secs(2);
+            state.runtime_tick(ctx);
+        };
+        let wait_for = |terminal: &Terminal, text: &str| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !terminal.screen_text(24).contains(text) {
+                assert!(Instant::now() < deadline, "terminal never showed {text}:\n{}", terminal.screen_text(24));
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let color = |hex: &str| crate::theme::parse_hex(hex).unwrap();
+        let themes = theme::themes_dir(&state.config_path);
+        std::fs::create_dir_all(&themes).unwrap();
+        std::fs::write(themes.join("mine.toml"), "extends = \"midnight\"\nterminal = \"#102030\"").unwrap();
+        std::fs::write(&state.config_path, "[theme]\nname = \"mine\"\naccent = \"#405060\"").unwrap();
+        reload(&mut state);
+        assert!(state.config_error.is_none(), "{:?}", state.config_error);
+        assert_eq!(state.palette.terminal, color("#102030"));
+        assert_eq!(state.palette.accent, color("#405060"), "inline [theme] tokens win");
+        assert_eq!(state.palette.syntax, "OneHalfDark", "the rest comes from midnight");
+
+        let terminal = Terminal::spawn(
+            state.wake.clone(),
+            state.palette.terminal_colors(),
+            "/bin/sh".into(),
+            crate::terminal::color_query_args("\\033]11;?\\007", 24),
+            &state.launch_dir,
+            HashMap::new(),
+            100,
+        )
+        .unwrap();
+        wait_for(&terminal, "ready");
+        terminal.write(b"x".to_vec());
+        wait_for(&terminal, "^]11;rgb:1010/2020/3030!");
+        let mut shell = session("shell", AgentKind::Shell, AgentStatus::Idle, &state.launch_dir);
+        shell.terminal = Some(terminal);
+        state.sessions = vec![shell];
+
+        // Same length, so only the content tells the edit apart.
+        std::fs::write(themes.join("mine.toml"), "extends = \"midnight\"\nterminal = \"#a0b0c0\"").unwrap();
+        reload(&mut state);
+        assert_eq!(state.toast.as_ref().unwrap().0, "Theme reloaded");
+        assert_eq!(state.palette.terminal, color("#a0b0c0"));
+        let terminal = state.sessions[0].terminal.as_ref().unwrap();
+        terminal.write(b"x".to_vec());
+        wait_for(terminal, "^]11;rgb:a0a0/b0b0/c0c0!");
+
+        std::fs::write(themes.join("mine.toml"), "extends = \"midnight\"\nterminal = \"#a0b0c\"").unwrap();
+        reload(&mut state);
+        let error = state.config_error.clone().unwrap();
+        assert!(error.contains("themes/mine.toml: terminal = \"#a0b0c\""), "{error}");
+        assert_eq!(state.palette.terminal, color("#16181d"), "a bad token falls back to the theme it extends");
+    });
+}
+
+#[test]
 fn review_followups() {
     with_app("app::tests::review_followups", |app, ctx| {
         permission_hooks_wake_waiters_and_accept_decisions(app, ctx);

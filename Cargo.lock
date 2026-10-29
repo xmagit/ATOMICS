@@ -1874,6 +1874,7 @@ dependencies = [
  "cpal",
  "eframe",
  "egui",
+ "fontique",
  "imacs-core",
  "libc",
  "notify-debouncer-mini",

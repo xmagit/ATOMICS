@@ -48,21 +48,13 @@ diff_size = 12.5
 scrollback = 5000           # lines each terminal keeps; a full 20000 on a wide terminal takes about 80 MB
 
 [theme]
-preset = "claude"           # "claude": near-black with Claude orange · "midnight": blue-gray
-# syntax = "Monokai Extended"   # any bat/two-face theme; each preset picks one
-# mono_ui = true                 # monospace for all UI text (claude preset: on)
-# Any preset color can be overridden:
-# background = "#0b0b0c"
-# panel = "#111113"
-# raised = "#18181b"
-# border = "#262629"
-# foreground = "#e8e4dc"
-# muted = "#8c8781"
+name = "claude"             # built in: "claude", "midnight"; or themes/<name>.toml beside this file
+# Any theme token set here wins over the theme; docs/themes.md lists them all. For example:
 # accent = "#d77757"
-# added = "#0f2e18"
-# removed = "#3a1219"
-# added_emphasis = "#225c2b"
-# removed_emphasis = "#7a2936"
+# syntax = "Monokai Extended"   # any bat/two-face theme
+# mono_ui = true                 # monospace for all UI text
+# ui_font = "Inter"              # an installed family or a font file
+# mono_size = 13.0               # terminal text, over [font] size
 
 # Agents you can start. kind = "claude" turns on hooks, session ids and resume.
 [[agents]]
@@ -380,36 +372,15 @@ pub struct TerminalConfig {
     pub scrollback: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ThemeConfig {
-    pub preset: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub syntax: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mono_ui: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub background: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub panel: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub raised: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub border: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub foreground: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub muted: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub accent: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub added: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub removed: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub added_emphasis: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub removed_emphasis: Option<String>,
+    /// A built-in theme or `themes/<name>.toml` beside the config; `preset` is the old key.
+    #[serde(alias = "preset")]
+    pub name: String,
+    /// Tokens set here win over the named theme.
+    #[serde(flatten)]
+    pub tokens: crate::theme::ThemeTokens,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -598,22 +569,7 @@ impl Default for TerminalConfig {
 
 impl Default for ThemeConfig {
     fn default() -> Self {
-        Self {
-            preset: "claude".into(),
-            syntax: None,
-            mono_ui: None,
-            background: None,
-            panel: None,
-            raised: None,
-            border: None,
-            foreground: None,
-            muted: None,
-            accent: None,
-            added: None,
-            removed: None,
-            added_emphasis: None,
-            removed_emphasis: None,
-        }
+        Self { name: crate::theme::DEFAULT.into(), tokens: crate::theme::ThemeTokens::default() }
     }
 }
 

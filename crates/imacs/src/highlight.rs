@@ -22,15 +22,19 @@ pub struct Highlighter {
     theme: Theme,
 }
 
+/// The embedded syntax theme `theme_name` means, ignoring case, spaces, `-` and `_`.
+pub fn theme_named(theme_name: &str) -> Option<EmbeddedThemeName> {
+    let wanted = theme_name.to_ascii_lowercase().replace([' ', '-', '_'], "");
+    two_face::theme::EmbeddedLazyThemeSet::theme_names()
+        .iter()
+        .copied()
+        .find(|n| n.as_name().to_ascii_lowercase().replace([' ', '-', '_'], "") == wanted)
+}
+
 impl Highlighter {
     pub fn new(theme_name: &str) -> Highlighter {
         let themes = two_face::theme::extra();
-        let wanted = theme_name.to_ascii_lowercase().replace([' ', '-', '_'], "");
-        let name = two_face::theme::EmbeddedLazyThemeSet::theme_names()
-            .iter()
-            .copied()
-            .find(|n| n.as_name().to_ascii_lowercase().replace([' ', '-', '_'], "") == wanted)
-            .unwrap_or(EmbeddedThemeName::OneHalfDark);
+        let name = theme_named(theme_name).unwrap_or(EmbeddedThemeName::OneHalfDark);
         Highlighter { syntaxes: two_face::syntax::extra_newlines(), theme: themes.get(name).clone() }
     }
 

@@ -210,11 +210,14 @@ impl State {
             let stamp = config_fingerprints(&self.config_path);
             self.apply_ticket_config();
             if stamp != self.config_stamp {
+                let stamp_themes_changed = stamp[2] != self.config_stamp[2];
                 self.config_stamp = stamp;
                 match Config::load(&self.config_path) {
                     Ok(config) => {
-                        let syntax = Palette::from_config(&config.theme).syntax;
-                        let theme_changed = syntax != self.palette.syntax;
+                        let (palette, theme_errors) =
+                            Palette::load(&config.theme, &imacs_core::theme::themes_dir(&self.config_path));
+                        let syntax_changed = palette.syntax != self.palette.syntax;
+                        let theme_reloaded = config.theme != self.config.theme || stamp_themes_changed;
                         if config.terminal.scrollback != self.config.terminal.scrollback {
                             let terminals =
                                 self.sessions.iter().filter_map(|s| s.terminal.as_ref()).chain(self.editors.values());
@@ -223,17 +226,23 @@ impl State {
                             }
                         }
                         self.config = config;
-                        self.config_error = None;
-                        self.palette = Arc::new(Palette::from_config(&self.config.theme));
-                        if theme_changed {
-                            self.highlighter = Arc::new(Highlighter::new(&syntax));
+                        self.config_error = theme_error(&theme_errors);
+                        if syntax_changed {
+                            self.highlighter = Arc::new(Highlighter::new(&palette.syntax));
+                        }
+                        self.palette = Arc::new(palette);
+                        let colors = self.palette.terminal_colors();
+                        let terminals =
+                            self.sessions.iter().filter_map(|s| s.terminal.as_ref()).chain(self.editors.values());
+                        for terminal in terminals {
+                            terminal.set_colors(colors.clone());
                         }
                         self.client_events.push(ClientEvent::ConfigChanged);
                         self.apply_config();
                         for state in self.diffs.values_mut() {
                             state.mark_dirty();
                         }
-                        self.toast("Config reloaded");
+                        self.toast(if theme_reloaded { "Theme reloaded" } else { "Config reloaded" });
                     }
                     Err(err) => self.config_error = Some(format!("{err:#}")),
                 }

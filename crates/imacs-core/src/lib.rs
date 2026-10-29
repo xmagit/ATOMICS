@@ -31,6 +31,7 @@ pub mod plan;
 pub mod session;
 pub mod steer;
 pub mod store;
+pub mod theme;
 pub mod tickets;
 pub mod usage;
 #[cfg(feature = "native")]

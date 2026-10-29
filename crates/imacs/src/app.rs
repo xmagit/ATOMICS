@@ -13,7 +13,7 @@ use imacs_core::git::{self, Integration, Merge, Worktree, WorktreeEntry};
 use imacs_core::layout::{self, DiffPlacement, DiffSplit, Layout};
 use imacs_core::session::{AgentStatus, pick_tiled, title_for};
 use imacs_core::store::{SessionRecord, Store};
-use imacs_core::{paths, steer};
+use imacs_core::{paths, steer, theme};
 use notify_debouncer_mini::notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_mini::{DebounceEventResult, Debouncer, new_debouncer};
 
@@ -333,7 +333,7 @@ pub(crate) struct State {
     action_rx: Receiver<commands::Action>,
     config: Config,
     config_path: PathBuf,
-    config_stamp: [Option<u64>; 2],
+    config_stamp: [Option<u64>; 3],
     config_checked: Instant,
     config_error: Option<String>,
     palette: Arc<Palette>,
@@ -620,7 +620,9 @@ impl State {
             Err(err) => (Config::default(), Some(format!("{err:#}"))),
         };
         let ctx = cc.egui_ctx.clone();
-        apply_style(&ctx, &config);
+        let (palette, theme_errors) = Palette::load(&config.theme, &theme::themes_dir(&config_path));
+        palette.apply(&ctx);
+        let config_error = config_error.or_else(|| theme_error(&theme_errors));
 
         let hub = Arc::new(Mutex::new(Hub::default()));
         let wake = crate::host::Wake::default();
@@ -681,8 +683,8 @@ impl State {
             client_events: Vec::new(),
             action_tx,
             action_rx,
-            palette: Arc::new(Palette::from_config(&config.theme)),
-            highlighter: Arc::new(Highlighter::new(&Palette::from_config(&config.theme).syntax)),
+            highlighter: Arc::new(Highlighter::new(&palette.syntax)),
+            palette: Arc::new(palette),
             config_stamp: config_fingerprints(&config_path),
             config,
             config_path,
@@ -976,8 +978,32 @@ fn modified(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
-fn config_fingerprints(path: &Path) -> [Option<u64>; 2] {
-    Config::source_paths(path).map(|file| file_fingerprint(&file))
+/// The config files and, last, every theme file, so editing a theme reloads it too.
+fn config_fingerprints(path: &Path) -> [Option<u64>; 3] {
+    let [config, host] = Config::source_paths(path).map(|file| file_fingerprint(&file));
+    [config, host, themes_fingerprint(&theme::themes_dir(path))]
+}
+
+fn themes_fingerprint(dir: &Path) -> Option<u64> {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|extension| extension == "toml"))
+        .collect();
+    files.sort();
+    let mut hasher = DefaultHasher::new();
+    for file in files {
+        file.hash(&mut hasher);
+        file_fingerprint(&file).hash(&mut hasher);
+    }
+    Some(hasher.finish())
+}
+
+/// Theme problems, shown where config errors are.
+fn theme_error(errors: &[String]) -> Option<String> {
+    (!errors.is_empty()).then(|| format!("theme: {}", errors.join("; ")))
 }
 
 /// A small config file's content as a hash, `None` when it cannot be read. Rapid edits
@@ -995,59 +1021,6 @@ fn file_fingerprint(file: &Path) -> Option<u64> {
 fn open_path(path: &Path) -> std::io::Result<std::process::Child> {
     let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
     std::process::Command::new(opener).arg(path).spawn()
-}
-
-fn apply_style(ctx: &egui::Context, config: &Config) {
-    let p = Palette::from_config(&config.theme);
-    let mut style = egui::Style::default();
-    let mut visuals = egui::Visuals::dark();
-    visuals.panel_fill = p.panel;
-    visuals.window_fill = p.raised;
-    visuals.window_stroke = Stroke::new(1.0, p.border);
-    visuals.window_corner_radius = egui::CornerRadius::same(4);
-    visuals.menu_corner_radius = egui::CornerRadius::same(3);
-    visuals.extreme_bg_color = p.background;
-    visuals.faint_bg_color = p.raised;
-    visuals.code_bg_color = p.raised;
-    visuals.selection.bg_fill = p.accent.gamma_multiply(0.35);
-    visuals.selection.stroke = Stroke::new(1.0, p.accent);
-    visuals.hyperlink_color = p.accent;
-    let widgets = &mut visuals.widgets;
-    for state in [
-        &mut widgets.noninteractive,
-        &mut widgets.inactive,
-        &mut widgets.hovered,
-        &mut widgets.active,
-        &mut widgets.open,
-    ] {
-        state.corner_radius = egui::CornerRadius::same(2);
-        state.expansion = 0.0;
-    }
-    widgets.noninteractive.bg_fill = p.panel;
-    widgets.noninteractive.bg_stroke = Stroke::new(1.0, p.border);
-    widgets.noninteractive.fg_stroke = Stroke::new(1.0, p.foreground);
-    widgets.inactive.bg_fill = p.raised;
-    widgets.inactive.weak_bg_fill = p.raised;
-    widgets.inactive.bg_stroke = Stroke::new(1.0, p.border);
-    widgets.inactive.fg_stroke = Stroke::new(1.0, p.foreground);
-    widgets.hovered.bg_fill = lerp(p.raised, p.accent, 0.2);
-    widgets.hovered.weak_bg_fill = lerp(p.raised, p.accent, 0.2);
-    widgets.hovered.bg_stroke = Stroke::new(1.0, p.accent.gamma_multiply(0.8));
-    widgets.hovered.fg_stroke = Stroke::new(1.0, p.foreground);
-    widgets.active.bg_fill = lerp(p.raised, p.accent, 0.35);
-    widgets.active.weak_bg_fill = lerp(p.raised, p.accent, 0.35);
-    widgets.active.bg_stroke = Stroke::new(1.0, p.accent);
-    widgets.open.weak_bg_fill = lerp(p.raised, p.accent, 0.25);
-    style.visuals = visuals;
-    if p.mono_ui {
-        for font in style.text_styles.values_mut() {
-            font.family = egui::FontFamily::Monospace;
-            font.size = (font.size * 0.92).round();
-        }
-    }
-    style.spacing.button_padding = vec2(7.0, 2.0);
-    style.spacing.item_spacing = vec2(7.0, 4.0);
-    ctx.set_global_style(style);
 }
 
 impl Desktop<'_> {
@@ -1103,7 +1076,7 @@ impl Desktop<'_> {
                     });
                     ctx.request_repaint();
                 }
-                ClientEvent::ConfigChanged => apply_style(ctx, &self.runtime.config),
+                ClientEvent::ConfigChanged => self.runtime.palette.apply(ctx),
                 ClientEvent::Viewport(command) => ctx.send_viewport_cmd(command),
                 ClientEvent::VoiceFailed { text, error } => self.voice_failed(&text, &error),
                 ClientEvent::Edit { root, path } => {
@@ -1165,7 +1138,8 @@ impl Desktop<'_> {
     }
 
     fn metrics(&self, ui: &egui::Ui) -> Metrics {
-        let font = FontId::monospace(self.runtime.config.font.size);
+        let p = &self.runtime.palette;
+        let font = p.mono(p.fonts.mono_size.unwrap_or(self.runtime.config.font.size));
         let cell = ui.fonts_mut(|f| vec2(f.glyph_width(&font, 'M'), f.row_height(&font)));
         Metrics { font, cell: vec2(cell.x, cell.y.ceil()) }
     }
@@ -1318,7 +1292,7 @@ impl Desktop<'_> {
 
         egui::Panel::top("top")
             .exact_size(34.0)
-            .frame(egui::Frame::new().fill(p.panel).inner_margin(egui::Margin::symmetric(10, 4)))
+            .frame(egui::Frame::new().fill(p.topbar).inner_margin(egui::Margin::symmetric(10, 4)))
             .show(ui, |ui| self.top_bar(ui));
         egui::Panel::bottom("steer")
             .frame(egui::Frame::new().fill(p.panel).inner_margin(egui::Margin::symmetric(10, 7)))
@@ -1371,7 +1345,7 @@ impl Desktop<'_> {
             egui::Panel::left("sidebar")
                 .exact_size(self.runtime.config.layout.sidebar_width)
                 .resizable(false)
-                .frame(egui::Frame::new().fill(p.panel).inner_margin(egui::Margin::symmetric(10, 4)))
+                .frame(egui::Frame::new().fill(p.sidebar).inner_margin(egui::Margin::symmetric(10, 4)))
                 .show(ui, |ui| self.sidebar(ui));
         }
 
@@ -1380,7 +1354,7 @@ impl Desktop<'_> {
                 egui::Panel::left("chief-dock")
                     .exact_size(layout.dock_width)
                     .resizable(false)
-                    .frame(egui::Frame::new().fill(p.background).inner_margin(egui::Margin::same(6)))
+                    .frame(egui::Frame::new().fill(p.terminal).inner_margin(egui::Margin::same(6)))
                     .show(ui, |ui| self.chief_content(ui))
                     .response
                     .rect,
@@ -1447,7 +1421,7 @@ impl Desktop<'_> {
                     _ => None,
                 };
                 if let Some(edge) = edge {
-                    ui.painter().line_segment(edge, Stroke::new(1.0, lerp(p.panel, p.muted, 0.35)));
+                    ui.painter().line_segment(edge, Stroke::new(1.0, p.separator));
                 }
             }
         });

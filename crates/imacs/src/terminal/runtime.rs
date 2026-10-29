@@ -29,13 +29,14 @@ pub struct Shared {
     size: Mutex<WindowSize>,
     shown: Mutex<Option<(Instant, bool)>>,
     typed: Mutex<Option<Instant>>,
+    /// The theme's 256 colors, foreground, background and cursor, answered to OSC 4/10/11/12.
+    colors: Mutex<Vec<Rgb>>,
 }
 
 #[derive(Clone)]
 pub(super) struct Listener {
     sender: Arc<OnceLock<EventLoopSender>>,
     shared: Arc<Shared>,
-    colors: Vec<Rgb>,
 }
 
 impl EventListener for Listener {
@@ -50,7 +51,10 @@ impl EventListener for Listener {
             TermEvent::ResetTitle => *self.shared.title.lock().unwrap() = None,
             TermEvent::PtyWrite(text) => write(text),
             TermEvent::ColorRequest(index, format) => {
-                write(format(self.colors.get(index).copied().unwrap_or(self.colors[256])))
+                let colors = self.shared.colors.lock().unwrap();
+                if let Some(color) = colors.get(index).or(colors.get(256)) {
+                    write(format(*color));
+                }
             }
             TermEvent::TextAreaSizeRequest(format) => write(format(*self.shared.size.lock().unwrap())),
             TermEvent::ClipboardStore(_, text) => *self.shared.clipboard.lock().unwrap() = Some(text),
@@ -148,8 +152,9 @@ impl Terminal {
             size: Mutex::new(size),
             shown: Mutex::new(None),
             typed: Mutex::new(None),
+            colors: Mutex::new(colors),
         });
-        let listener = Listener { sender: Arc::new(OnceLock::new()), shared: shared.clone(), colors };
+        let listener = Listener { sender: Arc::new(OnceLock::new()), shared: shared.clone() };
         let config = TermConfig { scrolling_history: scrollback, ..TermConfig::default() };
         let term = Arc::new(FairMutex::new(Term::new(config, &TermSize::new(80, 24), listener.clone())));
         let event_loop = EventLoop::new(term.clone(), listener.clone(), pty, true, false)?;
@@ -157,6 +162,11 @@ impl Terminal {
         let _ = listener.sender.set(sender.clone());
         event_loop.spawn();
         Ok(Terminal { process_id, term, sender, shared })
+    }
+
+    /// Colors answered to later color queries, after a theme change.
+    pub fn set_colors(&self, colors: Vec<Rgb>) {
+        *self.shared.colors.lock().unwrap() = colors;
     }
 
     /// Lines kept above the screen; fewer drops the oldest at once.
@@ -268,8 +278,9 @@ mod tests {
             size: Mutex::new(WindowSize { num_lines: 24, num_cols: 80, cell_width: 8, cell_height: 16 }),
             shown: Mutex::new(None),
             typed: Mutex::new(None),
+            colors: Mutex::new(Vec::new()),
         });
-        let listener = Listener { sender: Arc::new(OnceLock::new()), shared: shared.clone(), colors: Vec::new() };
+        let listener = Listener { sender: Arc::new(OnceLock::new()), shared: shared.clone() };
         listener.send_event(TermEvent::Exit);
         let now = Instant::now();
         wake.wait_until(now + Duration::from_secs(30));
