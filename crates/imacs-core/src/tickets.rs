@@ -513,6 +513,18 @@ impl FieldPaths {
     }
 }
 
+/// The credentials a config runs with, which nothing from its server may carry into plans
+/// or replies: the `token_env` value and secret-looking `server.env` values.
+pub fn secrets_of(config: &TicketConfig, env: impl FnMut(&str) -> Option<String>) -> Vec<String> {
+    let secret_name = |name: &str| {
+        let name = name.to_ascii_uppercase();
+        ["TOKEN", "KEY", "SECRET", "PASSWORD", "AUTH", "CREDENTIAL"].iter().any(|s| name.contains(s))
+    };
+    let token = config.server.token_env.as_deref().map(str::trim).filter(|name| !name.is_empty()).and_then(env);
+    let values = config.server.env.iter().filter(|(name, _)| secret_name(name)).map(|(_, value)| value.clone());
+    token.into_iter().chain(values).collect()
+}
+
 /// What replaces a server message that still held a known secret after masking, such
 /// as one split across lines or content blocks.
 pub const WITHHELD: &str = "the ticket server's message was withheld because it contained a credential";
