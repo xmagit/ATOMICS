@@ -77,7 +77,20 @@ impl State {
     }
 
     pub(super) fn save_workspace(&mut self, name: &str) {
-        let ws = Workspace { name: name.trim().to_string(), projects: self.open_projects.clone() };
+        let mut ws = match Workspace::load(name) {
+            Ok(ws) => ws,
+            Err(err)
+                if err.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                Workspace::default()
+            }
+            Err(err) => {
+                self.toast(format!("{err:#}"));
+                return;
+            }
+        };
+        ws.name = name.trim().to_string();
+        ws.projects = self.open_projects.clone();
         match ws.save() {
             Ok(file) => {
                 self.workspace = Some(ws.name);
@@ -97,5 +110,32 @@ impl State {
             .filter(|(worktree, _)| dir.starts_with(worktree))
             .max_by_key(|(worktree, _)| worktree.as_os_str().len())
             .map(|(_, project)| project.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::tests::with_state;
+
+    #[test]
+    fn saving_project_changes_keeps_workspace_ticket_settings() {
+        with_state("app::projects::tests::saving_project_changes_keeps_workspace_ticket_settings", |mut state, _| {
+            let dir = workspace::workspaces_dir();
+            std::fs::create_dir_all(&dir).unwrap();
+            let file = dir.join("daily.toml");
+            std::fs::write(&file, "projects = []\n[tickets]\nprovider = 'relay'\nworkflow = 'personal'\n").unwrap();
+            state.open_projects = vec![paths::home().join("repos/app")];
+            state.save_workspace("daily");
+            let saved = Workspace::load("daily").unwrap();
+            assert_eq!(saved.projects, state.open_projects);
+            assert_eq!(saved.extra["tickets"]["workflow"].as_str(), Some("personal"));
+            assert!(std::fs::read_to_string(&file).unwrap().contains("~/repos/app"));
+
+            std::fs::write(&file, "[broken").unwrap();
+            state.save_workspace("daily");
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), "[broken");
+            assert!(state.toast.as_ref().unwrap().0.contains("parsing"));
+        });
     }
 }

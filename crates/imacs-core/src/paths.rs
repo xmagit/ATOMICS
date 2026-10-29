@@ -1,5 +1,58 @@
 use std::path::{Path, PathBuf};
 
+/// Machine identity shared by config overrides and workspace storage.
+pub fn host_name() -> String {
+    let override_name = std::env::var("IMACS_HOST").ok();
+    let mut buffer = [0u8; 256];
+    // SAFETY: buffer is writable for the supplied length.
+    let system_name = if unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } == 0 {
+        let end = buffer.iter().position(|&byte| byte == 0).unwrap_or(buffer.len());
+        std::str::from_utf8(&buffer[..end]).ok()
+    } else {
+        None
+    };
+    select_host(override_name.as_deref(), local_host_name(), system_name).to_string()
+}
+
+fn local_host_name() -> Option<&'static str> {
+    #[cfg(target_os = "macos")]
+    {
+        // Cache the stable machine name; config reload checks run every second.
+        static NAME: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| {
+            std::process::Command::new("/usr/sbin/scutil")
+                .args(["--get", "LocalHostName"])
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .and_then(|out| String::from_utf8(out.stdout).ok())
+        });
+        NAME.as_deref()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+fn select_host<'a>(
+    override_name: Option<&'a str>,
+    local_name: Option<&'a str>,
+    system_name: Option<&'a str>,
+) -> &'a str {
+    [override_name, local_name, system_name]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .map(|name| name.strip_suffix(".local").unwrap_or(name))
+        .find(|name| {
+            !name.is_empty()
+                && *name != "."
+                && *name != ".."
+                && name.bytes().all(|byte| byte.is_ascii_alphanumeric() || b".-_".contains(&byte))
+        })
+        .unwrap_or("localhost")
+}
+
 /// Root for runtime state: socket, hook settings, session store.
 /// `IMACS_HOME` overrides it so several instances (or tests) can run side by side.
 pub fn imacs_home() -> PathBuf {
@@ -149,6 +202,46 @@ pub fn display(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_override_falls_back_to_system_hostname_then_localhost() {
+        assert_eq!(select_host(Some(" work-mac.local "), Some("stable-mac"), Some("Mac")), "work-mac");
+        for value in [None, Some(""), Some("  "), Some("../other"), Some("/tmp/other"), Some(".."), Some("a\\b")] {
+            assert_eq!(select_host(value, Some("stable-mac.local\n"), Some("Mac")), "stable-mac");
+            assert_eq!(select_host(value, None, Some("desktop.local")), "desktop");
+        }
+        for value in [None, Some(""), Some("bad/host"), Some(".local")] {
+            assert_eq!(select_host(None, value, Some("kernel.local")), "kernel");
+            assert_eq!(select_host(None, None, value), "localhost");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_local_hostname_comes_from_system_configuration() {
+        let output = std::process::Command::new("/usr/sbin/scutil").args(["--get", "LocalHostName"]).output().unwrap();
+        if output.status.success() {
+            let expected = String::from_utf8(output.stdout).unwrap();
+            assert_eq!(local_host_name().unwrap().trim(), expected.trim());
+            let expected = expected.trim();
+            assert_eq!(
+                select_host(None, local_host_name(), Some("Mac")),
+                expected.strip_suffix(".local").unwrap_or(expected)
+            );
+        } else {
+            assert!(local_host_name().is_none());
+        }
+    }
+
+    #[test]
+    fn home_paths_expand_without_changing_other_paths() {
+        assert_eq!(expand("~"), home());
+        assert_eq!(expand("~/repos/app"), home().join("repos/app"));
+        assert_eq!(expand("relative/app"), Path::new("relative/app"));
+        assert_eq!(expand("/srv/app"), Path::new("/srv/app"));
+        assert_eq!(expand("~someone/app"), Path::new("~someone/app"));
+        assert_eq!(display(&expand("~/repos/app")), "~/repos/app");
+    }
 
     #[test]
     fn migration_with_temporary_home() {

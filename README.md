@@ -99,6 +99,66 @@ and starts a turn asking it to call `imacs_wait`. The first wait receives a `res
 or a status filter, containing `restarted: <old build> -> <new build>, reason …`. Build identities come from
 `git describe --always --tags --dirty` at compile time, falling back to the crate version. `imacs --version` prints it.
 
+## Using IMACS on several machines
+
+Share `~/.config/imacs/config.toml` between your machines and put machine overrides beside it in
+`config.d/<hostname>.toml`. `IMACS_HOST` overrides the machine name (for example, `IMACS_HOST=work-mac imacs`).
+On macOS the default is the stable LocalHostName from System Configuration (`scutil --get LocalHostName`), with
+the kernel hostname as fallback. Linux uses the kernel hostname. A trailing `.local` is stripped.
+Names are case-sensitive and allow letters, numbers, dots, underscores and hyphens.
+Empty or invalid overrides fall back to the machine name; if that is unavailable, the name is `localhost`.
+The same name selects both the override file and the machine's workspaces.
+
+Configuration loads in this order: built-in defaults, `config.toml`, then the selected host file. Tables merge
+recursively by key: overriding `[resources.dotnet].processor_count` keeps other resource settings. Scalars and
+arrays replace the base value, so a host's `repos` or `agents` list replaces the whole list. The host file is optional;
+an unreadable or invalid existing file is an error. Both files reload while IMACS runs, including when you create
+or remove the host file. `imacs doctor` prints the selected host and every loaded config file in order.
+
+For example, the shared `config.toml` can contain:
+
+```toml
+repos = ["~/repos/imacs"]
+worktree_path = "~/repos/{repo}-{slug}"
+
+[font]
+size = 13.0
+diff_size = 12.5
+```
+
+And `config.d/work-mac.toml` can contain:
+
+```toml
+repos = ["~/repos/cz3backend"]
+
+[font]
+size = 15.0 # diff_size stays 12.5
+```
+
+Use `~` or `~/…` for repository and workspace project paths and worktree templates. They expand against the
+current machine's home directory when used; the shared config keeps its original portable strings. The default
+worktree template, `{repo_parent}/{repo}-{slug}`, uses the current repository's parent and also needs no machine path.
+Keep machine-specific absolute paths out of shared config. `IMACS_CONFIG` selects a different base file; its sibling
+`config.d/` and `workspaces/` directories are used too. Otherwise `XDG_CONFIG_HOME` is honored.
+
+Saved workspaces are per host: `~/.config/imacs/workspaces/<host>/<name>.toml`. Home and work can both have a `daily`
+workspace with different projects. Loading checks the host directory first, then falls back to flat
+`workspaces/<name>.toml` files saved by older IMACS versions. The workspace list combines both locations, with the
+host file winning on a name clash. Saving always writes to the host directory and leaves flat files untouched,
+so existing launch commands keep working and a shared config directory stays usable by other machines.
+Saving projects under your home writes `~/…` paths. For example, `workspaces/home-linux/daily.toml` can contain:
+
+```toml
+projects = ["~/repos/atomisk"]
+
+[tickets]
+provider = "relay"
+```
+
+`[tickets]` belongs to the workspace, so work can choose Linear and home Relay. Workspace loading and saving
+preserve this table and its provider settings; host configuration does not implement ticket-provider behavior.
+Keep runtime state (`~/.imacs`, including sessions, sockets and plans) local to each machine.
+
 ## Troubleshooting
 
 Run `imacs doctor` to check git, Claude Code, Codex, Helix, the config, the running IMACS socket and global Claude hooks.
