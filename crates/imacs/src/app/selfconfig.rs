@@ -63,7 +63,10 @@ impl State {
     /// one project's settings when given. Secret values never leave this function.
     pub(super) fn config_get(&self, project: Option<&str>, key: Option<&str>) -> Result<serde_json::Value, String> {
         let project = match project.map(str::trim).filter(|p| !p.is_empty()) {
-            Some(path) => Some(workspace::project_root(&paths::expand(path)).map_err(|err| format!("{err:#}"))?),
+            Some(path) => Some(
+                workspace::project_root(&paths::expand(path))
+                    .map_err(|err| self.config_cleaner(&self.config_layers(None)).error(&format!("{err:#}")))?,
+            ),
             None => None,
         };
         let repo_workflow = project.as_deref().map(imacs_core::repo_workflow::RepoWorkflow::read);
@@ -82,7 +85,7 @@ impl State {
                     "source": layer.source,
                     "path": layer.path,
                     "exists": layer.text.is_some(),
-                    "error": layer.error.as_deref().map(|error| cleaner.text(error)),
+                    "error": layer.error,
                 })
             })
             .collect();
@@ -102,12 +105,14 @@ impl State {
                 "new_worktree_example": paths::display(&git::worktree_path(&effective.worktree_path, &root, "example")),
             })
         });
-        let load_error = selfconfig::load_error(&layers).map(|error| cleaner.text(&error));
+        let load_error = selfconfig::load_error(&layers);
         let sections: Vec<_> = selfconfig::prompt_sections(&layers)
             .into_iter()
-            .map(|(source, text)| json!({ "source": source, "text": cleaner.text(&text) }))
+            .map(|(source, text)| json!({ "source": source, "text": text }))
             .collect();
-        Ok(json!({
+        // Clean the entire response, including prompts and metadata, so every
+        // agent-visible string gets credential syntax masking as well as known secrets.
+        Ok(cleaner.setting(json!({
             "host": paths::host_name(),
             "merge": "Built-in defaults, then config.toml, then config.d/<host>.toml: tables merge key by key, arrays and other values replace. A workspace's [tickets] and [workflow] replace each section as a whole. A project overlays allowlisted .imacs/config.toml settings; its [workflow] replaces the workspace workflow.",
             "files": files,
@@ -123,7 +128,7 @@ impl State {
             },
             "themes": self.themes_json(),
             "secrets": "Values of secret-looking names, credential flags and URL credentials read as ***. Ticket and voice keys stay in the environment variables token_env and api_key_env name.",
-        }))
+        })))
     }
 }
 
@@ -837,6 +842,54 @@ mod tests {
             assert_eq!(themes_info["files"], json!(["dusk"]));
             assert!(themes_info["built_in"].as_array().unwrap().contains(&json!("atomisk")));
             assert!(themes_info["tokens"].as_array().unwrap().contains(&json!("on_accent")));
+        });
+    }
+
+    #[test]
+    fn config_get_masks_credentials_in_prompts_and_response_metadata() {
+        with_app("app::selfconfig::tests::config_get_masks_credentials_in_prompts_and_response_metadata", |app, _| {
+            let [main, host] = Config::source_paths(&app.runtime.config_path);
+            std::fs::write(
+                &main,
+                "[chief]\nprompt = 'Use https://prompt-user:prompt-password@prompt.example/api with Bearer prompt-token'\n",
+            )
+            .unwrap();
+            std::fs::create_dir_all(host.parent().unwrap()).unwrap();
+            std::fs::write(&host, "[chief]\nprompt = 'Authorization: Bearer host-prompt-token'\n").unwrap();
+            app.runtime.config = Config::load(&main).unwrap();
+            app.runtime.workspace = Some("team".into());
+            let file = Workspace::file("team").unwrap();
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, "projects = []\n[chief]\nprompt = 'Bearer workspace-prompt-token'\n").unwrap();
+            app.runtime.config.theme.name = "Bearer theme-response-token".into();
+
+            let response = request(app, json!({"cmd":"config_get"}));
+            assert!(response.ok, "{:?}", response.error);
+            let result = response.result;
+            let sections = &result["chief_prompt"]["sections"];
+            assert_eq!(sections[0]["source"], "main");
+            assert_eq!(sections[0]["text"], "Use https://***@prompt.example/api with Bearer ***");
+            assert_eq!(sections[1], json!({"source":"host", "text":"Authorization: Bearer ***"}));
+            assert_eq!(sections[2], json!({"source":"workspace", "text":"Bearer ***"}));
+            assert_eq!(result["themes"]["selected"], "Bearer ***");
+            let text = result.to_string();
+            for secret in [
+                "prompt-password",
+                "prompt-token",
+                "host-prompt-token",
+                "workspace-prompt-token",
+                "theme-response-token",
+            ] {
+                assert!(!text.contains(secret), "{secret} leaked: {text}");
+            }
+
+            let invalid = request(
+                app,
+                json!({"cmd":"config_get", "project":"https://project-user:project-password@missing.example/imacs"}),
+            );
+            assert!(!invalid.ok);
+            let error = invalid.error.unwrap();
+            assert!(!error.contains("project-password"), "{error}");
         });
     }
 

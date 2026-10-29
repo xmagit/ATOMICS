@@ -247,8 +247,8 @@ pub fn key(path: &[String]) -> String {
 /// The value with what looks secret by name masked: ticket server environment values,
 /// operation arguments, `NAME=value` assignments and the values of secret-looking flags.
 fn masked(path: &[String], value: Value) -> Value {
-    let path: Vec<&str> = path.iter().map(String::as_str).collect();
-    let named_secret = match path.as_slice() {
+    let names: Vec<&str> = path.iter().map(String::as_str).collect();
+    let named_secret = match names.as_slice() {
         ["tickets", "server", "env", name] => secret_name(name),
         ["tickets", "operations", _, "arguments", .., name] => secret_name(name) && !placeholder(&value),
         _ => false,
@@ -257,7 +257,18 @@ fn masked(path: &[String], value: Value) -> Value {
         return Value::String(MASKED.into());
     }
     match value {
-        Value::Array(items) => Value::Array(masked_arguments(items)),
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(name, item)| {
+                    let mut child_path = path.to_vec();
+                    child_path.push(name.clone());
+                    (name, masked(&child_path, item))
+                })
+                .collect(),
+        ),
+        // Array elements keep their containing field's path: indices do not change
+        // whether a nested name is an operation argument or an environment value.
+        Value::Array(items) => Value::Array(masked_arguments(path, items)),
         other => other,
     }
 }
@@ -272,13 +283,13 @@ fn placeholder(value: &Value) -> bool {
 
 /// Command arguments and assignments with secret values masked: `--token=…`, the argument
 /// after `--api-key`, and `NAME=…` with a secret-looking name.
-fn masked_arguments(items: Vec<Value>) -> Vec<Value> {
+fn masked_arguments(path: &[String], items: Vec<Value>) -> Vec<Value> {
     let mut out = Vec::with_capacity(items.len());
     let mut mask_next = false;
     for item in items {
         let Value::String(text) = item else {
             mask_next = false;
-            out.push(masked_value(item));
+            out.push(masked(path, item));
             continue;
         };
         if std::mem::take(&mut mask_next) {
@@ -303,25 +314,6 @@ fn masked_arguments(items: Vec<Value>) -> Vec<Value> {
         out.push(Value::String(masked));
     }
     out
-}
-
-/// Arrays of tables, such as `[[agents]]`, with their command arrays masked too.
-fn masked_value(value: Value) -> Value {
-    match value {
-        Value::Object(map) => Value::Object(
-            map.into_iter()
-                .map(|(name, item)| {
-                    let item = match item {
-                        Value::Array(items) => Value::Array(masked_arguments(items)),
-                        other => masked_value(other),
-                    };
-                    (name, item)
-                })
-                .collect(),
-        ),
-        Value::Array(items) => Value::Array(masked_arguments(items)),
-        other => other,
-    }
 }
 
 /// The file a proposed change goes to.
@@ -1041,6 +1033,81 @@ arguments = { ticket = "{id}", apiKey = "argument-secret-333", header = "Authori
 
         let tickets = super::values(&effective, &layers, &cleaner, Some("tickets.server"));
         assert!(!tickets.is_empty() && tickets.keys().all(|key| key.starts_with("tickets.server.")));
+    }
+
+    #[test]
+    fn values_mask_nested_operation_arguments_without_losing_their_path() {
+        let main = layer(
+            Source::Main,
+            r#"
+[[agents]]
+name = "custom"
+command = ["agent", "--password", "agent-secret", "--model", "public"]
+[approvals]
+env = ["SERVICE_TOKEN=approval-secret", "PROFILE=work"]
+[tickets.operations.get]
+tool = "get_ticket"
+[tickets.operations.get.arguments]
+direct = { password = "direct-secret", name = "public" }
+requests = [{ api_key = "request-secret", ticket_key = "{key}", nested = { batches = [[{ credential = "deep-secret", public = 7, command = ["tool", "--token", "flag-secret"] }]] } }]
+[[tickets.operations.get.arguments.tables]]
+secret = "table-secret"
+children = [{ auth = { header = "object-secret" }, label = "public" }]
+"#,
+        );
+        assert!(main.error.is_none(), "{:?}", main.error);
+        let effective = Config::from_tables([main.table.clone()]).unwrap();
+        // None of these secrets is known to the cleaner: the field names and paths
+        // must protect them even inside arrays and inline tables.
+        let values = values(&effective, &[main], &Cleaner::default(), None);
+        let get = |key: &str| &values[key]["value"];
+        assert_eq!(get("tickets.operations.get.arguments.direct.password"), MASKED);
+        let request = &get("tickets.operations.get.arguments.requests")[0];
+        assert_eq!(request["api_key"], MASKED);
+        assert_eq!(request["ticket_key"], "{key}");
+        let deep = &request["nested"]["batches"][0][0];
+        assert_eq!(deep["credential"], MASKED);
+        assert_eq!(deep["public"], 7);
+        assert_eq!(deep["command"], serde_json::json!(["tool", "--token", MASKED]));
+        let table = &get("tickets.operations.get.arguments.tables")[0];
+        assert_eq!(table["secret"], MASKED);
+        assert_eq!(table["children"][0]["auth"], MASKED);
+        assert_eq!(table["children"][0]["label"], "public");
+        assert_eq!(
+            get("agents")[0]["command"],
+            serde_json::json!(["agent", "--password", MASKED, "--model", "public"])
+        );
+        assert_eq!(get("approvals.env"), &serde_json::json!(["SERVICE_TOKEN=***", "PROFILE=work"]));
+        let text = serde_json::to_string(&values).unwrap();
+        for secret in [
+            "direct-secret",
+            "request-secret",
+            "deep-secret",
+            "flag-secret",
+            "table-secret",
+            "object-secret",
+            "agent-secret",
+            "approval-secret",
+        ] {
+            assert!(!text.contains(secret), "{secret} leaked: {text}");
+        }
+    }
+
+    #[test]
+    fn command_masking_walks_nested_tables_and_arrays_in_other_sections() {
+        let value = serde_json::json!({
+            "groups": [[{ "nested": { "command": ["tool", "--api-key=inline-secret", "PASSWORD=assigned-secret", "--token", "flag-secret", "public"] } }]],
+            "token_env": "SERVICE_TOKEN",
+            "key": "public-key",
+        });
+        assert_eq!(
+            masked(&["other".into()], value),
+            serde_json::json!({
+                "groups": [[{ "nested": { "command": ["tool", "--api-key=***", "PASSWORD=***", "--token", MASKED, "public"] } }]],
+                "token_env": "SERVICE_TOKEN",
+                "key": "public-key",
+            }),
+        );
     }
 
     #[test]
