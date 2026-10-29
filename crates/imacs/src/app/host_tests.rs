@@ -150,8 +150,15 @@ fn heartbeat_fires_without_frames() {
 #[test]
 fn plan_is_saved_without_frames() {
     with_state("app::host_tests::plan_is_saved_without_frames", |state, _| {
-        let host = state.into_host();
-        let reply = command(&host, json!({"cmd":"plan_set", "goal":"Saved without painting", "tasks":[{"id":"a"}]}));
+        let _host = state.into_host();
+        let reply = ipc::request(
+            &serde_json::from_value(json!({
+                "cmd":"plan_set", "goal":"Saved without painting", "tasks":[{"id":"a"}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(reply.ok, "{:?}", reply.error);
         let (plans, errors) = plan::load_plans(&paths::imacs_home()).unwrap();
         assert!(errors.is_empty());
         let saved = plans.iter().find(|p| json!(p.id) == reply.result["plan"]).unwrap();
@@ -222,5 +229,42 @@ fn agent_exit_updates_and_saves_its_plan_without_frames() {
         eventually(&host, |state| state.plans[0].tasks[0].status == TaskStatus::Blocked);
         let saved = plan::load_plans(&paths::imacs_home()).unwrap().0;
         assert_eq!(saved[0].tasks[0].status, TaskStatus::Blocked);
+    });
+}
+
+#[test]
+fn delivery_verification_times_out_without_frames() {
+    with_state("app::host_tests::delivery_verification_times_out_without_frames", |mut state, ctx| {
+        let terminal = Terminal::spawn(
+            ctx,
+            state.palette.clone(),
+            "/bin/sleep".into(),
+            vec!["30".into()],
+            &state.launch_dir,
+            HashMap::new(),
+            100,
+        )
+        .unwrap();
+        let (reply, received) = channel();
+        let mut worker = session("worker", AgentKind::Generic, AgentStatus::Idle, &state.launch_dir);
+        worker.terminal = Some(terminal);
+        worker.pending = Some(Pending {
+            text: "unconfirmed message".into(),
+            sent: Instant::now() - DELIVERY_TIMEOUT + Duration::from_millis(100),
+            attempts: DELIVERY_ATTEMPTS,
+            was_working: false,
+            codex: false,
+            screen_before: String::new(),
+            paste_seen: false,
+            reply: Some(reply),
+        });
+        state.sessions = vec![worker];
+        let host = state.into_host();
+        let ControlOutcome::Done(result) = received.recv_timeout(Duration::from_secs(3)).unwrap() else {
+            panic!("delivery was not resolved");
+        };
+        assert!(!result.ok);
+        assert!(result.error.unwrap().contains("no receipt"));
+        assert!(host.state().sessions[0].pending.is_none());
     });
 }
