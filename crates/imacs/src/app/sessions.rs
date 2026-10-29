@@ -204,13 +204,7 @@ impl State {
                 let config = json!({ "mcpServers": { "imacs": {
                     "command": exe, "args": ["mcp", "--chief"], "env": { "IMACS_PANE": id, "IMACS_SOCKET": socket }
                 } } });
-                let projects: Vec<String> = self.repos.iter().map(|r| paths::display(r)).collect();
-                let prompt = self
-                    .config
-                    .chief
-                    .system_prompt
-                    .replace("{projects}", &projects.join(", "))
-                    .replace("{base_ref}", &self.config.base_ref);
+                let prompt = self.chief_prompt();
                 args.extend([
                     "--mcp-config".to_string(),
                     config.to_string(),

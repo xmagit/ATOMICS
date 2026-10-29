@@ -86,6 +86,7 @@ impl State {
                 && let Some(index) = self.plans.iter().position(|p| &p.id == plan_id)
                 && let Some(task) = self.plans[index].task_mut(task_id)
             {
+                let old = task.status;
                 match &outcome {
                     Ok(id) => {
                         task.session = Some(id.clone());
@@ -97,6 +98,11 @@ impl State {
                     }
                 }
                 self.save_plan(index);
+                if let Err(err) = &outcome {
+                    let note = format!("could not start: {err}");
+                    let author = imacs_core::tickets::Author::Imacs;
+                    self.ticket_status_changed(index, task_id, old, TaskStatus::Blocked, Some(&note), author);
+                }
             }
             let response = match outcome {
                 Ok(id) => ControlResponse::ok(self.describe(self.find(&id).expect("just started"))),
@@ -113,6 +119,7 @@ impl State {
             changed = true;
             self.finish_integration(integrated);
         }
+        changed |= self.ticket_results();
         self.expire_approvals(Instant::now());
         while let Ok(message) = self.control_rx.try_recv() {
             changed = true;
@@ -201,6 +208,7 @@ impl State {
         if self.config_checked.elapsed() > Duration::from_secs(1) {
             self.config_checked = Instant::now();
             let stamp = modified(&self.config_path);
+            self.apply_ticket_config();
             if stamp != self.config_stamp {
                 self.config_stamp = stamp;
                 match Config::load(&self.config_path) {
@@ -539,6 +547,7 @@ impl State {
                 report: None,
                 approval: self.sessions[index].approvals.last().map(|pending| pending.request.clone()),
                 findings: None,
+                ticket: None,
             });
             self.serve_waiters();
         }

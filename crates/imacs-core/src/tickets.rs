@@ -123,6 +123,14 @@ impl TicketLink {
     }
 }
 
+/// A ticket for `imacs_ticket_link` to create with the configured create operation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TicketDraft {
+    pub title: String,
+    #[serde(default)]
+    pub body: String,
+}
+
 /// How the external system's work maps onto IMACS plans.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

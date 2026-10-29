@@ -52,6 +52,7 @@ mod projects;
 mod restart;
 mod sessions;
 mod sidebar;
+mod tickets;
 mod topbar;
 mod voice;
 mod worktrees;
@@ -244,13 +245,17 @@ struct StatusEvent {
     report: Option<(String, String, Option<String>)>,
     approval: Option<ApprovalRequest>,
     findings: Option<Vec<imacs_core::heartbeat::Finding>>,
+    /// Set when someone changed a linked ticket in its system.
+    ticket: Option<serde_json::Value>,
 }
 
 impl StatusEvent {
-    /// What `wait` matches on: the agent's status, or "reported".
+    /// What `wait` matches on: the agent's status, "reported", "heartbeat" or "ticket".
     fn kind(&self) -> &str {
         if self.findings.is_some() {
             "heartbeat"
+        } else if self.ticket.is_some() {
+            "ticket"
         } else if self.report.is_some() {
             "reported"
         } else {
@@ -267,6 +272,9 @@ impl StatusEvent {
         }
         if let Some(findings) = &self.findings {
             value["findings"] = json!(findings);
+        }
+        if let Some(ticket) = &self.ticket {
+            value["ticket"] = ticket.clone();
         }
         if let Some(request) = &self.approval {
             value["approval"] = json!(request);
@@ -373,6 +381,7 @@ pub(crate) struct State {
     last_status: HashMap<String, AgentStatus>,
     waiters: Vec<Waiter>,
     heartbeat: heartbeat::Heartbeat,
+    tickets: tickets::Tickets,
     plans: Vec<Plan>,
     selected_plan: usize,
     changed_plans: HashSet<String>,
@@ -651,6 +660,7 @@ impl State {
         let (integrate_tx, integrate_rx) = wake.channel();
         let (integration_check_tx, integration_check_rx) = wake.channel();
         let launch_dir = std::env::current_dir().unwrap_or_else(|_| paths::home());
+        let tickets = tickets::Tickets::new(&wake);
 
         let (mut plans, plan_error) = match plan::load_plans(&paths::imacs_home()) {
             Ok((plans, errors)) => {
@@ -713,6 +723,7 @@ impl State {
             last_status: HashMap::new(),
             waiters: Vec::new(),
             heartbeat: heartbeat::Heartbeat::default(),
+            tickets,
             plans,
             selected_plan,
             changed_plans: HashSet::new(),
@@ -780,6 +791,7 @@ impl State {
         }
         self.repos = repos;
         self.worktrees_at = None;
+        self.apply_ticket_config();
     }
 
     fn resources_json(&self) -> serde_json::Value {

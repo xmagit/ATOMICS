@@ -20,8 +20,11 @@ png = "0.18.1"
 rfd = "0.17.2"
 serde_json = "1.0.154"
 uuid = { version = "1.29.0", features = ["v4"] }
+# The ticket layer's MCP client speaks streamable HTTP too.
+ureq = { version = "3.5.0", default-features = false, features = ["rustls"] }
 syntect = { version = "5.3.0", default-features = false, features = ["default-onig"] }
 two-face = { version = "0.5.2", default-features = false, features = ["syntect-onig"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
+toml = "1.1.8"

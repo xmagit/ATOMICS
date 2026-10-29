@@ -1882,7 +1882,9 @@ dependencies = [
  "serde_json",
  "syntect",
  "tempfile",
+ "toml",
  "two-face",
+ "ureq",
  "uuid",
 ]
 

@@ -402,11 +402,17 @@ impl Desktop<'_> {
                             if state.plans[index].status != PlanStatus::Open {
                                 return;
                             }
-                            if let Some(task) = state.plans[index].task_mut(&id) {
+                            let old = state.plans[index].task_mut(&id).map(|task| {
+                                let old = task.status;
                                 task.set_status(status);
-                            }
+                                old
+                            });
                             state.finish_plan_agents();
                             state.save_plan(index);
+                            if let Some(old) = old {
+                                let author = imacs_core::tickets::Author::User;
+                                state.ticket_status_changed(index, &id, old, status, None, author);
+                            }
                         });
                     }
                 }

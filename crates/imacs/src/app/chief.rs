@@ -102,6 +102,9 @@ pub(super) const CHIEF_ALLOWED_TOOLS: &[&str] = &[
     "mcp__imacs__imacs_send_review",
     "mcp__imacs__imacs_focus",
     "mcp__imacs__imacs_open",
+    "mcp__imacs__imacs_ticket_link",
+    "mcp__imacs__imacs_ticket_sync",
+    "mcp__imacs__imacs_ticket_comment",
 ];
 
 impl Desktop<'_> {

@@ -73,6 +73,7 @@ impl State {
                 report: None,
                 approval: None,
                 findings: Some(findings.clone()),
+                ticket: None,
             });
             self.heartbeat.last = Some((at, findings));
             self.serve_waiters();
@@ -86,6 +87,7 @@ impl State {
             return;
         }
         self.heartbeat.started = Instant::now();
+        self.ticket_heartbeat();
         let plans: Vec<_> = self.plans.iter().filter(|p| p.is_open()).cloned().collect();
         let sessions: Vec<_> = self
             .sessions
