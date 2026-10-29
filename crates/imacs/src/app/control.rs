@@ -342,8 +342,10 @@ impl State {
                 });
                 return;
             }
-            ControlRequest::ConfigPropose { scope, toml, remove, reason, pane } => {
-                done(match self.propose_config(scope, &toml, &remove, reason, pane.as_deref()) {
+            ControlRequest::ConfigPropose { scope, toml, remove, theme, reason, pane } => {
+                let change =
+                    selfconfig::ProposedChange { scope, toml: &toml, remove: &remove, theme: theme.as_deref() };
+                done(match self.propose_config(change, reason, pane.as_deref()) {
                     Ok(result) => ControlResponse::ok(result),
                     Err(error) => ControlResponse::error(error),
                 })

@@ -2,7 +2,7 @@ mod fonts;
 
 use std::path::Path;
 
-use egui::{Color32, Key, KeyboardShortcut, Modifiers, Stroke, vec2};
+use egui::{Align2, Color32, FontId, Key, KeyboardShortcut, Modifiers, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
 use imacs_core::config::{Chord, ThemeConfig};
 use imacs_core::theme::{Resolved, ThemeMode};
 
@@ -240,6 +240,151 @@ impl Palette {
         style
     }
 
+    /// What a proposed theme file would look like, resolved against the other theme files in `dir`.
+    pub fn preview(name: &str, text: &str, dir: &Path) -> (Palette, Vec<String>) {
+        let config = ThemeConfig { name: name.into(), ..ThemeConfig::default() };
+        let resolved = imacs_core::theme::resolve(&config, |file| {
+            if file == name { Some(Ok(text.to_string())) } else { imacs_core::theme::read_file(dir, file) }
+        });
+        Palette::from_resolved(resolved, dir)
+    }
+
+    /// A small IMACS painted in this theme: the bars, agent rows, a terminal with the ANSI
+    /// colors, a diff, the status colors and an accent button. Fonts and sizes are the current ones.
+    pub fn show_preview(&self, ui: &mut egui::Ui) -> egui::Response {
+        let p = self;
+        let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width().min(680.0), 250.0), Sense::hover());
+        let painter = ui.painter_at(rect);
+        let ui_font = |size: f32| p.ui(size);
+        let mono = FontId::monospace(11.0);
+        let text = |at: egui::Pos2, value: &str, font: FontId, color: Color32| {
+            painter.text(at, Align2::LEFT_CENTER, value, font, color).width()
+        };
+        painter.rect_filled(rect, 4.0, p.background);
+
+        let top = Rect::from_min_max(rect.min, pos2(rect.right(), rect.top() + 26.0));
+        painter.rect_filled(top, 0.0, p.topbar);
+        painter.hline(top.x_range(), top.bottom(), Stroke::new(1.0, p.separator));
+        let x = rect.left() + 10.0 + text(pos2(rect.left() + 10.0, top.center().y), "IMACS", ui_font(12.5), p.accent);
+        text(pos2(x + 8.0, top.center().y), "3 agents", ui_font(11.5), p.muted);
+        let settings = Rect::from_center_size(pos2(top.right() - 40.0, top.center().y), vec2(62.0, 18.0));
+        painter.rect(settings, 2.0, p.raised, Stroke::new(1.0, p.border), StrokeKind::Inside);
+        painter.text(settings.center(), Align2::CENTER_CENTER, "Settings", ui_font(11.0), p.foreground);
+
+        let bottom = Rect::from_min_max(pos2(rect.left(), rect.bottom() - 28.0), rect.max);
+        let side = Rect::from_min_max(pos2(rect.left(), top.bottom()), pos2(rect.left() + 150.0, bottom.top()));
+        painter.rect_filled(side, 0.0, p.sidebar);
+        painter.vline(side.right(), side.y_range(), Stroke::new(1.0, p.separator));
+        painter.rect_filled(Rect::from_min_size(side.min + vec2(10.0, 10.0), vec2(3.0, 10.0)), 0.0, p.accent);
+        text(pos2(side.left() + 18.0, side.top() + 15.0), "AGENTS", ui_font(10.0), p.muted);
+        let rows = [
+            ("orbit-tilt", "working", p.accent, true),
+            ("readme", "needs you", p.warning, false),
+            ("moons", "done", p.success, false),
+            ("docs", "exited", p.error, false),
+        ];
+        for (i, (title, status, color, active)) in rows.into_iter().enumerate() {
+            let row =
+                Rect::from_min_size(pos2(side.left() + 6.0, side.top() + 28.0 + i as f32 * 34.0), vec2(138.0, 32.0));
+            if active {
+                painter.rect_filled(row, 2.0, lerp(p.sidebar, p.accent, 0.14));
+            }
+            painter.circle_filled(pos2(row.left() + 8.0, row.top() + 10.0), 3.0, color);
+            let name = if active { p.accent } else { p.foreground };
+            text(pos2(row.left() + 16.0, row.top() + 10.0), title, ui_font(11.5), name);
+            text(pos2(row.left() + 16.0, row.top() + 24.0), &format!("shell · {status}"), ui_font(10.0), p.quiet);
+        }
+
+        let main = Rect::from_min_max(
+            pos2(side.right() + 6.0, top.bottom() + 6.0),
+            pos2(rect.right() - 6.0, bottom.top() - 6.0),
+        );
+        let split = main.left() + (main.width() * 0.48).round();
+        let tile = Rect::from_min_max(main.min, pos2(split - 3.0, main.bottom()));
+        let header = Rect::from_min_max(tile.min, pos2(tile.right(), tile.top() + 20.0));
+        painter.rect_filled(tile, 2.0, p.terminal);
+        painter.rect_filled(header, 2.0, p.raised);
+        painter.rect_stroke(tile, 2.0, Stroke::new(1.0, lerp(p.border, p.accent, 0.7)), StrokeKind::Inside);
+        text(pos2(header.left() + 8.0, header.center().y), "orbit-tilt", ui_font(11.0), p.accent);
+        let line = |row: usize| tile.top() + 32.0 + row as f32 * 15.0;
+        let x = tile.left() + 8.0;
+        let w = x + text(pos2(x, line(0)), "$ cargo test ", mono.clone(), p.foreground);
+        painter.rect_filled(Rect::from_min_size(pos2(w, line(0) - 7.0), vec2(7.0, 14.0)), 0.0, p.cursor);
+        let selected = Rect::from_min_size(pos2(x + 1.0, line(1) - 7.5), vec2(70.0, 15.0));
+        painter.rect_filled(selected, 0.0, p.selection);
+        text(pos2(x, line(1)), "Compiling orbit v0.1.0", mono.clone(), p.ansi[2]);
+        text(pos2(x, line(2)), "warning: unused import", mono.clone(), p.ansi[3]);
+        text(pos2(x, line(3)), "error[E0308]: mismatched", mono.clone(), p.ansi[1]);
+        let after = x + text(pos2(x, line(4)), "test ", mono.clone(), p.foreground);
+        let after = after + text(pos2(after, line(4)), "height ", mono.clone(), p.ansi[4]);
+        text(pos2(after, line(4)), "... ok", mono.clone(), p.ansi[6]);
+        text(pos2(x, line(5)), "dim · muted output", mono.clone(), p.dim(p.foreground));
+        for (i, color) in p.ansi.iter().enumerate() {
+            let swatch =
+                Rect::from_min_size(pos2(x + (i % 8) as f32 * 16.0, line(6) + (i / 8) as f32 * 14.0), vec2(14.0, 12.0));
+            painter.rect_filled(swatch, 1.0, *color);
+        }
+
+        let diff = Rect::from_min_max(pos2(split + 3.0, main.top()), main.max);
+        painter.rect_filled(diff, 2.0, p.background);
+        painter.rect_stroke(diff, 2.0, Stroke::new(1.0, p.border), StrokeKind::Inside);
+        let row = |i: usize| {
+            Rect::from_min_size(
+                pos2(diff.left() + 1.0, diff.top() + 8.0 + i as f32 * 16.0),
+                vec2(diff.width() - 2.0, 16.0),
+            )
+        };
+        text(pos2(diff.left() + 8.0, row(0).center().y), "M src/lib.rs  +2 −1", ui_font(11.0), p.foreground);
+        text(pos2(diff.left() + 40.0, row(1).center().y), "@@ -3,4 +3,5 @@", mono.clone(), p.info);
+        let lines = [
+            (None, "3", "/// A body circling a planet.", p.foreground),
+            (Some((p.removed, p.removed_emphasis)), "4", "pub fn speed() -> f64 {", p.foreground),
+            (Some((p.added, p.added_emphasis)), "4", "pub fn height() -> f64 {", p.foreground),
+            (Some((p.added, p.added_emphasis)), "5", "    self.tilt.sin()", p.foreground),
+            (None, "6", "}", p.foreground),
+        ];
+        for (i, (fill, number, code, color)) in lines.into_iter().enumerate() {
+            let line = row(i + 2);
+            if let Some((fill, emphasis)) = fill {
+                painter.rect_filled(line, 0.0, fill);
+                painter.rect_filled(
+                    Rect::from_min_size(pos2(line.left() + 75.0, line.top()), vec2(42.0, 16.0)),
+                    0.0,
+                    emphasis,
+                );
+            }
+            text(pos2(line.left() + 8.0, line.center().y), number, mono.clone(), p.quiet);
+            text(pos2(line.left() + 40.0, line.center().y), code, mono.clone(), color);
+        }
+        let popup = Rect::from_min_size(pos2(diff.right() - 120.0, diff.bottom() - 58.0), vec2(112.0, 50.0));
+        painter.rect(popup, 4.0, p.overlay, Stroke::new(1.0, p.border), StrokeKind::Inside);
+        text(pos2(popup.left() + 8.0, popup.top() + 13.0), "Open in editor", ui_font(11.0), p.foreground);
+        painter.rect_filled(
+            Rect::from_min_size(pos2(popup.left() + 4.0, popup.top() + 26.0), vec2(104.0, 18.0)),
+            2.0,
+            lerp(p.overlay, p.accent, 0.2),
+        );
+        text(pos2(popup.left() + 8.0, popup.top() + 35.0), "Copy path", ui_font(11.0), p.foreground);
+
+        painter.rect_filled(bottom, 0.0, p.panel);
+        painter.hline(bottom.x_range(), bottom.top(), Stroke::new(1.0, p.separator));
+        let field = Rect::from_min_max(
+            pos2(bottom.left() + 10.0, bottom.top() + 5.0),
+            pos2(bottom.right() - 290.0, bottom.bottom() - 5.0),
+        );
+        painter.rect(field, 2.0, p.background, Stroke::new(1.0, p.border), StrokeKind::Inside);
+        text(pos2(field.left() + 6.0, field.center().y), "Steer · Enter sends", ui_font(11.0), p.quiet);
+        let mut x = field.right() + 10.0;
+        for (label, color) in [("done", p.success), ("needs you", p.warning), ("failed", p.error), ("report", p.info)] {
+            x += text(pos2(x, bottom.center().y), label, ui_font(11.0), color) + 9.0;
+        }
+        let send = Rect::from_min_size(pos2(bottom.right() - 52.0, bottom.top() + 5.0), vec2(42.0, 18.0));
+        painter.rect_filled(send, 2.0, p.accent);
+        painter.text(send.center(), Align2::CENTER_CENTER, "Send", ui_font(11.0), p.on_accent);
+        painter.rect_stroke(rect, 4.0, Stroke::new(1.0, p.border), StrokeKind::Inside);
+        response
+    }
+
     /// Applies the theme to egui: one style whatever the system's appearance, fonts, and UI scale.
     pub fn apply(&self, ctx: &egui::Context) {
         let style = std::sync::Arc::new(self.style());
@@ -349,6 +494,47 @@ mod tests {
         assert_eq!(style.visuals.weak_text_color, Some(rgb(0x0a0b0c)));
         assert_eq!(style.visuals.selection.bg_fill, palette.selection);
         assert!(style.visuals.dark_mode);
+    }
+
+    #[test]
+    fn proposed_themes_preview_with_their_own_colors() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("base.toml"), "extends = \"paper\"\nadded = \"#c8f0d0\"").unwrap();
+        let text = "extends = \"base\"\nterminal = \"#fffdf6\"\naccent = \"#2a6fdb\"\non_accent = \"#fafafa\"";
+        let (palette, errors) = Palette::preview("ocean", text, dir.path());
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(palette.mode, ThemeMode::Light, "the preview follows extends through the other files");
+        assert_eq!(palette.added, rgb(0xc8f0d0));
+        assert_eq!(palette.accent, rgb(0x2a6fdb));
+
+        let ctx = egui::Context::default();
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            palette.show_preview(ui);
+        });
+        let fills: Vec<Color32> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Rect(rect) => Some(rect.fill),
+                _ => None,
+            })
+            .collect();
+        for (token, color) in [
+            ("terminal", palette.terminal),
+            ("accent", palette.accent),
+            ("added", palette.added),
+            ("selection", palette.selection),
+            ("overlay", palette.overlay),
+            ("ansi 9", palette.ansi[9]),
+        ] {
+            assert!(fills.contains(&color), "the preview paints {token}");
+        }
+        let send = output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.text() == "Send" => Some(text.clone()),
+            _ => None,
+        });
+        assert_eq!(send.unwrap().fallback_color, palette.on_accent, "Send is written in on_accent");
+        output.drop_without_applying_deltas();
     }
 
     #[test]

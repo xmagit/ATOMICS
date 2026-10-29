@@ -397,14 +397,47 @@ pub fn themes_dir(config_file: &Path) -> PathBuf {
     config_file.parent().unwrap_or_else(|| Path::new(".")).join("themes")
 }
 
-/// Resolves `[theme]` against the theme files in `dir`.
+/// Checks a proposed theme file strictly, as an agent's change must be: a usable name,
+/// every key known, every value usable, and the theme resolving without problems.
+/// `read` reads the other theme files. Returns what the user should know before applying.
+pub fn check(
+    name: &str,
+    text: &str,
+    read: impl Fn(&str) -> Option<Result<String, String>>,
+) -> Result<Vec<String>, String> {
+    if !valid_name(name) {
+        return Err(format!("theme names use letters, digits, - and _, not \"{name}\""));
+    }
+    let (_, problems) = ThemeFile::parse(text).map_err(|err| format!("themes/{name}.toml: {err:#}"))?;
+    if !problems.is_empty() {
+        return Err(format!("themes/{name}.toml: {}", problems.join("; ")));
+    }
+    let config = ThemeConfig { name: name.into(), ..ThemeConfig::default() };
+    let resolved = resolve(&config, |file| if file == name { Some(Ok(text.to_string())) } else { read(file) });
+    if !resolved.errors.is_empty() {
+        return Err(resolved.errors.join("; "));
+    }
+    let mut warnings = Vec::new();
+    if builtin(name).is_some() {
+        warnings.push(format!("themes/{name}.toml replaces the built-in {name} theme"));
+    }
+    Ok(warnings)
+}
+
+/// A theme file's text, `None` when there is no file of that name.
 #[cfg(feature = "native")]
-pub fn load(config: &ThemeConfig, dir: &Path) -> Resolved {
-    resolve(config, |name| match std::fs::read_to_string(dir.join(format!("{name}.toml"))) {
+pub fn read_file(dir: &Path, name: &str) -> Option<Result<String, String>> {
+    match std::fs::read_to_string(dir.join(format!("{name}.toml"))) {
         Ok(text) => Some(Ok(text)),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
         Err(err) => Some(Err(err.to_string())),
-    })
+    }
+}
+
+/// Resolves `[theme]` against the theme files in `dir`.
+#[cfg(feature = "native")]
+pub fn load(config: &ThemeConfig, dir: &Path) -> Resolved {
+    resolve(config, |name| read_file(dir, name))
 }
 
 #[cfg(test)]
@@ -579,6 +612,27 @@ mod tests {
         assert!(ThemeFile::parse("mode = \"sepia\"").is_err(), "a value of the wrong kind is not a theme");
         assert_eq!(parse_color("#7aa2f7"), Some([0x7a, 0xa2, 0xf7]));
         assert_eq!(parse_color("#+1+2+3"), None);
+    }
+
+    #[test]
+    fn proposed_theme_files_are_checked_strictly() {
+        let read = files(&[("base", "extends = \"midnight\""), ("loop", "extends = \"dusk\"")]);
+        assert_eq!(check("dusk", "extends = \"base\"\naccent = \"#e0a458\"", &read), Ok(vec![]));
+        assert_eq!(
+            check("claude", "extends = \"claude\"\naccent = \"#e0a458\"", &read).unwrap(),
+            ["themes/claude.toml replaces the built-in claude theme"]
+        );
+        for (name, text, problem) in [
+            ("dusk", "acent = \"#e0a458\"", "unknown key acent"),
+            ("dusk", "accent = \"orange\"", "accent = \"orange\" is not a #rrggbb color"),
+            ("dusk", "extends = \"nope\"", "unknown theme \"nope\""),
+            ("dusk", "extends = \"loop\"", "cycle"),
+            ("dusk", "mode = \"sepia\"", "themes/dusk.toml:"),
+            ("../dusk", "", "theme names use"),
+        ] {
+            let error = check(name, text, &read).unwrap_err();
+            assert!(error.contains(problem), "{text}: {error}");
+        }
     }
 
     #[cfg(feature = "native")]

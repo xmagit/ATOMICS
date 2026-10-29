@@ -121,6 +121,18 @@ token), 12 (cursor) and 4 (the palette). Claude Code and Codex ask for these to 
 their own, and after a theme change, later queries get the new colors. Programs that read `COLORFGBG`
 instead get `15;0` in dark themes and `0;15` in light ones, set when the terminal starts.
 
+## Themes from the chief
+
+The chief can write a theme for you. `imacs_config_get` lists the theme on screen, the built-in themes, the
+theme files and every token. `imacs_config_propose` with `scope = "theme"` and `theme = "<name>"` proposes
+`themes/<name>.toml`: the `toml` holds tokens, merged into the file if it exists. IMACS checks it strictly, as
+it would not check a file you write: an unknown key, a value that is not usable, an unknown syntax theme, or an
+`extends` that is missing or circular refuses the change. The proposal opens like any config change, with the
+theme drawn above the diff in its own colors, so you can judge it before you apply it. Applying writes the
+file (backing up an existing one); if the theme is the one on screen, IMACS switches to it at once. Showing a
+different theme is a separate proposal of `[theme] name` in the `main` or `host` scope. See
+[configuration](configuration.md#imacs_config_propose).
+
 ## For developers
 
 UI code takes every color from `Palette` (crates/imacs/src/theme.rs). A test fails on `Color32` constants,
