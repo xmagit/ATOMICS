@@ -27,7 +27,8 @@ enum Kind {
     List,
     State(String),
     Comment,
-    Create,
+    /// Creating a ticket for a slot, at the slot's generation when requested.
+    Create(u64),
 }
 
 type Done = (Tag, Result<TicketOutput, String>);
@@ -51,6 +52,9 @@ pub(super) struct Tickets {
     pub(super) boards: HashMap<String, Vec<TicketLink>>,
     batches: HashMap<u64, Batch>,
     next_batch: u64,
+    /// How often each slot's link was set by request, so a late create result never
+    /// replaces a link set after it was asked for.
+    generations: HashMap<LinkKey, u64>,
 }
 
 /// A control request answered once all of its ticket jobs are done.
@@ -85,6 +89,7 @@ impl Tickets {
             boards: HashMap::new(),
             batches: HashMap::new(),
             next_batch: 0,
+            generations: HashMap::new(),
         }
     }
 }
@@ -169,6 +174,13 @@ impl State {
             None => Some(&mut plan.ticket),
             Some(task) => Some(&mut plan.tasks.iter_mut().find(|t| &t.id == task)?.ticket),
         }
+    }
+
+    /// A request set or cleared a slot's link: results of earlier requests for it are stale.
+    pub(super) fn relinked(&mut self, key: LinkKey) -> u64 {
+        let generation = self.tickets.generations.entry(key).or_default();
+        *generation += 1;
+        *generation
     }
 
     fn save_plan_id(&self, id: &str) {
@@ -273,7 +285,7 @@ impl State {
             Kind::State(_) => {
                 self.tickets.pushing.remove(&tag.key);
             }
-            Kind::Read | Kind::Comment | Kind::Create => {}
+            Kind::Read | Kind::Comment | Kind::Create(_) => {}
         }
         let error = match (tag.kind.clone(), result) {
             (Kind::Read, Ok(TicketOutput::Read(value))) => {
@@ -310,14 +322,19 @@ impl State {
                 }
                 None
             }
-            (Kind::Create, Ok(TicketOutput::Ticket(created))) => {
-                let system = self.ticket_config().map(|c| c.system.clone()).unwrap_or_default();
-                let created = TicketLink { system, synced_at: Some(imacs_core::store::now()), ..created };
-                if let Some(slot) = self.link_slot(&tag.key) {
-                    *slot = Some(created);
-                    self.save_plan_id(&tag.key.0);
+            (Kind::Create(generation), Ok(TicketOutput::Ticket(created))) => {
+                if self.tickets.generations.get(&tag.key) != Some(&generation) {
+                    Some(format!("{} was created, but a newer link superseded it", created.label()))
+                } else {
+                    // The ticket exists in the system the request went to, whatever the config says now.
+                    let created =
+                        TicketLink { system: tag.system.clone(), synced_at: Some(imacs_core::store::now()), ..created };
+                    if let Some(slot) = self.link_slot(&tag.key) {
+                        *slot = Some(created);
+                        self.save_plan_id(&tag.key.0);
+                    }
+                    None
                 }
-                None
             }
             (kind, Err(err)) => {
                 let what = match &kind {
@@ -327,10 +344,10 @@ impl State {
                         format!("setting the state to {state} failed")
                     }
                     Kind::Comment => "commenting failed".into(),
-                    Kind::Create => "creating the ticket failed".into(),
+                    Kind::Create(_) => "creating the ticket failed".into(),
                 };
                 let message = format!("{what}: {err}");
-                if kind != Kind::Create {
+                if !matches!(kind, Kind::Create(_)) {
                     self.ticket_failed(&tag, message.clone());
                 }
                 Some(message)
@@ -789,6 +806,10 @@ impl State {
         {
             return fail(reply, format!("no task {task}"));
         }
+        if !unlink && given.is_none() && create.is_none() {
+            return fail(reply, "Give ticket (with its id), create (with a title), or unlink.".into());
+        }
+        let generation = self.relinked(key.clone());
         if unlink {
             if let Some(slot) = self.link_slot(&key) {
                 *slot = None;
@@ -842,7 +863,7 @@ impl State {
                     Tag {
                         key,
                         ticket: String::new(),
-                        kind: Kind::Create,
+                        kind: Kind::Create(generation),
                         batch: Some(batch),
                         system: config.system.clone(),
                     },
@@ -1732,6 +1753,63 @@ mod tests {
             settle(app);
             assert_eq!(ticket(&cards, "CARD-1")["state"], "Stuck", "the blocked status reaches the right system later");
         });
+    }
+
+    #[test]
+    fn a_late_create_never_replaces_a_newer_link_or_takes_another_system() {
+        with_app(
+            "app::tickets::tests::a_late_create_never_replaces_a_newer_link_or_takes_another_system",
+            |app, ctx| {
+                let dir = tempfile::tempdir().unwrap();
+                let state = tickets_fixture(dir.path(), "CARD");
+                configure(app, CARDS, &state, |_| {});
+                let plan = request(
+                    app,
+                    json!({"cmd":"plan_set", "goal":"Late", "ticket":{"id":"b1"}, "tasks":[{"id":"a"}, {"id":"b"}]}),
+                )
+                .result["plan"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                let index = app.runtime.selected_plan;
+                settle(app);
+                let send = |app: &mut Desktop<'_>, task: &str, ticket: Option<&str>| {
+                    let (tx, rx) = channel();
+                    let request = ControlRequest::TicketLink {
+                        plan: Some(plan.clone()),
+                        task: Some(task.into()),
+                        ticket: ticket.map(|id| TicketLink { id: id.into(), ..TicketLink::default() }),
+                        create: ticket
+                            .is_none()
+                            .then(|| TicketDraft { title: "Created late".into(), body: String::new() }),
+                        unlink: false,
+                    };
+                    app.runtime.control(ctx, request, tx);
+                    rx
+                };
+                // The create is under way when the chief links another ticket to the same task.
+                let created = send(app, "a", None);
+                let linked = send(app, "a", Some("2"));
+                settle(app);
+                let ControlOutcome::Done(created) = created.recv_timeout(Duration::from_secs(1)).unwrap() else {
+                    panic!()
+                };
+                linked.recv_timeout(Duration::from_secs(1)).unwrap();
+                assert_eq!(link(app, index, 0).label(), "CARD-2", "the newer link stays");
+                assert!(created.result["errors"].to_string().contains("superseded"), "{:?}", created);
+
+                // A create sent to one system keeps that system when the config changes meanwhile.
+                let created = send(app, "b", None);
+                std::fs::create_dir(dir.path().join("issues")).unwrap();
+                let other = tickets_fixture(&dir.path().join("issues"), "ISS");
+                configure(app, ISSUES, &other, |config| config.mode = TicketMode::Board);
+                settle(app);
+                created.recv_timeout(Duration::from_secs(1)).unwrap();
+                let b = link(app, index, 1);
+                assert!(b.label().starts_with("NEW-"));
+                assert_eq!(b.system, "cards");
+            },
+        );
     }
 
     #[test]
