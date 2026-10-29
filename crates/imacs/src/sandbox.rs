@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use imacs_core::isolation::{self, Listed, SandboxConfig, Spec};
+use imacs_core::isolation::{self, Diagnosis, Listed, MIN_SBX_VERSION, SandboxConfig, Spec};
 use imacs_core::{git, paths, workspace};
 
 /// Most sbx commands answer within a second; this bounds a stuck daemon.
@@ -81,13 +81,77 @@ impl Prepare {
     }
 }
 
-/// Makes the sandbox unless it exists, which is how a session reattaches after a restart.
-/// A new sandbox mounts the worktree and git's write folders, gets IMACS's MCP server, the
-/// configured ones and its repository's allowed hosts.
+/// What sbx said when it was checked.
+#[derive(Debug, Clone)]
+pub struct Ready {
+    pub version: (u64, u64, u64),
+    pub diagnosis: Diagnosis,
+}
+
+/// How to opt out, which every refusal says: IMACS never runs a sandboxed agent bare on its own.
+const BARE: &str = "or set [isolation] mode = \"bare\" to run agents directly on this machine";
+
+/// Checks that sbx can run sandboxes: installed, at least [`MIN_SBX_VERSION`], and signed in
+/// to Docker. A failure says what to do about it.
+pub fn preflight(program: &str) -> Result<Ready, String> {
+    if !installed(program) {
+        return Err(format!(
+            "Docker Sandboxes (sbx) is not installed. Install it (brew install --cask docker/tap/sbx, \
+             or see https://github.com/docker/sbx-releases) and sign in with `sbx login`, {BARE}."
+        ));
+    }
+    let output = sbx(program, &["version"], false, TIMEOUT)
+        .map_err(|err| format!("sbx did not report its version ({err:#}). Run `sbx version` to see why, {BARE}."))?;
+    let version = isolation::parse_version(&output).ok_or_else(|| {
+        format!("sbx reported no version IMACS can read ({:?}). Check `sbx version`, {BARE}.", output.trim())
+    })?;
+    if version < MIN_SBX_VERSION {
+        return Err(format!(
+            "sbx {} is older than {}, the oldest IMACS supports. Upgrade it (brew upgrade --cask sbx), {BARE}.",
+            isolation::version_text(version),
+            isolation::version_text(MIN_SBX_VERSION)
+        ));
+    }
+    // diagnose exits non-zero when any check fails, such as an unrelated SSH setting; the report still holds.
+    let (_, output, error) = sbx_output(program, &["diagnose", "--json"], false, TIMEOUT)
+        .map_err(|err| format!("sbx diagnose did not run ({err:#}). Run `sbx diagnose` to see why, {BARE}."))?;
+    let diagnosis: Diagnosis = serde_json::from_str(&output).map_err(|_| {
+        let detail = [error.trim(), output.trim()].into_iter().find(|t| !t.is_empty()).unwrap_or("no output");
+        format!("sbx diagnose gave no report ({detail}). Run `sbx diagnose` to see why, {BARE}.")
+    })?;
+    if !diagnosis.signed_in() {
+        return Err(format!("sbx is not signed in to Docker. Run `sbx login` in a terminal, {BARE}."));
+    }
+    Ok(Ready { version, diagnosis })
+}
+
+/// The doctor's line about sandboxes: a warning, since bare agents need none of this.
+pub fn doctor_line(program: &str) -> String {
+    match preflight(program) {
+        Ok(ready) => imacs_core::doctor::check_line(
+            true,
+            &format!("Docker Sandboxes ready (sbx {}, signed in)", isolation::version_text(ready.version)),
+            "",
+        ),
+        Err(error) => {
+            imacs_core::doctor::check_line(false, "Docker Sandboxes not ready for sandboxed agents (warning)", &error)
+        }
+    }
+}
+
+/// Makes the sandbox unless it exists, which is how a session reattaches after a restart,
+/// once sbx passes [`preflight`]. A new sandbox mounts the worktree and git's write folders,
+/// gets IMACS's MCP server, the configured ones and its repository's allowed hosts.
 pub fn prepare(job: &Prepare) -> Result<()> {
     let ssh = job.config.ssh_agent;
+    let ready = preflight(&job.sbx).map_err(anyhow::Error::msg)?;
     if list(&job.sbx)?.iter().any(|sandbox| sandbox.name == job.name) {
         return Ok(());
+    }
+    // A machine's first sandbox needs sbx's global network policy; one already set up is left alone.
+    if !ready.diagnosis.policy_initialized() {
+        sbx(&job.sbx, &["policy", "init", job.config.network.name()], ssh, TIMEOUT)
+            .context("setting up sbx's network policy")?;
     }
     let (workspace, git) = workspace(&job.cwd)?;
     if let Some(briefs) = &job.briefs {
@@ -223,9 +287,25 @@ pub fn installed(program: &str) -> bool {
     Path::new(program).is_absolute() && Path::new(program).is_file()
 }
 
-/// Runs `sbx args` within `timeout` and returns its output. Output goes to unlinked files, so
-/// a daemon sbx starts and that inherits them cannot keep this waiting.
+/// Runs `sbx args` within `timeout` and returns its output, failing when sbx does.
 fn sbx(program: &str, args: &[impl AsRef<str>], ssh_agent: bool, timeout: Duration) -> Result<String> {
+    let (status, out, err) = sbx_output(program, args, ssh_agent, timeout)?;
+    if !status.success() {
+        let shown = args.first().map_or("", AsRef::as_ref);
+        let detail = [err.trim(), out.trim()].into_iter().find(|text| !text.is_empty()).unwrap_or("no output");
+        bail!("sbx {shown} failed ({status}): {detail}");
+    }
+    Ok(out)
+}
+
+/// Runs `sbx args` within `timeout`: its status, output and errors. Output goes to unlinked
+/// files, so a daemon sbx starts and that inherits them cannot keep this waiting.
+fn sbx_output(
+    program: &str,
+    args: &[impl AsRef<str>],
+    ssh_agent: bool,
+    timeout: Duration,
+) -> Result<(std::process::ExitStatus, String, String)> {
     let args: Vec<&str> = args.iter().map(AsRef::as_ref).collect();
     let shown = format!("sbx {}", args.first().copied().unwrap_or_default());
     let (mut stdout, mut stderr) = (capture()?, capture()?);
@@ -259,12 +339,7 @@ fn sbx(program: &str, args: &[impl AsRef<str>], ssh_agent: bool, timeout: Durati
         file.read_to_string(&mut text)?;
         Ok(text)
     };
-    let (out, err) = (read(&mut stdout)?, read(&mut stderr)?);
-    if !status.success() {
-        let detail = [err.trim(), out.trim()].into_iter().find(|text| !text.is_empty()).unwrap_or("no output");
-        bail!("{shown} failed ({status}): {detail}");
-    }
-    Ok(out)
+    Ok((status, read(&mut stdout)?, read(&mut stderr)?))
 }
 
 fn capture() -> Result<File> {
@@ -388,8 +463,14 @@ mod tests {
         job.briefs = Some(bin.path().join("briefs/s1"));
 
         prepare(&job).unwrap();
-        let verbs: Vec<String> = fake::calls(bin.path()).iter().map(|call| call[..2].join(" ")).collect();
-        assert_eq!(verbs, ["ls --json", "mcp rm", "mcp add", "create --name", "policy allow"]);
+        let verbs: Vec<String> = fake::calls(bin.path())
+            .iter()
+            .map(|call| call.iter().take(2).cloned().collect::<Vec<_>>().join(" "))
+            .collect();
+        assert_eq!(
+            verbs,
+            ["version", "diagnose --json", "ls --json", "mcp rm", "mcp add", "create --name", "policy allow"]
+        );
         let (top, git) = workspace(&worktree).unwrap();
         let expected = Spec {
             name: "imacs-s1".into(),
@@ -415,7 +496,10 @@ mod tests {
         // After a restart the same session finds its sandbox and only attaches.
         let before = fake::calls(bin.path()).len();
         prepare(&job).unwrap();
-        assert_eq!(fake::calls(bin.path())[before..], [["ls", "--json"]]);
+        assert_eq!(
+            fake::calls(bin.path())[before..],
+            [vec!["version"], vec!["diagnose", "--json"], vec!["ls", "--json"]]
+        );
         stop(&job.sbx, "imacs-s1").unwrap();
         assert_eq!(fake::calls(bin.path()).last().unwrap(), &["stop", "imacs-s1"]);
     }
@@ -434,6 +518,65 @@ mod tests {
         assert!(list(&sbx.display().to_string()).unwrap().is_empty());
         let missing = job(&bin.path().join("missing-sbx"), "imacs-s1", &repo, SandboxConfig::default());
         assert!(prepare(&missing).is_err());
+    }
+
+    #[test]
+    fn preflight_refuses_a_missing_old_or_signed_out_sbx_with_what_to_do() {
+        let bin = tempfile::tempdir().unwrap();
+        let sbx = fake::install(bin.path()).display().to_string();
+        let ready = preflight(&sbx).unwrap();
+        assert_eq!(ready.version, (0, 50, 1));
+        assert!(ready.diagnosis.signed_in(), "an unrelated failing check does not matter");
+        assert!(doctor_line(&sbx).starts_with("✓ Docker Sandboxes ready (sbx v0.50.1, signed in)"));
+        std::fs::write(bin.path().join("version"), "v0.51.2").unwrap();
+        assert_eq!(preflight(&sbx).unwrap().version, (0, 51, 2));
+
+        let refusal = |program: &str, needles: &[&str]| {
+            let error = preflight(program).unwrap_err();
+            for needle in needles.iter().chain(&["[isolation] mode = \"bare\""]) {
+                assert!(error.contains(needle), "{needle:?} missing from: {error}");
+            }
+            error
+        };
+        let missing = bin.path().join("missing").display().to_string();
+        refusal(&missing, &["not installed", "brew install --cask docker/tap/sbx"]);
+        refusal("sbx-not-on-this-path", &["not installed"]);
+        std::fs::write(bin.path().join("version"), "v0.49.9").unwrap();
+        refusal(&sbx, &["sbx v0.49.9 is older than v0.50.1", "brew upgrade --cask sbx"]);
+        std::fs::write(bin.path().join("version"), "dev").unwrap();
+        refusal(&sbx, &["no version IMACS can read"]);
+        std::fs::write(bin.path().join("version"), "v0.50.1").unwrap();
+        std::fs::write(bin.path().join("signed-out"), "").unwrap();
+        let error = refusal(&sbx, &["not signed in", "sbx login"]);
+        let line = doctor_line(&sbx);
+        assert!(line.starts_with("✗ Docker Sandboxes not ready for sandboxed agents (warning) — "), "{line}");
+        assert!(line.ends_with(&error), "{line}");
+        std::fs::write(bin.path().join("fail-diagnose"), "").unwrap();
+        refusal(&sbx, &["sbx diagnose gave no report", "fake diagnose failure"]);
+
+        // A refused sandbox is never made: preparation stops before sbx creates anything.
+        std::fs::remove_file(bin.path().join("fail-diagnose")).unwrap();
+        let plain = tempfile::tempdir().unwrap();
+        let error =
+            format!("{:#}", prepare(&job(Path::new(&sbx), "imacs-s1", plain.path(), Default::default())).unwrap_err());
+        assert!(error.contains("not signed in"), "{error}");
+        assert!(fake::calls_to(bin.path(), &["create"]).is_empty() && fake::calls_to(bin.path(), &["mcp"]).is_empty());
+    }
+
+    #[test]
+    fn the_network_preset_sets_up_sbxs_policy_only_when_it_has_none() {
+        let bin = tempfile::tempdir().unwrap();
+        let sbx = fake::install(bin.path());
+        let plain = tempfile::tempdir().unwrap();
+        let config = SandboxConfig { network: isolation::NetworkPreset::DenyAll, ..Default::default() };
+        prepare(&job(&sbx, "imacs-s1", plain.path(), config.clone())).unwrap();
+        assert!(fake::calls_to(bin.path(), &["policy", "init"]).is_empty(), "an existing policy is left alone");
+        std::fs::write(bin.path().join("no-policy"), "").unwrap();
+        prepare(&job(&sbx, "imacs-s2", plain.path(), config)).unwrap();
+        assert_eq!(fake::calls_to(bin.path(), &["policy", "init"]), [["policy", "init", "deny-all"]]);
+        let calls: Vec<String> = fake::calls(bin.path()).iter().map(|call| call[0].clone()).collect();
+        let init = calls.iter().rposition(|verb| verb == "policy").unwrap();
+        assert!(init < calls.iter().rposition(|verb| verb == "create").unwrap(), "{calls:?}");
     }
 
     #[test]

@@ -221,3 +221,45 @@ fn the_cleanup_dialog_removes_a_worktrees_sandbox_and_chosen_orphans() {
         assert_eq!(left, ["imacs-keep"]);
     });
 }
+
+#[test]
+fn a_missing_or_signed_out_sbx_refuses_the_agent_and_blocks_its_task() {
+    with_app("app::sandbox_tests::a_missing_or_signed_out_sbx_refuses_the_agent_and_blocks_its_task", |app, ctx| {
+        let (_dir, repo) = repository();
+        let worktree = worktree(&repo, "task");
+        let bin = tempfile::tempdir().unwrap();
+        let sbx = fake::install(bin.path()).display().to_string();
+        std::fs::write(bin.path().join("signed-out"), "").unwrap();
+        app.runtime.config.isolation.mode = IsolationMode::Sandbox;
+        for (program, reason) in [(app.runtime.sbx.clone(), "not installed"), (sbx, "not signed in")] {
+            app.runtime.sbx = program;
+            let id =
+                app.runtime.start(ctx, "codex", worktree.clone(), None, vec![], Some("Do the task".into())).unwrap();
+            // Dispatch links the task to the session as soon as the tile exists.
+            app.runtime.plans = vec![Plan {
+                id: "plan".into(),
+                tasks: vec![Task {
+                    id: "task".into(),
+                    status: TaskStatus::Running,
+                    session: Some(id.clone()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }];
+            tick_until(app, ctx, "the refusal", |app| {
+                app.runtime.sessions.iter().any(|s| s.id == id && s.status == AgentStatus::Exited)
+            });
+            let session = &app.runtime.sessions[app.runtime.find(&id).unwrap()];
+            let message = session.last_message.clone().unwrap();
+            assert!(message.contains(reason) && message.contains("mode = \"bare\""), "{message}");
+            assert!(session.terminal.is_none() && session.sandbox.is_none(), "nothing ran, sandboxed or bare");
+            let task = &app.runtime.plans[0].tasks[0];
+            assert_eq!(task.status, TaskStatus::Blocked);
+            assert!(task.notes.last().unwrap().contains(reason), "{:?}", task.notes);
+            assert!(app.runtime.toast.as_ref().unwrap().0.contains(reason));
+        }
+        assert!(fake::calls_to(bin.path(), &["create"]).is_empty());
+        assert!(fake::calls_to(bin.path(), &["run"]).is_empty());
+        app.runtime.sessions.clear();
+    });
+}

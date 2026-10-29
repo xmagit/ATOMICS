@@ -28,9 +28,12 @@ case "$1" in
     [ -e "$dir/signed-out" ] && auth=fail
     policy=pass
     [ -e "$dir/no-policy" ] && policy=fail
+    # Like sbx, a failing check (here always the SSH one) makes diagnose exit 1 after its report.
     printf '{"version":"1.0","checks":[{"name":"Binary version","status":"pass"},'
+    printf '{"name":"SSH client config","status":"fail","message":"unmanaged Host stanza"},'
     printf '{"name":"Authentication","status":"%s","message":"not signed in","hint":"Run sbx login"},' "$auth"
     printf '{"name":"Global network policy","status":"%s","message":"not initialized"}]}\n' "$policy"
+    exit 1
     ;;
   ls)
     printf '['

@@ -44,6 +44,11 @@ fn doctor_checks_real_inputs_and_only_requires_git_and_valid_config() {
             assert!(text.contains("✓ git found (git version fixture)"), "{text}");
             assert!(text.contains("✓ config parses"), "{text}");
             assert!(text.contains("Host: fixture"), "{text}");
+            // Sandbox mode is the default; a missing sbx is a warning, not a failed doctor.
+            assert!(
+                text.contains("✗ Docker Sandboxes not ready for sandboxed agents (warning) — Docker Sandboxes (sbx) is not installed"),
+                "{text}"
+            );
             assert!(text.contains(&format!("Loaded config: {}", config.display())), "{text}");
             assert_eq!(text.matches("Loaded config:").count(), 1, "{text}");
         } else {
