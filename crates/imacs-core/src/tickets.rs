@@ -368,6 +368,20 @@ impl TicketConfig {
             && (!self.server.command.is_empty() || self.server.url.as_deref().is_some_and(|u| !u.trim().is_empty()))
     }
 
+    /// Whether operations may address this link: it was made for this system, or for
+    /// no system in particular. Links of another system are left alone after a switch,
+    /// so their ids, briefs and reports never reach unrelated tickets.
+    pub fn accepts(&self, link: &TicketLink) -> bool {
+        link.system.is_empty() || link.system == self.system
+    }
+
+    /// Why a link is left alone, for the card and for replies.
+    pub fn mismatch(&self, link: &TicketLink) -> Option<String> {
+        (!self.accepts(link)).then(|| {
+            format!("{} belongs to {}, but [tickets] is set up for {}", link.label(), link.system, self.system)
+        })
+    }
+
     pub fn operation(&self, name: &str) -> Option<&Operation> {
         match name {
             "get" => self.operations.get.as_ref(),
@@ -930,6 +944,17 @@ mod tests {
         assert_eq!(updated.state.as_deref(), Some("Done"));
         fetched.state = None;
         assert!(!updated.update_from(&fetched), "missing fields keep what is known");
+    }
+
+    #[test]
+    fn links_of_another_system_are_not_accepted() {
+        let config = TicketConfig { system: "alpha".into(), ..TicketConfig::default() };
+        assert!(config.accepts(&link("1")));
+        assert!(config.accepts(&TicketLink { system: String::new(), ..link("1") }), "a link made for no system");
+        let foreign = TicketLink { system: "beta".into(), key: Some("B-1".into()), ..link("1") };
+        assert!(!config.accepts(&foreign));
+        assert_eq!(config.mismatch(&foreign).unwrap(), "B-1 belongs to beta, but [tickets] is set up for alpha");
+        assert_eq!(config.mismatch(&link("1")), None);
     }
 
     #[test]

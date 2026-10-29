@@ -14,6 +14,8 @@ pub(super) struct Tag {
     key: LinkKey,
     /// The link's id when the job was queued: results for a link replaced since are dropped.
     ticket: String,
+    /// The configured system the job was sent to: results never land on another system's link.
+    system: String,
     kind: Kind,
     batch: Option<u64>,
 }
@@ -179,6 +181,19 @@ impl State {
         if let Some(batch) = tag.batch.and_then(|id| self.tickets.batches.get_mut(&id)) {
             batch.pending += 1;
         }
+        let addressed = match &op {
+            TicketOp::Get(link)
+            | TicketOp::Read(link)
+            | TicketOp::List(link)
+            | TicketOp::UpdateState(link, _)
+            | TicketOp::Comment(link, _) => Some(link),
+            TicketOp::Create { .. } => None,
+        };
+        // Callers already leave other systems' links alone; nothing may reach them anyway.
+        if let Some(mismatch) = addressed.and_then(|link| config.mismatch(link)) {
+            self.finish_ticket(tag, Err(mismatch));
+            return;
+        }
         let done = self.tickets.done_tx.clone();
         let jobs = self.tickets.jobs.get_or_insert_with(|| crate::tickets::spawn(done));
         self.tickets.pending += 1;
@@ -205,8 +220,8 @@ impl State {
             .collect();
         for index in plans {
             let id = self.plans[index].id.clone();
-            let board = self.plans[index].ticket.clone();
-            let listed = config.mode == TicketMode::Board && config.operation("list").is_some();
+            let board = self.plans[index].ticket.clone().filter(|link| self.accepted(&config, link, batch));
+            let listed = config.mode == TicketMode::Board && config.operation("list").is_some() && board.is_some();
             match board {
                 Some(board) if listed => self.queue_read(&config, (id.clone(), None), TicketOp::List(board), batch),
                 Some(link) if config.mode == TicketMode::Ticket => {
@@ -214,11 +229,13 @@ impl State {
                 }
                 _ => {}
             }
-            if !(listed && self.plans[index].ticket.is_some()) {
+            if !listed {
                 let links: Vec<(String, TicketLink)> =
                     self.plans[index].tasks.iter().filter_map(|t| Some((t.id.clone(), t.ticket.clone()?))).collect();
                 for (task, link) in links {
-                    self.queue_read(&config, (id.clone(), Some(task)), TicketOp::Get(link), batch);
+                    if self.accepted(&config, &link, batch) {
+                        self.queue_read(&config, (id.clone(), Some(task)), TicketOp::Get(link), batch);
+                    }
                 }
             }
         }
@@ -234,7 +251,7 @@ impl State {
         if config.operation(operation).is_none() || (!self.tickets.refreshing.insert(key.clone()) && batch.is_none()) {
             return;
         }
-        self.send_ticket(config, op, Tag { key, ticket, kind, batch });
+        self.send_ticket(config, op, Tag { key, ticket, kind, batch, system: config.system.clone() });
     }
 
     /// Takes finished ticket jobs; returns whether any arrived.
@@ -276,8 +293,7 @@ impl State {
             (kind @ (Kind::State(_) | Kind::Comment), Ok(TicketOutput::Pushed(fresh))) => {
                 if let Kind::State(state) = &kind {
                     self.tickets.failed.remove(&tag.key);
-                    if let Some(link) = self.link_slot(&tag.key).and_then(Option::as_mut).filter(|l| l.id == tag.ticket)
-                    {
+                    if let Some(link) = self.live_link(&tag, true) {
                         link.pushed_state = Some(state.clone());
                     }
                 }
@@ -285,9 +301,7 @@ impl State {
                     Some(Ok(fetched)) => self.take_ticket(&tag, &fetched, false),
                     Some(Err(err)) => self.ticket_failed(&tag, format!("reading it after the update failed: {err}")),
                     None if !self.tickets.failed.contains_key(&tag.key) => {
-                        if let Some(link) =
-                            self.link_slot(&tag.key).and_then(Option::as_mut).filter(|l| l.id == tag.ticket)
-                        {
+                        if let Some(link) = self.live_link(&tag, true) {
                             link.error = None;
                         }
                         self.save_plan_id(&tag.key.0);
@@ -345,9 +359,35 @@ impl State {
         ticket::redact(error, &self.ticket_secrets())
     }
 
+    /// The link a job's result belongs to: still the same ticket, and of the system the
+    /// job was sent to. With `pin`, a link made for no system takes that system now.
+    fn live_link(&mut self, tag: &Tag, pin: bool) -> Option<&mut TicketLink> {
+        let link = self.link_slot(&tag.key)?.as_mut()?;
+        if link.id != tag.ticket || !(link.system.is_empty() || link.system == tag.system) {
+            return None;
+        }
+        if pin && link.system.is_empty() {
+            link.system = tag.system.clone();
+        }
+        Some(link)
+    }
+
+    /// Whether operations may address a link; a skipped link is named in the batch's errors.
+    fn accepted(&mut self, config: &TicketConfig, link: &TicketLink, batch: Option<u64>) -> bool {
+        match config.mismatch(link) {
+            None => true,
+            Some(mismatch) => {
+                if let Some(entry) = batch.and_then(|id| self.tickets.batches.get_mut(&id)) {
+                    entry.errors.push(format!("{mismatch}; left alone"));
+                }
+                false
+            }
+        }
+    }
+
     fn ticket_failed(&mut self, tag: &Tag, error: String) {
         let error = self.scrub(&error);
-        if let Some(link) = self.link_slot(&tag.key).and_then(Option::as_mut).filter(|l| l.id == tag.ticket)
+        if let Some(link) = self.live_link(tag, false)
             && link.error.as_deref() != Some(&error)
         {
             link.error = Some(error);
@@ -361,7 +401,7 @@ impl State {
         let keep_error = self.tickets.failed.contains_key(&tag.key);
         // A webhook may echo IMACS's own push before the push itself has returned.
         let pushing = self.tickets.pushing.get(&tag.key).cloned();
-        let Some(link) = self.link_slot(&tag.key).and_then(Option::as_mut).filter(|l| l.id == tag.ticket) else {
+        let Some(link) = self.live_link(tag, true) else {
             return;
         };
         let before = link.state.clone();
@@ -385,7 +425,7 @@ impl State {
 
     fn take_board(&mut self, tag: &Tag, items: Vec<TicketLink>) {
         let Some(index) = self.plans.iter().position(|p| p.id == tag.key.0) else { return };
-        if let Some(board) = self.plans[index].ticket.as_mut().filter(|l| l.id == tag.ticket) {
+        if let Some(board) = self.live_link(tag, true) {
             board.synced_at = Some(imacs_core::store::now());
             board.error = None;
         }
@@ -393,7 +433,16 @@ impl State {
             self.plans[index].tasks.iter().filter_map(|t| Some((t.id.clone(), t.ticket.clone()?))).collect();
         for (task, link) in links {
             let key = (tag.key.0.clone(), Some(task));
-            let tag = Tag { key: key.clone(), ticket: link.id.clone(), kind: Kind::Refresh, batch: tag.batch };
+            if !(link.system.is_empty() || link.system == tag.system) {
+                continue;
+            }
+            let tag = Tag {
+                key: key.clone(),
+                ticket: link.id.clone(),
+                kind: Kind::Refresh,
+                batch: tag.batch,
+                system: tag.system.clone(),
+            };
             match items.iter().find(|item| link.same_ticket(item)) {
                 Some(item) => self.take_ticket(&tag, item, true),
                 // Not on the board (any more): read it on its own.
@@ -461,7 +510,7 @@ impl State {
             {
                 links.push(((plan.id.clone(), None), ticket::plan_status(plan), link));
             }
-            for (key, status, link) in links {
+            for (key, status, link) in links.into_iter().filter(|(_, _, link)| config.accepts(link)) {
                 let Some(desired) = config.states.get(status) else { continue };
                 if link.pushed_state.as_deref() == Some(desired)
                     || (link.pushed_state.is_none() && status == TaskStatus::Planned)
@@ -475,7 +524,13 @@ impl State {
         }
         for (key, link, state) in pushes {
             self.tickets.pushing.insert(key.clone(), state.clone());
-            let tag = Tag { key, ticket: link.id.clone(), kind: Kind::State(state.clone()), batch: None };
+            let tag = Tag {
+                key,
+                ticket: link.id.clone(),
+                kind: Kind::State(state.clone()),
+                batch: None,
+                system: config.system.clone(),
+            };
             self.send_ticket(&config, TicketOp::UpdateState(link, state), tag);
         }
     }
@@ -517,13 +572,17 @@ impl State {
             Some(task) => format!("Task {task} has no ticket, and the plan has no ticket to comment on instead."),
             None => "The plan has no ticket to comment on (in board mode, comment on a task's ticket).".into(),
         })?;
+        if let Some(mismatch) = config.mismatch(&link) {
+            return Err(format!("{mismatch}; IMACS leaves it alone."));
+        }
         Ok((config, key, link))
     }
 
     /// Posts a lifecycle comment when the config wants one; silently skips otherwise.
     fn lifecycle_comment(&mut self, index: usize, task: Option<&str>, author: &Author, body: String) {
         if let Ok((config, key, link)) = self.comment_job(index, task, author) {
-            let tag = Tag { key, ticket: link.id.clone(), kind: Kind::Comment, batch: None };
+            let tag =
+                Tag { key, ticket: link.id.clone(), kind: Kind::Comment, batch: None, system: config.system.clone() };
             self.send_ticket(&config, TicketOp::Comment(link, body), tag);
         }
     }
@@ -577,9 +636,12 @@ impl State {
     ) -> serde_json::Value {
         let mut matched: Vec<LinkKey> = Vec::new();
         let mut boards: Vec<String> = Vec::new();
-        let board_mode = self.ticket_config().is_some_and(|c| c.mode == TicketMode::Board);
+        let config = self.ticket_config();
+        let board_mode = config.as_ref().is_some_and(|c| c.mode == TicketMode::Board);
+        // An event naming no system comes from the configured one: other systems' links stay as they are.
+        let ours = |link: &&TicketLink| system.is_some() || config.as_ref().is_none_or(|c| c.accepts(link));
         for plan in self.plans.iter().filter(|p| !p.id.is_empty() && p.status != PlanStatus::Archived) {
-            if let Some(link) = &plan.ticket {
+            if let Some(link) = plan.ticket.as_ref().filter(ours) {
                 if board_mode && (link.matches(system, board, board) || link.matches(system, id, key)) {
                     boards.push(plan.id.clone());
                 } else if link.matches(system, id, key) {
@@ -587,18 +649,24 @@ impl State {
                 }
             }
             for task in &plan.tasks {
-                if task.ticket.as_ref().is_some_and(|link| link.matches(system, id, key)) {
+                if task.ticket.as_ref().filter(ours).is_some_and(|link| link.matches(system, id, key)) {
                     matched.push((plan.id.clone(), Some(task.id.clone())));
                 }
             }
         }
         for link_key in &matched {
             let Some(link) = self.link(link_key).cloned() else { continue };
-            let tag = Tag { key: link_key.clone(), ticket: link.id.clone(), kind: Kind::Refresh, batch: None };
+            let tag = Tag {
+                key: link_key.clone(),
+                ticket: link.id.clone(),
+                kind: Kind::Refresh,
+                batch: None,
+                system: link.system.clone(),
+            };
             self.take_ticket(&tag, &fields, true);
             if !boards.contains(&link_key.0)
                 && let Some(config) = self.ticket_config()
-                && let Some(link) = self.link(link_key).cloned()
+                && let Some(link) = self.link(link_key).cloned().filter(|link| config.accepts(link))
             {
                 self.queue_read(&config, link_key.clone(), TicketOp::Get(link), None);
             }
@@ -747,7 +815,9 @@ impl State {
                 }
                 self.save_plan(index);
                 let batch = self.open_batch(reply, Answer::Link(key.clone()));
-                if let (Some(config), Some(link)) = (config, self.link(&key).cloned()) {
+                if let (Some(config), Some(link)) = (config, self.link(&key).cloned())
+                    && self.accepted(&config, &link, Some(batch))
+                {
                     let op = match &key.1 {
                         None if config.mode == TicketMode::Board => TicketOp::List(link),
                         _ => TicketOp::Get(link),
@@ -763,13 +833,19 @@ impl State {
                 if draft.title.trim().is_empty() {
                     return fail(reply, "create.title is required".into());
                 }
-                let board = self.plans[index].ticket.clone();
+                let board = self.plans[index].ticket.clone().filter(|board| config.accepts(board));
                 let batch = self.open_batch(reply, Answer::Link(key.clone()));
                 let op = TicketOp::Create { board, title: draft.title, body: draft.body };
                 self.send_ticket(
                     &config,
                     op,
-                    Tag { key, ticket: String::new(), kind: Kind::Create, batch: Some(batch) },
+                    Tag {
+                        key,
+                        ticket: String::new(),
+                        kind: Kind::Create,
+                        batch: Some(batch),
+                        system: config.system.clone(),
+                    },
                 );
             }
             (None, None) => fail(reply, "Give ticket (with its id), create (with a title), or unlink.".into()),
@@ -818,7 +894,13 @@ impl State {
             }
             Ok((config, key, link)) => {
                 let batch = self.open_batch(reply, Answer::Comment);
-                let tag = Tag { key, ticket: link.id.clone(), kind: Kind::Comment, batch: Some(batch) };
+                let tag = Tag {
+                    key,
+                    ticket: link.id.clone(),
+                    kind: Kind::Comment,
+                    batch: Some(batch),
+                    system: config.system.clone(),
+                };
                 self.send_ticket(&config, TicketOp::Comment(link, ticket::chief_comment(&author, &text)), tag);
             }
         }
@@ -884,7 +966,8 @@ impl State {
             None => (TicketOp::Read(link.clone()), Kind::Read, Answer::Read(None)),
         };
         let batch = self.open_batch(reply, answer);
-        self.send_ticket(&config, op, Tag { key, ticket: link.id, kind, batch: Some(batch) });
+        let system = config.system.clone();
+        self.send_ticket(&config, op, Tag { key, ticket: link.id, kind, batch: Some(batch), system });
     }
 }
 
@@ -1566,6 +1649,92 @@ mod tests {
     }
 
     #[test]
+    fn switching_systems_never_sends_old_links_to_the_new_system() {
+        with_app("app::tickets::tests::switching_systems_never_sends_old_links_to_the_new_system", |app, ctx| {
+            let dir = tempfile::tempdir().unwrap();
+            for system in ["cards", "issues"] {
+                std::fs::create_dir(dir.path().join(system)).unwrap();
+            }
+            let cards = tickets_fixture(&dir.path().join("cards"), "CARD");
+            configure(app, CARDS, &cards, |_| {});
+            let plan = request(
+                app,
+                json!({"cmd":"plan_set", "goal":"Switch", "ticket":{"id":"b1"}, "tasks":[
+                    {"id":"a", "title":"Parser", "ticket":{"id":"1"}}, {"id":"b", "title":"Docs"}]}),
+            )
+            .result["plan"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let index = app.runtime.selected_plan;
+            app.runtime.plan_view = true;
+            app.runtime.panel = PanelMode::Plan;
+            assert!(request(app, json!({"cmd":"plan_update", "plan":plan, "id":"a", "status":"running"})).ok);
+            settle(app);
+            assert_eq!(ticket(&cards, "CARD-1")["state"], "Doing");
+            assert_eq!(link(app, index, 0).system, "cards");
+
+            // Another system with the same ticket and board ids: any cross-talk would land on them.
+            let issues = tickets_fixture(&dir.path().join("issues"), "ISS");
+            configure(app, ISSUES, &issues, |config| config.mode = TicketMode::Board);
+            settle(app);
+            app.runtime.ticket_heartbeat();
+            settle(app);
+            assert!(
+                request(app, json!({"cmd":"plan_update", "plan":plan, "id":"a", "status":"blocked", "note":"stuck"}))
+                    .ok
+            );
+            app.runtime.sessions.push(session("agent-a", AgentKind::Generic, AgentStatus::Working, dir.path()));
+            app.runtime.plans[index].tasks[0].session = Some("agent-a".into());
+            app.runtime.report(Some("agent-a"), "progress", "Halfway there.");
+            settle(app);
+            let (tx, rx) = channel();
+            let comment =
+                ControlRequest::TicketComment { plan: Some(plan.clone()), task: Some("a".into()), text: "Hi".into() };
+            app.runtime.control(ctx, comment, tx);
+            settle(app);
+            let ControlOutcome::Done(commented) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else { panic!() };
+            assert!(commented.error.unwrap_or_default().contains("belongs to cards"));
+            let (tx, rx) = channel();
+            app.runtime.sync_tickets(Some(plan.clone()), tx);
+            settle(app);
+            let ControlOutcome::Done(synced) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else { panic!() };
+            assert!(synced.result["errors"].to_string().contains("belongs to cards"), "{}", synced.result);
+            request(app, json!({"cmd":"ticket_event", "key":"CARD-1", "state":"Gone"}));
+            settle(app);
+            assert_eq!(tools(&issues), Vec::<String>::new(), "nothing reaches the new system");
+            assert_eq!(link(app, index, 0).state.as_deref(), Some("Doing"), "events from the new system do not apply");
+
+            let output = board_frame(app, ctx, vec![]);
+            let shown = texts(&output);
+            assert!(
+                shown.iter().any(|(text, _)| text.contains("belongs to cards") && text.contains("issues")),
+                "{:?}",
+                shown.iter().map(|(t, _)| t).collect::<Vec<_>>()
+            );
+            output.drop_without_applying_deltas();
+
+            // New links use the new system, and switching back resumes the old ones.
+            let (tx, rx) = channel();
+            let linked = ControlRequest::TicketLink {
+                plan: Some(plan.clone()),
+                task: Some("b".into()),
+                ticket: Some(TicketLink { id: "2".into(), ..TicketLink::default() }),
+                create: None,
+                unlink: false,
+            };
+            app.runtime.control(ctx, linked, tx);
+            settle(app);
+            rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(link(app, index, 1).system, "issues");
+            assert_eq!(tools(&issues), ["issue_read"]);
+            configure(app, CARDS, &cards, |_| {});
+            settle(app);
+            assert_eq!(ticket(&cards, "CARD-1")["state"], "Stuck", "the blocked status reaches the right system later");
+        });
+    }
+
+    #[test]
     fn secrets_echoed_by_a_backend_never_reach_plans_or_replies() {
         with_app("app::tickets::tests::secrets_echoed_by_a_backend_never_reach_plans_or_replies", |app, ctx| {
             const TOKEN: &str = "sk-synthetic-7f3a9c";
@@ -1664,7 +1833,7 @@ mod tests {
             configure(app, CARDS, &state, |_| {});
             assert!(app.runtime.chief_prompt().contains("Tickets: this workspace tracks its work in cards"));
             settle(app);
-            assert_eq!(link(app, index, 0).system, "", "links keep the system they were made with");
+            assert_eq!(link(app, index, 0).system, "cards", "a link made for no system takes the system that reads it");
             assert_eq!(link(app, index, 0).title.as_deref(), Some("Write the parser"), "read once configured");
             let board = call(app, json!({"cmd":"ticket_link", "plan":plan, "ticket":{"id":"b1"}}));
             assert_eq!(board.result["ticket"]["system"], "cards");
