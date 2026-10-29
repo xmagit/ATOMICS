@@ -22,11 +22,11 @@ impl State {
 
     pub(super) fn finish_plan_agents(&mut self) {
         let now = imacs_core::store::now();
-        let workflow = self.workflow().clone();
         for index in 0..self.plans.len() {
             if self.plans[index].status == plan::PlanStatus::Archived {
                 continue;
             }
+            let workflow = self.plan_workflow(&self.plans[index]);
             let was_open = self.plans[index].is_open();
             let mut changed = self.plans[index].finish_tasks(now, &workflow);
             if was_open && self.plans[index].status == PlanStatus::Completed {
@@ -112,12 +112,13 @@ impl State {
         if status == PlanStatus::Open {
             return Err("Choose completed or archived.".into());
         }
+        let workflow = self.plan_workflow(&self.plans[index]);
         if status == PlanStatus::Completed
-            && self.workflow().done != "accepted"
-            && (!self.plans[index].workflow_done(self.workflow())
+            && workflow.done != "accepted"
+            && (!self.plans[index].workflow_done(&workflow)
                 || self.plans[index].tasks.iter().any(|t| t.status != TaskStatus::Done))
         {
-            return Err(format!("Plan completion waits for workflow.done = {:?}.", self.workflow().done));
+            return Err(format!("Plan completion waits for workflow.done = {:?}.", workflow.done));
         }
         let mut closed = self.plans[index].clone();
         closed.status = status;
@@ -173,7 +174,7 @@ impl State {
 
     pub(super) fn plan_json(&self, index: usize) -> serde_json::Value {
         let mut value = serde_json::to_value(&self.plans[index]).unwrap_or_default();
-        value["workflow"] = json!(self.workflow());
+        value["workflow"] = json!(self.plan_workflow(&self.plans[index]));
         value["ready"] = json!(self.plans[index].ready().iter().map(|t| &t.id).collect::<Vec<_>>());
         value["integration"] = json!(self.plans[index].integration_branch());
         if let Some(board) = self.ticket_summary(&self.plans[index].id).and_then(|s| s.get("board").cloned()) {
@@ -205,7 +206,7 @@ impl State {
         repo: &Path,
         task: Option<&str>,
     ) -> Option<String> {
-        let config = self.ticket_config()?;
+        let config = self.project_config(repo).tickets;
         let plan_ticket = link.is_none();
         let link = link.or_else(|| {
             (config.mode == imacs_core::tickets::TicketMode::Ticket)
@@ -216,7 +217,7 @@ impl State {
         if let Some(task) = task.filter(|_| plan_ticket || branch == self.plans[index].integration_branch()) {
             branch.push_str(&format!("-{task}"));
         }
-        git::check_branch_name(repo, &branch, &self.config.base_ref).ok()?;
+        git::check_branch_name(repo, &branch, &self.project_config(repo).base_ref).ok()?;
         Some(branch)
     }
 
@@ -287,7 +288,7 @@ impl State {
             let mut brief = task.compose_brief(&self.plans[index].goal);
             if task.id == imacs_core::plan::REVIEW_TASK {
                 // The reviewer reads every task's branch from the shared repository.
-                let base = &self.config.base_ref;
+                let base = self.plan_base_ref(&self.plans[index]);
                 brief.push_str("\n\nBranches to review (all in this repository):\n");
                 let integration = self.plans[index].integration_branch();
                 brief.push_str(&format!(
@@ -475,6 +476,23 @@ mod tests {
             app.runtime.plans[0].tasks = vec![Task { branch: Some("existing".into()), ..Default::default() }];
             app.runtime.pin_ticket_integration(0);
             assert_eq!(app.runtime.plans[0].integration_branch(), "imacs/plan-branches");
+            std::fs::create_dir(repo.join(".imacs")).unwrap();
+            std::fs::write(
+                repo.join(".imacs/config.toml"),
+                "base_ref = 'main'\n[tickets]\nbranch = 'repo/{key_lower}/{slug}'",
+            )
+            .unwrap();
+            app.runtime.reload_repo_workflows();
+            assert_eq!(
+                app.runtime.ticket_branch(0, Some(&link), &repo, None).as_deref(),
+                Some("repo/eng-42/fix-parser")
+            );
+            app.runtime.pin_ticket_integration(0);
+            assert_eq!(
+                app.runtime.plans[0].integration_branch(),
+                "imacs/plan-branches",
+                "repo edits never rename existing branches"
+            );
         });
     }
 

@@ -1,4 +1,5 @@
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::process::Command;
 
 use imacs_core::{
@@ -24,7 +25,7 @@ struct Report {
 }
 
 pub fn run(workspace: Option<&str>) -> i32 {
-    let report = report(workspace, false);
+    let report = report(workspace, false, &[]);
     for line in &report.lines {
         println!("{line}");
     }
@@ -33,8 +34,8 @@ pub fn run(workspace: Option<&str>) -> i32 {
 
 /// The doctor's checks for an agent, as JSON. Config errors name the file and line without
 /// quoting it, and every line is cleaned of the secrets the configuration runs with.
-pub fn json(workspace: Option<&str>) -> Value {
-    let report = report(workspace, true);
+pub fn json(workspace: Option<&str>, projects: &[PathBuf]) -> Value {
+    let report = report(workspace, true, projects);
     let config_path = paths::config_file();
     let [main, host] = Config::source_paths(&config_path);
     let layers = [Layer::read(Source::Main, &main), Layer::read(Source::Host, &host)];
@@ -60,7 +61,7 @@ pub fn json(workspace: Option<&str>) -> Value {
     })
 }
 
-fn report(workspace: Option<&str>, for_agent: bool) -> Report {
+fn report(workspace: Option<&str>, for_agent: bool, projects: &[PathBuf]) -> Report {
     let mut lines = Vec::new();
     let git_version = Command::new(resolve_program("git"))
         .arg("--version")
@@ -126,15 +127,30 @@ fn report(workspace: Option<&str>, for_agent: bool) -> Report {
                 ))
             }
         }
-        let mut repos: Vec<_> = config.repos.iter().map(|repo| paths::expand(repo)).collect();
+        let mut repos: Vec<_> =
+            config.repos.iter().map(|repo| paths::expand(repo)).chain(projects.iter().cloned()).collect();
         if repos.is_empty()
             && let Ok(cwd) = std::env::current_dir()
         {
             repos.push(cwd);
         }
+        if let Some(workspace) = workspace.and_then(|name| Workspace::load(name).ok()) {
+            repos.extend(workspace.projects);
+        }
+        let mut repos: Vec<_> =
+            repos.into_iter().map(|repo| imacs_core::workspace::project_root(&repo).unwrap_or(repo)).collect();
         repos.sort();
         repos.dedup();
         for repo in repos {
+            let workflow = imacs_core::repo_workflow::RepoWorkflow::read(&repo);
+            for warning in &workflow.warnings {
+                lines.push(check_line(
+                    false,
+                    &format!("repository workflow (warning): {warning}"),
+                    "use only documented declarative keys in .imacs/config.toml",
+                ));
+            }
+            let config = workflow.apply(config);
             lines.push(cache_clone_check(&repo, &config.worktree_path));
             lines.extend(worktree_checks(&repo, &config.base_ref));
         }
@@ -392,7 +408,7 @@ mod tests {
             std::fs::create_dir_all(host.parent().unwrap()).unwrap();
             std::fs::write(&config, "[voice]\napi_key = 'sk-voice-doctor-secret'\n").unwrap();
             std::fs::write(&host, "[layout]\nsidebar_width = pw-doctor-secret\n").unwrap();
-            let broken = json(None);
+            let broken = json(None, &[]);
             let text = broken.to_string();
             assert!(!text.contains("pw-doctor-secret") && !text.contains("sk-voice-doctor-secret"), "{text}");
             assert_eq!(broken["ok"], false);
@@ -406,10 +422,10 @@ mod tests {
             assert_eq!(config_check["ok"], false);
             assert!(config_check["hint"].as_str().unwrap().contains("fix this config"));
             // The terminal's doctor still shows the user the failing line.
-            assert!(report(None, false).lines.iter().any(|line| line.contains("pw-doctor-secret")));
+            assert!(report(None, false, &[]).lines.iter().any(|line| line.contains("pw-doctor-secret")));
 
             std::fs::write(&host, "[layout]\nsidebar_width = 300.0\n").unwrap();
-            let healthy = json(None);
+            let healthy = json(None, &[]);
             let text = healthy.to_string();
             assert!(!text.contains("sk-voice-doctor-secret"), "{text}");
             assert_eq!(healthy["ok"], true, "{healthy}");

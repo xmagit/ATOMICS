@@ -30,7 +30,7 @@ pub enum Source {
     Host,
     /// The active workspace's file. Its `[tickets]` replaces the main config's section as a whole.
     Workspace,
-    /// A repository's own settings. Repositories carry none yet; their layer goes after the workspace.
+    /// A repository's allowlisted declarative settings, after the workspace.
     Repo,
 }
 
@@ -132,6 +132,16 @@ pub fn values(effective: &Config, layers: &[Layer], cleaner: &Cleaner, prefix: O
     let tree = toml::Table::try_from(effective).unwrap_or_default();
     let mut leaves = Vec::new();
     collect_leaves(&tree, &mut Vec::new(), &mut leaves);
+    // Repo-only hints instruct agents; they have no executable Config fields.
+    for layer in layers.iter().filter(|layer| layer.source == Source::Repo) {
+        let hints: toml::Table = layer
+            .table
+            .iter()
+            .filter(|(key, _)| matches!(key.as_str(), "pr_title" | "test_commands" | "qa_commands" | "review_policy"))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        collect_leaves(&hints, &mut Vec::new(), &mut leaves);
+    }
     // The voice key is never serialized; whether it is set in a file is still worth knowing.
     if effective.voice.api_key.is_some() {
         leaves.push((vec!["voice".into(), "api_key".into()], toml::Value::String(MASKED.into())));
@@ -170,12 +180,20 @@ pub fn prompt_sections(layers: &[Layer]) -> Vec<(Source, String)> {
 
 /// The source of the value at `path`: the last file that sets it, else the built-in default.
 pub fn source_of(layers: &[Layer], path: &[String]) -> Source {
-    let workspace_tickets =
-        layers.iter().rev().find(|layer| layer.source == Source::Workspace && layer.table.contains_key("tickets"));
-    if path.first().is_some_and(|first| first == "tickets")
-        && let Some(workspace) = workspace_tickets
+    // A repo overlays individual declarative keys, except workflow, which replaces
+    // the section as a whole just like the workspace workflow and tickets.
+    if let Some(repo) = layers.iter().rev().find(|layer| layer.source == Source::Repo) {
+        if defines(&repo.table, path) {
+            return Source::Repo;
+        }
+        if path.first().is_some_and(|name| name == "workflow") && repo.table.contains_key("workflow") {
+            return Source::Default;
+        }
+    }
+    if let Some(section) = path.first().filter(|name| matches!(name.as_str(), "tickets" | "workflow"))
+        && let Some(workspace) =
+            layers.iter().rev().find(|layer| layer.source == Source::Workspace && layer.table.contains_key(section))
     {
-        // The workspace's section replaces the main config's: what it leaves out is the default.
         return if defines(&workspace.table, path) { Source::Workspace } else { Source::Default };
     }
     layers
@@ -463,7 +481,7 @@ pub fn propose(scope: Scope, layers: &[Layer], fragment: &str, remove: &[String]
         Scope::Workspace => {
             if let Some(change) = changes.iter().find(|change| !workspace_setting(&change.key)) {
                 return Err(format!(
-                    "a workspace file takes only [tickets] and [chief] prompt; {} belongs in the main or host config",
+                    "a workspace file takes only [tickets] and [chief] prompt, plus [workflow]; {} belongs in the main or host config",
                     change.key
                 ));
             }
@@ -471,6 +489,12 @@ pub fn propose(scope: Scope, layers: &[Layer], fragment: &str, remove: &[String]
                 .map_err(|e| format!("the workspace file would not load: {e}"))?;
             if let Some(prompt) = lookup(&table, &["chief", "prompt"]).filter(|prompt| !prompt.is_str()) {
                 return Err(format!("chief.prompt must be text, not {}", prompt.type_str()));
+            }
+            if let Some(workflow) = table.get("workflow") {
+                let workflow = workflow.as_table().ok_or("[workflow] must be a table")?;
+                let workflow = load::<crate::workflow::Workflow>(workflow, "workflow.")
+                    .map_err(|e| format!("[workflow] would not load: {e}"))?;
+                workflow.validate()?;
             }
             if let Some(tickets) = table.get("tickets") {
                 let tickets = tickets.as_table().ok_or("[tickets] must be a table")?;
@@ -482,13 +506,14 @@ pub fn propose(scope: Scope, layers: &[Layer], fragment: &str, remove: &[String]
             let invalid = |e: String| format!("the config would not load: {e}");
             // The main file is shared: it must load on a machine without this host's overrides too.
             if scope == Scope::Main {
-                load::<Config>(&table, "").map_err(invalid)?;
+                load::<Config>(&table, "").map_err(invalid)?.workflow.validate()?;
             }
             let tables = layers
                 .iter()
                 .filter(|layer| matches!(layer.source, Source::Main | Source::Host))
                 .map(|layer| if Some(layer.source) == scope.source() { table.clone() } else { layer.table.clone() });
             let config = load::<Config>(&Config::merged(tables), "").map_err(invalid)?;
+            config.workflow.validate()?;
             warnings = warnings_for(scope, layers, &config, &changes);
         }
         Scope::Theme => unreachable!("theme changes have no config layer"),
@@ -578,6 +603,16 @@ pub fn load_error(layers: &[Layer]) -> Option<String> {
     if let Err(error) = load::<Config>(&merged, "") {
         return Some(format!("the config does not load: {error}"));
     }
+    if let Some(workflow) =
+        layers.iter().filter(|layer| layer.source == Source::Workspace).find_map(|l| l.table.get("workflow"))
+    {
+        let parsed: Result<crate::workflow::Workflow, _> = workflow.clone().try_into();
+        if let Some(error) =
+            parsed.map_err(|_| "invalid workflow settings".to_string()).and_then(|workflow| workflow.validate()).err()
+        {
+            return Some(format!("the workspace's [workflow] does not load: {error}"));
+        }
+    }
     let tickets = layers.iter().filter(|layer| layer.source == Source::Workspace).find_map(|l| l.table.get("tickets"));
     match tickets.map(|tickets| tickets.as_table().ok_or_else(|| "must be a table".to_string())) {
         Some(Ok(tickets)) => load::<crate::tickets::TicketConfig>(tickets, "tickets.").err(),
@@ -589,7 +624,11 @@ pub fn load_error(layers: &[Layer]) -> Option<String> {
 
 /// The settings a workspace file carries.
 fn workspace_setting(key: &str) -> bool {
-    key == "tickets" || key.starts_with("tickets.") || key == "chief.prompt"
+    key == "tickets"
+        || key.starts_with("tickets.")
+        || key == "workflow"
+        || key.starts_with("workflow.")
+        || key == "chief.prompt"
 }
 
 /// Every setting that differs between two versions of a file.
@@ -838,6 +877,38 @@ mod tests {
         }
         let error = propose(Scope::Theme, &[], "accent = \"#e0a458\"", &[]).unwrap_err();
         assert!(error.contains("names its theme"), "{error}");
+    }
+
+    #[test]
+    fn workspace_workflow_proposals_validate_and_sources_include_repo() {
+        let main = layer(Source::Main, "[workflow]\ndone = 'merged'\n");
+        let host = layer(Source::Host, "[workflow]\ndone = 'ci_passed'\n");
+        let workspace = layer(Source::Workspace, "projects = []\n");
+        let layers = [main, host, workspace];
+        let proposal = propose(
+            Scope::Workspace,
+            &layers,
+            "[workflow]\ndone = 'qa_passed'\nstages = ['accepted', 'qa_passed']",
+            &[],
+        )
+        .unwrap();
+        assert!(proposal.after.contains("qa_passed"));
+        assert!(propose(Scope::Workspace, &layers, "[workflow]\ndone = 'ci_failed'", &[]).is_err());
+        assert!(propose(Scope::Workspace, &layers, "[workflow]\nstages = ['merged']", &[]).is_err());
+        assert!(propose(Scope::Workspace, &layers, "[workflow]\ndone = 42", &[]).is_err());
+        let path = |key: &str| key.split('.').map(str::to_string).collect::<Vec<_>>();
+        assert_eq!(source_of(&layers, &path("workflow.done")), Source::Host);
+        let mut layers = layers.to_vec();
+        layers[2] = layer(Source::Workspace, "projects = []\n[workflow]\ndone = 'pr_opened'");
+        assert_eq!(source_of(&layers, &path("workflow.done")), Source::Workspace);
+        assert_eq!(source_of(&layers, &path("workflow.stages")), Source::Default);
+        layers.push(layer(
+            Source::Repo,
+            "[workflow]\nstages = ['accepted', 'merged']\n[tickets]\nbranch = 'repo/{slug}'",
+        ));
+        assert_eq!(source_of(&layers, &path("workflow.done")), Source::Default);
+        assert_eq!(source_of(&layers, &path("workflow.stages")), Source::Repo);
+        assert_eq!(source_of(&layers, &path("tickets.branch")), Source::Repo);
     }
 
     #[test]

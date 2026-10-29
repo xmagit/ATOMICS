@@ -5,8 +5,9 @@ impl State {
     /// or base_ref, and starts `launch` in it.
     pub(super) fn create_worktree(&mut self, repo: PathBuf, branch: String, start: Option<String>, launch: Launch) {
         let path = git::worktree_path(&self.config.worktree_path, &repo, &branch);
-        let (tx, base_ref) = (self.worktree_tx.clone(), self.config.base_ref.clone());
-        let warm = self.config.worktrees.warm.clone();
+        let config = self.project_config(&repo);
+        let (tx, base_ref) = (self.worktree_tx.clone(), config.base_ref);
+        let warm = config.worktrees.warm;
         self.creating.push(branch.clone());
         self.toast(format!("Creating worktree {}…", paths::display(&path)));
         std::thread::spawn(move || {
@@ -36,7 +37,7 @@ impl State {
 
     fn load_cleanup(&self, cleanup: &mut Cleanup) {
         cleanup.rows = None;
-        let (tx, repo, base) = (cleanup.tx.clone(), cleanup.repo.clone(), self.config.base_ref.clone());
+        let (tx, repo, base) = (cleanup.tx.clone(), cleanup.repo.clone(), self.project_config(&cleanup.repo).base_ref);
         std::thread::spawn(move || {
             let result = git::worktree_health(&repo, &base).map_err(|e| format!("{e:#}"));
             let _ = tx.send(CleanupEvent::Loaded(result));

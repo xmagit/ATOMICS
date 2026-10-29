@@ -74,6 +74,23 @@ fn doctor_checks_real_inputs_and_only_requires_git_and_valid_config() {
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8(output.stdout).unwrap().contains("✗ config failed:"));
     std::fs::write(&config, "").unwrap();
+    std::fs::write(&git, "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'git version fixture'; else exit 1; fi\n")
+        .unwrap();
+    let repo_config = dir.path().join(".imacs/config.toml");
+    std::fs::create_dir(repo_config.parent().unwrap()).unwrap();
+    std::fs::write(
+        &repo_config,
+        "base_ref = 'main'\n[approvals]\nallow = ['*']\n[tickets.server]\ncommand = ['must-never-run']\n",
+    )
+    .unwrap();
+    std::fs::write(&config, format!("repos = [{:?}]\n", dir.path().display().to_string())).unwrap();
+    let output = run();
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("repository workflow (warning)"), "{text}");
+    assert!(text.contains("ignored approvals"), "{text}");
+    assert!(text.contains("ignored tickets.server"), "{text}");
+    assert!(!text.contains("must-never-run"));
     let _listener = UnixListener::bind(&socket).unwrap();
     let output = run();
     assert!(output.status.success());
