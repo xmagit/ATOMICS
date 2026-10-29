@@ -40,7 +40,8 @@ pub(super) struct Tickets {
     /// Jobs sent and not yet answered.
     pub(super) pending: usize,
     refreshing: HashSet<LinkKey>,
-    pushing: HashSet<LinkKey>,
+    /// The state each link is being moved to right now.
+    pushing: HashMap<LinkKey, String>,
     /// State pushes that failed, retried on the next heartbeat or sync.
     failed: HashMap<LinkKey, String>,
     /// The tickets each board-mode plan's board lists.
@@ -75,7 +76,7 @@ impl Tickets {
             done_rx,
             pending: 0,
             refreshing: HashSet::new(),
-            pushing: HashSet::new(),
+            pushing: HashMap::new(),
             failed: HashMap::new(),
             boards: HashMap::new(),
             batches: HashMap::new(),
@@ -330,6 +331,8 @@ impl State {
     /// else changing it.
     fn take_ticket(&mut self, tag: &Tag, fetched: &TicketLink, external: bool) {
         let keep_error = self.tickets.failed.contains_key(&tag.key);
+        // A webhook may echo IMACS's own push before the push itself has returned.
+        let pushing = self.tickets.pushing.get(&tag.key).cloned();
         let Some(link) = self.link_slot(&tag.key).and_then(Option::as_mut).filter(|l| l.id == tag.ticket) else {
             return;
         };
@@ -343,7 +346,8 @@ impl State {
             && before.is_some()
             && link.state.is_some()
             && !same_state(link.state.as_deref(), before.as_deref())
-            && !same_state(link.state.as_deref(), link.pushed_state.as_deref());
+            && !same_state(link.state.as_deref(), link.pushed_state.as_deref())
+            && !same_state(link.state.as_deref(), pushing.as_deref());
         let link = link.clone();
         self.save_plan_id(&tag.key.0);
         if moved {
@@ -433,7 +437,7 @@ impl State {
                 let Some(desired) = config.states.get(status) else { continue };
                 if link.pushed_state.as_deref() == Some(desired)
                     || (link.pushed_state.is_none() && status == TaskStatus::Planned)
-                    || self.tickets.pushing.contains(&key)
+                    || self.tickets.pushing.contains_key(&key)
                     || self.tickets.failed.get(&key).is_some_and(|failed| failed == desired)
                 {
                     continue;
@@ -442,7 +446,7 @@ impl State {
             }
         }
         for (key, link, state) in pushes {
-            self.tickets.pushing.insert(key.clone());
+            self.tickets.pushing.insert(key.clone(), state.clone());
             let tag = Tag { key, ticket: link.id.clone(), kind: Kind::State(state.clone()), batch: None };
             self.send_ticket(&config, TicketOp::UpdateState(link, state), tag);
         }
@@ -1072,6 +1076,15 @@ mod tests {
             let reads = count(&state, "card_get");
             settle(app);
             assert_eq!(count(&state, "card_get"), reads + 1);
+            // A webhook echoing IMACS's own push, even before the push returns, is no news.
+            assert!(request(app, json!({"cmd":"plan_update", "plan":plan, "id":"b", "status":"review"})).ok);
+            app.runtime.push_ticket_states();
+            let events = app.runtime.events.iter().filter(|e| e.ticket.is_some()).count();
+            let echo = request(app, json!({"cmd":"ticket_event", "key":"CARD-2", "state":"Check"}));
+            assert_eq!(link(app, index, 1).state.as_deref(), Some("Check"));
+            assert_eq!(echo.result["matched"], json!([{"plan":plan, "task":"b"}]));
+            settle(app);
+            assert_eq!(app.runtime.events.iter().filter(|e| e.ticket.is_some()).count(), events);
             let other =
                 request(app, json!({"cmd":"ticket_event", "system":"elsewhere", "key":"CARD-1", "state":"Gone"}));
             assert_eq!(other.result["matched"], json!([]));

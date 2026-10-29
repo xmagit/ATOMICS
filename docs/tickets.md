@@ -135,7 +135,8 @@ not at all in board mode. Comments follow `comments`. With `"off"`, `imacs_ticke
 
 Each card shows a chip with its ticket's key and state; a click opens the ticket in the browser, and
 hovering shows its title, system, last update and when IMACS last read it. A failed operation shows in
-red beneath the chip. The plan header shows the linked board or ticket. In board mode it adds how many
+red beneath the chip until an operation on that ticket succeeds. Failed state updates are retried; a
+failed comment is not, and neither is a comment still queued when IMACS quits or restarts. The plan header shows the linked board or ticket. In board mode it adds how many
 of the board's tickets have no task yet, plus a **sync** button that reads everything again and retries
 failed updates.
 
