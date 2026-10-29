@@ -2,8 +2,8 @@
 //! streamable HTTP. The ticket layer uses it; nothing here knows about tickets.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -43,7 +43,8 @@ enum Transport {
 struct StdioServer {
     program: String,
     child: Child,
-    stdin: ChildStdin,
+    stdin: Sender<String>,
+    writes: Receiver<std::io::Result<()>>,
     lines: Receiver<String>,
     stderr: Arc<Mutex<String>>,
 }
@@ -156,7 +157,7 @@ impl McpClient {
     fn send(&mut self, message: &Value, id: Option<u64>) -> Result<Option<Value>, McpError> {
         match &mut self.transport {
             Transport::Stdio(server) => server.exchange(message, id, self.timeout),
-            Transport::Http(server) => server.exchange(message, id),
+            Transport::Http(server) => server.exchange(message, id, Instant::now() + self.timeout),
         }
     }
 }
@@ -173,10 +174,23 @@ impl StdioServer {
         let mut child =
             command.spawn().map_err(|err| McpError::Transport(format!("starting {program} failed: {err}")))?;
         let (stdin, stdout, stderr) = (child.stdin.take(), child.stdout.take(), child.stderr.take());
-        let (Some(stdin), Some(stdout), Some(mut stderr_pipe)) = (stdin, stdout, stderr) else {
+        let (Some(mut stdin), Some(stdout), Some(mut stderr_pipe)) = (stdin, stdout, stderr) else {
             let _ = child.kill();
             return Err(McpError::Transport(format!("{program} has no stdio")));
         };
+        // A full pipe must not block the ticket worker. Wait for each write using
+        // the same deadline as its response, including replies to server requests.
+        let (input, messages) = std::sync::mpsc::channel::<String>();
+        let (written, writes) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            while let Ok(message) = messages.recv() {
+                let result = writeln!(stdin, "{message}").and_then(|_| stdin.flush());
+                let failed = result.is_err();
+                if written.send(result).is_err() || failed {
+                    break;
+                }
+            }
+        });
         let (tx, lines) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
@@ -205,38 +219,27 @@ impl StdioServer {
                 }
             }
         });
-        Ok(StdioServer { program: program.to_string(), child, stdin, lines, stderr })
+        Ok(StdioServer { program: program.to_string(), child, stdin: input, writes, lines, stderr })
     }
 
     fn exchange(&mut self, message: &Value, id: Option<u64>, timeout: Duration) -> Result<Option<Value>, McpError> {
-        if let Err(err) = writeln!(self.stdin, "{message}").and_then(|_| self.stdin.flush()) {
-            return Err(self.gone(&format!("writing to it failed: {err}")));
-        }
-        let Some(id) = id else { return Ok(None) };
         let deadline = Instant::now() + timeout;
+        self.write(message, deadline, timeout)?;
+        let Some(id) = id else { return Ok(None) };
         loop {
+            if Instant::now() >= deadline {
+                return Err(self.timed_out(timeout));
+            }
             let line = match self.lines.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                 Ok(line) => line,
-                Err(RecvTimeoutError::Timeout) => {
-                    return Err(McpError::Transport(format!(
-                        "{} did not answer within {} s",
-                        self.program,
-                        timeout.as_secs_f32()
-                    )));
-                }
+                Err(RecvTimeoutError::Timeout) => return Err(self.timed_out(timeout)),
                 Err(RecvTimeoutError::Disconnected) => return Err(self.gone("it exited")),
             };
             // Servers that print banners or logs to stdout still work.
             let Ok(value) = serde_json::from_str::<Value>(&line) else { continue };
             if value.get("method").is_some() {
-                if let Some(request) = value.get("id") {
-                    let reply = if value["method"] == "ping" {
-                        json!({ "jsonrpc": "2.0", "id": request, "result": {} })
-                    } else {
-                        json!({ "jsonrpc": "2.0", "id": request,
-                                "error": { "code": -32601, "message": "IMACS does not support this request" } })
-                    };
-                    let _ = writeln!(self.stdin, "{reply}").and_then(|_| self.stdin.flush());
+                if let Some(reply) = server_reply(&value) {
+                    self.write(&reply, deadline, timeout)?;
                 }
                 continue;
             }
@@ -244,6 +247,23 @@ impl StdioServer {
                 return Ok(Some(value));
             }
         }
+    }
+
+    fn write(&mut self, message: &Value, deadline: Instant, timeout: Duration) -> Result<(), McpError> {
+        if self.stdin.send(message.to_string()).is_err() {
+            return Err(self.gone("writing to it failed"));
+        }
+        match self.writes.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => Err(self.gone(&format!("writing to it failed: {err}"))),
+            Err(RecvTimeoutError::Timeout) => Err(self.timed_out(timeout)),
+            Err(RecvTimeoutError::Disconnected) => Err(self.gone("writing to it failed")),
+        }
+    }
+
+    fn timed_out(&mut self, timeout: Duration) -> McpError {
+        let _ = self.child.kill();
+        McpError::Transport(format!("{} did not answer within {} s", self.program, timeout.as_secs_f32()))
     }
 
     /// The server stopped answering: say how it ended, with the end of its stderr.
@@ -276,10 +296,17 @@ impl Drop for StdioServer {
 }
 
 impl HttpServer {
-    fn exchange(&mut self, message: &Value, id: Option<u64>) -> Result<Option<Value>, McpError> {
+    fn exchange(&mut self, message: &Value, id: Option<u64>, deadline: Instant) -> Result<Option<Value>, McpError> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(McpError::Transport(format!("request to {} timed out", self.url)));
+        }
         let mut request = self
             .agent
             .post(&self.url)
+            .config()
+            .timeout_global(Some(remaining))
+            .build()
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream");
         if let Some(token) = &self.token {
@@ -304,55 +331,102 @@ impl HttpServer {
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default()
             .to_ascii_lowercase();
-        let body = response
-            .body_mut()
-            .read_to_string()
-            .map_err(|err| McpError::Transport(format!("reading the answer from {} failed: {err}", self.url)))?;
         if !(200..300).contains(&status) {
+            let body = response
+                .body_mut()
+                .read_to_string()
+                .map_err(|err| McpError::Transport(format!("reading the answer from {} failed: {err}", self.url)))?;
             let hint = if matches!(status, 401 | 403) { " (check server.token_env)" } else { "" };
             let body: String = body.chars().take(300).collect();
             return Err(McpError::Transport(format!("{} answered HTTP {status}{hint}: {}", self.url, body.trim())));
         }
         let Some(id) = id else { return Ok(None) };
-        let matching = |value: Value| -> Option<Value> {
-            match value {
-                Value::Array(items) => {
-                    items.into_iter().find(|item| item.get("id").and_then(Value::as_u64) == Some(id))
+        if content_type.starts_with("text/event-stream") {
+            let mut reader = BufReader::new(response.body_mut().as_reader());
+            loop {
+                if Instant::now() >= deadline {
+                    return Err(McpError::Transport(format!("request to {} timed out", self.url)));
                 }
-                value if value.get("id").and_then(Value::as_u64) == Some(id) => Some(value),
-                _ => None,
+                let data = read_sse_event(&mut reader).map_err(|err| {
+                    McpError::Transport(format!("reading the answer from {} failed: {err}", self.url))
+                })?;
+                let Some(data) = data else { break };
+                if let Ok(value) = serde_json::from_str(&data)
+                    && let Some(found) = self.handle_message(value, id, deadline)?
+                {
+                    return Ok(Some(found));
+                }
             }
-        };
-        let found = if content_type.starts_with("text/event-stream") {
-            sse_data(&body).into_iter().filter_map(|data| serde_json::from_str(&data).ok()).find_map(matching)
         } else {
-            serde_json::from_str(&body).ok().and_then(matching)
+            let body = response
+                .body_mut()
+                .read_to_string()
+                .map_err(|err| McpError::Transport(format!("reading the answer from {} failed: {err}", self.url)))?;
+            if let Ok(value) = serde_json::from_str(&body)
+                && let Some(found) = self.handle_message(value, id, deadline)?
+            {
+                return Ok(Some(found));
+            }
+        }
+        Err(McpError::Transport(format!("{} sent no answer to request {id}", self.url)))
+    }
+
+    fn handle_message(&mut self, value: Value, id: u64, deadline: Instant) -> Result<Option<Value>, McpError> {
+        let messages = match value {
+            Value::Array(items) => items,
+            value => vec![value],
         };
-        found.map(Some).ok_or_else(|| McpError::Transport(format!("{} sent no answer to request {id}", self.url)))
+        for value in messages {
+            if value.get("method").is_some() {
+                if let Some(reply) = server_reply(&value) {
+                    // MCP responses are separate POSTs, even while the original
+                    // response stream stays open. They share its time budget.
+                    self.exchange(&reply, None, deadline)?;
+                }
+            } else if value.get("id").and_then(Value::as_u64) == Some(id) {
+                return Ok(Some(value));
+            }
+        }
+        Ok(None)
     }
 }
 
-/// The data of each event in a server-sent event stream.
-fn sse_data(body: &str) -> Vec<String> {
-    let mut events = Vec::new();
-    let mut data: Vec<&str> = Vec::new();
-    for line in body.lines().chain([""]) {
+fn server_reply(value: &Value) -> Option<Value> {
+    let id = value.get("id")?;
+    Some(if value["method"] == "ping" {
+        json!({ "jsonrpc": "2.0", "id": id, "result": {} })
+    } else {
+        json!({ "jsonrpc": "2.0", "id": id,
+                "error": { "code": -32601, "message": "IMACS does not support this request" } })
+    })
+}
+
+/// Read only as far as the next event, so an open stream can deliver an answer.
+fn read_sse_event(reader: &mut impl BufRead) -> std::io::Result<Option<String>> {
+    let mut data = Vec::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            return Ok((!data.is_empty()).then(|| data.join("\n")));
+        }
+        let line = line.trim_end_matches(['\r', '\n']);
         if line.is_empty() {
             if !data.is_empty() {
-                events.push(data.join("\n"));
-                data.clear();
+                return Ok(Some(data.join("\n")));
             }
         } else if let Some(value) = line.strip_prefix("data:") {
-            data.push(value.strip_prefix(' ').unwrap_or(value));
+            data.push(value.strip_prefix(' ').unwrap_or(value).to_string());
+        } else if line == "data" {
+            data.push(String::new());
         }
     }
-    events
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
 
     /// Exercise the shipped commented blocks rather than maintaining test-only profiles.
@@ -462,43 +536,85 @@ pub(crate) mod tests {
         assert!(McpClient::connect(&McpServer::default(), Duration::from_secs(1), |_| None).is_err());
     }
 
+    #[test]
+    fn stdio_write_to_a_server_that_never_reads_times_out_and_kills_it() {
+        let program = fake_server().display().to_string();
+        let config = stdio(vec![program.clone(), "--no-read".into()]);
+        let mut server = StdioServer::spawn(&program, &config.command[1..], &config).unwrap();
+        let started = Instant::now();
+        let error = server
+            .exchange(
+                &json!({"method": "large", "params": "x".repeat(4 * 1024 * 1024)}),
+                Some(1),
+                Duration::from_millis(300),
+            )
+            .unwrap_err();
+        assert!(matches!(&error, McpError::Transport(m) if m.contains("did not answer")), "{error:?}");
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(!server.child.wait().unwrap().success(), "the timeout must kill the child");
+        assert!(server.writes.recv_timeout(Duration::from_secs(2)).unwrap().is_err(), "the writer must unblock");
+    }
+
+    #[test]
+    fn stdio_large_tool_call_after_initialize_cannot_block_the_worker() {
+        let config = stdio(vec![fake_server().display().to_string(), "--stop-reading-after-initialize".into()]);
+        let mut client = McpClient::connect(&config, Duration::from_secs(2), |_| None).unwrap();
+        client.timeout = Duration::from_millis(300);
+        let started = Instant::now();
+        let error = client.call_tool("comment", json!({"body": "x".repeat(4 * 1024 * 1024)})).unwrap_err();
+        assert!(matches!(&error, McpError::Transport(m) if m.contains("did not answer")), "{error:?}");
+        drop(client);
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
     /// Status, headers and body of a test server's answer.
     type HttpAnswer = (u16, Vec<(&'static str, String)>, String);
 
     /// One request per connection, answered by `answer` from the JSON-RPC body.
     fn http_server(answer: fn(&Value) -> HttpAnswer) -> (String, Receiver<String>) {
+        http_connections(move |body, stream| {
+            let (status, headers, text) = answer(body);
+            let mut response =
+                format!("HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n", text.len());
+            for (name, value) in headers {
+                response.push_str(&format!("{name}: {value}\r\n"));
+            }
+            response.push_str("\r\n");
+            response.push_str(&text);
+            let _ = stream.write_all(response.as_bytes());
+        })
+    }
+
+    fn http_connections(answer: impl Fn(&Value, &mut TcpStream) + Send + Sync + 'static) -> (String, Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/mcp", listener.local_addr().unwrap());
         let (tx, requests) = std::sync::mpsc::channel();
+        let answer = Arc::new(answer);
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { break };
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
-                let mut head = String::new();
-                let mut length = 0;
-                loop {
-                    let mut line = String::new();
-                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
-                        break;
+                let answer = answer.clone();
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut head = String::new();
+                    let mut length = 0;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                        if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                            length = value.trim().parse().unwrap_or(0);
+                        }
+                        head.push_str(&line);
                     }
-                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                        length = value.trim().parse().unwrap_or(0);
-                    }
-                    head.push_str(&line);
-                }
-                let mut body = vec![0; length];
-                reader.read_exact(&mut body).unwrap();
-                let body: Value = serde_json::from_slice(&body).unwrap();
-                let _ = tx.send(format!("{head}\n{body}"));
-                let (status, headers, text) = answer(&body);
-                let mut response =
-                    format!("HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n", text.len());
-                for (name, value) in headers {
-                    response.push_str(&format!("{name}: {value}\r\n"));
-                }
-                response.push_str("\r\n");
-                response.push_str(&text);
-                let _ = stream.write_all(response.as_bytes());
+                    let mut body = vec![0; length];
+                    reader.read_exact(&mut body).unwrap();
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    let _ = tx.send(format!("{head}\n{body}"));
+                    answer(&body, &mut stream);
+                });
             }
         });
         (url, requests)
@@ -555,8 +671,140 @@ pub(crate) mod tests {
         assert!(matches!(failed, Err(McpError::Transport(m)) if m.contains("HTTP 401 (check server.token_env)")));
     }
 
+    fn start_event_stream(stream: &mut TcpStream) {
+        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nMcp-Session-Id: stream-session\r\nConnection: close\r\n\r\n").unwrap();
+    }
+
+    fn write_event(stream: &mut TcpStream, value: Value) {
+        // Split JSON over data lines and TCP writes; neither is an event boundary.
+        let json = serde_json::to_string_pretty(&value).unwrap();
+        let data = format!(
+            "event: message\r\n{}\r\n\r\n",
+            json.lines().map(|line| format!("data: {line}")).collect::<Vec<_>>().join("\r\n")
+        );
+        for part in data.as_bytes().chunks(17) {
+            write!(stream, "{:x}\r\n", part.len()).unwrap();
+            stream.write_all(part).unwrap();
+            stream.write_all(b"\r\n").unwrap();
+        }
+    }
+
+    #[test]
+    fn http_returns_the_matching_response_while_the_event_stream_stays_open() {
+        let streams = Arc::new(Mutex::new(Vec::new()));
+        let held = streams.clone();
+        let (url, _) = http_connections(move |body, stream| {
+            if body.get("id").is_none() {
+                stream.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n").unwrap();
+                return;
+            }
+            held.lock().unwrap().push(stream.try_clone().unwrap());
+            start_event_stream(stream);
+            write_event(stream, json!({"jsonrpc": "2.0", "id": 999, "result": {}}));
+            write_event(stream, json!({"jsonrpc": "2.0", "id": body["id"], "result": {"ok": true}}));
+            // No terminating chunk: the response really remains open past the deadline.
+        });
+        let mut client =
+            McpClient::connect(&McpServer { url: Some(url), ..McpServer::default() }, Duration::from_secs(2), |_| None)
+                .unwrap();
+        for _ in 0..2 {
+            assert_eq!(client.call_tool("get", json!({})).unwrap(), json!({"ok": true}));
+        }
+        assert_eq!(streams.lock().unwrap().len(), 3, "all response streams are still open");
+    }
+
+    #[test]
+    fn http_answers_server_requests_before_the_tool_response_on_the_same_session() {
+        let pending = Arc::new(Mutex::new(None::<(TcpStream, Value)>));
+        let held = pending.clone();
+        let (url, requests) = http_connections(move |body, stream| {
+            match body["method"].as_str() {
+                Some("initialize") => {
+                    let reply = json!({"jsonrpc": "2.0", "id": body["id"], "result": {}}).to_string();
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: stream-session\r\nContent-Length: {}\r\n\r\n{reply}", reply.len()).unwrap();
+                }
+                Some("notifications/initialized") => {
+                    stream.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n").unwrap();
+                }
+                Some("tools/call") => {
+                    *held.lock().unwrap() = Some((stream.try_clone().unwrap(), body["id"].clone()));
+                    start_event_stream(stream);
+                    // Deliberately reuse our numeric id: a request is not our response.
+                    write_event(stream, json!({"jsonrpc": "2.0", "id": body["id"], "method": "ping"}));
+                }
+                None => {
+                    stream.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n").unwrap();
+                    let mut pending = held.lock().unwrap();
+                    let (original, id) = pending.as_mut().unwrap();
+                    if body.get("result").is_some() {
+                        assert_eq!(body["id"], *id);
+                        assert_eq!(body["result"], json!({}));
+                        write_event(
+                            original,
+                            json!({"jsonrpc": "2.0", "id": "server-unknown", "method": "sampling/createMessage"}),
+                        );
+                    } else {
+                        assert_eq!(body["id"], "server-unknown");
+                        assert_eq!(body["error"]["code"], -32601);
+                        write_event(original, json!({"jsonrpc": "2.0", "id": id, "result": {"ok": true}}));
+                    }
+                }
+                other => panic!("unexpected request: {other:?}"),
+            }
+        });
+        let mut client = McpClient::connect(
+            &McpServer { url: Some(url), token_env: Some("TOKEN".into()), ..McpServer::default() },
+            Duration::from_secs(2),
+            |_| Some("secret".into()),
+        )
+        .unwrap();
+        assert_eq!(client.call_tool("get", json!({})).unwrap(), json!({"ok": true}));
+        let seen: Vec<_> = requests.try_iter().collect();
+        assert_eq!(seen.len(), 5, "initialize, initialized, tool call, ping reply, unknown-method reply");
+        for request in &seen[1..] {
+            let head = request.to_ascii_lowercase();
+            assert!(head.contains("mcp-session-id: stream-session"), "{head}");
+            assert!(head.contains("mcp-protocol-version: 2025-06-18"), "{head}");
+            assert!(head.contains("authorization: bearer secret"), "{head}");
+        }
+        assert!(pending.lock().unwrap().is_some(), "the original stream remains open");
+    }
+
+    #[test]
+    fn http_unanswered_streams_and_stalled_server_replies_are_transport_timeouts() {
+        for server_request in [false, true] {
+            let streams = Arc::new(Mutex::new(Vec::new()));
+            let held = streams.clone();
+            let (url, _) = http_connections(move |body, stream| {
+                held.lock().unwrap().push(stream.try_clone().unwrap());
+                if body.get("method").is_some() {
+                    start_event_stream(stream);
+                    let message = if server_request {
+                        json!({"jsonrpc": "2.0", "method": "ping", "id": "server-ping"})
+                    } else {
+                        json!({"jsonrpc": "2.0", "method": "notifications/progress"})
+                    };
+                    write_event(stream, message);
+                }
+                // Keep both the stream and any reply's HTTP request unanswered.
+            });
+            let started = Instant::now();
+            let failed = McpClient::connect(
+                &McpServer { url: Some(url), ..McpServer::default() },
+                Duration::from_millis(300),
+                |_| None,
+            );
+            assert!(matches!(failed, Err(McpError::Transport(_))));
+            assert!(started.elapsed() < Duration::from_secs(2));
+            assert_eq!(streams.lock().unwrap().len(), if server_request { 2 } else { 1 });
+        }
+    }
+
     #[test]
     fn event_streams_join_multi_line_data() {
-        assert_eq!(sse_data("data: a\ndata: b\n\n: comment\nevent: x\ndata:c"), ["a\nb", "c"]);
+        let mut reader = &b"data: a\r\ndata: b\r\n\r\n: comment\nevent: x\ndata:c"[..];
+        assert_eq!(read_sse_event(&mut reader).unwrap(), Some("a\nb".into()));
+        assert_eq!(read_sse_event(&mut reader).unwrap(), Some("c".into()));
+        assert_eq!(read_sse_event(&mut reader).unwrap(), None);
     }
 }
