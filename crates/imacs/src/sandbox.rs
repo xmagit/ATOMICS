@@ -173,20 +173,30 @@ pub fn prepare(job: &Prepare) -> Result<()> {
         memory: job.config.memory.clone(),
         cpus: job.config.cpus,
         template: job.config.template.clone(),
-        mcp: std::iter::once(job.name.clone()).chain(job.config.mcp.iter().cloned()).collect(),
     };
     // A registration left by an earlier attempt would make `mcp add` fail.
     let _ = sbx(&job.sbx, &["mcp", "rm", "--force", &job.name], ssh, TIMEOUT);
     sbx(&job.sbx, &isolation::mcp_add_args(&job.name, &job.exe, &job.socket), ssh, TIMEOUT)
         .context("registering IMACS's MCP server with sbx")?;
     sbx(&job.sbx, &isolation::create_args(&spec), ssh, CREATE_TIMEOUT).context("creating the sandbox")?;
-    let root = real(&workspace::project_root(&job.cwd).unwrap_or_else(|_| job.cwd.clone()));
-    let hosts = job.config.hosts_for(&root, |repo| real(&paths::expand(repo)));
-    if !hosts.is_empty() {
-        sbx(&job.sbx, &isolation::allow_hosts_args(&job.name, &hosts), ssh, TIMEOUT)
-            .context("allowing the repository's hosts")?;
-    }
-    Ok(())
+    let finish = || -> Result<()> {
+        let servers = std::iter::once(job.name.as_str()).chain(job.config.mcp.iter().map(|s| s.trim()));
+        for server in servers.filter(|server| !server.is_empty()) {
+            sbx(&job.sbx, &isolation::mcp_load_args(server, &job.name), ssh, TIMEOUT)
+                .with_context(|| format!("loading MCP server {server}"))?;
+        }
+        let root = real(&workspace::project_root(&job.cwd).unwrap_or_else(|_| job.cwd.clone()));
+        let hosts = job.config.hosts_for(&root, |repo| real(&paths::expand(repo)));
+        if !hosts.is_empty() {
+            sbx(&job.sbx, &isolation::allow_hosts_args(&job.name, &hosts), ssh, TIMEOUT)
+                .context("allowing the repository's hosts")?;
+        }
+        Ok(())
+    };
+    // A half-made sandbox would be reattached to as it is: remove it so the next start makes it whole.
+    finish().inspect_err(|_| {
+        let _ = remove(&job.sbx, &job.name);
+    })
 }
 
 /// The folder a sandbox mounts read-write for `cwd`, its worktree (else `cwd` itself), and
@@ -488,7 +498,17 @@ mod tests {
             .collect();
         assert_eq!(
             verbs,
-            ["version", "diagnose --json", "ls --json", "mcp rm", "mcp add", "create --name", "policy allow"]
+            [
+                "version",
+                "diagnose --json",
+                "ls --json",
+                "mcp rm",
+                "mcp add",
+                "create --name",
+                "mcp load",
+                "mcp load",
+                "policy allow"
+            ]
         );
         let (top, git) = workspace(&worktree).unwrap();
         let expected = Spec {
@@ -500,12 +520,15 @@ mod tests {
             memory: Some("8g".into()),
             cpus: Some(4),
             template: Some("registry.example.com/agent:1".into()),
-            mcp: vec!["imacs-s1".into(), "notion".into()],
         };
         assert_eq!(fake::calls_to(bin.path(), &["create"]), [isolation::create_args(&expected)]);
         assert!(bin.path().join("briefs/s1").is_dir(), "the brief folder exists before it is mounted");
         let add = &fake::calls_to(bin.path(), &["mcp", "add"])[0];
         assert_eq!(*add, isolation::mcp_add_args("imacs-s1", &job.exe, &job.socket));
+        assert_eq!(
+            fake::calls_to(bin.path(), &["mcp", "load"]),
+            [isolation::mcp_load_args("imacs-s1", "imacs-s1"), isolation::mcp_load_args("notion", "imacs-s1")]
+        );
         assert_eq!(
             fake::calls_to(bin.path(), &["policy"]),
             [["policy", "allow", "network", "--sandbox", "imacs-s1", "nuget.example.com"]]
@@ -531,10 +554,22 @@ mod tests {
         let mut config = SandboxConfig::default();
         config.allow_hosts.insert(repo.display().to_string(), vec!["nuget.example.com".into()]);
         std::fs::write(bin.path().join("fail-create"), "").unwrap();
-        let error = format!("{:#}", prepare(&job(&sbx, "imacs-s1", &repo, config)).unwrap_err());
+        let error = format!("{:#}", prepare(&job(&sbx, "imacs-s1", &repo, config.clone())).unwrap_err());
         assert!(error.contains("creating the sandbox") && error.contains("fake create failure"), "{error}");
         assert!(fake::calls_to(bin.path(), &["policy"]).is_empty());
         assert!(list(&sbx.display().to_string()).unwrap().is_empty());
+
+        // A step after create fails: the half-made sandbox goes, so the next start makes it whole.
+        std::fs::remove_file(bin.path().join("fail-create")).unwrap();
+        std::fs::write(bin.path().join("fail-policy"), "").unwrap();
+        let error = format!("{:#}", prepare(&job(&sbx, "imacs-s1", &repo, config.clone())).unwrap_err());
+        assert!(error.contains("allowing the repository's hosts"), "{error}");
+        assert_eq!(fake::calls(bin.path()).last().unwrap(), &["mcp", "rm", "--force", "imacs-s1"]);
+        assert!(list(&sbx.display().to_string()).unwrap().is_empty());
+        std::fs::remove_file(bin.path().join("fail-policy")).unwrap();
+        prepare(&job(&sbx, "imacs-s1", &repo, config)).unwrap();
+        assert_eq!(fake::calls_to(bin.path(), &["create"]).len(), 3, "the failed, the removed and the whole one");
+        assert_eq!(list(&sbx.display().to_string()).unwrap().len(), 1);
         let missing = job(&bin.path().join("missing-sbx"), "imacs-s1", &repo, SandboxConfig::default());
         assert!(prepare(&missing).is_err());
     }

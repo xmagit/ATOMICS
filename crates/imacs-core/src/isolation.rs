@@ -145,8 +145,6 @@ pub struct Spec {
     pub memory: Option<String>,
     pub cpus: Option<u32>,
     pub template: Option<String>,
-    /// MCP servers fixed at creation: IMACS's own first, then the configured ones.
-    pub mcp: Vec<String>,
 }
 
 /// `sbx create` for `spec`: flags, the agent, then every workspace path.
@@ -160,10 +158,6 @@ pub fn create_args(spec: &Spec) -> Vec<String> {
     }
     if let Some(template) = spec.template.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
         args.extend(["--template".into(), template.into()]);
-    }
-    let mcp: Vec<&str> = spec.mcp.iter().map(|name| name.trim()).filter(|name| !name.is_empty()).collect();
-    if !mcp.is_empty() {
-        args.extend(["--static-mcp".into(), mcp.join(",")]);
     }
     args.push(spec.agent.into());
     args.push(spec.workspace.to_string_lossy().into_owned());
@@ -191,6 +185,12 @@ pub fn mcp_add_args(name: &str, exe: &Path, socket: &Path) -> Vec<String> {
     // `--args` is a comma-separated list; quoting keeps a comma in a path inside one argument.
     args.extend(command.iter().map(|arg| format!("--args={}", csv_field(arg))));
     args
+}
+
+/// `sbx mcp load`: give sandbox `name` a server registered with `sbx mcp add`. The sandbox
+/// keeps it, and a stopped sandbox gets it when it starts again.
+pub fn mcp_load_args(server: &str, name: &str) -> Vec<String> {
+    ["mcp", "load", server.trim(), "--sandbox", name].map(String::from).into()
 }
 
 fn csv_field(value: &str) -> String {
@@ -431,7 +431,6 @@ command = ["codex"]
             memory: None,
             cpus: None,
             template: None,
-            mcp: vec!["imacs-s1".into(), " ".into()],
         };
         assert_eq!(
             create_args(&spec),
@@ -440,8 +439,6 @@ command = ["codex"]
                 "--name",
                 "imacs-s1",
                 "--no-progress",
-                "--static-mcp",
-                "imacs-s1",
                 "codex",
                 "/repos/app-feature",
                 "/repos/app/.git/objects",
@@ -452,10 +449,9 @@ command = ["codex"]
         spec.memory = Some("8g".into());
         spec.cpus = Some(4);
         spec.template = Some("registry.example.com/agent:1".into());
-        spec.mcp.push("notion".into());
         let args = create_args(&spec);
         assert_eq!(
-            args[..12],
+            args[..11],
             [
                 "create",
                 "--name",
@@ -467,11 +463,9 @@ command = ["codex"]
                 "4",
                 "--template",
                 "registry.example.com/agent:1",
-                "--static-mcp",
-                "imacs-s1,notion"
+                "codex",
             ]
         );
-        assert_eq!(args[12], "codex");
     }
 
     #[test]
@@ -497,6 +491,7 @@ command = ["codex"]
                 "--args=--agent",
             ]
         );
+        assert_eq!(mcp_load_args(" notion", "imacs-s1"), ["mcp", "load", "notion", "--sandbox", "imacs-s1"]);
         assert_eq!(
             allow_hosts_args("imacs-s1", &["a.example.com".into(), "b.example.com".into()]),
             ["policy", "allow", "network", "--sandbox", "imacs-s1", "a.example.com,b.example.com"]

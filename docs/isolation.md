@@ -56,7 +56,7 @@ isolation = "bare"           # this agent runs on this machine, whatever mode sa
 | `network` | The preset IMACS uses when sbx has no global network policy yet (`sbx policy init`). A policy that is already set up is left alone, since it covers every sandbox on the machine. Change it with `sbx policy`. |
 | `allow_hosts` | Hosts a repository's sandboxes may reach beyond the policy, keyed by the repository's main checkout. They are added to each new sandbox (`sbx policy allow network --sandbox`). |
 | `ssh_agent` | Off by default: IMACS runs `sbx` without `SSH_AUTH_SOCK`, so there is no agent to forward. Turn it on to let sandboxed agents sign, and so push, as you. A fixed `ssh.agentSocketPath` in sbx's own settings bypasses this. |
-| `mcp` | MCP servers registered with `sbx mcp add`. Each sandbox loads them at creation. |
+| `mcp` | MCP servers registered with `sbx mcp add`. IMACS loads them into each new sandbox (`sbx mcp load`). |
 | `isolation` in `[[agents]]` | `"sandbox"` or `"bare"` for one agent. |
 
 `[isolation]` can be set in `config.toml`, in `config.d/<host>.toml`, or in a workspace file. A workspace's
@@ -126,7 +126,8 @@ mounted read-only.
 ## How sandboxed agents talk to IMACS
 
 - **Reports and ticket tools.** For each sandbox, IMACS registers its MCP server with
-  `sbx mcp add imacs-<session id> --command …`. The server runs on your machine as `imacs mcp --agent`
+  `sbx mcp add imacs-<session id> --command …` and loads it into the sandbox (`sbx mcp load`). The
+  server runs on your machine as `imacs mcp --agent`
   and offers the same tools as for bare agents (`imacs_report` and the agent ticket tools). It identifies
   its session by the sandbox's name, which stays the same across IMACS restarts.
 - **Status.** Hooks run `imacs hook` on your machine, and a sandbox does not have it. A sandboxed agent's
