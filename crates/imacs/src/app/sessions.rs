@@ -112,6 +112,8 @@ impl State {
             return Err(format!("{} is not a folder", cwd.display()));
         }
         let id = uuid::Uuid::new_v4().to_string();
+        // The chief is never sandboxed, whatever the isolation settings or a repository say: it needs
+        // this machine's tools (imacs ctl, git across repositories, builds and screenshots).
         let job = if chief { None } else { self.sandbox_job(&agent, &cwd, &id, resume.as_deref(), prompt.is_some())? };
         let runtime = job.as_ref().map_or(AgentRuntime::Bare, |job| AgentRuntime::Sandbox(job.sandboxed()));
         // Codex's hooks call IMACS on this machine, which a sandboxed Codex cannot reach.

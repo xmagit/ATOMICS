@@ -99,8 +99,8 @@ arguments, and keeps the rest, such as the model and reasoning effort:
 A task planned with `-m gpt-6.1-sol -c model_reasoning_effort=high -s workspace-write -a on-request`
 runs in its sandbox with `-m gpt-6.1-sol -c model_reasoning_effort=high`. Bare agents get every argument.
 
-The chief always runs bare: it reads every open project's main checkout, verifies agents' work in their
-worktrees, and needs every IMACS tool.
+The chief always runs bare, whatever `mode`, a workspace or a repository says, and after a restart too.
+It needs this machine's tools: `imacs ctl`, git across repositories, builds and screenshots.
 
 ## Lifecycle
 

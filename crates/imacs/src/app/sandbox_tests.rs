@@ -318,3 +318,46 @@ fn a_missing_or_signed_out_sbx_refuses_the_agent_and_blocks_its_task() {
         app.runtime.sessions.clear();
     });
 }
+
+#[test]
+fn the_chief_always_runs_on_this_machine() {
+    with_app("app::sandbox_tests::the_chief_always_runs_on_this_machine", |app, ctx| {
+        let (_dir, repo) = repository();
+        let bin = tempfile::tempdir().unwrap();
+        app.runtime.sbx = fake::install(bin.path()).display().to_string();
+        app.runtime.config.isolation.mode = IsolationMode::Sandbox;
+        std::fs::create_dir(repo.join(".imacs")).unwrap();
+        std::fs::write(repo.join(".imacs/config.toml"), "[isolation]\nmode = \"sandbox\"\n").unwrap();
+        app.runtime.view = Some(repo.clone());
+        let out = bin.path().join("chief-ran");
+        app.runtime.config.chief.command =
+            vec!["/bin/sh".into(), "-c".into(), format!("pwd > {0}.tmp; mv {0}.tmp {0}; sleep 5", out.display())];
+        app.runtime.config.chief.args = Vec::new();
+
+        let id = app.runtime.start_chief(ctx, None).unwrap();
+        let chief = &app.runtime.sessions[app.runtime.find(&id).unwrap()];
+        assert!(chief.chief && chief.terminal.is_some() && chief.sandbox.is_none(), "the chief starts bare at once");
+        tick_until(app, ctx, "the chief", |_| out.exists());
+        assert_eq!(Path::new(std::fs::read_to_string(&out).unwrap().trim()), repo.canonicalize().unwrap());
+
+        // Resumed after a restart, it stays on this machine too.
+        let record = SessionRecord {
+            chief: true,
+            pane: Some(id),
+            claude_session_id: "chief-session".into(),
+            agent: "chief".into(),
+            cwd: repo.clone(),
+            title: "chief".into(),
+            last_prompt: None,
+            updated: 0,
+            sandbox: None,
+        };
+        app.runtime.sessions.clear();
+        std::fs::remove_file(&out).unwrap();
+        app.runtime.resume_record(ctx, record);
+        assert!(app.runtime.sessions[0].chief && app.runtime.sessions[0].terminal.is_some());
+        tick_until(app, ctx, "the resumed chief", |_| out.exists());
+        assert!(fake::calls(bin.path()).is_empty(), "the chief never calls sbx");
+        app.runtime.sessions.clear();
+    });
+}
