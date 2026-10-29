@@ -125,9 +125,12 @@ fn ticket_check(config: &imacs_core::tickets::TicketConfig) -> String {
             .collect();
         if missing.is_empty() { Ok(()) } else { Err(format!("missing mapped tools: {}", missing.join(", "))) }
     })();
+    // Doctor output is shared in bug reports: the server's words go through the same
+    // cleaner as everything else IMACS keeps or shows from a ticket server.
+    let cleaner = imacs_core::tickets::Cleaner::of(config, crate::setup::env_var);
     let label = match &result {
         Ok(()) => format!("{} ticket MCP server starts and offers all mapped tools", config.system),
-        Err(error) => format!("{} ticket MCP check failed (warning): {error}", config.system),
+        Err(error) => format!("{} ticket MCP check failed (warning): {}", config.system, cleaner.error(error)),
     };
     check_line(
         result.is_ok(),
@@ -185,6 +188,20 @@ mod tests {
         std::fs::write(&file, "projects = []\n[tickets]\nmode = 'invalid'").unwrap();
         assert!(ticket_config(&main, Some("work")).is_err());
         assert!(ticket_config(&main, Some("missing")).is_err());
+    }
+
+    #[test]
+    fn ticket_check_never_prints_the_servers_credentials() {
+        let mut config: imacs_core::tickets::TicketConfig = toml::from_str("system = \"echo\"").unwrap();
+        config.server.command = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "echo \"bad key $API_KEY for https://me:pw@t.example\" >&2; exit 1".into(),
+        ];
+        config.server.env.insert("API_KEY".into(), "doctorkey-4e5f6a".into());
+        let line = ticket_check(&config);
+        assert!(line.starts_with('✗') && line.contains("bad key ***"), "{line}");
+        assert!(!line.contains("doctorkey-4e5f6a") && !line.contains("pw@"), "{line}");
     }
 
     #[test]

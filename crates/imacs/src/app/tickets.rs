@@ -360,18 +360,16 @@ impl State {
         self.settle_job(tag.batch, error);
     }
 
-    /// Secrets that ticket errors must never carry into plan files or replies: the
-    /// token and the server's secret-looking environment values.
-    /// The worker already cleans what a job brings back with that job's own secrets; this
-    /// second pass covers text made here, such as webhook fields.
-    fn ticket_secrets(&self) -> Vec<String> {
-        self.ticket_config().map_or_else(Vec::new, |config| ticket::secrets_of(&config, crate::setup::known_env_var))
+    /// The cleaner for the configured credentials. The worker already cleans what a job
+    /// brings back with that job's own secrets; this one covers what arrives here, such as
+    /// webhook fields and links the chief gives, and errors made here.
+    fn cleaner(&self) -> ticket::Cleaner {
+        self.ticket_config().map(|config| ticket::Cleaner::of(&config, crate::setup::known_env_var)).unwrap_or_default()
     }
 
-    /// Where ticket errors leave the MCP layer: redacted and bounded before they are
-    /// stored on a link or returned to a caller.
+    /// Where ticket errors are stored on a link or returned to a caller.
     fn scrub(&self, error: &str) -> String {
-        ticket::redact(error, &self.ticket_secrets())
+        self.cleaner().error(error)
     }
 
     /// The link a job's result belongs to: still the same ticket, and of the system the
@@ -651,7 +649,7 @@ impl State {
         fields: TicketLink,
     ) -> serde_json::Value {
         // Webhook fields come from outside like server results and are cleaned the same way.
-        let fields = ticket::clean_link(fields, &self.ticket_secrets());
+        let fields = self.cleaner().link(fields);
         let mut matched: Vec<LinkKey> = Vec::new();
         let mut boards: Vec<String> = Vec::new();
         let config = self.ticket_config();
@@ -780,7 +778,7 @@ impl State {
     /// A link given by the chief: cleaned like a ticket read from the server, and given
     /// the configured system when it names none.
     pub(super) fn stamp_system(&self, link: Option<TicketLink>) -> Option<TicketLink> {
-        link.map(|link| ticket::clean_link(link, &self.ticket_secrets())).map(|mut link| {
+        link.map(|link| self.cleaner().link(link)).map(|mut link| {
             if link.system.is_empty()
                 && let Some(config) = self.ticket_config()
             {
@@ -2079,6 +2077,58 @@ mod tests {
     }
 
     #[test]
+    fn split_and_property_name_secrets_never_reach_plans_events_or_agents() {
+        with_app(
+            "app::tickets::tests::split_and_property_name_secrets_never_reach_plans_events_or_agents",
+            |app, ctx| {
+                use crate::mcp_client::tests::example_profile;
+                const TOKEN: &str = "sk-split-9e8d7c";
+                let dir = tempfile::tempdir().unwrap();
+                let state = tickets_fixture(dir.path(), "ENG");
+                edit_fake(&state, |fake| {
+                    fake["tickets"][0]["title"] = json!("Rotate sk-split\n-9e8d7c now");
+                    fake["tickets"][0]["fields"] = json!({ TOKEN: "rejected", "note": "key sk-split-\r\n9e8d7c" });
+                });
+                let mut config = example_profile("RELAY", &state);
+                config.server.env.insert("API_KEY".into(), TOKEN.into());
+                app.runtime.config.tickets = config;
+                app.runtime.apply_ticket_config();
+                let plan = request(
+                    app,
+                    json!({"cmd":"plan_set", "goal":"Split", "tasks":[{"id":"a", "title":"Own", "ticket":{"id":"1"}}]}),
+                )
+                .result["plan"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                let index = app.runtime.selected_plan;
+                settle(app);
+                assert_eq!(link(app, index, 0).title.as_deref(), Some("Rotate *** now"));
+                // A webhook's state split across lines reaches the link, the wait event and the toast.
+                let waiter = wait_for(app, ctx, &["ticket"]);
+                request(app, json!({"cmd":"ticket_event", "key":"ENG-1", "state":"Blocked by sk-split-\n 9e8d7c"}));
+                let ControlOutcome::Done(event) = waiter.recv_timeout(Duration::from_secs(1)).unwrap() else {
+                    panic!()
+                };
+                assert_eq!(link(app, index, 0).state.as_deref(), Some("Blocked by ***"));
+                // The agent's read cleans property names as well as values.
+                app.runtime.plans[index].tasks[0].session = Some("agent-a".into());
+                app.runtime.sessions.push(session("agent-a", AgentKind::Generic, AgentStatus::Working, dir.path()));
+                let read = ticket_request(app, json!({"cmd":"agent_ticket_get", "pane":"agent-a"}));
+                assert!(read.ok, "{read:?}");
+
+                let saved =
+                    std::fs::read_to_string(paths::imacs_home().join("plans").join(format!("{plan}.json"))).unwrap();
+                let got = request(app, json!({"cmd":"plan_get", "plan":plan})).result.to_string();
+                let toast = app.runtime.toast.clone().map(|(text, _)| text).unwrap_or_default();
+                for text in [saved, got, event.result.to_string(), toast, read.result.to_string()] {
+                    assert!(!text.contains("9e8d7c"), "the token's tail reached {text}");
+                }
+            },
+        );
+    }
+
+    #[test]
     fn secrets_echoed_by_a_backend_never_reach_plans_or_replies() {
         with_app("app::tickets::tests::secrets_echoed_by_a_backend_never_reach_plans_or_replies", |app, ctx| {
             const TOKEN: &str = "sk-synthetic-7f3a9c";
@@ -2125,7 +2175,7 @@ mod tests {
             let ControlOutcome::Done(split) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else { panic!() };
             let split = split.error.unwrap();
             assert!(!split.contains("7f3a9c") && !split.contains("sk-synthe"), "{split}");
-            assert!(split.contains("withheld"), "{split}");
+            assert!(split.contains("rejected key ***, try again"), "masked in place: {split}");
 
             // A stdio server that prints its credentials to stderr before dying.
             let mut dying: TicketConfig = toml::from_str(CARDS).unwrap();

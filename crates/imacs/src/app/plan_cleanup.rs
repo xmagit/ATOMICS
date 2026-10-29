@@ -323,7 +323,9 @@ mod tests {
                 click(app, "✓ Ship cleanup");
                 assert!(app.runtime.plan_view && app.runtime.diff_open && app.runtime.panel == PanelMode::Plan);
                 click(app, "Clean up plan…");
-                let deadline = Instant::now() + Duration::from_secs(10);
+                // The preview runs several git commands per worktree; while the whole suite runs, one
+                // git call can take half a second. The bound only guards against a hang.
+                let deadline = Instant::now() + Duration::from_secs(30);
                 while app.runtime.plan_cleanup.as_ref().unwrap().busy {
                     assert!(Instant::now() < deadline);
                     app.runtime.runtime_tick(ctx);

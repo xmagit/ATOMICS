@@ -233,7 +233,7 @@ fn issue(ticket: &Value) -> Value {
 fn relay(ticket: &Value) -> Value {
     json!({"id":ticket["id"], "key":ticket["key"], "url":ticket["url"], "title":ticket["title"],
         "status":ticket["state"], "updated_at":format!("rev-{}",ticket["rev"].as_u64().unwrap_or(0)),
-        "description":ticket["description"], "comments":ticket["comments"]})
+        "description":ticket["description"], "comments":ticket["comments"], "fields":ticket["fields"]})
 }
 
 fn save(path: &str, state: &Value) {

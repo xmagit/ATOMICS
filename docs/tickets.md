@@ -32,16 +32,23 @@ with an MCP server, changes only the config.
   Failures show on the card and in `imacs_plan_get`, and IMACS carries on. After a connection failure,
   jobs fail at once for 15 seconds instead of each waiting for a server that is down. A failed state
   update is retried on the next heartbeat or sync, not on every tick.
-- **No secrets in plans or replies.** Everything a ticket server sends is cleaned before it leaves the
-  worker, using the credentials of the job that produced it (the `token_env` value and secret-looking
-  `server.env` values), so a result arriving after a rotation is cleaned with the old ones:
-  - Errors lose those credentials in any encoding (raw, percent-encoded, JSON- or `\u`-escaped), bearer and
-    basic credentials, `Authorization` values, URL user info, secret-looking query values, and long runs
-    that look like tokens. A message whose credential is split across lines or content blocks is withheld
-    whole, and every error is bounded to 600 characters.
-  - Every ticket field read (title, key, state, URL, update time) loses those credentials too, and URLs
-    lose user info and secret-looking query and fragment parameters, so the card's link never carries one.
-  - Webhook fields and links the chief gives are cleaned the same way when they arrive.
+- **No secrets in plans or replies.** One cleaner, built from a job's credentials (the `token_env` value and
+  secret-looking `server.env` values), cleans every string IMACS keeps or shows from a ticket system:
+  errors, every ticket field, URLs, agent reads (property names included), webhook fields, links the chief
+  gives, and the doctor's output. The worker cleans each result with the credentials of the job that
+  produced it, so a result arriving after a rotation is cleaned with the old ones. A connection remembers
+  the token it authenticated with, and a job with another token reconnects.
+  - A known credential is masked in place in any encoding (raw, percent-encoded, JSON- or `\u`-escaped, in
+    any mix), even when whitespace or a line break splits it. When it only shows once the text is decoded,
+    unescaped and stripped of whitespace, the whole field is replaced by `[withheld: contained a credential]`.
+  - Errors also lose bearer and basic credentials, `Authorization` values, URL user info, secret-looking query
+    values and long runs that look like tokens, and are bounded to 600 characters. Fields are bounded to
+    2000; bounds cut only after cleaning, between words.
+  - URLs always lose user info. A query or fragment parameter goes only when its decoded name is a credential
+    name (`access_token`, `token`, `api_key`, `apikey`, `password`, `passwd`, `secret`, `client_secret`,
+    `refresh_token`, `id_token`, `auth`, `authorization`, `sig`, `signature`, `x-amz-signature`,
+    `x-amz-credential`, `x-amz-security-token`) or its value holds a known credential; `issueKey`,
+    `assignee` and every other parameter stay, so the card's link still opens the ticket.
 
 ## Configuration
 
