@@ -167,6 +167,13 @@ impl State {
         codex: Option<bool>,
     ) -> Result<String, String> {
         let AgentLaunch { id, agent, cwd, resume, extra_args, prompt, chief } = launch;
+        let prompt = if !chief && agent.kind != AgentKind::Shell {
+            let root = workspace::project_root(&cwd).unwrap_or_else(|_| cwd.clone());
+            let section = imacs_core::repo_workflow::RepoWorkflow::read(&root).agent_section();
+            if section.is_empty() { prompt } else { Some(format!("{}{section}", prompt.unwrap_or_default())) }
+        } else {
+            prompt
+        };
         let agent_name = agent.name.clone();
         let shell = crate::setup::shell_program();
         let mut env: HashMap<String, String> =

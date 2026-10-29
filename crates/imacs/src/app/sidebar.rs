@@ -666,6 +666,20 @@ impl Desktop<'_> {
             return;
         };
 
+        if let Some(workflow) = self.runtime.repo_workflows.get(&project) {
+            egui::CollapsingHeader::new("Repository workflow").id_salt(("repo-workflow", &project)).show(ui, |ui| {
+                for (file, text) in &workflow.instructions {
+                    ui.label(RichText::new(file).small()).on_hover_text(text);
+                }
+                for warning in &workflow.warnings {
+                    ui.label(warning);
+                }
+                if workflow.instructions.is_empty() {
+                    ui.small("No IMACS.md or .imacs/*.md");
+                }
+            });
+        }
+
         // Worktrees of the focused project, folded by default (big repos have dozens).
         let worktrees: Vec<WorktreeEntry> = self
             .worktrees

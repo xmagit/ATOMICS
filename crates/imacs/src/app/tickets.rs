@@ -197,6 +197,10 @@ impl State {
                 prompt.push_str(&text);
             }
         }
+        for root in &self.repos {
+            let workflow = imacs_core::repo_workflow::RepoWorkflow::read(root);
+            prompt.push_str(&workflow.chief_section(&paths::display(root)));
+        }
         prompt
     }
 

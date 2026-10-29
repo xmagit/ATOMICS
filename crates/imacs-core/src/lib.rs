@@ -28,6 +28,7 @@ pub mod layout;
 #[cfg(feature = "native")]
 pub mod paths;
 pub mod plan;
+pub mod repo_workflow;
 pub mod selfconfig;
 pub mod session;
 pub mod steer;

@@ -49,6 +49,7 @@ mod plan_cleanup;
 mod plan_view;
 mod plans;
 mod projects;
+mod repo_workflow;
 mod restart;
 mod selfconfig;
 mod sessions;
@@ -343,6 +344,7 @@ pub(crate) struct State {
     config: Config,
     config_path: PathBuf,
     config_stamp: [Option<u64>; 2],
+    repo_workflows: HashMap<PathBuf, imacs_core::repo_workflow::RepoWorkflow>,
     config_checked: Instant,
     config_error: Option<String>,
     palette: Arc<Palette>,
@@ -702,6 +704,7 @@ impl State {
             palette: Arc::new(Palette::from_config(&config.theme)),
             highlighter: Arc::new(Highlighter::new(&Palette::from_config(&config.theme).syntax)),
             config_stamp: config_fingerprints(&config_path),
+            repo_workflows: HashMap::new(),
             config,
             config_path,
             config_checked: Instant::now(),

@@ -207,6 +207,7 @@ impl State {
 
         if self.config_checked.elapsed() > Duration::from_secs(1) {
             self.reload_config();
+            changed |= self.reload_repo_workflows();
         }
 
         if self.worktrees_at.is_none_or(|at| at.elapsed() > WORKTREE_REFRESH) {
