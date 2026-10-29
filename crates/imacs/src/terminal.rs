@@ -564,6 +564,45 @@ mod tests {
     }
 
     #[test]
+    fn color_queries_answer_the_theme_and_follow_theme_changes() {
+        let paper =
+            Palette::from_config(&imacs_core::config::ThemeConfig { name: "paper".into(), ..Default::default() });
+        let claude = Palette::from_config(&imacs_core::config::ThemeConfig::default());
+        let answer = |color: Color32| {
+            let channel = |v: u8| format!("{v:02x}{v:02x}");
+            format!("rgb:{}/{}/{}!", channel(color.r()), channel(color.g()), channel(color.b()))
+        };
+        let dir = tempfile::tempdir().unwrap();
+        // OSC 10 foreground, 11 background, 4;1 red, 12 cursor; each answer has a fixed length.
+        for (query, length, light, dark) in [
+            ("\\033]10;?\\007", 24, paper.foreground, claude.foreground),
+            ("\\033]11;?\\007", 24, paper.terminal, claude.terminal),
+            ("\\033]4;1;?\\007", 25, paper.ansi[1], claude.ansi[1]),
+            ("\\033]12;?\\007", 24, paper.cursor, claude.cursor),
+        ] {
+            let terminal = Terminal::spawn(
+                crate::host::Wake::default(),
+                paper.terminal_colors(),
+                "/bin/sh".into(),
+                color_query_args(query, length),
+                dir.path(),
+                HashMap::new(),
+                100,
+            )
+            .unwrap();
+            wait_for_text(&terminal, "ready");
+            terminal.write(b"x".to_vec());
+            wait_for_text(&terminal, &answer(light));
+            terminal.set_colors(claude.terminal_colors());
+            terminal.write(b"x".to_vec());
+            wait_for_text(&terminal, &answer(dark));
+            terminal.shutdown();
+        }
+        assert_eq!(paper.colorfgbg(), "0;15");
+        assert_eq!(claude.colorfgbg(), "15;0");
+    }
+
+    #[test]
     fn keys_map_to_terminal_sequences() {
         let none = Modifiers::NONE;
         assert_eq!(key_bytes(Key::Enter, none, false).unwrap(), b"\r");

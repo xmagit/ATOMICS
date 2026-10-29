@@ -14,8 +14,11 @@ use crate::config::ThemeConfig;
 pub const DEFAULT: &str = "claude";
 
 /// Built-in themes, each a theme file that sets every token.
-const BUILTIN: &[(&str, &str)] =
-    &[("claude", include_str!("../themes/claude.toml")), ("midnight", include_str!("../themes/midnight.toml"))];
+const BUILTIN: &[(&str, &str)] = &[
+    ("claude", include_str!("../themes/claude.toml")),
+    ("midnight", include_str!("../themes/midnight.toml")),
+    ("paper", include_str!("../themes/paper.toml")),
+];
 
 /// Theme files deeper than this are treated as a mistake rather than read forever.
 const MAX_DEPTH: usize = 16;
@@ -40,7 +43,7 @@ impl ThemeMode {
     pub fn base(self) -> &'static str {
         match self {
             ThemeMode::Dark => DEFAULT,
-            ThemeMode::Light => DEFAULT,
+            ThemeMode::Light => "paper",
         }
     }
 }
@@ -514,13 +517,25 @@ mod tests {
     }
 
     #[test]
-    fn switching_mode_without_a_syntax_theme_picks_the_mode_default() {
+    fn light_themes_get_light_bases_and_syntax() {
         let read = files(&[
-            ("light", "extends = \"claude\"\nmode = \"light\""),
-            ("named", "mode = \"light\"\nsyntax = \"GitHub\""),
+            ("claude-light", "extends = \"claude\"\nmode = \"light\"\nbackground = \"#ffffff\""),
+            ("named", "extends = \"claude\"\nmode = \"light\"\nsyntax = \"GitHub\""),
+            ("sepia", "mode = \"light\"\nbackground = \"#f4ecd8\""),
         ]);
-        assert_eq!(resolve(&theme("light"), &read).tokens.syntax.as_deref(), Some("OneHalfLight"));
+        let switched = resolve(&theme("claude-light"), &read).tokens;
+        assert_eq!(switched.syntax.as_deref(), Some("OneHalfLight"), "a mode switch drops the dark syntax theme");
+        assert_eq!(switched.accent, builtin("claude").unwrap().accent, "everything else is still inherited");
         assert_eq!(resolve(&theme("named"), &read).tokens.syntax.as_deref(), Some("GitHub"));
+        let sepia = resolve(&theme("sepia"), &read);
+        assert_eq!(sepia.chain, ["sepia", "paper"], "a light file without extends builds on the light base");
+        assert_eq!(sepia.tokens.foreground, builtin("paper").unwrap().foreground);
+        let paper = builtin("paper").unwrap();
+        assert_eq!(paper.mode, Some(ThemeMode::Light));
+        assert_eq!(paper.syntax.as_deref(), Some(ThemeMode::Light.default_syntax()));
+        let mut inline = theme("claude");
+        inline.tokens.mode = Some(ThemeMode::Light);
+        assert_eq!(resolve(&inline, |_| None).tokens.syntax.as_deref(), Some("OneHalfLight"));
     }
 
     #[test]

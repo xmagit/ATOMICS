@@ -174,6 +174,7 @@ impl State {
                 .into_iter()
                 .map(|(k, v)| (k.to_string(), v))
                 .collect();
+        env.insert("COLORFGBG".into(), self.palette.colorfgbg().into());
         if let Some(path) = SHELL_PATH.as_ref() {
             env.insert("PATH".into(), path.clone());
         }

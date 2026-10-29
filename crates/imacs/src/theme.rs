@@ -50,6 +50,7 @@ pub struct Palette {
     pub fonts: Fonts,
 }
 
+#[cfg(test)]
 const fn rgb(hex: u32) -> Color32 {
     Color32::from_rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
 }
@@ -59,6 +60,7 @@ const UI_SIZE: f32 = 13.0;
 
 impl Palette {
     /// `[theme]` resolved against the built-in themes only.
+    #[cfg(test)]
     pub fn from_config(theme: &ThemeConfig) -> Palette {
         Palette::from_resolved(imacs_core::theme::resolve(theme, |_| None), Path::new(".")).0
     }
@@ -145,6 +147,14 @@ impl Palette {
     /// The font for UI text: monospace when the theme asks for it.
     pub fn ui(&self, size: f32) -> egui::FontId {
         if self.mono_ui { egui::FontId::monospace(size * 0.92) } else { egui::FontId::proportional(size) }
+    }
+
+    /// `COLORFGBG` for programs that read it instead of asking the terminal: white on black, or black on white.
+    pub fn colorfgbg(&self) -> &'static str {
+        match self.mode {
+            ThemeMode::Dark => "15;0",
+            ThemeMode::Light => "0;15",
+        }
     }
 
     /// A faint wash of the foreground over whatever is under the pointer, in light and dark themes.
@@ -339,6 +349,30 @@ mod tests {
         assert_eq!(style.visuals.weak_text_color, Some(rgb(0x0a0b0c)));
         assert_eq!(style.visuals.selection.bg_fill, palette.selection);
         assert!(style.visuals.dark_mode);
+    }
+
+    #[test]
+    fn light_themes_reach_egui_whatever_the_system_appearance() {
+        let paper = Palette::from_config(&ThemeConfig { name: "paper".into(), ..ThemeConfig::default() });
+        assert_eq!(paper.mode, ThemeMode::Light);
+        assert_eq!(paper.syntax, "OneHalfLight");
+        let ctx = egui::Context::default();
+        for (palette, system, dark) in [
+            (&paper, egui::Theme::Dark, false),
+            (&Palette::from_config(&ThemeConfig::default()), egui::Theme::Light, true),
+        ] {
+            palette.apply(&ctx);
+            let output = ctx.run_ui(egui::RawInput { system_theme: Some(system), ..Default::default() }, |_| {});
+            output.drop_without_applying_deltas();
+            let visuals = ctx.global_style().visuals.clone();
+            assert_eq!(visuals.dark_mode, dark, "the theme's mode wins over a {system:?} system");
+            assert_eq!(visuals.panel_fill, palette.panel);
+            assert_eq!(visuals.window_fill, palette.overlay);
+            assert_eq!(visuals.widgets.inactive.bg_fill, palette.raised);
+            assert_eq!(visuals.widgets.inactive.fg_stroke.color, palette.foreground);
+            assert_eq!(visuals.selection.bg_fill, palette.selection);
+            assert_eq!(visuals.text_cursor.stroke.color, palette.cursor);
+        }
     }
 
     /// Colors written into UI code instead of taken from the theme, as `file:line: code`.
