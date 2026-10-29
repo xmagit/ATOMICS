@@ -1853,6 +1853,47 @@ mod tests {
     }
 
     #[test]
+    fn plan_set_supersedes_pending_creates_by_the_ids_tasks_end_up_with() {
+        with_app(
+            "app::tickets::tests::plan_set_supersedes_pending_creates_by_the_ids_tasks_end_up_with",
+            |app, ctx| {
+                let dir = tempfile::tempdir().unwrap();
+                let state = tickets_fixture(dir.path(), "CARD");
+                configure(app, CARDS, &state, |_| {});
+                let plan =
+                    request(app, json!({"cmd":"plan_set", "goal":"Ids", "ticket":{"id":"b1"}, "tasks":[{"id":"t1"}]}))
+                        .result["plan"]
+                        .as_str()
+                        .unwrap()
+                        .to_string();
+                let index = app.runtime.selected_plan;
+                settle(app);
+                let (tx, created) = channel();
+                let create = ControlRequest::TicketLink {
+                    plan: Some(plan.clone()),
+                    task: Some("t1".into()),
+                    ticket: None,
+                    create: Some(TicketDraft { title: "Created late".into(), body: String::new() }),
+                    unlink: false,
+                };
+                app.runtime.control(ctx, create, tx);
+                // A task without an id becomes t1, and its ticket is newer than the pending create.
+                assert!(
+                    request(
+                        app,
+                        json!({"cmd":"plan_set", "plan":plan, "goal":"Ids", "tasks":[{"id":" ", "ticket":{"id":"2"}}]})
+                    )
+                    .ok
+                );
+                settle(app);
+                created.recv_timeout(Duration::from_secs(1)).unwrap();
+                assert_eq!(app.runtime.plans[index].tasks[0].id, "t1");
+                assert_eq!(link(app, index, 0).label(), "CARD-2", "the plan_set link stays");
+            },
+        );
+    }
+
+    #[test]
     fn secrets_echoed_by_a_backend_never_reach_plans_or_replies() {
         with_app("app::tickets::tests::secrets_echoed_by_a_backend_never_reach_plans_or_replies", |app, ctx| {
             const TOKEN: &str = "sk-synthetic-7f3a9c";

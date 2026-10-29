@@ -312,11 +312,18 @@ impl Plan {
 
     /// Updates the plan, keeping progress of tasks that keep their id. The user
     /// approves the updated plan again.
-    pub fn replace(&mut self, goal: String, mut tasks: Vec<Task>) {
+    /// The ids `replace` gives tasks: blank ids become t1, t2… by position.
+    pub fn assign_task_ids(tasks: &mut [Task]) {
         for (i, task) in tasks.iter_mut().enumerate() {
             if task.id.trim().is_empty() {
                 task.id = format!("t{}", i + 1);
             }
+        }
+    }
+
+    pub fn replace(&mut self, goal: String, mut tasks: Vec<Task>) {
+        Plan::assign_task_ids(&mut tasks);
+        for task in tasks.iter_mut() {
             let old = self.tasks.iter().find(|t| t.id == task.id);
             task.ticket = crate::tickets::TicketLink::relink(task.ticket.take(), old.and_then(|o| o.ticket.as_ref()));
             if let Some(old) = old {

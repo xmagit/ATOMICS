@@ -153,7 +153,7 @@ impl State {
                     done(ControlResponse::ok(result))
                 }
             },
-            ControlRequest::PlanSet { plan, goal, tasks, integration, ticket } => {
+            ControlRequest::PlanSet { plan, goal, mut tasks, integration, ticket } => {
                 let new = plan.is_none();
                 let index = if plan.is_some() {
                     target
@@ -163,6 +163,8 @@ impl State {
                     self.plans.len() - 1
                 };
                 let plan_id = self.plans[index].id.clone();
+                // Newer links supersede pending creates of the slots tasks will have, not of the ids sent.
+                Plan::assign_task_ids(&mut tasks);
                 for task in tasks.iter().filter(|t| t.ticket.is_some()) {
                     self.relinked((plan_id.clone(), Some(task.id.clone())));
                 }
