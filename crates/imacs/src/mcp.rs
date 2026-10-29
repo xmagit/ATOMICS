@@ -94,7 +94,7 @@ fn agent_tools() -> Value {
 }
 
 /// Tools only the chief's own server offers: restarting IMACS and configuring it.
-const CHIEF_ONLY: &[&str] = &["imacs_restart", "imacs_config_get", "imacs_config_propose"];
+const CHIEF_ONLY: &[&str] = &["imacs_restart", "imacs_config_get", "imacs_config_propose", "imacs_doctor"];
 
 fn available_tools(agent: bool, chief: bool) -> Value {
     if agent {
@@ -424,6 +424,11 @@ fn config_tools() -> Value {
             } }
         },
         {
+            "name": "imacs_doctor",
+            "description": "Chief only: IMACS's setup checks as JSON, the same as `imacs doctor`: git, claude, codex and hx on the login-shell PATH, the Codex version, whether the config loads, plans, the approvals list, the workspace's ticket server and its tools, worktrees, the socket and the hooks. Each check has ok, its text and a hint when it failed; only git and the config are required, other failures are warnings. Secrets are left out, and config errors give the file and line. Takes a few seconds; use it to diagnose a setup before proposing a change.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
             "name": "imacs_config_propose",
             "description": "Chief only: propose a change to one config file for the user to apply. scope main is config.toml (shared by every machine that shares it), host is config.d/<host>.toml (this machine only), workspace is the active workspace's file ([tickets] and [chief] prompt only). remove takes dotted keys out first; toml then merges in: tables key by key, arrays and other values replace. IMACS checks that the result loads, then shows the user a diff with Apply and Reject, labeling settings that run commands, send credentials or instruct agents. Nothing is written before the user applies it. Returns a proposal id; the outcome (applied, rejected or failed, with the user's note) arrives as a config event in imacs_wait. Keep secrets out of the config: token_env and api_key_env name environment variables.",
             "inputSchema": { "type": "object", "properties": {
@@ -500,6 +505,7 @@ fn request_for_tool(name: &str, mut args: Value) -> Result<ControlRequest, Strin
         "imacs_ticket_event" => "ticket_event",
         "imacs_config_get" => "config_get",
         "imacs_config_propose" => "config_propose",
+        "imacs_doctor" => "doctor",
         _ => return Err(format!("unknown tool {name}")),
     };
     if let Some(map) = args.as_object_mut() {

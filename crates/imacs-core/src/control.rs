@@ -226,6 +226,8 @@ pub enum ControlRequest {
         #[serde(default)]
         key: Option<String>,
     },
+    /// The doctor's checks as JSON, without secrets, for the active workspace.
+    Doctor,
     /// A change to one config file, shown to the user as a diff to apply or reject. Nothing
     /// is written until the user applies it; the outcome arrives as a `config` event.
     ConfigPropose {

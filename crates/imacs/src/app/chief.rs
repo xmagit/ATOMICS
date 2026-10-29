@@ -108,6 +108,7 @@ pub(super) const CHIEF_ALLOWED_TOOLS: &[&str] = &[
     "mcp__imacs__imacs_ticket_comment",
     "mcp__imacs__imacs_config_get",
     "mcp__imacs__imacs_config_propose",
+    "mcp__imacs__imacs_doctor",
 ];
 
 impl Desktop<'_> {

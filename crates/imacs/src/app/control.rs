@@ -297,6 +297,15 @@ impl State {
                     fields,
                 )))
             }
+            ControlRequest::Doctor => {
+                // The checks start programs and the ticket server: run them off the runtime thread.
+                let workspace = self.workspace.clone();
+                std::thread::spawn(move || {
+                    let report = crate::doctor::json(workspace.as_deref());
+                    let _ = reply.send(ControlOutcome::Done(ControlResponse::ok(report)));
+                });
+                return;
+            }
             ControlRequest::ConfigPropose { scope, toml, remove, reason, pane } => {
                 done(match self.propose_config(scope, &toml, &remove, reason, pane.as_deref()) {
                     Ok(result) => ControlResponse::ok(result),

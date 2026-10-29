@@ -63,6 +63,30 @@ impl Layer {
     pub fn unreadable(source: Source, path: impl Into<String>, error: String) -> Layer {
         Layer { source, path: path.into(), text: None, table: toml::Table::new(), error: Some(error) }
     }
+
+    /// Reads a file: its text, nothing when it does not exist, or why it could not be read.
+    #[cfg(feature = "native")]
+    pub fn read(source: Source, file: &Path) -> Layer {
+        let path = crate::paths::display(file);
+        match std::fs::read_to_string(file) {
+            Ok(text) => Layer::new(source, path, Some(text)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Layer::new(source, path, None),
+            Err(err) => Layer::unreadable(source, path, err.to_string()),
+        }
+    }
+}
+
+/// Why the main and host files would not load, by file and line and never quoting a line:
+/// what an agent may read about a config that fails.
+pub fn problems(layers: &[Layer]) -> Vec<String> {
+    let mut problems: Vec<String> =
+        layers.iter().filter_map(|layer| Some(format!("{}: {}", layer.path, layer.error.as_ref()?))).collect();
+    let missing = |layer: &&Layer| layer.source == Source::Main && layer.text.is_none() && layer.error.is_none();
+    if let Some(main) = layers.iter().find(missing) {
+        problems.push(format!("{} does not exist; IMACS creates it when it starts", main.path));
+    }
+    problems.extend(load_error(layers));
+    problems
 }
 
 /// A TOML parse error by line and column, without the source line the error's display

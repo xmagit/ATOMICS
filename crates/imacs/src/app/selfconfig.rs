@@ -24,15 +24,6 @@ pub(super) struct Pending {
     from: String,
 }
 
-/// A configuration file read for a tool: its text, or the reason it could not be read.
-fn read_layer(source: Source, file: &Path) -> Layer {
-    match std::fs::read_to_string(file) {
-        Ok(text) => Layer::new(source, paths::display(file), Some(text)),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Layer::new(source, paths::display(file), None),
-        Err(err) => Layer::unreadable(source, paths::display(file), err.to_string()),
-    }
-}
-
 /// A repository's own settings file. Repositories carry no IMACS settings yet; this is
 /// where a repository's layer joins, after the workspace.
 fn repo_layer(_root: &Path) -> Option<Layer> {
@@ -44,9 +35,9 @@ impl State {
     /// this host's, the active workspace's, and the project's own when given.
     pub(super) fn config_layers(&self, project: Option<&Path>) -> Vec<Layer> {
         let [main, host] = Config::source_paths(&self.config_path);
-        let mut layers = vec![read_layer(Source::Main, &main), read_layer(Source::Host, &host)];
+        let mut layers = vec![Layer::read(Source::Main, &main), Layer::read(Source::Host, &host)];
         if let Some(file) = self.workspace.as_deref().and_then(|name| Workspace::file(name).ok()) {
-            layers.push(read_layer(Source::Workspace, &file));
+            layers.push(Layer::read(Source::Workspace, &file));
         }
         layers.extend(project.and_then(repo_layer));
         layers
