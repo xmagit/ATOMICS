@@ -513,19 +513,110 @@ impl FieldPaths {
     }
 }
 
-/// Text from a ticket server made safe to store and show: the given secrets, bearer and
-/// basic credentials, `Authorization` values, URL user info and secret-looking query
-/// values become `***`, and the result is at most [`MAX_ERROR_CHARS`] long.
+/// What replaces a server message that still held a known secret after masking, such
+/// as one split across lines or content blocks.
+pub const WITHHELD: &str = "the ticket server's message was withheld because it contained a credential";
+
+/// An error from a ticket server made safe to store and show. Known secrets in any
+/// encoding, bearer and basic credentials, `Authorization` values, URL user info,
+/// secret-looking query values and long credential-like runs become `***`; a message
+/// whose secret was split by a line or block break is withheld whole. The result is at
+/// most [`MAX_ERROR_CHARS`] long.
 pub fn redact(text: &str, secrets: &[String]) -> String {
-    let mut out = text.to_string();
-    for secret in secrets.iter().map(|s| s.trim()).filter(|s| s.chars().count() >= 6) {
-        out = out.replace(secret, "***");
+    let secrets = usable(secrets);
+    let masked = mask(text, &secrets);
+    let collapsed: String = masked.chars().filter(|c| !c.is_whitespace()).collect();
+    if secrets.iter().any(|secret| find_secret(&collapsed, secret, 0).is_some()) {
+        return WITHHELD.into();
     }
-    let out = redact_query(&redact_userinfo(&redact_credentials(&out)));
+    let out = redact_runs(&redact_query(&redact_userinfo(&redact_credentials(&masked))));
     match out.char_indices().nth(MAX_ERROR_CHARS) {
         Some((cut, _)) => format!("{}…", &out[..cut]),
         None => out,
     }
+}
+
+/// Secrets long enough to look for without masking ordinary words.
+fn usable(secrets: &[String]) -> Vec<&str> {
+    secrets.iter().map(|s| s.trim()).filter(|s| s.chars().count() >= 6).collect()
+}
+
+/// Known secrets, in any encoding, become `***`.
+fn mask(text: &str, secrets: &[&str]) -> String {
+    let mut out = text.to_string();
+    for secret in secrets {
+        let mut masked = String::with_capacity(out.len());
+        let mut pos = 0;
+        while let Some((start, end)) = find_secret(&out, secret, pos) {
+            masked.push_str(&out[pos..start]);
+            masked.push_str("***");
+            pos = end;
+        }
+        masked.push_str(&out[pos..]);
+        out = masked;
+    }
+    out
+}
+
+/// Where `secret` first occurs in `text` from byte `from`, with each of its characters
+/// written raw, percent-encoded, JSON-escaped (`\/`, `\\`, `\"`) or `\u`-escaped, in
+/// any mix, as JSON bodies and URLs echo them.
+fn find_secret(text: &str, secret: &str, from: usize) -> Option<(usize, usize)> {
+    (from..text.len())
+        .filter(|&start| text.is_char_boundary(start))
+        .find_map(|start| secret.chars().try_fold(start, |at, c| encoded_char(text, at, c)).map(|end| (start, end)))
+}
+
+/// Where `c` ends when it is written at byte `at` of `text` in one of its encodings.
+fn encoded_char(text: &str, at: usize, c: char) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let rest = &bytes[at..];
+    let mut raw = [0u8; 4];
+    let raw = c.encode_utf8(&mut raw).as_bytes();
+    if rest.starts_with(raw) {
+        return Some(at + raw.len());
+    }
+    let hex = |digits: &[u8]| std::str::from_utf8(digits).ok().and_then(|d| u32::from_str_radix(d, 16).ok());
+    if rest.len() >= 6 && rest.starts_with(b"\\u") && hex(&rest[2..6]) == Some(c as u32) {
+        return Some(at + 6);
+    }
+    if matches!(c, '/' | '\\' | '"') && rest.len() >= 2 && rest[0] == b'\\' && rest[1] == c as u8 {
+        return Some(at + 2);
+    }
+    let mut end = at;
+    for byte in raw {
+        let encoded = bytes.get(end..end + 3)?;
+        if encoded[0] != b'%' || hex(&encoded[1..]) != Some(u32::from(*byte)) {
+            return None;
+        }
+        end += 3;
+    }
+    Some(end)
+}
+
+/// Long runs of credential characters mixing letters and digits, like the tokens of most
+/// services, become `***` even when IMACS was never told the secret.
+fn redact_runs(text: &str) -> String {
+    let credential = |c: char| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '_' | '%' | '.' | '-' | '\\');
+    let mut out = String::with_capacity(text.len());
+    let mut run = String::new();
+    let flush = |run: &mut String, out: &mut String| {
+        let looks_like_credential = run.chars().count() >= 24
+            && run.chars().any(|c| c.is_ascii_digit())
+            && run.chars().any(|c| c.is_ascii_alphabetic());
+        out.push_str(if looks_like_credential { "***" } else { run });
+        run.clear();
+    };
+    for c in text.chars() {
+        if credential(c) {
+            run.push(c);
+        } else {
+            flush(&mut run, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut run, &mut out);
+    out
 }
 
 fn value_end(c: char) -> bool {
@@ -1043,6 +1134,38 @@ mod tests {
         assert!(comment.arguments(&Vars::new("alpha").ticket(&ticket)).unwrap_err().contains("{body}"));
         assert!(config.operation("update_state").is_none());
         assert!(!TicketConfig::default().is_configured());
+    }
+
+    #[test]
+    fn redaction_finds_secrets_in_any_encoding_and_unknown_credentials() {
+        let token = "sk/abc+def=ghi_123";
+        let secrets = vec![token.to_string()];
+        for leaked in [
+            token,
+            "sk%2Fabc%2Bdef%3Dghi_123",
+            "sk%2fabc%2bdef%3dghi_123",
+            "sk\\/abc+def=ghi_123",
+            "sk\\u002fabc\\u002Bdef\\u003dghi_123",
+            "sk\\/abc%2Bdef\\u003dghi_123",
+        ] {
+            assert_eq!(
+                redact(&format!("said {leaked} twice: {leaked}."), &secrets),
+                "said *** twice: ***.",
+                "{leaked}"
+            );
+        }
+        // Content blocks are joined with newlines, which can split a secret.
+        let split = redact("tool failed: key sk/abc+de\nf=ghi_123 rejected", &secrets);
+        assert!(!split.contains("ghi_123") && !split.contains("sk/abc"), "{split}");
+        assert!(split.contains("withheld"), "{split}");
+        // Credentials IMACS was never told about: long runs of letters and digits.
+        assert_eq!(redact("upstream key ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3 rejected", &[]), "upstream key *** rejected");
+        assert_eq!(redact("token: dGhpcyBpcyBhIHNlY3JldCB0b2tlbiAxMjM0NTY3OA==", &[]), "token: ***");
+        for kept in
+            ["no ticket ENG-123 in /usr/local/lib/node_modules/mcp-remote", "rate limited until 2026-10-29T10:00:00Z"]
+        {
+            assert_eq!(redact(kept, &secrets), kept);
+        }
     }
 
     #[test]

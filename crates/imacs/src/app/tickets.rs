@@ -1975,6 +1975,18 @@ mod tests {
             let ControlOutcome::Done(commented) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else { panic!() };
             let reply = commented.error.unwrap();
 
+            // A token split across two content blocks, joined with a newline on the way in.
+            edit_fake(&state, |fake| fake["fail_message"] = json!(["rejected key sk-synthe", "tic-7f3a9c, try again"]));
+            let (tx, rx) = channel();
+            let comment =
+                ControlRequest::TicketComment { plan: Some(plan.clone()), task: Some("a".into()), text: "Hi".into() };
+            app.runtime.control(ctx, comment, tx);
+            settle(app);
+            let ControlOutcome::Done(split) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else { panic!() };
+            let split = split.error.unwrap();
+            assert!(!split.contains("7f3a9c") && !split.contains("sk-synthe"), "{split}");
+            assert!(split.contains("withheld"), "{split}");
+
             // A stdio server that prints its credentials to stderr before dying.
             let mut dying: TicketConfig = toml::from_str(CARDS).unwrap();
             dying.server.command =

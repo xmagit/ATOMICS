@@ -6,7 +6,7 @@
 //! It speaks two unrelated tool dialects, so tests can swap ticket systems by config
 //! alone: "card_*" tools with nested, structured results, and "issue_*" tools with
 //! flat results as JSON text. The state file holds `tickets`, every call made
-//! (`calls`), tools that fail (`fail`, with an optional `fail_message`) and tools that never answer (`hang`). Each call
+//! (`calls`), tools that fail (`fail`, with an optional `fail_message`, one string or an array of blocks) and tools that never answer (`hang`). Each call
 //! rereads and rewrites it, so tests can change tickets behind IMACS's back and check
 //! what IMACS pushed.
 
@@ -103,9 +103,15 @@ fn call(path: &str, params: &Value) -> Result<Value, String> {
     }
     if listed("fail") {
         save(path, &state);
-        // `fail_message` lets tests make a failing backend echo whatever they need.
-        let text = state["fail_message"].as_str().map_or_else(|| format!("{name} is broken today"), str::to_string);
-        return Ok(json!({ "isError": true, "content": [{ "type": "text", "text": text }] }));
+        // `fail_message` lets tests make a failing backend echo whatever they need, as one
+        // text block or, given an array, as several.
+        let blocks = match &state["fail_message"] {
+            Value::String(text) => vec![text.clone()],
+            Value::Array(texts) => texts.iter().filter_map(Value::as_str).map(str::to_string).collect(),
+            _ => vec![format!("{name} is broken today")],
+        };
+        let content: Vec<Value> = blocks.into_iter().map(|text| json!({ "type": "text", "text": text })).collect();
+        return Ok(json!({ "isError": true, "content": content }));
     }
     let text = |value: Value| json!({ "content": [{ "type": "text", "text": value.to_string() }] });
     let structured =
