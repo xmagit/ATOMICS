@@ -48,7 +48,7 @@ diff_size = 12.5
 scrollback = 5000           # lines each terminal keeps; a full 20000 on a wide terminal takes about 80 MB
 
 [theme]
-name = "claude"             # built in: claude, midnight, atomisk, paper (light); or themes/<name>.toml beside this file
+name = "claude"             # built in: claude, midnight, atomisk, paper and tide (light); or themes/<name>.toml beside this file
 # Any theme token set here wins over the theme; docs/themes.md lists them all. For example:
 # accent = "#d77757"
 # syntax = "Monokai Extended"   # any bat/two-face theme

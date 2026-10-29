@@ -131,13 +131,7 @@ impl State {
     /// The theme on screen, the themes there are, and the tokens a theme file takes.
     fn themes_json(&self) -> serde_json::Value {
         let dir = imacs_core::theme::themes_dir(&self.config_path);
-        let mut files: Vec<String> = std::fs::read_dir(&dir)
-            .into_iter()
-            .flatten()
-            .filter_map(|entry| entry.ok()?.path().file_name()?.to_str()?.strip_suffix(".toml").map(str::to_string))
-            .filter(|name| imacs_core::theme::valid_name(name))
-            .collect();
-        files.sort();
+        let files = imacs_core::theme::file_names(&dir);
         json!({
             "selected": self.config.theme.name,
             "built_in": imacs_core::theme::builtin_names().collect::<Vec<_>>(),

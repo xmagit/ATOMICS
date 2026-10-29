@@ -183,6 +183,8 @@ mod tests {
                     Err(error) => panic!("hook connection: {error}"),
                 }
             };
+            // macOS hands accepted sockets the listener's non-blocking mode; reads must wait.
+            stream.set_nonblocking(false).unwrap();
             let remaining = child.remaining().max(Duration::from_millis(1));
             stream.set_read_timeout(Some(remaining)).unwrap();
             stream.set_write_timeout(Some(remaining)).unwrap();

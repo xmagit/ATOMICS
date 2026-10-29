@@ -869,6 +869,8 @@ impl Desktop<'_> {
             ui.close();
         }
         ui.separator();
+        self.themes_menu(ui);
+        ui.separator();
         let keys = &self.runtime.config.keys;
         for (key, what) in [
             (&keys.quick_open, "open file"),

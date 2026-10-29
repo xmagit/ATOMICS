@@ -312,6 +312,7 @@ impl State {
                     self.highlighter = Arc::new(Highlighter::new(&palette.syntax));
                 }
                 self.palette = Arc::new(palette);
+                self.refresh_themes();
                 let colors = self.palette.terminal_colors();
                 let terminals = self.sessions.iter().filter_map(|s| s.terminal.as_ref()).chain(self.editors.values());
                 for terminal in terminals {

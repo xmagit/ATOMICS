@@ -383,6 +383,10 @@ impl State {
                 }
                 Err(err) => done(ControlResponse::error(format!("{err:#}"))),
             },
+            ControlRequest::ShowSettings { open } => {
+                self.client_events.push(ClientEvent::ShowSettings(open));
+                done(ControlResponse::ok(json!({ "settings_open": open })))
+            }
             ControlRequest::ShowDiff { open } => {
                 self.diff_open = open;
                 done(ControlResponse::ok(json!({ "diff_open": open })))
