@@ -175,13 +175,11 @@ Saving projects under your home writes `~/…` paths. For example, `workspaces/h
 
 ```toml
 projects = ["~/repos/atomisk"]
-
-[tickets]
-provider = "relay"
 ```
 
-`[tickets]` belongs to the workspace, so work can choose Linear and home Relay. Workspace loading and saving
-preserve this table and its provider settings; host configuration does not implement ticket-provider behavior.
+A workspace file can also hold its own `[tickets]` section, so work can follow Linear and home Relay. It replaces
+the main config's `[tickets]` as a whole, so copy a complete profile: the Relay or Linear block in the default
+config. See [docs/tickets.md](docs/tickets.md). Loading and saving a workspace keep the section as written.
 Keep runtime state (`~/.imacs`, including sessions, sockets and plans) local to each machine.
 
 ## Testing on Linux

@@ -1071,6 +1071,20 @@ mod tests {
     }
 
     #[test]
+    fn readme_ticket_examples_are_whole_sections() {
+        let readme = include_str!("../../../README.md");
+        for block in readme.split("```toml\n").skip(1).filter_map(|rest| rest.split("```").next()) {
+            if !block.lines().any(|line| line.trim() == "[tickets]") {
+                continue;
+            }
+            let table: toml::Table = toml::from_str(block).unwrap();
+            let tickets: TicketConfig = table["tickets"].clone().try_into().unwrap();
+            // A workspace's section replaces the main config's, so a partial one switches tickets off.
+            assert!(tickets.is_configured(), "incomplete [tickets] example in the README:\n{block}");
+        }
+    }
+
+    #[test]
     fn inserted_values_are_never_substituted_again() {
         let config = config(
             "[operations.comment]\ntool = \"note\"\narguments = { text = \"{body} ({key})\", raw = \"{unknown}\" }\n",
