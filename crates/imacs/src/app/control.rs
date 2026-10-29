@@ -487,12 +487,8 @@ impl State {
                 Some(index) => {
                     let root = self.sessions[index].root();
                     self.diffs.entry(root.clone()).or_default().mark_dirty();
-                    ControlOutcome::Diff {
-                        root,
-                        base_ref: self.config.base_ref.clone(),
-                        patch,
-                        session: json!(self.sessions[index].id),
-                    }
+                    let base_ref = self.project_config(&root).base_ref;
+                    ControlOutcome::Diff { root, base_ref, patch, session: json!(self.sessions[index].id) }
                 }
             },
             ControlRequest::Comment { session, path, line, removed, text } => match self.find(&session) {

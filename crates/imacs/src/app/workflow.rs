@@ -10,8 +10,9 @@ impl State {
         event: Stage,
         author: Author,
     ) -> Result<serde_json::Value, String> {
-        self.workflow().validate()?;
-        if !self.workflow().allows(&event.stage) {
+        let workflow = self.plan_workflow(&self.plans[index]);
+        workflow.validate()?;
+        if !workflow.allows(&event.stage) {
             return Err(self.cleaner().error(&format!("unknown workflow stage {:?}", event.stage)));
         }
         if self.plans[index].status == PlanStatus::Archived {

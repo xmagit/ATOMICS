@@ -2,9 +2,36 @@ use super::*;
 use imacs_core::repo_workflow::RepoWorkflow;
 
 impl State {
+    pub(super) fn project_config(&self, repo: &Path) -> Config {
+        let root =
+            self.project_of(repo).or_else(|| workspace::project_root(repo).ok()).unwrap_or_else(|| repo.to_path_buf());
+        let config =
+            Config { tickets: self.effective_tickets(), workflow: self.workflow().clone(), ..self.config.clone() };
+        match self.repo_workflows.get(&root) {
+            Some(workflow) => workflow.apply(&config),
+            None => RepoWorkflow::read(&root).apply(&config),
+        }
+    }
+
+    pub(super) fn plan_base_ref(&self, plan: &Plan) -> String {
+        let root =
+            plan.project.clone().or_else(|| plan.tasks.iter().find_map(|t| t.repo.as_deref().map(paths::expand)));
+        root.map(|root| self.project_config(&root).base_ref).unwrap_or_else(|| self.config.base_ref.clone())
+    }
+
+    pub(super) fn plan_workflow(&self, plan: &Plan) -> imacs_core::workflow::Workflow {
+        let root =
+            plan.project.clone().or_else(|| plan.tasks.iter().find_map(|t| t.repo.as_deref().map(paths::expand)));
+        root.map(|root| self.project_config(&root).workflow).unwrap_or_else(|| self.workflow().clone())
+    }
+
     pub(super) fn reload_repo_workflows(&mut self) -> bool {
         let mut roots = self.repos.clone();
         roots.extend(self.plans.iter().filter_map(|p| p.project.clone()));
+        roots.extend(
+            self.plans.iter().flat_map(|p| p.tasks.iter()).filter_map(|t| t.repo.as_deref().map(paths::expand)),
+        );
+        let mut roots: Vec<_> = roots.into_iter().map(|root| workspace::project_root(&root).unwrap_or(root)).collect();
         roots.sort();
         roots.dedup();
         let mut changed = false;
@@ -13,6 +40,9 @@ impl State {
             let loaded = RepoWorkflow::read(&root);
             if self.repo_workflows.get(&root).is_none_or(|old| old.fingerprint != loaded.fingerprint) {
                 self.repo_workflows.insert(root, loaded);
+                for diff in self.diffs.values_mut() {
+                    diff.mark_dirty();
+                }
                 changed = true;
             }
         }
@@ -24,6 +54,55 @@ impl State {
 mod tests {
     use super::super::tests::{repository, with_app};
     use super::*;
+
+    #[test]
+    fn repo_settings_override_workspace_and_gate_only_their_project() {
+        with_app(
+            "app::repo_workflow::tests::repo_settings_override_workspace_and_gate_only_their_project",
+            |app, _| {
+                let (_dir, repo) = repository();
+                app.runtime.repos = vec![repo.clone()];
+                app.runtime.config.tickets.branch = Some("workspace/{slug}".into());
+                std::fs::create_dir(repo.join(".imacs")).unwrap();
+                std::fs::write(repo.join(".imacs/config.toml"), "base_ref = 'main'\n[tickets]\nbranch = 'issue/{key_number}-{slug}'\n[workflow]\ndone = 'qa_passed'\nstages = ['accepted', 'pr_opened', 'qa_passed']").unwrap();
+                app.runtime.reload_repo_workflows();
+                let plan = Plan {
+                    project: Some(repo.clone()),
+                    tasks: vec![plan::Task { id: "a".into(), status: TaskStatus::Done, ..Default::default() }],
+                    ..Default::default()
+                };
+                assert_eq!(app.runtime.plan_workflow(&plan).done, "qa_passed");
+                assert_eq!(app.runtime.plan_workflow(&Plan::default()).done, "accepted");
+                let config = app.runtime.project_config(&repo);
+                assert_eq!(config.base_ref, "main");
+                let ticket = imacs_core::tickets::TicketLink {
+                    id: "NEO-1234".into(),
+                    key: Some("NEO-1234".into()),
+                    title: Some("Project policy".into()),
+                    ..Default::default()
+                };
+                assert_eq!(config.tickets.branch_name(&ticket).as_deref(), Some("issue/1234-project-policy"));
+                let mut plan = plan;
+                plan.id = "repo-gate".into();
+                app.runtime.plans.push(plan);
+                let index = app.runtime.plans.len() - 1;
+                assert!(app.runtime.close_plan(index, PlanStatus::Completed).is_err());
+                let author = imacs_core::tickets::Author::Chief("GPT-6".into());
+                app.runtime
+                    .record_stage(
+                        index,
+                        None,
+                        imacs_core::workflow::Stage { stage: "qa_passed".into(), ..Default::default() },
+                        author,
+                    )
+                    .unwrap();
+                assert_eq!(app.runtime.plans[index].status, PlanStatus::Completed);
+                std::fs::remove_file(repo.join(".imacs/config.toml")).unwrap();
+                app.runtime.reload_repo_workflows();
+                assert_eq!(app.runtime.project_config(&repo).tickets.branch.as_deref(), Some("workspace/{slug}"));
+            },
+        );
+    }
 
     #[test]
     fn project_instructions_refresh_from_main_checkout() {
@@ -43,7 +122,11 @@ mod tests {
                 .set_times(std::fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))
                 .unwrap();
             assert!(app.runtime.reload_repo_workflows());
-            assert!(app.runtime.repo_workflows[&repo].agent_section().contains("Main instructions B"));
+            assert!(
+                app.runtime.repo_workflows[&workspace::project_root(&repo).unwrap()]
+                    .agent_section()
+                    .contains("Main instructions B")
+            );
             assert!(app.runtime.chief_prompt().contains("Main instructions B"));
             let linked = repo.parent().unwrap().join("linked");
             git::add_worktree(&repo, &linked, "instructions-test", "main").unwrap();

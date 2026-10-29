@@ -258,6 +258,8 @@ impl State {
             }
         }
         let now = Instant::now();
+        let bases: HashMap<_, _> =
+            self.diffs.keys().map(|root| (root.clone(), self.project_config(root).base_ref)).collect();
         for (root, state) in &mut self.diffs {
             // The diff on screen follows every change; the others at most every few seconds,
             // with only some of their untracked content.
@@ -267,7 +269,7 @@ impl State {
             match state.due_at(interval) {
                 Some(at) if at <= now => {
                     state.requested();
-                    let (base_ref, highlighter) = (self.config.base_ref.clone(), self.highlighter.clone());
+                    let (base_ref, highlighter) = (bases[root].clone(), self.highlighter.clone());
                     self.worker.request(root.clone(), base_ref, budget, highlighter);
                 }
                 _ => {}

@@ -132,9 +132,23 @@ fn report(workspace: Option<&str>, for_agent: bool) -> Report {
         {
             repos.push(cwd);
         }
+        if let Some(workspace) = workspace.and_then(|name| Workspace::load(name).ok()) {
+            repos.extend(workspace.projects);
+        }
+        let mut repos: Vec<_> =
+            repos.into_iter().map(|repo| imacs_core::workspace::project_root(&repo).unwrap_or(repo)).collect();
         repos.sort();
         repos.dedup();
         for repo in repos {
+            let workflow = imacs_core::repo_workflow::RepoWorkflow::read(&repo);
+            for warning in &workflow.warnings {
+                lines.push(check_line(
+                    false,
+                    &format!("repository workflow (warning): {warning}"),
+                    "use only documented declarative keys in .imacs/config.toml",
+                ));
+            }
+            let config = workflow.apply(config);
             lines.push(cache_clone_check(&repo, &config.worktree_path));
             lines.extend(worktree_checks(&repo, &config.base_ref));
         }

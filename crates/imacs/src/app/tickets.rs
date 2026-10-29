@@ -560,14 +560,14 @@ impl State {
         }
         let mut pushes = Vec::new();
         for plan in self.plans.iter().filter(|p| !p.id.is_empty() && p.status != PlanStatus::Archived) {
-            let workflow = self.workflow();
+            let workflow = self.plan_workflow(plan);
             let mut links = Vec::new();
             for task in &plan.tasks {
                 let Some(link) = &task.ticket else { continue };
                 let latest = plan.latest_stage(task);
                 let reached = workflow.reached(&task.stages) || workflow.reached(&plan.stages);
                 let desired = if task.status == TaskStatus::Done {
-                    config.states.after_acceptance(workflow, latest, reached)
+                    config.states.after_acceptance(&workflow, latest, reached)
                 } else if let Some(stage) =
                     latest.filter(|s| s.stage == "integrated" && task.status == TaskStatus::Review)
                 {
@@ -582,7 +582,7 @@ impl State {
             {
                 let status = ticket::plan_status(plan);
                 let desired = if status == TaskStatus::Done {
-                    config.states.after_acceptance(workflow, plan.stages.last(), plan.workflow_done(workflow))
+                    config.states.after_acceptance(&workflow, plan.stages.last(), plan.workflow_done(&workflow))
                 } else {
                     config.states.get(status)
                 };

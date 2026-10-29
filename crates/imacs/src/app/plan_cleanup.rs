@@ -36,7 +36,7 @@ impl State {
     fn load_plan_cleanup(&self, dialog: &mut PlanCleanup) {
         dialog.busy = true;
         dialog.rows.clear();
-        let (tx, plan, base) = (dialog.tx.clone(), dialog.plan.clone(), self.config.base_ref.clone());
+        let (tx, plan, base) = (dialog.tx.clone(), dialog.plan.clone(), self.plan_base_ref(&dialog.plan));
         std::thread::spawn(move || {
             let _ = tx.send(Event::Preview(cleanup::preview(&plan, &base).map_err(|err| format!("{err:#}"))));
         });
@@ -197,7 +197,7 @@ impl Desktop<'_> {
                 .filter(|row| self.client.plan_cleanup_selected.contains(&(row.repo.clone(), row.branch.clone())))
                 .cloned()
                 .collect();
-            let (tx, plan, base) = (dialog.tx.clone(), plan, self.runtime.config.base_ref.clone());
+            let (tx, plan, base) = (dialog.tx.clone(), plan.clone(), self.runtime.plan_base_ref(&plan));
             self.post(move |_| {
                 std::thread::spawn(move || {
                     for entry in targets {

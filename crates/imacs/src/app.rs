@@ -813,6 +813,7 @@ impl State {
             }
         }
         self.repos = repos;
+        self.reload_repo_workflows();
         self.worktrees_at = None;
         self.apply_ticket_config();
     }

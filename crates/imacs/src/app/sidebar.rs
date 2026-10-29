@@ -671,6 +671,9 @@ impl Desktop<'_> {
                 for (file, text) in &workflow.instructions {
                     ui.label(RichText::new(file).small()).on_hover_text(text);
                 }
+                if !workflow.config.table.is_empty() {
+                    ui.small(&workflow.config.path).on_hover_text(workflow.config_text());
+                }
                 for warning in &workflow.warnings {
                     ui.label(warning);
                 }
