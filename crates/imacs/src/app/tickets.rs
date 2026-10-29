@@ -310,7 +310,9 @@ impl State {
                     }
                 }
                 match fresh {
-                    Some(Ok(fetched)) => self.take_ticket(&tag, &fetched, false),
+                    // Only the read after IMACS's own state update acknowledges that update; a
+                    // read after a comment may show someone else's change like any other read.
+                    Some(Ok(fetched)) => self.take_ticket(&tag, &fetched, matches!(kind, Kind::Comment)),
                     Some(Err(err)) => self.ticket_failed(&tag, format!("reading it after the update failed: {err}")),
                     None if !self.tickets.failed.contains_key(&tag.key) => {
                         if let Some(link) = self.live_link(&tag, true) {
@@ -412,8 +414,8 @@ impl State {
         }
     }
 
-    /// Takes a ticket as read. Reads after IMACS's own pushes never count as someone
-    /// else changing it.
+    /// Takes a ticket as read. The read after IMACS's own state update never counts as
+    /// someone else changing it.
     fn take_ticket(&mut self, tag: &Tag, fetched: &TicketLink, external: bool) {
         let keep_error = self.tickets.failed.contains_key(&tag.key);
         // A webhook may echo IMACS's own push before the push itself has returned.
@@ -1814,6 +1816,39 @@ mod tests {
                 assert_eq!(b.system, "cards");
             },
         );
+    }
+
+    #[test]
+    fn a_read_after_a_comment_reports_what_someone_else_changed() {
+        with_app("app::tickets::tests::a_read_after_a_comment_reports_what_someone_else_changed", |app, ctx| {
+            let dir = tempfile::tempdir().unwrap();
+            let state = tickets_fixture(dir.path(), "CARD");
+            configure(app, CARDS, &state, |_| {});
+            let plan = request(
+                app,
+                json!({"cmd":"plan_set", "goal":"Watch", "tasks":[{"id":"a", "title":"Parser", "ticket":{"id":"1"}}]}),
+            )
+            .result["plan"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert!(request(app, json!({"cmd":"plan_update", "plan":plan, "id":"a", "status":"running"})).ok);
+            settle(app);
+            assert_eq!(ticket(&state, "CARD-1")["state"], "Doing");
+            set_field(&state, "CARD-1", "state", "Stuck");
+            let (tx, rx) = channel();
+            let comment =
+                ControlRequest::TicketComment { plan: Some(plan.clone()), task: Some("a".into()), text: "Note".into() };
+            app.runtime.control(ctx, comment, tx);
+            settle(app);
+            rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            let moved: Vec<_> = app.runtime.events.iter().filter_map(|e| e.ticket.clone()).collect();
+            assert_eq!(moved.len(), 1, "the read after the comment saw someone else's change");
+            assert_eq!((moved[0]["from"].as_str(), moved[0]["to"].as_str()), (Some("Doing"), Some("Stuck")));
+            app.runtime.ticket_heartbeat();
+            settle(app);
+            assert_eq!(app.runtime.events.iter().filter(|e| e.ticket.is_some()).count(), 1, "reported once");
+        });
     }
 
     #[test]
