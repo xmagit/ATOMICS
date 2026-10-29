@@ -147,10 +147,7 @@ impl State {
 
     pub(super) fn reopen_plan(&mut self, index: usize) -> Result<(), String> {
         let mut plan = self.plans[index].clone();
-        plan.status = PlanStatus::Open;
-        for task in &mut plan.tasks {
-            task.integration_verified = false;
-        }
+        plan.reopen();
         plan.save_in(&paths::imacs_home()).map_err(|err| format!("Reopening plan failed: {err:#}"))?;
         self.plans[index] = plan;
         self.integration_revision += 1;
@@ -491,6 +488,33 @@ impl State {
 mod tests {
     use super::super::tests::{repository, request, session, with_app};
     use super::*;
+
+    #[test]
+    fn explicitly_reopened_plan_waits_for_fresh_lifecycle_progress() {
+        with_app("app::plans::tests::explicitly_reopened_plan_waits_for_fresh_lifecycle_progress", |app, _| {
+            app.runtime.config.workflow.done = "ci_passed".into();
+            app.runtime.plans = vec![Plan {
+                id: "reopen".into(),
+                tasks: vec![Task { id: "a".into(), status: TaskStatus::Done, ..Default::default() }],
+                ..Default::default()
+            }];
+            app.runtime.finish_plan_agents();
+            let event = json!({"cmd":"stage_event", "plan":"reopen", "stage":"ci_passed"});
+            assert!(request(app, event.clone()).ok);
+            assert_eq!(app.runtime.plans[0].status, PlanStatus::Completed);
+            app.runtime.reopen_plan(0).unwrap();
+            for _ in 0..2 {
+                app.runtime.finish_plan_agents();
+                assert_eq!(app.runtime.plans[0].status, PlanStatus::Open);
+            }
+            let duplicate = request(app, event);
+            assert!(duplicate.ok);
+            assert_eq!(duplicate.result["recorded"], false);
+            assert_eq!(app.runtime.plans[0].status, PlanStatus::Open);
+            assert!(request(app, json!({"cmd":"stage_event", "plan":"reopen", "stage":"merged"})).ok);
+            assert_eq!(app.runtime.plans[0].status, PlanStatus::Completed);
+        });
+    }
 
     #[test]
     fn colliding_ticket_branches_reserve_ownership_and_only_retry_their_own_worktree() {
