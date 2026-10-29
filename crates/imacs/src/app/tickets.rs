@@ -150,7 +150,8 @@ impl State {
         Author::Chief(ticket::model_label("claude", &self.config.chief.args))
     }
 
-    /// The chief's prompt with the configured ticket workflow added.
+    /// The chief's prompt with the configured ticket workflow added, then the user's own
+    /// `[chief] prompt` from the main file, this host's and the workspace's, read as the chief starts.
     pub(super) fn chief_prompt(&self) -> String {
         let projects: Vec<String> = self.repos.iter().map(|r| paths::display(r)).collect();
         let mut prompt = self
@@ -162,6 +163,14 @@ impl State {
         if let Some(config) = self.ticket_config() {
             prompt.push_str("\n\n");
             prompt.push_str(&config.prompt_section());
+        }
+        let sections = imacs_core::selfconfig::prompt_sections(&self.config_layers(None));
+        if !sections.is_empty() {
+            prompt.push_str("\n\nThe user's own instructions, from [chief] prompt in the IMACS config:");
+            for (_, text) in sections {
+                prompt.push_str("\n\n");
+                prompt.push_str(&text);
+            }
         }
         prompt
     }

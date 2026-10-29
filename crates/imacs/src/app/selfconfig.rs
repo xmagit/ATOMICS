@@ -99,6 +99,10 @@ impl State {
             })
         });
         let load_error = selfconfig::load_error(&layers).map(|error| cleaner.text(&error));
+        let sections: Vec<_> = selfconfig::prompt_sections(&layers)
+            .into_iter()
+            .map(|(source, text)| json!({ "source": source, "text": cleaner.text(&text) }))
+            .collect();
         Ok(json!({
             "host": paths::host_name(),
             "merge": "Built-in defaults, then config.toml, then config.d/<host>.toml: tables merge key by key, arrays and other values replace. A workspace's [tickets] replaces the section as a whole.",
@@ -108,6 +112,11 @@ impl State {
             "load_error": load_error,
             "running_on_last_good_config": self.config_error.is_some(),
             "values": selfconfig::values(&effective, &layers, &cleaner, key),
+            "chief_prompt": {
+                "built_in": effective.chief.system_prompt == imacs_core::config::CHIEF_PROMPT,
+                "sections": sections,
+                "composed": "The built-in prompt (or chief.system_prompt), then the ticket workflow, then each [chief] prompt section: main, host, workspace. Read when the chief starts.",
+            },
             "secrets": "Values of secret-looking names, credential flags and URL credentials read as ***. Ticket and voice keys stay in the environment variables token_env and api_key_env name.",
         }))
     }
@@ -407,6 +416,63 @@ mod tests {
             .collect();
         found.sort();
         found
+    }
+
+    #[test]
+    fn chief_prompt_extensions_follow_main_host_and_workspace_order() {
+        with_app("app::selfconfig::tests::chief_prompt_extensions_follow_main_host_and_workspace_order", |app, _| {
+            let [main, host] = Config::source_paths(&app.runtime.config_path);
+            let base = app.runtime.chief_prompt();
+            assert!(!base.contains("The user's own instructions"));
+            std::fs::write(&main, "[chief]\nprompt = 'MAIN: keep briefs to five lines.'\n").unwrap();
+            std::fs::create_dir_all(host.parent().unwrap()).unwrap();
+            std::fs::write(&host, "[chief]\nprompt = 'HOST: this laptop has 8 cores.'\n").unwrap();
+            app.runtime.reload_config();
+            app.runtime.workspace = Some("team".into());
+            let file = Workspace::file("team").unwrap();
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(
+                &file,
+                "projects = []\n[tickets]\nsystem = 'relay'\nserver = { command = ['relay-mcp'] }\n\
+                 workflow = 'TICKETS: one board per plan.'\n",
+            )
+            .unwrap();
+            app.runtime.apply_ticket_config();
+
+            // The workspace's section arrives through a proposal the user applies.
+            let proposed = request(
+                app,
+                json!({"cmd":"config_propose", "scope":"workspace", "toml":"[chief]\nprompt = 'WORKSPACE: ask before touching the API.'"}),
+            );
+            assert!(proposed.ok, "{:?}", proposed.error);
+            assert_eq!(
+                proposed.result["changes"],
+                json!([{"key":"chief.prompt", "change":"added", "risk":"instructs_agents"}])
+            );
+            let id = app.runtime.proposals[0].id.clone();
+            app.runtime.apply_proposal(&id, String::new());
+            assert!(std::fs::read_to_string(&file).unwrap().contains("[tickets]\nsystem = 'relay'"));
+
+            let prompt = app.runtime.chief_prompt();
+            assert!(prompt.starts_with(&base[..200]), "the built-in prompt comes first");
+            let at = |text: &str| prompt.find(text).unwrap_or_else(|| panic!("{text} missing from {prompt}"));
+            assert!(at("TICKETS:") < at("The user's own instructions"));
+            assert!(at("MAIN:") < at("HOST:") && at("HOST:") < at("WORKSPACE:"), "{prompt}");
+            assert!(prompt.ends_with("WORKSPACE: ask before touching the API."));
+
+            let got = request(app, json!({"cmd":"config_get", "key":"chief"}));
+            let sections = &got.result["chief_prompt"]["sections"];
+            assert_eq!(
+                sections,
+                &json!([
+                    {"source":"main", "text":"MAIN: keep briefs to five lines."},
+                    {"source":"host", "text":"HOST: this laptop has 8 cores."},
+                    {"source":"workspace", "text":"WORKSPACE: ask before touching the API."}
+                ])
+            );
+            assert_eq!(got.result["chief_prompt"]["built_in"], true);
+            assert!(got.result["values"].get("chief.prompt").is_none());
+        });
     }
 
     #[test]

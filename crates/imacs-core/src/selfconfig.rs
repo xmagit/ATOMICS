@@ -115,6 +115,8 @@ pub fn values(effective: &Config, layers: &[Layer], cleaner: &Cleaner, prefix: O
     let prefix = prefix.map(str::trim).filter(|p| !p.is_empty());
     leaves
         .into_iter()
+        // Every file's prompt adds to the others'; `prompt_sections` shows them, not the last one.
+        .filter(|(path, _)| path != &["chief", "prompt"])
         .map(|(path, value)| (key(&path), path, value))
         .filter(|(key, ..)| prefix.is_none_or(|p| key == p || key.starts_with(&format!("{p}."))))
         .map(|(key, path, value)| {
@@ -125,6 +127,21 @@ pub fn values(effective: &Config, layers: &[Layer], cleaner: &Cleaner, prefix: O
             (key, Value::Object(entry))
         })
         .collect()
+}
+
+/// `[chief] prompt` from each file that sets it, in the order the chief's prompt adds them:
+/// the main file, this host's, then the workspace's.
+pub fn prompt_sections(layers: &[Layer]) -> Vec<(Source, String)> {
+    let mut sections: Vec<(Source, String)> = layers
+        .iter()
+        .filter(|layer| matches!(layer.source, Source::Main | Source::Host | Source::Workspace))
+        .filter_map(|layer| {
+            let text = lookup(&layer.table, &["chief", "prompt"])?.as_str()?.trim();
+            (!text.is_empty()).then(|| (layer.source, text.to_string()))
+        })
+        .collect();
+    sections.sort_by_key(|(source, _)| *source);
+    sections
 }
 
 /// The source of the value at `path`: the last file that sets it, else the built-in default.
@@ -422,6 +439,9 @@ pub fn propose(scope: Scope, layers: &[Layer], fragment: &str, remove: &[String]
             }
             load::<crate::workspace::Workspace>(&table, "")
                 .map_err(|e| format!("the workspace file would not load: {e}"))?;
+            if let Some(prompt) = lookup(&table, &["chief", "prompt"]).filter(|prompt| !prompt.is_str()) {
+                return Err(format!("chief.prompt must be text, not {}", prompt.type_str()));
+            }
             if let Some(tickets) = table.get("tickets") {
                 let tickets = tickets.as_table().ok_or("[tickets] must be a table")?;
                 load::<crate::tickets::TicketConfig>(tickets, "tickets.")
@@ -996,6 +1016,37 @@ arguments = { ticket = "{id}", apiKey = "argument-secret-333", header = "Authori
             .filter(|name| name.contains("imacs-tmp"))
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[test]
+    fn chief_prompt_sections_go_main_host_workspace() {
+        let workspace = layer(Source::Workspace, "projects = []\n[chief]\nprompt = 'Workspace rule.'");
+        let host = layer(Source::Host, "[chief]\nprompt = '''\n  Host rule.\n'''");
+        let main = layer(Source::Main, "[chief]\nprompt = 'Main rule.'\nargs = []");
+        let blank = layer(Source::Main, "[chief]\nprompt = '  '");
+        let sections = prompt_sections(&[workspace.clone(), host.clone(), main.clone()]);
+        assert_eq!(
+            sections,
+            [
+                (Source::Main, "Main rule.".to_string()),
+                (Source::Host, "Host rule.".to_string()),
+                (Source::Workspace, "Workspace rule.".to_string())
+            ]
+        );
+        assert_eq!(prompt_sections(&[blank, host.clone()]), [(Source::Host, "Host rule.".to_string())]);
+        // The merged value is only the last file's, so it is not shown as one.
+        let effective = Config::from_tables([main.table.clone(), host.table.clone()]).unwrap();
+        let values = values(&effective, &[main.clone(), host], &Cleaner::default(), Some("chief"));
+        assert!(values.contains_key("chief.args") && !values.contains_key("chief.prompt"), "{values:?}");
+
+        let layers = [main, layer(Source::Workspace, "projects = []")];
+        let proposal = propose(Scope::Workspace, &layers, "[chief]\nprompt = 'Use the team board.'", &[]).unwrap();
+        assert_eq!(proposal.risks(), [(Risk::InstructsAgents, vec!["chief.prompt"])]);
+        let error = propose(Scope::Workspace, &layers, "[chief]\nprompt = 3", &[]).unwrap_err();
+        assert!(error.contains("chief.prompt must be text"), "{error}");
+        assert!(propose(Scope::Workspace, &layers, "[chief]\nargs = ['x']", &[]).is_err());
+        let error = propose(Scope::Main, &layers, "[chief]\nprompt = ['x']", &[]).unwrap_err();
+        assert!(error.contains("chief.prompt: invalid type"), "{error}");
     }
 
     #[test]

@@ -192,6 +192,8 @@ dock = "floating"   # "floating" or "docked"
 command = ["claude"]
 args = ["--model", "claude-opus-5-5"]
 # system_prompt = "..."   # built in: plan, wait for approval, dispatch, verify, integrate
+# prompt = "..."          # your own instructions, added after the built-in prompt when the chief starts;
+                          # config.d/<host>.toml and the workspace file add theirs after this one
 
 [steer]
 # Added to every Claude session started or seen by IMACS (SessionStart hook).
@@ -319,6 +321,10 @@ pub struct ChiefConfig {
     pub command: Vec<String>,
     pub args: Vec<String>,
     pub system_prompt: String,
+    /// The user's instructions, added after the built-in prompt. Every file's adds to the
+    /// others' (main, host, then the workspace's), so read them with
+    /// [`crate::selfconfig::prompt_sections`]: merged, this holds only the last file's.
+    pub prompt: String,
 }
 
 impl Default for ChiefConfig {
@@ -329,6 +335,7 @@ impl Default for ChiefConfig {
             command: vec!["claude".into()],
             args: vec!["--model".into(), "claude-opus-5-5".into()],
             system_prompt: CHIEF_PROMPT.into(),
+            prompt: String::new(),
         }
     }
 }
