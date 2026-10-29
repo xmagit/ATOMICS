@@ -141,7 +141,10 @@ impl State {
                 None => PathBuf::new(),
             },
         };
-        let proposal = selfconfig::propose(scope, &layers, toml, remove).map_err(|error| cleaner.text(&error))?;
+        let mut proposal = selfconfig::propose(scope, &layers, toml, remove).map_err(|error| cleaner.text(&error))?;
+        if scope == Scope::Workspace && file.parent() != Some(workspace::workspaces_dir().as_path()) {
+            proposal.warnings.push(format!("{} is a flat workspace file that every host shares", proposal.file));
+        }
         self.proposal_seq += 1;
         let id = format!("config-{}", self.proposal_seq);
         let from = match pane.and_then(|pane| self.sessions.iter().find(|s| s.id == pane)) {
@@ -440,6 +443,7 @@ mod tests {
                 proposed.result["changes"],
                 json!([{"key":"chief.prompt", "change":"added", "risk":"instructs_agents"}])
             );
+            assert_eq!(proposed.result["warnings"], json!([]), "this host's own workspace file");
             let id = app.runtime.proposals[0].id.clone();
             app.runtime.apply_proposal(&id, String::new());
             assert!(std::fs::read_to_string(&file).unwrap().contains("[tickets]\nsystem = 'relay'"));
@@ -463,6 +467,18 @@ mod tests {
             );
             assert_eq!(got.result["chief_prompt"]["built_in"], true);
             assert!(got.result["values"].get("chief.prompt").is_none());
+
+            // A flat workspace file is shared by every host, and the proposal says so.
+            std::fs::remove_file(&file).unwrap();
+            let flat = file.parent().unwrap().parent().unwrap().join("team.toml");
+            std::fs::write(&flat, "projects = []\n").unwrap();
+            let proposed =
+                request(app, json!({"cmd":"config_propose", "scope":"workspace", "toml":"[chief]\nprompt = 'x'"}));
+            assert!(
+                proposed.result["warnings"][0].as_str().unwrap().contains("every host shares"),
+                "{}",
+                proposed.result
+            );
         });
     }
 
