@@ -171,6 +171,81 @@ pub fn run_args(name: &str, agent: &str, agent_args: &[String]) -> Vec<String> {
     ["run", "--name", name, agent, "--"].into_iter().map(String::from).chain(agent_args.iter().cloned()).collect()
 }
 
+/// How many values a dropped flag takes.
+#[derive(Clone, Copy)]
+enum Takes {
+    Nothing,
+    One,
+    /// Every following argument up to the next flag, like Claude's `--add-dir a b`.
+    Several,
+}
+
+/// An agent's own arguments, as its sandbox runs it. sbx runs Codex with `sandbox_mode =
+/// "danger-full-access"` and `approval_policy = "never"`, and Claude without permission prompts:
+/// the VM is the boundary. The host's sandbox, approval and permission flags, and folders
+/// outside the sandbox, would conflict with that, so they are dropped. Everything else, such as
+/// the model and reasoning effort, is kept.
+pub fn sandboxed_args(agent: &str, args: &[String]) -> Vec<String> {
+    use Takes::*;
+    let (flags, config_keys): (&[(&str, Takes)], &[&str]) = match agent {
+        "codex" => (
+            &[
+                ("-s", One),
+                ("--sandbox", One),
+                ("-a", One),
+                ("--ask-for-approval", One),
+                ("--add-dir", One),
+                ("--full-auto", Nothing),
+                ("--dangerously-bypass-approvals-and-sandbox", Nothing),
+                ("--yolo", Nothing),
+            ],
+            &["sandbox_mode", "approval_policy", "sandbox_workspace_write"],
+        ),
+        "claude" => (
+            &[
+                ("--permission-mode", One),
+                ("--add-dir", Several),
+                ("--dangerously-skip-permissions", Nothing),
+                ("--allow-dangerously-skip-permissions", Nothing),
+            ],
+            &[],
+        ),
+        _ => return args.to_vec(),
+    };
+    // A `-c key=value` override of a setting sbx makes, by key or a key below it.
+    let host_setting = |value: &str| {
+        let key = value.split('=').next().unwrap_or_default().trim();
+        config_keys.iter().any(|k| key == *k || key.strip_prefix(k).is_some_and(|rest| rest.starts_with('.')))
+    };
+    let mut kept = Vec::new();
+    let mut args = args.iter().peekable();
+    while let Some(arg) = args.next() {
+        let (name, inline) = match arg.split_once('=') {
+            Some((name, value)) if name.starts_with("--") => (name, Some(value)),
+            _ => (arg.as_str(), None),
+        };
+        if let Some((_, takes)) = flags.iter().find(|(flag, _)| *flag == name) {
+            match (takes, inline) {
+                (One, None) => drop(args.next()),
+                (Several, None) => while args.next_if(|value| !value.starts_with('-')).is_some() {},
+                _ => {}
+            }
+            continue;
+        }
+        if matches!(name, "-c" | "--config") {
+            let value = inline.or_else(|| args.peek().map(|value| value.as_str()));
+            if value.is_some_and(host_setting) {
+                if inline.is_none() {
+                    args.next();
+                }
+                continue;
+            }
+        }
+        kept.push(arg.clone());
+    }
+    kept
+}
+
 /// `sbx mcp add`: register IMACS's MCP server for sandbox `name`. It runs on this machine as
 /// `exe mcp --agent`, knowing its session as the sandbox's name, which outlives IMACS restarts.
 pub fn mcp_add_args(name: &str, exe: &Path, socket: &Path) -> Vec<String> {
@@ -496,6 +571,105 @@ command = ["codex"]
             allow_hosts_args("imacs-s1", &["a.example.com".into(), "b.example.com".into()]),
             ["policy", "allow", "network", "--sandbox", "imacs-s1", "a.example.com,b.example.com"]
         );
+    }
+
+    #[test]
+    fn host_sandbox_and_permission_flags_stay_on_the_host() {
+        let args = |list: &[&str]| list.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        // The arguments IMACS plans give Codex and Claude tasks.
+        for (agent, given, sandboxed) in [
+            (
+                "codex",
+                args(&[
+                    "-m",
+                    "gpt-6.1-sol",
+                    "-c",
+                    "model_reasoning_effort=high",
+                    "-s",
+                    "workspace-write",
+                    "-a",
+                    "on-request",
+                    "-c",
+                    r#"sandbox_workspace_write.writable_roots=["/Users/maxfalk/.cargo"]"#,
+                ]),
+                args(&["-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=high"]),
+            ),
+            (
+                "codex",
+                args(&[
+                    "-m",
+                    "gpt-6.1-sol",
+                    "-c",
+                    "model_reasoning_effort=high",
+                    "-s",
+                    "workspace-write",
+                    "-a",
+                    "on-request",
+                    "-c",
+                    r#"sandbox_workspace_write.writable_roots=["/Users/maxfalk/.cargo","/Users/maxfalk/.nuget","/Users/maxfalk/.dotnet"]"#,
+                ]),
+                args(&["-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=high"]),
+            ),
+            (
+                "codex",
+                args(&[
+                    "-m",
+                    "gpt-6.1-sol",
+                    "-c",
+                    "model_reasoning_effort=low",
+                    "-s",
+                    "workspace-write",
+                    "-a",
+                    "on-request",
+                ]),
+                args(&["-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=low"]),
+            ),
+            ("claude", args(&["--model", "claude-opus-5-5"]), args(&["--model", "claude-opus-5-5"])),
+            // Long forms, inline values and the other host-only flags.
+            (
+                "codex",
+                args(&[
+                    "--sandbox=read-only",
+                    "--ask-for-approval",
+                    "untrusted",
+                    "--full-auto",
+                    "--dangerously-bypass-approvals-and-sandbox",
+                    "--add-dir",
+                    "/Users/me/.cargo",
+                    "--config",
+                    "sandbox_mode=workspace-write",
+                    "--config=approval_policy=never",
+                    "-c",
+                    "sandbox_workspace_write.network_access=true",
+                    "-c",
+                    "sandbox_modes_extra=1",
+                    "--model=o4",
+                    "-c",
+                    "model_reasoning_effort=high",
+                ]),
+                args(&["-c", "sandbox_modes_extra=1", "--model=o4", "-c", "model_reasoning_effort=high"]),
+            ),
+            (
+                "claude",
+                args(&[
+                    "--permission-mode",
+                    "acceptEdits",
+                    "--dangerously-skip-permissions",
+                    "--add-dir",
+                    "/Users/me/docs",
+                    "/Users/me/notes",
+                    "--model",
+                    "claude-opus-5-5",
+                    "--permission-mode=plan",
+                    "--allowedTools",
+                    "Bash(git:*)",
+                ]),
+                args(&["--model", "claude-opus-5-5", "--allowedTools", "Bash(git:*)"]),
+            ),
+            ("shell", args(&["-s", "x"]), args(&["-s", "x"])),
+        ] {
+            assert_eq!(sandboxed_args(agent, &given), sandboxed, "{agent} {given:?}");
+        }
     }
 
     #[test]

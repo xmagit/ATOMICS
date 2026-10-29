@@ -78,6 +78,61 @@ fn sandboxed_agents_attach_through_sbx_run_and_reattach_after_a_restart() {
 }
 
 #[test]
+fn sandboxed_task_args_drop_host_sandbox_flags_and_bare_ones_keep_them() {
+    with_app("app::sandbox_tests::sandboxed_task_args_drop_host_sandbox_flags_and_bare_ones_keep_them", |app, ctx| {
+        let (_dir, repo) = repository();
+        let worktree = worktree(&repo, "task");
+        let bin = tempfile::tempdir().unwrap();
+        app.runtime.sbx = fake::install(bin.path()).display().to_string();
+        app.runtime.config.isolation.mode = IsolationMode::Sandbox;
+        // The arguments IMACS plans give a Codex task, and an agent command carrying a host flag.
+        let task_args: Vec<String> = [
+            "-m",
+            "gpt-6.1-sol",
+            "-c",
+            "model_reasoning_effort=high",
+            "-s",
+            "workspace-write",
+            "-a",
+            "on-request",
+            "-c",
+            r#"sandbox_workspace_write.writable_roots=["/Users/maxfalk/.cargo"]"#,
+        ]
+        .map(String::from)
+        .into();
+        let codex = app.runtime.config.agents.iter_mut().find(|a| a.name == "codex").unwrap();
+        codex.command = vec!["codex".into(), "--full-auto".into(), "--search".into()];
+        app.runtime.start(ctx, "codex", worktree.clone(), None, task_args.clone(), Some("Do the task".into())).unwrap();
+        tick_until(app, ctx, "the agent to attach", |_| bin.path().join("run-ssh").exists());
+        let run = fake::calls_to(bin.path(), &["run"]).pop().unwrap();
+        assert_eq!(
+            run[4..],
+            ["--", "--search", "-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=high", "Do the task"],
+            "{run:?}"
+        );
+
+        // A bare agent gets every argument, as before.
+        let out = bin.path().join("args");
+        let script = bin.path().join("agent");
+        std::fs::write(&script, format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > {}.tmp\nmv {0}.tmp {0}\n", out.display()))
+            .unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        app.runtime.config.agents.push(imacs_core::config::AgentConfig {
+            name: "bare-agent".into(),
+            command: vec![script.display().to_string()],
+            kind: AgentKind::Generic,
+            busy_text: None,
+            isolation: Some(IsolationMode::Bare),
+        });
+        app.runtime.start(ctx, "bare-agent", worktree.clone(), None, task_args.clone(), None).unwrap();
+        tick_until(app, ctx, "the bare agent", |_| out.exists());
+        let given: Vec<String> = std::fs::read_to_string(&out).unwrap().lines().map(String::from).collect();
+        assert!(given.ends_with(&task_args), "{given:?}");
+        app.runtime.sessions.clear();
+    });
+}
+
+#[test]
 fn bare_agents_never_touch_sbx_and_a_repository_can_only_tighten() {
     with_app("app::sandbox_tests::bare_agents_never_touch_sbx_and_a_repository_can_only_tighten", |app, ctx| {
         let (_dir, repo) = repository();

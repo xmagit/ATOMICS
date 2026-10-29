@@ -86,6 +86,19 @@ The rest of the agent's `command` and IMACS's own arguments go after `sbx run â€
 `--resume`, extra arguments and the first prompt. An agent sbx has no agent for is refused in sandbox
 mode. Set `isolation = "bare"` on it to run it on this machine.
 
+In a sandbox the VM is the boundary: sbx runs Codex with `sandbox_mode = "danger-full-access"` and
+`approval_policy = "never"`, and Claude without permission prompts. The host's own sandbox and
+permission flags would conflict with that, so IMACS drops them from the agent's command and a task's
+arguments, and keeps the rest, such as the model and reasoning effort:
+
+| Agent | Dropped in a sandbox |
+| --- | --- |
+| Codex | `-s`/`--sandbox`, `-a`/`--ask-for-approval`, `--full-auto`, `--dangerously-bypass-approvals-and-sandbox`, `--add-dir`, and `-c`/`--config` overrides of `sandbox_mode`, `approval_policy` and `sandbox_workspace_write.*` |
+| Claude | `--permission-mode`, `--dangerously-skip-permissions`, `--allow-dangerously-skip-permissions`, `--add-dir` and its folders |
+
+A task planned with `-m gpt-6.1-sol -c model_reasoning_effort=high -s workspace-write -a on-request`
+runs in its sandbox with `-m gpt-6.1-sol -c model_reasoning_effort=high`. Bare agents get every argument.
+
 The chief always runs bare: it reads every open project's main checkout, verifies agents' work in their
 worktrees, and needs every IMACS tool.
 

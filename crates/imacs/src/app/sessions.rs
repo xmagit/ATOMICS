@@ -313,8 +313,14 @@ impl State {
             env.extend(crate::governor::toolchain_env(&cwd, &self.config.resources, self.governor.cores));
         }
 
+        // A sandboxed agent's own and task arguments lose the host's sandbox and permission flags.
+        let own_args = |args: &[String]| match &sandboxed {
+            Some(sandboxed) => isolation::sandboxed_args(sandboxed.agent, args),
+            None => args.to_vec(),
+        };
+        let extra_args = own_args(&extra_args);
         let (program, mut args) = match agent.command.split_first() {
-            Some((program, rest)) => (program.clone(), rest.to_vec()),
+            Some((program, rest)) => (program.clone(), own_args(rest)),
             None if sandboxed.is_some() => (shell, Vec::new()),
             None => (shell, vec!["-l".to_string()]),
         };
