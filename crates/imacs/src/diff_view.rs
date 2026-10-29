@@ -113,23 +113,33 @@ impl DiffState {
     /// Opens `path`: its hunks when the diff touches it, the whole file otherwise.
     /// Returns true when the file content has to be loaded.
     pub fn open(&mut self, path: &str) -> bool {
+        let whole_file =
+            !self.prepared.as_ref().is_some_and(|prepared| prepared.diff.files.iter().any(|file| file.path() == path));
+        self.open_resolved(path, whole_file);
+        whole_file
+    }
+
+    /// Apply the host's authoritative target even if a newer diff arrived while
+    /// its client event was queued. A diff that no longer contains the file is
+    /// simply the newest diff; it must not become an unsubscribed file load.
+    pub fn open_resolved(&mut self, path: &str, whole_file: bool) {
         self.editor = None;
-        if let Some(prepared) = &self.prepared
-            && let Some(index) = prepared.diff.files.iter().position(|f| f.path() == path)
-        {
+        self.focused = Some(path.to_string());
+        if !whole_file {
             self.viewing = None;
             self.collapsed.remove(path);
-            self.scroll_to = Some(index as f32);
-            self.focused = Some(path.to_string());
-            return false;
+            self.scroll_to = self
+                .prepared
+                .as_ref()
+                .and_then(|prepared| prepared.diff.files.iter().position(|file| file.path() == path))
+                .map(|index| index as f32);
+            return;
         }
         if self.viewing.as_deref() != Some(path) {
             self.file = None;
         }
         self.viewing = Some(path.to_string());
-        self.focused = Some(path.to_string());
         self.file_error = None;
-        true
     }
 
     /// Moves to the next (`+1`) or previous (`-1`) changed file and jumps there.

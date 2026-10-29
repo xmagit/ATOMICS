@@ -17,7 +17,11 @@ impl State {
         if !changed {
             self.worker.request_file(root.to_path_buf(), path.to_string(), self.highlighter.clone());
         }
-        self.client_events.push(ClientEvent::OpenFile { root: root.to_path_buf(), path: path.to_string() });
+        self.client_events.push(ClientEvent::OpenFile {
+            root: root.to_path_buf(),
+            path: path.to_string(),
+            whole_file: !changed,
+        });
     }
 
     /// Switches the panel to the editor for `root`, opening `path` at `line`. One

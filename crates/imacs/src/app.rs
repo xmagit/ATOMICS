@@ -408,7 +408,7 @@ enum ClientEvent {
     Cleanup { preselect: Option<PathBuf> },
     PlanCleanup,
     PlanCleanupPreview(Vec<(PathBuf, String)>),
-    OpenFile { root: PathBuf, path: String },
+    OpenFile { root: PathBuf, path: String, whole_file: bool },
     Edit { root: PathBuf, path: Option<String> },
     Screenshot { path: String, reply: Sender<ControlOutcome> },
     VoiceFailed { text: String, error: String },
@@ -1019,8 +1019,8 @@ impl Desktop<'_> {
                 ClientEvent::PlanCleanupPreview(selected) => {
                     self.client.plan_cleanup_selected = selected.into_iter().collect()
                 }
-                ClientEvent::OpenFile { root, path } => {
-                    self.client.diff_views.entry(root).or_default().open(&path);
+                ClientEvent::OpenFile { root, path, whole_file } => {
+                    self.client.diff_views.entry(root).or_default().open_resolved(&path, whole_file);
                 }
                 ClientEvent::Screenshot { path, reply } => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
