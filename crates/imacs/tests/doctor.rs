@@ -26,6 +26,7 @@ fn doctor_checks_real_inputs_and_only_requires_git_and_valid_config() {
                 .env("PATH", &bin)
                 .env("IMACS_HOME", dir.path().join("state"))
                 .env("IMACS_CONFIG", &config)
+                .env("IMACS_HOST", "fixture")
                 .env("IMACS_SOCKET", &socket),
         )
     };
@@ -42,6 +43,9 @@ fn doctor_checks_real_inputs_and_only_requires_git_and_valid_config() {
         if expected == 0 {
             assert!(text.contains("✓ git found (git version fixture)"), "{text}");
             assert!(text.contains("✓ config parses"), "{text}");
+            assert!(text.contains("Host: fixture"), "{text}");
+            assert!(text.contains(&format!("Loaded config: {}", config.display())), "{text}");
+            assert_eq!(text.matches("Loaded config:").count(), 1, "{text}");
         } else {
             assert!(text.contains("✗ git not found"), "{text}");
         }
@@ -50,6 +54,21 @@ fn doctor_checks_real_inputs_and_only_requires_git_and_valid_config() {
     assert_eq!(run().status.code(), Some(1), "a missing git executable fails doctor");
     std::fs::write(&git, "#!/bin/sh\necho 'git version fixture'\n").unwrap();
     std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let host_config = dir.path().join("config.d/fixture.toml");
+    std::fs::create_dir_all(host_config.parent().unwrap()).unwrap();
+    std::fs::write(&host_config, "[font]\nsize = 17.0").unwrap();
+    let output = run();
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains(&format!("Loaded config: {}", host_config.display())), "{text}");
+    assert_eq!(text.matches("Loaded config:").count(), 2, "{text}");
+    std::fs::write(&host_config, "[font]\nsize = 'invalid'").unwrap();
+    let output = run();
+    assert_eq!(output.status.code(), Some(1));
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("✗ config failed:"), "{text}");
+    assert!(text.contains(&host_config.display().to_string()), "{text}");
+    std::fs::remove_file(host_config).unwrap();
     std::fs::write(&config, "[invalid").unwrap();
     let output = run();
     assert_eq!(output.status.code(), Some(1));

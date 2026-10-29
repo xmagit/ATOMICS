@@ -72,6 +72,37 @@ pub(super) fn with_state(name: &str, test: impl FnOnce(State, &egui::Context)) {
 }
 
 #[test]
+fn config_reloads_when_host_overrides_are_created_changed_or_removed() {
+    with_state("app::tests::config_reloads_when_host_overrides_are_created_changed_or_removed", |mut state, ctx| {
+        let [base, host_file] = Config::source_paths(&state.config_path);
+        std::fs::write(&base, "[font]\nsize = 14.0\ndiff_size = 11.0").unwrap();
+        state.config_checked = Instant::now() - Duration::from_secs(2);
+        state.runtime_tick(ctx);
+        assert_eq!(state.config.font.size, 14.0);
+
+        std::fs::create_dir_all(host_file.parent().unwrap()).unwrap();
+        for size in [16.0, 18.0] {
+            std::fs::write(&host_file, format!("[font]\nsize = {size:.1}")).unwrap();
+            state.config_checked = Instant::now() - Duration::from_secs(2);
+            state.runtime_tick(ctx);
+            assert_eq!(state.config.font.size, size);
+            assert_eq!(state.config.font.diff_size, 11.0);
+        }
+        std::fs::write(&host_file, "[font]\nsize = 'invalid'").unwrap();
+        state.config_checked = Instant::now() - Duration::from_secs(2);
+        state.runtime_tick(ctx);
+        assert!(state.config_error.is_some());
+        assert_eq!(state.config.font.size, 18.0);
+
+        std::fs::remove_file(&host_file).unwrap();
+        state.config_checked = Instant::now() - Duration::from_secs(2);
+        state.runtime_tick(ctx);
+        assert!(state.config_error.is_none());
+        assert_eq!(state.config.font.size, 14.0);
+    });
+}
+
+#[test]
 fn review_followups() {
     with_app("app::tests::review_followups", |app, ctx| {
         permission_hooks_wake_waiters_and_accept_decisions(app, ctx);
