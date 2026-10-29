@@ -616,7 +616,7 @@ impl Cleaner {
     /// info and credential query values in its text masked in place.
     pub fn value(&self, value: Value) -> Value {
         match value {
-            Value::String(text) => Value::String(self.field(&redact_query(&redact_userinfo(&text), secret_param))),
+            Value::String(text) => Value::String(self.field(&redact_query(&redact_userinfo(&text), credential_param))),
             Value::Array(items) => Value::Array(items.into_iter().map(|item| self.value(item)).collect()),
             Value::Object(map) => {
                 Value::Object(map.into_iter().map(|(key, item)| (self.field(&key), self.value(item))).collect())
@@ -737,7 +737,7 @@ fn strip_url(url: &str, holds_secret: &dyn Fn(&str) -> bool) -> String {
             .split('&')
             .filter(|param| {
                 let (name, value) = param.split_once('=').unwrap_or((param, ""));
-                !param.is_empty() && !secret_param(name) && !holds_secret(value)
+                !param.is_empty() && !credential_param(name) && !holds_secret(value)
             })
             .collect::<Vec<_>>()
             .join("&")
@@ -763,7 +763,35 @@ fn strip_url(url: &str, holds_secret: &dyn Fn(&str) -> bool) -> String {
     out
 }
 
-/// Parameter names that carry credentials.
+/// URL parameters that carry credentials by name, compared decoded and ignoring case. A
+/// name only containing such a word (issueKey, assignee) is a public parameter.
+const CREDENTIAL_PARAMS: &[&str] = &[
+    "access_token",
+    "token",
+    "api_key",
+    "apikey",
+    "password",
+    "passwd",
+    "secret",
+    "client_secret",
+    "refresh_token",
+    "id_token",
+    "auth",
+    "authorization",
+    "sig",
+    "signature",
+    "x-amz-signature",
+    "x-amz-credential",
+    "x-amz-security-token",
+];
+
+fn credential_param(name: &str) -> bool {
+    let name = percent_decode(name).to_ascii_lowercase();
+    CREDENTIAL_PARAMS.contains(&name.as_str())
+}
+
+/// Parameter names that may carry credentials, for error text, where masking a public
+/// value costs nothing.
 fn secret_param(name: &str) -> bool {
     const SECRET: &[&str] =
         &["token", "key", "secret", "password", "passwd", "pwd", "auth", "sig", "credential", "session", "code"];
@@ -1441,7 +1469,7 @@ mod tests {
         };
         let clean = clean_link(read.clone(), &secrets);
         assert_eq!(clean.title.as_deref(), Some("Rotate *** now"));
-        assert_eq!(clean.url.as_deref(), Some("https://t.example/7?view=full#tab=2"));
+        assert_eq!(clean.url.as_deref(), Some("https://t.example/7?view=full#code=z&tab=2"));
         assert_eq!(TicketLink { title: read.title.clone(), url: read.url.clone(), ..clean.clone() }, read);
         for (url, expected) in [
             ("https://t.example/7", "https://t.example/7"),
@@ -1456,6 +1484,30 @@ mod tests {
             clean_value(value, &secrets),
             json!({"title": "see https://***@x.example/?key=***&q=1", "n": 3, "list": ["***"]})
         );
+    }
+
+    #[test]
+    fn urls_keep_public_parameters_and_lose_only_credentials() {
+        let cleaner = Cleaner::new(["tok-3f2a1b".to_string()]);
+        for (url, expected) in [
+            // Kept: names that merely contain a credential word, and ordinary parameters.
+            (
+                "https://t.example/browse?issueKey=ENG-1&assignee=me&selectedIssue=ENG-1&filter=open&view=board",
+                "https://t.example/browse?issueKey=ENG-1&assignee=me&selectedIssue=ENG-1&filter=open&view=board",
+            ),
+            ("https://t.example/i/ENG-1#comment=12&monkey=1", "https://t.example/i/ENG-1#comment=12&monkey=1"),
+            // Dropped: exact credential names, decoded and in any case, and values holding a secret.
+            ("https://u:p@t.example/i?access_token=a&view=1", "https://t.example/i?view=1"),
+            (
+                "https://t.example/i?API_KEY=a&apikey=b&client%5Fsecret=c&X-Amz-Signature=d&ref=7",
+                "https://t.example/i?ref=7",
+            ),
+            ("https://t.example/i?state=tok%2D3f2a1b&page=2", "https://t.example/i?page=2"),
+            ("https://t.example/i#id_token=x&tab=2", "https://t.example/i#tab=2"),
+            ("https://t.example/i?Signature=s&X-Amz-Credential=c&x-amz-security-token=t", "https://t.example/i"),
+        ] {
+            assert_eq!(cleaner.url(url), expected, "{url}");
+        }
     }
 
     #[test]
@@ -1474,8 +1526,12 @@ mod tests {
         // Encoded twice, the secret cannot be placed: the field goes.
         assert_eq!(cleaner.field("Rotate sk-split%252D9e8d7c now"), WITHHELD_FIELD);
         assert_eq!(cleaner.error("bad sk-split%252D9e8d7c"), WITHHELD);
-        let value = json!({"sk-split-9e8d7c": "rejected", "nested": [{"sk-split\n-9e8d7c": 1, "ok": "fine"}]});
-        assert_eq!(cleaner.value(value), json!({"***": "rejected", "nested": [{"***": 1, "ok": "fine"}]}));
+        let value = json!({"sk-split-9e8d7c": "rejected", "nested": [{"sk-split\n-9e8d7c": 1, "ok": "fine"}],
+            "link": "see https://t.example/b?issueKey=ENG-1&token=zz"});
+        assert_eq!(
+            cleaner.value(value),
+            json!({"***": "rejected", "nested": [{"***": 1, "ok": "fine"}], "link": "see https://t.example/b?issueKey=ENG-1&token=***"})
+        );
         assert_eq!(cleaner.with(["another-secret".to_string()]).field("another-secret"), "***");
         let long = format!("{} tail", "word ".repeat(MAX_FIELD_CHARS));
         let bounded = Cleaner::default().field(&long);
