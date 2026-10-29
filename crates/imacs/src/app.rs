@@ -846,6 +846,7 @@ impl State {
     fn shutdown(&mut self) {
         // macOS never returns from the event loop after Cmd+Q, so the clean exit is recorded here.
         crate::crash::exited(&paths::imacs_home());
+        self.stop_tickets();
         for editor in self.editors.values() {
             editor.shutdown();
         }

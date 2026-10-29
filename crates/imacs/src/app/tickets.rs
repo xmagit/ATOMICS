@@ -178,7 +178,17 @@ impl State {
         let done = self.tickets.done_tx.clone();
         let jobs = self.tickets.jobs.get_or_insert_with(|| crate::tickets::spawn(done));
         self.tickets.pending += 1;
-        let _ = jobs.send(TicketJob { config: config.clone(), op, tag });
+        if let Err(unsent) = jobs.send(TicketJob { config: config.clone(), op, tag }) {
+            // A worker that stopped is started again for the next job; this one fails.
+            self.tickets.jobs = None;
+            self.tickets.pending -= 1;
+            self.finish_ticket(unsent.0.tag, Err("the ticket worker stopped".into()));
+        }
+    }
+
+    /// Stops the worker, which closes the ticket system's stdio server.
+    pub(super) fn stop_tickets(&mut self) {
+        self.tickets.jobs = None;
     }
 
     /// Reads the linked tickets of one plan, or of every open plan, again. In board

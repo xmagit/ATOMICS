@@ -286,6 +286,18 @@ Its completed tile fills an otherwise empty grid cell, showing the duration, las
 When every task is accepted, the plan tab shows ✓ and its board offers **Archive plan**. The chief stays running and
 worktrees remain for the existing **clean up…** flow. Set `[plan] close_done_agents = false` to keep agents running.
 
+## Tickets
+
+Plans can follow a ticket system that has an MCP server, such as Relay or Linear. In board mode a board in the
+ticket system is a plan and its tickets are tasks; in ticket mode one ticket is a plan. IMACS talks to the server
+itself (stdio, or streamable HTTP with a token from the environment). A `[tickets]` section in the workspace file
+or the config maps each generic operation (get, list, update state, comment, create) to one of its tools. Swapping
+systems changes only that section. Cards show each ticket's live key and state, and a click opens it. IMACS moves
+ticket states as tasks move and comments on dispatch, reports, acceptance, blocks and completion, signed with
+the reporting model. Changes made in the ticket system reach the chief as `ticket` events in `imacs_wait`.
+Failures show on the card and never block a plan. See [docs/tickets.md](docs/tickets.md) for the design, the
+config reference and examples.
+
 ## Running many agents
 
 Every agent works in its own worktree with its own `target/`, so its builds never wait on another's.
