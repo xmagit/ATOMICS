@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel};
+#[cfg(test)]
+use std::sync::mpsc::channel;
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -203,7 +205,7 @@ struct Cleanup {
     delete_branches: bool,
     busy: Option<String>,
     log: Vec<String>,
-    tx: Sender<CleanupEvent>,
+    tx: crate::host::Sender<CleanupEvent>,
     rx: Receiver<CleanupEvent>,
 }
 

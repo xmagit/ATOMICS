@@ -5,7 +5,7 @@ impl State {
     /// or base_ref, and starts `launch` in it.
     pub(super) fn create_worktree(&mut self, repo: PathBuf, branch: String, start: Option<String>, launch: Launch) {
         let path = git::worktree_path(&self.config.worktree_path, &repo, &branch);
-        let (tx, base_ref, ctx) = (self.worktree_tx.clone(), self.config.base_ref.clone(), self.ctx.clone());
+        let (tx, base_ref) = (self.worktree_tx.clone(), self.config.base_ref.clone());
         self.creating.push(branch.clone());
         self.toast(format!("Creating worktree {}…", paths::display(&path)));
         std::thread::spawn(move || {
@@ -19,12 +19,11 @@ impl State {
                     .map_err(|e| format!("{e:#}"))
             };
             let _ = tx.send((branch, result, launch));
-            ctx.request_repaint();
         });
     }
 
     pub(super) fn open_cleanup(&mut self, repo: PathBuf, preselect: Option<PathBuf>) {
-        let (tx, rx) = channel();
+        let (tx, rx) = self.wake.channel();
         let mut cleanup =
             Cleanup { repo, rows: None, preselect, delete_branches: true, busy: None, log: Vec::new(), tx, rx };
         self.load_cleanup(&mut cleanup);
@@ -33,33 +32,32 @@ impl State {
 
     fn load_cleanup(&self, cleanup: &mut Cleanup) {
         cleanup.rows = None;
-        let (tx, repo, base, ctx) =
-            (cleanup.tx.clone(), cleanup.repo.clone(), self.config.base_ref.clone(), self.ctx.clone());
+        let (tx, repo, base) = (cleanup.tx.clone(), cleanup.repo.clone(), self.config.base_ref.clone());
         std::thread::spawn(move || {
             let result = git::worktree_health(&repo, &base).map_err(|e| format!("{e:#}"));
             let _ = tx.send(CleanupEvent::Loaded(result));
-            ctx.request_repaint();
         });
     }
 
     /// Runs a git maintenance command for the dialog in the background.
     fn cleanup_git(&self, cleanup: &mut Cleanup, label: &str, args: &'static [&'static str]) {
         cleanup.busy = Some(label.to_string());
-        let (tx, repo, ctx, label) = (cleanup.tx.clone(), cleanup.repo.clone(), self.ctx.clone(), label.to_string());
+        let (tx, repo, label) = (cleanup.tx.clone(), cleanup.repo.clone(), label.to_string());
         std::thread::spawn(move || {
             let message = match git::git(&repo, args) {
                 Ok(_) => format!("{label}: done"),
                 Err(err) => format!("{label}: {err:#}"),
             };
             let _ = tx.send(CleanupEvent::Finished(message));
-            ctx.request_repaint();
         });
     }
 
-    pub(super) fn cleanup_dialog(&mut self, ctx: &egui::Context) {
-        let Some(mut cleanup) = self.cleanup.take() else { return };
+    pub(super) fn poll_cleanup(&mut self) -> bool {
+        let Some(mut cleanup) = self.cleanup.take() else { return false };
+        let mut changed = false;
         let mut reload = false;
         while let Ok(event) = cleanup.rx.try_recv() {
+            changed = true;
             match event {
                 CleanupEvent::Loaded(Ok(list)) => {
                     let preselect = cleanup.preselect.take();
@@ -97,6 +95,12 @@ impl State {
             self.load_cleanup(&mut cleanup);
         }
 
+        self.cleanup = Some(cleanup);
+        changed
+    }
+
+    pub(super) fn cleanup_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut cleanup) = self.cleanup.take() else { return };
         let p = self.palette.clone();
         let agent_roots: HashSet<PathBuf> = self.sessions.iter().map(Session::root).collect();
         let name = cleanup.repo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -240,17 +244,14 @@ impl State {
             let targets: Vec<(PathBuf, Option<String>)> =
                 rows.iter().filter(|r| r.selected).map(|r| (r.health.path.clone(), r.health.branch.clone())).collect();
             cleanup.busy = Some(format!("removing {} worktrees…", targets.len()));
-            let (tx, repo, delete, ctx) =
-                (cleanup.tx.clone(), cleanup.repo.clone(), cleanup.delete_branches, self.ctx.clone());
+            let (tx, repo, delete) = (cleanup.tx.clone(), cleanup.repo.clone(), cleanup.delete_branches);
             std::thread::spawn(move || {
                 for (path, branch) in targets {
                     let result =
                         git::remove_worktree(&repo, &path, branch.as_deref(), delete).map_err(|e| format!("{e:#}"));
                     let _ = tx.send(CleanupEvent::Removed(path, result));
-                    ctx.request_repaint();
                 }
                 let _ = tx.send(CleanupEvent::Finished("removal finished".into()));
-                ctx.request_repaint();
             });
         }
         if open {

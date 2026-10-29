@@ -6,8 +6,15 @@ pub(super) struct PlanCleanup {
     rows: Vec<(Entry, bool)>,
     busy: bool,
     log: Vec<String>,
-    tx: Sender<Event>,
+    tx: crate::host::Sender<Event>,
     rx: Receiver<Event>,
+}
+
+#[cfg(test)]
+impl PlanCleanup {
+    pub(super) fn ready(&self) -> bool {
+        !self.busy
+    }
 }
 
 enum Event {
@@ -18,7 +25,7 @@ enum Event {
 
 impl State {
     pub(super) fn open_plan_cleanup(&mut self, index: usize) {
-        let (tx, rx) = channel();
+        let (tx, rx) = self.wake.channel();
         let plan = self.plans[index].clone();
         let mut dialog = PlanCleanup { plan, rows: Vec::new(), busy: false, log: Vec::new(), tx, rx };
         self.load_plan_cleanup(&mut dialog);
@@ -28,17 +35,17 @@ impl State {
     fn load_plan_cleanup(&self, dialog: &mut PlanCleanup) {
         dialog.busy = true;
         dialog.rows.clear();
-        let (tx, plan, base, ctx) =
-            (dialog.tx.clone(), dialog.plan.clone(), self.config.base_ref.clone(), self.ctx.clone());
+        let (tx, plan, base) = (dialog.tx.clone(), dialog.plan.clone(), self.config.base_ref.clone());
         std::thread::spawn(move || {
             let _ = tx.send(Event::Preview(cleanup::preview(&plan, &base).map_err(|err| format!("{err:#}"))));
-            ctx.request_repaint();
         });
     }
 
-    pub(super) fn plan_cleanup_dialog(&mut self, ctx: &egui::Context) {
-        let Some(mut dialog) = self.plan_cleanup.take() else { return };
+    pub(super) fn poll_plan_cleanup(&mut self) -> bool {
+        let Some(mut dialog) = self.plan_cleanup.take() else { return false };
+        let mut changed = false;
         while let Ok(event) = dialog.rx.try_recv() {
+            changed = true;
             match event {
                 Event::Preview(result) => {
                     dialog.busy = false;
@@ -69,6 +76,12 @@ impl State {
                 }
             }
         }
+        self.plan_cleanup = Some(dialog);
+        changed
+    }
+
+    pub(super) fn plan_cleanup_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.plan_cleanup.take() else { return };
         let completed = self.plans.iter().any(|plan| plan.id == dialog.plan.id && plan.status == PlanStatus::Completed);
         // Sessions resolve their worktree in the background, so compare real paths (/var is /private/var).
         let real = |path: std::path::PathBuf| std::fs::canonicalize(&path).unwrap_or(path);
@@ -151,15 +164,13 @@ impl State {
             dialog.busy = true;
             let targets: Vec<_> =
                 dialog.rows.iter().filter(|(_, selected)| *selected).map(|(row, _)| row.clone()).collect();
-            let (tx, plan, base, ctx) = (dialog.tx.clone(), plan, self.config.base_ref.clone(), self.ctx.clone());
+            let (tx, plan, base) = (dialog.tx.clone(), plan, self.config.base_ref.clone());
             std::thread::spawn(move || {
                 for entry in targets {
                     let result = cleanup::remove(&plan, &base, &entry).map_err(|err| format!("{err:#}"));
                     let _ = tx.send(Event::Removed(entry, result));
-                    ctx.request_repaint();
                 }
                 let _ = tx.send(Event::Finished);
-                ctx.request_repaint();
             });
         }
         if open {
@@ -215,7 +226,7 @@ mod tests {
                     &app.config.agents[0],
                     dir.path().join("busy"),
                     false,
-                    &app.ctx,
+                    &app.wake,
                 ));
                 app.plans = vec![plan];
                 app.selected_plan = 0;
@@ -281,7 +292,7 @@ mod tests {
                 let deadline = Instant::now() + Duration::from_secs(10);
                 while app.plan_cleanup.as_ref().unwrap().busy {
                     assert!(Instant::now() < deadline);
-                    frame(app, vec![]);
+                    app.runtime_tick(ctx);
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 let text = frame(app, vec![]);
@@ -313,7 +324,7 @@ mod tests {
                 let deadline = Instant::now() + Duration::from_secs(10);
                 while app.plan_cleanup.as_ref().unwrap().busy {
                     assert!(Instant::now() < deadline);
-                    frame(app, vec![]);
+                    app.runtime_tick(ctx);
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 assert!(!dir.path().join("clean").exists());

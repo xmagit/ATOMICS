@@ -339,3 +339,19 @@ fn held_terminal_input_gets_a_receipt_without_frames() {
         assert!(host.state().sessions[0].last_message.is_none());
     });
 }
+
+#[test]
+fn cleanup_previews_finish_without_painting_the_dialogs() {
+    with_state("app::host_tests::cleanup_previews_finish_without_painting_the_dialogs", |mut state, _| {
+        let (_dir, repo) = repository();
+        state.config.base_ref = "main".into();
+        state.plans[0].project = Some(repo.clone());
+        state.plans[0].status = PlanStatus::Completed;
+        state.open_cleanup(repo, None);
+        state.open_plan_cleanup(0);
+        let host = state.into_host();
+        eventually(&host, |state| {
+            state.cleanup.as_ref().unwrap().rows.is_some() && state.plan_cleanup.as_ref().unwrap().ready()
+        });
+    });
+}

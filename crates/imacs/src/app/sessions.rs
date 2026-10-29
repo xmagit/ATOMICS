@@ -6,13 +6,12 @@ impl Session {
         agent: &imacs_core::config::AgentConfig,
         cwd: PathBuf,
         chief: bool,
-        ctx: &egui::Context,
+        wake: &crate::host::Wake,
     ) -> Self {
-        let (tx, rx) = channel();
-        let (dir, ctx) = (cwd.clone(), ctx.clone());
+        let (tx, rx) = wake.channel();
+        let dir = cwd.clone();
         std::thread::spawn(move || {
             let _ = tx.send(git::worktree_of(&dir));
-            ctx.request_repaint();
         });
         let title = if chief { "chief".into() } else { title_for(None, &cwd) };
         Self {
@@ -124,7 +123,13 @@ impl State {
                     Some(supported.unwrap_or(false))
                 }
                 None => {
-                    self.sessions.push(Session::starting(id.clone(), &launch.agent, launch.cwd.clone(), chief, ctx));
+                    self.sessions.push(Session::starting(
+                        id.clone(),
+                        &launch.agent,
+                        launch.cwd.clone(),
+                        chief,
+                        &self.wake,
+                    ));
                     self.pending_codex.push((launch, ready));
                     self.activate(&id, false);
                     return Ok(id);
@@ -136,7 +141,7 @@ impl State {
         self.launch_agent(ctx, launch, version)
     }
 
-    fn codex_version(&mut self, ctx: &egui::Context, program: String) -> CodexVersion {
+    fn codex_version(&mut self, _ctx: &egui::Context, program: String) -> CodexVersion {
         if self.codex_versions.get(&program).is_some_and(|ready| ready.get() == Some(&None)) {
             self.codex_versions.remove(&program);
         }
@@ -145,13 +150,11 @@ impl State {
             .or_insert_with(|| {
                 let ready = Arc::new(OnceLock::new());
                 let result = ready.clone();
-                let ctx = ctx.clone();
                 let wake = self.wake.clone();
                 std::thread::spawn(move || {
                     let supported = crate::setup::codex_supports_hooks(&program, CODEX_VERSION_TIMEOUT);
                     let _ = result.set(supported);
                     wake.notify();
-                    ctx.request_repaint();
                 });
                 ready
             })
@@ -160,7 +163,7 @@ impl State {
 
     pub(super) fn launch_agent(
         &mut self,
-        ctx: &egui::Context,
+        _ctx: &egui::Context,
         launch: AgentLaunch,
         codex: Option<bool>,
     ) -> Result<String, String> {
@@ -308,7 +311,7 @@ impl State {
                 }
                 let starting = self.sessions.iter().position(|session| session.id == id);
                 let index = starting.unwrap_or_else(|| {
-                    self.sessions.push(Session::starting(id.clone(), &agent, cwd, chief, ctx));
+                    self.sessions.push(Session::starting(id.clone(), &agent, cwd, chief, &self.wake));
                     self.sessions.len() - 1
                 });
                 self.sessions[index].terminal = Some(terminal);
@@ -1198,8 +1201,7 @@ fi
                 kind: AgentKind::Shell,
                 busy_text: None,
             };
-            let ctx = egui::Context::default();
-            let session = Session::starting("start".into(), &agent, dir.clone(), false, &ctx);
+            let session = Session::starting("start".into(), &agent, dir.clone(), false, &crate::host::Wake::default());
             assert!(!dir.join("timed-out").exists(), "session construction waited for git on the UI thread");
             assert!(session.worktree.is_none());
             std::fs::write(dir.join("ready"), "").unwrap();

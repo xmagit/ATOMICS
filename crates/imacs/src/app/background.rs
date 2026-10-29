@@ -11,6 +11,8 @@ impl State {
             changed = true;
         }
         self.refresh_integrations();
+        changed |= self.poll_cleanup();
+        changed |= self.poll_plan_cleanup();
         changed |= self.usage.drain();
         for session in &mut self.sessions {
             if let Some(ready) = &session.worktree_ready
