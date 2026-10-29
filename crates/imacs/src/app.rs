@@ -55,6 +55,7 @@ mod sidebar;
 mod tickets;
 mod topbar;
 mod voice;
+mod workflow;
 mod worktrees;
 
 use chief::{CHIEF_ALLOWED_TOOLS, chief_divider};

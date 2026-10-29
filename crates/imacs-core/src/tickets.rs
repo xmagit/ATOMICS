@@ -26,6 +26,9 @@ pub struct TicketLink {
     pub url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// The ticket system's suggested git branch, when supplied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     /// The system's own state name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
@@ -78,6 +81,7 @@ impl TicketLink {
             (&mut self.key, &fetched.key),
             (&mut self.url, &fetched.url),
             (&mut self.title, &fetched.title),
+            (&mut self.branch, &fetched.branch),
             (&mut self.state, &fetched.state),
             (&mut self.updated_at, &fetched.updated_at),
         ] {
@@ -102,6 +106,7 @@ impl TicketLink {
                     (&mut new.key, &old.key),
                     (&mut new.url, &old.url),
                     (&mut new.title, &old.title),
+                    (&mut new.branch, &old.branch),
                     (&mut new.state, &old.state),
                     (&mut new.updated_at, &old.updated_at),
                 ] {
@@ -165,6 +170,8 @@ pub struct TicketConfig {
     pub comments: CommentPolicy,
     /// Free text added to the chief's prompt: how this team works with its tickets.
     pub workflow: String,
+    /// Template for newly created branches of linked work.
+    pub branch: Option<String>,
     /// Longest wait for one MCP request.
     pub timeout_secs: u64,
     pub server: McpServer,
@@ -180,6 +187,7 @@ impl Default for TicketConfig {
             mode: TicketMode::Board,
             comments: CommentPolicy::Agents,
             workflow: String::new(),
+            branch: None,
             timeout_secs: 30,
             server: McpServer::default(),
             states: StateMap::default(),
@@ -232,6 +240,9 @@ pub struct StateMap {
     pub done: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blocked: Option<String>,
+    /// Additional lifecycle stage names, entirely config driven.
+    #[serde(flatten)]
+    pub stages: BTreeMap<String, String>,
 }
 
 impl StateMap {
@@ -246,6 +257,29 @@ impl StateMap {
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
+    }
+
+    pub fn stage(&self, name: &str) -> Option<&str> {
+        self.stages.get(name).map(String::as_str).map(str::trim).filter(|s| !s.is_empty())
+    }
+
+    /// Acceptance and completion differ when a later milestone is configured. Explicit
+    /// stage mappings apply after acceptance; the completion mapping wins at its gate.
+    pub fn after_acceptance(
+        &self,
+        workflow: &crate::workflow::Workflow,
+        latest: Option<&crate::workflow::Stage>,
+        reached: bool,
+    ) -> Option<&str> {
+        let done = reached.then(|| self.get(TaskStatus::Done)).flatten();
+        match latest {
+            None => done,
+            Some(stage) if stage.stage == "ci_failed" => self.stage("ci_failed"),
+            Some(stage) if stage.stage == workflow.done => done.or_else(|| self.stage(&stage.stage)),
+            Some(stage) => self.stage(&stage.stage).or_else(|| {
+                (workflow.done != "accepted" && workflow.reached(std::slice::from_ref(stage))).then_some(done).flatten()
+            }),
+        }
     }
 
     /// The IMACS status a system state name stands for, ignoring case.
@@ -301,6 +335,7 @@ pub struct FieldPaths {
     pub title: String,
     pub state: String,
     pub updated_at: String,
+    pub branch: String,
 }
 
 impl Default for FieldPaths {
@@ -312,6 +347,7 @@ impl Default for FieldPaths {
             title: "title".into(),
             state: "state".into(),
             updated_at: "updated_at".into(),
+            branch: String::new(),
         }
     }
 }
@@ -377,6 +413,36 @@ impl Vars {
 }
 
 impl TicketConfig {
+    /// Render only known placeholders in one pass. Missing values leave naming to IMACS.
+    pub fn branch_name(&self, link: &TicketLink) -> Option<String> {
+        if !self.accepts(link) {
+            return None;
+        }
+        let template = self.branch.as_deref()?;
+        let key = link.label();
+        let lower = key.to_lowercase();
+        let number = key.rsplit('-').next().filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()));
+        let slug = link.title.as_deref().map(crate::plan::short_slug).filter(|s| !s.is_empty());
+        let values = [
+            ("key", Some(key).filter(|s| !s.is_empty())),
+            ("key_lower", Some(lower.as_str()).filter(|s| !s.is_empty())),
+            ("key_number", number),
+            ("slug", slug.as_deref()),
+            ("branch", link.branch.as_deref().filter(|s| !s.is_empty())),
+        ];
+        let mut rest = template;
+        let mut out = String::new();
+        while let Some(start) = rest.find('{') {
+            out.push_str(&rest[..start]);
+            let end = rest[start..].find('}')? + start;
+            let name = &rest[start + 1..end];
+            out.push_str(values.iter().find(|(n, _)| *n == name)?.1?);
+            rest = &rest[end + 1..];
+        }
+        out.push_str(rest);
+        (!out.is_empty()).then_some(out)
+    }
+
     /// Configured with a system name and a server to reach it.
     pub fn is_configured(&self) -> bool {
         !self.system.trim().is_empty()
@@ -438,6 +504,8 @@ impl TicketConfig {
             .into_iter()
             .filter_map(|status| self.states.get(status).map(|state| format!("{} → {state}", status.label())))
             .collect();
+        let mut states = states;
+        states.extend(self.states.stages.iter().map(|(stage, state)| format!("{stage} → {state}")));
         if !states.is_empty() {
             text.push_str(&format!(
                 "IMACS sets ticket states as tasks move ({}), and shows each ticket's live state on its card.\n",
@@ -521,11 +589,17 @@ impl FieldPaths {
             key: field(&self.key),
             url: field(&self.url),
             title: field(&self.title),
+            branch: field(&self.branch),
             state: field(&self.state),
             updated_at: field(&self.updated_at),
             ..TicketLink::default()
         }
     }
+}
+
+/// A lifecycle comment uses the same author signature and policy as other lifecycle notes.
+pub fn stage_comment(author: &Author, stage: &crate::workflow::Stage) -> String {
+    format!("{}\n{}", author.opening(None), stage.comment())
 }
 
 /// The credentials a config runs with, which nothing from its server may carry into plans
@@ -621,6 +695,7 @@ impl Cleaner {
             key: field(link.key),
             url: link.url.map(|url| self.url(&url)),
             title: field(link.title),
+            branch: field(link.branch),
             state: field(link.state),
             updated_at: field(link.updated_at),
             pushed_state: field(link.pushed_state),
@@ -1261,6 +1336,57 @@ mod tests {
 
     fn link(id: &str) -> TicketLink {
         TicketLink { system: "alpha".into(), id: id.into(), ..TicketLink::default() }
+    }
+
+    #[test]
+    fn stage_maps_apply_after_acceptance_without_bypassing_a_later_done_gate() {
+        use crate::workflow::{Stage, Workflow};
+        let mut states = StateMap { done: Some("Done".into()), ..Default::default() };
+        states.stages.insert("pr_opened".into(), "In Review".into());
+        let pr = Stage { stage: "pr_opened".into(), ..Default::default() };
+        assert_eq!(states.after_acceptance(&Workflow::default(), Some(&pr), true), Some("In Review"));
+        let mut workflow = Workflow { done: "ci_passed".into(), ..Default::default() };
+        assert_eq!(states.after_acceptance(&workflow, None, false), None);
+        assert_eq!(states.after_acceptance(&workflow, Some(&pr), false), Some("In Review"));
+        let ci = Stage { stage: "ci_passed".into(), ..Default::default() };
+        assert_eq!(states.after_acceptance(&workflow, Some(&ci), true), Some("Done"));
+        let failed = Stage { stage: "ci_failed".into(), ..Default::default() };
+        assert_eq!(states.after_acceptance(&workflow, Some(&failed), true), None);
+        workflow.done = "pr_opened".into();
+        assert_eq!(states.after_acceptance(&workflow, Some(&pr), true), Some("Done"));
+    }
+
+    #[test]
+    fn branch_templates_require_values_and_render_once() {
+        let operation: Operation =
+            serde_json::from_value(serde_json::json!({"result":{"branch":"gitBranchName"}})).unwrap();
+        assert_eq!(
+            operation
+                .ticket(&serde_json::json!({"id":"ENG-42", "gitBranchName":"feature/parser"}), "example")
+                .unwrap()
+                .branch
+                .as_deref(),
+            Some("feature/parser")
+        );
+        let mut config = TicketConfig {
+            branch: Some("{key}/{key_lower}/{key_number}/{slug}/{branch}".into()),
+            ..Default::default()
+        };
+        let link = TicketLink {
+            id: "uuid".into(),
+            key: Some("ENG-42".into()),
+            title: Some("Fix parser now".into()),
+            branch: Some("feature/parser".into()),
+            ..Default::default()
+        };
+        assert_eq!(config.branch_name(&link).as_deref(), Some("ENG-42/eng-42/42/fix-parser-now/feature/parser"));
+        assert!(config.branch_name(&TicketLink { title: None, ..link.clone() }).is_none());
+        assert!(config.branch_name(&TicketLink { branch: None, ..link.clone() }).is_none());
+        assert!(config.branch_name(&TicketLink { key: Some("ENG".into()), ..link.clone() }).is_none());
+        config.branch = Some("{unknown}".into());
+        assert!(config.branch_name(&link).is_none());
+        config.branch = Some("{branch}".into());
+        assert_eq!(config.branch_name(&TicketLink { branch: Some("{key}".into()), ..link }).as_deref(), Some("{key}"));
     }
 
     #[test]

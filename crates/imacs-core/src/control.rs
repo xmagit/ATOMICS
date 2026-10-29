@@ -145,6 +145,34 @@ pub enum ControlRequest {
         #[serde(default)]
         session: Option<String>,
     },
+    /// Report a lifecycle milestone as chief, or from a webhook bridge via stage_event.
+    PlanStage {
+        plan: String,
+        #[serde(default)]
+        task: Option<String>,
+        stage: String,
+        #[serde(default)]
+        url: Option<String>,
+        #[serde(default)]
+        note: Option<String>,
+    },
+    StageEvent {
+        #[serde(default)]
+        plan: Option<String>,
+        #[serde(default)]
+        task: Option<String>,
+        #[serde(default)]
+        system: Option<String>,
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        key: Option<String>,
+        stage: String,
+        #[serde(default)]
+        url: Option<String>,
+        #[serde(default)]
+        note: Option<String>,
+    },
     /// Starts the given task, or every ready task, each in a new worktree.
     PlanDispatch {
         #[serde(default)]

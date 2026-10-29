@@ -11,7 +11,7 @@ with an MCP server, changes only the config.
 
 ## Design
 
-- **Links, not copies.** A link holds `system`, `id`, `key`, `url`, `title`, `state` and `updated_at` and is
+- **Links, not copies.** A link holds `system`, `id`, `key`, `url`, `title`, `state` and `updated_at`, optional suggested `branch` and is
   saved with the plan. Ids and states are opaque strings. IMACS stores the system's own state names, and
   the `id` stays what the link was made with, because that is what the operations address. IMACS also keeps
   `synced_at` (when it last read the ticket), `pushed_state` (the state it last set) and `error` (why the
@@ -59,17 +59,18 @@ main config's, such as the server command on one machine. A workspace can turn t
 `system = ""`. Both files reload while IMACS runs; changing the effective config reads every link again. A
 broken workspace section is reported and the last good one stays in use. Saving a workspace from IMACS
 keeps its `[tickets]` section key for key, though not its comments. The chief's prompt is fixed when the
-chief starts, so restart the chief after changing `mode`, `comments`, `states` or `workflow`.
+chief starts, so restart the chief after changing ticket settings or the declarative `[workflow]` settings.
 
 | Key | Meaning |
 | --- | --- |
 | `system` | The system's name, shown on cards and to the chief. Empty turns tickets off. |
 | `mode` | `"board"` (default): a board is a plan, its tickets are tasks. `"ticket"`: a ticket is a plan. |
 | `comments` | Who comments: `"agents"` (default) for agents' reports plus IMACS's lifecycle notes, `"chief"` for lifecycle notes and the chief's own comments only, `"off"` for none. |
+| `branch` | Optional branch template: `{key}`, `{key_lower}`, `{key_number}` (numeric suffix of the key), `{slug}` (ticket title), `{branch}` (system suggestion). |
 | `workflow` | Free text added to the chief's prompt: how your team works with tickets. |
 | `timeout_secs` | Longest wait for one MCP request (default 30). |
 | `server` | The MCP server; see below. |
-| `states` | The system's state names for `planned`, `running`, `review`, `done` and `blocked`. Unmapped statuses are never pushed. |
+| `states` | The system's state names for `planned`, `running`, `review`, `done`, `blocked` and any lifecycle stage. Unmapped statuses are never pushed. |
 | `operations` | Which tool implements each operation; see below. |
 
 ### The server
@@ -102,6 +103,18 @@ command = ["npx", "-y", "mcp-remote", "https://mcp.linear.app/mcp"]
 
 The bridge opens the browser on first use and stores the token for later runs. Run the command once in a
 terminal to sign in before IMACS needs it.
+
+### Ticket-aware branches
+
+Set `branch = "issue/{key_number}-{slug}"`, or `branch = "{branch}"` to use the system's suggestion.
+The optional operation result path `branch = "gitBranchName"` reads that suggestion (leave it unset
+when the server has none). IMACS uses a task's ticket, falling back to the plan ticket in ticket mode.
+Task branches using the plan ticket append `-<task-id>` to keep sibling tasks and the integration
+branch separate. In ticket mode the plan's integration branch uses the template too.
+
+Names are checked with `git check-ref-format --branch` and the usual base-branch guard. Missing fields,
+unknown placeholders or invalid names fall back to the existing `imacs/...` names. Naming is pinned
+before branch creation: existing task and integration branches never change after a sync or config edit.
 
 ### Operations
 
@@ -147,10 +160,96 @@ result, which tells you where the fields really are. `imacs_ticket_sync` is a qu
 | An agent reports | Comments with the report, signed with the agent's model, for example "This is GPT-6.1 Sol (high), the IMACS agent on task t2 (Add the --json flag)." The model comes from the task's `-m`/`--model` and effort arguments. |
 | A task is accepted or blocked | Comments with the note that came with it: signed by the chief through `imacs_plan_update`, "for the user" from the board, or by IMACS when an agent exits or cannot start. |
 | The plan completes | Ticket mode: comments on the plan's ticket. |
-| Someone changes a linked ticket | The card shows the new state. A state the chief did not set arrives as a `ticket` event in `imacs_wait` with `from`, `to` and `means` (the IMACS status the new state maps to). When that differs from the task's status, the card says "ticket says running". |
+| Someone changes a linked ticket | The card shows the new state. A state the chief did not set arrives as a `ticket` event in `imacs_wait` with `from`, `to` and `means` (the IMACS status the new state maps to). When that differs from active work's status, the card says "ticket says running". After acceptance or a recorded lifecycle stage, movement is expected progress: the event has `expected: true`, and the card has no drift note. |
 
 Comments go to the task's ticket. A task without one comments on the plan's ticket in ticket mode, and
 not at all in board mode. Comments follow `comments`. With `"off"`, `imacs_ticket_comment` refuses too.
+
+## Lifecycle and completion
+
+`[workflow]` is declarative and independent of the ticket provider. It belongs in the main config
+(with host overrides) or the active workspace file (which wins as a whole section); the repository workflow configuration task will make the same shape
+available in `.imacs/config.toml`. It does not run commands or poll CI.
+
+```toml
+[workflow]
+done = "pr_opened"
+# Successful stages in order; replace the list to insert custom milestones.
+stages = ["accepted", "integrated", "pr_opened", "ci_passed", "merged", "deployed"]
+
+[tickets.states]
+planned = "Todo"
+running = "In Progress"
+# For a system without PR automation:
+pr_opened = "In Review"
+# Optional: done = "Done" (only if opening a PR means done for your team)
+```
+
+For a team whose acceptance criterion includes CI:
+
+```toml
+[workflow]
+done = "ci_passed"
+stages = ["accepted", "integrated", "pr_opened", "ci_passed", "security_approved", "merged", "deployed"]
+
+[tickets.states]
+pr_opened = "In Review"
+ci_failed = "Blocked"
+done = "Done"
+```
+
+The default is `done = "accepted"`, preserving today's behavior. Task status `done` still means
+accepted for dependency dispatch and agent cleanup; it does not bypass the configured plan completion
+gate. All tasks, including final review, must be accepted and finish their usual integration/cleanup
+checks before the plan completes. A plan stage covers every task; alternatively every implementation
+task (excluding final review) must reach the milestone separately. Only then does IMACS complete the
+plan, post its closing ticket comment and push the optional `done` mapping. Explicitly closing a plan
+as completed also respects the gate; archiving remains available.
+
+The ordered successful stages start with `accepted`; custom names use lowercase letters, digits and
+underscores and appear in that list in their desired order. A later successful stage proves earlier
+milestones were reached. `ci_failed` is always allowed as a side event, cannot be the completion gate,
+and never proves CI passed. Once reached, a milestone stays reached; a later failure does not reopen
+a completed plan. Its optional `ci_failed` state mapping still applies. The latest recorded event, comparing plan and task histories, is shown on
+the card, including a clickable PR or CI URL. Full event history persists with the plan and appears in
+`imacs_plan_get`. A consecutive duplicate event (same stage, URL and note) has no second comment or state push.
+
+The chief reports a stage through one tool:
+
+```json
+{"name":"imacs_plan_stage","arguments":{"plan":"parser","stage":"pr_opened","url":"https://github.com/example/repo/pull/42"}}
+```
+
+Add `task` to target one accepted task. IMACS's own successful integration records `integrated` too
+(integration may be recorded while a task is in review). Other stages require acceptance. We use a
+separate stage tool instead of a `pr` field on `imacs_plan_update`: plans and tasks share the same
+milestones, and a PR is one of several possible completion criteria. The configured workflow and
+stage state maps appear in the chief's prompt. The chief can report stages on completed plans too.
+
+External systems use `imacs_stage_event` or the control socket with the same stage/URL/note fields:
+
+```sh
+imacs ctl '{"cmd":"stage_event","plan":"parser","stage":"ci_passed","url":"https://ci.example/runs/12"}'
+imacs ctl '{"cmd":"stage_event","system":"linear","key":"ENG-123","stage":"merged"}'
+```
+
+Identify one target with `plan` and optional `task`, or by a linked ticket's `system` plus `id`/`key`.
+Unknown and ambiguous targets fail without mutation. Events never run commands or dispatch work.
+A command-based CI poller is a follow-up; this implementation accepts chief reports and webhook events.
+
+After a plan or task is accepted or records a stage, further external ticket movement is expected
+progress. The chief still receives the ticket event, marked `expected: true`; IMACS suppresses the
+"ticket says …" note. Active work without acceptance or stages retains its existing drift notes and
+`expected: false` events. A plan's milestone also covers its tasks.
+
+Stage comments, such as `PR opened: <url>` and `CI passed`, follow the existing comment policy and
+signature rules. Stage state names are arbitrary config keys under `[tickets.states]`; unmapped
+stages leave the ticket alone. At the configured completion stage, the `done` mapping takes precedence over that stage's mapping,
+when both are configured. Other explicit stage mappings apply even after completion; an unmapped
+later successful milestone can also satisfy the done gate. A `ci_failed` mapping takes precedence over
+`done`.
+State failures use the existing heartbeat/sync retries; comments are best effort, as for other lifecycle
+comments. No ticket operation is required to advance IMACS's lifecycle.
 
 ## The board
 
@@ -210,7 +309,7 @@ mode = "board"
 comments = "agents"
 workflow = "Link the existing Relay board to the plan and one ticket to each task. Product writes what and why; the chief comments implementation details. IMACS posts signed agent reports and maps states live. Use imacs_report for reports, without a second ticket comment."
 server = { command = ["relay-mcp"] }
-states = { planned = "Todo", running = "In Progress", review = "In Review", done = "Done", blocked = "Blocked" }
+states = { planned = "Todo", running = "In Progress" }
 
 [tickets.operations.get]
 tool = "get_ticket"
@@ -250,12 +349,12 @@ mode = "ticket"
 comments = "chief"
 workflow = "One Linear issue per plan; the issue says what and why, the plan says how."
 server = { command = ["npx", "-y", "mcp-remote", "https://mcp.linear.app/mcp"] }
-states = { planned = "Todo", running = "In Progress", done = "Done" }
+states = { planned = "Todo", running = "In Progress" }
 
 [tickets.operations.get]
 tool = "get_issue"
 arguments = { id = "{key}" }
-result = { id = "", key = "id", url = "url", title = "title", state = "status", updated_at = "updatedAt" }
+result = { id = "", key = "id", url = "url", title = "title", state = "status", updated_at = "updatedAt", branch = "gitBranchName" }
 
 [tickets.operations.update_state]
 tool = "save_issue"
@@ -271,18 +370,23 @@ arguments = { team = "ENG", title = "{title}", description = "{body}" }
 result = { id = "id", key = "id", url = "url", title = "title", state = "status" }
 ```
 
-[Linear's default workflow](https://linear.app/docs/issue-property#status-overview) is Backlog → Todo →
-In Progress → Done → Canceled. IMACS maps planned to Todo, running to In Progress and done to Done.
-Review and blocked have no default equivalents, so both remain unmapped and leave the issue's state
-alone. Add `review = "In Review"` or `blocked = "Blocked"` only if your team created those states.
-Backlog and Canceled remain user decisions; IMACS does not cancel an issue when a task is blocked.
+### Let PR automation own review and done
+
+The shipped profiles map only planned and running. Acceptance in IMACS does not necessarily mean
+merged or deployed. Let your ticket system's GitHub integration or other automation move the ticket to
+review when the PR opens and to done when it deploys. Unmapped states and stages are never pushed.
+
+For teams without that automation, map `pr_opened = "In Review"` to report an actual PR, or
+`review = "In Review"` to report IMACS review before acceptance. Map `done = "Done"` only when the
+configured completion milestone really means done for your team. Add `blocked = "Blocked"` if that
+state should follow IMACS. Backlog and cancellation remain user decisions.
 
 The profile uses `comments = "chief"`; change it to `"agents"` to post signed agent reports and enable
 scoped agent tools. Link the issue to the plan with `ticket = { id = "ENG-123" }`. The optional create
 operation needs your real team in place of `ENG`. Check tool names and result paths against your
 server version: doctor validates offered tool names, and sync validates results. For a server returning
 `identifier` separately from a UUID `id`, set `result = { id = "id", key = "identifier", url = "url",
-title = "title", state = "status", updated_at = "updatedAt" }` on get and create.
+title = "title", state = "status", updated_at = "updatedAt", branch = "gitBranchName" }` on get and create.
 
 ### Checking a profile
 

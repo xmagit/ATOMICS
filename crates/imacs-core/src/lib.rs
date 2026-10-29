@@ -35,4 +35,5 @@ pub mod tickets;
 pub mod usage;
 #[cfg(feature = "native")]
 pub mod voice;
+pub mod workflow;
 pub mod workspace;

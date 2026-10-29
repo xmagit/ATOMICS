@@ -90,6 +90,11 @@ allow = ["ls", "cat", "rg", "git status", "git diff", "git log"]
 # For example ["RUSTC_WRAPPER="] allows only that empty value, not a wrapper program.
 env = []
 
+[workflow]
+# IMACS completion milestone; later stages come from the chief or stage_event webhooks.
+done = "accepted"
+# stages = ["accepted", "integrated", "pr_opened", "ci_passed", "merged", "deployed"]
+
 [plan]
 # Close accepted, integrated agents automatically. Worktrees remain available.
 close_done_agents = true
@@ -105,7 +110,7 @@ close_done_agents = true
 # comments = "agents"
 # workflow = "Link the existing Relay board to the plan and one ticket to each task. Product writes what and why; the chief comments implementation details. IMACS posts signed agent reports and maps states live. Use imacs_report for reports, without a second ticket comment."
 # server = { command = ["relay-mcp"] }
-# states = { planned = "Todo", running = "In Progress", review = "In Review", done = "Done", blocked = "Blocked" }
+# states = { planned = "Todo", running = "In Progress" }
 #
 # [tickets.operations.get]
 # tool = "get_ticket"
@@ -140,12 +145,12 @@ close_done_agents = true
 # comments = "chief"
 # workflow = "One Linear issue per plan; the issue says what and why, the plan says how."
 # server = { command = ["npx", "-y", "mcp-remote", "https://mcp.linear.app/mcp"] }
-# states = { planned = "Todo", running = "In Progress", done = "Done" }
+# states = { planned = "Todo", running = "In Progress" }
 #
 # [tickets.operations.get]
 # tool = "get_issue"
 # arguments = { id = "{key}" }
-# result = { id = "", key = "id", url = "url", title = "title", state = "status", updated_at = "updatedAt" }
+# result = { id = "", key = "id", url = "url", title = "title", state = "status", updated_at = "updatedAt", branch = "gitBranchName" }
 #
 # [tickets.operations.update_state]
 # tool = "save_issue"
@@ -239,6 +244,7 @@ pub struct Config {
     pub agents: Vec<AgentConfig>,
     pub approvals: crate::approvals::ApprovalPolicy,
     pub plan: PlanConfig,
+    pub workflow: crate::workflow::Workflow,
     pub resources: crate::governor::ResourceConfig,
     pub editor: EditorConfig,
     pub chief: ChiefConfig,
@@ -573,6 +579,7 @@ impl Default for Config {
             ],
             approvals: crate::approvals::ApprovalPolicy::default(),
             plan: PlanConfig::default(),
+            workflow: crate::workflow::Workflow::default(),
             resources: crate::governor::ResourceConfig::default(),
             editor: EditorConfig::default(),
             chief: ChiefConfig::default(),

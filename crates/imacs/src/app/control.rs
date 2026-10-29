@@ -266,6 +266,42 @@ impl State {
                     done(ControlResponse::ok(self.plan_mutation_json(target, Some(&id))))
                 }
             },
+            ControlRequest::PlanStage { plan, task, stage, url, note } => {
+                let result = self.stage_target(Some(&plan), task.as_deref(), None).and_then(|(index, task)| {
+                    self.record_stage(
+                        index,
+                        task.as_deref(),
+                        imacs_core::workflow::Stage { stage, url, note, ..Default::default() },
+                        self.chief_author(),
+                    )
+                });
+                done(match result {
+                    Ok(value) => ControlResponse::ok(value),
+                    Err(error) => ControlResponse::error(error),
+                })
+            }
+            ControlRequest::StageEvent { plan, task, system, id, key, stage, url, note } => {
+                let reference = (id.is_some() || key.is_some()).then(|| imacs_core::tickets::TicketLink {
+                    system: system.unwrap_or_default(),
+                    id: id.unwrap_or_default(),
+                    key,
+                    ..Default::default()
+                });
+                let result = self.stage_target(plan.as_deref(), task.as_deref(), reference.as_ref()).and_then(
+                    |(index, task)| {
+                        self.record_stage(
+                            index,
+                            task.as_deref(),
+                            imacs_core::workflow::Stage { stage, url, note, ..Default::default() },
+                            imacs_core::tickets::Author::Imacs,
+                        )
+                    },
+                );
+                done(match result {
+                    Ok(value) => ControlResponse::ok(value),
+                    Err(error) => ControlResponse::error(error),
+                })
+            }
             ControlRequest::PlanDispatch { plan: _, id } => match self.dispatch(target, id.as_deref()) {
                 Ok(started) => done(ControlResponse::ok(json!({ "started": started }))),
                 Err(err) => done(ControlResponse::error(err)),

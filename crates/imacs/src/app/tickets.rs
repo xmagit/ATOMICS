@@ -39,6 +39,7 @@ pub(super) struct Tickets {
     /// The workspace file and its content's fingerprint when last read.
     workspace_file: Option<(Option<PathBuf>, Option<u64>)>,
     workspace_config: Option<TicketConfig>,
+    workspace_workflow: Option<imacs_core::workflow::Workflow>,
     jobs: Option<std::sync::mpsc::Sender<TicketJob<Tag>>>,
     done_tx: crate::host::Sender<Done>,
     done_rx: Receiver<Done>,
@@ -80,6 +81,7 @@ impl Tickets {
             config: None,
             workspace_file: None,
             workspace_config: None,
+            workspace_workflow: None,
             jobs: None,
             done_tx,
             done_rx,
@@ -104,17 +106,35 @@ impl State {
         if self.tickets.workspace_file.as_ref() != Some(&(file.clone(), stamp)) {
             self.tickets.workspace_file = Some((file, stamp));
             let loaded = match self.workspace.clone().filter(|_| stamp.is_some()) {
-                Some(name) => Workspace::load(&name).map_err(|err| format!("{err:#}")).and_then(|workspace| {
-                    workspace.tickets().map_err(|err| format!("[tickets] in {name}: {}", err.message()))
-                }),
+                Some(name) => Workspace::load(&name).map(Some).map_err(|err| format!("{err:#}")),
                 None => Ok(None),
             };
             match loaded {
-                Ok(config) => self.tickets.workspace_config = config,
-                // A broken section keeps the last good one; the workspace itself still opens.
-                Err(err) => self.toast(format!("Workspace tickets: {err}")),
+                Ok(Some(workspace)) => {
+                    match workspace.tickets() {
+                        Ok(config) => self.tickets.workspace_config = config,
+                        Err(err) => self.toast(format!("Workspace tickets: {}", err.message())),
+                    }
+                    let workflow = workspace.workflow().map_err(|err| err.message().to_string()).and_then(|config| {
+                        if let Some(config) = &config {
+                            config.validate()?;
+                        }
+                        Ok(config)
+                    });
+                    match workflow {
+                        Ok(config) => self.tickets.workspace_workflow = config,
+                        Err(err) => self.toast(format!("Workspace workflow: {err}")),
+                    }
+                }
+                Ok(None) => {
+                    self.tickets.workspace_config = None;
+                    self.tickets.workspace_workflow = None;
+                }
+                // Broken settings keep their last good values.
+                Err(err) => self.toast(format!("Workspace tickets/workflow: {err}")),
             }
         }
+
         let effective = self.tickets.workspace_config.clone().unwrap_or_else(|| self.config.tickets.clone());
         let effective = effective.is_configured().then(|| Arc::new(effective));
         if effective != self.tickets.config {
@@ -137,6 +157,10 @@ impl State {
         self.push_ticket_states(None);
     }
 
+    pub(super) fn workflow(&self) -> &imacs_core::workflow::Workflow {
+        self.tickets.workspace_workflow.as_ref().unwrap_or(&self.config.workflow)
+    }
+
     pub(super) fn ticket_config(&self) -> Option<Arc<TicketConfig>> {
         self.tickets.config.clone()
     }
@@ -154,6 +178,7 @@ impl State {
             .system_prompt
             .replace("{projects}", &projects.join(", "))
             .replace("{base_ref}", &self.config.base_ref);
+        prompt.push_str(&format!("\n\nWorkflow: done = {:?}; ordered stages: {}. Acceptance still unblocks dependencies. Report lifecycle stages with imacs_plan_stage (plan, optional task, stage, optional url/note); external bridges use imacs_stage_event. Completion and the ticket done mapping wait for the configured milestone. ci_failed never proves success.\n", self.workflow().done, self.workflow().stages.join(", ")));
         if let Some(config) = self.ticket_config() {
             prompt.push_str("\n\n");
             prompt.push_str(&config.prompt_section());
@@ -363,7 +388,7 @@ impl State {
     /// The cleaner for the configured credentials. The worker already cleans what a job
     /// brings back with that job's own secrets; this one covers what arrives here, such as
     /// webhook fields and links the chief gives, and errors made here.
-    fn cleaner(&self) -> ticket::Cleaner {
+    pub(super) fn cleaner(&self) -> ticket::Cleaner {
         self.ticket_config().map(|config| ticket::Cleaner::of(&config, crate::setup::known_env_var)).unwrap_or_default()
     }
 
@@ -474,6 +499,8 @@ impl State {
     fn ticket_moved(&mut self, key: &LinkKey, link: &TicketLink, from: Option<String>) {
         let config = self.ticket_config();
         let means = config.as_ref().and_then(|c| c.states.status_of(link.state.as_deref().unwrap_or_default()));
+        let expected =
+            self.plans.iter().find(|p| p.id == key.0).is_some_and(|p| p.ticket_progress_expected(key.1.as_deref()));
         let session = key.1.as_ref().and_then(|task| {
             self.plans.iter().find(|p| p.id == key.0)?.tasks.iter().find(|t| &t.id == task)?.session.clone()
         });
@@ -491,7 +518,7 @@ impl State {
             findings: None,
             ticket: Some(json!({
                 "system": link.system, "id": link.id, "key": link.label(), "title": link.title, "url": link.url,
-                "from": from, "to": link.state, "means": means.map(TaskStatus::label),
+                "from": from, "to": link.state, "means": means.map(TaskStatus::label), "expected": expected,
             })),
         });
         self.serve_waiters();
@@ -514,18 +541,36 @@ impl State {
         }
         let mut pushes = Vec::new();
         for plan in self.plans.iter().filter(|p| !p.id.is_empty() && p.status != PlanStatus::Archived) {
-            let mut links: Vec<(LinkKey, TaskStatus, &TicketLink)> = plan
-                .tasks
-                .iter()
-                .filter_map(|t| Some(((plan.id.clone(), Some(t.id.clone())), t.status, t.ticket.as_ref()?)))
-                .collect();
+            let workflow = self.workflow();
+            let mut links = Vec::new();
+            for task in &plan.tasks {
+                let Some(link) = &task.ticket else { continue };
+                let latest = plan.latest_stage(task);
+                let reached = workflow.reached(&task.stages) || workflow.reached(&plan.stages);
+                let desired = if task.status == TaskStatus::Done {
+                    config.states.after_acceptance(workflow, latest, reached)
+                } else if let Some(stage) =
+                    latest.filter(|s| s.stage == "integrated" && task.status == TaskStatus::Review)
+                {
+                    config.states.stage(&stage.stage)
+                } else {
+                    config.states.get(task.status)
+                };
+                links.push(((plan.id.clone(), Some(task.id.clone())), task.status, link, desired));
+            }
             if config.mode == TicketMode::Ticket
                 && let Some(link) = &plan.ticket
             {
-                links.push(((plan.id.clone(), None), ticket::plan_status(plan), link));
+                let status = ticket::plan_status(plan);
+                let desired = if status == TaskStatus::Done {
+                    config.states.after_acceptance(workflow, plan.stages.last(), plan.workflow_done(workflow))
+                } else {
+                    config.states.get(status)
+                };
+                links.push(((plan.id.clone(), None), status, link, desired));
             }
-            for (key, status, link) in links.into_iter().filter(|(_, _, link)| config.accepts(link)) {
-                let Some(desired) = config.states.get(status) else { continue };
+            for (key, status, link, desired) in links.into_iter().filter(|(_, _, link, _)| config.accepts(link)) {
+                let Some(desired) = desired else { continue };
                 if link.pushed_state.as_deref() == Some(desired)
                     || (link.pushed_state.is_none() && status == TaskStatus::Planned)
                     || self.tickets.pushing.contains_key(&key)
@@ -593,7 +638,7 @@ impl State {
     }
 
     /// Posts a lifecycle comment when the config wants one; silently skips otherwise.
-    fn lifecycle_comment(&mut self, index: usize, task: Option<&str>, author: &Author, body: String) {
+    pub(super) fn lifecycle_comment(&mut self, index: usize, task: Option<&str>, author: &Author, body: String) {
         if let Ok((config, key, link)) = self.comment_job(index, task, author) {
             let tag =
                 Tag { key, ticket: link.id.clone(), kind: Kind::Comment, batch: None, system: config.system.clone() };
@@ -1113,12 +1158,10 @@ mod tests {
                 for status in ["running", "blocked", "review", "done"] {
                     assert!(request(app, json!({"cmd":"plan_update", "plan":plan, "id":"a", "status":status})).ok);
                     settle(app);
-                    let expected = if !board {
-                        "In Progress"
-                    } else {
-                        config.states.get(TaskStatus::parse(status).unwrap()).unwrap()
-                    };
-                    assert_eq!(ticket(&state, "ENG-1")["state"], expected);
+                    assert_eq!(ticket(&state, "ENG-1")["state"], "In Progress");
+                }
+                for status in [TaskStatus::Review, TaskStatus::Done, TaskStatus::Blocked] {
+                    assert!(config.states.get(status).is_none());
                 }
                 let created = ticket_request(
                     app,
@@ -1128,8 +1171,152 @@ mod tests {
                 assert!(created.result["ticket"]["id"].as_str().unwrap().starts_with(if board { "n" } else { "NEW-" }));
                 assert!(request(app, json!({"cmd":"plan_update", "plan":plan, "id":"review", "status":"done"})).ok);
                 settle(app);
-                assert_eq!(ticket(&state, "ENG-1")["state"], "Done");
+                assert_eq!(ticket(&state, "ENG-1")["state"], "In Progress");
             }
+        });
+    }
+
+    #[test]
+    fn lifecycle_stages_gate_completion_and_reach_tickets_through_mcp() {
+        with_app("app::tickets::tests::lifecycle_stages_gate_completion_and_reach_tickets_through_mcp", |app, ctx| {
+            for gate in ["pr_opened", "ci_passed"] {
+                let dir = tempfile::tempdir().unwrap();
+                let state = tickets_fixture(dir.path(), "ENG");
+                app.runtime.plans.clear();
+                configure(app, ISSUES, &state, |config| {
+                    config.states.stages.insert("pr_opened".into(), "In Review".into());
+                    config.states.stages.insert("ci_failed".into(), "Blocked".into());
+                });
+                app.runtime.config.workflow.done = gate.into();
+                let plan = request(
+                    app,
+                    json!({"cmd":"plan_set", "goal":gate,
+                    "ticket":{"id":"ENG-1"}, "tasks":[{"id":"a", "title":"Implement"}]}),
+                )
+                .result["plan"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                settle(app);
+                assert!(!request(app, json!({"cmd":"plan_stage", "plan":plan, "stage":"pr_opened"})).ok);
+                for id in ["a", "review"] {
+                    assert!(request(app, json!({"cmd":"plan_update", "plan":plan, "id":id, "status":"done"})).ok);
+                }
+                settle(app);
+                assert_eq!(app.runtime.plans[0].status, PlanStatus::Open);
+                assert_ne!(ticket(&state, "ENG-1")["state"], "Done");
+                assert!(!comments(&state, "ENG-1").iter().any(|c| c.contains("Plan complete:")));
+                assert!(!request(app, json!({"cmd":"plan_close", "plan":plan, "status":"completed"})).ok);
+                let args = json!({"plan":plan,"stage":"pr_opened","url":"https://github.com/example/repo/pull/42"});
+                let command = crate::mcp::request_for_tool("imacs_plan_stage", args.clone()).unwrap();
+                let reply = request(app, serde_json::to_value(command).unwrap());
+                assert!(reply.ok, "{:?}", reply.error);
+                settle(app);
+                assert!(
+                    comments(&state, "ENG-1")
+                        .iter()
+                        .any(|c| c.contains("PR opened: https://github.com/example/repo/pull/42"))
+                );
+                let output = board_frame(app, ctx, vec![]);
+                assert!(texts(&output).iter().any(|(t, _)| t == "PR opened"));
+                output.drop_without_applying_deltas();
+                let saved = plan::load_plans(&paths::imacs_home()).unwrap().0;
+                assert_eq!(
+                    saved.iter().find(|p| p.id == plan).unwrap().stages.last().unwrap().url.as_deref(),
+                    Some("https://github.com/example/repo/pull/42")
+                );
+                let count_before = comments(&state, "ENG-1").len();
+                let duplicate = request(
+                    app,
+                    json!({"cmd":"plan_stage", "plan":plan, "stage":"pr_opened", "url":"https://github.com/example/repo/pull/42"}),
+                );
+                assert_eq!(duplicate.result["recorded"], false);
+                settle(app);
+                assert_eq!(comments(&state, "ENG-1").len(), count_before);
+                if gate == "ci_passed" {
+                    assert_eq!(app.runtime.plans[0].status, PlanStatus::Open);
+                    assert_eq!(ticket(&state, "ENG-1")["state"], "In Review");
+                    let failed = crate::mcp::request_for_tool(
+                        "imacs_stage_event",
+                        json!({"system":"issues", "key":"ENG-1", "stage":"ci_failed"}),
+                    )
+                    .unwrap();
+                    assert!(request(app, serde_json::to_value(failed).unwrap()).ok);
+                    settle(app);
+                    assert_eq!(ticket(&state, "ENG-1")["state"], "Blocked");
+                    assert_eq!(app.runtime.plans[0].status, PlanStatus::Open);
+                    let passed = request(
+                        app,
+                        json!({"cmd":"stage_event", "plan":plan, "stage":"ci_passed", "url":"https://ci.example/runs/12"}),
+                    );
+                    assert!(passed.ok, "{:?}", passed.error);
+                    settle(app);
+                    assert!(
+                        comments(&state, "ENG-1").iter().any(|c| c.contains("CI passed: https://ci.example/runs/12"))
+                    );
+                }
+                assert_eq!(app.runtime.plans[0].status, PlanStatus::Completed);
+                assert_eq!(ticket(&state, "ENG-1")["state"], "Done");
+                assert_eq!(comments(&state, "ENG-1").iter().filter(|c| c.contains("Plan complete:")).count(), 1);
+                configure(app, ISSUES, &state, |config| config.comments = ticket::CommentPolicy::Off);
+                let before = comments(&state, "ENG-1").len();
+                assert!(request(app, json!({"cmd":"stage_event", "plan":plan, "stage":"deployed"})).ok);
+                settle(app);
+                assert_eq!(comments(&state, "ENG-1").len(), before);
+                assert!(!request(app, json!({"cmd":"stage_event", "plan":plan, "stage":"unknown"})).ok);
+            }
+        });
+    }
+
+    #[test]
+    fn task_stage_events_are_scoped_and_custom_stages_are_config_only() {
+        with_app("app::tickets::tests::task_stage_events_are_scoped_and_custom_stages_are_config_only", |app, _| {
+            let dir = tempfile::tempdir().unwrap();
+            let state = tickets_fixture(dir.path(), "CARD");
+            configure(app, CARDS, &state, |config| {
+                config.states.stages.insert("security_approved".into(), "Audited".into());
+                config.states.stages.insert("deployed".into(), "Live".into());
+                config.states.stages.insert("ci_failed".into(), "Stuck".into());
+                config.states.done = None;
+            });
+            app.runtime.config.workflow.done = "security_approved".into();
+            app.runtime.config.workflow.stages.insert(4, "security_approved".into());
+            let plan = request(
+                app,
+                json!({"cmd":"plan_set", "goal":"Custom", "tasks":[
+                    {"id":"a", "title":"A", "ticket":{"id":"CARD-1"}}, {"id":"b", "title":"B", "ticket":{"id":"CARD-2"}}
+                ]}),
+            )
+            .result["plan"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let index = app.runtime.selected_plan;
+            settle(app);
+            for id in ["a", "b", "review"] {
+                assert!(request(app, json!({"cmd":"plan_update", "plan":plan, "id":id, "status":"done"})).ok);
+            }
+            let event = json!({"cmd":"stage_event", "system":"cards", "key":"CARD-1", "stage":"security_approved", "note":"Audit passed"});
+            assert!(request(app, event).ok);
+            settle(app);
+            assert_eq!(ticket(&state, "CARD-1")["state"], "Audited");
+            assert_eq!(ticket(&state, "CARD-2")["state"], "Todo");
+            assert_eq!(app.runtime.plans[index].status, PlanStatus::Open);
+            assert!(comments(&state, "CARD-1").iter().any(|c| c.contains("Audit passed")));
+            assert!(request(app, json!({"cmd":"plan_stage", "plan":plan, "task":"b", "stage":"security_approved"})).ok);
+            settle(app);
+            assert_eq!(app.runtime.plans[index].status, PlanStatus::Completed);
+            assert_eq!(ticket(&state, "CARD-2")["state"], "Audited");
+            assert!(request(app, json!({"cmd":"plan_stage", "plan":plan, "stage":"deployed"})).ok);
+            settle(app);
+            assert_eq!(ticket(&state, "CARD-1")["state"], "Live", "plan stages supersede older task stages");
+            assert_eq!(ticket(&state, "CARD-2")["state"], "Live");
+            assert!(request(app, json!({"cmd":"stage_event", "plan":plan, "task":"a", "stage":"ci_failed"})).ok);
+            settle(app);
+            assert_eq!(ticket(&state, "CARD-1")["state"], "Stuck", "a newer task event supersedes the plan event");
+            assert_eq!(ticket(&state, "CARD-2")["state"], "Live");
+            assert!(!request(app, json!({"cmd":"stage_event", "stage":"merged"})).ok);
+            assert!(!request(app, json!({"cmd":"stage_event", "plan":plan, "task":"missing", "stage":"merged"})).ok);
         });
     }
 
@@ -1427,7 +1614,7 @@ mod tests {
             assert_eq!(
                 event["ticket"],
                 json!({"system":"cards", "id":"CARD-2", "key":"CARD-2", "title":"Document it",
-                       "url":"https://tickets.example/CARD-2", "from":"Stuck", "to":"Doing", "means":"running"})
+                       "url":"https://tickets.example/CARD-2", "from":"Stuck", "to":"Doing", "means":"running", "expected":false})
             );
             assert_eq!(app.runtime.plans[index].tasks[1].status, TaskStatus::Blocked);
             assert_eq!(count(&state, "card_move"), moves, "a state set in the ticket system is never overwritten");
@@ -2331,6 +2518,88 @@ mod tests {
     }
 
     #[test]
+    fn ticket_progress_is_expected_after_acceptance_stages_or_plan_completion() {
+        with_app(
+            "app::tickets::tests::ticket_progress_is_expected_after_acceptance_stages_or_plan_completion",
+            |app, ctx| {
+                let dir = tempfile::tempdir().unwrap();
+                let state = tickets_fixture(dir.path(), "CARD");
+                configure(app, CARDS, &state, |_| {});
+                app.runtime.sessions.push(session("agent-a", AgentKind::Generic, AgentStatus::Idle, dir.path()));
+                let plan = request(
+                    app,
+                    json!({"cmd":"plan_set", "goal":"Drift", "tasks":[
+                        {"id":"a", "title":"Parser", "ticket":{"id":"CARD-1"}}
+                    ]}),
+                )
+                .result["plan"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                let index = app.runtime.selected_plan;
+                settle(app);
+                for (scenario, external, expected) in [
+                    ("active", "Check", false),
+                    ("accepted", "Doing", true),
+                    ("stage", "Stuck", true),
+                    ("completed", "Doing", true),
+                ] {
+                    match scenario {
+                        "active" => {
+                            assert!(
+                                request(app, json!({"cmd":"plan_update", "plan":plan, "id":"a", "status":"running"}))
+                                    .ok
+                            );
+                        }
+                        "accepted" => {
+                            assert!(
+                                request(app, json!({"cmd":"plan_update", "plan":plan, "id":"a", "status":"done"})).ok
+                            );
+                        }
+                        "stage" => {
+                            app.runtime.plans[index].tasks[0].status = TaskStatus::Review;
+                            assert!(
+                                request(
+                                    app,
+                                    json!({"cmd":"plan_stage", "plan":plan, "task":"a", "stage":"integrated"})
+                                )
+                                .ok
+                            );
+                        }
+                        "completed" => {
+                            app.runtime.plans[index].status = PlanStatus::Completed;
+                            app.runtime.plans[index].tasks[0].stages.clear();
+                        }
+                        _ => unreachable!(),
+                    }
+                    settle(app);
+                    let waiter = wait_for(app, ctx, &["ticket"]);
+                    set_field(&state, "CARD-1", "state", external);
+                    assert!(
+                        request(app, json!({"cmd":"ticket_event", "system":"cards", "key":"CARD-1", "state":external}))
+                            .ok
+                    );
+                    settle(app);
+                    let ControlOutcome::Done(result) = waiter
+                        .recv_timeout(Duration::from_secs(1))
+                        .unwrap_or_else(|error| panic!("{scenario}: {error:?}"))
+                    else {
+                        panic!("wait reply")
+                    };
+                    assert_eq!(result.result["events"][0]["ticket"]["expected"], expected, "{scenario}: {result:?}");
+                    let output = board_frame(app, ctx, vec![]);
+                    assert_eq!(
+                        texts(&output).iter().any(|(t, _)| t.starts_with("ticket says")),
+                        !expected,
+                        "{scenario}"
+                    );
+                    output.drop_without_applying_deltas();
+                }
+            },
+        );
+    }
+
+    #[test]
     fn cards_and_the_plan_header_show_live_tickets_and_open_them() {
         with_app("app::tickets::tests::cards_and_the_plan_header_show_live_tickets_and_open_them", |app, ctx| {
             let dir = tempfile::tempdir().unwrap();
@@ -2416,6 +2685,34 @@ mod tests {
             settle(app);
             assert_eq!(count(&state, "card_list"), reads + 1);
         });
+    }
+
+    #[test]
+    fn workspace_workflow_wins_reloads_and_preserves_the_last_valid_settings() {
+        with_app(
+            "app::tickets::tests::workspace_workflow_wins_reloads_and_preserves_the_last_valid_settings",
+            |app, _| {
+                let file = Workspace::file("workflow-team").unwrap();
+                std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                std::fs::write(&file, "projects = []\n[workflow]\ndone = \"pr_opened\"\n").unwrap();
+                app.runtime.workspace = Some("workflow-team".into());
+                app.runtime.apply_ticket_config();
+                assert_eq!(app.runtime.workflow().done, "pr_opened");
+                let workspace = Workspace::load("workflow-team").unwrap();
+                workspace.save().unwrap();
+                assert_eq!(Workspace::load("workflow-team").unwrap().workflow().unwrap().unwrap().done, "pr_opened");
+                std::fs::write(&file, "projects = []\n[workflow]\ndone = \"ci_passed\"\n").unwrap();
+                app.runtime.apply_ticket_config();
+                assert_eq!(app.runtime.workflow().done, "ci_passed");
+                std::fs::write(&file, "projects = []\n[workflow]\ndone = \"unknown\"\n").unwrap();
+                app.runtime.apply_ticket_config();
+                assert_eq!(app.runtime.workflow().done, "ci_passed");
+                std::fs::write(&file, "projects = []\n").unwrap();
+                app.runtime.apply_ticket_config();
+                assert_eq!(app.runtime.workflow().done, "accepted");
+                assert!(app.runtime.chief_prompt().contains("imacs_plan_stage"));
+            },
+        );
     }
 
     #[test]

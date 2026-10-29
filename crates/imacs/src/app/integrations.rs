@@ -140,6 +140,7 @@ impl State {
                 return;
             }
         };
+        self.pin_ticket_integration(index);
         let into = self.plans[index].integration_branch();
         let into_path = git::worktree_path(&self.config.worktree_path, &repo, &into);
         let (tx, base_ref) = (self.integrate_tx.clone(), self.config.base_ref.clone());
@@ -196,6 +197,14 @@ impl State {
             task.notes.push(note.clone());
             self.save_plan(index);
         }
+        if response.ok {
+            let _ = self.record_stage(
+                index,
+                Some(&id),
+                imacs_core::workflow::Stage { stage: "integrated".into(), ..Default::default() },
+                imacs_core::tickets::Author::Imacs,
+            );
+        }
         self.finish_plan_agents();
         self.toast(format!("Task {id}: {note}"));
         if let Some(reply) = reply {
@@ -209,10 +218,9 @@ impl State {
     }
 }
 
-/// Whether a task's work is unchanged: its ticket link follows the ticket system and
-/// says nothing about its branch.
+/// Ticket and lifecycle metadata say nothing about a task's branch ancestry.
 fn same_work(a: &Task, b: &Task) -> bool {
-    let strip = |task: &Task| Task { ticket: None, ..task.clone() };
+    let strip = |task: &Task| Task { ticket: None, stages: Vec::new(), ..task.clone() };
     strip(a) == strip(b)
 }
 
