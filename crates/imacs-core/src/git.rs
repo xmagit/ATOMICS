@@ -263,10 +263,15 @@ pub fn add_worktree(repo: &Path, path: &Path, branch: &str, base_ref: &str) -> R
     add_worktree_unlocked(repo, path, branch, base_ref)
 }
 
+/// Canonical repository identity shared by its main checkout and linked worktrees.
+pub fn common_dir(repo: &Path) -> Result<PathBuf> {
+    let common = git(repo, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
+    Ok(std::fs::canonicalize(common.trim())?)
+}
+
 fn worktree_lock(repo: &Path) -> Result<Arc<Mutex<()>>> {
     static LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = LazyLock::new(Mutex::default);
-    let common = git(repo, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
-    let common = std::fs::canonicalize(common.trim())?;
+    let common = common_dir(repo)?;
     let mut locks = LOCKS.lock().unwrap_or_else(|e| e.into_inner());
     Ok(locks.entry(common).or_default().clone())
 }

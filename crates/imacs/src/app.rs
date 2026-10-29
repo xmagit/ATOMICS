@@ -408,9 +408,9 @@ pub(crate) struct State {
     plan_view: bool,
     /// The chief is shown, either floating or docked (otherwise only the pill).
     chief_open: bool,
-    worktree_tx: crate::host::Sender<(String, Result<PreparedWorktree, String>, Launch)>,
-    worktree_rx: Receiver<(String, Result<PreparedWorktree, String>, Launch)>,
-    creating: Vec<String>,
+    worktree_tx: crate::host::Sender<(String, Result<PreparedWorktree, String>, Launch, PathBuf)>,
+    worktree_rx: Receiver<(String, Result<PreparedWorktree, String>, Launch, PathBuf)>,
+    creating: Vec<(PathBuf, String)>,
     integrate_tx: crate::host::Sender<Integrated>,
     integrate_rx: Receiver<Integrated>,
     /// Tasks being merged into the integration branch.
