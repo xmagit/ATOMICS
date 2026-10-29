@@ -369,7 +369,7 @@ impl State {
                 self.ticket_status_changed(index, &id, TaskStatus::Running, TaskStatus::Blocked, note, author);
             }
         }
-        self.push_ticket_states();
+        self.push_ticket_states(None);
     }
 }
 

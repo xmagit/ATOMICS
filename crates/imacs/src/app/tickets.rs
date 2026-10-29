@@ -133,7 +133,7 @@ impl State {
     pub(super) fn resync_tickets(&mut self, plan: &str) {
         self.tickets.failed.retain(|key, _| key.0 != plan);
         self.refresh_tickets(Some(plan), None);
-        self.push_ticket_states();
+        self.push_ticket_states(None);
     }
 
     pub(super) fn ticket_config(&self) -> Option<Arc<TicketConfig>> {
@@ -509,8 +509,9 @@ impl State {
 
     /// Pushes ticket states that IMACS's statuses moved away from. A ticket linked to
     /// a task that has not started is left alone, and a failed push waits for the next
-    /// heartbeat or `imacs_ticket_sync` instead of repeating every tick.
-    pub(super) fn push_ticket_states(&mut self) {
+    /// heartbeat or `imacs_ticket_sync` instead of repeating every tick. A sync passes
+    /// its batch, so it answers only once the pushes and the reads after them are done.
+    pub(super) fn push_ticket_states(&mut self, batch: Option<u64>) {
         let Some(config) = self.ticket_config() else { return };
         if config.operation("update_state").is_none() {
             return;
@@ -545,7 +546,7 @@ impl State {
                 key,
                 ticket: link.id.clone(),
                 kind: Kind::State(state.clone()),
-                batch: None,
+                batch,
                 system: config.system.clone(),
             };
             self.send_ticket(&config, TicketOp::UpdateState(link, state), tag);
@@ -894,7 +895,7 @@ impl State {
         for id in &plans {
             self.refresh_tickets(Some(id), Some(batch));
         }
-        self.push_ticket_states();
+        self.push_ticket_states(Some(batch));
         self.settle_batch(batch);
     }
 
@@ -1244,7 +1245,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             app.runtime.ticket_results();
-            app.runtime.push_ticket_states();
+            app.runtime.push_ticket_states(None);
             if app.runtime.tickets.pending == 0 {
                 return;
             }
@@ -1451,7 +1452,7 @@ mod tests {
             assert_eq!(count(&state, "card_get"), reads + 1);
             // A webhook echoing IMACS's own push, even before the push returns, is no news.
             assert!(request(app, json!({"cmd":"plan_update", "plan":plan, "id":"b", "status":"review"})).ok);
-            app.runtime.push_ticket_states();
+            app.runtime.push_ticket_states(None);
             let events = app.runtime.events.iter().filter(|e| e.ticket.is_some()).count();
             let echo = request(app, json!({"cmd":"ticket_event", "key":"CARD-2", "state":"Check"}));
             assert_eq!(link(app, index, 1).state.as_deref(), Some("Check"));
@@ -1651,6 +1652,9 @@ mod tests {
             settle(app);
             let ControlOutcome::Done(synced) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else { panic!() };
             assert!(synced.ok && synced.result["errors"] == json!([]), "{:?}", synced.result);
+            // The reply waits for the retried state update and the read after it.
+            let replied = &synced.result["plans"][0]["tasks"][0]["ticket"];
+            assert_eq!((replied["state"].as_str(), replied.get("error")), (Some("Doing"), None), "{replied}");
             let healed = link(app, index, 0);
             assert_eq!((healed.state.as_deref(), healed.error.as_deref()), (Some("Doing"), None));
 
