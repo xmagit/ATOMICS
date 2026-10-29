@@ -43,7 +43,6 @@ pub fn json(workspace: Option<&str>, projects: &[PathBuf]) -> Value {
     let cleaner = Cleaner::new(selfconfig::secrets(&effective, &layers, crate::setup::env_var));
     let (mut checks, mut facts) = (Vec::new(), Vec::new());
     for line in &report.lines {
-        let line = cleaner.text(line);
         if let Some(check) = line.strip_prefix("✓ ") {
             checks.push(json!({ "ok": true, "check": check }));
         } else if let Some(failed) = line.strip_prefix("✗ ") {
@@ -53,12 +52,12 @@ pub fn json(workspace: Option<&str>, projects: &[PathBuf]) -> Value {
             facts.push(json!(line));
         }
     }
-    json!({
+    cleaner.setting(json!({
         "ok": report.git_ok && report.config_ok,
         "required": "git and a config that loads; every other failed check is a warning",
         "facts": facts,
         "checks": checks,
-    })
+    }))
 }
 
 fn report(workspace: Option<&str>, for_agent: bool, projects: &[PathBuf]) -> Report {
@@ -428,8 +427,16 @@ mod tests {
             let healthy = json(None, &[]);
             let text = healthy.to_string();
             assert!(!text.contains("sk-voice-doctor-secret"), "{text}");
+            assert!(!text.contains("doctor-password"), "{text}");
             assert_eq!(healthy["ok"], true, "{healthy}");
             assert!(healthy["facts"].as_array().unwrap().contains(&json!("Host: fixture")), "{healthy}");
+            assert!(
+                healthy["facts"].as_array().unwrap().iter().any(|fact| {
+                    let fact = fact.as_str().unwrap();
+                    fact.starts_with("Loaded config:") && fact.contains("https://***@doctor.example/config.toml")
+                }),
+                "{healthy}"
+            );
             let checks = healthy["checks"].as_array().unwrap();
             assert!(checks.iter().any(|c| c["ok"] == true && c["check"].as_str().unwrap().starts_with("git found")));
             let socket = checks.iter().find(|c| c["check"].as_str().unwrap().starts_with("IMACS running")).unwrap();
@@ -457,7 +464,7 @@ mod tests {
                 .env("HOME", dir.path())
                 .env("SHELL", &shell)
                 .env("IMACS_HOME", dir.path().join("state"))
-                .env("IMACS_CONFIG", dir.path().join("config/config.toml"))
+                .env("IMACS_CONFIG", dir.path().join("https://doctor-user:doctor-password@doctor.example/config.toml"))
                 .env("IMACS_HOST", "fixture")
                 .env("IMACS_SOCKET", dir.path().join("absent.sock"))
                 .current_dir(dir.path()),
