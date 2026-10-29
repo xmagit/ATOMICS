@@ -20,6 +20,8 @@ serde_json = "1.0.154"
 shlex = "2.0.1"
 similar = "3.2.1"
 toml = "1.1.8"
+# Proposed config changes keep the user's comments and layout.
+toml_edit = "0.25.17"
 tempfile = { version = "3.27.0", optional = true }
 # Browser usage parsing needs no clock; keep time's SystemTime helpers native.
 time = { version = "0.3.55", default-features = false, features = ["parsing"] }

@@ -42,8 +42,8 @@ pub fn run(agent: bool, chief: bool) {
             "tools/list" => Ok(json!({ "tools": available_tools(agent, chief) })),
             "tools/call" => Ok(if agent {
                 call_agent(&params)
-            } else if !chief && params["name"] == "imacs_restart" {
-                tool_error("imacs_restart is only available to the chief".into())
+            } else if let Some(name) = params["name"].as_str().filter(|name| !chief && CHIEF_ONLY.contains(name)) {
+                tool_error(format!("{name} is only available to the chief"))
             } else {
                 call(&params)
             }),
@@ -93,13 +93,16 @@ fn agent_tools() -> Value {
     }])
 }
 
+/// Tools only the chief's own server offers: restarting IMACS and configuring it.
+const CHIEF_ONLY: &[&str] = &["imacs_restart", "imacs_config_get", "imacs_config_propose", "imacs_doctor"];
+
 fn available_tools(agent: bool, chief: bool) -> Value {
     if agent {
         return agent_tools();
     }
     let mut tools = tools();
     if !chief {
-        tools.as_array_mut().unwrap().retain(|tool| tool["name"] != "imacs_restart");
+        tools.as_array_mut().unwrap().retain(|tool| !CHIEF_ONLY.iter().any(|name| tool["name"] == *name));
     }
     tools
 }
@@ -309,12 +312,12 @@ fn tools() -> Value {
         },
         {
             "name": "imacs_wait",
-            "description": "Block until an agent finishes a turn, needs input, exits or reports, or a linked ticket changes in its system (or other `statuses`), then return those events with a `cursor`. Pass the cursor as `after` next time to only see newer events. Use this instead of polling. Heartbeat events contain fleet findings (an empty list means all good). Ticket events say which plan or task's ticket moved from which state to which, and which IMACS status that state means. Plan-session events include plan and task ids; permission events also include the approval request. `sessions` empty means any; timeout_secs defaults to 120 (max 280).",
+            "description": "Block until an agent finishes a turn, needs input, exits or reports, or a linked ticket changes in its system (or other `statuses`), then return those events with a `cursor`. Pass the cursor as `after` next time to only see newer events. Use this instead of polling. Heartbeat events contain fleet findings (an empty list means all good). Ticket events say which plan or task's ticket moved from which state to which, and which IMACS status that state means. Config events say whether the user applied or rejected a proposed config change. Plan-session events include plan and task ids; permission events also include the approval request. `sessions` empty means any; timeout_secs defaults to 120 (max 280).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "sessions": { "type": "array", "items": { "type": "string" } },
-                    "statuses": { "type": "array", "items": { "type": "string", "enum": ["working", "turn done", "needs you", "idle", "exited", "reported", "heartbeat", "ticket"] } },
+                    "statuses": { "type": "array", "items": { "type": "string", "enum": ["working", "turn done", "needs you", "idle", "exited", "reported", "heartbeat", "ticket", "config"] } },
                     "after": { "type": "integer" },
                     "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 280 }
                 }
@@ -407,6 +410,9 @@ fn tools() -> Value {
     if let (Some(all), Value::Array(more)) = (tools.as_array_mut(), stage_tools()) {
         all.extend(more);
     }
+    if let (Some(all), Value::Array(more)) = (tools.as_array_mut(), config_tools()) {
+        all.extend(more);
+    }
     tools
 }
 
@@ -428,6 +434,34 @@ fn stage_tools() -> Value {
                 "system": { "type": "string" }, "id": { "type": "string" }, "key": { "type": "string" },
                 "stage": { "type": "string" }, "url": { "type": "string" }, "note": { "type": "string" }
             }, "required": ["stage"] }
+        }
+    ])
+}
+
+fn config_tools() -> Value {
+    json!([
+        {
+            "name": "imacs_config_get",
+            "description": "Chief only: IMACS's effective configuration, each value with its source (default, main for config.toml, host for config.d/<host>.toml, workspace for the active workspace file). Also lists the files and, with project, that project's settings. Secret values read as ***; token_env and api_key_env stay names. Read this before proposing a change.",
+            "inputSchema": { "type": "object", "properties": {
+                "project": { "type": "string", "description": "A folder in a project, to include that project's settings" },
+                "key": { "type": "string", "description": "Only keys under this dotted prefix, such as tickets or layout.sidebar_width" }
+            } }
+        },
+        {
+            "name": "imacs_doctor",
+            "description": "Chief only: IMACS's setup checks as JSON, the same as `imacs doctor`: git, claude, codex and hx on the login-shell PATH, the Codex version, whether the config loads, plans, the approvals list, the workspace's ticket server and its tools, worktrees, the socket and the hooks. Each check has ok, its text and a hint when it failed; only git and the config are required, other failures are warnings. Secrets are left out, and config errors give the file and line. Takes a few seconds; use it to diagnose a setup before proposing a change.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "imacs_config_propose",
+            "description": "Chief only: propose a change to one config file for the user to apply. scope main is config.toml (shared by every machine that shares it), host is config.d/<host>.toml (this machine only), workspace is the active workspace's file ([tickets] and [chief] prompt only). remove takes dotted keys out first; toml then merges in: tables key by key, arrays and other values replace. IMACS checks that the result loads, then shows the user a diff with Apply and Reject, labeling settings that run commands, send credentials or instruct agents. Nothing is written before the user applies it. Returns a proposal id; the outcome (applied, rejected or failed, with the user's note) arrives as a config event in imacs_wait. Keep secrets out of the config: token_env and api_key_env name environment variables.",
+            "inputSchema": { "type": "object", "properties": {
+                "scope": { "type": "string", "enum": ["main", "host", "workspace"] },
+                "toml": { "type": "string", "description": "The change as TOML, for example \"[layout]\\nsidebar_width = 300.0\"" },
+                "remove": { "type": "array", "items": { "type": "string" }, "description": "Dotted keys to take out of the file, such as layout.sidebar_width" },
+                "reason": { "type": "string", "description": "Why, in a sentence the user reads above the diff" }
+            }, "required": ["scope"] }
         }
     ])
 }
@@ -496,11 +530,14 @@ pub(crate) fn request_for_tool(name: &str, mut args: Value) -> Result<ControlReq
         "imacs_ticket_sync" => "ticket_sync",
         "imacs_ticket_comment" => "ticket_comment",
         "imacs_ticket_event" => "ticket_event",
+        "imacs_config_get" => "config_get",
+        "imacs_config_propose" => "config_propose",
+        "imacs_doctor" => "doctor",
         _ => return Err(format!("unknown tool {name}")),
     };
     if let Some(map) = args.as_object_mut() {
         map.insert("cmd".into(), json!(cmd));
-        if cmd == "report" {
+        if cmd == "report" || cmd == "config_propose" {
             map.insert("pane".into(), json!(std::env::var("IMACS_PANE").ok()));
         }
     }
@@ -561,7 +598,9 @@ mod tests {
     fn restart_is_chief_only_and_maps_optional_force_and_reason() {
         for (agent, chief, available) in [(true, false, false), (false, false, false), (false, true, true)] {
             let tools = super::available_tools(agent, chief);
-            assert_eq!(tools.as_array().unwrap().iter().any(|tool| tool["name"] == "imacs_restart"), available);
+            for name in super::CHIEF_ONLY {
+                assert_eq!(tools.as_array().unwrap().iter().any(|tool| tool["name"] == *name), available, "{name}");
+            }
         }
         let default = super::request_for_tool("imacs_restart", serde_json::json!({})).unwrap();
         assert!(matches!(default, imacs_core::control::ControlRequest::Restart { force: false, reason: None }));

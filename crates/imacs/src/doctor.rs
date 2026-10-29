@@ -5,13 +5,63 @@ use imacs_core::{
     config::Config,
     doctor::{approvals_check, cache_clone_check, check_line, codex_checks, plans_check, worktree_checks},
     paths,
+    selfconfig::{self, Layer, Source},
+    tickets::Cleaner,
+    workspace::Workspace,
 };
+use serde_json::{Value, json};
 
 use crate::setup::{
     codex_supports_hooks, find_program, global_hooks_installed, legacy_hooks_installed, resolve_program,
 };
 
+/// What the doctor found, line by line in the order it prints, and whether the required
+/// checks (git and a config that loads) passed.
+struct Report {
+    lines: Vec<String>,
+    git_ok: bool,
+    config_ok: bool,
+}
+
 pub fn run(workspace: Option<&str>) -> i32 {
+    let report = report(workspace, false);
+    for line in &report.lines {
+        println!("{line}");
+    }
+    exit_code(report.git_ok, report.config_ok)
+}
+
+/// The doctor's checks for an agent, as JSON. Config errors name the file and line without
+/// quoting it, and every line is cleaned of the secrets the configuration runs with.
+pub fn json(workspace: Option<&str>) -> Value {
+    let report = report(workspace, true);
+    let config_path = paths::config_file();
+    let [main, host] = Config::source_paths(&config_path);
+    let layers = [Layer::read(Source::Main, &main), Layer::read(Source::Host, &host)];
+    let effective = Config::load(&config_path).unwrap_or_default();
+    let cleaner = Cleaner::new(selfconfig::secrets(&effective, &layers, crate::setup::env_var));
+    let (mut checks, mut facts) = (Vec::new(), Vec::new());
+    for line in &report.lines {
+        let line = cleaner.text(line);
+        if let Some(check) = line.strip_prefix("✓ ") {
+            checks.push(json!({ "ok": true, "check": check }));
+        } else if let Some(failed) = line.strip_prefix("✗ ") {
+            let (check, hint) = failed.rsplit_once(" — ").unwrap_or((failed, ""));
+            checks.push(json!({ "ok": false, "warning": check.contains("(warning)"), "check": check, "hint": hint }));
+        } else {
+            facts.push(json!(line));
+        }
+    }
+    json!({
+        "ok": report.git_ok && report.config_ok,
+        "required": "git and a config that loads; every other failed check is a warning",
+        "facts": facts,
+        "checks": checks,
+    })
+}
+
+fn report(workspace: Option<&str>, for_agent: bool) -> Report {
+    let mut lines = Vec::new();
     let git_version = Command::new(resolve_program("git"))
         .arg("--version")
         .output()
@@ -21,7 +71,7 @@ pub fn run(workspace: Option<&str>) -> i32 {
         .filter(|version| !version.is_empty());
     let git_ok = git_version.is_some();
     let git = git_version.map(|version| format!("git found ({version})")).unwrap_or_else(|| "git not found".into());
-    println!("{}", check_line(git_ok, &git, "install git and add it to your login-shell PATH"));
+    lines.push(check_line(git_ok, &git, "install git and add it to your login-shell PATH"));
 
     for program in ["claude", "codex", "hx"] {
         let found = find_program(program);
@@ -29,45 +79,52 @@ pub fn run(workspace: Option<&str>) -> i32 {
             Some(path) => format!("{program} found on login-shell PATH ({})", path.display()),
             None => format!("{program} not found on login-shell PATH (warning)"),
         };
-        println!("{}", check_line(found.is_some(), &label, "install it or add it to your login-shell PATH"));
+        lines.push(check_line(found.is_some(), &label, "install it or add it to your login-shell PATH"));
         if program == "codex"
             && let Some(path) = found
         {
-            for line in codex_checks(codex_supports_hooks(&path.to_string_lossy(), std::time::Duration::from_secs(2))) {
-                println!("{line}");
-            }
+            lines
+                .extend(codex_checks(codex_supports_hooks(&path.to_string_lossy(), std::time::Duration::from_secs(2))));
         }
     }
 
     let config_path = paths::config_file();
-    println!("Host: {}", paths::host_name());
+    lines.push(format!("Host: {}", paths::host_name()));
     let config = Config::load_with_sources(&config_path);
     let label = match &config {
         Ok(_) => format!("config parses ({})", config_path.display()),
+        // TOML errors quote the failing line, which may hold a secret: agents get file and line only.
+        Err(_) if for_agent => {
+            let [main, host] = Config::source_paths(&config_path);
+            let layers = [Layer::read(Source::Main, &main), Layer::read(Source::Host, &host)];
+            format!("config failed: {}", selfconfig::problems(&layers).join("; "))
+        }
         Err(err) => format!("config failed: {err:#}"),
     };
-    println!(
-        "{}",
-        check_line(config.is_ok(), &label, "create or fix this config; start IMACS to create a missing file")
-    );
+    lines.push(check_line(config.is_ok(), &label, "create or fix this config; start IMACS to create a missing file"));
     if let Ok((_, sources)) = &config {
         for source in sources {
-            println!("Loaded config: {}", source.display());
+            lines.push(format!("Loaded config: {}", source.display()));
         }
     }
 
-    for line in plans_check(&paths::imacs_home()) {
-        println!("{line}");
-    }
+    lines.extend(plans_check(&paths::imacs_home()));
     if let Ok((config, _)) = &config {
-        println!("{}", approvals_check(&config.approvals));
+        lines.push(approvals_check(&config.approvals));
         match ticket_config(config, workspace) {
-            Ok(tickets) if !tickets.system.trim().is_empty() => println!("{}", ticket_check(&tickets)),
+            Ok(tickets) if !tickets.system.trim().is_empty() => lines.push(ticket_check(&tickets)),
             Ok(_) => {}
-            Err(error) => println!(
-                "{}",
-                check_line(false, &format!("ticket config failed: {error}"), "fix the workspace [tickets] section")
-            ),
+            Err(error) => {
+                let error = match workspace.and_then(|name| Workspace::file(name).ok()).filter(|_| for_agent) {
+                    Some(file) => selfconfig::problems(&[Layer::read(Source::Workspace, &file)]).join("; "),
+                    None => format!("{error:#}"),
+                };
+                lines.push(check_line(
+                    false,
+                    &format!("ticket config failed: {error}"),
+                    "fix the workspace [tickets] section",
+                ))
+            }
         }
         let mut repos: Vec<_> = config.repos.iter().map(|repo| paths::expand(repo)).collect();
         if repos.is_empty()
@@ -78,31 +135,29 @@ pub fn run(workspace: Option<&str>) -> i32 {
         repos.sort();
         repos.dedup();
         for repo in repos {
-            println!("{}", cache_clone_check(&repo, &config.worktree_path));
-            for line in worktree_checks(&repo, &config.base_ref) {
-                println!("{line}");
-            }
+            lines.push(cache_clone_check(&repo, &config.worktree_path));
+            lines.extend(worktree_checks(&repo, &config.base_ref));
         }
     }
 
     let socket_path = paths::socket_path();
     let running = UnixStream::connect(&socket_path).is_ok();
     let label = format!("IMACS running ({})", socket_path.display());
-    println!("{}", check_line(running, &label, "start IMACS or check IMACS_SOCKET / IMACS_HOME"));
+    lines.push(check_line(running, &label, "start IMACS or check IMACS_SOCKET / IMACS_HOME"));
 
-    println!("{}", check_line(global_hooks_installed(), "global Claude hooks installed", "run `imacs install-hooks`"));
+    lines.push(check_line(global_hooks_installed(), "global Claude hooks installed", "run `imacs install-hooks`"));
     if legacy_hooks_installed() {
-        println!(
-            "{}",
-            check_line(false, "leftover cox hook handlers (warning)", "run `imacs install-hooks` to remove them")
-        );
+        lines.push(check_line(
+            false,
+            "leftover cox hook handlers (warning)",
+            "run `imacs install-hooks` to remove them",
+        ));
     }
 
-    exit_code(git_ok, config.is_ok())
+    Report { lines, git_ok, config_ok: config.is_ok() }
 }
 
 fn ticket_config(config: &Config, workspace: Option<&str>) -> anyhow::Result<imacs_core::tickets::TicketConfig> {
-    use imacs_core::workspace::Workspace;
     let Some(name) = workspace else { return Ok(config.tickets.clone()) };
     let tickets = Workspace::load(name)?.tickets()?;
     Ok(tickets.unwrap_or_else(|| config.tickets.clone()))
@@ -324,6 +379,79 @@ mod tests {
             };
             assert_eq!(worktree_lines, [expected], "{stdout}");
         }
+    }
+
+    #[test]
+    fn json_lists_checks_with_hints_and_never_quotes_config_lines_or_secrets() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const CHILD: &str = "IMACS_DOCTOR_JSON_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let config = paths::config_file();
+            let host = Config::source_paths(&config)[1].clone();
+            std::fs::create_dir_all(host.parent().unwrap()).unwrap();
+            std::fs::write(&config, "[voice]\napi_key = 'sk-voice-doctor-secret'\n").unwrap();
+            std::fs::write(&host, "[layout]\nsidebar_width = pw-doctor-secret\n").unwrap();
+            let broken = json(None);
+            let text = broken.to_string();
+            assert!(!text.contains("pw-doctor-secret") && !text.contains("sk-voice-doctor-secret"), "{text}");
+            assert_eq!(broken["ok"], false);
+            let config_check = broken["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|check| check["check"].as_str().unwrap().starts_with("config failed:"))
+                .unwrap_or_else(|| panic!("{broken}"));
+            assert!(config_check["check"].as_str().unwrap().contains("fixture.toml: line 2, column"), "{config_check}");
+            assert_eq!(config_check["ok"], false);
+            assert!(config_check["hint"].as_str().unwrap().contains("fix this config"));
+            // The terminal's doctor still shows the user the failing line.
+            assert!(report(None, false).lines.iter().any(|line| line.contains("pw-doctor-secret")));
+
+            std::fs::write(&host, "[layout]\nsidebar_width = 300.0\n").unwrap();
+            let healthy = json(None);
+            let text = healthy.to_string();
+            assert!(!text.contains("sk-voice-doctor-secret"), "{text}");
+            assert_eq!(healthy["ok"], true, "{healthy}");
+            assert!(healthy["facts"].as_array().unwrap().contains(&json!("Host: fixture")), "{healthy}");
+            let checks = healthy["checks"].as_array().unwrap();
+            assert!(checks.iter().any(|c| c["ok"] == true && c["check"].as_str().unwrap().starts_with("git found")));
+            let socket = checks.iter().find(|c| c["check"].as_str().unwrap().starts_with("IMACS running")).unwrap();
+            assert_eq!((socket["ok"].clone(), socket["warning"].clone()), (json!(false), json!(false)));
+            assert_eq!(socket["hint"], "start IMACS or check IMACS_SOCKET / IMACS_HOME");
+            let codex = checks.iter().find(|c| c["check"].as_str().unwrap().starts_with("codex not found")).unwrap();
+            assert_eq!(codex["warning"], true);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let shell = bin.join("shell");
+        std::fs::write(&shell, format!("#!/bin/sh\nprintf '__IMACS__{}:/usr/bin:/bin__IMACS__'\n", bin.display()))
+            .unwrap();
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let output = crate::test_support::output(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "doctor::tests::json_lists_checks_with_hints_and_never_quotes_config_lines_or_secrets",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("HOME", dir.path())
+                .env("SHELL", &shell)
+                .env("IMACS_HOME", dir.path().join("state"))
+                .env("IMACS_CONFIG", dir.path().join("config/config.toml"))
+                .env("IMACS_HOST", "fixture")
+                .env("IMACS_SOCKET", dir.path().join("absent.sock"))
+                .current_dir(dir.path()),
+        );
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

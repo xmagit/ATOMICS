@@ -135,7 +135,7 @@ impl State {
             }
         }
 
-        let effective = self.tickets.workspace_config.clone().unwrap_or_else(|| self.config.tickets.clone());
+        let effective = self.effective_tickets();
         let effective = effective.is_configured().then(|| Arc::new(effective));
         if effective != self.tickets.config {
             self.tickets.config = effective;
@@ -161,6 +161,11 @@ impl State {
         self.tickets.workspace_workflow.as_ref().unwrap_or(&self.config.workflow)
     }
 
+    /// The `[tickets]` in effect, configured or not: the workspace file's, else the main config's.
+    pub(super) fn effective_tickets(&self) -> TicketConfig {
+        self.tickets.workspace_config.clone().unwrap_or_else(|| self.config.tickets.clone())
+    }
+
     pub(super) fn ticket_config(&self) -> Option<Arc<TicketConfig>> {
         self.tickets.config.clone()
     }
@@ -169,7 +174,8 @@ impl State {
         Author::Chief(ticket::model_label("claude", &self.config.chief.args))
     }
 
-    /// The chief's prompt with the configured ticket workflow added.
+    /// The chief's prompt with the configured ticket workflow added, then the user's own
+    /// `[chief] prompt` from the main file, this host's and the workspace's, read as the chief starts.
     pub(super) fn chief_prompt(&self) -> String {
         let projects: Vec<String> = self.repos.iter().map(|r| paths::display(r)).collect();
         let mut prompt = self
@@ -182,6 +188,14 @@ impl State {
         if let Some(config) = self.ticket_config() {
             prompt.push_str("\n\n");
             prompt.push_str(&config.prompt_section());
+        }
+        let sections = imacs_core::selfconfig::prompt_sections(&self.config_layers(None));
+        if !sections.is_empty() {
+            prompt.push_str("\n\nThe user's own instructions, from [chief] prompt in the IMACS config:");
+            for (_, text) in sections {
+                prompt.push_str("\n\n");
+                prompt.push_str(&text);
+            }
         }
         prompt
     }
@@ -516,6 +530,7 @@ impl State {
             report: None,
             approval: None,
             findings: None,
+            config: None,
             ticket: Some(json!({
                 "system": link.system, "id": link.id, "key": link.label(), "title": link.title, "url": link.url,
                 "from": from, "to": link.state, "means": means.map(TaskStatus::label), "expected": expected,

@@ -2,7 +2,7 @@ use super::*;
 use imacs_core::store::RestartState;
 
 impl State {
-    fn restart_blockers(&self) -> Vec<String> {
+    pub(super) fn restart_blockers(&self) -> Vec<String> {
         let mut blockers = Vec::new();
         for session in &self.sessions {
             // The chief is executing this request; its own turn is the handoff.
@@ -39,6 +39,9 @@ impl State {
         }
         if self.plan_edit_open {
             blockers.push("unsaved plan edit is open; finish editing the plan first".into());
+        }
+        for pending in &self.proposals {
+            blockers.push(format!("config change {} waits for the user to apply or reject it", pending.id));
         }
         blockers
     }

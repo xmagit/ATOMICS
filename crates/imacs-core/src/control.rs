@@ -245,6 +245,34 @@ pub enum ControlRequest {
         pane: Option<String>,
         text: String,
     },
+    /// The effective configuration with each value's source, without secrets: the main
+    /// config, the active workspace, and one project when given.
+    ConfigGet {
+        #[serde(default)]
+        project: Option<String>,
+        /// Only keys under this dotted prefix, such as `tickets`.
+        #[serde(default)]
+        key: Option<String>,
+    },
+    /// The doctor's checks as JSON, without secrets, for the active workspace.
+    Doctor,
+    /// A change to one config file, shown to the user as a diff to apply or reject. Nothing
+    /// is written until the user applies it; the outcome arrives as a `config` event.
+    ConfigPropose {
+        scope: crate::selfconfig::Scope,
+        /// Merged into the file: tables key by key, other values replace.
+        #[serde(default)]
+        toml: String,
+        /// Dotted keys taken out of the file first.
+        #[serde(default)]
+        remove: Vec<String>,
+        /// Why, shown to the user with the diff.
+        #[serde(default)]
+        reason: Option<String>,
+        /// The proposing session, set by `imacs mcp`.
+        #[serde(default)]
+        pane: Option<String>,
+    },
     /// A sub-agent reporting on its task (sent by `imacs mcp --agent`).
     Report {
         pane: Option<String>,

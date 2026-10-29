@@ -197,6 +197,8 @@ dock = "floating"   # "floating" or "docked"
 command = ["claude"]
 args = ["--model", "claude-opus-5-5"]
 # system_prompt = "..."   # built in: plan, wait for approval, dispatch, verify, integrate
+# prompt = "..."          # your own instructions, added after the built-in prompt when the chief starts;
+                          # config.d/<host>.toml and the workspace file add theirs after this one
 
 [steer]
 # Added to every Claude session started or seen by IMACS (SessionStart hook).
@@ -303,6 +305,9 @@ requests. Never push, open pull requests or delete branches without the user's O
 Several plans may be open at once, each with its own tab, agents, approval, integration branch and final review. \
 Start the next plan while another finishes. The chief is never closed. Use imacs_plan_get without plan for summaries.
 Close finished plans with imacs_plan_close (plan id, status completed or archived); their history remains available by id.
+To configure IMACS itself, read imacs_config_get (and imacs_doctor when something fails) and propose changes with \
+imacs_config_propose: the user applies or rejects each one, and the outcome arrives as a config event. Never edit \
+IMACS's config files yourself.
 Agents share this machine: their compilers draw from one job pool, and full test runs and QA instances wait for a slot through `imacs queue`. Size the fleet to the machine, and keep briefs asking for targeted checks while working and one full test run at the end.
 
 Keep briefs, notes and messages short: the user reads them on the board.";
@@ -323,6 +328,10 @@ pub struct ChiefConfig {
     pub command: Vec<String>,
     pub args: Vec<String>,
     pub system_prompt: String,
+    /// The user's instructions, added after the built-in prompt. Every file's adds to the
+    /// others' (main, host, then the workspace's), so read them with
+    /// [`crate::selfconfig::prompt_sections`]: merged, this holds only the last file's.
+    pub prompt: String,
 }
 
 impl Default for ChiefConfig {
@@ -333,6 +342,7 @@ impl Default for ChiefConfig {
             command: vec!["claude".into()],
             args: vec!["--model".into(), "claude-opus-5-5".into()],
             system_prompt: CHIEF_PROMPT.into(),
+            prompt: String::new(),
         }
     }
 }
@@ -699,7 +709,7 @@ impl Config {
     /// Arrays and scalar values are replaced; only files actually read are returned.
     #[cfg(feature = "native")]
     pub fn load_with_sources(path: &Path) -> Result<(Self, Vec<PathBuf>)> {
-        let mut merged = toml::Value::Table(toml::Table::new());
+        let mut tables = Vec::new();
         let mut sources = Vec::new();
         for (index, file) in Self::source_paths(path).into_iter().enumerate() {
             let text = match std::fs::read_to_string(&file) {
@@ -707,20 +717,35 @@ impl Config {
                 Err(err) if index > 0 && err.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(err) => return Err(err).with_context(|| format!("reading {}", file.display())),
             };
-            let value = toml::from_str(&text).with_context(|| format!("parsing {}", file.display()))?;
-            merge_values(&mut merged, value);
+            tables.push(toml::from_str(&text).with_context(|| format!("parsing {}", file.display()))?);
             sources.push(file);
         }
-        let mut config: Config = merged.try_into().with_context(|| {
+        let config = Self::from_tables(tables).with_context(|| {
             format!(
                 "parsing merged config from {}",
                 sources.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
             )
         })?;
+        Ok((config, sources))
+    }
+
+    /// The config the files' tables make, base first: tables merge key by key, and arrays
+    /// and other values replace what came before.
+    pub fn from_tables(tables: impl IntoIterator<Item = toml::Table>) -> Result<Self, toml::de::Error> {
+        let mut config: Config = toml::Value::Table(Self::merged(tables)).try_into()?;
         if config.agents.is_empty() {
             config.agents = Config::default().agents;
         }
-        Ok((config, sources))
+        Ok(config)
+    }
+
+    /// The files' tables merged, base first, before defaults apply.
+    pub fn merged(tables: impl IntoIterator<Item = toml::Table>) -> toml::Table {
+        let mut merged = toml::Table::new();
+        for table in tables {
+            merge_tables(&mut merged, table);
+        }
+        merged
     }
 
     pub fn agent(&self, name: &str) -> Option<&AgentConfig> {
@@ -733,20 +758,14 @@ impl Config {
     }
 }
 
-#[cfg(feature = "native")]
-fn merge_values(base: &mut toml::Value, overrides: toml::Value) {
-    match (base, overrides) {
-        (toml::Value::Table(base), toml::Value::Table(overrides)) => {
-            for (key, value) in overrides {
-                match base.get_mut(&key) {
-                    Some(existing) => merge_values(existing, value),
-                    None => {
-                        base.insert(key, value);
-                    }
-                }
+fn merge_tables(base: &mut toml::Table, overrides: toml::Table) {
+    for (key, value) in overrides {
+        match (base.get_mut(&key), value) {
+            (Some(toml::Value::Table(existing)), toml::Value::Table(value)) => merge_tables(existing, value),
+            (_, value) => {
+                base.insert(key, value);
             }
         }
-        (base, value) => *base = value,
     }
 }
 
