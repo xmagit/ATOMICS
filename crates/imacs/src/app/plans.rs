@@ -1,5 +1,7 @@
 use super::*;
 
+const MAX_BRANCH_ALLOCATION_ATTEMPTS: usize = 100;
+
 impl State {
     pub(super) fn show_plan_fleet(&mut self) {
         self.changed_plans.remove(&self.plans[self.selected_plan].id);
@@ -251,33 +253,55 @@ impl State {
     ) -> Result<String, String> {
         let common = git::common_dir(repo).map_err(|err| format!("{err:#}"))?;
         let base = self.project_config(repo).base_ref;
-        let mut branch = preferred.to_string();
-        let mut suffix = 2;
-        loop {
+        let preferred_path = git::worktree_path(&self.config.worktree_path, repo, preferred);
+        let fixed_path =
+            preferred_path == git::worktree_path(&self.config.worktree_path, repo, &format!("{preferred}-2"));
+        for attempt in 0..MAX_BRANCH_ALLOCATION_ATTEMPTS {
+            let branch = if attempt == 0 { preferred.to_string() } else { format!("{preferred}-{}", attempt + 1) };
             git::check_branch_name(repo, &branch, &base).map_err(|err| format!("{err:#}"))?;
             let owners = self.branch_owners(&common, &branch);
-            if pinned {
-                if let Some((other, task)) = owners.iter().find(|owner| **owner != (index, task)) {
-                    let owner = task.map(|id| format!("task {id} in ")).unwrap_or_default();
-                    return Err(format!(
-                        "Branch {branch} is already owned by {owner}plan {} in {}. Resolve the ownership conflict before retrying; the recorded branch was kept.",
-                        self.plans[*other].id,
-                        repo.display()
-                    ));
-                }
-                return Ok(branch);
+            if pinned && let Some((other, task)) = owners.iter().find(|owner| **owner != (index, task)) {
+                let owner = task.map(|id| format!("task {id} in ")).unwrap_or_default();
+                return Err(format!(
+                    "Branch {branch} is already owned by {owner}plan {} in {}. Resolve the ownership conflict before retrying; the recorded branch was kept.",
+                    self.plans[*other].id,
+                    repo.display()
+                ));
             }
             let owned = owners.as_slice() == [(index, task)];
             let path = git::worktree_path(&self.config.worktree_path, repo, &branch);
+            let reserved_path = self
+                .creating
+                .iter()
+                .any(|(dir, name, pending_path)| *pending_path == path && (*dir != common || *name != branch));
+            if fixed_path
+                && (!pinned || task.is_some())
+                && (path.exists() || reserved_path)
+                && !(owned
+                    && !reserved_path
+                    && git::common_dir(&path).is_ok_and(|dir| dir == common)
+                    && git::worktree_of(&path).and_then(|tree| tree.branch).as_deref() == Some(&branch))
+            {
+                return Err(format!(
+                    "Worktree path {} is occupied or reserved by other work. The worktree_path template does not vary with the branch; add {{slug}} to worktree_path or choose a free path.",
+                    path.display()
+                ));
+            }
+            if pinned {
+                return Ok(branch);
+            }
             let exists = git::git(repo, &["show-ref", "--verify", &format!("refs/heads/{branch}")]).is_ok()
                 || path.exists()
-                || self.creating.contains(&(common.clone(), branch.clone()));
+                || reserved_path
+                || self.creating.iter().any(|(dir, name, _)| *dir == common && *name == branch);
             if owners.iter().all(|owner| *owner == (index, task)) && (!exists || owned) {
                 return Ok(branch);
             }
-            branch = format!("{preferred}-{suffix}");
-            suffix += 1;
         }
+        Err(format!(
+            "Could not allocate a branch for {preferred} in {} after {MAX_BRANCH_ALLOCATION_ATTEMPTS} attempts. Choose a distinct branch name or update worktree_path to use a free location.",
+            repo.display()
+        ))
     }
 
     /// Pin before the first branch is created; never rename work already in progress.
@@ -621,12 +645,110 @@ mod tests {
             app.runtime.config.base_ref = "main".into();
             app.runtime.config.worktree_path = "{repo_parent}/{repo}-{slug}".into();
             app.runtime.plans = vec![Plan::default()];
-            app.runtime.creating.push((git::common_dir(&repo).unwrap(), "reserved".into()));
+            app.runtime.creating.push((
+                git::common_dir(&repo).unwrap(),
+                "reserved".into(),
+                dir.path().join("reserved"),
+            ));
             assert_eq!(
                 app.runtime.available_plan_branch(0, Some("a"), &linked, "reserved", false).unwrap(),
                 "reserved-2"
             );
             assert_eq!(app.runtime.available_plan_branch(0, Some("a"), &other, "reserved", false).unwrap(), "reserved");
+        });
+    }
+
+    #[test]
+    fn existing_fixed_worktree_path_returns_in_bounded_time() {
+        with_app("app::plans::tests::existing_fixed_worktree_path_returns_in_bounded_time", |app, _| {
+            let (dir, repo) = repository();
+            app.runtime.config.base_ref = "main".into();
+            let fixed = dir.path().join("fixed-worktree");
+            app.runtime.config.worktree_path = fixed.to_string_lossy().into_owned();
+            std::fs::create_dir(&fixed).unwrap();
+            app.runtime.plans = vec![Plan {
+                id: "fixed".into(),
+                project: Some(repo),
+                approved: true,
+                tasks: vec![Task { id: "a".into(), ..Default::default() }],
+                ..Default::default()
+            }];
+            let (done, monitor) = std::sync::mpsc::channel::<()>();
+            let watchdog = std::thread::spawn(move || {
+                if matches!(
+                    monitor.recv_timeout(Duration::from_secs(5)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    eprintln!("allocation never returns when an occupied worktree_path cannot vary with the branch");
+                    std::process::exit(91);
+                }
+            });
+            let started = Instant::now();
+            let result = app.runtime.dispatch(0, Some("a"));
+            done.send(()).unwrap();
+            watchdog.join().unwrap();
+            assert!(started.elapsed() < Duration::from_secs(5));
+            let err = result.unwrap_err();
+            assert!(
+                err.contains(fixed.to_str().unwrap()) && err.contains("worktree_path") && err.contains("{slug}"),
+                "{err}"
+            );
+            assert!(app.runtime.plans[0].tasks[0].branch.is_none());
+            assert!(app.runtime.creating.is_empty());
+        });
+    }
+
+    #[test]
+    fn fixed_worktree_path_reserves_pending_work_and_allows_its_owner_to_retry() {
+        with_app(
+            "app::plans::tests::fixed_worktree_path_reserves_pending_work_and_allows_its_owner_to_retry",
+            |app, _| {
+                let (dir, repo) = repository();
+                app.runtime.config.base_ref = "main".into();
+                let fixed = dir.path().join("fixed-worktree");
+                app.runtime.config.worktree_path = fixed.to_string_lossy().into_owned();
+                app.runtime.plans = vec![Plan {
+                    id: "fixed".into(),
+                    project: Some(repo.clone()),
+                    approved: true,
+                    tasks: vec![Task { id: "a".into(), branch: Some("pinned".into()), ..Default::default() }],
+                    ..Default::default()
+                }];
+                app.runtime.creating.push((git::common_dir(&repo).unwrap(), "other".into(), fixed.clone()));
+                let err = app.runtime.dispatch(0, Some("a")).unwrap_err();
+                assert!(err.contains("worktree_path"), "{err}");
+                assert!(!fixed.exists(), "the path is reserved before the worker creates it");
+                assert_eq!(app.runtime.plans[0].tasks[0].branch.as_deref(), Some("pinned"));
+                app.runtime.creating.clear();
+                git::add_worktree(&repo, &fixed, "pinned", "main").unwrap();
+                app.runtime.dispatch(0, Some("a")).unwrap();
+                let (branch, prepared, _, _) = app.runtime.worktree_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert_eq!(branch, "pinned");
+                assert_eq!(prepared.unwrap().path, fixed);
+                app.runtime.plans[0].tasks[0].branch = None;
+                assert!(
+                    app.runtime
+                        .available_plan_branch(0, Some("a"), &repo, "fresh", false)
+                        .unwrap_err()
+                        .contains("worktree_path")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn branch_allocation_stops_after_the_attempt_limit() {
+        with_app("app::plans::tests::branch_allocation_stops_after_the_attempt_limit", |app, _| {
+            let (dir, repo) = repository();
+            app.runtime.config.base_ref = "main".into();
+            app.runtime.config.worktree_path = format!("{}/{{slug}}", dir.path().display());
+            app.runtime.plans = vec![Plan::default()];
+            for attempt in 0..MAX_BRANCH_ALLOCATION_ATTEMPTS {
+                let branch = if attempt == 0 { "taken".into() } else { format!("taken-{}", attempt + 1) };
+                std::fs::create_dir(dir.path().join(branch)).unwrap();
+            }
+            let err = app.runtime.available_plan_branch(0, Some("a"), &repo, "taken", false).unwrap_err();
+            assert!(err.contains(&format!("after {MAX_BRANCH_ALLOCATION_ATTEMPTS} attempts")), "{err}");
         });
     }
 

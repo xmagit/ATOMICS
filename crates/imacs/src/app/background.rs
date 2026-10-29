@@ -64,7 +64,7 @@ impl State {
         while let Ok((branch, result, launch, common)) = self.worktree_rx.try_recv() {
             changed = true;
             self.worktrees_at = None;
-            if let Some(i) = self.creating.iter().position(|(repo, b)| *repo == common && *b == branch) {
+            if let Some(i) = self.creating.iter().position(|(repo, b, _)| *repo == common && *b == branch) {
                 self.creating.remove(i);
             }
             let background = launch

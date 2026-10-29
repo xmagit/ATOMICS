@@ -24,7 +24,7 @@ impl State {
             _ => false,
         };
         let conflict = !owners.is_empty() && !reuse;
-        self.creating.push((common.clone(), branch.clone()));
+        self.creating.push((common.clone(), branch.clone(), path.clone()));
         self.toast(format!("Creating worktree {}…", paths::display(&path)));
         std::thread::spawn(move || {
             // A retried task finds its worktree from the first attempt.

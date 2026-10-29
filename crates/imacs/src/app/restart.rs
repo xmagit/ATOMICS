@@ -29,7 +29,7 @@ impl State {
         if !self.creating.is_empty() || !self.pending_codex.is_empty() {
             blockers.push(format!(
                 "worktree or agent launch running: {}",
-                self.creating.iter().map(|(_, branch)| branch.as_str()).collect::<Vec<_>>().join(", ")
+                self.creating.iter().map(|(_, branch, _)| branch.as_str()).collect::<Vec<_>>().join(", ")
             ));
         }
         if !self.integrating.is_empty() || !self.integration_checks.is_empty() {
@@ -280,7 +280,7 @@ mod tests {
                 app.runtime.pending_questions.insert("worker".into());
                 refused(app, "question pending for worker");
                 app.runtime.pending_questions.clear();
-                app.runtime.creating.push((PathBuf::new(), "branch".into()));
+                app.runtime.creating.push((PathBuf::new(), "branch".into(), PathBuf::new()));
                 refused(app, "worktree");
                 app.runtime.creating.clear();
                 app.runtime.integrating.insert(("plan".into(), "task".into()));

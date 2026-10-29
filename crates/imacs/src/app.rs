@@ -410,7 +410,7 @@ pub(crate) struct State {
     chief_open: bool,
     worktree_tx: crate::host::Sender<(String, Result<PreparedWorktree, String>, Launch, PathBuf)>,
     worktree_rx: Receiver<(String, Result<PreparedWorktree, String>, Launch, PathBuf)>,
-    creating: Vec<(PathBuf, String)>,
+    creating: Vec<(PathBuf, String, PathBuf)>,
     integrate_tx: crate::host::Sender<Integrated>,
     integrate_rx: Receiver<Integrated>,
     /// Tasks being merged into the integration branch.
