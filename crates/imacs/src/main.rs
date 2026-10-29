@@ -16,6 +16,7 @@ mod hook_client;
 mod host;
 mod ipc;
 mod mcp;
+mod restart;
 mod setup;
 mod statusline;
 mod terminal;
@@ -28,7 +29,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "imacs", about = "Review-first workspace for coding agents")]
+#[command(name = "imacs", version = env!("IMACS_BUILD_VERSION"), about = "Review-first workspace for coding agents")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
