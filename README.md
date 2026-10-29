@@ -261,8 +261,7 @@ worktrees remain for the existing **clean up…** flow. Set `[plan] close_done_a
 
 ## Running many agents
 
-Every agent works in its own worktree with its own `target/`, so its builds never wait on another's. What they
-share is the machine, and IMACS keeps that in check for every agent it starts (`[resources]` in the config):
+Every agent works in its own worktree with its own `target/`, so its builds never wait on another's.
 
 New agent worktrees start with a warm build cache when the main checkout has one. Before launching the agent,
 IMACS clones the folders in `[worktrees] warm` (default `["target"]`) from the repository's **main checkout**, even
@@ -270,10 +269,10 @@ when you start from another linked worktree. The clone runs on the background wo
 clones are used: unsupported filesystems, missing folders and clone errors are skipped without retrying as a full
 copy or blocking launch on a fallback. macOS uses the native clone-only `clonefile` API
 (`cp -c` can silently fall back to full copying); Linux uses `cp -R --reflink=always`.
-Each worktree then owns its cache independently; builds cannot change the
-main checkout's cache. A successful clone shows **warm cache from main** in a toast. Existing worktrees are left
-alone when retrying a launch. `imacs doctor` probes CoW cloning between the repository and configured worktree
-folders, using temporary files that it removes afterwards.
+Each worktree then owns its cache independently; builds cannot change the main checkout's cache. A successful
+clone shows **warm cache from main** in a toast. Existing worktrees are left alone when retrying a launch.
+`imacs doctor` probes CoW cloning between the repository and configured worktree folders, using temporary files
+that it removes afterwards.
 
 ```toml
 [worktrees]
@@ -282,6 +281,21 @@ warm = ["target"]          # existing folders relative to the repository root; n
 # warm = []               # turn cache warming off
 ```
 
+Measured once per configuration on this Mac (APFS, 2026-10-29), with sccache disabled. IMACS itself created and
+launched both agent worktrees at revision `63dcfd1`, using separate isolated instances with their own
+`IMACS_HOME`, `IMACS_SOCKET` and `IMACS_CONFIG`. Each agent ran its first
+`imacs queue --class test -- cargo build -p imacs`:
+
+| Cache warming | Worktree creation → launch | Crates compiled | First queued build | Preparation + build |
+| --- | ---: | ---: | ---: | ---: |
+| Off (`warm = []`) | 0.18 s | 276 | 56.30 s | 56.48 s |
+| On (`warm = ["target"]`) | 6.83 s | 13 | 22.24 s | 29.07 s |
+
+Preparation includes the cache clone; build times are wall clock and include queue overhead. Warming cut
+preparation plus first-build time by about 49% in this run. The cache was present before the warm agent's first
+command, and absent before the cold agent's first command.
+
+Agents share the machine, and IMACS keeps that in check for every agent it starts (`[resources]` in the config):
 
 - **One compiler job pool.** IMACS owns a GNU make jobserver (a named pipe in a private folder under `/tmp`, which
   Codex's sandbox can open) with `jobs` tokens, cores minus 2 by default, and hands it to every agent terminal as
