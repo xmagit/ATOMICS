@@ -56,9 +56,7 @@ pub fn spawn<T: Send + 'static>(done: crate::host::Sender<(T, Result<TicketOutpu
         .spawn(move || {
             let mut worker = Worker::default();
             while let Ok(job) = rx.recv() {
-                // Everything a job brings back is cleaned with the secrets it ran with, so a
-                // result arriving after a config change never carries the old credentials.
-                worker.cleaner = tickets::Cleaner::new(worker.secrets_of(&job.config));
+                worker.prepare(&job.config);
                 let result = worker.run(&job.config, job.op);
                 let result = worker.clean(result);
                 if done.send((job.tag, result)).is_err() {
@@ -72,7 +70,10 @@ pub fn spawn<T: Send + 'static>(done: crate::host::Sender<(T, Result<TicketOutpu
 
 #[derive(Default)]
 struct Worker {
-    client: Option<(McpServer, McpClient)>,
+    /// The connection, with the server and token it was made with.
+    client: Option<(McpServer, Option<String>, McpClient)>,
+    /// The current job's token, as its `token_env` resolves now.
+    token: Option<String>,
     /// The server that failed, when, and its cleaned error.
     down: Option<(McpServer, Instant, String)>,
     /// Cleans what the current job returns, with that job's secrets.
@@ -82,20 +83,35 @@ struct Worker {
 }
 
 impl Worker {
-    /// The job's secrets as they are now, so a rotated token is never missed.
-    fn secrets_of(&mut self, config: &TicketConfig) -> Vec<String> {
-        let missing = &mut self.missing;
-        tickets::secrets_of(config, |name| {
-            if missing.get(name).is_some_and(|at| at.elapsed() < MISSING_ENV) {
-                return std::env::var(name).ok().filter(|v| !v.trim().is_empty());
-            }
-            let value = crate::setup::env_var(name);
-            match &value {
-                None => missing.insert(name.to_string(), Instant::now()),
-                Some(_) => missing.remove(name),
-            };
-            value
-        })
+    /// Resolves the job's credentials as they are now. Everything the job brings back is
+    /// cleaned with them, so a result arriving after a config change never carries the old
+    /// ones. A connection made with another token is replaced, and the job is cleaned for
+    /// that token too until the old connection is gone.
+    fn prepare(&mut self, config: &TicketConfig) {
+        self.token = config.server.token_env.clone().and_then(|name| self.env(&name));
+        let secrets = tickets::secrets_of(config, |name| self.env(name));
+        let mut cleaner = tickets::Cleaner::new(secrets);
+        if let Some((_, used, _)) = &self.client
+            && *used != self.token
+        {
+            cleaner = cleaner.with(used.clone());
+            self.client = None;
+        }
+        self.cleaner = cleaner;
+    }
+
+    /// A variable as IMACS or the login shell sets it now. One set nowhere is not looked up
+    /// again for a while: each lookup may start a login shell.
+    fn env(&mut self, name: &str) -> Option<String> {
+        if self.missing.get(name).is_some_and(|at| at.elapsed() < MISSING_ENV) {
+            return std::env::var(name).ok().filter(|v| !v.trim().is_empty());
+        }
+        let value = crate::setup::env_var(name);
+        match &value {
+            None => self.missing.insert(name.to_string(), Instant::now()),
+            Some(_) => self.missing.remove(name),
+        };
+        value
     }
 
     /// Errors and everything read from the server, before it leaves the worker.
@@ -163,15 +179,21 @@ impl Worker {
         {
             return Err(format!("{} is unavailable: {error}", config.system));
         }
-        if self.client.as_ref().is_none_or(|(server, _)| *server != config.server) {
+        if self.client.as_ref().is_none_or(|(server, used, _)| *server != config.server || *used != self.token) {
             self.client = None;
             let timeout = Duration::from_secs(config.timeout_secs.max(1));
-            match McpClient::connect(&config.server, timeout, crate::setup::env_var) {
-                Ok(client) => self.client = Some((config.server.clone(), client)),
+            // The connection authenticates with exactly the token this job resolved.
+            let token = self.token.clone();
+            let token_env = config.server.token_env.clone();
+            let env = |name: &str| {
+                if token_env.as_deref() == Some(name) { token.clone() } else { crate::setup::env_var(name) }
+            };
+            match McpClient::connect(&config.server, timeout, env) {
+                Ok(client) => self.client = Some((config.server.clone(), self.token.clone(), client)),
                 Err(err) => return Err(self.broken(&config.server, err)),
             }
         }
-        let (_, client) = self.client.as_mut().expect("connected");
+        let (_, _, client) = self.client.as_mut().expect("connected");
         match client.call_tool(&operation.tool, arguments) {
             Ok(result) => {
                 self.down = None;
@@ -189,5 +211,115 @@ impl Worker {
             self.down = Some((server.clone(), Instant::now(), self.cleaner.error(message)));
         }
         err.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc::Receiver;
+
+    /// A streamable HTTP MCP server whose every tool call fails, echoing the bearer token
+    /// it was called with. Each request's Authorization header goes to the receiver.
+    fn echo_server() -> (String, Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let (tx, tokens) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let (mut length, mut token) = (0, String::new());
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    let lower = line.to_ascii_lowercase();
+                    if let Some(value) = lower.strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap_or(0);
+                    }
+                    if lower.starts_with("authorization: bearer ") {
+                        token = line["authorization: bearer ".len()..].trim().to_string();
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let answer = match body["method"].as_str().unwrap_or_default() {
+                    "initialize" => Some(json!({"protocolVersion": "2025-06-18", "capabilities": {}})),
+                    "tools/call" => {
+                        let _ = tx.send(token.clone());
+                        let text = format!("credential {token} rejected");
+                        Some(json!({"isError": true, "content": [{"type": "text", "text": text}]}))
+                    }
+                    _ => None,
+                };
+                let response = match answer {
+                    Some(result) => {
+                        let text = json!({"jsonrpc": "2.0", "id": body["id"], "result": result}).to_string();
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+                            text.len()
+                        )
+                    }
+                    None => "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (url, tokens)
+    }
+
+    #[test]
+    fn a_rotated_token_reconnects_and_is_cleaned_together_with_the_old_one() {
+        const CHILD: &str = "IMACS_TICKET_WORKER_TOKEN_CHILD";
+        const NAME: &str = "tickets::tests::a_rotated_token_reconnects_and_is_cleaned_together_with_the_old_one";
+        if std::env::var_os(CHILD).is_none() {
+            // The test changes an environment variable, so it runs alone in a process of its own.
+            let output = crate::test_support::output(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", NAME, "--nocapture"])
+                    .env(CHILD, "1"),
+            );
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        const OLD: &str = "oldkey-7c1d9e";
+        const NEW: &str = "newkey-2b3c4d";
+        let (url, tokens) = echo_server();
+        let mut config: TicketConfig = toml::from_str(
+            "system = \"echo\"\n[operations.comment]\ntool = \"note\"\narguments = { body = \"{body}\" }",
+        )
+        .unwrap();
+        config.server.url = Some(url);
+        config.server.token_env = Some("ECHO_TEST_TOKEN".into());
+        let config = Arc::new(config);
+        let (done, results) = crate::host::Wake::default().channel();
+        let jobs = spawn(done);
+        let comment = |n: u32| {
+            let op = TicketOp::Comment(TicketLink { id: "1".into(), ..TicketLink::default() }, "Hi".into());
+            jobs.send(TicketJob { config: config.clone(), op, tag: n }).unwrap();
+            let (tag, result) = results.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert_eq!(tag, n);
+            result.err().unwrap()
+        };
+        // SAFETY: this process runs only this test, and the worker reads the variable only
+        // while a job runs; each job is awaited before the variable changes.
+        unsafe { std::env::set_var("ECHO_TEST_TOKEN", OLD) };
+        assert_eq!(comment(1), "note failed: credential *** rejected");
+        assert_eq!(tokens.recv().unwrap(), OLD);
+        unsafe { std::env::set_var("ECHO_TEST_TOKEN", NEW) };
+        let rotated = comment(2);
+        assert_eq!(tokens.recv().unwrap(), NEW, "the connection authenticates with the new token");
+        assert_eq!(rotated, "note failed: credential *** rejected");
     }
 }
