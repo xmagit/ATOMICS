@@ -12,6 +12,7 @@ mod doctor;
 mod governor;
 mod highlight;
 mod hook_client;
+mod host;
 mod ipc;
 mod mcp;
 mod setup;

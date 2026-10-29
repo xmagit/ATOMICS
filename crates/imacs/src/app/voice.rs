@@ -1,6 +1,6 @@
 use super::*;
 
-impl App {
+impl State {
     /// Push-to-talk: the first press records, the second transcribes and sends.
     pub(super) fn toggle_voice(&mut self) {
         match self.voice {

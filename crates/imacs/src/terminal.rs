@@ -26,6 +26,7 @@ use crate::theme::{Palette, is_app_chord};
 pub struct Shared {
     pub title: Mutex<Option<String>>,
     pub exited: AtomicBool,
+    runtime_wake: OnceLock<crate::host::Wake>,
     pub bell: AtomicBool,
     size: Mutex<WindowSize>,
     /// The pass that last drew the terminal, and whether it had keyboard focus then.
@@ -57,6 +58,8 @@ impl EventListener for Listener {
                 let _ = sender.send(Msg::Input(Cow::Owned(text.into_bytes())));
             }
         };
+        let runtime_changed =
+            matches!(&event, TermEvent::ChildExit(_) | TermEvent::Exit | TermEvent::Title(_) | TermEvent::ResetTitle);
         match event {
             TermEvent::Wakeup => self.repaint(),
             TermEvent::MouseCursorDirty | TermEvent::CursorBlinkingChange => self.ctx.request_repaint(),
@@ -72,6 +75,9 @@ impl EventListener for Listener {
                 self.ctx.request_repaint();
             }
             TermEvent::ClipboardLoad(..) => {}
+        }
+        if runtime_changed && let Some(wake) = self.shared.runtime_wake.get() {
+            wake.notify();
         }
     }
 }
@@ -120,6 +126,11 @@ fn isolated_args(program: String, args: Vec<String>) -> Vec<String> {
 }
 
 impl Terminal {
+    pub fn set_runtime_wake(&self, wake: crate::host::Wake) {
+        wake.notify();
+        let _ = self.shared.runtime_wake.set(wake);
+    }
+
     pub fn process_id(&self) -> u32 {
         self.process_id
     }
@@ -145,6 +156,7 @@ impl Terminal {
         let shared = Arc::new(Shared {
             title: Mutex::new(None),
             exited: AtomicBool::new(false),
+            runtime_wake: OnceLock::new(),
             bell: AtomicBool::new(false),
             size: Mutex::new(size),
             drawn: AtomicU64::new(0),

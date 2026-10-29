@@ -234,3 +234,50 @@ Bound scrollback, disk/log growth, child processes and CPU/memory; alert before 
 Each gate needs regression tests with the implementation phase; this document adds no runtime behavior.
 Use an isolated `IMACS_HOME`, `IMACS_SOCKET` and `IMACS_CONFIG` for UI checks, verify the process environment
 with `ps eww <pid>`, and never run migration experiments against the user's running IMACS instance.
+
+## Phase 2 implementation checkpoint: runtime host
+
+`host::Host` now owns the shared native `app::State` and services it on the
+`imacs-runtime` thread. Hook/control requests and worktree, integration,
+heartbeat and voice results signal its condition variable directly. The host
+chooses its next deadline for approvals, delivery verification, wait timeouts,
+heartbeat, configuration, terminal fallback checks and diff refreshes. It runs
+without an egui pass; repaint requests only notify the desktop of changes.
+The desktop borrows state under a mutex to paint and apply synchronous actions;
+the welcome screen starts agents through the host command channel. Status and
+recording animation timers remain in the client. Closing the application still
+joins the runtime and shuts down its terminals, as before.
+
+`app::host_tests` exercises the production host thread without running egui or
+calling a runtime tick: permission-hook replies through the Unix socket,
+approval expiry after a hook timeout, held-message release, status-change waits,
+wait deadlines, heartbeat completion, plan persistence through ctl, real Git
+integration and its saved result, agent exit and saved task status, and delivery
+verification timeout. Existing direct-pump harnesses use `State::runtime_tick`.
+
+Validation at this checkpoint: `cargo fmt --check`,
+`cargo clippy --all-targets -- -D warnings` and the full 296-test workspace suite
+through `imacs queue --class test -- cargo test --workspace` passed. Queued
+native QA with isolated home/socket/config paths verified shell output, ctl,
+plan persistence, heartbeat, terminal/board screenshots and clean shutdown.
+The QA harness explicitly requests paints while obscured so the existing
+frame-clock-based CLI screenshot delay can advance.
+
+Remaining for the `sessions` follow-up:
+
+- Separate session runtime data and agent launch/resume operations from terminal
+  painting, selection, keyboard/pointer input and other client view fields.
+  `app::State` still co-locates both behind the host lock; it is native desktop
+  state, not a UI-free host model.
+- Move the remaining synchronous UI mutations to explicit host commands, with
+  client-owned selection, drafts, dialogs, focus, screenshot handling and native
+  microphone capture. Rendering currently holds the shared state lock.
+- Separate PTY/emulator ownership and terminal notifications from egui. Child
+  exit/title changes already signal the host, while worktree discovery and
+  some worker results are collected at the host's bounded maintenance deadline.
+- Move cleanup-dialog completion handling off painting, and split diff and
+  highlighting workers/data from their client rendering state and egui wakeups.
+  Diff scheduling already runs on the host.
+
+The separate daemon, shutdown-without-closing-sessions behavior, serialized
+client protocol and browser rendering remain later migration phases.

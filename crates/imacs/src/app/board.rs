@@ -1,6 +1,6 @@
 use super::*;
 
-impl App {
+impl State {
     pub(super) fn toggle_plan(&mut self) {
         self.ctx.request_repaint();
         if self.panel == PanelMode::Plan && self.diff_open {

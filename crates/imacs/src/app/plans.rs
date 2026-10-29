@@ -1,6 +1,6 @@
 use super::*;
 
-impl App {
+impl State {
     pub(super) fn show_plan_fleet(&mut self) {
         self.changed_plans.remove(&self.plans[self.selected_plan].id);
         self.ctx.request_repaint();
@@ -874,7 +874,7 @@ mod tests {
                     let deadline = Instant::now() + Duration::from_secs(10);
                     while !app.creating.is_empty() {
                         assert!(Instant::now() < deadline);
-                        app.pump(ctx);
+                        app.runtime_tick(ctx);
                         std::thread::sleep(Duration::from_millis(10));
                     }
                     let session = app.plans[index].tasks[0].session.as_ref().unwrap();
@@ -929,7 +929,7 @@ mod tests {
                 let deadline = Instant::now() + Duration::from_secs(10);
                 while !app.creating.is_empty() {
                     assert!(Instant::now() < deadline);
-                    app.pump(ctx);
+                    app.runtime_tick(ctx);
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 assert!(app.plans[one].tasks[0].session.is_some());
@@ -1192,7 +1192,7 @@ mod tests {
                 app.show_plan_fleet();
                 let deadline = Instant::now() + Duration::from_secs(10);
                 while !app.creating.is_empty() && Instant::now() < deadline {
-                    app.pump(ctx);
+                    app.runtime_tick(ctx);
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 assert!(app.creating.is_empty());

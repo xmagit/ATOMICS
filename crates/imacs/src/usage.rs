@@ -39,13 +39,16 @@ impl UsagePanel {
         (Self { claude: Usage::default(), codex: Usage::default(), reports, stop }, tx)
     }
 
-    pub fn drain(&mut self) {
+    pub fn drain(&mut self) -> bool {
+        let mut changed = false;
         while let Ok(report) = self.reports.try_recv() {
+            changed = true;
             match report {
                 Report::Claude(usage) => self.claude.update(usage),
                 Report::Codex(usage) => self.codex.update(usage),
             };
         }
+        changed
     }
 
     pub fn show(&self, ui: &mut egui::Ui, p: &Palette) {

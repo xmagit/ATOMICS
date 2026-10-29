@@ -7,7 +7,7 @@ enum ViewTab {
     Plan(usize),
 }
 
-impl App {
+impl State {
     /// Tabs share a bounded navigation slot. First shorten labels, then move
     /// excess tabs into a menu, keeping the selected tab in the visible row.
     pub(super) fn view_tabs(&mut self, ui: &mut egui::Ui) {
@@ -671,7 +671,7 @@ mod tests {
                     app.sessions.push(session(id, AgentKind::Generic, AgentStatus::Working, Path::new("/project")));
                 }
                 let mut time = 0.0;
-                let mut frame = |app: &mut App, events| {
+                let mut frame = |app: &mut State, events| {
                     time += 0.05;
                     let output = ctx.run_ui(
                         egui::RawInput {
@@ -762,7 +762,7 @@ mod tests {
                 }
                 assert_eq!(app.plans[completed].status, PlanStatus::Completed);
                 assert_eq!(app.confirm_plan_close, Some((app.plans[completed].id.clone(), PlanStatus::Archived)));
-                let mut click = |app: &mut App, label: &str| {
+                let mut click = |app: &mut State, label: &str| {
                     frame(app, vec![]);
                     let text = frame(app, vec![]);
                     let pos =

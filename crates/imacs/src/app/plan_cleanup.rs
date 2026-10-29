@@ -16,7 +16,7 @@ enum Event {
     Finished,
 }
 
-impl App {
+impl State {
     pub(super) fn open_plan_cleanup(&mut self, index: usize) {
         let (tx, rx) = channel();
         let plan = self.plans[index].clone();
@@ -221,7 +221,7 @@ mod tests {
                 app.selected_plan = 0;
                 app.config.base_ref = "main".into();
                 let mut time = 0.0;
-                let mut frame = |app: &mut App, events| {
+                let mut frame = |app: &mut State, events| {
                     time += 0.05;
                     let output = ctx.run_ui(
                         egui::RawInput {
@@ -255,7 +255,7 @@ mod tests {
                     output.drop_without_applying_deltas();
                     text
                 };
-                let mut click = |app: &mut App, label: &str| {
+                let mut click = |app: &mut State, label: &str| {
                     let text = frame(app, vec![]);
                     let pos =
                         text.iter().find(|(s, _)| s == label).unwrap_or_else(|| panic!("missing {label}: {text:?}")).1;

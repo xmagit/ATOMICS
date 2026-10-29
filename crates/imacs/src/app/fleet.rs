@@ -1,6 +1,6 @@
 use super::*;
 
-impl App {
+impl State {
     /// Sessions in the selected project or plan view, excluding the chief.
     pub(super) fn visible_sessions(&self) -> Vec<usize> {
         (0..self.sessions.len())
@@ -597,7 +597,7 @@ mod tests {
                     ..Plan::default()
                 };
                 let mut time = 0.0;
-                let mut render = |app: &mut App, board: bool, events| {
+                let mut render = |app: &mut State, board: bool, events| {
                     time += 0.05;
                     let output = ctx.run_ui(
                         egui::RawInput {

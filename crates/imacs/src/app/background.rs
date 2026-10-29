@@ -1,15 +1,22 @@
 use super::*;
 
-impl App {
+impl State {
     // ── background events ─────────────────────────────────────────────────
 
-    pub(super) fn pump(&mut self, ctx: &egui::Context) {
+    pub(crate) fn runtime_tick(&mut self, ctx: &egui::Context) -> bool {
+        let before = self.runtime_view_revision();
+        let mut changed = false;
+        for record in std::mem::take(&mut self.resume) {
+            self.spawn(ctx, &record.agent, record.cwd.clone(), Some(record.claude_session_id));
+            changed = true;
+        }
         self.refresh_integrations();
-        self.usage.drain();
+        changed |= self.usage.drain();
         for session in &mut self.sessions {
             if let Some(ready) = &session.worktree_ready
                 && let Ok(worktree) = ready.try_recv()
             {
+                changed = true;
                 session.worktree = worktree;
                 session.worktree_ready = None;
                 if !session.chief {
@@ -18,6 +25,7 @@ impl App {
             }
         }
         for (agent, dir) in std::mem::take(&mut self.pending_open) {
+            changed = true;
             self.spawn(ctx, &agent, dir, None);
         }
         let pending = std::mem::take(&mut self.pending_codex);
@@ -26,6 +34,7 @@ impl App {
                 continue;
             }
             if let Some(supported) = ready.get().copied() {
+                changed = true;
                 let id = launch.id.clone();
                 if supported.is_none() {
                     self.toast(
@@ -44,9 +53,11 @@ impl App {
             }
         }
         while let Ok(message) = self.hook_rx.try_recv() {
+            changed = true;
             self.on_hook(message);
         }
         while let Ok((branch, result, launch)) = self.worktree_rx.try_recv() {
+            changed = true;
             self.worktrees_at = None;
             if let Some(i) = self.creating.iter().position(|b| *b == branch) {
                 self.creating.remove(i);
@@ -89,16 +100,16 @@ impl App {
             }
         }
         while let Ok(integrated) = self.integrate_rx.try_recv() {
+            changed = true;
             self.finish_integration(integrated);
         }
         self.expire_approvals(Instant::now());
-        if let Some(interval) = self.approval_poll_interval() {
-            ctx.request_repaint_after(interval);
-        }
         while let Ok(message) = self.control_rx.try_recv() {
+            changed = true;
             self.control(ctx, message.request, message.reply);
         }
         while let Ok(event) = self.voice_rx.try_recv() {
+            changed = true;
             match event {
                 VoiceEvent::Opened(cancelled, result) => {
                     if matches!(&self.voice, Voice::Opening(current) if Arc::ptr_eq(current, &cancelled)) {
@@ -120,13 +131,21 @@ impl App {
                 }
             }
         }
-        if let Voice::Recording(recorder) = &self.voice {
-            if recorder.elapsed() >= MAX_RECORDING {
-                self.stop_voice();
-                self.toast("Voice: stopped after 5 minutes, transcribing");
-            } else {
-                // Keeps the recording clock moving.
-                ctx.request_repaint_after(Duration::from_millis(250));
+        if let Voice::Recording(recorder) = &self.voice
+            && recorder.elapsed() >= MAX_RECORDING
+        {
+            self.stop_voice();
+            self.toast("Voice: stopped after 5 minutes, transcribing");
+        }
+        for session in &mut self.sessions {
+            if session.terminal.as_ref().is_some_and(Terminal::exited) {
+                session.status = AgentStatus::Exited;
+            }
+            if let Some(title) = session.terminal.as_ref().and_then(|t| t.shared.title.lock().unwrap().take())
+                && session.kind == AgentKind::Shell
+                && !title.trim().is_empty()
+            {
+                session.title = title;
             }
         }
         self.track_busy();
@@ -134,21 +153,11 @@ impl App {
         for index in 0..self.sessions.len() {
             self.release_held(index);
         }
-        if self.sessions.iter().any(|session| session.pending.is_some()) {
-            ctx.request_repaint_after(PULSE_STEP);
-        }
         self.record_events();
         self.sync_plan();
         self.heartbeat();
-        // Events wake waiters as they come in; this only times them out.
-        if let Some(deadline) = self.waiters.iter().map(|w| w.deadline).min() {
-            ctx.request_repaint_after(deadline.saturating_duration_since(Instant::now()));
-        }
-        if self.sessions.iter().any(|s| s.status == AgentStatus::Working) {
-            // Keeps the status pulse of working agents moving, in a few steps a second.
-            ctx.request_repaint_after(PULSE_STEP);
-        }
         while let Ok(result) = self.worker.rx.try_recv() {
+            changed = true;
             match result {
                 WorkerResult::Diff { root, result } => {
                     let state = self.diffs.entry(root.clone()).or_default();
@@ -194,18 +203,8 @@ impl App {
             }
         }
         while let Ok(root) = self.watch_rx.try_recv() {
+            changed = true;
             self.diffs.entry(root).or_default().mark_dirty();
-        }
-        for session in &mut self.sessions {
-            if session.terminal.as_ref().is_some_and(Terminal::exited) {
-                session.status = AgentStatus::Exited;
-            }
-            if let Some(title) = session.terminal.as_ref().and_then(|t| t.shared.title.lock().unwrap().take())
-                && session.kind == AgentKind::Shell
-                && !title.trim().is_empty()
-            {
-                session.title = title;
-            }
         }
 
         if self.config_checked.elapsed() > Duration::from_secs(1) {
@@ -290,7 +289,6 @@ impl App {
             }
         }
         let now = Instant::now();
-        let mut next: Option<Instant> = None;
         for (root, state) in &mut self.diffs {
             // The diff on screen follows every change; the others at most every few seconds,
             // with only some of their untracked content.
@@ -303,18 +301,76 @@ impl App {
                     let (base_ref, highlighter) = (self.config.base_ref.clone(), self.highlighter.clone());
                     self.worker.request(root.clone(), base_ref, budget, highlighter);
                 }
-                Some(at) => next = Some(next.map_or(at, |next| next.min(at))),
-                None => {}
+                _ => {}
             }
-        }
-        if let Some(at) = next {
-            ctx.request_repaint_after(at - now);
         }
         if let Some((_, at)) = &self.toast
             && at.elapsed() > Duration::from_secs(5)
         {
             self.toast = None;
         }
+        changed || before != self.runtime_view_revision()
+    }
+
+    /// Filesystem/config and terminal fallback checks have bounded polling
+    /// deadlines; messages and worker results wake the host immediately.
+    pub(crate) fn runtime_deadline(&self) -> Instant {
+        let now = Instant::now();
+        let mut next = self.config_checked + Duration::from_secs(1);
+        next = next.min(self.heartbeat.deadline(Duration::from_secs(self.config.chief.heartbeat_secs.max(1))));
+        for waiter in &self.waiters {
+            next = next.min(waiter.deadline);
+        }
+        if let Some(interval) = self.approval_poll_interval() {
+            next = next.min(self.approvals_checked + interval);
+        }
+        if self.sessions.iter().any(|s| s.pending.is_some()) {
+            next = next.min(now + PULSE_STEP);
+        }
+        if self.sessions.iter().any(|s| s.terminal.is_some()) {
+            next = next.min(self.busy_checked + Duration::from_millis(400));
+        }
+        if let Voice::Recording(recorder) = &self.voice {
+            next = next.min(now + MAX_RECORDING.saturating_sub(recorder.elapsed()));
+        }
+        let target = self.diff_target();
+        for (root, state) in &self.diffs {
+            let interval = if target.as_ref() == Some(root) { Duration::ZERO } else { BACKGROUND_REFRESH };
+            if let Some(at) = state.due_at(interval) {
+                next = next.min(at);
+            }
+        }
+        if let Some((_, at)) = &self.toast {
+            next = next.min(*at + Duration::from_secs(5));
+        }
+        // An already-due timer is serviced on the next turn, without spinning
+        // when the sampled clock is exactly equal to its deadline.
+        next.max(now + Duration::from_millis(1))
+    }
+
+    fn runtime_view_revision(&self) -> impl PartialEq + use<> {
+        (
+            self.event_seq,
+            self.config_stamp,
+            self.worktrees_at,
+            self.toast.as_ref().map(|(_, at)| *at),
+            self.integration_revision,
+            self.integration_checks.len(),
+            self.sessions
+                .iter()
+                .map(|s| {
+                    (
+                        s.id.clone(),
+                        s.title.clone(),
+                        s.status,
+                        s.approvals.len(),
+                        s.approval_hold,
+                        s.held.len(),
+                        s.pending.is_some(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
     }
 
     pub(super) fn on_hook(&mut self, message: HookMessage) {
@@ -517,6 +573,7 @@ impl App {
         if self.watcher.is_none() {
             let (tx, ctx, watched) = (self.watch_tx.clone(), ctx.clone(), self.watched.clone());
             let integration_dirty = self.integration_dirty.clone();
+            let wake = self.wake.clone();
             let handler = move |result: DebounceEventResult| {
                 let Ok(events) = result else { return };
                 let watched = watched.lock().unwrap();
@@ -527,6 +584,7 @@ impl App {
                             || event.path.file_name().is_some_and(|n| n == "HEAD" || n == "packed-refs"))
                     {
                         integration_dirty.store(true, Ordering::Relaxed);
+                        wake.notify();
                         ctx.request_repaint();
                         continue;
                     }
@@ -570,9 +628,6 @@ impl App {
                 }
             }
             self.watched.lock().unwrap().sort();
-        }
-        if self.watched.lock().unwrap().len() != wanted.len() {
-            ctx.request_repaint_after(Duration::from_secs(1));
         }
     }
 }
@@ -716,7 +771,7 @@ mod tests {
                 std::fs::write(folder.join("broken.json"), "{").unwrap();
                 std::fs::create_dir(folder.join("unreadable.json")).unwrap();
                 let cc = eframe::CreationContext::_new_kittest(ctx.clone());
-                let reopened = App::new(&cc, Options::default(), &crate::load_icon());
+                let reopened = State::new(&cc, Options::default(), &crate::load_icon());
                 let toast = &reopened.toast.as_ref().unwrap().0;
                 assert!(toast.contains("broken.json") && toast.contains("unreadable.json"), "{toast}");
                 assert_eq!(reopened.plans.iter().filter(|p| p.is_open()).count(), 1);

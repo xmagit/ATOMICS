@@ -1,6 +1,6 @@
 use super::*;
 
-impl App {
+impl State {
     /// Checks out `branch` in a new worktree, from `start` (a plan's integration branch)
     /// or base_ref, and starts `launch` in it.
     pub(super) fn create_worktree(&mut self, repo: PathBuf, branch: String, start: Option<String>, launch: Launch) {

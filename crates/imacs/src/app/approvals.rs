@@ -1,6 +1,6 @@
 use super::*;
 
-impl App {
+impl State {
     pub(super) fn approval_poll_interval(&self) -> Option<Duration> {
         if self.sessions.iter().any(|session| session.approval_hold || !session.approvals.is_empty()) {
             Some(Duration::from_millis(400))
@@ -143,7 +143,7 @@ mod tests {
                 app.record_events();
                 assert!(!app.hub.lock().unwrap().chief_running);
                 let mut time = 0.0;
-                let mut frame = |app: &mut App, events| {
+                let mut frame = |app: &mut State, events| {
                     time += 0.05;
                     let output = ctx.run_ui(
                         egui::RawInput {

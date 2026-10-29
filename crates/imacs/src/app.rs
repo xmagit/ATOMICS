@@ -306,8 +306,14 @@ struct Screenshot {
     done: Arc<AtomicBool>,
 }
 
-pub struct App {
+/// Shared desktop state during the runtime extraction. The host is its owner;
+/// the native client borrows it while painting and applying user actions.
+/// Session/terminal and client view state are separated in the next phase.
+pub(crate) struct State {
     ctx: egui::Context,
+    wake: crate::host::Wake,
+    control_tx: crate::host::Sender<ControlMessage>,
+    client_commands: Vec<ControlRequest>,
     icon: egui::TextureHandle,
     config: Config,
     config_path: PathBuf,
@@ -375,14 +381,14 @@ pub struct App {
     plan_view: bool,
     /// The chief is shown, either floating or docked (otherwise only the pill).
     chief_open: bool,
-    worktree_tx: Sender<(String, Result<PathBuf, String>, Launch)>,
+    worktree_tx: crate::host::Sender<(String, Result<PathBuf, String>, Launch)>,
     worktree_rx: Receiver<(String, Result<PathBuf, String>, Launch)>,
     creating: Vec<String>,
-    integrate_tx: Sender<Integrated>,
+    integrate_tx: crate::host::Sender<Integrated>,
     integrate_rx: Receiver<Integrated>,
     /// Tasks being merged into the integration branch.
     integrating: HashSet<(String, String)>,
-    integration_check_tx: Sender<CheckedIntegration>,
+    integration_check_tx: crate::host::Sender<CheckedIntegration>,
     integration_check_rx: Receiver<CheckedIntegration>,
     integration_checks: HashSet<(String, String)>,
     integration_checked: HashMap<(String, String), (u64, String, Task)>,
@@ -402,11 +408,11 @@ pub struct App {
     watcher: Option<Debouncer<RecommendedWatcher>>,
     /// Worktrees being watched, each with its path as the file system reports it.
     watched: Arc<Mutex<Vec<(PathBuf, PathBuf)>>>,
-    watch_tx: Sender<PathBuf>,
+    watch_tx: crate::host::Sender<PathBuf>,
     watch_rx: Receiver<PathBuf>,
     toast: Option<(String, Instant)>,
     voice: Voice,
-    voice_tx: Sender<VoiceEvent>,
+    voice_tx: crate::host::Sender<VoiceEvent>,
     voice_rx: Receiver<VoiceEvent>,
     screenshot: Option<Screenshot>,
     pending_open: Vec<(String, PathBuf)>,
@@ -414,8 +420,65 @@ pub struct App {
     launch_dir: PathBuf,
 }
 
+/// The only eframe client. Runtime work continues when neither callback is called.
+pub struct App {
+    host: crate::host::Host,
+    replies: Vec<Receiver<ControlOutcome>>,
+}
+
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>, options: Options, icon: &egui::IconData) -> App {
+    pub fn new(cc: &eframe::CreationContext<'_>, options: Options, icon: &egui::IconData) -> Self {
+        let state = State::new(cc, options, icon);
+        Self { host: state.into_host(), replies: Vec::new() }
+    }
+}
+
+impl eframe::App for App {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let mut state = self.host.state();
+        self.replies.retain(|reply| match reply.try_recv() {
+            Ok(ControlOutcome::Done(response)) => {
+                if let Some(error) = response.error {
+                    state.toast(error);
+                }
+                false
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => true,
+            _ => false,
+        });
+        state.client_logic(ctx);
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let mut state = self.host.state();
+        state.paint(ui);
+        if state.sessions.iter().any(|s| s.status == AgentStatus::Working) || matches!(state.voice, Voice::Recording(_))
+        {
+            ui.ctx().request_repaint_after(PULSE_STEP);
+        }
+        let commands = std::mem::take(&mut state.client_commands);
+        drop(state);
+        for command in commands {
+            self.replies.push(self.host.command(command));
+        }
+        if ui.input(|input| !input.events.is_empty()) {
+            self.host.wake();
+        }
+    }
+
+    fn on_exit(&mut self) {
+        self.host.stop();
+        self.host.state().shutdown();
+    }
+}
+
+impl State {
+    fn into_host(self) -> crate::host::Host {
+        let (wake, ctx, commands) = (self.wake.clone(), self.ctx.clone(), self.control_tx.clone());
+        crate::host::Host::start(self, wake, ctx, commands)
+    }
+
+    pub fn new(cc: &eframe::CreationContext<'_>, options: Options, icon: &egui::IconData) -> State {
         std::thread::spawn(|| LazyLock::force(&SHELL_PATH));
         let config_path = paths::config_file();
         let (config, config_error) = match Config::load_or_create(&config_path) {
@@ -426,11 +489,13 @@ impl App {
         apply_style(&ctx, &config);
 
         let hub = Arc::new(Mutex::new(Hub::default()));
-        let (hook_tx, hook_rx) = channel();
-        let (control_tx, control_rx) = channel();
+        let wake = crate::host::Wake::default();
+        let (hook_tx, hook_rx) = wake.channel();
+        let (control_tx, control_rx) = wake.channel();
         let (usage, usage_tx) = crate::usage::UsagePanel::new(ctx.clone());
         let governor = Arc::new(Governor::new(config.resources.clone(), Some(ctx.clone())));
-        let channels = Channels { hooks: hook_tx, control: control_tx, usage: usage_tx, governor: governor.clone() };
+        let channels =
+            Channels { hooks: hook_tx, control: control_tx.clone(), usage: usage_tx, governor: governor.clone() };
         let hook_error =
             ipc::serve(&paths::socket_path(), hub.clone(), channels, ctx.clone()).err().map(|e| format!("{e:#}"));
         // Only the instance that owns the socket owns the pool, so a second IMACS never replaces it.
@@ -455,11 +520,11 @@ impl App {
                 }
             }
         };
-        let (watch_tx, watch_rx) = channel();
-        let (worktree_tx, worktree_rx) = channel();
-        let (integrate_tx, integrate_rx) = channel();
-        let (integration_check_tx, integration_check_rx) = channel();
-        let (voice_tx, voice_rx) = channel();
+        let (watch_tx, watch_rx) = wake.channel();
+        let (worktree_tx, worktree_rx) = wake.channel();
+        let (integrate_tx, integrate_rx) = wake.channel();
+        let (integration_check_tx, integration_check_rx) = wake.channel();
+        let (voice_tx, voice_rx) = wake.channel();
         let launch_dir = std::env::current_dir().unwrap_or_else(|_| paths::home());
 
         let (mut plans, plan_error) = match plan::load_plans(&paths::imacs_home()) {
@@ -473,8 +538,11 @@ impl App {
             plans.push(Plan::default());
             plans.len() - 1
         });
-        let mut app = App {
+        let mut app = State {
             ctx: ctx.clone(),
+            wake,
+            control_tx,
+            client_commands: Vec::new(),
             icon: ctx.load_texture("atomisk", egui::ColorImage::from(icon), egui::TextureOptions::LINEAR),
             palette: Arc::new(Palette::from_config(&config.theme)),
             highlighter: Arc::new(Highlighter::new(&Palette::from_config(&config.theme).syntax)),
@@ -752,8 +820,10 @@ impl App {
             ui.horizontal(|ui| {
                 for agent in self.config.agents.clone() {
                     if ui.button(format!("Start {}", agent.name)).clicked() {
-                        let dir = self.launch_dir.clone();
-                        self.pending_open.push((agent.name.clone(), dir));
+                        self.client_commands.push(ControlRequest::Start {
+                            agent: agent.name.clone(), folder: Some(self.launch_dir.to_string_lossy().into_owned()),
+                            repo: None, branch: None, prompt: None, args: Vec::new(),
+                        });
                     }
                 }
             });
@@ -765,18 +835,12 @@ impl App {
     }
 }
 
-impl eframe::App for App {
-    /// Runs every frame, also while the window is hidden, so agents and remote
-    /// control never wait on the window being visible.
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+impl State {
+    fn client_logic(&mut self, ctx: &egui::Context) {
         self.screenshot(ctx);
-        for record in std::mem::take(&mut self.resume) {
-            self.spawn(ctx, &record.agent, record.cwd.clone(), Some(record.claude_session_id));
-        }
-        self.pump(ctx);
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn paint(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.shortcuts(&ctx);
         let p = self.palette.clone();
@@ -917,7 +981,7 @@ impl eframe::App for App {
         self.dialogs(&ctx);
     }
 
-    fn on_exit(&mut self) {
+    fn shutdown(&mut self) {
         // macOS never returns from the event loop after Cmd+Q, so the clean exit is recorded here.
         crate::crash::exited(&paths::imacs_home());
         for editor in self.editors.values() {
@@ -1110,3 +1174,6 @@ mod tests;
 
 #[cfg(test)]
 mod board_tests;
+
+#[cfg(test)]
+mod host_tests;
