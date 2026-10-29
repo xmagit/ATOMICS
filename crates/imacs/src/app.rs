@@ -24,7 +24,7 @@ use crate::highlight::Highlighter;
 use crate::ipc::{self, Channels, ControlMessage, ControlOutcome, HookMessage, Hub};
 use crate::setup::{SHELL_PATH, env_var, global_hooks_installed, install_global_hooks, resolve_program};
 use crate::terminal::{Metrics, Terminal, TerminalView};
-use crate::theme::{Palette, lerp, shortcut};
+use crate::theme::{Palette, lerp, shortcut, shortcut_label};
 use crate::voice::{MAX_RECORDING, Recorder};
 use imacs_core::approvals::{ApprovalRequest, Decision};
 use imacs_core::control::{ControlRequest, ControlResponse};
@@ -1187,7 +1187,7 @@ impl Desktop<'_> {
                 .desired_width(width)
                 .hint_text(format!(
                     "Steer · Enter sends · Shift+Enter newline · {} focuses",
-                    self.runtime.config.keys.focus_steer
+                    shortcut_label(ui.ctx(), &self.runtime.config.keys.focus_steer)
                 ))
                 .font(p.ui(13.5));
             let response = ui.add(edit);

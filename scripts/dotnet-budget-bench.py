@@ -22,7 +22,10 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--reuse-root", type=Path, help="reuse this script's generated, restored worktrees")
 parser.add_argument("--only", nargs="+", help="measure only these variant labels")
 options = parser.parse_args()
-DOTNET = str(Path.home() / ".dotnet/dotnet")
+personal_dotnet = Path.home() / ".dotnet/dotnet"
+DOTNET = os.environ.get("DOTNET") or (str(personal_dotnet) if personal_dotnet.is_file() else shutil.which("dotnet"))
+if not DOTNET:
+    raise SystemExit("Install .NET SDK 9 or set DOTNET to its executable before running this benchmark.")
 ROOT = options.reuse_root or Path(tempfile.mkdtemp(prefix="imacs-dotnet-budget-"))
 KEYS = (
     "DOTNET_PROCESSOR_COUNT", "MSBUILDDISABLENODEREUSE",

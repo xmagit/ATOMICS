@@ -291,7 +291,7 @@ impl Desktop<'_> {
     }
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
     use super::super::tests::{repository, with_state};
     use super::*;
@@ -314,9 +314,10 @@ mod tests {
                     kind: AgentKind::Shell,
                     busy_text: None,
                 });
+                let supported = git::probe_cache_clone(&repo, repo.parent().unwrap()).unwrap();
                 for (branch, folders, expected) in [
                     ("missing", vec!["target".into()], "cold"),
-                    ("warm", vec!["target".into()], "main cache"),
+                    ("warm", vec!["target".into()], if supported { "main cache" } else { "cold" }),
                     ("off", vec![], "cold"),
                     ("failed", vec!["target".into()], "cold"),
                 ] {
@@ -325,12 +326,10 @@ mod tests {
                         std::fs::write(repo.join("target/dependency"), "main cache").unwrap();
                     }
                     if branch == "failed" {
-                        use std::os::unix::fs::PermissionsExt;
-                        std::fs::set_permissions(
-                            repo.join("target/dependency"),
-                            std::fs::Permissions::from_mode(0o000),
-                        )
-                        .unwrap();
+                        // A socket cannot be reflinked, even when QA runs as root.
+                        let _ = std::fs::remove_file(repo.join("target/dependency"));
+                        let socket = std::os::unix::net::UnixListener::bind(repo.join("target/dependency")).unwrap();
+                        drop(socket);
                     }
                     state.config.worktrees.warm = folders;
                     let started = Instant::now();
@@ -343,7 +342,7 @@ mod tests {
                     let event = state.worktree_rx.recv_timeout(Duration::from_secs(5)).unwrap();
                     let prepared = event.1.as_ref().unwrap();
                     let path = prepared.path.clone();
-                    assert_eq!(prepared.warmed, branch == "warm");
+                    assert_eq!(prepared.warmed, branch == "warm" && supported);
                     assert!(!path.join("launched").exists());
                     if branch == "failed" {
                         assert!(started.elapsed() < Duration::from_secs(2));
@@ -351,7 +350,7 @@ mod tests {
                     }
                     state.worktree_tx.send(event).unwrap();
                     state.runtime_tick(ctx);
-                    if branch == "warm" {
+                    if branch == "warm" && supported {
                         assert_eq!(state.toast.as_ref().unwrap().0, "warm cache from main");
                     }
                     let deadline = Instant::now() + Duration::from_secs(5);

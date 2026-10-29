@@ -40,9 +40,12 @@ impl Desktop<'_> {
                     return Err("nothing recorded".to_string());
                 }
                 if imacs_core::voice::is_silent(&samples) {
-                    return Err("the microphone recorded only silence (muted, or no microphone access in System \
-                                Settings › Privacy & Security?)"
-                        .to_string());
+                    let hint = if cfg!(target_os = "macos") {
+                        "check mute and System Settings › Privacy & Security › Microphone"
+                    } else {
+                        "check the default input device, mute and microphone access in your desktop audio settings"
+                    };
+                    return Err(format!("the microphone recorded only silence ({hint})"));
                 }
                 let (samples, rate) = imacs_core::voice::downsample(&samples, rate, imacs_core::voice::SPEECH_RATE);
                 let wav = imacs_core::voice::wav(&samples, rate);

@@ -13,7 +13,8 @@ clap = { version = "4.6.7", features = ["derive"] }
 imacs-core = { version = "0.1.0", path = "../imacs-core" }
 libc = "0.2.191"
 cpal = "0.18.2"
-eframe = "0.37.0"
+# Keep both Linux window systems and embedded fallback fonts in desktop builds.
+eframe = { version = "0.37.0", features = ["wayland", "x11", "default_fonts"] }
 egui = "0.37"
 notify-debouncer-mini = "0.7.0"
 png = "0.18.1"

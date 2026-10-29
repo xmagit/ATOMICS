@@ -11,8 +11,9 @@ orchestrating agent plan the work, hand out tasks and review the results while y
 
 An atomisk.ai project.
 
-The command is `imacs`. `scripts/macos-app.sh` builds IMACS.app for the Dock; state lives in `~/.imacs` and the config
-in `~/.config/imacs` (moved once from `~/.cox` and `~/.config/cox` by earlier versions).
+The command is `imacs`. `scripts/macos-app.sh` builds IMACS.app for the Dock; `scripts/linux-install.sh` installs
+the Linux desktop app. State stays in `~/.imacs` on macOS and existing installs; new Linux installs use
+`${XDG_STATE_HOME:-~/.local/state}/imacs`. Config lives in `${XDG_CONFIG_HOME:-~/.config}/imacs`.
 
 ## What it does
 
@@ -68,13 +69,37 @@ scripts/macos-app.sh
 open -a IMACS --args --workspace cz3backend
 ```
 
-The config is created on first start at `~/.config/imacs/config.toml`. It is commented and reloads while IMACS runs: agents
+On Linux, install the build dependencies first (Debian/Ubuntu example), then install or update from this checkout:
+
+```sh
+sudo apt-get install build-essential pkg-config libasound2-dev libxkbcommon-dev libwayland-dev \
+  libx11-dev libxcursor-dev libxrandr-dev libxi-dev libgl1-mesa-dev
+scripts/linux-install.sh
+imacs --workspace daily
+scripts/linux-install.sh --uninstall  # removes the binary, desktop entry and icon; keeps config/state
+```
+
+The installer builds a release binary for the native Linux target and atomically replaces `~/.local/bin/imacs`,
+including while IMACS is running. Add `~/.local/bin` to PATH for terminal use. The desktop entry and icon go under
+`${XDG_DATA_HOME:-~/.local/share}`; rerunning updates the same files. Both Wayland and X11 are enabled. eframe supplies
+embedded fallback fonts, so the UI and terminal do not require macOS fonts; system fonts can also be used. A working
+Vulkan driver (for example Mesa's `mesa-vulkan-drivers`) supports the default wgpu renderer. File dialogs use the desktop
+portal and external files open through `xdg-open` (`xdg-utils`).
+
+The config is created on first start at `${XDG_CONFIG_HOME:-~/.config}/imacs/config.toml`. It is commented and reloads while IMACS runs: agents
 and their commands, `base_ref`, layout breakpoints, fonts, colors, terminal scrollback, shortcuts, and the texts used for
 steering.
 
+On Linux, a private, user-owned `XDG_RUNTIME_DIR` holds each new install's socket and the compiler jobserver FIFO,
+in an `imacs/<instance hash>` subdirectory. Without it, the socket stays beside the state and the FIFO uses the user's
+temporary directory. Existing `~/.imacs` installs retain their state and socket paths; the FIFO can use XDG runtime storage.
+`IMACS_HOME` always overrides the state path and keeps the socket beside that state; `IMACS_SOCKET` overrides just the
+socket, and `IMACS_CONFIG` overrides the config file. Runtime FIFO paths are distinct for each state home. Empty or relative
+XDG paths are ignored. The earlier `~/.cox` and config rename migration still runs without overwriting existing state.
+
 ### Restart onto a new build
 
-Rebuild and install into the same location first (`scripts/macos-app.sh` on macOS). The built-in chief can then call
+Rebuild and install into the same location first (`scripts/macos-app.sh` on macOS, `scripts/linux-install.sh` on Linux). The built-in chief can then call
 `imacs_restart` with an optional `reason`. It is available only in the chief's `imacs mcp --chief` server; ordinary
 orchestrators and task agents do not receive it. The equivalent local control request is:
 
@@ -247,8 +272,8 @@ first message is the brief. Every agent IMACS starts gets a `imacs_report` tool,
 blocked or has a question. Reports land on the task card, move done tasks to review, and wake the orchestrator's
 `imacs_wait`, which then reads `imacs_result` and `imacs_diff`, reviews, steers, and accepts with `imacs_plan_update`.
 
-Plans are stored separately in `~/.imacs/plans/<id>.json`, with status `open`, `completed` or `archived`. The old
-`~/.imacs/plan.json` migrates once and is kept as `plan.json.migrated`; an old plan whose tasks are all done
+Plans are stored separately in `plans/<id>.json` under the state directory, with status `open`, `completed` or `archived`. The old
+`plan.json` in that directory migrates once and is kept as `plan.json.migrated`; an old plan whose tasks are all done
 migrates as completed. Saves replace files atomically, and unreadable plan files are listed in the startup message.
 Open and completed plans get tabs; archived plans are hidden. Select a tab to see
 that plan’s sessions; `cmd+b` opens its board. Other sessions remain under All and their project tabs. Each plan has
@@ -296,6 +321,9 @@ when you start from another linked worktree. The clone runs on the background wo
 clones are used: unsupported filesystems, missing folders and clone errors are skipped without retrying as a full
 copy or blocking launch on a fallback. macOS uses the native clone-only `clonefile` API
 (`cp -c` can silently fall back to full copying); Linux uses `cp -R --reflink=always`.
+On btrfs and reflink-enabled XFS, caches on the same filesystem can be cloned. Filesystems without reflinks (including
+ordinary ext4), cross-filesystem clones and unsupported files skip warming and launch cold. A failed clone leaves no
+partial cache, and IMACS never retries it as a full copy. Use `imacs doctor` to check the actual filesystem pair.
 Each worktree then owns its cache independently; builds cannot change the main checkout's cache. A successful
 clone shows **warm cache from main** in a toast. Existing worktrees are left alone when retrying a launch.
 `imacs doctor` probes CoW cloning between the repository and configured worktree folders, using temporary files
@@ -324,10 +352,11 @@ command, and absent before the cold agent's first command.
 
 Agents share the machine, and IMACS keeps that in check for every agent it starts (`[resources]` in the config):
 
-- **One compiler job pool.** IMACS owns a GNU make jobserver (a named pipe in a private folder under `/tmp`, which
-  Codex's sandbox can open) with `jobs` tokens, cores minus 2 by default, and hands it to every agent terminal as
+- **One compiler job pool.** IMACS owns a GNU make jobserver (a named pipe in a private folder under Linux's
+  `XDG_RUNTIME_DIR`, or the user's temporary directory otherwise) with `jobs` tokens, cores minus 2 by default, and hands it to every agent terminal as
   `CARGO_MAKEFLAGS`. cargo takes a token per job, so ten agents building at once share those jobs instead of each
-  using every core. `MAKEFLAGS` is left alone, since `make` before GNU make 4.4 misreads a pipe jobserver. A job
+  using every core. On Linux, Codex also gets `--add-dir` for this instance's private XDG runtime directory so its
+  sandboxed compilers can open the FIFO. `MAKEFLAGS` is left alone, since `make` before GNU make 4.4 misreads a pipe jobserver. A job
   killed while holding a token never returns it, so whenever no compiler or build script runs, IMACS resets the
   pool to full. cargo passes the pool on to build scripts, and a build script that runs Apple's `make` 3.81 (some
   `-sys` crates, vendored OpenSSL) stops with "invalid --jobserver-fds"; set `jobs = 0` to turn the pool off, or put
@@ -378,7 +407,7 @@ three-build peak falling from 25 .NET processes to 12 (5.18 s to 6.49 s on the s
 
 The `load` gauge in the top bar shows the 1-minute load per core (grey, then yellow from 0.7 and red from 1.0); hover
 for the pool size and the slots in use. If IMACS ever ends without a clean quit, the next start says so and
-`~/.imacs/crash.log` has the panic and its backtrace when there was one.
+`crash.log` in the state directory (`~/.imacs` on macOS/existing installs) has the panic and its backtrace when there was one.
 
 ## Voice
 
@@ -426,7 +455,9 @@ scripting and testing: `show_diff`, `show_chief`, `resize` and `screenshot`. For
 
 ## Shortcuts
 
-`cmd` is Command on macOS and Ctrl+Shift elsewhere, so it never collides with the terminal.
+`cmd` is Command on macOS and Ctrl+Shift on Linux, so it never collides with the terminal's plain Ctrl keys.
+For example, `cmd+p` is Ctrl+Shift+P on Linux. `cmd+shift+space` becomes Ctrl+Shift+Space (Shift is applied once).
+Tooltips and the settings menu show the actual platform chord, including custom bindings.
 
 | Key | |
 |---|---|

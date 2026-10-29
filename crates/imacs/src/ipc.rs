@@ -131,9 +131,12 @@ pub fn serve(path: &Path, hub: Arc<Mutex<Hub>>, channels: Channels, ctx: egui::C
         std::fs::remove_file(path)?;
     }
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
     }
     let listener = UnixListener::bind(path)?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     let path: PathBuf = path.to_path_buf();
     std::thread::Builder::new().name("imacs-hooks".into()).spawn(move || {
         let channels = Arc::new(channels);

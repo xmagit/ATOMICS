@@ -33,17 +33,20 @@ pub struct Jobserver {
 impl Jobserver {
     pub fn create(path: &Path, tokens: usize) -> Result<Jobserver> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+            std::fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
             // Someone else's folder, or a link to one, must not hold our tokens.
             for dir in parent.ancestors().take(2) {
-                use std::os::unix::fs::{MetadataExt, PermissionsExt};
+                use std::os::unix::fs::MetadataExt;
                 let meta = std::fs::symlink_metadata(dir)?;
                 // SAFETY: getuid has no preconditions.
                 if meta.file_type().is_symlink() || meta.uid() != unsafe { libc::getuid() } {
                     bail!("{} is not a private folder of this user", dir.display());
                 }
-                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
             }
+            // Tighten our own pool folder, never chmod an existing ancestor (which
+            // could be XDG_RUNTIME_DIR or the caller's temporary directory).
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
         }
         let _ = std::fs::remove_file(path);
         let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
@@ -56,9 +59,12 @@ impl Jobserver {
         Ok(Jobserver { path: path.to_path_buf(), tokens, pipe })
     }
 
-    /// Where the pool lives for an IMACS home: in the user's temporary folder, which Codex's
-    /// sandbox can open, in a folder private to this user and specific to the home.
+    /// A private pool specific to this home: Linux's XDG runtime folder when
+    /// available, otherwise the established user-temporary location.
     pub fn path_for(home: &Path) -> PathBuf {
+        if let Some(runtime) = imacs_core::paths::runtime_dir_for(home) {
+            return runtime.join("jobserver.fifo");
+        }
         use std::hash::{DefaultHasher, Hash, Hasher};
         let mut hasher = DefaultHasher::new();
         home.hash(&mut hasher);
@@ -128,6 +134,9 @@ impl Drop for Jobserver {
 /// its compilers or build scripts runs, and a long `cargo run` must not block the refill.
 fn compilers_running() -> bool {
     let Ok(output) = std::process::Command::new("ps").args(["-axo", "args="]).output() else { return true };
+    if !output.status.success() {
+        return true;
+    }
     String::from_utf8_lossy(&output.stdout).lines().any(holds_tokens)
 }
 
@@ -427,7 +436,17 @@ mod tests {
     #[test]
     fn jobserver_pipe_holds_its_tokens_and_resets_leaks() {
         let dir = tempfile::tempdir().unwrap();
+        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o750)).unwrap();
         let jobserver = Jobserver::create(&dir.path().join("pool/jobs"), 3).unwrap();
+        let metadata = std::fs::metadata(dir.path().join("pool/jobs")).unwrap();
+        assert!(metadata.file_type().is_fifo());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
+            0o750,
+            "ancestors must retain their permissions"
+        );
         let mut client = OpenOptions::new().read(true).write(true).open(dir.path().join("pool/jobs")).unwrap();
         // A client takes two tokens and dies without returning them.
         let mut taken = [0u8; 2];
@@ -441,7 +460,6 @@ mod tests {
         let [(name, flags)] = jobserver.env();
         assert_eq!(name, "CARGO_MAKEFLAGS");
         assert_eq!(flags, format!("-j --jobserver-auth=fifo:{}", dir.path().join("pool/jobs").display()));
-        use std::os::unix::fs::PermissionsExt;
         assert_eq!(std::fs::metadata(dir.path().join("pool")).unwrap().permissions().mode() & 0o777, 0o700);
     }
 
@@ -452,7 +470,9 @@ mod tests {
         assert_ne!(a, b);
         // SAFETY: getuid has no preconditions.
         let uid = unsafe { libc::getuid() };
-        assert!(a.starts_with(std::env::temp_dir().join(format!("imacs-{uid}"))), "{}", a.display());
+        let base = imacs_core::paths::runtime_dir_for(Path::new("/Users/x/.imacs"))
+            .unwrap_or_else(|| std::env::temp_dir().join(format!("imacs-{uid}")));
+        assert!(a.starts_with(base), "{}", a.display());
         assert_eq!(a, Jobserver::path_for(Path::new("/Users/x/.imacs")));
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pool/jobs");

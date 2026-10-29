@@ -120,7 +120,7 @@ impl Desktop<'_> {
     fn top_bar_controls(&mut self, ui: &mut egui::Ui, show_load: bool, in_menu: bool) {
         let response = ui.button(if self.runtime.diff_open { "Hide diff" } else { "Show diff" });
         record_item(ui, "diff", &response);
-        if response.on_hover_text(&self.runtime.config.keys.toggle_diff).clicked() {
+        if response.on_hover_text(shortcut_label(ui.ctx(), &self.runtime.config.keys.toggle_diff)).clicked() {
             self.runtime.diff_open = !self.runtime.diff_open;
             if in_menu {
                 ui.close();
@@ -128,7 +128,7 @@ impl Desktop<'_> {
         }
         let response = ui.button("+ New");
         record_item(ui, "+ New", &response);
-        if response.on_hover_text(&self.runtime.config.keys.new_session).clicked() {
+        if response.on_hover_text(shortcut_label(ui.ctx(), &self.runtime.config.keys.new_session)).clicked() {
             self.open_new_dialog(None);
             if in_menu {
                 ui.close();
@@ -145,7 +145,7 @@ impl Desktop<'_> {
         });
         let response = ui.selectable_label(self.runtime.panel == PanelMode::Plan && self.runtime.diff_open, text);
         record_item(ui, "Plan", &response);
-        if response.on_hover_text(&self.runtime.config.keys.toggle_plan).clicked() {
+        if response.on_hover_text(shortcut_label(ui.ctx(), &self.runtime.config.keys.toggle_plan)).clicked() {
             self.runtime.toggle_plan();
             if in_menu {
                 ui.close();

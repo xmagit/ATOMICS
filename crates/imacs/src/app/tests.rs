@@ -36,6 +36,9 @@ pub(super) fn with_app(name: &str, test: impl FnOnce(&mut Desktop<'_>, &egui::Co
 pub(super) fn with_state(name: &str, test: impl FnOnce(State, &egui::Context)) {
     if std::env::var_os("IMACS_APP_TEST_CHILD").is_none() {
         let dir = tempfile::tempdir().unwrap();
+        use std::os::unix::fs::DirBuilderExt;
+        let runtime = dir.path().join("runtime");
+        std::fs::DirBuilder::new().mode(0o700).create(&runtime).unwrap();
         let output = crate::test_support::output(
             std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", name, "--nocapture"])
@@ -46,6 +49,7 @@ pub(super) fn with_state(name: &str, test: impl FnOnce(State, &egui::Context)) {
                 .env("IMACS_HOME", dir.path().join("state"))
                 .env("IMACS_CONFIG", dir.path().join("config.toml"))
                 .env("IMACS_SOCKET", dir.path().join("imacs.sock"))
+                .env("XDG_RUNTIME_DIR", runtime)
                 .env_remove("IMACS_PANE"),
         );
         assert!(
