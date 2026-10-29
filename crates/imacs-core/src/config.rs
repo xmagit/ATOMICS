@@ -94,15 +94,72 @@ env = []
 # Close accepted, integrated agents automatically. Worktrees remain available.
 close_done_agents = true
 
+# Ticket workflow profiles. Choose ONE block, or copy it into a workspace file.
+# A workspace's [tickets] replaces this section. See docs/tickets.md for setup and scoping.
+# Tools and result paths are config only; use doctor to check tool names and sync for paths.
+# BEGIN RELAY PROFILE
+# Relay: one existing board per plan (tool names are placeholders; adjust every map).
 # [tickets]
-# A ticket system reached over MCP, so plans and tasks carry their tickets and keep them
-# up to date. A workspace file's [tickets] wins over this one. See docs/tickets.md.
-# system = "tracker"
-# mode = "board"            # "board": a board is a plan, its tickets tasks · "ticket": a ticket is a plan
-# comments = "agents"       # who comments on tickets: "agents", "chief" or "off"
-# workflow = ""             # added to the chief's prompt
-# server = { command = ["tracker-mcp"] }   # or { url = "https://…/mcp", token_env = "TRACKER_TOKEN" }
-# states = { running = "In Progress", review = "In Review", done = "Done", blocked = "Blocked" }
+# system = "relay"
+# mode = "board"
+# comments = "agents"
+# workflow = "Link the existing Relay board to the plan and one ticket to each task. Product writes what and why; the chief comments implementation details. IMACS posts signed agent reports and maps states live. Use imacs_report for reports, without a second ticket comment."
+# server = { command = ["relay-mcp"] }
+# states = { planned = "Todo", running = "In Progress", review = "In Review", done = "Done", blocked = "Blocked" }
+#
+# [tickets.operations.get]
+# tool = "get_ticket"
+# arguments = { ticket = "{id}" }
+# result = { id = "ticket.id", key = "ticket.key", url = "ticket.url", title = "ticket.title", state = "ticket.status", updated_at = "ticket.updated_at" }
+#
+# [tickets.operations.list]
+# tool = "list_tickets"
+# arguments = { board = "{board}" }
+# items = "tickets"
+# result = { id = "id", key = "key", url = "url", title = "title", state = "status", updated_at = "updated_at" }
+#
+# [tickets.operations.update_state]
+# tool = "update_ticket"
+# arguments = { ticket = "{id}", status = "{state}" }
+#
+# [tickets.operations.comment]
+# tool = "add_comment"
+# arguments = { ticket = "{id}", body = "{body}" }
+#
+# [tickets.operations.create]
+# tool = "create_ticket"
+# arguments = { board = "{board}", title = "{title}", description = "{body}" }
+# result = { id = "ticket.id", key = "ticket.key", url = "ticket.url", title = "ticket.title", state = "ticket.status" }
+# END RELAY PROFILE
+#
+# BEGIN LINEAR PROFILE
+# Linear: one issue per plan (authenticate the bridge in a terminal first).
+# [tickets]
+# system = "linear"
+# mode = "ticket"
+# comments = "chief"
+# workflow = "One Linear issue per plan; the issue says what and why, the plan says how."
+# server = { command = ["npx", "-y", "mcp-remote", "https://mcp.linear.app/mcp"] }
+# states = { planned = "Todo", running = "In Progress", done = "Done" }
+#
+# [tickets.operations.get]
+# tool = "get_issue"
+# arguments = { id = "{key}" }
+# result = { id = "", key = "id", url = "url", title = "title", state = "status", updated_at = "updatedAt" }
+#
+# [tickets.operations.update_state]
+# tool = "save_issue"
+# arguments = { id = "{key}", state = "{state}" }
+#
+# [tickets.operations.comment]
+# tool = "save_comment"
+# arguments = { issueId = "{key}", body = "{body}" }
+#
+# [tickets.operations.create]
+# tool = "save_issue"
+# arguments = { team = "ENG", title = "{title}", description = "{body}" }
+# result = { id = "id", key = "id", url = "url", title = "title", state = "status" }
+# END LINEAR PROFILE
 
 [resources]
 # Heavy work shared by every agent IMACS starts. Compilers share one jobserver pool, and whole
@@ -890,6 +947,25 @@ kind = "shell"
             ["\x1b", ":theme base16_transparent\r", ":goto 42\r"]
         );
         assert_eq!(config.open_steps("README.md", None, true), ["\x1b", ":theme base16_transparent\r"]);
+    }
+
+    #[test]
+    fn ticket_profile_examples_match_the_documentation() {
+        let docs = include_str!("../../../docs/tickets.md");
+        for name in ["RELAY", "LINEAR"] {
+            let block = DEFAULT_CONFIG
+                .split(&format!("# BEGIN {name} PROFILE\n"))
+                .nth(1)
+                .unwrap()
+                .split(&format!("# END {name} PROFILE"))
+                .next()
+                .unwrap();
+            let text =
+                block.lines().skip(1).map(|line| line.strip_prefix("# ").unwrap_or("")).collect::<Vec<_>>().join("\n");
+            let config: Config = toml::from_str(&text).unwrap();
+            assert!(config.tickets.is_configured());
+            assert!(docs.contains(text.trim()), "{name} example drifted from docs/tickets.md");
+        }
     }
 
     #[test]

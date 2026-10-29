@@ -206,6 +206,17 @@ pub enum ControlRequest {
         #[serde(default)]
         updated_at: Option<String>,
     },
+    /// Read only the session's task ticket or its plan link through operations.get.
+    AgentTicketGet {
+        pane: Option<String>,
+        #[serde(default)]
+        plan: bool,
+    },
+    /// Comment only on the session's task ticket through operations.comment.
+    AgentTicketComment {
+        pane: Option<String>,
+        text: String,
+    },
     /// A sub-agent reporting on its task (sent by `imacs mcp --agent`).
     Report {
         pane: Option<String>,

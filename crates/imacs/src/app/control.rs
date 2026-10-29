@@ -59,6 +59,14 @@ impl State {
             self.selected_plan
         };
         let outcome = match request {
+            ControlRequest::AgentTicketGet { pane, plan } => {
+                self.agent_ticket(pane.as_deref(), plan, None, reply);
+                return;
+            }
+            ControlRequest::AgentTicketComment { pane, text } => {
+                self.agent_ticket(pane.as_deref(), false, Some(text), reply);
+                return;
+            }
             ControlRequest::Restart { force, reason } => done(self.restart(force, reason)),
             ControlRequest::Approve { session, decision, message } => match self.find(&session) {
                 Some(index) => {

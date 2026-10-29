@@ -27,9 +27,7 @@ fn main() {
                 "serverInfo": { "name": "fake-tickets", "version": "1" },
             })),
             "ping" => Ok(json!({})),
-            "tools/list" => Ok(json!({ "tools": TOOLS.iter().map(|name| json!({
-                "name": name, "inputSchema": { "type": "object" }
-            })).collect::<Vec<_>>() })),
+            "tools/list" => list(&path, &message["params"]),
             "tools/call" => call(&path, &message["params"]),
             other => Err(format!("unknown method {other}")),
         };
@@ -53,7 +51,33 @@ const TOOLS: &[&str] = &[
     "issue_save",
     "issue_comment",
     "issue_create",
+    "get_ticket",
+    "list_tickets",
+    "update_ticket",
+    "add_comment",
+    "create_ticket",
+    "get_issue",
+    "save_issue",
+    "save_comment",
 ];
+
+fn list(path: &str, params: &Value) -> Result<Value, String> {
+    let state: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    if state["list_hang"] == true {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+    }
+    let names = state["offered_tools"].as_array().cloned().unwrap_or_else(|| TOOLS.iter().map(|n| json!(n)).collect());
+    let start = params["cursor"].as_str().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+    let size = state["page_size"].as_u64().unwrap_or(names.len() as u64) as usize;
+    let end = (start + size).min(names.len());
+    let mut page = json!({"tools": names[start..end].iter().map(|name| json!({
+        "name": name, "inputSchema": {"type":"object"}
+    })).collect::<Vec<_>>()});
+    if end < names.len() {
+        page["nextCursor"] = json!(end.to_string());
+    }
+    Ok(page)
+}
 
 fn call(path: &str, params: &Value) -> Result<Value, String> {
     let name = params["name"].as_str().unwrap_or_default();
@@ -98,6 +122,29 @@ fn call(path: &str, params: &Value) -> Result<Value, String> {
             text(json!({ "success": true }))
         }
         "issue_create" => text(issue(&create(&mut state, &args["project"], &args["title"]))),
+        "get_ticket" => structured(json!({"ticket": relay(find(&state, &args["ticket"])?) })),
+        "list_tickets" => {
+            structured(json!({"tickets": on_board(&state, &args["board"]).map(relay).collect::<Vec<_>>() }))
+        }
+        "update_ticket" => {
+            change(&mut state, &args["ticket"], |t| t["state"] = args["status"].clone())?;
+            structured(json!({"updated":true}))
+        }
+        "add_comment" => {
+            change(&mut state, &args["ticket"], |t| comment(t, &args["body"]))?;
+            structured(json!({"posted":true}))
+        }
+        "create_ticket" => structured(json!({"ticket": relay(&create(&mut state, &args["board"], &args["title"]))})),
+        "get_issue" => text(issue(find(&state, &args["id"])?)),
+        "save_issue" if args["id"].is_string() => {
+            change(&mut state, &args["id"], |t| t["state"] = args["state"].clone())?;
+            text(json!({"success":true}))
+        }
+        "save_issue" => text(issue(&create(&mut state, &args["team"], &args["title"]))),
+        "save_comment" => {
+            change(&mut state, &args["issueId"], |t| comment(t, &args["body"]))?;
+            text(json!({"success":true}))
+        }
         _ => return Err(format!("unknown tool {name}")),
     };
     save(path, &state);
@@ -162,7 +209,14 @@ fn issue(ticket: &Value) -> Value {
     json!({
         "id": ticket["key"], "uuid": ticket["id"], "url": ticket["url"], "title": ticket["title"],
         "status": ticket["state"], "updatedAt": format!("rev-{}", ticket["rev"].as_u64().unwrap_or(0)),
+        "description": ticket["description"], "comments": ticket["comments"],
     })
+}
+
+fn relay(ticket: &Value) -> Value {
+    json!({"id":ticket["id"], "key":ticket["key"], "url":ticket["url"], "title":ticket["title"],
+        "status":ticket["state"], "updated_at":format!("rev-{}",ticket["rev"].as_u64().unwrap_or(0)),
+        "description":ticket["description"], "comments":ticket["comments"]})
 }
 
 fn save(path: &str, state: &Value) {

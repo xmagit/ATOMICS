@@ -20,6 +20,7 @@ pub(super) struct Tag {
 
 #[derive(Clone, PartialEq)]
 enum Kind {
+    Read,
     Refresh,
     List,
     State(String),
@@ -59,6 +60,7 @@ struct Batch {
 }
 
 enum Answer {
+    Read(Option<serde_json::Value>),
     Sync(Vec<String>),
     Link(LinkKey),
     Comment,
@@ -254,9 +256,15 @@ impl State {
             Kind::State(_) => {
                 self.tickets.pushing.remove(&tag.key);
             }
-            Kind::Comment | Kind::Create => {}
+            Kind::Read | Kind::Comment | Kind::Create => {}
         }
         let error = match (tag.kind.clone(), result) {
+            (Kind::Read, Ok(TicketOutput::Read(value))) => {
+                if let Some(batch) = tag.batch.and_then(|id| self.tickets.batches.get_mut(&id)) {
+                    batch.answer = Answer::Read(Some(value));
+                }
+                None
+            }
             (Kind::Refresh, Ok(TicketOutput::Ticket(fetched))) => {
                 self.take_ticket(&tag, &fetched, true);
                 None
@@ -299,7 +307,7 @@ impl State {
             }
             (kind, Err(err)) => {
                 let what = match &kind {
-                    Kind::Refresh | Kind::List => "reading the ticket failed".to_string(),
+                    Kind::Read | Kind::Refresh | Kind::List => "reading the ticket failed".to_string(),
                     Kind::State(state) => {
                         self.tickets.failed.insert(tag.key.clone(), state.clone());
                         format!("setting the state to {state} failed")
@@ -613,6 +621,8 @@ impl State {
     fn answer_batch(&mut self, id: u64) {
         let Some(batch) = self.tickets.batches.remove(&id) else { return };
         let response = match batch.answer {
+            Answer::Read(Some(value)) if batch.errors.is_empty() => ControlResponse::ok(value),
+            Answer::Read(_) => ControlResponse::error(batch.errors.join("; ")),
             Answer::Sync(plans) => ControlResponse::ok(json!({
                 "plans": plans.iter().filter_map(|plan| self.ticket_summary(plan)).collect::<Vec<_>>(),
                 "errors": batch.errors,
@@ -792,6 +802,69 @@ impl State {
             }
         }
     }
+
+    /// Session identity comes from the agent's IMACS MCP process, never tool arguments.
+    /// This path permits only get and comment; it never syncs a board or retries pushes.
+    pub(super) fn agent_ticket(
+        &mut self,
+        pane: Option<&str>,
+        plan_link: bool,
+        comment: Option<String>,
+        reply: Sender<ControlOutcome>,
+    ) {
+        let target = (|| {
+            let config = self.ticket_config().ok_or("No ticket system is configured.")?;
+            if config.comments != ticket::CommentPolicy::Agents {
+                return Err("Agent ticket access requires [tickets] comments = agents.");
+            }
+            let pane = pane.filter(|id| !id.is_empty()).ok_or("No agent session identity.")?;
+            if !self.sessions.iter().any(|s| s.id == pane && !s.chief) {
+                return Err("No task agent matches this session.");
+            }
+            let mut tasks =
+                self.plans.iter().filter(|p| p.is_open()).flat_map(|p| {
+                    p.tasks.iter().filter(move |t| t.session.as_deref() == Some(pane)).map(move |t| (p, t))
+                });
+            let (plan, task) = tasks.next().ok_or("This session has no task in an open plan.")?;
+            if tasks.next().is_some() {
+                return Err("This session belongs to more than one task.");
+            }
+            let link = if plan_link { plan.ticket.as_ref() } else { task.ticket.as_ref() }
+                .ok_or("The requested task or plan has no linked ticket.")?;
+            if !link.system.is_empty() && link.system != config.system {
+                return Err("The linked ticket belongs to another ticket system.");
+            }
+            let operation = if comment.is_some() { "comment" } else { "get" };
+            if config.operation(operation).is_none() {
+                return Err("The requested ticket operation is not configured.");
+            }
+            let key = (plan.id.clone(), (!plan_link).then(|| task.id.clone()));
+            let author = Author::Agent(ticket::model_label(&task.agent, &task.args));
+            Ok((
+                config,
+                key,
+                link.clone(),
+                ticket::agent_comment(&author, task, comment.as_deref().unwrap_or_default()),
+            ))
+        })();
+        let (config, key, link, body) = match target {
+            Ok(target) => target,
+            Err(error) => {
+                let _ = reply.send(ControlOutcome::Done(ControlResponse::error(error)));
+                return;
+            }
+        };
+        let (op, kind, answer) = match comment {
+            Some(text) if text.trim().is_empty() => {
+                let _ = reply.send(ControlOutcome::Done(ControlResponse::error("text is empty")));
+                return;
+            }
+            Some(_) => (TicketOp::Comment(link.clone(), body), Kind::Comment, Answer::Comment),
+            None => (TicketOp::Read(link.clone()), Kind::Read, Answer::Read(None)),
+        };
+        let batch = self.open_batch(reply, answer);
+        self.send_ticket(&config, op, Tag { key, ticket: link.id, kind, batch: Some(batch) });
+    }
 }
 
 fn same_state(a: Option<&str>, b: Option<&str>) -> bool {
@@ -864,6 +937,181 @@ mod tests {
         edit(&mut config);
         app.runtime.config.tickets = config;
         app.runtime.apply_ticket_config();
+    }
+
+    fn ticket_request(app: &mut Desktop<'_>, value: Value) -> ControlResponse {
+        let (tx, rx) = channel();
+        app.runtime.control(&app.runtime.ctx.clone(), serde_json::from_value(value).unwrap(), tx);
+        settle(app);
+        match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+            ControlOutcome::Done(response) => response,
+            _ => panic!("unexpected deferred response"),
+        }
+    }
+
+    #[test]
+    fn shipped_profiles_work_against_the_fake_server() {
+        with_app("app::tickets::tests::shipped_profiles_work_against_the_fake_server", |app, _| {
+            use crate::mcp_client::tests::example_profile;
+            for name in ["RELAY", "LINEAR"] {
+                let dir = tempfile::tempdir().unwrap();
+                let state = tickets_fixture(dir.path(), "ENG");
+                let config = example_profile(name, &state);
+                let board = config.mode == TicketMode::Board;
+                app.runtime.plans.clear();
+                app.runtime.config.tickets = config.clone();
+                app.runtime.apply_ticket_config();
+                let plan = request(
+                    app,
+                    json!({"cmd":"plan_set", "goal":name,
+                    "ticket":{"id": if board {"b1"} else {"ENG-1"}},
+                    "tasks":[{"id":"a", "title":"Parser", "ticket": if board {json!({"id":"ENG-1"})} else {Value::Null}}]}),
+                )
+                .result["plan"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                settle(app);
+                let fetched = if board { link(app, 0, 0) } else { app.runtime.plans[0].ticket.clone().unwrap() };
+                assert_eq!(fetched.state.as_deref(), Some("Todo"));
+                assert_eq!(fetched.label(), "ENG-1");
+                assert_eq!(app.runtime.tickets.boards.contains_key(&plan), board);
+                assert!(
+                    ticket_request(
+                        app,
+                        json!({"cmd":"ticket_comment", "plan":plan, "task":"a", "text":"Implementation details"})
+                    )
+                    .ok
+                );
+                assert_eq!(comments(&state, "ENG-1").len(), 1);
+                for status in ["running", "blocked", "review", "done"] {
+                    assert!(request(app, json!({"cmd":"plan_update", "plan":plan, "id":"a", "status":status})).ok);
+                    settle(app);
+                    let expected = if !board {
+                        "In Progress"
+                    } else {
+                        config.states.get(TaskStatus::parse(status).unwrap()).unwrap()
+                    };
+                    assert_eq!(ticket(&state, "ENG-1")["state"], expected);
+                }
+                let created = ticket_request(
+                    app,
+                    json!({"cmd":"ticket_link", "plan":plan, "task":"review", "create":{"title":"Review", "body":"Review the implementation"}}),
+                );
+                assert!(created.ok, "{:?}", created.error);
+                assert!(created.result["ticket"]["id"].as_str().unwrap().starts_with(if board { "n" } else { "NEW-" }));
+                assert!(request(app, json!({"cmd":"plan_update", "plan":plan, "id":"review", "status":"done"})).ok);
+                settle(app);
+                assert_eq!(ticket(&state, "ENG-1")["state"], "Done");
+            }
+        });
+    }
+
+    #[test]
+    fn agent_ticket_access_is_scoped_to_its_session_and_comment_policy() {
+        with_app("app::tickets::tests::agent_ticket_access_is_scoped_to_its_session_and_comment_policy", |app, _| {
+            use crate::mcp_client::tests::example_profile;
+            let dir = tempfile::tempdir().unwrap();
+            let state = tickets_fixture(dir.path(), "ENG");
+            edit_fake(&state, |fake| {
+                fake["tickets"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"id":"b1", "key":"BOARD", "title":"Board details", "description":"Plan context"}));
+                fake["tickets"][0]["description"] = json!("Task implementation details");
+            });
+            app.runtime.config.tickets = example_profile("RELAY", &state);
+            app.runtime.apply_ticket_config();
+            let plan = request(app, json!({"cmd":"plan_set", "goal":"Own plan", "ticket":{"id":"b1"}, "tasks":[
+                {"id":"a", "title":"Own task", "agent":"codex", "args":["-m","gpt-6.1-sol","-c","model_reasoning_effort=high"], "ticket":{"id":"1"}},
+                {"id":"b", "title":"Other task", "ticket":{"id":"2"}}
+            ]})).result["plan"].as_str().unwrap().to_string();
+            settle(app);
+            let own = app.runtime.selected_plan;
+            app.runtime.plans[own].tasks[0].session = Some("agent-a".into());
+            app.runtime.plans[own].tasks[1].session = Some("agent-b".into());
+            for id in ["agent-a", "agent-b", "outsider"] {
+                app.runtime.sessions.push(session(id, AgentKind::Generic, AgentStatus::Working, dir.path()));
+            }
+            // Selection and task ids in another plan must not affect session ownership.
+            request(
+                app,
+                json!({"cmd":"plan_set", "goal":"Other plan", "ticket":{"id":"2"}, "tasks":[{"id":"a", "ticket":{"id":"2"}}]}),
+            );
+            settle(app);
+            let other = app.runtime.selected_plan;
+            let before = tools(&state).len();
+            let read = ticket_request(app, json!({"cmd":"agent_ticket_get", "pane":"agent-a"}));
+            assert!(read.ok);
+            assert_eq!(read.result["ticket"]["description"], "Task implementation details");
+            let board = ticket_request(app, json!({"cmd":"agent_ticket_get", "pane":"agent-a", "plan":true}));
+            assert!(board.ok);
+            assert_eq!(board.result["ticket"]["description"], "Plan context");
+            let posted = ticket_request(
+                app,
+                json!({"cmd":"agent_ticket_comment", "pane":"agent-a", "text":"A design question"}),
+            );
+            assert!(posted.ok);
+            assert_eq!(
+                comments(&state, "ENG-1"),
+                ["This is GPT-6.1 Sol (high), the IMACS agent on task a (Own task).\n\nA design question"]
+            );
+            assert!(comments(&state, "ENG-2").is_empty());
+            assert!(tools(&state)[before..].iter().all(|name| name == "get_ticket" || name == "add_comment"));
+            let before = tools(&state).len();
+            for pane in [Value::Null, json!(""), json!("agent"), json!("missing"), json!("outsider")] {
+                for cmd in ["agent_ticket_get", "agent_ticket_comment"] {
+                    assert!(!ticket_request(app, json!({"cmd":cmd,"pane":pane,"text":"Denied"})).ok);
+                }
+            }
+            assert_eq!(tools(&state).len(), before, "denied identities must not reach the server");
+            for policy in [ticket::CommentPolicy::Chief, ticket::CommentPolicy::Off] {
+                app.runtime.config.tickets.comments = policy;
+                app.runtime.apply_ticket_config();
+                settle(app);
+                let calls = tools(&state).len();
+                for cmd in ["agent_ticket_get", "agent_ticket_comment"] {
+                    assert!(!ticket_request(app, json!({"cmd":cmd,"pane":"agent-a","text":"Denied"})).ok);
+                }
+                assert!(!ticket_request(app, json!({"cmd":"agent_ticket_get","pane":"agent-a","plan":true})).ok);
+                assert_eq!(tools(&state).len(), calls);
+            }
+            app.runtime.config.tickets.comments = ticket::CommentPolicy::Agents;
+            app.runtime.config.tickets.mode = TicketMode::Ticket;
+            app.runtime.apply_ticket_config();
+            settle(app);
+            let before = tools(&state).len();
+            app.runtime.plans[own].tasks[0].ticket = None;
+            assert!(
+                !ticket_request(app, json!({"cmd":"agent_ticket_comment", "pane":"agent-a", "text":"No fallback"})).ok
+            );
+            assert!(!ticket_request(app, json!({"cmd":"agent_ticket_get", "pane":"agent-a"})).ok);
+            assert_eq!(tools(&state).len(), before);
+            assert!(ticket_request(app, json!({"cmd":"agent_ticket_get", "pane":"agent-a", "plan":true})).ok);
+            app.runtime.plans[own].tasks[0].ticket =
+                Some(TicketLink { system: "different".into(), id: "2".into(), ..TicketLink::default() });
+            let before = tools(&state).len();
+            assert!(!ticket_request(app, json!({"cmd":"agent_ticket_get", "pane":"agent-a"})).ok);
+            app.runtime.plans[other].tasks[0].session = Some("agent-a".into());
+            assert!(!ticket_request(app, json!({"cmd":"agent_ticket_get", "pane":"agent-a", "plan":true})).ok);
+            app.runtime.plans[other].tasks[0].session = None;
+            app.runtime.sessions.iter_mut().find(|s| s.id == "agent-a").unwrap().chief = true;
+            assert!(!ticket_request(app, json!({"cmd":"agent_ticket_get", "pane":"agent-a", "plan":true})).ok);
+            assert_eq!(tools(&state).len(), before);
+            // The existing report path still posts exactly once, independently of explicit comments.
+            app.runtime.sessions.iter_mut().find(|s| s.id == "agent-a").unwrap().chief = false;
+            app.runtime.plans[own].tasks[0].ticket =
+                Some(TicketLink { system: "relay".into(), id: "1".into(), ..TicketLink::default() });
+            app.runtime.report(Some("agent-a"), "done", "Finished once");
+            settle(app);
+            assert_eq!(comments(&state, "ENG-1").iter().filter(|c| c.contains("Finished once")).count(), 1);
+            assert_eq!(app.runtime.plans[own].id, plan);
+            let before = tools(&state).len();
+            assert!(!ticket_request(app, json!({"cmd":"agent_ticket_comment", "pane":"agent-a", "text":"  "})).ok);
+            app.runtime.plans[own].status = PlanStatus::Archived;
+            assert!(!ticket_request(app, json!({"cmd":"agent_ticket_get", "pane":"agent-a", "plan":true})).ok);
+            assert_eq!(tools(&state).len(), before);
+        });
     }
 
     /// Runs ticket jobs, and the pushes they lead to, until none are left.

@@ -11,7 +11,7 @@ use crate::setup::{
     codex_supports_hooks, find_program, global_hooks_installed, legacy_hooks_installed, resolve_program,
 };
 
-pub fn run() -> i32 {
+pub fn run(workspace: Option<&str>) -> i32 {
     let git_version = Command::new(resolve_program("git"))
         .arg("--version")
         .output()
@@ -61,6 +61,14 @@ pub fn run() -> i32 {
     }
     if let Ok((config, _)) = &config {
         println!("{}", approvals_check(&config.approvals));
+        match ticket_config(config, workspace) {
+            Ok(tickets) if !tickets.system.trim().is_empty() => println!("{}", ticket_check(&tickets)),
+            Ok(_) => {}
+            Err(error) => println!(
+                "{}",
+                check_line(false, &format!("ticket config failed: {error}"), "fix the workspace [tickets] section")
+            ),
+        }
         let mut repos: Vec<_> = config.repos.iter().map(|repo| paths::expand(repo)).collect();
         if repos.is_empty()
             && let Ok(cwd) = std::env::current_dir()
@@ -93,6 +101,41 @@ pub fn run() -> i32 {
     exit_code(git_ok, config.is_ok())
 }
 
+fn ticket_config(config: &Config, workspace: Option<&str>) -> anyhow::Result<imacs_core::tickets::TicketConfig> {
+    use imacs_core::workspace::Workspace;
+    let Some(name) = workspace else { return Ok(config.tickets.clone()) };
+    let tickets = Workspace::load(name)?.tickets()?;
+    Ok(tickets.unwrap_or_else(|| config.tickets.clone()))
+}
+
+fn ticket_check(config: &imacs_core::tickets::TicketConfig) -> String {
+    let result = (|| {
+        let mut client = crate::mcp_client::McpClient::connect(
+            &config.server,
+            std::time::Duration::from_secs(config.timeout_secs.max(1)),
+            crate::setup::env_var,
+        )
+        .map_err(|e| e.to_string())?;
+        let tools = client.tool_names().map_err(|e| e.to_string())?;
+        let missing: Vec<_> = ["get", "list", "update_state", "comment", "create"]
+            .into_iter()
+            .filter_map(|name| {
+                config.operation(name).filter(|op| !tools.contains(&op.tool)).map(|op| format!("{name} → {}", op.tool))
+            })
+            .collect();
+        if missing.is_empty() { Ok(()) } else { Err(format!("missing mapped tools: {}", missing.join(", "))) }
+    })();
+    let label = match &result {
+        Ok(()) => format!("{} ticket MCP server starts and offers all mapped tools", config.system),
+        Err(error) => format!("{} ticket MCP check failed (warning): {error}", config.system),
+    };
+    check_line(
+        result.is_ok(),
+        &label,
+        "check [tickets].server and operations; authenticate a stdio bridge in a terminal first",
+    )
+}
+
 fn exit_code(git_ok: bool, config_ok: bool) -> i32 {
     i32::from(!git_ok || !config_ok)
 }
@@ -102,12 +145,85 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ticket_workspace_overrides_main_config_as_a_whole() {
+        const CHILD: &str = "IMACS_TICKET_DOCTOR_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let dir = tempfile::tempdir().unwrap();
+            let output = crate::test_support::output(
+                Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "doctor::tests::ticket_workspace_overrides_main_config_as_a_whole",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env("IMACS_CONFIG", dir.path().join("config.toml"))
+                    .env("IMACS_HOST", "fixture"),
+            );
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stdout));
+            return;
+        }
+        use imacs_core::{tickets::TicketConfig, workspace::Workspace};
+        let main = Config {
+            tickets: toml::from_str::<TicketConfig>(
+                "system = 'main'\nserver = {command = ['main-mcp']}\n[operations.get]\ntool = 'main_get'",
+            )
+            .unwrap(),
+            ..Config::default()
+        };
+        let file = Workspace::file("work").unwrap();
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        assert_eq!(ticket_config(&main, None).unwrap(), main.tickets);
+        std::fs::write(&file, "projects = []").unwrap();
+        assert_eq!(ticket_config(&main, Some("work")).unwrap(), main.tickets);
+        std::fs::write(&file, "projects = []\n[tickets]\nsystem = 'team'\nserver = {command = ['team-mcp']}").unwrap();
+        let team = ticket_config(&main, Some("work")).unwrap();
+        assert_eq!(team.system, "team");
+        assert!(team.operations.get.is_none(), "workspace does not inherit main operation maps");
+        std::fs::write(&file, "projects = []\n[tickets]\nsystem = ''").unwrap();
+        assert!(!ticket_config(&main, Some("work")).unwrap().is_configured());
+        std::fs::write(&file, "projects = []\n[tickets]\nmode = 'invalid'").unwrap();
+        assert!(ticket_config(&main, Some("work")).is_err());
+        assert!(ticket_config(&main, Some("missing")).is_err());
+    }
+
+    #[test]
+    fn ticket_check_starts_profiles_lists_all_pages_and_reports_failures_without_writes() {
+        use crate::mcp_client::tests::{example_profile, fake_state};
+        use serde_json::{Value, json};
+        let dir = tempfile::tempdir().unwrap();
+        let state = fake_state(dir.path(), json!([]));
+        for name in ["RELAY", "LINEAR"] {
+            let mut config = example_profile(name, &state);
+            let mut value: Value = serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+            value["page_size"] = json!(2);
+            std::fs::write(&state, value.to_string()).unwrap();
+            assert!(ticket_check(&config).starts_with('✓'));
+            config.operations.get.as_mut().unwrap().tool = "unknown_get".into();
+            let failed = ticket_check(&config);
+            assert!(failed.starts_with('✗') && failed.contains("get → unknown_get"), "{failed}");
+            config.server.command = vec![dir.path().join("absent-server").display().to_string()];
+            let failed = ticket_check(&config);
+            assert!(failed.starts_with('✗') && failed.contains("starting"), "{failed}");
+        }
+        let mut config = example_profile("RELAY", &state);
+        config.timeout_secs = 1;
+        let mut value: Value = serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+        value["list_hang"] = json!(true);
+        std::fs::write(&state, value.to_string()).unwrap();
+        let failed = ticket_check(&config);
+        assert!(failed.starts_with('✗') && failed.contains("did not answer within 1 s"), "{failed}");
+        let value: Value = serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+        assert_eq!(value["calls"], json!([]), "doctor must never call mapped operations");
+    }
+
+    #[test]
     fn doctor_reports_new_checks_without_changing_warning_exit_codes() {
         use std::os::unix::fs::PermissionsExt;
 
         const CHILD: &str = "IMACS_DOCTOR_TEST_CHILD";
         if std::env::var_os(CHILD).is_some() {
-            assert_eq!(run(), 0);
+            assert_eq!(run(None), 0);
             return;
         }
         let dir = tempfile::tempdir().unwrap();

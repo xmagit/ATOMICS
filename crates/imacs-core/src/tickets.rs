@@ -637,6 +637,11 @@ pub fn chief_comment(chief: &Author, text: &str) -> String {
     format!("{}\n\n{}", chief.opening(None), text.trim())
 }
 
+/// An explicit scoped agent comment, with the same task signature as reports.
+pub fn agent_comment(agent: &Author, task: &Task, text: &str) -> String {
+    format!("{}\n\n{}", agent.opening(Some(task)), text.trim())
+}
+
 /// A model label for signatures, such as "GPT-6.1 Sol (high)", from an agent's
 /// command-line arguments; the agent's name when they name no model.
 pub fn model_label(agent: &str, args: &[String]) -> String {

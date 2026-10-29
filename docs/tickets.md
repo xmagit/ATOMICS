@@ -176,16 +176,17 @@ imacs ctl '{"cmd":"ticket_event","board":"board-7"}'
 
 ### Relay: a board per plan
 
-The board is created in Relay first, and the plan hooks into it. Relay's tool names and result shapes
-below are placeholders: use what your Relay MCP server lists, and adjust the paths until a sync shows
-keys and states.
+The board is created in Relay first, and the plan hooks into it. Relay's exact tool names are not known yet: every tool name, argument, result path and state below
+is an editable placeholder. Use the names your Relay MCP server lists. The `get` operation must accept
+both a ticket id and the board id if agents need to read the plan link. Run doctor to check the mapped
+tools, then sync to check the result paths. No provider code needs changing.
 
 ```toml
 [tickets]
 system = "relay"
 mode = "board"
 comments = "agents"
-workflow = "Product writes the tickets on the board. Keep one task per ticket; put the how in the ticket as comments."
+workflow = "Link the existing Relay board to the plan and one ticket to each task. Product writes what and why; the chief comments implementation details. IMACS posts signed agent reports and maps states live. Use imacs_report for reports, without a second ticket comment."
 server = { command = ["relay-mcp"] }
 states = { planned = "Todo", running = "In Progress", review = "In Review", done = "Done", blocked = "Blocked" }
 
@@ -227,11 +228,11 @@ mode = "ticket"
 comments = "chief"
 workflow = "One Linear issue per plan; the issue says what and why, the plan says how."
 server = { command = ["npx", "-y", "mcp-remote", "https://mcp.linear.app/mcp"] }
-states = { running = "In Progress", review = "In Review", done = "Done" }
+states = { planned = "Todo", running = "In Progress", done = "Done" }
 
 [tickets.operations.get]
 tool = "get_issue"
-arguments = { id = "{key}", fields = ["id", "title", "url", "status", "updatedAt"] }
+arguments = { id = "{key}" }
 result = { id = "", key = "id", url = "url", title = "title", state = "status", updated_at = "updatedAt" }
 
 [tickets.operations.update_state]
@@ -248,8 +249,61 @@ arguments = { team = "ENG", title = "{title}", description = "{body}" }
 result = { id = "id", key = "id", url = "url", title = "title", state = "status" }
 ```
 
-Linear has no blocked state by default, so `blocked` is left unmapped and blocked tasks leave the issue as
-it is. Map it to a state your team added if you want one.
+[Linear's default workflow](https://linear.app/docs/issue-property#status-overview) is Backlog → Todo →
+In Progress → Done → Canceled. IMACS maps planned to Todo, running to In Progress and done to Done.
+Review and blocked have no default equivalents, so both remain unmapped and leave the issue's state
+alone. Add `review = "In Review"` or `blocked = "Blocked"` only if your team created those states.
+Backlog and Canceled remain user decisions; IMACS does not cancel an issue when a task is blocked.
+
+The profile uses `comments = "chief"`; change it to `"agents"` to post signed agent reports and enable
+scoped agent tools. Link the issue to the plan with `ticket = { id = "ENG-123" }`. The optional create
+operation needs your real team in place of `ENG`. Check tool names and result paths against your
+server version: doctor validates offered tool names, and sync validates results. For a server returning
+`identifier` separately from a UUID `id`, set `result = { id = "id", key = "identifier", url = "url",
+title = "title", state = "status", updated_at = "updatedAt" }` on get and create.
+
+### Checking a profile
+
+Copy **one** example into the main config or the workspace file; both examples are also commented in
+the default config template. Uncomment just the chosen block. For OAuth, run the bridge command once
+in a terminal to sign in, as described in [Linear's MCP setup](https://linear.app/docs/mcp). Then run:
+
+```sh
+imacs --workspace work doctor
+# Main config only:
+imacs doctor
+```
+
+Doctor uses the workspace's entire `[tickets]` section when present, including `system = ""` to disable
+it; otherwise it uses the main config after host overrides. It initializes the server, follows every
+`tools/list` page and checks every configured operation's tool, including optional create. It never
+calls a ticket operation or writes a ticket. Startup, authentication, timeout and missing-tool failures
+are warnings with configuration hints, preserving doctor's existing exit-code policy. The server is
+closed after the check. A successful check proves tool availability, not the argument/result mapping:
+use `imacs_ticket_sync` on a linked plan to verify the latter.
+
+### Agent access
+
+Agents use IMACS's own MCP server. They never receive the external ticket server or its credentials.
+When the effective workspace config has `comments = "agents"`, they can call:
+
+- `imacs_agent_ticket_get {}` to read their own task's ticket, or `{plan: true}` to read the plan's board
+  or ticket. Both call only the configured `get` operation and return the full result, including details
+  the server supplies beyond the card's fields. Neither lists other task tickets or retries state pushes.
+- `imacs_agent_ticket_comment {text}` to add a signed comment to their own task's linked ticket. It
+  requires an explicit task link; it does not fall back to the plan link. In ticket mode, reports still
+  use the existing lifecycle fallback to the plan ticket.
+
+The MCP process takes the session id from `IMACS_PANE`, and the host resolves that exact session to one
+task in an open plan. Tool arguments cannot select another session, task, plan or ticket. Access is
+refused for missing or ambiguous task ownership, a different configured system, absent links or
+operations, and both reads and comments are refused with `comments = "chief"` or `"off"`. Agents cannot
+create tickets, change their states, link tickets, or use chief tools through `mcp --agent`.
+
+`imacs_report` remains the only report path. IMACS already posts reports as signed comments according
+to the comment policy. Explicit comments are for implementation details or questions, not duplicate
+reports. Config changes are checked on each request, so the tools may be advertised while access is
+disabled.
 
 ## Tests
 
@@ -264,6 +318,18 @@ file. The tests in `crates/imacs/src/app/tickets.rs` drive IMACS against it:
 - inbound `ticket_event`;
 - failures shown on the card, timeouts and the backoff;
 - the board's chips and header;
-- the same steps against both dialects, where only the config differs.
+- the same steps against both dialects, where only the config differs;
+- the actual Relay and Linear examples extracted from the default template, with the server command
+  replaced by the fixture;
+- agent session scoping and denied reads/comments without external calls;
+- doctor startup, missing tools, pagination, and workspace precedence.
 
-`crates/imacs/src/mcp_client.rs` covers stdio and streamable HTTP.
+`crates/imacs/src/mcp_client.rs` covers stdio and streamable HTTP. For a focused run in a fresh
+worktree, build the fixture first, then run the affected tests:
+
+```sh
+cargo build -p imacs --example fake_ticket_server
+cargo test -p imacs ticket
+```
+
+Run the complete suite through `imacs queue --class test -- cargo test --workspace`.
