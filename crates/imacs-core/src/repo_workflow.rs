@@ -50,7 +50,7 @@ impl RepoWorkflow {
     pub fn agent_section(&self) -> String {
         let mut text = String::new();
         for (file, content) in &self.instructions {
-            if file.ends_with("/IMACS.md") {
+            if file.rsplit(['/', '\\']).next() == Some("IMACS.md") {
                 text.push_str(&format!("\n\nProject instructions from the main checkout, {file}:\n{content}\n"));
             } else {
                 text.push_str(&format!("\nAdditional project workflow topic: {file}\n"));
@@ -149,7 +149,9 @@ pub fn declarative(table: &toml::Table) -> (toml::Table, Vec<String>) {
             } else if matches!(name.as_str(), "tickets" | "worktrees" | "workflow") && value.is_table() {
                 let mut inner = toml::Table::new();
                 visit(value.as_table().unwrap(), &name, &mut inner, warnings);
-                accepted.insert(key.clone(), toml::Value::Table(inner));
+                if !inner.is_empty() || value.as_table().unwrap().is_empty() {
+                    accepted.insert(key.clone(), toml::Value::Table(inner));
+                }
             } else {
                 warnings.push(format!("ignored {name}: repository config allows only declarative workflow settings; commands, ticket servers and approvals are refused"));
             }

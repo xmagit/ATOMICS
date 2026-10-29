@@ -356,6 +356,8 @@ from, with secrets masked; `imacs_doctor` returns the doctor's checks; `imacs_co
 as a diff, with settings that run commands labeled, until you apply or reject it. Applying backs the file up
 beside itself, keeps its comments and reloads. Your own instructions for the chief go in `[chief] prompt`; each of
 those files adds its own. See [docs/configuration.md](docs/configuration.md) for scopes, merge order and the trust model.
+Commit `IMACS.md` and declarative `.imacs/config.toml` to share project instructions, branch templates and lifecycle
+settings with a team; see [Repository workflows](docs/repo-workflow.md).
 
 ## Orchestration: several plans you approve, agents that report back
 

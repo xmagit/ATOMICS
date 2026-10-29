@@ -2,7 +2,27 @@ use super::*;
 use imacs_core::repo_workflow::RepoWorkflow;
 
 impl State {
+    fn cached_repo_workflow(&self, repo: &Path) -> Option<&RepoWorkflow> {
+        self.repo_workflows.get(repo).or_else(|| self.project_of(repo).and_then(|root| self.repo_workflows.get(&root)))
+    }
+
+    pub(super) fn project_base_ref(&self, repo: &Path) -> String {
+        match self.cached_repo_workflow(repo) {
+            Some(workflow) => workflow
+                .config
+                .table
+                .get("base_ref")
+                .and_then(|value| value.as_str())
+                .unwrap_or(&self.config.base_ref)
+                .to_string(),
+            None => self.project_config(repo).base_ref,
+        }
+    }
+
     pub(super) fn project_config(&self, repo: &Path) -> Config {
+        if let Some(workflow) = self.cached_repo_workflow(repo) {
+            return workflow.apply(&self.effective_config());
+        }
         let root =
             self.project_of(repo).or_else(|| workspace::project_root(repo).ok()).unwrap_or_else(|| repo.to_path_buf());
         let config =
@@ -16,13 +36,24 @@ impl State {
     pub(super) fn plan_base_ref(&self, plan: &Plan) -> String {
         let root =
             plan.project.clone().or_else(|| plan.tasks.iter().find_map(|t| t.repo.as_deref().map(paths::expand)));
-        root.map(|root| self.project_config(&root).base_ref).unwrap_or_else(|| self.config.base_ref.clone())
+        root.map(|root| self.project_base_ref(&root)).unwrap_or_else(|| self.config.base_ref.clone())
     }
 
     pub(super) fn plan_workflow(&self, plan: &Plan) -> imacs_core::workflow::Workflow {
         let root =
             plan.project.clone().or_else(|| plan.tasks.iter().find_map(|t| t.repo.as_deref().map(paths::expand)));
-        root.map(|root| self.project_config(&root).workflow).unwrap_or_else(|| self.workflow().clone())
+        match root.as_deref() {
+            Some(root) => match self.cached_repo_workflow(root) {
+                Some(repo) => repo
+                    .config
+                    .table
+                    .get("workflow")
+                    .and_then(|value| value.clone().try_into().ok())
+                    .unwrap_or_else(|| self.workflow().clone()),
+                None => self.project_config(root).workflow,
+            },
+            None => self.workflow().clone(),
+        }
     }
 
     pub(super) fn reload_repo_workflows(&mut self) -> bool {
@@ -31,7 +62,18 @@ impl State {
         roots.extend(
             self.plans.iter().flat_map(|p| p.tasks.iter()).filter_map(|t| t.repo.as_deref().map(paths::expand)),
         );
-        let mut roots: Vec<_> = roots.into_iter().map(|root| workspace::project_root(&root).unwrap_or(root)).collect();
+        roots.sort();
+        roots.dedup();
+        let mut roots: Vec<_> = roots
+            .into_iter()
+            .map(|root| {
+                if self.repo_workflows.contains_key(&root) {
+                    root
+                } else {
+                    self.project_of(&root).or_else(|| workspace::project_root(&root).ok()).unwrap_or(root)
+                }
+            })
+            .collect();
         roots.sort();
         roots.dedup();
         let mut changed = false;
@@ -61,6 +103,7 @@ mod tests {
             "app::repo_workflow::tests::repo_settings_override_workspace_and_gate_only_their_project",
             |app, _| {
                 let (_dir, repo) = repository();
+                let repo = repo.canonicalize().unwrap();
                 app.runtime.repos = vec![repo.clone()];
                 app.runtime.config.tickets.branch = Some("workspace/{slug}".into());
                 std::fs::create_dir(repo.join(".imacs")).unwrap();
@@ -108,6 +151,7 @@ mod tests {
     fn project_instructions_refresh_from_main_checkout() {
         with_app("app::repo_workflow::tests::project_instructions_refresh_from_main_checkout", |app, _| {
             let (_dir, repo) = repository();
+            let repo = repo.canonicalize().unwrap();
             app.runtime.repos = vec![repo.clone()];
             std::fs::write(repo.join("IMACS.md"), "Main instructions A").unwrap();
             assert!(app.runtime.reload_repo_workflows());

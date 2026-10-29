@@ -190,6 +190,7 @@ impl State {
                         self.diff_target().and_then(|t| self.project_of(&t)).or_else(|| self.repos.first().cloned())
                     });
                 self.plans[index].project = project.and_then(|p| self.project_of(&p));
+                self.reload_repo_workflows();
                 self.save_plan(index);
                 let id = self.plans[index].id.clone();
                 self.refresh_tickets(Some(&id), None);
@@ -336,8 +337,9 @@ impl State {
             ControlRequest::Doctor => {
                 // The checks start programs and the ticket server: run them off the runtime thread.
                 let workspace = self.workspace.clone();
+                let projects = self.repos.clone();
                 std::thread::spawn(move || {
-                    let report = crate::doctor::json(workspace.as_deref());
+                    let report = crate::doctor::json(workspace.as_deref(), &projects);
                     let _ = reply.send(ControlOutcome::Done(ControlResponse::ok(report)));
                 });
                 return;

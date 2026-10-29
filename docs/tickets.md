@@ -168,8 +168,7 @@ not at all in board mode. Comments follow `comments`. With `"off"`, `imacs_ticke
 ## Lifecycle and completion
 
 `[workflow]` is declarative and independent of the ticket provider. It belongs in the main config
-(with host overrides) or the active workspace file (which wins as a whole section); the repository workflow configuration task will make the same shape
-available in `.imacs/config.toml`. It does not run commands or poll CI.
+(with host overrides) or the active workspace file (which wins as a whole section); a project may override it in `.imacs/config.toml` (see [Repository workflows](repo-workflow.md)). It does not run commands or poll CI.
 
 ```toml
 [workflow]

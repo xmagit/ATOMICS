@@ -55,7 +55,9 @@ impl State {
             Some(path) => Some(workspace::project_root(&paths::expand(path)).map_err(|err| format!("{err:#}"))?),
             None => None,
         };
-        let layers = self.config_layers(project.as_deref());
+        let repo_workflow = project.as_deref().map(imacs_core::repo_workflow::RepoWorkflow::read);
+        let mut layers = self.config_layers(None);
+        layers.extend(repo_workflow.as_ref().map(|repo| repo.config.clone()));
         let cleaner = self.config_cleaner(&layers);
         let mut effective = self.effective_config();
         if let Some(layer) = layers.iter().find(|layer| layer.source == Source::Repo) {
@@ -84,8 +86,8 @@ impl State {
                 "path": paths::display(&root),
                 "open": self.open_projects.contains(&root) || self.repos.contains(&root),
                 "sources": layers.iter().map(|layer| layer.source).collect::<Vec<_>>(),
-                "workflow_files": imacs_core::repo_workflow::RepoWorkflow::read(&root).instructions.iter().map(|(file, _)| file).collect::<Vec<_>>(),
-                "warnings": imacs_core::repo_workflow::RepoWorkflow::read(&root).warnings,
+                "workflow_files": repo_workflow.as_ref().map(|repo| repo.instructions.iter().map(|(file, _)| file).collect::<Vec<_>>()).unwrap_or_default(),
+                "warnings": repo_workflow.as_ref().map(|repo| &repo.warnings),
                 "new_worktree_example": paths::display(&git::worktree_path(&effective.worktree_path, &root, "example")),
             })
         });

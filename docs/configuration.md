@@ -12,15 +12,15 @@ a diff until you apply or reject it.
 | `default` | built into IMACS | everything | every setting; IMACS writes them, with comments, into a new `config.toml` |
 | `main` | `~/.config/imacs/config.toml` | every machine that shares the file | every setting |
 | `host` | `config.d/<host>.toml` beside it | this machine | every setting |
-| `workspace` | `workspaces/<host>/<name>.toml`, or a flat `workspaces/<name>.toml` shared by every host | the open workspace | `projects`, `[tickets]` and `[chief] prompt` |
-| `repo` | none yet | one repository | reserved: repositories carry no IMACS settings yet |
+| `workspace` | `workspaces/<host>/<name>.toml`, or a flat `workspaces/<name>.toml` shared by every host | the open workspace | `projects`, `[tickets]`, `[workflow]` and `[chief] prompt` |
+| `repo` | `<main checkout>/.imacs/config.toml` | one repository | allowlisted declarative workflow settings; see [Repository workflows](repo-workflow.md) |
 
 `IMACS_CONFIG` moves the main file; `config.d/` and `workspaces/` move with it. `IMACS_HOST` overrides the
 machine name. See [Using IMACS on several machines](../README.md#using-imacs-on-several-machines) for host
 names and portable paths.
 
 The scope of a proposed change is `main`, `host` or `workspace`. Use `host` for anything that is true of one
-machine only: its core count, its programs' paths, its repositories. A workspace change may touch `[tickets]` and
+machine only: its core count, its programs' paths, its repositories. A workspace change may touch `[tickets]`, `[workflow]` and
 `[chief] prompt`; open and close its projects in IMACS instead.
 
 ## Merge order
@@ -31,10 +31,13 @@ IMACS starts from the built-in defaults, then applies `config.toml`, then this h
 - Arrays and other values replace what came before. A host's `agents` or `repos` replaces the whole list.
 - A workspace's `[tickets]` replaces the main config's section as a whole: a key it leaves out has its
   default, not the main config's value. A workspace can turn tickets off with `system = ""`.
+- A workspace's `[workflow]` also replaces the whole section. A repo may override it for its project.
+- Repository config overlays only its documented declarative keys; `[tickets] branch` keeps the workspace provider.
 - `[chief] prompt` adds up instead of replacing; see below.
 
-A file that does not parse stops the config from loading, and IMACS keeps running on the last config that did.
-The top bar says so, and `imacs doctor` names the file.
+A main, host or workspace file that does not parse leaves IMACS on the last configuration that loaded.
+The top bar or toast says so, and `imacs doctor` names the file. A broken repository config is ignored
+with a warning; see [Repository workflows](repo-workflow.md).
 
 ## The chief's prompt
 
@@ -44,7 +47,8 @@ The chief's prompt is, in order:
 
 1. the built-in prompt, or `system_prompt`;
 2. the ticket workflow, when tickets are configured;
-3. `[chief] prompt` from `config.toml`, then `config.d/<host>.toml`, then the workspace file.
+3. `[chief] prompt` from `config.toml`, then `config.d/<host>.toml`, then the workspace file;
+4. a bounded section for each open project from `IMACS.md`, `.imacs/*.md` and declarative repo settings, naming its source files.
 
 The files are read when the chief starts, so a change takes effect the next time it starts. For example:
 
@@ -73,7 +77,7 @@ Task agents never get them.
 Returns the effective configuration:
 
 - `values`: every setting as `key → {value, source}`, where `source` is `default`, `main`, `host` or
-  `workspace`. `key` limits the result to keys under a dotted prefix, such as `tickets` or `layout.sidebar_width`.
+  `workspace` or `repo` (when `project` is given). `key` limits the result to keys under a dotted prefix, such as `tickets` or `layout.sidebar_width`.
 - `files`: each file with whether it exists and, when it does not parse, the line and column of the error.
 - `load_error`: why the files that parse would not load together, naming the key.
 - `chief_prompt`: each `[chief] prompt` section with its source, in the order the chief's prompt adds them.
@@ -99,7 +103,7 @@ IMACS checks the change before you see it, and refuses it with the reason when:
 - the result would not load. The error names the key, for example
   `layout.sidebar_width: invalid type: string "wide", expected f32`. A change to `config.toml` must load on its
   own too, since other machines share it without this host's overrides;
-- a workspace change touches anything but `[tickets]` and `[chief] prompt`, or its `[tickets]` would not load.
+- a workspace change touches anything but `[tickets]`, `[workflow]` and `[chief] prompt`, or its ticket/workflow settings would not load.
 
 It also warns, without refusing, about keys IMACS does not know, about a main-file setting this host's file
 overrides, and about a `[tickets]` change the open workspace's section replaces.
@@ -175,3 +179,7 @@ file. Waiting proposals block `imacs_restart` and do not survive a restart.
   file with the same permissions.
 - **Editing by hand still works.** IMACS reloads files you save yourself. A proposal made before your edit fails
   when applied instead of overwriting it.
+
+Repository workflow files are trusted project instructions like `AGENTS.md` and `CLAUDE.md`.
+Only declarative keys are accepted from repository config; see [Repository workflows](repo-workflow.md)
+for the allowlist, precedence, reload behavior and examples.

@@ -476,6 +476,23 @@ mod tests {
             app.runtime.plans[0].tasks = vec![Task { branch: Some("existing".into()), ..Default::default() }];
             app.runtime.pin_ticket_integration(0);
             assert_eq!(app.runtime.plans[0].integration_branch(), "imacs/plan-branches");
+            std::fs::create_dir(repo.join(".imacs")).unwrap();
+            std::fs::write(
+                repo.join(".imacs/config.toml"),
+                "base_ref = 'main'\n[tickets]\nbranch = 'repo/{key_lower}/{slug}'",
+            )
+            .unwrap();
+            app.runtime.reload_repo_workflows();
+            assert_eq!(
+                app.runtime.ticket_branch(0, Some(&link), &repo, None).as_deref(),
+                Some("repo/eng-42/fix-parser")
+            );
+            app.runtime.pin_ticket_integration(0);
+            assert_eq!(
+                app.runtime.plans[0].integration_branch(),
+                "imacs/plan-branches",
+                "repo edits never rename existing branches"
+            );
         });
     }
 
