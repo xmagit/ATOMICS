@@ -174,7 +174,7 @@ mod tests {
             assert_eq!(stdout.contains("IMACS Codex hook trust not verified"), probe != "missing", "{stdout}");
             assert_eq!(stdout.contains("/hooks"), probe != "missing", "{stdout}");
             assert!(stdout.contains(if bad_plan { "unreadable plan" } else { "plan files readable" }));
-            let worktree_lines: Vec<_> = stdout.lines().filter(|line| line.contains("worktree")).collect();
+            let worktree_lines: Vec<_> = stdout.lines().filter(|line| line.contains("merged worktree")).collect();
             let expected = if bad_plan {
                 format!(
                     "✗ merged worktree can be cleaned up (warning): {} (merged) — review it in IMACS's Clean up… dialog before removing the worktree",
