@@ -50,6 +50,7 @@ mod plan_view;
 mod plans;
 mod projects;
 mod restart;
+mod selfconfig;
 mod sessions;
 mod sidebar;
 mod tickets;

@@ -83,7 +83,8 @@ fn orbit_icon(painter: &egui::Painter, rect: Rect, accent: Color32, light: Color
 }
 
 /// Tools the chief may use without asking: reading, planning, reviewing, and running the
-/// plan the user approved. Starting agents, typing into terminals and closing sessions ask first.
+/// plan the user approved. Starting agents, typing into terminals and closing sessions ask
+/// first. Config tools only read or propose: a proposed change waits for the user to apply it.
 pub(super) const CHIEF_ALLOWED_TOOLS: &[&str] = &[
     "mcp__imacs__imacs_list",
     "mcp__imacs__imacs_wait",
@@ -105,6 +106,7 @@ pub(super) const CHIEF_ALLOWED_TOOLS: &[&str] = &[
     "mcp__imacs__imacs_ticket_link",
     "mcp__imacs__imacs_ticket_sync",
     "mcp__imacs__imacs_ticket_comment",
+    "mcp__imacs__imacs_config_get",
 ];
 
 impl Desktop<'_> {

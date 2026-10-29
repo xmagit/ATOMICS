@@ -297,6 +297,12 @@ impl State {
                     fields,
                 )))
             }
+            ControlRequest::ConfigGet { project, key } => {
+                done(match self.config_get(project.as_deref(), key.as_deref()) {
+                    Ok(result) => ControlResponse::ok(result),
+                    Err(error) => ControlResponse::error(error),
+                })
+            }
             ControlRequest::Report { pane, status, summary } => {
                 let task = self.report(pane.as_deref(), &status, &summary);
                 done(ControlResponse::ok(json!({ "recorded": true, "task": task })))

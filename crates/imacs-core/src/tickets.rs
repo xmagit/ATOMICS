@@ -531,13 +531,15 @@ impl FieldPaths {
 /// The credentials a config runs with, which nothing from its server may carry into plans
 /// or replies: the `token_env` value and secret-looking `server.env` values.
 pub fn secrets_of(config: &TicketConfig, env: impl FnMut(&str) -> Option<String>) -> Vec<String> {
-    let secret_name = |name: &str| {
-        let name = name.to_ascii_uppercase();
-        ["TOKEN", "KEY", "SECRET", "PASSWORD", "AUTH", "CREDENTIAL"].iter().any(|s| name.contains(s))
-    };
     let token = config.server.token_env.as_deref().map(str::trim).filter(|name| !name.is_empty()).and_then(env);
     let values = config.server.env.iter().filter(|(name, _)| secret_name(name)).map(|(_, value)| value.clone());
     token.into_iter().chain(values).collect()
+}
+
+/// Whether an environment variable or argument name looks like it holds a credential.
+pub fn secret_name(name: &str) -> bool {
+    let name = name.to_ascii_uppercase();
+    ["TOKEN", "KEY", "SECRET", "PASSWORD", "AUTH", "CREDENTIAL"].iter().any(|s| name.contains(s))
 }
 
 /// What replaces an error whose credential could not be masked in place.
@@ -638,6 +640,21 @@ impl Cleaner {
             Value::Array(items) => Value::Array(items.into_iter().map(|item| self.value(item)).collect()),
             Value::Object(map) => {
                 Value::Object(map.into_iter().map(|(key, item)| (self.text(&key), self.value(item))).collect())
+            }
+            other => other,
+        }
+    }
+
+    /// A configuration value shown to an agent: cleaned like an agent read, with bearer and
+    /// basic credentials and `Authorization` values in its strings masked too.
+    pub fn setting(&self, value: Value) -> Value {
+        match value {
+            Value::String(text) => {
+                Value::String(self.text(&redact_credentials(&redact_query(&redact_userinfo(&text), credential_param))))
+            }
+            Value::Array(items) => Value::Array(items.into_iter().map(|item| self.setting(item)).collect()),
+            Value::Object(map) => {
+                Value::Object(map.into_iter().map(|(key, item)| (self.text(&key), self.setting(item))).collect())
             }
             other => other,
         }

@@ -115,7 +115,7 @@ impl State {
                 Err(err) => self.toast(format!("Workspace tickets: {err}")),
             }
         }
-        let effective = self.tickets.workspace_config.clone().unwrap_or_else(|| self.config.tickets.clone());
+        let effective = self.effective_tickets();
         let effective = effective.is_configured().then(|| Arc::new(effective));
         if effective != self.tickets.config {
             self.tickets.config = effective;
@@ -135,6 +135,11 @@ impl State {
         self.tickets.failed.retain(|key, _| key.0 != plan);
         self.refresh_tickets(Some(plan), None);
         self.push_ticket_states(None);
+    }
+
+    /// The `[tickets]` in effect, configured or not: the workspace file's, else the main config's.
+    pub(super) fn effective_tickets(&self) -> TicketConfig {
+        self.tickets.workspace_config.clone().unwrap_or_else(|| self.config.tickets.clone())
     }
 
     pub(super) fn ticket_config(&self) -> Option<Arc<TicketConfig>> {

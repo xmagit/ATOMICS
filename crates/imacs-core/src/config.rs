@@ -692,7 +692,7 @@ impl Config {
     /// Arrays and scalar values are replaced; only files actually read are returned.
     #[cfg(feature = "native")]
     pub fn load_with_sources(path: &Path) -> Result<(Self, Vec<PathBuf>)> {
-        let mut merged = toml::Value::Table(toml::Table::new());
+        let mut tables = Vec::new();
         let mut sources = Vec::new();
         for (index, file) in Self::source_paths(path).into_iter().enumerate() {
             let text = match std::fs::read_to_string(&file) {
@@ -700,20 +700,30 @@ impl Config {
                 Err(err) if index > 0 && err.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(err) => return Err(err).with_context(|| format!("reading {}", file.display())),
             };
-            let value = toml::from_str(&text).with_context(|| format!("parsing {}", file.display()))?;
-            merge_values(&mut merged, value);
+            tables.push(toml::from_str(&text).with_context(|| format!("parsing {}", file.display()))?);
             sources.push(file);
         }
-        let mut config: Config = merged.try_into().with_context(|| {
+        let config = Self::from_tables(tables).with_context(|| {
             format!(
                 "parsing merged config from {}",
                 sources.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
             )
         })?;
+        Ok((config, sources))
+    }
+
+    /// The config the files' tables make, base first: tables merge key by key, and arrays
+    /// and other values replace what came before.
+    pub fn from_tables(tables: impl IntoIterator<Item = toml::Table>) -> Result<Self, toml::de::Error> {
+        let mut merged = toml::Value::Table(toml::Table::new());
+        for table in tables {
+            merge_values(&mut merged, toml::Value::Table(table));
+        }
+        let mut config: Config = merged.try_into()?;
         if config.agents.is_empty() {
             config.agents = Config::default().agents;
         }
-        Ok((config, sources))
+        Ok(config)
     }
 
     pub fn agent(&self, name: &str) -> Option<&AgentConfig> {
@@ -726,7 +736,6 @@ impl Config {
     }
 }
 
-#[cfg(feature = "native")]
 fn merge_values(base: &mut toml::Value, overrides: toml::Value) {
     match (base, overrides) {
         (toml::Value::Table(base), toml::Value::Table(overrides)) => {

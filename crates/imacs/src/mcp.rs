@@ -42,8 +42,8 @@ pub fn run(agent: bool, chief: bool) {
             "tools/list" => Ok(json!({ "tools": available_tools(agent, chief) })),
             "tools/call" => Ok(if agent {
                 call_agent(&params)
-            } else if !chief && params["name"] == "imacs_restart" {
-                tool_error("imacs_restart is only available to the chief".into())
+            } else if let Some(name) = params["name"].as_str().filter(|name| !chief && CHIEF_ONLY.contains(name)) {
+                tool_error(format!("{name} is only available to the chief"))
             } else {
                 call(&params)
             }),
@@ -93,13 +93,16 @@ fn agent_tools() -> Value {
     }])
 }
 
+/// Tools only the chief's own server offers: restarting IMACS and configuring it.
+const CHIEF_ONLY: &[&str] = &["imacs_restart", "imacs_config_get"];
+
 fn available_tools(agent: bool, chief: bool) -> Value {
     if agent {
         return agent_tools();
     }
     let mut tools = tools();
     if !chief {
-        tools.as_array_mut().unwrap().retain(|tool| tool["name"] != "imacs_restart");
+        tools.as_array_mut().unwrap().retain(|tool| !CHIEF_ONLY.iter().any(|name| tool["name"] == *name));
     }
     tools
 }
@@ -404,7 +407,23 @@ fn tools() -> Value {
     if let (Some(all), Value::Array(more)) = (tools.as_array_mut(), ticket_tools(&plan)) {
         all.extend(more);
     }
+    if let (Some(all), Value::Array(more)) = (tools.as_array_mut(), config_tools()) {
+        all.extend(more);
+    }
     tools
+}
+
+fn config_tools() -> Value {
+    json!([
+        {
+            "name": "imacs_config_get",
+            "description": "Chief only: IMACS's effective configuration, each value with its source (default, main for config.toml, host for config.d/<host>.toml, workspace for the active workspace file). Also lists the files and, with project, that project's settings. Secret values read as ***; token_env and api_key_env stay names. Read this before proposing a change.",
+            "inputSchema": { "type": "object", "properties": {
+                "project": { "type": "string", "description": "A folder in a project, to include that project's settings" },
+                "key": { "type": "string", "description": "Only keys under this dotted prefix, such as tickets or layout.sidebar_width" }
+            } }
+        }
+    ])
 }
 
 fn call(params: &Value) -> Value {
@@ -469,6 +488,7 @@ fn request_for_tool(name: &str, mut args: Value) -> Result<ControlRequest, Strin
         "imacs_ticket_sync" => "ticket_sync",
         "imacs_ticket_comment" => "ticket_comment",
         "imacs_ticket_event" => "ticket_event",
+        "imacs_config_get" => "config_get",
         _ => return Err(format!("unknown tool {name}")),
     };
     if let Some(map) = args.as_object_mut() {
@@ -534,7 +554,9 @@ mod tests {
     fn restart_is_chief_only_and_maps_optional_force_and_reason() {
         for (agent, chief, available) in [(true, false, false), (false, false, false), (false, true, true)] {
             let tools = super::available_tools(agent, chief);
-            assert_eq!(tools.as_array().unwrap().iter().any(|tool| tool["name"] == "imacs_restart"), available);
+            for name in super::CHIEF_ONLY {
+                assert_eq!(tools.as_array().unwrap().iter().any(|tool| tool["name"] == *name), available, "{name}");
+            }
         }
         let default = super::request_for_tool("imacs_restart", serde_json::json!({})).unwrap();
         assert!(matches!(default, imacs_core::control::ControlRequest::Restart { force: false, reason: None }));

@@ -217,6 +217,15 @@ pub enum ControlRequest {
         pane: Option<String>,
         text: String,
     },
+    /// The effective configuration with each value's source, without secrets: the main
+    /// config, the active workspace, and one project when given.
+    ConfigGet {
+        #[serde(default)]
+        project: Option<String>,
+        /// Only keys under this dotted prefix, such as `tickets`.
+        #[serde(default)]
+        key: Option<String>,
+    },
     /// A sub-agent reporting on its task (sent by `imacs mcp --agent`).
     Report {
         pane: Option<String>,
