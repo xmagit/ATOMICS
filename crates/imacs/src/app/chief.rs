@@ -185,9 +185,13 @@ impl Desktop<'_> {
         let keys = &self.runtime.config.keys;
         let hover = match self.client.voice {
             Voice::Opening(_) => "Opening microphone: Esc cancels".to_string(),
-            Voice::Recording(_) => format!("Recording: {} sends, Esc cancels", keys.voice),
+            Voice::Recording(_) => format!("Recording: {} sends, Esc cancels", shortcut_label(ui.ctx(), &keys.voice)),
             Voice::Transcribing => "Transcribing".to_string(),
-            Voice::Idle => format!("The chief agent ({}) · voice ({})", keys.toggle_chief, keys.voice),
+            Voice::Idle => format!(
+                "The chief agent ({}) · voice ({})",
+                shortcut_label(ui.ctx(), &keys.toggle_chief),
+                shortcut_label(ui.ctx(), &keys.voice)
+            ),
         };
         response.context_menu(|ui| {
             if ui.selectable_value(&mut dock, ChiefDock::Floating, "Float chief").clicked()
@@ -263,7 +267,11 @@ impl Desktop<'_> {
         ui.horizontal(|ui| {
             ui.label(RichText::new("◆ CHIEF AGENT").color(p.accent).strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("minimize").on_hover_text(&self.runtime.config.keys.toggle_chief).clicked() {
+                if ui
+                    .small_button("minimize")
+                    .on_hover_text(shortcut_label(ui.ctx(), &self.runtime.config.keys.toggle_chief))
+                    .clicked()
+                {
                     self.runtime.chief_open = false;
                 }
                 let dock = self.runtime.chief_dock();

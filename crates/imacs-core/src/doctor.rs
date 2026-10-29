@@ -150,12 +150,13 @@ mod tests {
     use super::*;
 
     #[test]
-    #[cfg(all(feature = "native", target_os = "macos"))]
+    #[cfg(all(feature = "native", any(target_os = "macos", target_os = "linux")))]
     fn cache_clone_diagnostic_probes_repo_folder_and_cleans_up() {
         let (dir, repo) = crate::git::tests::project();
         let template = "{repo_parent}/{repo}-{slug}";
         let before = std::fs::read_dir(dir.path()).unwrap().count();
-        assert!(cache_clone_check(&repo, template).starts_with('✓'));
+        let supported = git::probe_cache_clone(&repo, dir.path()).unwrap();
+        assert!(cache_clone_check(&repo, template).starts_with(if supported { '✓' } else { '✗' }));
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), before);
         assert!(
             !std::fs::read_dir(&repo).unwrap().any(|entry| entry

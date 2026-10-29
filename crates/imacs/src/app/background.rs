@@ -207,7 +207,7 @@ impl State {
 
         if self.config_checked.elapsed() > Duration::from_secs(1) {
             self.config_checked = Instant::now();
-            let stamp = config_modified(&self.config_path);
+            let stamp = config_fingerprints(&self.config_path);
             self.apply_ticket_config();
             if stamp != self.config_stamp {
                 self.config_stamp = stamp;

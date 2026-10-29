@@ -75,6 +75,13 @@ mod tests {
     use std::process::{Command, Stdio};
 
     #[test]
+    fn process_ancestry_includes_the_real_parent() {
+        // SAFETY: getppid has no preconditions. This also exercises the platform's ps flags.
+        let parent = unsafe { libc::getppid() } as u32;
+        assert!(ancestors().contains(&parent));
+    }
+
+    #[test]
     fn permission_forward_waits_beyond_the_ordinary_hook_timeout() {
         let started = std::time::Instant::now();
         let dir = tempfile::tempdir().unwrap();

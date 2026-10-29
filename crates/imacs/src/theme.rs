@@ -223,6 +223,11 @@ pub fn shortcut(text: &str) -> Option<KeyboardShortcut> {
     Some(KeyboardShortcut::new(modifiers, key))
 }
 
+/// Display exactly the platform modifiers used to consume the configured chord.
+pub fn shortcut_label(ctx: &egui::Context, text: &str) -> String {
+    shortcut(text).map(|chord| ctx.format_shortcut(&chord)).unwrap_or_else(|| text.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,5 +256,14 @@ mod tests {
         assert!(voice.modifiers.shift);
         assert_eq!(shortcut("cmd+Escape").unwrap().logical_key, Key::Escape);
         assert!(shortcut("cmd+notakey").is_none());
+        let cmd = shortcut("cmd+d").unwrap().modifiers;
+        assert!(is_app_chord(&cmd));
+        if cfg!(target_os = "macos") {
+            assert!(cmd.mac_cmd && !cmd.ctrl && !cmd.shift);
+        } else {
+            assert!(cmd.ctrl && cmd.shift && !cmd.mac_cmd);
+            assert!(!is_app_chord(&Modifiers::CTRL), "plain Ctrl must reach the terminal");
+            assert_eq!(shortcut("cmd+shift+space"), shortcut("ctrl+shift+space"));
+        }
     }
 }

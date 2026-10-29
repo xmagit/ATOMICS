@@ -5,13 +5,37 @@ use std::sync::{LazyLock, Mutex};
 
 use imacs_core::paths;
 
-/// The PATH of an interactive login shell. Apps started from the Dock get a bare
-/// PATH, which would hide `claude`, `codex` and everything installed by Homebrew.
+/// The PATH of an interactive login shell. Desktop launchers can supply a bare
+/// PATH, hiding tools installed by the user's shell startup files.
 pub static SHELL_PATH: LazyLock<Option<String>> = LazyLock::new(|| login_shell_var("PATH"));
+
+pub fn shell_program() -> String {
+    std::env::var("SHELL")
+        .ok()
+        .filter(|shell| !shell.is_empty())
+        .unwrap_or_else(|| if cfg!(target_os = "macos") { "/bin/zsh" } else { "/bin/sh" }.into())
+}
+
+/// The installed path, including after an atomic update of a running Linux app.
+pub fn executable_path() -> std::io::Result<PathBuf> {
+    let executable = std::env::current_exe()?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        // /proc/self/exe describes the old, unlinked inode after an installer
+        // renames its replacement into place. Hooks and restart need the new file.
+        if !executable.exists()
+            && let Some(installed) = executable.as_os_str().as_bytes().strip_suffix(b" (deleted)")
+        {
+            return Ok(PathBuf::from(std::ffi::OsStr::from_bytes(installed)));
+        }
+    }
+    Ok(executable)
+}
 
 /// A variable as an interactive login shell sets it. `name` must be a plain identifier.
 fn login_shell_var(name: &str) -> Option<String> {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+    let shell = shell_program();
     let out = std::process::Command::new(shell)
         .args(["-l", "-i", "-c", &format!("printf '{MARKER}%s{MARKER}' \"${name}\"")])
         .stdin(std::process::Stdio::null())
@@ -105,7 +129,7 @@ fn claude_settings_path() -> PathBuf {
 }
 
 pub fn global_hooks_installed() -> bool {
-    let Ok(exe) = std::env::current_exe() else { return false };
+    let Ok(exe) = executable_path() else { return false };
     std::fs::read_to_string(claude_settings_path()).is_ok_and(|text| text.contains(&format!("{} hook", exe.display())))
 }
 
@@ -118,7 +142,7 @@ pub fn legacy_hooks_installed() -> bool {
 
 pub fn install_global_hooks() -> anyhow::Result<PathBuf> {
     let path = claude_settings_path();
-    let exe = std::env::current_exe()?;
+    let exe = executable_path()?;
     let mut settings: serde_json::Value = match std::fs::read_to_string(&path) {
         Ok(text) => {
             std::fs::write(path.with_extension("json.imacs-backup"), &text)?;
@@ -137,6 +161,62 @@ pub fn install_global_hooks() -> anyhow::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn replaced_linux_executable_still_resolves_the_installation() {
+        use crate::test_support::{CHILD_TIMEOUT, TestChild};
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+
+        const CHILD: &str = "IMACS_REPLACED_EXE_TEST";
+        if let Some(executable) = std::env::var_os(CHILD) {
+            let executable = PathBuf::from(executable);
+            let ready = executable.with_extension("ready");
+            std::fs::write(&ready, "ready").unwrap();
+            let deadline = Instant::now() + CHILD_TIMEOUT;
+            while !executable.with_extension("updated").exists() {
+                assert!(Instant::now() < deadline, "installer never replaced the running executable");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_ne!(std::env::current_exe().unwrap(), executable, "exercise /proc/self/exe's deleted suffix");
+            assert_eq!(executable_path().unwrap(), executable);
+            let target = crate::restart::Target::current().unwrap();
+            assert_eq!(target.executable, executable);
+            target.validate().unwrap();
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("imacs with spaces");
+        std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        let mut child = TestChild::spawn(
+            std::process::Command::new(&executable)
+                .args([
+                    "--exact",
+                    "setup::tests::replaced_linux_executable_still_resolves_the_installation",
+                    "--nocapture",
+                ])
+                .env(CHILD, &executable),
+            CHILD_TIMEOUT,
+        )
+        .unwrap();
+        while !executable.with_extension("ready").exists() {
+            child.check_timeout().unwrap();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let replacement = dir.path().join("replacement");
+        std::fs::write(&replacement, "#!/bin/sh\ntest \"$1\" = --version\n").unwrap();
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::rename(replacement, &executable).unwrap();
+        std::fs::write(executable.with_extension("updated"), "updated").unwrap();
+        let output = child.wait_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn version_probe_times_out_even_after_printing_a_valid_version() {

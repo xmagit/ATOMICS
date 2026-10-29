@@ -482,7 +482,7 @@ pub struct KeyConfig {
     pub voice: String,
 }
 
-/// A parsed shortcut such as `cmd+shift+d`. `cmd` means Command on macOS and Ctrl elsewhere.
+/// A parsed shortcut such as `cmd+shift+d`. `cmd` means Command on macOS and Ctrl+Shift elsewhere.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chord {
     pub cmd: bool,

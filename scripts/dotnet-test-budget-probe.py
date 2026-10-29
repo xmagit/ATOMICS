@@ -19,7 +19,10 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--reuse-root", type=Path, help="only probe VSTest using earlier generated projects")
 options = parser.parse_args()
 root = (options.reuse_root or Path(tempfile.mkdtemp(prefix="imacs-dotnet-tests-"))).resolve()
-dotnet = str(Path.home() / ".dotnet/dotnet")
+personal_dotnet = Path.home() / ".dotnet/dotnet"
+dotnet = os.environ.get("DOTNET") or (str(personal_dotnet) if personal_dotnet.is_file() else shutil.which("dotnet"))
+if not dotnet:
+    raise SystemExit("Install .NET SDK 9 or set DOTNET to its executable before running this probe.")
 env = {k: v for k, v in os.environ.items() if k != "DOTNET_PROCESSOR_COUNT"}
 env.update(MSBUILDDISABLENODEREUSE="1", UseSharedCompilation="false",
            DOTNET_CLI_USE_MSBUILD_SERVER="0", DOTNET_CLI_TELEMETRY_OPTOUT="1")

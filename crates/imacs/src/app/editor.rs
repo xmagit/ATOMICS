@@ -133,7 +133,13 @@ impl Desktop<'_> {
         let palette = self.runtime.palette.clone();
         let split = self.client.diff_split.unwrap_or(self.runtime.config.layout.diff_split);
         let state = self.client.diff_views.entry(root.clone()).or_default();
-        let header = Header { title: &title, branch: branch.as_deref(), can_send, split };
+        let header = Header {
+            title: &title,
+            branch: branch.as_deref(),
+            can_send,
+            split,
+            editor_shortcut: &self.runtime.config.keys.toggle_editor,
+        };
         let before = state.comments.clone();
         let action = diff_view::show(ui, rect, state, header, &palette, &font);
         let after = state.comments.clone();
@@ -184,7 +190,10 @@ impl Desktop<'_> {
             }
             if ui
                 .small_button("diff")
-                .on_hover_text(format!("Back to the diff ({})", self.runtime.config.keys.toggle_editor))
+                .on_hover_text(format!(
+                    "Back to the diff ({})",
+                    shortcut_label(ui.ctx(), &self.runtime.config.keys.toggle_editor)
+                ))
                 .clicked()
             {
                 action = Some("diff");
