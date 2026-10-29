@@ -83,6 +83,13 @@ fn config_reloads_when_host_overrides_are_created_changed_or_removed() {
         std::fs::create_dir_all(host_file.parent().unwrap()).unwrap();
         for size in [16.0, 18.0] {
             std::fs::write(&host_file, format!("[font]\nsize = {size:.1}")).unwrap();
+            // Same-length edits with identical mtimes must still reload.
+            std::fs::File::options()
+                .write(true)
+                .open(&host_file)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1)))
+                .unwrap();
             state.config_checked = Instant::now() - Duration::from_secs(2);
             state.runtime_tick(ctx);
             assert_eq!(state.config.font.size, size);

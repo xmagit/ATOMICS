@@ -325,7 +325,7 @@ pub(crate) struct State {
     action_rx: Receiver<commands::Action>,
     config: Config,
     config_path: PathBuf,
-    config_stamp: [Option<SystemTime>; 2],
+    config_stamp: [Option<u64>; 2],
     config_checked: Instant,
     config_error: Option<String>,
     palette: Arc<Palette>,
@@ -673,7 +673,7 @@ impl State {
             action_rx,
             palette: Arc::new(Palette::from_config(&config.theme)),
             highlighter: Arc::new(Highlighter::new(&Palette::from_config(&config.theme).syntax)),
-            config_stamp: config_modified(&config_path),
+            config_stamp: config_fingerprints(&config_path),
             config,
             config_path,
             config_checked: Instant::now(),
@@ -963,8 +963,17 @@ fn modified(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
-fn config_modified(path: &Path) -> [Option<SystemTime>; 2] {
-    Config::source_paths(path).map(|file| modified(&file))
+fn config_fingerprints(path: &Path) -> [Option<u64>; 2] {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+
+    // Rapid edits can share a modification timestamp on Linux filesystems.
+    // These small config files are polled once per second off the UI thread.
+    Config::source_paths(path).map(|file| {
+        let bytes = std::fs::read(file).ok()?;
+        let mut hasher = DefaultHasher::new();
+        bytes.hash(&mut hasher);
+        Some(hasher.finish())
+    })
 }
 
 fn open_path(path: &Path) -> std::io::Result<std::process::Child> {

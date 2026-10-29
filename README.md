@@ -91,7 +91,7 @@ and their commands, `base_ref`, layout breakpoints, fonts, colors, terminal scro
 steering.
 
 On Linux, a private, user-owned `XDG_RUNTIME_DIR` holds each new install's socket and the compiler jobserver FIFO,
-in an `imacs/<instance hash>` subdirectory. Without it, the socket stays beside the state and the FIFO uses the user's
+in an `imacs/<instance hash>` subdirectory, with the FIFO isolated inside `jobserver/`. Without it, the socket stays beside the state and the FIFO uses the user's
 temporary directory. Existing `~/.imacs` installs retain their state and socket paths; the FIFO can use XDG runtime storage.
 `IMACS_HOME` always overrides the state path and keeps the socket beside that state; `IMACS_SOCKET` overrides just the
 socket, and `IMACS_CONFIG` overrides the config file. Runtime FIFO paths are distinct for each state home. Empty or relative
@@ -451,7 +451,7 @@ Agents share the machine, and IMACS keeps that in check for every agent it start
 - **One compiler job pool.** IMACS owns a GNU make jobserver (a named pipe in a private folder under Linux's
   `XDG_RUNTIME_DIR`, or the user's temporary directory otherwise) with `jobs` tokens, cores minus 2 by default, and hands it to every agent terminal as
   `CARGO_MAKEFLAGS`. cargo takes a token per job, so ten agents building at once share those jobs instead of each
-  using every core. On Linux, Codex also gets `--add-dir` for this instance's private XDG runtime directory so its
+  using every core. On Linux, Codex also gets `--add-dir` for this instance's private XDG runtime `jobserver/` subdirectory so its
   sandboxed compilers can open the FIFO. `MAKEFLAGS` is left alone, since `make` before GNU make 4.4 misreads a pipe jobserver. A job
   killed while holding a token never returns it, so whenever no compiler or build script runs, IMACS resets the
   pool to full. cargo passes the pool on to build scripts, and a build script that runs Apple's `make` 3.81 (some

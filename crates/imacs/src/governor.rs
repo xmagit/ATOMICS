@@ -63,7 +63,7 @@ impl Jobserver {
     /// available, otherwise the established user-temporary location.
     pub fn path_for(home: &Path) -> PathBuf {
         if let Some(runtime) = imacs_core::paths::runtime_dir_for(home) {
-            return runtime.join("jobserver.fifo");
+            return runtime.join("jobserver/jobserver.fifo");
         }
         use std::hash::{DefaultHasher, Hash, Hasher};
         let mut hasher = DefaultHasher::new();

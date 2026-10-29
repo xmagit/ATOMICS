@@ -374,12 +374,30 @@ fn clone_cache_contents(source: &Path, destination: &Path) -> std::io::Result<()
 
 #[cfg(target_os = "linux")]
 fn clone_cache_contents(source: &Path, destination: &Path) -> std::io::Result<()> {
+    // GNU cp recreates sockets/FIFOs even with --reflink=always. Match the
+    // native macOS walker: cache warming must skip those trees entirely.
+    check_cache_types(source)?;
     let status = linux_clone_command(source, destination)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()?;
     if status.success() { Ok(()) } else { Err(std::io::Error::other("CoW clone failed")) }
+}
+
+#[cfg(target_os = "linux")]
+fn check_cache_types(path: &Path) -> std::io::Result<()> {
+    let kind = path.symlink_metadata()?.file_type();
+    if kind.is_file() || kind.is_symlink() {
+        return Ok(());
+    }
+    if !kind.is_dir() {
+        return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "cache contains a special file"));
+    }
+    for entry in std::fs::read_dir(path)? {
+        check_cache_types(&entry?.path())?;
+    }
+    Ok(())
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -599,7 +617,8 @@ pub(crate) mod tests {
         let source = dir.path().join("source");
         let destination = dir.path().join("cache");
         std::fs::create_dir(&source).unwrap();
-        std::fs::write(source.join("dependency"), "cached dependency").unwrap();
+        // A socket-only tree catches GNU cp recreating special files even on a
+        // filesystem that correctly rejects reflinks for ordinary files.
         let _socket = std::os::unix::net::UnixListener::bind(source.join("socket")).unwrap();
         assert!(!clone_directory(&source, &destination));
         assert!(!destination.exists());

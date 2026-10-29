@@ -1,5 +1,7 @@
 FROM rust:1.98.0-bookworm
 
+RUN rustup component add clippy rustfmt
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config git ca-certificates bash \
     libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev \

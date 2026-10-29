@@ -240,7 +240,7 @@ impl State {
                 if self.jobserver.is_some()
                     && let Some(runtime) = paths::runtime_dir_for(&paths::imacs_home())
                 {
-                    args.extend(["--add-dir".to_string(), runtime.to_string_lossy().into_owned()]);
+                    args.extend(["--add-dir".to_string(), runtime.join("jobserver").to_string_lossy().into_owned()]);
                 }
                 if codex == Some(true) {
                     if !args.iter().any(|arg| arg == "--no-daemon") {
@@ -924,7 +924,16 @@ fi
                 let args = std::fs::read_to_string(dir.path().join(name).join("launch-args")).unwrap();
                 let args: Vec<_> = args.lines().collect();
                 if let Some(runtime) = paths::runtime_dir_for(&paths::imacs_home()) {
-                    assert!(args.windows(2).any(|pair| pair == ["--add-dir", runtime.to_str().unwrap()]));
+                    let pool = runtime.join("jobserver");
+                    assert!(args.windows(2).any(|pair| pair == ["--add-dir", pool.to_str().unwrap()]));
+                    // The default socket is a sibling of jobserver/, even when
+                    // this test instance uses an explicit IMACS_SOCKET override.
+                    for pair in args.windows(2).filter(|pair| pair[0] == "--add-dir") {
+                        let writable = Path::new(pair[1]);
+                        assert!(!runtime.join("imacs.sock").starts_with(writable));
+                        assert!(!paths::socket_path().starts_with(writable));
+                        assert!(Jobserver::path_for(&paths::imacs_home()).starts_with(writable));
+                    }
                 } else {
                     assert!(!args.contains(&"--add-dir"));
                 }
