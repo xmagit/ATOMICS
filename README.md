@@ -136,7 +136,8 @@ The same name selects both the override file and the machine's workspaces.
 
 Configuration loads in this order: built-in defaults, `config.toml`, then the selected host file. Tables merge
 recursively by key: overriding `[resources.dotnet].processor_count` keeps other resource settings. Scalars and
-arrays replace the base value, so a host's `repos` or `agents` list replaces the whole list. The host file is optional;
+arrays replace the base value, so a host's `repos` or `agents` list replaces the whole list; only `[chief] prompt`
+adds to the main file's instead (see [docs/configuration.md](docs/configuration.md)). The host file is optional;
 an unreadable or invalid existing file is an error. Both files reload while IMACS runs, including when you create
 or remove the host file. `imacs doctor` prints the selected host and every loaded config file in order.
 
@@ -348,6 +349,13 @@ The chief pill shows a compact age and a dot when that check found something; ho
 The chief may read, plan, review and run the plan you approved without asking. It can also answer other
 agents' permission prompts through the pre-approved `imacs_approve`, including `allow_always` for the rest
 of a session. Starting agents, typing into terminals and closing sessions still ask for permission.
+
+The chief can help configure IMACS too. `imacs_config_get` shows every effective setting and the file it comes
+from, with secrets masked; `imacs_doctor` returns the doctor's checks; `imacs_config_propose` proposes a change to
+`config.toml`, this machine's `config.d/<host>.toml` or the workspace file. Each proposal waits in the IMACS window
+as a diff, with settings that run commands labeled, until you apply or reject it. Applying backs the file up
+beside itself, keeps its comments and reloads. Your own instructions for the chief go in `[chief] prompt`; each of
+those files adds its own. See [docs/configuration.md](docs/configuration.md) for scopes, merge order and the trust model.
 
 ## Orchestration: several plans you approve, agents that report back
 

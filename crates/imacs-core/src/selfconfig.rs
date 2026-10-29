@@ -1074,6 +1074,16 @@ arguments = { ticket = "{id}", apiKey = "argument-secret-333", header = "Authori
     }
 
     #[test]
+    fn documented_labels_match_the_labeled_settings() {
+        let docs = include_str!("../../../docs/configuration.md");
+        for risk in Risk::ALL {
+            let keys = risk.keys().iter().map(|key| format!("`{key}`")).collect::<Vec<_>>().join(", ");
+            let row = format!("| {} | {keys} |", risk.label());
+            assert!(docs.contains(&row), "{row} is missing from docs/configuration.md");
+        }
+    }
+
+    #[test]
     fn parse_errors_name_the_place_without_quoting_the_line() {
         let text = "a = 1\nsecret = sk-unquoted-999\n";
         let error = toml::from_str::<toml::Table>(text).unwrap_err();
