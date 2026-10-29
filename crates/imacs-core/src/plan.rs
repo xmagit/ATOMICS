@@ -29,6 +29,9 @@ pub struct Plan {
     pub ticket: Option<crate::tickets::TicketLink>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stages: Vec<crate::workflow::Stage>,
+    /// Latest lifecycle progress consumed by the completion sweep, including while closed.
+    #[serde(default)]
+    pub finished_stage_sequence: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -232,9 +235,29 @@ impl TaskStatus {
 pub const REVIEW_TASK: &str = "review";
 
 impl Plan {
+    fn stage_sequence(&self) -> u64 {
+        self.stages
+            .iter()
+            .chain(self.tasks.iter().flat_map(|task| &task.stages))
+            .map(|event| event.sequence)
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub fn reopen(&mut self) {
+        self.status = PlanStatus::Open;
+        self.finished_stage_sequence = self.stage_sequence();
+        for task in &mut self.tasks {
+            task.integration_verified = false;
+        }
+    }
+
     /// Accepted work keeps its agent until integration; final review closes on acceptance.
     pub fn finish_tasks(&mut self, now: u64, workflow: &crate::workflow::Workflow) -> bool {
         let integration = self.integration_branch();
+        let stage_sequence = self.stage_sequence();
+        let new_stage = stage_sequence != self.finished_stage_sequence;
+        self.finished_stage_sequence = stage_sequence;
         let mut changed = false;
         for task in &mut self.tasks {
             if task.status != TaskStatus::Done && task.finished_at.take().is_some() {
@@ -253,7 +276,7 @@ impl Plan {
                 changed = true;
             }
         }
-        if (changed || workflow.done != "accepted")
+        if (changed || new_stage)
             && self.is_open()
             && !self.tasks.is_empty()
             && self.tasks.iter().all(|t| t.status == TaskStatus::Done && t.finished_at.is_some())
@@ -262,7 +285,7 @@ impl Plan {
             self.status = PlanStatus::Completed;
             changed = true;
         }
-        changed
+        changed || new_stage
     }
 
     /// A plan milestone covers all its tasks; otherwise each implementation task must reach the gate.
@@ -538,6 +561,52 @@ mod tests {
     use super::*;
     #[cfg(feature = "native")]
     use crate::git;
+
+    #[test]
+    fn reopened_plan_consumes_old_gate_progress_until_a_new_stage_or_task_change() {
+        use crate::workflow::{Stage, Workflow};
+        let workflow = Workflow { done: "ci_passed".into(), ..Default::default() };
+        let mut plan = Plan {
+            id: "reopen".into(),
+            tasks: vec![Task { id: "a".into(), status: TaskStatus::Done, ..Default::default() }],
+            ..Default::default()
+        };
+        assert!(plan.finish_tasks(1, &workflow));
+        assert_eq!(plan.status, PlanStatus::Open);
+        plan.tasks[0].stages.push(Stage { stage: "ci_passed".into(), sequence: 1, ..Default::default() });
+        assert!(plan.finish_tasks(2, &workflow), "new task stage completes already finished tasks");
+        assert_eq!(plan.status, PlanStatus::Completed);
+        plan.reopen();
+        // The consumed progress persists across saving/loading an explicitly reopened plan.
+        let mut plan: Plan = serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
+        assert!(!plan.finish_tasks(3, &workflow));
+        assert!(!plan.finish_tasks(4, &workflow));
+        assert_eq!(plan.status, PlanStatus::Open);
+
+        plan.stages.push(Stage { stage: "merged".into(), sequence: 2, ..Default::default() });
+        assert!(plan.finish_tasks(5, &workflow), "a newly recorded plan stage is fresh progress");
+        assert_eq!(plan.status, PlanStatus::Completed);
+        // Events recorded while completed must also be consumed before a later reopen.
+        plan.stages.push(Stage { stage: "deployed".into(), sequence: 3, ..Default::default() });
+        assert!(plan.finish_tasks(6, &workflow));
+        plan.reopen();
+        assert!(!plan.finish_tasks(7, &workflow));
+
+        plan.tasks[0].set_status(TaskStatus::Running);
+        assert!(plan.finish_tasks(8, &workflow));
+        assert_eq!(plan.status, PlanStatus::Open);
+        plan.tasks[0].set_status(TaskStatus::Done);
+        assert!(plan.finish_tasks(9, &workflow), "new task completion can satisfy the existing gate");
+        assert_eq!(plan.status, PlanStatus::Completed);
+
+        // Older saved plans have no consumed-stage marker yet; reopening snapshots their history.
+        let mut legacy = serde_json::to_value(&plan).unwrap();
+        legacy.as_object_mut().unwrap().remove("finished_stage_sequence");
+        let mut legacy: Plan = serde_json::from_value(legacy).unwrap();
+        legacy.reopen();
+        assert!(!legacy.finish_tasks(10, &workflow));
+        assert_eq!(legacy.status, PlanStatus::Open);
+    }
 
     #[test]
     fn later_completion_gate_preserves_acceptance_and_integration_requirements() {

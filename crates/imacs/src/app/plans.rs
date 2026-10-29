@@ -147,10 +147,7 @@ impl State {
 
     pub(super) fn reopen_plan(&mut self, index: usize) -> Result<(), String> {
         let mut plan = self.plans[index].clone();
-        plan.status = PlanStatus::Open;
-        for task in &mut plan.tasks {
-            task.integration_verified = false;
-        }
+        plan.reopen();
         plan.save_in(&paths::imacs_home()).map_err(|err| format!("Reopening plan failed: {err:#}"))?;
         self.plans[index] = plan;
         self.integration_revision += 1;
@@ -221,6 +218,48 @@ impl State {
         Some(branch)
     }
 
+    /// Include pinned names even before their asynchronous worktree jobs finish.
+    pub(super) fn branch_owners(&self, branch: &str) -> Vec<(usize, Option<&str>)> {
+        let mut owners = Vec::new();
+        for (index, plan) in self.plans.iter().enumerate() {
+            if plan.integration_branch() == branch {
+                owners.push((index, None));
+            }
+            for task in &plan.tasks {
+                if task.branch.as_deref() == Some(branch) {
+                    owners.push((index, Some(task.id.as_str())));
+                }
+            }
+        }
+        owners
+    }
+
+    fn available_plan_branch(
+        &self,
+        index: usize,
+        task: Option<&str>,
+        repo: &Path,
+        preferred: &str,
+    ) -> Result<String, String> {
+        let base = self.project_config(repo).base_ref;
+        let mut branch = preferred.to_string();
+        let mut suffix = 2;
+        loop {
+            git::check_branch_name(repo, &branch, &base).map_err(|err| format!("{err:#}"))?;
+            let owners = self.branch_owners(&branch);
+            let owned = owners.as_slice() == [(index, task)];
+            let path = git::worktree_path(&self.config.worktree_path, repo, &branch);
+            let exists = git::git(repo, &["show-ref", "--verify", &format!("refs/heads/{branch}")]).is_ok()
+                || path.exists()
+                || self.creating.contains(&branch);
+            if owners.iter().all(|owner| *owner == (index, task)) && (!exists || owned) {
+                return Ok(branch);
+            }
+            branch = format!("{preferred}-{suffix}");
+            suffix += 1;
+        }
+    }
+
     /// Pin before the first branch is created; never rename work already in progress.
     pub(super) fn pin_ticket_integration(&mut self, index: usize) {
         if self.plans[index].integration.is_some() {
@@ -240,7 +279,19 @@ impl State {
         } else {
             None
         };
-        self.plans[index].integration = Some(branch.unwrap_or_else(|| self.plans[index].integration_branch()));
+        let branch = branch.unwrap_or_else(|| self.plans[index].integration_branch());
+        let branch = if let Some(repo) = repo {
+            match self.available_plan_branch(index, None, &repo, &branch) {
+                Ok(branch) => branch,
+                Err(err) => {
+                    self.toast(err);
+                    return;
+                }
+            }
+        } else {
+            branch
+        };
+        self.plans[index].integration = Some(branch);
         self.save_plan(index);
     }
 
@@ -284,6 +335,7 @@ impl State {
                 .clone()
                 .or_else(|| self.ticket_branch(index, task.ticket.as_ref(), &repo, Some(&task.id)))
                 .unwrap_or_else(|| format!("imacs/{}-{}-{}", self.plans[index].id, task.id, short_slug(&task.title)));
+            let branch = self.available_plan_branch(index, Some(&task.id), &repo, &branch)?;
             let agent = if task.agent.trim().is_empty() { "claude".to_string() } else { task.agent.clone() };
             let mut brief = task.compose_brief(&self.plans[index].goal);
             if task.id == imacs_core::plan::REVIEW_TASK {
@@ -307,16 +359,17 @@ impl State {
                 task: Some((self.plans[index].id.clone(), task.id.clone())),
             };
             let start = self.plans[index].start_branch(&task);
-            self.create_worktree(repo.clone(), branch.clone(), start, launch);
             if let Some(t) = self.plans[index].task_mut(&task.id) {
                 t.set_status(TaskStatus::Running);
-                t.branch = Some(branch);
+                t.branch = Some(branch.clone());
                 t.finished_at = None;
                 t.dispatched_at = Some(imacs_core::store::now());
                 t.session = None;
                 t.report = None;
                 t.repo.get_or_insert_with(|| repo.to_string_lossy().into_owned());
             }
+            self.save_plan(index);
+            self.create_worktree(repo.clone(), branch, start, launch);
             self.ticket_dispatched(index, &task.id);
             started.push(task.id);
         }
@@ -435,6 +488,128 @@ impl State {
 mod tests {
     use super::super::tests::{repository, request, session, with_app};
     use super::*;
+
+    #[test]
+    fn explicitly_reopened_plan_waits_for_fresh_lifecycle_progress() {
+        with_app("app::plans::tests::explicitly_reopened_plan_waits_for_fresh_lifecycle_progress", |app, _| {
+            app.runtime.config.workflow.done = "ci_passed".into();
+            app.runtime.plans = vec![Plan {
+                id: "reopen".into(),
+                tasks: vec![Task { id: "a".into(), status: TaskStatus::Done, ..Default::default() }],
+                ..Default::default()
+            }];
+            app.runtime.finish_plan_agents();
+            let event = json!({"cmd":"stage_event", "plan":"reopen", "stage":"ci_passed"});
+            assert!(request(app, event.clone()).ok);
+            assert_eq!(app.runtime.plans[0].status, PlanStatus::Completed);
+            app.runtime.reopen_plan(0).unwrap();
+            for _ in 0..2 {
+                app.runtime.finish_plan_agents();
+                assert_eq!(app.runtime.plans[0].status, PlanStatus::Open);
+            }
+            let duplicate = request(app, event);
+            assert!(duplicate.ok);
+            assert_eq!(duplicate.result["recorded"], false);
+            assert_eq!(app.runtime.plans[0].status, PlanStatus::Open);
+            assert!(request(app, json!({"cmd":"stage_event", "plan":"reopen", "stage":"merged"})).ok);
+            assert_eq!(app.runtime.plans[0].status, PlanStatus::Completed);
+        });
+    }
+
+    #[test]
+    fn colliding_ticket_branches_reserve_ownership_and_only_retry_their_own_worktree() {
+        with_app(
+            "app::plans::tests::colliding_ticket_branches_reserve_ownership_and_only_retry_their_own_worktree",
+            |app, _| {
+                use imacs_core::tickets::{McpServer, TicketConfig, TicketLink, TicketMode};
+                let (dir, repo) = repository();
+                app.runtime.config.base_ref = "main".into();
+                app.runtime.config.worktree_path = format!("{}/{{slug}}", dir.path().display());
+                app.runtime.config.tickets = TicketConfig {
+                    system: "example".into(),
+                    branch: Some("issue/{key_number}-{slug}".into()),
+                    server: McpServer { command: vec!["unused".into()], ..Default::default() },
+                    ..Default::default()
+                };
+                app.runtime.apply_ticket_config();
+                let link =
+                    |key: &str| TicketLink { id: key.into(), title: Some("Fix parser".into()), ..Default::default() };
+                app.runtime.plans = vec![Plan {
+                    id: "collisions".into(),
+                    project: Some(repo.clone()),
+                    approved: true,
+                    tasks: vec![
+                        Task { id: "eng".into(), ticket: Some(link("ENG-42")), ..Default::default() },
+                        Task { id: "ops".into(), ticket: Some(link("OPS-42")), ..Default::default() },
+                    ],
+                    ..Default::default()
+                }];
+                assert_eq!(app.runtime.dispatch(0, None).unwrap(), ["eng", "ops"]);
+                let mut trees = HashMap::new();
+                for _ in 0..2 {
+                    let (branch, result, _) = app.runtime.worktree_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    trees.insert(branch, result.unwrap().path);
+                }
+                let eng = "issue/42-fix-parser";
+                let ops = "issue/42-fix-parser-2";
+                assert_eq!(app.runtime.plans[0].tasks[0].branch.as_deref(), Some(eng));
+                assert_eq!(app.runtime.plans[0].tasks[1].branch.as_deref(), Some(ops));
+                assert_ne!(trees[eng], trees[ops]);
+                for (branch, path) in &trees {
+                    assert_eq!(git::worktree_of(path).unwrap().branch.as_ref(), Some(branch));
+                }
+
+                app.runtime.plans[0].tasks[0].set_status(TaskStatus::Planned);
+                app.runtime.config.tickets.branch = Some("changed/{key}".into());
+                app.runtime.dispatch(0, Some("eng")).unwrap();
+                let (branch, result, _) = app.runtime.worktree_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert_eq!(branch, eng);
+                assert_eq!(result.unwrap().path, trees[eng]);
+
+                // Even a caller that skips branch allocation cannot reuse another task's worktree.
+                app.runtime.create_worktree(
+                    repo.clone(),
+                    eng.into(),
+                    None,
+                    Launch {
+                        agent: "unused".into(),
+                        prompt: None,
+                        args: vec![],
+                        reply: None,
+                        task: Some(("collisions".into(), "ops".into())),
+                    },
+                );
+                let (_, result, _) = app.runtime.worktree_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(result.is_err());
+
+                // Reserve another plan's name and an unmanaged branch, including the next suffix.
+                app.runtime.config.tickets.mode = TicketMode::Ticket;
+                app.runtime.config.tickets.branch = Some("issue/{key_number}-{slug}".into());
+                app.runtime.apply_ticket_config();
+                let unmanaged = "issue/42-fix-parser-3";
+                git::ensure_branch(&repo, unmanaged, "main").unwrap();
+                app.runtime.plans.push(Plan {
+                    id: "another".into(),
+                    project: Some(repo.clone()),
+                    ticket: Some(link("OTHER-42")),
+                    ..Default::default()
+                });
+                app.runtime.pin_ticket_integration(1);
+                assert_eq!(app.runtime.plans[1].integration_branch(), "issue/42-fix-parser-4");
+                app.runtime.plans[1].approved = true;
+                app.runtime.plans[1].tasks.push(Task {
+                    id: "third".into(),
+                    ticket: Some(link("THIRD-42")),
+                    ..Default::default()
+                });
+                app.runtime.dispatch(1, None).unwrap();
+                let (branch, result, _) = app.runtime.worktree_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert_eq!(branch, "issue/42-fix-parser-5");
+                assert!(!trees.values().any(|path| *path == result.as_ref().unwrap().path));
+                assert_eq!(git::worktree_of(&result.unwrap().path).unwrap().branch, Some(branch));
+            },
+        );
+    }
 
     #[test]
     fn ticket_branches_validate_fallback_and_preserve_existing_names() {

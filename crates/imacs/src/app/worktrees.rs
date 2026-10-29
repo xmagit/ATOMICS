@@ -8,11 +8,19 @@ impl State {
         let config = self.project_config(&repo);
         let (tx, base_ref) = (self.worktree_tx.clone(), config.base_ref);
         let warm = config.worktrees.warm;
+        let owners = self.branch_owners(&branch);
+        let reuse = match owners.as_slice() {
+            [(index, Some(task))] => {
+                launch.task.as_ref().is_some_and(|(plan, id)| self.plans[*index].id == *plan && id == task)
+            }
+            [(_, None)] => launch.task.is_none(),
+            _ => false,
+        };
         self.creating.push(branch.clone());
         self.toast(format!("Creating worktree {}…", paths::display(&path)));
         std::thread::spawn(move || {
             // A retried task finds its worktree from the first attempt.
-            let existing = git::worktree_of(&path).and_then(|w| w.branch).is_some_and(|b| b == branch);
+            let existing = reuse && git::worktree_of(&path).and_then(|w| w.branch).is_some_and(|b| b == branch);
             let result = if existing {
                 Ok(PreparedWorktree { path, warmed: false })
             } else {
