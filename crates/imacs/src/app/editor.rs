@@ -47,6 +47,7 @@ impl State {
                 .into_iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect();
+        env.insert("COLORFGBG".into(), self.palette.colorfgbg().into());
         if let Some(shell_path) = SHELL_PATH.as_ref() {
             env.insert("PATH".into(), shell_path.clone());
         }
@@ -129,8 +130,8 @@ impl Desktop<'_> {
             .or_else(|| self.runtime.worktrees.iter().find(|w| w.path == root).and_then(|w| w.branch.clone()))
             .filter(|b| *b != title);
         let can_send = self.runtime.sessions.iter().any(|s| s.root() == root && s.is_agent() && s.can_receive());
-        let font = FontId::monospace(self.runtime.config.font.diff_size);
         let palette = self.runtime.palette.clone();
+        let font = palette.mono(palette.fonts.diff_size.unwrap_or(self.runtime.config.font.diff_size));
         let split = self.client.diff_split.unwrap_or(self.runtime.config.layout.diff_split);
         let state = self.client.diff_views.entry(root.clone()).or_default();
         let header = Header {
@@ -168,7 +169,7 @@ impl Desktop<'_> {
 
     fn editor_panel(&mut self, ui: &mut egui::Ui, rect: Rect, root: &Path) {
         let p = self.runtime.palette.clone();
-        ui.painter().rect_filled(rect, 0.0, p.background);
+        ui.painter().rect_filled(rect, 0.0, p.terminal);
         let header = rect.with_max_y(rect.top() + 30.0);
         let body = rect.with_min_y(header.bottom());
         ui.painter().rect_filled(header, 0.0, p.raised);

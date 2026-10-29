@@ -244,12 +244,9 @@ pub fn show(
                 action = DiffAction::Edit { path: state.viewing.clone().or(first), line: None };
             }
             let n = state.comments.len();
-            let send = egui::Button::new(egui::RichText::new(format!("Send review ({n})")).color(if n > 0 {
-                Color32::WHITE
-            } else {
-                palette.muted
-            }))
-            .fill(if n > 0 { palette.accent.gamma_multiply(0.55) } else { Color32::TRANSPARENT });
+            let (text, fill) =
+                if n > 0 { (palette.on_accent, palette.accent) } else { (palette.muted, Color32::TRANSPARENT) };
+            let send = egui::Button::new(egui::RichText::new(format!("Send review ({n})")).color(text)).fill(fill);
             if ui
                 .add_enabled(n > 0 && header.can_send, send)
                 .on_hover_text("Send every comment to the agent as one message")
@@ -445,10 +442,7 @@ pub fn show(
                     if state.focused.as_deref() == Some(file.path()) {
                         painter.rect_filled(rect.with_max_x(rect.left() + 3.0), 0.0, palette.accent);
                     }
-                    painter.line_segment(
-                        [rect.left_top(), rect.right_top()],
-                        Stroke::new(1.0, lerp(palette.panel, palette.muted, 0.3)),
-                    );
+                    painter.line_segment([rect.left_top(), rect.right_top()], Stroke::new(1.0, palette.separator));
                     let arrow = if state.collapsed.contains(file.path()) { "▸" } else { "▾" };
                     let (badge, color) = status_badge(file.status, palette);
                     painter.text(text_pos(4.0), egui::Align2::LEFT_TOP, arrow, font.clone(), palette.muted);
@@ -506,14 +500,14 @@ pub fn show(
                         egui::Align2::LEFT_TOP,
                         number(line.old_no),
                         font.clone(),
-                        palette.muted,
+                        palette.quiet,
                     );
                     painter.text(
                         text_pos(char_w * 5.5),
                         egui::Align2::LEFT_TOP,
                         number(line.new_no),
                         font.clone(),
-                        palette.muted,
+                        palette.quiet,
                     );
                     if line.kind != LineKind::Note {
                         if response.double_clicked() {
@@ -539,7 +533,7 @@ pub fn show(
                         paint_line(painter, cell, code_x, shift, char_w, line, spans(fi, hi, li), over, font, palette);
                         let n = if right { line.new_no } else { line.old_no };
                         let at = pos2(cell.left() + char_w * 0.5, rect.top() + 1.5);
-                        painter.text(at, egui::Align2::LEFT_TOP, number(n), font.clone(), palette.muted);
+                        painter.text(at, egui::Align2::LEFT_TOP, number(n), font.clone(), palette.quiet);
                     }
                     let clicked = response.interact_pointer_pos().map(|p| p.x >= mid);
                     let target = clicked
@@ -687,7 +681,7 @@ fn show_file(ui: &mut egui::Ui, state: &mut DiffState, path: &str, palette: &Pal
                 match *row {
                     Row::FileLine(i) => {
                         if response.hovered() {
-                            painter.rect_filled(rect, 0.0, Color32::from_white_alpha(8));
+                            painter.rect_filled(rect, 0.0, palette.hover());
                             painter.text(
                                 text_pos(char_w * 7.0),
                                 egui::Align2::LEFT_TOP,
@@ -1004,7 +998,7 @@ fn paint_line(
     }
     let y = cell.top() + 1.5;
     if hovered {
-        painter.rect_filled(cell, 0.0, Color32::from_white_alpha(8));
+        painter.rect_filled(cell, 0.0, palette.hover());
         painter.text(pos2(code_x - char_w * 2.0, y), egui::Align2::LEFT_TOP, "💬", font.clone(), palette.accent);
     } else {
         painter.text(pos2(code_x - char_w * 1.5, y), egui::Align2::LEFT_TOP, sign, font.clone(), palette.muted);

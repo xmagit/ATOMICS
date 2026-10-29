@@ -316,14 +316,18 @@ pub enum Scope {
     Host,
     /// The active workspace's file, which takes `[tickets]` and `[chief] prompt`.
     Workspace,
+    /// `themes/<name>.toml` beside the config: one theme, checked by [`propose_theme`].
+    Theme,
 }
 
 impl Scope {
-    pub fn source(self) -> Source {
+    /// The configuration layer the scope's file is; a theme file is none.
+    pub fn source(self) -> Option<Source> {
         match self {
-            Scope::Main => Source::Main,
-            Scope::Host => Source::Host,
-            Scope::Workspace => Source::Workspace,
+            Scope::Main => Some(Source::Main),
+            Scope::Host => Some(Source::Host),
+            Scope::Workspace => Some(Source::Workspace),
+            Scope::Theme => None,
         }
     }
 
@@ -332,6 +336,7 @@ impl Scope {
             Scope::Main => "main",
             Scope::Host => "host",
             Scope::Workspace => "workspace",
+            Scope::Theme => "theme",
         }
     }
 }
@@ -435,8 +440,9 @@ impl Proposal {
 /// in (tables key by key, other values replace). The result must parse and load as a
 /// valid configuration, the ticket config included. Nothing is written here.
 pub fn propose(scope: Scope, layers: &[Layer], fragment: &str, remove: &[String]) -> Result<Proposal, String> {
-    let layer = layers.iter().find(|layer| layer.source == scope.source()).ok_or_else(|| match scope {
+    let layer = layers.iter().find(|layer| Some(layer.source) == scope.source()).ok_or_else(|| match scope {
         Scope::Workspace => "no workspace is open: open or save one in IMACS first".to_string(),
+        Scope::Theme => "a theme change names its theme".to_string(),
         _ => format!("the {} config file is unknown", scope.name()),
     })?;
     if let Some(error) = &layer.error {
@@ -481,17 +487,57 @@ pub fn propose(scope: Scope, layers: &[Layer], fragment: &str, remove: &[String]
             let tables = layers
                 .iter()
                 .filter(|layer| matches!(layer.source, Source::Main | Source::Host))
-                .map(|layer| if layer.source == scope.source() { table.clone() } else { layer.table.clone() });
+                .map(|layer| if Some(layer.source) == scope.source() { table.clone() } else { layer.table.clone() });
             let config = load::<Config>(&Config::merged(tables), "").map_err(invalid)?;
             warnings = warnings_for(scope, layers, &config, &changes);
         }
+        Scope::Theme => unreachable!("theme changes have no config layer"),
     }
-    let diff = similar::TextDiff::from_lines(before, &after)
-        .unified_diff()
-        .context_radius(3)
-        .header(&layer.path, &layer.path)
-        .to_string();
+    let diff = unified_diff(&layer.path, before, &after);
     Ok(Proposal { scope, file: layer.path.clone(), before: layer.text.clone(), after, diff, changes, warnings })
+}
+
+/// Checks a change to the theme file `themes/<name>.toml`, shown as `file`, whose text is
+/// `before` (`None` for a new theme): `remove` takes keys out, then `fragment` merges in.
+/// The result must be a theme file with only known keys and usable values that resolves
+/// without problems; `read` reads the other theme files it may extend. Nothing is written here.
+pub fn propose_theme(
+    name: &str,
+    file: &str,
+    before: Option<&str>,
+    fragment: &str,
+    remove: &[String],
+    read: impl Fn(&str) -> Option<Result<String, String>>,
+) -> Result<Proposal, String> {
+    if !crate::theme::valid_name(name) {
+        return Err(format!("theme names use letters, digits, - and _, not \"{name}\""));
+    }
+    let old: toml::Table = toml::from_str(before.unwrap_or(""))
+        .map_err(|e| format!("{file} must be fixed by hand first: {}", parse_error(before.unwrap_or(""), &e)))?;
+    if fragment.trim().is_empty() && remove.is_empty() {
+        return Err("give the theme as TOML, keys to remove, or both".into());
+    }
+    let after = edit(before.unwrap_or(""), fragment, remove)?;
+    let table: toml::Table = toml::from_str(&after).map_err(|e| parse_error(&after, &e))?;
+    let changes = changes(&old, &table);
+    if changes.is_empty() {
+        return Err(format!("the change sets nothing new in {file}"));
+    }
+    let warnings = crate::theme::check(name, &after, read)?;
+    let diff = unified_diff(file, before.unwrap_or(""), &after);
+    Ok(Proposal {
+        scope: Scope::Theme,
+        file: file.to_string(),
+        before: before.map(str::to_string),
+        after,
+        diff,
+        changes,
+        warnings,
+    })
+}
+
+fn unified_diff(file: &str, before: &str, after: &str) -> String {
+    similar::TextDiff::from_lines(before, after).unified_diff().context_radius(3).header(file, file).to_string()
 }
 
 /// Deserializes a table, naming the key an error points at, after `prefix`. Values carry no
@@ -757,6 +803,41 @@ mod tests {
 
     fn layer(source: Source, text: &str) -> Layer {
         Layer::new(source, format!("{source:?}.toml"), Some(text.into()))
+    }
+
+    #[test]
+    fn theme_changes_are_checked_as_theme_files() {
+        let read = |name: &str| (name == "base").then(|| Ok("extends = \"midnight\"\n".to_string()));
+        let file = "~/.config/imacs/themes/dusk.toml";
+        let new = propose_theme("dusk", file, None, "extends = \"base\"\naccent = \"#e0a458\"", &[], read).unwrap();
+        assert_eq!(new.scope, Scope::Theme);
+        assert_eq!(new.after, "extends = \"base\"\naccent = \"#e0a458\"\n");
+        assert!(new.before.is_none() && new.warnings.is_empty());
+        let keys: Vec<_> = new.changes.iter().map(|c| (c.key.as_str(), c.change, c.risk)).collect();
+        assert_eq!(keys, [("accent", "added", None), ("extends", "added", None)]);
+        assert!(new.diff.contains("+accent = \"#e0a458\""), "{}", new.diff);
+
+        let before = "extends = \"base\"\n# Warm dusk\naccent = \"#e0a458\" # amber\nraised = \"#2a2620\"\n";
+        let changed =
+            propose_theme("dusk", file, Some(before), "accent = \"#d08c3a\"", &["raised".into()], read).unwrap();
+        assert_eq!(changed.after, "extends = \"base\"\n# Warm dusk\naccent = \"#d08c3a\" # amber\n", "comments stay");
+        let shadow = propose_theme("claude", file, None, "extends = \"claude\"\naccent = \"#e0a458\"", &[], read);
+        assert_eq!(shadow.unwrap().warnings, ["themes/claude.toml replaces the built-in claude theme"]);
+        for (name, before, fragment, problem) in [
+            ("dusk", None, "acent = \"#e0a458\"", "unknown key acent"),
+            ("dusk", None, "accent = \"amber\"", "is not a #rrggbb color"),
+            ("dusk", None, "extends = \"nope\"", "unknown theme"),
+            ("dusk", None, "mode = \"sepia\"", "themes/dusk.toml"),
+            ("dusk", Some(before), "accent = \"#e0a458\"", "nothing new"),
+            ("dusk", Some("accent = "), "accent = \"#e0a458\"", "fixed by hand"),
+            ("dusk", None, "", "give the theme"),
+            ("../dusk", None, "accent = \"#e0a458\"", "theme names use"),
+        ] {
+            let error = propose_theme(name, file, before, fragment, &[], read).unwrap_err();
+            assert!(error.contains(problem), "{fragment}: {error}");
+        }
+        let error = propose(Scope::Theme, &[], "accent = \"#e0a458\"", &[]).unwrap_err();
+        assert!(error.contains("names its theme"), "{error}");
     }
 
     #[test]

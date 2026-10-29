@@ -1,0 +1,39 @@
+# Near-black with Claude Code's orange and its diff colors.
+mode = "dark"
+
+background = "#0b0b0c"
+panel = "#111113"
+raised = "#18181b"
+sidebar = "#111113"
+topbar = "#111113"
+terminal = "#0b0b0c"
+overlay = "#18181b"
+
+foreground = "#e8e4dc"
+muted = "#8c8781"
+quiet = "#64605b"
+
+border = "#26262a"
+separator = "#26262a"
+
+accent = "#d77757"
+on_accent = "#0b0b0c"
+selection = "#4a2c22"
+cursor = "#d77757"
+
+success = "#4eba65"
+warning = "#ffc107"
+error = "#ff6b80"
+info = "#b1b9f9"
+
+added = "#0f2e18"
+removed = "#3a1219"
+added_emphasis = "#225c2b"
+removed_emphasis = "#7a2936"
+
+ansi = [
+    "#1c1c1f", "#ff6b80", "#4eba65", "#ffc107", "#b1b9f9", "#d77757", "#48968c", "#d9d5cc",
+    "#5a5753", "#ff8c9c", "#6fd486", "#ffd54f", "#cdd2ff", "#eb9a7e", "#6cb8ad", "#f5f2ea",
+]
+syntax = "Monokai Extended"
+mono_ui = true

@@ -1,0 +1,45 @@
+# atomisk.ai: void and surface, paper text, and the signal green.
+# Tokens named in the site's stylesheet keep its values; lines are its --line,
+# rgba(230,237,244,.14), laid over void (separators use its .11 frame line).
+mode = "dark"
+
+background = "#08090a"   # --void
+panel = "#101113"        # --surface
+raised = "#16181a"
+sidebar = "#101113"
+topbar = "#08090a"
+terminal = "#08090a"
+overlay = "#101418"      # the site's dialogs
+
+foreground = "#f1f2f3"   # --paper
+muted = "#95989e"        # --muted
+quiet = "#72777e"        # --quiet
+
+border = "#27292b"       # --line over void
+separator = "#202224"
+
+accent = "#c5decf"       # --signal
+on_accent = "#08090a"
+selection = "#2e3431"    # signal at 20% over void
+cursor = "#c5decf"
+
+success = "#9fd6ae"
+warning = "#e4d1a8"      # sand
+error = "#e9a6a1"
+info = "#adc8dc"         # pale blue
+
+added = "#12251b"
+removed = "#2a1719"
+added_emphasis = "#1e4630"
+removed_emphasis = "#55292d"
+
+ansi = [
+    "#16181a", "#e9a6a1", "#9fd6ae", "#e4d1a8", "#adc8dc", "#c9b5dc", "#a6d4d2", "#c9ccd0",
+    "#72777e", "#f2bfbb", "#c5decf", "#efdfbe", "#d2e3f0", "#dccbea", "#c2e6e3", "#f1f2f3",
+]
+syntax = "Nord"
+mono_ui = false
+
+# Inter and IBM Plex Mono (both OFL) when installed; otherwise egui's fonts.
+ui_font = "Inter"
+mono_font = "IBM Plex Mono"

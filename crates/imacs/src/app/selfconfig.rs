@@ -22,6 +22,17 @@ pub(super) struct Pending {
     reason: Option<String>,
     /// Who proposed it, as far as IMACS can tell. The user judges the diff, not the name.
     from: String,
+    /// A theme change's theme, drawn above its diff.
+    preview: Option<Arc<Palette>>,
+}
+
+/// What `imacs_config_propose` asks to change.
+pub(super) struct ProposedChange<'a> {
+    pub(super) scope: Scope,
+    pub(super) toml: &'a str,
+    pub(super) remove: &'a [String],
+    /// With scope theme: the theme's name.
+    pub(super) theme: Option<&'a str>,
 }
 
 /// A repository's own settings file. Repositories carry no IMACS settings yet; this is
@@ -108,22 +119,42 @@ impl State {
                 "sections": sections,
                 "composed": "The built-in prompt (or chief.system_prompt), then the ticket workflow, then each [chief] prompt section: main, host, workspace. Read when the chief starts.",
             },
+            "themes": self.themes_json(),
             "secrets": "Values of secret-looking names, credential flags and URL credentials read as ***. Ticket and voice keys stay in the environment variables token_env and api_key_env name.",
         }))
     }
 }
 
 impl State {
+    /// The theme on screen, the themes there are, and the tokens a theme file takes.
+    fn themes_json(&self) -> serde_json::Value {
+        let dir = imacs_core::theme::themes_dir(&self.config_path);
+        let mut files: Vec<String> = std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok()?.path().file_name()?.to_str()?.strip_suffix(".toml").map(str::to_string))
+            .filter(|name| imacs_core::theme::valid_name(name))
+            .collect();
+        files.sort();
+        json!({
+            "selected": self.config.theme.name,
+            "built_in": imacs_core::theme::builtin_names().collect::<Vec<_>>(),
+            "folder": paths::display(&dir),
+            "files": files,
+            "tokens": imacs_core::theme::token_keys().collect::<Vec<_>>(),
+            "how": "A theme file sets any tokens (colors are #rrggbb) and inherits the rest with extends = \"<theme>\". Propose one with scope theme; select it with [theme] name in main or host.",
+        })
+    }
+
     /// `imacs_config_propose`: checks a change and holds it for the user. Nothing is written
     /// here; the user applies or rejects it in the window, and the outcome becomes a `config` event.
     pub(super) fn propose_config(
         &mut self,
-        scope: Scope,
-        toml: &str,
-        remove: &[String],
+        change: ProposedChange<'_>,
         reason: Option<String>,
         pane: Option<&str>,
     ) -> Result<serde_json::Value, String> {
+        let ProposedChange { scope, toml, remove, theme } = change;
         if self.proposals.len() >= MAX_PROPOSALS {
             return Err(format!(
                 "{} config changes already wait for the user; wait for their config events first",
@@ -132,16 +163,28 @@ impl State {
         }
         let layers = self.config_layers(None);
         let cleaner = self.config_cleaner(&layers);
-        let file = match scope {
-            Scope::Main => self.config_path.clone(),
-            Scope::Host => Config::source_paths(&self.config_path)[1].clone(),
-            Scope::Workspace => match self.workspace.as_deref().map(Workspace::file) {
-                Some(file) => file.map_err(|err| format!("{err:#}"))?,
-                // `propose` explains that no workspace is open.
-                None => PathBuf::new(),
-            },
+        let mut preview = None;
+        let (file, mut proposal) = match scope {
+            Scope::Theme => {
+                let name = theme.map(str::trim).filter(|name| !name.is_empty());
+                let name = name.ok_or("a theme change names its theme: give theme, such as \"dusk\"")?;
+                let (file, proposal, palette) = self.propose_theme(name, toml, remove)?;
+                preview = Some(Arc::new(palette));
+                (file, proposal)
+            }
+            _ => {
+                let file = match scope {
+                    Scope::Host => Config::source_paths(&self.config_path)[1].clone(),
+                    Scope::Workspace => match self.workspace.as_deref().map(Workspace::file) {
+                        Some(file) => file.map_err(|err| format!("{err:#}"))?,
+                        // `propose` explains that no workspace is open.
+                        None => PathBuf::new(),
+                    },
+                    _ => self.config_path.clone(),
+                };
+                (file, selfconfig::propose(scope, &layers, toml, remove).map_err(|error| cleaner.text(&error))?)
+            }
         };
-        let mut proposal = selfconfig::propose(scope, &layers, toml, remove).map_err(|error| cleaner.text(&error))?;
         if scope == Scope::Workspace && file.parent() != Some(workspace::workspaces_dir().as_path()) {
             proposal.warnings.push(format!("{} is a flat workspace file that every host shares", proposal.file));
         }
@@ -161,8 +204,37 @@ impl State {
             "next": "Nothing is written until the user applies the change in IMACS. Its outcome (applied, rejected or failed) arrives as a config event in imacs_wait.",
         }));
         self.toast(format!("Config change proposed for {}: review it", proposal.file));
-        self.proposals.push(Pending { id, file, proposal, reason: reason.filter(|r| !r.trim().is_empty()), from });
+        let reason = reason.filter(|r| !r.trim().is_empty());
+        self.proposals.push(Pending { id, file, proposal, reason, from, preview });
         Ok(reply)
+    }
+
+    /// A theme change: checked as a theme file, resolved through the other theme files, and
+    /// drawn for the user. Its syntax theme must exist too, which only the app can tell.
+    fn propose_theme(&self, name: &str, toml: &str, remove: &[String]) -> Result<(PathBuf, Proposal, Palette), String> {
+        let dir = imacs_core::theme::themes_dir(&self.config_path);
+        // Checked before the name becomes a path.
+        if !imacs_core::theme::valid_name(name) {
+            return Err(format!("theme names use letters, digits, - and _, not \"{name}\""));
+        }
+        let file = dir.join(format!("{name}.toml"));
+        let before = imacs_core::theme::read_file(&dir, name)
+            .transpose()
+            .map_err(|err| format!("reading {}: {err}", paths::display(&file)))?;
+        let read = |other: &str| imacs_core::theme::read_file(&dir, other);
+        let mut proposal =
+            selfconfig::propose_theme(name, &paths::display(&file), before.as_deref(), toml, remove, read)?;
+        let (palette, problems) = Palette::preview(name, &proposal.after, &dir);
+        if !problems.is_empty() {
+            return Err(problems.join("; "));
+        }
+        let selected = self.config.theme.name.trim();
+        if selected != name {
+            proposal.warnings.push(format!(
+                "IMACS shows the {selected} theme; showing this one is a separate main or host change: [theme] name = \"{name}\""
+            ));
+        }
+        Ok((file, proposal, palette))
     }
 
     /// Writes a proposal the user applied, after a backup, and reloads the config.
@@ -183,6 +255,7 @@ impl State {
                     "outcome": "applied",
                     "backup": backup.map(|backup| paths::display(&backup)),
                     "load_error": self.config_error.is_some().then_some("the config no longer loads; IMACS keeps the last good one"),
+                    "theme_problems": (proposal.scope == Scope::Theme).then(|| self.theme_error.clone()).flatten(),
                     "chief": chief.then_some("the chief's prompt and launch settings take effect when the chief starts again"),
                 })
             }
@@ -282,13 +355,20 @@ impl Desktop<'_> {
                     for warning in &proposal.warnings {
                         ui.label(RichText::new(warning).color(p.warning).size(12.0));
                     }
+                    if let Some(preview) = &pending.preview {
+                        ui.add_space(4.0);
+                        ui.label(RichText::new("Preview").color(p.muted).size(12.0));
+                        preview.show_preview(ui);
+                        if preview.fonts != p.fonts {
+                            ui.label(RichText::new("Its fonts and sizes show once applied.").color(p.quiet).size(11.5));
+                        }
+                    }
                     ui.add_space(4.0);
                 });
                 egui::Panel::bottom("config-proposal-actions").frame(egui::Frame::new()).show(ui, |ui| {
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
-                        let apply = egui::Button::new(RichText::new("Apply").color(Color32::WHITE))
-                            .fill(p.accent.gamma_multiply(0.6));
+                        let apply = egui::Button::new(RichText::new("Apply").color(p.on_accent)).fill(p.accent);
                         if ui
                             .add_enabled(ready, apply)
                             .on_hover_text("Back up the file, write the change and reload")
@@ -612,6 +692,102 @@ mod tests {
                 assert_eq!(app.runtime.proposals[0].from, "a client of the IMACS socket");
             },
         );
+    }
+
+    #[test]
+    fn agents_propose_themes_that_the_user_previews_then_applies() {
+        with_app("app::selfconfig::tests::agents_propose_themes_that_the_user_previews_then_applies", |app, ctx| {
+            let main = app.runtime.config_path.clone();
+            std::fs::write(&main, "[theme]\nname = \"dusk\"\n").unwrap();
+            app.runtime.reload_config();
+            assert_eq!(app.runtime.theme_error.as_deref(), Some("unknown theme \"dusk\""));
+            let amber = crate::theme::parse_hex("#e0a458").unwrap();
+            let themes = imacs_core::theme::themes_dir(&main);
+            let dusk = themes.join("dusk.toml");
+
+            for (change, problem) in [
+                (json!({"toml":"accent = '#e0a458'"}), "names its theme"),
+                (json!({"theme":"../dusk", "toml":"accent = '#e0a458'"}), "theme names use"),
+                (json!({"theme":"dusk", "toml":"acent = '#e0a458'"}), "unknown key acent"),
+                (json!({"theme":"dusk", "toml":"syntax = 'Sepia Nights'"}), "unknown syntax theme"),
+                (json!({"theme":"dusk", "toml":"extends = 'nope'"}), "unknown theme"),
+            ] {
+                let mut request_json = json!({"cmd":"config_propose", "scope":"theme"});
+                request_json.as_object_mut().unwrap().extend(change.as_object().unwrap().clone());
+                let refused = request(app, request_json);
+                assert!(refused.error.as_deref().unwrap_or_default().contains(problem), "{:?}", refused.error);
+            }
+            assert!(app.runtime.proposals.is_empty());
+
+            let events = wait_for_config(app, ctx);
+            let proposed = request(
+                app,
+                json!({"cmd":"config_propose", "scope":"theme", "theme":"dusk", "reason":"A warm theme for evenings",
+                       "toml":"extends = 'midnight'\naccent = '#e0a458'\non_accent = '#16181d'"}),
+            );
+            assert!(proposed.ok, "{:?}", proposed.error);
+            assert_eq!(proposed.result["scope"], "theme");
+            assert_eq!(proposed.result["file"], paths::display(&dusk));
+            assert!(proposed.result["warnings"].as_array().unwrap().is_empty(), "dusk is the selected theme");
+            assert!(!dusk.exists(), "nothing is written before the user applies it");
+            assert_eq!(app.runtime.proposals[0].preview.as_ref().unwrap().accent, amber);
+
+            // The dialog draws the proposed theme above the diff, in its own colors, once it
+            // has been measured and faded in.
+            render(app, ctx, vec![]);
+            render(app, ctx, vec![]);
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1600.0, 1000.0))),
+                    time: Some(ctx.input(|i| i.time) + 0.1),
+                    ..Default::default()
+                },
+                |ui| app.dialogs(ui.ctx()),
+            );
+            app.runtime.drain_actions();
+            let texts: Vec<String> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text.galley.text().to_string()),
+                    _ => None,
+                })
+                .collect();
+            let amber_fill =
+                output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Rect(r) if r.fill == amber));
+            output.drop_without_applying_deltas();
+            assert!(texts.iter().any(|t| t == "Preview"), "{texts:?}");
+            assert!(texts.iter().any(|t| t.starts_with("+accent = '#e0a458'")), "{texts:?}");
+            assert!(amber_fill, "the preview paints the proposed accent");
+            assert_ne!(app.runtime.palette.accent, amber, "the theme itself waits for Apply");
+
+            app.client.config_seen.as_mut().unwrap().1 -= APPLY_DELAY;
+            click(app, ctx, "Apply");
+            let applied = event(&events);
+            assert_eq!((applied["outcome"].as_str(), applied["scope"].as_str()), (Some("applied"), Some("theme")));
+            assert!(applied["theme_problems"].is_null(), "{applied}");
+            assert_eq!(
+                std::fs::read_to_string(&dusk).unwrap(),
+                "extends = 'midnight'\naccent = '#e0a458'\non_accent = '#16181d'\n"
+            );
+            assert_eq!(app.runtime.palette.accent, amber, "an applied theme shows at once");
+            assert!(app.runtime.theme_error.is_none(), "{:?}", app.runtime.theme_error);
+
+            // Another theme is written but not shown; selecting it is a config change.
+            let other = request(
+                app,
+                json!({"cmd":"config_propose", "scope":"theme", "theme":"dawn", "toml":"mode = 'light'\naccent = '#2a6fdb'"}),
+            );
+            let warnings = other.result["warnings"].as_array().unwrap();
+            assert!(warnings[0].as_str().unwrap().contains("[theme] name = \"dawn\""), "{warnings:?}");
+            assert_eq!(app.runtime.proposals[0].preview.as_ref().unwrap().mode, imacs_core::theme::ThemeMode::Light);
+
+            let themes_info = request(app, json!({"cmd":"config_get"})).result["themes"].clone();
+            assert_eq!(themes_info["selected"], "dusk");
+            assert_eq!(themes_info["files"], json!(["dusk"]));
+            assert!(themes_info["built_in"].as_array().unwrap().contains(&json!("atomisk")));
+            assert!(themes_info["tokens"].as_array().unwrap().contains(&json!("on_accent")));
+        });
     }
 
     #[test]

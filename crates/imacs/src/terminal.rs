@@ -221,7 +221,7 @@ impl TerminalView {
         focused: bool,
     ) {
         let painter = ui.painter_at(outer);
-        painter.rect_filled(outer, 0.0, palette.background);
+        painter.rect_filled(outer, 0.0, palette.terminal);
 
         let term = terminal.term.lock();
         self.sync_selection(terminal);
@@ -257,7 +257,7 @@ impl TerminalView {
                 bg = palette.selection;
             }
             let width = if c.flags.contains(Flags::WIDE_CHAR) { 2.0 } else { 1.0 };
-            if bg != palette.background {
+            if bg != palette.terminal {
                 painter.rect_filled(Rect::from_min_size(at(row, col), vec2(cell.x * width, cell.y)), 0.0, bg);
             }
             if c.flags.intersects(Flags::ALL_UNDERLINES) {
@@ -429,7 +429,7 @@ impl Palette {
     fn named(&self, name: NamedColor) -> Color32 {
         match name {
             NamedColor::Foreground | NamedColor::BrightForeground => self.foreground,
-            NamedColor::Background => self.background,
+            NamedColor::Background => self.terminal,
             NamedColor::Cursor => self.cursor,
             NamedColor::DimForeground => self.dim(self.foreground),
             other => {
@@ -452,12 +452,23 @@ impl Palette {
     fn indexed_rgb(&self, index: usize) -> Rgb {
         let color = match index {
             256 => self.foreground,
-            257 => self.background,
+            257 => self.terminal,
             258 => self.cursor,
             i => self.indexed(i),
         };
         Rgb { r: color.r(), g: color.g(), b: color.b() }
     }
+}
+
+/// A shell that prints `ready`, then for every key it reads sends `query` and shows the
+/// `reply_len`-byte answer on screen, with `^` for ESC and `!` for BEL.
+#[cfg(test)]
+pub(crate) fn color_query_args(query: &str, reply_len: usize) -> Vec<String> {
+    let script = format!(
+        "stty raw -echo; printf 'ready\\r\\n'; while dd bs=1 count=1 >/dev/null 2>&1; do printf '{query}'; \
+         r=$(dd bs=1 count={reply_len} 2>/dev/null); printf '%s\\r\\n' \"$r\" | tr '\\033\\007' '^!'; done"
+    );
+    vec!["-c".into(), script]
 }
 
 #[cfg(test)]
@@ -550,6 +561,45 @@ mod tests {
         view.resize(&terminal, Rect::from_min_size(Pos2::ZERO, vec2(64.0, 48.0)), &metrics);
         assert_eq!(copy_selection(&terminal, &mut view), None);
         assert!(view.selection.is_none());
+    }
+
+    #[test]
+    fn color_queries_answer_the_theme_and_follow_theme_changes() {
+        let paper =
+            Palette::from_config(&imacs_core::config::ThemeConfig { name: "paper".into(), ..Default::default() });
+        let claude = Palette::from_config(&imacs_core::config::ThemeConfig::default());
+        let answer = |color: Color32| {
+            let channel = |v: u8| format!("{v:02x}{v:02x}");
+            format!("rgb:{}/{}/{}!", channel(color.r()), channel(color.g()), channel(color.b()))
+        };
+        let dir = tempfile::tempdir().unwrap();
+        // OSC 10 foreground, 11 background, 4;1 red, 12 cursor; each answer has a fixed length.
+        for (query, length, light, dark) in [
+            ("\\033]10;?\\007", 24, paper.foreground, claude.foreground),
+            ("\\033]11;?\\007", 24, paper.terminal, claude.terminal),
+            ("\\033]4;1;?\\007", 25, paper.ansi[1], claude.ansi[1]),
+            ("\\033]12;?\\007", 24, paper.cursor, claude.cursor),
+        ] {
+            let terminal = Terminal::spawn(
+                crate::host::Wake::default(),
+                paper.terminal_colors(),
+                "/bin/sh".into(),
+                color_query_args(query, length),
+                dir.path(),
+                HashMap::new(),
+                100,
+            )
+            .unwrap();
+            wait_for_text(&terminal, "ready");
+            terminal.write(b"x".to_vec());
+            wait_for_text(&terminal, &answer(light));
+            terminal.set_colors(claude.terminal_colors());
+            terminal.write(b"x".to_vec());
+            wait_for_text(&terminal, &answer(dark));
+            terminal.shutdown();
+        }
+        assert_eq!(paper.colorfgbg(), "0;15");
+        assert_eq!(claude.colorfgbg(), "15;0");
     }
 
     #[test]

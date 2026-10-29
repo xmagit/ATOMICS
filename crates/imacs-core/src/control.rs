@@ -266,6 +266,9 @@ pub enum ControlRequest {
         /// Dotted keys taken out of the file first.
         #[serde(default)]
         remove: Vec<String>,
+        /// With scope `theme`: the theme's name; the file is `themes/<theme>.toml`.
+        #[serde(default)]
+        theme: Option<String>,
         /// Why, shown to the user with the diff.
         #[serde(default)]
         reason: Option<String>,

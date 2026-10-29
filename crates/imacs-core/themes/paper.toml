@@ -1,0 +1,40 @@
+# Light: warm paper with a deeper Claude orange that reads on white.
+mode = "light"
+
+background = "#f7f6f3"
+panel = "#efede8"
+raised = "#ffffff"
+sidebar = "#efede8"
+topbar = "#efede8"
+terminal = "#fbfaf8"
+overlay = "#ffffff"
+
+foreground = "#1f1e1b"
+muted = "#6b675f"
+quiet = "#8f8a80"
+
+border = "#d6d2c9"
+separator = "#e2ded6"
+
+accent = "#c4562f"
+on_accent = "#ffffff"
+selection = "#f6d8c9"
+cursor = "#c4562f"
+
+success = "#2e7d43"
+warning = "#a36200"
+error = "#c23a4b"
+info = "#4656c8"
+
+added = "#e1f2e3"
+removed = "#f8e1e3"
+added_emphasis = "#b4dfbd"
+removed_emphasis = "#f0b5bd"
+
+# White and bright white stay readable on the light terminal.
+ansi = [
+    "#1f1e1b", "#c23a4b", "#2e7d43", "#a36200", "#3d5bc6", "#9a3f9f", "#1d7a80", "#8a857c",
+    "#5f5b54", "#d94b5e", "#3a9654", "#c07a08", "#5873e0", "#b555bb", "#2a959c", "#b9b4aa",
+]
+syntax = "OneHalfLight"
+mono_ui = false

@@ -159,8 +159,7 @@ impl Desktop<'_> {
                         return;
                     }
                     if !self.runtime.plans[self.runtime.selected_plan].approved {
-                        let button = egui::Button::new(RichText::new("Approve plan").color(Color32::WHITE))
-                            .fill(p.accent.gamma_multiply(0.7));
+                        let button = egui::Button::new(RichText::new("Approve plan").color(p.on_accent)).fill(p.accent);
                         approve = ui.add(button).on_hover_text("Let the orchestrator dispatch these tasks").clicked();
                     } else {
                         dispatch_all = ui

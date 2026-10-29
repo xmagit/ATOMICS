@@ -283,3 +283,42 @@ fn completed_and_archived_boards_are_read_only_even_with_ready_tasks() {
         },
     );
 }
+
+#[test]
+fn approve_plan_fills_with_the_accent_and_writes_on_accent() {
+    super::tests::with_app("app::board_tests::approve_plan_fills_with_the_accent_and_writes_on_accent", |app, ctx| {
+        populate(app);
+        app.runtime.plans[0].approved = false;
+        let p = app.runtime.palette.clone();
+        assert_ne!(p.on_accent, p.foreground, "the check needs on_accent to differ from ordinary text");
+        for time in 0..2 {
+            frame(app, ctx, 1600.0, time as f64, vec![]);
+        }
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1600.0, 1000.0))),
+                time: Some(2.0),
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| app.plan_panel(ui, ui.max_rect()));
+            },
+        );
+        app.runtime.drain_actions();
+        let label = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) if text.galley.text() == "Approve plan" => Some(text.clone()),
+                _ => None,
+            })
+            .expect("an unapproved plan shows Approve plan");
+        assert!(label.galley.job.sections.iter().all(|section| section.format.color == p.on_accent));
+        let filled = output.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::epaint::Shape::Rect(rect)
+                if rect.fill == p.accent && rect.rect.contains(label.visual_bounding_rect().center()))
+        });
+        assert!(filled, "the button behind the label is filled with the accent");
+        output.drop_without_applying_deltas();
+    });
+}

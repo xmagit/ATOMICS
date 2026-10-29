@@ -261,7 +261,7 @@ impl Desktop<'_> {
             .pivot(egui::Align2::CENTER_CENTER)
             .frame(
                 egui::Frame::window(&ctx.global_style())
-                    .fill(p.background)
+                    .fill(p.terminal)
                     .stroke(Stroke::new(1.5, p.accent.gamma_multiply(0.8))),
             )
             .show(ctx, |ui| self.chief_content(ui));

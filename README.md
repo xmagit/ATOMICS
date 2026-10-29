@@ -88,7 +88,8 @@ portal and external files open through `xdg-open` (`xdg-utils`).
 
 The config is created on first start at `${XDG_CONFIG_HOME:-~/.config}/imacs/config.toml`. It is commented and reloads while IMACS runs: agents
 and their commands, `base_ref`, layout breakpoints, fonts, colors, terminal scrollback, shortcuts, and the texts used for
-steering.
+steering. Themes (built-in `claude`, `midnight`, `atomisk` and the light `paper`, or your own theme files) are described
+in [docs/themes.md](docs/themes.md).
 
 On Linux, a private, user-owned `XDG_RUNTIME_DIR` holds each new install's socket and the compiler jobserver FIFO,
 in an `imacs/<instance hash>` subdirectory, with the FIFO isolated inside `jobserver/`. Without it, the socket stays beside the state and the FIFO uses the user's

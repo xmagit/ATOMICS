@@ -1,0 +1,39 @@
+# The original blue-gray look.
+mode = "dark"
+
+background = "#16181d"
+panel = "#1d2026"
+raised = "#23262d"
+sidebar = "#1d2026"
+topbar = "#1d2026"
+terminal = "#16181d"
+overlay = "#23262d"
+
+foreground = "#d4d7dd"
+muted = "#7d8490"
+quiet = "#5c6370"
+
+border = "#2c3038"
+separator = "#2c3038"
+
+accent = "#7aa2f7"
+on_accent = "#16181d"
+selection = "#344a6e"
+cursor = "#e6e9ef"
+
+success = "#98c379"
+warning = "#e5c07b"
+error = "#e06c75"
+info = "#61afef"
+
+added = "#1f3a2a"
+removed = "#3f2228"
+added_emphasis = "#2f6a45"
+removed_emphasis = "#7a2f3a"
+
+ansi = [
+    "#1d2026", "#e06c75", "#98c379", "#e5c07b", "#61afef", "#c678dd", "#56b6c2", "#abb2bf",
+    "#5c6370", "#f07c85", "#a8d389", "#f5d08b", "#71bfff", "#d688ed", "#66c6d2", "#e6e9ef",
+]
+syntax = "OneHalfDark"
+mono_ui = false

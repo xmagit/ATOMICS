@@ -175,6 +175,9 @@ impl Desktop<'_> {
         if let Some(err) = &self.runtime.config_error {
             notices.push(format!("config error: {err}"));
         }
+        if let Some(err) = &self.runtime.theme_error {
+            notices.push(format!("theme: {err}"));
+        }
         if let Some(err) = &self.runtime.hook_error {
             notices.push(format!("hooks offline: {err}"));
         }

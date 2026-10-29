@@ -14,14 +14,16 @@ a diff until you apply or reject it.
 | `host` | `config.d/<host>.toml` beside it | this machine | every setting |
 | `workspace` | `workspaces/<host>/<name>.toml`, or a flat `workspaces/<name>.toml` shared by every host | the open workspace | `projects`, `[tickets]` and `[chief] prompt` |
 | `repo` | none yet | one repository | reserved: repositories carry no IMACS settings yet |
+| `theme` | `themes/<name>.toml` beside `config.toml` | whatever selects the theme | theme tokens; see [themes](themes.md) |
 
 `IMACS_CONFIG` moves the main file; `config.d/` and `workspaces/` move with it. `IMACS_HOST` overrides the
 machine name. See [Using IMACS on several machines](../README.md#using-imacs-on-several-machines) for host
 names and portable paths.
 
-The scope of a proposed change is `main`, `host` or `workspace`. Use `host` for anything that is true of one
+The scope of a proposed change is `main`, `host`, `workspace` or `theme`. Use `host` for anything that is true of one
 machine only: its core count, its programs' paths, its repositories. A workspace change may touch `[tickets]` and
-`[chief] prompt`; open and close its projects in IMACS instead.
+`[chief] prompt`; open and close its projects in IMACS instead. A theme change writes one theme file; showing
+that theme is a separate `main` or `host` change to `[theme] name`.
 
 ## Merge order
 
@@ -87,7 +89,8 @@ Proposes a change to one file:
 
 | Argument | Meaning |
 | --- | --- |
-| `scope` | `main`, `host` or `workspace`. |
+| `scope` | `main`, `host`, `workspace` or `theme`. |
+| `theme` | With scope `theme`: the theme's name, new or existing (letters, digits, `-` and `_`). |
 | `remove` | Dotted keys to take out of the file first, such as `layout.sidebar_width`. Removing a table removes all of it. |
 | `toml` | The change. Tables merge into the file key by key; arrays and other values replace. |
 | `reason` | One sentence, shown to you above the diff. |
@@ -99,10 +102,14 @@ IMACS checks the change before you see it, and refuses it with the reason when:
 - the result would not load. The error names the key, for example
   `layout.sidebar_width: invalid type: string "wide", expected f32`. A change to `config.toml` must load on its
   own too, since other machines share it without this host's overrides;
-- a workspace change touches anything but `[tickets]` and `[chief] prompt`, or its `[tickets]` would not load.
+- a workspace change touches anything but `[tickets]` and `[chief] prompt`, or its `[tickets]` would not load;
+- a theme change names no theme or an unusable name, sets a key themes do not have or a value that is not
+  usable (such as a color that is not `#rrggbb` or an unknown syntax theme), or extends a theme that does not
+  exist or extends itself in a cycle.
 
 It also warns, without refusing, about keys IMACS does not know, about a main-file setting this host's file
-overrides, and about a `[tickets]` change the open workspace's section replaces.
+overrides, about a `[tickets]` change the open workspace's section replaces, about a theme file that replaces a
+built-in theme, and about a theme that is not the one on screen.
 
 The tool returns a proposal id, the changed keys and the warnings, never the diff: its context lines may hold
 secrets. At most five proposals wait at once.
@@ -124,6 +131,10 @@ diff:
 | runs commands | `agents`, `approvals`, `chief.command`, `chief.args`, `editor`, `tickets.server.command`, `tickets.server.env`, `tickets.server.url` |
 | sends credentials | `tickets.server.token_env`, `voice.provider`, `voice.base_url`, `voice.api_key_env`, `voice.api_key` |
 | instructs agents | `chief.prompt`, `chief.system_prompt`, `steer`, `tickets.workflow` |
+
+A theme change also shows the theme itself above the diff: bars, agent rows, a terminal with its ANSI colors, a
+diff, the status colors and an accent button, drawn in the proposed colors through whatever it extends. Its
+fonts and sizes show once applied.
 
 **Apply** is enabled a moment after the proposal appears, so a click meant for something else cannot apply it.
 **Reject** discards it. An optional note goes back to the chief with either.
