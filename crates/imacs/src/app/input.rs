@@ -291,6 +291,7 @@ impl Desktop<'_> {
                                 args: Vec::new(),
                                 reply: None,
                                 task: None,
+                                isolation: None,
                             };
                             create = Some((repo, branch, launch));
                             keep = false;

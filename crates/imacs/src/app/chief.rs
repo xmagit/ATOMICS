@@ -5,7 +5,7 @@ impl State {
     pub(super) fn start_chief(&mut self, ctx: &egui::Context, prompt: Option<String>) -> Result<String, String> {
         let cwd = self.view.clone().or_else(|| self.repos.first().cloned()).unwrap_or_else(|| self.launch_dir.clone());
         let args = self.config.chief.args.clone();
-        self.start_as(ctx, "chief", cwd, None, args, prompt, true)
+        self.start_as(ctx, "chief", cwd, None, args, prompt, Role::Chief)
     }
 
     pub(super) fn chief_dock(&self) -> ChiefDock {

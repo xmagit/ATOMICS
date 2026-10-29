@@ -190,6 +190,12 @@ pub fn source_of(layers: &[Layer], path: &[String]) -> Source {
             return Source::Default;
         }
     }
+    // A workspace's [isolation] merges key by key over the main and host files'.
+    if path.first().is_some_and(|name| name == "isolation")
+        && layers.iter().rev().any(|layer| layer.source == Source::Workspace && defines(&layer.table, path))
+    {
+        return Source::Workspace;
+    }
     if let Some(section) = path.first().filter(|name| matches!(name.as_str(), "tickets" | "workflow"))
         && let Some(workspace) =
             layers.iter().rev().find(|layer| layer.source == Source::Workspace && layer.table.contains_key(section))
@@ -384,6 +390,7 @@ impl Risk {
                 "chief.command",
                 "chief.args",
                 "editor",
+                "isolation",
                 "tickets.server.command",
                 "tickets.server.env",
                 "tickets.server.url",
@@ -473,7 +480,7 @@ pub fn propose(scope: Scope, layers: &[Layer], fragment: &str, remove: &[String]
         Scope::Workspace => {
             if let Some(change) = changes.iter().find(|change| !workspace_setting(&change.key)) {
                 return Err(format!(
-                    "a workspace file takes only [tickets] and [chief] prompt, plus [workflow]; {} belongs in the main or host config",
+                    "a workspace file takes only [tickets], [workflow], [isolation] and [chief] prompt; {} belongs in the main or host config",
                     change.key
                 ));
             }
@@ -492,6 +499,11 @@ pub fn propose(scope: Scope, layers: &[Layer], fragment: &str, remove: &[String]
                 let tickets = tickets.as_table().ok_or("[tickets] must be a table")?;
                 load::<crate::tickets::TicketConfig>(tickets, "tickets.")
                     .map_err(|e| format!("[tickets] would not load: {e}"))?;
+            }
+            if let Some(isolation) = table.get("isolation") {
+                let isolation = isolation.as_table().ok_or("[isolation] must be a table")?;
+                load::<crate::isolation::IsolationConfig>(isolation, "isolation.")
+                    .map_err(|e| format!("[isolation] would not load: {e}"))?;
             }
         }
         Scope::Main | Scope::Host => {
@@ -637,10 +649,9 @@ pub fn load_error(layers: &[Layer]) -> Option<String> {
 
 /// The settings a workspace file carries.
 fn workspace_setting(key: &str) -> bool {
-    key == "tickets"
-        || key.starts_with("tickets.")
-        || key == "workflow"
-        || key.starts_with("workflow.")
+    ["tickets", "workflow", "isolation"]
+        .iter()
+        .any(|section| key == *section || key.strip_prefix(section).is_some_and(|rest| rest.starts_with('.')))
         || key == "chief.prompt"
 }
 
@@ -1227,8 +1238,26 @@ children = [{ auth = { header = "object-secret" }, label = "public" }]
         let workspace = layer(Source::Workspace, "projects = ['~/repos/app']\n");
         let layers = [layers[0].clone(), layers[1].clone(), workspace];
         let error = propose(Scope::Workspace, &layers, "[layout]\nsidebar_width = 1.0", &[]).unwrap_err();
-        assert!(error.contains("only [tickets] and [chief] prompt"), "{error}");
+        assert!(error.contains("only [tickets], [workflow], [isolation] and [chief] prompt"), "{error}");
         assert!(propose(Scope::Workspace, &layers, "projects = []", &[]).is_err());
+        let error = propose(Scope::Workspace, &layers, "[isolation]\nmode = 'open'", &[]).unwrap_err();
+        assert!(error.starts_with("[isolation] would not load: isolation.mode: unknown variant"), "{error}");
+        let proposal = propose(Scope::Workspace, &layers, "[isolation]\nmode = 'bare'", &[]).unwrap();
+        assert_eq!(proposal.risks(), [(Risk::RunsCommands, vec!["isolation.mode"])]);
+        let with_isolation = [
+            layers[0].clone(),
+            layer(Source::Host, "[isolation.sandbox]\nmemory = '8g'\ncpus = 4"),
+            layer(Source::Workspace, "projects = []\n[isolation]\nmode = 'bare'\n[isolation.sandbox]\ncpus = 2"),
+        ];
+        for (key, source) in [
+            ("mode", Source::Workspace),
+            ("sandbox.cpus", Source::Workspace),
+            ("sandbox.memory", Source::Host),
+            ("sandbox.ssh_agent", Source::Default),
+        ] {
+            let path: Vec<String> = format!("isolation.{key}").split('.').map(String::from).collect();
+            assert_eq!(source_of(&with_isolation, &path), source, "{key}");
+        }
         let error = propose(Scope::Workspace, &layers, "[tickets]\ncomments = 'loud'", &[]).unwrap_err();
         assert!(error.starts_with("[tickets] would not load: tickets.comments: unknown variant"), "{error}");
         let proposal = propose(

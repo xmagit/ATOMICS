@@ -56,6 +56,24 @@ name = "claude"             # built in: claude, midnight, atomisk, paper and tid
 # ui_font = "Inter"              # an installed family or a font file
 # mono_size = 13.0               # terminal text, over [font] size
 
+[isolation]
+# Where agents run. "sandbox" gives each agent its own Docker Sandboxes microVM (sbx) that
+# sees only its worktree and git's write folders; "bare" runs agents directly on this machine.
+# An agent below, or a plan task, can set its own isolation = "bare" or "sandbox"; a repository's
+# .imacs/config.toml can only tighten this to "sandbox". See docs/isolation.md.
+mode = "sandbox"
+
+[isolation.sandbox]
+# memory = "8g"              # per sandbox; unset = 8g; "" = sbx's default, half of this machine's memory
+# cpus = 4                   # unset = [resources] jobs ÷ test_slots, at least 2; 0 = every core
+# template = "registry.example.com/agent-sandbox:1"   # container image; unset = the agent's own
+mounts = []                  # extra host folders, mounted read-only
+network = "balanced"         # sbx's global policy, set up if it has none: "balanced", "allow-all", "deny-all"
+ssh_agent = false            # let sandboxes sign with this machine's SSH agent
+mcp = []                     # MCP servers registered with `sbx mcp add`, loaded into every sandbox
+# Hosts a repository's sandboxes may reach beyond the network policy, by its main checkout:
+# allow_hosts = { "~/repos/app" = ["nuget.example.com"] }
+
 # Agents you can start. kind = "claude" turns on hooks, session ids and resume.
 [[agents]]
 name = "claude"
@@ -235,6 +253,7 @@ pub struct Config {
     pub font: FontConfig,
     pub terminal: TerminalConfig,
     pub theme: ThemeConfig,
+    pub isolation: crate::isolation::IsolationConfig,
     pub agents: Vec<AgentConfig>,
     pub approvals: crate::approvals::ApprovalPolicy,
     pub plan: PlanConfig,
@@ -417,6 +436,9 @@ pub struct AgentConfig {
     /// Text the agent shows while it works. Used to track status of agents without hooks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub busy_text: Option<String>,
+    /// Runs this agent sandboxed or bare, whatever `[isolation] mode` says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolation: Option<crate::isolation::IsolationMode>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -543,6 +565,7 @@ impl Default for Config {
             command: command.iter().map(|c| c.to_string()).collect(),
             kind,
             busy_text: busy.map(str::to_string),
+            isolation: None,
         };
         Self {
             base_ref: "origin/main".into(),
@@ -553,6 +576,7 @@ impl Default for Config {
             font: FontConfig::default(),
             terminal: TerminalConfig::default(),
             theme: ThemeConfig::default(),
+            isolation: crate::isolation::IsolationConfig::default(),
             agents: vec![
                 agent("claude", &["claude"], AgentKind::Claude, None),
                 agent("codex", &["codex"], AgentKind::Generic, Some("esc to interrupt")),
@@ -706,6 +730,12 @@ impl Config {
 
     pub fn agent(&self, name: &str) -> Option<&AgentConfig> {
         self.agents.iter().find(|a| a.name == name)
+    }
+
+    /// Every agent runs sandboxed, whatever its own or its task's setting: what a repository may require.
+    pub fn require_sandbox(&mut self) {
+        self.isolation.mode = crate::isolation::IsolationMode::Sandbox;
+        self.isolation.required = true;
     }
 
     /// Replaces `{base_ref}` in a configured text.
@@ -881,6 +911,7 @@ kind = "shell"
                 command: command.into_iter().map(str::to_string).collect(),
                 kind,
                 busy_text: None,
+                isolation: None,
             };
             assert_eq!(agent.is_codex(), expected, "{agent:?}");
         }

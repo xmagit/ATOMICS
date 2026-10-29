@@ -428,6 +428,16 @@ the reporting model. Changes made in the ticket system reach the chief as `ticke
 Failures show on the card and never block a plan. See [docs/tickets.md](docs/tickets.md) for the design, the
 config reference and examples.
 
+## Agents in sandboxes
+
+By default each agent runs in its own [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) microVM,
+which sees only its worktree and git's write folders. IMACS creates the sandbox when the agent starts,
+attaches the tile to it with `sbx run`, reattaches after a restart and removes it with the worktree. It
+needs `sbx` v0.50.1 or newer, signed in. Without it, sandboxed agents are refused, never started bare.
+Set `[isolation] mode = "bare"`, or `isolation = "bare"` on one agent, to run agents directly on your
+machine. A repository can require sandboxes in `.imacs/config.toml`, but never turn them off. See
+[docs/isolation.md](docs/isolation.md) for the settings and the trust model.
+
 ## Running many agents
 
 Every agent works in its own worktree with its own `target/`, so its builds never wait on another's.

@@ -49,7 +49,8 @@ impl State {
 
     pub(super) fn open_cleanup(&mut self, repo: PathBuf, preselect: Option<PathBuf>) {
         let (tx, rx) = self.wake.channel();
-        let mut cleanup = Cleanup { repo, rows: None, busy: None, log: Vec::new(), tx, rx };
+        let mut cleanup =
+            Cleanup { repo, rows: None, sandboxes: Default::default(), busy: None, log: Vec::new(), tx, rx };
         self.load_cleanup(&mut cleanup);
         self.cleanup = Some(cleanup);
         self.client_events.push(ClientEvent::Cleanup { preselect });
@@ -57,10 +58,17 @@ impl State {
 
     fn load_cleanup(&self, cleanup: &mut Cleanup) {
         cleanup.rows = None;
+        cleanup.sandboxes = Default::default();
         let (tx, repo, base) = (cleanup.tx.clone(), cleanup.repo.clone(), self.project_config(&cleanup.repo).base_ref);
+        let sbx = resolve_program(&self.sbx);
         std::thread::spawn(move || {
             let result = git::worktree_health(&repo, &base).map_err(|e| format!("{e:#}"));
             let _ = tx.send(CleanupEvent::Loaded(result));
+            // Without sbx there can be no sandboxes, and nothing to say about it.
+            if crate::sandbox::installed(&sbx) {
+                let sandboxes = crate::sandbox::for_repo(&sbx, &repo).map_err(|e| format!("listing sandboxes: {e:#}"));
+                let _ = tx.send(CleanupEvent::Sandboxes(sandboxes));
+            }
         });
     }
 
@@ -91,6 +99,18 @@ impl State {
                     cleanup.log.push(err);
                     cleanup.rows = Some(Vec::new());
                 }
+                CleanupEvent::Sandboxes(Ok(sandboxes)) => cleanup.sandboxes = sandboxes,
+                CleanupEvent::Sandboxes(Err(err)) => cleanup.log.push(err),
+                CleanupEvent::SandboxRemoved(name, result) => match result {
+                    Ok(()) => {
+                        cleanup.log.push(format!("removed sandbox {name}"));
+                        cleanup.sandboxes.attached.retain(|(_, attached)| *attached != name);
+                        cleanup.sandboxes.orphans.retain(|orphan| orphan.name != name);
+                    }
+                    Err(err) => {
+                        cleanup.log.push(format!("kept sandbox {name}: {}", err.lines().last().unwrap_or(&err)))
+                    }
+                },
                 CleanupEvent::Removed(path, result) => {
                     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                     match result {
@@ -129,6 +149,7 @@ impl Desktop<'_> {
         let Some(mut cleanup) = self.runtime.cleanup.take() else { return };
         let p = self.runtime.palette.clone();
         let agent_roots: HashSet<PathBuf> = self.runtime.sessions.iter().map(Session::root).collect();
+        let live_sandboxes: HashSet<String> = self.runtime.sessions.iter().filter_map(|s| s.sandbox.clone()).collect();
         let name = cleanup.repo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let mut open = true;
         let mut remove = false;
@@ -216,6 +237,9 @@ impl Desktop<'_> {
                                 if agent {
                                     chip(ui, "● agent".into(), p.accent);
                                 }
+                                if cleanup.sandboxes.attached.iter().any(|(path, _)| *path == h.path) {
+                                    chip(ui, "sandbox".into(), p.muted);
+                                }
                                 if h.dirty_files > 0 {
                                     chip(ui, format!("{} uncommitted", h.dirty_files), p.warning);
                                 }
@@ -236,8 +260,43 @@ impl Desktop<'_> {
                         }
                     });
                 });
+                if !cleanup.sandboxes.orphans.is_empty() {
+                    ui.separator();
+                    ui.label(RichText::new("Sandboxes whose worktree is gone").color(p.foreground));
+                    for orphan in &cleanup.sandboxes.orphans {
+                        let live = live_sandboxes.contains(&orphan.name);
+                        if live {
+                            self.client.cleanup_sandboxes.remove(&orphan.name);
+                        }
+                        let mut selected = self.client.cleanup_sandboxes.contains(&orphan.name);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(!live, egui::Checkbox::without_text(&mut selected))
+                                .on_disabled_hover_text("an agent is running in it")
+                                .changed()
+                            {
+                                if selected {
+                                    self.client.cleanup_sandboxes.insert(orphan.name.clone());
+                                } else {
+                                    self.client.cleanup_sandboxes.remove(&orphan.name);
+                                }
+                            }
+                            ui.label(RichText::new(&orphan.name).color(p.foreground));
+                            let workspace = orphan.workspace().map(paths::display).unwrap_or_default();
+                            ui.label(
+                                RichText::new(format!("{} · {workspace}", orphan.status)).color(p.muted).size(11.0),
+                            );
+                        });
+                    }
+                }
                 ui.separator();
                 let selected = rows.iter().filter(|r| self.client.cleanup_selected.contains(&r.path)).count();
+                let orphans = cleanup
+                    .sandboxes
+                    .orphans
+                    .iter()
+                    .filter(|orphan| self.client.cleanup_sandboxes.contains(&orphan.name))
+                    .count();
                 ui.horizontal(|ui| {
                     if ui
                         .button("select safe")
@@ -252,15 +311,20 @@ impl Desktop<'_> {
                     }
                     if ui.button("select none").clicked() {
                         self.client.cleanup_selected.clear();
+                        self.client.cleanup_sandboxes.clear();
                     }
                     ui.checkbox(
                         &mut self.client.cleanup_delete_branches,
                         "also delete their branches (only if merged)",
                     );
-                    let label = format!("Remove {selected} worktree{}", if selected == 1 { "" } else { "s" });
-                    let (text, fill) = if selected > 0 { (p.on_accent, p.error) } else { (p.muted, p.raised) };
+                    let mut label = format!("Remove {selected} worktree{}", if selected == 1 { "" } else { "s" });
+                    if orphans > 0 {
+                        label.push_str(&format!(" and {orphans} sandbox{}", if orphans == 1 { "" } else { "es" }));
+                    }
+                    let any = selected + orphans > 0;
+                    let (text, fill) = if any { (p.on_accent, p.error) } else { (p.muted, p.raised) };
                     let button = egui::Button::new(RichText::new(label).color(text)).fill(fill);
-                    if ui.add_enabled(selected > 0 && cleanup.busy.is_none(), button).clicked() {
+                    if ui.add_enabled(any && cleanup.busy.is_none(), button).clicked() {
                         remove = true;
                     }
                 });
@@ -283,20 +347,41 @@ impl Desktop<'_> {
             });
         }
         if remove && let Some(rows) = &cleanup.rows {
-            let targets: Vec<(PathBuf, Option<String>)> = rows
+            let sandboxes = &cleanup.sandboxes;
+            let targets: Vec<(PathBuf, Option<String>, Vec<String>)> = rows
                 .iter()
                 .filter(|r| self.client.cleanup_selected.contains(&r.path))
-                .map(|r| (r.path.clone(), r.branch.clone()))
+                .map(|r| {
+                    let names = sandboxes.attached.iter().filter(|(path, _)| *path == r.path).map(|(_, n)| n.clone());
+                    (r.path.clone(), r.branch.clone(), names.collect())
+                })
+                .collect();
+            let orphans: Vec<String> = sandboxes
+                .orphans
+                .iter()
+                .filter(|o| self.client.cleanup_sandboxes.contains(&o.name) && !live_sandboxes.contains(&o.name))
+                .map(|o| o.name.clone())
                 .collect();
             cleanup.busy = Some(format!("removing {} worktrees…", targets.len()));
             let (tx, repo, delete) = (cleanup.tx.clone(), cleanup.repo.clone(), self.client.cleanup_delete_branches);
+            let sbx = resolve_program(&self.runtime.sbx);
             self.post(move |_| {
                 std::thread::spawn(move || {
-                    for (path, branch) in targets {
+                    let remove_sandbox = |name: String| {
+                        let result = crate::sandbox::remove(&sbx, &name).map_err(|e| format!("{e:#}"));
+                        let _ = tx.send(CleanupEvent::SandboxRemoved(name, result));
+                    };
+                    for (path, branch, sandboxes) in targets {
                         let result =
                             git::remove_worktree(&repo, &path, branch.as_deref(), delete).map_err(|e| format!("{e:#}"));
+                        let removed = result.is_ok();
                         let _ = tx.send(CleanupEvent::Removed(path, result));
+                        // A worktree's sandbox goes with it; a kept worktree keeps its sandbox.
+                        if removed {
+                            sandboxes.into_iter().for_each(remove_sandbox);
+                        }
                     }
+                    orphans.into_iter().for_each(remove_sandbox);
                     let _ = tx.send(CleanupEvent::Finished("removal finished".into()));
                 });
             });
@@ -331,6 +416,7 @@ mod tests {
                     ],
                     kind: AgentKind::Shell,
                     busy_text: None,
+                    isolation: None,
                 });
                 let supported = git::probe_cache_clone(&repo, repo.parent().unwrap()).unwrap();
                 for (branch, folders, expected) in [
@@ -355,7 +441,14 @@ mod tests {
                         repo.clone(),
                         branch.into(),
                         None,
-                        Launch { agent: "probe".into(), prompt: None, args: vec![], reply: None, task: None },
+                        Launch {
+                            agent: "probe".into(),
+                            prompt: None,
+                            args: vec![],
+                            reply: None,
+                            task: None,
+                            isolation: None,
+                        },
                     );
                     let event = state.worktree_rx.recv_timeout(Duration::from_secs(5)).unwrap();
                     let prepared = event.1.as_ref().unwrap();

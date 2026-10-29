@@ -86,6 +86,12 @@ impl RepoWorkflow {
         if let Some(workflow) = self.config.table.get("workflow") {
             config.workflow = workflow.clone().try_into().unwrap_or_default();
         }
+        // `declarative` keeps only `mode = "sandbox"`: a repository can tighten isolation, never loosen it.
+        if self.config.table.get("isolation").and_then(|table| table.get("mode")).and_then(toml::Value::as_str)
+            == Some("sandbox")
+        {
+            config.require_sandbox();
+        }
         config
     }
 
@@ -216,8 +222,16 @@ pub fn declarative(table: &toml::Table) -> (toml::Table, Vec<String>) {
     fn visit(table: &toml::Table, prefix: &str, accepted: &mut toml::Table, warnings: &mut Vec<String>) {
         for (key, value) in table {
             let name = if prefix.is_empty() { key.clone() } else { format!("{prefix}.{key}") };
+            if name == "isolation.mode" && value.as_str() != Some("sandbox") {
+                warnings.push(format!(
+                    "ignored {name}: a repository can only tighten isolation to \"sandbox\", never loosen it"
+                ));
+                continue;
+            }
             let valid = match name.as_str() {
-                "base_ref" | "pr_title" | "review_policy" | "tickets.branch" | "workflow.done" => Some(value.is_str()),
+                "base_ref" | "pr_title" | "review_policy" | "tickets.branch" | "workflow.done" | "isolation.mode" => {
+                    Some(value.is_str())
+                }
                 "test_commands" | "qa_commands" | "worktrees.warm" | "workflow.stages" => {
                     Some(value.as_array().is_some_and(|items| items.iter().all(toml::Value::is_str)))
                 }
@@ -229,7 +243,7 @@ pub fn declarative(table: &toml::Table) -> (toml::Table, Vec<String>) {
                 } else {
                     warnings.push(format!("ignored {name}: invalid type for declarative setting"));
                 }
-            } else if matches!(name.as_str(), "tickets" | "worktrees" | "workflow") && value.is_table() {
+            } else if matches!(name.as_str(), "tickets" | "worktrees" | "workflow" | "isolation") && value.is_table() {
                 let mut inner = toml::Table::new();
                 visit(value.as_table().unwrap(), &name, &mut inner, warnings);
                 if !inner.is_empty() || value.as_table().unwrap().is_empty() {
@@ -485,5 +499,52 @@ stages = ["accepted", "pr_opened", "qa_passed", "merged"]
         assert!(warnings.iter().any(|warning| warning.contains("ignored workflow")));
         let (_, warnings) = declarative(&toml::from_str("base_ref = 42\ntest_commands = 'execute me'").unwrap());
         assert_eq!(warnings.len(), 2);
+    }
+
+    #[test]
+    fn repo_config_can_only_tighten_isolation() {
+        use crate::isolation::IsolationMode::{Bare, Sandbox};
+        let mut user = crate::config::Config::default();
+        user.isolation.mode = Bare;
+        user.agents[1].isolation = Some(Bare);
+        user.agents[2].isolation = Some(Sandbox);
+        let applied = |text: &str| {
+            let (table, warnings) = declarative(&toml::from_str(text).unwrap());
+            let mut repo = RepoWorkflow::default();
+            repo.config.table = table;
+            (repo.apply(&user), warnings)
+        };
+        let (config, warnings) = applied("[isolation]\nmode = 'sandbox'");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(config.isolation.mode, Sandbox);
+        for agent in &config.agents {
+            for task in [None, Some(Bare), Some(Sandbox)] {
+                assert_eq!(config.isolation.mode_for(agent, task), Sandbox, "{} must run sandboxed", agent.name);
+            }
+        }
+
+        let mut sandboxed = user.clone();
+        sandboxed.isolation.mode = Sandbox;
+        for text in [
+            "[isolation]\nmode = 'bare'",
+            "[isolation]\nmode = 'none'",
+            "[isolation]\nmode = 1",
+            "[isolation.sandbox]\nssh_agent = true\nmounts = ['/']\nallow_hosts = { '.' = ['**'] }",
+        ] {
+            let (table, warnings) = declarative(&toml::from_str(text).unwrap());
+            assert!(!warnings.is_empty(), "{text}");
+            assert!(warnings.iter().all(|w| w.starts_with("ignored isolation")), "{warnings:?}");
+            let mut repo = RepoWorkflow::default();
+            repo.config.table = table;
+            for config in [&user, &sandboxed] {
+                let applied = repo.apply(config);
+                assert_eq!(applied.isolation, config.isolation, "{text} must not change isolation");
+                for (applied, agent) in applied.agents.iter().zip(&config.agents) {
+                    assert_eq!(applied.isolation, agent.isolation, "{text}");
+                }
+            }
+        }
+        let (_, warnings) = declarative(&toml::from_str("[isolation]\nmode = 'bare'").unwrap());
+        assert!(warnings[0].contains("only tighten"), "{warnings:?}");
     }
 }

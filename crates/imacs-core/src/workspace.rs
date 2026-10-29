@@ -33,6 +33,13 @@ impl Workspace {
     pub fn workflow(&self) -> Result<Option<crate::workflow::Workflow>, toml::de::Error> {
         self.extra.get("workflow").map(|section| section.clone().try_into()).transpose()
     }
+
+    /// This workspace's `[isolation]`. Unlike `[tickets]` it merges key by key over the main
+    /// and host config's, with [`crate::isolation::IsolationConfig::with_overrides`].
+    pub fn isolation(&self) -> Result<Option<crate::isolation::IsolationOverrides>, toml::de::Error> {
+        let section = self.extra.get("isolation").map(|section| section.clone().try_into()).transpose()?;
+        Ok(section.map(crate::isolation::IsolationOverrides))
+    }
 }
 
 #[cfg(feature = "native")]
@@ -314,6 +321,20 @@ result = { key = "id", state = "status" }
         let main = project_root(&repo).unwrap();
         assert_eq!(project_root(&worktree.join("src")).unwrap(), main);
         assert!(project_root(dir.path()).is_err());
+    }
+
+    #[test]
+    fn workspace_isolation_merges_over_the_user_config() {
+        let workspace: Workspace =
+            toml::from_str("projects = []\n[isolation]\nmode = 'bare'\n[isolation.sandbox]\ncpus = 2").unwrap();
+        let mut user = crate::isolation::IsolationConfig::default();
+        user.sandbox.memory = Some("8g".into());
+        let merged = user.with_overrides(&workspace.isolation().unwrap().unwrap()).unwrap();
+        assert_eq!(merged.mode, crate::isolation::IsolationMode::Bare);
+        assert_eq!((merged.sandbox.memory.as_deref(), merged.sandbox.cpus), (Some("8g"), Some(2)));
+        assert!(Workspace::default().isolation().unwrap().is_none());
+        let broken: Workspace = toml::from_str("projects = []\nisolation = 'bare'").unwrap();
+        assert!(broken.isolation().is_err());
     }
 
     #[test]

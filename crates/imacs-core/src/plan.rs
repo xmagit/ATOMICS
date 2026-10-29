@@ -152,6 +152,10 @@ pub struct Task {
     pub depends_on: Vec<String>,
     pub agent: String,
     pub args: Vec<String>,
+    /// Runs this task's agent sandboxed or bare, over its agent's and the workspace's setting.
+    /// A repository that requires sandboxes still wins.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub isolation: Option<crate::isolation::IsolationMode>,
     /// Repository to branch the task's worktree from.
     pub repo: Option<String>,
     pub branch: Option<String>,
@@ -973,6 +977,27 @@ mod tests {
         assert_eq!(plan.tasks[1].id, "t2");
         assert_eq!(plan.unknown_dependencies(), [("t2".to_string(), "zz".to_string())]);
         assert_eq!(plan.tasks.len(), 3, "plus the review task");
+    }
+
+    #[test]
+    fn a_tasks_isolation_is_saved_and_follows_the_chiefs_updates() {
+        use crate::isolation::IsolationMode::Bare;
+        let mut plan = Plan::default();
+        let bare = Task { isolation: Some(Bare), ..task("a", &[]) };
+        plan.replace("g".into(), vec![bare.clone()]);
+        plan.task_mut("a").unwrap().status = TaskStatus::Running;
+        let saved = serde_json::to_value(&plan).unwrap();
+        assert_eq!(saved["tasks"][0]["isolation"], "bare");
+        assert!(saved["tasks"][1].get("isolation").is_none(), "unset isolation is not written");
+        let loaded: Plan = serde_json::from_value(saved).unwrap();
+        assert_eq!(loaded.tasks[0].isolation, Some(Bare));
+        let old: Task = serde_json::from_str(r#"{"id":"a","agent":"codex"}"#).unwrap();
+        assert_eq!(old.isolation, None, "tasks saved before the field load");
+        // imacs_plan_set replaces the setting, keeping the task's progress.
+        plan.replace("g".into(), vec![task("a", &[])]);
+        assert_eq!((plan.tasks[0].isolation, plan.tasks[0].status), (None, TaskStatus::Running));
+        plan.replace("g".into(), vec![bare]);
+        assert_eq!(plan.tasks[0].isolation, Some(Bare));
     }
 
     #[test]

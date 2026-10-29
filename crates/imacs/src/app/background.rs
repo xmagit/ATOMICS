@@ -57,6 +57,28 @@ impl State {
                 self.pending_codex.push((launch, ready));
             }
         }
+        for (launch, ready) in std::mem::take(&mut self.pending_sandbox) {
+            let result = match ready.try_recv() {
+                Ok(result) => result,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.pending_sandbox.push((launch, ready));
+                    continue;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Err("Sandbox preparation stopped".into()),
+            };
+            changed = true;
+            if !self.sessions.iter().any(|s| s.id == launch.id) {
+                // Closed while its sandbox was made: leave the sandbox stopped for reuse or cleanup.
+                if let (Ok(()), AgentRuntime::Sandbox(sandboxed)) = (&result, &launch.runtime) {
+                    self.stop_sandbox(sandboxed.name.clone());
+                }
+                continue;
+            }
+            let id = launch.id.clone();
+            if let Err(error) = result.and_then(|()| self.launch_agent(ctx, launch, None)) {
+                self.launch_failed(&id, error);
+            }
+        }
         while let Ok(message) = self.hook_rx.try_recv() {
             changed = true;
             self.on_hook(message);
@@ -73,7 +95,8 @@ impl State {
                 .is_some_and(|(plan, _)| !self.plan_view || self.plans[self.selected_plan].id != *plan);
             let selection = (self.active.clone(), self.diff_root.clone(), self.focus_terminal.clone());
             let outcome = result.and_then(|PreparedWorktree { path, warmed }| {
-                let outcome = self.start(ctx, &launch.agent, path, None, launch.args, launch.prompt);
+                let role = Role::Agent(launch.isolation);
+                let outcome = self.start_as(ctx, &launch.agent, path, None, launch.args, launch.prompt, role);
                 if warmed && outcome.is_ok() {
                     self.toast("warm cache from main");
                 }
@@ -134,8 +157,13 @@ impl State {
                 self.output_delay = Some(self.output_delay.map_or(delay, |pending| pending.min(delay)));
             }
         }
+        let mut idle = Vec::new();
         for session in &mut self.sessions {
             if session.terminal.as_ref().is_some_and(Terminal::exited) {
+                // A sandbox stops once its agent exits; the next `sbx run` starts it again.
+                if session.status != AgentStatus::Exited {
+                    idle.extend(session.sandbox.clone());
+                }
                 session.status = AgentStatus::Exited;
             }
             if let Some(title) = session.terminal.as_ref().and_then(|t| t.shared.title.lock().unwrap().take())
@@ -144,6 +172,9 @@ impl State {
             {
                 session.title = title;
             }
+        }
+        for name in idle {
+            self.stop_sandbox(name);
         }
         self.track_busy();
         self.verify_deliveries();
@@ -440,6 +471,7 @@ impl State {
                     menu_absent_since: None,
                     chief: false,
                     pending: None,
+                    sandbox: None,
                 });
                 if self.active.is_none() {
                     self.active = Some(format!("ext:{}", event.session_id));
@@ -683,6 +715,7 @@ mod tests {
                 command: vec![],
                 kind: AgentKind::Generic,
                 busy_text: Some("esc to interrupt".into()),
+                isolation: None,
             });
             app.runtime.sessions =
                 vec![session("waiting", AgentKind::Generic, AgentStatus::NeedsInput, &app.runtime.launch_dir)];

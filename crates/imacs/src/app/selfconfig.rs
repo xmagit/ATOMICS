@@ -48,9 +48,14 @@ impl State {
         layers
     }
 
-    /// The configuration IMACS runs with, the workspace's tickets included.
+    /// The configuration IMACS runs with, the workspace's tickets, workflow and isolation included.
     pub(super) fn effective_config(&self) -> Config {
-        Config { tickets: self.effective_tickets(), workflow: self.workflow().clone(), ..self.config.clone() }
+        Config {
+            tickets: self.effective_tickets(),
+            workflow: self.workflow().clone(),
+            isolation: self.effective_isolation(),
+            ..self.config.clone()
+        }
     }
 
     /// The cleaner for everything the configuration tools return: built from the secrets
@@ -114,7 +119,7 @@ impl State {
         // agent-visible string gets credential syntax masking as well as known secrets.
         Ok(cleaner.setting(json!({
             "host": paths::host_name(),
-            "merge": "Built-in defaults, then config.toml, then config.d/<host>.toml: tables merge key by key, arrays and other values replace. A workspace's [tickets] and [workflow] replace each section as a whole. A project overlays allowlisted .imacs/config.toml settings; its [workflow] replaces the workspace workflow.",
+            "merge": "Built-in defaults, then config.toml, then config.d/<host>.toml: tables merge key by key, arrays and other values replace. A workspace's [tickets] and [workflow] replace each section as a whole; its [isolation] merges key by key. A project overlays allowlisted .imacs/config.toml settings; its [workflow] replaces the workspace workflow, and its isolation.mode can only tighten to sandbox.",
             "files": files,
             "workspace": workspace,
             "project": project,

@@ -24,6 +24,7 @@ pub mod git;
 pub mod governor;
 pub mod heartbeat;
 pub mod hook;
+pub mod isolation;
 pub mod layout;
 #[cfg(feature = "native")]
 pub mod paths;

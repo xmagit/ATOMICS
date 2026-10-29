@@ -60,6 +60,19 @@ pub fn json(workspace: Option<&str>, projects: &[PathBuf]) -> Value {
     }))
 }
 
+/// Whether any agent would run sandboxed: `[isolation] mode`, with the workspace's merged in,
+/// or an agent's own `isolation`.
+fn sandboxes_wanted(config: &Config, workspace: Option<&str>) -> bool {
+    use imacs_core::isolation::IsolationMode;
+    let overrides = workspace.and_then(|name| Workspace::load(name).ok()).and_then(|w| w.isolation().ok().flatten());
+    let isolation = match overrides {
+        Some(overrides) => config.isolation.with_overrides(&overrides).unwrap_or_else(|_| config.isolation.clone()),
+        None => config.isolation.clone(),
+    };
+    isolation.mode == IsolationMode::Sandbox
+        || config.agents.iter().any(|a| a.isolation == Some(IsolationMode::Sandbox))
+}
+
 fn report(workspace: Option<&str>, for_agent: bool, projects: &[PathBuf]) -> Report {
     let mut lines = Vec::new();
     let git_version = Command::new(resolve_program("git"))
@@ -111,6 +124,11 @@ fn report(workspace: Option<&str>, for_agent: bool, projects: &[PathBuf]) -> Rep
     lines.extend(plans_check(&paths::imacs_home()));
     if let Ok((config, _)) = &config {
         lines.push(approvals_check(&config.approvals));
+        if sandboxes_wanted(config, workspace) {
+            // Tests never reach the sbx installed on the machine running them.
+            let sbx = if cfg!(test) { "/nonexistent/imacs-test-sbx".into() } else { resolve_program("sbx") };
+            lines.push(crate::sandbox::doctor_line(&sbx));
+        }
         match ticket_config(config, workspace) {
             Ok(tickets) if !tickets.system.trim().is_empty() => lines.push(ticket_check(&tickets)),
             Ok(_) => {}

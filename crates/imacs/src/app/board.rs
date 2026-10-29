@@ -332,6 +332,9 @@ impl Desktop<'_> {
                                                     {
                                                         meta.push_str(&format!(" {model}"));
                                                     }
+                                                    if let Some(isolation) = task.isolation {
+                                                        meta.push_str(&format!(" · {}", isolation.name()));
+                                                    }
                                                     ui.label(RichText::new(meta).color(p.muted).size(11.0));
                                                     stage_chip(ui, latest_stages.get(&task.id));
                                                     if let Some(link) = &task.ticket {

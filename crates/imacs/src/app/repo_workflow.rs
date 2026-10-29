@@ -25,8 +25,7 @@ impl State {
         }
         let root =
             self.project_of(repo).or_else(|| workspace::project_root(repo).ok()).unwrap_or_else(|| repo.to_path_buf());
-        let config =
-            Config { tickets: self.effective_tickets(), workflow: self.workflow().clone(), ..self.config.clone() };
+        let config = self.effective_config();
         match self.repo_workflows.get(&root) {
             Some(workflow) => workflow.apply(&config),
             None => RepoWorkflow::read(&root).apply(&config),

@@ -307,6 +307,7 @@ fn held_terminal_input_gets_a_receipt_without_frames() {
             command: vec![fixture.to_string_lossy().into_owned()],
             kind: AgentKind::Generic,
             busy_text: None,
+            isolation: None,
         });
         let reply = expired_approval(&mut state);
         let worker = &mut state.sessions[0];

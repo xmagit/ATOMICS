@@ -18,6 +18,7 @@ mod ipc;
 mod mcp;
 mod mcp_client;
 mod restart;
+mod sandbox;
 mod setup;
 mod statusline;
 mod terminal;

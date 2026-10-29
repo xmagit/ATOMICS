@@ -12,7 +12,7 @@ a diff until you apply or reject it.
 | `default` | built into IMACS | everything | every setting; IMACS writes them, with comments, into a new `config.toml` |
 | `main` | `~/.config/imacs/config.toml` | every machine that shares the file | every setting |
 | `host` | `config.d/<host>.toml` beside it | this machine | every setting |
-| `workspace` | `workspaces/<host>/<name>.toml`, or a flat `workspaces/<name>.toml` shared by every host | the open workspace | `projects`, `[tickets]`, `[workflow]` and `[chief] prompt` |
+| `workspace` | `workspaces/<host>/<name>.toml`, or a flat `workspaces/<name>.toml` shared by every host | the open workspace | `projects`, `[tickets]`, `[workflow]`, `[isolation]` and `[chief] prompt` |
 | `repo` | `<main checkout>/.imacs/config.toml` | one repository | allowlisted declarative workflow settings; see [Repository workflows](repo-workflow.md) |
 | `theme` | `themes/<name>.toml` beside `config.toml` | whatever selects the theme | theme tokens; see [themes](themes.md) |
 
@@ -21,8 +21,8 @@ machine name. See [Using IMACS on several machines](../README.md#using-imacs-on-
 names and portable paths.
 
 The scope of a proposed change is `main`, `host`, `workspace` or `theme`. Use `host` for anything that is true of one
-machine only: its core count, its programs' paths, its repositories. A workspace change may touch `[tickets]`, `[workflow]` and
-`[chief] prompt`; open and close its projects in IMACS instead. A theme change writes one theme file; showing
+machine only: its core count, its programs' paths, its repositories. A workspace change may touch `[tickets]`, `[workflow]`,
+`[isolation]` and `[chief] prompt`; open and close its projects in IMACS instead. A theme change writes one theme file; showing
 that theme is a separate `main` or `host` change to `[theme] name`.
 
 ## Merge order
@@ -34,6 +34,8 @@ IMACS starts from the built-in defaults, then applies `config.toml`, then this h
 - A workspace's `[tickets]` replaces the main config's section as a whole: a key it leaves out has its
   default, not the main config's value. A workspace can turn tickets off with `system = ""`.
 - A workspace's `[workflow]` also replaces the whole section. A repo may override it for its project.
+- A workspace's `[isolation]` merges key by key, like a host file. A repo may only tighten it to
+  `mode = "sandbox"`; see [Agent isolation](isolation.md).
 - Repository config overlays only its documented declarative keys; `[tickets] branch` keeps the workspace provider.
 - `[chief] prompt` adds up instead of replacing; see below.
 
@@ -132,7 +134,7 @@ diff:
 
 | Label | Settings |
 | --- | --- |
-| runs commands | `agents`, `approvals`, `chief.command`, `chief.args`, `editor`, `tickets.server.command`, `tickets.server.env`, `tickets.server.url` |
+| runs commands | `agents`, `approvals`, `chief.command`, `chief.args`, `editor`, `isolation`, `tickets.server.command`, `tickets.server.env`, `tickets.server.url` |
 | sends credentials | `tickets.server.token_env`, `voice.provider`, `voice.base_url`, `voice.api_key_env`, `voice.api_key` |
 | instructs agents | `chief.prompt`, `chief.system_prompt`, `steer`, `tickets.workflow` |
 
