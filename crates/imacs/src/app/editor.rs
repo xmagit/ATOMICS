@@ -348,3 +348,70 @@ impl Desktop<'_> {
         ctx.request_repaint_after(Duration::from_millis(100));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::with_app;
+    use super::*;
+
+    #[test]
+    fn restarted_editor_receives_geometry_at_an_unchanged_panel_size() {
+        with_app("app::editor::tests::restarted_editor_receives_geometry_at_an_unchanged_panel_size", |app, ctx| {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            app.runtime.config.editor.command = vec!["/bin/sh".into(), "-c".into(), "stty -echo; printf 'ready\\n'; while read -r input; do case \"$input\" in quit) exit;; *) stty size;; esac; done".into()];
+            app.runtime.config.editor.startup_keys.clear();
+            app.runtime.config.editor.open_keys.clear();
+            let wait = |terminal: &Terminal, check: &dyn Fn() -> bool| {
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while !check() {
+                    assert!(Instant::now() < deadline, "editor did not respond: {}", terminal.screen_text(40));
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            };
+            let frame = |app: &mut Desktop<'_>| {
+                ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 800.0))),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        app.editor_panel(ui, Rect::from_min_size(Pos2::ZERO, vec2(800.0, 650.0)), root);
+                    },
+                )
+                .drop_without_applying_deltas();
+            };
+            app.runtime.edit(ctx, root, None, None);
+            let terminal = &app.runtime.editors[root];
+            wait(terminal, &|| terminal.screen_text(40).contains("ready"));
+            frame(app);
+            let old_id = app.runtime.editors[root].process_id();
+            let terminal = &app.runtime.editors[root];
+            terminal.write(b"size\r".to_vec());
+            let size_line = || {
+                terminal
+                    .screen_text(40)
+                    .lines()
+                    .find(|line| {
+                        line.split_whitespace().count() == 2
+                            && line.split_whitespace().all(|part| part.parse::<usize>().is_ok())
+                    })
+                    .map(str::to_string)
+            };
+            wait(terminal, &|| size_line().is_some());
+            let expected = size_line().unwrap();
+            assert_ne!(expected.trim(), "24 80");
+            terminal.write(b"quit\r".to_vec());
+            wait(terminal, &|| terminal.exited());
+            // Restart without a client frame or consuming either Edit event.
+            app.runtime.edit(ctx, root, None, None);
+            assert_ne!(app.runtime.editors[root].process_id(), old_id);
+            assert_eq!(app.client.terminal_views.len(), 1);
+            frame(app);
+            let terminal = &app.runtime.editors[root];
+            terminal.write(b"size\r".to_vec());
+            wait(terminal, &|| terminal.screen_text(40).lines().any(|line| line == expected));
+            assert_eq!(app.client.terminal_views.len(), 1, "the same editor view must be reused");
+        });
+    }
+}

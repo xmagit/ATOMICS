@@ -19,6 +19,7 @@ pub struct Metrics {
 }
 
 pub struct TerminalView {
+    terminal: Option<std::sync::Weak<runtime::Shared>>,
     grid: (usize, usize),
     scroll_remainder: f32,
     selection: Option<Selection>,
@@ -27,7 +28,7 @@ pub struct TerminalView {
 
 impl Default for TerminalView {
     fn default() -> Self {
-        Self { grid: (80, 24), scroll_remainder: 0.0, selection: None, selection_revision: 0 }
+        Self { terminal: None, grid: (80, 24), scroll_remainder: 0.0, selection: None, selection_revision: 0 }
     }
 }
 
@@ -42,6 +43,13 @@ impl TerminalView {
         metrics: &Metrics,
         palette: &Palette,
     ) -> egui::Response {
+        let instance = std::sync::Arc::downgrade(&terminal.shared);
+        if !self.terminal.as_ref().is_some_and(|previous| previous.ptr_eq(&instance)) {
+            self.terminal = Some(instance);
+            self.grid = (0, 0);
+            self.selection = None;
+            self.scroll_remainder = 0.0;
+        }
         let response = ui.interact(rect, id, Sense::click_and_drag());
         if response.clicked() || response.drag_started() {
             response.request_focus();
