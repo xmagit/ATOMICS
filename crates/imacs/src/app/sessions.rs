@@ -61,7 +61,7 @@ impl Session {
     }
 }
 
-impl App {
+impl State {
     // ── sessions ──────────────────────────────────────────────────────────
 
     pub(super) fn spawn(&mut self, ctx: &egui::Context, agent_name: &str, cwd: PathBuf, resume: Option<String>) {
@@ -146,9 +146,11 @@ impl App {
                 let ready = Arc::new(OnceLock::new());
                 let result = ready.clone();
                 let ctx = ctx.clone();
+                let wake = self.wake.clone();
                 std::thread::spawn(move || {
                     let supported = crate::setup::codex_supports_hooks(&program, CODEX_VERSION_TIMEOUT);
                     let _ = result.set(supported);
+                    wake.notify();
                     ctx.request_repaint();
                 });
                 ready
@@ -293,6 +295,7 @@ impl App {
         };
         match Terminal::spawn(ctx, self.palette.clone(), program, args, &cwd, env, self.config.terminal.scrollback) {
             Ok(terminal) => {
+                terminal.set_runtime_wake(self.wake.clone());
                 if let Some(id) = &claude_id {
                     self.dismissed.remove(id);
                 }
@@ -931,7 +934,7 @@ fi
                         .is_none_or(|terminal| !terminal.exited())
                     {
                         assert!(Instant::now() < deadline, "recovered fake agent must launch and exit");
-                        app.pump(ctx);
+                        app.runtime_tick(ctx);
                         std::thread::sleep(Duration::from_millis(10));
                     }
                     let args = std::fs::read_to_string(dir.path().join("launch-args")).unwrap();

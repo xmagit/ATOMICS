@@ -50,7 +50,13 @@ impl Default for Heartbeat {
     }
 }
 
-impl App {
+impl Heartbeat {
+    pub(super) fn deadline(&self, interval: Duration) -> Instant {
+        if self.pending.is_some() { Instant::now() + interval } else { self.started + interval }
+    }
+}
+
+impl State {
     pub(super) fn heartbeat(&mut self) {
         if let Some(findings) = self.heartbeat.pending.as_ref().and_then(|rx| rx.try_recv().ok()) {
             self.heartbeat.pending = None;
@@ -77,7 +83,6 @@ impl App {
             return;
         }
         if !remaining.is_zero() {
-            self.ctx.request_repaint_after(remaining);
             return;
         }
         self.heartbeat.started = Instant::now();
@@ -112,7 +117,7 @@ impl App {
                 .iter()
                 .any(|p| p.id == f.plan && p.tasks.iter().any(|t| t.id == f.task && t.status == TaskStatus::Blocked))
         });
-        let (tx, rx) = channel();
+        let (tx, rx) = self.wake.channel();
         self.heartbeat.pending = Some(rx);
         let ctx = self.ctx.clone();
         std::thread::spawn(move || {
@@ -134,7 +139,6 @@ impl App {
             let _ = tx.send(findings);
             ctx.request_repaint();
         });
-        self.ctx.request_repaint_after(interval);
     }
 }
 
@@ -143,7 +147,7 @@ mod tests {
     use super::super::tests::{session, with_app};
     use super::*;
 
-    fn finish(app: &mut App) {
+    fn finish(app: &mut State) {
         let deadline = Instant::now() + Duration::from_secs(3);
         while app.heartbeat.pending.is_some() {
             assert!(Instant::now() < deadline, "heartbeat worker did not finish");

@@ -1,6 +1,6 @@
 use super::*;
 
-impl App {
+impl State {
     // ── input ─────────────────────────────────────────────────────────────
 
     pub(super) fn shortcuts(&mut self, ctx: &egui::Context) {

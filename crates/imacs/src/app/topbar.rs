@@ -35,7 +35,7 @@ pub(super) fn record_item(_ui: &egui::Ui, _name: &str, _response: &egui::Respons
     }
 }
 
-impl App {
+impl State {
     pub(super) fn top_bar(&mut self, ui: &mut egui::Ui) {
         let rect = ui.available_rect_before_wrap();
         let gap = ui.spacing().item_spacing.x;
@@ -172,7 +172,7 @@ mod tests {
     use super::*;
 
     fn render(
-        app: &mut App,
+        app: &mut State,
         ctx: &egui::Context,
         width: f32,
         events: Vec<egui::Event>,
@@ -195,7 +195,7 @@ mod tests {
         (items, output)
     }
 
-    fn fixture(app: &mut App, count: usize) {
+    fn fixture(app: &mut State, count: usize) {
         app.repos = vec![PathBuf::from("/project/IMACS")];
         app.plans = (0..count)
             .map(|i| Plan {
@@ -297,7 +297,7 @@ mod tests {
             app.toast = None;
             app.config_error = None;
             app.hook_error = None;
-            let click = |app: &mut App, label: &str| {
+            let click = |app: &mut State, label: &str| {
                 let (items, output) = render(app, ctx, 700.0, vec![]);
                 let mut pos = items.iter().find(|(name, _)| name == label).map(|(_, r)| r.center());
                 if pos.is_none() {

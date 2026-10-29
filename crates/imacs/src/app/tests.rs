@@ -27,7 +27,11 @@ pub(super) fn session(id: &str, kind: AgentKind, status: AgentStatus, cwd: &Path
     }
 }
 
-pub(super) fn with_app(name: &str, test: impl FnOnce(&mut App, &egui::Context)) {
+pub(super) fn with_app(name: &str, test: impl FnOnce(&mut State, &egui::Context)) {
+    with_state(name, |mut state, ctx| test(&mut state, ctx));
+}
+
+pub(super) fn with_state(name: &str, test: impl FnOnce(State, &egui::Context)) {
     if std::env::var_os("IMACS_APP_TEST_CHILD").is_none() {
         let dir = tempfile::tempdir().unwrap();
         let output = crate::test_support::output(
@@ -52,13 +56,13 @@ pub(super) fn with_app(name: &str, test: impl FnOnce(&mut App, &egui::Context)) 
     }
     let ctx = egui::Context::default();
     let cc = eframe::CreationContext::_new_kittest(ctx.clone());
-    let mut app = App::new(
+    let app = State::new(
         &cc,
         Options { migration_errors: vec!["Migration failed".into()], ..Options::default() },
         &crate::load_icon(),
     );
     assert_eq!(app.toast.as_ref().unwrap().0, "Migration failed");
-    test(&mut app, &ctx);
+    test(app, &ctx);
 }
 
 #[test]
@@ -73,7 +77,7 @@ fn review_followups() {
     });
 }
 
-pub(super) fn request(app: &mut App, value: serde_json::Value) -> ControlResponse {
+pub(super) fn request(app: &mut State, value: serde_json::Value) -> ControlResponse {
     let (tx, rx) = channel();
     app.control(&app.ctx.clone(), serde_json::from_value(value).unwrap(), tx);
     match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
@@ -93,7 +97,7 @@ pub(super) fn repository() -> (tempfile::TempDir, PathBuf) {
     (dir, repo)
 }
 
-fn permission_hooks_wake_waiters_and_accept_decisions(app: &mut App, ctx: &egui::Context) {
+fn permission_hooks_wake_waiters_and_accept_decisions(app: &mut State, ctx: &egui::Context) {
     let dir = tempfile::tempdir().unwrap();
     app.sessions = vec![session("codex", AgentKind::Generic, AgentStatus::Working, dir.path())];
     app.sessions[0].claude_id = Some("s1".into());
@@ -179,7 +183,7 @@ fn permission_hooks_wake_waiters_and_accept_decisions(app: &mut App, ctx: &egui:
     assert!(CHIEF_ALLOWED_TOOLS.contains(&"mcp__imacs__imacs_approve"));
 }
 
-fn busy_text_is_only_a_fallback(app: &mut App, ctx: &egui::Context) {
+fn busy_text_is_only_a_fallback(app: &mut State, ctx: &egui::Context) {
     app.config.agents.push(imacs_core::config::AgentConfig {
         name: "test".into(),
         command: vec![],
@@ -289,7 +293,7 @@ fn busy_text_is_only_a_fallback(app: &mut App, ctx: &egui::Context) {
     app.sessions.clear();
 }
 
-fn close_idle_leaves_shells_alone(app: &mut App) {
+fn close_idle_leaves_shells_alone(app: &mut State) {
     let project = Path::new("/project");
     app.repos = vec![project.into()];
     app.sessions = vec![
@@ -312,7 +316,7 @@ fn close_idle_leaves_shells_alone(app: &mut App) {
     );
 }
 
-fn voice_to_a_shell_stays_in_the_steer_bar(app: &mut App, ctx: &egui::Context) {
+fn voice_to_a_shell_stays_in_the_steer_bar(app: &mut State, ctx: &egui::Context) {
     app.config.voice.target = VoiceTarget::Active;
     app.active = Some("shell".into());
     assert!(app.sessions[0].can_receive());
@@ -323,7 +327,7 @@ fn voice_to_a_shell_stays_in_the_steer_bar(app: &mut App, ctx: &egui::Context) {
     assert!(app.sessions[0].pending.is_none());
 }
 
-fn plan_set_resolves_cached_worktree_projects(app: &mut App) {
+fn plan_set_resolves_cached_worktree_projects(app: &mut State) {
     let project = PathBuf::from("/project");
     app.worktree_project.insert("/worktree".into(), project.clone());
     let (tx, rx) = channel();
@@ -341,7 +345,7 @@ fn plan_set_resolves_cached_worktree_projects(app: &mut App) {
     assert_eq!(app.plans[app.selected_plan].project, Some(project));
 }
 
-fn dispatch_requires_integrated_dependencies(app: &mut App) {
+fn dispatch_requires_integrated_dependencies(app: &mut State) {
     let plan_id = app.plans[app.selected_plan].id.clone();
     app.plans[app.selected_plan] = Plan {
         id: plan_id,

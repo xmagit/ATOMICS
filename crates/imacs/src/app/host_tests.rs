@@ -1,0 +1,226 @@
+//! These tests never run egui, call a client callback, or drive a runtime tick.
+//! All progress after startup must come from the production host thread.
+
+use super::tests::{repository, session, with_state};
+use super::*;
+use crate::host::Host;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
+
+fn response(rx: Receiver<ControlOutcome>) -> ControlResponse {
+    let ControlOutcome::Done(response) = rx.recv_timeout(Duration::from_secs(10)).expect("host did not answer") else {
+        panic!("expected completed command");
+    };
+    assert!(response.ok, "{:?}", response.error);
+    response
+}
+
+fn command(host: &Host, value: serde_json::Value) -> ControlResponse {
+    response(host.command(serde_json::from_value(value).unwrap()))
+}
+
+fn eventually(host: &Host, check: impl Fn(&State) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if check(&host.state()) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "host did not make progress without frames");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn hook(name: &str, tool: Option<&str>) -> HookReply {
+    let stream = UnixStream::connect(paths::socket_path()).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    writeln!(
+        &stream,
+        "{}",
+        json!({
+            "pane":"worker", "ancestors":[],
+            "payload":{
+                "hook_event_name":name, "session_id":"worker", "cwd":paths::imacs_home(),
+                "tool_name":tool, "tool_input":{"command":"git status"}
+            }
+        })
+    )
+    .unwrap();
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).unwrap();
+    serde_json::from_str(&line).unwrap()
+}
+
+fn expired_approval(state: &mut State) -> Arc<ipc::ApprovalReply> {
+    let reply = Arc::new(ipc::ApprovalReply::default());
+    let mut worker = session("worker", AgentKind::Claude, AgentStatus::NeedsInput, &state.launch_dir);
+    worker.approval_hold = true;
+    worker.approvals.push(PendingApproval {
+        request: ApprovalRequest {
+            tool: "Bash".into(),
+            command: Some("touch pending".into()),
+            cwd: state.launch_dir.clone(),
+            reason: None,
+            input: json!({}),
+        },
+        reply: Some(reply.clone()),
+    });
+    state.sessions = vec![worker];
+    reply
+}
+
+#[test]
+fn permission_hook_gets_its_reply_without_frames() {
+    with_state("app::host_tests::permission_hook_gets_its_reply_without_frames", |mut state, _| {
+        state.sessions = vec![session("worker", AgentKind::Claude, AgentStatus::Working, &state.launch_dir)];
+        let host = state.into_host();
+        let reply = hook("PermissionRequest", Some("Bash"));
+        assert!(reply.stdout.unwrap().contains("allow"));
+        assert_eq!(host.state().sessions.len(), 1);
+    });
+}
+
+#[test]
+fn approval_expires_without_frames() {
+    with_state("app::host_tests::approval_expires_without_frames", |mut state, _| {
+        let reply = expired_approval(&mut state);
+        let host = state.into_host();
+        // Simulate the hook's own timeout after the runtime is already running.
+        assert!(reply.wait(Duration::ZERO).stdout.is_none());
+        eventually(&host, |state| !state.sessions[0].approval_hold && state.sessions[0].approvals.is_empty());
+        assert_eq!(host.state().sessions[0].status, AgentStatus::Working);
+    });
+}
+
+#[test]
+fn held_messages_release_without_frames() {
+    with_state("app::host_tests::held_messages_release_without_frames", |mut state, _| {
+        let reply = expired_approval(&mut state);
+        state.sessions[0].held = vec!["held message".into()];
+        let hub = state.hub.clone();
+        let host = state.into_host();
+        reply.wait(Duration::ZERO);
+        eventually(&host, |state| state.sessions[0].held.is_empty());
+        assert_eq!(hub.lock().unwrap().outbox["worker"], ["held message"]);
+    });
+}
+
+#[test]
+fn waiter_wakes_on_a_hook_status_change_without_frames() {
+    with_state("app::host_tests::waiter_wakes_on_a_hook_status_change_without_frames", |mut state, _| {
+        state.sessions = vec![session("worker", AgentKind::Claude, AgentStatus::Working, &state.launch_dir)];
+        let host = state.into_host();
+        let wait = host.command(ControlRequest::Wait {
+            sessions: vec!["worker".into()],
+            statuses: vec!["turn done".into()],
+            after: Some(0),
+            timeout_secs: Some(10),
+        });
+        // A following command is a FIFO barrier: the waiter has been registered.
+        command(&host, json!({"cmd":"list"}));
+        hook("Stop", None);
+        let reply = response(wait);
+        assert_eq!(reply.result["timed_out"], false);
+        assert_eq!(reply.result["events"][0]["session"], "worker");
+        assert_eq!(reply.result["events"][0]["status"], "turn done");
+    });
+}
+
+#[test]
+fn waiter_times_out_on_its_own_deadline_without_frames() {
+    with_state("app::host_tests::waiter_times_out_on_its_own_deadline_without_frames", |state, _| {
+        let host = state.into_host();
+        let reply = command(&host, json!({"cmd":"wait", "after":0, "timeout_secs":1}));
+        assert_eq!(reply.result["timed_out"], true);
+        assert!(reply.result["events"].as_array().unwrap().is_empty());
+    });
+}
+
+#[test]
+fn heartbeat_fires_without_frames() {
+    with_state("app::host_tests::heartbeat_fires_without_frames", |mut state, _| {
+        state.config.chief.heartbeat_secs = 1;
+        let host = state.into_host();
+        let reply = command(&host, json!({"cmd":"wait", "statuses":["heartbeat"], "after":0, "timeout_secs":5}));
+        assert_eq!(reply.result["timed_out"], false);
+        assert_eq!(reply.result["events"][0]["status"], "heartbeat");
+        assert!(host.state().heartbeat.last.is_some());
+    });
+}
+
+#[test]
+fn plan_is_saved_without_frames() {
+    with_state("app::host_tests::plan_is_saved_without_frames", |state, _| {
+        let host = state.into_host();
+        let reply = command(&host, json!({"cmd":"plan_set", "goal":"Saved without painting", "tasks":[{"id":"a"}]}));
+        let (plans, errors) = plan::load_plans(&paths::imacs_home()).unwrap();
+        assert!(errors.is_empty());
+        let saved = plans.iter().find(|p| json!(p.id) == reply.result["plan"]).unwrap();
+        assert_eq!(saved.goal, "Saved without painting");
+        assert_eq!(saved.tasks[0].id, "a");
+    });
+}
+
+#[test]
+fn integration_finishes_and_persists_without_frames() {
+    with_state("app::host_tests::integration_finishes_and_persists_without_frames", |mut state, _| {
+        let (_dir, repo) = repository();
+        let worktree = repo.with_file_name("worker");
+        git::add_worktree(&repo, &worktree, "task-a", "main").unwrap();
+        std::fs::write(worktree.join("result.txt"), "completed work").unwrap();
+        state.plans = vec![Plan {
+            id: "no-frames".into(),
+            project: Some(repo.clone()),
+            approved: true,
+            tasks: vec![Task {
+                id: "a".into(),
+                branch: Some("task-a".into()),
+                worktree: Some(worktree),
+                status: TaskStatus::Review,
+                ..Task::default()
+            }],
+            ..Plan::default()
+        }];
+        state.selected_plan = 0;
+        state.config.worktree_path = repo.with_file_name("worktrees").to_string_lossy().into_owned();
+        let into = state.plans[0].integration_branch();
+        let host = state.into_host();
+        let result = command(&host, json!({"cmd":"plan_integrate", "plan":"no-frames", "id":"a"}));
+        assert_eq!(result.result["integration"], into);
+        assert_eq!(git::git(&repo, &["show", &format!("{into}:result.txt")]).unwrap().trim(), "completed work");
+        let saved = plan::load_plans(&paths::imacs_home()).unwrap().0;
+        assert_eq!(saved[0].tasks[0].integrated.as_deref(), Some(into.as_str()));
+    });
+}
+
+#[test]
+fn agent_exit_updates_and_saves_its_plan_without_frames() {
+    with_state("app::host_tests::agent_exit_updates_and_saves_its_plan_without_frames", |mut state, ctx| {
+        let terminal = Terminal::spawn(
+            ctx,
+            state.palette.clone(),
+            "/bin/sh".into(),
+            vec!["-c".into(), "sleep 0.1".into()],
+            &state.launch_dir,
+            HashMap::new(),
+            100,
+        )
+        .unwrap();
+        terminal.set_runtime_wake(state.wake.clone());
+        state.sessions = vec![session("worker", AgentKind::Generic, AgentStatus::Working, &state.launch_dir)];
+        state.sessions[0].terminal = Some(terminal);
+        state.plans = vec![Plan {
+            id: "agent-exit".into(),
+            tasks: vec![Task {
+                id: "a".into(),
+                session: Some("worker".into()),
+                status: TaskStatus::Running,
+                ..Task::default()
+            }],
+            ..Plan::default()
+        }];
+        let host = state.into_host();
+        eventually(&host, |state| state.plans[0].tasks[0].status == TaskStatus::Blocked);
+        let saved = plan::load_plans(&paths::imacs_home()).unwrap().0;
+        assert_eq!(saved[0].tasks[0].status, TaskStatus::Blocked);
+    });
+}

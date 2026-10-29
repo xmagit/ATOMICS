@@ -1,6 +1,6 @@
 use super::*;
 
-impl App {
+impl State {
     /// Starts the chief agent in the main checkout of the project on screen.
     pub(super) fn start_chief(&mut self, ctx: &egui::Context, prompt: Option<String>) -> Result<String, String> {
         let cwd = self.view.clone().or_else(|| self.repos.first().cloned()).unwrap_or_else(|| self.launch_dir.clone());

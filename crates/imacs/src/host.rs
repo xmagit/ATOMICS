@@ -1,8 +1,78 @@
 //! In-process runtime wakeups. Producers signal work directly, independently of egui.
 
+use std::sync::MutexGuard;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
-#[cfg(test)]
+use std::thread::JoinHandle;
 use std::time::Instant;
+
+use crate::app::State;
+use crate::ipc::{ControlMessage, ControlOutcome};
+use imacs_core::control::ControlRequest;
+
+/// Owns runtime state and the thread that services it. The desktop is an
+/// in-process client; closing the whole application still shuts down the host.
+pub struct Host {
+    state: Arc<Mutex<State>>,
+    wake: Wake,
+    stopped: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+    commands: Sender<ControlMessage>,
+}
+
+impl Host {
+    pub(crate) fn start(state: State, wake: Wake, ctx: egui::Context, commands: Sender<ControlMessage>) -> Self {
+        let state = Arc::new(Mutex::new(state));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let (runtime, signal, stop) = (state.clone(), wake.clone(), stopped.clone());
+        let thread = std::thread::Builder::new()
+            .name("imacs-runtime".into())
+            .spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    let deadline = {
+                        let mut state = runtime.lock().unwrap();
+                        if state.runtime_tick(&ctx) {
+                            ctx.request_repaint();
+                        }
+                        state.runtime_deadline()
+                    };
+                    signal.wait_until(deadline);
+                }
+            })
+            .expect("runtime thread");
+        Self { state, wake, stopped, thread: Some(thread), commands }
+    }
+
+    /// Borrow the shared native view and apply synchronous UI actions. No
+    /// runtime processing is performed by this borrow or by egui callbacks.
+    pub(crate) fn state(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap()
+    }
+
+    pub fn wake(&self) {
+        self.wake.notify();
+    }
+
+    pub fn command(&self, request: ControlRequest) -> mpsc::Receiver<ControlOutcome> {
+        let (reply, response) = mpsc::channel();
+        let _ = self.commands.send(ControlMessage { request, reply });
+        response
+    }
+
+    pub fn stop(&mut self) {
+        self.stopped.store(true, Ordering::Release);
+        self.wake.notify();
+        if let Some(thread) = self.thread.take() {
+            thread.join().expect("runtime thread panicked");
+        }
+    }
+}
+
+impl Drop for Host {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
 
 #[derive(Clone, Default)]
 pub struct Wake(Arc<(Mutex<bool>, Condvar)>);
@@ -14,7 +84,6 @@ impl Wake {
         ready.notify_one();
     }
 
-    #[cfg(test)]
     pub fn wait_until(&self, deadline: Instant) {
         let (pending, ready) = &*self.0;
         let mut pending = pending.lock().unwrap();

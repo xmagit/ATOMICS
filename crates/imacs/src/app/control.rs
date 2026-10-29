@@ -1,6 +1,6 @@
 use super::*;
 
-impl App {
+impl State {
     pub(super) fn describe(&self, index: usize) -> serde_json::Value {
         let s = &self.sessions[index];
         let stats = self.diffs.get(&s.root()).and_then(|d| d.prepared.as_ref()).map(|p| {

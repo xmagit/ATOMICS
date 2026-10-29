@@ -1,6 +1,6 @@
 use super::*;
 
-impl App {
+impl State {
     /// `imacs <path>` or `--workspace`, else the repository IMACS was started in, else
     /// the projects from last time.
     pub(super) fn open_initial_projects(&mut self, requested: Vec<PathBuf>, workspace: Option<String>) {

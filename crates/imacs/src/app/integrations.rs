@@ -1,6 +1,6 @@
 use super::*;
 
-impl App {
+impl State {
     /// The repository a task works in.
     pub(super) fn task_repo(&self, index: usize, task: &Task) -> Option<PathBuf> {
         task.repo
@@ -264,7 +264,7 @@ mod tests {
                 app.sessions.clear();
                 app.active = None;
                 app.diff_root = None;
-                app.pump(ctx);
+                app.runtime_tick(ctx);
                 assert!(
                     app.watched.lock().unwrap().iter().any(|(root, _)| root == &repo),
                     "the task repository must be watched even without a live agent or visible diff"
@@ -273,7 +273,7 @@ mod tests {
                 while !app.plans[index].tasks[0].integration_verified {
                     assert!(Instant::now() < deadline, "initial integration check did not finish");
                     std::thread::sleep(Duration::from_millis(10));
-                    app.pump(ctx);
+                    app.runtime_tick(ctx);
                 }
                 assert_eq!(app.plans[index].ready().iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["b"]);
                 git::git(&repo, &["switch", "task-a"]).unwrap();
@@ -281,7 +281,7 @@ mod tests {
                 while app.plans[index].tasks[0].integrated.is_some() {
                     assert!(Instant::now() < deadline, "a later commit in the task repository was not detected");
                     std::thread::sleep(Duration::from_millis(25));
-                    app.pump(ctx);
+                    app.runtime_tick(ctx);
                 }
                 assert!(!app.plans[index].tasks[0].integration_verified);
                 assert!(app.plans[index].ready().is_empty());

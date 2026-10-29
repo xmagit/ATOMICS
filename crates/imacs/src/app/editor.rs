@@ -1,6 +1,6 @@
 use super::*;
 
-impl App {
+impl State {
     /// Shows a file in the diff panel: its hunks when changed, the whole file otherwise.
     pub(super) fn open_file(&mut self, root: &Path, path: &str) {
         if self.panel == PanelMode::Editor {

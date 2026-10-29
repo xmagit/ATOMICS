@@ -5,7 +5,7 @@ struct BoardFrame {
     cards: Vec<Rect>,
 }
 
-fn frame(app: &mut App, ctx: &egui::Context, width: f32, time: f64, events: Vec<egui::Event>) -> BoardFrame {
+fn frame(app: &mut State, ctx: &egui::Context, width: f32, time: f64, events: Vec<egui::Event>) -> BoardFrame {
     let output = ctx.run_ui(
         egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(width, 1000.0))),
@@ -39,7 +39,7 @@ fn frame(app: &mut App, ctx: &egui::Context, width: f32, time: f64, events: Vec<
     BoardFrame { text, cards }
 }
 
-fn populate(app: &mut App) {
+fn populate(app: &mut State) {
     let agent = imacs_core::config::AgentConfig {
         name: "codex".into(),
         command: vec![],
