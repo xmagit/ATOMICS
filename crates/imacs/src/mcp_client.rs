@@ -447,27 +447,60 @@ pub(crate) mod tests {
         tickets
     }
 
-    /// The fake ticket server built from `examples/fake_ticket_server.rs`.
+    /// The fake ticket server built from `examples/fake_ticket_server.rs`. Only workspace-wide
+    /// test runs and builds rebuild examples, so a binary older than its source fails loudly
+    /// instead of quietly testing an old fixture.
     pub(crate) fn fake_server() -> PathBuf {
         let exe = std::env::current_exe().unwrap();
         let examples = exe.parent().and_then(|deps| deps.parent()).unwrap().join("examples");
-        let path = examples.join("fake_ticket_server");
-        if path.exists() {
-            return path;
-        }
-        // Cargo keeps the hashed binary next to the uplifted name.
-        std::fs::read_dir(&examples)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|entry| entry.path())
-            .find(|p| {
+        let build = "run cargo build -p imacs --example fake_ticket_server";
+        // Cargo keeps the hashed binaries next to the uplifted name; the newest is the current build.
+        let hashed =
+            std::fs::read_dir(&examples).into_iter().flatten().flatten().map(|entry| entry.path()).filter(|p| {
                 p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("fake_ticket_server-"))
                     && p.extension().is_none()
-            })
-            .unwrap_or_else(|| {
-                panic!("{} is missing: run cargo build -p imacs --example fake_ticket_server first", path.display())
-            })
+            });
+        let path = std::iter::once(examples.join("fake_ticket_server"))
+            .chain(hashed)
+            .filter(|p| p.is_file())
+            .max_by_key(|p| modified(p))
+            .unwrap_or_else(|| panic!("the fake ticket server is missing from {}: {build}", examples.display()));
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/fake_ticket_server.rs");
+        assert!(
+            !fixture_is_stale(&path, &source),
+            "stale fixture: {} is older than {}: {build}",
+            path.display(),
+            source.display()
+        );
+        path
+    }
+
+    fn modified(path: &std::path::Path) -> Option<std::time::SystemTime> {
+        std::fs::metadata(path).and_then(|m| m.modified()).ok()
+    }
+
+    /// Whether a built fixture predates its source. Without the source to compare against,
+    /// it is taken as current.
+    fn fixture_is_stale(binary: &std::path::Path, source: &std::path::Path) -> bool {
+        matches!((modified(binary), modified(source)), (Some(binary), Some(source)) if binary < source)
+    }
+
+    #[test]
+    fn a_fixture_older_than_its_source_is_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let (binary, source) = (dir.path().join("fake_ticket_server"), dir.path().join("fake_ticket_server.rs"));
+        std::fs::write(&binary, "").unwrap();
+        std::fs::write(&source, "").unwrap();
+        let set = |path: &std::path::Path, seconds_ago: u64| {
+            let at = std::time::SystemTime::now() - Duration::from_secs(seconds_ago);
+            std::fs::File::options().write(true).open(path).unwrap().set_modified(at).unwrap();
+        };
+        set(&binary, 60);
+        set(&source, 10);
+        assert!(fixture_is_stale(&binary, &source), "built before the source changed");
+        set(&binary, 5);
+        assert!(!fixture_is_stale(&binary, &source));
+        assert!(!fixture_is_stale(&binary, &dir.path().join("missing.rs")));
     }
 
     /// A state file for the fake server holding these tickets.
