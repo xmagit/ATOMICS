@@ -127,7 +127,7 @@ impl State {
                     }
                 }
                 let statuses = if statuses.is_empty() {
-                    vec!["turn done".into(), "needs you".into(), "exited".into(), "reported".into(), "ticket".into()]
+                    ["turn done", "needs you", "exited", "reported", "ticket", "config"].map(String::from).to_vec()
                 } else {
                     statuses
                 };
@@ -266,6 +266,42 @@ impl State {
                     done(ControlResponse::ok(self.plan_mutation_json(target, Some(&id))))
                 }
             },
+            ControlRequest::PlanStage { plan, task, stage, url, note } => {
+                let result = self.stage_target(Some(&plan), task.as_deref(), None).and_then(|(index, task)| {
+                    self.record_stage(
+                        index,
+                        task.as_deref(),
+                        imacs_core::workflow::Stage { stage, url, note, ..Default::default() },
+                        self.chief_author(),
+                    )
+                });
+                done(match result {
+                    Ok(value) => ControlResponse::ok(value),
+                    Err(error) => ControlResponse::error(error),
+                })
+            }
+            ControlRequest::StageEvent { plan, task, system, id, key, stage, url, note } => {
+                let reference = (id.is_some() || key.is_some()).then(|| imacs_core::tickets::TicketLink {
+                    system: system.unwrap_or_default(),
+                    id: id.unwrap_or_default(),
+                    key,
+                    ..Default::default()
+                });
+                let result = self.stage_target(plan.as_deref(), task.as_deref(), reference.as_ref()).and_then(
+                    |(index, task)| {
+                        self.record_stage(
+                            index,
+                            task.as_deref(),
+                            imacs_core::workflow::Stage { stage, url, note, ..Default::default() },
+                            imacs_core::tickets::Author::Imacs,
+                        )
+                    },
+                );
+                done(match result {
+                    Ok(value) => ControlResponse::ok(value),
+                    Err(error) => ControlResponse::error(error),
+                })
+            }
             ControlRequest::PlanDispatch { plan: _, id } => match self.dispatch(target, id.as_deref()) {
                 Ok(started) => done(ControlResponse::ok(json!({ "started": started }))),
                 Err(err) => done(ControlResponse::error(err)),
@@ -296,6 +332,27 @@ impl State {
                     board.as_deref(),
                     fields,
                 )))
+            }
+            ControlRequest::Doctor => {
+                // The checks start programs and the ticket server: run them off the runtime thread.
+                let workspace = self.workspace.clone();
+                std::thread::spawn(move || {
+                    let report = crate::doctor::json(workspace.as_deref());
+                    let _ = reply.send(ControlOutcome::Done(ControlResponse::ok(report)));
+                });
+                return;
+            }
+            ControlRequest::ConfigPropose { scope, toml, remove, reason, pane } => {
+                done(match self.propose_config(scope, &toml, &remove, reason, pane.as_deref()) {
+                    Ok(result) => ControlResponse::ok(result),
+                    Err(error) => ControlResponse::error(error),
+                })
+            }
+            ControlRequest::ConfigGet { project, key } => {
+                done(match self.config_get(project.as_deref(), key.as_deref()) {
+                    Ok(result) => ControlResponse::ok(result),
+                    Err(error) => ControlResponse::error(error),
+                })
             }
             ControlRequest::Report { pane, status, summary } => {
                 let task = self.report(pane.as_deref(), &status, &summary);
@@ -541,6 +598,7 @@ impl State {
                     report: None,
                     approval: session.approvals.first().map(|pending| pending.request.clone()),
                     findings: None,
+                    config: None,
                     ticket: None,
                 });
             }
@@ -562,6 +620,7 @@ impl State {
                 .filter(|e| {
                     e.findings.is_some()
                         || e.ticket.is_some()
+                        || e.config.is_some()
                         || waiter.sessions.is_empty()
                         || waiter.sessions.contains(&e.session)
                 })

@@ -28,6 +28,7 @@ pub mod layout;
 #[cfg(feature = "native")]
 pub mod paths;
 pub mod plan;
+pub mod selfconfig;
 pub mod session;
 pub mod steer;
 pub mod store;
@@ -36,4 +37,5 @@ pub mod tickets;
 pub mod usage;
 #[cfg(feature = "native")]
 pub mod voice;
+pub mod workflow;
 pub mod workspace;

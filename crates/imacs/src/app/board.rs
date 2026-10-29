@@ -80,6 +80,19 @@ fn ticket_chip(
     }
 }
 
+fn stage_chip(ui: &mut egui::Ui, stage: Option<&imacs_core::workflow::Stage>) {
+    if let Some(stage) = stage {
+        if let Some(url) = &stage.url {
+            ui.hyperlink_to(stage.label(), url);
+        } else {
+            ui.label(stage.label());
+        }
+        if let Some(note) = &stage.note {
+            ui.label(note);
+        }
+    }
+}
+
 fn task_color(status: TaskStatus, p: &Palette) -> Color32 {
     match status {
         TaskStatus::Planned => p.muted,
@@ -171,6 +184,7 @@ impl Desktop<'_> {
                 .on_hover_text("Integrated tasks are merged into it, and tasks with dependencies branch from it");
         }
         let ticket_config = self.runtime.ticket_config();
+        stage_chip(ui, self.runtime.plans[self.runtime.selected_plan].stages.last());
         let mut sync_tickets = false;
         if let Some(link) = self.runtime.plans[self.runtime.selected_plan].ticket.clone() {
             let plan = &self.runtime.plans[self.runtime.selected_plan];
@@ -183,7 +197,9 @@ impl Desktop<'_> {
                 ui.label(RichText::new(format!("{system} {what}")).color(p.muted).size(11.5));
                 let means = ticket_config
                     .as_ref()
-                    .filter(|c| c.mode == imacs_core::tickets::TicketMode::Ticket)
+                    .filter(|c| {
+                        c.mode == imacs_core::tickets::TicketMode::Ticket && !plan.ticket_progress_expected(None)
+                    })
                     .and_then(|c| c.states.status_of(link.state.as_deref()?))
                     .map(|ticket| (ticket, imacs_core::tickets::plan_status(plan)));
                 ui.vertical(|ui| ticket_chip(ui, &link, means, ticket_config.as_deref(), &p));
@@ -240,6 +256,21 @@ impl Desktop<'_> {
         let integrating = &self.runtime.integrating;
         let plan_id = self.runtime.plans[self.runtime.selected_plan].id.clone();
         let ticket_states = ticket_config.as_ref().map(|c| c.states.clone());
+        let latest_stages: std::collections::HashMap<_, _> = self.runtime.plans[self.runtime.selected_plan]
+            .tasks
+            .iter()
+            .filter_map(|task| {
+                self.runtime.plans[self.runtime.selected_plan]
+                    .latest_stage(task)
+                    .map(|stage| (task.id.clone(), stage.clone()))
+            })
+            .collect();
+        let expected_tasks: std::collections::HashSet<_> = self.runtime.plans[self.runtime.selected_plan]
+            .tasks
+            .iter()
+            .filter(|task| self.runtime.plans[self.runtime.selected_plan].ticket_progress_expected(Some(&task.id)))
+            .map(|task| task.id.clone())
+            .collect();
         let mut edited_tasks = self.runtime.plans[self.runtime.selected_plan].tasks.clone();
         let tasks = &mut edited_tasks;
         if !tasks.is_empty() {
@@ -302,9 +333,11 @@ impl Desktop<'_> {
                                                         meta.push_str(&format!(" {model}"));
                                                     }
                                                     ui.label(RichText::new(meta).color(p.muted).size(11.0));
+                                                    stage_chip(ui, latest_stages.get(&task.id));
                                                     if let Some(link) = &task.ticket {
                                                         let means = ticket_states
                                                             .as_ref()
+                                                            .filter(|_| !expected_tasks.contains(&task.id))
                                                             .and_then(|s| s.status_of(link.state.as_deref()?))
                                                             .map(|ticket| (ticket, task.status));
                                                         ticket_chip(ui, link, means, ticket_config.as_deref(), &p);

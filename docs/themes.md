@@ -46,7 +46,7 @@ cursor = "#e0a458"
 - Chains can be as long as needed, up to 16 themes; a cycle is reported.
 - Tokens set inline in `[theme]` win over every file.
 
-Problems are shown in the top bar as `config error: theme: …`, and IMACS keeps going: an unknown key or a
+Problems are shown in the top bar as `theme: …`, and IMACS keeps going: an unknown key or a
 value that is not a color is left out, so the rest of the file still applies. A file that is not TOML, or a
 theme that does not exist, falls back to `claude`.
 

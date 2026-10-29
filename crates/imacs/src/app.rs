@@ -50,11 +50,13 @@ mod plan_view;
 mod plans;
 mod projects;
 mod restart;
+mod selfconfig;
 mod sessions;
 mod sidebar;
 mod tickets;
 mod topbar;
 mod voice;
+mod workflow;
 mod worktrees;
 
 use chief::{CHIEF_ALLOWED_TOOLS, chief_divider};
@@ -247,15 +249,19 @@ struct StatusEvent {
     findings: Option<Vec<imacs_core::heartbeat::Finding>>,
     /// Set when someone changed a linked ticket in its system.
     ticket: Option<serde_json::Value>,
+    /// Set when the user applied or rejected a proposed config change.
+    config: Option<serde_json::Value>,
 }
 
 impl StatusEvent {
-    /// What `wait` matches on: the agent's status, "reported", "heartbeat" or "ticket".
+    /// What `wait` matches on: the agent's status, "reported", "heartbeat", "ticket" or "config".
     fn kind(&self) -> &str {
         if self.findings.is_some() {
             "heartbeat"
         } else if self.ticket.is_some() {
             "ticket"
+        } else if self.config.is_some() {
+            "config"
         } else if self.report.is_some() {
             "reported"
         } else {
@@ -275,6 +281,9 @@ impl StatusEvent {
         }
         if let Some(ticket) = &self.ticket {
             value["ticket"] = ticket.clone();
+        }
+        if let Some(config) = &self.config {
+            value["config"] = config.clone();
         }
         if let Some(request) = &self.approval {
             value["approval"] = json!(request);
@@ -336,6 +345,8 @@ pub(crate) struct State {
     config_stamp: [Option<u64>; 3],
     config_checked: Instant,
     config_error: Option<String>,
+    /// What the theme files or `[theme]` could not apply; the rest of the theme still does.
+    theme_error: Option<String>,
     palette: Arc<Palette>,
     highlighter: Arc<Highlighter>,
     sessions: Vec<Session>,
@@ -420,6 +431,9 @@ pub(crate) struct State {
     restart_layout: Option<imacs_core::store::RestartState>,
     plan_edit_open: bool,
     pending_questions: HashSet<String>,
+    /// Config changes proposed through the tools, waiting for the user, oldest first.
+    proposals: Vec<selfconfig::Pending>,
+    proposal_seq: u64,
     desktop_split: Option<f32>,
     desktop_diff_split: Option<DiffSplit>,
     launch_dir: PathBuf,
@@ -470,6 +484,10 @@ struct Client {
     new_dialog: Option<NewDialog>,
     quick_open: Option<QuickOpen>,
     voice: Voice,
+    /// The proposal on screen and when it appeared, which enables Apply after a moment.
+    config_seen: Option<(String, Instant)>,
+    /// The user's note on the proposal on screen, sent with Apply or Reject.
+    config_note: String,
     voice_tx: Sender<VoiceEvent>,
     voice_rx: Receiver<VoiceEvent>,
     screenshot: Option<Screenshot>,
@@ -508,6 +526,8 @@ impl Client {
             new_dialog: None,
             quick_open: None,
             voice: Voice::Idle,
+            config_seen: None,
+            config_note: String::new(),
             voice_tx,
             voice_rx,
             screenshot: options.screenshot.take().map(|path| Screenshot {
@@ -622,7 +642,7 @@ impl State {
         let ctx = cc.egui_ctx.clone();
         let (palette, theme_errors) = Palette::load(&config.theme, &theme::themes_dir(&config_path));
         palette.apply(&ctx);
-        let config_error = config_error.or_else(|| theme_error(&theme_errors));
+        let theme_error = theme_error(&theme_errors);
 
         let hub = Arc::new(Mutex::new(Hub::default()));
         let wake = crate::host::Wake::default();
@@ -690,6 +710,7 @@ impl State {
             config_path,
             config_checked: Instant::now(),
             config_error,
+            theme_error,
             sessions: Vec::new(),
             codex_versions: HashMap::new(),
             pending_codex: Vec::new(),
@@ -760,6 +781,8 @@ impl State {
             restart_layout: None,
             plan_edit_open: false,
             pending_questions: HashSet::new(),
+            proposals: Vec::new(),
+            proposal_seq: 0,
             desktop_split: None,
             desktop_diff_split: None,
             launch_dir,
@@ -1001,9 +1024,9 @@ fn themes_fingerprint(dir: &Path) -> Option<u64> {
     Some(hasher.finish())
 }
 
-/// Theme problems, shown where config errors are.
+/// Theme problems, shown in the top bar beside config errors.
 fn theme_error(errors: &[String]) -> Option<String> {
-    (!errors.is_empty()).then(|| format!("theme: {}", errors.join("; ")))
+    (!errors.is_empty()).then(|| errors.join("; "))
 }
 
 /// A small config file's content as a hash, `None` when it cannot be read. Rapid edits

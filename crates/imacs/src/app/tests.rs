@@ -129,7 +129,7 @@ fn themes_reload_live_and_terminals_answer_the_new_colors() {
         std::fs::write(themes.join("mine.toml"), "extends = \"midnight\"\nterminal = \"#102030\"").unwrap();
         std::fs::write(&state.config_path, "[theme]\nname = \"mine\"\naccent = \"#405060\"").unwrap();
         reload(&mut state);
-        assert!(state.config_error.is_none(), "{:?}", state.config_error);
+        assert!(state.config_error.is_none() && state.theme_error.is_none(), "{:?}", state.theme_error);
         assert_eq!(state.palette.terminal, color("#102030"));
         assert_eq!(state.palette.accent, color("#405060"), "inline [theme] tokens win");
         assert_eq!(state.palette.syntax, "OneHalfDark", "the rest comes from midnight");
@@ -162,8 +162,9 @@ fn themes_reload_live_and_terminals_answer_the_new_colors() {
 
         std::fs::write(themes.join("mine.toml"), "extends = \"midnight\"\nterminal = \"#a0b0c\"").unwrap();
         reload(&mut state);
-        let error = state.config_error.clone().unwrap();
+        let error = state.theme_error.clone().unwrap();
         assert!(error.contains("themes/mine.toml: terminal = \"#a0b0c\""), "{error}");
+        assert!(state.config_error.is_none(), "the config itself still loads");
         assert_eq!(state.palette.terminal, color("#16181d"), "a bad token falls back to the theme it extends");
     });
 }
