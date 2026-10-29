@@ -36,7 +36,8 @@ type Done = (Tag, Result<TicketOutput, String>);
 pub(super) struct Tickets {
     /// The effective `[tickets]`: the workspace file's, else the main config's.
     pub(super) config: Option<Arc<TicketConfig>>,
-    workspace_file: Option<(Option<PathBuf>, Option<SystemTime>)>,
+    /// The workspace file and its content's fingerprint when last read.
+    workspace_file: Option<(Option<PathBuf>, Option<u64>)>,
     workspace_config: Option<TicketConfig>,
     jobs: Option<std::sync::mpsc::Sender<TicketJob<Tag>>>,
     done_tx: crate::host::Sender<Done>,
@@ -99,7 +100,7 @@ impl State {
     /// link again when the effective config changes.
     pub(super) fn apply_ticket_config(&mut self) {
         let file = self.workspace.as_deref().and_then(|name| Workspace::file(name).ok());
-        let stamp = file.as_deref().and_then(modified);
+        let stamp = file.as_deref().and_then(file_fingerprint);
         if self.tickets.workspace_file.as_ref() != Some(&(file.clone(), stamp)) {
             self.tickets.workspace_file = Some((file, stamp));
             let loaded = match self.workspace.clone().filter(|_| stamp.is_some()) {
@@ -2123,14 +2124,24 @@ mod tests {
                 app.runtime.workspace = Some("team".into());
                 app.runtime.apply_ticket_config();
                 assert_eq!(app.runtime.ticket_config().unwrap().system, "team");
-                std::thread::sleep(Duration::from_millis(20));
                 std::fs::write(&file, "projects = []\n[tickets]\nsystem = \"\"\n").unwrap();
                 app.runtime.apply_ticket_config();
                 assert!(app.runtime.ticket_config().is_none(), "a workspace can turn tickets off");
-                std::thread::sleep(Duration::from_millis(20));
                 std::fs::write(&file, "projects = []\n").unwrap();
                 app.runtime.apply_ticket_config();
                 assert_eq!(app.runtime.ticket_config().unwrap().system, "main");
+
+                // An edit within the same modification time (fast saves, coarse clocks) still counts.
+                let stamp = std::fs::metadata(&file).unwrap().modified().unwrap();
+                std::fs::write(
+                    &file,
+                    "projects = []\n[tickets]\nsystem = \"same-second\"\nserver = { command = [\"x\"] }\n",
+                )
+                .unwrap();
+                std::fs::File::options().write(true).open(&file).unwrap().set_modified(stamp).unwrap();
+                assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), stamp);
+                app.runtime.apply_ticket_config();
+                assert_eq!(app.runtime.ticket_config().unwrap().system, "same-second");
             },
         );
     }
