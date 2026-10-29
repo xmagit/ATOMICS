@@ -426,8 +426,9 @@ impl App {
         apply_style(&ctx, &config);
 
         let hub = Arc::new(Mutex::new(Hub::default()));
-        let (hook_tx, hook_rx) = channel();
-        let (control_tx, control_rx) = channel();
+        let wake = crate::host::Wake::default();
+        let (hook_tx, hook_rx) = wake.channel();
+        let (control_tx, control_rx) = wake.channel();
         let (usage, usage_tx) = crate::usage::UsagePanel::new(ctx.clone());
         let governor = Arc::new(Governor::new(config.resources.clone(), Some(ctx.clone())));
         let channels = Channels { hooks: hook_tx, control: control_tx, usage: usage_tx, governor: governor.clone() };

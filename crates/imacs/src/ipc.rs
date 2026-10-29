@@ -95,8 +95,8 @@ pub struct ControlMessage {
 }
 
 pub struct Channels {
-    pub hooks: Sender<HookMessage>,
-    pub control: Sender<ControlMessage>,
+    pub hooks: crate::host::Sender<HookMessage>,
+    pub control: crate::host::Sender<ControlMessage>,
     pub usage: Sender<crate::usage::Report>,
     pub governor: Arc<crate::governor::Governor>,
 }
@@ -222,7 +222,7 @@ fn handle_with_wait_duration(
     Ok(())
 }
 
-fn control(request: ControlRequest, app: &Sender<ControlMessage>, ctx: &egui::Context) -> ControlResponse {
+fn control(request: ControlRequest, app: &crate::host::Sender<ControlMessage>, ctx: &egui::Context) -> ControlResponse {
     let (reply, outcome) = std::sync::mpsc::channel();
     if app.send(ControlMessage { request, reply }).is_err() {
         return ControlResponse::error("IMACS is shutting down");
@@ -282,7 +282,7 @@ mod tests {
         handle(
             server,
             &Mutex::new(Hub::default()),
-            &Channels { hooks, control, usage, governor },
+            &Channels { hooks: hooks.into(), control: control.into(), usage, governor },
             &egui::Context::default(),
         )
         .unwrap();
@@ -307,7 +307,7 @@ mod tests {
         handle(
             server,
             &Mutex::new(Hub::default()),
-            &Channels { hooks, control, usage, governor },
+            &Channels { hooks: hooks.into(), control: control.into(), usage, governor },
             &egui::Context::default(),
         )
         .unwrap();
@@ -349,7 +349,12 @@ mod tests {
                 handle_with_wait_duration(
                     server,
                     &server_hub,
-                    &Channels { hooks, control, governor, usage: std::sync::mpsc::channel().0 },
+                    &Channels {
+                        hooks: hooks.into(),
+                        control: control.into(),
+                        governor,
+                        usage: std::sync::mpsc::channel().0,
+                    },
                     &egui::Context::default(),
                     |seconds| Duration::from_millis(seconds * 5),
                 )
