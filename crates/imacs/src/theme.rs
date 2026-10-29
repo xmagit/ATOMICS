@@ -147,6 +147,11 @@ impl Palette {
         if self.mono_ui { egui::FontId::monospace(size * 0.92) } else { egui::FontId::proportional(size) }
     }
 
+    /// A faint wash of the foreground over whatever is under the pointer, in light and dark themes.
+    pub fn hover(&self) -> Color32 {
+        self.foreground.gamma_multiply(0.04)
+    }
+
     /// Terminal text faded toward the terminal background.
     pub fn dim(&self, color: Color32) -> Color32 {
         lerp(self.terminal, color, 0.62)
@@ -334,6 +339,104 @@ mod tests {
         assert_eq!(style.visuals.weak_text_color, Some(rgb(0x0a0b0c)));
         assert_eq!(style.visuals.selection.bg_fill, palette.selection);
         assert!(style.visuals.dark_mode);
+    }
+
+    /// Colors written into UI code instead of taken from the theme, as `file:line: code`.
+    fn color_literals(file: &Path, text: &str) -> Vec<String> {
+        let code: Vec<&str> = text.lines().map(|line| line.split("//").next().unwrap_or("")).collect();
+        let joined = code.join("\n");
+        let numeric = |arg: &str| {
+            let arg = arg.trim().replace('_', "");
+            let unsuffixed = |text: &str, suffixes: &[&str]| {
+                suffixes.iter().find_map(|suffix| text.strip_suffix(suffix)).unwrap_or(text).to_string()
+            };
+            match arg.strip_prefix("0x") {
+                Some(hex) => u64::from_str_radix(&unsuffixed(hex, &["u8", "u32", "u64"]), 16).is_ok(),
+                None => unsuffixed(&arg, &["u8", "u32", "u64", "f32", "f64"]).parse::<f64>().is_ok(),
+            }
+        };
+        let mut found = Vec::new();
+        for ty in ["Color32::", "Rgba::", "Hsva::", "Hsva {", "hex_color!("] {
+            for (at, _) in joined.match_indices(ty) {
+                let rest = &joined[at + ty.len()..];
+                let name: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                let args = rest[name.len()..].strip_prefix('(').map(|args| {
+                    let mut depth = 1;
+                    let end = args
+                        .char_indices()
+                        .find(|&(_, c)| {
+                            depth += match c {
+                                '(' => 1,
+                                ')' => -1,
+                                _ => 0,
+                            };
+                            depth == 0
+                        })
+                        .map_or(args.len(), |(end, _)| end);
+                    &args[..end]
+                });
+                let literal = match name.as_str() {
+                    "TRANSPARENT" => false,
+                    constant if constant.chars().next().is_some_and(char::is_uppercase) => true,
+                    "from_gray" | "from_white_alpha" | "from_black_alpha" | "additive_luminance" | "from_hex" => true,
+                    _ if ty == "Hsva {" || ty == "hex_color!(" => true,
+                    _ => args.is_some_and(|args| args.split(',').any(numeric)),
+                };
+                if literal {
+                    let line = joined[..at].matches('\n').count();
+                    found.push(format!("{}:{}: {}", file.display(), line + 1, code[line].trim()));
+                }
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn ui_code_takes_every_color_from_the_theme() {
+        fn rust_files(dir: &Path, files: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    rust_files(&path, files);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    files.push(path);
+                }
+            }
+        }
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_files(&src, &mut files);
+        assert!(files.len() > 20, "the scan must see the UI code");
+        let found: Vec<String> = files
+            .iter()
+            .filter(|file| **file != src.join("theme.rs"))
+            .flat_map(|file| color_literals(file.strip_prefix(&src).unwrap(), &std::fs::read_to_string(file).unwrap()))
+            .collect();
+        assert!(found.is_empty(), "use a theme token from theme.rs instead of:\n{}", found.join("\n"));
+
+        // The scan itself catches each way of writing a color.
+        let file = Path::new("x.rs");
+        for literal in [
+            "let c = Color32::WHITE;",
+            "egui::Color32::from_rgb(255, 0, 0)",
+            "Color32::from_rgba_unmultiplied(\n    0x10,\n    a,\n    b,\n    c,\n)",
+            "Color32::from_white_alpha(8)",
+            "Color32::from_gray(v)",
+            "egui::Rgba::from_rgb(1.0, 0.5, 0.0)",
+            "Color32::from_rgb(10u8, g, b)",
+            "Color32::from_rgb(0xff, 0x32, 0)",
+            "Color32::from_rgb(r, 0x1fu8, b)",
+        ] {
+            assert_eq!(color_literals(file, literal).len(), 1, "{literal}");
+        }
+        for allowed in [
+            "Color32::TRANSPARENT",
+            "Color32::from_rgb(rgb.r, rgb.g, rgb.b)",
+            "Color32::from_rgba_unmultiplied(s.color[0], s.color[1], s.color[2], s.color[3])",
+            "fn chip(color: Color32) {} // Color32::WHITE in a comment",
+        ] {
+            assert!(color_literals(file, allowed).is_empty(), "{allowed}");
+        }
     }
 
     #[test]

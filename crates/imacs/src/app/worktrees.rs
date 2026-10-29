@@ -237,11 +237,8 @@ impl Desktop<'_> {
                         "also delete their branches (only if merged)",
                     );
                     let label = format!("Remove {selected} worktree{}", if selected == 1 { "" } else { "s" });
-                    let button = egui::Button::new(RichText::new(label).color(Color32::WHITE)).fill(if selected > 0 {
-                        p.error.gamma_multiply(0.55)
-                    } else {
-                        p.raised
-                    });
+                    let (text, fill) = if selected > 0 { (p.on_accent, p.error) } else { (p.muted, p.raised) };
+                    let button = egui::Button::new(RichText::new(label).color(text)).fill(fill);
                     if ui.add_enabled(selected > 0 && cleanup.busy.is_none(), button).clicked() {
                         remove = true;
                     }

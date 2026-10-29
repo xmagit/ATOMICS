@@ -1197,8 +1197,7 @@ impl Desktop<'_> {
             if std::mem::take(&mut self.client.focus_steer) {
                 response.request_focus();
             }
-            let button =
-                egui::Button::new(RichText::new("Send").color(Color32::WHITE)).fill(p.accent.gamma_multiply(0.6));
+            let button = egui::Button::new(RichText::new("Send").color(p.on_accent)).fill(p.accent);
             if ui.add(button).clicked() {
                 send = true;
             }
