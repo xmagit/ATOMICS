@@ -11,6 +11,14 @@ pub(super) enum PlanState {
 }
 
 impl PlanState {
+    pub(super) fn urgency(self) -> u8 {
+        match self {
+            Self::NeedsYou => 2,
+            Self::Running(_) => 1,
+            _ => 0,
+        }
+    }
+
     pub(super) fn color(self, palette: &Palette) -> Color32 {
         match self {
             Self::Running(_) => palette.accent,

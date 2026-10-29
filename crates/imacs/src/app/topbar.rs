@@ -46,13 +46,15 @@ impl Desktop<'_> {
         let full_brand = measure(ui, |ui| self.top_bar_brand(ui, true));
         let compact_brand = measure(ui, |ui| self.top_bar_brand(ui, false));
         let tabs = measure(ui, |ui| self.view_tabs(ui));
+        let (urgent_label, urgent_color) = self.urgent_tabs_label();
         let min_tabs = measure(ui, |ui| {
-            ui.menu_button("Tabs", |_| {});
+            ui.menu_button(RichText::new(&urgent_label).color(urgent_color), |_| {});
         });
+        let protected_navigation = self.urgent_navigation_width(ui).max(min_tabs);
 
         // Once even the minimum navigation cannot fit, put the actions in a
         // menu. All four slots then retain their measured natural minimums.
-        let actions_menu = compact_brand + min_tabs + compact_chief + controls + gap * 3.0 > rect.width();
+        let actions_menu = compact_brand + protected_navigation + compact_chief + controls + gap * 3.0 > rect.width();
         let show_load =
             !actions_menu && full_brand + tabs + full_chief + controls_with_load + gap * 3.0 <= rect.width();
         let controls_width = if actions_menu {
@@ -64,17 +66,20 @@ impl Desktop<'_> {
         } else {
             controls
         };
-        let show_agents = full_brand + min_tabs + compact_chief + controls_width + gap * 3.0 <= rect.width();
+        let show_agents =
+            full_brand + protected_navigation + compact_chief + controls_width + gap * 3.0 <= rect.width();
         let brand_width = if show_agents { full_brand } else { compact_brand };
-        let compact = brand_width + min_tabs + full_chief + controls_width + gap * 3.0 > rect.width();
+        let compact = brand_width + protected_navigation + full_chief + controls_width + gap * 3.0 > rect.width();
         let chief_width = if compact { compact_chief } else { full_chief };
         let controls_left = rect.right() - controls_width;
         let tabs_left = rect.left() + brand_width + gap;
-        // Keep the wide-screen center. Shift only when the brand/navigation or
-        // fixed actions cannot fit on their respective side of the pill.
-        let chief_left = (rect.center().x - chief_width / 2.0)
-            .max(tabs_left + min_tabs + gap)
-            .min(controls_left - gap - chief_width);
+        // Keep the wide-screen center when navigation fits. Otherwise use the
+        // free space up to the actions before deciding which tabs overflow.
+        let chief_limit = controls_left - gap - chief_width;
+        let desired_navigation = tabs_left + tabs + gap;
+        let navigation_goal = desired_navigation.min(chief_limit);
+        let chief_left =
+            (rect.center().x - chief_width / 2.0).max(navigation_goal).max(tabs_left + min_tabs + gap).min(chief_limit);
         let navigation = Rect::from_x_y_ranges(tabs_left..=chief_left - gap, rect.y_range());
         slot(ui, "brand", rect.with_max_x(rect.left() + brand_width), |ui| self.top_bar_brand(ui, show_agents));
         slot(ui, "chief", rect.with_min_x(chief_left).with_max_x(chief_left + chief_width), |ui| {
@@ -319,7 +324,7 @@ mod tests {
                                 text_rects.push((text.galley.text(), rect));
                             }
                         }
-                        if width >= 2400.0 {
+                        if width == 5120.0 {
                             let chief = items.iter().find(|(n, _)| n == "chief").unwrap().1;
                             assert!((chief.center().x - width / 2.0).abs() < 1.0, "wide pill remains centered");
                         }
@@ -332,6 +337,97 @@ mod tests {
                 }
             }
         });
+    }
+
+    #[test]
+    fn urgent_plans_stay_visible_or_are_surfaced_by_tabs_at_supported_widths() {
+        with_app(
+            "app::topbar::tests::urgent_plans_stay_visible_or_are_surfaced_by_tabs_at_supported_widths",
+            |app, ctx| {
+                fixture(app, 5);
+                app.runtime.plans[0].status = PlanStatus::Open;
+                app.runtime.plans[0].goal = "A long running plan name that must yield before its running count".into();
+                app.runtime.plans[0].tasks = ["first", "second"]
+                    .into_iter()
+                    .map(|id| Task {
+                        id: id.into(),
+                        session: Some(id.into()),
+                        status: TaskStatus::Running,
+                        ..Task::default()
+                    })
+                    .collect();
+                app.runtime.plans[1].status = PlanStatus::Open;
+                app.runtime.plans[1].goal = "A needs-you plan with a long descriptive name".into();
+                app.runtime.plans[1].tasks[0].status = TaskStatus::Blocked;
+                app.runtime.plans[3].status = PlanStatus::Completed;
+                app.runtime.plans[4].status = PlanStatus::Completed;
+                for id in ["first", "second"] {
+                    app.runtime.sessions.push(session(
+                        id,
+                        AgentKind::Generic,
+                        AgentStatus::Working,
+                        Path::new("/project/IMACS"),
+                    ));
+                }
+                app.runtime.changed_plans.insert(app.runtime.plans[0].id.clone());
+                app.runtime.changed_plans.insert(app.runtime.plans[1].id.clone());
+                for width in [480.0, 900.0, 1200.0, 1400.0] {
+                    let (items, output) = render(app, ctx, width, vec![]);
+                    let labels: Vec<_> = output
+                        .shapes
+                        .iter()
+                        .filter_map(|shape| if let egui::Shape::Text(text) = &shape.shape { Some(text) } else { None })
+                        .collect();
+                    let needs_visible = items
+                        .iter()
+                        .any(|(name, _)| name.starts_with("◆ ") && name.trim_end_matches(" *").ends_with("needs you"));
+                    let surfaced = labels.iter().find(|text| {
+                        text.galley.text().starts_with("Tabs · ") && text.galley.text().ends_with("needs you")
+                    });
+                    assert!(
+                        needs_visible || surfaced.is_some(),
+                        "width={width}: needs-you plan disappeared: {items:?}"
+                    );
+                    if let Some(text) = surfaced {
+                        assert!(
+                            text.galley
+                                .job
+                                .sections
+                                .iter()
+                                .any(|section| section.format.color == app.runtime.palette.warning)
+                        );
+                        assert!(!text.galley.elided, "width={width}: urgency suffix on Tabs was clipped");
+                    }
+                    for text in labels.iter().filter(|text| {
+                        text.galley.text().starts_with("◆ ") && text.galley.text().contains("needs you")
+                            || text.galley.text().starts_with("● ") && text.galley.text().contains("2 running")
+                    }) {
+                        assert!(
+                            !text.galley.elided,
+                            "width={width}: important state was elided: {}",
+                            text.galley.text()
+                        );
+                        let bounds = text.galley.rect.translate(text.pos.to_vec2());
+                        let clip = output
+                            .shapes
+                            .iter()
+                            .find(|shape| matches!(&shape.shape,egui::Shape::Text(other) if std::ptr::eq(other,*text)))
+                            .unwrap()
+                            .clip_rect;
+                        assert!(clip.expand(0.5).contains_rect(bounds), "width={width}: important label was clipped");
+                    }
+                    if width >= 900.0 {
+                        assert!(needs_visible, "width={width}: needs-you should fit");
+                        assert!(
+                            items.iter().any(|(name, _)| name.starts_with("● ")
+                                && name.trim_end_matches(" *").ends_with("2 running")),
+                            "width={width}: running count disappeared: {items:?}"
+                        );
+                    }
+                    output.drop_without_applying_deltas();
+                }
+            },
+        );
     }
 
     #[test]
