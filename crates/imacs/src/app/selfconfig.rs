@@ -24,12 +24,6 @@ pub(super) struct Pending {
     from: String,
 }
 
-/// A repository's own settings file. Repositories carry no IMACS settings yet; this is
-/// where a repository's layer joins, after the workspace.
-fn repo_layer(_root: &Path) -> Option<Layer> {
-    None
-}
-
 impl State {
     /// The files that make up the configuration, lowest precedence first: the main file,
     /// this host's, the active workspace's, and the project's own when given.
@@ -39,13 +33,13 @@ impl State {
         if let Some(file) = self.workspace.as_deref().and_then(|name| Workspace::file(name).ok()) {
             layers.push(Layer::read(Source::Workspace, &file));
         }
-        layers.extend(project.and_then(repo_layer));
+        layers.extend(project.map(|root| imacs_core::repo_workflow::RepoWorkflow::read(root).config));
         layers
     }
 
     /// The configuration IMACS runs with, the workspace's tickets included.
     pub(super) fn effective_config(&self) -> Config {
-        Config { tickets: self.effective_tickets(), ..self.config.clone() }
+        Config { tickets: self.effective_tickets(), workflow: self.workflow().clone(), ..self.config.clone() }
     }
 
     /// The cleaner for everything the configuration tools return: built from the secrets
@@ -63,7 +57,11 @@ impl State {
         };
         let layers = self.config_layers(project.as_deref());
         let cleaner = self.config_cleaner(&layers);
-        let effective = self.effective_config();
+        let mut effective = self.effective_config();
+        if let Some(layer) = layers.iter().find(|layer| layer.source == Source::Repo) {
+            let repo = imacs_core::repo_workflow::RepoWorkflow { config: layer.clone(), ..Default::default() };
+            effective = repo.apply(&effective);
+        }
         let files: Vec<_> = layers
             .iter()
             .map(|layer| {
@@ -86,6 +84,8 @@ impl State {
                 "path": paths::display(&root),
                 "open": self.open_projects.contains(&root) || self.repos.contains(&root),
                 "sources": layers.iter().map(|layer| layer.source).collect::<Vec<_>>(),
+                "workflow_files": imacs_core::repo_workflow::RepoWorkflow::read(&root).instructions.iter().map(|(file, _)| file).collect::<Vec<_>>(),
+                "warnings": imacs_core::repo_workflow::RepoWorkflow::read(&root).warnings,
                 "new_worktree_example": paths::display(&git::worktree_path(&effective.worktree_path, &root, "example")),
             })
         });
@@ -96,7 +96,7 @@ impl State {
             .collect();
         Ok(json!({
             "host": paths::host_name(),
-            "merge": "Built-in defaults, then config.toml, then config.d/<host>.toml: tables merge key by key, arrays and other values replace. A workspace's [tickets] replaces the section as a whole.",
+            "merge": "Built-in defaults, then config.toml, then config.d/<host>.toml: tables merge key by key, arrays and other values replace. A workspace's [tickets] and [workflow] replace each section as a whole. A project overlays allowlisted .imacs/config.toml settings; its [workflow] replaces the workspace workflow.",
             "files": files,
             "workspace": workspace,
             "project": project,
@@ -106,7 +106,7 @@ impl State {
             "chief_prompt": {
                 "built_in": effective.chief.system_prompt == imacs_core::config::CHIEF_PROMPT,
                 "sections": sections,
-                "composed": "The built-in prompt (or chief.system_prompt), then the ticket workflow, then each [chief] prompt section: main, host, workspace. Read when the chief starts.",
+                "composed": "The built-in prompt (or chief.system_prompt), then the ticket workflow, then each [chief] prompt section: main, host, workspace; then a bounded section per project from IMACS.md, .imacs/*.md and declarative config. Read when the chief starts.",
             },
             "secrets": "Values of secret-looking names, credential flags and URL credentials read as ***. Ticket and voice keys stay in the environment variables token_env and api_key_env name.",
         }))
@@ -177,7 +177,9 @@ impl State {
                 self.reload_config();
                 self.toast(format!("Config change applied to {}", proposal.file));
                 let chief = proposal.changes.iter().any(|change| {
-                    ["chief.", "tickets.", "base_ref", "repos"].iter().any(|prefix| change.key.starts_with(prefix))
+                    ["chief.", "tickets.", "workflow.", "base_ref", "repos"]
+                        .iter()
+                        .any(|prefix| change.key.starts_with(prefix))
                 });
                 json!({
                     "outcome": "applied",
@@ -410,6 +412,58 @@ mod tests {
             .collect();
         found.sort();
         found
+    }
+
+    #[test]
+    fn config_get_exposes_project_settings_and_workflow_sources() {
+        with_app("app::selfconfig::tests::config_get_exposes_project_settings_and_workflow_sources", |app, _| {
+            let (_dir, repo) = super::super::tests::repository();
+            let [main, host] = Config::source_paths(&app.runtime.config_path);
+            std::fs::write(&main, "[workflow]\ndone = 'merged'\n").unwrap();
+            app.runtime.config = Config::load(&main).unwrap();
+            let get = |app: &mut Desktop<'_>| request(app, json!({"cmd":"config_get", "project": repo})).result;
+            assert_eq!(get(app)["values"]["workflow.done"], json!({"value":"merged", "source":"main"}));
+            std::fs::create_dir_all(host.parent().unwrap()).unwrap();
+            std::fs::write(&host, "[workflow]\ndone = 'ci_passed'\n").unwrap();
+            app.runtime.config = Config::load(&main).unwrap();
+            assert_eq!(get(app)["values"]["workflow.done"], json!({"value":"ci_passed", "source":"host"}));
+            app.runtime.workspace = Some("repo-team".into());
+            let file = Workspace::file("repo-team").unwrap();
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(
+                &file,
+                "projects = []\n[tickets]\nbranch = 'workspace/{slug}'\n[workflow]\ndone = 'pr_opened'\n",
+            )
+            .unwrap();
+            app.runtime.apply_ticket_config();
+            assert_eq!(get(app)["values"]["workflow.done"], json!({"value":"pr_opened", "source":"workspace"}));
+            std::fs::create_dir(repo.join(".imacs")).unwrap();
+            std::fs::write(repo.join(".imacs/config.toml"), "base_ref = 'main'\npr_title = '#{key} - {title}'\ntest_commands = ['cargo test']\n[workflow]\ndone = 'qa_passed'\nstages = ['accepted', 'qa_passed']\n[tickets]\nbranch = 'repo/{slug}'\nserver.command = ['evil']\n").unwrap();
+            let got = get(app);
+            for key in ["workflow.done", "workflow.stages", "tickets.branch", "base_ref", "pr_title", "test_commands"] {
+                assert_eq!(got["values"][key]["source"], "repo", "{key}: {got}");
+            }
+            assert_eq!(got["values"]["workflow.done"]["value"], "qa_passed");
+            assert_eq!(got["values"]["tickets.branch"]["value"], "repo/{slug}");
+            assert!(
+                got["project"]["warnings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|w| w.as_str().unwrap().contains("ignored tickets.server"))
+            );
+            assert!(!got.to_string().contains("evil"));
+            assert_eq!(got["files"][3]["source"], "repo");
+            assert_eq!(got["files"][3]["exists"], true);
+            let without_project = request(app, json!({"cmd":"config_get", "key":"workflow"})).result;
+            assert_eq!(without_project["values"]["workflow.done"]["source"], "workspace");
+            let proposal = request(
+                app,
+                json!({"cmd":"config_propose", "scope":"workspace", "toml":"[workflow]\ndone = 'merged'"}),
+            );
+            assert!(proposal.ok, "{proposal:?}");
+            assert!(std::fs::read_to_string(file).unwrap().contains("done = 'pr_opened'"));
+        });
     }
 
     #[test]
@@ -681,7 +735,7 @@ mod tests {
             let response = request(app, json!({"cmd":"config_get", "project": repo, "key":"base_ref"}));
             assert!(response.ok, "{:?}", response.error);
             assert_eq!(response.result["project"]["path"], paths::display(&repo.canonicalize().unwrap()));
-            assert_eq!(response.result["project"]["sources"], json!(["main", "host", "workspace"]));
+            assert_eq!(response.result["project"]["sources"], json!(["main", "host", "workspace", "repo"]));
             assert!(!request(app, json!({"cmd":"config_get", "project": "/nonexistent/imacs"})).ok);
         });
     }

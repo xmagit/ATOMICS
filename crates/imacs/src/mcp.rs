@@ -442,7 +442,7 @@ fn config_tools() -> Value {
     json!([
         {
             "name": "imacs_config_get",
-            "description": "Chief only: IMACS's effective configuration, each value with its source (default, main for config.toml, host for config.d/<host>.toml, workspace for the active workspace file). Also lists the files and, with project, that project's settings. Secret values read as ***; token_env and api_key_env stay names. Read this before proposing a change.",
+            "description": "Chief only: IMACS's effective configuration, each value with its source (default, main for config.toml, host for config.d/<host>.toml, workspace for the active workspace file, repo for declarative .imacs/config.toml settings when project is given). Also lists the files and, with project, that project's settings. Secret values read as ***; token_env and api_key_env stay names. Read this before proposing a change.",
             "inputSchema": { "type": "object", "properties": {
                 "project": { "type": "string", "description": "A folder in a project, to include that project's settings" },
                 "key": { "type": "string", "description": "Only keys under this dotted prefix, such as tickets or layout.sidebar_width" }
@@ -455,7 +455,7 @@ fn config_tools() -> Value {
         },
         {
             "name": "imacs_config_propose",
-            "description": "Chief only: propose a change to one config file for the user to apply. scope main is config.toml (shared by every machine that shares it), host is config.d/<host>.toml (this machine only), workspace is the active workspace's file ([tickets] and [chief] prompt only). remove takes dotted keys out first; toml then merges in: tables key by key, arrays and other values replace. IMACS checks that the result loads, then shows the user a diff with Apply and Reject, labeling settings that run commands, send credentials or instruct agents. Nothing is written before the user applies it. Returns a proposal id; the outcome (applied, rejected or failed, with the user's note) arrives as a config event in imacs_wait. Keep secrets out of the config: token_env and api_key_env name environment variables.",
+            "description": "Chief only: propose a change to one config file for the user to apply. scope main is config.toml (shared by every machine that shares it), host is config.d/<host>.toml (this machine only), workspace is the active workspace's file ([tickets], [workflow] and [chief] prompt only). remove takes dotted keys out first; toml then merges in: tables key by key, arrays and other values replace. IMACS checks that the result loads, then shows the user a diff with Apply and Reject, labeling settings that run commands, send credentials or instruct agents. Nothing is written before the user applies it. Returns a proposal id; the outcome (applied, rejected or failed, with the user's note) arrives as a config event in imacs_wait. Keep secrets out of the config: token_env and api_key_env name environment variables.",
             "inputSchema": { "type": "object", "properties": {
                 "scope": { "type": "string", "enum": ["main", "host", "workspace"] },
                 "toml": { "type": "string", "description": "The change as TOML, for example \"[layout]\\nsidebar_width = 300.0\"" },
