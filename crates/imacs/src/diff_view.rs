@@ -13,7 +13,7 @@ use imacs_core::layout::DiffSplit;
 use imacs_core::steer::ReviewComment;
 
 use crate::highlight::Span;
-use crate::theme::{Palette, lerp};
+use crate::theme::{Palette, lerp, shortcut_label};
 
 pub use crate::diff_worker::{FileView, Prepared};
 
@@ -200,6 +200,7 @@ pub struct Header<'a> {
     pub branch: Option<&'a str>,
     pub can_send: bool,
     pub split: DiffSplit,
+    pub editor_shortcut: &'a str,
 }
 
 pub fn show(
@@ -233,7 +234,10 @@ pub fn show(
             }
             if ui
                 .small_button("editor")
-                .on_hover_text("Edit in the editor (cmd+e) · double-click a line to edit there")
+                .on_hover_text(format!(
+                    "Edit in the editor ({}) · double-click a line to edit there",
+                    shortcut_label(ui.ctx(), header.editor_shortcut)
+                ))
                 .clicked()
             {
                 let first = state.prepared.as_ref().and_then(|p| p.diff.files.first().map(|f| f.path().to_string()));

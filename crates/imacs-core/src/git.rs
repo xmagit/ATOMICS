@@ -374,12 +374,30 @@ fn clone_cache_contents(source: &Path, destination: &Path) -> std::io::Result<()
 
 #[cfg(target_os = "linux")]
 fn clone_cache_contents(source: &Path, destination: &Path) -> std::io::Result<()> {
+    // GNU cp recreates sockets/FIFOs even with --reflink=always. Match the
+    // native macOS walker: cache warming must skip those trees entirely.
+    check_cache_types(source)?;
     let status = linux_clone_command(source, destination)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()?;
     if status.success() { Ok(()) } else { Err(std::io::Error::other("CoW clone failed")) }
+}
+
+#[cfg(target_os = "linux")]
+fn check_cache_types(path: &Path) -> std::io::Result<()> {
+    let kind = path.symlink_metadata()?.file_type();
+    if kind.is_file() || kind.is_symlink() {
+        return Ok(());
+    }
+    if !kind.is_dir() {
+        return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "cache contains a special file"));
+    }
+    for entry in std::fs::read_dir(path)? {
+        check_cache_types(&entry?.path())?;
+    }
+    Ok(())
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -593,13 +611,14 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn native_clone_skips_special_files_without_copying_a_cache() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("source");
         let destination = dir.path().join("cache");
         std::fs::create_dir(&source).unwrap();
-        std::fs::write(source.join("dependency"), "cached dependency").unwrap();
+        // A socket-only tree catches GNU cp recreating special files even on a
+        // filesystem that correctly rejects reflinks for ordinary files.
         let _socket = std::os::unix::net::UnixListener::bind(source.join("socket")).unwrap();
         assert!(!clone_directory(&source, &destination));
         assert!(!destination.exists());
@@ -633,7 +652,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn warm_worktree_clones_existing_folders_from_main_and_keeps_caches_independent() {
         let (_dir, repo) = project();
         let linked = repo.with_file_name("linked");
@@ -646,6 +665,12 @@ pub(crate) mod tests {
         std::fs::write(linked.join("target/dependency"), "wrong checkout").unwrap();
         std::fs::create_dir_all(repo.join("build/cache")).unwrap();
         std::fs::write(repo.join("build/cache/object"), "nested cache").unwrap();
+        if !probe_cache_clone(&repo, destination.parent().unwrap()).unwrap() {
+            assert!(!warm_worktree(&linked, &destination, &["target".into(), "build/cache".into()]));
+            assert!(!destination.join("target").exists());
+            assert!(!destination.join("build/cache").exists());
+            return;
+        }
         assert!(!warm_worktree(&linked, &destination, &[]));
         assert!(!destination.join("target").exists());
         let folders =
@@ -659,6 +684,43 @@ pub(crate) mod tests {
         assert_eq!(std::fs::read_to_string(destination.join("target/dependency")).unwrap(), "agent build");
         assert_eq!(std::fs::read_to_string(repo.join("target/dependency")).unwrap(), "from main");
         assert!(probe_cache_clone(&repo, destination.parent().unwrap()).unwrap());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_native_reflink_clones_independently_or_skips_cleanly() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+
+        // The Linux harness can repeat this test on ext4, btrfs and XFS mounts.
+        let dir = match std::env::var_os("IMACS_COW_TEST_DIR") {
+            Some(parent) => tempfile::tempdir_in(parent).unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        };
+        let source = dir.path().join("source");
+        let destination = dir.path().join("cache");
+        std::fs::create_dir_all(source.join("nested")).unwrap();
+        std::fs::write(source.join("nested/data"), vec![b'+'; 8192]).unwrap();
+        symlink("nested/data", source.join("link")).unwrap();
+        let supported = probe_cache_clone(&source, dir.path()).unwrap();
+        assert_eq!(clone_directory(&source, &destination), supported);
+        println!("Linux native cache clone supported on {}: {supported}", dir.path().display());
+        if supported {
+            assert_eq!(std::fs::read(destination.join("nested/data")).unwrap(), vec![b'+'; 8192]);
+            assert_eq!(std::fs::read_link(destination.join("link")).unwrap(), Path::new("nested/data"));
+            assert_ne!(
+                std::fs::metadata(source.join("nested/data")).unwrap().ino(),
+                std::fs::metadata(destination.join("nested/data")).unwrap().ino()
+            );
+            std::fs::write(destination.join("nested/data"), "agent build").unwrap();
+            assert_eq!(std::fs::read(source.join("nested/data")).unwrap(), vec![b'+'; 8192]);
+        } else {
+            assert!(!destination.exists());
+            assert_eq!(
+                std::fs::read_dir(dir.path()).unwrap().count(),
+                1,
+                "failed clones must leave no staging directory"
+            );
+        }
     }
 
     #[test]

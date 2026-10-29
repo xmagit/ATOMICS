@@ -16,7 +16,7 @@ pub struct Target {
 
 impl Target {
     pub fn current() -> Result<Self> {
-        let executable = std::env::current_exe().context("locating this installation")?;
+        let executable = crate::setup::executable_path().context("locating this installation")?;
         let args: Vec<_> = std::env::args_os().skip(1).collect();
         let command = relaunch_command(&executable, &args, cfg!(target_os = "macos"))?;
         Ok(Self { executable, command })

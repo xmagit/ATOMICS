@@ -233,7 +233,7 @@ Bound scrollback, disk/log growth, child processes and CPU/memory; alert before 
 
 Each gate needs regression tests with the implementation phase; this document adds no runtime behavior.
 Use an isolated `IMACS_HOME`, `IMACS_SOCKET` and `IMACS_CONFIG` for UI checks, verify the process environment
-with `ps eww <pid>`, and never run migration experiments against the user's running IMACS instance.
+with `ps eww <pid>` on macOS or `ps eww -p <pid>` on Linux, and never run migration experiments against the user's running IMACS instance.
 
 ## Phase 2 complete: in-process native host
 

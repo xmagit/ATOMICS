@@ -53,20 +53,64 @@ fn select_host<'a>(
         .unwrap_or("localhost")
 }
 
-/// Root for runtime state: socket, hook settings, session store.
+/// Root for persistent state: hook settings, plans and session store.
 /// `IMACS_HOME` overrides it so several instances (or tests) can run side by side.
 pub fn imacs_home() -> PathBuf {
     if let Some(dir) = std::env::var_os("IMACS_HOME") {
         return PathBuf::from(dir);
     }
-    home().join(".imacs")
+    state_home(&home(), xdg_dir("XDG_STATE_HOME"), cfg!(target_os = "linux"))
+}
+
+fn state_home(home: &Path, xdg: Option<PathBuf>, linux: bool) -> PathBuf {
+    let legacy = home.join(".imacs");
+    // Keep existing installs in place, including links to state on another volume.
+    // Selecting a new empty directory must never hide a user's sessions or plans.
+    if !linux || legacy.symlink_metadata().is_ok() {
+        legacy
+    } else {
+        xdg.unwrap_or_else(|| home.join(".local/state")).join("imacs")
+    }
+}
+
+fn xdg_dir(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name).map(PathBuf::from).filter(|path| path.is_absolute())
+}
+
+/// Per-instance runtime folder in a valid, private Linux XDG_RUNTIME_DIR.
+/// Callers create the folder as needed; missing/invalid runtime roots fall back
+/// to their established socket or temporary FIFO locations.
+pub fn runtime_dir_for(home: &Path) -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let base = xdg_dir("XDG_RUNTIME_DIR")?;
+        let metadata = base.symlink_metadata().ok()?;
+        // SAFETY: getuid has no preconditions.
+        if !metadata.is_dir()
+            || metadata.uid() != unsafe { libc::getuid() }
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            return None;
+        }
+        let mut hasher = DefaultHasher::new();
+        home.hash(&mut hasher);
+        Some(base.join("imacs").join(format!("{:016x}", hasher.finish())))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = home;
+        None
+    }
 }
 
 pub fn config_file() -> PathBuf {
     if let Some(file) = std::env::var_os("IMACS_CONFIG") {
         return PathBuf::from(file);
     }
-    let base = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|| home().join(".config"));
+    let base = xdg_dir("XDG_CONFIG_HOME").unwrap_or_else(|| home().join(".config"));
     base.join("imacs").join("config.toml")
 }
 
@@ -74,7 +118,15 @@ pub fn socket_path() -> PathBuf {
     if let Some(path) = std::env::var_os("IMACS_SOCKET") {
         return PathBuf::from(path);
     }
-    imacs_home().join("imacs.sock")
+    let state = imacs_home();
+    // Explicit instance homes and existing installs retain their socket location.
+    if std::env::var_os("IMACS_HOME").is_none()
+        && state != home().join(".imacs")
+        && let Some(runtime) = runtime_dir_for(&state)
+    {
+        return runtime.join("imacs.sock");
+    }
+    state.join("imacs.sock")
 }
 
 #[derive(Debug, Default)]
@@ -202,6 +254,116 @@ pub fn display(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn state_paths_keep_existing_installs_and_macos_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let xdg = dir.path().join("state");
+        assert_eq!(state_home(dir.path(), Some(xdg.clone()), false), dir.path().join(".imacs"));
+        assert_eq!(state_home(dir.path(), Some(xdg.clone()), true), xdg.join("imacs"));
+        assert_eq!(state_home(dir.path(), None, true), dir.path().join(".local/state/imacs"));
+        let legacy = dir.path().join(".imacs");
+        std::fs::create_dir(&legacy).unwrap();
+        std::fs::write(legacy.join("sessions.json"), "existing sessions").unwrap();
+        assert_eq!(state_home(dir.path(), Some(xdg.clone()), true), legacy);
+        std::fs::remove_dir_all(&legacy).unwrap();
+        std::os::unix::fs::symlink("offline-volume", &legacy).unwrap();
+        assert_eq!(state_home(dir.path(), Some(xdg), true), legacy, "even a dangling link must not hide state");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_xdg_paths_and_instance_overrides() {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+        const CHILD: &str = "IMACS_PATHS_TEST_CASE";
+        let Ok(case) = std::env::var(CHILD) else {
+            for case in
+                ["new", "legacy", "explicit", "socket", "relative", "empty", "missing-runtime", "public-runtime"]
+            {
+                let dir = tempfile::tempdir().unwrap();
+                let home = dir.path().join("home");
+                let runtime = home.join("runtime");
+                std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&runtime).unwrap();
+                if case == "legacy" {
+                    std::fs::create_dir(home.join(".imacs")).unwrap();
+                    std::fs::write(home.join(".imacs/sessions.json"), "existing").unwrap();
+                }
+                if case == "public-runtime" {
+                    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o755)).unwrap();
+                }
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args(["--exact", "paths::tests::linux_xdg_paths_and_instance_overrides", "--nocapture"])
+                    .env(CHILD, case)
+                    .env("HOME", &home)
+                    .env("XDG_STATE_HOME", home.join("state"))
+                    .env("XDG_CONFIG_HOME", home.join("config"))
+                    .env("XDG_RUNTIME_DIR", &runtime)
+                    .env_remove("IMACS_HOME")
+                    .env_remove("IMACS_SOCKET")
+                    .env_remove("IMACS_CONFIG");
+                match case {
+                    "explicit" => {
+                        command.env("IMACS_HOME", home.join("isolated"));
+                    }
+                    "socket" => {
+                        command.env("IMACS_SOCKET", home.join("custom.sock"));
+                    }
+                    "relative" | "empty" => {
+                        for name in ["XDG_STATE_HOME", "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR"] {
+                            command.env(name, if case == "empty" { "" } else { "relative" });
+                        }
+                    }
+                    "missing-runtime" => {
+                        command.env_remove("XDG_RUNTIME_DIR");
+                    }
+                    _ => {}
+                }
+                let output = crate::test_support::output(&mut command);
+                assert!(
+                    output.status.success(),
+                    "{case}: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+        let home = home();
+        let state = match case.as_str() {
+            "legacy" => home.join(".imacs"),
+            "explicit" => home.join("isolated"),
+            "relative" | "empty" => home.join(".local/state/imacs"),
+            _ => home.join("state/imacs"),
+        };
+        assert_eq!(imacs_home(), state);
+        assert_eq!(
+            config_file(),
+            home.join(if matches!(case.as_str(), "relative" | "empty") {
+                ".config/imacs/config.toml"
+            } else {
+                "config/imacs/config.toml"
+            })
+        );
+        let runtime = runtime_dir_for(&state);
+        if matches!(case.as_str(), "relative" | "empty" | "missing-runtime" | "public-runtime") {
+            assert!(runtime.is_none());
+        } else {
+            let runtime = runtime.as_ref().unwrap();
+            assert!(runtime.starts_with(home.join("runtime/imacs")));
+            assert_ne!(Some(runtime.clone()), runtime_dir_for(&home.join("other-instance")));
+        }
+        let expected = match case.as_str() {
+            "socket" => home.join("custom.sock"),
+            "legacy" | "explicit" => state.join("imacs.sock"),
+            _ => runtime.unwrap_or_else(|| state.clone()).join("imacs.sock"),
+        };
+        assert_eq!(socket_path(), expected);
+        if case == "legacy" {
+            assert_eq!(std::fs::read_to_string(store_file()).unwrap(), "existing");
+        }
+    }
 
     #[test]
     fn host_override_falls_back_to_system_hostname_then_localhost() {

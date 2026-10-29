@@ -155,7 +155,7 @@ fn main() -> eframe::Result {
             return Ok(());
         }
         Some(Command::HooksJson { agent, pane }) => {
-            let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("imacs"));
+            let exe = setup::executable_path().unwrap_or_else(|_| PathBuf::from("imacs"));
             println!(
                 "{}",
                 serde_json::to_string_pretty(&imacs_core::hook::session_settings(

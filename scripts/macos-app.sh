@@ -3,6 +3,7 @@
 # The app belongs to macOS once opened, so closing a terminal no longer quits it.
 # Usage: scripts/macos-app.sh [destination folder, default ~/Applications]
 set -eu
+[ "$(uname -s)" = Darwin ] || { echo 'This packager requires macOS; use scripts/linux-install.sh on Linux.' >&2; exit 1; }
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 dest=${1:-"$HOME/Applications"}

@@ -859,7 +859,7 @@ impl Desktop<'_> {
             (&keys.new_session, "new session"),
             (&keys.voice, "voice: record, send (Esc cancels)"),
         ] {
-            ui.label(RichText::new(format!("{key}  {what}")).size(12.0).monospace());
+            ui.label(RichText::new(format!("{}  {what}", shortcut_label(ui.ctx(), key))).size(12.0).monospace());
         }
     }
 
