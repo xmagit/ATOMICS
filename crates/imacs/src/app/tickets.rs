@@ -92,16 +92,17 @@ impl State {
         let stamp = file.as_deref().and_then(modified);
         if self.tickets.workspace_file.as_ref() != Some(&(file.clone(), stamp)) {
             self.tickets.workspace_file = Some((file, stamp));
-            self.tickets.workspace_config = match self.workspace.clone().filter(|_| stamp.is_some()) {
-                Some(name) => match Workspace::load(&name) {
-                    Ok(workspace) => workspace.tickets,
-                    Err(err) => {
-                        self.toast(format!("Workspace tickets: {err:#}"));
-                        self.tickets.workspace_config.clone()
-                    }
-                },
-                None => None,
+            let loaded = match self.workspace.clone().filter(|_| stamp.is_some()) {
+                Some(name) => Workspace::load(&name).map_err(|err| format!("{err:#}")).and_then(|workspace| {
+                    workspace.tickets().map_err(|err| format!("[tickets] in {name}: {}", err.message()))
+                }),
+                None => Ok(None),
             };
+            match loaded {
+                Ok(config) => self.tickets.workspace_config = config,
+                // A broken section keeps the last good one; the workspace itself still opens.
+                Err(err) => self.toast(format!("Workspace tickets: {err}")),
+            }
         }
         let effective = self.tickets.workspace_config.clone().unwrap_or_else(|| self.config.tickets.clone());
         let effective = effective.is_configured().then(|| Arc::new(effective));

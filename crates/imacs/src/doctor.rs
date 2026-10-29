@@ -40,7 +40,8 @@ pub fn run() -> i32 {
     }
 
     let config_path = paths::config_file();
-    let config = Config::load(&config_path);
+    println!("Host: {}", paths::host_name());
+    let config = Config::load_with_sources(&config_path);
     let label = match &config {
         Ok(_) => format!("config parses ({})", config_path.display()),
         Err(err) => format!("config failed: {err:#}"),
@@ -49,11 +50,16 @@ pub fn run() -> i32 {
         "{}",
         check_line(config.is_ok(), &label, "create or fix this config; start IMACS to create a missing file")
     );
+    if let Ok((_, sources)) = &config {
+        for source in sources {
+            println!("Loaded config: {}", source.display());
+        }
+    }
 
     for line in plans_check(&paths::imacs_home()) {
         println!("{line}");
     }
-    if let Ok(config) = &config {
+    if let Ok((config, _)) = &config {
         println!("{}", approvals_check(&config.approvals));
         let mut repos: Vec<_> = config.repos.iter().map(|repo| paths::expand(repo)).collect();
         if repos.is_empty()
@@ -174,7 +180,7 @@ mod tests {
             assert_eq!(stdout.contains("IMACS Codex hook trust not verified"), probe != "missing", "{stdout}");
             assert_eq!(stdout.contains("/hooks"), probe != "missing", "{stdout}");
             assert!(stdout.contains(if bad_plan { "unreadable plan" } else { "plan files readable" }));
-            let worktree_lines: Vec<_> = stdout.lines().filter(|line| line.contains("worktree")).collect();
+            let worktree_lines: Vec<_> = stdout.lines().filter(|line| line.contains("merged worktree")).collect();
             let expected = if bad_plan {
                 format!(
                     "✗ merged worktree can be cleaned up (warning): {} (merged) — review it in IMACS's Clean up… dialog before removing the worktree",

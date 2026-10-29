@@ -31,12 +31,14 @@ with an MCP server, changes only the config.
 
 ## Configuration
 
-`[tickets]` goes in a workspace file (`~/.config/imacs/workspaces/<name>.toml`, next to `projects`) or in
-the main `config.toml`. A workspace's section wins over the main config's. A workspace can turn tickets
-off with `system = ""`. Both files reload while IMACS runs; changing the effective config reads every
-link again. Saving a workspace from IMACS rewrites only its `projects` and keeps the rest of the file,
-comments included. The chief's prompt is fixed when the chief starts, so restart the chief after
-changing `mode`, `comments`, `states` or `workflow`.
+`[tickets]` goes in a workspace file (`~/.config/imacs/workspaces/<host>/<name>.toml`, or a flat
+`workspaces/<name>.toml` shared by every host, next to `projects`) or in the main `config.toml`. A
+workspace's section wins over the main config's, and `config.d/<host>.toml` can override single keys of the
+main config's, such as the server command on one machine. A workspace can turn tickets off with
+`system = ""`. Both files reload while IMACS runs; changing the effective config reads every link again. A
+broken workspace section is reported and the last good one stays in use. Saving a workspace from IMACS
+keeps its `[tickets]` section key for key, though not its comments. The chief's prompt is fixed when the
+chief starts, so restart the chief after changing `mode`, `comments`, `states` or `workflow`.
 
 | Key | Meaning |
 | --- | --- |

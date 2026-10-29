@@ -1,5 +1,5 @@
 #[cfg(feature = "native")]
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -9,6 +9,8 @@ use crate::layout::LayoutConfig;
 /// Written to `~/.config/imacs/config.toml` on first start. Every key is optional;
 /// anything left out falls back to the defaults below.
 pub const DEFAULT_CONFIG: &str = r##"# IMACS configuration. Saved changes are picked up while IMACS is running.
+# config.d/<hostname>.toml overrides individual keys (IMACS_HOST overrides hostname).
+# Use ~/ paths in shared config; they expand on the machine running IMACS.
 
 # Every diff is taken against the merge-base of this ref and the worktree's HEAD,
 # so commits landing on main never show up as your agent's changes.
@@ -615,12 +617,46 @@ impl Config {
 
     #[cfg(feature = "native")]
     pub fn load(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let mut config: Config = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        Self::load_with_sources(path).map(|(config, _)| config)
+    }
+
+    /// Base and selected host file, including a host file that does not exist yet.
+    #[cfg(feature = "native")]
+    pub fn source_paths(path: &Path) -> [PathBuf; 2] {
+        let host_file = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("config.d")
+            .join(format!("{}.toml", crate::paths::host_name()));
+        [path.to_path_buf(), host_file]
+    }
+
+    /// Loads base then host overrides, recursively merging tables before applying defaults.
+    /// Arrays and scalar values are replaced; only files actually read are returned.
+    #[cfg(feature = "native")]
+    pub fn load_with_sources(path: &Path) -> Result<(Self, Vec<PathBuf>)> {
+        let mut merged = toml::Value::Table(toml::Table::new());
+        let mut sources = Vec::new();
+        for (index, file) in Self::source_paths(path).into_iter().enumerate() {
+            let text = match std::fs::read_to_string(&file) {
+                Ok(text) => text,
+                Err(err) if index > 0 && err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err).with_context(|| format!("reading {}", file.display())),
+            };
+            let value = toml::from_str(&text).with_context(|| format!("parsing {}", file.display()))?;
+            merge_values(&mut merged, value);
+            sources.push(file);
+        }
+        let mut config: Config = merged.try_into().with_context(|| {
+            format!(
+                "parsing merged config from {}",
+                sources.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+            )
+        })?;
         if config.agents.is_empty() {
             config.agents = Config::default().agents;
         }
-        Ok(config)
+        Ok((config, sources))
     }
 
     pub fn agent(&self, name: &str) -> Option<&AgentConfig> {
@@ -630,6 +666,23 @@ impl Config {
     /// Replaces `{base_ref}` in a configured text.
     pub fn fill(&self, template: &str) -> String {
         template.replace("{base_ref}", &self.base_ref)
+    }
+}
+
+#[cfg(feature = "native")]
+fn merge_values(base: &mut toml::Value, overrides: toml::Value) {
+    match (base, overrides) {
+        (toml::Value::Table(base), toml::Value::Table(overrides)) => {
+            for (key, value) in overrides {
+                match base.get_mut(&key) {
+                    Some(existing) => merge_values(existing, value),
+                    None => {
+                        base.insert(key, value);
+                    }
+                }
+            }
+        }
+        (base, value) => *base = value,
     }
 }
 
@@ -653,6 +706,126 @@ impl Chord {
 mod tests {
     use super::*;
     use crate::layout::DiffSplit;
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn host_config_merges_keys_and_expands_paths_on_each_machine() {
+        use crate::{git, paths};
+        const CHILD: &str = "IMACS_HOST_CONFIG_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            for host in [Some("work-mac"), None] {
+                let dir = tempfile::tempdir().unwrap();
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args(["--exact", "config::tests::host_config_merges_keys_and_expands_paths_on_each_machine"])
+                    .env(CHILD, "1")
+                    .env("HOME", dir.path())
+                    .env_remove("IMACS_CONFIG")
+                    .env_remove("XDG_CONFIG_HOME");
+                match host {
+                    Some(host) => {
+                        command.env("IMACS_HOST", host);
+                    }
+                    None => {
+                        command.env_remove("IMACS_HOST");
+                    }
+                }
+                let output = crate::test_support::output(&mut command);
+                assert!(
+                    output.status.success(),
+                    "{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        }
+        let path = paths::config_file();
+        let [_, host_file] = Config::source_paths(&path);
+        if let Ok(host) = std::env::var("IMACS_HOST") {
+            assert_eq!(paths::host_name(), host);
+            assert_eq!(host_file.file_name().unwrap(), "work-mac.toml");
+        }
+        let defaults = Config::load_or_create(&path).unwrap();
+        assert_eq!(defaults.worktree_path, "{repo_parent}/{repo}-{slug}");
+        assert!(!std::fs::read_to_string(&path).unwrap().contains(&paths::home().display().to_string()));
+        std::fs::write(
+            &path,
+            r#"
+base_ref = "main"
+repos = ["~/repos/base"]
+worktree_path = "~/worktrees/{repo}-{slug}"
+[layout]
+sidebar_width = 300.0
+diff_min_width = 600.0
+[resources]
+jobs = 4
+test_slots = 2
+[resources.dotnet]
+enabled = false
+processor_count = 3
+[voice]
+api_key = "secret-from-base"
+"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(host_file.parent().unwrap()).unwrap();
+        // Only the selected host is read, even when other host files are broken.
+        std::fs::write(host_file.with_file_name("unselected host.toml"), "[invalid").unwrap();
+        let (base, sources) = Config::load_with_sources(&path).unwrap();
+        assert_eq!(sources, std::slice::from_ref(&path));
+        assert_eq!(base.layout.sidebar_width, 300.0);
+        std::fs::write(
+            &host_file,
+            r#"
+base_ref = "work/main"
+repos = ["~/repos/host", "~"]
+[layout]
+sidebar_width = 350.0
+[resources.dotnet]
+enabled = true
+[worktrees]
+warm = []
+[[agents]]
+name = "local-shell"
+kind = "shell"
+"#,
+        )
+        .unwrap();
+        let (config, sources) = Config::load_with_sources(&path).unwrap();
+        assert_eq!(sources, [path.clone(), host_file.clone()]);
+        assert_eq!(config.base_ref, "work/main");
+        assert_eq!(config.layout.sidebar_width, 350.0);
+        assert_eq!(config.layout.diff_min_width, 600.0);
+        assert_eq!(config.font.size, Config::default().font.size);
+        assert_eq!(config.resources.jobs, Some(4));
+        assert_eq!(config.resources.test_slots, Some(2));
+        assert!(config.resources.dotnet.enabled);
+        assert_eq!(config.resources.dotnet.processor_count, Some(3));
+        assert_eq!(config.voice.api_key.as_deref(), Some("secret-from-base"));
+        assert!(config.worktrees.warm.is_empty());
+        assert_eq!(config.agents.len(), 1);
+        assert_eq!(config.agents[0].name, "local-shell");
+        assert_eq!(config.repos, ["~/repos/host", "~"]);
+        assert_eq!(paths::expand(&config.repos[0]), paths::home().join("repos/host"));
+        assert_eq!(paths::expand(&config.repos[1]), paths::home());
+        assert_eq!(
+            git::worktree_path(&config.worktree_path, &paths::expand("~/repos/app"), "fix/thing"),
+            paths::home().join("worktrees/app-fix-thing")
+        );
+
+        std::fs::write(&host_file, "repos = []").unwrap();
+        assert!(Config::load(&path).unwrap().repos.is_empty());
+        for invalid in ["[invalid", "[layout]\nsidebar_width = 'wide'"] {
+            std::fs::write(&host_file, invalid).unwrap();
+            let error = format!("{:#}", Config::load(&path).unwrap_err());
+            assert!(error.contains(&host_file.display().to_string()), "{error}");
+        }
+        std::fs::remove_file(&host_file).unwrap();
+        assert_eq!(Config::load_with_sources(&path).unwrap().1, std::slice::from_ref(&path));
+        std::fs::remove_file(&path).unwrap();
+        assert!(Config::load(&path).is_err());
+    }
 
     #[test]
     fn codex_detection_uses_the_program_and_agent_kind() {
