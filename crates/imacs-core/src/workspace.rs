@@ -29,6 +29,10 @@ impl Workspace {
     pub fn tickets(&self) -> Result<Option<crate::tickets::TicketConfig>, toml::de::Error> {
         self.extra.get("tickets").map(|section| section.clone().try_into()).transpose()
     }
+
+    pub fn workflow(&self) -> Result<Option<crate::workflow::Workflow>, toml::de::Error> {
+        self.extra.get("workflow").map(|section| section.clone().try_into()).transpose()
+    }
 }
 
 #[cfg(feature = "native")]

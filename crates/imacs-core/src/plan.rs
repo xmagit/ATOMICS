@@ -27,6 +27,8 @@ pub struct Plan {
     /// The external board (board mode) or ticket (ticket mode) this plan follows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ticket: Option<crate::tickets::TicketLink>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stages: Vec<crate::workflow::Stage>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -169,6 +171,8 @@ pub struct Task {
     /// The external ticket saying what this task is for.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ticket: Option<crate::tickets::TicketLink>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stages: Vec<crate::workflow::Stage>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -229,7 +233,7 @@ pub const REVIEW_TASK: &str = "review";
 
 impl Plan {
     /// Accepted work keeps its agent until integration; final review closes on acceptance.
-    pub fn finish_tasks(&mut self, now: u64) -> bool {
+    pub fn finish_tasks(&mut self, now: u64, workflow: &crate::workflow::Workflow) -> bool {
         let integration = self.integration_branch();
         let mut changed = false;
         for task in &mut self.tasks {
@@ -249,15 +253,22 @@ impl Plan {
                 changed = true;
             }
         }
-        if changed
+        if (changed || workflow.done != "accepted")
             && self.is_open()
             && !self.tasks.is_empty()
             && self.tasks.iter().all(|t| t.status == TaskStatus::Done && t.finished_at.is_some())
+            && self.workflow_done(workflow)
         {
             self.status = PlanStatus::Completed;
             changed = true;
         }
         changed
+    }
+
+    /// A plan milestone covers all its tasks; otherwise each implementation task must reach the gate.
+    pub fn workflow_done(&self, workflow: &crate::workflow::Workflow) -> bool {
+        let tasks: Vec<_> = self.tasks.iter().filter(|t| t.id != REVIEW_TASK).collect();
+        workflow.reached(&self.stages) || (!tasks.is_empty() && tasks.iter().all(|t| workflow.reached(&t.stages)))
     }
 
     pub fn is_open(&self) -> bool {
@@ -328,6 +339,7 @@ impl Plan {
             task.ticket = crate::tickets::TicketLink::relink(task.ticket.take(), old.and_then(|o| o.ticket.as_ref()));
             if let Some(old) = old {
                 task.status = old.status;
+                task.stages = old.stages.clone();
                 task.session = old.session.clone();
                 task.report = old.report.clone();
                 task.notes = old.notes.clone();
@@ -504,6 +516,29 @@ mod tests {
     use crate::git;
 
     #[test]
+    fn later_completion_gate_preserves_acceptance_and_integration_requirements() {
+        use crate::workflow::{Stage, Workflow};
+        let workflow = Workflow { done: "ci_passed".into(), ..Default::default() };
+        let mut plan = Plan {
+            id: "gate".into(),
+            tasks: vec![Task {
+                id: "a".into(),
+                status: TaskStatus::Done,
+                branch: Some("work".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        plan.stages.push(Stage { stage: "ci_passed".into(), url: None, note: None });
+        assert!(!plan.finish_tasks(1, &workflow), "CI cannot bypass integration");
+        plan.tasks[0].integrated = Some(plan.integration_branch());
+        plan.tasks[0].integration_verified = true;
+        assert!(plan.finish_tasks(2, &workflow));
+        assert_eq!(plan.status, PlanStatus::Completed);
+        assert_eq!(plan.tasks[0].status, TaskStatus::Done);
+    }
+
+    #[test]
     fn acceptance_waits_for_integration_and_final_review_before_completing_plan() {
         let mut plan = Plan {
             id: "ship".into(),
@@ -524,21 +559,24 @@ mod tests {
             ],
             ..Plan::default()
         };
-        assert!(!plan.finish_tasks(890));
+        assert!(!plan.finish_tasks(890, &crate::workflow::Workflow::default()));
         assert!(plan.tasks[0].finished_at.is_none());
         plan.tasks[0].integrated = Some("wrong-plan".into());
-        assert!(!plan.finish_tasks(890));
+        assert!(!plan.finish_tasks(890, &crate::workflow::Workflow::default()));
         plan.tasks[0].integrated = Some(plan.integration_branch());
-        assert!(!plan.finish_tasks(890), "an unverified integration marker must not close an agent");
+        assert!(
+            !plan.finish_tasks(890, &crate::workflow::Workflow::default()),
+            "an unverified integration marker must not close an agent"
+        );
         plan.tasks[0].integration_verified = true;
-        assert!(plan.finish_tasks(890));
+        assert!(plan.finish_tasks(890, &crate::workflow::Workflow::default()));
         assert_eq!(plan.tasks[0].completion_line().as_deref(), Some("Agent completed in 13m 10s"));
         assert_eq!(plan.status, PlanStatus::Open);
         plan.tasks[1].status = TaskStatus::Done;
-        assert!(plan.finish_tasks(1000));
+        assert!(plan.finish_tasks(1000, &crate::workflow::Workflow::default()));
         assert_eq!(plan.status, PlanStatus::Completed);
         assert_eq!(plan.tasks[0].finished_at, Some(890));
-        assert!(!plan.finish_tasks(2000));
+        assert!(!plan.finish_tasks(2000, &crate::workflow::Workflow::default()));
         plan.tasks[0].integration_verified = false;
         #[cfg(feature = "native")]
         {
@@ -547,10 +585,10 @@ mod tests {
             assert_eq!(load_plans(dir.path()).unwrap().0, [plan.clone()]);
         }
         plan.status = PlanStatus::Open;
-        assert!(!plan.finish_tasks(2500));
+        assert!(!plan.finish_tasks(2500, &crate::workflow::Workflow::default()));
         assert_eq!(plan.status, PlanStatus::Open, "an explicitly reopened plan stays open");
         plan.tasks[0].status = TaskStatus::Running;
-        assert!(plan.finish_tasks(3000));
+        assert!(plan.finish_tasks(3000, &crate::workflow::Workflow::default()));
         assert_eq!(plan.status, PlanStatus::Open);
         assert!(plan.tasks[0].finished_at.is_none());
     }
@@ -579,7 +617,7 @@ mod tests {
         assert!(old.dispatched_at.is_none() && old.finished_at.is_none());
         assert_eq!(old.completion_line(), None);
         let mut empty = Plan { id: "empty".into(), ..Plan::default() };
-        assert!(!empty.finish_tasks(1));
+        assert!(!empty.finish_tasks(1, &crate::workflow::Workflow::default()));
         assert_eq!(empty.status, PlanStatus::Open);
     }
 

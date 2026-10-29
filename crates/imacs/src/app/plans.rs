@@ -22,12 +22,13 @@ impl State {
 
     pub(super) fn finish_plan_agents(&mut self) {
         let now = imacs_core::store::now();
+        let workflow = self.workflow().clone();
         for index in 0..self.plans.len() {
             if self.plans[index].status == plan::PlanStatus::Archived {
                 continue;
             }
             let was_open = self.plans[index].is_open();
-            let mut changed = self.plans[index].finish_tasks(now);
+            let mut changed = self.plans[index].finish_tasks(now, &workflow);
             if was_open && self.plans[index].status == PlanStatus::Completed {
                 self.ticket_plan_completed(index);
             }
@@ -111,6 +112,13 @@ impl State {
         if status == PlanStatus::Open {
             return Err("Choose completed or archived.".into());
         }
+        if status == PlanStatus::Completed
+            && self.workflow().done != "accepted"
+            && (!self.plans[index].workflow_done(self.workflow())
+                || self.plans[index].tasks.iter().any(|t| t.status != TaskStatus::Done))
+        {
+            return Err(format!("Plan completion waits for workflow.done = {:?}.", self.workflow().done));
+        }
         let mut closed = self.plans[index].clone();
         closed.status = status;
         closed.save_in(&paths::imacs_home()).map_err(|err| format!("Closing plan failed: {err:#}"))?;
@@ -165,6 +173,7 @@ impl State {
 
     pub(super) fn plan_json(&self, index: usize) -> serde_json::Value {
         let mut value = serde_json::to_value(&self.plans[index]).unwrap_or_default();
+        value["workflow"] = json!(self.workflow());
         value["ready"] = json!(self.plans[index].ready().iter().map(|t| &t.id).collect::<Vec<_>>());
         value["integration"] = json!(self.plans[index].integration_branch());
         if let Some(board) = self.ticket_summary(&self.plans[index].id).and_then(|s| s.get("board").cloned()) {

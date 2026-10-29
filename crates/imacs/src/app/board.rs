@@ -80,6 +80,19 @@ fn ticket_chip(
     }
 }
 
+fn stage_chip(ui: &mut egui::Ui, stage: Option<&imacs_core::workflow::Stage>) {
+    if let Some(stage) = stage {
+        if let Some(url) = &stage.url {
+            ui.hyperlink_to(stage.label(), url);
+        } else {
+            ui.label(stage.label());
+        }
+        if let Some(note) = &stage.note {
+            ui.label(note);
+        }
+    }
+}
+
 fn task_color(status: TaskStatus, p: &Palette) -> Color32 {
     match status {
         TaskStatus::Planned => p.muted,
@@ -172,6 +185,7 @@ impl Desktop<'_> {
                 .on_hover_text("Integrated tasks are merged into it, and tasks with dependencies branch from it");
         }
         let ticket_config = self.runtime.ticket_config();
+        stage_chip(ui, self.runtime.plans[self.runtime.selected_plan].stages.last());
         let mut sync_tickets = false;
         if let Some(link) = self.runtime.plans[self.runtime.selected_plan].ticket.clone() {
             let plan = &self.runtime.plans[self.runtime.selected_plan];
@@ -303,6 +317,7 @@ impl Desktop<'_> {
                                                         meta.push_str(&format!(" {model}"));
                                                     }
                                                     ui.label(RichText::new(meta).color(p.muted).size(11.0));
+                                                    stage_chip(ui, task.stages.last());
                                                     if let Some(link) = &task.ticket {
                                                         let means = ticket_states
                                                             .as_ref()

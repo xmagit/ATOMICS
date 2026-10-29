@@ -90,6 +90,11 @@ allow = ["ls", "cat", "rg", "git status", "git diff", "git log"]
 # For example ["RUSTC_WRAPPER="] allows only that empty value, not a wrapper program.
 env = []
 
+[workflow]
+# IMACS completion milestone; later stages come from the chief or stage_event webhooks.
+done = "accepted"
+# stages = ["accepted", "integrated", "pr_opened", "ci_passed", "merged", "deployed"]
+
 [plan]
 # Close accepted, integrated agents automatically. Worktrees remain available.
 close_done_agents = true
@@ -239,6 +244,7 @@ pub struct Config {
     pub agents: Vec<AgentConfig>,
     pub approvals: crate::approvals::ApprovalPolicy,
     pub plan: PlanConfig,
+    pub workflow: crate::workflow::Workflow,
     pub resources: crate::governor::ResourceConfig,
     pub editor: EditorConfig,
     pub chief: ChiefConfig,
@@ -573,6 +579,7 @@ impl Default for Config {
             ],
             approvals: crate::approvals::ApprovalPolicy::default(),
             plan: PlanConfig::default(),
+            workflow: crate::workflow::Workflow::default(),
             resources: crate::governor::ResourceConfig::default(),
             editor: EditorConfig::default(),
             chief: ChiefConfig::default(),

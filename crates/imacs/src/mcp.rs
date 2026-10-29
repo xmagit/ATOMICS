@@ -404,7 +404,32 @@ fn tools() -> Value {
     if let (Some(all), Value::Array(more)) = (tools.as_array_mut(), ticket_tools(&plan)) {
         all.extend(more);
     }
+    if let (Some(all), Value::Array(more)) = (tools.as_array_mut(), stage_tools()) {
+        all.extend(more);
+    }
     tools
+}
+
+fn stage_tools() -> Value {
+    json!([
+        {
+            "name": "imacs_plan_stage",
+            "description": "Record an accepted plan or task's lifecycle milestone (integrated, pr_opened, ci_passed, ci_failed, merged, deployed or configured custom stage). workflow.done gates plan completion. Include a PR or CI run URL when available. Repeating the same event is idempotent.",
+            "inputSchema": { "type": "object", "properties": {
+                "plan": { "type": "string" }, "task": { "type": "string" },
+                "stage": { "type": "string" }, "url": { "type": "string" }, "note": { "type": "string" }
+            }, "required": ["plan", "stage"] }
+        },
+        {
+            "name": "imacs_stage_event",
+            "description": "Inbound lifecycle event from CI, n8n or another external system. Identify work by plan and optional task, or by linked ticket system/id/key. Ambiguous targets are refused. No polling is performed.",
+            "inputSchema": { "type": "object", "properties": {
+                "plan": { "type": "string" }, "task": { "type": "string" },
+                "system": { "type": "string" }, "id": { "type": "string" }, "key": { "type": "string" },
+                "stage": { "type": "string" }, "url": { "type": "string" }, "note": { "type": "string" }
+            }, "required": ["stage"] }
+        }
+    ])
 }
 
 fn call(params: &Value) -> Value {
@@ -438,7 +463,7 @@ fn response_text(name: &str, result: &Value) -> String {
     serde_json::to_string_pretty(result).unwrap_or_default()
 }
 
-fn request_for_tool(name: &str, mut args: Value) -> Result<ControlRequest, String> {
+pub(crate) fn request_for_tool(name: &str, mut args: Value) -> Result<ControlRequest, String> {
     if name == "imacs_agent_ticket_get" || name == "imacs_agent_ticket_comment" {
         return agent_ticket_request(name, args, std::env::var("IMACS_PANE").ok());
     }
@@ -458,6 +483,8 @@ fn request_for_tool(name: &str, mut args: Value) -> Result<ControlRequest, Strin
         "imacs_plan_get" => "plan_get",
         "imacs_plan_close" => "plan_close",
         "imacs_plan_update" => "plan_update",
+        "imacs_plan_stage" => "plan_stage",
+        "imacs_stage_event" => "stage_event",
         "imacs_plan_dispatch" => "plan_dispatch",
         "imacs_plan_integrate" => "plan_integrate",
         "imacs_result" => "result",

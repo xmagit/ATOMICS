@@ -98,6 +98,8 @@ pub(super) const CHIEF_ALLOWED_TOOLS: &[&str] = &[
     "mcp__imacs__imacs_plan_update",
     "mcp__imacs__imacs_plan_dispatch",
     "mcp__imacs__imacs_plan_integrate",
+    "mcp__imacs__imacs_plan_stage",
+    "mcp__imacs__imacs_stage_event",
     "mcp__imacs__imacs_comment",
     "mcp__imacs__imacs_send_review",
     "mcp__imacs__imacs_focus",

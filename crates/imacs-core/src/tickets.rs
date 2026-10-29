@@ -240,6 +240,9 @@ pub struct StateMap {
     pub done: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blocked: Option<String>,
+    /// Additional lifecycle stage names, entirely config driven.
+    #[serde(flatten)]
+    pub stages: BTreeMap<String, String>,
 }
 
 impl StateMap {
@@ -254,6 +257,29 @@ impl StateMap {
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
+    }
+
+    pub fn stage(&self, name: &str) -> Option<&str> {
+        self.stages.get(name).map(String::as_str).map(str::trim).filter(|s| !s.is_empty())
+    }
+
+    /// Acceptance and completion differ when a later milestone is configured. Explicit
+    /// stage mappings apply after acceptance; the completion mapping wins at its gate.
+    pub fn after_acceptance(
+        &self,
+        workflow: &crate::workflow::Workflow,
+        latest: Option<&crate::workflow::Stage>,
+        reached: bool,
+    ) -> Option<&str> {
+        let done = reached.then(|| self.get(TaskStatus::Done)).flatten();
+        match latest {
+            None => done,
+            Some(stage) if stage.stage == "ci_failed" => self.stage("ci_failed"),
+            Some(stage) if stage.stage == workflow.done => done.or_else(|| self.stage(&stage.stage)),
+            Some(stage) => self.stage(&stage.stage).or_else(|| {
+                (workflow.done != "accepted" && workflow.reached(std::slice::from_ref(stage))).then_some(done).flatten()
+            }),
+        }
     }
 
     /// The IMACS status a system state name stands for, ignoring case.
@@ -478,6 +504,8 @@ impl TicketConfig {
             .into_iter()
             .filter_map(|status| self.states.get(status).map(|state| format!("{} → {state}", status.label())))
             .collect();
+        let mut states = states;
+        states.extend(self.states.stages.iter().map(|(stage, state)| format!("{stage} → {state}")));
         if !states.is_empty() {
             text.push_str(&format!(
                 "IMACS sets ticket states as tasks move ({}), and shows each ticket's live state on its card.\n",
@@ -567,6 +595,11 @@ impl FieldPaths {
             ..TicketLink::default()
         }
     }
+}
+
+/// A lifecycle comment uses the same author signature and policy as other lifecycle notes.
+pub fn stage_comment(author: &Author, stage: &crate::workflow::Stage) -> String {
+    format!("{}\n{}", author.opening(None), stage.comment())
 }
 
 /// The credentials a config runs with, which nothing from its server may carry into plans

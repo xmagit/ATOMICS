@@ -197,6 +197,14 @@ impl State {
             task.notes.push(note.clone());
             self.save_plan(index);
         }
+        if response.ok {
+            let _ = self.record_stage(
+                index,
+                Some(&id),
+                imacs_core::workflow::Stage { stage: "integrated".into(), url: None, note: None },
+                imacs_core::tickets::Author::Imacs,
+            );
+        }
         self.finish_plan_agents();
         self.toast(format!("Task {id}: {note}"));
         if let Some(reply) = reply {
