@@ -42,8 +42,8 @@ with an MCP server, changes only the config.
     any mix), even when whitespace or a line break splits it. When it only shows once the text is decoded,
     unescaped and stripped of whitespace, the whole field is replaced by `[withheld: contained a credential]`.
   - Errors also lose bearer and basic credentials, `Authorization` values, URL user info, secret-looking query
-    values and long runs that look like tokens, and are bounded to 600 characters. Fields are bounded to
-    2000; bounds cut only after cleaning, between words.
+    values and long runs that look like tokens, and are bounded to 600 characters. Card and webhook fields
+    are bounded to 2000; agent ticket reads keep whole strings. Bounds cut only after cleaning, between words.
   - URLs always lose user info. A query or fragment parameter goes only when its decoded name is a credential
     name (`access_token`, `token`, `api_key`, `apikey`, `password`, `passwd`, `secret`, `client_secret`,
     `refresh_token`, `id_token`, `auth`, `authorization`, `sig`, `signature`, `x-amz-signature`,
