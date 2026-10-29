@@ -9,6 +9,16 @@ instructions to the chief and coding agents. Review them when opening an unfamil
 The declarative config has a separate, explicit allowlist: a cloned repository cannot configure an agent
 program, ticket server, credentials or approval rules, or make IMACS execute its test/QA hints.
 
+Before reading `IMACS.md`, `.imacs/*.md` or `.imacs/config.toml`, IMACS resolves symlinks and requires
+the resulting path to stay inside the canonical main checkout. Links to files inside that checkout are
+allowed. The `.imacs` directory is checked before listing topics, so a link outside the checkout is
+not walked. Only regular files are read; devices, FIFOs, sockets and directories are refused.
+Each read consumes at most 65,536 bytes (64 KiB). Files reaching that limit are refused in full,
+including configuration files, rather than using partial instructions or settings. Refused paths produce
+doctor warnings naming the file or directory and the reason, and contribute no content to prompts or
+agent briefs. These checks limit which files a repository can import; review the accepted instructions
+themselves before trusting an unfamiliar repository.
+
 ## Instructions
 
 An example `IMACS.md`:
