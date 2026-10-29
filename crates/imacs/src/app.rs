@@ -399,8 +399,7 @@ pub(crate) struct State {
     launch_dir: PathBuf,
 }
 
-/// The only eframe client. Runtime work continues when neither callback is called.
-/// View data belongs to the desktop, never to the runtime scheduler.
+/// Native effects delivered to the desktop; these never drive runtime progress.
 enum ClientEvent {
     Cleanup { preselect: Option<PathBuf> },
     PlanCleanup,
@@ -413,6 +412,7 @@ enum ClientEvent {
     Viewport(egui::ViewportCommand),
 }
 
+/// View data belongs to the desktop, never to the runtime scheduler.
 struct Client {
     focus_terminal: Option<String>,
     cleanup_open: bool,
@@ -736,8 +736,6 @@ impl State {
         self.worktrees_at = None;
     }
 
-    /// Load per core with a colour, and the pool and queue on hover.
-
     fn resources_json(&self) -> serde_json::Value {
         let (running, waiting) = self.governor.snapshot();
         json!({
@@ -1038,6 +1036,7 @@ impl Desktop<'_> {
         }
     }
 
+    /// Load per core, with the pool and queue on hover.
     fn load_gauge(&mut self, ui: &mut egui::Ui) {
         if self.client.load.0.elapsed() > Duration::from_secs(2) {
             self.client.load = (Instant::now(), crate::governor::load_average());

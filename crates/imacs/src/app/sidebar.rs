@@ -8,9 +8,6 @@ enum ViewTab {
 }
 
 impl State {
-    /// Tabs share a bounded navigation slot. First shorten labels, then move
-    /// excess tabs into a menu, keeping the selected tab in the visible row.
-
     pub(super) fn set_view(&mut self, view: Option<PathBuf>) {
         self.plan_view = false;
         self.view = view.clone();
@@ -87,6 +84,8 @@ fn session_row(
 }
 
 impl Desktop<'_> {
+    /// Tabs share a bounded navigation slot. First shorten labels, then move
+    /// excess tabs into a menu, keeping the selected tab in the visible row.
     pub(super) fn view_tabs(&mut self, ui: &mut egui::Ui) {
         let mut tabs = vec![ViewTab::All];
         tabs.extend(self.runtime.repos.iter().cloned().map(ViewTab::Project));

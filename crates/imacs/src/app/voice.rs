@@ -1,7 +1,5 @@
 use super::*;
 
-impl State {}
-
 impl Desktop<'_> {
     pub(super) fn toggle_voice(&mut self) {
         match self.client.voice {

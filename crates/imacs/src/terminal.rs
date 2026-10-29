@@ -62,7 +62,7 @@ impl TerminalView {
         if focused {
             self.handle_keys(terminal, ui);
         }
-        self.paint(terminal, ui, rect, inner, metrics, palette, focused);
+        self.paint(terminal, ui, (rect, inner), metrics, palette, focused);
         response
     }
 
@@ -193,8 +193,7 @@ impl TerminalView {
         &self,
         terminal: &Terminal,
         ui: &egui::Ui,
-        outer: Rect,
-        rect: Rect,
+        (outer, rect): (Rect, Rect),
         metrics: &Metrics,
         palette: &Palette,
         focused: bool,

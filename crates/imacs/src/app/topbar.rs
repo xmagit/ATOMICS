@@ -35,8 +35,6 @@ pub(super) fn record_item(_ui: &egui::Ui, _name: &str, _response: &egui::Respons
     }
 }
 
-impl State {}
-
 impl Desktop<'_> {
     pub(super) fn top_bar(&mut self, ui: &mut egui::Ui) {
         let rect = ui.available_rect_before_wrap();

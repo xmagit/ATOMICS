@@ -213,7 +213,7 @@ Bound scrollback, disk/log growth, child processes and CPU/memory; alert before 
 1. **Browser-safe boundaries.** Separate native dependencies from shared data/layout logic while the
    existing desktop still owns its runtime. Ship unchanged desktop behavior and a wasm compilation check.
    Gate: core unit tests, native regression suite and wasm target build; no browser feature is claimed yet.
-2. **Runtime without painting.** Extract host ownership behind an in-process command/event boundary;
+2. **Runtime without painting — complete.** Extract host ownership behind an in-process command/event boundary;
    the desktop remains the only client. Replace repaint-driven timers with host scheduling.
    Gate: with no frames drawn, hooks reply, approvals expire, held messages release, waits wake,
    agents exit and plans persist. Keep existing UI regression checks against an isolated instance.
@@ -235,49 +235,68 @@ Each gate needs regression tests with the implementation phase; this document ad
 Use an isolated `IMACS_HOME`, `IMACS_SOCKET` and `IMACS_CONFIG` for UI checks, verify the process environment
 with `ps eww <pid>`, and never run migration experiments against the user's running IMACS instance.
 
-## Phase 2 implementation checkpoint: runtime host
+## Phase 2 complete: in-process native host
 
-`host::Host` now owns the shared native `app::State` and services it on the
-`imacs-runtime` thread. Hook/control requests and worktree, integration,
-heartbeat and voice results signal its condition variable directly. The host
-chooses its next deadline for approvals, delivery verification, wait timeouts,
-heartbeat, configuration, terminal fallback checks and diff refreshes. It runs
-without an egui pass; repaint requests only notify the desktop of changes.
-The desktop borrows state under a mutex to paint and apply synchronous actions;
-the welcome screen starts agents through the host command channel. Status and
-recording animation timers remain in the client. Closing the application still
-joins the runtime and shuts down its terminals, as before.
+`host::Host` owns the native runtime model and services it on the
+`imacs-runtime` thread. Hook/control requests, terminal events, worktree discovery,
+filesystem notifications, diff/file results, integrations, heartbeat and cleanup
+results wake its condition variable directly. Approvals, delivery verification,
+waiters, fallback status checks, configuration and diff scheduling use host deadlines.
+None of those operations needs an egui pass or a repaint callback to make progress.
 
-`app::host_tests` exercises the production host thread without running egui or
-calling a runtime tick: permission-hook replies through the Unix socket,
-approval expiry after a hook timeout, held-message release, status-change waits,
-wait deadlines, heartbeat completion, plan persistence through ctl, real Git
-integration and its saved result, agent exit and saved task status, and delivery
-verification timeout. Existing direct-pump harnesses use `State::runtime_tick`.
+The native desktop owns its terminal views, selection, diff navigation and scroll
+positions, comment drafts, explorer state, dialogs, steering drafts, focus,
+layout inputs, screenshot saving and microphone lifecycle. Desktop runtime actions
+are queued in-process; session and plan IDs are resolved again when executed.
+Native view hints remain in the shared model for ctl compatibility and scheduling.
+The desktop still borrows that model under a mutex while rendering; it never pumps
+runtime work or waits for a command while holding the guard.
 
-Validation at this checkpoint: `cargo fmt --check`,
-`cargo clippy --all-targets -- -D warnings` and the full 296-test workspace suite
-through `imacs queue --class test -- cargo test --workspace` passed. Queued
-native QA with isolated home/socket/config paths verified shell output, ctl,
-plan persistence, heartbeat, terminal/board screenshots and clean shutdown.
-The QA harness explicitly requests paints while obscured so the existing
-frame-clock-based CLI screenshot delay can advance.
+`terminal::runtime::Terminal` owns the child, PTY sender and alacritty emulator.
+Its listener has no egui dependency: it answers color/size queries locally,
+records title/exit/output changes and signals the host. Clipboard escape requests
+are consumed by the native client. `TerminalView` owns painting, geometry,
+keyboard/pointer encoding, scrolling and selection. Host notifications retain the
+100/200/500 ms output cadence, using expiring wall-clock visibility hints instead
+of egui frame counters; input echo can still flush immediately.
 
-Remaining for the `sessions` follow-up:
+`diff_worker` owns preparation, coalescing, budgets and cache reuse. It publishes
+results to a host-signalling channel. `DiffData` holds completed revisions,
+accepted comments, file subscriptions and refresh scheduling; `DiffState` holds
+client navigation, collapsed sections, scroll position and the draft editor.
+Highlight spans use byte offsets and plain RGBA values. Cleanup jobs remain owned
+and polled by the host after their client dialogs close.
 
-- Separate session runtime data and agent launch/resume operations from terminal
-  painting, selection, keyboard/pointer input and other client view fields.
-  `app::State` still co-locates both behind the host lock; it is native desktop
-  state, not a UI-free host model.
-- Move the remaining synchronous UI mutations to explicit host commands, with
-  client-owned selection, drafts, dialogs, focus, screenshot handling and native
-  microphone capture. Rendering currently holds the shared state lock.
-- Separate PTY/emulator ownership and terminal notifications from egui. Child
-  exit/title changes already signal the host, while worktree discovery and
-  some worker results are collected at the host's bounded maintenance deadline.
-- Move cleanup-dialog completion handling off painting, and split diff and
-  highlighting workers/data from their client rendering state and egui wakeups.
-  Diff scheduling already runs on the host.
+Fourteen production-thread gates in `app::host_tests` run without drawing a frame
+or calling a runtime tick: hook reply, approval expiry, held external messages,
+status-change wait, wait timeout, heartbeat, ctl plan persistence, real Git
+integration persistence, agent exit with saved task status, delivery timeout,
+filesystem changes publishing fresh diffs, held PTY input receiving its receipt,
+cleanup previews completing, and desktop-command shell launch/input delivery.
+A listener test also verifies that exit wakes a host without any client.
+Direct UI harnesses service the same action queue after a simulated frame.
 
-The separate daemon, shutdown-without-closing-sessions behavior, serialized
-client protocol and browser rendering remain later migration phases.
+Queued native QA with isolated `IMACS_HOME`, `IMACS_SOCKET` and `IMACS_CONFIG`,
+verified on the GUI process with `ps eww`, passed shell input/output, fresh diff,
+ctl plan persistence, heartbeat, fleet/board/chief screenshots and clean shutdown.
+The screenshot harness requests paints while obscured so the existing CLI
+screenshot delay can advance. Targeted application and terminal tests pass.
+The final workspace checks are recorded with the completing task report.
+
+### Remaining for phase 3
+
+- Start the host independently of the native window/creation context. Move egui
+  notification and style/viewport adapters out of native service construction.
+- Replace the shared native model borrow and emulator reads with immutable,
+  versioned client projections and terminal screen snapshots/deltas. Keep the
+  native input/resize channel behind the protocol adapter, with control leases.
+- Implement the versioned loopback WebSocket protocol and authenticated pairing,
+  subscriptions, bounded queues, reconnect/reset handling and slow-client tests.
+- Add operation acceptance/outcome journaling, duplicate-command and uncertain
+  crash recovery behavior while preserving hook, ctl and MCP adapter formats.
+- Change shutdown ownership: closing/reopening the desktop must preserve child
+  PIDs, emulator state and plan progress. Today exiting the entire application
+  still joins the host and shuts down its terminals, as before.
+
+The separate daemon, browser rendering and remote deployment are not shipped by
+phase 2. Their gates remain the phase 3–5 gates above.
