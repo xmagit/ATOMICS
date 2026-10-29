@@ -98,13 +98,16 @@ impl Worker {
         })
     }
 
+    /// Errors and everything read from the server, before it leaves the worker.
     fn clean(&self, result: Result<TicketOutput, String>) -> Result<TicketOutput, String> {
         let error = |error: String| tickets::redact(&error, &self.secrets);
-        match result {
-            Err(err) => Err(error(err)),
-            Ok(TicketOutput::Pushed(Some(Err(err)))) => Ok(TicketOutput::Pushed(Some(Err(error(err))))),
-            Ok(output) => Ok(output),
-        }
+        let link = |link: TicketLink| tickets::clean_link(link, &self.secrets);
+        Ok(match result.map_err(error)? {
+            TicketOutput::Ticket(ticket) => TicketOutput::Ticket(link(ticket)),
+            TicketOutput::Tickets(tickets) => TicketOutput::Tickets(tickets.into_iter().map(link).collect()),
+            TicketOutput::Read(value) => TicketOutput::Read(tickets::clean_value(value, &self.secrets)),
+            TicketOutput::Pushed(read) => TicketOutput::Pushed(read.map(|read| read.map(link).map_err(error))),
+        })
     }
 
     fn run(&mut self, config: &TicketConfig, op: TicketOp) -> Result<TicketOutput, String> {

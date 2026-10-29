@@ -650,6 +650,8 @@ impl State {
         board: Option<&str>,
         fields: TicketLink,
     ) -> serde_json::Value {
+        // Webhook fields come from outside like server results and are cleaned the same way.
+        let fields = ticket::clean_link(fields, &self.ticket_secrets());
         let mut matched: Vec<LinkKey> = Vec::new();
         let mut boards: Vec<String> = Vec::new();
         let config = self.ticket_config();
@@ -775,9 +777,10 @@ impl State {
         Some(summary)
     }
 
-    /// Fills in the configured system for a link given without one.
+    /// A link given by the chief: cleaned like a ticket read from the server, and given
+    /// the configured system when it names none.
     pub(super) fn stamp_system(&self, link: Option<TicketLink>) -> Option<TicketLink> {
-        link.map(|mut link| {
+        link.map(|link| ticket::clean_link(link, &self.ticket_secrets())).map(|mut link| {
             if link.system.is_empty()
                 && let Some(config) = self.ticket_config()
             {
@@ -2005,6 +2008,74 @@ mod tests {
                 }
             },
         );
+    }
+
+    #[test]
+    fn tickets_read_from_a_backend_are_cleaned_before_they_are_stored() {
+        with_app("app::tickets::tests::tickets_read_from_a_backend_are_cleaned_before_they_are_stored", |app, ctx| {
+            const TOKEN: &str = "sk-title-4d5e6f";
+            // SAFETY: set before the ticket worker starts; nothing else reads this variable.
+            unsafe { std::env::set_var("CARDS_TOKEN", TOKEN) };
+            let dir = tempfile::tempdir().unwrap();
+            let state = tickets_fixture(dir.path(), "CARD");
+            set_field(&state, "CARD-1", "title", &format!("Rotate {TOKEN} today"));
+            set_field(
+                &state,
+                "CARD-1",
+                "url",
+                &format!("https://bot:hunter22@cards.example/1?access_token={TOKEN}&view=full"),
+            );
+            configure(app, CARDS, &state, |config| config.server.token_env = Some("CARDS_TOKEN".into()));
+            let plan = request(
+                app,
+                json!({"cmd":"plan_set", "goal":"Clean", "ticket":{"id":"b1"}, "tasks":[
+                {"id":"a", "ticket":{"id":"1"}}, {"id":"b", "ticket":{"id":"2"}}, {"id":"c"}]}),
+            )
+            .result["plan"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let index = app.runtime.selected_plan;
+            settle(app);
+            let a = link(app, index, 0);
+            assert_eq!(a.title.as_deref(), Some("Rotate *** today"));
+            assert_eq!(a.url.as_deref(), Some("https://cards.example/1?view=full"));
+
+            // Fields from a webhook and links from the chief are cleaned the same way.
+            request(
+                app,
+                json!({"cmd":"ticket_event", "key":"CARD-2",
+                "url":"https://u:pw@cards.example/2?token=abc123xyz&tab=1", "title":format!("Echo {TOKEN}")}),
+            );
+            let b = link(app, index, 1);
+            assert_eq!(b.url.as_deref(), Some("https://cards.example/2?tab=1"));
+            assert_eq!(b.title.as_deref(), Some("Echo ***"));
+            let (tx, rx) = channel();
+            let linked = ControlRequest::TicketLink {
+                plan: Some(plan.clone()),
+                task: Some("c".into()),
+                ticket: Some(TicketLink {
+                    id: "3".into(),
+                    url: Some(format!("https://cards.example/3?api_key={TOKEN}")),
+                    ..TicketLink::default()
+                }),
+                create: None,
+                unlink: false,
+            };
+            app.runtime.control(ctx, linked, tx);
+            assert_eq!(link(app, index, 2).url.as_deref(), Some("https://cards.example/3"), "cleaned as given");
+            settle(app);
+            rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+            let saved =
+                std::fs::read_to_string(paths::imacs_home().join("plans").join(format!("{plan}.json"))).unwrap();
+            let got = request(app, json!({"cmd":"plan_get", "plan":plan})).result.to_string();
+            for text in [&saved, &got] {
+                for secret in [TOKEN, "hunter22", "pw@", "abc123xyz", "access_token", "api_key"] {
+                    assert!(!text.contains(secret), "{secret} reached {text}");
+                }
+            }
+        });
     }
 
     #[test]
