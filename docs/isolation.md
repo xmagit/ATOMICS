@@ -58,6 +58,11 @@ isolation = "bare"           # this agent runs on this machine, whatever mode sa
 | `ssh_agent` | Off by default: IMACS runs `sbx` without `SSH_AUTH_SOCK`, so there is no agent to forward. Turn it on to let sandboxed agents sign, and so push, as you. A fixed `ssh.agentSocketPath` in sbx's own settings bypasses this. |
 | `mcp` | MCP servers registered with `sbx mcp add`. IMACS loads them into each new sandbox (`sbx mcp load`). |
 | `isolation` in `[[agents]]` | `"sandbox"` or `"bare"` for one agent. |
+| `isolation` in a plan task | `"sandbox"` or `"bare"` for one task, set by the chief in `imacs_plan_set` and shown on its board card. Use `"bare"` for work that needs this machine, such as macOS-native builds or screenshot QA. |
+
+A repository that requires sandboxes wins over everything. Otherwise a plan task's `isolation` wins,
+then the agent's, then `mode`. A task keeps its isolation when it is resumed, from the board or after a
+restart.
 
 `[isolation]` can be set in `config.toml`, in `config.d/<host>.toml`, or in a workspace file. A workspace's
 `[isolation]` merges key by key, the same way a host file does. Settings apply to agents started
@@ -70,8 +75,8 @@ A repository's `.imacs/config.toml` can only tighten isolation:
 mode = "sandbox"
 ```
 
-With this setting, every agent working in that repository runs sandboxed, even under `mode = "bare"` or an agent's own
-`isolation = "bare"`. A repository cannot set `mode = "bare"` or any `[isolation.sandbox]` key. Those
+With this setting, every agent working in that repository runs sandboxed, even under `mode = "bare"`, an agent's own
+`isolation = "bare"` or a plan task's. A repository cannot set `mode = "bare"` or any `[isolation.sandbox]` key. Those
 settings are ignored with a doctor warning, because a cloned repository must not widen what an agent can reach.
 
 ## Agents
@@ -167,8 +172,10 @@ mounted read-only.
   whatever its tools do.
 - **Bare agents run as you.** In bare mode, an agent can reach everything you can: your files, keys,
   network and other repositories. Use it for agents you supervise, or that sbx cannot run.
-- **Repositories only tighten.** A repository's `.imacs/config.toml` can require sandboxes. It cannot
-  turn them off, add mounts or hosts, or forward your SSH agent.
+- **Repositories only tighten.** A repository's `.imacs/config.toml` can require sandboxes, and then no
+  agent or plan task there runs bare. It cannot turn them off, add mounts or hosts, or forward your SSH agent.
+- **The chief can mark tasks bare.** A plan task's `isolation = "bare"` runs that agent as you. You see
+  it on the card when you approve the plan.
 - **sbx's machine-wide settings apply to every sandbox,** including IMACS's: the global network policy,
   `ssh.agentForwardingEnabled` and `ssh.agentSocketPath`. Changing a mode or setting in IMACS is a
   `runs commands` change when the chief proposes it.

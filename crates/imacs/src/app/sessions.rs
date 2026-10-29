@@ -80,7 +80,7 @@ impl State {
         extra_args: Vec<String>,
         prompt: Option<String>,
     ) -> Result<String, String> {
-        self.start_as(ctx, agent_name, cwd, resume, extra_args, prompt, false)
+        self.start_as(ctx, agent_name, cwd, resume, extra_args, prompt, Role::Agent(None))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -92,8 +92,9 @@ impl State {
         resume: Option<String>,
         extra_args: Vec<String>,
         prompt: Option<String>,
-        chief: bool,
+        role: Role,
     ) -> Result<String, String> {
+        let chief = role == Role::Chief;
         let agent = if chief {
             imacs_core::config::AgentConfig {
                 name: "chief".into(),
@@ -114,7 +115,10 @@ impl State {
         let id = uuid::Uuid::new_v4().to_string();
         // The chief is never sandboxed, whatever the isolation settings or a repository say: it needs
         // this machine's tools (imacs ctl, git across repositories, builds and screenshots).
-        let job = if chief { None } else { self.sandbox_job(&agent, &cwd, &id, resume.as_deref(), prompt.is_some())? };
+        let job = match role {
+            Role::Chief => None,
+            Role::Agent(task) => self.sandbox_job(&agent, &cwd, &id, resume.as_deref(), prompt.is_some(), task)?,
+        };
         let runtime = job.as_ref().map_or(AgentRuntime::Bare, |job| AgentRuntime::Sandbox(job.sandboxed()));
         // Codex's hooks call IMACS on this machine, which a sandboxed Codex cannot reach.
         let codex = agent.is_codex() && job.is_none();
@@ -160,8 +164,8 @@ impl State {
     }
 
     /// The sandbox `agent` gets in `cwd`, or `None` to run it bare: the isolation in effect for
-    /// its project, which the repository may have tightened. A resumed session reattaches to the
-    /// sandbox it ran in.
+    /// its project, which the repository may have tightened, and its plan `task`'s own. A resumed
+    /// session reattaches to the sandbox it ran in.
     fn sandbox_job(
         &self,
         agent: &imacs_core::config::AgentConfig,
@@ -169,15 +173,15 @@ impl State {
         id: &str,
         resume: Option<&str>,
         prompt: bool,
+        task: Option<IsolationMode>,
     ) -> Result<Option<crate::sandbox::Prepare>, String> {
         let config = self.project_config(cwd);
-        // The project's copy of the agent carries what its repository requires.
-        if config.isolation.mode_for(config.agent(&agent.name).unwrap_or(agent)) == IsolationMode::Bare {
+        if config.isolation.mode_for(agent, task) == IsolationMode::Bare {
             return Ok(None);
         }
         let sbx_agent = isolation::sbx_agent(agent).ok_or_else(|| {
             let program = agent.command.first().map_or("an empty command", String::as_str);
-            let fix = if self.effective_config().isolation.mode_for(agent) == IsolationMode::Bare {
+            let fix = if config.isolation.required {
                 "Its repository requires sandboxed agents in .imacs/config.toml; use claude, codex or shell there."
             } else {
                 "Set isolation = \"bare\" on it in [[agents]] to run it on this machine."

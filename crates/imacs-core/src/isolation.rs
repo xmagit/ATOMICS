@@ -18,12 +18,24 @@ pub enum IsolationMode {
     Bare,
 }
 
-/// `[isolation]`: the mode every agent runs in unless its `[[agents]]` entry says otherwise.
+impl IsolationMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            IsolationMode::Sandbox => "sandbox",
+            IsolationMode::Bare => "bare",
+        }
+    }
+}
+
+/// `[isolation]`: the mode every agent runs in unless a plan task or its `[[agents]]` entry says otherwise.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct IsolationConfig {
     pub mode: IsolationMode,
     pub sandbox: SandboxConfig,
+    /// Set by a repository's `mode = "sandbox"`: nothing runs bare there. Never read from a file.
+    #[serde(skip)]
+    pub required: bool,
 }
 
 /// The global network policy IMACS sets up when `sbx` has none yet.
@@ -70,9 +82,13 @@ pub struct SandboxConfig {
 }
 
 impl IsolationConfig {
-    /// The mode `agent` runs in: its own `isolation` when set, else `mode`.
-    pub fn mode_for(&self, agent: &AgentConfig) -> IsolationMode {
-        agent.isolation.unwrap_or(self.mode)
+    /// The mode `agent` runs in for a plan task with its own `task` isolation, if any: sandboxed
+    /// where a repository requires it, else the task's, the agent's or `mode`, in that order.
+    pub fn mode_for(&self, agent: &AgentConfig, task: Option<IsolationMode>) -> IsolationMode {
+        if self.required {
+            return IsolationMode::Sandbox;
+        }
+        task.or(agent.isolation).unwrap_or(self.mode)
     }
 
     /// These settings with a workspace's `[isolation]` merged in key by key, as a host file's are.
@@ -422,8 +438,20 @@ command = ["codex"]
         .unwrap();
         let isolation = &config.isolation;
         assert_eq!(isolation.mode, IsolationMode::Bare);
-        assert_eq!(isolation.mode_for(config.agent("claude").unwrap()), IsolationMode::Sandbox);
-        assert_eq!(isolation.mode_for(config.agent("codex").unwrap()), IsolationMode::Bare);
+        assert_eq!(isolation.mode_for(config.agent("claude").unwrap(), None), IsolationMode::Sandbox);
+        assert_eq!(isolation.mode_for(config.agent("codex").unwrap(), None), IsolationMode::Bare);
+        // A plan task's own isolation wins over the agent's and the mode.
+        let claude = config.agent("claude").unwrap();
+        assert_eq!(isolation.mode_for(claude, Some(IsolationMode::Bare)), IsolationMode::Bare);
+        assert_eq!(
+            isolation.mode_for(config.agent("codex").unwrap(), Some(IsolationMode::Sandbox)),
+            IsolationMode::Sandbox
+        );
+        let mut required = isolation.clone();
+        required.required = true;
+        for task in [None, Some(IsolationMode::Bare), Some(IsolationMode::Sandbox)] {
+            assert_eq!(required.mode_for(config.agent("codex").unwrap(), task), IsolationMode::Sandbox);
+        }
         let sandbox = &isolation.sandbox;
         assert_eq!((sandbox.memory.as_deref(), sandbox.cpus), (Some("8g"), Some(4)));
         assert_eq!(sandbox.template.as_deref(), Some("registry.example.com/agent:1"));
@@ -452,7 +480,7 @@ command = ["codex"]
         let config: Config = toml::from_str(blocks[0]).unwrap();
         assert_eq!(config.isolation.mode, IsolationMode::Sandbox);
         assert_eq!(config.isolation.sandbox.allow_hosts["~/repos/app"], ["nuget.example.com"]);
-        assert_eq!(config.isolation.mode_for(config.agent("aider").unwrap()), IsolationMode::Bare);
+        assert_eq!(config.isolation.mode_for(config.agent("aider").unwrap(), None), IsolationMode::Bare);
         let (repo, warnings) = crate::repo_workflow::declarative(&toml::from_str(blocks[1]).unwrap());
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(repo["isolation"]["mode"].as_str(), Some("sandbox"));

@@ -430,7 +430,7 @@ impl State {
                             paths::expand(&repo),
                             branch,
                             None,
-                            Launch { agent, prompt, args, reply: Some(reply), task: None },
+                            Launch { agent, prompt, args, reply: Some(reply), task: None, isolation: None },
                         );
                         return;
                     }

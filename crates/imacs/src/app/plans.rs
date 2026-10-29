@@ -93,7 +93,8 @@ impl State {
             "resume" if !self.sessions.iter().any(|s| task.session.as_deref() == Some(&s.id)) => {
                 let ctx = self.ctx.clone();
                 let agent = if task.agent.is_empty() { "claude" } else { &task.agent };
-                match self.start(&ctx, agent, root, Some(task.resume_id.unwrap_or_default()), task.args, None) {
+                let resume = Some(task.resume_id.unwrap_or_default());
+                match self.start_as(&ctx, agent, root, resume, task.args, None, Role::Agent(task.isolation)) {
                     Ok(session) => {
                         let task = &mut self.plans[index].tasks[task_index];
                         task.session = Some(session);
@@ -394,6 +395,7 @@ impl State {
                 args: task.args.clone(),
                 reply: None,
                 task: Some((self.plans[index].id.clone(), task.id.clone())),
+                isolation: task.isolation,
             };
             let start = self.plans[index].start_branch(&task);
             if let Some(t) = self.plans[index].task_mut(&task.id) {
@@ -813,6 +815,7 @@ mod tests {
                         args: vec![],
                         reply: None,
                         task: Some(("collisions".into(), "ops".into())),
+                        isolation: None,
                     },
                 );
                 let (_, result, _, _) = app.runtime.worktree_rx.recv_timeout(Duration::from_secs(5)).unwrap();

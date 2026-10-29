@@ -441,7 +441,14 @@ mod tests {
                         repo.clone(),
                         branch.into(),
                         None,
-                        Launch { agent: "probe".into(), prompt: None, args: vec![], reply: None, task: None },
+                        Launch {
+                            agent: "probe".into(),
+                            prompt: None,
+                            args: vec![],
+                            reply: None,
+                            task: None,
+                            isolation: None,
+                        },
                     );
                     let event = state.worktree_rx.recv_timeout(Duration::from_secs(5)).unwrap();
                     let prepared = event.1.as_ref().unwrap();

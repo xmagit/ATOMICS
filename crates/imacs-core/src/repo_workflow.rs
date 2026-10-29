@@ -518,7 +518,9 @@ stages = ["accepted", "pr_opened", "qa_passed", "merged"]
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(config.isolation.mode, Sandbox);
         for agent in &config.agents {
-            assert_eq!(config.isolation.mode_for(agent), Sandbox, "{} must run sandboxed", agent.name);
+            for task in [None, Some(Bare), Some(Sandbox)] {
+                assert_eq!(config.isolation.mode_for(agent, task), Sandbox, "{} must run sandboxed", agent.name);
+            }
         }
 
         let mut sandboxed = user.clone();

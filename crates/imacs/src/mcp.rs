@@ -197,6 +197,11 @@ fn tools() -> Value {
     let plan = json!({ "type": "string", "description": "Plan id from imacs_plan_set/get. Required for update/dispatch/integrate when several plans are open." });
     let session = json!({ "type": "string", "description": "Session id, unique id prefix, or title" });
     let ticket = ticket_schema();
+    let isolation = json!({
+        "type": "string",
+        "enum": ["sandbox", "bare"],
+        "description": "Where this task's agent runs, over its agent's and the workspace's setting. bare only for work that needs this machine, such as macOS-native builds or screenshot QA; a repository that requires sandboxes still wins."
+    });
     let mut tools = json!([
         {
             "name": "imacs_restart",
@@ -262,6 +267,7 @@ fn tools() -> Value {
                                 "depends_on": { "type": "array", "items": { "type": "string" } },
                                 "agent": { "type": "string" },
                                 "args": { "type": "array", "items": { "type": "string" } },
+                                "isolation": isolation,
                                 "repo": { "type": "string" },
                                 "branch": { "type": "string" },
                                 "ticket": ticket

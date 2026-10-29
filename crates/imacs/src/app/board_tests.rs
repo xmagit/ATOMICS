@@ -67,6 +67,8 @@ fn populate(app: &mut Desktop<'_>) {
             session: Some("existing-session".into()),
             agent: "codex".into(),
             args: vec!["-m".into(), "gpt-6.1-terra".into()],
+            // A task the chief marked bare says so on its card.
+            isolation: (i == 0).then_some(imacs_core::isolation::IsolationMode::Bare),
             brief: "Detailed instructions stay readable when the card is expanded.".into(),
             acceptance: vec!["Keep the original acceptance checks".into()],
             report: Some(Report {
@@ -134,6 +136,7 @@ fn cards_wrap_words_with_normal_spacing_at_narrow_and_wide_sizes() {
                 }
                 for content in [
                     "· codex gpt-6.1-terra",
+                    "task-0 · codex gpt-6.1-terra · bare",
                     "progress:",
                     "Keep the original task note",
                     "Detailed instructions",

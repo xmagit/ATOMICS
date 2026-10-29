@@ -133,6 +133,13 @@ struct PendingApproval {
     reply: Option<Arc<ipc::ApprovalReply>>,
 }
 
+/// Who a session is started as: the chief, or an agent with its plan task's own isolation, if any.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Role {
+    Chief,
+    Agent(Option<imacs_core::isolation::IsolationMode>),
+}
+
 struct AgentLaunch {
     id: String,
     agent: imacs_core::config::AgentConfig,
@@ -189,6 +196,8 @@ struct Launch {
     reply: Option<Sender<ControlOutcome>>,
     /// Plan task this agent works on.
     task: Option<(String, String)>,
+    /// That task's own isolation.
+    isolation: Option<imacs_core::isolation::IsolationMode>,
 }
 
 /// A background worktree job completed all preparation needed before launch.

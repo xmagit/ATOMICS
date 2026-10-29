@@ -1,5 +1,5 @@
 //! Agents in Docker Sandboxes, against the fake `sbx` in tests/fixtures.
-use super::tests::{repository, with_app};
+use super::tests::{repository, request, with_app};
 use super::*;
 use crate::sandbox::fake;
 use imacs_core::isolation::IsolationMode;
@@ -360,4 +360,79 @@ fn the_chief_always_runs_on_this_machine() {
         assert!(fake::calls(bin.path()).is_empty(), "the chief never calls sbx");
         app.runtime.sessions.clear();
     });
+}
+
+#[test]
+fn a_tasks_isolation_wins_over_the_agent_and_mode_but_never_over_a_repository() {
+    with_app(
+        "app::sandbox_tests::a_tasks_isolation_wins_over_the_agent_and_mode_but_never_over_a_repository",
+        |app, ctx| {
+            let (dir, repo) = repository();
+            let bin = tempfile::tempdir().unwrap();
+            app.runtime.sbx = fake::install(bin.path()).display().to_string();
+            app.runtime.config.isolation.mode = IsolationMode::Sandbox;
+            app.runtime.config.base_ref = "main".into();
+            app.runtime.config.worktree_path = format!("{}/{{slug}}", dir.path().display());
+            let out = bin.path().join("probe-ran");
+            app.runtime.config.agents.push(probe("probe", &out, None));
+
+            // The chief marks a task bare, here one sbx has no agent for; the other follows the mode.
+            let tasks = json!([
+                {"id":"native", "title":"Native build", "brief":"Build the app", "agent":"probe", "isolation":"bare"},
+                {"id":"code", "title":"Code", "brief":"Change the code", "agent":"shell"},
+            ]);
+            let set = request(app, json!({"cmd":"plan_set", "goal":"Mixed", "tasks":tasks}));
+            assert!(set.ok, "{set:?}");
+            let index = app.runtime.plans.iter().position(|plan| plan.goal == "Mixed").unwrap();
+            assert_eq!(app.runtime.plans[index].tasks[0].isolation, Some(IsolationMode::Bare));
+            assert_eq!(app.runtime.plans[index].tasks[1].isolation, None);
+            app.runtime.plans[index].project = Some(repo.clone());
+            app.runtime.plans[index].approved = true;
+            let plan = app.runtime.plans[index].id.clone();
+            let shown = request(app, json!({"cmd":"plan_get", "plan":plan}));
+            assert_eq!(shown.result["tasks"][0]["isolation"], "bare", "{:?}", shown.result);
+
+            app.runtime.dispatch(index, None).unwrap();
+            tick_until(app, ctx, "both agents", |_| out.exists() && bin.path().join("run-ssh").exists());
+            let session = |app: &Desktop<'_>, task: usize| {
+                let id = app.runtime.plans[index].tasks[task].session.clone().unwrap();
+                app.runtime.sessions.iter().find(|s| s.id == id).unwrap().sandbox.clone()
+            };
+            assert_eq!(session(app, 0), None, "the bare task runs on this machine");
+            assert!(session(app, 1).is_some_and(|name| name.starts_with("imacs-")));
+            assert_eq!(fake::calls_to(bin.path(), &["create"]).len(), 1);
+
+            // After a restart the task keeps its isolation.
+            let native = app.runtime.plans[index].tasks[0].session.clone().unwrap();
+            let record = SessionRecord {
+                chief: false,
+                pane: Some(native.clone()),
+                claude_session_id: "native-session".into(),
+                agent: "probe".into(),
+                cwd: app.runtime.plans[index].tasks[0].worktree.clone().unwrap(),
+                title: "native".into(),
+                last_prompt: None,
+                updated: 0,
+                sandbox: None,
+            };
+            app.runtime.close(&native);
+            std::fs::remove_file(&out).unwrap();
+            app.runtime.resume_record(ctx, record);
+            tick_until(app, ctx, "the resumed bare task", |_| out.exists());
+            assert_eq!(session(app, 0), None);
+
+            // A repository that requires sandboxes beats the task: the probe cannot run in one.
+            std::fs::create_dir(repo.join(".imacs")).unwrap();
+            std::fs::write(repo.join(".imacs/config.toml"), "[isolation]\nmode = \"sandbox\"\n").unwrap();
+            app.runtime.reload_repo_workflows();
+            let resumed = app.runtime.plans[index].tasks[0].session.clone().unwrap();
+            app.runtime.close(&resumed);
+            std::fs::remove_file(&out).unwrap();
+            app.runtime.task_action(index, 0, "resume");
+            let toast = app.runtime.toast.as_ref().unwrap().0.clone();
+            assert!(toast.contains("requires sandboxed agents"), "{toast}");
+            assert!(!out.exists());
+            app.runtime.sessions.clear();
+        },
+    );
 }

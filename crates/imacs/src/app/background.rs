@@ -95,7 +95,8 @@ impl State {
                 .is_some_and(|(plan, _)| !self.plan_view || self.plans[self.selected_plan].id != *plan);
             let selection = (self.active.clone(), self.diff_root.clone(), self.focus_terminal.clone());
             let outcome = result.and_then(|PreparedWorktree { path, warmed }| {
-                let outcome = self.start(ctx, &launch.agent, path, None, launch.args, launch.prompt);
+                let role = Role::Agent(launch.isolation);
+                let outcome = self.start_as(ctx, &launch.agent, path, None, launch.args, launch.prompt, role);
                 if warmed && outcome.is_ok() {
                     self.toast("warm cache from main");
                 }

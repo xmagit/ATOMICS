@@ -192,8 +192,16 @@ impl State {
         // A prompt starts a new chief turn, so it can call imacs_wait immediately.
         let prompt = (record.chief && handoff)
             .then(|| "IMACS restarted. Call imacs_wait to receive the restart event, then carry on.".into());
-        match self.start_as(ctx, &record.agent, record.cwd, Some(record.claude_session_id), args, prompt, record.chief)
-        {
+        // A resumed task agent keeps its task's isolation.
+        let role = if record.chief {
+            Role::Chief
+        } else {
+            let task = record.pane.as_ref().and_then(|pane| {
+                self.plans.iter().flat_map(|plan| &plan.tasks).find(|task| task.session.as_ref() == Some(pane))
+            });
+            Role::Agent(task.and_then(|task| task.isolation))
+        };
+        match self.start_as(ctx, &record.agent, record.cwd, Some(record.claude_session_id), args, prompt, role) {
             Ok(id) => {
                 if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) {
                     session.last_prompt = record.last_prompt;

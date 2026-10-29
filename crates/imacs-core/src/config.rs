@@ -59,7 +59,7 @@ name = "claude"             # built in: claude, midnight, atomisk, paper and tid
 [isolation]
 # Where agents run. "sandbox" gives each agent its own Docker Sandboxes microVM (sbx) that
 # sees only its worktree and git's write folders; "bare" runs agents directly on this machine.
-# An agent below can set its own isolation = "bare" or "sandbox"; a repository's
+# An agent below, or a plan task, can set its own isolation = "bare" or "sandbox"; a repository's
 # .imacs/config.toml can only tighten this to "sandbox". See docs/isolation.md.
 mode = "sandbox"
 
@@ -732,12 +732,10 @@ impl Config {
         self.agents.iter().find(|a| a.name == name)
     }
 
-    /// Every agent runs sandboxed, whatever its own setting: what a repository may require.
+    /// Every agent runs sandboxed, whatever its own or its task's setting: what a repository may require.
     pub fn require_sandbox(&mut self) {
         self.isolation.mode = crate::isolation::IsolationMode::Sandbox;
-        for agent in &mut self.agents {
-            agent.isolation = None;
-        }
+        self.isolation.required = true;
     }
 
     /// Replaces `{base_ref}` in a configured text.
