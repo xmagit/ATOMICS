@@ -525,69 +525,204 @@ pub fn secrets_of(config: &TicketConfig, env: impl FnMut(&str) -> Option<String>
     token.into_iter().chain(values).collect()
 }
 
-/// What replaces a server message that still held a known secret after masking, such
-/// as one split across lines or content blocks.
+/// What replaces an error whose credential could not be masked in place.
 pub const WITHHELD: &str = "the ticket server's message was withheld because it contained a credential";
 
-/// An error from a ticket server made safe to store and show. Known secrets in any
-/// encoding, bearer and basic credentials, `Authorization` values, URL user info,
-/// secret-looking query values and long credential-like runs become `***`; a message
-/// whose secret was split by a line or block break is withheld whole. The result is at
-/// most [`MAX_ERROR_CHARS`] long.
-pub fn redact(text: &str, secrets: &[String]) -> String {
-    let secrets = usable(secrets);
-    let masked = mask(text, &secrets);
-    let collapsed: String = masked.chars().filter(|c| !c.is_whitespace()).collect();
-    if secrets.iter().any(|secret| find_secret(&collapsed, secret, 0).is_some()) {
-        return WITHHELD.into();
-    }
-    let out = redact_runs(&redact_query(&redact_userinfo(&redact_credentials(&masked))));
-    match out.char_indices().nth(MAX_ERROR_CHARS) {
-        Some((cut, _)) => format!("{}…", &out[..cut]),
-        None => out,
-    }
+/// What replaces a ticket field or JSON string whose credential could not be masked in place.
+pub const WITHHELD_FIELD: &str = "[withheld: contained a credential]";
+
+/// The longest ticket field kept.
+pub const MAX_FIELD_CHARS: usize = 2000;
+
+/// The one cleaner for every string that comes from a ticket server, a webhook or a caller
+/// and is then stored or shown, built from the secrets of the job or config involved.
+///
+/// A known secret is masked in place wherever it can be found: raw, percent-encoded,
+/// JSON- or `\u`-escaped, in any mix, even split by whitespace or line breaks. When a
+/// secret still shows once the text is percent-decoded, unescaped and stripped of
+/// whitespace, the whole field is withheld instead. Bounds cut only after cleaning, at a
+/// word boundary.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Cleaner {
+    secrets: Vec<String>,
 }
 
-/// A ticket as a server described it, safe to store and show: known secrets in any of its
-/// fields are masked, and its URL loses user info and secret-looking parameters.
-pub fn clean_link(link: TicketLink, secrets: &[String]) -> TicketLink {
-    let secrets = usable(secrets);
-    let text = |field: Option<String>| field.map(|text| mask(&text, &secrets));
-    TicketLink {
-        id: mask(&link.id, &secrets),
-        key: text(link.key),
-        url: link.url.map(|url| strip_url(&mask(&url, &secrets))),
-        title: text(link.title),
-        state: text(link.state),
-        updated_at: text(link.updated_at),
-        pushed_state: text(link.pushed_state),
-        error: link.error.map(|error| redact(&error, &usable_owned(&secrets))),
-        ..link
+impl Cleaner {
+    /// Secrets shorter than six characters are ignored: masking them would mask words.
+    pub fn new(secrets: impl IntoIterator<Item = String>) -> Cleaner {
+        let mut kept: Vec<String> = Vec::new();
+        for secret in secrets {
+            let secret = secret.trim().to_string();
+            if secret.chars().count() >= 6 && !kept.contains(&secret) {
+                kept.push(secret);
+            }
+        }
+        Cleaner { secrets: kept }
     }
-}
 
-/// A ticket read for an agent: every string keeps its text, with known secrets, URL user
-/// info and secret-looking query values masked in place.
-pub fn clean_value(value: Value, secrets: &[String]) -> Value {
-    let usable = usable(secrets);
-    fn walk(value: Value, secrets: &[&str]) -> Value {
+    /// The cleaner for a config's credentials.
+    pub fn of(config: &TicketConfig, env: impl FnMut(&str) -> Option<String>) -> Cleaner {
+        Cleaner::new(secrets_of(config, env))
+    }
+
+    /// This cleaner, also covering `more`.
+    pub fn with(self, more: impl IntoIterator<Item = String>) -> Cleaner {
+        Cleaner::new(self.secrets.into_iter().chain(more))
+    }
+
+    pub fn secrets(&self) -> &[String] {
+        &self.secrets
+    }
+
+    /// A ticket field, webhook field or JSON property name.
+    pub fn field(&self, text: &str) -> String {
+        match self.masked(text) {
+            Some(masked) => bound(&masked, MAX_FIELD_CHARS),
+            None => WITHHELD_FIELD.into(),
+        }
+    }
+
+    /// An error message: field rules, then bearer and basic credentials, `Authorization`
+    /// values, URL user info, secret-looking query values and long credential-like runs.
+    pub fn error(&self, text: &str) -> String {
+        let Some(masked) = self.masked(text) else { return WITHHELD.into() };
+        let out = redact_runs(&redact_query(&redact_userinfo(&redact_credentials(&masked)), secret_param));
+        bound(&out, MAX_ERROR_CHARS)
+    }
+
+    /// A URL to store and open: without user info, credential parameters or parameters
+    /// whose value holds a secret, and field rules for the rest.
+    pub fn url(&self, url: &str) -> String {
+        self.field(&strip_url(url, &|value| self.holds_secret(value)))
+    }
+
+    /// A ticket as read or given: every field cleaned.
+    pub fn link(&self, link: TicketLink) -> TicketLink {
+        let field = |text: Option<String>| text.map(|text| self.field(&text));
+        TicketLink {
+            id: self.field(&link.id),
+            key: field(link.key),
+            url: link.url.map(|url| self.url(&url)),
+            title: field(link.title),
+            state: field(link.state),
+            updated_at: field(link.updated_at),
+            pushed_state: field(link.pushed_state),
+            error: link.error.map(|error| self.error(&error)),
+            ..link
+        }
+    }
+
+    /// A ticket read for an agent: every string and property name cleaned, with URL user
+    /// info and credential query values in its text masked in place.
+    pub fn value(&self, value: Value) -> Value {
         match value {
-            Value::String(text) => Value::String(redact_query(&redact_userinfo(&mask(&text, secrets)))),
-            Value::Array(items) => Value::Array(items.into_iter().map(|v| walk(v, secrets)).collect()),
-            Value::Object(map) => Value::Object(map.into_iter().map(|(k, v)| (k, walk(v, secrets))).collect()),
+            Value::String(text) => Value::String(self.field(&redact_query(&redact_userinfo(&text), secret_param))),
+            Value::Array(items) => Value::Array(items.into_iter().map(|item| self.value(item)).collect()),
+            Value::Object(map) => {
+                Value::Object(map.into_iter().map(|(key, item)| (self.field(&key), self.value(item))).collect())
+            }
             other => other,
         }
     }
-    walk(value, &usable)
+
+    /// The text with known secrets masked, or `None` when one survives masking.
+    fn masked(&self, text: &str) -> Option<String> {
+        let masked = self.secrets.iter().fold(text.to_string(), |text, secret| mask(&text, secret));
+        (!self.holds_secret(&masked)).then_some(masked)
+    }
+
+    /// Whether a known secret shows once percent-encoding and JSON escapes are undone and
+    /// whitespace is removed.
+    fn holds_secret(&self, text: &str) -> bool {
+        let normalized = normalize(text);
+        self.secrets.iter().any(|secret| normalized.contains(&normalize(secret)))
+    }
 }
 
-fn usable_owned(secrets: &[&str]) -> Vec<String> {
-    secrets.iter().map(|s| s.to_string()).collect()
+/// Text cut to `max` characters, at the last word boundary before it, after cleaning.
+fn bound(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        None => text.to_string(),
+        Some((cut, _)) => {
+            let cut = text[..cut].rfind(char::is_whitespace).filter(|&at| at > 0).unwrap_or(cut);
+            format!("{}…", text[..cut].trim_end())
+        }
+    }
+}
+
+/// Percent-decoded and JSON-unescaped (repeatedly, so nested encodings unfold), without whitespace.
+fn normalize(text: &str) -> String {
+    let mut current = text.to_string();
+    for _ in 0..3 {
+        let next = unescape_json(&percent_decode(&current));
+        if next == current {
+            break;
+        }
+        current = next;
+    }
+    current.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let decoded = (bytes[i] == b'%')
+            .then(|| bytes.get(i + 1..i + 3))
+            .flatten()
+            .and_then(|hex| std::str::from_utf8(hex).ok())
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match decoded {
+            Some(byte) => {
+                out.push(byte);
+                i += 3;
+            }
+            None => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn unescape_json(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find('\\') {
+        out.push_str(&rest[..at]);
+        let escape = &rest[at + 1..];
+        let (decoded, used) = match escape.chars().next() {
+            Some('n') => (Some('\n'), 1),
+            Some('r') => (Some('\r'), 1),
+            Some('t') => (Some('\t'), 1),
+            Some('b') => (Some('\u{8}'), 1),
+            Some('f') => (Some('\u{c}'), 1),
+            Some(c @ ('/' | '\\' | '"')) => (Some(c), 1),
+            Some('u') => {
+                (escape.get(1..5).and_then(|hex| u32::from_str_radix(hex, 16).ok()).and_then(char::from_u32), 5)
+            }
+            _ => (None, 0),
+        };
+        match decoded {
+            Some(c) => {
+                out.push(c);
+                rest = &escape[used..];
+            }
+            None => {
+                out.push('\\');
+                rest = escape;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// A URL without user info and without secret-looking query or fragment parameters, so
 /// the open action and stored plans never carry a credential.
-fn strip_url(url: &str) -> String {
+fn strip_url(url: &str, holds_secret: &dyn Fn(&str) -> bool) -> String {
     let Some(scheme) = url.find("://") else { return url.to_string() };
     let start = scheme + 3;
     let authority_end = url[start..].find(['/', '?', '#']).map_or(url.len(), |end| start + end);
@@ -600,7 +735,10 @@ fn strip_url(url: &str) -> String {
     let public = |params: &str| {
         params
             .split('&')
-            .filter(|param| !param.is_empty() && !secret_param(param.split('=').next().unwrap_or_default()))
+            .filter(|param| {
+                let (name, value) = param.split_once('=').unwrap_or((param, ""));
+                !param.is_empty() && !secret_param(name) && !holds_secret(value)
+            })
             .collect::<Vec<_>>()
             .join("&")
     };
@@ -633,35 +771,51 @@ fn secret_param(name: &str) -> bool {
     SECRET.iter().any(|secret| name.contains(secret))
 }
 
-/// Secrets long enough to look for without masking ordinary words.
-fn usable(secrets: &[String]) -> Vec<&str> {
-    secrets.iter().map(|s| s.trim()).filter(|s| s.chars().count() >= 6).collect()
-}
-
-/// Known secrets, in any encoding, become `***`.
-fn mask(text: &str, secrets: &[&str]) -> String {
-    let mut out = text.to_string();
-    for secret in secrets {
-        let mut masked = String::with_capacity(out.len());
-        let mut pos = 0;
-        while let Some((start, end)) = find_secret(&out, secret, pos) {
-            masked.push_str(&out[pos..start]);
-            masked.push_str("***");
-            pos = end;
-        }
-        masked.push_str(&out[pos..]);
-        out = masked;
+/// Every occurrence of a known secret, in any encoding, becomes `***`.
+fn mask(text: &str, secret: &str) -> String {
+    let mut masked = String::with_capacity(text.len());
+    let mut pos = 0;
+    while let Some((start, end)) = find_secret(text, secret, pos) {
+        masked.push_str(&text[pos..start]);
+        masked.push_str("***");
+        pos = end;
     }
-    out
+    masked.push_str(&text[pos..]);
+    masked
 }
 
 /// Where `secret` first occurs in `text` from byte `from`, with each of its characters
 /// written raw, percent-encoded, JSON-escaped (`\/`, `\\`, `\"`) or `\u`-escaped, in
 /// any mix, as JSON bodies and URLs echo them.
 fn find_secret(text: &str, secret: &str, from: usize) -> Option<(usize, usize)> {
-    (from..text.len())
-        .filter(|&start| text.is_char_boundary(start))
-        .find_map(|start| secret.chars().try_fold(start, |at, c| encoded_char(text, at, c)).map(|end| (start, end)))
+    (from..text.len()).filter(|&start| text.is_char_boundary(start)).find_map(|start| {
+        let mut chars = secret.chars();
+        let first = encoded_char(text, start, chars.next()?)?;
+        chars.try_fold(first, |at, c| encoded_char(text, skip_gap(text, at), c)).map(|end| (start, end))
+    })
+}
+
+/// Skips whitespace inside a secret: raw, escaped (`\n`, `\r`, `\t`) or percent-encoded.
+fn skip_gap(text: &str, mut at: usize) -> usize {
+    loop {
+        let rest = &text[at..];
+        let step = if rest.starts_with(char::is_whitespace) {
+            rest.chars().next().map_or(0, char::len_utf8)
+        } else if ["\\n", "\\r", "\\t"].iter().any(|escape| rest.starts_with(escape)) {
+            2
+        } else if ["%0a", "%0d", "%09", "%20"]
+            .iter()
+            .any(|code| rest.get(..3).is_some_and(|r| r.eq_ignore_ascii_case(code)))
+        {
+            3
+        } else {
+            0
+        };
+        if step == 0 {
+            return at;
+        }
+        at += step;
+    }
 }
 
 /// Where `c` ends when it is written at byte `at` of `text` in one of its encodings.
@@ -796,7 +950,7 @@ fn redact_userinfo(text: &str) -> String {
 }
 
 /// `?access_token=…` and `&api_key=…` and the like keep their names only.
-fn redact_query(text: &str) -> String {
+fn redact_query(text: &str, secret: fn(&str) -> bool) -> String {
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
     while let Some(found) = text[i..].find(['?', '&']) {
@@ -805,7 +959,7 @@ fn redact_query(text: &str) -> String {
         let name_end = text[name_start..]
             .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '[' | ']')))
             .map_or(text.len(), |end| name_start + end);
-        if text[name_end..].starts_with('=') && secret_param(&text[name_start..name_end]) {
+        if text[name_end..].starts_with('=') && secret(&text[name_start..name_end]) {
             out.push_str(&text[name_start..=name_end]);
             out.push_str("***");
             i = skip_value(text, name_end + 1);
@@ -1047,6 +1201,18 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn redact(text: &str, secrets: &[String]) -> String {
+        Cleaner::new(secrets.to_vec()).error(text)
+    }
+
+    fn clean_link(link: TicketLink, secrets: &[String]) -> TicketLink {
+        Cleaner::new(secrets.to_vec()).link(link)
+    }
+
+    fn clean_value(value: Value, secrets: &[String]) -> Value {
+        Cleaner::new(secrets.to_vec()).value(value)
+    }
+
     fn link(id: &str) -> TicketLink {
         TicketLink { system: "alpha".into(), id: id.into(), ..TicketLink::default() }
     }
@@ -1249,9 +1415,7 @@ mod tests {
             );
         }
         // Content blocks are joined with newlines, which can split a secret.
-        let split = redact("tool failed: key sk/abc+de\nf=ghi_123 rejected", &secrets);
-        assert!(!split.contains("ghi_123") && !split.contains("sk/abc"), "{split}");
-        assert!(split.contains("withheld"), "{split}");
+        assert_eq!(redact("tool failed: key sk/abc+de\nf=ghi_123 rejected", &secrets), "tool failed: key *** rejected");
         // Credentials IMACS was never told about: long runs of letters and digits.
         assert_eq!(redact("upstream key ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3 rejected", &[]), "upstream key *** rejected");
         assert_eq!(redact("token: dGhpcyBpcyBhIHNlY3JldCB0b2tlbiAxMjM0NTY3OA==", &[]), "token: ***");
@@ -1285,13 +1449,37 @@ mod tests {
             ("https://t.example/7#section", "https://t.example/7#section"),
             ("not a url ?token=1", "not a url ?token=1"),
         ] {
-            assert_eq!(strip_url(url), expected);
+            assert_eq!(strip_url(url, &|_| false), expected);
         }
         let value = json!({"title": "see https://a:b@x.example/?key=tok/en+42=&q=1", "n": 3, "list": ["tok\\/en+42="]});
         assert_eq!(
             clean_value(value, &secrets),
             json!({"title": "see https://***@x.example/?key=***&q=1", "n": 3, "list": ["***"]})
         );
+    }
+
+    #[test]
+    fn the_cleaner_masks_split_secrets_in_place_and_withholds_what_it_cannot_place() {
+        let cleaner = Cleaner::new(["sk-split-9e8d7c".to_string(), "tiny".to_string()]);
+        assert_eq!(cleaner.secrets(), ["sk-split-9e8d7c"], "short secrets would mask words");
+        for split in [
+            "Rotate sk-split\n-9e8d7c now",
+            "Rotate sk-split\\n-9e8d7c now",
+            "Rotate sk-split\r\n  -9e8d7c now",
+            "Rotate sk-split%0A-9e8d7c now",
+            "Rotate sk%2Dsplit\\u002d9e8d7c now",
+        ] {
+            assert_eq!(cleaner.field(split), "Rotate *** now", "{split:?}");
+        }
+        // Encoded twice, the secret cannot be placed: the field goes.
+        assert_eq!(cleaner.field("Rotate sk-split%252D9e8d7c now"), WITHHELD_FIELD);
+        assert_eq!(cleaner.error("bad sk-split%252D9e8d7c"), WITHHELD);
+        let value = json!({"sk-split-9e8d7c": "rejected", "nested": [{"sk-split\n-9e8d7c": 1, "ok": "fine"}]});
+        assert_eq!(cleaner.value(value), json!({"***": "rejected", "nested": [{"***": 1, "ok": "fine"}]}));
+        assert_eq!(cleaner.with(["another-secret".to_string()]).field("another-secret"), "***");
+        let long = format!("{} tail", "word ".repeat(MAX_FIELD_CHARS));
+        let bounded = Cleaner::default().field(&long);
+        assert!(bounded.ends_with("word…") && bounded.chars().count() <= MAX_FIELD_CHARS + 1, "cut between words");
     }
 
     #[test]

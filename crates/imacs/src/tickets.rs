@@ -58,7 +58,7 @@ pub fn spawn<T: Send + 'static>(done: crate::host::Sender<(T, Result<TicketOutpu
             while let Ok(job) = rx.recv() {
                 // Everything a job brings back is cleaned with the secrets it ran with, so a
                 // result arriving after a config change never carries the old credentials.
-                worker.secrets = worker.secrets_of(&job.config);
+                worker.cleaner = tickets::Cleaner::new(worker.secrets_of(&job.config));
                 let result = worker.run(&job.config, job.op);
                 let result = worker.clean(result);
                 if done.send((job.tag, result)).is_err() {
@@ -75,8 +75,8 @@ struct Worker {
     client: Option<(McpServer, McpClient)>,
     /// The server that failed, when, and its cleaned error.
     down: Option<(McpServer, Instant, String)>,
-    /// The current job's secrets.
-    secrets: Vec<String>,
+    /// Cleans what the current job returns, with that job's secrets.
+    cleaner: tickets::Cleaner,
     /// Variables recently found set nowhere.
     missing: std::collections::HashMap<String, Instant>,
 }
@@ -100,12 +100,12 @@ impl Worker {
 
     /// Errors and everything read from the server, before it leaves the worker.
     fn clean(&self, result: Result<TicketOutput, String>) -> Result<TicketOutput, String> {
-        let error = |error: String| tickets::redact(&error, &self.secrets);
-        let link = |link: TicketLink| tickets::clean_link(link, &self.secrets);
+        let error = |error: String| self.cleaner.error(&error);
+        let link = |link: TicketLink| self.cleaner.link(link);
         Ok(match result.map_err(error)? {
             TicketOutput::Ticket(ticket) => TicketOutput::Ticket(link(ticket)),
             TicketOutput::Tickets(tickets) => TicketOutput::Tickets(tickets.into_iter().map(link).collect()),
-            TicketOutput::Read(value) => TicketOutput::Read(tickets::clean_value(value, &self.secrets)),
+            TicketOutput::Read(value) => TicketOutput::Read(self.cleaner.value(value)),
             TicketOutput::Pushed(read) => TicketOutput::Pushed(read.map(|read| read.map(link).map_err(error))),
         })
     }
@@ -186,7 +186,7 @@ impl Worker {
     fn broken(&mut self, server: &McpServer, err: McpError) -> String {
         if let McpError::Transport(message) = &err {
             self.client = None;
-            self.down = Some((server.clone(), Instant::now(), tickets::redact(message, &self.secrets)));
+            self.down = Some((server.clone(), Instant::now(), self.cleaner.error(message)));
         }
         err.to_string()
     }
