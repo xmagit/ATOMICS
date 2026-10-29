@@ -5,6 +5,10 @@ use std::path::{Path, PathBuf};
 /// Maximum characters added to the chief prompt for one project, including file names.
 pub const CHIEF_LIMIT: usize = 12_000;
 
+/// Maximum bytes read from any repository workflow file. Files reaching this limit are refused.
+#[cfg(feature = "native")]
+const FILE_LIMIT: u64 = 64 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct RepoWorkflow {
     pub instructions: Vec<(String, String)>,
@@ -89,30 +93,60 @@ impl RepoWorkflow {
     pub fn read(root: &Path) -> Self {
         use std::hash::{DefaultHasher, Hash, Hasher};
         let mut workflow = Self::default();
+        let mut hash = DefaultHasher::new();
+        let canonical_root = match root.canonicalize() {
+            Ok(root) => root,
+            Err(error) => {
+                workflow.warnings.push(format!("{}: cannot resolve main checkout: {error}", root.display()));
+                workflow.warnings.hash(&mut hash);
+                workflow.fingerprint = hash.finish();
+                return workflow;
+            }
+        };
         let mut files = vec![root.join("IMACS.md")];
-        let mut topics: Vec<PathBuf> = std::fs::read_dir(root.join(".imacs"))
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
-            .collect();
+        let topics_dir = root.join(".imacs");
+        let topics = canonical_repo_path(&canonical_root, &topics_dir).and_then(|path| {
+            path.map(|path| {
+                if !path.is_dir() {
+                    return Err("not a directory".to_string());
+                }
+                std::fs::read_dir(path)
+                    .and_then(|entries| {
+                        entries.map(|entry| entry.map(|entry| topics_dir.join(entry.file_name()))).collect()
+                    })
+                    .map_err(|error| error.to_string())
+            })
+            .transpose()
+        });
+        let topics_allowed = topics.is_ok();
+        let mut topics: Vec<PathBuf> = match topics {
+            Ok(topics) => topics.unwrap_or_default(),
+            Err(error) => {
+                workflow.warnings.push(format!("{}: {error}", topics_dir.display()));
+                Vec::new()
+            }
+        };
+        topics.retain(|path| path.extension().is_some_and(|ext| ext == "md"));
         topics.sort();
         files.extend(topics);
-        let mut hash = DefaultHasher::new();
         for file in files {
             file.hash(&mut hash);
-            match std::fs::read_to_string(&file) {
-                Ok(text) => {
+            match read_repo_file(&canonical_root, &file) {
+                Ok(Some(text)) => {
                     text.hash(&mut hash);
                     workflow.instructions.push((file.display().to_string(), text));
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(None) => {}
                 Err(error) => workflow.warnings.push(format!("{}: {error}", file.display())),
             }
         }
-        let mut config =
-            crate::selfconfig::Layer::read(crate::selfconfig::Source::Repo, &root.join(".imacs/config.toml"));
+        let config_file = topics_dir.join("config.toml");
+        let config_path = crate::paths::display(&config_file);
+        let source = crate::selfconfig::Source::Repo;
+        let mut config = match if topics_allowed { read_repo_file(&canonical_root, &config_file) } else { Ok(None) } {
+            Ok(text) => crate::selfconfig::Layer::new(source, config_path, text),
+            Err(error) => crate::selfconfig::Layer::unreadable(source, config_path, error),
+        };
         config.text.hash(&mut hash);
         if let Some(error) = &config.error {
             workflow.warnings.push(format!("{}: {error}; repository settings ignored", config.path));
@@ -125,6 +159,55 @@ impl RepoWorkflow {
         workflow.fingerprint = hash.finish();
         workflow
     }
+}
+
+/// Resolve links before inspecting or opening files, or walking the topics directory.
+#[cfg(feature = "native")]
+fn canonical_repo_path(root: &Path, path: &Path) -> Result<Option<PathBuf>, String> {
+    let canonical = match path.canonicalize() {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && std::fs::symlink_metadata(path).is_err() => {
+            return Ok(None);
+        }
+        Err(error) => return Err(format!("cannot resolve repository workflow path: {error}")),
+    };
+    if !canonical.starts_with(root) {
+        return Err("resolves outside the main checkout; repository workflow refused".into());
+    }
+    Ok(Some(canonical))
+}
+
+#[cfg(feature = "native")]
+fn read_repo_file(root: &Path, path: &Path) -> Result<Option<String>, String> {
+    use std::io::Read;
+
+    let Some(canonical) = canonical_repo_path(root, path)? else { return Ok(None) };
+    let read = || -> std::io::Result<String> {
+        if !std::fs::metadata(&canonical)?.is_file() {
+            return Err(std::io::Error::other("not a regular file; repository workflow refused"));
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        // A file replaced by a FIFO or symlink between inspection and open must not block or follow the link.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+        }
+        let file = options.open(canonical)?;
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::other("not a regular file; repository workflow refused"));
+        }
+        let mut bytes = Vec::new();
+        file.take(FILE_LIMIT).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 == FILE_LIMIT {
+            return Err(std::io::Error::other(format!(
+                "reaches the {FILE_LIMIT}-byte read limit; repository workflow refused"
+            )));
+        }
+        String::from_utf8(bytes).map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    };
+    read().map(Some).map_err(|error| error.to_string())
 }
 
 /// Explicit leaf allowlist. Unknown tables are walked only to report their keys;
@@ -183,6 +266,150 @@ fn bounded(text: &str, limit: usize) -> String {
 #[cfg(all(test, feature = "native"))]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn outside_instruction_and_config_symlinks_are_refused() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".imacs")).unwrap();
+        std::fs::write(outside.path().join("instructions"), "outside-secret").unwrap();
+        std::fs::write(outside.path().join("config"), "review_policy = 'outside-secret'").unwrap();
+        symlink(outside.path().join("instructions"), dir.path().join("IMACS.md")).unwrap();
+        symlink(outside.path().join("instructions"), dir.path().join(".imacs/topic.md")).unwrap();
+        symlink(outside.path().join("config"), dir.path().join(".imacs/config.toml")).unwrap();
+
+        let workflow = RepoWorkflow::read(dir.path());
+        assert!(workflow.instructions.is_empty());
+        assert!(workflow.config.text.is_none());
+        assert!(workflow.config.table.is_empty());
+        assert!(workflow.chief_section("app").is_empty());
+        assert!(workflow.agent_section().is_empty());
+        for file in ["IMACS.md", ".imacs/topic.md", ".imacs/config.toml"] {
+            assert!(
+                workflow
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains(file) && warning.contains("outside the main checkout")),
+                "{:?}",
+                workflow.warnings
+            );
+        }
+        assert!(!workflow.warnings.join("\n").contains("outside-secret"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn outside_topics_directory_is_not_walked() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("IMACS.md"), "inside instructions").unwrap();
+        std::fs::write(outside.path().join("topic.md"), "outside-secret").unwrap();
+        std::fs::write(outside.path().join("config.toml"), "base_ref = 'outside-secret'").unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join(".imacs")).unwrap();
+
+        let workflow = RepoWorkflow::read(dir.path());
+        assert_eq!(workflow.instructions.len(), 1);
+        assert!(workflow.config.text.is_none());
+        assert!(workflow.config.table.is_empty());
+        assert_eq!(workflow.warnings.len(), 1);
+        assert!(workflow.warnings[0].contains(".imacs: resolves outside the main checkout"));
+        assert!(!workflow.chief_section("app").contains("outside-secret"));
+        assert!(!workflow.agent_section().contains("outside-secret"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_within_the_canonical_checkout_are_allowed() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("checkout");
+        std::fs::create_dir_all(root.join("topics")).unwrap();
+        std::fs::write(root.join("instructions"), "inside instructions").unwrap();
+        std::fs::write(root.join("config"), "base_ref = 'origin/develop'").unwrap();
+        symlink("instructions", root.join("IMACS.md")).unwrap();
+        symlink("topics", root.join(".imacs")).unwrap();
+        symlink("../instructions", root.join("topics/test.md")).unwrap();
+        symlink("../config", root.join("topics/config.toml")).unwrap();
+        symlink(&root, dir.path().join("linked-checkout")).unwrap();
+
+        let workflow = RepoWorkflow::read(&dir.path().join("linked-checkout"));
+        assert!(workflow.warnings.is_empty(), "{:?}", workflow.warnings);
+        assert_eq!(workflow.instructions.len(), 2);
+        assert!(workflow.instructions.iter().all(|(_, text)| text == "inside instructions"));
+        assert!(workflow.instructions[1].0.ends_with(".imacs/test.md"));
+        assert_eq!(workflow.config.table["base_ref"].as_str(), Some("origin/develop"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn special_files_are_refused_without_blocking() {
+        use std::os::unix::{ffi::OsStrExt, net::UnixListener};
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".imacs")).unwrap();
+        for file in ["IMACS.md", ".imacs/config.toml"] {
+            let path = std::ffi::CString::new(dir.path().join(file).as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        }
+        let _socket = UnixListener::bind(dir.path().join(".imacs/socket.md")).unwrap();
+        std::fs::create_dir(dir.path().join(".imacs/directory.md")).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || sender.send(RepoWorkflow::read(dir.path())).unwrap());
+        let workflow =
+            receiver.recv_timeout(std::time::Duration::from_secs(2)).expect("workflow read must not block on a FIFO");
+        reader.join().unwrap();
+        assert!(workflow.instructions.is_empty());
+        assert!(workflow.config.table.is_empty());
+        for file in ["IMACS.md", ".imacs/config.toml", ".imacs/socket.md", ".imacs/directory.md"] {
+            assert!(
+                workflow
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains(file) && warning.contains("not a regular file")),
+                "{:?}",
+                workflow.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn file_reads_are_bounded_and_oversized_files_are_omitted() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".imacs")).unwrap();
+        std::fs::write(dir.path().join("IMACS.md"), vec![b'x'; FILE_LIMIT as usize - 1]).unwrap();
+        let workflow = RepoWorkflow::read(dir.path());
+        assert!(workflow.warnings.is_empty());
+        assert_eq!(workflow.instructions[0].1.len(), FILE_LIMIT as usize - 1);
+
+        // Invalid UTF-8 beyond the limit must never be read or decoded, including for config.
+        let mut oversized = vec![b'x'; FILE_LIMIT as usize];
+        oversized.push(0xff);
+        for file in ["IMACS.md", ".imacs/topic.md", ".imacs/config.toml"] {
+            std::fs::write(dir.path().join(file), &oversized).unwrap();
+        }
+        let workflow = RepoWorkflow::read(dir.path());
+        assert!(workflow.instructions.is_empty());
+        assert!(workflow.config.text.is_none());
+        assert!(workflow.config.table.is_empty());
+        assert!(workflow.chief_section("app").is_empty());
+        assert!(workflow.agent_section().is_empty());
+        for file in ["IMACS.md", ".imacs/topic.md", ".imacs/config.toml"] {
+            assert!(
+                workflow
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains(file) && warning.contains("65536-byte read limit")),
+                "{:?}",
+                workflow.warnings
+            );
+        }
+        std::fs::write(dir.path().join("IMACS.md"), vec![b'x'; FILE_LIMIT as usize]).unwrap();
+        assert!(RepoWorkflow::read(dir.path()).instructions.is_empty());
+    }
 
     #[test]
     fn instructions_reload_by_content_and_bound_each_project() {
