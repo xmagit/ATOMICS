@@ -8,7 +8,9 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 
 fn response(rx: Receiver<ControlOutcome>) -> ControlResponse {
-    let ControlOutcome::Done(response) = rx.recv_timeout(Duration::from_secs(10)).expect("host did not answer") else {
+    // Some commands run git in the background (an integration takes a dozen calls), and while the
+    // whole suite runs one git call can take half a second. The bound only guards against a hang.
+    let ControlOutcome::Done(response) = rx.recv_timeout(Duration::from_secs(30)).expect("host did not answer") else {
         panic!("expected completed command");
     };
     assert!(response.ok, "{:?}", response.error);
