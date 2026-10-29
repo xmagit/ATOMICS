@@ -327,7 +327,15 @@ impl Desktop<'_> {
                 ui.new_child(egui::UiBuilder::new().id_salt(("completed", plan, task)).max_rect(tile.shrink(14.0)));
             let task_data = &self.runtime.plans[plan].tasks[task];
             child.label(RichText::new(&task_data.title).color(p.foreground).strong().size(13.0));
-            if let Some(action) = task_result(&mut child, task_data, None, false, &self.runtime.config, &p) {
+            if let Some(action) = task_result(
+                &mut child,
+                task_data,
+                None,
+                false,
+                !self.runtime.plans[plan].is_open(),
+                &self.runtime.config,
+                &p,
+            ) {
                 task_action = Some((plan, task, action));
             }
         }
@@ -448,7 +456,15 @@ mod tests {
                         let mut action = None;
                         let output = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
                             egui::CentralPanel::default().show(ui, |ui| {
-                                action = task_result(ui, &task, None, false, &app.runtime.config, &app.runtime.palette);
+                                action = task_result(
+                                    ui,
+                                    &task,
+                                    None,
+                                    false,
+                                    false,
+                                    &app.runtime.config,
+                                    &app.runtime.palette,
+                                );
                             });
                         });
                         let pos = output
@@ -511,7 +527,7 @@ mod tests {
                 let mut action = None;
                 let output = ctx.run_ui(egui::RawInput { time: Some(time), events, ..Default::default() }, |ui| {
                     egui::CentralPanel::default().show(ui, |ui| {
-                        action = task_result(ui, &task, None, false, &app.runtime.config, &app.runtime.palette);
+                        action = task_result(ui, &task, None, false, false, &app.runtime.config, &app.runtime.palette);
                     });
                 });
                 let text: Vec<_> = output
@@ -692,26 +708,7 @@ mod tests {
                 assert_eq!(app.runtime.diff_target().as_deref(), Some(root));
                 app.runtime.plans[index].status = plan::PlanStatus::Completed;
                 let text = render(app, true, vec![]);
-                let pos = text.iter().find(|(t, _)| t == "Archive plan").unwrap().1;
-                for pressed in [true, false] {
-                    render(
-                        app,
-                        true,
-                        vec![
-                            egui::Event::PointerMoved(pos),
-                            egui::Event::PointerButton {
-                                pos,
-                                button: egui::PointerButton::Primary,
-                                pressed,
-                                modifiers: egui::Modifiers::NONE,
-                            },
-                        ],
-                    );
-                }
-                assert_eq!(app.runtime.plans[index].status, PlanStatus::Completed);
-                assert_eq!(app.client.confirm_plan_close, Some(("results".into(), PlanStatus::Archived)));
-                let text = render(app, true, vec![]);
-                let pos = text.iter().find(|(t, _)| t == "Confirm archive").unwrap().1;
+                let pos = text.iter().find(|(t, _)| t == "Archive").unwrap().1;
                 for pressed in [true, false] {
                     render(
                         app,

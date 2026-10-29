@@ -109,6 +109,9 @@ impl State {
     /// integration branch, off the UI thread; the outcome lands on the task.
     pub(super) fn integrate(&mut self, index: usize, id: &str, reply: Option<Sender<ControlOutcome>>) {
         let job = match self.plans[index].tasks.iter().find(|t| t.id == id) {
+            _ if self.plans[index].status != PlanStatus::Open => {
+                Err("Reopen the plan before integrating tasks.".into())
+            }
             None => Err(format!("no task {id}")),
             Some(_) if id == plan::REVIEW_TASK => {
                 Err("The review task cannot be integrated: it only reviews the plan's integration branch.".into())

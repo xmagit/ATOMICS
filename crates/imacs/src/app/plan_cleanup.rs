@@ -320,8 +320,7 @@ mod tests {
                         );
                     }
                 };
-                click(app, "✓ Ship cleanup · 4/4");
-                app.runtime.toggle_plan();
+                click(app, "✓ Ship cleanup");
                 assert!(app.runtime.plan_view && app.runtime.diff_open && app.runtime.panel == PanelMode::Plan);
                 click(app, "Clean up plan…");
                 let deadline = Instant::now() + Duration::from_secs(10);

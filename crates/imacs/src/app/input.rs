@@ -143,30 +143,33 @@ impl Desktop<'_> {
     pub(super) fn dialogs(&mut self, ctx: &egui::Context) {
         self.quick_open_dialog(ctx);
         self.cleanup_dialog(ctx);
-        if let Some((id, status)) = self.client.confirm_plan_close.clone() {
-            if let Some(index) = self.runtime.plans.iter().position(|p| {
-                p.id == id && (p.is_open() || (status == PlanStatus::Archived && p.status == PlanStatus::Completed))
-            }) {
-                let archive = status == PlanStatus::Archived;
+        if let Some((id, _)) = self.client.confirm_plan_close.clone() {
+            if let Some(index) =
+                self.runtime.plans.iter().position(|plan| plan.id == id && plan.status == PlanStatus::Open)
+            {
                 let mut open = true;
-                egui::Window::new(if archive { "Archive plan?" } else { "Complete plan?" })
+                egui::Window::new("Close plan?")
                     .collapsible(false)
                     .resizable(false)
                     .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
                     .open(&mut open)
                     .show(ctx, |ui| {
                         ui.label(format!(
-                            "Close “{}”? You can reopen it from Closed plans.",
+                            "Close “{}”? You can view or reopen it from History.",
                             self.runtime.plans[index].goal
                         ));
                         ui.horizontal(|ui| {
-                            if ui.button(if archive { "Confirm archive" } else { "Confirm complete" }).clicked() {
-                                self.post_plan(index, move |state, index| {
-                                    if let Err(err) = state.close_plan(index, status) {
-                                        state.toast(err);
-                                    }
-                                });
-                                self.client.confirm_plan_close = None;
+                            for (label, status) in
+                                [("Complete plan", PlanStatus::Completed), ("Archive plan", PlanStatus::Archived)]
+                            {
+                                if ui.button(label).clicked() {
+                                    self.post_plan(index, move |state, index| {
+                                        if let Err(error) = state.close_plan(index, status) {
+                                            state.toast(error);
+                                        }
+                                    });
+                                    self.client.confirm_plan_close = None;
+                                }
                             }
                             if ui.button("Cancel").clicked() {
                                 self.client.confirm_plan_close = None;

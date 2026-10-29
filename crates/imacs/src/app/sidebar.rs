@@ -27,6 +27,12 @@ impl State {
     }
 }
 
+fn measure_divider(ui: &mut egui::Ui) -> f32 {
+    super::topbar::measure(ui, |ui| {
+        ui.separator();
+    })
+}
+
 fn section(ui: &mut egui::Ui, p: &Palette, title: &str) {
     ui.horizontal(|ui| {
         ui.label(RichText::new("▍").color(p.accent).size(11.0));
@@ -94,7 +100,11 @@ impl Desktop<'_> {
                 .plans
                 .iter()
                 .enumerate()
-                .filter(|(_, p)| !p.id.is_empty() && p.status != PlanStatus::Archived)
+                .filter(|(index, p)| {
+                    !p.id.is_empty()
+                        && (p.status != PlanStatus::Archived
+                            || self.runtime.plan_view && self.runtime.selected_plan == *index)
+                })
                 .map(|(index, _)| ViewTab::Plan(index)),
         );
         let gap = ui.spacing().item_spacing.x;
@@ -109,7 +119,7 @@ impl Desktop<'_> {
         let closed = self.runtime.plans.iter().any(|p| !p.id.is_empty() && !p.is_open());
         let closed_width = if closed {
             super::topbar::measure(ui, |ui| {
-                ui.menu_button("Closed plans", |_| {});
+                ui.menu_button("History", |_| {});
             }) + gap
         } else {
             0.0
@@ -119,7 +129,9 @@ impl Desktop<'_> {
         });
         let available = ui.available_width();
         let pin_closed = closed && available >= closed_width + menu_width + gap + 90.0;
-        let budget = available - if pin_closed { closed_width } else { 0.0 };
+        let has_groups = tabs.iter().any(|tab| matches!(tab, ViewTab::Plan(_)));
+        let divider_width = if has_groups { measure_divider(ui) + gap } else { 0.0 };
+        let budget = available - if pin_closed { closed_width } else { 0.0 } - divider_width;
         let minimum: Vec<f32> = widths.iter().map(|w| w.min(90.0)).collect();
         let total = |widths: &[f32]| widths.iter().sum::<f32>() + gap * widths.len().saturating_sub(1) as f32;
         let overflow = total(&minimum) > budget || (closed && !pin_closed);
@@ -148,29 +160,47 @@ impl Desktop<'_> {
         let natural: Vec<f32> = visible.iter().map(|&i| widths[i]).collect();
         let shrink = (total(&natural) - visible_budget).max(0.0);
         let capacity: f32 = visible.iter().map(|&i| widths[i] - minimum[i]).sum();
+        let mut divider_drawn = false;
+        let mut project_drawn = false;
         for &index in &visible {
+            if matches!(tabs[index], ViewTab::Plan(_)) && project_drawn && !divider_drawn {
+                ui.separator();
+                divider_drawn = true;
+            }
+            project_drawn |= !matches!(tabs[index], ViewTab::Plan(_));
             let width = widths[index]
                 - if capacity > 0.0 { shrink.min(capacity) * (widths[index] - minimum[index]) / capacity } else { 0.0 };
             self.view_tab(ui, &tabs[index], Some(width));
         }
         if overflow {
+            if has_groups && project_drawn && !divider_drawn {
+                ui.separator();
+            }
             let response = ui
                 .menu_button("Tabs", |ui| {
                     ui.set_max_width(500.0_f32.min(ui.ctx().content_rect().width() - 32.0));
+                    let mut projects = false;
                     for (index, tab) in tabs.iter().enumerate() {
                         if !visible.contains(&index) {
+                            if matches!(tab, ViewTab::Plan(_)) && projects {
+                                ui.separator();
+                                projects = false;
+                            }
+                            if !matches!(tab, ViewTab::Plan(_)) {
+                                projects = true;
+                            }
                             self.view_tab(ui, tab, None);
                         }
                     }
                     if closed && !pin_closed {
-                        self.closed_plans_menu(ui);
+                        self.history_menu(ui);
                     }
                 })
                 .response;
             super::topbar::record_item(ui, "Tabs", &response);
         }
         if pin_closed {
-            self.closed_plans_menu(ui);
+            self.history_menu(ui);
         }
     }
 
@@ -201,29 +231,37 @@ impl Desktop<'_> {
             }
             ViewTab::Plan(index) => {
                 let plan = &self.runtime.plans[*index];
-                let name: String = plan.goal.chars().take(28).collect();
+                let state = self.runtime.plan_state(*index);
                 let marker = if self.runtime.changed_plans.contains(&plan.id) { " *" } else { "" };
-                let glyph = if plan.status == PlanStatus::Completed { "✓" } else { "●" };
-                let attention =
-                    if self.runtime.sessions.iter().any(|s| plan.contains_session(&s.id) && s.status.needs_attention())
-                    {
-                        "needs you"
-                    } else {
-                        plan.attention()
-                    };
-                let color = match attention {
-                    "needs you" => p.warning,
-                    "all done" => p.success,
-                    _ => p.accent,
-                };
-                (
-                    format!("{glyph} {name} · {}/{}{marker}", plan.count(TaskStatus::Done), plan.tasks.len()),
-                    format!("{}: {}", plan.goal, attention),
-                    color,
-                )
+                (format!("{}{marker}", state.label(&plan.goal)), plan.goal.clone(), state.color(&p))
             }
         };
-        let button = egui::Button::selectable(selected, RichText::new(&label).size(12.5).color(color)).truncate();
+        let state = if let ViewTab::Plan(index) = tab { Some(self.runtime.plan_state(*index)) } else { None };
+        let mut text = egui::text::LayoutJob::default();
+        let mut rest = label.as_str();
+        if matches!(state, Some(PlanState::Running(_))) {
+            let pulse = 0.55 + 0.45 * (ui.input(|input| input.time) * 3.2).sin() as f32;
+            text.append(
+                "● ",
+                0.0,
+                egui::TextFormat { font_id: p.ui(12.5), color: color.gamma_multiply(pulse), ..Default::default() },
+            );
+            rest = rest.strip_prefix("● ").unwrap_or(rest);
+            ui.ctx().request_repaint_after(PULSE_STEP);
+        }
+        text.append(rest, 0.0, egui::TextFormat { font_id: p.ui(12.5), color, ..Default::default() });
+        let fill = match state {
+            Some(PlanState::Running(_)) => p.accent.gamma_multiply(0.35),
+            Some(PlanState::NeedsYou) => p.warning.gamma_multiply(0.12),
+            _ => Color32::TRANSPARENT,
+        };
+        let mut button = egui::Button::new(text)
+            .fill(fill)
+            .stroke(if selected { Stroke::new(1.0, p.accent) } else { Stroke::NONE })
+            .truncate();
+        if state.is_some() {
+            button = button.right_text("   ");
+        }
         let response = match width {
             Some(width) => ui.add_sized(vec2(width, ui.spacing().interact_size.y), button),
             None => ui.add(button),
@@ -232,13 +270,49 @@ impl Desktop<'_> {
         if width.is_some() {
             super::topbar::record_item(ui, &label, &response);
         }
-        if response.clicked() {
+        let mut close_clicked = false;
+        let mut over_close = false;
+        if let ViewTab::Plan(index) = tab {
+            let close =
+                Rect::from_center_size(pos2(response.rect.right() - 12.0, response.rect.center().y), vec2(18.0, 18.0));
+            let _id = egui::Id::NULL.with(("plan-close", self.runtime.plans[*index].id.as_str()));
+            let hit = ui.interact(close, response.id.with("close"), Sense::click());
+            over_close = ui.input(|input| input.pointer.hover_pos().is_some_and(|pos| close.contains(pos)));
+            if selected || response.hovered() || hit.hovered() {
+                if hit.hovered() {
+                    ui.painter().rect_filled(close, 2.0, p.raised);
+                }
+                let center = close.center();
+                for sign in [-1.0, 1.0] {
+                    ui.painter().line_segment(
+                        [center + vec2(-3.0, sign * -3.0), center + vec2(3.0, sign * 3.0)],
+                        Stroke::new(1.0, p.muted),
+                    );
+                }
+                #[cfg(test)]
+                if !ui.is_sizing_pass() {
+                    ui.ctx().data_mut(|data| data.insert_temp(_id, close));
+                }
+            }
+            close_clicked = hit.clicked() || response.clicked() && over_close;
+            if close_clicked {
+                self.close_plan_tab(*index);
+                if width.is_none() {
+                    ui.close();
+                }
+            }
+        }
+        if response.clicked() && !close_clicked && !over_close {
             match tab {
                 ViewTab::All => self.runtime.set_view(None),
                 ViewTab::Project(root) => self.runtime.set_view(Some(root.clone())),
                 ViewTab::Plan(index) => {
-                    self.runtime.selected_plan = *index;
-                    self.runtime.show_plan_fleet();
+                    if self.runtime.plans[*index].status == PlanStatus::Open {
+                        self.runtime.selected_plan = *index;
+                        self.runtime.show_plan_fleet();
+                    } else {
+                        self.view_plan_history(*index);
+                    }
                 }
             }
             if width.is_none() {
@@ -265,38 +339,12 @@ impl Desktop<'_> {
             ViewTab::Plan(index) if self.runtime.plans[*index].status == PlanStatus::Completed => {
                 response.context_menu(|ui| {
                     if ui.button("Archive plan").clicked() {
-                        self.client.confirm_plan_close =
-                            Some((self.runtime.plans[*index].id.clone(), PlanStatus::Archived));
+                        self.close_plan_tab(*index);
                         ui.close();
                     }
                 });
             }
             _ => {}
-        }
-    }
-
-    fn closed_plans_menu(&mut self, ui: &mut egui::Ui) {
-        let mut reopen = None;
-        let response = ui
-            .menu_button("Closed plans", |ui| {
-                for (index, plan) in
-                    self.runtime.plans.iter().enumerate().filter(|(_, p)| !p.id.is_empty() && !p.is_open())
-                {
-                    let status = if plan.status == PlanStatus::Completed { "completed" } else { "archived" };
-                    if ui.button(format!("Reopen {} ({status})", plan.goal)).clicked() {
-                        reopen = Some(index);
-                        ui.close();
-                    }
-                }
-            })
-            .response;
-        super::topbar::record_item(ui, "Closed plans", &response);
-        if let Some(index) = reopen {
-            self.post_plan(index, |state, index| {
-                if let Err(err) = state.reopen_plan(index) {
-                    state.toast(err);
-                }
-            });
         }
     }
 
@@ -740,7 +788,7 @@ mod tests {
                 for (goal, index, visible) in [("Atlas", one, 0), ("Beacon", two, 1)] {
                     let text = frame(app, vec![]);
                     assert!(!text.iter().any(|(t, _)| t.contains("Archived")));
-                    assert!(text.iter().any(|(t, _)| t.starts_with("✓ Completed ·")));
+                    assert!(text.iter().any(|(t, _)| t.starts_with("✓ Completed")));
                     let pos = text.iter().find(|(t, _)| t.starts_with(&format!("● {goal} ·"))).unwrap().1;
                     frame(app, vec![egui::Event::PointerMoved(pos), button(pos, true)]);
                     frame(app, vec![button(pos, false)]);
@@ -765,76 +813,6 @@ mod tests {
                     if index == one {
                         assert!(!app.runtime.plans[two].approved);
                     }
-                }
-                let completed = app.runtime.plans.iter().position(|p| p.goal == "Completed").unwrap();
-                let text = frame(app, vec![]);
-                let pos = text.iter().find(|(t, _)| t.starts_with("✓ Completed ·")).unwrap().1;
-                for pressed in [true, false] {
-                    frame(
-                        app,
-                        vec![
-                            egui::Event::PointerMoved(pos),
-                            egui::Event::PointerButton {
-                                pos,
-                                button: egui::PointerButton::Secondary,
-                                pressed,
-                                modifiers: egui::Modifiers::NONE,
-                            },
-                        ],
-                    );
-                }
-                let text = frame(app, vec![]);
-                let pos = text.iter().rev().find(|(t, _)| t == "Archive plan").unwrap().1;
-                for pressed in [true, false] {
-                    frame(app, vec![egui::Event::PointerMoved(pos), button(pos, pressed)]);
-                }
-                assert_eq!(app.runtime.plans[completed].status, PlanStatus::Completed);
-                assert_eq!(
-                    app.client.confirm_plan_close,
-                    Some((app.runtime.plans[completed].id.clone(), PlanStatus::Archived))
-                );
-                let mut click = |app: &mut Desktop<'_>, label: &str| {
-                    frame(app, vec![]);
-                    let text = frame(app, vec![]);
-                    let pos =
-                        text.iter().find(|(t, _)| t == label).unwrap_or_else(|| panic!("missing {label}: {text:?}")).1;
-                    frame(app, vec![egui::Event::PointerMoved(pos), button(pos, true)]);
-                    frame(app, vec![button(pos, false)]);
-                };
-                click(app, "Cancel");
-                assert!(app.client.confirm_plan_close.is_none());
-                click(app, "Closed plans");
-                click(app, "Reopen Completed (completed)");
-                app.runtime.sync_plan();
-                assert!(app.runtime.plans[completed].is_open());
-                assert_eq!(app.runtime.selected_plan, completed);
-                for (index, action, confirm, status, reopen) in [
-                    (two, "Archive plan", "Confirm archive", PlanStatus::Archived, "Reopen Beacon (archived)"),
-                    (one, "Complete plan", "Confirm complete", PlanStatus::Completed, "Reopen Atlas (completed)"),
-                ] {
-                    app.runtime.selected_plan = index;
-                    app.runtime.show_plan_fleet();
-                    app.runtime.toggle_plan();
-                    click(app, action);
-                    assert_eq!(app.runtime.plans[index].status, PlanStatus::Open, "closing requires confirmation");
-                    click(app, "Cancel");
-                    assert!(app.client.confirm_plan_close.is_none());
-                    assert_eq!(app.runtime.plans[index].status, PlanStatus::Open);
-                    click(app, action);
-                    click(app, confirm);
-                    assert_eq!(app.runtime.plans[index].status, status);
-                    click(app, "Closed plans");
-                    click(app, reopen);
-                    assert!(app.runtime.plans[index].is_open());
-                    assert_eq!(app.runtime.selected_plan, index);
-                    assert!(app.runtime.plan_view && app.runtime.panel == PanelMode::Plan);
-                    let saved = Plan::load(
-                        &paths::imacs_home().join("plans").join(format!("{}.json", app.runtime.plans[index].id)),
-                    )
-                    .unwrap();
-                    assert_eq!(saved.status, PlanStatus::Open);
-                    assert_eq!(saved.tasks, app.runtime.plans[index].tasks);
-                    assert!(saved.approved);
                 }
                 assert_eq!(app.runtime.sessions.len(), 2, "closing plans does not terminate their sessions");
             },

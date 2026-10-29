@@ -46,6 +46,7 @@ mod heartbeat;
 mod input;
 mod integrations;
 mod plan_cleanup;
+mod plan_view;
 mod plans;
 mod projects;
 mod sessions;
@@ -57,6 +58,7 @@ mod worktrees;
 use chief::{CHIEF_ALLOWED_TOOLS, chief_divider};
 use editor::save_png;
 use fleet::queue_note;
+use plan_view::PlanState;
 
 const TAB_HEIGHT: f32 = 30.0;
 const TILE_HEADER: f32 = 26.0;
@@ -834,6 +836,7 @@ fn task_result(
     task: &Task,
     status: Option<AgentStatus>,
     expanded: bool,
+    read_only: bool,
     config: &Config,
     p: &Palette,
 ) -> Option<&'static str> {
@@ -875,15 +878,16 @@ fn task_result(
                 if ui.add_enabled(available, egui::Button::new("diff").small()).clicked() {
                     action = Some("diff");
                 }
-                if ui
-                    .add_enabled(
-                        status.is_none()
-                            && available
-                            && (task.resume_id.is_some()
-                                || config.agent(&task.agent).is_some_and(|agent| agent.is_codex())),
-                        egui::Button::new("resume").small(),
-                    )
-                    .clicked()
+                if !read_only
+                    && ui
+                        .add_enabled(
+                            status.is_none()
+                                && available
+                                && (task.resume_id.is_some()
+                                    || config.agent(&task.agent).is_some_and(|agent| agent.is_codex())),
+                            egui::Button::new("resume").small(),
+                        )
+                        .clicked()
                 {
                     action = Some("resume");
                 }

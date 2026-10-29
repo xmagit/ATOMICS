@@ -32,10 +32,12 @@ impl Desktop<'_> {
                 .max_rect(rect.shrink2(vec2(12.0, 8.0))),
         );
         let ui = &mut child;
+        let read_only = self.runtime.plans[self.runtime.selected_plan].status != PlanStatus::Open;
+        let mut reopen = false;
+        let mut archive = false;
         let mut approve = false;
         let mut dispatch_all = false;
         let mut close_status = None;
-        let mut close = false;
         let mut clean_plan = false;
         let ready = self.runtime.plans[self.runtime.selected_plan].ready().len();
         if self
@@ -53,50 +55,47 @@ impl Desktop<'_> {
                 let done = self.runtime.plans[self.runtime.selected_plan].count(TaskStatus::Done);
                 ui.label(RichText::new(format!("{done}/{total} done")).color(p.muted).size(12.0));
             }
+            if read_only {
+                let status = if self.runtime.plans[self.runtime.selected_plan].status == PlanStatus::Completed {
+                    "Completed ✓ · read-only"
+                } else {
+                    "Archived · read-only"
+                };
+                ui.label(RichText::new(status).color(p.muted).size(12.0));
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if self.runtime.plans[self.runtime.selected_plan].status == PlanStatus::Completed {
-                    clean_plan = ui.small_button("Clean up plan…").clicked();
-                }
-                if self.runtime.plans[self.runtime.selected_plan].is_open() {
-                    if ui.small_button("Archive plan").clicked() {
-                        close_status = Some(PlanStatus::Archived);
+                if read_only {
+                    if self.runtime.plans[self.runtime.selected_plan].status == PlanStatus::Completed {
+                        archive = ui.small_button("Archive").clicked();
+                        clean_plan = ui.small_button("Clean up plan…").clicked();
                     }
-                    if ui.small_button("Complete plan").clicked() {
+                    reopen = ui.small_button("Reopen plan").clicked();
+                } else {
+                    if ui.small_button("Close plan…").clicked() {
                         close_status = Some(PlanStatus::Completed);
                     }
-                }
-                if ui.small_button("×").on_hover_text("Back to the diff").clicked() {
-                    close = true;
-                }
-                if total == 0 {
-                    return;
-                }
-                if self.runtime.plans[self.runtime.selected_plan].status == plan::PlanStatus::Completed {
-                    if ui.small_button("Archive plan").clicked() {
-                        close_status = Some(PlanStatus::Archived);
+                    if total == 0 {
+                        return;
                     }
-                } else if !self.runtime.plans[self.runtime.selected_plan].approved {
-                    let button = egui::Button::new(RichText::new("Approve plan").color(Color32::WHITE))
-                        .fill(p.accent.gamma_multiply(0.7));
-                    if ui.add(button).on_hover_text("Let the orchestrator dispatch these tasks").clicked() {
-                        approve = true;
+                    if !self.runtime.plans[self.runtime.selected_plan].approved {
+                        let button = egui::Button::new(RichText::new("Approve plan").color(Color32::WHITE))
+                            .fill(p.accent.gamma_multiply(0.7));
+                        approve = ui.add(button).on_hover_text("Let the orchestrator dispatch these tasks").clicked();
+                    } else {
+                        dispatch_all = ui
+                            .add_enabled(ready > 0, egui::Button::new(format!("Dispatch ready ({ready})")))
+                            .on_hover_text("Start every task whose dependencies are done")
+                            .clicked();
+                        ui.label(RichText::new("approved ✓").color(p.success).size(12.0));
                     }
-                } else {
-                    let button = egui::Button::new(format!("Dispatch ready ({ready})"));
-                    if ui
-                        .add_enabled(ready > 0, button)
-                        .on_hover_text("Start every task whose dependencies are done")
-                        .clicked()
-                    {
-                        dispatch_all = true;
-                    }
-                    ui.label(RichText::new("approved ✓").color(p.success).size(12.0));
                 }
             });
         });
         if !self.runtime.plans[self.runtime.selected_plan].goal.is_empty() {
             ui.label(
-                RichText::new(&self.runtime.plans[self.runtime.selected_plan].goal).color(p.foreground).size(13.0),
+                RichText::new(&self.runtime.plans[self.runtime.selected_plan].goal)
+                    .color(self.runtime.plan_state(self.runtime.selected_plan).color(&p))
+                    .size(13.0),
             );
         }
         let integration = self.runtime.plans[self.runtime.selected_plan].integration_branch();
@@ -128,7 +127,7 @@ impl Desktop<'_> {
 
         let mut actions: Vec<(String, &str)> = Vec::new();
         let mut open_session: Option<String> = None;
-        let editable = !self.runtime.plans[self.runtime.selected_plan].approved;
+        let editable = !read_only && !self.runtime.plans[self.runtime.selected_plan].approved;
         let ready_ids: HashSet<String> =
             self.runtime.plans[self.runtime.selected_plan].ready().iter().map(|t| t.id.clone()).collect();
         let approved = self.runtime.plans[self.runtime.selected_plan].approved;
@@ -234,9 +233,15 @@ impl Desktop<'_> {
                                                         .as_ref()
                                                         .and_then(|s| sessions.get(s))
                                                         .map(|(_, s)| *s);
-                                                    if let Some(action) =
-                                                        task_result(ui, task, status, open, &self.runtime.config, &p)
-                                                    {
+                                                    if let Some(action) = task_result(
+                                                        ui,
+                                                        task,
+                                                        status,
+                                                        open,
+                                                        read_only,
+                                                        &self.runtime.config,
+                                                        &p,
+                                                    ) {
                                                         actions.push((task.id.clone(), action));
                                                     }
                                                     if let Some(note) = task.notes.last() {
@@ -276,6 +281,9 @@ impl Desktop<'_> {
                                                             && ui.small_button("open").clicked()
                                                         {
                                                             open_session = task.session.clone();
+                                                        }
+                                                        if read_only {
+                                                            return;
                                                         }
                                                         match task.status {
                                                             TaskStatus::Planned
@@ -389,6 +397,9 @@ impl Desktop<'_> {
                 status => {
                     if let Some(status) = TaskStatus::parse(status) {
                         self.post_plan(self.runtime.selected_plan, move |state, index| {
+                            if state.plans[index].status != PlanStatus::Open {
+                                return;
+                            }
                             if let Some(task) = state.plans[index].task_mut(&id) {
                                 task.set_status(status);
                             }
@@ -417,8 +428,19 @@ impl Desktop<'_> {
             self.activate(&session, true);
             self.runtime.panel = PanelMode::Diff;
         }
-        if close {
-            self.runtime.panel = PanelMode::Diff;
+        if reopen {
+            self.post_plan(self.runtime.selected_plan, |state, index| {
+                if let Err(error) = state.reopen_plan(index) {
+                    state.toast(error);
+                }
+            });
+        }
+        if archive {
+            self.post_plan(self.runtime.selected_plan, |state, index| {
+                if let Err(error) = state.close_plan(index, PlanStatus::Archived) {
+                    state.toast(error);
+                }
+            });
         }
         if let Some(status) = close_status {
             self.client.confirm_plan_close = Some((self.runtime.plans[self.runtime.selected_plan].id.clone(), status));

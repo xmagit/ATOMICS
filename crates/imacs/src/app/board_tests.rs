@@ -246,3 +246,40 @@ fn board_scrolls_horizontally_to_the_last_column_and_keeps_card_buttons() {
         },
     );
 }
+
+#[test]
+fn completed_and_archived_boards_are_read_only_even_with_ready_tasks() {
+    super::tests::with_app(
+        "app::board_tests::completed_and_archived_boards_are_read_only_even_with_ready_tasks",
+        |app, ctx| {
+            populate(app);
+            let dir = tempfile::tempdir().unwrap();
+            app.runtime.plans[0].tasks[4].worktree = Some(dir.path().into());
+            app.runtime.plans[0].tasks[4].finished_at = Some(890);
+            app.runtime.plans[0].tasks[4].resume_id = Some("resume-id".into());
+            app.runtime.plans[0].tasks[4].session = None;
+            for status in [PlanStatus::Completed, PlanStatus::Archived] {
+                for approved in [true, false] {
+                    app.runtime.plans[0].status = status;
+                    app.runtime.plans[0].approved = approved;
+                    let before = app.runtime.plans[0].clone();
+                    let rendered = frame(app, ctx, 5120.0, 10.0, vec![]);
+                    let labels: Vec<_> = rendered.text.iter().map(|text| text.galley.text()).collect();
+                    assert!(labels.contains(&"Reopen plan"));
+                    assert!(labels.iter().any(|text| text.contains("read-only")));
+                    for forbidden in
+                        ["start", "accept", "send back", "unblock", "reopen", "integrate", "resume", "Approve plan"]
+                    {
+                        assert!(!labels.contains(&forbidden), "{status:?} offers {forbidden}: {labels:?}");
+                    }
+                    assert!(!labels.iter().any(|text| text.starts_with("Dispatch ready")));
+                    assert_eq!(app.runtime.plans[0], before);
+                    assert!(app.runtime.creating.is_empty());
+                    assert!(app.runtime.dispatch(0, Some("task-0")).unwrap_err().contains("Reopen"));
+                    app.runtime.task_action(0, 4, "resume");
+                    assert_eq!(app.runtime.plans[0], before);
+                }
+            }
+        },
+    );
+}

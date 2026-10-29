@@ -65,6 +65,10 @@ impl State {
     }
 
     pub(super) fn task_action(&mut self, index: usize, task_index: usize, action: &str) {
+        if action == "resume" && self.plans[index].status != PlanStatus::Open {
+            self.toast("Reopen the plan before resuming a task");
+            return;
+        }
         let task = self.plans[index].tasks[task_index].clone();
         let Some(root) = task.worktree else {
             return;
@@ -176,6 +180,9 @@ impl State {
     /// Starts `only`, or every ready task, each in a new worktree with its brief as
     /// the agent's first message.
     pub(super) fn dispatch(&mut self, index: usize, only: Option<&str>) -> Result<Vec<String>, String> {
+        if self.plans[index].status != PlanStatus::Open {
+            return Err("Reopen the plan before dispatching tasks.".into());
+        }
         if !self.plans[index].approved {
             return Err("The plan is not approved yet: the user approves it on the plan board.".into());
         }
@@ -636,6 +643,9 @@ mod tests {
                     }],
                     ..Plan::default()
                 };
+                app.runtime.task_action(index, 0, "resume");
+                assert!(!output.exists(), "a completed plan cannot resume without an explicit reopen");
+                app.runtime.reopen_plan(index).unwrap();
                 app.runtime.task_action(index, 0, "resume");
                 let deadline = Instant::now() + Duration::from_secs(5);
                 let args = loop {

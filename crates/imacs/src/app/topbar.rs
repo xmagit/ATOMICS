@@ -384,7 +384,7 @@ mod tests {
                 click(app, width, "diff");
                 assert_ne!(app.runtime.diff_open, was_open, "width={width}: diff action");
                 click(app, width, "Tabs");
-                click(app, width, "● Plan 0:");
+                click(app, width, "Plan 0:");
                 assert_eq!(app.runtime.selected_plan, 0, "width={width}: Tabs selection");
                 assert!(app.runtime.plan_view);
                 if collapsed {
