@@ -22,11 +22,12 @@ pub struct TerminalView {
     grid: (usize, usize),
     scroll_remainder: f32,
     selection: Option<Selection>,
+    selection_revision: u64,
 }
 
 impl Default for TerminalView {
     fn default() -> Self {
-        Self { grid: (80, 24), scroll_remainder: 0.0, selection: None }
+        Self { grid: (80, 24), scroll_remainder: 0.0, selection: None, selection_revision: 0 }
     }
 }
 
@@ -73,6 +74,7 @@ impl TerminalView {
             return;
         }
         self.grid = (cols, rows);
+        self.selection = None;
         let size = WindowSize {
             num_lines: rows as u16,
             num_cols: cols as u16,
@@ -80,6 +82,16 @@ impl TerminalView {
             cell_height: metrics.cell.y as u16,
         };
         terminal.resize(size);
+    }
+
+    // Client anchors are grid coordinates. Output can scroll or rewrite the
+    // cells beneath them, so discard them before any locked query or paint.
+    fn sync_selection(&mut self, terminal: &Terminal) {
+        let revision = terminal.revision();
+        if self.selection_revision != revision {
+            self.selection = None;
+            self.selection_revision = revision;
+        }
     }
 
     fn point_at(&self, pos: Pos2, rect: Rect, metrics: &Metrics, offset: usize) -> (Point, Side) {
@@ -99,6 +111,7 @@ impl TerminalView {
         metrics: &Metrics,
     ) {
         let mut term = terminal.term.lock();
+        self.sync_selection(terminal);
         let offset = term.grid().display_offset();
 
         if let Some(pos) = response.interact_pointer_pos() {
@@ -162,6 +175,7 @@ impl TerminalView {
                 egui::Event::Paste(text) => out.extend(imacs_core::steer::paste_bytes(&text, bracketed)),
                 egui::Event::Copy => {
                     let mut term = terminal.term.lock();
+                    self.sync_selection(terminal);
                     // alacritty's copy helper reads its selection field. Install the
                     // client's selection only for this locked query, then restore it.
                     let previous = std::mem::replace(&mut term.selection, self.selection.clone());
@@ -190,7 +204,7 @@ impl TerminalView {
     }
 
     fn paint(
-        &self,
+        &mut self,
         terminal: &Terminal,
         ui: &egui::Ui,
         (outer, rect): (Rect, Rect),
@@ -202,6 +216,7 @@ impl TerminalView {
         painter.rect_filled(outer, 0.0, palette.background);
 
         let term = terminal.term.lock();
+        self.sync_selection(terminal);
         let selection = self.selection.as_ref().and_then(|s| s.to_range(&*term));
         let content = term.renderable_content();
         let colors = content.colors;
@@ -467,6 +482,66 @@ mod tests {
         assert!(rx.recv_timeout(Duration::from_secs(2)).unwrap().is_empty());
         worker.join().unwrap();
         terminal.shutdown();
+    }
+
+    fn selected_terminal() -> (Terminal, TerminalView, Metrics, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let palette = Palette::from_config(&imacs_core::config::ThemeConfig::default());
+        let terminal = Terminal::spawn(crate::host::Wake::default(), palette.terminal_colors(), "/bin/sh".into(), vec!["-c".into(), "stty -echo; printf 'reviewed\\r\\n'; read -r ignored; printf 'one\\r\\ntwo\\r\\nthree\\r\\nfour\\r\\nfive\\r\\n'; exec /bin/sleep 30".into()], dir.path(), HashMap::new(), 100).unwrap();
+        wait_for_text(&terminal, "reviewed");
+        let metrics = Metrics { font: FontId::monospace(12.0), cell: vec2(8.0, 16.0) };
+        let mut view = TerminalView::default();
+        view.resize(&terminal, Rect::from_min_size(Pos2::ZERO, vec2(160.0, 64.0)), &metrics);
+        {
+            let _guard = terminal.term.lock();
+            view.sync_selection(&terminal);
+            let mut selection = Selection::new(SelectionType::Simple, Point::new(Line(0), Column(0)), Side::Left);
+            selection.update(Point::new(Line(0), Column(7)), Side::Right);
+            view.selection = Some(selection);
+        }
+        (terminal, view, metrics, dir)
+    }
+
+    fn wait_for_text(terminal: &Terminal, text: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !terminal.screen_text(24).contains(text) {
+            assert!(std::time::Instant::now() < deadline, "terminal did not output {text}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn copy_selection(terminal: &Terminal, view: &mut TerminalView) -> Option<String> {
+        let ctx = egui::Context::default();
+        let output = ctx.run_ui(egui::RawInput { events: vec![egui::Event::Copy], ..Default::default() }, |ui| {
+            view.handle_keys(terminal, ui)
+        });
+        let copied = output.platform_output.commands.iter().find_map(|command| match command {
+            egui::OutputCommand::CopyText(text) => Some(text.clone()),
+            _ => None,
+        });
+        output.drop_without_applying_deltas();
+        copied
+    }
+
+    #[test]
+    fn selection_is_discarded_after_output_scrolls_without_a_frame() {
+        let (terminal, mut view, _, _dir) = selected_terminal();
+        assert_eq!(copy_selection(&terminal, &mut view).as_deref(), Some("reviewed"));
+        terminal.write(b"\r".to_vec());
+        // Output scrolls on the PTY thread while the client consumes no frames.
+        wait_for_text(&terminal, "five");
+        assert!(!terminal.screen_text(4).contains("reviewed"));
+        assert_eq!(copy_selection(&terminal, &mut view), None);
+        assert!(view.selection.is_none());
+    }
+
+    #[test]
+    fn selection_is_discarded_when_geometry_changes() {
+        let (terminal, mut view, metrics, _dir) = selected_terminal();
+        assert_eq!(copy_selection(&terminal, &mut view).as_deref(), Some("reviewed"));
+        view.resize(&terminal, Rect::from_min_size(Pos2::ZERO, vec2(64.0, 48.0)), &metrics);
+        assert_eq!(copy_selection(&terminal, &mut view), None);
+        assert!(view.selection.is_none());
     }
 
     #[test]
