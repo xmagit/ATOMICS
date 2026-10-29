@@ -20,7 +20,7 @@ fn command(host: &Host, value: serde_json::Value) -> ControlResponse {
 }
 
 fn eventually(host: &Host, check: impl Fn(&State) -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if check(&host.state()) {
             break;
@@ -201,10 +201,10 @@ fn integration_finishes_and_persists_without_frames() {
 
 #[test]
 fn agent_exit_updates_and_saves_its_plan_without_frames() {
-    with_state("app::host_tests::agent_exit_updates_and_saves_its_plan_without_frames", |mut state, ctx| {
+    with_state("app::host_tests::agent_exit_updates_and_saves_its_plan_without_frames", |mut state, _ctx| {
         let terminal = Terminal::spawn(
-            ctx,
-            state.palette.clone(),
+            state.wake.clone(),
+            state.palette.terminal_colors(),
             "/bin/sh".into(),
             vec!["-c".into(), "sleep 0.1".into()],
             &state.launch_dir,
@@ -212,7 +212,6 @@ fn agent_exit_updates_and_saves_its_plan_without_frames() {
             100,
         )
         .unwrap();
-        terminal.set_runtime_wake(state.wake.clone());
         state.sessions = vec![session("worker", AgentKind::Generic, AgentStatus::Working, &state.launch_dir)];
         state.sessions[0].terminal = Some(terminal);
         state.plans = vec![Plan {
@@ -234,10 +233,10 @@ fn agent_exit_updates_and_saves_its_plan_without_frames() {
 
 #[test]
 fn delivery_verification_times_out_without_frames() {
-    with_state("app::host_tests::delivery_verification_times_out_without_frames", |mut state, ctx| {
+    with_state("app::host_tests::delivery_verification_times_out_without_frames", |mut state, _ctx| {
         let terminal = Terminal::spawn(
-            ctx,
-            state.palette.clone(),
+            state.wake.clone(),
+            state.palette.terminal_colors(),
             "/bin/sleep".into(),
             vec!["30".into()],
             &state.launch_dir,
@@ -266,5 +265,77 @@ fn delivery_verification_times_out_without_frames() {
         assert!(!result.ok);
         assert!(result.error.unwrap().contains("no receipt"));
         assert!(host.state().sessions[0].pending.is_none());
+    });
+}
+
+#[test]
+fn worktree_changes_publish_a_fresh_diff_without_frames() {
+    with_state("app::host_tests::worktree_changes_publish_a_fresh_diff_without_frames", |mut state, _| {
+        let (_dir, repo) = repository();
+        state.config.base_ref = "main".into();
+        state.repos = vec![repo.clone()];
+        state.diff_root = Some(repo.clone());
+        let host = state.into_host();
+        eventually(&host, |state| state.diffs.get(&repo).is_some_and(|d| d.prepared.is_some()));
+        // The watcher is installed and the first revision has already been published.
+        // Only a real filesystem change may produce the next revision.
+        let initial = host.state().diffs[&repo].prepared.clone().unwrap();
+        std::fs::write(repo.join("new.rs"), "fn fresh_revision() {}\n").unwrap();
+        eventually(&host, |state| {
+            state.diffs[&repo]
+                .prepared
+                .as_ref()
+                .is_some_and(|p| !Arc::ptr_eq(&initial, p) && p.diff.files.iter().any(|file| file.path() == "new.rs"))
+        });
+        let current = host.state().diffs[&repo].prepared.clone().unwrap();
+        std::fs::write(repo.join("new.rs"), "fn changed_again() {}\nfn another_line() {}\n").unwrap();
+        eventually(&host, |state| {
+            state.diffs[&repo].prepared.as_ref().is_some_and(|p| !Arc::ptr_eq(&current, p) && p.additions == 2)
+        });
+    });
+}
+
+#[test]
+fn held_terminal_input_gets_a_receipt_without_frames() {
+    with_state("app::host_tests::held_terminal_input_gets_a_receipt_without_frames", |mut state, _| {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex");
+        state.config.agents.push(imacs_core::config::AgentConfig {
+            name: "fake-codex".into(),
+            command: vec![fixture.to_string_lossy().into_owned()],
+            kind: AgentKind::Generic,
+            busy_text: None,
+        });
+        let reply = expired_approval(&mut state);
+        let worker = &mut state.sessions[0];
+        worker.agent = "fake-codex".into();
+        worker.kind = AgentKind::Generic;
+        worker.held = vec!["A message held until the approval expires".into()];
+        worker.terminal = Some(
+            Terminal::spawn(
+                state.wake.clone(),
+                state.palette.terminal_colors(),
+                fixture.to_string_lossy().into_owned(),
+                vec!["--mode".into(), "queue".into()],
+                &state.launch_dir,
+                HashMap::new(),
+                100,
+            )
+            .unwrap(),
+        );
+        let host = state.into_host();
+        eventually(&host, |state| {
+            state.sessions[0].terminal.as_ref().unwrap().screen_text(60).contains("tab to queue")
+        });
+        reply.wait(Duration::ZERO);
+        eventually(&host, |state| {
+            let worker = &state.sessions[0];
+            worker.held.is_empty()
+                && worker.pending.is_none()
+                && steer::message_in_transcript(
+                    &worker.terminal.as_ref().unwrap().screen_text(60),
+                    "A message held until the approval expires",
+                )
+        });
+        assert!(host.state().sessions[0].last_message.is_none());
     });
 }

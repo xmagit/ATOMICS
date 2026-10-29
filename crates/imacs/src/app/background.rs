@@ -137,6 +137,9 @@ impl State {
             self.stop_voice();
             self.toast("Voice: stopped after 5 minutes, transcribing");
         }
+        for terminal in self.sessions.iter().filter_map(|s| s.terminal.as_ref()).chain(self.editors.values()) {
+            changed |= terminal.shared.changed.swap(false, Ordering::AcqRel);
+        }
         for session in &mut self.sessions {
             if session.terminal.as_ref().is_some_and(Terminal::exited) {
                 session.status = AgentStatus::Exited;
@@ -547,7 +550,7 @@ impl State {
 
     /// Watches the worktree of every agent and the one on screen, so their diffs follow
     /// file changes without polling.
-    fn watch(&mut self, ctx: &egui::Context, target: Option<&Path>) {
+    fn watch(&mut self, _ctx: &egui::Context, target: Option<&Path>) {
         let mut wanted: Vec<PathBuf> = self
             .sessions
             .iter()
@@ -571,7 +574,7 @@ impl State {
             return;
         }
         if self.watcher.is_none() {
-            let (tx, ctx, watched) = (self.watch_tx.clone(), ctx.clone(), self.watched.clone());
+            let (tx, watched) = (self.watch_tx.clone(), self.watched.clone());
             let integration_dirty = self.integration_dirty.clone();
             let wake = self.wake.clone();
             let handler = move |result: DebounceEventResult| {
@@ -585,7 +588,6 @@ impl State {
                     {
                         integration_dirty.store(true, Ordering::Relaxed);
                         wake.notify();
-                        ctx.request_repaint();
                         continue;
                     }
                     // The innermost worktree, for worktrees inside another.
@@ -603,9 +605,6 @@ impl State {
                 }
                 for root in &changed {
                     let _ = tx.send((*root).clone());
-                }
-                if !changed.is_empty() {
-                    ctx.request_repaint();
                 }
             };
             match new_debouncer(Duration::from_millis(250), handler) {
@@ -639,10 +638,10 @@ mod tests {
 
     #[test]
     fn needs_input_without_a_pending_menu_uses_slow_screen_checks() {
-        with_app("app::background::tests::needs_input_without_a_pending_menu_uses_slow_screen_checks", |app, ctx| {
+        with_app("app::background::tests::needs_input_without_a_pending_menu_uses_slow_screen_checks", |app, _ctx| {
             let terminal = Terminal::spawn(
-                ctx,
-                app.palette.clone(),
+                app.wake.clone(),
+                app.palette.terminal_colors(),
                 "/bin/sh".into(),
                 vec!["-c".into(), "printf 'Working (esc to interrupt)'; exec sleep 30".into()],
                 &app.launch_dir,

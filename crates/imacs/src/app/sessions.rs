@@ -293,9 +293,16 @@ impl State {
         } else {
             (program, args)
         };
-        match Terminal::spawn(ctx, self.palette.clone(), program, args, &cwd, env, self.config.terminal.scrollback) {
+        match Terminal::spawn(
+            self.wake.clone(),
+            self.palette.terminal_colors(),
+            program,
+            args,
+            &cwd,
+            env,
+            self.config.terminal.scrollback,
+        ) {
             Ok(terminal) => {
-                terminal.set_runtime_wake(self.wake.clone());
                 if let Some(id) = &claude_id {
                     self.dismissed.remove(id);
                 }
@@ -960,8 +967,8 @@ fi
             let text = "Please check the first change and then the second change";
             for mode in ["queue", "retry", "drop", "drop-paste", "drop-empty", "exit", "hook"] {
                 let terminal = Terminal::spawn(
-                    ctx,
-                    app.palette.clone(),
+                    app.wake.clone(),
+                    app.palette.terminal_colors(),
                     fixture.to_string_lossy().into_owned(),
                     vec!["--mode".into(), mode.into()],
                     &app.launch_dir,
@@ -1065,8 +1072,8 @@ fi
                     "Please check the first change and then the second change".into()
                 };
                 let terminal = Terminal::spawn(
-                    ctx,
-                    app.palette.clone(),
+                    app.wake.clone(),
+                    app.palette.terminal_colors(),
                     fixture.to_string_lossy().into_owned(),
                     vec!["--mode".into(), mode.into()],
                     &app.launch_dir,
@@ -1127,7 +1134,7 @@ fi
 
     #[test]
     fn steering_during_a_pending_codex_send_is_held_and_released() {
-        with_app("app::sessions::tests::steering_during_a_pending_codex_send_is_held_and_released", |app, ctx| {
+        with_app("app::sessions::tests::steering_during_a_pending_codex_send_is_held_and_released", |app, _ctx| {
             let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex");
             app.config.agents.push(imacs_core::config::AgentConfig {
                 name: "fake-codex".into(),
@@ -1139,8 +1146,8 @@ fi
             app.sessions[0].agent = "fake-codex".into();
             app.sessions[0].terminal = Some(
                 Terminal::spawn(
-                    ctx,
-                    app.palette.clone(),
+                    app.wake.clone(),
+                    app.palette.terminal_colors(),
                     fixture.to_string_lossy().into_owned(),
                     vec![],
                     &app.launch_dir,

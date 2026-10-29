@@ -80,7 +80,7 @@ impl State {
 
     /// Switches the panel to the editor for `root`, opening `path` at `line`. One
     /// editor runs per worktree and keeps running when you switch back to the diff.
-    pub(super) fn edit(&mut self, ctx: &egui::Context, root: &Path, path: Option<&str>, line: Option<u32>) {
+    pub(super) fn edit(&mut self, _ctx: &egui::Context, root: &Path, path: Option<&str>, line: Option<u32>) {
         self.panel = PanelMode::Editor;
         self.diff_open = true;
         self.focus_editor = true;
@@ -108,7 +108,15 @@ impl State {
             env.insert("PATH".into(), shell_path.clone());
         }
         let scrollback = self.config.terminal.scrollback;
-        match Terminal::spawn(ctx, self.palette.clone(), resolve_program(program), args, root, env, scrollback) {
+        match Terminal::spawn(
+            self.wake.clone(),
+            self.palette.terminal_colors(),
+            resolve_program(program),
+            args,
+            root,
+            env,
+            scrollback,
+        ) {
             Ok(editor) => {
                 // The file is already open; only the theme and the jump to the line are left.
                 editor.type_steps(
@@ -173,7 +181,7 @@ impl State {
         self.editor_id = Some(id);
         match self.editors.get_mut(root).filter(|e| !e.exited()) {
             Some(editor) => {
-                let response = editor.show(ui, body, id, &metrics, &p);
+                let response = self.terminal_views.entry(id).or_default().show(editor, ui, body, id, &metrics, &p);
                 if std::mem::take(&mut self.focus_editor) {
                     response.request_focus();
                 }

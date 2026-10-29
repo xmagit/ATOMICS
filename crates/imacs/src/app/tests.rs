@@ -183,7 +183,7 @@ fn permission_hooks_wake_waiters_and_accept_decisions(app: &mut State, ctx: &egu
     assert!(CHIEF_ALLOWED_TOOLS.contains(&"mcp__imacs__imacs_approve"));
 }
 
-fn busy_text_is_only_a_fallback(app: &mut State, ctx: &egui::Context) {
+fn busy_text_is_only_a_fallback(app: &mut State, _ctx: &egui::Context) {
     app.config.agents.push(imacs_core::config::AgentConfig {
         name: "test".into(),
         command: vec![],
@@ -192,8 +192,8 @@ fn busy_text_is_only_a_fallback(app: &mut State, ctx: &egui::Context) {
     });
     let dir = tempfile::tempdir().unwrap();
     let terminal = Terminal::spawn(
-        ctx,
-        app.palette.clone(),
+        app.wake.clone(),
+        app.palette.terminal_colors(),
         "/bin/sh".into(),
         vec!["-c".into(), "printf 'esc to interrupt'; sleep 10".into()],
         dir.path(),

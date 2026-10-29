@@ -413,12 +413,12 @@ mod tests {
     fn accepted_agents_exit_keep_results_and_complete_without_closing_chief() {
         with_app(
             "app::plans::tests::accepted_agents_exit_keep_results_and_complete_without_closing_chief",
-            |app, ctx| {
+            |app, _ctx| {
                 let dir = tempfile::tempdir().unwrap();
                 let root = dir.path();
                 let terminal = Terminal::spawn(
-                    ctx,
-                    app.palette.clone(),
+                    app.wake.clone(),
+                    app.palette.terminal_colors(),
                     "/bin/sh".into(),
                     vec!["-c".into(), "exec sleep 600".into()],
                     root,
@@ -657,68 +657,71 @@ mod tests {
 
     #[test]
     fn redispatch_and_late_exit_events_preserve_the_current_task_session() {
-        with_app("app::plans::tests::redispatch_and_late_exit_events_preserve_the_current_task_session", |app, ctx| {
-            let (_dir, repo) = repository();
-            app.plans[0] = Plan {
-                id: "delivery".into(),
-                approved: true,
-                tasks: vec![Task {
-                    id: "task".into(),
-                    repo: Some(repo.to_string_lossy().into_owned()),
-                    session: Some("old".into()),
-                    report: Some(Report { status: "blocked".into(), summary: "old".into(), at: 0 }),
-                    status: TaskStatus::Planned,
-                    ..Task::default()
-                }],
-                ..Plan::default()
-            };
-            app.sessions = vec![session("old", AgentKind::Generic, AgentStatus::Exited, &repo)];
-            app.dispatch(0, Some("task")).unwrap();
-            assert!(app.plans[0].tasks[0].session.is_none());
-            assert!(app.plans[0].tasks[0].report.is_none());
-            app.sync_plan();
-            assert_eq!(app.plans[0].tasks[0].status, TaskStatus::Running);
-            app.sessions.push(session("new", AgentKind::Generic, AgentStatus::Working, &repo));
-            app.sessions[1].terminal = Some(
-                Terminal::spawn(
-                    ctx,
-                    app.palette.clone(),
-                    "/bin/sleep".into(),
-                    vec!["10".into()],
-                    &repo,
-                    HashMap::new(),
-                    100,
-                )
-                .unwrap(),
-            );
-            app.plans[0].tasks[0].session = Some("new".into());
-            let exit = |pane: &str, id: &str| HookMessage {
-                pane: Some(pane.into()),
-                ancestors: vec![],
-                delivered: 0,
-                approval_reply: None,
-                event: imacs_core::hook::HookEvent::from_payload(&json!({
-                    "hook_event_name":"SessionEnd", "session_id":id,
-                }))
-                .unwrap(),
-            };
-            app.on_hook(exit("new", "old"));
-            app.on_hook(exit("old", "old"));
-            let mut stale = exit("new", "retired");
-            stale.pane = None;
-            stale.ancestors = vec![app.sessions[1].terminal.as_ref().unwrap().process_id()];
-            app.on_hook(stale);
-            app.sync_plan();
-            assert_eq!(app.sessions[1].status, AgentStatus::Working);
-            assert_eq!(app.plans[0].tasks[0].status, TaskStatus::Running);
-            app.on_hook(exit("new", "new"));
-            app.sync_plan();
-            assert_eq!(app.plans[0].tasks[0].status, TaskStatus::Blocked);
-            assert_eq!(app.plans[0].tasks[0].notes, ["the agent exited before reporting"]);
-            // Finish the worktree job before its temporary repository is removed.
-            let (_, result, _) = app.worktree_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-            result.unwrap();
-        });
+        with_app(
+            "app::plans::tests::redispatch_and_late_exit_events_preserve_the_current_task_session",
+            |app, _ctx| {
+                let (_dir, repo) = repository();
+                app.plans[0] = Plan {
+                    id: "delivery".into(),
+                    approved: true,
+                    tasks: vec![Task {
+                        id: "task".into(),
+                        repo: Some(repo.to_string_lossy().into_owned()),
+                        session: Some("old".into()),
+                        report: Some(Report { status: "blocked".into(), summary: "old".into(), at: 0 }),
+                        status: TaskStatus::Planned,
+                        ..Task::default()
+                    }],
+                    ..Plan::default()
+                };
+                app.sessions = vec![session("old", AgentKind::Generic, AgentStatus::Exited, &repo)];
+                app.dispatch(0, Some("task")).unwrap();
+                assert!(app.plans[0].tasks[0].session.is_none());
+                assert!(app.plans[0].tasks[0].report.is_none());
+                app.sync_plan();
+                assert_eq!(app.plans[0].tasks[0].status, TaskStatus::Running);
+                app.sessions.push(session("new", AgentKind::Generic, AgentStatus::Working, &repo));
+                app.sessions[1].terminal = Some(
+                    Terminal::spawn(
+                        app.wake.clone(),
+                        app.palette.terminal_colors(),
+                        "/bin/sleep".into(),
+                        vec!["10".into()],
+                        &repo,
+                        HashMap::new(),
+                        100,
+                    )
+                    .unwrap(),
+                );
+                app.plans[0].tasks[0].session = Some("new".into());
+                let exit = |pane: &str, id: &str| HookMessage {
+                    pane: Some(pane.into()),
+                    ancestors: vec![],
+                    delivered: 0,
+                    approval_reply: None,
+                    event: imacs_core::hook::HookEvent::from_payload(&json!({
+                        "hook_event_name":"SessionEnd", "session_id":id,
+                    }))
+                    .unwrap(),
+                };
+                app.on_hook(exit("new", "old"));
+                app.on_hook(exit("old", "old"));
+                let mut stale = exit("new", "retired");
+                stale.pane = None;
+                stale.ancestors = vec![app.sessions[1].terminal.as_ref().unwrap().process_id()];
+                app.on_hook(stale);
+                app.sync_plan();
+                assert_eq!(app.sessions[1].status, AgentStatus::Working);
+                assert_eq!(app.plans[0].tasks[0].status, TaskStatus::Running);
+                app.on_hook(exit("new", "new"));
+                app.sync_plan();
+                assert_eq!(app.plans[0].tasks[0].status, TaskStatus::Blocked);
+                assert_eq!(app.plans[0].tasks[0].notes, ["the agent exited before reporting"]);
+                // Finish the worktree job before its temporary repository is removed.
+                let (_, result, _) = app.worktree_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                result.unwrap();
+            },
+        );
     }
 
     #[test]

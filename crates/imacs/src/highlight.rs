@@ -1,7 +1,6 @@
 //! Syntax highlighting for diff lines with syntect and bat's grammar set. syntect
 //! works line by line, which suits hunks that start mid-file.
 
-use egui::Color32;
 use imacs_core::diff::{FileDiff, LineKind};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::Theme;
@@ -13,7 +12,7 @@ use two_face::theme::EmbeddedThemeName;
 pub struct Span {
     pub start: u32,
     pub end: u32,
-    pub color: Color32,
+    pub color: [u8; 4],
 }
 
 pub type Spans = Vec<Span>;
@@ -91,7 +90,7 @@ impl Highlighter {
             let end = (pos + piece.len()).min(text.len() - 1);
             if end > pos {
                 let c = style.foreground;
-                spans.push(Span { start: pos as u32, end: end as u32, color: Color32::from_rgb(c.r, c.g, c.b) });
+                spans.push(Span { start: pos as u32, end: end as u32, color: [c.r, c.g, c.b, 255] });
             }
             pos += piece.len();
         }

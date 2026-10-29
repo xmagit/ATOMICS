@@ -15,12 +15,13 @@ use imacs_core::{paths, steer};
 use notify_debouncer_mini::notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_mini::{DebounceEventResult, Debouncer, new_debouncer};
 
-use crate::diff_view::{self, DiffAction, DiffState, DiffWorker, ExplorerState, Header, WorkerResult};
+use crate::diff_view::{self, DiffAction, DiffState, ExplorerState, Header};
+use crate::diff_worker::{DiffWorker, WorkerResult};
 use crate::governor::{Governor, Jobserver};
 use crate::highlight::Highlighter;
 use crate::ipc::{self, Channels, ControlMessage, ControlOutcome, HookMessage, Hub};
 use crate::setup::{SHELL_PATH, env_var, global_hooks_installed, install_global_hooks, resolve_program};
-use crate::terminal::{Metrics, Terminal};
+use crate::terminal::{Metrics, Terminal, TerminalView};
 use crate::theme::{Palette, lerp, shortcut};
 use crate::voice::{MAX_RECORDING, Recorder};
 use imacs_core::approvals::{ApprovalRequest, Decision};
@@ -365,6 +366,7 @@ pub(crate) struct State {
     plan_cleanup: Option<plan_cleanup::PlanCleanup>,
     panel: PanelMode,
     editors: HashMap<PathBuf, Terminal>,
+    terminal_views: HashMap<egui::Id, TerminalView>,
     focus_editor: bool,
     editor_id: Option<egui::Id>,
     events: Vec<StatusEvent>,
@@ -540,7 +542,7 @@ impl State {
         });
         let mut app = State {
             ctx: ctx.clone(),
-            wake,
+            wake: wake.clone(),
             control_tx,
             client_commands: Vec::new(),
             icon: ctx.load_texture("atomisk", egui::ColorImage::from(icon), egui::TextureOptions::LINEAR),
@@ -558,7 +560,7 @@ impl State {
             diff_open: true,
             diff_root: None,
             diffs: HashMap::new(),
-            worker: DiffWorker::new(ctx.clone()),
+            worker: DiffWorker::new(wake),
             hub,
             hook_rx,
             usage,
@@ -586,6 +588,7 @@ impl State {
             plan_cleanup: None,
             panel: PanelMode::Diff,
             editors: HashMap::new(),
+            terminal_views: HashMap::new(),
             focus_editor: false,
             editor_id: None,
             events: Vec::new(),
@@ -838,6 +841,11 @@ impl State {
 impl State {
     fn client_logic(&mut self, ctx: &egui::Context) {
         self.screenshot(ctx);
+        for terminal in self.sessions.iter().filter_map(|s| s.terminal.as_ref()).chain(self.editors.values()) {
+            if let Some(text) = terminal.shared.clipboard.lock().unwrap().take() {
+                ctx.copy_text(text);
+            }
+        }
     }
 
     fn paint(&mut self, ui: &mut egui::Ui) {

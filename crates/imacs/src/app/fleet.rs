@@ -239,7 +239,8 @@ impl State {
             }
             match &mut session.terminal {
                 Some(terminal) => {
-                    let response = terminal.show(ui, body, term_id, &metrics, &p);
+                    let response =
+                        self.terminal_views.entry(term_id).or_default().show(terminal, ui, body, term_id, &metrics, &p);
                     if focus_request.as_deref() == Some(session.id.as_str()) {
                         response.request_focus();
                     }

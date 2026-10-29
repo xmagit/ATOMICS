@@ -1,257 +1,40 @@
-//! An embedded terminal: alacritty's emulator and PTY event loop, drawn with egui.
+//! Native terminal client: painting, keyboard/pointer input and selection.
 
-use std::borrow::Cow;
-use std::collections::HashMap;
-use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
-
-use alacritty_terminal::event::{Event as TermEvent, EventListener, WindowSize};
-use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
-use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Line, Point, Side};
-use alacritty_terminal::selection::{Selection, SelectionType};
-use alacritty_terminal::sync::FairMutex;
-use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::test::TermSize;
-use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
-use alacritty_terminal::tty;
-use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb};
-use anyhow::Result;
-use egui::{Color32, FontId, Key, Modifiers, Pos2, Rect, Sense, Stroke, Vec2, pos2, vec2};
+mod runtime;
+pub use runtime::Terminal;
 
 use crate::theme::{Palette, is_app_chord};
-
-pub struct Shared {
-    pub title: Mutex<Option<String>>,
-    pub exited: AtomicBool,
-    runtime_wake: OnceLock<crate::host::Wake>,
-    pub bell: AtomicBool,
-    size: Mutex<WindowSize>,
-    /// The pass that last drew the terminal, and whether it had keyboard focus then.
-    drawn: AtomicU64,
-    focused: AtomicBool,
-    typed: Mutex<Option<Instant>>,
-}
-
-/// How long output may wait to be drawn: in the focused terminal, in the others on
-/// screen, and off screen, where it only keeps the agent's status current.
-const FOCUSED_REPAINT: Duration = Duration::from_millis(100);
-const OUTPUT_REPAINT: Duration = Duration::from_millis(200);
-const HIDDEN_REPAINT: Duration = Duration::from_millis(500);
-/// Output this soon after a key press is its echo and is drawn at once.
-const ECHO_WINDOW: Duration = Duration::from_secs(1);
-
-#[derive(Clone)]
-struct Listener {
-    ctx: egui::Context,
-    sender: Arc<OnceLock<EventLoopSender>>,
-    shared: Arc<Shared>,
-    palette: Arc<Palette>,
-}
-
-impl EventListener for Listener {
-    fn send_event(&self, event: TermEvent) {
-        let write = |text: String| {
-            if let Some(sender) = self.sender.get() {
-                let _ = sender.send(Msg::Input(Cow::Owned(text.into_bytes())));
-            }
-        };
-        let runtime_changed =
-            matches!(&event, TermEvent::ChildExit(_) | TermEvent::Exit | TermEvent::Title(_) | TermEvent::ResetTitle);
-        match event {
-            TermEvent::Wakeup => self.repaint(),
-            TermEvent::MouseCursorDirty | TermEvent::CursorBlinkingChange => self.ctx.request_repaint(),
-            TermEvent::Title(title) => *self.shared.title.lock().unwrap() = Some(title),
-            TermEvent::ResetTitle => *self.shared.title.lock().unwrap() = None,
-            TermEvent::PtyWrite(text) => write(text),
-            TermEvent::ColorRequest(index, format) => write(format(self.palette.indexed_rgb(index))),
-            TermEvent::TextAreaSizeRequest(format) => write(format(*self.shared.size.lock().unwrap())),
-            TermEvent::ClipboardStore(_, text) => self.ctx.copy_text(text),
-            TermEvent::Bell => self.shared.bell.store(true, Ordering::Relaxed),
-            TermEvent::ChildExit(_) | TermEvent::Exit => {
-                self.shared.exited.store(true, Ordering::Relaxed);
-                self.ctx.request_repaint();
-            }
-            TermEvent::ClipboardLoad(..) => {}
-        }
-        if runtime_changed && let Some(wake) = self.shared.runtime_wake.get() {
-            wake.notify();
-        }
-    }
-}
-
-impl Listener {
-    fn repaint(&self) {
-        let shared = &self.shared;
-        let on_screen = shared.drawn.load(Ordering::Relaxed) + 2 >= self.ctx.cumulative_pass_nr();
-        let focused = on_screen && shared.focused.load(Ordering::Relaxed);
-        let echo = focused && shared.typed.lock().unwrap().is_some_and(|at| at.elapsed() < ECHO_WINDOW);
-        if echo {
-            self.ctx.request_repaint();
-        } else {
-            let wait = match (on_screen, focused) {
-                (true, true) => FOCUSED_REPAINT,
-                (true, false) => OUTPUT_REPAINT,
-                (false, _) => HIDDEN_REPAINT,
-            };
-            self.ctx.request_repaint_after(wait);
-        }
-    }
-}
-
-pub struct Terminal {
-    process_id: u32,
-    term: Arc<FairMutex<Term<Listener>>>,
-    sender: EventLoopSender,
-    pub shared: Arc<Shared>,
-    grid: (usize, usize),
-    scroll_remainder: f32,
-}
+use alacritty_terminal::event::WindowSize;
+use alacritty_terminal::grid::Scroll;
+use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
+use alacritty_terminal::term::TermMode;
+use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb};
+use egui::{Color32, FontId, Key, Modifiers, Pos2, Rect, Sense, Stroke, Vec2, pos2, vec2};
 
 pub struct Metrics {
     pub font: FontId,
     pub cell: Vec2,
 }
 
-/// Remove instance routing from every terminal, including inherited bundle settings.
-fn isolated_args(program: String, args: Vec<String>) -> Vec<String> {
-    ["-u", "IMACS_SOCKET", "-u", "IMACS_PANE", "-u", "IMACS_HOME", "-u", "IMACS_CONFIG"]
-        .into_iter()
-        .map(str::to_string)
-        .chain([program])
-        .chain(args)
-        .collect()
+pub struct TerminalView {
+    grid: (usize, usize),
+    scroll_remainder: f32,
+    selection: Option<Selection>,
 }
 
-impl Terminal {
-    pub fn set_runtime_wake(&self, wake: crate::host::Wake) {
-        wake.notify();
-        let _ = self.shared.runtime_wake.set(wake);
+impl Default for TerminalView {
+    fn default() -> Self {
+        Self { grid: (80, 24), scroll_remainder: 0.0, selection: None }
     }
+}
 
-    pub fn process_id(&self) -> u32 {
-        self.process_id
-    }
-
-    pub fn spawn(
-        ctx: &egui::Context,
-        palette: Arc<Palette>,
-        program: String,
-        args: Vec<String>,
-        cwd: &Path,
-        env: HashMap<String, String>,
-        scrollback: usize,
-    ) -> Result<Terminal> {
-        let options = tty::Options {
-            shell: Some(tty::Shell::new("/usr/bin/env".into(), isolated_args(program, args))),
-            working_directory: Some(cwd.to_path_buf()),
-            drain_on_exit: true,
-            env,
-        };
-        let size = WindowSize { num_lines: 24, num_cols: 80, cell_width: 8, cell_height: 16 };
-        let pty = tty::new(&options, size, 0)?;
-        let process_id = pty.child().id();
-        let shared = Arc::new(Shared {
-            title: Mutex::new(None),
-            exited: AtomicBool::new(false),
-            runtime_wake: OnceLock::new(),
-            bell: AtomicBool::new(false),
-            size: Mutex::new(size),
-            drawn: AtomicU64::new(0),
-            focused: AtomicBool::new(false),
-            typed: Mutex::new(None),
-        });
-        let listener =
-            Listener { ctx: ctx.clone(), sender: Arc::new(OnceLock::new()), shared: shared.clone(), palette };
-        let config = TermConfig { scrolling_history: scrollback, ..TermConfig::default() };
-        let term = Arc::new(FairMutex::new(Term::new(config, &TermSize::new(80, 24), listener.clone())));
-        let event_loop = EventLoop::new(term.clone(), listener.clone(), pty, true, false)?;
-        let sender = event_loop.channel();
-        let _ = listener.sender.set(sender.clone());
-        event_loop.spawn();
-        Ok(Terminal { process_id, term, sender, shared, grid: (80, 24), scroll_remainder: 0.0 })
-    }
-
-    /// Lines kept above the screen; fewer drops the oldest at once.
-    pub fn set_scrollback(&self, lines: usize) {
-        self.term.lock().set_options(TermConfig { scrolling_history: lines, ..TermConfig::default() });
-    }
-
-    pub fn exited(&self) -> bool {
-        self.shared.exited.load(Ordering::Relaxed)
-    }
-
-    pub fn write(&self, bytes: impl Into<Cow<'static, [u8]>>) {
-        let _ = self.sender.send(Msg::Input(bytes.into()));
-    }
-
-    /// Types `text` as one message and presses Enter, the way a person would.
-    pub fn submit(&self, text: &str) {
-        let bracketed = self.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
-        self.term.lock().scroll_display(Scroll::Bottom);
-        self.write(imacs_core::steer::paste_bytes(text, bracketed));
-        // Programs that debounce pastes would read an immediate Enter as part of it.
-        let sender = self.sender.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(120));
-            let _ = sender.send(Msg::Input(Cow::Borrowed(b"\r")));
-        });
-    }
-
-    /// Types editor commands: each step after a lone Escape, with pauses so the
-    /// editor reads Escape as a key of its own rather than as Alt+next key.
-    pub fn type_steps(&self, steps: Vec<String>, initial_delay: Duration) {
-        let sender = self.sender.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(initial_delay);
-            for step in steps {
-                let _ = sender.send(Msg::Input(Cow::Borrowed(b"\x1b")));
-                std::thread::sleep(Duration::from_millis(120));
-                let _ = sender.send(Msg::Input(Cow::Owned(step.into_bytes())));
-                std::thread::sleep(Duration::from_millis(120));
-            }
-        });
-    }
-
-    /// The visible screen as text, without trailing blank lines; the last `max_lines` of it.
-    pub fn screen_text(&self, max_lines: usize) -> String {
-        self.screen_reader(max_lines)()
-    }
-
-    pub fn screen_reader(&self, max_lines: usize) -> impl FnOnce() -> String + Send + 'static {
-        let term = self.term.clone();
-        move || {
-            let term = term.lock();
-            let grid = term.grid();
-            let mut lines: Vec<String> = (0..grid.screen_lines())
-                .map(|r| {
-                    let row = &grid[Line(r as i32)];
-                    let mut text: String = (0..grid.columns())
-                        .map(|c| &row[Column(c)])
-                        .filter(|cell| !cell.flags.contains(Flags::WIDE_CHAR_SPACER))
-                        .map(|cell| if cell.c == '\0' { ' ' } else { cell.c })
-                        .collect();
-                    text.truncate(text.trim_end().len());
-                    text
-                })
-                .collect();
-            while lines.last().is_some_and(|l| l.is_empty()) {
-                lines.pop();
-            }
-            let skip = lines.len().saturating_sub(max_lines);
-            lines[skip..].join("\n")
-        }
-    }
-
-    pub fn shutdown(&self) {
-        let _ = self.sender.send(Msg::Shutdown);
-    }
-
+impl TerminalView {
     /// Draws the terminal into `rect` and, when focused, feeds it keyboard and mouse input.
     pub fn show(
         &mut self,
+        terminal: &Terminal,
         ui: &mut egui::Ui,
         rect: Rect,
         id: egui::Id,
@@ -263,8 +46,6 @@ impl Terminal {
             response.request_focus();
         }
         let focused = response.has_focus();
-        self.shared.drawn.store(ui.ctx().cumulative_pass_nr(), Ordering::Relaxed);
-        self.shared.focused.store(focused, Ordering::Relaxed);
         if focused {
             ui.memory_mut(|m| {
                 m.set_focus_lock_filter(
@@ -275,31 +56,29 @@ impl Terminal {
         }
 
         let inner = rect.shrink2(vec2(6.0, 4.0));
-        self.resize(inner, metrics);
-        self.handle_mouse(ui, &response, inner, metrics);
+        self.resize(terminal, inner, metrics);
+        self.handle_mouse(terminal, ui, &response, inner, metrics);
         if focused {
-            self.handle_keys(ui);
+            self.handle_keys(terminal, ui);
         }
-        self.paint(ui, rect, inner, metrics, palette, focused);
+        self.paint(terminal, ui, rect, inner, metrics, palette, focused);
         response
     }
 
-    fn resize(&mut self, rect: Rect, metrics: &Metrics) {
+    fn resize(&mut self, terminal: &Terminal, rect: Rect, metrics: &Metrics) {
         let cols = ((rect.width() / metrics.cell.x).floor() as usize).max(2);
         let rows = ((rect.height() / metrics.cell.y).floor() as usize).max(1);
         if (cols, rows) == self.grid {
             return;
         }
         self.grid = (cols, rows);
-        self.term.lock().resize(TermSize::new(cols, rows));
         let size = WindowSize {
             num_lines: rows as u16,
             num_cols: cols as u16,
             cell_width: metrics.cell.x as u16,
             cell_height: metrics.cell.y as u16,
         };
-        *self.shared.size.lock().unwrap() = size;
-        let _ = self.sender.send(Msg::Resize(size));
+        terminal.resize(size);
     }
 
     fn point_at(&self, pos: Pos2, rect: Rect, metrics: &Metrics, offset: usize) -> (Point, Side) {
@@ -310,22 +89,29 @@ impl Terminal {
         (Point::new(Line(row as i32 - offset as i32), Column(col)), side)
     }
 
-    fn handle_mouse(&mut self, ui: &egui::Ui, response: &egui::Response, rect: Rect, metrics: &Metrics) {
-        let mut term = self.term.lock();
+    fn handle_mouse(
+        &mut self,
+        terminal: &Terminal,
+        ui: &egui::Ui,
+        response: &egui::Response,
+        rect: Rect,
+        metrics: &Metrics,
+    ) {
+        let mut term = terminal.term.lock();
         let offset = term.grid().display_offset();
 
         if let Some(pos) = response.interact_pointer_pos() {
             let (point, side) = self.point_at(pos, rect, metrics, offset);
             if response.drag_started() {
-                term.selection = Some(Selection::new(SelectionType::Simple, point, side));
+                self.selection = Some(Selection::new(SelectionType::Simple, point, side));
             } else if response.dragged()
-                && let Some(selection) = term.selection.as_mut()
+                && let Some(selection) = self.selection.as_mut()
             {
                 selection.update(point, side);
             }
         }
         if response.clicked() {
-            term.selection = None;
+            self.selection = None;
         }
 
         if !response.hovered() {
@@ -349,20 +135,20 @@ impl Terminal {
             let row = point.line.0 + offset as i32 + 1;
             let seq = format!("\x1b[<{button};{};{row}M", point.column.0 + 1).repeat(lines.unsigned_abs() as usize);
             drop(term);
-            self.write(seq.into_bytes());
+            terminal.write(seq.into_bytes());
         } else if mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL) {
             let key = if lines > 0 { "\x1bOA" } else { "\x1bOB" };
             drop(term);
-            self.write(key.repeat(lines.unsigned_abs() as usize).into_bytes());
+            terminal.write(key.repeat(lines.unsigned_abs() as usize).into_bytes());
         } else {
             term.scroll_display(Scroll::Delta(lines));
         }
     }
 
-    fn handle_keys(&mut self, ui: &egui::Ui) {
+    fn handle_keys(&mut self, terminal: &Terminal, ui: &egui::Ui) {
         let events = ui.input(|i| i.events.clone());
-        let app_cursor = self.term.lock().mode().contains(TermMode::APP_CURSOR);
-        let bracketed = self.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
+        let app_cursor = terminal.term.lock().mode().contains(TermMode::APP_CURSOR);
+        let bracketed = terminal.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
         let mut out: Vec<u8> = Vec::new();
         for event in events {
             match event {
@@ -374,7 +160,13 @@ impl Terminal {
                 }
                 egui::Event::Paste(text) => out.extend(imacs_core::steer::paste_bytes(&text, bracketed)),
                 egui::Event::Copy => {
-                    if let Some(text) = self.term.lock().selection_to_string() {
+                    let mut term = terminal.term.lock();
+                    // alacritty's copy helper reads its selection field. Install the
+                    // client's selection only for this locked query, then restore it.
+                    let previous = std::mem::replace(&mut term.selection, self.selection.clone());
+                    let text = term.selection_to_string();
+                    term.selection = previous;
+                    if let Some(text) = text {
                         ui.ctx().copy_text(text);
                     }
                 }
@@ -387,20 +179,29 @@ impl Terminal {
             }
         }
         if !out.is_empty() {
-            *self.shared.typed.lock().unwrap() = Some(Instant::now());
-            let mut term = self.term.lock();
+            let mut term = terminal.term.lock();
             term.scroll_display(Scroll::Bottom);
-            term.selection = None;
+            self.selection = None;
             drop(term);
-            self.write(out);
+            terminal.write(out);
         }
     }
 
-    fn paint(&self, ui: &egui::Ui, outer: Rect, rect: Rect, metrics: &Metrics, palette: &Palette, focused: bool) {
+    fn paint(
+        &self,
+        terminal: &Terminal,
+        ui: &egui::Ui,
+        outer: Rect,
+        rect: Rect,
+        metrics: &Metrics,
+        palette: &Palette,
+        focused: bool,
+    ) {
         let painter = ui.painter_at(outer);
         painter.rect_filled(outer, 0.0, palette.background);
 
-        let term = self.term.lock();
+        let term = terminal.term.lock();
+        let selection = self.selection.as_ref().and_then(|s| s.to_range(&*term));
         let content = term.renderable_content();
         let colors = content.colors;
         let offset = content.display_offset as i32;
@@ -428,7 +229,7 @@ impl Terminal {
             if c.flags.contains(Flags::HIDDEN) {
                 fg = bg;
             }
-            if content.selection.is_some_and(|s| s.contains(point)) {
+            if selection.is_some_and(|s| s.contains(point)) {
                 bg = palette.selection;
             }
             let width = if c.flags.contains(Flags::WIDE_CHAR) { 2.0 } else { 1.0 };
@@ -495,12 +296,6 @@ impl Terminal {
                 }
             }
         }
-    }
-}
-
-impl Drop for Terminal {
-    fn drop(&mut self) {
-        self.shutdown();
     }
 }
 
@@ -626,6 +421,10 @@ impl Palette {
         }
     }
 
+    pub fn terminal_colors(&self) -> Vec<Rgb> {
+        (0..=258).map(|index| self.indexed_rgb(index)).collect()
+    }
+
     fn indexed_rgb(&self, index: usize) -> Rgb {
         let color = match index {
             256 => self.foreground,
@@ -640,14 +439,22 @@ impl Palette {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{collections::HashMap, sync::Arc, time::Duration};
 
     #[test]
     fn screen_reader_defers_terminal_lock_to_worker() {
-        let ctx = egui::Context::default();
         let palette = Arc::new(Palette::from_config(&imacs_core::config::ThemeConfig::default()));
         let dir = tempfile::tempdir().unwrap();
-        let terminal =
-            Terminal::spawn(&ctx, palette, "/bin/cat".into(), vec![], dir.path(), HashMap::new(), 100).unwrap();
+        let terminal = Terminal::spawn(
+            crate::host::Wake::default(),
+            palette.terminal_colors(),
+            "/bin/cat".into(),
+            vec![],
+            dir.path(),
+            HashMap::new(),
+            100,
+        )
+        .unwrap();
         let guard = terminal.term.lock();
         let read = terminal.screen_reader(3);
         let (tx, rx) = std::sync::mpsc::channel();
@@ -682,7 +489,7 @@ mod isolation_tests {
 
     #[test]
     fn children_cannot_inherit_instance_routing() {
-        let args = isolated_args("/usr/bin/env".into(), Vec::new());
+        let args = runtime::isolated_args("/usr/bin/env".into(), Vec::new());
         let output = crate::test_support::output(
             std::process::Command::new("/usr/bin/env")
                 .args(args)

@@ -8,6 +8,7 @@ mod platform_tests;
 mod app;
 mod crash;
 mod diff_view;
+mod diff_worker;
 mod doctor;
 mod governor;
 mod highlight;

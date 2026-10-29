@@ -129,8 +129,8 @@ mod tests {
             "app::approvals::tests::permission_banner_buttons_answer_hooks_and_chief_liveness_selects_the_wait",
             |app, ctx| {
                 let terminal = Terminal::spawn(
-                    ctx,
-                    app.palette.clone(),
+                    app.wake.clone(),
+                    app.palette.terminal_colors(),
                     "/bin/sleep".into(),
                     vec!["30".into()],
                     &app.launch_dir,
@@ -237,7 +237,7 @@ mod tests {
     fn hidden_permission_commands_expand_before_approval_and_running_clears_needs_input() {
         with_app(
             "app::approvals::tests::hidden_permission_commands_expand_before_approval_and_running_clears_needs_input",
-            |app, ctx| {
+            |app, _ctx| {
                 let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex");
                 app.config.agents.push(imacs_core::config::AgentConfig {
                     name: "test".into(),
@@ -246,8 +246,8 @@ mod tests {
                     busy_text: Some("esc to interrupt".into()),
                 });
                 let terminal = Terminal::spawn(
-                    ctx,
-                    app.palette.clone(),
+                    app.wake.clone(),
+                    app.palette.terminal_colors(),
                     fixture.to_string_lossy().into_owned(),
                     vec!["--mode".into(), "hidden".into()],
                     &app.launch_dir,
@@ -316,7 +316,7 @@ mod tests {
 
     #[test]
     fn expired_approvals_wait_for_menu_quiet_or_lifecycle() {
-        with_app("app::approvals::tests::expired_approvals_wait_for_menu_quiet_or_lifecycle", |app, ctx| {
+        with_app("app::approvals::tests::expired_approvals_wait_for_menu_quiet_or_lifecycle", |app, _ctx| {
             let dir = tempfile::tempdir().unwrap();
             app.sessions = vec![session("stale", AgentKind::Generic, AgentStatus::NeedsInput, dir.path())];
             let permission = imacs_core::hook::HookEvent::from_payload(&json!({
@@ -356,8 +356,8 @@ mod tests {
             let menu = "Allow these file edits?\n› 1. Yes, proceed\n  2. No\nPress enter to confirm or esc to cancel";
             assert!(imacs_core::approvals::menu_key(menu, Some("touch fixture"), Decision::Allow).is_none());
             let terminal = Terminal::spawn(
-                ctx,
-                app.palette.clone(),
+                app.wake.clone(),
+                app.palette.terminal_colors(),
                 "/bin/sh".into(),
                 vec!["-c".into(), "printf '%s' \"$1\"; exec sleep 10".into(), "fixture".into(), menu.into()],
                 dir.path(),
@@ -434,8 +434,8 @@ mod tests {
                     worker.claude_id = Some(format!("codex-{id}"));
                     worker.terminal = Some(
                         Terminal::spawn(
-                            ctx,
-                            app.palette.clone(),
+                            app.wake.clone(),
+                            app.palette.terminal_colors(),
                             "/bin/cat".into(),
                             vec![],
                             dir.path(),

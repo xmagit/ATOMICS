@@ -220,7 +220,8 @@ impl State {
         let session = &mut self.sessions[index];
         let focus = self.focus_terminal.as_deref() == Some(session.id.as_str());
         if let Some(terminal) = &mut session.terminal {
-            let response = terminal.show(ui, rect, egui::Id::NULL.with(("chief-term", &session.id)), &metrics, &p);
+            let id = egui::Id::NULL.with(("chief-term", &session.id));
+            let response = self.terminal_views.entry(id).or_default().show(terminal, ui, rect, id, &metrics, &p);
             if focus {
                 response.request_focus();
                 self.focus_terminal = None;
