@@ -210,7 +210,7 @@ mode = "board"
 comments = "agents"
 workflow = "Link the existing Relay board to the plan and one ticket to each task. Product writes what and why; the chief comments implementation details. IMACS posts signed agent reports and maps states live. Use imacs_report for reports, without a second ticket comment."
 server = { command = ["relay-mcp"] }
-states = { planned = "Todo", running = "In Progress", review = "In Review", done = "Done", blocked = "Blocked" }
+states = { planned = "Todo", running = "In Progress" }
 
 [tickets.operations.get]
 tool = "get_ticket"
@@ -250,7 +250,7 @@ mode = "ticket"
 comments = "chief"
 workflow = "One Linear issue per plan; the issue says what and why, the plan says how."
 server = { command = ["npx", "-y", "mcp-remote", "https://mcp.linear.app/mcp"] }
-states = { planned = "Todo", running = "In Progress", done = "Done" }
+states = { planned = "Todo", running = "In Progress" }
 
 [tickets.operations.get]
 tool = "get_issue"
@@ -271,11 +271,17 @@ arguments = { team = "ENG", title = "{title}", description = "{body}" }
 result = { id = "id", key = "id", url = "url", title = "title", state = "status" }
 ```
 
-[Linear's default workflow](https://linear.app/docs/issue-property#status-overview) is Backlog → Todo →
-In Progress → Done → Canceled. IMACS maps planned to Todo, running to In Progress and done to Done.
-Review and blocked have no default equivalents, so both remain unmapped and leave the issue's state
-alone. Add `review = "In Review"` or `blocked = "Blocked"` only if your team created those states.
-Backlog and Canceled remain user decisions; IMACS does not cancel an issue when a task is blocked.
+### Let PR automation own review and done
+
+The shipped profiles map only planned and running. IMACS done means its work has been accepted and
+is ready for an open PR; it does not mean deployed. Let your ticket system's GitHub integration or
+other automation move the ticket to review when the PR opens and to done when it deploys. IMACS
+leaves unmapped states alone, so completing a plan cannot mark undeployed work done.
+
+For teams without that automation, map `review = "In Review"` to report IMACS review and
+`done = "Done"` only when accepting work in IMACS really means done for your team. Add
+`blocked = "Blocked"` if that state exists and should follow IMACS. Backlog and cancellation remain
+user decisions.
 
 The profile uses `comments = "chief"`; change it to `"agents"` to post signed agent reports and enable
 scoped agent tools. Link the issue to the plan with `ticket = { id = "ENG-123" }`. The optional create

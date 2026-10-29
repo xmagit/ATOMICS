@@ -1113,12 +1113,10 @@ mod tests {
                 for status in ["running", "blocked", "review", "done"] {
                     assert!(request(app, json!({"cmd":"plan_update", "plan":plan, "id":"a", "status":status})).ok);
                     settle(app);
-                    let expected = if !board {
-                        "In Progress"
-                    } else {
-                        config.states.get(TaskStatus::parse(status).unwrap()).unwrap()
-                    };
-                    assert_eq!(ticket(&state, "ENG-1")["state"], expected);
+                    assert_eq!(ticket(&state, "ENG-1")["state"], "In Progress");
+                }
+                for status in [TaskStatus::Review, TaskStatus::Done, TaskStatus::Blocked] {
+                    assert!(config.states.get(status).is_none());
                 }
                 let created = ticket_request(
                     app,
@@ -1128,7 +1126,7 @@ mod tests {
                 assert!(created.result["ticket"]["id"].as_str().unwrap().starts_with(if board { "n" } else { "NEW-" }));
                 assert!(request(app, json!({"cmd":"plan_update", "plan":plan, "id":"review", "status":"done"})).ok);
                 settle(app);
-                assert_eq!(ticket(&state, "ENG-1")["state"], "Done");
+                assert_eq!(ticket(&state, "ENG-1")["state"], "In Progress");
             }
         });
     }

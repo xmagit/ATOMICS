@@ -105,7 +105,7 @@ close_done_agents = true
 # comments = "agents"
 # workflow = "Link the existing Relay board to the plan and one ticket to each task. Product writes what and why; the chief comments implementation details. IMACS posts signed agent reports and maps states live. Use imacs_report for reports, without a second ticket comment."
 # server = { command = ["relay-mcp"] }
-# states = { planned = "Todo", running = "In Progress", review = "In Review", done = "Done", blocked = "Blocked" }
+# states = { planned = "Todo", running = "In Progress" }
 #
 # [tickets.operations.get]
 # tool = "get_ticket"
@@ -140,7 +140,7 @@ close_done_agents = true
 # comments = "chief"
 # workflow = "One Linear issue per plan; the issue says what and why, the plan says how."
 # server = { command = ["npx", "-y", "mcp-remote", "https://mcp.linear.app/mcp"] }
-# states = { planned = "Todo", running = "In Progress", done = "Done" }
+# states = { planned = "Todo", running = "In Progress" }
 #
 # [tickets.operations.get]
 # tool = "get_issue"
