@@ -24,6 +24,9 @@ pub struct Plan {
     /// Branch the tasks are merged into; `imacs/plan-<plan-id>` when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub integration: Option<String>,
+    /// The external board (board mode) or ticket (ticket mode) this plan follows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket: Option<crate::tickets::TicketLink>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,6 +166,9 @@ pub struct Task {
     pub deletions: usize,
     pub report: Option<Report>,
     pub notes: Vec<String>,
+    /// The external ticket saying what this task is for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ticket: Option<crate::tickets::TicketLink>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -269,7 +275,8 @@ impl Plan {
             "id": self.id, "goal": self.goal, "done": self.count(TaskStatus::Done),
             "total": self.tasks.len(), "approved": self.approved,
             "waiting": self.tasks.iter().filter(|t| matches!(t.status, TaskStatus::Blocked | TaskStatus::Review))
-                .map(|t| &t.id).collect::<Vec<_>>()
+                .map(|t| &t.id).collect::<Vec<_>>(),
+            "ticket": self.ticket.as_ref().map(|t| serde_json::json!({ "key": t.label(), "state": t.state })),
         })
     }
 
@@ -310,7 +317,9 @@ impl Plan {
             if task.id.trim().is_empty() {
                 task.id = format!("t{}", i + 1);
             }
-            if let Some(old) = self.tasks.iter().find(|t| t.id == task.id) {
+            let old = self.tasks.iter().find(|t| t.id == task.id);
+            task.ticket = crate::tickets::TicketLink::relink(task.ticket.take(), old.and_then(|o| o.ticket.as_ref()));
+            if let Some(old) = old {
                 task.status = old.status;
                 task.session = old.session.clone();
                 task.report = old.report.clone();

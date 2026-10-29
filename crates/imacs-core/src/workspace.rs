@@ -13,11 +13,14 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "native")]
 use crate::{git, paths};
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Workspace {
     #[serde(skip)]
     pub name: String,
     pub projects: Vec<PathBuf>,
+    /// This workspace's ticket system; the main config's `[tickets]` applies without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tickets: Option<crate::tickets::TicketConfig>,
 }
 
 #[cfg(feature = "native")]
@@ -38,21 +41,40 @@ pub fn project_root(dir: &Path) -> Result<PathBuf> {
 #[cfg(feature = "native")]
 impl Workspace {
     pub fn load(name: &str) -> Result<Workspace> {
-        let file = workspaces_dir().join(format!("{}.toml", file_name(name)?));
-        let text = std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
+        Self::load_file(name, &Self::file(name)?)
+    }
+
+    pub fn file(name: &str) -> Result<PathBuf> {
+        Ok(workspaces_dir().join(format!("{}.toml", file_name(name)?)))
+    }
+
+    fn load_file(name: &str, file: &Path) -> Result<Workspace> {
+        let text = std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
         let mut workspace: Workspace = toml::from_str(&text).with_context(|| format!("parsing {}", file.display()))?;
         workspace.name = name.to_string();
         workspace.projects = workspace.projects.iter().map(|p| paths::expand(&p.to_string_lossy())).collect();
         Ok(workspace)
     }
 
+    /// Writes the project list, keeping everything else in an existing file as written.
     pub fn save(&self) -> Result<PathBuf> {
-        let dir = workspaces_dir();
-        std::fs::create_dir_all(&dir)?;
-        let file = dir.join(format!("{}.toml", file_name(&self.name)?));
-        let shown: Vec<String> = self.projects.iter().map(|p| paths::display(p)).collect();
-        std::fs::write(&file, toml::to_string(&toml::toml! { projects = shown })?)?;
+        let file = Self::file(&self.name)?;
+        std::fs::create_dir_all(workspaces_dir())?;
+        self.save_file(&file)?;
         Ok(file)
+    }
+
+    fn save_file(&self, file: &Path) -> Result<()> {
+        let mut document = match std::fs::read_to_string(file) {
+            Ok(text) => text
+                .parse::<toml_edit::DocumentMut>()
+                .with_context(|| format!("parsing {}; fix or remove it first", file.display()))?,
+            Err(_) => toml_edit::DocumentMut::new(),
+        };
+        let shown: toml_edit::Array = self.projects.iter().map(|p| paths::display(p)).collect();
+        document["projects"] = toml_edit::value(shown);
+        std::fs::write(file, document.to_string())?;
+        Ok(())
     }
 
     /// Names of the saved workspaces, sorted.
@@ -103,6 +125,34 @@ mod tests {
         let main = project_root(&repo).unwrap();
         assert_eq!(project_root(&worktree.join("src")).unwrap(), main);
         assert!(project_root(dir.path()).is_err());
+    }
+
+    #[test]
+    fn saving_keeps_the_hand_written_tickets_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("daily.toml");
+        let workspace = Workspace { name: "daily".into(), projects: vec!["/repos/app".into()], tickets: None };
+        workspace.save_file(&file).unwrap();
+        assert_eq!(Workspace::load_file("daily", &file).unwrap(), workspace);
+        let text = std::fs::read_to_string(&file).unwrap();
+        std::fs::write(
+            &file,
+            format!("{text}\n# The team's tracker.\n[tickets]\nsystem = \"alpha\" # ours\nserver = {{ command = [\"alpha-mcp\"] }}\n"),
+        )
+        .unwrap();
+        let loaded = Workspace::load_file("daily", &file).unwrap();
+        assert_eq!(loaded.tickets.as_ref().unwrap().system, "alpha");
+        Workspace { projects: vec!["/repos/app".into(), "/repos/api".into()], ..loaded.clone() }
+            .save_file(&file)
+            .unwrap();
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.contains("# The team's tracker.") && text.contains("# ours"), "{text}");
+        let reloaded = Workspace::load_file("daily", &file).unwrap();
+        assert_eq!(reloaded.projects.len(), 2);
+        assert_eq!(reloaded.tickets, loaded.tickets);
+        std::fs::write(&file, "projects = [").unwrap();
+        assert!(workspace.save_file(&file).is_err(), "an unreadable file is never overwritten");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "projects = [");
     }
 
     #[test]

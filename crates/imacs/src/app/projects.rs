@@ -77,7 +77,8 @@ impl State {
     }
 
     pub(super) fn save_workspace(&mut self, name: &str) {
-        let ws = Workspace { name: name.trim().to_string(), projects: self.open_projects.clone() };
+        // Saving writes only the project list; a [tickets] section in the file stays as written.
+        let ws = Workspace { name: name.trim().to_string(), projects: self.open_projects.clone(), tickets: None };
         match ws.save() {
             Ok(file) => {
                 self.workspace = Some(ws.name);
