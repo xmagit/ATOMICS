@@ -49,6 +49,7 @@ mod plan_cleanup;
 mod plan_view;
 mod plans;
 mod projects;
+mod repo_workflow;
 mod restart;
 mod selfconfig;
 mod sessions;
@@ -344,6 +345,7 @@ pub(crate) struct State {
     config: Config,
     config_path: PathBuf,
     config_stamp: [Option<u64>; 3],
+    repo_workflows: HashMap<PathBuf, imacs_core::repo_workflow::RepoWorkflow>,
     config_checked: Instant,
     config_error: Option<String>,
     /// What the theme files or `[theme]` could not apply; the rest of the theme still does.
@@ -737,6 +739,7 @@ impl State {
             highlighter: Arc::new(Highlighter::new(&palette.syntax)),
             palette: Arc::new(palette),
             config_stamp: config_fingerprints(&config_path),
+            repo_workflows: HashMap::new(),
             config,
             config_path,
             config_checked: Instant::now(),
@@ -849,6 +852,7 @@ impl State {
             }
         }
         self.repos = repos;
+        self.reload_repo_workflows();
         self.worktrees_at = None;
         self.apply_ticket_config();
     }
