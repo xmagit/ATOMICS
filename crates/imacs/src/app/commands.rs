@@ -122,12 +122,10 @@ impl Desktop<'_> {
         self.post(move |state| state.close_project(&root));
     }
 
-    pub(super) fn pick_project(&self) {
-        let start =
-            self.runtime.repos.first().and_then(|r| r.parent()).map(Path::to_path_buf).unwrap_or_else(paths::home);
-        if let Some(root) = rfd::FileDialog::new().set_title("Open project").set_directory(start).pick_folder() {
-            self.open_project(&root);
-        }
+    pub(super) fn pick_project(&mut self) {
+        self.client.project_picker = Some(
+            self.runtime.repos.first().and_then(|r| r.parent()).map(Path::to_path_buf).unwrap_or_else(paths::home),
+        );
     }
 
     pub(super) fn open_workspace(&self, name: &str) {
