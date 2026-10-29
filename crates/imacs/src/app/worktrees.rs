@@ -24,10 +24,10 @@ impl State {
 
     pub(super) fn open_cleanup(&mut self, repo: PathBuf, preselect: Option<PathBuf>) {
         let (tx, rx) = self.wake.channel();
-        let mut cleanup =
-            Cleanup { repo, rows: None, preselect, delete_branches: true, busy: None, log: Vec::new(), tx, rx };
+        let mut cleanup = Cleanup { repo, rows: None, busy: None, log: Vec::new(), tx, rx };
         self.load_cleanup(&mut cleanup);
         self.cleanup = Some(cleanup);
+        self.client_events.push(ClientEvent::Cleanup { preselect });
     }
 
     fn load_cleanup(&self, cleanup: &mut Cleanup) {
@@ -60,12 +60,7 @@ impl State {
             changed = true;
             match event {
                 CleanupEvent::Loaded(Ok(list)) => {
-                    let preselect = cleanup.preselect.take();
-                    cleanup.rows = Some(
-                        list.into_iter()
-                            .map(|health| CleanupRow { selected: preselect.as_ref() == Some(&health.path), health })
-                            .collect(),
-                    );
+                    cleanup.rows = Some(list);
                 }
                 CleanupEvent::Loaded(Err(err)) => {
                     cleanup.log.push(err);
@@ -77,7 +72,7 @@ impl State {
                         Ok(()) => {
                             cleanup.log.push(format!("removed {name}"));
                             if let Some(rows) = &mut cleanup.rows {
-                                rows.retain(|r| r.health.path != path);
+                                rows.retain(|r| r.path != path);
                             }
                         }
                         Err(err) => cleanup.log.push(format!("kept {name}: {}", err.lines().last().unwrap_or(&err))),
@@ -102,6 +97,10 @@ impl State {
 
 impl Desktop<'_> {
     pub(super) fn cleanup_dialog(&mut self, ctx: &egui::Context) {
+        self.apply_client_events(ctx);
+        if !self.client.cleanup_open {
+            return;
+        }
         let Some(mut cleanup) = self.runtime.cleanup.take() else { return };
         let p = self.runtime.palette.clone();
         let agent_roots: HashSet<PathBuf> = self.runtime.sessions.iter().map(Session::root).collect();
@@ -152,12 +151,11 @@ impl Desktop<'_> {
                 };
                 egui::ScrollArea::vertical().id_salt("cleanup-rows").max_height(440.0).show(ui, |ui| {
                     egui::Grid::new("cleanup-grid").num_columns(5).spacing([14.0, 6.0]).striped(true).show(ui, |ui| {
-                        for row in rows.iter_mut() {
-                            let h = &row.health;
+                        for h in rows.iter() {
                             let agent = agent_roots.contains(&h.path);
                             let blocked = agent || h.dirty_files > 0 || h.missing;
                             if blocked {
-                                row.selected = false;
+                                self.client.cleanup_selected.remove(&h.path);
                             }
                             let why = if agent {
                                 "an agent is working here"
@@ -166,8 +164,18 @@ impl Desktop<'_> {
                             } else {
                                 "has uncommitted changes"
                             };
-                            ui.add_enabled(!blocked, egui::Checkbox::without_text(&mut row.selected))
-                                .on_disabled_hover_text(why);
+                            let mut selected = self.client.cleanup_selected.contains(&h.path);
+                            if ui
+                                .add_enabled(!blocked, egui::Checkbox::without_text(&mut selected))
+                                .on_disabled_hover_text(why)
+                                .changed()
+                            {
+                                if selected {
+                                    self.client.cleanup_selected.insert(h.path.clone());
+                                } else {
+                                    self.client.cleanup_selected.remove(&h.path);
+                                }
+                            }
                             let folder =
                                 h.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                             ui.label(RichText::new(folder).color(p.foreground));
@@ -204,23 +212,26 @@ impl Desktop<'_> {
                     });
                 });
                 ui.separator();
-                let selected = rows.iter().filter(|r| r.selected).count();
+                let selected = rows.iter().filter(|r| self.client.cleanup_selected.contains(&r.path)).count();
                 ui.horizontal(|ui| {
                     if ui
                         .button("select safe")
                         .on_hover_text("Clean, and merged or with its remote branch deleted")
                         .clicked()
                     {
-                        for row in rows.iter_mut() {
-                            row.selected = row.health.is_safe_to_remove() && !agent_roots.contains(&row.health.path);
-                        }
+                        self.client.cleanup_selected = rows
+                            .iter()
+                            .filter(|h| h.is_safe_to_remove() && !agent_roots.contains(&h.path))
+                            .map(|h| h.path.clone())
+                            .collect();
                     }
                     if ui.button("select none").clicked() {
-                        for row in rows.iter_mut() {
-                            row.selected = false;
-                        }
+                        self.client.cleanup_selected.clear();
                     }
-                    ui.checkbox(&mut cleanup.delete_branches, "also delete their branches (only if merged)");
+                    ui.checkbox(
+                        &mut self.client.cleanup_delete_branches,
+                        "also delete their branches (only if merged)",
+                    );
                     let label = format!("Remove {selected} worktree{}", if selected == 1 { "" } else { "s" });
                     let button = egui::Button::new(RichText::new(label).color(Color32::WHITE)).fill(if selected > 0 {
                         p.error.gamma_multiply(0.55)
@@ -236,29 +247,41 @@ impl Desktop<'_> {
                 }
             });
 
-        match action {
-            Some("fetch") => self.runtime.cleanup_git(&mut cleanup, "fetch --prune", &["fetch", "--prune", "--quiet"]),
-            Some("prune") => self.runtime.cleanup_git(&mut cleanup, "prune", &["worktree", "prune"]),
-            Some("reload") => self.runtime.load_cleanup(&mut cleanup),
-            _ => {}
-        }
-        if remove && let Some(rows) = &cleanup.rows {
-            let targets: Vec<(PathBuf, Option<String>)> =
-                rows.iter().filter(|r| r.selected).map(|r| (r.health.path.clone(), r.health.branch.clone())).collect();
-            cleanup.busy = Some(format!("removing {} worktrees…", targets.len()));
-            let (tx, repo, delete) = (cleanup.tx.clone(), cleanup.repo.clone(), cleanup.delete_branches);
-            std::thread::spawn(move || {
-                for (path, branch) in targets {
-                    let result =
-                        git::remove_worktree(&repo, &path, branch.as_deref(), delete).map_err(|e| format!("{e:#}"));
-                    let _ = tx.send(CleanupEvent::Removed(path, result));
+        if let Some(action) = action {
+            self.post(move |state| {
+                if let Some(mut cleanup) = state.cleanup.take() {
+                    match action {
+                        "fetch" => state.cleanup_git(&mut cleanup, "fetch --prune", &["fetch", "--prune", "--quiet"]),
+                        "prune" => state.cleanup_git(&mut cleanup, "prune", &["worktree", "prune"]),
+                        "reload" => state.load_cleanup(&mut cleanup),
+                        _ => {}
+                    }
+                    state.cleanup = Some(cleanup);
                 }
-                let _ = tx.send(CleanupEvent::Finished("removal finished".into()));
             });
         }
-        if open {
-            self.runtime.cleanup = Some(cleanup);
-        } else {
+        if remove && let Some(rows) = &cleanup.rows {
+            let targets: Vec<(PathBuf, Option<String>)> = rows
+                .iter()
+                .filter(|r| self.client.cleanup_selected.contains(&r.path))
+                .map(|r| (r.path.clone(), r.branch.clone()))
+                .collect();
+            cleanup.busy = Some(format!("removing {} worktrees…", targets.len()));
+            let (tx, repo, delete) = (cleanup.tx.clone(), cleanup.repo.clone(), self.client.cleanup_delete_branches);
+            self.post(move |_| {
+                std::thread::spawn(move || {
+                    for (path, branch) in targets {
+                        let result =
+                            git::remove_worktree(&repo, &path, branch.as_deref(), delete).map_err(|e| format!("{e:#}"));
+                        let _ = tx.send(CleanupEvent::Removed(path, result));
+                    }
+                    let _ = tx.send(CleanupEvent::Finished("removal finished".into()));
+                });
+            });
+        }
+        self.client.cleanup_open = open;
+        self.runtime.cleanup = Some(cleanup);
+        if !open {
             self.runtime.worktrees_at = None;
         }
     }

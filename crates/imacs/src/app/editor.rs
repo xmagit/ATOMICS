@@ -10,9 +10,14 @@ impl State {
         }
         self.diff_open = true;
         let state = self.diffs.entry(root.to_path_buf()).or_default();
-        if state.open(path) {
+        let changed = state.prepared.as_ref().is_some_and(|p| p.diff.files.iter().any(|file| file.path() == path));
+        state.viewing = (!changed).then(|| path.to_string());
+        state.file = None;
+        state.file_error = None;
+        if !changed {
             self.worker.request_file(root.to_path_buf(), path.to_string(), self.highlighter.clone());
         }
+        self.client_events.push(ClientEvent::OpenFile { root: root.to_path_buf(), path: path.to_string() });
     }
 
     /// Switches the panel to the editor for `root`, opening `path` at `line`. One
@@ -77,6 +82,7 @@ pub(super) fn save_png(path: &Path, image: &egui::ColorImage) -> anyhow::Result<
 
 impl Desktop<'_> {
     pub(super) fn diff_panel(&mut self, ui: &mut egui::Ui, rect: Rect) {
+        self.sync_diffs();
         if self.runtime.panel == PanelMode::Plan {
             self.plan_panel(ui, rect);
             return;
@@ -87,18 +93,18 @@ impl Desktop<'_> {
             let column = rect.with_max_x(rect.left() + 250.0);
             let current = match self.runtime.panel {
                 PanelMode::Editor => self.client.editor_file.get(&root).cloned(),
-                _ => self.runtime.diffs.get(&root).and_then(|d| d.focused.clone()),
+                _ => self.client.diff_views.get(&root).and_then(|d| d.focused.clone()),
             };
             let p = self.runtime.palette.clone();
-            let state = self.runtime.diffs.entry(root.clone()).or_default();
+            let state = self.client.diff_views.entry(root.clone()).or_default();
             if let Some((path, line)) = diff_view::changed_files(ui, column, state, current.as_deref(), &p) {
                 match self.runtime.panel {
                     PanelMode::Editor => {
                         let ctx = ui.ctx().clone();
-                        self.runtime.edit(&ctx, &root, Some(&path), line);
+                        self.edit(&ctx, &root, Some(&path), line);
                     }
                     _ => {
-                        let _ = self.runtime.diffs.entry(root.clone()).or_default().open(&path);
+                        self.open_file(&root, &path);
                     }
                 }
             }
@@ -122,21 +128,37 @@ impl Desktop<'_> {
         let font = FontId::monospace(self.runtime.config.font.diff_size);
         let palette = self.runtime.palette.clone();
         let split = self.client.diff_split.unwrap_or(self.runtime.config.layout.diff_split);
-        let state = self.runtime.diffs.entry(root.clone()).or_default();
+        let state = self.client.diff_views.entry(root.clone()).or_default();
         let header = Header { title: &title, branch: branch.as_deref(), can_send, split };
-        match diff_view::show(ui, rect, state, header, &palette, &font) {
+        let before = state.comments.clone();
+        let action = diff_view::show(ui, rect, state, header, &palette, &font);
+        let after = state.comments.clone();
+        if before != after {
+            let root = root.clone();
+            self.post(move |runtime| {
+                let data = runtime.diffs.entry(root).or_default();
+                // Preserve comments accepted through ctl since this view was read.
+                data.comments.retain(|comment| !before.contains(comment) || after.contains(comment));
+                for comment in after {
+                    if !data.comments.contains(&comment) {
+                        data.comments.push(comment);
+                    }
+                }
+            });
+        }
+        match action {
             DiffAction::None => {}
             DiffAction::SendReview => {
-                self.runtime.send_review(&root);
+                self.send_review(&root);
             }
-            DiffAction::Refresh => state_refresh(self.runtime.diffs.entry(root).or_default()),
+            DiffAction::Refresh => self.post(move |runtime| state_refresh(runtime.diffs.entry(root).or_default())),
             DiffAction::Close => self.runtime.diff_open = false,
             DiffAction::Split(on) => {
                 self.client.diff_split = Some(if on { DiffSplit::Always } else { DiffSplit::Never })
             }
             DiffAction::Edit { path, line } => {
                 let ctx = ui.ctx().clone();
-                self.runtime.edit(&ctx, &root, path.as_deref(), line);
+                self.edit(&ctx, &root, path.as_deref(), line);
             }
         }
     }
@@ -206,7 +228,7 @@ impl Desktop<'_> {
                 child.label(RichText::new("The editor is not running.").color(p.muted));
                 if child.button("Open editor").clicked() {
                     let ctx = ui.ctx().clone();
-                    self.runtime.edit(&ctx, root, None, None);
+                    self.edit(&ctx, root, None, None);
                 }
             }
         }
@@ -215,7 +237,7 @@ impl Desktop<'_> {
     pub(super) fn quick_open_dialog(&mut self, ctx: &egui::Context) {
         let Some(mut dialog) = self.client.quick_open.take() else { return };
         let Some(root) = self.runtime.diff_target() else { return };
-        let Some(prepared) = self.runtime.diffs.get(&root).and_then(|s| s.prepared.clone()) else {
+        let Some(prepared) = self.client.diff_views.get(&root).and_then(|s| s.prepared.clone()) else {
             self.client.quick_open = Some(dialog);
             return;
         };
@@ -294,7 +316,7 @@ impl Desktop<'_> {
                 }
             });
         if let Some(path) = open {
-            self.runtime.open_file(&root, &path);
+            self.open_file(&root, &path);
             keep = false;
         }
         if keep {

@@ -32,13 +32,13 @@ impl Desktop<'_> {
             if self.runtime.panel == PanelMode::Editor {
                 self.runtime.panel = PanelMode::Diff;
             } else {
-                let state = self.runtime.diffs.get(&root);
+                let state = self.client.diff_views.get(&root);
                 let file = state.and_then(|s| s.viewing.clone()).or_else(|| {
                     state
                         .and_then(|s| s.prepared.as_ref())
                         .and_then(|p| p.diff.files.first().map(|f| f.path().to_string()))
                 });
-                self.runtime.edit(ctx, &root, file.as_deref(), None);
+                self.edit(ctx, &root, file.as_deref(), None);
             }
         }
         // Shift+↓/↑ walk the changed files from anywhere but a text field or the editor.
@@ -60,11 +60,16 @@ impl Desktop<'_> {
                 if self.runtime.panel == PanelMode::Plan {
                     self.runtime.panel = PanelMode::Diff;
                 }
-                let moved = self.runtime.diffs.entry(root.clone()).or_default().step(step);
+                let moved = self.client.diff_views.entry(root.clone()).or_default().step(step);
+                if self.runtime.panel != PanelMode::Editor
+                    && let Some((path, _)) = &moved
+                {
+                    self.open_file(&root, path);
+                }
                 if self.runtime.panel == PanelMode::Editor
                     && let Some((path, line)) = moved
                 {
-                    self.runtime.edit(ctx, &root, Some(&path), line);
+                    self.edit(ctx, &root, Some(&path), line);
                     self.client.focus_editor = false;
                 }
             }
@@ -73,7 +78,7 @@ impl Desktop<'_> {
             self.runtime.toggle_plan();
         }
         if pressed(&keys.toggle_chief) {
-            self.runtime.toggle_chief(ctx);
+            self.toggle_chief(ctx);
         }
         if pressed(&keys.quick_open) && self.runtime.diff_target().is_some() {
             self.client.quick_open = Some(QuickOpen { query: String::new(), selected: 0, focus: true });
@@ -84,8 +89,7 @@ impl Desktop<'_> {
         if pressed(&keys.refresh_diff)
             && let Some(root) = self.runtime.diff_target()
         {
-            let state = self.runtime.diffs.entry(root).or_default();
-            state.dirty_since = Some(Instant::now() - Duration::from_secs(1));
+            self.post(move |runtime| state_refresh(runtime.diffs.entry(root).or_default()));
         }
         if pressed(&keys.next_attention) {
             let start = self.runtime.active_index().map(|i| i + 1).unwrap_or(0);
@@ -94,7 +98,7 @@ impl Desktop<'_> {
                 (0..n).map(|k| (start + k) % n).find(|&i| self.runtime.sessions[i].status.needs_attention())
             {
                 let id = self.runtime.sessions[i].id.clone();
-                self.runtime.activate(&id, true);
+                self.activate(&id, true);
             } else {
                 self.runtime.toast("Nothing needs you right now");
             }
@@ -115,7 +119,7 @@ impl Desktop<'_> {
             if ctx.input_mut(|i| i.consume_shortcut(&chord))
                 && let Some(id) = visible.get(n).map(|&i| self.runtime.sessions[i].id.clone())
             {
-                self.runtime.activate(&id, true);
+                self.activate(&id, true);
                 if self.runtime.panel == PanelMode::Plan {
                     self.runtime.panel = PanelMode::Diff;
                 }
@@ -157,9 +161,11 @@ impl Desktop<'_> {
                         ));
                         ui.horizontal(|ui| {
                             if ui.button(if archive { "Confirm archive" } else { "Confirm complete" }).clicked() {
-                                if let Err(err) = self.runtime.close_plan(index, status) {
-                                    self.runtime.toast(err);
-                                }
+                                self.post_plan(index, move |state, index| {
+                                    if let Err(err) = state.close_plan(index, status) {
+                                        state.toast(err);
+                                    }
+                                });
                                 self.client.confirm_plan_close = None;
                             }
                             if ui.button("Cancel").clicked() {
@@ -191,7 +197,7 @@ impl Desktop<'_> {
                     ui.label(format!("Closing “{title}” stops its process. Claude sessions can be resumed later."));
                     ui.horizontal(|ui| {
                         if ui.button("Close session").clicked() {
-                            self.runtime.close(&id);
+                            self.close(&id);
                             self.client.confirm_close = None;
                         }
                         if ui.button("Cancel").clicked() {
@@ -294,10 +300,10 @@ impl Desktop<'_> {
                 });
             });
         if let Some((repo, branch, launch)) = create {
-            self.runtime.create_worktree(repo, branch, None, launch);
+            self.create_worktree(repo, branch, None, launch);
         }
         if let Some(target) = start {
-            self.runtime.pending_open.push(target);
+            self.post(move |state| state.pending_open.push(target));
             keep = false;
         }
         if keep {

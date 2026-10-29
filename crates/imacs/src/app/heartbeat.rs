@@ -119,7 +119,6 @@ impl State {
         });
         let (tx, rx) = self.wake.channel();
         self.heartbeat.pending = Some(rx);
-        let ctx = self.ctx.clone();
         std::thread::spawn(move || {
             let sessions: Vec<_> = sessions
                 .into_iter()
@@ -137,7 +136,6 @@ impl State {
                 }
             }
             let _ = tx.send(findings);
-            ctx.request_repaint();
         });
     }
 }

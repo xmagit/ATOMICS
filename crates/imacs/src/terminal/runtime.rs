@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
@@ -26,6 +26,8 @@ pub struct Shared {
     pub clipboard: Mutex<Option<String>>,
     wake: crate::host::Wake,
     size: Mutex<WindowSize>,
+    shown: Mutex<Option<(Instant, bool)>>,
+    typed: Mutex<Option<Instant>>,
 }
 
 #[derive(Clone)]
@@ -46,7 +48,9 @@ impl EventListener for Listener {
             TermEvent::Title(title) => *self.shared.title.lock().unwrap() = Some(title),
             TermEvent::ResetTitle => *self.shared.title.lock().unwrap() = None,
             TermEvent::PtyWrite(text) => write(text),
-            TermEvent::ColorRequest(index, format) => write(format(self.colors[index])),
+            TermEvent::ColorRequest(index, format) => {
+                write(format(self.colors.get(index).copied().unwrap_or(self.colors[256])))
+            }
             TermEvent::TextAreaSizeRequest(format) => write(format(*self.shared.size.lock().unwrap())),
             TermEvent::ClipboardStore(_, text) => *self.shared.clipboard.lock().unwrap() = Some(text),
             TermEvent::Bell => self.shared.bell.store(true, Ordering::Relaxed),
@@ -78,6 +82,31 @@ pub(super) fn isolated_args(program: String, args: Vec<String>) -> Vec<String> {
 }
 
 impl Terminal {
+    pub fn shown(&self, focused: bool) {
+        *self.shared.shown.lock().unwrap() = Some((Instant::now(), focused));
+    }
+
+    pub fn typed(&self) {
+        *self.shared.typed.lock().unwrap() = Some(Instant::now());
+    }
+
+    /// Output cadence is a host decision informed by native-client visibility.
+    /// These hints expire by wall clock, independently of egui frame counters.
+    pub fn repaint_delay(&self) -> Duration {
+        let shown = *self.shared.shown.lock().unwrap();
+        let visible = shown.is_some_and(|(at, _)| at.elapsed() < Duration::from_millis(500));
+        let focused = visible && shown.is_some_and(|(_, focused)| focused);
+        if focused && self.shared.typed.lock().unwrap().is_some_and(|at| at.elapsed() < Duration::from_secs(1)) {
+            Duration::ZERO
+        } else if focused {
+            Duration::from_millis(100)
+        } else if visible {
+            Duration::from_millis(200)
+        } else {
+            Duration::from_millis(500)
+        }
+    }
+
     pub fn process_id(&self) -> u32 {
         self.process_id
     }
@@ -108,6 +137,8 @@ impl Terminal {
             clipboard: Mutex::new(None),
             wake,
             size: Mutex::new(size),
+            shown: Mutex::new(None),
+            typed: Mutex::new(None),
         });
         let listener = Listener { sender: Arc::new(OnceLock::new()), shared: shared.clone(), colors };
         let config = TermConfig { scrolling_history: scrollback, ..TermConfig::default() };
@@ -204,5 +235,33 @@ impl Terminal {
 impl Drop for Terminal {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn listener_exit_wakes_the_host_without_a_client() {
+        let wake = crate::host::Wake::default();
+        let shared = Arc::new(Shared {
+            title: Mutex::new(None),
+            exited: AtomicBool::new(false),
+            bell: AtomicBool::new(false),
+            changed: AtomicBool::new(false),
+            clipboard: Mutex::new(None),
+            wake: wake.clone(),
+            size: Mutex::new(WindowSize { num_lines: 24, num_cols: 80, cell_width: 8, cell_height: 16 }),
+            shown: Mutex::new(None),
+            typed: Mutex::new(None),
+        });
+        let listener = Listener { sender: Arc::new(OnceLock::new()), shared: shared.clone(), colors: Vec::new() };
+        listener.send_event(TermEvent::Exit);
+        let now = Instant::now();
+        wake.wait_until(now + Duration::from_secs(30));
+        assert!(now.elapsed() < Duration::from_secs(1));
+        assert!(shared.exited.load(Ordering::Acquire));
+        assert!(shared.changed.load(Ordering::Acquire));
     }
 }

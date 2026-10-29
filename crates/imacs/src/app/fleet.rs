@@ -115,7 +115,7 @@ impl Desktop<'_> {
             });
         });
         if let Some(id) = clicked {
-            self.runtime.activate(&id, false);
+            self.activate(&id, false);
         }
     }
 
@@ -131,7 +131,7 @@ impl Desktop<'_> {
         let mut close: Option<String> = None;
         let mut resume: Option<usize> = None;
         let mut approval = None;
-        let focus_request = self.runtime.focus_terminal.take();
+        let focus_request = self.client.focus_terminal.take();
         let now = ui.input(|i| i.time);
         let (slots_running, slots_waiting) = self.runtime.governor.snapshot();
 
@@ -332,17 +332,19 @@ impl Desktop<'_> {
             }
         }
         if let Some((plan, task, action)) = task_action {
-            self.runtime.task_action(plan, task, action);
+            self.task_action(plan, task, action);
         }
 
-        if let Some((index, decision)) = approval
-            && let Err(error) = self.runtime.approve(index, decision, None)
-        {
-            self.runtime.toast(error);
+        if let Some((index, decision)) = approval {
+            self.post_session(index, move |state, index| {
+                if let Err(error) = state.approve(index, decision, None) {
+                    state.toast(error);
+                }
+            });
         }
 
         if let Some((id, open)) = activate {
-            self.runtime.activate(&id, open);
+            self.activate(&id, open);
         }
         if let Some(id) = close {
             let running = self
@@ -351,7 +353,7 @@ impl Desktop<'_> {
                 .find(|s| s.id == id)
                 .and_then(|s| s.terminal.as_ref())
                 .is_some_and(|t| !t.exited());
-            if running { self.client.confirm_close = Some(id) } else { self.runtime.close(&id) }
+            if running { self.client.confirm_close = Some(id) } else { self.close(&id) }
         }
         if let Some(index) = resume {
             let s = &self.runtime.sessions[index];
@@ -364,8 +366,8 @@ impl Desktop<'_> {
                 updated: 0,
             };
             let id = s.id.clone();
-            self.runtime.close(&id);
-            self.runtime.resume.push(record);
+            self.close(&id);
+            self.post(move |state| state.resume.push(record));
         }
     }
 }
@@ -628,6 +630,7 @@ mod tests {
                             app.dialogs(ctx);
                         },
                     );
+                    app.runtime.drain_actions();
                     for shape in &output.shapes {
                         if let egui::epaint::Shape::Text(text) = &shape.shape
                             && text.galley.text().starts_with("Agent completed in")

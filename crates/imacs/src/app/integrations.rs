@@ -72,7 +72,7 @@ impl State {
             }
         }
         if !jobs.is_empty() {
-            let (tx, ctx, revision) = (self.integration_check_tx.clone(), self.ctx.clone(), self.integration_revision);
+            let (tx, revision) = (self.integration_check_tx.clone(), self.integration_revision);
             std::thread::spawn(move || {
                 for (plan, task, into, repo) in jobs {
                     let valid = task
@@ -100,7 +100,6 @@ impl State {
                             }
                         });
                     let _ = tx.send(CheckedIntegration { revision, plan, task, into, valid });
-                    ctx.request_repaint();
                 }
             });
         }
@@ -140,7 +139,7 @@ impl State {
         };
         let into = self.plans[index].integration_branch();
         let into_path = git::worktree_path(&self.config.worktree_path, &repo, &into);
-        let (tx, base_ref, ctx) = (self.integrate_tx.clone(), self.config.base_ref.clone(), self.ctx.clone());
+        let (tx, base_ref) = (self.integrate_tx.clone(), self.config.base_ref.clone());
         let task = id.to_string();
         let plan = self.plans[index].id.clone();
         self.integrating.insert((plan.clone(), task.clone()));
@@ -148,7 +147,6 @@ impl State {
             let result =
                 git::integrate(&repo, &branch, &message, &into, &into_path, &base_ref).map_err(|e| format!("{e:#}"));
             let _ = tx.send(Integrated { plan, task, branch, into, result, reply });
-            ctx.request_repaint();
         });
     }
 
@@ -335,6 +333,7 @@ mod tests {
                 json!({"cmd":"plan_set", "goal":"Unavailable ref", "integration":"integration", "tasks":[
                     {"id":"a", "repo":repo, "branch":"task-a"}, {"id":"b", "depends_on":["a"]}]}),
             );
+            app.runtime.drain_actions();
             let index = app.runtime.selected_plan;
             app.runtime.plans[index].tasks[0].status = TaskStatus::Done;
             app.runtime.plans[index].tasks[0].integrated = Some("integration".into());

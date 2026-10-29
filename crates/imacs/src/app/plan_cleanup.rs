@@ -3,7 +3,7 @@ use imacs_core::cleanup::{self, Entry};
 
 pub(super) struct PlanCleanup {
     plan: Plan,
-    rows: Vec<(Entry, bool)>,
+    rows: Vec<Entry>,
     busy: bool,
     log: Vec<String>,
     tx: crate::host::Sender<Event>,
@@ -30,6 +30,7 @@ impl State {
         let mut dialog = PlanCleanup { plan, rows: Vec::new(), busy: false, log: Vec::new(), tx, rx };
         self.load_plan_cleanup(&mut dialog);
         self.plan_cleanup = Some(dialog);
+        self.client_events.push(ClientEvent::PlanCleanup);
     }
 
     fn load_plan_cleanup(&self, dialog: &mut PlanCleanup) {
@@ -51,13 +52,13 @@ impl State {
                     dialog.busy = false;
                     match result {
                         Ok(rows) => {
-                            dialog.rows = rows
-                                .into_iter()
-                                .map(|row| {
-                                    let selected = row.keep.is_none();
-                                    (row, selected)
-                                })
-                                .collect()
+                            self.client_events.push(ClientEvent::PlanCleanupPreview(
+                                rows.iter()
+                                    .filter(|row| row.keep.is_none())
+                                    .map(|row| (row.repo.clone(), row.branch.clone()))
+                                    .collect(),
+                            ));
+                            dialog.rows = rows;
                         }
                         Err(err) => dialog.log.push(err),
                     }
@@ -65,7 +66,7 @@ impl State {
                 Event::Removed(entry, result) => match result {
                     Ok(()) => {
                         dialog.log.push(format!("Removed {} and its worktree, if present", entry.branch));
-                        dialog.rows.retain(|(row, _)| row != &entry);
+                        dialog.rows.retain(|row| row != &entry);
                     }
                     Err(err) => dialog.log.push(format!("Kept {}: {err}", entry.branch)),
                 },
@@ -83,6 +84,10 @@ impl State {
 
 impl Desktop<'_> {
     pub(super) fn plan_cleanup_dialog(&mut self, ctx: &egui::Context) {
+        self.apply_client_events(ctx);
+        if !self.client.plan_cleanup_open {
+            return;
+        }
         let Some(mut dialog) = self.runtime.plan_cleanup.take() else { return };
         let completed =
             self.runtime.plans.iter().any(|plan| plan.id == dialog.plan.id && plan.status == PlanStatus::Completed);
@@ -105,7 +110,9 @@ impl Desktop<'_> {
                     ui.label("No plan branches or worktrees to remove.");
                 }
                 egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
-                    for (entry, selected) in &mut dialog.rows {
+                    for entry in &dialog.rows {
+                        let key = (entry.repo.clone(), entry.branch.clone());
+                        let mut selected = self.client.plan_cleanup_selected.contains(&key);
                         let agent = entry.worktree.clone().is_some_and(|path| roots.contains(&real(path)));
                         let reason = entry
                             .keep
@@ -113,13 +120,23 @@ impl Desktop<'_> {
                             .or(agent.then_some("an agent session is using this worktree"))
                             .or((!completed).then_some("plan is no longer completed"));
                         if reason.is_some() {
-                            *selected = false;
+                            selected = false;
+                            self.client.plan_cleanup_selected.remove(&key);
                         }
                         ui.horizontal(|ui| {
-                            ui.add_enabled(
-                                !dialog.busy && reason.is_none(),
-                                egui::Checkbox::new(selected, &entry.branch),
-                            );
+                            if ui
+                                .add_enabled(
+                                    !dialog.busy && reason.is_none(),
+                                    egui::Checkbox::new(&mut selected, &entry.branch),
+                                )
+                                .changed()
+                            {
+                                if selected {
+                                    self.client.plan_cleanup_selected.insert(key.clone());
+                                } else {
+                                    self.client.plan_cleanup_selected.remove(&key);
+                                }
+                            }
                             let label = reason.map(|why| format!("Keep: {why}")).unwrap_or_else(|| "Remove".into());
                             ui.label(RichText::new(label).color(if reason.is_some() {
                                 self.runtime.palette.warning
@@ -137,7 +154,11 @@ impl Desktop<'_> {
                         ui.separator();
                     }
                 });
-                let selected = dialog.rows.iter().filter(|(_, selected)| *selected).count();
+                let selected = dialog
+                    .rows
+                    .iter()
+                    .filter(|row| self.client.plan_cleanup_selected.contains(&(row.repo.clone(), row.branch.clone())))
+                    .count();
                 ui.horizontal(|ui| {
                     remove = ui
                         .add_enabled(
@@ -155,7 +176,12 @@ impl Desktop<'_> {
             if let Some(plan) = self.runtime.plans.iter().find(|plan| plan.id == dialog.plan.id) {
                 dialog.plan = plan.clone();
             }
-            self.runtime.load_plan_cleanup(&mut dialog);
+            self.post(|state| {
+                if let Some(mut dialog) = state.plan_cleanup.take() {
+                    state.load_plan_cleanup(&mut dialog);
+                    state.plan_cleanup = Some(dialog);
+                }
+            });
         }
         if remove
             && let Some(plan) = self
@@ -165,20 +191,25 @@ impl Desktop<'_> {
                 .cloned()
         {
             dialog.busy = true;
-            let targets: Vec<_> =
-                dialog.rows.iter().filter(|(_, selected)| *selected).map(|(row, _)| row.clone()).collect();
+            let targets: Vec<_> = dialog
+                .rows
+                .iter()
+                .filter(|row| self.client.plan_cleanup_selected.contains(&(row.repo.clone(), row.branch.clone())))
+                .cloned()
+                .collect();
             let (tx, plan, base) = (dialog.tx.clone(), plan, self.runtime.config.base_ref.clone());
-            std::thread::spawn(move || {
-                for entry in targets {
-                    let result = cleanup::remove(&plan, &base, &entry).map_err(|err| format!("{err:#}"));
-                    let _ = tx.send(Event::Removed(entry, result));
-                }
-                let _ = tx.send(Event::Finished);
+            self.post(move |_| {
+                std::thread::spawn(move || {
+                    for entry in targets {
+                        let result = cleanup::remove(&plan, &base, &entry).map_err(|err| format!("{err:#}"));
+                        let _ = tx.send(Event::Removed(entry, result));
+                    }
+                    let _ = tx.send(Event::Finished);
+                });
             });
         }
-        if open {
-            self.runtime.plan_cleanup = Some(dialog);
-        }
+        self.client.plan_cleanup_open = open;
+        self.runtime.plan_cleanup = Some(dialog);
     }
 }
 
@@ -256,6 +287,7 @@ mod tests {
                             app.plan_cleanup_dialog(ctx);
                         },
                     );
+                    app.runtime.drain_actions();
                     let text: Vec<_> = output
                         .shapes
                         .iter()
@@ -298,13 +330,14 @@ mod tests {
                     app.runtime.runtime_tick(ctx);
                     std::thread::sleep(Duration::from_millis(10));
                 }
+                frame(app, vec![]); // egui sizes a newly opened window before painting it.
                 let text = frame(app, vec![]);
                 for reason in ["uncommitted changes", "unmerged commits", "an agent session is using"] {
                     assert!(text.iter().any(|(s, _)| s.contains(reason)), "missing {reason}: {text:?}");
                 }
                 let dialog = app.runtime.plan_cleanup.as_ref().unwrap();
                 assert_eq!(dialog.rows.len(), 5);
-                assert_eq!(dialog.rows.iter().filter(|(_, selected)| *selected).count(), 2);
+                assert_eq!(app.client.plan_cleanup_selected.len(), 2);
                 assert!(dir.path().join("clean").exists(), "opening the preview never deletes work");
                 for label in ["imacs/plan-ship", "Remove 1 selected branches and worktrees"] {
                     let text = frame(app, vec![]);
@@ -340,7 +373,7 @@ mod tests {
                 app.runtime.plans[0].status = PlanStatus::Open;
                 let text = frame(app, vec![]);
                 assert!(text.iter().any(|(s, _)| s.contains("plan is no longer completed")));
-                assert!(app.runtime.plan_cleanup.as_ref().unwrap().rows.iter().all(|(_, selected)| !selected));
+                assert!(app.client.plan_cleanup_selected.is_empty());
             },
         );
     }

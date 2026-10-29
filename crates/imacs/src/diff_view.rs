@@ -4,7 +4,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use egui::text::{LayoutJob, TextFormat};
 use egui::{Color32, FontId, Key, Pos2, Rect, RichText, Sense, Stroke, pos2, vec2};
@@ -23,9 +22,6 @@ pub struct DiffState {
     pub prepared: Option<Arc<Prepared>>,
     pub error: Option<String>,
     pub loading: bool,
-    /// A refresh is wanted; it is sent once things have been quiet for a moment.
-    pub dirty_since: Option<Instant>,
-    pub last_request: Option<Instant>,
     pub collapsed: HashSet<String>,
     pub comments: Vec<ReviewComment>,
     editor: Option<Editor>,
@@ -113,8 +109,6 @@ pub enum DiffAction {
     Split(bool),
 }
 
-const DEBOUNCE: Duration = Duration::from_millis(350);
-
 impl DiffState {
     /// Opens `path`: its hunks when the diff touches it, the whole file otherwise.
     /// Returns true when the file content has to be loaded.
@@ -156,23 +150,6 @@ impl DiffState {
         let path = file.path().to_string();
         self.open(&path);
         Some((path, first_change(file)))
-    }
-
-    pub fn mark_dirty(&mut self) {
-        self.dirty_since.get_or_insert_with(Instant::now);
-    }
-
-    /// When a dirty diff is due: once it has been quiet for a moment, and no sooner than
-    /// `interval` after the last request.
-    pub fn due_at(&self, interval: Duration) -> Option<Instant> {
-        let quiet = self.dirty_since? + DEBOUNCE;
-        Some(self.last_request.map_or(quiet, |at| quiet.max(at + interval)))
-    }
-
-    pub fn requested(&mut self) {
-        self.dirty_since = None;
-        self.loading = true;
-        self.last_request = Some(Instant::now());
     }
 }
 

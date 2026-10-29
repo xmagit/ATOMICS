@@ -34,6 +34,9 @@ impl Host {
                         if state.runtime_tick(&ctx) {
                             ctx.request_repaint();
                         }
+                        if let Some(delay) = state.take_output_delay() {
+                            ctx.request_repaint_after(delay);
+                        }
                         state.runtime_deadline()
                     };
                     signal.wait_until(deadline);
@@ -43,8 +46,8 @@ impl Host {
         Self { state, wake, stopped, thread: Some(thread), commands }
     }
 
-    /// Borrow the shared native view and apply synchronous UI actions. No
-    /// runtime processing is performed by this borrow or by egui callbacks.
+    /// Borrow the in-process native model. Desktop actions are sent to the host
+    /// queue; this guard never services runtime work or waits for a command.
     pub(crate) fn state(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap()
     }

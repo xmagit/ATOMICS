@@ -254,9 +254,11 @@ impl Desktop<'_> {
                         .on_hover_text("Idle or exited sessions no plan task uses")
                         .clicked()
                     {
-                        let closed = self.runtime.close_idle(root);
-                        self.runtime
-                            .toast(format!("Closed {closed} idle session{}", if closed == 1 { "" } else { "s" }));
+                        let root = root.clone();
+                        self.post(move |state| {
+                            let closed = state.close_idle(&root);
+                            state.toast(format!("Closed {closed} idle session{}", if closed == 1 { "" } else { "s" }));
+                        });
                         ui.close();
                     }
                 });
@@ -290,10 +292,12 @@ impl Desktop<'_> {
             })
             .response;
         super::topbar::record_item(ui, "Closed plans", &response);
-        if let Some(index) = reopen
-            && let Err(err) = self.runtime.reopen_plan(index)
-        {
-            self.runtime.toast(err);
+        if let Some(index) = reopen {
+            self.post_plan(index, |state, index| {
+                if let Err(err) = state.reopen_plan(index) {
+                    state.toast(err);
+                }
+            });
         }
     }
 
@@ -343,7 +347,7 @@ impl Desktop<'_> {
                 ui.label(RichText::new("No agents yet. Start one with + New,\nor install hooks to see agents\nrunning in other terminals.").color(p.muted).size(12.0));
             }
             if let Some(id) = clicked {
-                self.runtime.activate(&id, true);
+                self.activate(&id, true);
             }
             if let Some(id) = close {
                 self.client.confirm_close = Some(id);
@@ -390,7 +394,7 @@ impl Desktop<'_> {
             section(ui, p, "EXPLORER");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.small_button("+").on_hover_text("Open project…").clicked() {
-                    self.runtime.pick_project();
+                    self.pick_project();
                 }
             });
         });
@@ -440,7 +444,7 @@ impl Desktop<'_> {
             self.runtime.diff_open = true;
         }
         if let Some(root) = close {
-            self.runtime.close_project(&root);
+            self.close_project(&root);
             return;
         }
         let Some(project) = focus else {
@@ -478,7 +482,7 @@ impl Desktop<'_> {
             }
         });
         if open_cleanup {
-            self.runtime.open_cleanup(project.clone(), None);
+            self.open_cleanup(project.clone(), None);
             return;
         }
         let explorer = self.client.explorers.entry(project.clone()).or_default();
@@ -524,12 +528,12 @@ impl Desktop<'_> {
                 }
             });
             if let Some(path) = remove_one {
-                self.runtime.open_cleanup(project.clone(), Some(path));
+                self.open_cleanup(project.clone(), Some(path));
                 return;
             }
             if let Some(path) = pick {
                 match self.runtime.sessions.iter().find(|s| s.root() == path).map(|s| s.id.clone()) {
-                    Some(id) => self.runtime.activate(&id, true),
+                    Some(id) => self.activate(&id, true),
                     None => {
                         self.runtime.active = None;
                         self.runtime.diff_root = Some(path);
@@ -547,7 +551,7 @@ impl Desktop<'_> {
         }
         let main = self.runtime.diffs.get(&project).and_then(|d| d.prepared.clone());
         let changes = self.runtime.diffs.get(&review).and_then(|d| d.prepared.clone());
-        let viewing = self.runtime.diffs.get(&review).and_then(|d| d.viewing.clone());
+        let viewing = self.client.diff_views.get(&review).and_then(|d| d.viewing.clone());
         let (main, changes) = match (main, changes) {
             (Some(main), Some(changes)) => (main, changes),
             (Some(main), None) => (main.clone(), main),
@@ -559,14 +563,14 @@ impl Desktop<'_> {
         };
         let explorer = self.client.explorers.entry(project).or_default();
         if let Some(path) = diff_view::files_panel(ui, explorer, &main, &changes, viewing.as_deref(), p) {
-            self.runtime.open_file(&review, &path);
+            self.open_file(&review, &path);
         }
     }
 
     pub(super) fn project_menu(&mut self, ui: &mut egui::Ui) {
         if ui.button("Open project…").clicked() {
             ui.close();
-            self.runtime.pick_project();
+            self.pick_project();
         }
         let recent: Vec<PathBuf> = self
             .store
@@ -581,7 +585,7 @@ impl Desktop<'_> {
             ui.label(RichText::new("Recent projects").size(11.0).color(self.runtime.palette.muted));
             for root in recent {
                 if ui.button(paths::display(&root)).clicked() {
-                    self.runtime.open_project(&root);
+                    self.open_project(&root);
                     ui.close();
                 }
             }
@@ -591,7 +595,7 @@ impl Desktop<'_> {
         for name in Workspace::list() {
             let current = self.runtime.workspace.as_deref() == Some(name.as_str());
             if ui.selectable_label(current, &name).clicked() {
-                self.runtime.open_workspace(&name);
+                self.open_workspace(&name);
                 ui.close();
             }
         }
@@ -605,7 +609,7 @@ impl Desktop<'_> {
                 )
                 .clicked()
             {
-                self.runtime.save_workspace(&name);
+                self.save_workspace(&name);
                 self.client.workspace_input.clear();
                 ui.close();
             }
@@ -647,7 +651,7 @@ impl Desktop<'_> {
     }
 
     fn pending_open_resume(&mut self, record: SessionRecord) {
-        self.runtime.resume.push(record);
+        self.post(move |state| state.resume.push(record));
     }
 }
 
@@ -714,6 +718,7 @@ mod tests {
                             app.dialogs(ctx);
                         },
                     );
+                    app.runtime.drain_actions();
                     let text: Vec<_> = output
                         .shapes
                         .iter()

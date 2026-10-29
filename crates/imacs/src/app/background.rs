@@ -5,7 +5,7 @@ impl State {
 
     pub(crate) fn runtime_tick(&mut self, ctx: &egui::Context) -> bool {
         let before = self.runtime_view_revision();
-        let mut changed = false;
+        let mut changed = self.drain_actions();
         for record in std::mem::take(&mut self.resume) {
             self.spawn(ctx, &record.agent, record.cwd.clone(), Some(record.claude_session_id));
             changed = true;
@@ -111,7 +111,10 @@ impl State {
             self.control(ctx, message.request, message.reply);
         }
         for terminal in self.sessions.iter().filter_map(|s| s.terminal.as_ref()).chain(self.editors.values()) {
-            changed |= terminal.shared.changed.swap(false, Ordering::AcqRel);
+            if terminal.shared.changed.swap(false, Ordering::AcqRel) {
+                let delay = terminal.repaint_delay();
+                self.output_delay = Some(self.output_delay.map_or(delay, |pending| pending.min(delay)));
+            }
         }
         for session in &mut self.sessions {
             if session.terminal.as_ref().is_some_and(Terminal::exited) {
@@ -138,6 +141,7 @@ impl State {
                 WorkerResult::Diff { root, result } => {
                     let state = self.diffs.entry(root.clone()).or_default();
                     state.loading = false;
+                    state.revision += 1;
                     match result {
                         Ok(prepared) => {
                             for (index, plan) in self.plans.iter_mut().enumerate() {
@@ -205,7 +209,7 @@ impl State {
                         if theme_changed {
                             self.highlighter = Arc::new(Highlighter::new(&syntax));
                         }
-                        apply_style(ctx, &self.config);
+                        self.client_events.push(ClientEvent::ConfigChanged);
                         self.apply_config();
                         for state in self.diffs.values_mut() {
                             state.mark_dirty();
@@ -241,7 +245,7 @@ impl State {
             None => format!("IMACS · {}", names.join(", ")),
         };
         if title != self.title {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.client_events.push(ClientEvent::Viewport(egui::ViewportCommand::Title(title.clone())));
             self.title = title;
         }
 
@@ -290,6 +294,10 @@ impl State {
 
     /// Filesystem/config and terminal fallback checks have bounded polling
     /// deadlines; messages and worker results wake the host immediately.
+    pub(crate) fn take_output_delay(&mut self) -> Option<Duration> {
+        self.output_delay.take()
+    }
+
     pub(crate) fn runtime_deadline(&self) -> Instant {
         let now = Instant::now();
         let mut next = self.config_checked + Duration::from_secs(1);

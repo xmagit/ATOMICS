@@ -3,7 +3,6 @@ use super::*;
 impl State {
     pub(super) fn show_plan_fleet(&mut self) {
         self.changed_plans.remove(&self.plans[self.selected_plan].id);
-        self.ctx.request_repaint();
         self.view = self.plans[self.selected_plan].project.clone();
         self.plan_view = true;
         self.panel = PanelMode::Diff;
@@ -123,7 +122,6 @@ impl State {
                 self.panel = PanelMode::Diff;
             }
         }
-        self.ctx.request_repaint();
         Ok(())
     }
 
@@ -378,6 +376,7 @@ mod tests {
                             egui::CentralPanel::default().show(ui, |ui| app.plan_panel(ui, ui.max_rect()));
                         },
                     );
+                    app.runtime.drain_actions();
                     assert_eq!(
                         output.shapes.iter().any(|shape| {
                             matches!(&shape.shape, egui::epaint::Shape::Text(text) if text.galley.text() == "integrate")

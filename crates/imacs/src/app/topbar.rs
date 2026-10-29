@@ -167,7 +167,7 @@ impl Desktop<'_> {
             && let Some(i) = self.runtime.sessions.iter().position(|s| s.status.needs_attention())
         {
             let id = self.runtime.sessions[i].id.clone();
-            self.runtime.activate(&id, true);
+            self.activate(&id, true);
         }
     }
 }
@@ -197,6 +197,7 @@ mod tests {
                     .show(ui, |ui| app.top_bar(ui));
             },
         );
+        app.runtime.drain_actions();
         let items = ctx.data(|d| d.get_temp::<Vec<(String, Rect)>>(egui::Id::NULL.with("topbar-items")).unwrap());
         (items, output)
     }

@@ -670,35 +670,40 @@ impl Desktop<'_> {
             self.runtime.toast("No session to send to");
             return;
         }
-        let mut typed = 0;
-        let mut queued = 0;
-        let mut held = 0;
-        let mut verifying = 0;
-        for i in targets {
-            match self.runtime.deliver(i, &text) {
-                Delivery::Sent => typed += 1,
-                Delivery::Pending => verifying += 1,
-                Delivery::Queued => queued += 1,
-                Delivery::Held => held += 1,
-                Delivery::Unavailable => {}
-            }
-        }
+        let targets: Vec<String> = targets.into_iter().map(|i| self.runtime.sessions[i].id.clone()).collect();
         self.client.steer_text.clear();
-        let mut parts = Vec::new();
-        if verifying > 0 {
-            parts.push(format!("Verifying delivery to {verifying} session(s)"));
-        }
-        if typed > 0 {
-            parts.push(format!("Sent to {typed} session{}", if typed == 1 { "" } else { "s" }));
-        }
-        if queued > 0 {
-            parts.push(format!("Queued for {queued} outside IMACS"));
-        }
-        if held > 0 {
-            parts.push(format!("Held for {held} until the session is ready"));
-        }
-        let summary = if parts.is_empty() { "No session could receive the message".into() } else { parts.join(", ") };
-        self.runtime.toast(summary);
+        self.post(move |state| {
+            let mut typed = 0;
+            let mut queued = 0;
+            let mut held = 0;
+            let mut verifying = 0;
+            for id in targets {
+                let Some(i) = state.find(&id) else { continue };
+                match state.deliver(i, &text) {
+                    Delivery::Sent => typed += 1,
+                    Delivery::Pending => verifying += 1,
+                    Delivery::Queued => queued += 1,
+                    Delivery::Held => held += 1,
+                    Delivery::Unavailable => {}
+                }
+            }
+            let mut parts = Vec::new();
+            if verifying > 0 {
+                parts.push(format!("Verifying delivery to {verifying} session(s)"));
+            }
+            if typed > 0 {
+                parts.push(format!("Sent to {typed} session{}", if typed == 1 { "" } else { "s" }));
+            }
+            if queued > 0 {
+                parts.push(format!("Queued for {queued} outside IMACS"));
+            }
+            if held > 0 {
+                parts.push(format!("Held for {held} until the session is ready"));
+            }
+            let summary =
+                if parts.is_empty() { "No session could receive the message".into() } else { parts.join(", ") };
+            state.toast(summary);
+        });
     }
 }
 
@@ -1179,8 +1184,10 @@ fi
             app.client.steer_target = SteerTarget::Active;
             app.client.steer_text = "second".into();
             app.send_steer();
+            app.runtime.drain_actions();
             app.client.steer_text = "third".into();
             app.send_steer();
+            app.runtime.drain_actions();
             assert!(app.client.steer_text.is_empty());
             assert_eq!(app.runtime.sessions[0].pending.as_ref().unwrap().text, "first");
             assert_eq!(app.runtime.sessions[0].held, ["second", "third"]);

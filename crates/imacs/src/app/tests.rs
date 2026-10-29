@@ -273,6 +273,7 @@ fn busy_text_is_only_a_fallback(app: &mut Desktop<'_>, _ctx: &egui::Context) {
     app.runtime.active = Some("fallback".into());
     app.client.steer_text = "steer while waiting".into();
     app.send_steer();
+    app.runtime.drain_actions();
     assert!(app.runtime.toast.as_ref().unwrap().0.starts_with("Held for 1"));
     let root = app.runtime.sessions[0].root();
     app.runtime.diffs.entry(root.clone()).or_default().comments.push(steer::ReviewComment {

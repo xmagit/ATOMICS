@@ -24,7 +24,6 @@ impl State {
         if self.chief_open {
             self.focus_terminal = self.sessions.iter().find(|s| s.chief).map(|s| s.id.clone());
         }
-        self.ctx.request_repaint();
     }
 
     pub(super) fn toggle_chief(&mut self, ctx: &egui::Context) {
@@ -226,10 +225,10 @@ impl Desktop<'_> {
             toggle = true;
         }
         if dock != self.runtime.chief_dock() {
-            self.runtime.set_chief_dock(dock);
+            self.set_chief_dock(dock);
         }
         if toggle {
-            self.runtime.toggle_chief(&ctx);
+            self.toggle_chief(&ctx);
         }
     }
 
@@ -266,7 +265,7 @@ impl Desktop<'_> {
                 let dock = self.runtime.chief_dock();
                 let label = if dock == ChiefDock::Floating { "dock" } else { "float" };
                 if ui.small_button(label).clicked() {
-                    self.runtime.set_chief_dock(if dock == ChiefDock::Floating {
+                    self.set_chief_dock(if dock == ChiefDock::Floating {
                         ChiefDock::Docked
                     } else {
                         ChiefDock::Floating
@@ -279,13 +278,13 @@ impl Desktop<'_> {
         let rect = ui.available_rect_before_wrap();
         ui.allocate_rect(rect, Sense::hover());
         let session = &mut self.runtime.sessions[index];
-        let focus = self.runtime.focus_terminal.as_deref() == Some(session.id.as_str());
+        let focus = self.client.focus_terminal.as_deref() == Some(session.id.as_str());
         if let Some(terminal) = &mut session.terminal {
             let id = egui::Id::NULL.with(("chief-term", &session.id));
             let response = self.client.terminal_views.entry(id).or_default().show(terminal, ui, rect, id, &metrics, &p);
             if focus {
                 response.request_focus();
-                self.runtime.focus_terminal = None;
+                self.client.focus_terminal = None;
             }
         }
     }

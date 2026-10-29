@@ -17,6 +17,7 @@ fn frame(app: &mut Desktop<'_>, ctx: &egui::Context, width: f32, time: f64, even
             egui::CentralPanel::default().show(ui, |ui| app.plan_panel(ui, ui.max_rect()));
         },
     );
+    app.runtime.drain_actions();
     let text = output
         .shapes
         .iter()

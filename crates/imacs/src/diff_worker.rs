@@ -6,7 +6,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 pub struct Prepared {
     pub diff: WorktreeDiff,
     /// Per file, per hunk, per line.
@@ -255,5 +255,38 @@ impl Cache {
             tracked.files = Arc::new(files.unwrap_or_default().into_iter().map(shared).collect());
         }
         tracked.files.clone()
+    }
+}
+
+/// Host-owned accepted content and scheduling, independent of any diff view.
+#[derive(Clone, Default)]
+pub struct DiffData {
+    pub revision: u64,
+    pub prepared: Option<Arc<Prepared>>,
+    pub error: Option<String>,
+    pub loading: bool,
+    pub dirty_since: Option<Instant>,
+    pub last_request: Option<Instant>,
+    pub comments: Vec<imacs_core::steer::ReviewComment>,
+    /// Current native client's file subscription, used for background refresh.
+    pub viewing: Option<String>,
+    pub file: Option<Arc<FileView>>,
+    pub file_error: Option<String>,
+}
+
+impl DiffData {
+    pub fn mark_dirty(&mut self) {
+        self.dirty_since.get_or_insert_with(Instant::now);
+    }
+
+    pub fn due_at(&self, interval: Duration) -> Option<Instant> {
+        let quiet = self.dirty_since? + Duration::from_millis(350);
+        Some(self.last_request.map_or(quiet, |at| quiet.max(at + interval)))
+    }
+
+    pub fn requested(&mut self) {
+        self.dirty_since = None;
+        self.loading = true;
+        self.last_request = Some(Instant::now());
     }
 }

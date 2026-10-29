@@ -109,7 +109,7 @@ impl Desktop<'_> {
                 RichText::new("Completed · preview cleanup to check what is merged and safe to remove.").color(p.muted),
             );
             if clean_plan {
-                self.runtime.open_plan_cleanup(self.runtime.selected_plan);
+                self.open_plan_cleanup(self.runtime.selected_plan);
             }
         }
         for (task, dep) in self.runtime.plans[self.runtime.selected_plan].unknown_dependencies() {
@@ -137,7 +137,8 @@ impl Desktop<'_> {
         let expanded = &mut self.client.expanded_tasks;
         let integrating = &self.runtime.integrating;
         let plan_id = self.runtime.plans[self.runtime.selected_plan].id.clone();
-        let tasks = &mut self.runtime.plans[self.runtime.selected_plan].tasks;
+        let mut edited_tasks = self.runtime.plans[self.runtime.selected_plan].tasks.clone();
+        let tasks = &mut edited_tasks;
         if !tasks.is_empty() {
             egui::ScrollArea::horizontal().id_salt(("plan-board", &plan_id)).auto_shrink([false, false]).show(
                 ui,
@@ -347,7 +348,6 @@ impl Desktop<'_> {
             );
         }
 
-        let mut changed = false;
         for (id, action) in actions {
             match action {
                 "toggle" => {
@@ -356,44 +356,65 @@ impl Desktop<'_> {
                         self.client.expanded_tasks.insert(key);
                     }
                 }
-                "edited" => changed = true,
-                "start" => {
-                    if let Err(err) = self.runtime.dispatch(self.runtime.selected_plan, Some(&id)) {
-                        self.runtime.toast(err);
+                "edited" => {
+                    if let Some(edited) = edited_tasks.iter().find(|t| t.id == id) {
+                        let brief = edited.brief.clone();
+                        self.post_plan(self.runtime.selected_plan, move |state, index| {
+                            if !state.plans[index].approved
+                                && let Some(task) = state.plans[index].task_mut(&id)
+                                && task.status == TaskStatus::Planned
+                            {
+                                task.brief = brief;
+                                state.save_plan(index);
+                            }
+                        });
                     }
                 }
-                "integrate" => self.runtime.integrate(self.runtime.selected_plan, &id, None),
+                "start" => self.post_plan(self.runtime.selected_plan, move |state, index| {
+                    if let Err(err) = state.dispatch(index, Some(&id)) {
+                        state.toast(err);
+                    }
+                }),
+                "integrate" => {
+                    self.post_plan(self.runtime.selected_plan, move |state, index| state.integrate(index, &id, None))
+                }
                 "diff" | "resume" => {
                     if let Some(task) =
                         self.runtime.plans[self.runtime.selected_plan].tasks.iter().position(|t| t.id == id)
                     {
-                        self.runtime.task_action(self.runtime.selected_plan, task, action);
+                        let index = self.runtime.selected_plan;
+                        self.task_action(index, task, action);
                     }
                 }
                 status => {
-                    if let (Some(task), Some(status)) =
-                        (self.runtime.plans[self.runtime.selected_plan].task_mut(&id), TaskStatus::parse(status))
-                    {
-                        task.set_status(status);
-                        changed = true;
+                    if let Some(status) = TaskStatus::parse(status) {
+                        self.post_plan(self.runtime.selected_plan, move |state, index| {
+                            if let Some(task) = state.plans[index].task_mut(&id) {
+                                task.set_status(status);
+                            }
+                            state.finish_plan_agents();
+                            state.save_plan(index);
+                        });
                     }
                 }
             }
         }
         if approve {
-            self.runtime.plans[self.runtime.selected_plan].approved = true;
-            changed = true;
-            self.runtime.toast("Plan approved: the orchestrator can dispatch it now");
+            self.post_plan(self.runtime.selected_plan, |state, index| {
+                state.plans[index].approved = true;
+                state.save_plan(index);
+                state.toast("Plan approved: the orchestrator can dispatch it now");
+            });
         }
-        if dispatch_all && let Err(err) = self.runtime.dispatch(self.runtime.selected_plan, None) {
-            self.runtime.toast(err);
-        }
-        if changed {
-            self.runtime.finish_plan_agents();
-            self.runtime.save_plan(self.runtime.selected_plan);
+        if dispatch_all {
+            self.post_plan(self.runtime.selected_plan, |state, index| {
+                if let Err(err) = state.dispatch(index, None) {
+                    state.toast(err);
+                }
+            });
         }
         if let Some(session) = open_session {
-            self.runtime.activate(&session, true);
+            self.activate(&session, true);
             self.runtime.panel = PanelMode::Diff;
         }
         if close {

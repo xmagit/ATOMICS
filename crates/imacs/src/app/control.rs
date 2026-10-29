@@ -284,7 +284,7 @@ impl State {
                 }
             }
             ControlRequest::Resize { width, height } => {
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(vec2(width, height)));
+                self.client_events.push(ClientEvent::Viewport(egui::ViewportCommand::InnerSize(vec2(width, height))));
                 done(ControlResponse::ok(json!({ "requested": [width, height] })))
             }
             ControlRequest::Start { agent, folder, repo, branch, prompt, args } => {
@@ -442,18 +442,7 @@ impl State {
                 }
             },
             ControlRequest::Screenshot { path } => {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaintWhileHidden);
-                let path = paths::expand(&path);
-                let reply = reply.clone();
-                ctx.request_screenshot(move |image| {
-                    let response = match save_png(&path, &image) {
-                        Ok(()) => ControlResponse::ok(json!({ "path": path, "size": image.size })),
-                        Err(err) => ControlResponse::error(format!("{err:#}")),
-                    };
-                    let _ = reply.send(ControlOutcome::Done(response));
-                });
-                ctx.request_repaint();
+                self.client_events.push(ClientEvent::Screenshot { path, reply });
                 return;
             }
         };

@@ -56,56 +56,61 @@ impl Desktop<'_> {
         });
     }
 
-    pub(super) fn send_voice(&mut self, ctx: &egui::Context, text: &str) {
+    pub(super) fn send_voice(&mut self, _ctx: &egui::Context, text: &str) {
         if text.is_empty() {
             self.runtime.toast("Voice: heard nothing");
             return;
         }
-        let quoted = format!("“{}”", truncate(text, 60));
-        let failed = match self.runtime.config.voice.target {
-            VoiceTarget::Chief => {
-                let started = match self.runtime.sessions.iter().position(|s| s.chief && s.can_receive()) {
+        let text = text.to_string();
+        let quoted = format!("“{}”", truncate(&text, 60));
+        match self.runtime.config.voice.target {
+            VoiceTarget::Chief => self.post(move |state| {
+                let started = match state.sessions.iter().position(|s| s.chief && s.can_receive()) {
                     Some(index) => {
-                        self.runtime.deliver(index, text);
+                        state.deliver(index, &text);
                         Ok(())
                     }
                     None => {
-                        self.runtime.sessions.retain(|s| !s.chief);
-                        self.runtime.start_chief(ctx, Some(text.to_string())).map(|_| ())
+                        state.sessions.retain(|s| !s.chief);
+                        state.start_chief(&state.ctx.clone(), Some(text.clone())).map(|_| ())
                     }
                 };
                 match started {
                     Ok(()) => {
-                        self.runtime.chief_open = true;
-                        self.runtime.focus_terminal =
-                            self.runtime.sessions.iter().find(|s| s.chief).map(|s| s.id.clone());
-                        self.runtime.toast(format!("Sent to the chief: {quoted}"));
-                        None
+                        state.chief_open = true;
+                        state.focus_terminal = state.sessions.iter().find(|s| s.chief).map(|s| s.id.clone());
+                        state.toast(format!("Sent to the chief: {quoted}"));
                     }
-                    Err(err) => Some(err),
+                    Err(error) => state.client_events.push(ClientEvent::VoiceFailed { text, error }),
                 }
-            }
+            }),
             VoiceTarget::Active => {
-                match self
+                if let Some(index) = self
                     .runtime
                     .active_index()
                     .filter(|&i| self.runtime.sessions[i].is_agent() && self.runtime.sessions[i].can_receive())
                 {
-                    Some(index) if self.runtime.deliver(index, text) != Delivery::Unavailable => {
-                        self.runtime.toast(format!("Sent to {}: {quoted}", self.runtime.sessions[index].title));
-                        None
-                    }
-                    _ => Some("No active agent to send to".to_string()),
+                    self.post_session(index, move |state, index| {
+                        if state.deliver(index, &text) != Delivery::Unavailable {
+                            state.toast(format!("Sent to {}: {quoted}", state.sessions[index].title));
+                        } else {
+                            state
+                                .client_events
+                                .push(ClientEvent::VoiceFailed { text, error: "No active agent to send to".into() });
+                        }
+                    });
+                } else {
+                    self.voice_failed(&text, "No active agent to send to");
                 }
             }
-        };
-        if let Some(err) = failed {
-            if !self.client.steer_text.trim().is_empty() {
-                self.client.steer_text.push('\n');
-            }
-            self.client.steer_text.push_str(text);
-            self.client.focus_steer = true;
-            self.runtime.toast(format!("{err}; the transcript is in the steer bar"));
         }
+    }
+    pub(super) fn voice_failed(&mut self, text: &str, error: &str) {
+        if !self.client.steer_text.trim().is_empty() {
+            self.client.steer_text.push('\n');
+        }
+        self.client.steer_text.push_str(text);
+        self.client.focus_steer = true;
+        self.runtime.toast(format!("{error}; the transcript is in the steer bar"));
     }
 }

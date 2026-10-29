@@ -46,6 +46,7 @@ impl TerminalView {
             response.request_focus();
         }
         let focused = response.has_focus();
+        terminal.shown(focused);
         if focused {
             ui.memory_mut(|m| {
                 m.set_focus_lock_filter(
@@ -179,6 +180,7 @@ impl TerminalView {
             }
         }
         if !out.is_empty() {
+            terminal.typed();
             let mut term = terminal.term.lock();
             term.scroll_display(Scroll::Bottom);
             self.selection = None;

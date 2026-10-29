@@ -18,7 +18,7 @@ use notify_debouncer_mini::notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_mini::{DebounceEventResult, Debouncer, new_debouncer};
 
 use crate::diff_view::{self, DiffAction, DiffState, ExplorerState, Header};
-use crate::diff_worker::{DiffWorker, WorkerResult};
+use crate::diff_worker::{DiffData, DiffWorker, WorkerResult};
 use crate::governor::{Governor, Jobserver};
 use crate::highlight::Highlighter;
 use crate::ipc::{self, Channels, ControlMessage, ControlOutcome, HookMessage, Hub};
@@ -38,6 +38,7 @@ mod approvals;
 mod background;
 mod board;
 mod chief;
+mod commands;
 mod control;
 mod editor;
 mod fleet;
@@ -199,18 +200,11 @@ struct CheckedIntegration {
 /// The worktree clean-up dialog for one project.
 struct Cleanup {
     repo: PathBuf,
-    rows: Option<Vec<CleanupRow>>,
-    preselect: Option<PathBuf>,
-    delete_branches: bool,
+    rows: Option<Vec<git::WorktreeHealth>>,
     busy: Option<String>,
     log: Vec<String>,
     tx: crate::host::Sender<CleanupEvent>,
     rx: Receiver<CleanupEvent>,
-}
-
-struct CleanupRow {
-    health: git::WorktreeHealth,
-    selected: bool,
 }
 
 enum CleanupEvent {
@@ -308,15 +302,17 @@ struct Screenshot {
     done: Arc<AtomicBool>,
 }
 
-/// Shared desktop state during the runtime extraction. The host is its owner;
-/// the native client borrows it while painting and applying user actions.
-/// Session/terminal and client view state are separated in the next phase.
+/// The host's native model and services. The desktop borrows the model to read
+/// content and publish view hints; runtime effects run through its action queue.
+/// Drafts, selections, dialogs, terminal painting and microphone capture are client-owned.
 pub(crate) struct State {
     ctx: egui::Context,
     wake: crate::host::Wake,
     control_tx: crate::host::Sender<ControlMessage>,
     client_commands: Vec<ControlRequest>,
     client_events: Vec<ClientEvent>,
+    action_tx: crate::host::Sender<commands::Action>,
+    action_rx: Receiver<commands::Action>,
     config: Config,
     config_path: PathBuf,
     config_stamp: Option<SystemTime>,
@@ -331,7 +327,7 @@ pub(crate) struct State {
     diff_open: bool,
     /// Worktree picked in the sidebar without an agent; the diff otherwise follows the active session.
     diff_root: Option<PathBuf>,
-    diffs: HashMap<PathBuf, DiffState>,
+    diffs: HashMap<PathBuf, DiffData>,
     worker: DiffWorker,
     hub: Arc<Mutex<Hub>>,
     hook_rx: Receiver<HookMessage>,
@@ -344,6 +340,7 @@ pub(crate) struct State {
     jobserver: Option<Arc<Jobserver>>,
     /// One-minute load average, read at most every 2 seconds.
     busy_checked: Instant,
+    output_delay: Option<Duration>,
     approvals_checked: Instant,
     needs_input_checked: Instant,
     store: Store,
@@ -405,10 +402,25 @@ pub(crate) struct State {
 /// The only eframe client. Runtime work continues when neither callback is called.
 /// View data belongs to the desktop, never to the runtime scheduler.
 enum ClientEvent {
+    Cleanup { preselect: Option<PathBuf> },
+    PlanCleanup,
+    PlanCleanupPreview(Vec<(PathBuf, String)>),
+    OpenFile { root: PathBuf, path: String },
     Edit { root: PathBuf, path: Option<String> },
+    Screenshot { path: String, reply: Sender<ControlOutcome> },
+    VoiceFailed { text: String, error: String },
+    ConfigChanged,
+    Viewport(egui::ViewportCommand),
 }
 
 struct Client {
+    focus_terminal: Option<String>,
+    cleanup_open: bool,
+    cleanup_selected: HashSet<PathBuf>,
+    cleanup_delete_branches: bool,
+    plan_cleanup_open: bool,
+    plan_cleanup_selected: HashSet<(PathBuf, String)>,
+    diff_views: HashMap<PathBuf, DiffState>,
     icon: egui::TextureHandle,
     load: (Instant, Option<f64>),
     workspace_input: String,
@@ -438,6 +450,13 @@ impl Client {
     fn new(ctx: &egui::Context, options: &mut Options, icon: &egui::IconData) -> Self {
         let (voice_tx, voice_rx) = std::sync::mpsc::channel();
         Self {
+            focus_terminal: None,
+            cleanup_open: false,
+            cleanup_selected: HashSet::new(),
+            cleanup_delete_branches: true,
+            plan_cleanup_open: false,
+            plan_cleanup_selected: HashSet::new(),
+            diff_views: HashMap::new(),
             icon: ctx.load_texture("atomisk", egui::ColorImage::from(icon), egui::TextureOptions::LINEAR),
             load: (Instant::now() - Duration::from_secs(10), None),
             workspace_input: String::new(),
@@ -562,6 +581,7 @@ impl State {
         let wake = crate::host::Wake::default();
         let (hook_tx, hook_rx) = wake.channel();
         let (control_tx, control_rx) = wake.channel();
+        let (action_tx, action_rx) = wake.channel();
         let (usage, usage_tx) = crate::usage::UsagePanel::new(ctx.clone());
         let governor = Arc::new(Governor::new(config.resources.clone(), Some(ctx.clone())));
         let channels =
@@ -613,6 +633,8 @@ impl State {
             control_tx,
             client_commands: Vec::new(),
             client_events: Vec::new(),
+            action_tx,
+            action_rx,
             palette: Arc::new(Palette::from_config(&config.theme)),
             highlighter: Arc::new(Highlighter::new(&Palette::from_config(&config.theme).syntax)),
             config_stamp: modified(&config_path),
@@ -636,6 +658,7 @@ impl State {
             governor,
             jobserver,
             busy_checked: Instant::now(),
+            output_delay: None,
             approvals_checked: Instant::now() - APPROVAL_CHECK_INTERVAL,
             needs_input_checked: Instant::now() - NEEDS_INPUT_CHECK_INTERVAL,
             store: Store::load(&paths::store_file()),
@@ -782,7 +805,7 @@ impl State {
     }
 }
 
-fn state_refresh(state: &mut DiffState) {
+fn state_refresh(state: &mut DiffData) {
     state.dirty_since = Some(Instant::now() - Duration::from_secs(1));
 }
 
@@ -953,6 +976,68 @@ fn apply_style(ctx: &egui::Context, config: &Config) {
 }
 
 impl Desktop<'_> {
+    fn apply_client_events(&mut self, ctx: &egui::Context) {
+        if let Some(id) = self.runtime.focus_terminal.take() {
+            self.client.focus_terminal = Some(id);
+        }
+        for event in std::mem::take(&mut self.runtime.client_events) {
+            match event {
+                ClientEvent::Cleanup { preselect } => {
+                    self.client.cleanup_open = true;
+                    self.client.cleanup_selected = preselect.into_iter().collect();
+                    self.client.cleanup_delete_branches = true;
+                }
+                ClientEvent::PlanCleanup => {
+                    self.client.plan_cleanup_open = true;
+                    self.client.plan_cleanup_selected.clear();
+                }
+                ClientEvent::PlanCleanupPreview(selected) => {
+                    self.client.plan_cleanup_selected = selected.into_iter().collect()
+                }
+                ClientEvent::OpenFile { root, path } => {
+                    self.client.diff_views.entry(root).or_default().open(&path);
+                }
+                ClientEvent::Screenshot { path, reply } => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaintWhileHidden);
+                    let path = paths::expand(&path);
+                    let reply = reply.clone();
+                    ctx.request_screenshot(move |image| {
+                        let response = match save_png(&path, &image) {
+                            Ok(()) => ControlResponse::ok(json!({ "path": path, "size": image.size })),
+                            Err(err) => ControlResponse::error(format!("{err:#}")),
+                        };
+                        let _ = reply.send(ControlOutcome::Done(response));
+                    });
+                    ctx.request_repaint();
+                }
+                ClientEvent::ConfigChanged => apply_style(ctx, &self.runtime.config),
+                ClientEvent::Viewport(command) => ctx.send_viewport_cmd(command),
+                ClientEvent::VoiceFailed { text, error } => self.voice_failed(&text, &error),
+                ClientEvent::Edit { root, path } => {
+                    self.client.focus_editor = true;
+                    if let Some(path) = path {
+                        self.client.editor_file.insert(root, path);
+                    }
+                }
+            }
+        }
+    }
+
+    fn sync_diffs(&mut self) {
+        for (root, data) in &self.runtime.diffs {
+            let view = self.client.diff_views.entry(root.clone()).or_default();
+            view.prepared = data.prepared.clone();
+            view.error = data.error.clone();
+            view.loading = data.loading;
+            view.comments = data.comments.clone();
+            if view.viewing == data.viewing {
+                view.file = data.file.clone();
+                view.file_error = data.file_error.clone();
+            }
+        }
+    }
+
     fn load_gauge(&mut self, ui: &mut egui::Ui) {
         if self.client.load.0.elapsed() > Duration::from_secs(2) {
             self.client.load = (Instant::now(), crate::governor::load_average());
@@ -1086,16 +1171,8 @@ impl Desktop<'_> {
     }
 
     fn client_logic(&mut self, ctx: &egui::Context) {
-        for event in std::mem::take(&mut self.runtime.client_events) {
-            match event {
-                ClientEvent::Edit { root, path } => {
-                    self.client.focus_editor = true;
-                    if let Some(path) = path {
-                        self.client.editor_file.insert(root, path);
-                    }
-                }
-            }
-        }
+        self.sync_diffs();
+        self.apply_client_events(ctx);
         while let Ok(event) = self.client.voice_rx.try_recv() {
             match event {
                 VoiceEvent::Opened(cancelled, result) => {
@@ -1136,6 +1213,8 @@ impl Desktop<'_> {
     }
 
     fn paint(&mut self, ui: &mut egui::Ui) {
+        self.sync_diffs();
+        self.apply_client_events(ui.ctx());
         let ctx = ui.ctx().clone();
         self.shortcuts(&ctx);
         let p = self.runtime.palette.clone();
@@ -1271,7 +1350,7 @@ impl Desktop<'_> {
         if let Some(rect) = chief_rect
             && chief_divider(ui, rect, &mut self.runtime.store.chief_width, &p)
         {
-            self.runtime.save_chief_preferences();
+            self.save_chief_preferences();
         }
 
         self.chief_ui(&ctx);

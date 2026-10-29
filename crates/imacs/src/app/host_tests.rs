@@ -355,3 +355,37 @@ fn cleanup_previews_finish_without_painting_the_dialogs() {
         });
     });
 }
+
+#[test]
+fn desktop_actions_launch_and_deliver_on_the_host_without_frames() {
+    with_state("app::host_tests::desktop_actions_launch_and_deliver_on_the_host_without_frames", |state, _| {
+        let actions = state.action_tx.clone();
+        let host = state.into_host();
+        let (tx, rx) = channel();
+        actions
+            .send(Box::new(move |state| {
+                assert_eq!(std::thread::current().name(), Some("imacs-runtime"));
+                let id =
+                    state.start(&state.ctx.clone(), "shell", state.launch_dir.clone(), None, vec![], None).unwrap();
+                tx.send(id).unwrap();
+            }))
+            .unwrap();
+        let id = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let session = id.clone();
+        actions
+            .send(Box::new(move |state| {
+                let index = state.find(&session).unwrap();
+                state.deliver(index, "printf 'desktop-action-delivered\\n'");
+            }))
+            .unwrap();
+        eventually(&host, |state| {
+            state.sessions[state.find(&id).unwrap()]
+                .terminal
+                .as_ref()
+                .unwrap()
+                .screen_text(60)
+                .lines()
+                .any(|line| line.trim() == "desktop-action-delivered")
+        });
+    });
+}

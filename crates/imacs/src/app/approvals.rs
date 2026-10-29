@@ -161,6 +161,7 @@ mod tests {
                             });
                         },
                     );
+                    app.runtime.drain_actions();
                     let text: Vec<_> = output
                         .shapes
                         .iter()

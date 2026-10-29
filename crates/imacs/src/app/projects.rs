@@ -61,13 +61,6 @@ impl State {
         }
     }
 
-    pub(super) fn pick_project(&mut self) {
-        let start = self.repos.first().and_then(|r| r.parent()).map(Path::to_path_buf).unwrap_or_else(paths::home);
-        if let Some(dir) = rfd::FileDialog::new().set_title("Open project").set_directory(start).pick_folder() {
-            self.open_project(&dir);
-        }
-    }
-
     pub(super) fn open_workspace(&mut self, name: &str) {
         match Workspace::load(name) {
             Ok(ws) => {
