@@ -195,7 +195,8 @@ impl State {
             config: config.isolation.sandbox,
             exe,
             socket: paths::socket_path(),
-            briefs: (prompt && agent.kind == AgentKind::Generic).then(|| paths::briefs_dir().join(id)),
+            // Claude takes any prompt as an argument; other agents may get a brief file.
+            briefs: (prompt && agent.kind != AgentKind::Claude).then(|| paths::briefs_dir().join(id)),
         }))
     }
 

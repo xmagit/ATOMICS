@@ -150,8 +150,13 @@ pub fn prepare(job: &Prepare) -> Result<()> {
     }
     // A machine's first sandbox needs sbx's global network policy; one already set up is left alone.
     if !ready.diagnosis.policy_initialized() {
-        sbx(&job.sbx, &["policy", "init", job.config.network.name()], ssh, TIMEOUT)
-            .context("setting up sbx's network policy")?;
+        static SETUP: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _setup = SETUP.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Another launch may have set it up while this one waited.
+        if !preflight(&job.sbx).map_err(anyhow::Error::msg)?.diagnosis.policy_initialized() {
+            sbx(&job.sbx, &["policy", "init", job.config.network.name()], ssh, TIMEOUT)
+                .context("setting up sbx's network policy")?;
+        }
     }
     let (workspace, git) = workspace(&job.cwd)?;
     if let Some(briefs) = &job.briefs {
@@ -190,7 +195,16 @@ pub fn prepare(job: &Prepare) -> Result<()> {
 /// machine. A checkout whose git dir lies inside it keeps that dir's hooks and config read-only.
 pub fn workspace(cwd: &Path) -> Result<(PathBuf, Vec<String>)> {
     let args = ["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-dir", "--git-common-dir"];
-    let Ok(output) = git::git(cwd, &args) else { return Ok((cwd.to_path_buf(), Vec::new())) };
+    let output = git::git(cwd, &args).ok();
+    let top = output.as_deref().and_then(|output| output.lines().next()).map_or(cwd, Path::new);
+    if real(&paths::home()).starts_with(real(top)) {
+        bail!(
+            "{} holds your whole home folder, which a sandbox would mount read-write. Start the agent in a \
+             project folder, or set isolation = \"bare\" on it.",
+            top.display()
+        );
+    }
+    let Some(output) = output else { return Ok((cwd.to_path_buf(), Vec::new())) };
     let lines: Vec<&str> = output.lines().collect();
     let [top, git_dir, common] = lines[..] else { bail!("unexpected git rev-parse output: {output}") };
     let (top, git_dir, common) = (PathBuf::from(top), PathBuf::from(git_dir), PathBuf::from(common));
@@ -439,6 +453,11 @@ mod tests {
 
         let plain = tempfile::tempdir().unwrap();
         assert_eq!(workspace(plain.path()).unwrap(), (plain.path().to_path_buf(), Vec::new()));
+        // A folder holding the home folder is never mounted whole, repository or not.
+        for folder in [paths::home(), PathBuf::from("/")] {
+            let error = workspace(&folder).unwrap_err().to_string();
+            assert!(error.contains("whole home folder"), "{error}");
+        }
     }
 
     #[test]
