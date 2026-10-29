@@ -87,6 +87,8 @@ impl Desktop<'_> {
     pub(super) fn themes_menu(&mut self, ui: &mut egui::Ui) {
         let p = self.runtime.palette.clone();
         ui.label(RichText::new("Themes").strong());
+        // Outlines that stay visible on the menu, where a dark swatch or the checkbox would vanish.
+        let edge = lerp(p.border, p.foreground, 0.3);
         let current = self.runtime.config.theme.name.trim();
         let mut picked = None;
         for choice in self.runtime.theme_choices.iter() {
@@ -107,7 +109,7 @@ impl Desktop<'_> {
                 let cell = Rect::from_min_size(strip.min + vec2(12.0 * i as f32, 0.0), vec2(12.0, 12.0));
                 painter.rect_filled(cell, 0.0, *color);
             }
-            painter.rect_stroke(strip, 1.0, Stroke::new(1.0, p.border), egui::StrokeKind::Outside);
+            painter.rect_stroke(strip, 1.0, Stroke::new(1.0, edge), egui::StrokeKind::Outside);
             let name_color = if selected { p.accent } else { p.foreground };
             painter.text(
                 pos2(strip.right() + 10.0, y),
@@ -132,7 +134,12 @@ impl Desktop<'_> {
         }
         let host_file = Config::source_paths(&self.runtime.config_path)[1].clone();
         let host_name = host_file.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
-        ui.checkbox(&mut self.client.theme_host_only, format!("This machine only (config.d/{host_name})"));
+        ui.scope(|ui| {
+            let box_style = &mut ui.visuals_mut().widgets.inactive;
+            box_style.bg_fill = p.background;
+            box_style.bg_stroke = Stroke::new(1.0, edge);
+            ui.checkbox(&mut self.client.theme_host_only, format!("This machine only (config.d/{host_name})"));
+        });
         let host = self.client.theme_host_only;
         if !host && self.runtime.host_theme {
             ui.label(
