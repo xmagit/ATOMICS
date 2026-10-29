@@ -53,10 +53,14 @@ impl State {
         };
         let outcome = match request {
             ControlRequest::Approve { session, decision, message } => match self.find(&session) {
-                Some(index) => done(match self.approve(index, decision, message.as_deref()) {
-                    Ok(()) => ControlResponse::ok(json!({"answered": true})),
-                    Err(error) => ControlResponse::error(error),
-                }),
+                Some(index) => {
+                    let approval =
+                        self.sessions[index].approvals.first().map(|pending| pending.id.clone()).unwrap_or_default();
+                    done(match self.approve(index, &approval, decision, message.as_deref()) {
+                        Ok(()) => ControlResponse::ok(json!({"answered":true})),
+                        Err(error) => ControlResponse::error(error),
+                    })
+                }
                 None => missing(&session),
             },
             ControlRequest::List => {

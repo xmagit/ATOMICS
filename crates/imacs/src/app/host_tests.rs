@@ -55,6 +55,7 @@ fn expired_approval(state: &mut State) -> Arc<ipc::ApprovalReply> {
     let mut worker = session("worker", AgentKind::Claude, AgentStatus::NeedsInput, &state.launch_dir);
     worker.approval_hold = true;
     worker.approvals.push(PendingApproval {
+        id: uuid::Uuid::new_v4().to_string(),
         request: ApprovalRequest {
             tool: "Bash".into(),
             command: Some("touch pending".into()),

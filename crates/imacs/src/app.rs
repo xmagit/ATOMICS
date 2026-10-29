@@ -119,6 +119,7 @@ enum Delivery {
 }
 
 struct PendingApproval {
+    id: String,
     request: ApprovalRequest,
     reply: Option<Arc<ipc::ApprovalReply>>,
 }
@@ -403,6 +404,7 @@ pub(crate) struct State {
 
 /// Native effects delivered to the desktop; these never drive runtime progress.
 enum ClientEvent {
+    ApprovalDecided { session: String, approval: String },
     Cleanup { preselect: Option<PathBuf> },
     PlanCleanup,
     PlanCleanupPreview(Vec<(PathBuf, String)>),
@@ -416,6 +418,7 @@ enum ClientEvent {
 
 /// View data belongs to the desktop, never to the runtime scheduler.
 struct Client {
+    approval_decisions: HashSet<(String, String)>,
     focus_terminal: Option<String>,
     cleanup_open: bool,
     cleanup_selected: HashSet<PathBuf>,
@@ -452,6 +455,7 @@ impl Client {
     fn new(ctx: &egui::Context, options: &mut Options, icon: &egui::IconData) -> Self {
         let (voice_tx, voice_rx) = std::sync::mpsc::channel();
         Self {
+            approval_decisions: HashSet::new(),
             focus_terminal: None,
             cleanup_open: false,
             cleanup_selected: HashSet::new(),
@@ -984,6 +988,9 @@ impl Desktop<'_> {
         }
         for event in std::mem::take(&mut self.runtime.client_events) {
             match event {
+                ClientEvent::ApprovalDecided { session, approval } => {
+                    self.client.approval_decisions.remove(&(session, approval));
+                }
                 ClientEvent::Cleanup { preselect } => {
                     self.client.cleanup_open = true;
                     self.client.cleanup_selected = preselect.into_iter().collect();

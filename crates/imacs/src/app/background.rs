@@ -428,7 +428,11 @@ impl State {
             }
             session.approval_hold = true;
             session.menu_absent_since = None;
-            session.approvals.push(PendingApproval { request, reply: message.approval_reply });
+            session.approvals.push(PendingApproval {
+                id: uuid::Uuid::new_v4().to_string(),
+                request,
+                reply: message.approval_reply,
+            });
             self.last_status.remove(&session.id);
         } else if event.name == "PreToolUse" {
             let running = ApprovalRequest::from_event(&event);
@@ -703,7 +707,14 @@ mod tests {
             assert!(matching.wait(Duration::ZERO).stdout.is_none());
             assert!(!other.expired(), "the other hook must still be waiting for its own decision");
             assert_eq!(app.runtime.sessions[0].status, AgentStatus::NeedsInput);
-            app.runtime.approve(0, Decision::Deny, None).unwrap();
+            app.runtime
+                .approve(
+                    0,
+                    &app.runtime.sessions[0].approvals.first().map(|pending| pending.id.clone()).unwrap_or_default(),
+                    Decision::Deny,
+                    None,
+                )
+                .unwrap();
             let output = other.wait(Duration::ZERO).stdout.unwrap();
             assert!(output.contains("deny"));
         });
