@@ -325,7 +325,7 @@ pub(crate) struct State {
     action_rx: Receiver<commands::Action>,
     config: Config,
     config_path: PathBuf,
-    config_stamp: Option<SystemTime>,
+    config_stamp: [Option<SystemTime>; 2],
     config_checked: Instant,
     config_error: Option<String>,
     palette: Arc<Palette>,
@@ -673,7 +673,7 @@ impl State {
             action_rx,
             palette: Arc::new(Palette::from_config(&config.theme)),
             highlighter: Arc::new(Highlighter::new(&Palette::from_config(&config.theme).syntax)),
-            config_stamp: modified(&config_path),
+            config_stamp: config_modified(&config_path),
             config,
             config_path,
             config_checked: Instant::now(),
@@ -961,6 +961,10 @@ fn truncate(text: &str, max: usize) -> String {
 
 fn modified(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+fn config_modified(path: &Path) -> [Option<SystemTime>; 2] {
+    Config::source_paths(path).map(|file| modified(&file))
 }
 
 fn open_path(path: &Path) -> std::io::Result<std::process::Child> {

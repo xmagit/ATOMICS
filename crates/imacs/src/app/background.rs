@@ -200,7 +200,7 @@ impl State {
 
         if self.config_checked.elapsed() > Duration::from_secs(1) {
             self.config_checked = Instant::now();
-            let stamp = modified(&self.config_path);
+            let stamp = config_modified(&self.config_path);
             if stamp != self.config_stamp {
                 self.config_stamp = stamp;
                 match Config::load(&self.config_path) {
