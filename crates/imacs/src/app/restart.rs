@@ -26,7 +26,7 @@ impl State {
         for ticket in &waiting {
             blockers.push(format!("queued work waiting: {} ({})", ticket.label, ticket.id));
         }
-        if !self.creating.is_empty() || !self.pending_codex.is_empty() {
+        if !self.creating.is_empty() || !self.pending_codex.is_empty() || !self.pending_sandbox.is_empty() {
             blockers.push(format!(
                 "worktree or agent launch running: {}",
                 self.creating.iter().map(|(_, branch, _)| branch.as_str()).collect::<Vec<_>>().join(", ")
@@ -112,6 +112,7 @@ impl State {
                     title: s.title.clone(),
                     last_prompt: s.last_prompt.clone(),
                     updated: imacs_core::store::now(),
+                    sandbox: s.sandbox.clone(),
                 })
             })
             .collect();
@@ -296,8 +297,15 @@ mod tests {
                 refused(app, "undelivered message");
                 app.runtime.sessions[0].held.clear();
                 let (tx, rx) = app.runtime.wake.channel();
-                app.runtime.cleanup =
-                    Some(Cleanup { repo: app.runtime.launch_dir.clone(), rows: None, busy: None, log: vec![], tx, rx });
+                app.runtime.cleanup = Some(Cleanup {
+                    repo: app.runtime.launch_dir.clone(),
+                    rows: None,
+                    sandboxes: Default::default(),
+                    busy: None,
+                    log: vec![],
+                    tx,
+                    rx,
+                });
                 refused(app, "cleanup job");
                 app.runtime.cleanup = None;
                 let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -414,6 +422,7 @@ mod tests {
                     title: "chief".into(),
                     last_prompt: Some("carry on".into()),
                     updated: 0,
+                    sandbox: None,
                 };
                 app.runtime.store.chief_dock = Some(ChiefDock::Docked);
                 app.runtime.store.chief_width = Some(500.0);

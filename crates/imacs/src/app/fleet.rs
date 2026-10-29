@@ -379,6 +379,7 @@ impl Desktop<'_> {
                 title: s.title.clone(),
                 last_prompt: None,
                 updated: 0,
+                sandbox: s.sandbox.clone(),
             };
             let id = s.id.clone();
             self.close(&id);

@@ -23,6 +23,7 @@ pub(super) fn session(id: &str, kind: AgentKind, status: AgentStatus, cwd: &Path
         menu_absent_since: None,
         chief: false,
         pending: None,
+        sandbox: None,
     }
 }
 
@@ -59,6 +60,12 @@ pub(super) fn with_state(name: &str, test: impl FnOnce(State, &egui::Context)) {
             String::from_utf8_lossy(&output.stderr)
         );
         return;
+    }
+    // Agents run bare in tests unless a test sets up a fake sbx; State never reaches the real one.
+    let config = paths::config_file();
+    if !config.exists() {
+        std::fs::write(&config, imacs_core::config::DEFAULT_CONFIG.replace("mode = \"sandbox\"", "mode = \"bare\""))
+            .unwrap();
     }
     let ctx = egui::Context::default();
     let cc = eframe::CreationContext::_new_kittest(ctx.clone());

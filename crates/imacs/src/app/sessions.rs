@@ -1,4 +1,5 @@
 use super::*;
+use imacs_core::isolation::{self, IsolationMode};
 
 impl Session {
     pub(super) fn starting(
@@ -36,6 +37,7 @@ impl Session {
             menu_absent_since: None,
             chief,
             pending: None,
+            sandbox: None,
         }
     }
 
@@ -110,8 +112,22 @@ impl State {
             return Err(format!("{} is not a folder", cwd.display()));
         }
         let id = uuid::Uuid::new_v4().to_string();
-        let codex = agent.is_codex();
-        let launch = AgentLaunch { id: id.clone(), agent, cwd, resume, extra_args, prompt, chief };
+        let job = if chief { None } else { self.sandbox_job(&agent, &cwd, &id, resume.as_deref(), prompt.is_some())? };
+        let runtime = job.as_ref().map_or(AgentRuntime::Bare, |job| AgentRuntime::Sandbox(job.sandboxed()));
+        // Codex's hooks call IMACS on this machine, which a sandboxed Codex cannot reach.
+        let codex = agent.is_codex() && job.is_none();
+        let launch = AgentLaunch { id: id.clone(), agent, cwd, resume, extra_args, prompt, chief, runtime };
+        if let Some(job) = job {
+            self.sessions.push(Session::starting(id.clone(), &launch.agent, launch.cwd.clone(), chief, &self.wake));
+            let (tx, rx) = self.wake.channel();
+            std::thread::spawn(move || {
+                let _ = tx
+                    .send(crate::sandbox::prepare(&job).map_err(|err| format!("Could not start the sandbox: {err:#}")));
+            });
+            self.pending_sandbox.push((launch, rx));
+            self.activate(&id, false);
+            return Ok(id);
+        }
         let version = if codex {
             let program = resolve_program(&launch.agent.command[0]);
             let ready = self.codex_version(ctx, program);
@@ -141,6 +157,94 @@ impl State {
         self.launch_agent(ctx, launch, version)
     }
 
+    /// The sandbox `agent` gets in `cwd`, or `None` to run it bare: the isolation in effect for
+    /// its project, which the repository may have tightened. A resumed session reattaches to the
+    /// sandbox it ran in.
+    fn sandbox_job(
+        &self,
+        agent: &imacs_core::config::AgentConfig,
+        cwd: &Path,
+        id: &str,
+        resume: Option<&str>,
+        prompt: bool,
+    ) -> Result<Option<crate::sandbox::Prepare>, String> {
+        let config = self.project_config(cwd);
+        // The project's copy of the agent carries what its repository requires.
+        if config.isolation.mode_for(config.agent(&agent.name).unwrap_or(agent)) == IsolationMode::Bare {
+            return Ok(None);
+        }
+        let sbx_agent = isolation::sbx_agent(agent).ok_or_else(|| {
+            let program = agent.command.first().map_or("an empty command", String::as_str);
+            let fix = if self.effective_config().isolation.mode_for(agent) == IsolationMode::Bare {
+                "Its repository requires sandboxed agents in .imacs/config.toml; use claude, codex or shell there."
+            } else {
+                "Set isolation = \"bare\" on it in [[agents]] to run it on this machine."
+            };
+            format!("Could not start {}: Docker Sandboxes has no agent for {program}. {fix}", agent.name)
+        })?;
+        let name = resume
+            .and_then(|resume| self.store.sessions.iter().find(|record| record.claude_session_id == resume))
+            .and_then(|record| record.sandbox.clone())
+            .unwrap_or_else(|| isolation::sandbox_name(id));
+        let exe = crate::setup::executable_path().map_err(|err| format!("Could not locate IMACS: {err}"))?;
+        Ok(Some(crate::sandbox::Prepare {
+            sbx: resolve_program(&self.sbx),
+            name,
+            agent: sbx_agent,
+            cwd: cwd.to_path_buf(),
+            config: config.isolation.sandbox,
+            exe,
+            socket: paths::socket_path(),
+            briefs: (prompt && agent.kind == AgentKind::Generic).then(|| paths::briefs_dir().join(id)),
+        }))
+    }
+
+    /// Stops a sandbox in the background: its agent exited or its tile closed.
+    pub(super) fn stop_sandbox(&self, name: String) {
+        let sbx = resolve_program(&self.sbx);
+        std::thread::spawn(move || {
+            if let Err(err) = crate::sandbox::stop(&sbx, &name) {
+                eprintln!("IMACS: stopping sandbox {name} failed: {err:#}");
+            }
+        });
+    }
+
+    /// A launch that failed after its tile appeared: the tile and a toast say why, and the
+    /// plan task it was started for is blocked with the reason.
+    pub(super) fn launch_failed(&mut self, id: &str, error: String) {
+        if let Some(index) = self.sessions.iter().position(|s| s.id == id) {
+            self.sessions[index].status = AgentStatus::Exited;
+            self.sessions[index].last_message = Some(error.clone());
+        }
+        let note = format!("could not start: {error}");
+        let tasks: Vec<(usize, String)> = self
+            .plans
+            .iter()
+            .enumerate()
+            .flat_map(|(index, plan)| {
+                plan.tasks.iter().filter(|t| t.session.as_deref() == Some(id)).map(move |t| (index, t.id.clone()))
+            })
+            .collect();
+        for (index, task_id) in tasks {
+            let Some(task) = self.plans[index].task_mut(&task_id) else { continue };
+            let old = task.status;
+            task.set_status(TaskStatus::Blocked);
+            task.notes.push(note.clone());
+            self.save_plan(index);
+            let author = imacs_core::tickets::Author::Imacs;
+            self.ticket_status_changed(index, &task_id, old, TaskStatus::Blocked, Some(&note), author);
+        }
+        self.toast(error);
+    }
+
+    /// The session an agent's MCP server speaks for. A sandboxed agent's server is registered
+    /// with sbx under its sandbox's name, which outlives IMACS restarts and new session ids.
+    pub(super) fn pane_session(&self, pane: Option<String>) -> Option<String> {
+        pane.map(|pane| {
+            self.sessions.iter().find(|s| s.sandbox.as_deref() == Some(pane.as_str())).map_or(pane, |s| s.id.clone())
+        })
+    }
+
     fn codex_version(&mut self, _ctx: &egui::Context, program: String) -> CodexVersion {
         if self.codex_versions.get(&program).is_some_and(|ready| ready.get() == Some(&None)) {
             self.codex_versions.remove(&program);
@@ -167,7 +271,11 @@ impl State {
         launch: AgentLaunch,
         codex: Option<bool>,
     ) -> Result<String, String> {
-        let AgentLaunch { id, agent, cwd, resume, extra_args, prompt, chief } = launch;
+        let AgentLaunch { id, agent, cwd, resume, extra_args, prompt, chief, runtime } = launch;
+        let sandboxed = match runtime {
+            AgentRuntime::Sandbox(sandboxed) => Some(sandboxed),
+            AgentRuntime::Bare => None,
+        };
         let prompt = if !chief && agent.kind != AgentKind::Shell {
             let root = workspace::project_root(&cwd).unwrap_or_else(|_| cwd.clone());
             let section = imacs_core::repo_workflow::RepoWorkflow::read(&root).agent_section();
@@ -187,20 +295,26 @@ impl State {
             env.insert("PATH".into(), path.clone());
         }
         // `imacs queue` in an agent resolves to this IMACS, and its compilers share one job pool.
-        if let Some(dir) = crate::setup::executable_path().ok().and_then(|exe| exe.parent().map(Path::to_path_buf)) {
+        // None of this reaches into a sandbox, whose toolchain and limits are its own.
+        if sandboxed.is_none()
+            && let Some(dir) = crate::setup::executable_path().ok().and_then(|exe| exe.parent().map(Path::to_path_buf))
+        {
             let path = env.get("PATH").cloned().or_else(|| std::env::var("PATH").ok()).unwrap_or_default();
             // An empty entry would put the current directory on PATH.
             let path = if path.is_empty() { dir.display().to_string() } else { format!("{}:{path}", dir.display()) };
             env.insert("PATH".into(), path);
         }
-        if let Some(jobserver) = &self.jobserver {
-            env.extend(jobserver.env());
+        if sandboxed.is_none() {
+            if let Some(jobserver) = &self.jobserver {
+                env.extend(jobserver.env());
+            }
+            env.extend(compile_cache_env(&cwd));
+            env.extend(crate::governor::toolchain_env(&cwd, &self.config.resources, self.governor.cores));
         }
-        env.extend(compile_cache_env(&cwd));
-        env.extend(crate::governor::toolchain_env(&cwd, &self.config.resources, self.governor.cores));
 
         let (program, mut args) = match agent.command.split_first() {
             Some((program, rest)) => (program.clone(), rest.to_vec()),
+            None if sandboxed.is_some() => (shell, Vec::new()),
             None => (shell, vec!["-l".to_string()]),
         };
         let mut claude_id = None;
@@ -225,7 +339,8 @@ impl State {
                     prompt,
                 ]);
             }
-            AgentKind::Claude => {
+            // A sandboxed agent reaches IMACS's MCP server through sbx, registered with its sandbox.
+            AgentKind::Claude if sandboxed.is_none() => {
                 let config = json!({ "mcpServers": { "imacs": {
                     "command": exe, "args": ["mcp", "--agent"], "env": { "IMACS_PANE": id, "IMACS_SOCKET": socket }
                 } } });
@@ -269,8 +384,13 @@ impl State {
             _ => {}
         }
         if agent.kind == AgentKind::Claude {
-            args.push("--settings".into());
-            args.push(imacs_core::hook::session_settings(Path::new(&exe), Path::new(&socket), &id, false).to_string());
+            // Hooks run `imacs hook` on this machine, which a sandbox does not have.
+            if sandboxed.is_none() {
+                args.push("--settings".into());
+                args.push(
+                    imacs_core::hook::session_settings(Path::new(&exe), Path::new(&socket), &id, false).to_string(),
+                );
+            }
             let session_id = match resume {
                 Some(id) => {
                     args.extend(["--resume".to_string(), id.clone()]);
@@ -289,7 +409,9 @@ impl State {
         }
         args.extend(extra_args);
         let prompt = match prompt {
-            Some(text) if agent.kind != AgentKind::Claude && text.len() > LONG_PROMPT => Some(brief_file(&id, &text)?),
+            Some(text) if agent.kind != AgentKind::Claude && text.len() > LONG_PROMPT => {
+                Some(brief_file(&id, &text, sandboxed.is_some())?)
+            }
             other => other,
         };
         let shell_prompt = match (&prompt, agent.kind) {
@@ -300,12 +422,14 @@ impl State {
             }
             _ => None,
         };
-        let program = resolve_program(&program);
         let nice = self.config.resources.agent_nice;
-        let (program, args) = if !chief && agent.kind != AgentKind::Shell && nice != 0 {
-            ("nice".to_string(), ["-n".to_string(), nice.to_string(), program].into_iter().chain(args).collect())
-        } else {
-            (program, args)
+        let (program, args) = match &sandboxed {
+            Some(sandboxed) => sandboxed.command(&args),
+            None if !chief && agent.kind != AgentKind::Shell && nice != 0 => (
+                "nice".to_string(),
+                ["-n".to_string(), nice.to_string(), resolve_program(&program)].into_iter().chain(args).collect(),
+            ),
+            None => (resolve_program(&program), args),
         };
         match Terminal::spawn(
             self.wake.clone(),
@@ -327,6 +451,7 @@ impl State {
                 });
                 self.sessions[index].terminal = Some(terminal);
                 self.sessions[index].claude_id = claude_id;
+                self.sessions[index].sandbox = sandboxed.map(|sandboxed| sandboxed.name);
                 if chief {
                     self.hub.lock().unwrap().chief_running = true;
                 }
@@ -436,7 +561,10 @@ impl State {
         self.busy_checked = Instant::now();
         let mut finished = Vec::new();
         for session in &mut self.sessions {
-            let Some(busy_text) = self.config.agent(&session.agent).and_then(|a| a.busy_text.clone()) else { continue };
+            let busy_text = self.config.agent(&session.agent).and_then(|a| a.busy_text.clone());
+            let busy_text =
+                busy_text.or_else(|| (session.sandbox.is_some() && session.is_agent()).then(|| SANDBOX_BUSY.into()));
+            let Some(busy_text) = busy_text else { continue };
             let Some(terminal) = &session.terminal else { continue };
             if session.hooks_active || terminal.exited() || session.status == AgentStatus::NeedsInput {
                 continue;
@@ -468,6 +596,12 @@ impl State {
                 let _ =
                     reply.send(ControlOutcome::Done(ControlResponse::error("message not delivered: session closed")));
             }
+            // An exited agent's sandbox was stopped when it exited; one still preparing stops when ready.
+            if let Some(name) = session.sandbox.clone()
+                && session.terminal.as_ref().is_some_and(|terminal| !terminal.exited())
+            {
+                self.stop_sandbox(name);
+            }
             if session.terminal.is_none()
                 && let Some(cid) = session.claude_id
             {
@@ -491,6 +625,7 @@ impl State {
             title: s.title.clone(),
             last_prompt: s.last_prompt.clone(),
             updated: 0,
+            sandbox: s.sandbox.clone(),
         });
         if let Err(err) = self.store.save(&paths::store_file()) {
             eprintln!("IMACS: saving sessions failed: {err:#}");
@@ -631,11 +766,16 @@ fn codex_transcript_receipt(screen: &str, before: &str, text: &str) -> bool {
 /// Longest first prompt passed on the command line to agents other than Claude.
 const LONG_PROMPT: usize = 700;
 
-/// Writes a long prompt to a brief file and returns the short prompt that points to it.
-fn brief_file(session: &str, text: &str) -> Result<String, String> {
-    let dir = paths::briefs_dir();
+/// What Claude Code and Codex show while they work: a sandboxed agent's status, since its hooks
+/// cannot reach IMACS.
+const SANDBOX_BUSY: &str = "esc to interrupt";
+
+/// Writes a long prompt to a brief file and returns the short prompt that points to it. A
+/// sandboxed session's brief goes in its own folder, the one its sandbox mounts read-only.
+fn brief_file(session: &str, text: &str, sandboxed: bool) -> Result<String, String> {
+    let dir = if sandboxed { paths::briefs_dir().join(session) } else { paths::briefs_dir() };
     std::fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
-    let path = dir.join(format!("{session}.md"));
+    let path = if sandboxed { dir.join("brief.md") } else { dir.join(format!("{session}.md")) };
     std::fs::write(&path, text).map_err(|e| format!("writing {}: {e}", path.display()))?;
     Ok(format!("Your task brief is in {}. Read it first and follow it exactly.", path.display()))
 }

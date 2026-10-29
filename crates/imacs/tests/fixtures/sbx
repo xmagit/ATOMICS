@@ -1,0 +1,81 @@
+#!/bin/sh
+# A fake Docker Sandboxes CLI. Every call is appended to calls.log beside this script, one call per
+# line with its arguments separated by tabs. Sandboxes live as JSON files under sandboxes/, so
+# `ls --json` lists what `create` made and `rm` removed. Files beside the script change behavior:
+#   version      the version `sbx version` prints (default v0.50.1)
+#   signed-out   `diagnose` reports Authentication failing
+#   no-policy    `diagnose` reports the global network policy as not set up
+#   fail-<verb>  that verb fails, e.g. fail-create
+#   run-waits    `run` keeps the agent attached instead of exiting at once
+dir=${0%/*}
+state="$dir/sandboxes"
+mkdir -p "$state"
+line=
+for arg in "$@"; do
+  line="$line${line:+	}$arg"
+done
+printf '%s\n' "$line" >> "$dir/calls.log"
+if [ -e "$dir/fail-$1" ]; then
+  echo "fake $1 failure" >&2
+  exit 1
+fi
+case "$1" in
+  version)
+    printf 'sbx version %s 0123abcd\n' "$(cat "$dir/version" 2>/dev/null || echo v0.50.1)"
+    ;;
+  diagnose)
+    auth=pass
+    [ -e "$dir/signed-out" ] && auth=fail
+    policy=pass
+    [ -e "$dir/no-policy" ] && policy=fail
+    printf '{"version":"1.0","checks":[{"name":"Binary version","status":"pass"},'
+    printf '{"name":"Authentication","status":"%s","message":"not signed in","hint":"Run sbx login"},' "$auth"
+    printf '{"name":"Global network policy","status":"%s","message":"not initialized"}]}\n' "$policy"
+    ;;
+  ls)
+    printf '['
+    sep=
+    for file in "$state"/*; do
+      [ -e "$file" ] || continue
+      printf '%s%s' "$sep" "$(cat "$file")"
+      sep=,
+    done
+    printf ']\n'
+    ;;
+  create)
+    shift
+    name=
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --name) name=$2; shift 2 ;;
+        --memory|--cpus|--template|--static-mcp) shift 2 ;;
+        --*) shift ;;
+        *) break ;;
+      esac
+    done
+    agent=$1
+    shift
+    workspaces=
+    for path in "$@"; do
+      workspaces="$workspaces${workspaces:+,}\"$path\""
+    done
+    printf '{"name":"%s","agent":"%s","status":"running","workspaces":[%s]}' "$name" "$agent" "$workspaces" \
+      > "$state/$name"
+    ;;
+  rm)
+    for arg in "$@"; do
+      case "$arg" in
+        rm|-*) ;;
+        *) rm -f "$state/$arg" ;;
+      esac
+    done
+    ;;
+  run)
+    printf '%s\n' "${SSH_AUTH_SOCK-unset}" > "$dir/run-ssh"
+    printf 'attached to %s\n' "$3"
+    if [ -e "$dir/run-waits" ]; then
+      exec sleep 30
+    fi
+    ;;
+esac
+exit 0

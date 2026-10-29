@@ -19,6 +19,7 @@ impl State {
             "branch": s.branch(),
             "outside_imacs": s.terminal.is_none() && s.status != AgentStatus::Starting,
             "claude_session_id": s.claude_id,
+            "sandbox": s.sandbox,
             "last_prompt": s.last_prompt,
             "approval": s.approvals.first().map(|p| &p.request),
             "queue": s.terminal.as_ref().and_then(|t| {
@@ -60,10 +61,12 @@ impl State {
         };
         let outcome = match request {
             ControlRequest::AgentTicketGet { pane, plan } => {
+                let pane = self.pane_session(pane);
                 self.agent_ticket(pane.as_deref(), plan, None, reply);
                 return;
             }
             ControlRequest::AgentTicketComment { pane, text } => {
+                let pane = self.pane_session(pane);
                 self.agent_ticket(pane.as_deref(), false, Some(text), reply);
                 return;
             }
@@ -347,6 +350,7 @@ impl State {
             ControlRequest::ConfigPropose { scope, toml, remove, theme, reason, pane } => {
                 let change =
                     selfconfig::ProposedChange { scope, toml: &toml, remove: &remove, theme: theme.as_deref() };
+                let pane = self.pane_session(pane);
                 done(match self.propose_config(change, reason, pane.as_deref()) {
                     Ok(result) => ControlResponse::ok(result),
                     Err(error) => ControlResponse::error(error),
@@ -359,6 +363,7 @@ impl State {
                 })
             }
             ControlRequest::Report { pane, status, summary } => {
+                let pane = self.pane_session(pane);
                 let task = self.report(pane.as_deref(), &status, &summary);
                 done(ControlResponse::ok(json!({ "recorded": true, "task": task })))
             }

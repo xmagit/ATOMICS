@@ -22,6 +22,7 @@ use crate::diff_worker::{DiffData, DiffWorker, WorkerResult};
 use crate::governor::{Governor, Jobserver};
 use crate::highlight::Highlighter;
 use crate::ipc::{self, Channels, ControlMessage, ControlOutcome, HookMessage, Hub};
+use crate::sandbox::AgentRuntime;
 use crate::setup::{SHELL_PATH, env_var, global_hooks_installed, install_global_hooks, resolve_program};
 use crate::terminal::{Metrics, Terminal, TerminalView};
 use crate::theme::{Palette, lerp, shortcut, shortcut_label};
@@ -113,6 +114,8 @@ pub struct Session {
     pub chief: bool,
     /// A message typed into the terminal that the agent has not visibly picked up yet.
     pending: Option<Pending>,
+    /// The sandbox a sandboxed agent runs in.
+    sandbox: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,6 +141,7 @@ struct AgentLaunch {
     extra_args: Vec<String>,
     prompt: Option<String>,
     chief: bool,
+    runtime: AgentRuntime,
 }
 
 struct Pending {
@@ -216,6 +220,7 @@ struct CheckedIntegration {
 struct Cleanup {
     repo: PathBuf,
     rows: Option<Vec<git::WorktreeHealth>>,
+    sandboxes: crate::sandbox::RepoSandboxes,
     busy: Option<String>,
     log: Vec<String>,
     tx: crate::host::Sender<CleanupEvent>,
@@ -224,7 +229,9 @@ struct Cleanup {
 
 enum CleanupEvent {
     Loaded(Result<Vec<git::WorktreeHealth>, String>),
+    Sandboxes(Result<crate::sandbox::RepoSandboxes, String>),
     Removed(PathBuf, Result<(), String>),
+    SandboxRemoved(String, Result<(), String>),
     Finished(String),
 }
 
@@ -359,6 +366,10 @@ pub(crate) struct State {
     sessions: Vec<Session>,
     codex_versions: HashMap<String, CodexVersion>,
     pending_codex: Vec<(AgentLaunch, CodexVersion)>,
+    /// The `sbx` program sandboxed agents run with.
+    sbx: String,
+    /// Sandboxed launches waiting for their sandbox.
+    pending_sandbox: Vec<(AgentLaunch, Receiver<Result<(), String>>)>,
     active: Option<String>,
     diff_open: bool,
     /// Worktree picked in the sidebar without an agent; the diff otherwise follows the active session.
@@ -487,6 +498,8 @@ struct Client {
     focus_terminal: Option<String>,
     cleanup_open: bool,
     cleanup_selected: HashSet<PathBuf>,
+    /// Orphaned sandboxes picked for removal in the clean-up dialog.
+    cleanup_sandboxes: HashSet<String>,
     cleanup_delete_branches: bool,
     plan_cleanup_open: bool,
     plan_cleanup_selected: HashSet<(PathBuf, String)>,
@@ -533,6 +546,7 @@ impl Client {
             focus_terminal: None,
             cleanup_open: false,
             cleanup_selected: HashSet::new(),
+            cleanup_sandboxes: HashSet::new(),
             cleanup_delete_branches: true,
             plan_cleanup_open: false,
             plan_cleanup_selected: HashSet::new(),
@@ -750,6 +764,9 @@ impl State {
             sessions: Vec::new(),
             codex_versions: HashMap::new(),
             pending_codex: Vec::new(),
+            // Tests never reach the sbx installed on the machine running them.
+            sbx: if cfg!(test) { "/nonexistent/imacs-test-sbx" } else { "sbx" }.into(),
+            pending_sandbox: Vec::new(),
             active: None,
             diff_open: true,
             diff_root: None,
@@ -1111,6 +1128,7 @@ impl Desktop<'_> {
                 ClientEvent::Cleanup { preselect } => {
                     self.client.cleanup_open = true;
                     self.client.cleanup_selected = preselect.into_iter().collect();
+                    self.client.cleanup_sandboxes.clear();
                     self.client.cleanup_delete_branches = true;
                 }
                 ClientEvent::PlanCleanup => {
@@ -1508,3 +1526,6 @@ mod board_tests;
 
 #[cfg(test)]
 mod host_tests;
+
+#[cfg(test)]
+mod sandbox_tests;

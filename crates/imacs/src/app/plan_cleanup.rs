@@ -20,6 +20,7 @@ impl PlanCleanup {
 enum Event {
     Preview(Result<Vec<Entry>, String>),
     Removed(Entry, Result<(), String>),
+    Note(String),
     Finished,
 }
 
@@ -70,6 +71,7 @@ impl State {
                     }
                     Err(err) => dialog.log.push(format!("Kept {}: {err}", entry.branch)),
                 },
+                Event::Note(note) => dialog.log.push(note),
                 Event::Finished => {
                     dialog.busy = false;
                     self.worktrees_at = None;
@@ -198,11 +200,29 @@ impl Desktop<'_> {
                 .cloned()
                 .collect();
             let (tx, plan, base) = (dialog.tx.clone(), plan.clone(), self.runtime.plan_base_ref(&plan));
+            let sbx = resolve_program(&self.runtime.sbx);
             self.post(move |_| {
                 std::thread::spawn(move || {
                     for entry in targets {
+                        // Which sandboxes work there is asked while the worktree is still on disk.
+                        let sandboxes = match &entry.worktree {
+                            Some(path) if crate::sandbox::installed(&sbx) => crate::sandbox::in_worktree(&sbx, path)
+                                .unwrap_or_else(|err| {
+                                    let _ = tx.send(Event::Note(format!("Listing sandboxes failed: {err:#}")));
+                                    Vec::new()
+                                }),
+                            _ => Vec::new(),
+                        };
                         let result = cleanup::remove(&plan, &base, &entry).map_err(|err| format!("{err:#}"));
+                        let removed = result.is_ok();
                         let _ = tx.send(Event::Removed(entry, result));
+                        for name in sandboxes.into_iter().filter(|_| removed) {
+                            let note = match crate::sandbox::remove(&sbx, &name) {
+                                Ok(()) => format!("Removed sandbox {name}"),
+                                Err(err) => format!("Kept sandbox {name}: {err:#}"),
+                            };
+                            let _ = tx.send(Event::Note(note));
+                        }
                     }
                     let _ = tx.send(Event::Finished);
                 });

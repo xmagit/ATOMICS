@@ -25,6 +25,9 @@ pub struct SessionRecord {
     pub title: String,
     pub last_prompt: Option<String>,
     pub updated: u64,
+    /// The sandbox a sandboxed session runs in; resuming reattaches to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<String>,
 }
 
 /// One-shot handoff, written before quitting and consumed by the new process.
@@ -123,6 +126,7 @@ mod tests {
             title: id.into(),
             last_prompt: prompt.map(str::to_string),
             updated: 0,
+            sandbox: None,
         }
     }
 
