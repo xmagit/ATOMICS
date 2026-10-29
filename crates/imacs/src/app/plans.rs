@@ -26,7 +26,11 @@ impl State {
             if self.plans[index].status == plan::PlanStatus::Archived {
                 continue;
             }
+            let was_open = self.plans[index].is_open();
             let mut changed = self.plans[index].finish_tasks(now);
+            if was_open && self.plans[index].status == PlanStatus::Completed {
+                self.ticket_plan_completed(index);
+            }
             let mut close = Vec::new();
             for task in &mut self.plans[index].tasks {
                 if task.finished_at.is_none() {
@@ -112,6 +116,9 @@ impl State {
         closed.save_in(&paths::imacs_home()).map_err(|err| format!("Closing plan failed: {err:#}"))?;
         self.plans[index] = closed;
         self.changed_plans.remove(&self.plans[index].id);
+        if status == PlanStatus::Completed {
+            self.ticket_plan_completed(index);
+        }
         if self.selected_plan == index {
             self.selected_plan = self.plans.iter().position(Plan::is_open).unwrap_or_else(|| {
                 self.plans.push(Plan::default());
@@ -138,6 +145,8 @@ impl State {
         plan.save_in(&paths::imacs_home()).map_err(|err| format!("Reopening plan failed: {err:#}"))?;
         self.plans[index] = plan;
         self.integration_revision += 1;
+        let id = self.plans[index].id.clone();
+        self.refresh_tickets(Some(&id), None);
         self.selected_plan = index;
         self.show_plan_fleet();
         self.panel = PanelMode::Plan;
@@ -158,6 +167,9 @@ impl State {
         let mut value = serde_json::to_value(&self.plans[index]).unwrap_or_default();
         value["ready"] = json!(self.plans[index].ready().iter().map(|t| &t.id).collect::<Vec<_>>());
         value["integration"] = json!(self.plans[index].integration_branch());
+        if let Some(board) = self.ticket_summary(&self.plans[index].id).and_then(|s| s.get("board").cloned()) {
+            value["ticket_board"] = board;
+        }
         value
     }
 
@@ -248,6 +260,7 @@ impl State {
                 t.report = None;
                 t.repo.get_or_insert_with(|| repo.to_string_lossy().into_owned());
             }
+            self.ticket_dispatched(index, &task.id);
             started.push(task.id);
         }
         if self.selected_plan == index && (self.plan_view || (self.panel == PanelMode::Plan && self.diff_open)) {
@@ -304,8 +317,12 @@ impl State {
             report: Some((status.to_string(), summary.to_string(), task_id.clone())),
             approval: None,
             findings: None,
+            ticket: None,
         });
         self.serve_waiters();
+        if let Some((index, id)) = &owner {
+            self.ticket_reported(*index, id, status, summary);
+        }
         let what = task_id.as_deref().map(|t| format!("task {t}")).unwrap_or(title);
         self.toast(format!("{what} reported {status}"));
         task_id
@@ -319,6 +336,7 @@ impl State {
                 continue;
             }
             let mut changed = false;
+            let mut blocked = Vec::new();
             let plan_id = self.plans[index].id.clone();
             for task in &mut self.plans[index].tasks {
                 if task.status != TaskStatus::Running {
@@ -339,13 +357,19 @@ impl State {
                     });
                     task.set_status(TaskStatus::Blocked);
                     task.notes.push("the agent exited before reporting".into());
+                    blocked.push(task.id.clone());
                     changed = true;
                 }
             }
             if changed {
                 self.save_plan(index);
             }
+            for id in blocked {
+                let (note, author) = (Some("the agent exited before reporting"), imacs_core::tickets::Author::Imacs);
+                self.ticket_status_changed(index, &id, TaskStatus::Running, TaskStatus::Blocked, note, author);
+            }
         }
+        self.push_ticket_states();
     }
 }
 

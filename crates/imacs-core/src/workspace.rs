@@ -23,6 +23,14 @@ pub struct Workspace {
     pub extra: toml::Table,
 }
 
+impl Workspace {
+    /// This workspace's ticket system, read from its `[tickets]`. The section stays in
+    /// `extra` as written, so saving never drops, rewrites or duplicates it.
+    pub fn tickets(&self) -> Result<Option<crate::tickets::TicketConfig>, toml::de::Error> {
+        self.extra.get("tickets").map(|section| section.clone().try_into()).transpose()
+    }
+}
+
 #[cfg(feature = "native")]
 fn workspaces_root() -> PathBuf {
     paths::config_file().parent().map(Path::to_path_buf).unwrap_or_else(paths::imacs_home).join("workspaces")
@@ -46,20 +54,20 @@ pub fn project_root(dir: &Path) -> Result<PathBuf> {
 #[cfg(feature = "native")]
 impl Workspace {
     pub fn load(name: &str) -> Result<Workspace> {
-        let filename = format!("{}.toml", file_name(name)?);
-        let mut file = workspaces_dir().join(&filename);
-        let text = match std::fs::read_to_string(&file) {
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                file = workspaces_root().join(filename);
-                std::fs::read_to_string(&file)
-            }
-            result => result,
-        }
-        .with_context(|| format!("reading {}", file.display()))?;
+        let file = Self::file(name)?;
+        let text = std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
         let mut workspace: Workspace = toml::from_str(&text).with_context(|| format!("parsing {}", file.display()))?;
         workspace.name = name.to_string();
         workspace.projects = workspace.projects.iter().map(|p| paths::expand(&p.to_string_lossy())).collect();
         Ok(workspace)
+    }
+
+    /// The file `load` reads: this host's, else a legacy flat file, else where `save` writes.
+    pub fn file(name: &str) -> Result<PathBuf> {
+        let filename = format!("{}.toml", file_name(name)?);
+        let host = workspaces_dir().join(&filename);
+        let legacy = workspaces_root().join(filename);
+        Ok(if host.exists() || !legacy.exists() { host } else { legacy })
     }
 
     pub fn save(&self) -> Result<PathBuf> {
@@ -217,6 +225,73 @@ custom = true
         let reloaded = Workspace::load("daily").unwrap();
         assert_eq!(reloaded.projects, workspace.projects);
         assert_eq!(reloaded.extra, settings);
+    }
+
+    #[test]
+    fn saving_keeps_one_tickets_section_that_still_parses() {
+        const CHILD: &str = "IMACS_WORKSPACE_TICKETS_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let dir = tempfile::tempdir().unwrap();
+            let output = crate::test_support::output(
+                Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "workspace::tests::saving_keeps_one_tickets_section_that_still_parses"])
+                    .env(CHILD, "1")
+                    .env("HOME", dir.path())
+                    .env("IMACS_HOST", "work-mac")
+                    .env("IMACS_CONFIG", dir.path().join("config/config.toml")),
+            );
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let tickets_header = |text: &str| text.lines().filter(|line| line.trim() == "[tickets]").count();
+        // A legacy flat file is read, and the first save moves it to this host's folder.
+        std::fs::create_dir_all(workspaces_root()).unwrap();
+        let legacy = workspaces_root().join("team.toml");
+        std::fs::write(
+            &legacy,
+            r#"projects = ["~/repos/app"]
+[tickets]
+system = "alpha"
+mode = "ticket"
+unknown_option = "kept"
+server = { command = ["alpha-mcp"], env = { PROFILE = "work" } }
+states = { running = "Doing", done = "Done" }
+[tickets.operations.get]
+tool = "read"
+arguments = { id = "{key}", fields = ["id", "status"] }
+result = { key = "id", state = "status" }
+"#,
+        )
+        .unwrap();
+        assert_eq!(Workspace::file("team").unwrap(), legacy);
+        let loaded = Workspace::load("team").unwrap();
+        let typed = loaded.tickets().unwrap().unwrap();
+        assert_eq!((typed.system.as_str(), typed.mode), ("alpha", crate::tickets::TicketMode::Ticket));
+        assert_eq!(typed.server.env["PROFILE"], "work");
+        assert_eq!(typed.operation("get").unwrap().result.state, "status");
+        let mut workspace = loaded.clone();
+        workspace.projects.push(paths::home().join("repos/api"));
+        for _ in 0..2 {
+            let file = workspace.save().unwrap();
+            assert_eq!(file, workspaces_dir().join("team.toml"));
+            assert_eq!(Workspace::file("team").unwrap(), file);
+            let text = std::fs::read_to_string(&file).unwrap();
+            assert_eq!(tickets_header(&text), 1, "{text}");
+            assert_eq!(text.matches("system = \"alpha\"").count(), 1, "{text}");
+            let reloaded = Workspace::load("team").unwrap();
+            assert_eq!(reloaded.projects, workspace.projects);
+            assert_eq!(reloaded.extra, loaded.extra, "unknown keys survive too");
+            assert_eq!(reloaded.tickets().unwrap(), Some(typed.clone()));
+            workspace = reloaded;
+        }
+        assert!(Workspace { extra: toml::Table::new(), ..workspace.clone() }.tickets().unwrap().is_none());
+        workspace.extra.insert("tickets".into(), toml::Value::String("not a table".into()));
+        assert!(workspace.tickets().is_err());
     }
 
     #[test]

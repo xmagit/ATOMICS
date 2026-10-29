@@ -94,6 +94,16 @@ env = []
 # Close accepted, integrated agents automatically. Worktrees remain available.
 close_done_agents = true
 
+# [tickets]
+# A ticket system reached over MCP, so plans and tasks carry their tickets and keep them
+# up to date. A workspace file's [tickets] wins over this one. See docs/tickets.md.
+# system = "tracker"
+# mode = "board"            # "board": a board is a plan, its tickets tasks · "ticket": a ticket is a plan
+# comments = "agents"       # who comments on tickets: "agents", "chief" or "off"
+# workflow = ""             # added to the chief's prompt
+# server = { command = ["tracker-mcp"] }   # or { url = "https://…/mcp", token_env = "TRACKER_TOKEN" }
+# states = { running = "In Progress", review = "In Review", done = "Done", blocked = "Blocked" }
+
 [resources]
 # Heavy work shared by every agent IMACS starts. Compilers share one jobserver pool, and whole
 # test runs or QA instances wait for a slot through `imacs queue --class test|qa -- <command>`.
@@ -178,6 +188,7 @@ pub struct Config {
     pub steer: SteerConfig,
     pub voice: VoiceConfig,
     pub keys: KeyConfig,
+    pub tickets: crate::tickets::TicketConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -511,6 +522,7 @@ impl Default for Config {
             steer: SteerConfig::default(),
             voice: VoiceConfig::default(),
             keys: KeyConfig::default(),
+            tickets: crate::tickets::TicketConfig::default(),
         }
     }
 }

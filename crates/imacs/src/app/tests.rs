@@ -417,6 +417,7 @@ fn plan_set_resolves_cached_worktree_projects(app: &mut Desktop<'_>) {
     app.runtime.control(
         &app.runtime.ctx.clone(),
         ControlRequest::PlanSet {
+            ticket: None,
             plan: None,
             goal: "ship".into(),
             tasks: vec![Task { id: "a".into(), repo: Some("/worktree/src".into()), ..Task::default() }],

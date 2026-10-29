@@ -62,7 +62,7 @@ fn write(out: &mut impl Write, value: Value) {
     let _ = out.flush();
 }
 
-const INSTRUCTIONS: &str = "IMACS runs coding agents (Claude Code, Codex, shells) in terminals the user watches, each in its own git worktree, and shows every worktree's diff against main. As an orchestrator: write a plan with imacs_plan_set and let the user approve it on the board, then imacs_plan_dispatch. Loop on imacs_wait instead of polling: agents report with imacs_report (status reported) or finish turns. Then read imacs_result and imacs_diff, steer with imacs_send or inline review comments (imacs_comment + imacs_send_review), and move tasks along with imacs_plan_update. Merge each accepted task into the plan's integration branch with imacs_plan_integrate before dispatching tasks that depend on it: those branch from the integration branch. For one-off work, imacs_start starts an agent directly. Several plans can run at once: retain each returned plan id and pass plan to every plan tool. Start the next plan while one finishes. The chief is never closed. The user sees everything and can steer too, so keep briefs and reviews readable.";
+const INSTRUCTIONS: &str = "IMACS runs coding agents (Claude Code, Codex, shells) in terminals the user watches, each in its own git worktree, and shows every worktree's diff against main. As an orchestrator: write a plan with imacs_plan_set and let the user approve it on the board, then imacs_plan_dispatch. Loop on imacs_wait instead of polling: agents report with imacs_report (status reported) or finish turns. Then read imacs_result and imacs_diff, steer with imacs_send or inline review comments (imacs_comment + imacs_send_review), and move tasks along with imacs_plan_update. Merge each accepted task into the plan's integration branch with imacs_plan_integrate before dispatching tasks that depend on it: those branch from the integration branch. For one-off work, imacs_start starts an agent directly. Several plans can run at once: retain each returned plan id and pass plan to every plan tool. Start the next plan while one finishes. The chief is never closed. With a ticket system configured, plans and tasks carry ticket links (ticket in imacs_plan_set, or imacs_ticket_link): IMACS keeps their states in step, comments on them, and reports changes made in the ticket system as ticket events in imacs_wait. The user sees everything and can steer too, so keep briefs and reviews readable.";
 
 const AGENT_INSTRUCTIONS: &str = "You run inside IMACS, where an orchestrator and the user follow your work. Call imacs_report when you finish your task (status done), when you are blocked or need a decision (blocked or question), and optionally to report progress.";
 
@@ -110,10 +110,75 @@ fn call_report(params: &Value) -> Value {
     }
 }
 
+fn ticket_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "A ticket in the configured ticket system. id is what its tools address it by; the rest is filled in from the system.",
+        "properties": {
+            "id": { "type": "string" },
+            "key": { "type": "string", "description": "Human-readable key, if different from id" },
+            "url": { "type": "string" },
+            "title": { "type": "string" },
+            "system": { "type": "string", "description": "Defaults to the configured system" }
+        },
+        "required": ["id"]
+    })
+}
+
+fn ticket_tools(plan: &Value) -> Value {
+    let ticket = ticket_schema();
+    let ticket_ref = |what: &str| json!({ "type": "string", "description": what });
+    json!([
+        {
+            "name": "imacs_ticket_link",
+            "description": "Attach a ticket to a plan (no task: the board in board mode, the plan's one ticket in ticket mode) or to a task, then read it from the ticket system. Or create a new ticket with the configured create operation and attach it (create: title and body), or remove the link (unlink). Returns the link as read, with an error if the ticket system failed.",
+            "inputSchema": { "type": "object", "properties": {
+                "plan": plan,
+                "task": { "type": "string", "description": "Task id; omit to link the plan" },
+                "ticket": ticket,
+                "create": { "type": "object", "properties": {
+                    "title": { "type": "string" },
+                    "body": { "type": "string", "description": "What to do: the ticket's description" }
+                }, "required": ["title"] },
+                "unlink": { "type": "boolean" }
+            } }
+        },
+        {
+            "name": "imacs_ticket_sync",
+            "description": "Read the linked tickets of one plan (or every open plan) from the ticket system now, retry failed state updates, and return each plan's links. In board mode this includes the board's tickets and which task each belongs to, so tickets without a task stand out.",
+            "inputSchema": { "type": "object", "properties": { "plan": { "type": "string", "description": "Plan id; omit for every open plan" } } }
+        },
+        {
+            "name": "imacs_ticket_comment",
+            "description": "Comment on a task's ticket (or, in ticket mode, the plan's ticket), signed as the chief: implementation details, decisions, anything the ticket's readers should know. Refused when comments are off.",
+            "inputSchema": { "type": "object", "properties": {
+                "plan": plan,
+                "task": { "type": "string", "description": "Task id; omit for the plan's ticket" },
+                "text": { "type": "string" }
+            }, "required": ["text"] }
+        },
+        {
+            "name": "imacs_ticket_event",
+            "description": "For external systems and webhook bridges: a ticket (id or key) or a board changed. Given fields (state, title, url, updated_at) apply to the linked tickets at once, and IMACS reads them again; state changes reach the chief as ticket events.",
+            "inputSchema": { "type": "object", "properties": {
+                "system": ticket_ref("Ticket system name; omit to match any"),
+                "id": ticket_ref("Ticket id"),
+                "key": ticket_ref("Ticket key"),
+                "board": ticket_ref("Board id, to read a board-mode plan's board again"),
+                "state": ticket_ref("New state name"),
+                "title": ticket_ref("New title"),
+                "url": ticket_ref("Ticket URL"),
+                "updated_at": ticket_ref("When it changed, as the system says")
+            } }
+        }
+    ])
+}
+
 fn tools() -> Value {
     let plan = json!({ "type": "string", "description": "Plan id from imacs_plan_set/get. Required for update/dispatch/integrate when several plans are open." });
     let session = json!({ "type": "string", "description": "Session id, unique id prefix, or title" });
-    json!([
+    let ticket = ticket_schema();
+    let mut tools = json!([
         {
             "name": "imacs_restart",
             "description": "Chief only: restart this installation after rebuilding it. Saves plans, sessions and layout, then automatically resumes the chief. Refuses while agents work, approvals/questions are pending, queue slots are held, jobs run or a plan edit is open. Wait for blockers instead of forcing. Force bypasses busy checks, never executable validation or saving.",
@@ -158,13 +223,14 @@ fn tools() -> Value {
         },
         {
             "name": "imacs_plan_set",
-            "description": "Write the plan for a goal as tasks. It appears on IMACS's plan board, where the user reviews, edits and approves it; nothing starts before approval. Each task: id (short, e.g. t1), title, brief (what to do, with context), acceptance (list of checks that mean done), depends_on (task ids), agent (claude or codex), args (e.g. [\"-m\", \"gpt-6.1-terra\"]), repo (project folder), branch. Without plan, creates a separate new plan; pass its returned plan id to update it, keeping progress of tasks whose id stays, even when rewording the goal. Tasks are merged into the integration branch (default imacs/plan-<plan-id>, kept unless explicitly overridden).",
+            "description": "Write the plan for a goal as tasks. It appears on IMACS's plan board, where the user reviews, edits and approves it; nothing starts before approval. Each task: id (short, e.g. t1), title, brief (what to do, with context), acceptance (list of checks that mean done), depends_on (task ids), agent (claude or codex), args (e.g. [\"-m\", \"gpt-6.1-terra\"]), repo (project folder), branch, and optionally ticket (its ticket in the configured ticket system). ticket on the plan links its board (board mode) or its one ticket (ticket mode). Omitted tickets keep their links. Without plan, creates a separate new plan; pass its returned plan id to update it, keeping progress of tasks whose id stays, even when rewording the goal. Tasks are merged into the integration branch (default imacs/plan-<plan-id>, kept unless explicitly overridden).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "plan": plan,
                     "goal": { "type": "string" },
                     "integration": { "type": "string", "description": "Integration branch name, if not imacs/plan-<plan-id>" },
+                    "ticket": ticket,
                     "tasks": {
                         "type": "array",
                         "items": {
@@ -178,7 +244,8 @@ fn tools() -> Value {
                                 "agent": { "type": "string" },
                                 "args": { "type": "array", "items": { "type": "string" } },
                                 "repo": { "type": "string" },
-                                "branch": { "type": "string" }
+                                "branch": { "type": "string" },
+                                "ticket": ticket
                             },
                             "required": ["id", "title", "brief"]
                         }
@@ -226,12 +293,12 @@ fn tools() -> Value {
         },
         {
             "name": "imacs_wait",
-            "description": "Block until an agent finishes a turn, needs input, or exits (or other `statuses`), then return those events with a `cursor`. Pass the cursor as `after` next time to only see newer events. Use this instead of polling. Heartbeat events contain fleet findings (an empty list means all good). Plan-session events include plan and task ids; permission events also include the approval request. `sessions` empty means any; timeout_secs defaults to 120 (max 280).",
+            "description": "Block until an agent finishes a turn, needs input, exits or reports, or a linked ticket changes in its system (or other `statuses`), then return those events with a `cursor`. Pass the cursor as `after` next time to only see newer events. Use this instead of polling. Heartbeat events contain fleet findings (an empty list means all good). Ticket events say which plan or task's ticket moved from which state to which, and which IMACS status that state means. Plan-session events include plan and task ids; permission events also include the approval request. `sessions` empty means any; timeout_secs defaults to 120 (max 280).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "sessions": { "type": "array", "items": { "type": "string" } },
-                    "statuses": { "type": "array", "items": { "type": "string", "enum": ["working", "turn done", "needs you", "idle", "exited", "heartbeat"] } },
+                    "statuses": { "type": "array", "items": { "type": "string", "enum": ["working", "turn done", "needs you", "idle", "exited", "reported", "heartbeat", "ticket"] } },
                     "after": { "type": "integer" },
                     "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 280 }
                 }
@@ -317,7 +384,11 @@ fn tools() -> Value {
             "description": "Stop a session's process and remove it from IMACS.",
             "inputSchema": { "type": "object", "properties": { "session": session }, "required": ["session"] }
         }
-    ])
+    ]);
+    if let (Some(all), Value::Array(more)) = (tools.as_array_mut(), ticket_tools(&plan)) {
+        all.extend(more);
+    }
+    tools
 }
 
 fn call(params: &Value) -> Value {
@@ -375,6 +446,10 @@ fn request_for_tool(name: &str, mut args: Value) -> Result<ControlRequest, Strin
         "imacs_send_review" => "send_review",
         "imacs_close" => "close",
         "imacs_report" => "report",
+        "imacs_ticket_link" => "ticket_link",
+        "imacs_ticket_sync" => "ticket_sync",
+        "imacs_ticket_comment" => "ticket_comment",
+        "imacs_ticket_event" => "ticket_event",
         _ => return Err(format!("unknown tool {name}")),
     };
     if let Some(map) = args.as_object_mut() {

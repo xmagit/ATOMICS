@@ -119,6 +119,9 @@ pub enum ControlRequest {
         /// Branch the tasks are merged into; kept unless explicitly overridden.
         #[serde(default)]
         integration: Option<String>,
+        /// The plan's board or ticket; kept when omitted.
+        #[serde(default)]
+        ticket: Option<crate::tickets::TicketLink>,
     },
     /// Removes an open plan from the tabs, retaining its tasks and history.
     PlanClose {
@@ -155,6 +158,53 @@ pub enum ControlRequest {
         #[serde(default)]
         plan: Option<String>,
         id: String,
+    },
+    /// Attaches a ticket to a plan (without `task`) or a task, creates one through the
+    /// configured create operation, or with `unlink` removes the link.
+    TicketLink {
+        #[serde(default)]
+        plan: Option<String>,
+        #[serde(default)]
+        task: Option<String>,
+        #[serde(default)]
+        ticket: Option<crate::tickets::TicketLink>,
+        #[serde(default)]
+        create: Option<crate::tickets::TicketDraft>,
+        #[serde(default)]
+        unlink: bool,
+    },
+    /// Reads the linked tickets again and retries failed pushes; answers when done.
+    TicketSync {
+        #[serde(default)]
+        plan: Option<String>,
+    },
+    /// Comments on the task's ticket (or the plan's ticket in ticket mode) as the chief.
+    TicketComment {
+        #[serde(default)]
+        plan: Option<String>,
+        #[serde(default)]
+        task: Option<String>,
+        text: String,
+    },
+    /// An external system or webhook bridge saying a ticket (or a board) changed.
+    /// Given fields apply at once; the linked tickets are then read again.
+    TicketEvent {
+        #[serde(default)]
+        system: Option<String>,
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        key: Option<String>,
+        #[serde(default)]
+        board: Option<String>,
+        #[serde(default)]
+        state: Option<String>,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        url: Option<String>,
+        #[serde(default)]
+        updated_at: Option<String>,
     },
     /// A sub-agent reporting on its task (sent by `imacs mcp --agent`).
     Report {

@@ -16,11 +16,13 @@ mod hook_client;
 mod host;
 mod ipc;
 mod mcp;
+mod mcp_client;
 mod restart;
 mod setup;
 mod statusline;
 mod terminal;
 mod theme;
+mod tickets;
 mod usage;
 mod voice;
 

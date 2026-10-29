@@ -12,6 +12,67 @@ impl State {
     }
 }
 
+/// A ticket's key and state. A click opens it in the browser; hovering shows the rest.
+/// A failed ticket operation shows beneath it, and a state that means another IMACS
+/// status than the task's is pointed out.
+fn ticket_chip(
+    ui: &mut egui::Ui,
+    link: &imacs_core::tickets::TicketLink,
+    means: Option<(TaskStatus, TaskStatus)>,
+    p: &Palette,
+) {
+    let color = if link.error.is_some() { p.warning } else { p.info };
+    ui.horizontal_wrapped(|ui| {
+        let text = match &link.state {
+            Some(state) => format!("{} · {state}", link.label()),
+            None => link.label().to_string(),
+        };
+        let mut response = egui::Frame::new()
+            .fill(lerp(p.raised, color, 0.12))
+            .stroke(Stroke::new(1.0, color.gamma_multiply(0.6)))
+            .corner_radius(8)
+            .inner_margin(egui::Margin::symmetric(6, 1))
+            .show(ui, |ui| ui.add(egui::Label::new(RichText::new(text).color(color).size(11.0)).selectable(false)))
+            .response
+            .interact(Sense::click());
+        if link.url.is_some() {
+            response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+        }
+        let response = response.on_hover_ui(|ui| {
+            if let Some(title) = &link.title {
+                ui.label(RichText::new(title).strong());
+            }
+            let system = if link.system.is_empty() { "ticket" } else { &link.system };
+            ui.label(format!("{system} {}", link.id));
+            if let Some(updated) = &link.updated_at {
+                ui.label(format!("updated {updated}"));
+            }
+            match link.synced_at {
+                Some(at) => ui.label(format!("read {} min ago", imacs_core::store::now().saturating_sub(at) / 60)),
+                None => ui.label("not read yet"),
+            };
+            if let Some(error) = &link.error {
+                ui.label(RichText::new(error).color(p.error));
+            }
+            if let Some(url) = &link.url {
+                ui.label(RichText::new(format!("click to open {url}")).color(p.muted));
+            }
+        });
+        if response.clicked()
+            && let Some(url) = &link.url
+        {
+            ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+        }
+        if let Some((ticket, task)) = means.filter(|(ticket, task)| ticket != task) {
+            ui.label(RichText::new(format!("ticket says {}", ticket.label())).color(p.warning).size(11.0))
+                .on_hover_text(format!("The task is {}; IMACS leaves the ticket as it was set", task.label()));
+        }
+    });
+    if let Some(error) = &link.error {
+        ui.label(RichText::new(format!("⚠ {}", truncate(error, 160))).color(p.error).size(11.0)).on_hover_text(error);
+    }
+}
+
 fn task_color(status: TaskStatus, p: &Palette) -> Color32 {
     match status {
         TaskStatus::Planned => p.muted,
@@ -103,6 +164,42 @@ impl Desktop<'_> {
             ui.label(RichText::new(format!("integration branch: {integration}")).color(p.muted).size(11.5))
                 .on_hover_text("Integrated tasks are merged into it, and tasks with dependencies branch from it");
         }
+        let ticket_config = self.runtime.ticket_config();
+        let mut sync_tickets = false;
+        if let Some(link) = self.runtime.plans[self.runtime.selected_plan].ticket.clone() {
+            let plan = &self.runtime.plans[self.runtime.selected_plan];
+            ui.horizontal_wrapped(|ui| {
+                let system = ticket_config.as_ref().map_or(link.system.as_str(), |c| c.system.as_str());
+                let what = match ticket_config.as_ref().map(|c| c.mode) {
+                    Some(imacs_core::tickets::TicketMode::Board) => "board",
+                    _ => "ticket",
+                };
+                ui.label(RichText::new(format!("{system} {what}")).color(p.muted).size(11.5));
+                let means = ticket_config
+                    .as_ref()
+                    .filter(|c| c.mode == imacs_core::tickets::TicketMode::Ticket)
+                    .and_then(|c| c.states.status_of(link.state.as_deref()?))
+                    .map(|ticket| (ticket, imacs_core::tickets::plan_status(plan)));
+                ui.vertical(|ui| ticket_chip(ui, &link, means, &p));
+                if let Some(title) = &link.title {
+                    ui.label(RichText::new(title).color(p.foreground).size(11.5));
+                }
+                if let Some(items) = self.runtime.tickets.boards.get(&plan.id) {
+                    let planned = |item: &imacs_core::tickets::TicketLink| {
+                        plan.tasks.iter().any(|t| t.ticket.as_ref().is_some_and(|l| l.same_ticket(item)))
+                    };
+                    let loose = items.iter().filter(|item| !planned(item)).count();
+                    ui.label(
+                        RichText::new(format!("{} tickets · {loose} without a task", items.len()))
+                            .color(if loose > 0 { p.warning } else { p.muted })
+                            .size(11.5),
+                    );
+                }
+                if ticket_config.is_some() {
+                    sync_tickets = ui.small_button("sync").on_hover_text("Read the tickets again now").clicked();
+                }
+            });
+        }
         if self.runtime.plans[self.runtime.selected_plan].status == PlanStatus::Completed {
             ui.label(
                 RichText::new("Completed · preview cleanup to check what is merged and safe to remove.").color(p.muted),
@@ -136,6 +233,7 @@ impl Desktop<'_> {
         let expanded = &mut self.client.expanded_tasks;
         let integrating = &self.runtime.integrating;
         let plan_id = self.runtime.plans[self.runtime.selected_plan].id.clone();
+        let ticket_states = ticket_config.as_ref().map(|c| c.states.clone());
         let mut edited_tasks = self.runtime.plans[self.runtime.selected_plan].tasks.clone();
         let tasks = &mut edited_tasks;
         if !tasks.is_empty() {
@@ -198,6 +296,13 @@ impl Desktop<'_> {
                                                         meta.push_str(&format!(" {model}"));
                                                     }
                                                     ui.label(RichText::new(meta).color(p.muted).size(11.0));
+                                                    if let Some(link) = &task.ticket {
+                                                        let means = ticket_states
+                                                            .as_ref()
+                                                            .and_then(|s| s.status_of(link.state.as_deref()?))
+                                                            .map(|ticket| (ticket, task.status));
+                                                        ticket_chip(ui, link, means, &p);
+                                                    }
                                                     if let Some(branch) = &task.branch {
                                                         ui.add(
                                                             egui::Label::new(
@@ -402,11 +507,17 @@ impl Desktop<'_> {
                             if state.plans[index].status != PlanStatus::Open {
                                 return;
                             }
-                            if let Some(task) = state.plans[index].task_mut(&id) {
+                            let old = state.plans[index].task_mut(&id).map(|task| {
+                                let old = task.status;
                                 task.set_status(status);
-                            }
+                                old
+                            });
                             state.finish_plan_agents();
                             state.save_plan(index);
+                            if let Some(old) = old {
+                                let author = imacs_core::tickets::Author::User;
+                                state.ticket_status_changed(index, &id, old, status, None, author);
+                            }
                         });
                     }
                 }
@@ -417,6 +528,12 @@ impl Desktop<'_> {
                 state.plans[index].approved = true;
                 state.save_plan(index);
                 state.toast("Plan approved: the orchestrator can dispatch it now");
+            });
+        }
+        if sync_tickets {
+            self.post_plan(self.runtime.selected_plan, |state, index| {
+                let id = state.plans[index].id.clone();
+                state.resync_tickets(&id);
             });
         }
         if dispatch_all {

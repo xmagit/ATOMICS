@@ -42,7 +42,9 @@ impl State {
             }
             ControlRequest::PlanUpdate { plan, .. }
             | ControlRequest::PlanDispatch { plan, .. }
-            | ControlRequest::PlanIntegrate { plan, .. } => Some(plan.as_deref()),
+            | ControlRequest::PlanIntegrate { plan, .. }
+            | ControlRequest::TicketLink { plan, .. }
+            | ControlRequest::TicketComment { plan, .. } => Some(plan.as_deref()),
             _ => None,
         };
         let target = if let Some(id) = target {
@@ -117,7 +119,7 @@ impl State {
                     }
                 }
                 let statuses = if statuses.is_empty() {
-                    vec!["turn done".into(), "needs you".into(), "exited".into(), "reported".into()]
+                    vec!["turn done".into(), "needs you".into(), "exited".into(), "reported".into(), "ticket".into()]
                 } else {
                     statuses
                 };
@@ -143,7 +145,7 @@ impl State {
                     done(ControlResponse::ok(result))
                 }
             },
-            ControlRequest::PlanSet { plan, goal, tasks, integration } => {
+            ControlRequest::PlanSet { plan, goal, tasks, integration, ticket } => {
                 let new = plan.is_none();
                 let index = if plan.is_some() {
                     target
@@ -152,7 +154,12 @@ impl State {
                     self.plans.push(Plan { id, ..Plan::default() });
                     self.plans.len() - 1
                 };
+                let tasks =
+                    tasks.into_iter().map(|t| Task { ticket: self.stamp_system(t.ticket.clone()), ..t }).collect();
                 self.plans[index].replace(goal, tasks);
+                let ticket = self.stamp_system(ticket);
+                self.plans[index].ticket =
+                    imacs_core::tickets::TicketLink::relink(ticket, self.plans[index].ticket.as_ref());
                 if let Some(branch) = integration.filter(|b| !b.trim().is_empty()) {
                     self.plans[index].integration = Some(branch.trim().to_string());
                 }
@@ -167,6 +174,8 @@ impl State {
                     });
                 self.plans[index].project = project.and_then(|p| self.project_of(&p));
                 self.save_plan(index);
+                let id = self.plans[index].id.clone();
+                self.refresh_tickets(Some(&id), None);
                 if new || (self.plan_view && self.selected_plan == index) {
                     self.selected_plan = index;
                     self.show_plan_fleet();
@@ -205,6 +214,8 @@ impl State {
             {
                 None => done(ControlResponse::error(format!("no task {id}"))),
                 Some(task) => {
+                    let old = task.status;
+                    let accepted = note.clone();
                     if let Some(status) = &status {
                         match TaskStatus::parse(status) {
                             Some(status) => task.set_status(status),
@@ -231,6 +242,10 @@ impl State {
                     }
                     self.finish_plan_agents();
                     self.save_plan(target);
+                    if let Some(new) = self.plans[target].tasks.iter().find(|t| t.id == id).map(|t| t.status) {
+                        let author = self.chief_author();
+                        self.ticket_status_changed(target, &id, old, new, accepted.as_deref(), author);
+                    }
                     done(ControlResponse::ok(self.plan_mutation_json(target, Some(&id))))
                 }
             },
@@ -242,6 +257,28 @@ impl State {
                 // Committing and merging can take a while: answer once it is done.
                 self.integrate(target, &id, Some(reply));
                 return;
+            }
+            ControlRequest::TicketLink { plan: _, task, ticket, create, unlink } => {
+                self.link_ticket(target, task, ticket, create, unlink, reply);
+                return;
+            }
+            ControlRequest::TicketSync { plan } => {
+                self.sync_tickets(plan, reply);
+                return;
+            }
+            ControlRequest::TicketComment { plan: _, task, text } => {
+                self.comment_ticket(target, task, text, reply);
+                return;
+            }
+            ControlRequest::TicketEvent { system, id, key, board, state, title, url, updated_at } => {
+                let fields = imacs_core::tickets::TicketLink { state, title, url, updated_at, ..Default::default() };
+                done(ControlResponse::ok(self.ticket_event(
+                    system.as_deref(),
+                    id.as_deref(),
+                    key.as_deref(),
+                    board.as_deref(),
+                    fields,
+                )))
             }
             ControlRequest::Report { pane, status, summary } => {
                 let task = self.report(pane.as_deref(), &status, &summary);
@@ -487,6 +524,7 @@ impl State {
                     report: None,
                     approval: session.approvals.first().map(|pending| pending.request.clone()),
                     findings: None,
+                    ticket: None,
                 });
             }
         }
@@ -504,7 +542,12 @@ impl State {
                 .events
                 .iter()
                 .filter(|e| e.seq > waiter.after)
-                .filter(|e| e.findings.is_some() || waiter.sessions.is_empty() || waiter.sessions.contains(&e.session))
+                .filter(|e| {
+                    e.findings.is_some()
+                        || e.ticket.is_some()
+                        || waiter.sessions.is_empty()
+                        || waiter.sessions.contains(&e.session)
+                })
                 .filter(|e| waiter.statuses.iter().any(|s| s == e.kind()))
                 .map(StatusEvent::to_json)
                 .collect();

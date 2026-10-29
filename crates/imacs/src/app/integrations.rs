@@ -29,7 +29,7 @@ impl State {
                 continue;
             }
             if let Some(task) = self.plans[index].task_mut(&checked.task.id)
-                && *task == checked.task
+                && same_work(task, &checked.task)
             {
                 task.integration_verified = checked.valid == Some(true);
                 if checked.valid == Some(false) {
@@ -49,7 +49,7 @@ impl State {
                 let key = (plan.id.clone(), task.id.clone());
                 if task.integrated.as_deref() != Some(&into)
                     || self.integration_checked.get(&key).is_some_and(|(revision, branch, checked)| {
-                        *revision == self.integration_revision && branch == &into && checked == task
+                        *revision == self.integration_revision && branch == &into && same_work(checked, task)
                     })
                 {
                     continue;
@@ -207,6 +207,13 @@ impl State {
             let _ = reply.send(ControlOutcome::Done(response));
         }
     }
+}
+
+/// Whether a task's work is unchanged: its ticket link follows the ticket system and
+/// says nothing about its branch.
+fn same_work(a: &Task, b: &Task) -> bool {
+    let strip = |task: &Task| Task { ticket: None, ..task.clone() };
+    strip(a) == strip(b)
 }
 
 #[cfg(test)]
