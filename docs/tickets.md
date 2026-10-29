@@ -32,9 +32,16 @@ with an MCP server, changes only the config.
   Failures show on the card and in `imacs_plan_get`, and IMACS carries on. After a connection failure,
   jobs fail at once for 15 seconds instead of each waiting for a server that is down. A failed state
   update is retried on the next heartbeat or sync, not on every tick.
-- **No secrets in errors.** Before an error is stored on a link or returned to a caller, IMACS redacts the
-  `token_env` value, secret-looking `server.env` values, bearer and basic credentials, `Authorization`
-  values, URL user info and secret-looking query values, and bounds it to 600 characters.
+- **No secrets in plans or replies.** Everything a ticket server sends is cleaned before it leaves the
+  worker, using the credentials of the job that produced it (the `token_env` value and secret-looking
+  `server.env` values), so a result arriving after a rotation is cleaned with the old ones:
+  - Errors lose those credentials in any encoding (raw, percent-encoded, JSON- or `\u`-escaped), bearer and
+    basic credentials, `Authorization` values, URL user info, secret-looking query values, and long runs
+    that look like tokens. A message whose credential is split across lines or content blocks is withheld
+    whole, and every error is bounded to 600 characters.
+  - Every ticket field read (title, key, state, URL, update time) loses those credentials too, and URLs
+    lose user info and secret-looking query and fragment parameters, so the card's link never carries one.
+  - Webhook fields and links the chief gives are cleaned the same way when they arrive.
 
 ## Configuration
 

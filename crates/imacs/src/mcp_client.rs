@@ -536,19 +536,42 @@ pub(crate) mod tests {
         assert!(McpClient::connect(&McpServer::default(), Duration::from_secs(1), |_| None).is_err());
     }
 
+    /// Runs `call` on a thread of its own and fails the test when it has not returned within
+    /// `limit`, killing `pid` so the stuck write ends: a regression to a write without a
+    /// deadline then fails instead of hanging the whole suite.
+    fn bounded<T: Send + 'static>(limit: Duration, pid: u32, call: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(call());
+        });
+        match rx.recv_timeout(limit) {
+            Ok(value) => value,
+            Err(_) => {
+                // SAFETY: kill only signals the child this test started.
+                unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                panic!("the call did not return within {limit:?}: a stdio write has no deadline");
+            }
+        }
+    }
+
+    fn stdio_pid(client: &McpClient) -> u32 {
+        match &client.transport {
+            Transport::Stdio(server) => server.child.id(),
+            Transport::Http(_) => panic!("not a stdio client"),
+        }
+    }
+
     #[test]
     fn stdio_write_to_a_server_that_never_reads_times_out_and_kills_it() {
         let program = fake_server().display().to_string();
         let config = stdio(vec![program.clone(), "--no-read".into()]);
         let mut server = StdioServer::spawn(&program, &config.command[1..], &config).unwrap();
         let started = Instant::now();
-        let error = server
-            .exchange(
-                &json!({"method": "large", "params": "x".repeat(4 * 1024 * 1024)}),
-                Some(1),
-                Duration::from_millis(300),
-            )
-            .unwrap_err();
+        let (error, mut server) = bounded(Duration::from_secs(10), server.child.id(), move || {
+            let message = json!({"method": "large", "params": "x".repeat(4 * 1024 * 1024)});
+            let error = server.exchange(&message, Some(1), Duration::from_millis(300)).unwrap_err();
+            (error, server)
+        });
         assert!(matches!(&error, McpError::Transport(m) if m.contains("did not answer")), "{error:?}");
         assert!(started.elapsed() < Duration::from_secs(3));
         assert!(!server.child.wait().unwrap().success(), "the timeout must kill the child");
@@ -561,9 +584,10 @@ pub(crate) mod tests {
         let mut client = McpClient::connect(&config, Duration::from_secs(2), |_| None).unwrap();
         client.timeout = Duration::from_millis(300);
         let started = Instant::now();
-        let error = client.call_tool("comment", json!({"body": "x".repeat(4 * 1024 * 1024)})).unwrap_err();
+        let error = bounded(Duration::from_secs(10), stdio_pid(&client), move || {
+            client.call_tool("comment", json!({"body": "x".repeat(4 * 1024 * 1024)})).unwrap_err()
+        });
         assert!(matches!(&error, McpError::Transport(m) if m.contains("did not answer")), "{error:?}");
-        drop(client);
         assert!(started.elapsed() < Duration::from_secs(3));
     }
 

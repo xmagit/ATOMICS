@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
-use imacs_core::tickets::{McpServer, TicketConfig, TicketLink, Vars};
+use imacs_core::tickets::{self, McpServer, TicketConfig, TicketLink, Vars};
 use serde_json::Value;
 
 use crate::mcp_client::{McpClient, McpError};
@@ -14,6 +14,10 @@ use crate::mcp_client::{McpClient, McpError};
 /// After a connection failure, jobs fail at once for this long instead of each
 /// waiting for a server that is down.
 const BACKOFF: Duration = Duration::from_secs(15);
+
+/// How long a variable that was set nowhere is not looked up again (each lookup may start
+/// a login shell).
+const MISSING_ENV: Duration = Duration::from_secs(60);
 
 pub enum TicketOp {
     Get(TicketLink),
@@ -52,7 +56,11 @@ pub fn spawn<T: Send + 'static>(done: crate::host::Sender<(T, Result<TicketOutpu
         .spawn(move || {
             let mut worker = Worker::default();
             while let Ok(job) = rx.recv() {
+                // Everything a job brings back is cleaned with the secrets it ran with, so a
+                // result arriving after a config change never carries the old credentials.
+                worker.secrets = worker.secrets_of(&job.config);
                 let result = worker.run(&job.config, job.op);
+                let result = worker.clean(result);
                 if done.send((job.tag, result)).is_err() {
                     break;
                 }
@@ -65,10 +73,43 @@ pub fn spawn<T: Send + 'static>(done: crate::host::Sender<(T, Result<TicketOutpu
 #[derive(Default)]
 struct Worker {
     client: Option<(McpServer, McpClient)>,
-    down: Option<(Instant, String)>,
+    /// The server that failed, when, and its cleaned error.
+    down: Option<(McpServer, Instant, String)>,
+    /// The current job's secrets.
+    secrets: Vec<String>,
+    /// Variables recently found set nowhere.
+    missing: std::collections::HashMap<String, Instant>,
 }
 
 impl Worker {
+    /// The job's secrets as they are now, so a rotated token is never missed.
+    fn secrets_of(&mut self, config: &TicketConfig) -> Vec<String> {
+        let missing = &mut self.missing;
+        tickets::secrets_of(config, |name| {
+            if missing.get(name).is_some_and(|at| at.elapsed() < MISSING_ENV) {
+                return std::env::var(name).ok().filter(|v| !v.trim().is_empty());
+            }
+            let value = crate::setup::env_var(name);
+            match &value {
+                None => missing.insert(name.to_string(), Instant::now()),
+                Some(_) => missing.remove(name),
+            };
+            value
+        })
+    }
+
+    /// Errors and everything read from the server, before it leaves the worker.
+    fn clean(&self, result: Result<TicketOutput, String>) -> Result<TicketOutput, String> {
+        let error = |error: String| tickets::redact(&error, &self.secrets);
+        let link = |link: TicketLink| tickets::clean_link(link, &self.secrets);
+        Ok(match result.map_err(error)? {
+            TicketOutput::Ticket(ticket) => TicketOutput::Ticket(link(ticket)),
+            TicketOutput::Tickets(tickets) => TicketOutput::Tickets(tickets.into_iter().map(link).collect()),
+            TicketOutput::Read(value) => TicketOutput::Read(tickets::clean_value(value, &self.secrets)),
+            TicketOutput::Pushed(read) => TicketOutput::Pushed(read.map(|read| read.map(link).map_err(error))),
+        })
+    }
+
     fn run(&mut self, config: &TicketConfig, op: TicketOp) -> Result<TicketOutput, String> {
         let system = config.system.as_str();
         match op {
@@ -116,7 +157,8 @@ impl Worker {
     fn call(&mut self, config: &TicketConfig, name: &str, vars: &Vars) -> Result<Value, String> {
         let operation = config.operation(name).ok_or_else(|| format!("operations.{name} is not configured"))?;
         let arguments = operation.arguments(vars)?;
-        if let Some((since, error)) = &self.down
+        if let Some((server, since, error)) = &self.down
+            && *server == config.server
             && since.elapsed() < BACKOFF
         {
             return Err(format!("{} is unavailable: {error}", config.system));
@@ -126,7 +168,7 @@ impl Worker {
             let timeout = Duration::from_secs(config.timeout_secs.max(1));
             match McpClient::connect(&config.server, timeout, crate::setup::env_var) {
                 Ok(client) => self.client = Some((config.server.clone(), client)),
-                Err(err) => return Err(self.broken(err)),
+                Err(err) => return Err(self.broken(&config.server, err)),
             }
         }
         let (_, client) = self.client.as_mut().expect("connected");
@@ -135,14 +177,16 @@ impl Worker {
                 self.down = None;
                 Ok(imacs_core::tickets::tool_output(&result))
             }
-            Err(err) => Err(self.broken(err)),
+            Err(err) => Err(self.broken(&config.server, err)),
         }
     }
 
-    fn broken(&mut self, err: McpError) -> String {
+    /// The backoff remembers the failure cleaned with this job's secrets: a later job may
+    /// run with others.
+    fn broken(&mut self, server: &McpServer, err: McpError) -> String {
         if let McpError::Transport(message) = &err {
             self.client = None;
-            self.down = Some((Instant::now(), message.clone()));
+            self.down = Some((server.clone(), Instant::now(), tickets::redact(message, &self.secrets)));
         }
         err.to_string()
     }

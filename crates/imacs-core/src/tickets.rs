@@ -513,19 +513,207 @@ impl FieldPaths {
     }
 }
 
-/// Text from a ticket server made safe to store and show: the given secrets, bearer and
-/// basic credentials, `Authorization` values, URL user info and secret-looking query
-/// values become `***`, and the result is at most [`MAX_ERROR_CHARS`] long.
+/// The credentials a config runs with, which nothing from its server may carry into plans
+/// or replies: the `token_env` value and secret-looking `server.env` values.
+pub fn secrets_of(config: &TicketConfig, env: impl FnMut(&str) -> Option<String>) -> Vec<String> {
+    let secret_name = |name: &str| {
+        let name = name.to_ascii_uppercase();
+        ["TOKEN", "KEY", "SECRET", "PASSWORD", "AUTH", "CREDENTIAL"].iter().any(|s| name.contains(s))
+    };
+    let token = config.server.token_env.as_deref().map(str::trim).filter(|name| !name.is_empty()).and_then(env);
+    let values = config.server.env.iter().filter(|(name, _)| secret_name(name)).map(|(_, value)| value.clone());
+    token.into_iter().chain(values).collect()
+}
+
+/// What replaces a server message that still held a known secret after masking, such
+/// as one split across lines or content blocks.
+pub const WITHHELD: &str = "the ticket server's message was withheld because it contained a credential";
+
+/// An error from a ticket server made safe to store and show. Known secrets in any
+/// encoding, bearer and basic credentials, `Authorization` values, URL user info,
+/// secret-looking query values and long credential-like runs become `***`; a message
+/// whose secret was split by a line or block break is withheld whole. The result is at
+/// most [`MAX_ERROR_CHARS`] long.
 pub fn redact(text: &str, secrets: &[String]) -> String {
-    let mut out = text.to_string();
-    for secret in secrets.iter().map(|s| s.trim()).filter(|s| s.chars().count() >= 6) {
-        out = out.replace(secret, "***");
+    let secrets = usable(secrets);
+    let masked = mask(text, &secrets);
+    let collapsed: String = masked.chars().filter(|c| !c.is_whitespace()).collect();
+    if secrets.iter().any(|secret| find_secret(&collapsed, secret, 0).is_some()) {
+        return WITHHELD.into();
     }
-    let out = redact_query(&redact_userinfo(&redact_credentials(&out)));
+    let out = redact_runs(&redact_query(&redact_userinfo(&redact_credentials(&masked))));
     match out.char_indices().nth(MAX_ERROR_CHARS) {
         Some((cut, _)) => format!("{}…", &out[..cut]),
         None => out,
     }
+}
+
+/// A ticket as a server described it, safe to store and show: known secrets in any of its
+/// fields are masked, and its URL loses user info and secret-looking parameters.
+pub fn clean_link(link: TicketLink, secrets: &[String]) -> TicketLink {
+    let secrets = usable(secrets);
+    let text = |field: Option<String>| field.map(|text| mask(&text, &secrets));
+    TicketLink {
+        id: mask(&link.id, &secrets),
+        key: text(link.key),
+        url: link.url.map(|url| strip_url(&mask(&url, &secrets))),
+        title: text(link.title),
+        state: text(link.state),
+        updated_at: text(link.updated_at),
+        pushed_state: text(link.pushed_state),
+        error: link.error.map(|error| redact(&error, &usable_owned(&secrets))),
+        ..link
+    }
+}
+
+/// A ticket read for an agent: every string keeps its text, with known secrets, URL user
+/// info and secret-looking query values masked in place.
+pub fn clean_value(value: Value, secrets: &[String]) -> Value {
+    let usable = usable(secrets);
+    fn walk(value: Value, secrets: &[&str]) -> Value {
+        match value {
+            Value::String(text) => Value::String(redact_query(&redact_userinfo(&mask(&text, secrets)))),
+            Value::Array(items) => Value::Array(items.into_iter().map(|v| walk(v, secrets)).collect()),
+            Value::Object(map) => Value::Object(map.into_iter().map(|(k, v)| (k, walk(v, secrets))).collect()),
+            other => other,
+        }
+    }
+    walk(value, &usable)
+}
+
+fn usable_owned(secrets: &[&str]) -> Vec<String> {
+    secrets.iter().map(|s| s.to_string()).collect()
+}
+
+/// A URL without user info and without secret-looking query or fragment parameters, so
+/// the open action and stored plans never carry a credential.
+fn strip_url(url: &str) -> String {
+    let Some(scheme) = url.find("://") else { return url.to_string() };
+    let start = scheme + 3;
+    let authority_end = url[start..].find(['/', '?', '#']).map_or(url.len(), |end| start + end);
+    let host = url[start..authority_end].rfind('@').map_or(start, |at| start + at + 1);
+    let mut out = format!("{}{}", &url[..start], &url[host..authority_end]);
+    let rest = &url[authority_end..];
+    let (rest, fragment) = rest.split_once('#').map_or((rest, None), |(rest, fragment)| (rest, Some(fragment)));
+    let (path, query) = rest.split_once('?').map_or((rest, None), |(path, query)| (path, Some(query)));
+    out.push_str(path);
+    let public = |params: &str| {
+        params
+            .split('&')
+            .filter(|param| !param.is_empty() && !secret_param(param.split('=').next().unwrap_or_default()))
+            .collect::<Vec<_>>()
+            .join("&")
+    };
+    if let Some(query) = query.map(public).filter(|query| !query.is_empty()) {
+        out.push('?');
+        out.push_str(&query);
+    }
+    match fragment {
+        Some(fragment) if fragment.contains('=') => {
+            let fragment = public(fragment);
+            if !fragment.is_empty() {
+                out.push('#');
+                out.push_str(&fragment);
+            }
+        }
+        Some(fragment) => {
+            out.push('#');
+            out.push_str(fragment);
+        }
+        None => {}
+    }
+    out
+}
+
+/// Parameter names that carry credentials.
+fn secret_param(name: &str) -> bool {
+    const SECRET: &[&str] =
+        &["token", "key", "secret", "password", "passwd", "pwd", "auth", "sig", "credential", "session", "code"];
+    let name = name.to_ascii_lowercase();
+    SECRET.iter().any(|secret| name.contains(secret))
+}
+
+/// Secrets long enough to look for without masking ordinary words.
+fn usable(secrets: &[String]) -> Vec<&str> {
+    secrets.iter().map(|s| s.trim()).filter(|s| s.chars().count() >= 6).collect()
+}
+
+/// Known secrets, in any encoding, become `***`.
+fn mask(text: &str, secrets: &[&str]) -> String {
+    let mut out = text.to_string();
+    for secret in secrets {
+        let mut masked = String::with_capacity(out.len());
+        let mut pos = 0;
+        while let Some((start, end)) = find_secret(&out, secret, pos) {
+            masked.push_str(&out[pos..start]);
+            masked.push_str("***");
+            pos = end;
+        }
+        masked.push_str(&out[pos..]);
+        out = masked;
+    }
+    out
+}
+
+/// Where `secret` first occurs in `text` from byte `from`, with each of its characters
+/// written raw, percent-encoded, JSON-escaped (`\/`, `\\`, `\"`) or `\u`-escaped, in
+/// any mix, as JSON bodies and URLs echo them.
+fn find_secret(text: &str, secret: &str, from: usize) -> Option<(usize, usize)> {
+    (from..text.len())
+        .filter(|&start| text.is_char_boundary(start))
+        .find_map(|start| secret.chars().try_fold(start, |at, c| encoded_char(text, at, c)).map(|end| (start, end)))
+}
+
+/// Where `c` ends when it is written at byte `at` of `text` in one of its encodings.
+fn encoded_char(text: &str, at: usize, c: char) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let rest = &bytes[at..];
+    let mut raw = [0u8; 4];
+    let raw = c.encode_utf8(&mut raw).as_bytes();
+    if rest.starts_with(raw) {
+        return Some(at + raw.len());
+    }
+    let hex = |digits: &[u8]| std::str::from_utf8(digits).ok().and_then(|d| u32::from_str_radix(d, 16).ok());
+    if rest.len() >= 6 && rest.starts_with(b"\\u") && hex(&rest[2..6]) == Some(c as u32) {
+        return Some(at + 6);
+    }
+    if matches!(c, '/' | '\\' | '"') && rest.len() >= 2 && rest[0] == b'\\' && rest[1] == c as u8 {
+        return Some(at + 2);
+    }
+    let mut end = at;
+    for byte in raw {
+        let encoded = bytes.get(end..end + 3)?;
+        if encoded[0] != b'%' || hex(&encoded[1..]) != Some(u32::from(*byte)) {
+            return None;
+        }
+        end += 3;
+    }
+    Some(end)
+}
+
+/// Long runs of credential characters mixing letters and digits, like the tokens of most
+/// services, become `***` even when IMACS was never told the secret.
+fn redact_runs(text: &str) -> String {
+    let credential = |c: char| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '_' | '%' | '.' | '-' | '\\');
+    let mut out = String::with_capacity(text.len());
+    let mut run = String::new();
+    let flush = |run: &mut String, out: &mut String| {
+        let looks_like_credential = run.chars().count() >= 24
+            && run.chars().any(|c| c.is_ascii_digit())
+            && run.chars().any(|c| c.is_ascii_alphabetic());
+        out.push_str(if looks_like_credential { "***" } else { run });
+        run.clear();
+    };
+    for c in text.chars() {
+        if credential(c) {
+            run.push(c);
+        } else {
+            flush(&mut run, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut run, &mut out);
+    out
 }
 
 fn value_end(c: char) -> bool {
@@ -609,8 +797,6 @@ fn redact_userinfo(text: &str) -> String {
 
 /// `?access_token=…` and `&api_key=…` and the like keep their names only.
 fn redact_query(text: &str) -> String {
-    const SECRET: &[&str] =
-        &["token", "key", "secret", "password", "passwd", "pwd", "auth", "sig", "credential", "session", "code"];
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
     while let Some(found) = text[i..].find(['?', '&']) {
@@ -619,8 +805,7 @@ fn redact_query(text: &str) -> String {
         let name_end = text[name_start..]
             .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '[' | ']')))
             .map_or(text.len(), |end| name_start + end);
-        let name = text[name_start..name_end].to_ascii_lowercase();
-        if text[name_end..].starts_with('=') && SECRET.iter().any(|s| name.contains(s)) {
+        if text[name_end..].starts_with('=') && secret_param(&text[name_start..name_end]) {
             out.push_str(&text[name_start..=name_end]);
             out.push_str("***");
             i = skip_value(text, name_end + 1);
@@ -1043,6 +1228,70 @@ mod tests {
         assert!(comment.arguments(&Vars::new("alpha").ticket(&ticket)).unwrap_err().contains("{body}"));
         assert!(config.operation("update_state").is_none());
         assert!(!TicketConfig::default().is_configured());
+    }
+
+    #[test]
+    fn redaction_finds_secrets_in_any_encoding_and_unknown_credentials() {
+        let token = "sk/abc+def=ghi_123";
+        let secrets = vec![token.to_string()];
+        for leaked in [
+            token,
+            "sk%2Fabc%2Bdef%3Dghi_123",
+            "sk%2fabc%2bdef%3dghi_123",
+            "sk\\/abc+def=ghi_123",
+            "sk\\u002fabc\\u002Bdef\\u003dghi_123",
+            "sk\\/abc%2Bdef\\u003dghi_123",
+        ] {
+            assert_eq!(
+                redact(&format!("said {leaked} twice: {leaked}."), &secrets),
+                "said *** twice: ***.",
+                "{leaked}"
+            );
+        }
+        // Content blocks are joined with newlines, which can split a secret.
+        let split = redact("tool failed: key sk/abc+de\nf=ghi_123 rejected", &secrets);
+        assert!(!split.contains("ghi_123") && !split.contains("sk/abc"), "{split}");
+        assert!(split.contains("withheld"), "{split}");
+        // Credentials IMACS was never told about: long runs of letters and digits.
+        assert_eq!(redact("upstream key ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3 rejected", &[]), "upstream key *** rejected");
+        assert_eq!(redact("token: dGhpcyBpcyBhIHNlY3JldCB0b2tlbiAxMjM0NTY3OA==", &[]), "token: ***");
+        for kept in
+            ["no ticket ENG-123 in /usr/local/lib/node_modules/mcp-remote", "rate limited until 2026-10-29T10:00:00Z"]
+        {
+            assert_eq!(redact(kept, &secrets), kept);
+        }
+    }
+
+    #[test]
+    fn tickets_read_from_a_server_lose_secrets_in_every_field() {
+        let secrets = vec!["tok/en+42=".to_string()];
+        let read = TicketLink {
+            system: "alpha".into(),
+            id: "7".into(),
+            key: Some("AL-7".into()),
+            title: Some("Rotate tok%2Fen%2B42%3D now".into()),
+            state: Some("Doing".into()),
+            url: Some("https://me:pw@t.example/7?view=full&access_token=x&API_KEY=y#code=z&tab=2".into()),
+            updated_at: Some("2026-10-29".into()),
+            ..TicketLink::default()
+        };
+        let clean = clean_link(read.clone(), &secrets);
+        assert_eq!(clean.title.as_deref(), Some("Rotate *** now"));
+        assert_eq!(clean.url.as_deref(), Some("https://t.example/7?view=full#tab=2"));
+        assert_eq!(TicketLink { title: read.title.clone(), url: read.url.clone(), ..clean.clone() }, read);
+        for (url, expected) in [
+            ("https://t.example/7", "https://t.example/7"),
+            ("https://t.example/7?token=1", "https://t.example/7"),
+            ("https://t.example/7#section", "https://t.example/7#section"),
+            ("not a url ?token=1", "not a url ?token=1"),
+        ] {
+            assert_eq!(strip_url(url), expected);
+        }
+        let value = json!({"title": "see https://a:b@x.example/?key=tok/en+42=&q=1", "n": 3, "list": ["tok\\/en+42="]});
+        assert_eq!(
+            clean_value(value, &secrets),
+            json!({"title": "see https://***@x.example/?key=***&q=1", "n": 3, "list": ["***"]})
+        );
     }
 
     #[test]

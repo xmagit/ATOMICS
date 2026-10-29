@@ -362,15 +362,10 @@ impl State {
 
     /// Secrets that ticket errors must never carry into plan files or replies: the
     /// token and the server's secret-looking environment values.
+    /// The worker already cleans what a job brings back with that job's own secrets; this
+    /// second pass covers text made here, such as webhook fields.
     fn ticket_secrets(&self) -> Vec<String> {
-        let Some(config) = self.ticket_config() else { return Vec::new() };
-        let secret_name = |name: &str| {
-            let name = name.to_ascii_uppercase();
-            ["TOKEN", "KEY", "SECRET", "PASSWORD", "AUTH", "CREDENTIAL"].iter().any(|s| name.contains(s))
-        };
-        let token = config.server.token_env.as_deref().and_then(crate::setup::known_env_var);
-        let env = config.server.env.iter().filter(|(name, _)| secret_name(name)).map(|(_, value)| value.clone());
-        token.into_iter().chain(env).collect()
+        self.ticket_config().map_or_else(Vec::new, |config| ticket::secrets_of(&config, crate::setup::known_env_var))
     }
 
     /// Where ticket errors leave the MCP layer: redacted and bounded before they are
@@ -655,6 +650,8 @@ impl State {
         board: Option<&str>,
         fields: TicketLink,
     ) -> serde_json::Value {
+        // Webhook fields come from outside like server results and are cleaned the same way.
+        let fields = ticket::clean_link(fields, &self.ticket_secrets());
         let mut matched: Vec<LinkKey> = Vec::new();
         let mut boards: Vec<String> = Vec::new();
         let config = self.ticket_config();
@@ -780,9 +777,10 @@ impl State {
         Some(summary)
     }
 
-    /// Fills in the configured system for a link given without one.
+    /// A link given by the chief: cleaned like a ticket read from the server, and given
+    /// the configured system when it names none.
     pub(super) fn stamp_system(&self, link: Option<TicketLink>) -> Option<TicketLink> {
-        link.map(|mut link| {
+        link.map(|link| ticket::clean_link(link, &self.ticket_secrets())).map(|mut link| {
             if link.system.is_empty()
                 && let Some(config) = self.ticket_config()
             {
@@ -810,11 +808,10 @@ impl State {
         {
             return fail(reply, format!("no task {task}"));
         }
-        if !unlink && given.is_none() && create.is_none() {
-            return fail(reply, "Give ticket (with its id), create (with a title), or unlink.".into());
-        }
-        let generation = self.relinked(key.clone());
+        // Each branch advances the slot's generation only once its request is valid, so a
+        // rejected request never cancels a pending create.
         if unlink {
+            self.relinked(key.clone());
             if let Some(slot) = self.link_slot(&key) {
                 *slot = None;
             }
@@ -833,6 +830,7 @@ impl State {
                 if link.id.trim().is_empty() {
                     return fail(reply, "ticket.id is required".into());
                 }
+                self.relinked(key.clone());
                 let old = self.link(&key).cloned();
                 let link = TicketLink::relink(self.stamp_system(Some(link)), old.as_ref());
                 if let Some(slot) = self.link_slot(&key) {
@@ -858,6 +856,7 @@ impl State {
                 if draft.title.trim().is_empty() {
                     return fail(reply, "create.title is required".into());
                 }
+                let generation = self.relinked(key.clone());
                 let board = self.plans[index].ticket.clone().filter(|board| config.accepts(board));
                 let batch = self.open_batch(reply, Answer::Link(key.clone()));
                 let op = TicketOp::Create { board, title: draft.title, body: draft.body };
@@ -1853,6 +1852,233 @@ mod tests {
     }
 
     #[test]
+    fn plan_set_supersedes_pending_creates_by_the_ids_tasks_end_up_with() {
+        with_app(
+            "app::tickets::tests::plan_set_supersedes_pending_creates_by_the_ids_tasks_end_up_with",
+            |app, ctx| {
+                let dir = tempfile::tempdir().unwrap();
+                let state = tickets_fixture(dir.path(), "CARD");
+                configure(app, CARDS, &state, |_| {});
+                let plan =
+                    request(app, json!({"cmd":"plan_set", "goal":"Ids", "ticket":{"id":"b1"}, "tasks":[{"id":"t1"}]}))
+                        .result["plan"]
+                        .as_str()
+                        .unwrap()
+                        .to_string();
+                let index = app.runtime.selected_plan;
+                settle(app);
+                let (tx, created) = channel();
+                let create = ControlRequest::TicketLink {
+                    plan: Some(plan.clone()),
+                    task: Some("t1".into()),
+                    ticket: None,
+                    create: Some(TicketDraft { title: "Created late".into(), body: String::new() }),
+                    unlink: false,
+                };
+                app.runtime.control(ctx, create, tx);
+                // A task without an id becomes t1, and its ticket is newer than the pending create.
+                assert!(
+                    request(
+                        app,
+                        json!({"cmd":"plan_set", "plan":plan, "goal":"Ids", "tasks":[{"id":" ", "ticket":{"id":"2"}}]})
+                    )
+                    .ok
+                );
+                settle(app);
+                created.recv_timeout(Duration::from_secs(1)).unwrap();
+                assert_eq!(app.runtime.plans[index].tasks[0].id, "t1");
+                assert_eq!(link(app, index, 0).label(), "CARD-2", "the plan_set link stays");
+            },
+        );
+    }
+
+    #[test]
+    fn a_rejected_link_request_leaves_a_pending_create_alone() {
+        with_app("app::tickets::tests::a_rejected_link_request_leaves_a_pending_create_alone", |app, ctx| {
+            let dir = tempfile::tempdir().unwrap();
+            let state = tickets_fixture(dir.path(), "CARD");
+            configure(app, CARDS, &state, |_| {});
+            let plan =
+                request(app, json!({"cmd":"plan_set", "goal":"Reject", "ticket":{"id":"b1"}, "tasks":[{"id":"a"}]}))
+                    .result["plan"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+            let index = app.runtime.selected_plan;
+            settle(app);
+            let link_request = |ticket: Option<TicketLink>, create: Option<TicketDraft>| ControlRequest::TicketLink {
+                plan: Some(plan.clone()),
+                task: Some("a".into()),
+                ticket,
+                create,
+                unlink: false,
+            };
+            let (tx, created) = channel();
+            app.runtime.control(
+                ctx,
+                link_request(None, Some(TicketDraft { title: "Wanted".into(), body: String::new() })),
+                tx,
+            );
+            for invalid in [
+                link_request(Some(TicketLink::default()), None),
+                link_request(None, Some(TicketDraft { title: " ".into(), body: String::new() })),
+                link_request(None, None),
+            ] {
+                let (tx, rx) = channel();
+                app.runtime.control(ctx, invalid, tx);
+                let ControlOutcome::Done(rejected) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else { panic!() };
+                assert!(!rejected.ok);
+            }
+            settle(app);
+            let ControlOutcome::Done(created) = created.recv_timeout(Duration::from_secs(1)).unwrap() else { panic!() };
+            assert!(created.ok && created.result["errors"] == json!([]), "{:?}", created);
+            assert!(link(app, index, 0).label().starts_with("NEW-"), "the created ticket is attached");
+        });
+    }
+
+    #[test]
+    fn late_results_are_cleaned_with_the_secrets_of_the_job_that_made_them() {
+        with_app(
+            "app::tickets::tests::late_results_are_cleaned_with_the_secrets_of_the_job_that_made_them",
+            |app, ctx| {
+                const OLD_KEY: &str = "alpha-key-7c1d9e";
+                const OLD_TOKEN: &str = "alpha-token-5b6c7d";
+                let dir = tempfile::tempdir().unwrap();
+                let state = tickets_fixture(dir.path(), "CARD");
+                let with_key = |key: &'static str| {
+                    move |config: &mut TicketConfig| {
+                        config.server.env.insert("API_KEY".into(), key.into());
+                    }
+                };
+                configure(app, CARDS, &state, with_key(OLD_KEY));
+                edit_fake(&state, |fake| {
+                    fake["fail"] = json!(["card_note"]);
+                    fake["fail_message"] = json!(format!("denied for {OLD_KEY}"));
+                });
+                let plan =
+                    request(app, json!({"cmd":"plan_set", "goal":"Rotate", "tasks":[{"id":"a", "ticket":{"id":"1"}}]}))
+                        .result["plan"]
+                        .as_str()
+                        .unwrap()
+                        .to_string();
+                let index = app.runtime.selected_plan;
+                settle(app);
+                // The comment is under way with the old key when the key is rotated.
+                let (tx, commented) = channel();
+                let comment = ControlRequest::TicketComment {
+                    plan: Some(plan.clone()),
+                    task: Some("a".into()),
+                    text: "Hi".into(),
+                };
+                app.runtime.control(ctx, comment, tx);
+                configure(app, CARDS, &state, with_key("bravo-key-2e8f4a"));
+                settle(app);
+                let ControlOutcome::Done(commented) = commented.recv_timeout(Duration::from_secs(1)).unwrap() else {
+                    panic!()
+                };
+                let reply = commented.error.unwrap();
+                assert!(reply.contains("denied for ***"), "{reply}");
+
+                // A server that dies printing the old token: the backoff message must not carry it later.
+                // SAFETY: no ticket job runs while the variable changes, and nothing else reads it.
+                unsafe { std::env::set_var("ROTATE_TOKEN", OLD_TOKEN) };
+                let dying = |config: &mut TicketConfig| {
+                    config.server.command =
+                        vec!["/bin/sh".into(), "-c".into(), "echo \"denied for $ROTATE_TOKEN\" >&2; exit 1".into()];
+                    config.server.token_env = Some("ROTATE_TOKEN".into());
+                };
+                configure(app, CARDS, &state, dying);
+                settle(app);
+                unsafe { std::env::set_var("ROTATE_TOKEN", "bravo-token-9a0b1c") };
+                let (tx, synced) = channel();
+                app.runtime.sync_tickets(Some(plan.clone()), tx);
+                settle(app);
+                let ControlOutcome::Done(synced) = synced.recv_timeout(Duration::from_secs(1)).unwrap() else {
+                    panic!()
+                };
+                let errors = synced.result["errors"].to_string();
+                assert!(errors.contains("unavailable"), "{errors}");
+
+                let saved =
+                    std::fs::read_to_string(paths::imacs_home().join("plans").join(format!("{plan}.json"))).unwrap();
+                for text in [&reply, &errors, &link(app, index, 0).error.unwrap_or_default(), &saved] {
+                    for secret in [OLD_KEY, OLD_TOKEN] {
+                        assert!(!text.contains(secret), "{secret} leaked into {text}");
+                    }
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn tickets_read_from_a_backend_are_cleaned_before_they_are_stored() {
+        with_app("app::tickets::tests::tickets_read_from_a_backend_are_cleaned_before_they_are_stored", |app, ctx| {
+            const TOKEN: &str = "sk-title-4d5e6f";
+            // SAFETY: set before the ticket worker starts; nothing else reads this variable.
+            unsafe { std::env::set_var("CARDS_TOKEN", TOKEN) };
+            let dir = tempfile::tempdir().unwrap();
+            let state = tickets_fixture(dir.path(), "CARD");
+            set_field(&state, "CARD-1", "title", &format!("Rotate {TOKEN} today"));
+            set_field(
+                &state,
+                "CARD-1",
+                "url",
+                &format!("https://bot:hunter22@cards.example/1?access_token={TOKEN}&view=full"),
+            );
+            configure(app, CARDS, &state, |config| config.server.token_env = Some("CARDS_TOKEN".into()));
+            let plan = request(
+                app,
+                json!({"cmd":"plan_set", "goal":"Clean", "ticket":{"id":"b1"}, "tasks":[
+                {"id":"a", "ticket":{"id":"1"}}, {"id":"b", "ticket":{"id":"2"}}, {"id":"c"}]}),
+            )
+            .result["plan"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let index = app.runtime.selected_plan;
+            settle(app);
+            let a = link(app, index, 0);
+            assert_eq!(a.title.as_deref(), Some("Rotate *** today"));
+            assert_eq!(a.url.as_deref(), Some("https://cards.example/1?view=full"));
+
+            // Fields from a webhook and links from the chief are cleaned the same way.
+            request(
+                app,
+                json!({"cmd":"ticket_event", "key":"CARD-2",
+                "url":"https://u:pw@cards.example/2?token=abc123xyz&tab=1", "title":format!("Echo {TOKEN}")}),
+            );
+            let b = link(app, index, 1);
+            assert_eq!(b.url.as_deref(), Some("https://cards.example/2?tab=1"));
+            assert_eq!(b.title.as_deref(), Some("Echo ***"));
+            let (tx, rx) = channel();
+            let linked = ControlRequest::TicketLink {
+                plan: Some(plan.clone()),
+                task: Some("c".into()),
+                ticket: Some(TicketLink {
+                    id: "3".into(),
+                    url: Some(format!("https://cards.example/3?api_key={TOKEN}")),
+                    ..TicketLink::default()
+                }),
+                create: None,
+                unlink: false,
+            };
+            app.runtime.control(ctx, linked, tx);
+            assert_eq!(link(app, index, 2).url.as_deref(), Some("https://cards.example/3"), "cleaned as given");
+            settle(app);
+            rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+            let saved =
+                std::fs::read_to_string(paths::imacs_home().join("plans").join(format!("{plan}.json"))).unwrap();
+            let got = request(app, json!({"cmd":"plan_get", "plan":plan})).result.to_string();
+            for text in [&saved, &got] {
+                for secret in [TOKEN, "hunter22", "pw@", "abc123xyz", "access_token", "api_key"] {
+                    assert!(!text.contains(secret), "{secret} reached {text}");
+                }
+            }
+        });
+    }
+
+    #[test]
     fn secrets_echoed_by_a_backend_never_reach_plans_or_replies() {
         with_app("app::tickets::tests::secrets_echoed_by_a_backend_never_reach_plans_or_replies", |app, ctx| {
             const TOKEN: &str = "sk-synthetic-7f3a9c";
@@ -1888,6 +2114,18 @@ mod tests {
             settle(app);
             let ControlOutcome::Done(commented) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else { panic!() };
             let reply = commented.error.unwrap();
+
+            // A token split across two content blocks, joined with a newline on the way in.
+            edit_fake(&state, |fake| fake["fail_message"] = json!(["rejected key sk-synthe", "tic-7f3a9c, try again"]));
+            let (tx, rx) = channel();
+            let comment =
+                ControlRequest::TicketComment { plan: Some(plan.clone()), task: Some("a".into()), text: "Hi".into() };
+            app.runtime.control(ctx, comment, tx);
+            settle(app);
+            let ControlOutcome::Done(split) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else { panic!() };
+            let split = split.error.unwrap();
+            assert!(!split.contains("7f3a9c") && !split.contains("sk-synthe"), "{split}");
+            assert!(split.contains("withheld"), "{split}");
 
             // A stdio server that prints its credentials to stderr before dying.
             let mut dying: TicketConfig = toml::from_str(CARDS).unwrap();
