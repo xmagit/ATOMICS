@@ -181,6 +181,12 @@ struct Launch {
     task: Option<(String, String)>,
 }
 
+/// A background worktree job completed all preparation needed before launch.
+struct PreparedWorktree {
+    path: PathBuf,
+    warmed: bool,
+}
+
 /// A finished plan integration, to note on its task and answer.
 struct Integrated {
     plan: String,
@@ -374,8 +380,8 @@ pub(crate) struct State {
     plan_view: bool,
     /// The chief is shown, either floating or docked (otherwise only the pill).
     chief_open: bool,
-    worktree_tx: crate::host::Sender<(String, Result<PathBuf, String>, Launch)>,
-    worktree_rx: Receiver<(String, Result<PathBuf, String>, Launch)>,
+    worktree_tx: crate::host::Sender<(String, Result<PreparedWorktree, String>, Launch)>,
+    worktree_rx: Receiver<(String, Result<PreparedWorktree, String>, Launch)>,
     creating: Vec<String>,
     integrate_tx: crate::host::Sender<Integrated>,
     integrate_rx: Receiver<Integrated>,

@@ -21,6 +21,12 @@ repos = []
 # {slug} the branch name with "/" replaced by "-". Siblings of the repo by default.
 worktree_path = "{repo_parent}/{repo}-{slug}"
 
+[worktrees]
+# Clone existing cache folders from the main checkout before starting an agent.
+# Copy-on-write only (APFS on macOS, reflink on Linux); unsupported clones are skipped.
+# Paths are relative to the repository root. [] turns warming off.
+warm = ["target"]
+
 [layout]
 min_tile_width = 520.0      # below this a terminal tile collapses into a tab
 min_tile_height = 280.0
@@ -156,6 +162,7 @@ pub struct Config {
     pub base_ref: String,
     pub repos: Vec<String>,
     pub worktree_path: String,
+    pub worktrees: WorktreeConfig,
     pub layout: LayoutConfig,
     pub font: FontConfig,
     pub terminal: TerminalConfig,
@@ -169,6 +176,18 @@ pub struct Config {
     pub steer: SteerConfig,
     pub voice: VoiceConfig,
     pub keys: KeyConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WorktreeConfig {
+    pub warm: Vec<String>,
+}
+
+impl Default for WorktreeConfig {
+    fn default() -> Self {
+        Self { warm: vec!["target".into()] }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -471,6 +490,7 @@ impl Default for Config {
             base_ref: "origin/main".into(),
             repos: Vec::new(),
             worktree_path: "{repo_parent}/{repo}-{slug}".into(),
+            worktrees: WorktreeConfig::default(),
             layout: LayoutConfig::default(),
             font: FontConfig::default(),
             terminal: TerminalConfig::default(),
@@ -651,6 +671,19 @@ mod tests {
         let saved = toml::to_string(&config).unwrap();
         let loaded: Config = toml::from_str(&saved).unwrap();
         assert_eq!(loaded.approvals.env, config.approvals.env);
+    }
+
+    #[test]
+    fn worktree_warming_defaults_off_switch_and_custom_folders() {
+        for text in ["", "[worktrees]"] {
+            assert_eq!(toml::from_str::<Config>(text).unwrap().worktrees.warm, ["target"]);
+        }
+        assert!(toml::from_str::<Config>("[worktrees]\nwarm = []").unwrap().worktrees.warm.is_empty());
+        let config: Config = toml::from_str("[worktrees]\nwarm = [\"target\", \"build/cache\"]").unwrap();
+        assert_eq!(config.worktrees.warm, ["target", "build/cache"]);
+        let saved = toml::to_string(&config).unwrap();
+        assert_eq!(toml::from_str::<Config>(&saved).unwrap().worktrees.warm, config.worktrees.warm);
+        assert!(toml::from_str::<Config>("[worktrees]\nwarm = \"target\"").is_err());
     }
 
     #[test]

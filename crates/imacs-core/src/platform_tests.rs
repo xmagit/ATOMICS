@@ -15,7 +15,7 @@ fn dependencies(args: &[&str]) -> String {
 fn native_dependencies_are_default_but_absent_from_browser_core() {
     let native = dependencies(&[]);
     let browser = dependencies(&["--target", "wasm32-unknown-unknown", "--no-default-features"]);
-    for package in ["ureq", "dirs", "base64", "rustls"] {
+    for package in ["ureq", "dirs", "base64", "rustls", "tempfile", "libc"] {
         let prefix = format!("{package} v");
         assert!(native.lines().any(|line| line.starts_with(&prefix)), "native: {package}");
         assert!(!browser.lines().any(|line| line.starts_with(&prefix)), "browser: {package}");

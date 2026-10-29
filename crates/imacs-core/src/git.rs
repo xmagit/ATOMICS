@@ -292,6 +292,130 @@ pub fn add_worktree_from(repo: &Path, path: &Path, branch: &str, start: Option<&
     }
 }
 
+/// Best-effort cache warming, called on the worktree job before publishing it for launch.
+/// The first worktree is Git's main checkout, even when `repo` is a linked worktree.
+/// Existing destinations (including retries) are never overwritten.
+pub fn warm_worktree(repo: &Path, worktree: &Path, folders: &[String]) -> bool {
+    if folders.is_empty() {
+        return false;
+    }
+    let Some(main) = list_worktrees(repo).ok().and_then(|trees| trees.into_iter().next()) else { return false };
+    let Ok(main) = main.path.canonicalize() else { return false };
+    let mut warmed = false;
+    for folder in folders {
+        let relative = Path::new(folder);
+        // Refuse absolute paths, traversal and Git metadata. Nested cache folders are fine.
+        if relative.as_os_str().is_empty()
+            || !relative.components().all(|part| matches!(part, std::path::Component::Normal(name) if name != ".git"))
+        {
+            continue;
+        }
+        let source = main.join(relative);
+        let destination = worktree.join(relative);
+        if !source.symlink_metadata().is_ok_and(|meta| meta.is_dir())
+            || !source.canonicalize().is_ok_and(|path| path.starts_with(&main))
+            || destination.symlink_metadata().is_ok()
+        {
+            continue;
+        }
+        // Do not follow destination symlinks out of the new checkout.
+        let mut parent = worktree.to_path_buf();
+        let safe = relative.parent().unwrap().components().all(|part| {
+            parent.push(part);
+            !parent.symlink_metadata().is_ok_and(|meta| meta.file_type().is_symlink())
+        });
+        if safe && std::fs::create_dir_all(&parent).is_ok() {
+            warmed |= clone_directory(&source, &destination);
+        }
+    }
+    warmed
+}
+
+/// GNU cp must fail rather than fall back to copying file data.
+#[cfg(any(target_os = "linux", test))]
+fn linux_clone_command(source: &Path, destination: &Path) -> Command {
+    let mut command = Command::new("cp");
+    command.args(["-R", "--reflink=always"]).arg(source).arg(destination);
+    command
+}
+
+/// Clone regular files with the native clone-only API. Walk directories ourselves:
+/// Darwin discourages passing directory hierarchies directly to clonefile(2).
+/// Symlinks are recreated, never followed into other folders or filesystems.
+#[cfg(target_os = "macos")]
+fn clone_cache_contents(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let metadata = source.symlink_metadata()?;
+    if metadata.is_dir() {
+        std::fs::create_dir(destination)?;
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            clone_cache_contents(&entry.path(), &destination.join(entry.file_name()))?;
+        }
+        std::fs::set_permissions(destination, metadata.permissions())
+    } else if metadata.file_type().is_symlink() {
+        std::os::unix::fs::symlink(std::fs::read_link(source)?, destination)
+    } else if metadata.is_file() {
+        let source = CString::new(source.as_os_str().as_bytes())?;
+        let destination = CString::new(destination.as_os_str().as_bytes())?;
+        // SAFETY: both paths are valid, NUL-terminated strings, live for this call.
+        // clonefile has no full-copy fallback; errors fail this cache folder open.
+        if unsafe { libc::clonefile(source.as_ptr(), destination.as_ptr(), 0) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    } else {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "cache contains a special file"))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn clone_cache_contents(source: &Path, destination: &Path) -> std::io::Result<()> {
+    let status = linux_clone_command(source, destination)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()?;
+    if status.success() { Ok(()) } else { Err(std::io::Error::other("CoW clone failed")) }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn clone_cache_contents(_: &Path, _: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "no CoW clone support"))
+}
+
+fn clone_directory(source: &Path, destination: &Path) -> bool {
+    clone_directory_with(source, destination, clone_cache_contents)
+}
+
+fn clone_directory_with(
+    source: &Path,
+    destination: &Path,
+    clone: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> bool {
+    if destination.symlink_metadata().is_ok() {
+        return false;
+    }
+    // A failed clone can leave a partial tree. Stage beside the destination so only a
+    // complete clone is published, and TempDir removes partial output without a retry.
+    let Some(parent) = destination.parent() else { return false };
+    let Ok(stage) = tempfile::Builder::new().prefix(".imacs-warm-").tempdir_in(parent) else { return false };
+    let cloned = stage.path().join("cache");
+    clone(source, &cloned).is_ok() && std::fs::rename(cloned, destination).is_ok()
+}
+
+/// Exercise the same clone operation on the repository/worktree filesystems, using
+/// temporary directories only. Doctor calls this explicitly; launch has no extra probe.
+pub fn probe_cache_clone(source_folder: &Path, destination_folder: &Path) -> Result<bool> {
+    let source = tempfile::Builder::new().prefix(".imacs-cow-").tempdir_in(source_folder)?;
+    std::fs::write(source.path().join("probe"), "copy-on-write probe")?;
+    let destination = tempfile::Builder::new().prefix(".imacs-cow-").tempdir_in(destination_folder)?;
+    Ok(clone_directory(source.path(), &destination.path().join("cache")))
+}
+
 fn branch_exists(repo: &Path, branch: &str) -> bool {
     git(repo, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_ok()
 }
@@ -448,6 +572,109 @@ pub(crate) mod tests {
         std::fs::create_dir(&repo).unwrap();
         init(&repo);
         (dir, repo)
+    }
+
+    #[test]
+    fn linux_clone_command_requires_reflinks_and_preserves_path_arguments() {
+        let source = Path::new("/repo with spaces/target");
+        let destination = Path::new("/new checkout/target");
+        let command = linux_clone_command(source, destination);
+        assert_eq!(command.get_program(), "cp");
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(
+            args,
+            [
+                std::ffi::OsStr::new("-R"),
+                std::ffi::OsStr::new("--reflink=always"),
+                source.as_os_str(),
+                destination.as_os_str()
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn native_clone_skips_special_files_without_copying_a_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let destination = dir.path().join("cache");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("dependency"), "cached dependency").unwrap();
+        let _socket = std::os::unix::net::UnixListener::bind(source.join("socket")).unwrap();
+        assert!(!clone_directory(&source, &destination));
+        assert!(!destination.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn failed_or_unsupported_clone_leaves_no_cache_and_never_retries_as_a_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let destination = dir.path().join("target");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("dependency"), "cached dependency").unwrap();
+        for failure in ["unsupported", "missing command", "partial clone"] {
+            let started = std::time::Instant::now();
+            assert!(!clone_directory_with(&source, &destination, |_, staged| {
+                match failure {
+                    "unsupported" => Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "not supported")),
+                    "missing command" => Command::new(dir.path().join("missing-command")).status().map(|_| ()),
+                    _ => {
+                        std::fs::create_dir(staged)?;
+                        std::fs::write(staged.join("partial"), "partial clone")?;
+                        Err(std::io::Error::other("clone failed partway through"))
+                    }
+                }
+            }));
+            assert!(started.elapsed() < std::time::Duration::from_secs(2), "{failure} delayed launch");
+            assert!(!destination.exists(), "{failure} must not fall back to copying");
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "partial output must be removed");
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn warm_worktree_clones_existing_folders_from_main_and_keeps_caches_independent() {
+        let (_dir, repo) = project();
+        let linked = repo.with_file_name("linked");
+        let destination = repo.with_file_name("new");
+        add_worktree(&repo, &linked, "linked", "main").unwrap();
+        add_worktree(&repo, &destination, "new", "main").unwrap();
+        std::fs::create_dir(repo.join("target")).unwrap();
+        std::fs::write(repo.join("target/dependency"), "from main").unwrap();
+        std::fs::create_dir(linked.join("target")).unwrap();
+        std::fs::write(linked.join("target/dependency"), "wrong checkout").unwrap();
+        std::fs::create_dir_all(repo.join("build/cache")).unwrap();
+        std::fs::write(repo.join("build/cache/object"), "nested cache").unwrap();
+        assert!(!warm_worktree(&linked, &destination, &[]));
+        assert!(!destination.join("target").exists());
+        let folders =
+            ["missing", "a.txt", "../target", "/tmp", ".", ".git", "target", "build/cache"].map(str::to_string);
+        assert!(warm_worktree(&linked, &destination, &folders));
+        assert!(!destination.join("missing").exists());
+        assert_eq!(std::fs::read_to_string(destination.join("target/dependency")).unwrap(), "from main");
+        assert_eq!(std::fs::read_to_string(destination.join("build/cache/object")).unwrap(), "nested cache");
+        std::fs::write(destination.join("target/dependency"), "agent build").unwrap();
+        assert!(!warm_worktree(&repo, &destination, &folders));
+        assert_eq!(std::fs::read_to_string(destination.join("target/dependency")).unwrap(), "agent build");
+        assert_eq!(std::fs::read_to_string(repo.join("target/dependency")).unwrap(), "from main");
+        assert!(probe_cache_clone(&repo, destination.parent().unwrap()).unwrap());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn warm_worktree_does_not_follow_cache_symlinks_outside_checkouts() {
+        let (dir, repo) = project();
+        let destination = repo.with_file_name("new");
+        add_worktree(&repo, &destination, "new", "main").unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, repo.join("target")).unwrap();
+        assert!(!warm_worktree(&repo, &destination, &["target".into()]));
+        std::fs::create_dir_all(repo.join("build/cache")).unwrap();
+        std::os::unix::fs::symlink(&outside, destination.join("build")).unwrap();
+        assert!(!warm_worktree(&repo, &destination, &["build/cache".into()]));
+        assert!(!outside.join("cache").exists());
     }
 
     #[test]

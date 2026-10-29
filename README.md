@@ -264,6 +264,25 @@ worktrees remain for the existing **clean up…** flow. Set `[plan] close_done_a
 Every agent works in its own worktree with its own `target/`, so its builds never wait on another's. What they
 share is the machine, and IMACS keeps that in check for every agent it starts (`[resources]` in the config):
 
+New agent worktrees start with a warm build cache when the main checkout has one. Before launching the agent,
+IMACS clones the folders in `[worktrees] warm` (default `["target"]`) from the repository's **main checkout**, even
+when you start from another linked worktree. The clone runs on the background worktree job. Only copy-on-write
+clones are used: unsupported filesystems, missing folders and clone errors are skipped without retrying as a full
+copy or blocking launch on a fallback. macOS uses the native clone-only `clonefile` API
+(`cp -c` can silently fall back to full copying); Linux uses `cp -R --reflink=always`.
+Each worktree then owns its cache independently; builds cannot change the
+main checkout's cache. A successful clone shows **warm cache from main** in a toast. Existing worktrees are left
+alone when retrying a launch. `imacs doctor` probes CoW cloning between the repository and configured worktree
+folders, using temporary files that it removes afterwards.
+
+```toml
+[worktrees]
+warm = ["target"]          # existing folders relative to the repository root; nested paths also work
+# warm = ["target", "build/cache"]
+# warm = []               # turn cache warming off
+```
+
+
 - **One compiler job pool.** IMACS owns a GNU make jobserver (a named pipe in a private folder under `/tmp`, which
   Codex's sandbox can open) with `jobs` tokens, cores minus 2 by default, and hands it to every agent terminal as
   `CARGO_MAKEFLAGS`. cargo takes a token per job, so ten agents building at once share those jobs instead of each
