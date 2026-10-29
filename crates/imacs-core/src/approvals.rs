@@ -111,11 +111,11 @@ impl ApprovalPolicy {
                 break;
             }
         }
-        let Some(words) = self.cargo_command(words, cwd) else { return false };
+        let Some(words) = self.cargo_command(words) else { return false };
         if words.is_empty()
             || !self.allow.iter().any(|prefix| {
                 shlex::split(prefix)
-                    .and_then(|prefix| self.cargo_command(&prefix, cwd))
+                    .and_then(|prefix| self.cargo_command(&prefix))
                     .is_some_and(|prefix| !prefix.is_empty() && words.starts_with(&prefix))
             })
         {
@@ -173,20 +173,20 @@ impl ApprovalPolicy {
         true
     }
 
-    fn cargo_command(&self, words: &[String], cwd: &Path) -> Option<Vec<String>> {
+    fn cargo_command(&self, words: &[String]) -> Option<Vec<String>> {
         let mut words = words;
         if words.first().map(String::as_str) == Some("rustup") {
             if words.get(1).map(String::as_str) != Some("run") || !toolchain(words.get(2)?) {
                 return None;
             }
             words = &words[3..];
-            if !self.is_cargo(words.first()?, cwd) {
+            if !self.is_cargo(words.first()?) {
                 return None;
             }
         }
         let mut normalized = words.to_vec();
         if let Some(program) = words.first()
-            && self.is_cargo(program, cwd)
+            && self.is_cargo(program)
         {
             normalized[0] = "cargo".into();
             if let Some(version) = words.get(1).and_then(|word| word.strip_prefix('+')) {
@@ -199,7 +199,7 @@ impl ApprovalPolicy {
         Some(normalized)
     }
 
-    fn is_cargo(&self, program: &str, cwd: &Path) -> bool {
+    fn is_cargo(&self, program: &str) -> bool {
         use std::os::unix::fs::PermissionsExt;
 
         if program == "cargo" {
@@ -219,8 +219,10 @@ impl ApprovalPolicy {
             return true;
         }
         let Some(path) = std::env::var_os("PATH") else { return false };
+        // Relative and empty entries would resolve inside the agent's own directory.
         std::env::split_paths(&path)
-            .map(|dir| cwd.join(dir).join("cargo"))
+            .filter(|dir| dir.is_absolute())
+            .map(|dir| dir.join("cargo"))
             .find(|path| path.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
             .and_then(|path| path.canonicalize().ok())
             .is_some_and(|path| path == real)
@@ -607,6 +609,42 @@ mod tests {
         ] {
             assert!(!policy.allows(&request(&command, &root), &root), "{command}");
         }
+    }
+
+    #[test]
+    #[cfg(feature = "native")]
+    fn relative_path_entries_never_make_an_agent_cargo_trusted() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        // Isolate PATH in a child, without mutating the environment of parallel tests.
+        let Some(fixture) = std::env::var_os("IMACS_APPROVAL_RELATIVE_PATH_FIXTURE") else {
+            let dir = tempfile::tempdir().unwrap();
+            for folder in ["host", "worktree/bin"] {
+                std::fs::create_dir_all(dir.path().join(folder)).unwrap();
+                let path = dir.path().join(folder).join("cargo");
+                std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            std::fs::copy(dir.path().join("host/cargo"), dir.path().join("worktree/cargo")).unwrap();
+            let path = std::env::join_paths([PathBuf::new(), PathBuf::from("bin"), dir.path().join("host")]).unwrap();
+            let output = crate::test_support::output(
+                Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "approvals::tests::relative_path_entries_never_make_an_agent_cargo_trusted"])
+                    .current_dir(dir.path().join("worktree"))
+                    .env("IMACS_APPROVAL_RELATIVE_PATH_FIXTURE", dir.path())
+                    .env("PATH", path),
+            );
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            return;
+        };
+        let fixture = PathBuf::from(fixture);
+        let root = fixture.join("worktree");
+        let policy = ApprovalPolicy { allow: vec!["cargo test".into()], ..ApprovalPolicy::default() };
+        let allows = |cargo: PathBuf| policy.allows(&request(&format!("{} test", cargo.display()), &root), &root);
+        assert!(!allows(root.join("cargo")), "an empty PATH entry must not resolve to the agent's directory");
+        assert!(!allows(root.join("bin/cargo")), "a relative PATH entry must not resolve inside the agent's directory");
+        assert!(allows(fixture.join("host/cargo")), "the first absolute PATH entry is the trusted cargo");
     }
 
     #[test]
