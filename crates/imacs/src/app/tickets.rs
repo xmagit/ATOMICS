@@ -810,11 +810,10 @@ impl State {
         {
             return fail(reply, format!("no task {task}"));
         }
-        if !unlink && given.is_none() && create.is_none() {
-            return fail(reply, "Give ticket (with its id), create (with a title), or unlink.".into());
-        }
-        let generation = self.relinked(key.clone());
+        // Each branch advances the slot's generation only once its request is valid, so a
+        // rejected request never cancels a pending create.
         if unlink {
+            self.relinked(key.clone());
             if let Some(slot) = self.link_slot(&key) {
                 *slot = None;
             }
@@ -833,6 +832,7 @@ impl State {
                 if link.id.trim().is_empty() {
                     return fail(reply, "ticket.id is required".into());
                 }
+                self.relinked(key.clone());
                 let old = self.link(&key).cloned();
                 let link = TicketLink::relink(self.stamp_system(Some(link)), old.as_ref());
                 if let Some(slot) = self.link_slot(&key) {
@@ -858,6 +858,7 @@ impl State {
                 if draft.title.trim().is_empty() {
                     return fail(reply, "create.title is required".into());
                 }
+                let generation = self.relinked(key.clone());
                 let board = self.plans[index].ticket.clone().filter(|board| config.accepts(board));
                 let batch = self.open_batch(reply, Answer::Link(key.clone()));
                 let op = TicketOp::Create { board, title: draft.title, body: draft.body };
@@ -1891,6 +1892,50 @@ mod tests {
                 assert_eq!(link(app, index, 0).label(), "CARD-2", "the plan_set link stays");
             },
         );
+    }
+
+    #[test]
+    fn a_rejected_link_request_leaves_a_pending_create_alone() {
+        with_app("app::tickets::tests::a_rejected_link_request_leaves_a_pending_create_alone", |app, ctx| {
+            let dir = tempfile::tempdir().unwrap();
+            let state = tickets_fixture(dir.path(), "CARD");
+            configure(app, CARDS, &state, |_| {});
+            let plan =
+                request(app, json!({"cmd":"plan_set", "goal":"Reject", "ticket":{"id":"b1"}, "tasks":[{"id":"a"}]}))
+                    .result["plan"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+            let index = app.runtime.selected_plan;
+            settle(app);
+            let link_request = |ticket: Option<TicketLink>, create: Option<TicketDraft>| ControlRequest::TicketLink {
+                plan: Some(plan.clone()),
+                task: Some("a".into()),
+                ticket,
+                create,
+                unlink: false,
+            };
+            let (tx, created) = channel();
+            app.runtime.control(
+                ctx,
+                link_request(None, Some(TicketDraft { title: "Wanted".into(), body: String::new() })),
+                tx,
+            );
+            for invalid in [
+                link_request(Some(TicketLink::default()), None),
+                link_request(None, Some(TicketDraft { title: " ".into(), body: String::new() })),
+                link_request(None, None),
+            ] {
+                let (tx, rx) = channel();
+                app.runtime.control(ctx, invalid, tx);
+                let ControlOutcome::Done(rejected) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else { panic!() };
+                assert!(!rejected.ok);
+            }
+            settle(app);
+            let ControlOutcome::Done(created) = created.recv_timeout(Duration::from_secs(1)).unwrap() else { panic!() };
+            assert!(created.ok && created.result["errors"] == json!([]), "{:?}", created);
+            assert!(link(app, index, 0).label().starts_with("NEW-"), "the created ticket is attached");
+        });
     }
 
     #[test]
