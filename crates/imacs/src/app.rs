@@ -977,16 +977,19 @@ fn modified(path: &Path) -> Option<SystemTime> {
 }
 
 fn config_fingerprints(path: &Path) -> [Option<u64>; 2] {
+    Config::source_paths(path).map(|file| file_fingerprint(&file))
+}
+
+/// A small config file's content as a hash, `None` when it cannot be read. Rapid edits
+/// can share a modification timestamp on Linux filesystems, so polling compares content.
+/// These files are polled once per second off the UI thread.
+fn file_fingerprint(file: &Path) -> Option<u64> {
     use std::hash::{DefaultHasher, Hash, Hasher};
 
-    // Rapid edits can share a modification timestamp on Linux filesystems.
-    // These small config files are polled once per second off the UI thread.
-    Config::source_paths(path).map(|file| {
-        let bytes = std::fs::read(file).ok()?;
-        let mut hasher = DefaultHasher::new();
-        bytes.hash(&mut hasher);
-        Some(hasher.finish())
-    })
+    let bytes = std::fs::read(file).ok()?;
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    Some(hasher.finish())
 }
 
 fn open_path(path: &Path) -> std::io::Result<std::process::Child> {

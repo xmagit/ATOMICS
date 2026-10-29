@@ -57,7 +57,6 @@ fn between_markers(text: &str) -> Option<String> {
 /// An environment variable of IMACS, or of the login shell when IMACS lacks it (as apps
 /// started from the Dock do). Blocks while the shell starts, so call it off the UI thread.
 pub fn env_var(name: &str) -> Option<String> {
-    static FOUND: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(Default::default);
     if let Some(value) = std::env::var(name).ok().filter(|v| !v.trim().is_empty()) {
         return Some(value);
     }
@@ -72,6 +71,15 @@ pub fn env_var(name: &str) -> Option<String> {
     let value = login_shell_var(name).filter(|v| !v.trim().is_empty())?;
     FOUND.lock().unwrap().insert(name.to_string(), value.clone());
     Some(value)
+}
+
+/// Login-shell variables `env_var` has looked up.
+static FOUND: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(Default::default);
+
+/// What `env_var` knows without starting a shell: IMACS's own environment, or a value
+/// the login shell already gave. Safe on the runtime thread.
+pub fn known_env_var(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.trim().is_empty()).or_else(|| FOUND.lock().unwrap().get(name).cloned())
 }
 
 pub fn find_program(program: &str) -> Option<PathBuf> {

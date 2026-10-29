@@ -162,6 +162,13 @@ impl State {
                     self.plans.push(Plan { id, ..Plan::default() });
                     self.plans.len() - 1
                 };
+                let plan_id = self.plans[index].id.clone();
+                for task in tasks.iter().filter(|t| t.ticket.is_some()) {
+                    self.relinked((plan_id.clone(), Some(task.id.clone())));
+                }
+                if ticket.is_some() {
+                    self.relinked((plan_id, None));
+                }
                 let tasks =
                     tasks.into_iter().map(|t| Task { ticket: self.stamp_system(t.ticket.clone()), ..t }).collect();
                 self.plans[index].replace(goal, tasks);

@@ -14,6 +14,8 @@ pub(super) struct Tag {
     key: LinkKey,
     /// The link's id when the job was queued: results for a link replaced since are dropped.
     ticket: String,
+    /// The configured system the job was sent to: results never land on another system's link.
+    system: String,
     kind: Kind,
     batch: Option<u64>,
 }
@@ -25,7 +27,8 @@ enum Kind {
     List,
     State(String),
     Comment,
-    Create,
+    /// Creating a ticket for a slot, at the slot's generation when requested.
+    Create(u64),
 }
 
 type Done = (Tag, Result<TicketOutput, String>);
@@ -33,7 +36,8 @@ type Done = (Tag, Result<TicketOutput, String>);
 pub(super) struct Tickets {
     /// The effective `[tickets]`: the workspace file's, else the main config's.
     pub(super) config: Option<Arc<TicketConfig>>,
-    workspace_file: Option<(Option<PathBuf>, Option<SystemTime>)>,
+    /// The workspace file and its content's fingerprint when last read.
+    workspace_file: Option<(Option<PathBuf>, Option<u64>)>,
     workspace_config: Option<TicketConfig>,
     jobs: Option<std::sync::mpsc::Sender<TicketJob<Tag>>>,
     done_tx: crate::host::Sender<Done>,
@@ -49,6 +53,9 @@ pub(super) struct Tickets {
     pub(super) boards: HashMap<String, Vec<TicketLink>>,
     batches: HashMap<u64, Batch>,
     next_batch: u64,
+    /// How often each slot's link was set by request, so a late create result never
+    /// replaces a link set after it was asked for.
+    generations: HashMap<LinkKey, u64>,
 }
 
 /// A control request answered once all of its ticket jobs are done.
@@ -83,6 +90,7 @@ impl Tickets {
             boards: HashMap::new(),
             batches: HashMap::new(),
             next_batch: 0,
+            generations: HashMap::new(),
         }
     }
 }
@@ -92,7 +100,7 @@ impl State {
     /// link again when the effective config changes.
     pub(super) fn apply_ticket_config(&mut self) {
         let file = self.workspace.as_deref().and_then(|name| Workspace::file(name).ok());
-        let stamp = file.as_deref().and_then(modified);
+        let stamp = file.as_deref().and_then(file_fingerprint);
         if self.tickets.workspace_file.as_ref() != Some(&(file.clone(), stamp)) {
             self.tickets.workspace_file = Some((file, stamp));
             let loaded = match self.workspace.clone().filter(|_| stamp.is_some()) {
@@ -126,7 +134,7 @@ impl State {
     pub(super) fn resync_tickets(&mut self, plan: &str) {
         self.tickets.failed.retain(|key, _| key.0 != plan);
         self.refresh_tickets(Some(plan), None);
-        self.push_ticket_states();
+        self.push_ticket_states(None);
     }
 
     pub(super) fn ticket_config(&self) -> Option<Arc<TicketConfig>> {
@@ -169,6 +177,13 @@ impl State {
         }
     }
 
+    /// A request set or cleared a slot's link: results of earlier requests for it are stale.
+    pub(super) fn relinked(&mut self, key: LinkKey) -> u64 {
+        let generation = self.tickets.generations.entry(key).or_default();
+        *generation += 1;
+        *generation
+    }
+
     fn save_plan_id(&self, id: &str) {
         if let Some(index) = self.plans.iter().position(|p| p.id == id) {
             self.save_plan(index);
@@ -178,6 +193,19 @@ impl State {
     fn send_ticket(&mut self, config: &Arc<TicketConfig>, op: TicketOp, tag: Tag) {
         if let Some(batch) = tag.batch.and_then(|id| self.tickets.batches.get_mut(&id)) {
             batch.pending += 1;
+        }
+        let addressed = match &op {
+            TicketOp::Get(link)
+            | TicketOp::Read(link)
+            | TicketOp::List(link)
+            | TicketOp::UpdateState(link, _)
+            | TicketOp::Comment(link, _) => Some(link),
+            TicketOp::Create { .. } => None,
+        };
+        // Callers already leave other systems' links alone; nothing may reach them anyway.
+        if let Some(mismatch) = addressed.and_then(|link| config.mismatch(link)) {
+            self.finish_ticket(tag, Err(mismatch));
+            return;
         }
         let done = self.tickets.done_tx.clone();
         let jobs = self.tickets.jobs.get_or_insert_with(|| crate::tickets::spawn(done));
@@ -205,8 +233,8 @@ impl State {
             .collect();
         for index in plans {
             let id = self.plans[index].id.clone();
-            let board = self.plans[index].ticket.clone();
-            let listed = config.mode == TicketMode::Board && config.operation("list").is_some();
+            let board = self.plans[index].ticket.clone().filter(|link| self.accepted(&config, link, batch));
+            let listed = config.mode == TicketMode::Board && config.operation("list").is_some() && board.is_some();
             match board {
                 Some(board) if listed => self.queue_read(&config, (id.clone(), None), TicketOp::List(board), batch),
                 Some(link) if config.mode == TicketMode::Ticket => {
@@ -214,11 +242,13 @@ impl State {
                 }
                 _ => {}
             }
-            if !(listed && self.plans[index].ticket.is_some()) {
+            if !listed {
                 let links: Vec<(String, TicketLink)> =
                     self.plans[index].tasks.iter().filter_map(|t| Some((t.id.clone(), t.ticket.clone()?))).collect();
                 for (task, link) in links {
-                    self.queue_read(&config, (id.clone(), Some(task)), TicketOp::Get(link), batch);
+                    if self.accepted(&config, &link, batch) {
+                        self.queue_read(&config, (id.clone(), Some(task)), TicketOp::Get(link), batch);
+                    }
                 }
             }
         }
@@ -234,7 +264,7 @@ impl State {
         if config.operation(operation).is_none() || (!self.tickets.refreshing.insert(key.clone()) && batch.is_none()) {
             return;
         }
-        self.send_ticket(config, op, Tag { key, ticket, kind, batch });
+        self.send_ticket(config, op, Tag { key, ticket, kind, batch, system: config.system.clone() });
     }
 
     /// Takes finished ticket jobs; returns whether any arrived.
@@ -256,7 +286,7 @@ impl State {
             Kind::State(_) => {
                 self.tickets.pushing.remove(&tag.key);
             }
-            Kind::Read | Kind::Comment | Kind::Create => {}
+            Kind::Read | Kind::Comment | Kind::Create(_) => {}
         }
         let error = match (tag.kind.clone(), result) {
             (Kind::Read, Ok(TicketOutput::Read(value))) => {
@@ -276,18 +306,17 @@ impl State {
             (kind @ (Kind::State(_) | Kind::Comment), Ok(TicketOutput::Pushed(fresh))) => {
                 if let Kind::State(state) = &kind {
                     self.tickets.failed.remove(&tag.key);
-                    if let Some(link) = self.link_slot(&tag.key).and_then(Option::as_mut).filter(|l| l.id == tag.ticket)
-                    {
+                    if let Some(link) = self.live_link(&tag, true) {
                         link.pushed_state = Some(state.clone());
                     }
                 }
                 match fresh {
-                    Some(Ok(fetched)) => self.take_ticket(&tag, &fetched, false),
+                    // Only the read after IMACS's own state update acknowledges that update; a
+                    // read after a comment may show someone else's change like any other read.
+                    Some(Ok(fetched)) => self.take_ticket(&tag, &fetched, matches!(kind, Kind::Comment)),
                     Some(Err(err)) => self.ticket_failed(&tag, format!("reading it after the update failed: {err}")),
                     None if !self.tickets.failed.contains_key(&tag.key) => {
-                        if let Some(link) =
-                            self.link_slot(&tag.key).and_then(Option::as_mut).filter(|l| l.id == tag.ticket)
-                        {
+                        if let Some(link) = self.live_link(&tag, true) {
                             link.error = None;
                         }
                         self.save_plan_id(&tag.key.0);
@@ -296,14 +325,19 @@ impl State {
                 }
                 None
             }
-            (Kind::Create, Ok(TicketOutput::Ticket(created))) => {
-                let system = self.ticket_config().map(|c| c.system.clone()).unwrap_or_default();
-                let created = TicketLink { system, synced_at: Some(imacs_core::store::now()), ..created };
-                if let Some(slot) = self.link_slot(&tag.key) {
-                    *slot = Some(created);
-                    self.save_plan_id(&tag.key.0);
+            (Kind::Create(generation), Ok(TicketOutput::Ticket(created))) => {
+                if self.tickets.generations.get(&tag.key) != Some(&generation) {
+                    Some(format!("{} was created, but a newer link superseded it", created.label()))
+                } else {
+                    // The ticket exists in the system the request went to, whatever the config says now.
+                    let created =
+                        TicketLink { system: tag.system.clone(), synced_at: Some(imacs_core::store::now()), ..created };
+                    if let Some(slot) = self.link_slot(&tag.key) {
+                        *slot = Some(created);
+                        self.save_plan_id(&tag.key.0);
+                    }
+                    None
                 }
-                None
             }
             (kind, Err(err)) => {
                 let what = match &kind {
@@ -313,10 +347,10 @@ impl State {
                         format!("setting the state to {state} failed")
                     }
                     Kind::Comment => "commenting failed".into(),
-                    Kind::Create => "creating the ticket failed".into(),
+                    Kind::Create(_) => "creating the ticket failed".into(),
                 };
                 let message = format!("{what}: {err}");
-                if kind != Kind::Create {
+                if !matches!(kind, Kind::Create(_)) {
                     self.ticket_failed(&tag, message.clone());
                 }
                 Some(message)
@@ -326,8 +360,54 @@ impl State {
         self.settle_job(tag.batch, error);
     }
 
+    /// Secrets that ticket errors must never carry into plan files or replies: the
+    /// token and the server's secret-looking environment values.
+    fn ticket_secrets(&self) -> Vec<String> {
+        let Some(config) = self.ticket_config() else { return Vec::new() };
+        let secret_name = |name: &str| {
+            let name = name.to_ascii_uppercase();
+            ["TOKEN", "KEY", "SECRET", "PASSWORD", "AUTH", "CREDENTIAL"].iter().any(|s| name.contains(s))
+        };
+        let token = config.server.token_env.as_deref().and_then(crate::setup::known_env_var);
+        let env = config.server.env.iter().filter(|(name, _)| secret_name(name)).map(|(_, value)| value.clone());
+        token.into_iter().chain(env).collect()
+    }
+
+    /// Where ticket errors leave the MCP layer: redacted and bounded before they are
+    /// stored on a link or returned to a caller.
+    fn scrub(&self, error: &str) -> String {
+        ticket::redact(error, &self.ticket_secrets())
+    }
+
+    /// The link a job's result belongs to: still the same ticket, and of the system the
+    /// job was sent to. With `pin`, a link made for no system takes that system now.
+    fn live_link(&mut self, tag: &Tag, pin: bool) -> Option<&mut TicketLink> {
+        let link = self.link_slot(&tag.key)?.as_mut()?;
+        if link.id != tag.ticket || !(link.system.is_empty() || link.system == tag.system) {
+            return None;
+        }
+        if pin && link.system.is_empty() {
+            link.system = tag.system.clone();
+        }
+        Some(link)
+    }
+
+    /// Whether operations may address a link; a skipped link is named in the batch's errors.
+    fn accepted(&mut self, config: &TicketConfig, link: &TicketLink, batch: Option<u64>) -> bool {
+        match config.mismatch(link) {
+            None => true,
+            Some(mismatch) => {
+                if let Some(entry) = batch.and_then(|id| self.tickets.batches.get_mut(&id)) {
+                    entry.errors.push(format!("{mismatch}; left alone"));
+                }
+                false
+            }
+        }
+    }
+
     fn ticket_failed(&mut self, tag: &Tag, error: String) {
-        if let Some(link) = self.link_slot(&tag.key).and_then(Option::as_mut).filter(|l| l.id == tag.ticket)
+        let error = self.scrub(&error);
+        if let Some(link) = self.live_link(tag, false)
             && link.error.as_deref() != Some(&error)
         {
             link.error = Some(error);
@@ -335,13 +415,13 @@ impl State {
         }
     }
 
-    /// Takes a ticket as read. Reads after IMACS's own pushes never count as someone
-    /// else changing it.
+    /// Takes a ticket as read. The read after IMACS's own state update never counts as
+    /// someone else changing it.
     fn take_ticket(&mut self, tag: &Tag, fetched: &TicketLink, external: bool) {
         let keep_error = self.tickets.failed.contains_key(&tag.key);
         // A webhook may echo IMACS's own push before the push itself has returned.
         let pushing = self.tickets.pushing.get(&tag.key).cloned();
-        let Some(link) = self.link_slot(&tag.key).and_then(Option::as_mut).filter(|l| l.id == tag.ticket) else {
+        let Some(link) = self.live_link(tag, true) else {
             return;
         };
         let before = link.state.clone();
@@ -365,7 +445,7 @@ impl State {
 
     fn take_board(&mut self, tag: &Tag, items: Vec<TicketLink>) {
         let Some(index) = self.plans.iter().position(|p| p.id == tag.key.0) else { return };
-        if let Some(board) = self.plans[index].ticket.as_mut().filter(|l| l.id == tag.ticket) {
+        if let Some(board) = self.live_link(tag, true) {
             board.synced_at = Some(imacs_core::store::now());
             board.error = None;
         }
@@ -373,7 +453,16 @@ impl State {
             self.plans[index].tasks.iter().filter_map(|t| Some((t.id.clone(), t.ticket.clone()?))).collect();
         for (task, link) in links {
             let key = (tag.key.0.clone(), Some(task));
-            let tag = Tag { key: key.clone(), ticket: link.id.clone(), kind: Kind::Refresh, batch: tag.batch };
+            if !(link.system.is_empty() || link.system == tag.system) {
+                continue;
+            }
+            let tag = Tag {
+                key: key.clone(),
+                ticket: link.id.clone(),
+                kind: Kind::Refresh,
+                batch: tag.batch,
+                system: tag.system.clone(),
+            };
             match items.iter().find(|item| link.same_ticket(item)) {
                 Some(item) => self.take_ticket(&tag, item, true),
                 // Not on the board (any more): read it on its own.
@@ -423,8 +512,9 @@ impl State {
 
     /// Pushes ticket states that IMACS's statuses moved away from. A ticket linked to
     /// a task that has not started is left alone, and a failed push waits for the next
-    /// heartbeat or `imacs_ticket_sync` instead of repeating every tick.
-    pub(super) fn push_ticket_states(&mut self) {
+    /// heartbeat or `imacs_ticket_sync` instead of repeating every tick. A sync passes
+    /// its batch, so it answers only once the pushes and the reads after them are done.
+    pub(super) fn push_ticket_states(&mut self, batch: Option<u64>) {
         let Some(config) = self.ticket_config() else { return };
         if config.operation("update_state").is_none() {
             return;
@@ -441,7 +531,7 @@ impl State {
             {
                 links.push(((plan.id.clone(), None), ticket::plan_status(plan), link));
             }
-            for (key, status, link) in links {
+            for (key, status, link) in links.into_iter().filter(|(_, _, link)| config.accepts(link)) {
                 let Some(desired) = config.states.get(status) else { continue };
                 if link.pushed_state.as_deref() == Some(desired)
                     || (link.pushed_state.is_none() && status == TaskStatus::Planned)
@@ -455,7 +545,13 @@ impl State {
         }
         for (key, link, state) in pushes {
             self.tickets.pushing.insert(key.clone(), state.clone());
-            let tag = Tag { key, ticket: link.id.clone(), kind: Kind::State(state.clone()), batch: None };
+            let tag = Tag {
+                key,
+                ticket: link.id.clone(),
+                kind: Kind::State(state.clone()),
+                batch,
+                system: config.system.clone(),
+            };
             self.send_ticket(&config, TicketOp::UpdateState(link, state), tag);
         }
     }
@@ -497,13 +593,17 @@ impl State {
             Some(task) => format!("Task {task} has no ticket, and the plan has no ticket to comment on instead."),
             None => "The plan has no ticket to comment on (in board mode, comment on a task's ticket).".into(),
         })?;
+        if let Some(mismatch) = config.mismatch(&link) {
+            return Err(format!("{mismatch}; IMACS leaves it alone."));
+        }
         Ok((config, key, link))
     }
 
     /// Posts a lifecycle comment when the config wants one; silently skips otherwise.
     fn lifecycle_comment(&mut self, index: usize, task: Option<&str>, author: &Author, body: String) {
         if let Ok((config, key, link)) = self.comment_job(index, task, author) {
-            let tag = Tag { key, ticket: link.id.clone(), kind: Kind::Comment, batch: None };
+            let tag =
+                Tag { key, ticket: link.id.clone(), kind: Kind::Comment, batch: None, system: config.system.clone() };
             self.send_ticket(&config, TicketOp::Comment(link, body), tag);
         }
     }
@@ -557,9 +657,12 @@ impl State {
     ) -> serde_json::Value {
         let mut matched: Vec<LinkKey> = Vec::new();
         let mut boards: Vec<String> = Vec::new();
-        let board_mode = self.ticket_config().is_some_and(|c| c.mode == TicketMode::Board);
+        let config = self.ticket_config();
+        let board_mode = config.as_ref().is_some_and(|c| c.mode == TicketMode::Board);
+        // An event naming no system comes from the configured one: other systems' links stay as they are.
+        let ours = |link: &&TicketLink| system.is_some() || config.as_ref().is_none_or(|c| c.accepts(link));
         for plan in self.plans.iter().filter(|p| !p.id.is_empty() && p.status != PlanStatus::Archived) {
-            if let Some(link) = &plan.ticket {
+            if let Some(link) = plan.ticket.as_ref().filter(ours) {
                 if board_mode && (link.matches(system, board, board) || link.matches(system, id, key)) {
                     boards.push(plan.id.clone());
                 } else if link.matches(system, id, key) {
@@ -567,18 +670,24 @@ impl State {
                 }
             }
             for task in &plan.tasks {
-                if task.ticket.as_ref().is_some_and(|link| link.matches(system, id, key)) {
+                if task.ticket.as_ref().filter(ours).is_some_and(|link| link.matches(system, id, key)) {
                     matched.push((plan.id.clone(), Some(task.id.clone())));
                 }
             }
         }
         for link_key in &matched {
             let Some(link) = self.link(link_key).cloned() else { continue };
-            let tag = Tag { key: link_key.clone(), ticket: link.id.clone(), kind: Kind::Refresh, batch: None };
+            let tag = Tag {
+                key: link_key.clone(),
+                ticket: link.id.clone(),
+                kind: Kind::Refresh,
+                batch: None,
+                system: link.system.clone(),
+            };
             self.take_ticket(&tag, &fields, true);
             if !boards.contains(&link_key.0)
                 && let Some(config) = self.ticket_config()
-                && let Some(link) = self.link(link_key).cloned()
+                && let Some(link) = self.link(link_key).cloned().filter(|link| config.accepts(link))
             {
                 self.queue_read(&config, link_key.clone(), TicketOp::Get(link), None);
             }
@@ -604,6 +713,7 @@ impl State {
     /// and no job, checks whether a batch whose jobs were all queued is complete.
     fn settle_job(&mut self, batch: Option<u64>, error: Option<String>) {
         let Some(id) = batch else { return };
+        let error = error.map(|error| self.scrub(&error));
         let Some(entry) = self.tickets.batches.get_mut(&id) else { return };
         entry.pending = entry.pending.saturating_sub(1);
         entry.errors.extend(error);
@@ -700,6 +810,10 @@ impl State {
         {
             return fail(reply, format!("no task {task}"));
         }
+        if !unlink && given.is_none() && create.is_none() {
+            return fail(reply, "Give ticket (with its id), create (with a title), or unlink.".into());
+        }
+        let generation = self.relinked(key.clone());
         if unlink {
             if let Some(slot) = self.link_slot(&key) {
                 *slot = None;
@@ -726,7 +840,9 @@ impl State {
                 }
                 self.save_plan(index);
                 let batch = self.open_batch(reply, Answer::Link(key.clone()));
-                if let (Some(config), Some(link)) = (config, self.link(&key).cloned()) {
+                if let (Some(config), Some(link)) = (config, self.link(&key).cloned())
+                    && self.accepted(&config, &link, Some(batch))
+                {
                     let op = match &key.1 {
                         None if config.mode == TicketMode::Board => TicketOp::List(link),
                         _ => TicketOp::Get(link),
@@ -742,13 +858,19 @@ impl State {
                 if draft.title.trim().is_empty() {
                     return fail(reply, "create.title is required".into());
                 }
-                let board = self.plans[index].ticket.clone();
+                let board = self.plans[index].ticket.clone().filter(|board| config.accepts(board));
                 let batch = self.open_batch(reply, Answer::Link(key.clone()));
                 let op = TicketOp::Create { board, title: draft.title, body: draft.body };
                 self.send_ticket(
                     &config,
                     op,
-                    Tag { key, ticket: String::new(), kind: Kind::Create, batch: Some(batch) },
+                    Tag {
+                        key,
+                        ticket: String::new(),
+                        kind: Kind::Create(generation),
+                        batch: Some(batch),
+                        system: config.system.clone(),
+                    },
                 );
             }
             (None, None) => fail(reply, "Give ticket (with its id), create (with a title), or unlink.".into()),
@@ -776,7 +898,7 @@ impl State {
         for id in &plans {
             self.refresh_tickets(Some(id), Some(batch));
         }
-        self.push_ticket_states();
+        self.push_ticket_states(Some(batch));
         self.settle_batch(batch);
     }
 
@@ -797,7 +919,13 @@ impl State {
             }
             Ok((config, key, link)) => {
                 let batch = self.open_batch(reply, Answer::Comment);
-                let tag = Tag { key, ticket: link.id.clone(), kind: Kind::Comment, batch: Some(batch) };
+                let tag = Tag {
+                    key,
+                    ticket: link.id.clone(),
+                    kind: Kind::Comment,
+                    batch: Some(batch),
+                    system: config.system.clone(),
+                };
                 self.send_ticket(&config, TicketOp::Comment(link, ticket::chief_comment(&author, &text)), tag);
             }
         }
@@ -863,7 +991,8 @@ impl State {
             None => (TicketOp::Read(link.clone()), Kind::Read, Answer::Read(None)),
         };
         let batch = self.open_batch(reply, answer);
-        self.send_ticket(&config, op, Tag { key, ticket: link.id, kind, batch: Some(batch) });
+        let system = config.system.clone();
+        self.send_ticket(&config, op, Tag { key, ticket: link.id, kind, batch: Some(batch), system });
     }
 }
 
@@ -1119,7 +1248,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             app.runtime.ticket_results();
-            app.runtime.push_ticket_states();
+            app.runtime.push_ticket_states(None);
             if app.runtime.tickets.pending == 0 {
                 return;
             }
@@ -1326,7 +1455,7 @@ mod tests {
             assert_eq!(count(&state, "card_get"), reads + 1);
             // A webhook echoing IMACS's own push, even before the push returns, is no news.
             assert!(request(app, json!({"cmd":"plan_update", "plan":plan, "id":"b", "status":"review"})).ok);
-            app.runtime.push_ticket_states();
+            app.runtime.push_ticket_states(None);
             let events = app.runtime.events.iter().filter(|e| e.ticket.is_some()).count();
             let echo = request(app, json!({"cmd":"ticket_event", "key":"CARD-2", "state":"Check"}));
             assert_eq!(link(app, index, 1).state.as_deref(), Some("Check"));
@@ -1526,6 +1655,9 @@ mod tests {
             settle(app);
             let ControlOutcome::Done(synced) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else { panic!() };
             assert!(synced.ok && synced.result["errors"] == json!([]), "{:?}", synced.result);
+            // The reply waits for the retried state update and the read after it.
+            let replied = &synced.result["plans"][0]["tasks"][0]["ticket"];
+            assert_eq!((replied["state"].as_str(), replied.get("error")), (Some("Doing"), None), "{replied}");
             let healed = link(app, index, 0);
             assert_eq!((healed.state.as_deref(), healed.error.as_deref()), (Some("Doing"), None));
 
@@ -1541,6 +1673,251 @@ mod tests {
             let error = link(app, index, 0).error.unwrap();
             assert!(error.contains("setting the state to Check failed: cards is unavailable"), "{error}");
             assert_eq!(app.runtime.plans[index].tasks[0].status, TaskStatus::Review);
+        });
+    }
+
+    #[test]
+    fn switching_systems_never_sends_old_links_to_the_new_system() {
+        with_app("app::tickets::tests::switching_systems_never_sends_old_links_to_the_new_system", |app, ctx| {
+            let dir = tempfile::tempdir().unwrap();
+            for system in ["cards", "issues"] {
+                std::fs::create_dir(dir.path().join(system)).unwrap();
+            }
+            let cards = tickets_fixture(&dir.path().join("cards"), "CARD");
+            configure(app, CARDS, &cards, |_| {});
+            let plan = request(
+                app,
+                json!({"cmd":"plan_set", "goal":"Switch", "ticket":{"id":"b1"}, "tasks":[
+                    {"id":"a", "title":"Parser", "ticket":{"id":"1"}}, {"id":"b", "title":"Docs"}]}),
+            )
+            .result["plan"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let index = app.runtime.selected_plan;
+            app.runtime.plan_view = true;
+            app.runtime.panel = PanelMode::Plan;
+            assert!(request(app, json!({"cmd":"plan_update", "plan":plan, "id":"a", "status":"running"})).ok);
+            settle(app);
+            assert_eq!(ticket(&cards, "CARD-1")["state"], "Doing");
+            assert_eq!(link(app, index, 0).system, "cards");
+
+            // Another system with the same ticket and board ids: any cross-talk would land on them.
+            let issues = tickets_fixture(&dir.path().join("issues"), "ISS");
+            configure(app, ISSUES, &issues, |config| config.mode = TicketMode::Board);
+            settle(app);
+            app.runtime.ticket_heartbeat();
+            settle(app);
+            assert!(
+                request(app, json!({"cmd":"plan_update", "plan":plan, "id":"a", "status":"blocked", "note":"stuck"}))
+                    .ok
+            );
+            app.runtime.sessions.push(session("agent-a", AgentKind::Generic, AgentStatus::Working, dir.path()));
+            app.runtime.plans[index].tasks[0].session = Some("agent-a".into());
+            app.runtime.report(Some("agent-a"), "progress", "Halfway there.");
+            settle(app);
+            let (tx, rx) = channel();
+            let comment =
+                ControlRequest::TicketComment { plan: Some(plan.clone()), task: Some("a".into()), text: "Hi".into() };
+            app.runtime.control(ctx, comment, tx);
+            settle(app);
+            let ControlOutcome::Done(commented) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else { panic!() };
+            assert!(commented.error.unwrap_or_default().contains("belongs to cards"));
+            let (tx, rx) = channel();
+            app.runtime.sync_tickets(Some(plan.clone()), tx);
+            settle(app);
+            let ControlOutcome::Done(synced) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else { panic!() };
+            assert!(synced.result["errors"].to_string().contains("belongs to cards"), "{}", synced.result);
+            request(app, json!({"cmd":"ticket_event", "key":"CARD-1", "state":"Gone"}));
+            settle(app);
+            assert_eq!(tools(&issues), Vec::<String>::new(), "nothing reaches the new system");
+            assert_eq!(link(app, index, 0).state.as_deref(), Some("Doing"), "events from the new system do not apply");
+
+            let output = board_frame(app, ctx, vec![]);
+            let shown = texts(&output);
+            assert!(
+                shown.iter().any(|(text, _)| text.contains("belongs to cards") && text.contains("issues")),
+                "{:?}",
+                shown.iter().map(|(t, _)| t).collect::<Vec<_>>()
+            );
+            output.drop_without_applying_deltas();
+
+            // New links use the new system, and switching back resumes the old ones.
+            let (tx, rx) = channel();
+            let linked = ControlRequest::TicketLink {
+                plan: Some(plan.clone()),
+                task: Some("b".into()),
+                ticket: Some(TicketLink { id: "2".into(), ..TicketLink::default() }),
+                create: None,
+                unlink: false,
+            };
+            app.runtime.control(ctx, linked, tx);
+            settle(app);
+            rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(link(app, index, 1).system, "issues");
+            assert_eq!(tools(&issues), ["issue_read"]);
+            configure(app, CARDS, &cards, |_| {});
+            settle(app);
+            assert_eq!(ticket(&cards, "CARD-1")["state"], "Stuck", "the blocked status reaches the right system later");
+        });
+    }
+
+    #[test]
+    fn a_late_create_never_replaces_a_newer_link_or_takes_another_system() {
+        with_app(
+            "app::tickets::tests::a_late_create_never_replaces_a_newer_link_or_takes_another_system",
+            |app, ctx| {
+                let dir = tempfile::tempdir().unwrap();
+                let state = tickets_fixture(dir.path(), "CARD");
+                configure(app, CARDS, &state, |_| {});
+                let plan = request(
+                    app,
+                    json!({"cmd":"plan_set", "goal":"Late", "ticket":{"id":"b1"}, "tasks":[{"id":"a"}, {"id":"b"}]}),
+                )
+                .result["plan"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                let index = app.runtime.selected_plan;
+                settle(app);
+                let send = |app: &mut Desktop<'_>, task: &str, ticket: Option<&str>| {
+                    let (tx, rx) = channel();
+                    let request = ControlRequest::TicketLink {
+                        plan: Some(plan.clone()),
+                        task: Some(task.into()),
+                        ticket: ticket.map(|id| TicketLink { id: id.into(), ..TicketLink::default() }),
+                        create: ticket
+                            .is_none()
+                            .then(|| TicketDraft { title: "Created late".into(), body: String::new() }),
+                        unlink: false,
+                    };
+                    app.runtime.control(ctx, request, tx);
+                    rx
+                };
+                // The create is under way when the chief links another ticket to the same task.
+                let created = send(app, "a", None);
+                let linked = send(app, "a", Some("2"));
+                settle(app);
+                let ControlOutcome::Done(created) = created.recv_timeout(Duration::from_secs(1)).unwrap() else {
+                    panic!()
+                };
+                linked.recv_timeout(Duration::from_secs(1)).unwrap();
+                assert_eq!(link(app, index, 0).label(), "CARD-2", "the newer link stays");
+                assert!(created.result["errors"].to_string().contains("superseded"), "{:?}", created);
+
+                // A create sent to one system keeps that system when the config changes meanwhile.
+                let created = send(app, "b", None);
+                std::fs::create_dir(dir.path().join("issues")).unwrap();
+                let other = tickets_fixture(&dir.path().join("issues"), "ISS");
+                configure(app, ISSUES, &other, |config| config.mode = TicketMode::Board);
+                settle(app);
+                created.recv_timeout(Duration::from_secs(1)).unwrap();
+                let b = link(app, index, 1);
+                assert!(b.label().starts_with("NEW-"));
+                assert_eq!(b.system, "cards");
+            },
+        );
+    }
+
+    #[test]
+    fn a_read_after_a_comment_reports_what_someone_else_changed() {
+        with_app("app::tickets::tests::a_read_after_a_comment_reports_what_someone_else_changed", |app, ctx| {
+            let dir = tempfile::tempdir().unwrap();
+            let state = tickets_fixture(dir.path(), "CARD");
+            configure(app, CARDS, &state, |_| {});
+            let plan = request(
+                app,
+                json!({"cmd":"plan_set", "goal":"Watch", "tasks":[{"id":"a", "title":"Parser", "ticket":{"id":"1"}}]}),
+            )
+            .result["plan"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert!(request(app, json!({"cmd":"plan_update", "plan":plan, "id":"a", "status":"running"})).ok);
+            settle(app);
+            assert_eq!(ticket(&state, "CARD-1")["state"], "Doing");
+            set_field(&state, "CARD-1", "state", "Stuck");
+            let (tx, rx) = channel();
+            let comment =
+                ControlRequest::TicketComment { plan: Some(plan.clone()), task: Some("a".into()), text: "Note".into() };
+            app.runtime.control(ctx, comment, tx);
+            settle(app);
+            rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            let moved: Vec<_> = app.runtime.events.iter().filter_map(|e| e.ticket.clone()).collect();
+            assert_eq!(moved.len(), 1, "the read after the comment saw someone else's change");
+            assert_eq!((moved[0]["from"].as_str(), moved[0]["to"].as_str()), (Some("Doing"), Some("Stuck")));
+            app.runtime.ticket_heartbeat();
+            settle(app);
+            assert_eq!(app.runtime.events.iter().filter(|e| e.ticket.is_some()).count(), 1, "reported once");
+        });
+    }
+
+    #[test]
+    fn secrets_echoed_by_a_backend_never_reach_plans_or_replies() {
+        with_app("app::tickets::tests::secrets_echoed_by_a_backend_never_reach_plans_or_replies", |app, ctx| {
+            const TOKEN: &str = "sk-synthetic-7f3a9c";
+            // SAFETY: set before the ticket worker starts; nothing else reads this variable.
+            unsafe { std::env::set_var("TRACKER_TOKEN", TOKEN) };
+            let dir = tempfile::tempdir().unwrap();
+            let state = tickets_fixture(dir.path(), "CARD");
+            configure(app, CARDS, &state, |config| config.server.token_env = Some("TRACKER_TOKEN".into()));
+            let echo = format!(
+                "rejected Authorization: Bearer {TOKEN} for https://bot:hunter22@cards.example/api?page=2&access_token={TOKEN} {}",
+                "padding ".repeat(400)
+            );
+            edit_fake(&state, |fake| {
+                fake["fail"] = json!(["card_move", "card_note"]);
+                fake["fail_message"] = json!(echo);
+            });
+            let plan = request(
+                app,
+                json!({"cmd":"plan_set", "goal":"Secrets", "tasks":[{"id":"a", "title":"Parser", "ticket":{"id":"1"}}]}),
+            )
+            .result["plan"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let index = app.runtime.selected_plan;
+            settle(app);
+            assert!(request(app, json!({"cmd":"plan_update", "plan":plan, "id":"a", "status":"running"})).ok);
+            settle(app);
+            let (tx, rx) = channel();
+            let comment =
+                ControlRequest::TicketComment { plan: Some(plan.clone()), task: Some("a".into()), text: "Hi".into() };
+            app.runtime.control(ctx, comment, tx);
+            settle(app);
+            let ControlOutcome::Done(commented) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else { panic!() };
+            let reply = commented.error.unwrap();
+
+            // A stdio server that prints its credentials to stderr before dying.
+            let mut dying: TicketConfig = toml::from_str(CARDS).unwrap();
+            dying.server.command =
+                vec!["/bin/sh".into(), "-c".into(), "echo \"denied: Bearer $TICKET_API_KEY\" >&2; exit 1".into()];
+            dying.server.env.insert("TICKET_API_KEY".into(), "sk-stderr-5d1e8b".into());
+            app.runtime.config.tickets = dying;
+            app.runtime.apply_ticket_config();
+            settle(app);
+            let error = link(app, index, 0).error.unwrap();
+            assert!(error.contains("denied: Bearer ***"), "{error}");
+
+            let saved =
+                std::fs::read_to_string(paths::imacs_home().join("plans").join(format!("{plan}.json"))).unwrap();
+            let got = request(app, json!({"cmd":"plan_get", "plan":plan})).result.to_string();
+            for text in [&saved, &got, &reply, &error] {
+                for secret in [TOKEN, "hunter22", "sk-stderr-5d1e8b"] {
+                    assert!(!text.contains(secret), "{secret} leaked into {text}");
+                }
+            }
+            assert!(
+                reply.contains("Authorization: Bearer ***")
+                    && reply.contains("https://***@cards.example/api?page=2&access_token=***"),
+                "{reply}"
+            );
+            assert!(
+                reply.chars().count() <= imacs_core::tickets::MAX_ERROR_CHARS + 1,
+                "errors are bounded: {}",
+                reply.len()
+            );
         });
     }
 
@@ -1574,7 +1951,7 @@ mod tests {
             configure(app, CARDS, &state, |_| {});
             assert!(app.runtime.chief_prompt().contains("Tickets: this workspace tracks its work in cards"));
             settle(app);
-            assert_eq!(link(app, index, 0).system, "", "links keep the system they were made with");
+            assert_eq!(link(app, index, 0).system, "cards", "a link made for no system takes the system that reads it");
             assert_eq!(link(app, index, 0).title.as_deref(), Some("Write the parser"), "read once configured");
             let board = call(app, json!({"cmd":"ticket_link", "plan":plan, "ticket":{"id":"b1"}}));
             assert_eq!(board.result["ticket"]["system"], "cards");
@@ -1747,14 +2124,24 @@ mod tests {
                 app.runtime.workspace = Some("team".into());
                 app.runtime.apply_ticket_config();
                 assert_eq!(app.runtime.ticket_config().unwrap().system, "team");
-                std::thread::sleep(Duration::from_millis(20));
                 std::fs::write(&file, "projects = []\n[tickets]\nsystem = \"\"\n").unwrap();
                 app.runtime.apply_ticket_config();
                 assert!(app.runtime.ticket_config().is_none(), "a workspace can turn tickets off");
-                std::thread::sleep(Duration::from_millis(20));
                 std::fs::write(&file, "projects = []\n").unwrap();
                 app.runtime.apply_ticket_config();
                 assert_eq!(app.runtime.ticket_config().unwrap().system, "main");
+
+                // An edit within the same modification time (fast saves, coarse clocks) still counts.
+                let stamp = std::fs::metadata(&file).unwrap().modified().unwrap();
+                std::fs::write(
+                    &file,
+                    "projects = []\n[tickets]\nsystem = \"same-second\"\nserver = { command = [\"x\"] }\n",
+                )
+                .unwrap();
+                std::fs::File::options().write(true).open(&file).unwrap().set_modified(stamp).unwrap();
+                assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), stamp);
+                app.runtime.apply_ticket_config();
+                assert_eq!(app.runtime.ticket_config().unwrap().system, "same-second");
             },
         );
     }

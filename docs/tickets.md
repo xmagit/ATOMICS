@@ -24,10 +24,17 @@ with an MCP server, changes only the config.
   changes again. That change reaches the chief as a `ticket` event, and the chief decides whether the plan
   should follow. IMACS never dispatches, accepts or closes anything because a ticket moved, since those
   steps start agents, merge branches and close sessions.
+- **One system at a time.** A link remembers the system it was made for. IMACS reads, updates and comments
+  only on links of the configured system. After a switch, links of the old system are left alone, and their
+  cards say so, so old ids, briefs and reports never reach unrelated tickets; link tickets of the new system
+  instead, or switch back. A link made while no system was configured takes the system that first reads it.
 - **Never in the way.** Ticket operations run one at a time on a worker thread with a per-request timeout.
   Failures show on the card and in `imacs_plan_get`, and IMACS carries on. After a connection failure,
   jobs fail at once for 15 seconds instead of each waiting for a server that is down. A failed state
   update is retried on the next heartbeat or sync, not on every tick.
+- **No secrets in errors.** Before an error is stored on a link or returned to a caller, IMACS redacts the
+  `token_env` value, secret-looking `server.env` values, bearer and basic credentials, `Authorization`
+  values, URL user info and secret-looking query values, and bounds it to 600 characters.
 
 ## Configuration
 
@@ -151,8 +158,9 @@ The chief's prompt gains a section describing the configured system, mode, state
   ticket) or to a task, then reads it. With `create: {title, body}` it creates the ticket through the
   `create` operation and attaches it. In board mode, linking the plan answers with the board's tickets.
 - `imacs_ticket_sync {plan?}` reads the plan's (or every open plan's) tickets now, retries failed updates,
-  and answers with each plan's links. In board mode the answer includes which of the board's tickets belong
-  to which task, so tickets without a task stand out.
+  and answers with each plan's links once the retried updates and the reads after them are done. In board
+  mode the answer includes which of the board's tickets belong to which task, so tickets without a task stand
+  out. Links of another system are named in its errors.
 - `imacs_ticket_comment {plan, task?, text}` adds implementation details or decisions to the ticket,
   signed with the chief's model.
 - `imacs_wait` with `ticket` in `statuses` receives changes made in the ticket system.

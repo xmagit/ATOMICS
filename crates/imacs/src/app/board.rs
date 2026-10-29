@@ -19,9 +19,11 @@ fn ticket_chip(
     ui: &mut egui::Ui,
     link: &imacs_core::tickets::TicketLink,
     means: Option<(TaskStatus, TaskStatus)>,
+    config: Option<&imacs_core::tickets::TicketConfig>,
     p: &Palette,
 ) {
-    let color = if link.error.is_some() { p.warning } else { p.info };
+    let mismatch = config.and_then(|config| config.mismatch(link));
+    let color = if link.error.is_some() || mismatch.is_some() { p.warning } else { p.info };
     ui.horizontal_wrapped(|ui| {
         let text = match &link.state {
             Some(state) => format!("{} · {state}", link.label()),
@@ -68,6 +70,11 @@ fn ticket_chip(
                 .on_hover_text(format!("The task is {}; IMACS leaves the ticket as it was set", task.label()));
         }
     });
+    if let Some(mismatch) = mismatch {
+        ui.label(RichText::new(format!("⚠ {mismatch}: not synced")).color(p.warning).size(11.0)).on_hover_text(
+            "IMACS leaves tickets of another system alone. Link a ticket of the configured system instead.",
+        );
+    }
     if let Some(error) = &link.error {
         ui.label(RichText::new(format!("⚠ {}", truncate(error, 160))).color(p.error).size(11.0)).on_hover_text(error);
     }
@@ -180,7 +187,7 @@ impl Desktop<'_> {
                     .filter(|c| c.mode == imacs_core::tickets::TicketMode::Ticket)
                     .and_then(|c| c.states.status_of(link.state.as_deref()?))
                     .map(|ticket| (ticket, imacs_core::tickets::plan_status(plan)));
-                ui.vertical(|ui| ticket_chip(ui, &link, means, &p));
+                ui.vertical(|ui| ticket_chip(ui, &link, means, ticket_config.as_deref(), &p));
                 if let Some(title) = &link.title {
                     ui.label(RichText::new(title).color(p.foreground).size(11.5));
                 }
@@ -301,7 +308,7 @@ impl Desktop<'_> {
                                                             .as_ref()
                                                             .and_then(|s| s.status_of(link.state.as_deref()?))
                                                             .map(|ticket| (ticket, task.status));
-                                                        ticket_chip(ui, link, means, &p);
+                                                        ticket_chip(ui, link, means, ticket_config.as_deref(), &p);
                                                     }
                                                     if let Some(branch) = &task.branch {
                                                         ui.add(
