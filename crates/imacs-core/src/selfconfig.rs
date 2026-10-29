@@ -536,6 +536,27 @@ pub fn propose_theme(
     })
 }
 
+/// A config file's text with `[theme] name` set, as the theme picker saves it: comments and the
+/// rest of the file kept, and a legacy `preset` key taken out, since a file with both does not
+/// load. `None` when the file already names that theme.
+pub fn with_theme_name(text: &str, name: &str) -> Result<Option<String>, String> {
+    if !crate::theme::valid_name(name) {
+        return Err(format!("\"{name}\" is not a theme name"));
+    }
+    let table: toml::Table =
+        toml::from_str(text).map_err(|e| format!("it must be fixed by hand first: {}", parse_error(text, &e)))?;
+    let legacy = lookup(&table, &["theme", "preset"]).is_some();
+    let remove = if legacy { vec!["theme.preset".to_string()] } else { Vec::new() };
+    let after = edit(text, &format!("[theme]\nname = \"{name}\""), &remove)?;
+    Ok((after != text).then_some(after))
+}
+
+/// Whether a config file's text picks a theme, by name or with the legacy `preset` key.
+pub fn picks_theme(text: &str) -> bool {
+    let table = toml::from_str::<toml::Table>(text).unwrap_or_default();
+    lookup(&table, &["theme", "name"]).or_else(|| lookup(&table, &["theme", "preset"])).is_some()
+}
+
 fn unified_diff(file: &str, before: &str, after: &str) -> String {
     similar::TextDiff::from_lines(before, after).unified_diff().context_radius(3).header(file, file).to_string()
 }
@@ -803,6 +824,21 @@ mod tests {
 
     fn layer(source: Source, text: &str) -> Layer {
         Layer::new(source, format!("{source:?}.toml"), Some(text.into()))
+    }
+
+    #[test]
+    fn the_theme_picker_sets_the_name_and_drops_a_legacy_preset() {
+        let config = "# shared\n[theme]\nname = \"claude\" # the default\n[font]\nsize = 14.0\n";
+        let picked = with_theme_name(config, "atomisk").unwrap().unwrap();
+        assert_eq!(picked, "# shared\n[theme]\nname = \"atomisk\" # the default\n[font]\nsize = 14.0\n");
+        assert_eq!(with_theme_name(&picked, "atomisk").unwrap(), None, "nothing to write");
+        assert_eq!(with_theme_name("", "tide").unwrap().unwrap(), "[theme]\nname = \"tide\"\n");
+        let legacy = with_theme_name("[theme]\npreset = \"midnight\"\naccent = \"#00ff88\"\n", "paper").unwrap();
+        assert_eq!(legacy.unwrap(), "[theme]\naccent = \"#00ff88\"\nname = \"paper\"\n");
+        assert!(with_theme_name("[theme\n", "paper").unwrap_err().contains("fixed by hand"));
+        assert!(with_theme_name("", "../x").is_err());
+        assert!(picks_theme("[theme]\nname = \"x\"") && picks_theme("[theme]\npreset = \"x\""));
+        assert!(!picks_theme("[theme]\naccent = \"#000000\"") && !picks_theme("[theme"));
     }
 
     #[test]

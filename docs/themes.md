@@ -1,8 +1,8 @@
 # Themes
 
-Every color and font in IMACS comes from a theme. Four themes are built in, theme files beside the config
-can add more, and `[theme]` in the config picks one and can override any part of it. Saving a theme file
-or the config applies the change while IMACS runs.
+Every color and font in IMACS comes from a theme. Five themes are built in, theme files beside the config
+can add more, and `[theme]` in the config picks one and can override any part of it. Pick one in
+Settings → Themes, or save a theme file or the config: either applies while IMACS runs.
 
 ```toml
 [theme]
@@ -20,9 +20,24 @@ accent = "#9fd6ae"        # optional: any token set here wins over the theme
 | `midnight` | The original blue-gray look. |
 | `atomisk` | atomisk.ai: void `#08090a`, surface `#101113` panels, paper `#f1f2f3` text, the signal `#c5decf` accent, pale blue `#adc8dc` for info and sand `#e4d1a8` for warnings. Inter and IBM Plex Mono when available. |
 | `paper` | Light: warm paper with a deeper orange that reads on white. |
+| `tide` | Light: paper with a clear blue accent `#2f6fdb` and GitHub's syntax colors. |
 
 The built-in themes are ordinary theme files that set every token. They are in
 [crates/imacs-core/themes](../crates/imacs-core/themes), and make good starting points.
+
+## Picking a theme
+
+Settings → Themes lists the built-in themes and your theme files (marked *yours*), each with a strip of its
+own colors: background, panel, text, accent, and red, green and blue from its terminal colors. The current
+theme is checked. Clicking another shows it at once and saves `[theme] name` in `config.toml` the way an
+applied config change is saved: the rest of the file and its comments stay as they were, the old file is kept
+as a `.bak` backup beside it, and the new one replaces it in one step. A legacy `preset` key gives way to
+`name`. The menu stays open, so you can try several.
+
+**This machine only** saves to `config.d/<host>.toml` instead, so other machines that share `config.toml` keep
+their theme. A host file that names a theme wins over `config.toml`, and the menu says so when you are saving to
+`config.toml`. Tokens set inline in `[theme]` still win over whichever theme you pick; the menu names them under
+the list.
 
 ## Theme files
 

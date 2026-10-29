@@ -565,7 +565,8 @@ keys for menus), `imacs_read` (screen text), `imacs_diff`, `imacs_comment` + `im
 Comments an agent leaves show inline in the diff panel before they are sent, so you can see what it asks for.
 
 `imacs ctl '<json>'` sends the same requests from a shell, e.g. `imacs ctl '{"cmd":"list"}'`. A few extras exist for
-scripting and testing: `show_diff`, `show_chief`, `resize` and `screenshot`. For example,
+scripting and testing: `show_diff`, `show_chief`, `show_settings` (the Settings menu and its theme picker), `resize`
+and `screenshot`. For example,
 `imacs ctl '{"cmd":"show_chief","open":true,"dock":"docked","width":720}'` shows the dock and remembers its width.
 
 ## Shortcuts

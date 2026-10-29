@@ -19,6 +19,7 @@ const BUILTIN: &[(&str, &str)] = &[
     ("midnight", include_str!("../themes/midnight.toml")),
     ("paper", include_str!("../themes/paper.toml")),
     ("atomisk", include_str!("../themes/atomisk.toml")),
+    ("tide", include_str!("../themes/tide.toml")),
 ];
 
 /// Theme files deeper than this are treated as a mistake rather than read forever.
@@ -234,6 +235,23 @@ impl ThemeTokens {
         take!(mode, syntax, mono_ui, ui_font, mono_font, ui_size, mono_size, diff_size);
     }
 
+    /// The names of the tokens this sets.
+    pub fn set_keys(&self) -> Vec<&'static str> {
+        let colors = self.colors().into_iter().filter(|(_, value)| value.is_some()).map(|(name, _)| name);
+        let others = [
+            ("mode", self.mode.is_some()),
+            ("ansi", self.ansi.is_some()),
+            ("syntax", self.syntax.is_some()),
+            ("mono_ui", self.mono_ui.is_some()),
+            ("ui_font", self.ui_font.is_some()),
+            ("mono_font", self.mono_font.is_some()),
+            ("ui_size", self.ui_size.is_some()),
+            ("mono_size", self.mono_size.is_some()),
+            ("diff_size", self.diff_size.is_some()),
+        ];
+        colors.chain(others.into_iter().filter(|(_, set)| *set).map(|(name, _)| name)).collect()
+    }
+
     /// Drops values that cannot be used and says why, so one typo keeps the rest of a theme.
     pub fn sanitize(&mut self) -> Vec<String> {
         let mut problems = Vec::new();
@@ -434,6 +452,19 @@ pub fn read_file(dir: &Path, name: &str) -> Option<Result<String, String>> {
     }
 }
 
+/// The names of the theme files in `dir`, sorted; files that are not usable names are left out.
+#[cfg(feature = "native")]
+pub fn file_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok()?.path().file_name()?.to_str()?.strip_suffix(".toml").map(str::to_string))
+        .filter(|name| valid_name(name))
+        .collect();
+    names.sort();
+    names
+}
+
 /// Resolves `[theme]` against the theme files in `dir`.
 #[cfg(feature = "native")]
 pub fn load(config: &ThemeConfig, dir: &Path) -> Resolved {
@@ -470,11 +501,16 @@ mod tests {
         tokens.mono_font = Some("IBM Plex Mono".into());
         (tokens.ui_size, tokens.mono_size, tokens.diff_size) = (Some(13.0), Some(13.0), Some(12.5));
         let table: toml::Table = toml::from_str(&toml::to_string(&tokens).unwrap()).unwrap();
+        let mut set = tokens.set_keys();
         let mut keys: Vec<&str> = table.keys().map(String::as_str).collect();
+        set.sort();
         let mut known: Vec<&str> = token_keys().collect();
         keys.sort();
         known.sort();
         assert_eq!(keys, known);
+        assert_eq!(set, known, "set_keys names every token that is set");
+        let one = ThemeTokens { accent: Some("#000000".into()), ui_size: Some(14.0), ..ThemeTokens::default() };
+        assert_eq!(one.set_keys(), ["accent", "ui_size"]);
     }
 
     #[test]
@@ -487,6 +523,10 @@ mod tests {
             assert_eq!(file.tokens.ansi.as_ref().unwrap().len(), 16, "{name}");
         }
         assert!(builtin("Midnight").is_some(), "built-in names ignore case");
+        assert_eq!(builtin_names().collect::<Vec<_>>(), ["claude", "midnight", "paper", "atomisk", "tide"]);
+        let tide = builtin("tide").unwrap();
+        assert_eq!((tide.mode, tide.accent.as_deref()), (Some(ThemeMode::Light), Some("#2f6fdb")));
+        assert_eq!(tide.syntax.as_deref(), Some("GitHub"));
     }
 
     #[test]
@@ -648,5 +688,10 @@ mod tests {
         assert_eq!(resolved.chain, ["mine", "midnight"]);
         assert_eq!(resolved.tokens.foreground.as_deref(), Some("#fafafa"));
         assert_eq!(load(&theme("missing"), &themes).errors, ["unknown theme \"missing\""]);
+        std::fs::write(themes.join("a-dusk.toml"), "").unwrap();
+        std::fs::write(themes.join("not a name.toml"), "").unwrap();
+        std::fs::write(themes.join("notes.txt"), "").unwrap();
+        assert_eq!(file_names(&themes), ["a-dusk", "mine"]);
+        assert!(file_names(&dir.path().join("none")).is_empty());
     }
 }

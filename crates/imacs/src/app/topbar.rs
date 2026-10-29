@@ -156,8 +156,24 @@ impl Desktop<'_> {
         if show_load {
             self.load_gauge(ui);
         }
-        let response = ui.menu_button("Settings", |ui| self.settings_menu(ui)).response;
+        // Trying themes and toggling where they are saved keep the menu open.
+        let config =
+            egui::containers::menu::MenuConfig::new().close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
+        let (response, _) = if egui::containers::menu::is_in_menu(ui) {
+            egui::containers::menu::SubMenuButton::new("Settings").config(config).ui(ui, |ui| self.settings_menu(ui))
+        } else {
+            egui::containers::menu::MenuButton::new("Settings").config(config).ui(ui, |ui| self.settings_menu(ui))
+        };
         record_item(ui, "Settings", &response);
+        if let Some(open) = self.client.show_settings.take() {
+            let id = egui::Popup::default_response_id(&response);
+            if open {
+                egui::Popup::open_id(ui.ctx(), id);
+            } else {
+                egui::Popup::close_id(ui.ctx(), id);
+            }
+            ui.ctx().request_repaint();
+        }
     }
 
     fn top_bar_notice(&mut self, ui: &mut egui::Ui) {

@@ -295,6 +295,10 @@ pub enum ControlRequest {
         project: String,
     },
     /// Shows or hides the diff panel.
+    /// Open or close the Settings menu, with its theme picker, in the window.
+    ShowSettings {
+        open: bool,
+    },
     ShowDiff {
         open: bool,
     },

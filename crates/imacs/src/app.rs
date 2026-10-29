@@ -53,6 +53,7 @@ mod restart;
 mod selfconfig;
 mod sessions;
 mod sidebar;
+mod themes;
 mod tickets;
 mod topbar;
 mod voice;
@@ -347,6 +348,10 @@ pub(crate) struct State {
     config_error: Option<String>,
     /// What the theme files or `[theme]` could not apply; the rest of the theme still does.
     theme_error: Option<String>,
+    /// The themes the Settings menu offers, read when the config or a theme file changes.
+    theme_choices: Arc<Vec<themes::ThemeChoice>>,
+    /// This machine's config.d file picks a theme, which wins over config.toml's.
+    host_theme: bool,
     palette: Arc<Palette>,
     highlighter: Arc<Highlighter>,
     sessions: Vec<Session>,
@@ -441,16 +446,36 @@ pub(crate) struct State {
 
 /// Native effects delivered to the desktop; these never drive runtime progress.
 enum ClientEvent {
-    ApprovalDecided { session: String, approval: String },
-    Cleanup { preselect: Option<PathBuf> },
+    ApprovalDecided {
+        session: String,
+        approval: String,
+    },
+    Cleanup {
+        preselect: Option<PathBuf>,
+    },
     PlanCleanup,
     PlanCleanupPreview(Vec<(PathBuf, String)>),
-    OpenFile { root: PathBuf, path: String, whole_file: bool },
-    Edit { root: PathBuf, path: Option<String> },
-    Screenshot { path: String, reply: Sender<ControlOutcome> },
-    VoiceFailed { text: String, error: String },
+    OpenFile {
+        root: PathBuf,
+        path: String,
+        whole_file: bool,
+    },
+    Edit {
+        root: PathBuf,
+        path: Option<String>,
+    },
+    Screenshot {
+        path: String,
+        reply: Sender<ControlOutcome>,
+    },
+    VoiceFailed {
+        text: String,
+        error: String,
+    },
     ConfigChanged,
     Viewport(egui::ViewportCommand),
+    /// Open or close the Settings menu, for `show_settings`.
+    ShowSettings(bool),
 }
 
 /// View data belongs to the desktop, never to the runtime scheduler.
@@ -488,6 +513,10 @@ struct Client {
     config_seen: Option<(String, Instant)>,
     /// The user's note on the proposal on screen, sent with Apply or Reject.
     config_note: String,
+    /// The theme picker saves to this machine's config.d file instead of config.toml.
+    theme_host_only: bool,
+    /// Open or close the Settings menu on the next frame.
+    show_settings: Option<bool>,
     voice_tx: Sender<VoiceEvent>,
     voice_rx: Receiver<VoiceEvent>,
     screenshot: Option<Screenshot>,
@@ -528,6 +557,8 @@ impl Client {
             voice: Voice::Idle,
             config_seen: None,
             config_note: String::new(),
+            theme_host_only: false,
+            show_settings: None,
             voice_tx,
             voice_rx,
             screenshot: options.screenshot.take().map(|path| Screenshot {
@@ -711,6 +742,8 @@ impl State {
             config_checked: Instant::now(),
             config_error,
             theme_error,
+            theme_choices: Arc::default(),
+            host_theme: false,
             sessions: Vec::new(),
             codex_versions: HashMap::new(),
             pending_codex: Vec::new(),
@@ -787,6 +820,7 @@ impl State {
             desktop_diff_split: None,
             launch_dir,
         };
+        app.refresh_themes();
         app.open_initial_projects(options.projects, options.workspace);
         app.apply_config();
         if app.hook_error.is_none() {
@@ -1101,6 +1135,7 @@ impl Desktop<'_> {
                 }
                 ClientEvent::ConfigChanged => self.runtime.palette.apply(ctx),
                 ClientEvent::Viewport(command) => ctx.send_viewport_cmd(command),
+                ClientEvent::ShowSettings(open) => self.client.show_settings = Some(open),
                 ClientEvent::VoiceFailed { text, error } => self.voice_failed(&text, &error),
                 ClientEvent::Edit { root, path } => {
                     self.client.focus_editor = true;
