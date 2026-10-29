@@ -589,12 +589,14 @@ impl Cleaner {
         &self.secrets
     }
 
-    /// A ticket field, webhook field or JSON property name.
+    /// A ticket field shown on a card, or a webhook field: cleaned, and bounded for display.
     pub fn field(&self, text: &str) -> String {
-        match self.masked(text) {
-            Some(masked) => bound(&masked, MAX_FIELD_CHARS),
-            None => WITHHELD_FIELD.into(),
-        }
+        bound(&self.text(text), MAX_FIELD_CHARS)
+    }
+
+    /// Text cleaned without a bound, for payloads such as agent reads that need it whole.
+    pub fn text(&self, text: &str) -> String {
+        self.masked(text).unwrap_or_else(|| WITHHELD_FIELD.into())
     }
 
     /// An error message: field rules, then bearer and basic credentials, `Authorization`
@@ -628,13 +630,14 @@ impl Cleaner {
     }
 
     /// A ticket read for an agent: every string and property name cleaned, with URL user
-    /// info and credential query values in its text masked in place.
+    /// info and credential query values in its text masked in place. Strings stay whole: the
+    /// card bound is for display, and an agent needs the end of a long description too.
     pub fn value(&self, value: Value) -> Value {
         match value {
-            Value::String(text) => Value::String(self.field(&redact_query(&redact_userinfo(&text), credential_param))),
+            Value::String(text) => Value::String(self.text(&redact_query(&redact_userinfo(&text), credential_param))),
             Value::Array(items) => Value::Array(items.into_iter().map(|item| self.value(item)).collect()),
             Value::Object(map) => {
-                Value::Object(map.into_iter().map(|(key, item)| (self.field(&key), self.value(item))).collect())
+                Value::Object(map.into_iter().map(|(key, item)| (self.text(&key), self.value(item))).collect())
             }
             other => other,
         }
@@ -1549,6 +1552,11 @@ mod tests {
         );
         assert_eq!(cleaner.with(["another-secret".to_string()]).field("another-secret"), "***");
         let long = format!("{} tail", "word ".repeat(MAX_FIELD_CHARS));
+        assert_eq!(
+            Cleaner::default().value(json!({"description": long})),
+            json!({"description": long}),
+            "agents get it whole"
+        );
         let bounded = Cleaner::default().field(&long);
         assert!(bounded.ends_with("word…") && bounded.chars().count() <= MAX_FIELD_CHARS + 1, "cut between words");
     }
