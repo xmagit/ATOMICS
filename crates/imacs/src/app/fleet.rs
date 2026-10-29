@@ -65,9 +65,21 @@ impl State {
         }
         idle.len()
     }
+}
 
+/// What the slot queue holds for the process tree under `pid`.
+pub(super) fn queue_note(pid: u32, running: &[Ticket], waiting: &[Ticket]) -> Option<String> {
+    if let Some(ticket) = running.iter().find(|t| t.ancestors.contains(&pid)) {
+        return Some(format!("{} slot", ticket.class.name()));
+    }
+    let ticket = waiting.iter().find(|t| t.ancestors.contains(&pid))?;
+    let place = waiting.iter().filter(|t| t.class == ticket.class).position(|t| t.id == ticket.id)? + 1;
+    Some(format!("queued for a {} slot ({place} in line)", ticket.class.name()))
+}
+
+impl Desktop<'_> {
     pub(super) fn tab_strip(&mut self, ui: &mut egui::Ui, rect: Rect, tiled: &[usize], visible: &[usize]) {
-        let p = self.palette.clone();
+        let p = self.runtime.palette.clone();
         ui.painter().rect_filled(rect, 0.0, p.panel);
         let mut child = ui.new_child(
             egui::UiBuilder::new()
@@ -79,8 +91,8 @@ impl State {
         egui::ScrollArea::horizontal().id_salt("tab-strip-scroll").show(&mut child, |ui| {
             ui.horizontal(|ui| {
                 for &i in visible {
-                    let s = &self.sessions[i];
-                    let active = self.active.as_deref() == Some(s.id.as_str());
+                    let s = &self.runtime.sessions[i];
+                    let active = self.runtime.active.as_deref() == Some(s.id.as_str());
                     let shown = tiled.contains(&i);
                     let color = if active {
                         p.foreground
@@ -103,7 +115,7 @@ impl State {
             });
         });
         if let Some(id) = clicked {
-            self.activate(&id, false);
+            self.runtime.activate(&id, false);
         }
     }
 
@@ -112,31 +124,32 @@ impl State {
             return;
         }
         let metrics = self.metrics(ui);
-        let p = self.palette.clone();
+        let p = self.runtime.palette.clone();
         let (cols, rows) = (layout.columns.max(1), layout.rows.max(1));
         let size = vec2(rect.width() / cols as f32, rect.height() / rows as f32);
         let mut activate: Option<(String, bool)> = None;
         let mut close: Option<String> = None;
         let mut resume: Option<usize> = None;
         let mut approval = None;
-        let focus_request = self.focus_terminal.take();
+        let focus_request = self.runtime.focus_terminal.take();
         let now = ui.input(|i| i.time);
-        let (slots_running, slots_waiting) = self.governor.snapshot();
+        let (slots_running, slots_waiting) = self.runtime.governor.snapshot();
 
         for (slot, &index) in tiled.iter().enumerate() {
             let min = rect.min + vec2((slot % cols) as f32 * size.x, (slot / cols) as f32 * size.y);
             let tile = Rect::from_min_size(min, size).shrink(3.0);
-            let active = self.active.as_deref() == Some(self.sessions[index].id.as_str());
-            let reported = if matches!(self.sessions[index].status, AgentStatus::Idle | AgentStatus::Done) {
-                self.plans
+            let active = self.runtime.active.as_deref() == Some(self.runtime.sessions[index].id.as_str());
+            let reported = if matches!(self.runtime.sessions[index].status, AgentStatus::Idle | AgentStatus::Done) {
+                self.runtime
+                    .plans
                     .iter()
                     .flat_map(|p| &p.tasks)
-                    .find(|t| t.session.as_deref() == Some(&self.sessions[index].id))
+                    .find(|t| t.session.as_deref() == Some(&self.runtime.sessions[index].id))
                     .and_then(|t| t.reported_line(imacs_core::store::now()))
             } else {
                 None
             };
-            let session = &mut self.sessions[index];
+            let session = &mut self.runtime.sessions[index];
 
             let header = tile.with_max_y(tile.top() + TILE_HEADER);
             let mut body = tile.with_min_y(header.bottom());
@@ -239,8 +252,12 @@ impl State {
             }
             match &mut session.terminal {
                 Some(terminal) => {
-                    let response =
-                        self.terminal_views.entry(term_id).or_default().show(terminal, ui, body, term_id, &metrics, &p);
+                    let response = self
+                        .client
+                        .terminal_views
+                        .entry(term_id)
+                        .or_default()
+                        .show(terminal, ui, body, term_id, &metrics, &p);
                     if focus_request.as_deref() == Some(session.id.as_str()) {
                         response.request_focus();
                     }
@@ -300,7 +317,7 @@ impl State {
         }
 
         let mut task_action = None;
-        for (offset, (plan, task)) in self.completed_tasks().into_iter().take(layout.completed).enumerate() {
+        for (offset, (plan, task)) in self.runtime.completed_tasks().into_iter().take(layout.completed).enumerate() {
             let slot = tiled.len() + offset;
             let min = rect.min + vec2((slot % cols) as f32 * size.x, (slot / cols) as f32 * size.y);
             let tile = Rect::from_min_size(min, size).shrink(3.0);
@@ -308,24 +325,24 @@ impl State {
             ui.painter().rect_stroke(tile, 2.0, Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
             let mut child =
                 ui.new_child(egui::UiBuilder::new().id_salt(("completed", plan, task)).max_rect(tile.shrink(14.0)));
-            let task_data = &self.plans[plan].tasks[task];
+            let task_data = &self.runtime.plans[plan].tasks[task];
             child.label(RichText::new(&task_data.title).color(p.foreground).strong().size(13.0));
-            if let Some(action) = task_result(&mut child, task_data, None, false, &self.config, &p) {
+            if let Some(action) = task_result(&mut child, task_data, None, false, &self.runtime.config, &p) {
                 task_action = Some((plan, task, action));
             }
         }
         if let Some((plan, task, action)) = task_action {
-            self.task_action(plan, task, action);
+            self.runtime.task_action(plan, task, action);
         }
 
         if let Some((index, decision)) = approval
-            && let Err(error) = self.approve(index, decision, None)
+            && let Err(error) = self.runtime.approve(index, decision, None)
         {
-            self.toast(error);
+            self.runtime.toast(error);
         }
 
         if let Some((id, open)) = activate {
-            self.activate(&id, open);
+            self.runtime.activate(&id, open);
         }
         if let Some(id) = close {
             let running = self
@@ -334,10 +351,10 @@ impl State {
                 .find(|s| s.id == id)
                 .and_then(|s| s.terminal.as_ref())
                 .is_some_and(|t| !t.exited());
-            if running { self.confirm_close = Some(id) } else { self.close(&id) }
+            if running { self.client.confirm_close = Some(id) } else { self.runtime.close(&id) }
         }
         if let Some(index) = resume {
-            let s = &self.sessions[index];
+            let s = &self.runtime.sessions[index];
             let record = SessionRecord {
                 claude_session_id: s.claude_id.clone().unwrap_or_default(),
                 agent: s.agent.clone(),
@@ -347,20 +364,10 @@ impl State {
                 updated: 0,
             };
             let id = s.id.clone();
-            self.close(&id);
-            self.resume.push(record);
+            self.runtime.close(&id);
+            self.runtime.resume.push(record);
         }
     }
-}
-
-/// What the slot queue holds for the process tree under `pid`.
-pub(super) fn queue_note(pid: u32, running: &[Ticket], waiting: &[Ticket]) -> Option<String> {
-    if let Some(ticket) = running.iter().find(|t| t.ancestors.contains(&pid)) {
-        return Some(format!("{} slot", ticket.class.name()));
-    }
-    let ticket = waiting.iter().find(|t| t.ancestors.contains(&pid))?;
-    let place = waiting.iter().filter(|t| t.class == ticket.class).position(|t| t.id == ticket.id)? + 1;
-    Some(format!("queued for a {} slot ({place} in line)", ticket.class.name()))
 }
 
 #[cfg(test)]
@@ -385,8 +392,8 @@ mod tests {
     fn all_view_only_shows_completed_tiles_from_open_plans() {
         with_app("app::fleet::tests::all_view_only_shows_completed_tiles_from_open_plans", |app, _| {
             let dir = tempfile::tempdir().unwrap();
-            app.sessions.clear();
-            app.plans = [PlanStatus::Open, PlanStatus::Completed, PlanStatus::Archived]
+            app.runtime.sessions.clear();
+            app.runtime.plans = [PlanStatus::Open, PlanStatus::Completed, PlanStatus::Archived]
                 .into_iter()
                 .enumerate()
                 .map(|(index, status)| Plan {
@@ -401,16 +408,16 @@ mod tests {
                     ..Plan::default()
                 })
                 .collect();
-            app.plan_view = false;
-            app.view = None;
-            assert_eq!(app.completed_tasks(), [(0, 0)]);
-            app.view = Some(dir.path().into());
-            assert_eq!(app.completed_tasks(), [(0, 0), (1, 0)]);
-            app.plan_view = true;
-            app.selected_plan = 1;
-            assert_eq!(app.completed_tasks(), [(1, 0)], "completed plan history stays visible in its own view");
-            app.selected_plan = 2;
-            assert!(app.completed_tasks().is_empty());
+            app.runtime.plan_view = false;
+            app.runtime.view = None;
+            assert_eq!(app.runtime.completed_tasks(), [(0, 0)]);
+            app.runtime.view = Some(dir.path().into());
+            assert_eq!(app.runtime.completed_tasks(), [(0, 0), (1, 0)]);
+            app.runtime.plan_view = true;
+            app.runtime.selected_plan = 1;
+            assert_eq!(app.runtime.completed_tasks(), [(1, 0)], "completed plan history stays visible in its own view");
+            app.runtime.selected_plan = 2;
+            assert!(app.runtime.completed_tasks().is_empty());
         });
     }
 
@@ -423,7 +430,7 @@ mod tests {
                 for (name, program, expected) in
                     [("custom-codex", "/tools/codex", true), ("codex", "/tools/other", false)]
                 {
-                    app.config.agents = vec![imacs_core::config::AgentConfig {
+                    app.runtime.config.agents = vec![imacs_core::config::AgentConfig {
                         name: name.into(),
                         command: vec![program.into()],
                         kind: AgentKind::Generic,
@@ -439,7 +446,7 @@ mod tests {
                         let mut action = None;
                         let output = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
                             egui::CentralPanel::default().show(ui, |ui| {
-                                action = task_result(ui, &task, None, false, &app.config, &app.palette);
+                                action = task_result(ui, &task, None, false, &app.runtime.config, &app.runtime.palette);
                             });
                         });
                         let pos = output
@@ -481,7 +488,7 @@ mod tests {
             let (_dir, repo) = repository();
             let worktree = repo.with_file_name("task");
             git::add_worktree(&repo, &worktree, "task", "main").unwrap();
-            app.plans = vec![Plan {
+            app.runtime.plans = vec![Plan {
                 id: "cleaned".into(),
                 status: PlanStatus::Completed,
                 project: Some(repo),
@@ -494,15 +501,15 @@ mod tests {
                 }],
                 ..Plan::default()
             }];
-            app.selected_plan = 0;
-            let task = app.plans[0].tasks[0].clone();
+            app.runtime.selected_plan = 0;
+            let task = app.runtime.plans[0].tasks[0].clone();
             let mut time = 0.0;
             let mut render = |events| {
                 time += 0.05;
                 let mut action = None;
                 let output = ctx.run_ui(egui::RawInput { time: Some(time), events, ..Default::default() }, |ui| {
                     egui::CentralPanel::default().show(ui, |ui| {
-                        action = task_result(ui, &task, None, false, &app.config, &app.palette);
+                        action = task_result(ui, &task, None, false, &app.runtime.config, &app.runtime.palette);
                     });
                 });
                 let text: Vec<_> = output
@@ -538,19 +545,19 @@ mod tests {
                     }
                 }
                 if available {
-                    let rows = imacs_core::cleanup::preview(&app.plans[0], "main").unwrap();
-                    imacs_core::cleanup::remove(&app.plans[0], "main", &rows[0]).unwrap();
+                    let rows = imacs_core::cleanup::preview(&app.runtime.plans[0], "main").unwrap();
+                    imacs_core::cleanup::remove(&app.runtime.plans[0], "main", &rows[0]).unwrap();
                     assert!(!worktree.exists());
                 }
             }
-            app.active = None;
-            app.diff_root = None;
-            let sessions = app.sessions.len();
+            app.runtime.active = None;
+            app.runtime.diff_root = None;
+            let sessions = app.runtime.sessions.len();
             for action in ["diff", "resume"] {
-                app.task_action(0, 0, action);
-                assert!(app.diff_target().is_none());
-                assert_eq!(app.sessions.len(), sessions);
-                assert_eq!(app.plans[0].status, PlanStatus::Completed);
+                app.runtime.task_action(0, 0, action);
+                assert!(app.runtime.diff_target().is_none());
+                assert_eq!(app.runtime.sessions.len(), sessions);
+                assert_eq!(app.runtime.plans[0].status, PlanStatus::Completed);
             }
         });
     }
@@ -562,9 +569,9 @@ mod tests {
             |app, ctx| {
                 let dir = tempfile::tempdir().unwrap();
                 let root = dir.path();
-                app.sessions =
+                app.runtime.sessions =
                     (0..3).map(|i| session(&format!("live-{i}"), AgentKind::Claude, AgentStatus::Idle, root)).collect();
-                let index = app.selected_plan;
+                let index = app.runtime.selected_plan;
                 let completed = Task {
                     id: "done".into(),
                     title: "Finished task".into(),
@@ -582,7 +589,7 @@ mod tests {
                     deletions: 88,
                     ..Task::default()
                 };
-                app.plans[index] = Plan {
+                app.runtime.plans[index] = Plan {
                     id: "results".into(),
                     goal: "Results".into(),
                     tasks: vec![
@@ -598,7 +605,7 @@ mod tests {
                     ..Plan::default()
                 };
                 let mut time = 0.0;
-                let mut render = |app: &mut State, board: bool, events| {
+                let mut render = |app: &mut Desktop<'_>, board: bool, events| {
                     time += 0.05;
                     let output = ctx.run_ui(
                         egui::RawInput {
@@ -612,7 +619,8 @@ mod tests {
                                 if board {
                                     app.plan_panel(ui, ui.max_rect());
                                 } else {
-                                    let layout = layout::compute(1600.0, 1000.0, 3, 1, false, 0.0, &app.config.layout);
+                                    let layout =
+                                        layout::compute(1600.0, 1000.0, 3, 1, false, 0.0, &app.runtime.config.layout);
                                     assert_eq!(layout.completed, 1);
                                     app.tiles(ui, ui.max_rect(), &layout, &[0, 1, 2]);
                                 }
@@ -657,7 +665,7 @@ mod tests {
                     );
                     assert!(!text.iter().any(|(t, _)| t.contains("Hidden fourth line")));
                 }
-                app.sessions[0].status = AgentStatus::Working;
+                app.runtime.sessions[0].status = AgentStatus::Working;
                 for board in [false, true] {
                     assert!(!render(app, board, vec![]).iter().any(|(t, _)| t == "reported 25 min ago"));
                 }
@@ -678,8 +686,8 @@ mod tests {
                         ],
                     );
                 }
-                assert_eq!(app.diff_target().as_deref(), Some(root));
-                app.plans[index].status = plan::PlanStatus::Completed;
+                assert_eq!(app.runtime.diff_target().as_deref(), Some(root));
+                app.runtime.plans[index].status = plan::PlanStatus::Completed;
                 let text = render(app, true, vec![]);
                 let pos = text.iter().find(|(t, _)| t == "Archive plan").unwrap().1;
                 for pressed in [true, false] {
@@ -697,8 +705,8 @@ mod tests {
                         ],
                     );
                 }
-                assert_eq!(app.plans[index].status, PlanStatus::Completed);
-                assert_eq!(app.confirm_plan_close, Some(("results".into(), PlanStatus::Archived)));
+                assert_eq!(app.runtime.plans[index].status, PlanStatus::Completed);
+                assert_eq!(app.client.confirm_plan_close, Some(("results".into(), PlanStatus::Archived)));
                 let text = render(app, true, vec![]);
                 let pos = text.iter().find(|(t, _)| t == "Confirm archive").unwrap().1;
                 for pressed in [true, false] {
@@ -716,7 +724,7 @@ mod tests {
                         ],
                     );
                 }
-                assert_eq!(app.plans[index].status, plan::PlanStatus::Archived);
+                assert_eq!(app.runtime.plans[index].status, plan::PlanStatus::Archived);
             },
         );
     }

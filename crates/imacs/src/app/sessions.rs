@@ -34,7 +34,6 @@ impl Session {
             held: Vec::new(),
             approval_hold: false,
             menu_absent_since: None,
-            selected: false,
             chief,
             pending: None,
         }
@@ -527,61 +526,6 @@ impl State {
         Delivery::Queued
     }
 
-    fn steer_targets(&self) -> Vec<usize> {
-        let indices = 0..self.sessions.len();
-        match self.steer_target {
-            SteerTarget::Active => self.active_index().into_iter().collect::<Vec<usize>>(),
-            SteerTarget::Agents => {
-                indices.filter(|&i| self.sessions[i].is_agent() && !self.sessions[i].chief).collect::<Vec<usize>>()
-            }
-            SteerTarget::Selected => indices.filter(|&i| self.sessions[i].selected).collect::<Vec<usize>>(),
-        }
-        .into_iter()
-        .filter(|&i| self.sessions[i].can_receive())
-        .collect()
-    }
-
-    pub(super) fn send_steer(&mut self) {
-        let text = self.steer_text.trim().to_string();
-        if text.is_empty() {
-            return;
-        }
-        let targets = self.steer_targets();
-        if targets.is_empty() {
-            self.toast("No session to send to");
-            return;
-        }
-        let mut typed = 0;
-        let mut queued = 0;
-        let mut held = 0;
-        let mut verifying = 0;
-        for i in targets {
-            match self.deliver(i, &text) {
-                Delivery::Sent => typed += 1,
-                Delivery::Pending => verifying += 1,
-                Delivery::Queued => queued += 1,
-                Delivery::Held => held += 1,
-                Delivery::Unavailable => {}
-            }
-        }
-        self.steer_text.clear();
-        let mut parts = Vec::new();
-        if verifying > 0 {
-            parts.push(format!("Verifying delivery to {verifying} session(s)"));
-        }
-        if typed > 0 {
-            parts.push(format!("Sent to {typed} session{}", if typed == 1 { "" } else { "s" }));
-        }
-        if queued > 0 {
-            parts.push(format!("Queued for {queued} outside IMACS"));
-        }
-        if held > 0 {
-            parts.push(format!("Held for {held} until the session is ready"));
-        }
-        let summary = if parts.is_empty() { "No session could receive the message".into() } else { parts.join(", ") };
-        self.toast(summary);
-    }
-
     pub(super) fn send_review(&mut self, root: &Path) -> Delivery {
         let comments = self.diffs.get(root).map(|s| s.comments.clone()).unwrap_or_default();
         if comments.is_empty() {
@@ -699,6 +643,65 @@ fn compile_cache_env(cwd: &Path) -> Vec<(String, String)> {
     vec![("RUSTC_WRAPPER".into(), sccache), ("SCCACHE_IGNORE_SERVER_IO_ERROR".into(), "1".into())]
 }
 
+impl Desktop<'_> {
+    fn steer_targets(&self) -> Vec<usize> {
+        let indices = 0..self.runtime.sessions.len();
+        match self.client.steer_target {
+            SteerTarget::Active => self.runtime.active_index().into_iter().collect::<Vec<usize>>(),
+            SteerTarget::Agents => indices
+                .filter(|&i| self.runtime.sessions[i].is_agent() && !self.runtime.sessions[i].chief)
+                .collect::<Vec<usize>>(),
+            SteerTarget::Selected => {
+                indices.filter(|&i| self.client.selected.contains(&self.runtime.sessions[i].id)).collect::<Vec<usize>>()
+            }
+        }
+        .into_iter()
+        .filter(|&i| self.runtime.sessions[i].can_receive())
+        .collect()
+    }
+
+    pub(super) fn send_steer(&mut self) {
+        let text = self.client.steer_text.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        let targets = self.steer_targets();
+        if targets.is_empty() {
+            self.runtime.toast("No session to send to");
+            return;
+        }
+        let mut typed = 0;
+        let mut queued = 0;
+        let mut held = 0;
+        let mut verifying = 0;
+        for i in targets {
+            match self.runtime.deliver(i, &text) {
+                Delivery::Sent => typed += 1,
+                Delivery::Pending => verifying += 1,
+                Delivery::Queued => queued += 1,
+                Delivery::Held => held += 1,
+                Delivery::Unavailable => {}
+            }
+        }
+        self.client.steer_text.clear();
+        let mut parts = Vec::new();
+        if verifying > 0 {
+            parts.push(format!("Verifying delivery to {verifying} session(s)"));
+        }
+        if typed > 0 {
+            parts.push(format!("Sent to {typed} session{}", if typed == 1 { "" } else { "s" }));
+        }
+        if queued > 0 {
+            parts.push(format!("Queued for {queued} outside IMACS"));
+        }
+        if held > 0 {
+            parts.push(format!("Held for {held} until the session is ready"));
+        }
+        let summary = if parts.is_empty() { "No session could receive the message".into() } else { parts.join(", ") };
+        self.runtime.toast(summary);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests::{request, session, with_app};
@@ -744,16 +747,16 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let out = dir.path().join("probe");
             let script = format!("ps -o nice= -p $$ > {0}.nice; env > {0}.tmp; mv {0}.tmp {0}; sleep 5", out.display());
-            app.config.agents.push(imacs_core::config::AgentConfig {
+            app.runtime.config.agents.push(imacs_core::config::AgentConfig {
                 name: "probe".into(),
                 command: vec!["/bin/sh".into(), "-c".into(), script],
                 kind: AgentKind::Generic,
                 busy_text: None,
             });
-            app.config.resources.agent_nice = 7;
+            app.runtime.config.resources.agent_nice = 7;
             // SAFETY: querying this process's priority has no preconditions.
             let inherited_nice = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
-            app.start(ctx, "probe", dir.path().into(), None, vec![], None).unwrap();
+            app.runtime.start(ctx, "probe", dir.path().into(), None, vec![], None).unwrap();
             let deadline = Instant::now() + Duration::from_secs(10);
             while !out.exists() {
                 assert!(Instant::now() < deadline, "the probe agent never wrote its environment");
@@ -774,7 +777,7 @@ mod tests {
                 std::fs::read_to_string(dir.path().join("probe.nice")).unwrap().trim(),
                 (inherited_nice + 7).min(19).to_string()
             );
-            app.sessions.clear();
+            app.runtime.sessions.clear();
         });
     }
 
@@ -785,8 +788,8 @@ mod tests {
             std::fs::create_dir(dir.path().join("src")).unwrap();
             std::fs::write(dir.path().join("src/Example.csproj"), "").unwrap();
             let out = dir.path().join("env");
-            app.config.resources.dotnet.processor_count = Some(2);
-            app.config.agents.push(imacs_core::config::AgentConfig {
+            app.runtime.config.resources.dotnet.processor_count = Some(2);
+            app.runtime.config.agents.push(imacs_core::config::AgentConfig {
                 name: "dotnet-probe".into(),
                 command: vec![
                     "/bin/sh".into(),
@@ -796,17 +799,19 @@ mod tests {
                 kind: AgentKind::Generic,
                 busy_text: None,
             });
-            app.start(ctx, "dotnet-probe", dir.path().into(), None, vec![], None).unwrap();
+            app.runtime.start(ctx, "dotnet-probe", dir.path().into(), None, vec![], None).unwrap();
             let deadline = Instant::now() + Duration::from_secs(10);
             while !out.exists() {
                 assert!(Instant::now() < deadline, "the .NET probe never wrote its environment");
                 std::thread::sleep(Duration::from_millis(20));
             }
             let env = std::fs::read_to_string(out).unwrap();
-            for (key, value) in app.config.resources.env(imacs_core::governor::Toolchain::Dotnet, app.governor.cores) {
+            for (key, value) in
+                app.runtime.config.resources.env(imacs_core::governor::Toolchain::Dotnet, app.runtime.governor.cores)
+            {
                 assert!(env.lines().any(|line| line == format!("{key}={value}")), "{env}");
             }
-            app.sessions.clear();
+            app.runtime.sessions.clear();
         });
     }
 
@@ -840,7 +845,7 @@ fi
                 )
                 .unwrap();
                 std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
-                app.config.agents.push(imacs_core::config::AgentConfig {
+                app.runtime.config.agents.push(imacs_core::config::AgentConfig {
                     name: name.into(),
                     command: vec![program.to_string_lossy().into_owned()],
                     kind: AgentKind::Generic,
@@ -860,9 +865,9 @@ fi
                 }
             });
             let program = |name: &str| dir.path().join(name).join("codex").to_string_lossy().into_owned();
-            let one = app.codex_version(ctx, program("one"));
-            assert!(Arc::ptr_eq(&one, &app.codex_version(ctx, program("one"))));
-            let two = app.codex_version(ctx, program("two"));
+            let one = app.runtime.codex_version(ctx, program("one"));
+            assert!(Arc::ptr_eq(&one, &app.runtime.codex_version(ctx, program("one"))));
+            let two = app.runtime.codex_version(ctx, program("two"));
             release.join().unwrap();
             let deadline = Instant::now() + Duration::from_secs(5);
             while one.get().is_none() || two.get().is_none() {
@@ -871,15 +876,18 @@ fi
             }
             assert_eq!(one.get(), Some(&Some(true)));
             assert_eq!(two.get(), Some(&Some(false)));
-            assert_eq!(app.codex_versions.len(), 2);
+            assert_eq!(app.runtime.codex_versions.len(), 2);
             // A gated probe must finish before start() runs git: concurrent children can
             // inherit pipe writers on macOS and otherwise keep git's output() waiting for EOF.
             let mut ids = Vec::new();
             for name in ["one", "one", "two"] {
-                ids.push(app.start(ctx, name, dir.path().into(), None, vec![], None).unwrap());
+                ids.push(app.runtime.start(ctx, name, dir.path().into(), None, vec![], None).unwrap());
             }
             let deadline = Instant::now() + Duration::from_secs(5);
-            while ids.iter().any(|id| !app.sessions[app.find(id).unwrap()].terminal.as_ref().unwrap().exited()) {
+            while ids
+                .iter()
+                .any(|id| !app.runtime.sessions[app.runtime.find(id).unwrap()].terminal.as_ref().unwrap().exited())
+            {
                 assert!(Instant::now() < deadline, "finite fake agents must exit before teardown");
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -893,11 +901,11 @@ fi
                     .unwrap()
                     .contains("hooks.PermissionRequest")
             );
-            assert!(Arc::ptr_eq(&one, &app.codex_version(ctx, program("one"))));
+            assert!(Arc::ptr_eq(&one, &app.runtime.codex_version(ctx, program("one"))));
             for name in ["one", "two"] {
                 assert_eq!(std::fs::read_to_string(dir.path().join(name).join("checks")).unwrap().lines().count(), 1);
             }
-            app.sessions.clear();
+            app.runtime.sessions.clear();
         });
     }
 
@@ -910,7 +918,7 @@ fi
                 let dir = tempfile::tempdir().unwrap();
                 let program = dir.path().join("codex");
                 let name = program.to_string_lossy().into_owned();
-                app.config.agents.push(imacs_core::config::AgentConfig {
+                app.runtime.config.agents.push(imacs_core::config::AgentConfig {
                     name: "flaky".into(),
                     command: vec![name.clone()],
                     kind: AgentKind::Generic,
@@ -922,7 +930,7 @@ fi
                     let failed = Arc::new(OnceLock::new());
                     failed.set(crate::setup::codex_supports_hooks(&name, Duration::from_millis(100))).unwrap();
                     assert_eq!(failed.get(), Some(&None));
-                    app.codex_versions.insert(name.clone(), failed.clone());
+                    app.runtime.codex_versions.insert(name.clone(), failed.clone());
                     std::fs::write(
                         &program,
                         r#"#!/bin/sh
@@ -934,24 +942,24 @@ fi
 "#,
                     )
                     .unwrap();
-                    let id = app.start(ctx, "flaky", dir.path().into(), None, vec![], None).unwrap();
-                    let retried = app.codex_versions[&name].clone();
+                    let id = app.runtime.start(ctx, "flaky", dir.path().into(), None, vec![], None).unwrap();
+                    let retried = app.runtime.codex_versions[&name].clone();
                     assert!(!Arc::ptr_eq(&failed, &retried), "failed probes must not be reused as old versions");
                     let deadline = Instant::now() + Duration::from_secs(10);
-                    while app.sessions[app.find(&id).unwrap()]
+                    while app.runtime.sessions[app.runtime.find(&id).unwrap()]
                         .terminal
                         .as_ref()
                         .is_none_or(|terminal| !terminal.exited())
                     {
                         assert!(Instant::now() < deadline, "recovered fake agent must launch and exit");
-                        app.runtime_tick(ctx);
+                        app.runtime.runtime_tick(ctx);
                         std::thread::sleep(Duration::from_millis(10));
                     }
                     let args = std::fs::read_to_string(dir.path().join("launch-args")).unwrap();
                     assert!(args.contains("--no-daemon"));
                     assert!(args.contains("hooks.PermissionRequest"));
                     assert_eq!(retried.get(), Some(&Some(true)));
-                    assert!(Arc::ptr_eq(&retried, &app.codex_version(ctx, name.clone())));
+                    assert!(Arc::ptr_eq(&retried, &app.runtime.codex_version(ctx, name.clone())));
                 }
             },
         );
@@ -961,7 +969,7 @@ fi
     fn busy_codex_sends_wait_for_receipts_retry_and_report_failure() {
         with_app("app::sessions::tests::busy_codex_sends_wait_for_receipts_retry_and_report_failure", |app, ctx| {
             let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex");
-            app.config.agents.push(imacs_core::config::AgentConfig {
+            app.runtime.config.agents.push(imacs_core::config::AgentConfig {
                 name: "fake-codex".into(),
                 command: vec![fixture.to_string_lossy().into_owned()],
                 kind: AgentKind::Generic,
@@ -970,11 +978,11 @@ fi
             let text = "Please check the first change and then the second change";
             for mode in ["queue", "retry", "drop", "drop-paste", "drop-empty", "exit", "hook"] {
                 let terminal = Terminal::spawn(
-                    app.wake.clone(),
-                    app.palette.terminal_colors(),
+                    app.runtime.wake.clone(),
+                    app.runtime.palette.terminal_colors(),
                     fixture.to_string_lossy().into_owned(),
                     vec!["--mode".into(), mode.into()],
-                    &app.launch_dir,
+                    &app.runtime.launch_dir,
                     HashMap::new(),
                     100,
                 )
@@ -984,19 +992,24 @@ fi
                     assert!(Instant::now() < deadline);
                     std::thread::sleep(Duration::from_millis(10));
                 }
-                app.sessions = vec![session(mode, AgentKind::Generic, AgentStatus::Working, &app.launch_dir)];
-                app.sessions[0].agent = "fake-codex".into();
-                app.sessions[0].terminal = Some(terminal);
+                app.runtime.sessions =
+                    vec![session(mode, AgentKind::Generic, AgentStatus::Working, &app.runtime.launch_dir)];
+                app.runtime.sessions[0].agent = "fake-codex".into();
+                app.runtime.sessions[0].terminal = Some(terminal);
                 let (tx, rx) = channel();
-                app.control(ctx, ControlRequest::Send { session: mode.into(), text: text.into(), raw: false }, tx);
+                app.runtime.control(
+                    ctx,
+                    ControlRequest::Send { session: mode.into(), text: text.into(), raw: false },
+                    tx,
+                );
                 assert!(rx.try_recv().is_err(), "an unverified send must not claim success");
                 let held = request(app, json!({"cmd":"send", "session":mode, "text":"second message"}));
                 assert!(held.ok && held.result["held"] == true, "another send must wait for the pending receipt");
-                assert_eq!(app.sessions[0].pending.as_ref().unwrap().text, text);
+                assert_eq!(app.runtime.sessions[0].pending.as_ref().unwrap().text, text);
                 // Let the initial paste and its delayed Enter reach the fake busy terminal.
                 std::thread::sleep(Duration::from_millis(250));
-                app.sessions[0].status = AgentStatus::Done;
-                app.verify_deliveries();
+                app.runtime.sessions[0].status = AgentStatus::Done;
+                app.runtime.verify_deliveries();
                 if mode != "exit" {
                     assert!(rx.try_recv().is_err(), "composer text or a shared prefix is not a receipt");
                 }
@@ -1005,7 +1018,7 @@ fi
                         "hook_event_name":"UserPromptSubmit", "session_id":mode, "prompt":text,
                     }))
                     .unwrap();
-                    app.on_hook(HookMessage {
+                    app.runtime.on_hook(HookMessage {
                         pane: Some(mode.into()),
                         ancestors: vec![],
                         event,
@@ -1015,12 +1028,12 @@ fi
                 }
                 let mut response = None;
                 for _ in 0..DELIVERY_ATTEMPTS {
-                    if let Some(pending) = &mut app.sessions[0].pending {
+                    if let Some(pending) = &mut app.runtime.sessions[0].pending {
                         pending.sent = Instant::now() - DELIVERY_TIMEOUT;
                     }
-                    app.verify_deliveries();
+                    app.runtime.verify_deliveries();
                     std::thread::sleep(Duration::from_millis(200));
-                    app.verify_deliveries();
+                    app.runtime.verify_deliveries();
                     if let Ok(ControlOutcome::Done(result)) = rx.try_recv() {
                         response = Some(result);
                         break;
@@ -1033,7 +1046,7 @@ fi
                     assert!(
                         mode == "hook"
                             || steer::message_in_transcript(
-                                &app.sessions[0].terminal.as_ref().unwrap().screen_text(60),
+                                &app.runtime.sessions[0].terminal.as_ref().unwrap().screen_text(60),
                                 text
                             )
                     );
@@ -1041,19 +1054,19 @@ fi
                     assert!(response.error.unwrap().contains("unconfirmed"));
                 }
                 if matches!(mode, "drop-paste" | "drop-empty") {
-                    let screen = app.sessions[0].terminal.as_ref().unwrap().screen_text(60);
+                    let screen = app.runtime.sessions[0].terminal.as_ref().unwrap().screen_text(60);
                     assert!(screen.contains("Pastes: 1"), "{screen}");
                     assert!(screen.contains("Enters: 1"), "{screen}");
                     assert!(screen.contains("Tabs: 0"), "{screen}");
                     assert_eq!(response.result.get("sent"), None);
                 }
                 if mode == "hook" {
-                    assert_eq!(app.sessions[0].pending.as_ref().unwrap().text, "second message");
-                    assert!(app.sessions[0].held.is_empty());
+                    assert_eq!(app.runtime.sessions[0].pending.as_ref().unwrap().text, "second message");
+                    assert!(app.runtime.sessions[0].held.is_empty());
                 } else {
-                    assert!(app.sessions[0].pending.is_none());
+                    assert!(app.runtime.sessions[0].pending.is_none());
                 }
-                app.sessions.clear();
+                app.runtime.sessions.clear();
             }
         });
     }
@@ -1062,7 +1075,7 @@ fi
     fn codex_clipped_and_repeated_receipts_never_repaste() {
         with_app("app::sessions::tests::codex_clipped_and_repeated_receipts_never_repaste", |app, ctx| {
             let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex");
-            app.config.agents.push(imacs_core::config::AgentConfig {
+            app.runtime.config.agents.push(imacs_core::config::AgentConfig {
                 name: "fake-codex".into(),
                 command: vec![fixture.to_string_lossy().into_owned()],
                 kind: AgentKind::Generic,
@@ -1075,11 +1088,11 @@ fi
                     "Please check the first change and then the second change".into()
                 };
                 let terminal = Terminal::spawn(
-                    app.wake.clone(),
-                    app.palette.terminal_colors(),
+                    app.runtime.wake.clone(),
+                    app.runtime.palette.terminal_colors(),
                     fixture.to_string_lossy().into_owned(),
                     vec!["--mode".into(), mode.into()],
-                    &app.launch_dir,
+                    &app.runtime.launch_dir,
                     HashMap::new(),
                     100,
                 )
@@ -1089,16 +1102,17 @@ fi
                     assert!(Instant::now() < deadline);
                     std::thread::sleep(Duration::from_millis(10));
                 }
-                app.sessions = vec![session(mode, AgentKind::Generic, AgentStatus::Working, &app.launch_dir)];
-                app.sessions[0].agent = "fake-codex".into();
-                app.sessions[0].terminal = Some(terminal);
+                app.runtime.sessions =
+                    vec![session(mode, AgentKind::Generic, AgentStatus::Working, &app.runtime.launch_dir)];
+                app.runtime.sessions[0].agent = "fake-codex".into();
+                app.runtime.sessions[0].terminal = Some(terminal);
                 let (tx, rx) = channel();
-                app.control(ctx, ControlRequest::Send { session: mode.into(), text, raw: false }, tx);
+                app.runtime.control(ctx, ControlRequest::Send { session: mode.into(), text, raw: false }, tx);
                 let mut paste_seen = false;
-                while !app.sessions[0].terminal.as_ref().unwrap().screen_text(60).contains("Enters: 1") {
+                while !app.runtime.sessions[0].terminal.as_ref().unwrap().screen_text(60).contains("Enters: 1") {
                     assert!(Instant::now() < deadline, "{mode}: the original paste and Enter must reach the fixture");
-                    app.verify_deliveries();
-                    paste_seen |= app.sessions[0].pending.as_ref().is_some_and(|pending| pending.paste_seen);
+                    app.runtime.verify_deliveries();
+                    paste_seen |= app.runtime.sessions[0].pending.as_ref().is_some_and(|pending| pending.paste_seen);
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 if mode == "marker" {
@@ -1106,16 +1120,16 @@ fi
                 }
                 let mut response = None;
                 for _ in 0..=DELIVERY_ATTEMPTS {
-                    if let Some(pending) = &mut app.sessions[0].pending {
+                    if let Some(pending) = &mut app.runtime.sessions[0].pending {
                         pending.sent = Instant::now() - DELIVERY_TIMEOUT;
                     }
-                    app.verify_deliveries();
+                    app.runtime.verify_deliveries();
                     if let Ok(ControlOutcome::Done(result)) = rx.try_recv() {
                         response = Some(result);
                         break;
                     }
                     if mode == "collapsed" {
-                        while !app.sessions[0].terminal.as_ref().unwrap().screen_text(60).contains("Queued") {
+                        while !app.runtime.sessions[0].terminal.as_ref().unwrap().screen_text(60).contains("Queued") {
                             assert!(Instant::now() < deadline, "{mode}: the retry must submit with Tab");
                             std::thread::sleep(Duration::from_millis(10));
                         }
@@ -1125,12 +1139,12 @@ fi
                 assert_eq!(response.ok, mode != "no-prompt", "{mode}: {response:?}");
                 // A missing prompt cannot confirm delivery, but must never cause
                 // a second paste after the original text has left the composer.
-                let screen = app.sessions[0].terminal.as_ref().unwrap().screen_text(60);
+                let screen = app.runtime.sessions[0].terminal.as_ref().unwrap().screen_text(60);
                 assert!(screen.contains("Pastes: 1"), "{mode}: {screen}");
                 assert!(screen.contains("Enters: 1"), "{mode}: {screen}");
                 assert!(screen.contains(if mode == "collapsed" { "Tabs: 1" } else { "Tabs: 0" }), "{mode}: {screen}");
                 assert!(rx.try_recv().is_err(), "{mode}: a send resolves only once");
-                app.sessions.clear();
+                app.runtime.sessions.clear();
             }
         });
     }
@@ -1139,55 +1153,56 @@ fi
     fn steering_during_a_pending_codex_send_is_held_and_released() {
         with_app("app::sessions::tests::steering_during_a_pending_codex_send_is_held_and_released", |app, _ctx| {
             let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex");
-            app.config.agents.push(imacs_core::config::AgentConfig {
+            app.runtime.config.agents.push(imacs_core::config::AgentConfig {
                 name: "fake-codex".into(),
                 command: vec![fixture.to_string_lossy().into_owned()],
                 kind: AgentKind::Generic,
                 busy_text: None,
             });
-            app.sessions = vec![session("worker", AgentKind::Generic, AgentStatus::Working, &app.launch_dir)];
-            app.sessions[0].agent = "fake-codex".into();
-            app.sessions[0].terminal = Some(
+            app.runtime.sessions =
+                vec![session("worker", AgentKind::Generic, AgentStatus::Working, &app.runtime.launch_dir)];
+            app.runtime.sessions[0].agent = "fake-codex".into();
+            app.runtime.sessions[0].terminal = Some(
                 Terminal::spawn(
-                    app.wake.clone(),
-                    app.palette.terminal_colors(),
+                    app.runtime.wake.clone(),
+                    app.runtime.palette.terminal_colors(),
                     fixture.to_string_lossy().into_owned(),
                     vec![],
-                    &app.launch_dir,
+                    &app.runtime.launch_dir,
                     HashMap::new(),
                     100,
                 )
                 .unwrap(),
             );
-            assert_eq!(app.deliver(0, "first"), Delivery::Pending);
-            app.active = Some("worker".into());
-            app.steer_target = SteerTarget::Active;
-            app.steer_text = "second".into();
+            assert_eq!(app.runtime.deliver(0, "first"), Delivery::Pending);
+            app.runtime.active = Some("worker".into());
+            app.client.steer_target = SteerTarget::Active;
+            app.client.steer_text = "second".into();
             app.send_steer();
-            app.steer_text = "third".into();
+            app.client.steer_text = "third".into();
             app.send_steer();
-            assert!(app.steer_text.is_empty());
-            assert_eq!(app.sessions[0].pending.as_ref().unwrap().text, "first");
-            assert_eq!(app.sessions[0].held, ["second", "third"]);
-            assert!(app.sessions[0].activity.held_since.is_some());
-            app.release_held(0);
-            assert_eq!(app.sessions[0].held.len(), 2);
+            assert!(app.client.steer_text.is_empty());
+            assert_eq!(app.runtime.sessions[0].pending.as_ref().unwrap().text, "first");
+            assert_eq!(app.runtime.sessions[0].held, ["second", "third"]);
+            assert!(app.runtime.sessions[0].activity.held_since.is_some());
+            app.runtime.release_held(0);
+            assert_eq!(app.runtime.sessions[0].held.len(), 2);
             let event = imacs_core::hook::HookEvent::from_payload(&json!({
                 "hook_event_name":"UserPromptSubmit", "session_id":"worker", "prompt":"first"
             }))
             .unwrap();
-            app.on_hook(HookMessage {
+            app.runtime.on_hook(HookMessage {
                 pane: Some("worker".into()),
                 ancestors: vec![],
                 event,
                 delivered: 0,
                 approval_reply: None,
             });
-            app.release_held(0);
-            assert!(app.sessions[0].held.is_empty());
-            assert!(app.sessions[0].activity.held_since.is_none());
-            assert_eq!(app.sessions[0].pending.as_ref().unwrap().text, "second\n\nthird");
-            app.sessions.clear();
+            app.runtime.release_held(0);
+            assert!(app.runtime.sessions[0].held.is_empty());
+            assert!(app.runtime.sessions[0].activity.held_since.is_none());
+            assert_eq!(app.runtime.sessions[0].pending.as_ref().unwrap().text, "second\n\nthird");
+            app.runtime.sessions.clear();
         });
     }
 

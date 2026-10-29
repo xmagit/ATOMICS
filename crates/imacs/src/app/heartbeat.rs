@@ -147,12 +147,12 @@ mod tests {
     use super::super::tests::{session, with_app};
     use super::*;
 
-    fn finish(app: &mut State) {
+    fn finish(app: &mut Desktop<'_>) {
         let deadline = Instant::now() + Duration::from_secs(3);
-        while app.heartbeat.pending.is_some() {
+        while app.runtime.heartbeat.pending.is_some() {
             assert!(Instant::now() < deadline, "heartbeat worker did not finish");
             std::thread::sleep(Duration::from_millis(5));
-            app.heartbeat();
+            app.runtime.heartbeat();
         }
     }
 
@@ -179,12 +179,12 @@ mod tests {
         with_app(
             "app::heartbeat::tests::interval_emits_one_empty_event_to_waiters_and_updates_pill_state",
             |app, ctx| {
-                app.config.chief.heartbeat_secs = 7;
-                app.heartbeat();
-                assert!(app.heartbeat.pending.is_none());
-                assert!(app.heartbeat.last.is_none());
+                app.runtime.config.chief.heartbeat_secs = 7;
+                app.runtime.heartbeat();
+                assert!(app.runtime.heartbeat.pending.is_none());
+                assert!(app.runtime.heartbeat.last.is_none());
                 let (tx, rx) = channel();
-                app.control(
+                app.runtime.control(
                     ctx,
                     ControlRequest::Wait {
                         sessions: vec![],
@@ -194,9 +194,9 @@ mod tests {
                     },
                     tx,
                 );
-                app.heartbeat.started = Instant::now() - Duration::from_secs(7);
-                app.heartbeat();
-                assert!(app.heartbeat.pending.is_some());
+                app.runtime.heartbeat.started = Instant::now() - Duration::from_secs(7);
+                app.runtime.heartbeat();
+                assert!(app.runtime.heartbeat.pending.is_some());
                 finish(app);
                 let ControlOutcome::Done(response) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else {
                     panic!("wait did not finish")
@@ -207,13 +207,13 @@ mod tests {
                 assert_eq!(response.result["events"][0]["findings"], json!([]));
                 assert_eq!(response.result["cursor"], 1);
                 assert_eq!(response.result["timed_out"], false);
-                assert!(app.heartbeat.last.as_ref().unwrap().1.is_empty());
-                app.heartbeat();
-                assert_eq!(app.event_seq, 1);
-                app.heartbeat.started -= Duration::from_secs(7);
-                app.heartbeat();
+                assert!(app.runtime.heartbeat.last.as_ref().unwrap().1.is_empty());
+                app.runtime.heartbeat();
+                assert_eq!(app.runtime.event_seq, 1);
+                app.runtime.heartbeat.started -= Duration::from_secs(7);
+                app.runtime.heartbeat();
                 finish(app);
-                assert_eq!(app.event_seq, 2);
+                assert_eq!(app.runtime.event_seq, 2);
             },
         );
     }
@@ -223,8 +223,13 @@ mod tests {
         with_app(
             "app::heartbeat::tests::gone_agents_survive_plan_sync_and_filtered_waiters_receive_findings",
             |app, ctx| {
-                app.sessions.push(session("gone", AgentKind::Generic, AgentStatus::Exited, &paths::imacs_home()));
-                app.plans = vec![Plan {
+                app.runtime.sessions.push(session(
+                    "gone",
+                    AgentKind::Generic,
+                    AgentStatus::Exited,
+                    &paths::imacs_home(),
+                ));
+                app.runtime.plans = vec![Plan {
                     id: "open".into(),
                     tasks: vec![Task {
                         id: "task".into(),
@@ -235,7 +240,7 @@ mod tests {
                     ..Plan::default()
                 }];
                 let (tx, rx) = channel();
-                app.control(
+                app.runtime.control(
                     ctx,
                     ControlRequest::Wait {
                         sessions: vec!["gone".into()],
@@ -245,10 +250,10 @@ mod tests {
                     },
                     tx,
                 );
-                app.sync_plan();
-                assert_eq!(app.plans[0].tasks[0].status, TaskStatus::Blocked);
-                app.heartbeat.started -= Duration::from_secs(300);
-                app.heartbeat();
+                app.runtime.sync_plan();
+                assert_eq!(app.runtime.plans[0].tasks[0].status, TaskStatus::Blocked);
+                app.runtime.heartbeat.started -= Duration::from_secs(300);
+                app.runtime.heartbeat();
                 finish(app);
                 let ControlOutcome::Done(response) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else {
                     panic!("wait did not finish")
@@ -259,7 +264,7 @@ mod tests {
                         "plan":"open", "task":"task", "session":"gone", "kind":"agent_gone"
                     })
                 );
-                assert_eq!(app.heartbeat.last.as_ref().unwrap().1.len(), 1);
+                assert_eq!(app.runtime.heartbeat.last.as_ref().unwrap().1.len(), 1);
             },
         );
     }
@@ -267,17 +272,17 @@ mod tests {
     #[test]
     fn activity_tracks_status_hooks_reports_and_oldest_held_message() {
         with_app("app::heartbeat::tests::activity_tracks_status_hooks_reports_and_oldest_held_message", |app, _| {
-            app.sessions.push(session("agent", AgentKind::Claude, AgentStatus::Working, &paths::imacs_home()));
-            app.record_events();
-            app.sessions[0].activity.last_event = 1;
-            app.sessions[0].activity.status_since = 2;
-            app.record_events();
-            assert_eq!(app.sessions[0].activity.last_event, 1, "frames are not agent events");
-            assert_eq!(app.sessions[0].activity.status_since, 2);
-            app.report(Some("agent"), "progress", "working");
-            assert!(app.sessions[0].activity.last_event > 1);
-            app.sessions[0].activity.last_event = 1;
-            app.on_hook(HookMessage {
+            app.runtime.sessions.push(session("agent", AgentKind::Claude, AgentStatus::Working, &paths::imacs_home()));
+            app.runtime.record_events();
+            app.runtime.sessions[0].activity.last_event = 1;
+            app.runtime.sessions[0].activity.status_since = 2;
+            app.runtime.record_events();
+            assert_eq!(app.runtime.sessions[0].activity.last_event, 1, "frames are not agent events");
+            assert_eq!(app.runtime.sessions[0].activity.status_since, 2);
+            app.runtime.report(Some("agent"), "progress", "working");
+            assert!(app.runtime.sessions[0].activity.last_event > 1);
+            app.runtime.sessions[0].activity.last_event = 1;
+            app.runtime.on_hook(HookMessage {
                 pane: Some("agent".into()),
                 ancestors: vec![],
                 delivered: 0,
@@ -288,18 +293,18 @@ mod tests {
                     ..Default::default()
                 },
             });
-            assert!(app.sessions[0].activity.last_event > 1, "same-status hooks refresh activity");
-            app.sessions[0].status = AgentStatus::Done;
-            app.record_events();
-            assert!(app.sessions[0].activity.status_since > 2);
-            app.sessions[0].approval_hold = true;
-            assert_eq!(app.deliver(0, "first"), Delivery::Held);
-            app.sessions[0].activity.held_since = Some(3);
-            assert_eq!(app.deliver(0, "second"), Delivery::Held);
-            assert_eq!(app.sessions[0].activity.held_since, Some(3));
-            app.sessions[0].approval_hold = false;
-            app.release_held(0);
-            assert!(app.sessions[0].activity.held_since.is_none());
+            assert!(app.runtime.sessions[0].activity.last_event > 1, "same-status hooks refresh activity");
+            app.runtime.sessions[0].status = AgentStatus::Done;
+            app.runtime.record_events();
+            assert!(app.runtime.sessions[0].activity.status_since > 2);
+            app.runtime.sessions[0].approval_hold = true;
+            assert_eq!(app.runtime.deliver(0, "first"), Delivery::Held);
+            app.runtime.sessions[0].activity.held_since = Some(3);
+            assert_eq!(app.runtime.deliver(0, "second"), Delivery::Held);
+            assert_eq!(app.runtime.sessions[0].activity.held_since, Some(3));
+            app.runtime.sessions[0].approval_hold = false;
+            app.runtime.release_held(0);
+            assert!(app.runtime.sessions[0].activity.held_since.is_none());
         });
     }
 
@@ -318,8 +323,8 @@ mod tests {
             {
                 let has_findings = !findings.is_empty();
                 let at = imacs_core::store::now() - age;
-                app.heartbeat.last = Some((at, findings));
-                let error = app.palette.error;
+                app.runtime.heartbeat.last = Some((at, findings));
+                let error = app.runtime.palette.error;
                 let mut frame = |events| {
                     time += 1.0;
                     ctx.run_ui(

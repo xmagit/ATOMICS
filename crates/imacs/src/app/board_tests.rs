@@ -5,7 +5,7 @@ struct BoardFrame {
     cards: Vec<Rect>,
 }
 
-fn frame(app: &mut State, ctx: &egui::Context, width: f32, time: f64, events: Vec<egui::Event>) -> BoardFrame {
+fn frame(app: &mut Desktop<'_>, ctx: &egui::Context, width: f32, time: f64, events: Vec<egui::Event>) -> BoardFrame {
     let output = ctx.run_ui(
         egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(width, 1000.0))),
@@ -29,7 +29,7 @@ fn frame(app: &mut State, ctx: &egui::Context, width: f32, time: f64, events: Ve
         .shapes
         .iter()
         .filter_map(|shape| match &shape.shape {
-            egui::epaint::Shape::Rect(rect) if rect.fill == app.palette.raised && rect.rect.height() > 40.0 => {
+            egui::epaint::Shape::Rect(rect) if rect.fill == app.runtime.palette.raised && rect.rect.height() > 40.0 => {
                 Some(rect.rect)
             }
             _ => None,
@@ -39,14 +39,20 @@ fn frame(app: &mut State, ctx: &egui::Context, width: f32, time: f64, events: Ve
     BoardFrame { text, cards }
 }
 
-fn populate(app: &mut State) {
+fn populate(app: &mut Desktop<'_>) {
     let agent = imacs_core::config::AgentConfig {
         name: "codex".into(),
         command: vec![],
         kind: AgentKind::Generic,
         busy_text: None,
     };
-    app.sessions = vec![Session::starting("existing-session".into(), &agent, app.launch_dir.clone(), false, &app.wake)];
+    app.runtime.sessions = vec![Session::starting(
+        "existing-session".into(),
+        &agent,
+        app.runtime.launch_dir.clone(),
+        false,
+        &app.runtime.wake,
+    )];
     let tasks = TaskStatus::ALL
         .into_iter()
         .enumerate()
@@ -70,16 +76,16 @@ fn populate(app: &mut State) {
             ..Task::default()
         })
         .collect();
-    app.plans = vec![Plan {
+    app.runtime.plans = vec![Plan {
         id: "readable-board".into(),
         goal: "Readable plan board cards".into(),
         tasks,
         approved: true,
         ..Plan::default()
     }];
-    app.selected_plan = 0;
-    for task in &app.plans[0].tasks {
-        app.expanded_tasks.insert((app.plans[0].id.clone(), task.id.clone()));
+    app.runtime.selected_plan = 0;
+    for task in &app.runtime.plans[0].tasks {
+        app.client.expanded_tasks.insert((app.runtime.plans[0].id.clone(), task.id.clone()));
     }
 }
 
@@ -159,7 +165,7 @@ fn branch_names_are_single_line_elided_and_show_the_full_name_on_hover() {
             assert!(branch.galley.elided);
             assert_eq!(branch.galley.rows.len(), 1);
             assert_eq!(branch.galley.rows[0].glyphs.last().unwrap().chr, '…');
-            let full = app.plans[0].tasks[0].branch.clone().unwrap();
+            let full = app.runtime.plans[0].tasks[0].branch.clone().unwrap();
             let hover = branch.pos + branch.galley.rect.center().to_vec2();
             frame(app, ctx, 1600.0, 4.0, vec![egui::Event::PointerMoved(hover)]);
             frame(app, ctx, 1600.0, 5.0, vec![]);
@@ -235,7 +241,7 @@ fn board_scrolls_horizontally_to_the_last_column_and_keeps_card_buttons() {
                     ],
                 );
             }
-            assert_eq!(app.plans[0].tasks[4].status, TaskStatus::Review);
+            assert_eq!(app.runtime.plans[0].tasks[4].status, TaskStatus::Review);
         },
     );
 }

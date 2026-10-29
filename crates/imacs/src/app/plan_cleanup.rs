@@ -79,13 +79,16 @@ impl State {
         self.plan_cleanup = Some(dialog);
         changed
     }
+}
 
+impl Desktop<'_> {
     pub(super) fn plan_cleanup_dialog(&mut self, ctx: &egui::Context) {
-        let Some(mut dialog) = self.plan_cleanup.take() else { return };
-        let completed = self.plans.iter().any(|plan| plan.id == dialog.plan.id && plan.status == PlanStatus::Completed);
+        let Some(mut dialog) = self.runtime.plan_cleanup.take() else { return };
+        let completed =
+            self.runtime.plans.iter().any(|plan| plan.id == dialog.plan.id && plan.status == PlanStatus::Completed);
         // Sessions resolve their worktree in the background, so compare real paths (/var is /private/var).
         let real = |path: std::path::PathBuf| std::fs::canonicalize(&path).unwrap_or(path);
-        let roots: HashSet<_> = self.sessions.iter().map(|s| real(s.root())).collect();
+        let roots: HashSet<_> = self.runtime.sessions.iter().map(|s| real(s.root())).collect();
         let mut open = true;
         let mut remove = false;
         let mut reload = false;
@@ -119,9 +122,9 @@ impl State {
                             );
                             let label = reason.map(|why| format!("Keep: {why}")).unwrap_or_else(|| "Remove".into());
                             ui.label(RichText::new(label).color(if reason.is_some() {
-                                self.palette.warning
+                                self.runtime.palette.warning
                             } else {
-                                self.palette.success
+                                self.runtime.palette.success
                             }));
                         });
                         let path =
@@ -129,7 +132,7 @@ impl State {
                         ui.label(
                             RichText::new(format!("{} · {path}", paths::display(&entry.repo)))
                                 .small()
-                                .color(self.palette.muted),
+                                .color(self.runtime.palette.muted),
                         );
                         ui.separator();
                     }
@@ -149,10 +152,10 @@ impl State {
                 }
             });
         if reload {
-            if let Some(plan) = self.plans.iter().find(|plan| plan.id == dialog.plan.id) {
+            if let Some(plan) = self.runtime.plans.iter().find(|plan| plan.id == dialog.plan.id) {
                 dialog.plan = plan.clone();
             }
-            self.load_plan_cleanup(&mut dialog);
+            self.runtime.load_plan_cleanup(&mut dialog);
         }
         if remove
             && let Some(plan) = self
@@ -164,7 +167,7 @@ impl State {
             dialog.busy = true;
             let targets: Vec<_> =
                 dialog.rows.iter().filter(|(_, selected)| *selected).map(|(row, _)| row.clone()).collect();
-            let (tx, plan, base) = (dialog.tx.clone(), plan, self.config.base_ref.clone());
+            let (tx, plan, base) = (dialog.tx.clone(), plan, self.runtime.config.base_ref.clone());
             std::thread::spawn(move || {
                 for entry in targets {
                     let result = cleanup::remove(&plan, &base, &entry).map_err(|err| format!("{err:#}"));
@@ -174,7 +177,7 @@ impl State {
             });
         }
         if open {
-            self.plan_cleanup = Some(dialog);
+            self.runtime.plan_cleanup = Some(dialog);
         }
     }
 }
@@ -221,18 +224,18 @@ mod tests {
                 std::fs::write(dir.path().join("unmerged/new-file"), "keep commit").unwrap();
                 git::commit_all(&dir.path().join("unmerged"), "unmerged").unwrap();
                 git::git(&repo, &["branch", &plan.integration_branch()]).unwrap();
-                app.sessions.push(Session::starting(
+                app.runtime.sessions.push(Session::starting(
                     "busy".into(),
-                    &app.config.agents[0],
+                    &app.runtime.config.agents[0],
                     dir.path().join("busy"),
                     false,
-                    &app.wake,
+                    &app.runtime.wake,
                 ));
-                app.plans = vec![plan];
-                app.selected_plan = 0;
-                app.config.base_ref = "main".into();
+                app.runtime.plans = vec![plan];
+                app.runtime.selected_plan = 0;
+                app.runtime.config.base_ref = "main".into();
                 let mut time = 0.0;
-                let mut frame = |app: &mut State, events| {
+                let mut frame = |app: &mut Desktop<'_>, events| {
                     time += 0.05;
                     let output = ctx.run_ui(
                         egui::RawInput {
@@ -246,7 +249,7 @@ mod tests {
                                 ui.horizontal(|ui| app.view_tabs(ui));
                             });
                             egui::CentralPanel::default().show(ui, |ui| {
-                                if app.panel == PanelMode::Plan {
+                                if app.runtime.panel == PanelMode::Plan {
                                     app.plan_panel(ui, ui.max_rect());
                                 }
                             });
@@ -266,7 +269,7 @@ mod tests {
                     output.drop_without_applying_deltas();
                     text
                 };
-                let mut click = |app: &mut State, label: &str| {
+                let mut click = |app: &mut Desktop<'_>, label: &str| {
                     let text = frame(app, vec![]);
                     let pos =
                         text.iter().find(|(s, _)| s == label).unwrap_or_else(|| panic!("missing {label}: {text:?}")).1;
@@ -286,20 +289,20 @@ mod tests {
                     }
                 };
                 click(app, "✓ Ship cleanup · 4/4");
-                app.toggle_plan();
-                assert!(app.plan_view && app.diff_open && app.panel == PanelMode::Plan);
+                app.runtime.toggle_plan();
+                assert!(app.runtime.plan_view && app.runtime.diff_open && app.runtime.panel == PanelMode::Plan);
                 click(app, "Clean up plan…");
                 let deadline = Instant::now() + Duration::from_secs(10);
-                while app.plan_cleanup.as_ref().unwrap().busy {
+                while app.runtime.plan_cleanup.as_ref().unwrap().busy {
                     assert!(Instant::now() < deadline);
-                    app.runtime_tick(ctx);
+                    app.runtime.runtime_tick(ctx);
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 let text = frame(app, vec![]);
                 for reason in ["uncommitted changes", "unmerged commits", "an agent session is using"] {
                     assert!(text.iter().any(|(s, _)| s.contains(reason)), "missing {reason}: {text:?}");
                 }
-                let dialog = app.plan_cleanup.as_ref().unwrap();
+                let dialog = app.runtime.plan_cleanup.as_ref().unwrap();
                 assert_eq!(dialog.rows.len(), 5);
                 assert_eq!(dialog.rows.iter().filter(|(_, selected)| *selected).count(), 2);
                 assert!(dir.path().join("clean").exists(), "opening the preview never deletes work");
@@ -322,9 +325,9 @@ mod tests {
                     }
                 }
                 let deadline = Instant::now() + Duration::from_secs(10);
-                while app.plan_cleanup.as_ref().unwrap().busy {
+                while app.runtime.plan_cleanup.as_ref().unwrap().busy {
                     assert!(Instant::now() < deadline);
-                    app.runtime_tick(ctx);
+                    app.runtime.runtime_tick(ctx);
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 assert!(!dir.path().join("clean").exists());
@@ -333,11 +336,11 @@ mod tests {
                     assert!(git::git(&repo, &["show-ref", "--verify", &format!("refs/heads/{branch}")]).is_ok());
                 }
                 assert!(git::git(&repo, &["show-ref", "--verify", "refs/heads/imacs/plan-ship"]).is_ok());
-                assert_eq!(app.plans[0].status, PlanStatus::Completed);
-                app.plans[0].status = PlanStatus::Open;
+                assert_eq!(app.runtime.plans[0].status, PlanStatus::Completed);
+                app.runtime.plans[0].status = PlanStatus::Open;
                 let text = frame(app, vec![]);
                 assert!(text.iter().any(|(s, _)| s.contains("plan is no longer completed")));
-                assert!(app.plan_cleanup.as_ref().unwrap().rows.iter().all(|(_, selected)| !selected));
+                assert!(app.runtime.plan_cleanup.as_ref().unwrap().rows.iter().all(|(_, selected)| !selected));
             },
         );
     }

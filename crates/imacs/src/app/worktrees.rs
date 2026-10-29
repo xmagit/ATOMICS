@@ -98,11 +98,13 @@ impl State {
         self.cleanup = Some(cleanup);
         changed
     }
+}
 
+impl Desktop<'_> {
     pub(super) fn cleanup_dialog(&mut self, ctx: &egui::Context) {
-        let Some(mut cleanup) = self.cleanup.take() else { return };
-        let p = self.palette.clone();
-        let agent_roots: HashSet<PathBuf> = self.sessions.iter().map(Session::root).collect();
+        let Some(mut cleanup) = self.runtime.cleanup.take() else { return };
+        let p = self.runtime.palette.clone();
+        let agent_roots: HashSet<PathBuf> = self.runtime.sessions.iter().map(Session::root).collect();
         let name = cleanup.repo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let mut open = true;
         let mut remove = false;
@@ -235,9 +237,9 @@ impl State {
             });
 
         match action {
-            Some("fetch") => self.cleanup_git(&mut cleanup, "fetch --prune", &["fetch", "--prune", "--quiet"]),
-            Some("prune") => self.cleanup_git(&mut cleanup, "prune", &["worktree", "prune"]),
-            Some("reload") => self.load_cleanup(&mut cleanup),
+            Some("fetch") => self.runtime.cleanup_git(&mut cleanup, "fetch --prune", &["fetch", "--prune", "--quiet"]),
+            Some("prune") => self.runtime.cleanup_git(&mut cleanup, "prune", &["worktree", "prune"]),
+            Some("reload") => self.runtime.load_cleanup(&mut cleanup),
             _ => {}
         }
         if remove && let Some(rows) = &cleanup.rows {
@@ -255,9 +257,9 @@ impl State {
             });
         }
         if open {
-            self.cleanup = Some(cleanup);
+            self.runtime.cleanup = Some(cleanup);
         } else {
-            self.worktrees_at = None;
+            self.runtime.worktrees_at = None;
         }
     }
 }

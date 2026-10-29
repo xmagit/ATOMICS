@@ -1,13 +1,15 @@
 use super::*;
 
-impl State {
-    /// Push-to-talk: the first press records, the second transcribes and sends.
+impl State {}
+
+impl Desktop<'_> {
     pub(super) fn toggle_voice(&mut self) {
-        match self.voice {
+        match self.client.voice {
             Voice::Idle => {
                 let cancelled = Arc::new(AtomicBool::new(false));
-                self.voice = Voice::Opening(cancelled.clone());
-                let (config, tx, ctx) = (self.config.voice.clone(), self.voice_tx.clone(), self.ctx.clone());
+                self.client.voice = Voice::Opening(cancelled.clone());
+                let (config, tx, ctx) =
+                    (self.runtime.config.voice.clone(), self.client.voice_tx.clone(), self.runtime.ctx.clone());
                 std::thread::spawn(move || {
                     let recording = Recorder::start().and_then(|recorder| {
                         config.api_key(env_var).map_err(|err| format!("{err:#}"))?;
@@ -21,19 +23,19 @@ impl State {
             }
             Voice::Opening(ref cancelled) => {
                 cancelled.store(true, Ordering::Relaxed);
-                self.voice = Voice::Idle;
-                self.toast("Voice: recording cancelled");
+                self.client.voice = Voice::Idle;
+                self.runtime.toast("Voice: recording cancelled");
             }
             Voice::Recording(_) => self.stop_voice(),
-            Voice::Transcribing => self.toast("Voice: still transcribing the last recording"),
+            Voice::Transcribing => self.runtime.toast("Voice: still transcribing the last recording"),
         }
     }
 
-    /// Stops recording and transcribes on a background thread.
     pub(super) fn stop_voice(&mut self) {
-        let Voice::Recording(recorder) = std::mem::replace(&mut self.voice, Voice::Transcribing) else { return };
+        let Voice::Recording(recorder) = std::mem::replace(&mut self.client.voice, Voice::Transcribing) else { return };
         let recording = recorder.finish();
-        let (config, tx, ctx) = (self.config.voice.clone(), self.voice_tx.clone(), self.ctx.clone());
+        let (config, tx, ctx) =
+            (self.runtime.config.voice.clone(), self.client.voice_tx.clone(), self.runtime.ctx.clone());
         std::thread::spawn(move || {
             let transcript = recording.and_then(|(samples, rate)| {
                 if samples.len() < rate as usize / 5 {
@@ -54,40 +56,43 @@ impl State {
         });
     }
 
-    /// Sends a transcript the way the steer bar does: to the chief (started and shown
-    /// if needed) or to the active agent. Text that cannot be sent lands in the steer bar.
     pub(super) fn send_voice(&mut self, ctx: &egui::Context, text: &str) {
         if text.is_empty() {
-            self.toast("Voice: heard nothing");
+            self.runtime.toast("Voice: heard nothing");
             return;
         }
         let quoted = format!("“{}”", truncate(text, 60));
-        let failed = match self.config.voice.target {
+        let failed = match self.runtime.config.voice.target {
             VoiceTarget::Chief => {
-                let started = match self.sessions.iter().position(|s| s.chief && s.can_receive()) {
+                let started = match self.runtime.sessions.iter().position(|s| s.chief && s.can_receive()) {
                     Some(index) => {
-                        self.deliver(index, text);
+                        self.runtime.deliver(index, text);
                         Ok(())
                     }
                     None => {
-                        self.sessions.retain(|s| !s.chief);
-                        self.start_chief(ctx, Some(text.to_string())).map(|_| ())
+                        self.runtime.sessions.retain(|s| !s.chief);
+                        self.runtime.start_chief(ctx, Some(text.to_string())).map(|_| ())
                     }
                 };
                 match started {
                     Ok(()) => {
-                        self.chief_open = true;
-                        self.focus_terminal = self.sessions.iter().find(|s| s.chief).map(|s| s.id.clone());
-                        self.toast(format!("Sent to the chief: {quoted}"));
+                        self.runtime.chief_open = true;
+                        self.runtime.focus_terminal =
+                            self.runtime.sessions.iter().find(|s| s.chief).map(|s| s.id.clone());
+                        self.runtime.toast(format!("Sent to the chief: {quoted}"));
                         None
                     }
                     Err(err) => Some(err),
                 }
             }
             VoiceTarget::Active => {
-                match self.active_index().filter(|&i| self.sessions[i].is_agent() && self.sessions[i].can_receive()) {
-                    Some(index) if self.deliver(index, text) != Delivery::Unavailable => {
-                        self.toast(format!("Sent to {}: {quoted}", self.sessions[index].title));
+                match self
+                    .runtime
+                    .active_index()
+                    .filter(|&i| self.runtime.sessions[i].is_agent() && self.runtime.sessions[i].can_receive())
+                {
+                    Some(index) if self.runtime.deliver(index, text) != Delivery::Unavailable => {
+                        self.runtime.toast(format!("Sent to {}: {quoted}", self.runtime.sessions[index].title));
                         None
                     }
                     _ => Some("No active agent to send to".to_string()),
@@ -95,12 +100,12 @@ impl State {
             }
         };
         if let Some(err) = failed {
-            if !self.steer_text.trim().is_empty() {
-                self.steer_text.push('\n');
+            if !self.client.steer_text.trim().is_empty() {
+                self.client.steer_text.push('\n');
             }
-            self.steer_text.push_str(text);
-            self.focus_steer = true;
-            self.toast(format!("{err}; the transcript is in the steer bar"));
+            self.client.steer_text.push_str(text);
+            self.client.focus_steer = true;
+            self.runtime.toast(format!("{err}; the transcript is in the steer bar"));
         }
     }
 }

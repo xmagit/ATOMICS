@@ -35,7 +35,9 @@ pub(super) fn record_item(_ui: &egui::Ui, _name: &str, _response: &egui::Respons
     }
 }
 
-impl State {
+impl State {}
+
+impl Desktop<'_> {
     pub(super) fn top_bar(&mut self, ui: &mut egui::Ui) {
         let rect = ui.available_rect_before_wrap();
         let gap = ui.spacing().item_spacing.x;
@@ -79,15 +81,16 @@ impl State {
     }
 
     fn top_bar_brand(&self, ui: &mut egui::Ui, show_agents: bool) {
-        let response = ui.image((self.icon.id(), vec2(20.0, 20.0)));
+        let response = ui.image((self.client.icon.id(), vec2(20.0, 20.0)));
         record_item(ui, "icon", &response);
-        let response = ui.label(RichText::new("IMACS").strong().size(14.0).color(self.palette.accent).monospace());
+        let response =
+            ui.label(RichText::new("IMACS").strong().size(14.0).color(self.runtime.palette.accent).monospace());
         record_item(ui, "brand", &response);
         if show_agents {
-            let agents = self.sessions.iter().filter(|s| s.is_agent()).count();
+            let agents = self.runtime.sessions.iter().filter(|s| s.is_agent()).count();
             let response = ui.label(
                 RichText::new(format!("{agents} agent{}", if agents == 1 { "" } else { "s" }))
-                    .color(self.palette.muted),
+                    .color(self.runtime.palette.muted),
             );
             record_item(ui, "agents", &response);
         }
@@ -95,26 +98,29 @@ impl State {
     }
 
     fn top_bar_controls(&mut self, ui: &mut egui::Ui, show_load: bool) {
-        let response = ui.button(if self.diff_open { "Hide diff" } else { "Show diff" });
+        let response = ui.button(if self.runtime.diff_open { "Hide diff" } else { "Show diff" });
         record_item(ui, "diff", &response);
-        if response.on_hover_text(&self.config.keys.toggle_diff).clicked() {
-            self.diff_open = !self.diff_open;
+        if response.on_hover_text(&self.runtime.config.keys.toggle_diff).clicked() {
+            self.runtime.diff_open = !self.runtime.diff_open;
         }
         let response = ui.button("+ New");
         record_item(ui, "+ New", &response);
-        if response.on_hover_text(&self.config.keys.new_session).clicked() {
+        if response.on_hover_text(&self.runtime.config.keys.new_session).clicked() {
             self.open_new_dialog(None);
         }
-        let plan = &self.plans[self.selected_plan];
+        let plan = &self.runtime.plans[self.runtime.selected_plan];
         let (done, total) = (plan.count(TaskStatus::Done), plan.tasks.len());
         let label = if total == 0 { "Plan".to_string() } else { format!("Plan {done}/{total}") };
         let attention = plan.count(TaskStatus::Review) + plan.count(TaskStatus::Blocked);
-        let text =
-            RichText::new(label).color(if attention > 0 { self.palette.warning } else { self.palette.foreground });
-        let response = ui.selectable_label(self.panel == PanelMode::Plan && self.diff_open, text);
+        let text = RichText::new(label).color(if attention > 0 {
+            self.runtime.palette.warning
+        } else {
+            self.runtime.palette.foreground
+        });
+        let response = ui.selectable_label(self.runtime.panel == PanelMode::Plan && self.runtime.diff_open, text);
         record_item(ui, "Plan", &response);
-        if response.on_hover_text(&self.config.keys.toggle_plan).clicked() {
-            self.toggle_plan();
+        if response.on_hover_text(&self.runtime.config.keys.toggle_plan).clicked() {
+            self.runtime.toggle_plan();
         }
         let response = ui.menu_button("Project", |ui| self.project_menu(ui)).response;
         record_item(ui, "Project", &response);
@@ -129,18 +135,18 @@ impl State {
         if ui.available_width() < 24.0 {
             return;
         }
-        let waiting = self.sessions.iter().filter(|s| s.status.needs_attention()).count();
+        let waiting = self.runtime.sessions.iter().filter(|s| s.status.needs_attention()).count();
         let mut notices = Vec::new();
         if waiting > 0 {
             notices.push(format!("● {waiting} need{} you", if waiting == 1 { "s" } else { "" }));
         }
-        if let Some((text, _)) = &self.toast {
+        if let Some((text, _)) = &self.runtime.toast {
             notices.push(text.clone());
         }
-        if let Some(err) = &self.config_error {
+        if let Some(err) = &self.runtime.config_error {
             notices.push(format!("config error: {err}"));
         }
-        if let Some(err) = &self.hook_error {
+        if let Some(err) = &self.runtime.hook_error {
             notices.push(format!("hooks offline: {err}"));
         }
         if notices.is_empty() {
@@ -149,19 +155,19 @@ impl State {
         let text = notices.join(" · ");
         let response = ui.add(
             egui::Label::new(RichText::new(&text).color(if waiting > 0 {
-                self.palette.warning
+                self.runtime.palette.warning
             } else {
-                self.palette.foreground
+                self.runtime.palette.foreground
             }))
             .truncate()
             .sense(Sense::click()),
         );
         record_item(ui, "notice", &response);
         if response.on_hover_text(text).clicked()
-            && let Some(i) = self.sessions.iter().position(|s| s.status.needs_attention())
+            && let Some(i) = self.runtime.sessions.iter().position(|s| s.status.needs_attention())
         {
-            let id = self.sessions[i].id.clone();
-            self.activate(&id, true);
+            let id = self.runtime.sessions[i].id.clone();
+            self.runtime.activate(&id, true);
         }
     }
 }
@@ -172,7 +178,7 @@ mod tests {
     use super::*;
 
     fn render(
-        app: &mut State,
+        app: &mut Desktop<'_>,
         ctx: &egui::Context,
         width: f32,
         events: Vec<egui::Event>,
@@ -195,9 +201,9 @@ mod tests {
         (items, output)
     }
 
-    fn fixture(app: &mut State, count: usize) {
-        app.repos = vec![PathBuf::from("/project/IMACS")];
-        app.plans = (0..count)
+    fn fixture(app: &mut Desktop<'_>, count: usize) {
+        app.runtime.repos = vec![PathBuf::from("/project/IMACS")];
+        app.runtime.plans = (0..count)
             .map(|i| Plan {
                 id: format!("plan-{i}"),
                 goal: format!("Plan {i}: resource budgets and built-in approval rules"),
@@ -207,20 +213,21 @@ mod tests {
             })
             .collect();
         if count == 0 {
-            app.plans.push(Plan::default());
+            app.runtime.plans.push(Plan::default());
         }
-        app.selected_plan = count.saturating_sub(1);
-        app.plan_view = true;
-        app.sessions = vec![session("chief", AgentKind::Generic, AgentStatus::NeedsInput, Path::new("/project/IMACS"))];
-        app.sessions[0].chief = true;
-        app.toast = Some((
+        app.runtime.selected_plan = count.saturating_sub(1);
+        app.runtime.plan_view = true;
+        app.runtime.sessions =
+            vec![session("chief", AgentKind::Generic, AgentStatus::NeedsInput, Path::new("/project/IMACS"))];
+        app.runtime.sessions[0].chief = true;
+        app.runtime.toast = Some((
             "A very long notification that should never draw over the chief, tabs, or buttons\nMore details".repeat(4),
             Instant::now(),
         ));
-        app.config_error = Some("Invalid config fixture".into());
-        app.hook_error = Some("Offline hook fixture".into());
-        app.heartbeat.last = Some((imacs_core::store::now(), vec![]));
-        app.load = (Instant::now(), Some(123.4));
+        app.runtime.config_error = Some("Invalid config fixture".into());
+        app.runtime.hook_error = Some("Offline hook fixture".into());
+        app.runtime.heartbeat.last = Some((imacs_core::store::now(), vec![]));
+        app.client.load = (Instant::now(), Some(123.4));
     }
 
     #[test]
@@ -230,8 +237,8 @@ mod tests {
                 fixture(app, count);
                 let mut action_widths = HashMap::new();
                 for dock in [ChiefDock::Floating, ChiefDock::Docked] {
-                    app.store.chief_dock = Some(dock);
-                    app.chief_open = true;
+                    app.runtime.store.chief_dock = Some(dock);
+                    app.runtime.chief_open = true;
                     for width in [700.0, 900.0, 1200.0, 1500.0, 2400.0, 5120.0] {
                         let (items, output) = render(app, ctx, width, vec![]);
                         let case = format!("width={width}, plans={count}, dock={dock:?}");
@@ -294,10 +301,10 @@ mod tests {
     fn overflow_tabs_and_actions_remain_clickable() {
         with_app("app::topbar::tests::overflow_tabs_and_actions_remain_clickable", |app, ctx| {
             fixture(app, 6);
-            app.toast = None;
-            app.config_error = None;
-            app.hook_error = None;
-            let click = |app: &mut State, label: &str| {
+            app.runtime.toast = None;
+            app.runtime.config_error = None;
+            app.runtime.hook_error = None;
+            let click = |app: &mut Desktop<'_>, label: &str| {
                 let (items, output) = render(app, ctx, 700.0, vec![]);
                 let mut pos = items.iter().find(|(name, _)| name == label).map(|(_, r)| r.center());
                 if pos.is_none() {
@@ -329,15 +336,15 @@ mod tests {
                     .drop_without_applying_deltas();
                 }
             };
-            let was_open = app.diff_open;
+            let was_open = app.runtime.diff_open;
             click(app, "diff");
-            assert_ne!(app.diff_open, was_open);
+            assert_ne!(app.runtime.diff_open, was_open);
             click(app, "Tabs");
             click(app, "● Plan 0:");
-            assert_eq!(app.selected_plan, 0);
-            assert!(app.plan_view);
+            assert_eq!(app.runtime.selected_plan, 0);
+            assert!(app.runtime.plan_view);
             click(app, "+ New");
-            assert!(app.new_dialog.is_some());
+            assert!(app.client.new_dialog.is_some());
         });
     }
 }

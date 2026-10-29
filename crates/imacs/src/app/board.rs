@@ -10,13 +10,25 @@ impl State {
             self.diff_open = true;
         }
     }
+}
 
+fn task_color(status: TaskStatus, p: &Palette) -> Color32 {
+    match status {
+        TaskStatus::Planned => p.muted,
+        TaskStatus::Running => p.accent,
+        TaskStatus::Blocked => p.warning,
+        TaskStatus::Review => p.info,
+        TaskStatus::Done => p.success,
+    }
+}
+
+impl Desktop<'_> {
     pub(super) fn plan_panel(&mut self, ui: &mut egui::Ui, rect: Rect) {
-        let p = self.palette.clone();
+        let p = self.runtime.palette.clone();
         ui.painter().rect_filled(rect, 0.0, p.background);
         let mut child = ui.new_child(
             egui::UiBuilder::new()
-                .id_salt(("plan-panel", &self.plans[self.selected_plan].id))
+                .id_salt(("plan-panel", &self.runtime.plans[self.runtime.selected_plan].id))
                 .max_rect(rect.shrink2(vec2(12.0, 8.0))),
         );
         let ui = &mut child;
@@ -25,22 +37,27 @@ impl State {
         let mut close_status = None;
         let mut close = false;
         let mut clean_plan = false;
-        let ready = self.plans[self.selected_plan].ready().len();
-        if self.integration_checks.iter().any(|(plan, _)| plan == &self.plans[self.selected_plan].id) {
+        let ready = self.runtime.plans[self.runtime.selected_plan].ready().len();
+        if self
+            .runtime
+            .integration_checks
+            .iter()
+            .any(|(plan, _)| plan == &self.runtime.plans[self.runtime.selected_plan].id)
+        {
             ui.label(RichText::new("Checking integration freshness…").color(p.muted));
         }
         ui.horizontal(|ui| {
             ui.label(RichText::new("PLAN").color(p.accent).strong().size(13.0));
-            let total = self.plans[self.selected_plan].tasks.len();
+            let total = self.runtime.plans[self.runtime.selected_plan].tasks.len();
             if total > 0 {
-                let done = self.plans[self.selected_plan].count(TaskStatus::Done);
+                let done = self.runtime.plans[self.runtime.selected_plan].count(TaskStatus::Done);
                 ui.label(RichText::new(format!("{done}/{total} done")).color(p.muted).size(12.0));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if self.plans[self.selected_plan].status == PlanStatus::Completed {
+                if self.runtime.plans[self.runtime.selected_plan].status == PlanStatus::Completed {
                     clean_plan = ui.small_button("Clean up plan…").clicked();
                 }
-                if self.plans[self.selected_plan].is_open() {
+                if self.runtime.plans[self.runtime.selected_plan].is_open() {
                     if ui.small_button("Archive plan").clicked() {
                         close_status = Some(PlanStatus::Archived);
                     }
@@ -54,11 +71,11 @@ impl State {
                 if total == 0 {
                     return;
                 }
-                if self.plans[self.selected_plan].status == plan::PlanStatus::Completed {
+                if self.runtime.plans[self.runtime.selected_plan].status == plan::PlanStatus::Completed {
                     if ui.small_button("Archive plan").clicked() {
                         close_status = Some(PlanStatus::Archived);
                     }
-                } else if !self.plans[self.selected_plan].approved {
+                } else if !self.runtime.plans[self.runtime.selected_plan].approved {
                     let button = egui::Button::new(RichText::new("Approve plan").color(Color32::WHITE))
                         .fill(p.accent.gamma_multiply(0.7));
                     if ui.add(button).on_hover_text("Let the orchestrator dispatch these tasks").clicked() {
@@ -77,27 +94,29 @@ impl State {
                 }
             });
         });
-        if !self.plans[self.selected_plan].goal.is_empty() {
-            ui.label(RichText::new(&self.plans[self.selected_plan].goal).color(p.foreground).size(13.0));
+        if !self.runtime.plans[self.runtime.selected_plan].goal.is_empty() {
+            ui.label(
+                RichText::new(&self.runtime.plans[self.runtime.selected_plan].goal).color(p.foreground).size(13.0),
+            );
         }
-        let integration = self.plans[self.selected_plan].integration_branch();
-        if !self.plans[self.selected_plan].tasks.is_empty() {
+        let integration = self.runtime.plans[self.runtime.selected_plan].integration_branch();
+        if !self.runtime.plans[self.runtime.selected_plan].tasks.is_empty() {
             ui.label(RichText::new(format!("integration branch: {integration}")).color(p.muted).size(11.5))
                 .on_hover_text("Integrated tasks are merged into it, and tasks with dependencies branch from it");
         }
-        if self.plans[self.selected_plan].status == PlanStatus::Completed {
+        if self.runtime.plans[self.runtime.selected_plan].status == PlanStatus::Completed {
             ui.label(
                 RichText::new("Completed · preview cleanup to check what is merged and safe to remove.").color(p.muted),
             );
             if clean_plan {
-                self.open_plan_cleanup(self.selected_plan);
+                self.runtime.open_plan_cleanup(self.runtime.selected_plan);
             }
         }
-        for (task, dep) in self.plans[self.selected_plan].unknown_dependencies() {
+        for (task, dep) in self.runtime.plans[self.runtime.selected_plan].unknown_dependencies() {
             ui.label(RichText::new(format!("{task} depends on unknown task {dep}")).color(p.error).size(11.5));
         }
         ui.add_space(6.0);
-        if self.plans[self.selected_plan].tasks.is_empty() {
+        if self.runtime.plans[self.runtime.selected_plan].tasks.is_empty() {
             ui.label(
                 RichText::new(
                     "No plan yet. Ask an orchestrator (a Claude session with the IMACS MCP server) to plan a goal: \
@@ -109,15 +128,16 @@ impl State {
 
         let mut actions: Vec<(String, &str)> = Vec::new();
         let mut open_session: Option<String> = None;
-        let editable = !self.plans[self.selected_plan].approved;
-        let ready_ids: HashSet<String> = self.plans[self.selected_plan].ready().iter().map(|t| t.id.clone()).collect();
-        let approved = self.plans[self.selected_plan].approved;
+        let editable = !self.runtime.plans[self.runtime.selected_plan].approved;
+        let ready_ids: HashSet<String> =
+            self.runtime.plans[self.runtime.selected_plan].ready().iter().map(|t| t.id.clone()).collect();
+        let approved = self.runtime.plans[self.runtime.selected_plan].approved;
         let sessions: HashMap<String, (String, AgentStatus)> =
-            self.sessions.iter().map(|s| (s.id.clone(), (s.title.clone(), s.status))).collect();
-        let expanded = &mut self.expanded_tasks;
-        let integrating = &self.integrating;
-        let plan_id = self.plans[self.selected_plan].id.clone();
-        let tasks = &mut self.plans[self.selected_plan].tasks;
+            self.runtime.sessions.iter().map(|s| (s.id.clone(), (s.title.clone(), s.status))).collect();
+        let expanded = &mut self.client.expanded_tasks;
+        let integrating = &self.runtime.integrating;
+        let plan_id = self.runtime.plans[self.runtime.selected_plan].id.clone();
+        let tasks = &mut self.runtime.plans[self.runtime.selected_plan].tasks;
         if !tasks.is_empty() {
             egui::ScrollArea::horizontal().id_salt(("plan-board", &plan_id)).auto_shrink([false, false]).show(
                 ui,
@@ -214,7 +234,7 @@ impl State {
                                                         .and_then(|s| sessions.get(s))
                                                         .map(|(_, s)| *s);
                                                     if let Some(action) =
-                                                        task_result(ui, task, status, open, &self.config, &p)
+                                                        task_result(ui, task, status, open, &self.runtime.config, &p)
                                                     {
                                                         actions.push((task.id.clone(), action));
                                                     }
@@ -332,25 +352,27 @@ impl State {
             match action {
                 "toggle" => {
                     let key = (plan_id.clone(), id);
-                    if !self.expanded_tasks.remove(&key) {
-                        self.expanded_tasks.insert(key);
+                    if !self.client.expanded_tasks.remove(&key) {
+                        self.client.expanded_tasks.insert(key);
                     }
                 }
                 "edited" => changed = true,
                 "start" => {
-                    if let Err(err) = self.dispatch(self.selected_plan, Some(&id)) {
-                        self.toast(err);
+                    if let Err(err) = self.runtime.dispatch(self.runtime.selected_plan, Some(&id)) {
+                        self.runtime.toast(err);
                     }
                 }
-                "integrate" => self.integrate(self.selected_plan, &id, None),
+                "integrate" => self.runtime.integrate(self.runtime.selected_plan, &id, None),
                 "diff" | "resume" => {
-                    if let Some(task) = self.plans[self.selected_plan].tasks.iter().position(|t| t.id == id) {
-                        self.task_action(self.selected_plan, task, action);
+                    if let Some(task) =
+                        self.runtime.plans[self.runtime.selected_plan].tasks.iter().position(|t| t.id == id)
+                    {
+                        self.runtime.task_action(self.runtime.selected_plan, task, action);
                     }
                 }
                 status => {
                     if let (Some(task), Some(status)) =
-                        (self.plans[self.selected_plan].task_mut(&id), TaskStatus::parse(status))
+                        (self.runtime.plans[self.runtime.selected_plan].task_mut(&id), TaskStatus::parse(status))
                     {
                         task.set_status(status);
                         changed = true;
@@ -359,36 +381,26 @@ impl State {
             }
         }
         if approve {
-            self.plans[self.selected_plan].approved = true;
+            self.runtime.plans[self.runtime.selected_plan].approved = true;
             changed = true;
-            self.toast("Plan approved: the orchestrator can dispatch it now");
+            self.runtime.toast("Plan approved: the orchestrator can dispatch it now");
         }
-        if dispatch_all && let Err(err) = self.dispatch(self.selected_plan, None) {
-            self.toast(err);
+        if dispatch_all && let Err(err) = self.runtime.dispatch(self.runtime.selected_plan, None) {
+            self.runtime.toast(err);
         }
         if changed {
-            self.finish_plan_agents();
-            self.save_plan(self.selected_plan);
+            self.runtime.finish_plan_agents();
+            self.runtime.save_plan(self.runtime.selected_plan);
         }
         if let Some(session) = open_session {
-            self.activate(&session, true);
-            self.panel = PanelMode::Diff;
+            self.runtime.activate(&session, true);
+            self.runtime.panel = PanelMode::Diff;
         }
         if close {
-            self.panel = PanelMode::Diff;
+            self.runtime.panel = PanelMode::Diff;
         }
         if let Some(status) = close_status {
-            self.confirm_plan_close = Some((self.plans[self.selected_plan].id.clone(), status));
+            self.client.confirm_plan_close = Some((self.runtime.plans[self.runtime.selected_plan].id.clone(), status));
         }
-    }
-}
-
-fn task_color(status: TaskStatus, p: &Palette) -> Color32 {
-    match status {
-        TaskStatus::Planned => p.muted,
-        TaskStatus::Running => p.accent,
-        TaskStatus::Blocked => p.warning,
-        TaskStatus::Review => p.info,
-        TaskStatus::Done => p.success,
     }
 }

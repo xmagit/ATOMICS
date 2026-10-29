@@ -100,7 +100,6 @@ pub struct Session {
     held: Vec<String>,
     approval_hold: bool,
     menu_absent_since: Option<Instant>,
-    pub selected: bool,
     /// The chief agent stays outside the agent fleet.
     pub chief: bool,
     /// A message typed into the terminal that the agent has not visibly picked up yet.
@@ -317,7 +316,7 @@ pub(crate) struct State {
     wake: crate::host::Wake,
     control_tx: crate::host::Sender<ControlMessage>,
     client_commands: Vec<ControlRequest>,
-    icon: egui::TextureHandle,
+    client_events: Vec<ClientEvent>,
     config: Config,
     config_path: PathBuf,
     config_stamp: Option<SystemTime>,
@@ -344,7 +343,6 @@ pub(crate) struct State {
     /// Compiler job pool every agent inherits; None when this instance does not own the socket.
     jobserver: Option<Arc<Jobserver>>,
     /// One-minute load average, read at most every 2 seconds.
-    load: (Instant, Option<f64>),
     busy_checked: Instant,
     approvals_checked: Instant,
     needs_input_checked: Instant,
@@ -354,23 +352,15 @@ pub(crate) struct State {
     repos: Vec<PathBuf>,
     open_projects: Vec<PathBuf>,
     workspace: Option<String>,
-    workspace_input: String,
-    explorers: HashMap<PathBuf, ExplorerState>,
     /// Worktree folder → its project's main checkout.
     worktree_project: HashMap<PathBuf, PathBuf>,
     title: String,
     /// Diff/editor width set by dragging the divider.
-    split: Option<f32>,
     /// Side by side or unified, picked in the diff header; wins over the config until IMACS quits.
-    diff_split: Option<DiffSplit>,
-    editor_file: HashMap<PathBuf, String>,
     cleanup: Option<Cleanup>,
     plan_cleanup: Option<plan_cleanup::PlanCleanup>,
     panel: PanelMode,
     editors: HashMap<PathBuf, Terminal>,
-    terminal_views: HashMap<egui::Id, TerminalView>,
-    focus_editor: bool,
-    editor_id: Option<egui::Id>,
     events: Vec<StatusEvent>,
     event_seq: u64,
     last_status: HashMap<String, AgentStatus>,
@@ -379,7 +369,6 @@ pub(crate) struct State {
     plans: Vec<Plan>,
     selected_plan: usize,
     changed_plans: HashSet<String>,
-    expanded_tasks: HashSet<(String, String)>,
     /// The project tab on screen; `None` shows every project.
     view: Option<PathBuf>,
     plan_view: bool,
@@ -400,14 +389,7 @@ pub(crate) struct State {
     integration_revision: u64,
     worktrees: Vec<WorktreeEntry>,
     worktrees_at: Option<Instant>,
-    steer_text: String,
-    steer_target: SteerTarget,
-    focus_steer: bool,
     focus_terminal: Option<String>,
-    confirm_close: Option<String>,
-    confirm_plan_close: Option<(String, PlanStatus)>,
-    new_dialog: Option<NewDialog>,
-    quick_open: Option<QuickOpen>,
     last_layout: Option<Layout>,
     watcher: Option<Debouncer<RecommendedWatcher>>,
     /// Worktrees being watched, each with its path as the file system reports it.
@@ -415,25 +397,108 @@ pub(crate) struct State {
     watch_tx: crate::host::Sender<PathBuf>,
     watch_rx: Receiver<PathBuf>,
     toast: Option<(String, Instant)>,
-    voice: Voice,
-    voice_tx: crate::host::Sender<VoiceEvent>,
-    voice_rx: Receiver<VoiceEvent>,
-    screenshot: Option<Screenshot>,
     pending_open: Vec<(String, PathBuf)>,
     resume: Vec<SessionRecord>,
     launch_dir: PathBuf,
 }
 
 /// The only eframe client. Runtime work continues when neither callback is called.
+/// View data belongs to the desktop, never to the runtime scheduler.
+enum ClientEvent {
+    Edit { root: PathBuf, path: Option<String> },
+}
+
+struct Client {
+    icon: egui::TextureHandle,
+    load: (Instant, Option<f64>),
+    workspace_input: String,
+    explorers: HashMap<PathBuf, ExplorerState>,
+    split: Option<f32>,
+    diff_split: Option<DiffSplit>,
+    editor_file: HashMap<PathBuf, String>,
+    focus_editor: bool,
+    editor_id: Option<egui::Id>,
+    terminal_views: HashMap<egui::Id, TerminalView>,
+    expanded_tasks: HashSet<(String, String)>,
+    selected: HashSet<String>,
+    steer_text: String,
+    steer_target: SteerTarget,
+    focus_steer: bool,
+    confirm_close: Option<String>,
+    confirm_plan_close: Option<(String, PlanStatus)>,
+    new_dialog: Option<NewDialog>,
+    quick_open: Option<QuickOpen>,
+    voice: Voice,
+    voice_tx: Sender<VoiceEvent>,
+    voice_rx: Receiver<VoiceEvent>,
+    screenshot: Option<Screenshot>,
+}
+
+impl Client {
+    fn new(ctx: &egui::Context, options: &mut Options, icon: &egui::IconData) -> Self {
+        let (voice_tx, voice_rx) = std::sync::mpsc::channel();
+        Self {
+            icon: ctx.load_texture("atomisk", egui::ColorImage::from(icon), egui::TextureOptions::LINEAR),
+            load: (Instant::now() - Duration::from_secs(10), None),
+            workspace_input: String::new(),
+            explorers: HashMap::new(),
+            split: None,
+            diff_split: None,
+            editor_file: HashMap::new(),
+            focus_editor: false,
+            editor_id: None,
+            terminal_views: HashMap::new(),
+            expanded_tasks: HashSet::new(),
+            selected: HashSet::new(),
+            steer_text: String::new(),
+            steer_target: SteerTarget::Active,
+            focus_steer: false,
+            confirm_close: None,
+            confirm_plan_close: None,
+            new_dialog: None,
+            quick_open: None,
+            voice: Voice::Idle,
+            voice_tx,
+            voice_rx,
+            screenshot: options.screenshot.take().map(|path| Screenshot {
+                path,
+                at: options.screenshot_delay as f64,
+                requested: false,
+                done: Arc::new(AtomicBool::new(false)),
+            }),
+        }
+    }
+}
+
+/// A short-lived desktop borrow. Runtime effects are sent as host commands.
+struct Desktop<'a> {
+    runtime: &'a mut State,
+    client: &'a mut Client,
+}
+
+impl std::ops::Deref for Desktop<'_> {
+    type Target = State;
+    fn deref(&self) -> &State {
+        self.runtime
+    }
+}
+impl std::ops::DerefMut for Desktop<'_> {
+    fn deref_mut(&mut self) -> &mut State {
+        self.runtime
+    }
+}
+
 pub struct App {
+    client: Client,
     host: crate::host::Host,
     replies: Vec<Receiver<ControlOutcome>>,
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>, options: Options, icon: &egui::IconData) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, mut options: Options, icon: &egui::IconData) -> Self {
+        let client = Client::new(&cc.egui_ctx, &mut options, icon);
         let state = State::new(cc, options, icon);
-        Self { host: state.into_host(), replies: Vec::new() }
+        Self { host: state.into_host(), client, replies: Vec::new() }
     }
 }
 
@@ -450,13 +515,14 @@ impl eframe::App for App {
             Err(std::sync::mpsc::TryRecvError::Empty) => true,
             _ => false,
         });
-        state.client_logic(ctx);
+        Desktop { runtime: &mut state, client: &mut self.client }.client_logic(ctx);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let mut state = self.host.state();
-        state.paint(ui);
-        if state.sessions.iter().any(|s| s.status == AgentStatus::Working) || matches!(state.voice, Voice::Recording(_))
+        Desktop { runtime: &mut state, client: &mut self.client }.paint(ui);
+        if state.sessions.iter().any(|s| s.status == AgentStatus::Working)
+            || matches!(self.client.voice, Voice::Recording(_))
         {
             ui.ctx().request_repaint_after(PULSE_STEP);
         }
@@ -482,7 +548,7 @@ impl State {
         crate::host::Host::start(self, wake, ctx, commands)
     }
 
-    pub fn new(cc: &eframe::CreationContext<'_>, options: Options, icon: &egui::IconData) -> State {
+    pub fn new(cc: &eframe::CreationContext<'_>, options: Options, _icon: &egui::IconData) -> State {
         std::thread::spawn(|| LazyLock::force(&SHELL_PATH));
         let config_path = paths::config_file();
         let (config, config_error) = match Config::load_or_create(&config_path) {
@@ -528,7 +594,6 @@ impl State {
         let (worktree_tx, worktree_rx) = wake.channel();
         let (integrate_tx, integrate_rx) = wake.channel();
         let (integration_check_tx, integration_check_rx) = wake.channel();
-        let (voice_tx, voice_rx) = wake.channel();
         let launch_dir = std::env::current_dir().unwrap_or_else(|_| paths::home());
 
         let (mut plans, plan_error) = match plan::load_plans(&paths::imacs_home()) {
@@ -547,7 +612,7 @@ impl State {
             wake: wake.clone(),
             control_tx,
             client_commands: Vec::new(),
-            icon: ctx.load_texture("atomisk", egui::ColorImage::from(icon), egui::TextureOptions::LINEAR),
+            client_events: Vec::new(),
             palette: Arc::new(Palette::from_config(&config.theme)),
             highlighter: Arc::new(Highlighter::new(&Palette::from_config(&config.theme).syntax)),
             config_stamp: modified(&config_path),
@@ -570,7 +635,6 @@ impl State {
             hook_error,
             governor,
             jobserver,
-            load: (Instant::now() - Duration::from_secs(10), None),
             busy_checked: Instant::now(),
             approvals_checked: Instant::now() - APPROVAL_CHECK_INTERVAL,
             needs_input_checked: Instant::now() - NEEDS_INPUT_CHECK_INTERVAL,
@@ -579,20 +643,12 @@ impl State {
             repos: Vec::new(),
             open_projects: Vec::new(),
             workspace: options.workspace.clone(),
-            workspace_input: String::new(),
-            explorers: HashMap::new(),
             worktree_project: HashMap::new(),
             title: String::new(),
-            split: None,
-            diff_split: None,
-            editor_file: HashMap::new(),
             cleanup: None,
             plan_cleanup: None,
             panel: PanelMode::Diff,
             editors: HashMap::new(),
-            terminal_views: HashMap::new(),
-            focus_editor: false,
-            editor_id: None,
             events: Vec::new(),
             event_seq: 0,
             last_status: HashMap::new(),
@@ -601,7 +657,6 @@ impl State {
             plans,
             selected_plan,
             changed_plans: HashSet::new(),
-            expanded_tasks: HashSet::new(),
             view: None,
             plan_view: false,
             chief_open: false,
@@ -619,29 +674,13 @@ impl State {
             integration_revision: 0,
             worktrees: Vec::new(),
             worktrees_at: None,
-            steer_text: String::new(),
-            steer_target: SteerTarget::Active,
-            focus_steer: false,
             focus_terminal: None,
-            confirm_close: None,
-            confirm_plan_close: None,
-            new_dialog: None,
-            quick_open: None,
             last_layout: None,
             watcher: None,
             watched: Arc::default(),
             watch_tx,
             watch_rx,
             toast: None,
-            voice: Voice::Idle,
-            voice_tx,
-            voice_rx,
-            screenshot: options.screenshot.map(|path| Screenshot {
-                path,
-                at: options.screenshot_delay as f64,
-                requested: false,
-                done: Arc::new(AtomicBool::new(false)),
-            }),
             pending_open: options.open,
             resume: Vec::new(),
             launch_dir,
@@ -675,38 +714,6 @@ impl State {
     }
 
     /// Load per core with a colour, and the pool and queue on hover.
-    fn load_gauge(&mut self, ui: &mut egui::Ui) {
-        if self.load.0.elapsed() > Duration::from_secs(2) {
-            self.load = (Instant::now(), crate::governor::load_average());
-        }
-        let Some(load) = self.load.1 else { return };
-        let p = self.palette.clone();
-        let per_core = load / self.governor.cores as f64;
-        let color = if per_core >= 1.0 {
-            p.error
-        } else if per_core >= 0.7 {
-            p.warning
-        } else {
-            p.muted
-        };
-        let (running, waiting) = self.governor.snapshot();
-        let mut hover = format!("Load {load:.1} on {} cores", self.governor.cores);
-        match &self.jobserver {
-            Some(jobserver) => hover.push_str(&format!("\nCompilers of all agents share {} jobs", jobserver.tokens())),
-            None => hover.push_str("\nNo shared compiler job pool"),
-        }
-        for class in [SlotClass::Test, SlotClass::Qa] {
-            let busy = running.iter().filter(|t| t.class == class).count();
-            let queued = waiting.iter().filter(|t| t.class == class).count();
-            hover.push_str(&format!(
-                "\n{} slots: {busy}/{} in use, {queued} waiting",
-                class.name(),
-                self.governor.slots(class)
-            ));
-        }
-        let response = ui.label(RichText::new(format!("load {load:.1}")).color(color).size(12.0)).on_hover_text(hover);
-        topbar::record_item(ui, "load", &response);
-    }
 
     fn resources_json(&self) -> serde_json::Value {
         let (running, waiting) = self.governor.snapshot();
@@ -754,243 +761,9 @@ impl State {
     }
 
     // ── drawing ───────────────────────────────────────────────────────────
-
-    fn metrics(&self, ui: &egui::Ui) -> Metrics {
-        let font = FontId::monospace(self.config.font.size);
-        let cell = ui.fonts_mut(|f| vec2(f.glyph_width(&font, 'M'), f.row_height(&font)));
-        Metrics { font, cell: vec2(cell.x, cell.y.ceil()) }
-    }
-
-    fn steer_bar(&mut self, ui: &mut egui::Ui) {
-        let p = self.palette.clone();
-        ui.horizontal(|ui| {
-            let active_title =
-                self.active_index().map(|i| self.sessions[i].title.clone()).unwrap_or_else(|| "none".into());
-            let agents = self.sessions.iter().filter(|s| s.is_agent() && s.can_receive()).count();
-            let selected = self.sessions.iter().filter(|s| s.selected).count();
-            let label = match self.steer_target {
-                SteerTarget::Active => format!("→ {active_title}"),
-                SteerTarget::Agents => format!("→ all agents ({agents})"),
-                SteerTarget::Selected => format!("→ selected ({selected})"),
-            };
-            egui::ComboBox::from_id_salt("steer-target").selected_text(label).width(190.0).show_ui(ui, |ui| {
-                ui.selectable_value(&mut self.steer_target, SteerTarget::Active, format!("Active: {active_title}"));
-                ui.selectable_value(&mut self.steer_target, SteerTarget::Agents, format!("All agents ({agents})"));
-                ui.selectable_value(&mut self.steer_target, SteerTarget::Selected, format!("Selected ({selected})"));
-            });
-
-            let id = ui.scope_id().with("steer-input");
-            let focused = ui.memory(|m| m.has_focus(id));
-            let mut send = false;
-            if focused && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter)) {
-                send = true;
-            }
-            let width = ui.available_width() - 70.0;
-            let edit = egui::TextEdit::multiline(&mut self.steer_text)
-                .id(id)
-                .desired_rows(1)
-                .desired_width(width)
-                .hint_text(format!(
-                    "Steer · Enter sends · Shift+Enter newline · {} focuses",
-                    self.config.keys.focus_steer
-                ))
-                .font(p.ui(13.5));
-            let response = ui.add(edit);
-            if std::mem::take(&mut self.focus_steer) {
-                response.request_focus();
-            }
-            let button =
-                egui::Button::new(RichText::new("Send").color(Color32::WHITE)).fill(p.accent.gamma_multiply(0.6));
-            if ui.add(button).clicked() {
-                send = true;
-            }
-            if send {
-                self.send_steer();
-            }
-        });
-    }
-
-    fn welcome(&mut self, ui: &mut egui::Ui, rect: Rect) {
-        let p = self.palette.clone();
-        let mut child = ui.new_child(
-            egui::UiBuilder::new()
-                .id_salt("welcome")
-                .max_rect(Rect::from_center_size(rect.center(), vec2(rect.width().min(460.0), 260.0))),
-        );
-        child.vertical_centered(|ui| {
-            ui.label(RichText::new("IMACS").size(28.0).strong().color(p.accent));
-            ui.label(RichText::new("Emacs, but for agents").color(p.muted));
-            ui.label(RichText::new("an atomisk.ai project").color(p.muted).size(12.0));
-            ui.add_space(14.0);
-            ui.horizontal(|ui| {
-                for agent in self.config.agents.clone() {
-                    if ui.button(format!("Start {}", agent.name)).clicked() {
-                        self.client_commands.push(ControlRequest::Start {
-                            agent: agent.name.clone(), folder: Some(self.launch_dir.to_string_lossy().into_owned()),
-                            repo: None, branch: None, prompt: None, args: Vec::new(),
-                        });
-                    }
-                }
-            });
-            ui.add_space(6.0);
-            ui.label(RichText::new(format!("in {}", paths::display(&self.launch_dir))).color(p.muted).size(12.0));
-            ui.add_space(14.0);
-            ui.label(RichText::new("Click an agent's title to see its worktree's diff against main.\nComment on any line and send the review straight to the agent.").color(p.muted).size(12.0));
-        });
-    }
 }
 
 impl State {
-    fn client_logic(&mut self, ctx: &egui::Context) {
-        self.screenshot(ctx);
-        for terminal in self.sessions.iter().filter_map(|s| s.terminal.as_ref()).chain(self.editors.values()) {
-            if let Some(text) = terminal.shared.clipboard.lock().unwrap().take() {
-                ctx.copy_text(text);
-            }
-        }
-    }
-
-    fn paint(&mut self, ui: &mut egui::Ui) {
-        let ctx = ui.ctx().clone();
-        self.shortcuts(&ctx);
-        let p = self.palette.clone();
-
-        egui::Panel::top("top")
-            .exact_size(34.0)
-            .frame(egui::Frame::new().fill(p.panel).inner_margin(egui::Margin::symmetric(10, 4)))
-            .show(ui, |ui| self.top_bar(ui));
-        egui::Panel::bottom("steer")
-            .frame(egui::Frame::new().fill(p.panel).inner_margin(egui::Margin::symmetric(10, 7)))
-            .show(ui, |ui| self.steer_bar(ui));
-
-        let area = ui.available_rect_before_wrap();
-        let diff_open = self.diff_open && (self.diff_target().is_some() || self.panel == PanelMode::Plan);
-        let layout_config = layout::LayoutConfig { diff_width: self.split, ..self.config.layout.clone() };
-        let visible = self.visible_sessions();
-        let completed = self.completed_tasks().len();
-        let dock_width = if self.chief_open && self.chief_dock() == ChiefDock::Docked {
-            self.store.chief_width.filter(|w| w.is_finite()).unwrap_or_else(|| {
-                let sidebar =
-                    if area.width() >= layout_config.sidebar_min_window { layout_config.sidebar_width } else { 0.0 };
-                ((area.width() - sidebar) * 0.34).max(layout::MIN_DOCK_WIDTH)
-            })
-        } else {
-            0.0
-        };
-        let mut layout = layout::compute(
-            area.width(),
-            area.height(),
-            visible.len(),
-            completed,
-            diff_open,
-            dock_width,
-            &layout_config,
-        );
-        if layout.tabs {
-            layout = layout::compute(
-                area.width(),
-                area.height() - TAB_HEIGHT,
-                visible.len(),
-                completed,
-                diff_open,
-                dock_width,
-                &layout_config,
-            );
-            layout.tabs = visible.len() > layout.tiled || layout.tiled == 0;
-        }
-
-        self.last_layout = Some(layout);
-        if layout.sidebar {
-            egui::Panel::left("sidebar")
-                .exact_size(self.config.layout.sidebar_width)
-                .resizable(false)
-                .frame(egui::Frame::new().fill(p.panel).inner_margin(egui::Margin::symmetric(10, 4)))
-                .show(ui, |ui| self.sidebar(ui));
-        }
-
-        let chief_rect = if layout.dock_width > 0.0 {
-            Some(
-                egui::Panel::left("chief-dock")
-                    .exact_size(layout.dock_width)
-                    .resizable(false)
-                    .frame(egui::Frame::new().fill(p.background).inner_margin(egui::Margin::same(6)))
-                    .show(ui, |ui| self.chief_content(ui))
-                    .response
-                    .rect,
-            )
-        } else {
-            None
-        };
-
-        egui::CentralPanel::default().frame(egui::Frame::new().fill(p.background)).show(ui, |ui| {
-            let mut rect = ui.max_rect();
-            let statuses: Vec<AgentStatus> = visible.iter().map(|&i| self.sessions[i].status).collect();
-            let active = self.active_index().and_then(|a| visible.iter().position(|&i| i == a));
-            let tiled: Vec<usize> =
-                pick_tiled(&statuses, active, layout.tiled).into_iter().map(|k| visible[k]).collect();
-            if layout.tabs {
-                self.tab_strip(ui, rect.with_max_y(rect.top() + TAB_HEIGHT), &tiled, &visible);
-                rect.min.y += TAB_HEIGHT;
-            }
-            if visible.is_empty() && completed == 0 && !diff_open {
-                self.welcome(ui, rect);
-                return;
-            }
-            let (diff_rect, term_rect) = match layout.diff {
-                DiffPlacement::Right { width } => {
-                    (Some(rect.with_min_x(rect.right() - width)), Some(rect.with_max_x(rect.right() - width)))
-                }
-                DiffPlacement::Top { height } => {
-                    (Some(rect.with_max_y(rect.top() + height)), Some(rect.with_min_y(rect.top() + height)))
-                }
-                DiffPlacement::Full => (Some(rect), None),
-                DiffPlacement::Hidden => (None, Some(rect)),
-            };
-            if let Some(term_rect) = term_rect {
-                if visible.is_empty() && layout.completed == 0 {
-                    self.welcome(ui, term_rect);
-                } else {
-                    self.tiles(ui, term_rect, &layout, &tiled);
-                }
-            }
-            if let Some(diff_rect) = diff_rect {
-                self.diff_panel(ui, diff_rect);
-                if let DiffPlacement::Right { width } = layout.diff {
-                    // Drag the divider to give the diff/editor more or less room; double-click resets.
-                    let handle = Rect::from_center_size(diff_rect.left_center(), vec2(8.0, diff_rect.height()));
-                    let response = ui.interact(handle, ui.scope_id().with("divider"), Sense::click_and_drag());
-                    if response.hovered() || response.dragged() {
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-                        ui.painter().rect_filled(handle.shrink2(vec2(3.0, 0.0)), 0.0, p.accent.gamma_multiply(0.6));
-                    }
-                    if response.dragged() {
-                        self.split = Some(width - response.drag_delta().x);
-                    }
-                    if response.double_clicked() {
-                        self.split = None;
-                    }
-                }
-                let edge = match layout.diff {
-                    DiffPlacement::Right { .. } => Some([diff_rect.left_top(), diff_rect.left_bottom()]),
-                    DiffPlacement::Top { .. } => Some([diff_rect.left_bottom(), diff_rect.right_bottom()]),
-                    _ => None,
-                };
-                if let Some(edge) = edge {
-                    ui.painter().line_segment(edge, Stroke::new(1.0, lerp(p.panel, p.muted, 0.35)));
-                }
-            }
-        });
-
-        if let Some(rect) = chief_rect
-            && chief_divider(ui, rect, &mut self.store.chief_width, &p)
-        {
-            self.save_chief_preferences();
-        }
-
-        self.chief_ui(&ctx);
-        self.dialogs(&ctx);
-    }
-
     fn shutdown(&mut self) {
         // macOS never returns from the event loop after Cmd+Q, so the clean exit is recorded here.
         crate::crash::exited(&paths::imacs_home());
@@ -1177,6 +950,333 @@ fn apply_style(ctx: &egui::Context, config: &Config) {
     style.spacing.button_padding = vec2(7.0, 2.0);
     style.spacing.item_spacing = vec2(7.0, 4.0);
     ctx.set_global_style(style);
+}
+
+impl Desktop<'_> {
+    fn load_gauge(&mut self, ui: &mut egui::Ui) {
+        if self.client.load.0.elapsed() > Duration::from_secs(2) {
+            self.client.load = (Instant::now(), crate::governor::load_average());
+        }
+        let Some(load) = self.client.load.1 else { return };
+        let p = self.runtime.palette.clone();
+        let per_core = load / self.runtime.governor.cores as f64;
+        let color = if per_core >= 1.0 {
+            p.error
+        } else if per_core >= 0.7 {
+            p.warning
+        } else {
+            p.muted
+        };
+        let (running, waiting) = self.runtime.governor.snapshot();
+        let mut hover = format!("Load {load:.1} on {} cores", self.runtime.governor.cores);
+        match &self.runtime.jobserver {
+            Some(jobserver) => hover.push_str(&format!("\nCompilers of all agents share {} jobs", jobserver.tokens())),
+            None => hover.push_str("\nNo shared compiler job pool"),
+        }
+        for class in [SlotClass::Test, SlotClass::Qa] {
+            let busy = running.iter().filter(|t| t.class == class).count();
+            let queued = waiting.iter().filter(|t| t.class == class).count();
+            hover.push_str(&format!(
+                "\n{} slots: {busy}/{} in use, {queued} waiting",
+                class.name(),
+                self.runtime.governor.slots(class)
+            ));
+        }
+        let response = ui.label(RichText::new(format!("load {load:.1}")).color(color).size(12.0)).on_hover_text(hover);
+        topbar::record_item(ui, "load", &response);
+    }
+
+    fn metrics(&self, ui: &egui::Ui) -> Metrics {
+        let font = FontId::monospace(self.runtime.config.font.size);
+        let cell = ui.fonts_mut(|f| vec2(f.glyph_width(&font, 'M'), f.row_height(&font)));
+        Metrics { font, cell: vec2(cell.x, cell.y.ceil()) }
+    }
+
+    fn steer_bar(&mut self, ui: &mut egui::Ui) {
+        let p = self.runtime.palette.clone();
+        ui.horizontal(|ui| {
+            let active_title = self
+                .runtime
+                .active_index()
+                .map(|i| self.runtime.sessions[i].title.clone())
+                .unwrap_or_else(|| "none".into());
+            let agents = self.runtime.sessions.iter().filter(|s| s.is_agent() && s.can_receive()).count();
+            let selected = self.client.selected.len();
+            let label = match self.client.steer_target {
+                SteerTarget::Active => format!("→ {active_title}"),
+                SteerTarget::Agents => format!("→ all agents ({agents})"),
+                SteerTarget::Selected => format!("→ selected ({selected})"),
+            };
+            egui::ComboBox::from_id_salt("steer-target").selected_text(label).width(190.0).show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut self.client.steer_target,
+                    SteerTarget::Active,
+                    format!("Active: {active_title}"),
+                );
+                ui.selectable_value(
+                    &mut self.client.steer_target,
+                    SteerTarget::Agents,
+                    format!("All agents ({agents})"),
+                );
+                ui.selectable_value(
+                    &mut self.client.steer_target,
+                    SteerTarget::Selected,
+                    format!("Selected ({selected})"),
+                );
+            });
+
+            let id = ui.scope_id().with("steer-input");
+            let focused = ui.memory(|m| m.has_focus(id));
+            let mut send = false;
+            if focused && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter)) {
+                send = true;
+            }
+            let width = ui.available_width() - 70.0;
+            let edit = egui::TextEdit::multiline(&mut self.client.steer_text)
+                .id(id)
+                .desired_rows(1)
+                .desired_width(width)
+                .hint_text(format!(
+                    "Steer · Enter sends · Shift+Enter newline · {} focuses",
+                    self.runtime.config.keys.focus_steer
+                ))
+                .font(p.ui(13.5));
+            let response = ui.add(edit);
+            if std::mem::take(&mut self.client.focus_steer) {
+                response.request_focus();
+            }
+            let button =
+                egui::Button::new(RichText::new("Send").color(Color32::WHITE)).fill(p.accent.gamma_multiply(0.6));
+            if ui.add(button).clicked() {
+                send = true;
+            }
+            if send {
+                self.send_steer();
+            }
+        });
+    }
+
+    fn welcome(&mut self, ui: &mut egui::Ui, rect: Rect) {
+        let p = self.runtime.palette.clone();
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt("welcome")
+                .max_rect(Rect::from_center_size(rect.center(), vec2(rect.width().min(460.0), 260.0))),
+        );
+        child.vertical_centered(|ui| {
+            ui.label(RichText::new("IMACS").size(28.0).strong().color(p.accent));
+            ui.label(RichText::new("Emacs, but for agents").color(p.muted));
+            ui.label(RichText::new("an atomisk.ai project").color(p.muted).size(12.0));
+            ui.add_space(14.0);
+            ui.horizontal(|ui| {
+                for agent in self.runtime.config.agents.clone() {
+                    if ui.button(format!("Start {}", agent.name)).clicked() {
+                        self.runtime.client_commands.push(ControlRequest::Start {
+                            agent: agent.name.clone(), folder: Some(self.runtime.launch_dir.to_string_lossy().into_owned()),
+                            repo: None, branch: None, prompt: None, args: Vec::new(),
+                        });
+                    }
+                }
+            });
+            ui.add_space(6.0);
+            ui.label(RichText::new(format!("in {}", paths::display(&self.runtime.launch_dir))).color(p.muted).size(12.0));
+            ui.add_space(14.0);
+            ui.label(RichText::new("Click an agent's title to see its worktree's diff against main.\nComment on any line and send the review straight to the agent.").color(p.muted).size(12.0));
+        });
+    }
+
+    fn client_logic(&mut self, ctx: &egui::Context) {
+        for event in std::mem::take(&mut self.runtime.client_events) {
+            match event {
+                ClientEvent::Edit { root, path } => {
+                    self.client.focus_editor = true;
+                    if let Some(path) = path {
+                        self.client.editor_file.insert(root, path);
+                    }
+                }
+            }
+        }
+        while let Ok(event) = self.client.voice_rx.try_recv() {
+            match event {
+                VoiceEvent::Opened(cancelled, result) => {
+                    if matches!(&self.client.voice, Voice::Opening(current) if Arc::ptr_eq(current, &cancelled)) {
+                        match result {
+                            Ok(recorder) => self.client.voice = Voice::Recording(recorder),
+                            Err(err) => {
+                                self.client.voice = Voice::Idle;
+                                self.runtime.toast(format!("Voice: {err}"));
+                            }
+                        }
+                    }
+                }
+                VoiceEvent::Transcript(result) => {
+                    self.client.voice = Voice::Idle;
+                    match result {
+                        Ok(text) => self.send_voice(ctx, &text),
+                        Err(err) => self.runtime.toast(format!("Voice: {err}")),
+                    }
+                }
+            }
+        }
+        if let Voice::Recording(recorder) = &self.client.voice
+            && recorder.elapsed() >= MAX_RECORDING
+        {
+            self.stop_voice();
+            self.runtime.toast("Voice: stopped after 5 minutes, transcribing");
+        }
+
+        self.screenshot(ctx);
+        for terminal in
+            self.runtime.sessions.iter().filter_map(|s| s.terminal.as_ref()).chain(self.runtime.editors.values())
+        {
+            if let Some(text) = terminal.shared.clipboard.lock().unwrap().take() {
+                ctx.copy_text(text);
+            }
+        }
+    }
+
+    fn paint(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        self.shortcuts(&ctx);
+        let p = self.runtime.palette.clone();
+
+        egui::Panel::top("top")
+            .exact_size(34.0)
+            .frame(egui::Frame::new().fill(p.panel).inner_margin(egui::Margin::symmetric(10, 4)))
+            .show(ui, |ui| self.top_bar(ui));
+        egui::Panel::bottom("steer")
+            .frame(egui::Frame::new().fill(p.panel).inner_margin(egui::Margin::symmetric(10, 7)))
+            .show(ui, |ui| self.steer_bar(ui));
+
+        let area = ui.available_rect_before_wrap();
+        let diff_open =
+            self.runtime.diff_open && (self.runtime.diff_target().is_some() || self.runtime.panel == PanelMode::Plan);
+        let layout_config =
+            layout::LayoutConfig { diff_width: self.client.split, ..self.runtime.config.layout.clone() };
+        let visible = self.runtime.visible_sessions();
+        let completed = self.runtime.completed_tasks().len();
+        let dock_width = if self.runtime.chief_open && self.runtime.chief_dock() == ChiefDock::Docked {
+            self.runtime.store.chief_width.filter(|w| w.is_finite()).unwrap_or_else(|| {
+                let sidebar =
+                    if area.width() >= layout_config.sidebar_min_window { layout_config.sidebar_width } else { 0.0 };
+                ((area.width() - sidebar) * 0.34).max(layout::MIN_DOCK_WIDTH)
+            })
+        } else {
+            0.0
+        };
+        let mut layout = layout::compute(
+            area.width(),
+            area.height(),
+            visible.len(),
+            completed,
+            diff_open,
+            dock_width,
+            &layout_config,
+        );
+        if layout.tabs {
+            layout = layout::compute(
+                area.width(),
+                area.height() - TAB_HEIGHT,
+                visible.len(),
+                completed,
+                diff_open,
+                dock_width,
+                &layout_config,
+            );
+            layout.tabs = visible.len() > layout.tiled || layout.tiled == 0;
+        }
+
+        self.runtime.last_layout = Some(layout);
+        if layout.sidebar {
+            egui::Panel::left("sidebar")
+                .exact_size(self.runtime.config.layout.sidebar_width)
+                .resizable(false)
+                .frame(egui::Frame::new().fill(p.panel).inner_margin(egui::Margin::symmetric(10, 4)))
+                .show(ui, |ui| self.sidebar(ui));
+        }
+
+        let chief_rect = if layout.dock_width > 0.0 {
+            Some(
+                egui::Panel::left("chief-dock")
+                    .exact_size(layout.dock_width)
+                    .resizable(false)
+                    .frame(egui::Frame::new().fill(p.background).inner_margin(egui::Margin::same(6)))
+                    .show(ui, |ui| self.chief_content(ui))
+                    .response
+                    .rect,
+            )
+        } else {
+            None
+        };
+
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(p.background)).show(ui, |ui| {
+            let mut rect = ui.max_rect();
+            let statuses: Vec<AgentStatus> = visible.iter().map(|&i| self.runtime.sessions[i].status).collect();
+            let active = self.runtime.active_index().and_then(|a| visible.iter().position(|&i| i == a));
+            let tiled: Vec<usize> =
+                pick_tiled(&statuses, active, layout.tiled).into_iter().map(|k| visible[k]).collect();
+            if layout.tabs {
+                self.tab_strip(ui, rect.with_max_y(rect.top() + TAB_HEIGHT), &tiled, &visible);
+                rect.min.y += TAB_HEIGHT;
+            }
+            if visible.is_empty() && completed == 0 && !diff_open {
+                self.welcome(ui, rect);
+                return;
+            }
+            let (diff_rect, term_rect) = match layout.diff {
+                DiffPlacement::Right { width } => {
+                    (Some(rect.with_min_x(rect.right() - width)), Some(rect.with_max_x(rect.right() - width)))
+                }
+                DiffPlacement::Top { height } => {
+                    (Some(rect.with_max_y(rect.top() + height)), Some(rect.with_min_y(rect.top() + height)))
+                }
+                DiffPlacement::Full => (Some(rect), None),
+                DiffPlacement::Hidden => (None, Some(rect)),
+            };
+            if let Some(term_rect) = term_rect {
+                if visible.is_empty() && layout.completed == 0 {
+                    self.welcome(ui, term_rect);
+                } else {
+                    self.tiles(ui, term_rect, &layout, &tiled);
+                }
+            }
+            if let Some(diff_rect) = diff_rect {
+                self.diff_panel(ui, diff_rect);
+                if let DiffPlacement::Right { width } = layout.diff {
+                    // Drag the divider to give the diff/editor more or less room; double-click resets.
+                    let handle = Rect::from_center_size(diff_rect.left_center(), vec2(8.0, diff_rect.height()));
+                    let response = ui.interact(handle, ui.scope_id().with("divider"), Sense::click_and_drag());
+                    if response.hovered() || response.dragged() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                        ui.painter().rect_filled(handle.shrink2(vec2(3.0, 0.0)), 0.0, p.accent.gamma_multiply(0.6));
+                    }
+                    if response.dragged() {
+                        self.client.split = Some(width - response.drag_delta().x);
+                    }
+                    if response.double_clicked() {
+                        self.client.split = None;
+                    }
+                }
+                let edge = match layout.diff {
+                    DiffPlacement::Right { .. } => Some([diff_rect.left_top(), diff_rect.left_bottom()]),
+                    DiffPlacement::Top { .. } => Some([diff_rect.left_bottom(), diff_rect.right_bottom()]),
+                    _ => None,
+                };
+                if let Some(edge) = edge {
+                    ui.painter().line_segment(edge, Stroke::new(1.0, lerp(p.panel, p.muted, 0.35)));
+                }
+            }
+        });
+
+        if let Some(rect) = chief_rect
+            && chief_divider(ui, rect, &mut self.runtime.store.chief_width, &p)
+        {
+            self.runtime.save_chief_preferences();
+        }
+
+        self.chief_ui(&ctx);
+        self.dialogs(&ctx);
+    }
 }
 
 #[cfg(test)]

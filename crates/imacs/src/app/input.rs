@@ -2,45 +2,47 @@ use super::*;
 
 impl State {
     // ── input ─────────────────────────────────────────────────────────────
+}
 
+impl Desktop<'_> {
     pub(super) fn shortcuts(&mut self, ctx: &egui::Context) {
-        let keys = self.config.keys.clone();
+        let keys = self.runtime.config.keys.clone();
         let pressed = |text: &str| shortcut(text).is_some_and(|s| ctx.input_mut(|i| i.consume_shortcut(&s)));
         if pressed(&keys.voice) {
             self.toggle_voice();
         }
-        if matches!(self.voice, Voice::Opening(_) | Voice::Recording(_))
+        if matches!(self.client.voice, Voice::Opening(_) | Voice::Recording(_))
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape))
         {
-            if let Voice::Opening(cancelled) = &self.voice {
+            if let Voice::Opening(cancelled) = &self.client.voice {
                 cancelled.store(true, Ordering::Relaxed);
             }
-            self.voice = Voice::Idle;
-            self.toast("Voice: recording cancelled");
+            self.client.voice = Voice::Idle;
+            self.runtime.toast("Voice: recording cancelled");
         }
         if pressed(&keys.toggle_diff) {
-            self.diff_open = !self.diff_open;
+            self.runtime.diff_open = !self.runtime.diff_open;
         }
         if pressed(&keys.focus_steer) {
-            self.focus_steer = true;
+            self.client.focus_steer = true;
         }
         if pressed(&keys.toggle_editor)
-            && let Some(root) = self.diff_target()
+            && let Some(root) = self.runtime.diff_target()
         {
-            if self.panel == PanelMode::Editor {
-                self.panel = PanelMode::Diff;
+            if self.runtime.panel == PanelMode::Editor {
+                self.runtime.panel = PanelMode::Diff;
             } else {
-                let state = self.diffs.get(&root);
+                let state = self.runtime.diffs.get(&root);
                 let file = state.and_then(|s| s.viewing.clone()).or_else(|| {
                     state
                         .and_then(|s| s.prepared.as_ref())
                         .and_then(|p| p.diff.files.first().map(|f| f.path().to_string()))
                 });
-                self.edit(ctx, &root, file.as_deref(), None);
+                self.runtime.edit(ctx, &root, file.as_deref(), None);
             }
         }
         // Shift+↓/↑ walk the changed files from anywhere but a text field or the editor.
-        let editor_focused = self.editor_id.is_some_and(|id| ctx.memory(|m| m.has_focus(id)));
+        let editor_focused = self.client.editor_id.is_some_and(|id| ctx.memory(|m| m.has_focus(id)));
         if !ctx.text_edit_focused() && !editor_focused {
             let step = ctx.input_mut(|i| {
                 if i.consume_key(egui::Modifiers::SHIFT, Key::ArrowDown) {
@@ -52,53 +54,55 @@ impl State {
                 }
             });
             if step != 0
-                && let Some(root) = self.diff_target()
+                && let Some(root) = self.runtime.diff_target()
             {
-                self.diff_open = true;
-                if self.panel == PanelMode::Plan {
-                    self.panel = PanelMode::Diff;
+                self.runtime.diff_open = true;
+                if self.runtime.panel == PanelMode::Plan {
+                    self.runtime.panel = PanelMode::Diff;
                 }
-                let moved = self.diffs.entry(root.clone()).or_default().step(step);
-                if self.panel == PanelMode::Editor
+                let moved = self.runtime.diffs.entry(root.clone()).or_default().step(step);
+                if self.runtime.panel == PanelMode::Editor
                     && let Some((path, line)) = moved
                 {
-                    self.edit(ctx, &root, Some(&path), line);
-                    self.focus_editor = false;
+                    self.runtime.edit(ctx, &root, Some(&path), line);
+                    self.client.focus_editor = false;
                 }
             }
         }
         if pressed(&keys.toggle_plan) {
-            self.toggle_plan();
+            self.runtime.toggle_plan();
         }
         if pressed(&keys.toggle_chief) {
-            self.toggle_chief(ctx);
+            self.runtime.toggle_chief(ctx);
         }
-        if pressed(&keys.quick_open) && self.diff_target().is_some() {
-            self.quick_open = Some(QuickOpen { query: String::new(), selected: 0, focus: true });
+        if pressed(&keys.quick_open) && self.runtime.diff_target().is_some() {
+            self.client.quick_open = Some(QuickOpen { query: String::new(), selected: 0, focus: true });
         }
         if pressed(&keys.new_session) {
             self.open_new_dialog(None);
         }
         if pressed(&keys.refresh_diff)
-            && let Some(root) = self.diff_target()
+            && let Some(root) = self.runtime.diff_target()
         {
-            let state = self.diffs.entry(root).or_default();
+            let state = self.runtime.diffs.entry(root).or_default();
             state.dirty_since = Some(Instant::now() - Duration::from_secs(1));
         }
         if pressed(&keys.next_attention) {
-            let start = self.active_index().map(|i| i + 1).unwrap_or(0);
-            let n = self.sessions.len();
-            if let Some(i) = (0..n).map(|k| (start + k) % n).find(|&i| self.sessions[i].status.needs_attention()) {
-                let id = self.sessions[i].id.clone();
-                self.activate(&id, true);
+            let start = self.runtime.active_index().map(|i| i + 1).unwrap_or(0);
+            let n = self.runtime.sessions.len();
+            if let Some(i) =
+                (0..n).map(|k| (start + k) % n).find(|&i| self.runtime.sessions[i].status.needs_attention())
+            {
+                let id = self.runtime.sessions[i].id.clone();
+                self.runtime.activate(&id, true);
             } else {
-                self.toast("Nothing needs you right now");
+                self.runtime.toast("Nothing needs you right now");
             }
         }
         if pressed(&keys.close_session)
-            && let Some(id) = self.active.clone()
+            && let Some(id) = self.runtime.active.clone()
         {
-            self.confirm_close = Some(id);
+            self.client.confirm_close = Some(id);
         }
         for (n, key) in
             [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9]
@@ -107,23 +111,23 @@ impl State {
         {
             let chord = egui::KeyboardShortcut::new(shortcut("cmd+a").map(|s| s.modifiers).unwrap_or_default(), key);
             // cmd+N jumps to the Nth agent on screen and loads its diff.
-            let visible = self.visible_sessions();
+            let visible = self.runtime.visible_sessions();
             if ctx.input_mut(|i| i.consume_shortcut(&chord))
-                && let Some(id) = visible.get(n).map(|&i| self.sessions[i].id.clone())
+                && let Some(id) = visible.get(n).map(|&i| self.runtime.sessions[i].id.clone())
             {
-                self.activate(&id, true);
-                if self.panel == PanelMode::Plan {
-                    self.panel = PanelMode::Diff;
+                self.runtime.activate(&id, true);
+                if self.runtime.panel == PanelMode::Plan {
+                    self.runtime.panel = PanelMode::Diff;
                 }
             }
         }
     }
 
     pub(super) fn open_new_dialog(&mut self, folder: Option<PathBuf>) {
-        let folder = folder.or_else(|| self.diff_target()).unwrap_or_else(|| self.launch_dir.clone());
-        let repo = self.repos.first().cloned().unwrap_or_else(|| folder.clone());
-        self.new_dialog = Some(NewDialog {
-            agent: self.config.agents.first().map(|a| a.name.clone()).unwrap_or_default(),
+        let folder = folder.or_else(|| self.runtime.diff_target()).unwrap_or_else(|| self.runtime.launch_dir.clone());
+        let repo = self.runtime.repos.first().cloned().unwrap_or_else(|| folder.clone());
+        self.client.new_dialog = Some(NewDialog {
+            agent: self.runtime.config.agents.first().map(|a| a.name.clone()).unwrap_or_default(),
             new_worktree: false,
             folder: paths::display(&folder),
             repo: paths::display(&repo),
@@ -135,8 +139,8 @@ impl State {
     pub(super) fn dialogs(&mut self, ctx: &egui::Context) {
         self.quick_open_dialog(ctx);
         self.cleanup_dialog(ctx);
-        if let Some((id, status)) = self.confirm_plan_close.clone() {
-            if let Some(index) = self.plans.iter().position(|p| {
+        if let Some((id, status)) = self.client.confirm_plan_close.clone() {
+            if let Some(index) = self.runtime.plans.iter().position(|p| {
                 p.id == id && (p.is_open() || (status == PlanStatus::Archived && p.status == PlanStatus::Completed))
             }) {
                 let archive = status == PlanStatus::Archived;
@@ -147,31 +151,34 @@ impl State {
                     .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
                     .open(&mut open)
                     .show(ctx, |ui| {
-                        ui.label(format!("Close “{}”? You can reopen it from Closed plans.", self.plans[index].goal));
+                        ui.label(format!(
+                            "Close “{}”? You can reopen it from Closed plans.",
+                            self.runtime.plans[index].goal
+                        ));
                         ui.horizontal(|ui| {
                             if ui.button(if archive { "Confirm archive" } else { "Confirm complete" }).clicked() {
-                                if let Err(err) = self.close_plan(index, status) {
-                                    self.toast(err);
+                                if let Err(err) = self.runtime.close_plan(index, status) {
+                                    self.runtime.toast(err);
                                 }
-                                self.confirm_plan_close = None;
+                                self.client.confirm_plan_close = None;
                             }
                             if ui.button("Cancel").clicked() {
-                                self.confirm_plan_close = None;
+                                self.client.confirm_plan_close = None;
                             }
                         });
                     });
                 if !open {
-                    self.confirm_plan_close = None;
+                    self.client.confirm_plan_close = None;
                 }
             } else {
-                self.confirm_plan_close = None;
+                self.client.confirm_plan_close = None;
             }
         }
         self.plan_cleanup_dialog(ctx);
-        if let Some(id) = self.confirm_close.clone() {
-            let title = self.sessions.iter().find(|s| s.id == id).map(|s| s.title.clone());
+        if let Some(id) = self.client.confirm_close.clone() {
+            let title = self.runtime.sessions.iter().find(|s| s.id == id).map(|s| s.title.clone());
             let Some(title) = title else {
-                self.confirm_close = None;
+                self.client.confirm_close = None;
                 return;
             };
             let mut open = true;
@@ -184,20 +191,20 @@ impl State {
                     ui.label(format!("Closing “{title}” stops its process. Claude sessions can be resumed later."));
                     ui.horizontal(|ui| {
                         if ui.button("Close session").clicked() {
-                            self.close(&id);
-                            self.confirm_close = None;
+                            self.runtime.close(&id);
+                            self.client.confirm_close = None;
                         }
                         if ui.button("Cancel").clicked() {
-                            self.confirm_close = None;
+                            self.client.confirm_close = None;
                         }
                     });
                 });
             if !open {
-                self.confirm_close = None;
+                self.client.confirm_close = None;
             }
         }
 
-        let Some(mut dialog) = self.new_dialog.take() else { return };
+        let Some(mut dialog) = self.client.new_dialog.take() else { return };
         let mut keep = true;
         let mut start: Option<(String, PathBuf)> = None;
         let mut create: Option<(PathBuf, String, Launch)> = None;
@@ -209,7 +216,7 @@ impl State {
                 egui::Grid::new("new-session").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
                     ui.label("Agent");
                     egui::ComboBox::from_id_salt("agent").selected_text(&dialog.agent).show_ui(ui, |ui| {
-                        for agent in &self.config.agents {
+                        for agent in &self.runtime.config.agents {
                             ui.selectable_value(&mut dialog.agent, agent.name.clone(), &agent.name);
                         }
                     });
@@ -229,7 +236,7 @@ impl State {
                         ui.end_row();
                         if !dialog.branch.trim().is_empty() {
                             let path = git::worktree_path(
-                                &self.config.worktree_path,
+                                &self.runtime.config.worktree_path,
                                 &paths::expand(dialog.repo.trim()),
                                 dialog.branch.trim(),
                             );
@@ -242,8 +249,9 @@ impl State {
                         ui.horizontal(|ui| {
                             ui.text_edit_singleline(&mut dialog.folder);
                             ui.menu_button("▾", |ui| {
-                                let mut known: Vec<PathBuf> = self.worktrees.iter().map(|w| w.path.clone()).collect();
-                                known.extend(self.sessions.iter().map(Session::root));
+                                let mut known: Vec<PathBuf> =
+                                    self.runtime.worktrees.iter().map(|w| w.path.clone()).collect();
+                                known.extend(self.runtime.sessions.iter().map(Session::root));
                                 known.sort();
                                 known.dedup();
                                 for path in known {
@@ -258,7 +266,7 @@ impl State {
                     }
                 });
                 if let Some(err) = &dialog.error {
-                    ui.label(RichText::new(err).color(self.palette.error));
+                    ui.label(RichText::new(err).color(self.runtime.palette.error));
                 }
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
@@ -286,14 +294,14 @@ impl State {
                 });
             });
         if let Some((repo, branch, launch)) = create {
-            self.create_worktree(repo, branch, None, launch);
+            self.runtime.create_worktree(repo, branch, None, launch);
         }
         if let Some(target) = start {
-            self.pending_open.push(target);
+            self.runtime.pending_open.push(target);
             keep = false;
         }
         if keep {
-            self.new_dialog = Some(dialog);
+            self.client.new_dialog = Some(dialog);
         }
     }
 }

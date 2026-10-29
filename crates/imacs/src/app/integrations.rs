@@ -218,24 +218,24 @@ mod tests {
         with_app("app::integrations::tests::review_task_cannot_be_integrated", |app, _| {
             let (_dir, repo) = repository();
             request(app, json!({"cmd":"plan_set", "goal":"Review integration", "tasks":[{"id":"a", "repo":repo}]}));
-            let index = app.selected_plan;
-            let plan = app.plans[index].id.clone();
-            let into = app.plans[index].integration_branch();
+            let index = app.runtime.selected_plan;
+            let plan = app.runtime.plans[index].id.clone();
+            let into = app.runtime.plans[index].integration_branch();
             git::git(&repo, &["branch", &into]).unwrap();
             let review = repo.with_file_name("review");
             git::add_worktree(&repo, &review, "review-branch", "main").unwrap();
             std::fs::write(review.join("uncommitted"), "keep review changes").unwrap();
             let before = git::git(&repo, &["rev-parse", &into, "review-branch"]).unwrap();
             for status in [TaskStatus::Planned, TaskStatus::Review, TaskStatus::Done] {
-                let task = app.plans[index].task_mut(plan::REVIEW_TASK).unwrap();
+                let task = app.runtime.plans[index].task_mut(plan::REVIEW_TASK).unwrap();
                 task.status = status;
                 task.branch = Some("review-branch".into());
                 let response = request(app, json!({"cmd":"plan_integrate", "plan":plan, "id":plan::REVIEW_TASK}));
                 assert!(!response.ok);
                 assert!(response.error.unwrap().contains("The review task cannot be integrated"));
-                assert!(app.integrating.is_empty());
-                assert!(app.integrate_rx.try_recv().is_err());
-                assert!(app.plans[index].task_mut(plan::REVIEW_TASK).unwrap().integrated.is_none());
+                assert!(app.runtime.integrating.is_empty());
+                assert!(app.runtime.integrate_rx.try_recv().is_err());
+                assert!(app.runtime.plans[index].task_mut(plan::REVIEW_TASK).unwrap().integrated.is_none());
             }
             assert_eq!(git::git(&repo, &["rev-parse", &into, "review-branch"]).unwrap(), before);
             assert_eq!(git::git(&review, &["status", "--porcelain"]).unwrap().trim(), "?? uncommitted");
@@ -257,34 +257,34 @@ mod tests {
                 "integration":"integration", "tasks":[{"id":"a", "repo":repo, "branch":"task-a"},
                 {"id":"b", "depends_on":["a"]}]}),
                 );
-                let index = app.selected_plan;
-                app.plans[index].project = Some(project);
-                app.plans[index].tasks[0].status = TaskStatus::Done;
-                app.plans[index].tasks[0].integrated = Some("integration".into());
-                app.sessions.clear();
-                app.active = None;
-                app.diff_root = None;
-                app.runtime_tick(ctx);
+                let index = app.runtime.selected_plan;
+                app.runtime.plans[index].project = Some(project);
+                app.runtime.plans[index].tasks[0].status = TaskStatus::Done;
+                app.runtime.plans[index].tasks[0].integrated = Some("integration".into());
+                app.runtime.sessions.clear();
+                app.runtime.active = None;
+                app.runtime.diff_root = None;
+                app.runtime.runtime_tick(ctx);
                 assert!(
-                    app.watched.lock().unwrap().iter().any(|(root, _)| root == &repo),
+                    app.runtime.watched.lock().unwrap().iter().any(|(root, _)| root == &repo),
                     "the task repository must be watched even without a live agent or visible diff"
                 );
                 let deadline = Instant::now() + Duration::from_secs(10);
-                while !app.plans[index].tasks[0].integration_verified {
+                while !app.runtime.plans[index].tasks[0].integration_verified {
                     assert!(Instant::now() < deadline, "initial integration check did not finish");
                     std::thread::sleep(Duration::from_millis(10));
-                    app.runtime_tick(ctx);
+                    app.runtime.runtime_tick(ctx);
                 }
-                assert_eq!(app.plans[index].ready().iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["b"]);
+                assert_eq!(app.runtime.plans[index].ready().iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["b"]);
                 git::git(&repo, &["switch", "task-a"]).unwrap();
                 git::git(&repo, &["commit", "--allow-empty", "-qm", "later task work"]).unwrap();
-                while app.plans[index].tasks[0].integrated.is_some() {
+                while app.runtime.plans[index].tasks[0].integrated.is_some() {
                     assert!(Instant::now() < deadline, "a later commit in the task repository was not detected");
                     std::thread::sleep(Duration::from_millis(25));
-                    app.runtime_tick(ctx);
+                    app.runtime.runtime_tick(ctx);
                 }
-                assert!(!app.plans[index].tasks[0].integration_verified);
-                assert!(app.plans[index].ready().is_empty());
+                assert!(!app.runtime.plans[index].tasks[0].integration_verified);
+                assert!(app.runtime.plans[index].ready().is_empty());
             },
         );
     }
@@ -300,28 +300,28 @@ mod tests {
                 json!({"cmd":"plan_set", "goal":"Idle integration", "integration":"integration", "tasks":[
                     {"id":"a", "repo":repo, "branch":"task-a"}]}),
             );
-            let index = app.selected_plan;
-            app.plans[index].tasks[0].status = TaskStatus::Done;
-            app.plans[index].tasks[0].integrated = Some("integration".into());
+            let index = app.runtime.selected_plan;
+            app.runtime.plans[index].tasks[0].status = TaskStatus::Done;
+            app.runtime.plans[index].tasks[0].integrated = Some("integration".into());
             // Isolate the integration refresh from other app repaint sources.
-            app.ctx = egui::Context::default();
-            app.refresh_integrations();
+            app.runtime.ctx = egui::Context::default();
+            app.runtime.refresh_integrations();
             let deadline = Instant::now() + Duration::from_secs(5);
-            while !app.plans[index].tasks[0].integration_verified {
+            while !app.runtime.plans[index].tasks[0].integration_verified {
                 assert!(Instant::now() < deadline);
                 std::thread::sleep(Duration::from_millis(10));
-                app.refresh_integrations();
+                app.runtime.refresh_integrations();
             }
-            let ctx = app.ctx.clone();
+            let ctx = app.runtime.ctx.clone();
             for _ in 0..3 {
                 ctx.run_ui(Default::default(), |_| {}).drop_without_applying_deltas();
             }
             std::thread::sleep(Duration::from_millis(5100));
-            let output = ctx.run_ui(Default::default(), |_| app.refresh_integrations());
-            assert!(app.integration_checks.is_empty(), "idle refresh must not start another git check");
+            let output = ctx.run_ui(Default::default(), |_| app.runtime.refresh_integrations());
+            assert!(app.runtime.integration_checks.is_empty(), "idle refresh must not start another git check");
             assert_eq!(output.viewport_output[&egui::ViewportId::ROOT].repaint_delay, Duration::MAX);
             output.drop_without_applying_deltas();
-            assert!(app.integration_check_rx.try_recv().is_err(), "idle refresh must not run git");
+            assert!(app.runtime.integration_check_rx.try_recv().is_err(), "idle refresh must not run git");
         });
     }
 
@@ -335,39 +335,42 @@ mod tests {
                 json!({"cmd":"plan_set", "goal":"Unavailable ref", "integration":"integration", "tasks":[
                     {"id":"a", "repo":repo, "branch":"task-a"}, {"id":"b", "depends_on":["a"]}]}),
             );
-            let index = app.selected_plan;
-            app.plans[index].tasks[0].status = TaskStatus::Done;
-            app.plans[index].tasks[0].integrated = Some("integration".into());
-            app.save_plan(index);
+            let index = app.runtime.selected_plan;
+            app.runtime.plans[index].tasks[0].status = TaskStatus::Done;
+            app.runtime.plans[index].tasks[0].integrated = Some("integration".into());
+            app.runtime.save_plan(index);
             // Loading a persisted marker must trigger a check, even without a ref event.
-            let path = paths::imacs_home().join("plans").join(format!("{}.json", app.plans[index].id));
-            app.plans[index] = Plan::load(&path).unwrap();
-            app.refresh_integrations();
-            assert!(!app.integration_checks.is_empty());
+            let path = paths::imacs_home().join("plans").join(format!("{}.json", app.runtime.plans[index].id));
+            app.runtime.plans[index] = Plan::load(&path).unwrap();
+            app.runtime.refresh_integrations();
+            assert!(!app.runtime.integration_checks.is_empty());
             let deadline = Instant::now() + Duration::from_secs(5);
-            while !app.integration_checks.is_empty() {
+            while !app.runtime.integration_checks.is_empty() {
                 assert!(Instant::now() < deadline);
                 std::thread::sleep(Duration::from_millis(10));
-                app.refresh_integrations();
+                app.runtime.refresh_integrations();
             }
-            assert_eq!(app.plans[index].tasks[0].integrated.as_deref(), Some("integration"));
-            assert!(!app.plans[index].tasks[0].integration_verified);
-            assert!(app.plans[index].ready().is_empty());
+            assert_eq!(app.runtime.plans[index].tasks[0].integrated.as_deref(), Some("integration"));
+            assert!(!app.runtime.plans[index].tasks[0].integration_verified);
+            assert!(app.runtime.plans[index].ready().is_empty());
             assert_eq!(Plan::load(&path).unwrap().tasks[0].integrated.as_deref(), Some("integration"));
 
             git::git(&repo, &["branch", "task-a"]).unwrap();
-            app.refresh_integrations();
-            assert!(app.integration_checks.is_empty(), "a git error must wait for a ref change before retrying");
-            assert!(!app.plans[index].tasks[0].integration_verified);
-            app.integration_dirty.store(true, Ordering::Relaxed);
-            app.refresh_integrations();
-            while !app.integration_checks.is_empty() {
+            app.runtime.refresh_integrations();
+            assert!(
+                app.runtime.integration_checks.is_empty(),
+                "a git error must wait for a ref change before retrying"
+            );
+            assert!(!app.runtime.plans[index].tasks[0].integration_verified);
+            app.runtime.integration_dirty.store(true, Ordering::Relaxed);
+            app.runtime.refresh_integrations();
+            while !app.runtime.integration_checks.is_empty() {
                 assert!(Instant::now() < deadline);
                 std::thread::sleep(Duration::from_millis(10));
-                app.refresh_integrations();
+                app.runtime.refresh_integrations();
             }
-            assert!(app.plans[index].tasks[0].integration_verified);
-            assert_eq!(app.plans[index].ready().iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["b"]);
+            assert!(app.runtime.plans[index].tasks[0].integration_verified);
+            assert_eq!(app.runtime.plans[index].ready().iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["b"]);
         });
     }
 
@@ -436,41 +439,45 @@ exec {} "$@"
                 json!({"cmd":"plan_set", "goal":"Background ancestry", "integration":"integration", "tasks":[
                 {"id":"a", "repo":repo, "branch":"task-a"}, {"id":"b", "repo":repo, "depends_on":["a"]}]}),
             );
-            let index = app.selected_plan;
-            app.plans[index].approved = true;
-            app.plans[index].tasks[0].status = TaskStatus::Done;
-            app.plans[index].tasks[0].integrated = Some("integration".into());
-            app.refresh_integrations();
+            let index = app.runtime.selected_plan;
+            app.runtime.plans[index].approved = true;
+            app.runtime.plans[index].tasks[0].status = TaskStatus::Done;
+            app.runtime.plans[index].tasks[0].integrated = Some("integration".into());
+            app.runtime.refresh_integrations();
             let deadline = Instant::now() + Duration::from_secs(5);
             while !paths::home().join("started").exists() {
                 assert!(Instant::now() < deadline, "background git did not start");
                 std::thread::sleep(Duration::from_millis(10));
             }
-            assert!(app.plans[index].ready().is_empty());
-            assert_eq!(app.plan_json(index)["ready"], json!([]));
-            assert!(app.dispatch(index, Some("b")).is_err(), "dispatch must agree while git is blocked");
-            assert!(app.creating.is_empty());
-            let checked = app.plans[index].tasks[0].clone();
-            app.integration_dirty.store(true, Ordering::Relaxed);
-            app.refresh_integrations();
-            app.integration_check_tx
+            assert!(app.runtime.plans[index].ready().is_empty());
+            assert_eq!(app.runtime.plan_json(index)["ready"], json!([]));
+            assert!(app.runtime.dispatch(index, Some("b")).is_err(), "dispatch must agree while git is blocked");
+            assert!(app.runtime.creating.is_empty());
+            let checked = app.runtime.plans[index].tasks[0].clone();
+            app.runtime.integration_dirty.store(true, Ordering::Relaxed);
+            app.runtime.refresh_integrations();
+            app.runtime
+                .integration_check_tx
                 .send(CheckedIntegration {
-                    revision: app.integration_revision - 1,
-                    plan: app.plans[index].id.clone(),
+                    revision: app.runtime.integration_revision - 1,
+                    plan: app.runtime.plans[index].id.clone(),
                     task: checked,
                     into: "integration".into(),
                     valid: Some(true),
                 })
                 .unwrap();
-            app.refresh_integrations();
-            assert!(!app.plans[index].tasks[0].integration_verified, "a stale result must not restore readiness");
+            app.runtime.refresh_integrations();
+            assert!(
+                !app.runtime.plans[index].tasks[0].integration_verified,
+                "a stale result must not restore readiness"
+            );
             std::fs::write(paths::home().join("release"), "").unwrap();
-            while !app.plans[index].tasks[0].integration_verified {
+            while !app.runtime.plans[index].tasks[0].integration_verified {
                 assert!(Instant::now() < deadline);
                 std::thread::sleep(Duration::from_millis(10));
-                app.refresh_integrations();
+                app.runtime.refresh_integrations();
             }
-            assert_eq!(app.plan_json(index)["ready"], json!(["b"]));
+            assert_eq!(app.runtime.plan_json(index)["ready"], json!(["b"]));
         });
     }
 
@@ -489,13 +496,13 @@ exec {} "$@"
                 )
                 .result["plan"]
                     .clone();
-                let index = app.selected_plan;
-                app.plans[index].approved = true;
-                app.plans[index].tasks[0].status = TaskStatus::Done;
-                app.plans[index].tasks[0].integrated = Some("integration".into());
+                let index = app.runtime.selected_plan;
+                app.runtime.plans[index].approved = true;
+                app.runtime.plans[index].tasks[0].status = TaskStatus::Done;
+                app.runtime.plans[index].tasks[0].integrated = Some("integration".into());
                 assert!(request(app, json!({"cmd":"plan_update", "plan":plan, "id":"a", "status":"running"})).ok);
-                assert!(app.plans[index].tasks[0].integrated.is_none());
-                app.finish_integration(Integrated {
+                assert!(app.runtime.plans[index].tasks[0].integrated.is_none());
+                app.runtime.finish_integration(Integrated {
                     plan: plan.as_str().unwrap().into(),
                     task: "a".into(),
                     branch: "task-a".into(),
@@ -504,39 +511,39 @@ exec {} "$@"
                     result: Ok(Integration { committed: false, merge: Merge::UpToDate, worktree: repo.clone() }),
                 });
                 assert!(
-                    app.plans[index].tasks[0].integrated.is_none(),
+                    app.runtime.plans[index].tasks[0].integrated.is_none(),
                     "a late integration must not mark a running task integrated"
                 );
                 assert!(request(app, json!({"cmd":"plan_update", "plan":plan, "id":"a", "status":"done"})).ok);
-                assert!(app.dispatch(index, Some("b")).unwrap_err().contains("integrated dependencies"));
-                app.plans[index].tasks[0].integrated = Some("integration".into());
+                assert!(app.runtime.dispatch(index, Some("b")).unwrap_err().contains("integrated dependencies"));
+                app.runtime.plans[index].tasks[0].integrated = Some("integration".into());
                 git::git(&repo, &["switch", "task-a"]).unwrap();
                 git::git(&repo, &["commit", "--allow-empty", "-qm", "new work after integration"]).unwrap();
-                assert!(app.dispatch(index, Some("b")).unwrap_err().contains("integrated dependencies"));
+                assert!(app.runtime.dispatch(index, Some("b")).unwrap_err().contains("integrated dependencies"));
                 let deadline = Instant::now() + Duration::from_secs(5);
-                while !app.integration_checks.is_empty() {
+                while !app.runtime.integration_checks.is_empty() {
                     assert!(Instant::now() < deadline);
                     std::thread::sleep(Duration::from_millis(10));
-                    app.refresh_integrations();
+                    app.runtime.refresh_integrations();
                 }
-                assert!(app.plans[index].tasks[0].integrated.is_none());
-                assert!(app.creating.is_empty());
+                assert!(app.runtime.plans[index].tasks[0].integrated.is_none());
+                assert!(app.runtime.creating.is_empty());
                 let saved =
                     Plan::load(&paths::imacs_home().join("plans").join(format!("{}.json", plan.as_str().unwrap())))
                         .unwrap();
                 assert!(saved.tasks[0].integrated.is_none());
                 git::git(&repo, &["branch", "-f", "integration", "task-a"]).unwrap();
-                app.plans[index].tasks[0].integrated = Some("integration".into());
+                app.runtime.plans[index].tasks[0].integrated = Some("integration".into());
                 // A missing requested task does not invalidate a genuinely integrated dependency.
-                assert!(app.dispatch(index, Some("missing")).is_err());
-                assert!(app.plans[index].ready().is_empty());
-                while !app.integration_checks.is_empty() {
+                assert!(app.runtime.dispatch(index, Some("missing")).is_err());
+                assert!(app.runtime.plans[index].ready().is_empty());
+                while !app.runtime.integration_checks.is_empty() {
                     assert!(Instant::now() < deadline);
                     std::thread::sleep(Duration::from_millis(10));
-                    app.refresh_integrations();
+                    app.runtime.refresh_integrations();
                 }
-                assert_eq!(app.plans[index].tasks[0].integrated.as_deref(), Some("integration"));
-                assert!(app.plans[index].ready().iter().any(|task| task.id == "b"));
+                assert_eq!(app.runtime.plans[index].tasks[0].integrated.as_deref(), Some("integration"));
+                assert!(app.runtime.plans[index].ready().iter().any(|task| task.id == "b"));
             },
         );
     }
@@ -562,7 +569,7 @@ exec {} "$@"
                 )
                 .unwrap();
                 std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
-                app.config.worktree_path = "{repo_parent}/{slug}".into();
+                app.runtime.config.worktree_path = "{repo_parent}/{slug}".into();
                 let mut indices = Vec::new();
                 for (goal, repo) in [("One", &repo1), ("Two", &repo2)] {
                     git::git(repo, &["branch", "task"]).unwrap();
@@ -573,11 +580,11 @@ exec {} "$@"
                         app,
                         json!({"cmd":"plan_set", "goal":goal, "tasks":[{"id":"a", "repo":repo, "branch":"task"}]}),
                     );
-                    let index = app.selected_plan;
-                    app.plans[index].tasks[0].status = TaskStatus::Done;
+                    let index = app.runtime.selected_plan;
+                    app.runtime.plans[index].tasks[0].status = TaskStatus::Done;
                     indices.push(index);
                 }
-                app.integrate(indices[0], "a", None);
+                app.runtime.integrate(indices[0], "a", None);
                 let deadline = Instant::now() + Duration::from_secs(5);
                 while !started.exists() {
                     if Instant::now() >= deadline {
@@ -586,19 +593,19 @@ exec {} "$@"
                     }
                     std::thread::sleep(Duration::from_millis(10));
                 }
-                app.integrate(indices[1], "a", None);
-                let other = app.integrate_rx.recv_timeout(Duration::from_secs(5));
+                app.runtime.integrate(indices[1], "a", None);
+                let other = app.runtime.integrate_rx.recv_timeout(Duration::from_secs(5));
                 std::fs::write(&release, "").unwrap();
                 let other = other.expect("a second repository must not wait for the first repository's integration");
-                assert_eq!(other.plan, app.plans[indices[1]].id);
+                assert_eq!(other.plan, app.runtime.plans[indices[1]].id);
                 assert!(other.result.is_ok());
-                app.finish_integration(other);
-                let first = app.integrate_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-                assert_eq!(first.plan, app.plans[indices[0]].id);
+                app.runtime.finish_integration(other);
+                let first = app.runtime.integrate_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert_eq!(first.plan, app.runtime.plans[indices[0]].id);
                 assert!(first.result.is_ok());
-                app.finish_integration(first);
-                assert!(app.plans[indices[0]].tasks[0].integrated.is_some());
-                assert!(app.plans[indices[1]].tasks[0].integrated.is_some());
+                app.runtime.finish_integration(first);
+                assert!(app.runtime.plans[indices[0]].tasks[0].integrated.is_some());
+                assert!(app.runtime.plans[indices[1]].tasks[0].integrated.is_some());
             },
         );
     }

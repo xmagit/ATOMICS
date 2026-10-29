@@ -110,35 +110,6 @@ impl State {
             changed = true;
             self.control(ctx, message.request, message.reply);
         }
-        while let Ok(event) = self.voice_rx.try_recv() {
-            changed = true;
-            match event {
-                VoiceEvent::Opened(cancelled, result) => {
-                    if matches!(&self.voice, Voice::Opening(current) if Arc::ptr_eq(current, &cancelled)) {
-                        match result {
-                            Ok(recorder) => self.voice = Voice::Recording(recorder),
-                            Err(err) => {
-                                self.voice = Voice::Idle;
-                                self.toast(format!("Voice: {err}"));
-                            }
-                        }
-                    }
-                }
-                VoiceEvent::Transcript(result) => {
-                    self.voice = Voice::Idle;
-                    match result {
-                        Ok(text) => self.send_voice(ctx, &text),
-                        Err(err) => self.toast(format!("Voice: {err}")),
-                    }
-                }
-            }
-        }
-        if let Voice::Recording(recorder) = &self.voice
-            && recorder.elapsed() >= MAX_RECORDING
-        {
-            self.stop_voice();
-            self.toast("Voice: stopped after 5 minutes, transcribing");
-        }
         for terminal in self.sessions.iter().filter_map(|s| s.terminal.as_ref()).chain(self.editors.values()) {
             changed |= terminal.shared.changed.swap(false, Ordering::AcqRel);
         }
@@ -335,9 +306,6 @@ impl State {
         if self.sessions.iter().any(|s| s.terminal.is_some()) {
             next = next.min(self.busy_checked + Duration::from_millis(400));
         }
-        if let Voice::Recording(recorder) = &self.voice {
-            next = next.min(now + MAX_RECORDING.saturating_sub(recorder.elapsed()));
-        }
         let target = self.diff_target();
         for (root, state) in &self.diffs {
             let interval = if target.as_ref() == Some(root) { Duration::ZERO } else { BACKGROUND_REFRESH };
@@ -422,7 +390,6 @@ impl State {
                     held: Vec::new(),
                     approval_hold: false,
                     menu_absent_since: None,
-                    selected: false,
                     chief: false,
                     pending: None,
                 });
@@ -642,11 +609,11 @@ mod tests {
     fn needs_input_without_a_pending_menu_uses_slow_screen_checks() {
         with_app("app::background::tests::needs_input_without_a_pending_menu_uses_slow_screen_checks", |app, _ctx| {
             let terminal = Terminal::spawn(
-                app.wake.clone(),
-                app.palette.terminal_colors(),
+                app.runtime.wake.clone(),
+                app.runtime.palette.terminal_colors(),
                 "/bin/sh".into(),
                 vec!["-c".into(), "printf 'Working (esc to interrupt)'; exec sleep 30".into()],
-                &app.launch_dir,
+                &app.runtime.launch_dir,
                 HashMap::new(),
                 100,
             )
@@ -656,39 +623,44 @@ mod tests {
                 assert!(Instant::now() < deadline);
                 std::thread::sleep(Duration::from_millis(10));
             }
-            app.config.agents.push(imacs_core::config::AgentConfig {
+            app.runtime.config.agents.push(imacs_core::config::AgentConfig {
                 name: "test".into(),
                 command: vec![],
                 kind: AgentKind::Generic,
                 busy_text: Some("esc to interrupt".into()),
             });
-            app.sessions = vec![session("waiting", AgentKind::Generic, AgentStatus::NeedsInput, &app.launch_dir)];
-            app.sessions[0].terminal = Some(terminal);
+            app.runtime.sessions =
+                vec![session("waiting", AgentKind::Generic, AgentStatus::NeedsInput, &app.runtime.launch_dir)];
+            app.runtime.sessions[0].terminal = Some(terminal);
             let now = Instant::now();
-            app.approvals_checked = now - APPROVAL_CHECK_INTERVAL;
-            app.needs_input_checked = now;
-            assert_eq!(app.approval_poll_interval(), Some(NEEDS_INPUT_CHECK_INTERVAL));
-            app.expire_approvals(now);
-            assert!(app.sessions[0].menu_absent_since.is_none(), "a frame must not read an idle needs-input screen");
-            app.expire_approvals(now + NEEDS_INPUT_CHECK_INTERVAL);
+            app.runtime.approvals_checked = now - APPROVAL_CHECK_INTERVAL;
+            app.runtime.needs_input_checked = now;
+            assert_eq!(app.runtime.approval_poll_interval(), Some(NEEDS_INPUT_CHECK_INTERVAL));
+            app.runtime.expire_approvals(now);
             assert!(
-                app.sessions[0].menu_absent_since.is_some(),
+                app.runtime.sessions[0].menu_absent_since.is_none(),
+                "a frame must not read an idle needs-input screen"
+            );
+            app.runtime.expire_approvals(now + NEEDS_INPUT_CHECK_INTERVAL);
+            assert!(
+                app.runtime.sessions[0].menu_absent_since.is_some(),
                 "the slow check still recovers missed lifecycle events"
             );
-            app.sessions[0].approval_hold = true;
-            assert_eq!(app.approval_poll_interval(), Some(Duration::from_millis(400)));
-            app.expire_approvals(now + NEEDS_INPUT_CHECK_INTERVAL + APPROVAL_MENU_GRACE);
-            assert!(!app.sessions[0].approval_hold);
-            assert_eq!(app.sessions[0].status, AgentStatus::Working);
-            assert_eq!(app.approval_poll_interval(), None);
-            app.sessions.clear();
+            app.runtime.sessions[0].approval_hold = true;
+            assert_eq!(app.runtime.approval_poll_interval(), Some(Duration::from_millis(400)));
+            app.runtime.expire_approvals(now + NEEDS_INPUT_CHECK_INTERVAL + APPROVAL_MENU_GRACE);
+            assert!(!app.runtime.sessions[0].approval_hold);
+            assert_eq!(app.runtime.sessions[0].status, AgentStatus::Working);
+            assert_eq!(app.runtime.approval_poll_interval(), None);
+            app.runtime.sessions.clear();
         });
     }
 
     #[test]
     fn pre_tool_use_retires_only_the_matching_approval() {
         with_app("app::background::tests::pre_tool_use_retires_only_the_matching_approval", |app, _| {
-            app.sessions = vec![session("worker", AgentKind::Generic, AgentStatus::Working, &app.launch_dir)];
+            app.runtime.sessions =
+                vec![session("worker", AgentKind::Generic, AgentStatus::Working, &app.runtime.launch_dir)];
             let hook = |name: &str, command: &str, tool: &str, cwd: &Path, reply| HookMessage {
                 pane: Some("worker".into()),
                 ancestors: vec![],
@@ -700,30 +672,30 @@ mod tests {
                 }))
                 .unwrap(),
             };
-            let root = app.launch_dir.clone();
+            let root = app.runtime.launch_dir.clone();
             let matching = Arc::new(ipc::ApprovalReply::default());
             let other = Arc::new(ipc::ApprovalReply::default());
             for (command, reply) in [("touch first", matching.clone()), ("touch second", other.clone())] {
-                app.on_hook(hook("PermissionRequest", command, "Bash", &root, Some(reply)));
+                app.runtime.on_hook(hook("PermissionRequest", command, "Bash", &root, Some(reply)));
             }
             for (command, tool, cwd) in [
                 ("touch third", "Bash", root.clone()),
                 ("touch first", "Edit", root.clone()),
                 ("touch first", "Bash", root.join("elsewhere")),
             ] {
-                app.on_hook(hook("PreToolUse", command, tool, &cwd, None));
-                assert_eq!(app.sessions[0].approvals.len(), 2);
+                app.runtime.on_hook(hook("PreToolUse", command, tool, &cwd, None));
+                assert_eq!(app.runtime.sessions[0].approvals.len(), 2);
                 assert!(!matching.expired() && !other.expired());
-                assert_eq!(app.sessions[0].status, AgentStatus::NeedsInput);
+                assert_eq!(app.runtime.sessions[0].status, AgentStatus::NeedsInput);
             }
-            app.on_hook(hook("PreToolUse", "touch first", "Bash", &root, None));
-            assert_eq!(app.sessions[0].approvals.len(), 1);
-            assert_eq!(app.sessions[0].approvals[0].request.command.as_deref(), Some("touch second"));
+            app.runtime.on_hook(hook("PreToolUse", "touch first", "Bash", &root, None));
+            assert_eq!(app.runtime.sessions[0].approvals.len(), 1);
+            assert_eq!(app.runtime.sessions[0].approvals[0].request.command.as_deref(), Some("touch second"));
             assert!(!matching.answer(HookReply { stdout: Some("must already be answered".into()) }));
             assert!(matching.wait(Duration::ZERO).stdout.is_none());
             assert!(!other.expired(), "the other hook must still be waiting for its own decision");
-            assert_eq!(app.sessions[0].status, AgentStatus::NeedsInput);
-            app.approve(0, Decision::Deny, None).unwrap();
+            assert_eq!(app.runtime.sessions[0].status, AgentStatus::NeedsInput);
+            app.runtime.approve(0, Decision::Deny, None).unwrap();
             let output = other.wait(Duration::ZERO).stdout.unwrap();
             assert!(output.contains("deny"));
         });
@@ -740,24 +712,27 @@ mod tests {
                 let alias = dir.path().join("alias");
                 std::os::unix::fs::symlink(&real, &alias).unwrap();
                 let root = alias.join("worktree");
-                app.sessions.clear();
-                app.plans.clear();
-                app.watch(ctx, Some(&root));
-                assert!(app.watched.lock().unwrap().is_empty(), "a failed watch must remain pending");
+                app.runtime.sessions.clear();
+                app.runtime.plans.clear();
+                app.runtime.watch(ctx, Some(&root));
+                assert!(app.runtime.watched.lock().unwrap().is_empty(), "a failed watch must remain pending");
                 std::fs::create_dir(&root).unwrap();
-                app.watch(ctx, Some(&root));
-                assert_eq!(*app.watched.lock().unwrap(), [(root.clone(), std::fs::canonicalize(&root).unwrap())]);
+                app.runtime.watch(ctx, Some(&root));
+                assert_eq!(
+                    *app.runtime.watched.lock().unwrap(),
+                    [(root.clone(), std::fs::canonicalize(&root).unwrap())]
+                );
                 let deadline = Instant::now() + Duration::from_secs(10);
                 loop {
                     std::fs::write(root.join("changed.txt"), "changed").unwrap();
-                    if let Ok(changed) = app.watch_rx.recv_timeout(Duration::from_millis(100)) {
+                    if let Ok(changed) = app.runtime.watch_rx.recv_timeout(Duration::from_millis(100)) {
                         assert_eq!(changed, root, "events must retain the application's worktree path");
                         break;
                     }
                     assert!(Instant::now() < deadline, "no event for symlinked worktree");
                 }
-                app.watch(ctx, None);
-                assert!(app.watched.lock().unwrap().is_empty());
+                app.runtime.watch(ctx, None);
+                assert!(app.runtime.watched.lock().unwrap().is_empty());
             },
         );
     }

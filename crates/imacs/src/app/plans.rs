@@ -350,25 +350,25 @@ mod tests {
             "app::plans::tests::dispatched_review_records_branch_closes_on_acceptance_and_can_be_cleaned_up",
             |app, ctx| {
                 let (_dir, repo) = repository();
-                app.plans = vec![Plan {
+                app.runtime.plans = vec![Plan {
                     id: "review-cleanup".into(),
                     project: Some(repo.clone()),
                     approved: true,
                     tasks: vec![Task { id: plan::REVIEW_TASK.into(), ..Task::default() }],
                     ..Plan::default()
                 }];
-                app.selected_plan = 0;
-                app.dispatch(0, Some(plan::REVIEW_TASK)).unwrap();
-                let (branch, worktree, _) = app.worktree_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                app.runtime.selected_plan = 0;
+                app.runtime.dispatch(0, Some(plan::REVIEW_TASK)).unwrap();
+                let (branch, worktree, _) = app.runtime.worktree_rx.recv_timeout(Duration::from_secs(5)).unwrap();
                 let worktree = worktree.unwrap();
-                assert_eq!(app.plans[0].tasks[0].branch.as_deref(), Some(branch.as_str()));
+                assert_eq!(app.runtime.plans[0].tasks[0].branch.as_deref(), Some(branch.as_str()));
                 assert_eq!(git::worktree_of(&worktree).unwrap().branch.as_deref(), Some(branch.as_str()));
                 assert_eq!(plan::load_plans(&paths::imacs_home()).unwrap().0[0].tasks[0].branch, Some(branch.clone()));
-                app.sessions = vec![session("reviewer", AgentKind::Claude, AgentStatus::Done, &worktree)];
-                app.plans[0].tasks[0].session = Some("reviewer".into());
-                app.plans[0].tasks[0].status = TaskStatus::Review;
+                app.runtime.sessions = vec![session("reviewer", AgentKind::Claude, AgentStatus::Done, &worktree)];
+                app.runtime.plans[0].tasks[0].session = Some("reviewer".into());
+                app.runtime.plans[0].tasks[0].status = TaskStatus::Review;
                 for (id, can_integrate) in [("code", true), (plan::REVIEW_TASK, false)] {
-                    app.plans[0].tasks[0].id = id.into();
+                    app.runtime.plans[0].tasks[0].id = id.into();
                     let output = ctx.run_ui(
                         egui::RawInput {
                             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1600.0, 1000.0))),
@@ -395,14 +395,14 @@ mod tests {
                     )
                     .ok
                 );
-                assert!(app.find("reviewer").is_none());
-                assert_eq!(app.plans[0].status, PlanStatus::Completed);
-                assert!(app.plans[0].tasks[0].integrated.is_none());
-                assert_eq!(app.plans[0].tasks[0].worktree.as_ref(), Some(&worktree));
-                let rows = imacs_core::cleanup::preview(&app.plans[0], "main").unwrap();
+                assert!(app.runtime.find("reviewer").is_none());
+                assert_eq!(app.runtime.plans[0].status, PlanStatus::Completed);
+                assert!(app.runtime.plans[0].tasks[0].integrated.is_none());
+                assert_eq!(app.runtime.plans[0].tasks[0].worktree.as_ref(), Some(&worktree));
+                let rows = imacs_core::cleanup::preview(&app.runtime.plans[0], "main").unwrap();
                 assert_eq!(rows.len(), 1);
                 assert_eq!(rows[0].branch, branch);
-                imacs_core::cleanup::remove(&app.plans[0], "main", &rows[0]).unwrap();
+                imacs_core::cleanup::remove(&app.runtime.plans[0], "main", &rows[0]).unwrap();
                 assert!(!worktree.exists());
                 assert!(git::git(&repo, &["show-ref", "--verify", &format!("refs/heads/{branch}")]).is_err());
             },
@@ -417,8 +417,8 @@ mod tests {
                 let dir = tempfile::tempdir().unwrap();
                 let root = dir.path();
                 let terminal = Terminal::spawn(
-                    app.wake.clone(),
-                    app.palette.terminal_colors(),
+                    app.runtime.wake.clone(),
+                    app.runtime.palette.terminal_colors(),
                     "/bin/sh".into(),
                     vec!["-c".into(), "exec sleep 600".into()],
                     root,
@@ -427,16 +427,16 @@ mod tests {
                 )
                 .unwrap();
                 let pid = terminal.process_id();
-                app.sessions = vec![
+                app.runtime.sessions = vec![
                     session("worker", AgentKind::Claude, AgentStatus::Done, root),
                     session("reviewer", AgentKind::Claude, AgentStatus::Idle, root),
                     session("chief", AgentKind::Claude, AgentStatus::Working, root),
                     session("other-plan", AgentKind::Generic, AgentStatus::Working, root),
                 ];
-                app.sessions[0].terminal = Some(terminal);
-                app.sessions[2].chief = true;
-                let index = app.selected_plan;
-                app.plans[index] = Plan {
+                app.runtime.sessions[0].terminal = Some(terminal);
+                app.runtime.sessions[2].chief = true;
+                let index = app.runtime.selected_plan;
+                app.runtime.plans[index] = Plan {
                     id: "lifecycle".into(),
                     goal: "Ship".into(),
                     tasks: vec![
@@ -466,21 +466,26 @@ mod tests {
                     ],
                     ..Plan::default()
                 };
-                let into = app.plans[index].integration_branch();
-                app.plans[index].tasks[0].status = TaskStatus::Running;
-                app.plans[index].tasks[0].integrated = Some(into.clone());
-                assert_eq!(app.report(Some("worker"), "done", "Last report\nSecond line"), Some("code".into()));
-                app.sync_plan();
-                assert_eq!(app.plans[index].tasks[0].status, TaskStatus::Review);
-                assert!(app.plans[index].tasks[0].finished_at.is_none());
-                assert!(app.completed_tasks().is_empty());
-                assert!(app.sessions[app.find("worker").unwrap()].terminal.as_ref().is_some_and(|t| !t.exited()));
-                app.plans[index].tasks[0].integrated = None;
+                let into = app.runtime.plans[index].integration_branch();
+                app.runtime.plans[index].tasks[0].status = TaskStatus::Running;
+                app.runtime.plans[index].tasks[0].integrated = Some(into.clone());
+                assert_eq!(app.runtime.report(Some("worker"), "done", "Last report\nSecond line"), Some("code".into()));
+                app.runtime.sync_plan();
+                assert_eq!(app.runtime.plans[index].tasks[0].status, TaskStatus::Review);
+                assert!(app.runtime.plans[index].tasks[0].finished_at.is_none());
+                assert!(app.runtime.completed_tasks().is_empty());
+                assert!(
+                    app.runtime.sessions[app.runtime.find("worker").unwrap()]
+                        .terminal
+                        .as_ref()
+                        .is_some_and(|t| !t.exited())
+                );
+                app.runtime.plans[index].tasks[0].integrated = None;
                 assert!(
                     request(app, json!({"cmd":"plan_update", "plan":"lifecycle", "id":"code", "status":"done"})).ok
                 );
-                assert!(app.find("worker").is_some(), "acceptance alone must not close unintegrated work");
-                app.diffs.entry(root.into()).or_default().prepared = Some(Arc::new(diff_view::Prepared {
+                assert!(app.runtime.find("worker").is_some(), "acceptance alone must not close unintegrated work");
+                app.runtime.diffs.entry(root.into()).or_default().prepared = Some(Arc::new(diff_view::Prepared {
                     diff: imacs_core::diff::WorktreeDiff::default(),
                     highlights: vec![],
                     longest_line: 0,
@@ -488,7 +493,7 @@ mod tests {
                     deletions: 88,
                     all_files: Arc::default(),
                 }));
-                app.finish_integration(Integrated {
+                app.runtime.finish_integration(Integrated {
                     plan: "lifecycle".into(),
                     task: "code".into(),
                     branch: "code".into(),
@@ -496,21 +501,21 @@ mod tests {
                     result: Ok(Integration { committed: false, merge: Merge::Merged, worktree: root.into() }),
                     reply: None,
                 });
-                assert!(app.find("worker").is_none());
-                assert_eq!(app.report(Some("worker"), "done", "Final late report"), Some("code".into()));
-                assert_eq!(app.plans[index].tasks[0].status, TaskStatus::Done);
+                assert!(app.runtime.find("worker").is_none());
+                assert_eq!(app.runtime.report(Some("worker"), "done", "Final late report"), Some("code".into()));
+                assert_eq!(app.runtime.plans[index].tasks[0].status, TaskStatus::Done);
                 let event = imacs_core::hook::HookEvent::from_payload(&json!({
                     "hook_event_name":"Stop", "session_id":"worker", "cwd":root,
                 }))
                 .unwrap();
-                app.on_hook(HookMessage {
+                app.runtime.on_hook(HookMessage {
                     pane: Some("worker".into()),
                     ancestors: vec![],
                     event,
                     delivered: 0,
                     approval_reply: None,
                 });
-                assert!(app.find("worker").is_none(), "late shutdown hooks must not recreate a closed agent");
+                assert!(app.runtime.find("worker").is_none(), "late shutdown hooks must not recreate a closed agent");
                 let deadline = Instant::now() + Duration::from_secs(5);
                 while std::process::Command::new("ps")
                     .args(["-p", &pid.to_string(), "-o", "pid="])
@@ -523,33 +528,37 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 assert!(root.exists(), "closing never removes the worktree");
-                assert_eq!(app.completed_tasks(), [(index, 0)]);
-                let task = &app.plans[index].tasks[0];
+                assert_eq!(app.runtime.completed_tasks(), [(index, 0)]);
+                let task = &app.runtime.plans[index].tasks[0];
                 assert_eq!(task.worktree.as_deref(), Some(root));
                 assert_eq!(task.resume_id.as_deref(), Some("worker"));
                 assert_eq!((task.additions, task.deletions), (412, 88));
                 assert_eq!(task.report.as_ref().unwrap().summary, "Final late report");
-                assert_eq!(app.plans[index].status, plan::PlanStatus::Open);
-                assert_eq!(app.report(Some("reviewer"), "done", "Review passed"), Some("review".into()));
-                app.sync_plan();
-                assert!(app.find("reviewer").is_some(), "the reviewer report must also wait for acceptance");
-                assert!(app.plans[index].tasks[1].finished_at.is_none());
+                assert_eq!(app.runtime.plans[index].status, plan::PlanStatus::Open);
+                assert_eq!(app.runtime.report(Some("reviewer"), "done", "Review passed"), Some("review".into()));
+                app.runtime.sync_plan();
+                assert!(app.runtime.find("reviewer").is_some(), "the reviewer report must also wait for acceptance");
+                assert!(app.runtime.plans[index].tasks[1].finished_at.is_none());
                 assert!(
                     request(app, json!({"cmd":"plan_update", "plan":"lifecycle", "id":"review", "status":"done"})).ok
                 );
-                assert_eq!(app.plans[index].status, plan::PlanStatus::Completed);
-                assert!(app.find("reviewer").is_none());
-                assert!(app.find("chief").is_some());
-                assert!(app.find("other-plan").is_some());
-                app.task_action(index, 0, "diff");
-                assert_eq!(app.diff_target().as_deref(), Some(root));
-                assert!(app.panel == PanelMode::Diff);
-                app.reopen_plan(index).unwrap();
-                app.sync_plan();
-                assert_eq!(app.plans[index].status, PlanStatus::Open, "reopening must survive a lifecycle sweep");
-                app.close_plan(index, PlanStatus::Archived).unwrap();
-                assert_eq!(app.plans[index].status, plan::PlanStatus::Archived);
-                assert!(app.completed_tasks().is_empty());
+                assert_eq!(app.runtime.plans[index].status, plan::PlanStatus::Completed);
+                assert!(app.runtime.find("reviewer").is_none());
+                assert!(app.runtime.find("chief").is_some());
+                assert!(app.runtime.find("other-plan").is_some());
+                app.runtime.task_action(index, 0, "diff");
+                assert_eq!(app.runtime.diff_target().as_deref(), Some(root));
+                assert!(app.runtime.panel == PanelMode::Diff);
+                app.runtime.reopen_plan(index).unwrap();
+                app.runtime.sync_plan();
+                assert_eq!(
+                    app.runtime.plans[index].status,
+                    PlanStatus::Open,
+                    "reopening must survive a lifecycle sweep"
+                );
+                app.runtime.close_plan(index, PlanStatus::Archived).unwrap();
+                assert_eq!(app.runtime.plans[index].status, plan::PlanStatus::Archived);
+                assert!(app.runtime.completed_tasks().is_empty());
                 assert_eq!(
                     plan::load_plans(&paths::imacs_home())
                         .unwrap()
@@ -568,23 +577,23 @@ mod tests {
     #[test]
     fn disabling_automatic_closing_keeps_agents_and_completed_plans() {
         with_app("app::plans::tests::disabling_automatic_closing_keeps_agents_and_completed_plans", |app, _| {
-            app.config.plan.close_done_agents = false;
-            app.sessions = vec![session("worker", AgentKind::Claude, AgentStatus::Idle, Path::new("/work"))];
-            app.plans[app.selected_plan] = Plan {
+            app.runtime.config.plan.close_done_agents = false;
+            app.runtime.sessions = vec![session("worker", AgentKind::Claude, AgentStatus::Idle, Path::new("/work"))];
+            app.runtime.plans[app.runtime.selected_plan] = Plan {
                 id: "disabled".into(),
                 tasks: vec![Task { status: TaskStatus::Done, session: Some("worker".into()), ..Task::default() }],
                 ..Plan::default()
             };
-            app.finish_plan_agents();
-            assert!(app.find("worker").is_some());
-            assert_eq!(app.plans[app.selected_plan].status, plan::PlanStatus::Completed);
-            assert!(app.completed_tasks().is_empty());
-            app.config.plan.close_done_agents = true;
-            app.finish_plan_agents();
-            assert!(app.find("worker").is_none());
-            assert!(app.completed_tasks().is_empty());
-            app.plan_view = true;
-            assert_eq!(app.completed_tasks(), [(app.selected_plan, 0)]);
+            app.runtime.finish_plan_agents();
+            assert!(app.runtime.find("worker").is_some());
+            assert_eq!(app.runtime.plans[app.runtime.selected_plan].status, plan::PlanStatus::Completed);
+            assert!(app.runtime.completed_tasks().is_empty());
+            app.runtime.config.plan.close_done_agents = true;
+            app.runtime.finish_plan_agents();
+            assert!(app.runtime.find("worker").is_none());
+            assert!(app.runtime.completed_tasks().is_empty());
+            app.runtime.plan_view = true;
+            assert_eq!(app.runtime.completed_tasks(), [(app.runtime.selected_plan, 0)]);
         });
     }
 
@@ -603,7 +612,7 @@ mod tests {
                 if output.exists() {
                     std::fs::remove_file(&output).unwrap();
                 }
-                app.config.agents = vec![imacs_core::config::AgentConfig {
+                app.runtime.config.agents = vec![imacs_core::config::AgentConfig {
                     name: agent.into(),
                     command: vec![
                         "/bin/sh".into(),
@@ -613,8 +622,8 @@ mod tests {
                     kind,
                     busy_text: None,
                 }];
-                let index = app.selected_plan;
-                app.plans[index] = Plan {
+                let index = app.runtime.selected_plan;
+                app.runtime.plans[index] = Plan {
                     id: "resume".into(),
                     status: plan::PlanStatus::Completed,
                     tasks: vec![Task {
@@ -628,29 +637,29 @@ mod tests {
                     }],
                     ..Plan::default()
                 };
-                app.task_action(index, 0, "resume");
+                app.runtime.task_action(index, 0, "resume");
                 let deadline = Instant::now() + Duration::from_secs(5);
                 let args = loop {
                     let args = std::fs::read_to_string(&output).unwrap_or_default();
                     if args.contains("test-model") {
                         break args;
                     }
-                    assert!(Instant::now() < deadline, "resume did not start: {:?}", app.toast);
+                    assert!(Instant::now() < deadline, "resume did not start: {:?}", app.runtime.toast);
                     std::thread::sleep(Duration::from_millis(10));
                 };
                 assert!(args.contains(expected), "{args}");
-                assert_eq!(app.plans[index].status, plan::PlanStatus::Open);
-                let task = &app.plans[index].tasks[0];
+                assert_eq!(app.runtime.plans[index].status, plan::PlanStatus::Open);
+                let task = &app.runtime.plans[index].tasks[0];
                 assert_eq!(task.status, TaskStatus::Running);
                 assert!(task.finished_at.is_none() && task.dispatched_at.is_some() && task.integrated.is_none());
                 let session = task.session.clone().unwrap();
-                assert_eq!(app.sessions[app.find(&session).unwrap()].root(), dir.path());
-                assert!(app.completed_tasks().is_empty());
-                let count = app.sessions.len();
-                app.task_action(index, 0, "resume");
-                assert_eq!(app.sessions.len(), count, "a live session must never be resumed into a duplicate");
-                assert_eq!(app.plans[index].tasks[0].session.as_deref(), Some(session.as_str()));
-                app.close(&session);
+                assert_eq!(app.runtime.sessions[app.runtime.find(&session).unwrap()].root(), dir.path());
+                assert!(app.runtime.completed_tasks().is_empty());
+                let count = app.runtime.sessions.len();
+                app.runtime.task_action(index, 0, "resume");
+                assert_eq!(app.runtime.sessions.len(), count, "a live session must never be resumed into a duplicate");
+                assert_eq!(app.runtime.plans[index].tasks[0].session.as_deref(), Some(session.as_str()));
+                app.runtime.close(&session);
             }
         });
     }
@@ -661,7 +670,7 @@ mod tests {
             "app::plans::tests::redispatch_and_late_exit_events_preserve_the_current_task_session",
             |app, _ctx| {
                 let (_dir, repo) = repository();
-                app.plans[0] = Plan {
+                app.runtime.plans[0] = Plan {
                     id: "delivery".into(),
                     approved: true,
                     tasks: vec![Task {
@@ -674,17 +683,17 @@ mod tests {
                     }],
                     ..Plan::default()
                 };
-                app.sessions = vec![session("old", AgentKind::Generic, AgentStatus::Exited, &repo)];
-                app.dispatch(0, Some("task")).unwrap();
-                assert!(app.plans[0].tasks[0].session.is_none());
-                assert!(app.plans[0].tasks[0].report.is_none());
-                app.sync_plan();
-                assert_eq!(app.plans[0].tasks[0].status, TaskStatus::Running);
-                app.sessions.push(session("new", AgentKind::Generic, AgentStatus::Working, &repo));
-                app.sessions[1].terminal = Some(
+                app.runtime.sessions = vec![session("old", AgentKind::Generic, AgentStatus::Exited, &repo)];
+                app.runtime.dispatch(0, Some("task")).unwrap();
+                assert!(app.runtime.plans[0].tasks[0].session.is_none());
+                assert!(app.runtime.plans[0].tasks[0].report.is_none());
+                app.runtime.sync_plan();
+                assert_eq!(app.runtime.plans[0].tasks[0].status, TaskStatus::Running);
+                app.runtime.sessions.push(session("new", AgentKind::Generic, AgentStatus::Working, &repo));
+                app.runtime.sessions[1].terminal = Some(
                     Terminal::spawn(
-                        app.wake.clone(),
-                        app.palette.terminal_colors(),
+                        app.runtime.wake.clone(),
+                        app.runtime.palette.terminal_colors(),
                         "/bin/sleep".into(),
                         vec!["10".into()],
                         &repo,
@@ -693,7 +702,7 @@ mod tests {
                     )
                     .unwrap(),
                 );
-                app.plans[0].tasks[0].session = Some("new".into());
+                app.runtime.plans[0].tasks[0].session = Some("new".into());
                 let exit = |pane: &str, id: &str| HookMessage {
                     pane: Some(pane.into()),
                     ancestors: vec![],
@@ -704,21 +713,21 @@ mod tests {
                     }))
                     .unwrap(),
                 };
-                app.on_hook(exit("new", "old"));
-                app.on_hook(exit("old", "old"));
+                app.runtime.on_hook(exit("new", "old"));
+                app.runtime.on_hook(exit("old", "old"));
                 let mut stale = exit("new", "retired");
                 stale.pane = None;
-                stale.ancestors = vec![app.sessions[1].terminal.as_ref().unwrap().process_id()];
-                app.on_hook(stale);
-                app.sync_plan();
-                assert_eq!(app.sessions[1].status, AgentStatus::Working);
-                assert_eq!(app.plans[0].tasks[0].status, TaskStatus::Running);
-                app.on_hook(exit("new", "new"));
-                app.sync_plan();
-                assert_eq!(app.plans[0].tasks[0].status, TaskStatus::Blocked);
-                assert_eq!(app.plans[0].tasks[0].notes, ["the agent exited before reporting"]);
+                stale.ancestors = vec![app.runtime.sessions[1].terminal.as_ref().unwrap().process_id()];
+                app.runtime.on_hook(stale);
+                app.runtime.sync_plan();
+                assert_eq!(app.runtime.sessions[1].status, AgentStatus::Working);
+                assert_eq!(app.runtime.plans[0].tasks[0].status, TaskStatus::Running);
+                app.runtime.on_hook(exit("new", "new"));
+                app.runtime.sync_plan();
+                assert_eq!(app.runtime.plans[0].tasks[0].status, TaskStatus::Blocked);
+                assert_eq!(app.runtime.plans[0].tasks[0].notes, ["the agent exited before reporting"]);
                 // Finish the worktree job before its temporary repository is removed.
-                let (_, result, _) = app.worktree_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                let (_, result, _) = app.runtime.worktree_rx.recv_timeout(Duration::from_secs(5)).unwrap();
                 result.unwrap();
             },
         );
@@ -741,9 +750,9 @@ mod tests {
                 )
                 .result["plan"]
                     .clone();
-                let index = app.selected_plan;
-                app.plans[index].tasks[0].notes = vec!["old note".into(); 1000];
-                app.plans[index].tasks[0].report =
+                let index = app.runtime.selected_plan;
+                app.runtime.plans[index].tasks[0].notes = vec!["old note".into(); 1000];
+                app.runtime.plans[index].tasks[0].report =
                     Some(Report { status: "done".into(), summary: brief.clone(), at: 1 });
                 let update = request(
                     app,
@@ -761,13 +770,13 @@ mod tests {
                     })
                 );
                 assert!(update.result.to_string().len() < 1024);
-                let into = app.plans[index].integration_branch();
+                let into = app.runtime.plans[index].integration_branch();
                 for (merge, committed, merged, note) in [
                     (Merge::Merged, true, true, format!("committed and merged into {into}")),
                     (Merge::UpToDate, false, false, format!("already in {into}")),
                 ] {
                     let (reply, received) = channel();
-                    app.finish_integration(Integrated {
+                    app.runtime.finish_integration(Integrated {
                         plan: plan.as_str().unwrap().into(),
                         task: "a".into(),
                         branch: "task-a".into(),
@@ -825,14 +834,14 @@ mod tests {
                 let closed = request(app, json!({"cmd":"plan_close", "plan":two, "status":"completed"}));
                 assert!(closed.ok);
                 assert_eq!(closed.result["status"], "completed");
-                app.sync_plan();
+                app.runtime.sync_plan();
                 assert_eq!(request(app, json!({"cmd":"plan_get", "plan":two})).result["status"], "completed");
                 assert!(request(app, json!({"cmd":"plan_update", "id":"a", "status":"done"})).ok);
-                assert_eq!(app.plans[app.selected_plan].id, one.as_str().unwrap());
+                assert_eq!(app.runtime.plans[app.runtime.selected_plan].id, one.as_str().unwrap());
                 assert_eq!(request(app, json!({"cmd":"plan_get"})).result["plans"].as_array().unwrap().len(), 1);
                 assert!(request(app, json!({"cmd":"plan_close", "plan":one, "status":"archived"})).ok);
-                assert!(!app.plan_view);
-                assert!(app.plans.iter().all(|p| !p.is_open()));
+                assert!(!app.runtime.plan_view);
+                assert!(app.runtime.plans.iter().all(|p| !p.is_open()));
                 let (loaded, errors) = plan::load_plans(&paths::imacs_home()).unwrap();
                 assert!(errors.is_empty());
                 assert_eq!(loaded.iter().find(|p| p.id == one.as_str().unwrap()).unwrap().status, PlanStatus::Archived);
@@ -851,8 +860,8 @@ mod tests {
             "app::plans::tests::dispatch_from_visible_board_returns_to_fleet_and_preserves_docked_chief",
             |app, ctx| {
                 let (dir, repo) = repository();
-                app.config.worktree_path = format!("{}/{{slug}}", dir.path().display());
-                app.config.agents.push(imacs_core::config::AgentConfig {
+                app.runtime.config.worktree_path = format!("{}/{{slug}}", dir.path().display());
+                app.runtime.config.agents.push(imacs_core::config::AgentConfig {
                     name: "fixture".into(),
                     command: vec!["/bin/cat".into()],
                     kind: AgentKind::Shell,
@@ -863,26 +872,26 @@ mod tests {
                         app,
                         json!({"cmd":"plan_set", "goal":format!("Board {dock:?}"), "tasks":[{"id":"a", "repo":repo, "agent":"fixture"}]}),
                     );
-                    let index = app.selected_plan;
-                    app.plans[index].approved = true;
-                    app.plan_view = false;
-                    app.panel = PanelMode::Plan;
-                    app.diff_open = true;
-                    app.chief_open = true;
-                    app.store.chief_dock = Some(dock);
-                    assert_eq!(app.dispatch(index, Some("a")).unwrap(), ["a"]);
-                    assert!(app.plan_view && app.panel == PanelMode::Diff);
-                    assert_eq!(app.chief_open, dock == ChiefDock::Docked);
-                    assert!(!app.changed_plans.contains(&app.plans[index].id));
+                    let index = app.runtime.selected_plan;
+                    app.runtime.plans[index].approved = true;
+                    app.runtime.plan_view = false;
+                    app.runtime.panel = PanelMode::Plan;
+                    app.runtime.diff_open = true;
+                    app.runtime.chief_open = true;
+                    app.runtime.store.chief_dock = Some(dock);
+                    assert_eq!(app.runtime.dispatch(index, Some("a")).unwrap(), ["a"]);
+                    assert!(app.runtime.plan_view && app.runtime.panel == PanelMode::Diff);
+                    assert_eq!(app.runtime.chief_open, dock == ChiefDock::Docked);
+                    assert!(!app.runtime.changed_plans.contains(&app.runtime.plans[index].id));
                     let deadline = Instant::now() + Duration::from_secs(10);
-                    while !app.creating.is_empty() {
+                    while !app.runtime.creating.is_empty() {
                         assert!(Instant::now() < deadline);
-                        app.runtime_tick(ctx);
+                        app.runtime.runtime_tick(ctx);
                         std::thread::sleep(Duration::from_millis(10));
                     }
-                    let session = app.plans[index].tasks[0].session.as_ref().unwrap();
+                    let session = app.runtime.plans[index].tasks[0].session.as_ref().unwrap();
                     assert_eq!(
-                        app.visible_sessions().iter().map(|&i| &app.sessions[i].id).collect::<Vec<_>>(),
+                        app.runtime.visible_sessions().iter().map(|&i| &app.runtime.sessions[i].id).collect::<Vec<_>>(),
                         [session]
                     );
                 }
@@ -896,23 +905,23 @@ mod tests {
             "app::plans::tests::background_plan_updates_and_successful_dispatch_preserve_the_foreground_and_chief",
             |app, ctx| {
                 let (dir, repo) = repository();
-                app.config.worktree_path = format!("{}/{{slug}}", dir.path().display());
-                app.config.agents.push(imacs_core::config::AgentConfig {
+                app.runtime.config.worktree_path = format!("{}/{{slug}}", dir.path().display());
+                app.runtime.config.agents.push(imacs_core::config::AgentConfig {
                     name: "fixture".into(),
                     command: vec!["/bin/cat".into()],
                     kind: AgentKind::Shell,
                     busy_text: None,
                 });
                 let first = request(app, json!({"cmd":"plan_set", "goal":"Background", "tasks":[{"id":"a", "repo":repo, "agent":"fixture"}]})).result["plan"].clone();
-                let one = app.selected_plan;
+                let one = app.runtime.selected_plan;
                 request(app, json!({"cmd":"plan_set", "goal":"Foreground", "tasks":[{"id":"a"}]}));
-                let two = app.selected_plan;
-                app.sessions.push(session("foreground", AgentKind::Generic, AgentStatus::Idle, &repo));
-                app.active = Some("foreground".into());
-                app.diff_root = Some(repo.clone());
-                app.focus_terminal = Some("foreground".into());
-                app.chief_open = true;
-                app.panel = PanelMode::Editor;
+                let two = app.runtime.selected_plan;
+                app.runtime.sessions.push(session("foreground", AgentKind::Generic, AgentStatus::Idle, &repo));
+                app.runtime.active = Some("foreground".into());
+                app.runtime.diff_root = Some(repo.clone());
+                app.runtime.focus_terminal = Some("foreground".into());
+                app.runtime.chief_open = true;
+                app.runtime.panel = PanelMode::Editor;
                 assert!(
                     request(
                         app,
@@ -921,30 +930,30 @@ mod tests {
                     )
                     .ok
                 );
-                assert_eq!(app.selected_plan, two);
-                assert!(app.chief_open && app.panel == PanelMode::Editor);
-                assert_eq!(app.active.as_deref(), Some("foreground"));
-                assert_eq!(app.diff_root.as_ref(), Some(&repo));
-                assert!(app.changed_plans.contains(first.as_str().unwrap()));
-                assert!(app.toast.as_ref().unwrap().0.starts_with("Plan updated:"));
-                app.plans[one].approved = true;
+                assert_eq!(app.runtime.selected_plan, two);
+                assert!(app.runtime.chief_open && app.runtime.panel == PanelMode::Editor);
+                assert_eq!(app.runtime.active.as_deref(), Some("foreground"));
+                assert_eq!(app.runtime.diff_root.as_ref(), Some(&repo));
+                assert!(app.runtime.changed_plans.contains(first.as_str().unwrap()));
+                assert!(app.runtime.toast.as_ref().unwrap().0.starts_with("Plan updated:"));
+                app.runtime.plans[one].approved = true;
                 assert!(request(app, json!({"cmd":"plan_dispatch", "plan":first, "id":"a"})).ok);
                 let deadline = Instant::now() + Duration::from_secs(10);
-                while !app.creating.is_empty() {
+                while !app.runtime.creating.is_empty() {
                     assert!(Instant::now() < deadline);
-                    app.runtime_tick(ctx);
+                    app.runtime.runtime_tick(ctx);
                     std::thread::sleep(Duration::from_millis(10));
                 }
-                assert!(app.plans[one].tasks[0].session.is_some());
-                assert_eq!(app.selected_plan, two);
-                assert!(app.chief_open && app.panel == PanelMode::Editor);
-                assert_eq!(app.active.as_deref(), Some("foreground"));
-                assert_eq!(app.diff_root.as_ref(), Some(&repo));
-                assert_eq!(app.focus_terminal.as_deref(), Some("foreground"));
-                assert!(app.changed_plans.contains(first.as_str().unwrap()));
-                app.selected_plan = one;
-                app.show_plan_fleet();
-                assert!(!app.changed_plans.contains(first.as_str().unwrap()));
+                assert!(app.runtime.plans[one].tasks[0].session.is_some());
+                assert_eq!(app.runtime.selected_plan, two);
+                assert!(app.runtime.chief_open && app.runtime.panel == PanelMode::Editor);
+                assert_eq!(app.runtime.active.as_deref(), Some("foreground"));
+                assert_eq!(app.runtime.diff_root.as_ref(), Some(&repo));
+                assert_eq!(app.runtime.focus_terminal.as_deref(), Some("foreground"));
+                assert!(app.runtime.changed_plans.contains(first.as_str().unwrap()));
+                app.runtime.selected_plan = one;
+                app.runtime.show_plan_fleet();
+                assert!(!app.runtime.changed_plans.contains(first.as_str().unwrap()));
                 assert!(
                     request(
                         app,
@@ -952,8 +961,8 @@ mod tests {
                     )
                     .ok
                 );
-                assert!(app.panel == PanelMode::Plan);
-                assert!(!app.chief_open);
+                assert!(app.runtime.panel == PanelMode::Plan);
+                assert!(!app.runtime.chief_open);
             },
         );
     }
@@ -963,17 +972,17 @@ mod tests {
         with_app(
             "app::plans::tests::multiple_plans_keep_boards_fleets_tools_reports_and_integrations_separate",
             |app, _| {
-                app.config.plan.close_done_agents = false;
+                app.runtime.config.plan.close_done_agents = false;
                 let first = request(
                     app,
                     json!({"cmd":"plan_set", "goal":"First goal", "tasks":[{"id":"a", "title":"First task"}]}),
                 );
                 assert!(first.ok);
                 let first_id = first.result["plan"].as_str().unwrap().to_string();
-                let one = app.selected_plan;
-                app.plans[one].approved = true;
-                app.plans[one].tasks[0].status = TaskStatus::Blocked;
-                app.plans[one].tasks[0].session = Some("one-agent".into());
+                let one = app.runtime.selected_plan;
+                app.runtime.plans[one].approved = true;
+                app.runtime.plans[one].tasks[0].status = TaskStatus::Blocked;
+                app.runtime.plans[one].tasks[0].session = Some("one-agent".into());
                 let second = request(
                     app,
                     json!({"cmd":"plan_set", "goal":"First goal", "tasks":[{"id":"a", "title":"Second task"}]}),
@@ -981,40 +990,40 @@ mod tests {
                 assert!(second.ok);
                 let second_id = second.result["plan"].as_str().unwrap().to_string();
                 assert_ne!(first_id, second_id);
-                let two = app.selected_plan;
-                assert!(app.plans[one].approved);
-                assert!(!app.plans[two].approved);
-                assert_eq!(app.plans[two].tasks[0].status, TaskStatus::Planned);
-                assert_ne!(app.plans[one].integration_branch(), app.plans[two].integration_branch());
-                assert_eq!(app.plans[one].tasks.last().unwrap().id, "review");
-                assert_eq!(app.plans[two].tasks.last().unwrap().id, "review");
-                app.plans[two].tasks[0].session = Some("two-agent".into());
-                app.sessions = vec![
+                let two = app.runtime.selected_plan;
+                assert!(app.runtime.plans[one].approved);
+                assert!(!app.runtime.plans[two].approved);
+                assert_eq!(app.runtime.plans[two].tasks[0].status, TaskStatus::Planned);
+                assert_ne!(app.runtime.plans[one].integration_branch(), app.runtime.plans[two].integration_branch());
+                assert_eq!(app.runtime.plans[one].tasks.last().unwrap().id, "review");
+                assert_eq!(app.runtime.plans[two].tasks.last().unwrap().id, "review");
+                app.runtime.plans[two].tasks[0].session = Some("two-agent".into());
+                app.runtime.sessions = vec![
                     session("one-agent", AgentKind::Generic, AgentStatus::Working, Path::new("/project")),
                     session("two-agent", AgentKind::Generic, AgentStatus::Working, Path::new("/project")),
                     session("outside", AgentKind::Generic, AgentStatus::Idle, Path::new("/project")),
                     session("chief", AgentKind::Claude, AgentStatus::Idle, Path::new("/project")),
                 ];
-                app.sessions[3].chief = true;
-                app.repos = vec!["/project".into()];
+                app.runtime.sessions[3].chief = true;
+                app.runtime.repos = vec!["/project".into()];
                 for (index, visible) in [(one, vec![0]), (two, vec![1])] {
-                    app.selected_plan = index;
-                    app.show_plan_fleet();
-                    assert_eq!(app.visible_sessions(), visible);
-                    app.toggle_plan();
-                    assert!(app.panel == PanelMode::Plan);
-                    app.toggle_plan();
-                    assert!(app.panel == PanelMode::Diff);
+                    app.runtime.selected_plan = index;
+                    app.runtime.show_plan_fleet();
+                    assert_eq!(app.runtime.visible_sessions(), visible);
+                    app.runtime.toggle_plan();
+                    assert!(app.runtime.panel == PanelMode::Plan);
+                    app.runtime.toggle_plan();
+                    assert!(app.runtime.panel == PanelMode::Diff);
                 }
-                app.set_view(None);
-                assert_eq!(app.visible_sessions(), [0, 1, 2]);
-                app.set_view(Some("/project".into()));
-                assert_eq!(app.visible_sessions(), [0, 1, 2]);
-                app.selected_plan = two;
-                app.plans[one].project = Some("/one".into());
-                app.plans[two].project = Some("/two".into());
-                assert_eq!(app.task_repo(one, &Task::default()), Some("/one".into()));
-                assert_eq!(app.task_repo(two, &Task::default()), Some("/two".into()));
+                app.runtime.set_view(None);
+                assert_eq!(app.runtime.visible_sessions(), [0, 1, 2]);
+                app.runtime.set_view(Some("/project".into()));
+                assert_eq!(app.runtime.visible_sessions(), [0, 1, 2]);
+                app.runtime.selected_plan = two;
+                app.runtime.plans[one].project = Some("/one".into());
+                app.runtime.plans[two].project = Some("/two".into());
+                assert_eq!(app.runtime.task_repo(one, &Task::default()), Some("/one".into()));
+                assert_eq!(app.runtime.task_repo(two, &Task::default()), Some("/two".into()));
                 for cmd in ["plan_update", "plan_dispatch", "plan_integrate"] {
                     let response = request(app, json!({"cmd":cmd, "id":"a", "status":"done"}));
                     let error = response.error.unwrap();
@@ -1025,19 +1034,19 @@ mod tests {
                 assert_eq!(summary.result["plans"][0]["waiting"], json!(["a"]));
                 let full = request(app, json!({"cmd":"plan_get", "plan":first_id}));
                 assert_eq!(full.result["tasks"][0]["title"], "First task");
-                assert_eq!(app.selected_plan, two);
+                assert_eq!(app.runtime.selected_plan, two);
                 let update = request(
                     app,
                     json!({"cmd":"plan_update", "plan":first_id, "id":"a", "status":"done", "note":"verified"}),
                 );
                 assert!(update.ok);
-                assert_eq!(app.plans[one].tasks[0].status, TaskStatus::Done);
-                assert_eq!(app.plans[two].tasks[0].status, TaskStatus::Planned);
-                assert_eq!(app.selected_plan, two);
-                let into = app.plans[one].integration_branch();
-                app.integrating.insert((first_id.clone(), "a".into()));
-                app.integrating.insert((second_id.clone(), "a".into()));
-                app.finish_integration(Integrated {
+                assert_eq!(app.runtime.plans[one].tasks[0].status, TaskStatus::Done);
+                assert_eq!(app.runtime.plans[two].tasks[0].status, TaskStatus::Planned);
+                assert_eq!(app.runtime.selected_plan, two);
+                let into = app.runtime.plans[one].integration_branch();
+                app.runtime.integrating.insert((first_id.clone(), "a".into()));
+                app.runtime.integrating.insert((second_id.clone(), "a".into()));
+                app.runtime.finish_integration(Integrated {
                     plan: first_id.clone(),
                     task: "a".into(),
                     branch: "first".into(),
@@ -1045,33 +1054,38 @@ mod tests {
                     result: Ok(Integration { committed: true, merge: Merge::Merged, worktree: "/integration".into() }),
                     reply: None,
                 });
-                assert_eq!(app.plans[one].tasks[0].integrated.as_deref(), Some(into.as_str()));
-                assert!(app.plans[two].tasks[0].integrated.is_none());
-                assert!(app.integrating.contains(&(second_id.clone(), "a".into())));
-                assert_eq!(app.report(Some("one-agent"), "done", "first report"), Some("a".into()));
-                assert_eq!(app.plans[one].tasks[0].status, TaskStatus::Done);
-                assert!(app.plans[two].tasks[0].report.is_none());
+                assert_eq!(app.runtime.plans[one].tasks[0].integrated.as_deref(), Some(into.as_str()));
+                assert!(app.runtime.plans[two].tasks[0].integrated.is_none());
+                assert!(app.runtime.integrating.contains(&(second_id.clone(), "a".into())));
+                assert_eq!(app.runtime.report(Some("one-agent"), "done", "first report"), Some("a".into()));
+                assert_eq!(app.runtime.plans[one].tasks[0].status, TaskStatus::Done);
+                assert!(app.runtime.plans[two].tasks[0].report.is_none());
                 let waited = request(app, json!({"cmd":"wait", "after":0, "statuses":["reported"]}));
                 assert_eq!(waited.result["events"][0]["plan"], first_id);
                 assert_eq!(waited.result["events"][0]["task"], "a");
-                app.record_events();
+                app.runtime.record_events();
                 for (session, plan) in [("one-agent", &first_id), ("two-agent", &second_id)] {
-                    let event =
-                        app.events.iter().find(|e| e.session == session && e.report.is_none()).unwrap().to_json();
+                    let event = app
+                        .runtime
+                        .events
+                        .iter()
+                        .find(|e| e.session == session && e.report.is_none())
+                        .unwrap()
+                        .to_json();
                     assert_eq!(event["plan"], *plan);
                     assert_eq!(event["task"], "a");
                 }
-                app.sessions[0].status = AgentStatus::Exited;
-                app.plans[one].tasks[0].status = TaskStatus::Running;
-                app.sync_plan();
-                assert_eq!(app.plans[one].tasks[0].status, TaskStatus::Blocked);
-                assert_eq!(app.plans[two].tasks[0].status, TaskStatus::Planned);
-                let old = app.plans[two].clone();
+                app.runtime.sessions[0].status = AgentStatus::Exited;
+                app.runtime.plans[one].tasks[0].status = TaskStatus::Running;
+                app.runtime.sync_plan();
+                assert_eq!(app.runtime.plans[one].tasks[0].status, TaskStatus::Blocked);
+                assert_eq!(app.runtime.plans[two].tasks[0].status, TaskStatus::Planned);
+                let old = app.runtime.plans[two].clone();
                 assert!(request(app, json!({"cmd":"plan_set", "plan":first_id, "goal":"First goal", "tasks":[{"id":"a", "title":"Revised"}]})).ok);
-                assert_eq!(app.plans[two], old);
-                assert_eq!(app.plans[one].tasks[0].session.as_deref(), Some("one-agent"));
+                assert_eq!(app.runtime.plans[two], old);
+                assert_eq!(app.runtime.plans[one].tasks[0].session.as_deref(), Some("one-agent"));
                 let loaded = plan::load_plans(&paths::imacs_home()).unwrap().0;
-                assert_eq!(loaded.iter().find(|p| p.id == first_id).unwrap(), &app.plans[one]);
+                assert_eq!(loaded.iter().find(|p| p.id == first_id).unwrap(), &app.runtime.plans[one]);
                 assert_eq!(loaded.iter().find(|p| p.id == second_id).unwrap().tasks[0].title, "Second task");
             },
         );
@@ -1099,20 +1113,20 @@ mod tests {
                     task.integrated = legacy.integration.clone();
                 }
                 legacy.save(&paths::plan_file()).unwrap();
-                app.plans = plan::load_plans(&paths::imacs_home()).unwrap().0;
-                app.selected_plan = 0;
-                let id = app.plans[0].id.clone();
-                let progress = app.plans[0].tasks.clone();
+                app.runtime.plans = plan::load_plans(&paths::imacs_home()).unwrap().0;
+                app.runtime.selected_plan = 0;
+                let id = app.runtime.plans[0].id.clone();
+                let progress = app.runtime.plans[0].tasks.clone();
                 let tasks =
                     json!([{"id":"a", "title":"Revised API task"}, {"id":"review", "title":"Review revised plan"}]);
                 let updated =
                     request(app, json!({"cmd":"plan_set", "plan":id, "goal":"Deliver the API", "tasks":tasks}));
                 assert!(updated.ok);
-                assert_eq!(app.plans[0].goal, "Deliver the API");
-                assert!(!app.plans[0].approved);
-                assert_eq!(app.plans[0].integration, legacy.integration);
+                assert_eq!(app.runtime.plans[0].goal, "Deliver the API");
+                assert!(!app.runtime.plans[0].approved);
+                assert_eq!(app.runtime.plans[0].integration, legacy.integration);
                 assert_eq!(updated.result["integration"], "imacs/already-integrated");
-                for (task, old) in app.plans[0].tasks.iter().zip(&progress) {
+                for (task, old) in app.runtime.plans[0].tasks.iter().zip(&progress) {
                     assert_eq!(task.status, old.status);
                     assert_eq!(task.session, old.session);
                     assert_eq!(task.branch, old.branch);
@@ -1121,11 +1135,11 @@ mod tests {
                     assert_eq!(task.report, old.report);
                     assert_eq!(task.integrated, old.integrated);
                 }
-                let original = app.plans[0].clone();
+                let original = app.runtime.plans[0].clone();
                 for goal in ["Deliver the API", "Another goal"] {
                     let created = request(app, json!({"cmd":"plan_set", "goal":goal, "tasks":tasks}));
                     assert!(created.ok);
-                    let fresh = &app.plans[app.selected_plan];
+                    let fresh = &app.runtime.plans[app.runtime.selected_plan];
                     assert_ne!(fresh.id, id);
                     assert!(!fresh.approved);
                     assert!(fresh.integration.is_none());
@@ -1138,7 +1152,7 @@ mod tests {
                         assert!(task.report.is_none());
                         assert!(task.integrated.is_none());
                     }
-                    assert_eq!(app.plans[0], original);
+                    assert_eq!(app.runtime.plans[0], original);
                 }
                 let loaded = plan::load_plans(&paths::imacs_home()).unwrap().0;
                 assert_eq!(loaded.len(), 3);
@@ -1170,7 +1184,7 @@ mod tests {
                     ],
                 )
                 .unwrap();
-                app.config.worktree_path = format!("{}/{{slug}}", dir.path().display());
+                app.runtime.config.worktree_path = format!("{}/{{slug}}", dir.path().display());
                 let mut indices = Vec::new();
                 for goal in ["One", "Two"] {
                     assert!(
@@ -1181,29 +1195,29 @@ mod tests {
                         )
                         .ok
                     );
-                    indices.push(app.selected_plan);
+                    indices.push(app.runtime.selected_plan);
                 }
                 let (one, two) = (indices[0], indices[1]);
-                assert!(app.dispatch(one, Some("a")).unwrap_err().contains("not approved"));
-                app.plans[one].approved = true;
-                assert_eq!(app.dispatch(one, Some("a")).unwrap(), ["a"]);
-                assert!(app.plans[one].tasks[0].dispatched_at.is_some());
-                assert_eq!(app.selected_plan, two);
-                assert!(app.plan_view);
-                assert!(app.changed_plans.contains(&app.plans[one].id));
-                app.selected_plan = two;
-                app.show_plan_fleet();
+                assert!(app.runtime.dispatch(one, Some("a")).unwrap_err().contains("not approved"));
+                app.runtime.plans[one].approved = true;
+                assert_eq!(app.runtime.dispatch(one, Some("a")).unwrap(), ["a"]);
+                assert!(app.runtime.plans[one].tasks[0].dispatched_at.is_some());
+                assert_eq!(app.runtime.selected_plan, two);
+                assert!(app.runtime.plan_view);
+                assert!(app.runtime.changed_plans.contains(&app.runtime.plans[one].id));
+                app.runtime.selected_plan = two;
+                app.runtime.show_plan_fleet();
                 let deadline = Instant::now() + Duration::from_secs(10);
-                while !app.creating.is_empty() && Instant::now() < deadline {
-                    app.runtime_tick(ctx);
+                while !app.runtime.creating.is_empty() && Instant::now() < deadline {
+                    app.runtime.runtime_tick(ctx);
                     std::thread::sleep(Duration::from_millis(10));
                 }
-                assert!(app.creating.is_empty());
-                assert_eq!(app.selected_plan, two);
-                assert_eq!(app.plans[one].tasks[0].status, TaskStatus::Blocked);
-                assert!(app.plans[one].tasks[0].notes.last().unwrap().contains("could not start"));
-                assert_eq!(app.plans[two].tasks[0].status, TaskStatus::Planned);
-                assert!(app.plans[two].tasks[0].notes.is_empty());
+                assert!(app.runtime.creating.is_empty());
+                assert_eq!(app.runtime.selected_plan, two);
+                assert_eq!(app.runtime.plans[one].tasks[0].status, TaskStatus::Blocked);
+                assert!(app.runtime.plans[one].tasks[0].notes.last().unwrap().contains("could not start"));
+                assert_eq!(app.runtime.plans[two].tasks[0].status, TaskStatus::Planned);
+                assert!(app.runtime.plans[two].tasks[0].notes.is_empty());
             },
         );
     }
