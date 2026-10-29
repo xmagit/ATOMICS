@@ -18,6 +18,7 @@ const BUILTIN: &[(&str, &str)] = &[
     ("claude", include_str!("../themes/claude.toml")),
     ("midnight", include_str!("../themes/midnight.toml")),
     ("paper", include_str!("../themes/paper.toml")),
+    ("atomisk", include_str!("../themes/atomisk.toml")),
 ];
 
 /// Theme files deeper than this are treated as a mistake rather than read forever.
@@ -514,6 +515,33 @@ mod tests {
         let resolved = resolve(&legacy.theme, |_| None);
         assert_eq!(resolved.chain, ["midnight"], "preset still selects a theme");
         assert_eq!(resolved.tokens.accent.as_deref(), Some("#00ff00"));
+    }
+
+    #[test]
+    fn atomisk_follows_the_atomisk_stylesheet() {
+        let atomisk = builtin("atomisk").unwrap();
+        let get = |name: &str| atomisk.colors().into_iter().find(|(n, _)| *n == name).unwrap().1.unwrap().to_string();
+        for (token, value) in [
+            ("background", "#08090a"),
+            ("panel", "#101113"),
+            ("foreground", "#f1f2f3"),
+            ("muted", "#95989e"),
+            ("quiet", "#72777e"),
+            ("accent", "#c5decf"),
+            ("on_accent", "#08090a"),
+            ("info", "#adc8dc"),
+            ("warning", "#e4d1a8"),
+        ] {
+            assert_eq!(get(token), value, "{token}");
+        }
+        // --line is rgba(230,237,244,.14) over void.
+        let over_void = |c: u8, v: u8| (0.14 * c as f32 + 0.86 * v as f32).round() as u8;
+        let [r, g, b] = parse_color(&get("border")).unwrap();
+        assert_eq!([r, g, b], [over_void(230, 0x08), over_void(237, 0x09), over_void(244, 0x0a)]);
+        let lighter = |token: &str| parse_color(&get(token)).unwrap().iter().map(|&c| c as u32).sum::<u32>();
+        assert!(lighter("raised") > lighter("panel"), "raised sits slightly above surface");
+        assert_eq!(atomisk.ui_font.as_deref(), Some("Inter"));
+        assert_eq!(atomisk.mono_font.as_deref(), Some("IBM Plex Mono"));
     }
 
     #[test]

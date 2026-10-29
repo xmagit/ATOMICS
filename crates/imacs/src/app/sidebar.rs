@@ -35,7 +35,9 @@ fn measure_divider(ui: &mut egui::Ui) -> f32 {
 
 fn section(ui: &mut egui::Ui, p: &Palette, title: &str) {
     ui.horizontal(|ui| {
-        ui.label(RichText::new("▍").color(p.accent).size(11.0));
+        // Painted rather than a "▍" glyph, which proportional UI fonts lack.
+        let (bar, _) = ui.allocate_exact_size(vec2(3.0, 12.0), Sense::hover());
+        ui.painter().rect_filled(bar, 0.0, p.accent);
         ui.label(RichText::new(title).size(10.5).color(p.muted).strong());
     });
     ui.add_space(1.0);
