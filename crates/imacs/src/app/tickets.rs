@@ -326,7 +326,27 @@ impl State {
         self.settle_job(tag.batch, error);
     }
 
+    /// Secrets that ticket errors must never carry into plan files or replies: the
+    /// token and the server's secret-looking environment values.
+    fn ticket_secrets(&self) -> Vec<String> {
+        let Some(config) = self.ticket_config() else { return Vec::new() };
+        let secret_name = |name: &str| {
+            let name = name.to_ascii_uppercase();
+            ["TOKEN", "KEY", "SECRET", "PASSWORD", "AUTH", "CREDENTIAL"].iter().any(|s| name.contains(s))
+        };
+        let token = config.server.token_env.as_deref().and_then(crate::setup::known_env_var);
+        let env = config.server.env.iter().filter(|(name, _)| secret_name(name)).map(|(_, value)| value.clone());
+        token.into_iter().chain(env).collect()
+    }
+
+    /// Where ticket errors leave the MCP layer: redacted and bounded before they are
+    /// stored on a link or returned to a caller.
+    fn scrub(&self, error: &str) -> String {
+        ticket::redact(error, &self.ticket_secrets())
+    }
+
     fn ticket_failed(&mut self, tag: &Tag, error: String) {
+        let error = self.scrub(&error);
         if let Some(link) = self.link_slot(&tag.key).and_then(Option::as_mut).filter(|l| l.id == tag.ticket)
             && link.error.as_deref() != Some(&error)
         {
@@ -604,6 +624,7 @@ impl State {
     /// and no job, checks whether a batch whose jobs were all queued is complete.
     fn settle_job(&mut self, batch: Option<u64>, error: Option<String>) {
         let Some(id) = batch else { return };
+        let error = error.map(|error| self.scrub(&error));
         let Some(entry) = self.tickets.batches.get_mut(&id) else { return };
         entry.pending = entry.pending.saturating_sub(1);
         entry.errors.extend(error);
@@ -1541,6 +1562,75 @@ mod tests {
             let error = link(app, index, 0).error.unwrap();
             assert!(error.contains("setting the state to Check failed: cards is unavailable"), "{error}");
             assert_eq!(app.runtime.plans[index].tasks[0].status, TaskStatus::Review);
+        });
+    }
+
+    #[test]
+    fn secrets_echoed_by_a_backend_never_reach_plans_or_replies() {
+        with_app("app::tickets::tests::secrets_echoed_by_a_backend_never_reach_plans_or_replies", |app, ctx| {
+            const TOKEN: &str = "sk-synthetic-7f3a9c";
+            // SAFETY: set before the ticket worker starts; nothing else reads this variable.
+            unsafe { std::env::set_var("TRACKER_TOKEN", TOKEN) };
+            let dir = tempfile::tempdir().unwrap();
+            let state = tickets_fixture(dir.path(), "CARD");
+            configure(app, CARDS, &state, |config| config.server.token_env = Some("TRACKER_TOKEN".into()));
+            let echo = format!(
+                "rejected Authorization: Bearer {TOKEN} for https://bot:hunter22@cards.example/api?page=2&access_token={TOKEN} {}",
+                "padding ".repeat(400)
+            );
+            edit_fake(&state, |fake| {
+                fake["fail"] = json!(["card_move", "card_note"]);
+                fake["fail_message"] = json!(echo);
+            });
+            let plan = request(
+                app,
+                json!({"cmd":"plan_set", "goal":"Secrets", "tasks":[{"id":"a", "title":"Parser", "ticket":{"id":"1"}}]}),
+            )
+            .result["plan"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let index = app.runtime.selected_plan;
+            settle(app);
+            assert!(request(app, json!({"cmd":"plan_update", "plan":plan, "id":"a", "status":"running"})).ok);
+            settle(app);
+            let (tx, rx) = channel();
+            let comment =
+                ControlRequest::TicketComment { plan: Some(plan.clone()), task: Some("a".into()), text: "Hi".into() };
+            app.runtime.control(ctx, comment, tx);
+            settle(app);
+            let ControlOutcome::Done(commented) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else { panic!() };
+            let reply = commented.error.unwrap();
+
+            // A stdio server that prints its credentials to stderr before dying.
+            let mut dying: TicketConfig = toml::from_str(CARDS).unwrap();
+            dying.server.command =
+                vec!["/bin/sh".into(), "-c".into(), "echo \"denied: Bearer $TICKET_API_KEY\" >&2; exit 1".into()];
+            dying.server.env.insert("TICKET_API_KEY".into(), "sk-stderr-5d1e8b".into());
+            app.runtime.config.tickets = dying;
+            app.runtime.apply_ticket_config();
+            settle(app);
+            let error = link(app, index, 0).error.unwrap();
+            assert!(error.contains("denied: Bearer ***"), "{error}");
+
+            let saved =
+                std::fs::read_to_string(paths::imacs_home().join("plans").join(format!("{plan}.json"))).unwrap();
+            let got = request(app, json!({"cmd":"plan_get", "plan":plan})).result.to_string();
+            for text in [&saved, &got, &reply, &error] {
+                for secret in [TOKEN, "hunter22", "sk-stderr-5d1e8b"] {
+                    assert!(!text.contains(secret), "{secret} leaked into {text}");
+                }
+            }
+            assert!(
+                reply.contains("Authorization: Bearer ***")
+                    && reply.contains("https://***@cards.example/api?page=2&access_token=***"),
+                "{reply}"
+            );
+            assert!(
+                reply.chars().count() <= imacs_core::tickets::MAX_ERROR_CHARS + 1,
+                "errors are bounded: {}",
+                reply.len()
+            );
         });
     }
 

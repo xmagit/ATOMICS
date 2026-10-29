@@ -301,6 +301,9 @@ impl Default for FieldPaths {
     }
 }
 
+/// The longest ticket error kept: enough to diagnose, bounded for plan files and replies.
+pub const MAX_ERROR_CHARS: usize = 600;
+
 /// Placeholders operation arguments may use; other text in braces is left as written.
 pub const PLACEHOLDERS: &[&str] = &["id", "key", "state", "body", "title", "board", "board_key", "system"];
 
@@ -494,6 +497,125 @@ impl FieldPaths {
             ..TicketLink::default()
         }
     }
+}
+
+/// Text from a ticket server made safe to store and show: the given secrets, bearer and
+/// basic credentials, `Authorization` values, URL user info and secret-looking query
+/// values become `***`, and the result is at most [`MAX_ERROR_CHARS`] long.
+pub fn redact(text: &str, secrets: &[String]) -> String {
+    let mut out = text.to_string();
+    for secret in secrets.iter().map(|s| s.trim()).filter(|s| s.chars().count() >= 6) {
+        out = out.replace(secret, "***");
+    }
+    let out = redact_query(&redact_userinfo(&redact_credentials(&out)));
+    match out.char_indices().nth(MAX_ERROR_CHARS) {
+        Some((cut, _)) => format!("{}…", &out[..cut]),
+        None => out,
+    }
+}
+
+fn value_end(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '"' | '\'' | ',' | ';' | '}' | ')' | ']' | '<' | '>' | '&' | '#')
+}
+
+/// Skips a value starting at `from` and returns where it ends.
+fn skip_value(text: &str, from: usize) -> usize {
+    text[from..].find(value_end).map_or(text.len(), |end| from + end)
+}
+
+fn redact_credentials(text: &str) -> String {
+    // ASCII lowercasing keeps byte offsets, so positions in `lower` index `text` too.
+    let lower = text.to_ascii_lowercase();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < text.len() {
+        let rest = &lower[i..];
+        if let Some(scheme) = ["bearer", "basic"].into_iter().find(|s| rest.starts_with(s)) {
+            let spaces = text[i + scheme.len()..].len() - text[i + scheme.len()..].trim_start().len();
+            if spaces > 0 && (i == 0 || !lower[..i].ends_with(|c: char| c.is_ascii_alphanumeric())) {
+                let start = i + scheme.len() + spaces;
+                let end = skip_value(text, start);
+                // Prose ("a bearer of news") stays; credentials are long or not just letters.
+                let word = &text[start..end];
+                if word.chars().count() >= 8 || word.chars().any(|c| !c.is_alphabetic()) {
+                    out.push_str(&text[i..start]);
+                    out.push_str("***");
+                    i = end;
+                    continue;
+                }
+            }
+        }
+        if rest.starts_with("authorization") {
+            let key_end = i + "authorization".len();
+            let gap = text[key_end..]
+                .char_indices()
+                .find(|(_, c)| !matches!(c, '"' | '\'' | ' ' | ':' | '='))
+                .map_or(text.len() - key_end, |(n, _)| n);
+            let separated = text[key_end..key_end + gap].contains([':', '=']);
+            let value = key_end + gap;
+            let scheme = ["bearer", "basic"].iter().any(|s| lower[value..].starts_with(s));
+            if separated && !scheme {
+                let end = skip_value(text, value);
+                out.push_str(&text[i..value]);
+                if end > value {
+                    out.push_str("***");
+                }
+                i = end;
+                continue;
+            }
+        }
+        let c = text[i..].chars().next().expect("in bounds");
+        out.push(c);
+        i += c.len_utf8();
+    }
+    out
+}
+
+/// `scheme://user:password@host` keeps only the host.
+fn redact_userinfo(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("://") {
+        let start = at + 3;
+        out.push_str(&rest[..start]);
+        let authority_end =
+            rest[start..].find(|c: char| value_end(c) || matches!(c, '/' | '?')).map_or(rest.len(), |end| start + end);
+        match rest[start..authority_end].rfind('@') {
+            Some(user) => {
+                out.push_str("***");
+                out.push_str(&rest[start + user..authority_end]);
+            }
+            None => out.push_str(&rest[start..authority_end]),
+        }
+        rest = &rest[authority_end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `?access_token=…` and `&api_key=…` and the like keep their names only.
+fn redact_query(text: &str) -> String {
+    const SECRET: &[&str] =
+        &["token", "key", "secret", "password", "passwd", "pwd", "auth", "sig", "credential", "session", "code"];
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while let Some(found) = text[i..].find(['?', '&']) {
+        let name_start = i + found + 1;
+        out.push_str(&text[i..name_start]);
+        let name_end = text[name_start..]
+            .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '[' | ']')))
+            .map_or(text.len(), |end| name_start + end);
+        let name = text[name_start..name_end].to_ascii_lowercase();
+        if text[name_end..].starts_with('=') && SECRET.iter().any(|s| name.contains(s)) {
+            out.push_str(&text[name_start..=name_end]);
+            out.push_str("***");
+            i = skip_value(text, name_end + 1);
+        } else {
+            i = name_start;
+        }
+    }
+    out.push_str(&text[i..]);
+    out
 }
 
 /// Follows a simple JSON path: dot-separated keys and array indexes, with an optional
@@ -896,6 +1018,31 @@ mod tests {
         assert!(comment.arguments(&Vars::new("alpha").ticket(&ticket)).unwrap_err().contains("{body}"));
         assert!(config.operation("update_state").is_none());
         assert!(!TicketConfig::default().is_configured());
+    }
+
+    #[test]
+    fn redaction_hides_credentials_and_bounds_the_text() {
+        let secrets = vec!["sk-live-123456".to_string(), "tiny".to_string()];
+        for (input, expected) in [
+            ("token sk-live-123456 echoed", "token *** echoed"),
+            ("Authorization: Bearer abc.def==, more", "Authorization: Bearer ***, more"),
+            ("{\"authorization\":\"Basic dXNlcjpwYXNz\"}", "{\"authorization\":\"Basic ***\"}"),
+            ("authorization=s3cr3t-value next", "authorization=*** next"),
+            (
+                "GET https://me:pa55@host.example:8443/x?q=1&api_key=zz9&page=2#top",
+                "GET https://***@host.example:8443/x?q=1&api_key=***&page=2#top",
+            ),
+            ("see https://host.example/a?Access_Token=abc", "see https://host.example/a?Access_Token=***"),
+            ("the basic plan, a bearer of news", "the basic plan, a bearer of news"),
+            ("unauthorized: no tiny secrets?", "unauthorized: no tiny secrets?"),
+            ("Bearer", "Bearer"),
+            ("café Bearer ëé-tok", "café Bearer ***"),
+        ] {
+            assert_eq!(redact(input, &secrets), expected, "{input}");
+        }
+        let long = redact(&"é".repeat(MAX_ERROR_CHARS * 2), &[]);
+        assert_eq!(long.chars().count(), MAX_ERROR_CHARS + 1);
+        assert!(long.ends_with('…'));
     }
 
     #[test]
