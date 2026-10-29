@@ -140,14 +140,7 @@ impl Desktop<'_> {
         if before != after {
             let root = root.clone();
             self.post(move |runtime| {
-                let data = runtime.diffs.entry(root).or_default();
-                // Preserve comments accepted through ctl since this view was read.
-                data.comments.retain(|comment| !before.contains(comment) || after.contains(comment));
-                for comment in after {
-                    if !data.comments.contains(&comment) {
-                        data.comments.push(comment);
-                    }
-                }
+                runtime.diffs.entry(root).or_default().edit_comments(before, after);
             });
         }
         match action {
@@ -357,6 +350,37 @@ impl Desktop<'_> {
 mod tests {
     use super::super::tests::with_app;
     use super::*;
+
+    #[test]
+    fn delayed_comment_edits_preserve_duplicate_and_concurrent_comments() {
+        with_app("app::editor::tests::delayed_comment_edits_preserve_duplicate_and_concurrent_comments", |app, ctx| {
+            let root = app.runtime.launch_dir.clone();
+            let comment = steer::ReviewComment {
+                path: "review.rs".into(),
+                line: Some(1),
+                removed: false,
+                excerpt: "line".into(),
+                body: "same feedback".into(),
+            };
+            app.runtime.diffs.entry(root.clone()).or_default().comments = vec![comment.clone(), comment.clone()];
+            let before = app.runtime.diffs[&root].comments.clone();
+            let after = vec![comment.clone()];
+            let target = root.clone();
+            app.post(move |state| state.diffs.get_mut(&target).unwrap().edit_comments(before, after));
+            for _ in 0..2 {
+                ctx.run_ui(egui::RawInput::default(), |_| app.sync_diffs()).drop_without_applying_deltas();
+            }
+            // A matching ctl comment accepted before the desktop action runs.
+            app.runtime.diffs.get_mut(&root).unwrap().comments.push(comment.clone());
+            app.runtime.drain_actions();
+            assert_eq!(app.runtime.diffs[&root].comments, vec![comment.clone(), comment.clone()]);
+            let before = app.runtime.diffs[&root].comments.clone();
+            let mut after = before.clone();
+            after.push(comment.clone());
+            app.runtime.diffs.get_mut(&root).unwrap().edit_comments(before, after);
+            assert_eq!(app.runtime.diffs[&root].comments, vec![comment.clone(), comment.clone(), comment]);
+        });
+    }
 
     #[test]
     fn restarted_editor_receives_geometry_at_an_unchanged_panel_size() {
