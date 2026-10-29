@@ -66,6 +66,7 @@ chief starts, so restart the chief after changing `mode`, `comments`, `states` o
 | `system` | The system's name, shown on cards and to the chief. Empty turns tickets off. |
 | `mode` | `"board"` (default): a board is a plan, its tickets are tasks. `"ticket"`: a ticket is a plan. |
 | `comments` | Who comments: `"agents"` (default) for agents' reports plus IMACS's lifecycle notes, `"chief"` for lifecycle notes and the chief's own comments only, `"off"` for none. |
+| `branch` | Optional branch template: `{key}`, `{key_lower}`, `{key_number}` (numeric suffix of the key), `{slug}` (ticket title), `{branch}` (system suggestion). |
 | `workflow` | Free text added to the chief's prompt: how your team works with tickets. |
 | `timeout_secs` | Longest wait for one MCP request (default 30). |
 | `server` | The MCP server; see below. |
@@ -102,6 +103,18 @@ command = ["npx", "-y", "mcp-remote", "https://mcp.linear.app/mcp"]
 
 The bridge opens the browser on first use and stores the token for later runs. Run the command once in a
 terminal to sign in before IMACS needs it.
+
+### Ticket-aware branches
+
+Set `branch = "issue/{key_number}-{slug}"`, or `branch = "{branch}"` to use the system's suggestion.
+The optional operation result path `branch = "gitBranchName"` reads that suggestion (leave it unset
+when the server has none). IMACS uses a task's ticket, falling back to the plan ticket in ticket mode.
+Task branches using the plan ticket append `-<task-id>` to keep sibling tasks and the integration
+branch separate. In ticket mode the plan's integration branch uses the template too.
+
+Names are checked with `git check-ref-format --branch` and the usual base-branch guard. Missing fields,
+unknown placeholders or invalid names fall back to the existing `imacs/...` names. Naming is pinned
+before branch creation: existing task and integration branches never change after a sync or config edit.
 
 ### Operations
 
@@ -255,7 +268,7 @@ states = { planned = "Todo", running = "In Progress" }
 [tickets.operations.get]
 tool = "get_issue"
 arguments = { id = "{key}" }
-result = { id = "", key = "id", url = "url", title = "title", state = "status", updated_at = "updatedAt" }
+result = { id = "", key = "id", url = "url", title = "title", state = "status", updated_at = "updatedAt", branch = "gitBranchName" }
 
 [tickets.operations.update_state]
 tool = "save_issue"
@@ -288,7 +301,7 @@ scoped agent tools. Link the issue to the plan with `ticket = { id = "ENG-123" }
 operation needs your real team in place of `ENG`. Check tool names and result paths against your
 server version: doctor validates offered tool names, and sync validates results. For a server returning
 `identifier` separately from a UUID `id`, set `result = { id = "id", key = "identifier", url = "url",
-title = "title", state = "status", updated_at = "updatedAt" }` on get and create.
+title = "title", state = "status", updated_at = "updatedAt", branch = "gitBranchName" }` on get and create.
 
 ### Checking a profile
 

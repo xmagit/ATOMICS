@@ -189,6 +189,51 @@ impl State {
         })
     }
 
+    fn ticket_branch(
+        &self,
+        index: usize,
+        link: Option<&imacs_core::tickets::TicketLink>,
+        repo: &Path,
+        task: Option<&str>,
+    ) -> Option<String> {
+        let config = self.ticket_config()?;
+        let plan_ticket = link.is_none();
+        let link = link.or_else(|| {
+            (config.mode == imacs_core::tickets::TicketMode::Ticket)
+                .then_some(self.plans[index].ticket.as_ref())
+                .flatten()
+        })?;
+        let mut branch = config.branch_name(link)?;
+        if let Some(task) = task.filter(|_| plan_ticket || branch == self.plans[index].integration_branch()) {
+            branch.push_str(&format!("-{task}"));
+        }
+        git::check_branch_name(repo, &branch, &self.config.base_ref).ok()?;
+        Some(branch)
+    }
+
+    /// Pin before the first branch is created; never rename work already in progress.
+    pub(super) fn pin_ticket_integration(&mut self, index: usize) {
+        if self.plans[index].integration.is_some() {
+            return;
+        }
+        let plan = &self.plans[index];
+        let existing = plan.tasks.iter().any(|t| t.branch.is_some() || t.integrated.is_some());
+        let repo =
+            plan.project.clone().or_else(|| plan.tasks.iter().find_map(|t| t.repo.as_deref().map(paths::expand)));
+        let ticket_mode = self.ticket_config().is_some_and(|c| c.mode == imacs_core::tickets::TicketMode::Ticket);
+        let existing = existing
+            || repo.as_deref().is_some_and(|repo| {
+                git::git(repo, &["show-ref", "--verify", &format!("refs/heads/{}", plan.integration_branch())]).is_ok()
+            });
+        let branch = if !existing && ticket_mode {
+            repo.as_deref().and_then(|repo| self.ticket_branch(index, plan.ticket.as_ref(), repo, None))
+        } else {
+            None
+        };
+        self.plans[index].integration = Some(branch.unwrap_or_else(|| self.plans[index].integration_branch()));
+        self.save_plan(index);
+    }
+
     /// Starts `only`, or every ready task, each in a new worktree with its brief as
     /// the agent's first message.
     pub(super) fn dispatch(&mut self, index: usize, only: Option<&str>) -> Result<Vec<String>, String> {
@@ -198,6 +243,7 @@ impl State {
         if !self.plans[index].approved {
             return Err("The plan is not approved yet: the user approves it on the plan board.".into());
         }
+        self.pin_ticket_integration(index);
         self.refresh_integrations();
         let ready: Vec<Task> =
             self.plans[index].ready().into_iter().filter(|t| only.is_none_or(|id| t.id == id)).cloned().collect();
@@ -226,6 +272,7 @@ impl State {
             let branch = task
                 .branch
                 .clone()
+                .or_else(|| self.ticket_branch(index, task.ticket.as_ref(), &repo, Some(&task.id)))
                 .unwrap_or_else(|| format!("imacs/{}-{}-{}", self.plans[index].id, task.id, short_slug(&task.title)));
             let agent = if task.agent.trim().is_empty() { "claude".to_string() } else { task.agent.clone() };
             let mut brief = task.compose_brief(&self.plans[index].goal);
@@ -377,6 +424,49 @@ impl State {
 mod tests {
     use super::super::tests::{repository, request, session, with_app};
     use super::*;
+
+    #[test]
+    fn ticket_branches_validate_fallback_and_preserve_existing_names() {
+        with_app("app::plans::tests::ticket_branches_validate_fallback_and_preserve_existing_names", |app, _| {
+            use imacs_core::tickets::{McpServer, TicketConfig, TicketLink, TicketMode};
+            let (_dir, repo) = repository();
+            app.runtime.config.tickets = TicketConfig {
+                system: "example".into(),
+                mode: TicketMode::Ticket,
+                branch: Some("issue/{key_number}-{slug}".into()),
+                server: McpServer { command: vec!["unused".into()], ..Default::default() },
+                ..Default::default()
+            };
+            app.runtime.apply_ticket_config();
+            let link = TicketLink { id: "ENG-42".into(), title: Some("Fix parser".into()), ..Default::default() };
+            app.runtime.plans = vec![Plan {
+                id: "branches".into(),
+                project: Some(repo.clone()),
+                ticket: Some(link.clone()),
+                ..Default::default()
+            }];
+            assert_eq!(app.runtime.ticket_branch(0, None, &repo, Some("a")).as_deref(), Some("issue/42-fix-parser-a"));
+            assert_eq!(
+                app.runtime.ticket_branch(0, Some(&link), &repo, Some("a")).as_deref(),
+                Some("issue/42-fix-parser")
+            );
+            app.runtime.pin_ticket_integration(0);
+            assert_eq!(app.runtime.plans[0].integration_branch(), "issue/42-fix-parser");
+            app.runtime.config.tickets.branch = Some("changed/{key}".into());
+            app.runtime.apply_ticket_config();
+            app.runtime.pin_ticket_integration(0);
+            assert_eq!(app.runtime.plans[0].integration_branch(), "issue/42-fix-parser");
+            for invalid in ["bad..name", "main", "-option", "refs/heads/bad name", "{branch}"] {
+                app.runtime.config.tickets.branch = Some(invalid.into());
+                app.runtime.apply_ticket_config();
+                assert!(app.runtime.ticket_branch(0, Some(&link), &repo, None).is_none(), "{invalid}");
+            }
+            app.runtime.plans[0].integration = None;
+            app.runtime.plans[0].tasks = vec![Task { branch: Some("existing".into()), ..Default::default() }];
+            app.runtime.pin_ticket_integration(0);
+            assert_eq!(app.runtime.plans[0].integration_branch(), "imacs/plan-branches");
+        });
+    }
 
     #[test]
     fn dispatched_review_records_branch_closes_on_acceptance_and_can_be_cleaned_up() {

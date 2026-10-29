@@ -26,6 +26,9 @@ pub struct TicketLink {
     pub url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// The ticket system's suggested git branch, when supplied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     /// The system's own state name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
@@ -78,6 +81,7 @@ impl TicketLink {
             (&mut self.key, &fetched.key),
             (&mut self.url, &fetched.url),
             (&mut self.title, &fetched.title),
+            (&mut self.branch, &fetched.branch),
             (&mut self.state, &fetched.state),
             (&mut self.updated_at, &fetched.updated_at),
         ] {
@@ -102,6 +106,7 @@ impl TicketLink {
                     (&mut new.key, &old.key),
                     (&mut new.url, &old.url),
                     (&mut new.title, &old.title),
+                    (&mut new.branch, &old.branch),
                     (&mut new.state, &old.state),
                     (&mut new.updated_at, &old.updated_at),
                 ] {
@@ -165,6 +170,8 @@ pub struct TicketConfig {
     pub comments: CommentPolicy,
     /// Free text added to the chief's prompt: how this team works with its tickets.
     pub workflow: String,
+    /// Template for newly created branches of linked work.
+    pub branch: Option<String>,
     /// Longest wait for one MCP request.
     pub timeout_secs: u64,
     pub server: McpServer,
@@ -180,6 +187,7 @@ impl Default for TicketConfig {
             mode: TicketMode::Board,
             comments: CommentPolicy::Agents,
             workflow: String::new(),
+            branch: None,
             timeout_secs: 30,
             server: McpServer::default(),
             states: StateMap::default(),
@@ -301,6 +309,7 @@ pub struct FieldPaths {
     pub title: String,
     pub state: String,
     pub updated_at: String,
+    pub branch: String,
 }
 
 impl Default for FieldPaths {
@@ -312,6 +321,7 @@ impl Default for FieldPaths {
             title: "title".into(),
             state: "state".into(),
             updated_at: "updated_at".into(),
+            branch: String::new(),
         }
     }
 }
@@ -377,6 +387,36 @@ impl Vars {
 }
 
 impl TicketConfig {
+    /// Render only known placeholders in one pass. Missing values leave naming to IMACS.
+    pub fn branch_name(&self, link: &TicketLink) -> Option<String> {
+        if !self.accepts(link) {
+            return None;
+        }
+        let template = self.branch.as_deref()?;
+        let key = link.label();
+        let lower = key.to_lowercase();
+        let number = key.rsplit('-').next().filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()));
+        let slug = link.title.as_deref().map(crate::plan::short_slug).filter(|s| !s.is_empty());
+        let values = [
+            ("key", Some(key).filter(|s| !s.is_empty())),
+            ("key_lower", Some(lower.as_str()).filter(|s| !s.is_empty())),
+            ("key_number", number),
+            ("slug", slug.as_deref()),
+            ("branch", link.branch.as_deref().filter(|s| !s.is_empty())),
+        ];
+        let mut rest = template;
+        let mut out = String::new();
+        while let Some(start) = rest.find('{') {
+            out.push_str(&rest[..start]);
+            let end = rest[start..].find('}')? + start;
+            let name = &rest[start + 1..end];
+            out.push_str(values.iter().find(|(n, _)| *n == name)?.1?);
+            rest = &rest[end + 1..];
+        }
+        out.push_str(rest);
+        (!out.is_empty()).then_some(out)
+    }
+
     /// Configured with a system name and a server to reach it.
     pub fn is_configured(&self) -> bool {
         !self.system.trim().is_empty()
@@ -521,6 +561,7 @@ impl FieldPaths {
             key: field(&self.key),
             url: field(&self.url),
             title: field(&self.title),
+            branch: field(&self.branch),
             state: field(&self.state),
             updated_at: field(&self.updated_at),
             ..TicketLink::default()
@@ -621,6 +662,7 @@ impl Cleaner {
             key: field(link.key),
             url: link.url.map(|url| self.url(&url)),
             title: field(link.title),
+            branch: field(link.branch),
             state: field(link.state),
             updated_at: field(link.updated_at),
             pushed_state: field(link.pushed_state),
@@ -1261,6 +1303,29 @@ mod tests {
 
     fn link(id: &str) -> TicketLink {
         TicketLink { system: "alpha".into(), id: id.into(), ..TicketLink::default() }
+    }
+
+    #[test]
+    fn branch_templates_require_values_and_render_once() {
+        let mut config = TicketConfig {
+            branch: Some("{key}/{key_lower}/{key_number}/{slug}/{branch}".into()),
+            ..Default::default()
+        };
+        let link = TicketLink {
+            id: "uuid".into(),
+            key: Some("ENG-42".into()),
+            title: Some("Fix parser now".into()),
+            branch: Some("feature/parser".into()),
+            ..Default::default()
+        };
+        assert_eq!(config.branch_name(&link).as_deref(), Some("ENG-42/eng-42/42/fix-parser-now/feature/parser"));
+        assert!(config.branch_name(&TicketLink { title: None, ..link.clone() }).is_none());
+        assert!(config.branch_name(&TicketLink { branch: None, ..link.clone() }).is_none());
+        assert!(config.branch_name(&TicketLink { key: Some("ENG".into()), ..link.clone() }).is_none());
+        config.branch = Some("{unknown}".into());
+        assert!(config.branch_name(&link).is_none());
+        config.branch = Some("{branch}".into());
+        assert_eq!(config.branch_name(&TicketLink { branch: Some("{key}".into()), ..link }).as_deref(), Some("{key}"));
     }
 
     #[test]

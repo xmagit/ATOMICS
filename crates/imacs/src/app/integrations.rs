@@ -140,6 +140,7 @@ impl State {
                 return;
             }
         };
+        self.pin_ticket_integration(index);
         let into = self.plans[index].integration_branch();
         let into_path = git::worktree_path(&self.config.worktree_path, &repo, &into);
         let (tx, base_ref) = (self.integrate_tx.clone(), self.config.base_ref.clone());
