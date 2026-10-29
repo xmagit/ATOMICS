@@ -226,13 +226,14 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::mpsc::Receiver;
 
-    /// A streamable HTTP MCP server whose every tool call fails, echoing the bearer token
-    /// it was called with. Each request's Authorization header goes to the receiver.
+    /// A streamable HTTP MCP server whose every tool call fails, echoing the bearer token it
+    /// was called with and the one its previous call had. Each call's token goes to the receiver.
     fn echo_server() -> (String, Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/mcp", listener.local_addr().unwrap());
         let (tx, tokens) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
+            let mut previous: Option<String> = None;
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { break };
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
@@ -257,7 +258,10 @@ mod tests {
                     "initialize" => Some(json!({"protocolVersion": "2025-06-18", "capabilities": {}})),
                     "tools/call" => {
                         let _ = tx.send(token.clone());
-                        let text = format!("credential {token} rejected");
+                        let mut text = format!("credential {token} rejected");
+                        if let Some(previous) = previous.replace(token.clone()).filter(|p| *p != token) {
+                            text.push_str(&format!("; last time {previous}"));
+                        }
                         Some(json!({"isError": true, "content": [{"type": "text", "text": text}]}))
                     }
                     _ => None,
@@ -325,7 +329,8 @@ mod tests {
             unsafe { std::env::set_var("ECHO_TEST_TOKEN", &new) };
             let rotated = comment(2);
             assert_eq!(tokens.recv().unwrap(), new, "{name:?}: the connection authenticates with the new token");
-            assert!(!rotated.contains(&old) && !rotated.contains(&new), "{name:?}: {rotated}");
+            // The new connection's server echoes both tokens: the old one is cleaned too.
+            assert_eq!(rotated, "note failed: credential *** rejected; last time ***", "{name:?}");
         }
     }
 }
