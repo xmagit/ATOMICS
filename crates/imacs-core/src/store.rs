@@ -15,6 +15,10 @@ const MAX_RECORDS: usize = 60;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionRecord {
+    #[serde(default)]
+    pub chief: bool,
+    #[serde(default)]
+    pub pane: Option<String>,
     pub claude_session_id: String,
     pub agent: String,
     pub cwd: PathBuf,
@@ -23,8 +27,30 @@ pub struct SessionRecord {
     pub updated: u64,
 }
 
+/// One-shot handoff, written before quitting and consumed by the new process.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RestartState {
+    pub old_version: String,
+    pub reason: Option<String>,
+    pub sessions: Vec<SessionRecord>,
+    pub chief_open: bool,
+    pub active: Option<String>,
+    pub selected_plan: Option<String>,
+    pub plan_view: bool,
+    pub diff_open: bool,
+    pub diff_root: Option<PathBuf>,
+    pub view: Option<PathBuf>,
+    pub split: Option<f32>,
+    pub diff_split: Option<crate::layout::DiffSplit>,
+    pub panel: String,
+    pub window_size: Option<[f32; 2]>,
+    pub maximized: bool,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Store {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart: Option<RestartState>,
     #[serde(default)]
     pub chief_dock: Option<ChiefDock>,
     #[serde(default)]
@@ -89,6 +115,8 @@ mod tests {
 
     fn record(id: &str, prompt: Option<&str>) -> SessionRecord {
         SessionRecord {
+            chief: false,
+            pane: None,
             claude_session_id: id.into(),
             agent: "claude".into(),
             cwd: PathBuf::from("/r"),

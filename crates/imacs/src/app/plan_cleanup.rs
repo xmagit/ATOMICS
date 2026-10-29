@@ -4,7 +4,7 @@ use imacs_core::cleanup::{self, Entry};
 pub(super) struct PlanCleanup {
     plan: Plan,
     rows: Vec<Entry>,
-    busy: bool,
+    pub(super) busy: bool,
     log: Vec<String>,
     tx: crate::host::Sender<Event>,
     rx: Receiver<Event>,

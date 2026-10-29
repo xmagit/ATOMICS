@@ -10,6 +10,7 @@ impl State {
         });
         json!({
             "id": s.id,
+            "chief": s.chief,
             "title": s.title,
             "agent": s.agent,
             "status": s.status.label(),
@@ -29,6 +30,10 @@ impl State {
     }
 
     pub(super) fn control(&mut self, ctx: &egui::Context, request: ControlRequest, reply: Sender<ControlOutcome>) {
+        if self.restarting {
+            let _ = reply.send(ControlOutcome::Done(ControlResponse::error("IMACS is restarting")));
+            return;
+        }
         let done = |response: ControlResponse| ControlOutcome::Done(response);
         let missing = |reference: &str| done(ControlResponse::error(format!("no session matches {reference:?}")));
         let target = match &request {
@@ -52,6 +57,7 @@ impl State {
             self.selected_plan
         };
         let outcome = match request {
+            ControlRequest::Restart { force, reason } => done(self.restart(force, reason)),
             ControlRequest::Approve { session, decision, message } => match self.find(&session) {
                 Some(index) => {
                     let approval =
@@ -494,7 +500,7 @@ impl State {
         let now = Instant::now();
         let mut pending = Vec::new();
         for waiter in std::mem::take(&mut self.waiters) {
-            let matching: Vec<serde_json::Value> = self
+            let mut matching: Vec<serde_json::Value> = self
                 .events
                 .iter()
                 .filter(|e| e.seq > waiter.after)
@@ -502,6 +508,10 @@ impl State {
                 .filter(|e| waiter.statuses.iter().any(|s| s == e.kind()))
                 .map(StatusEvent::to_json)
                 .collect();
+            // Deliver the handoff even with a cursor from the previous process.
+            if let Some(event) = self.restart_event.take() {
+                matching.insert(0, event);
+            }
             let timed_out = now >= waiter.deadline;
             if matching.is_empty() && !timed_out {
                 pending.push(waiter);

@@ -10,6 +10,13 @@ use crate::diff::{FileStatus, LineKind, WorktreeDiff};
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum ControlRequest {
     List,
+    /// Restart the same installation after saving state. Force bypasses busy checks only.
+    Restart {
+        #[serde(default)]
+        force: bool,
+        #[serde(default)]
+        reason: Option<String>,
+    },
     /// Starts an agent in `folder`, or in a new worktree of `repo` on `branch`.
     Start {
         agent: String,

@@ -62,7 +62,17 @@ fn relaunch_command(executable: &Path, args: &[OsString], macos: bool) -> Result
         let mut command = vec!["/usr/bin/open".into(), "-n".into(), "-a".into(), bundle.as_os_str().to_owned()];
         // LaunchServices does not inherit the caller's environment. Preserve instance
         // isolation explicitly, as well as the login environment used to launch agents.
-        for key in ["IMACS_HOME", "IMACS_SOCKET", "IMACS_CONFIG", "HOME", "PATH", "SHELL", "XDG_CONFIG_HOME"] {
+        for key in [
+            "IMACS_HOME",
+            "IMACS_SOCKET",
+            "IMACS_CONFIG",
+            "HOME",
+            "PATH",
+            "SHELL",
+            "XDG_CONFIG_HOME",
+            "CODEX_HOME",
+            "CLAUDE_CONFIG_DIR",
+        ] {
             if let Some(value) = std::env::var_os(key) {
                 let mut variable = OsString::from(format!("{key}="));
                 variable.push(value);

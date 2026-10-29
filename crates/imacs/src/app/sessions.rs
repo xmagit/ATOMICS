@@ -202,7 +202,7 @@ impl State {
             AgentKind::Claude if chief => {
                 // The chief gets every IMACS tool and knows how to run a plan.
                 let config = json!({ "mcpServers": { "imacs": {
-                    "command": exe, "args": ["mcp"], "env": { "IMACS_PANE": id, "IMACS_SOCKET": socket }
+                    "command": exe, "args": ["mcp", "--chief"], "env": { "IMACS_PANE": id, "IMACS_SOCKET": socket }
                 } } });
                 let projects: Vec<String> = self.repos.iter().map(|r| paths::display(r)).collect();
                 let prompt = self
@@ -446,6 +446,7 @@ impl State {
     }
 
     pub(super) fn close(&mut self, id: &str) {
+        self.pending_questions.remove(id);
         if let Some(i) = self.sessions.iter().position(|s| s.id == id) {
             let mut session = self.sessions.remove(i);
             if session.chief {
@@ -470,6 +471,8 @@ impl State {
         let Some(s) = self.sessions.iter().find(|s| s.id == id) else { return };
         let Some(claude_id) = s.claude_id.clone() else { return };
         self.store.upsert(SessionRecord {
+            chief: s.chief,
+            pane: Some(s.id.clone()),
             claude_session_id: claude_id,
             agent: s.agent.clone(),
             cwd: s.cwd.clone(),

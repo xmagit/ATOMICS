@@ -255,7 +255,9 @@ impl Desktop<'_> {
                                                             let edit = egui::TextEdit::multiline(&mut task.brief)
                                                                 .desired_rows(4)
                                                                 .desired_width(f32::INFINITY);
-                                                            if ui.add(edit).changed() {
+                                                            let response = ui.add(edit);
+                                                            self.runtime.plan_edit_open |= response.has_focus();
+                                                            if response.changed() {
                                                                 actions.push((task.id.clone(), "edited"));
                                                             }
                                                         } else {

@@ -268,6 +268,11 @@ impl State {
         }
         let session = found.map(|found| &self.sessions[found]);
         let session_id = pane.unwrap_or_default().to_string();
+        if status == "question" {
+            self.pending_questions.insert(session_id.clone());
+        } else if status != "progress" {
+            self.pending_questions.remove(&session_id);
+        }
         let title = session.map(|s| s.title.clone()).unwrap_or_else(|| "closed agent".into());
         let owner = self.plans.iter().enumerate().find_map(|(index, plan)| {
             plan.tasks.iter().find(|t| t.session.as_deref() == Some(&session_id)).map(|task| (index, task.id.clone()))

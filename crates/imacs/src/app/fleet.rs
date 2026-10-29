@@ -371,6 +371,8 @@ impl Desktop<'_> {
         if let Some(index) = resume {
             let s = &self.runtime.sessions[index];
             let record = SessionRecord {
+                chief: s.chief,
+                pane: Some(s.id.clone()),
                 claude_session_id: s.claude_id.clone().unwrap_or_default(),
                 agent: s.agent.clone(),
                 cwd: s.cwd.clone(),

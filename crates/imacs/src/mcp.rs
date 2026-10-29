@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
 /// `agent` serves only `imacs_report`: agents IMACS starts use it to report on their task.
-pub fn run(agent: bool) {
+pub fn run(agent: bool, chief: bool) {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     for line in stdin.lock().lines() {
@@ -39,8 +39,14 @@ pub fn run(agent: bool) {
                 }))
             }
             "ping" => Ok(json!({})),
-            "tools/list" => Ok(json!({ "tools": if agent { agent_tools() } else { tools() } })),
-            "tools/call" => Ok(if agent { call_report(&params) } else { call(&params) }),
+            "tools/list" => Ok(json!({ "tools": available_tools(agent, chief) })),
+            "tools/call" => Ok(if agent {
+                call_report(&params)
+            } else if !chief && params["name"] == "imacs_restart" {
+                tool_error("imacs_restart is only available to the chief".into())
+            } else {
+                call(&params)
+            }),
             _ => Err(json!({ "code": -32601, "message": format!("unknown method {method}") })),
         };
         let reply = match response {
@@ -75,6 +81,17 @@ fn agent_tools() -> Value {
     }])
 }
 
+fn available_tools(agent: bool, chief: bool) -> Value {
+    if agent {
+        return agent_tools();
+    }
+    let mut tools = tools();
+    if !chief {
+        tools.as_array_mut().unwrap().retain(|tool| tool["name"] != "imacs_restart");
+    }
+    tools
+}
+
 fn call_report(params: &Value) -> Value {
     if params.get("name").and_then(Value::as_str) != Some("imacs_report") {
         return tool_error("only imacs_report is available here".into());
@@ -97,6 +114,14 @@ fn tools() -> Value {
     let plan = json!({ "type": "string", "description": "Plan id from imacs_plan_set/get. Required for update/dispatch/integrate when several plans are open." });
     let session = json!({ "type": "string", "description": "Session id, unique id prefix, or title" });
     json!([
+        {
+            "name": "imacs_restart",
+            "description": "Chief only: restart this installation after rebuilding it. Saves plans, sessions and layout, then automatically resumes the chief. Refuses while agents work, approvals/questions are pending, queue slots are held, jobs run or a plan edit is open. Wait for blockers instead of forcing. Force bypasses busy checks, never executable validation or saving.",
+            "inputSchema": { "type": "object", "properties": {
+                "force": { "type": "boolean", "default": false },
+                "reason": { "type": "string" }
+            } }
+        },
         {
             "name": "imacs_list",
             "description": "List the sessions in IMACS with status (working, needs you, turn done, idle, exited), folder, branch and diff size.",
@@ -329,6 +354,7 @@ fn response_text(name: &str, result: &Value) -> String {
 fn request_for_tool(name: &str, mut args: Value) -> Result<ControlRequest, String> {
     let cmd = match name {
         "imacs_list" => "list",
+        "imacs_restart" => "restart",
         "imacs_start" => "start",
         "imacs_send" => "send",
         "imacs_approve" => "approve",
@@ -366,6 +392,21 @@ fn tool_error(message: String) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn restart_is_chief_only_and_maps_optional_force_and_reason() {
+        for (agent, chief, available) in [(true, false, false), (false, false, false), (false, true, true)] {
+            let tools = super::available_tools(agent, chief);
+            assert_eq!(tools.as_array().unwrap().iter().any(|tool| tool["name"] == "imacs_restart"), available);
+        }
+        let default = super::request_for_tool("imacs_restart", serde_json::json!({})).unwrap();
+        assert!(matches!(default, imacs_core::control::ControlRequest::Restart { force: false, reason: None }));
+        let force =
+            super::request_for_tool("imacs_restart", serde_json::json!({"force":true,"reason":"upgrade"})).unwrap();
+        assert!(
+            matches!(force, imacs_core::control::ControlRequest::Restart {force:true,reason:Some(reason)} if reason == "upgrade")
+        );
+        assert_eq!(super::call_report(&serde_json::json!({"name":"imacs_restart"}))["isError"], true);
+    }
     #[test]
     fn wait_schema_accepts_heartbeat() {
         let tools = super::tools();

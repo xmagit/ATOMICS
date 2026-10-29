@@ -87,6 +87,7 @@ fn orbit_icon(painter: &egui::Painter, rect: Rect, accent: Color32, light: Color
 pub(super) const CHIEF_ALLOWED_TOOLS: &[&str] = &[
     "mcp__imacs__imacs_list",
     "mcp__imacs__imacs_wait",
+    "mcp__imacs__imacs_restart",
     "mcp__imacs__imacs_approve",
     "mcp__imacs__imacs_result",
     "mcp__imacs__imacs_read",

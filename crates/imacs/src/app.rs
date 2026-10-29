@@ -49,6 +49,7 @@ mod plan_cleanup;
 mod plan_view;
 mod plans;
 mod projects;
+mod restart;
 mod sessions;
 mod sidebar;
 mod topbar;
@@ -399,6 +400,13 @@ pub(crate) struct State {
     toast: Option<(String, Instant)>,
     pending_open: Vec<(String, PathBuf)>,
     resume: Vec<SessionRecord>,
+    restarting: bool,
+    restart_event: Option<serde_json::Value>,
+    restart_layout: Option<imacs_core::store::RestartState>,
+    plan_edit_open: bool,
+    pending_questions: HashSet<String>,
+    desktop_split: Option<f32>,
+    desktop_diff_split: Option<DiffSplit>,
     launch_dir: PathBuf,
 }
 
@@ -728,10 +736,20 @@ impl State {
             toast: None,
             pending_open: options.open,
             resume: Vec::new(),
+            restarting: false,
+            restart_event: None,
+            restart_layout: None,
+            plan_edit_open: false,
+            pending_questions: HashSet::new(),
+            desktop_split: None,
+            desktop_diff_split: None,
             launch_dir,
         };
         app.open_initial_projects(options.projects, options.workspace);
         app.apply_config();
+        if app.hook_error.is_none() {
+            app.restore_restart();
+        }
         // One toast for everything startup has to say, so no notice hides another.
         notices.splice(0..0, options.migration_errors.iter().cloned());
         notices.extend(plan_error);
@@ -999,6 +1017,20 @@ fn apply_style(ctx: &egui::Context, config: &Config) {
 
 impl Desktop<'_> {
     fn apply_client_events(&mut self, ctx: &egui::Context) {
+        if let Some(layout) = self.runtime.restart_layout.take() {
+            self.client.split = layout.split;
+            self.client.diff_split = layout.diff_split;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(layout.maximized));
+            if !layout.maximized
+                && let Some([width, height]) = layout.window_size
+            {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(vec2(width, height)));
+            }
+        }
+        if self.runtime.restarting {
+            self.client.confirm_close = None;
+            self.client.confirm_plan_close = None;
+        }
         if let Some(id) = self.runtime.focus_terminal.take() {
             self.client.focus_terminal = Some(id);
         }
@@ -1239,8 +1271,12 @@ impl Desktop<'_> {
     }
 
     fn paint(&mut self, ui: &mut egui::Ui) {
+        self.runtime.plan_edit_open = false;
         self.sync_diffs();
         self.apply_client_events(ui.ctx());
+        if self.runtime.restarting {
+            return;
+        }
         let ctx = ui.ctx().clone();
         self.shortcuts(&ctx);
         let p = self.runtime.palette.clone();
@@ -1388,6 +1424,8 @@ impl Desktop<'_> {
         }
 
         self.chief_ui(&ctx);
+        self.runtime.desktop_split = self.client.split;
+        self.runtime.desktop_diff_split = self.client.diff_split;
         self.dialogs(&ctx);
     }
 }

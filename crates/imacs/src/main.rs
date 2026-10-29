@@ -83,6 +83,9 @@ enum Command {
         /// Expose only `imacs_report`, for agents IMACS starts to report on their task
         #[arg(long)]
         agent: bool,
+        /// Enable chief-only tools (used by the built-in chief session)
+        #[arg(long, conflicts_with = "agent")]
+        chief: bool,
     },
     /// Send one control request to the running IMACS, e.g. '{"cmd":"list"}'
     Ctl { json: String },
@@ -165,8 +168,8 @@ fn main() -> eframe::Result {
             );
             return Ok(());
         }
-        Some(Command::Mcp { agent }) => {
-            mcp::run(agent);
+        Some(Command::Mcp { agent, chief }) => {
+            mcp::run(agent, chief);
             return Ok(());
         }
         Some(Command::Queue { class, command }) => {

@@ -5,6 +5,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -142,6 +143,7 @@ fn holds_tokens(args: &str) -> bool {
 
 pub struct Governor {
     queue: Mutex<SlotQueue>,
+    restarting: AtomicBool,
     changed: Condvar,
     config: Mutex<ResourceConfig>,
     repaint: Option<egui::Context>,
@@ -151,7 +153,14 @@ pub struct Governor {
 impl Governor {
     pub fn new(config: ResourceConfig, repaint: Option<egui::Context>) -> Governor {
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        Governor { queue: Mutex::default(), changed: Condvar::new(), config: Mutex::new(config), repaint, cores }
+        Governor {
+            queue: Mutex::default(),
+            restarting: AtomicBool::new(false),
+            changed: Condvar::new(),
+            config: Mutex::new(config),
+            repaint,
+            cores,
+        }
     }
 
     pub fn set_config(&self, config: ResourceConfig) {
@@ -177,6 +186,25 @@ impl Governor {
         (queue.running().to_vec(), queue.waiting().cloned().collect())
     }
 
+    /// Freeze queue admission under the same lock used to enqueue work.
+    pub fn begin_restart(&self, force: bool) -> Result<()> {
+        let queue = self.queue.lock().unwrap();
+        if !force && (!queue.running().is_empty() || queue.waiting().next().is_some()) {
+            bail!("queue slots are held or waiting; wait for queued work to finish");
+        }
+        self.restarting.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    pub fn cancel_restart(&self) {
+        self.restarting.store(false, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub fn restarting_for_test(&self) -> bool {
+        self.restarting.load(Ordering::Acquire)
+    }
+
     /// Serves one `imacs queue` connection: waits for a slot, telling the client its place,
     /// then holds the slot until the client hangs up (its command ended, or it died).
     pub fn serve(&self, stream: &UnixStream, request: &Value) -> Result<()> {
@@ -187,7 +215,13 @@ impl Governor {
             .and_then(Value::as_array)
             .map(|pids| pids.iter().filter_map(Value::as_u64).map(|pid| pid as u32).collect())
             .unwrap_or_default();
-        let id = self.queue.lock().unwrap().enqueue(class, label, ancestors);
+        let id = {
+            let mut queue = self.queue.lock().unwrap();
+            if self.restarting.load(Ordering::Acquire) {
+                bail!("IMACS is restarting");
+            }
+            queue.enqueue(class, label, ancestors)
+        };
         let result = self.wait_and_hold(stream, id);
         self.queue.lock().unwrap().release(id);
         self.grant();
@@ -353,6 +387,23 @@ pub fn load_average() -> Option<f64> {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn restart_refuses_held_and_waiting_slots_and_force_freezes_admission() {
+        let governor = Governor::new(ResourceConfig::default(), None);
+        let id = governor.queue.lock().unwrap().enqueue(SlotClass::Test, "full test suite".into(), vec![]);
+        assert!(governor.begin_restart(false).is_err(), "waiting work must not be lost");
+        governor.grant();
+        assert!(!governor.snapshot().0.is_empty());
+        assert!(governor.begin_restart(false).is_err(), "held slots must not be lost");
+        governor.begin_restart(true).unwrap();
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        assert!(governor.serve(&stream, &json!({"cmd":"queue"})).unwrap_err().to_string().contains("restarting"));
+        governor.cancel_restart();
+        governor.queue.lock().unwrap().release(id);
+        governor.begin_restart(false).unwrap();
+        assert!(governor.restarting_for_test());
+    }
 
     #[test]
     fn toolchain_env_detects_sibling_projects_from_a_worktree_subdirectory() {

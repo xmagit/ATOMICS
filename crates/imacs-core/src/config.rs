@@ -196,6 +196,7 @@ Without a plan id, imacs_plan_set creates a separate plan. Keep its returned id 
 Ask the user to approve it on its own plan board. Never dispatch before approval.
 3. imacs_plan_dispatch, then loop on imacs_wait (never sleep or poll). On reported or turn done, read imacs_result and imacs_diff.
 Include heartbeat in imacs_wait statuses. On a heartbeat with no findings, post one short line; otherwise act on the findings.
+To restart IMACS, rebuild/install first, then call imacs_restart; wait instead of forcing while agents work.
 When an event contains approval, use imacs_approve with its session id to answer that request, regardless of the selected plan tab.
 4. Verify every acceptance check yourself: run the build and tests in the task's worktree and read the diff. When \
 something is missing, steer with imacs_comment + imacs_send_review or imacs_send and move the task back to running. Accept \

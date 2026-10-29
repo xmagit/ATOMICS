@@ -4,10 +4,13 @@ impl State {
     // ── background events ─────────────────────────────────────────────────
 
     pub(crate) fn runtime_tick(&mut self, ctx: &egui::Context) -> bool {
+        if self.restarting {
+            return false;
+        }
         let before = self.runtime_view_revision();
         let mut changed = self.drain_actions();
         for record in std::mem::take(&mut self.resume) {
-            self.spawn(ctx, &record.agent, record.cwd.clone(), Some(record.claude_session_id));
+            self.resume_record(ctx, record);
             changed = true;
         }
         self.refresh_integrations();
@@ -109,6 +112,9 @@ impl State {
         while let Ok(message) = self.control_rx.try_recv() {
             changed = true;
             self.control(ctx, message.request, message.reply);
+            if self.restarting {
+                return true;
+            }
         }
         for terminal in self.sessions.iter().filter_map(|s| s.terminal.as_ref()).chain(self.editors.values()) {
             if terminal.shared.changed.swap(false, Ordering::AcqRel) {
@@ -300,6 +306,9 @@ impl State {
 
     pub(crate) fn runtime_deadline(&self) -> Instant {
         let now = Instant::now();
+        if self.restarting {
+            return now + Duration::from_secs(1);
+        }
         let mut next = self.config_checked + Duration::from_secs(1);
         next = next.min(self.heartbeat.deadline(Duration::from_secs(self.config.chief.heartbeat_secs.max(1))));
         for waiter in &self.waiters {
@@ -465,6 +474,7 @@ impl State {
         }
         match event.name.as_str() {
             "UserPromptSubmit" => {
+                self.pending_questions.remove(&session.id);
                 if let Some(pending) = &mut session.pending
                     && pending.codex
                     && event.prompt.as_deref() == Some(&pending.text)
