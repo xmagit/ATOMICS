@@ -1339,7 +1339,35 @@ mod tests {
     }
 
     #[test]
+    fn stage_maps_apply_after_acceptance_without_bypassing_a_later_done_gate() {
+        use crate::workflow::{Stage, Workflow};
+        let mut states = StateMap { done: Some("Done".into()), ..Default::default() };
+        states.stages.insert("pr_opened".into(), "In Review".into());
+        let pr = Stage { stage: "pr_opened".into(), ..Default::default() };
+        assert_eq!(states.after_acceptance(&Workflow::default(), Some(&pr), true), Some("In Review"));
+        let mut workflow = Workflow { done: "ci_passed".into(), ..Default::default() };
+        assert_eq!(states.after_acceptance(&workflow, None, false), None);
+        assert_eq!(states.after_acceptance(&workflow, Some(&pr), false), Some("In Review"));
+        let ci = Stage { stage: "ci_passed".into(), ..Default::default() };
+        assert_eq!(states.after_acceptance(&workflow, Some(&ci), true), Some("Done"));
+        let failed = Stage { stage: "ci_failed".into(), ..Default::default() };
+        assert_eq!(states.after_acceptance(&workflow, Some(&failed), true), None);
+        workflow.done = "pr_opened".into();
+        assert_eq!(states.after_acceptance(&workflow, Some(&pr), true), Some("Done"));
+    }
+
+    #[test]
     fn branch_templates_require_values_and_render_once() {
+        let operation: Operation =
+            serde_json::from_value(serde_json::json!({"result":{"branch":"gitBranchName"}})).unwrap();
+        assert_eq!(
+            operation
+                .ticket(&serde_json::json!({"id":"ENG-42", "gitBranchName":"feature/parser"}), "example")
+                .unwrap()
+                .branch
+                .as_deref(),
+            Some("feature/parser")
+        );
         let mut config = TicketConfig {
             branch: Some("{key}/{key_lower}/{key_number}/{slug}/{branch}".into()),
             ..Default::default()

@@ -271,7 +271,7 @@ impl State {
                     self.record_stage(
                         index,
                         task.as_deref(),
-                        imacs_core::workflow::Stage { stage, url, note },
+                        imacs_core::workflow::Stage { stage, url, note, ..Default::default() },
                         self.chief_author(),
                     )
                 });
@@ -292,7 +292,7 @@ impl State {
                         self.record_stage(
                             index,
                             task.as_deref(),
-                            imacs_core::workflow::Stage { stage, url, note },
+                            imacs_core::workflow::Stage { stage, url, note, ..Default::default() },
                             imacs_core::tickets::Author::Imacs,
                         )
                     },

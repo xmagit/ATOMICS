@@ -499,6 +499,8 @@ impl State {
     fn ticket_moved(&mut self, key: &LinkKey, link: &TicketLink, from: Option<String>) {
         let config = self.ticket_config();
         let means = config.as_ref().and_then(|c| c.states.status_of(link.state.as_deref().unwrap_or_default()));
+        let expected =
+            self.plans.iter().find(|p| p.id == key.0).is_some_and(|p| p.ticket_progress_expected(key.1.as_deref()));
         let session = key.1.as_ref().and_then(|task| {
             self.plans.iter().find(|p| p.id == key.0)?.tasks.iter().find(|t| &t.id == task)?.session.clone()
         });
@@ -516,7 +518,7 @@ impl State {
             findings: None,
             ticket: Some(json!({
                 "system": link.system, "id": link.id, "key": link.label(), "title": link.title, "url": link.url,
-                "from": from, "to": link.state, "means": means.map(TaskStatus::label),
+                "from": from, "to": link.state, "means": means.map(TaskStatus::label), "expected": expected,
             })),
         });
         self.serve_waiters();
@@ -543,7 +545,7 @@ impl State {
             let mut links = Vec::new();
             for task in &plan.tasks {
                 let Some(link) = &task.ticket else { continue };
-                let latest = task.stages.last().or_else(|| plan.stages.last());
+                let latest = plan.latest_stage(task);
                 let reached = workflow.reached(&task.stages) || workflow.reached(&plan.stages);
                 let desired = if task.status == TaskStatus::Done {
                     config.states.after_acceptance(workflow, latest, reached)
@@ -1273,6 +1275,8 @@ mod tests {
             let state = tickets_fixture(dir.path(), "CARD");
             configure(app, CARDS, &state, |config| {
                 config.states.stages.insert("security_approved".into(), "Audited".into());
+                config.states.stages.insert("deployed".into(), "Live".into());
+                config.states.stages.insert("ci_failed".into(), "Stuck".into());
                 config.states.done = None;
             });
             app.runtime.config.workflow.done = "security_approved".into();
@@ -1303,6 +1307,14 @@ mod tests {
             settle(app);
             assert_eq!(app.runtime.plans[index].status, PlanStatus::Completed);
             assert_eq!(ticket(&state, "CARD-2")["state"], "Audited");
+            assert!(request(app, json!({"cmd":"plan_stage", "plan":plan, "stage":"deployed"})).ok);
+            settle(app);
+            assert_eq!(ticket(&state, "CARD-1")["state"], "Live", "plan stages supersede older task stages");
+            assert_eq!(ticket(&state, "CARD-2")["state"], "Live");
+            assert!(request(app, json!({"cmd":"stage_event", "plan":plan, "task":"a", "stage":"ci_failed"})).ok);
+            settle(app);
+            assert_eq!(ticket(&state, "CARD-1")["state"], "Stuck", "a newer task event supersedes the plan event");
+            assert_eq!(ticket(&state, "CARD-2")["state"], "Live");
             assert!(!request(app, json!({"cmd":"stage_event", "stage":"merged"})).ok);
             assert!(!request(app, json!({"cmd":"stage_event", "plan":plan, "task":"missing", "stage":"merged"})).ok);
         });
@@ -1602,7 +1614,7 @@ mod tests {
             assert_eq!(
                 event["ticket"],
                 json!({"system":"cards", "id":"CARD-2", "key":"CARD-2", "title":"Document it",
-                       "url":"https://tickets.example/CARD-2", "from":"Stuck", "to":"Doing", "means":"running"})
+                       "url":"https://tickets.example/CARD-2", "from":"Stuck", "to":"Doing", "means":"running", "expected":false})
             );
             assert_eq!(app.runtime.plans[index].tasks[1].status, TaskStatus::Blocked);
             assert_eq!(count(&state, "card_move"), moves, "a state set in the ticket system is never overwritten");
@@ -2503,6 +2515,88 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn ticket_progress_is_expected_after_acceptance_stages_or_plan_completion() {
+        with_app(
+            "app::tickets::tests::ticket_progress_is_expected_after_acceptance_stages_or_plan_completion",
+            |app, ctx| {
+                let dir = tempfile::tempdir().unwrap();
+                let state = tickets_fixture(dir.path(), "CARD");
+                configure(app, CARDS, &state, |_| {});
+                app.runtime.sessions.push(session("agent-a", AgentKind::Generic, AgentStatus::Idle, dir.path()));
+                let plan = request(
+                    app,
+                    json!({"cmd":"plan_set", "goal":"Drift", "tasks":[
+                        {"id":"a", "title":"Parser", "ticket":{"id":"CARD-1"}}
+                    ]}),
+                )
+                .result["plan"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                let index = app.runtime.selected_plan;
+                settle(app);
+                for (scenario, external, expected) in [
+                    ("active", "Check", false),
+                    ("accepted", "Doing", true),
+                    ("stage", "Stuck", true),
+                    ("completed", "Doing", true),
+                ] {
+                    match scenario {
+                        "active" => {
+                            assert!(
+                                request(app, json!({"cmd":"plan_update", "plan":plan, "id":"a", "status":"running"}))
+                                    .ok
+                            );
+                        }
+                        "accepted" => {
+                            assert!(
+                                request(app, json!({"cmd":"plan_update", "plan":plan, "id":"a", "status":"done"})).ok
+                            );
+                        }
+                        "stage" => {
+                            app.runtime.plans[index].tasks[0].status = TaskStatus::Review;
+                            assert!(
+                                request(
+                                    app,
+                                    json!({"cmd":"plan_stage", "plan":plan, "task":"a", "stage":"integrated"})
+                                )
+                                .ok
+                            );
+                        }
+                        "completed" => {
+                            app.runtime.plans[index].status = PlanStatus::Completed;
+                            app.runtime.plans[index].tasks[0].stages.clear();
+                        }
+                        _ => unreachable!(),
+                    }
+                    settle(app);
+                    let waiter = wait_for(app, ctx, &["ticket"]);
+                    set_field(&state, "CARD-1", "state", external);
+                    assert!(
+                        request(app, json!({"cmd":"ticket_event", "system":"cards", "key":"CARD-1", "state":external}))
+                            .ok
+                    );
+                    settle(app);
+                    let ControlOutcome::Done(result) = waiter
+                        .recv_timeout(Duration::from_secs(1))
+                        .unwrap_or_else(|error| panic!("{scenario}: {error:?}"))
+                    else {
+                        panic!("wait reply")
+                    };
+                    assert_eq!(result.result["events"][0]["ticket"]["expected"], expected, "{scenario}: {result:?}");
+                    let output = board_frame(app, ctx, vec![]);
+                    assert_eq!(
+                        texts(&output).iter().any(|(t, _)| t.starts_with("ticket says")),
+                        !expected,
+                        "{scenario}"
+                    );
+                    output.drop_without_applying_deltas();
+                }
+            },
+        );
     }
 
     #[test]

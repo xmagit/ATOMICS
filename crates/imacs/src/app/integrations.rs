@@ -201,7 +201,7 @@ impl State {
             let _ = self.record_stage(
                 index,
                 Some(&id),
-                imacs_core::workflow::Stage { stage: "integrated".into(), url: None, note: None },
+                imacs_core::workflow::Stage { stage: "integrated".into(), ..Default::default() },
                 imacs_core::tickets::Author::Imacs,
             );
         }
@@ -218,10 +218,9 @@ impl State {
     }
 }
 
-/// Whether a task's work is unchanged: its ticket link follows the ticket system and
-/// says nothing about its branch.
+/// Ticket and lifecycle metadata say nothing about a task's branch ancestry.
 fn same_work(a: &Task, b: &Task) -> bool {
-    let strip = |task: &Task| Task { ticket: None, ..task.clone() };
+    let strip = |task: &Task| Task { ticket: None, stages: Vec::new(), ..task.clone() };
     strip(a) == strip(b)
 }
 

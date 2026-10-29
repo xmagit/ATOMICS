@@ -21,9 +21,12 @@ impl Default for Workflow {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stage {
     pub stage: String,
+    /// Plan-local recording order, shared by plan and task events.
+    #[serde(default)]
+    pub sequence: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -99,7 +102,7 @@ mod tests {
     #[test]
     fn ordered_stages_gate_completion_and_failure_is_not_success() {
         let mut workflow = Workflow { done: "ci_passed".into(), ..Default::default() };
-        let event = |name: &str| Stage { stage: name.into(), url: None, note: None };
+        let event = |name: &str| Stage { stage: name.into(), ..Default::default() };
         assert!(workflow.validate().is_ok());
         assert!(!workflow.reached(&[event("pr_opened"), event("ci_failed")]));
         assert!(workflow.reached(&[event("ci_passed")]));

@@ -18,7 +18,16 @@ impl State {
             return Err("Reopen the plan before reporting a stage.".into());
         }
         let cleaner = self.cleaner();
+        let sequence = self.plans[index]
+            .stages
+            .iter()
+            .chain(self.plans[index].tasks.iter().flat_map(|t| &t.stages))
+            .map(|event| event.sequence)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
         let event = Stage {
+            sequence,
             stage: event.stage,
             url: event.url.map(|url| cleaner.url(&url)),
             note: event.note.map(|note| cleaner.field(&note)),
@@ -36,7 +45,9 @@ impl State {
             }
             &mut plan.stages
         };
-        let recorded = !history.contains(&event);
+        let recorded = !history
+            .last()
+            .is_some_and(|old| old.stage == event.stage && old.url == event.url && old.note == event.note);
         if recorded {
             history.push(event.clone());
             self.save_plan(index);
@@ -59,9 +70,14 @@ impl State {
         if plan.is_none() && reference.is_none() {
             return Err("Give a plan id or a linked ticket id/key.".into());
         }
+        let config = self.ticket_config();
         let matches = |link: Option<&TicketLink>| {
-            reference
-                .is_none_or(|r| link.is_some_and(|link| link.matches(Some(&r.system), Some(&r.id), r.key.as_deref())))
+            reference.is_none_or(|r| {
+                link.is_some_and(|link| {
+                    (!r.system.is_empty() || config.as_ref().is_none_or(|config| config.accepts(link)))
+                        && link.matches(Some(&r.system), Some(&r.id), r.key.as_deref())
+                })
+            })
         };
         let mut targets = Vec::new();
         for (index, p) in self.plans.iter().enumerate().filter(|(_, p)| p.status != PlanStatus::Archived) {

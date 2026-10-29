@@ -160,7 +160,7 @@ result, which tells you where the fields really are. `imacs_ticket_sync` is a qu
 | An agent reports | Comments with the report, signed with the agent's model, for example "This is GPT-6.1 Sol (high), the IMACS agent on task t2 (Add the --json flag)." The model comes from the task's `-m`/`--model` and effort arguments. |
 | A task is accepted or blocked | Comments with the note that came with it: signed by the chief through `imacs_plan_update`, "for the user" from the board, or by IMACS when an agent exits or cannot start. |
 | The plan completes | Ticket mode: comments on the plan's ticket. |
-| Someone changes a linked ticket | The card shows the new state. A state the chief did not set arrives as a `ticket` event in `imacs_wait` with `from`, `to` and `means` (the IMACS status the new state maps to). When that differs from the task's status, the card says "ticket says running". |
+| Someone changes a linked ticket | The card shows the new state. A state the chief did not set arrives as a `ticket` event in `imacs_wait` with `from`, `to` and `means` (the IMACS status the new state maps to). When that differs from active work's status, the card says "ticket says running". After acceptance or a recorded lifecycle stage, movement is expected progress: the event has `expected: true`, and the card has no drift note. |
 
 Comments go to the task's ticket. A task without one comments on the plan's ticket in ticket mode, and
 not at all in board mode. Comments follow `comments`. With `"off"`, `imacs_ticket_comment` refuses too.
@@ -210,9 +210,9 @@ The ordered successful stages start with `accepted`; custom names use lowercase 
 underscores and appear in that list in their desired order. A later successful stage proves earlier
 milestones were reached. `ci_failed` is always allowed as a side event, cannot be the completion gate,
 and never proves CI passed. Once reached, a milestone stays reached; a later failure does not reopen
-a completed plan. Its optional `ci_failed` state mapping still applies. The latest event is shown on
+a completed plan. Its optional `ci_failed` state mapping still applies. The latest recorded event, comparing plan and task histories, is shown on
 the card, including a clickable PR or CI URL. Full event history persists with the plan and appears in
-`imacs_plan_get`. A duplicate event (same stage, URL and note) has no second comment or state push.
+`imacs_plan_get`. A consecutive duplicate event (same stage, URL and note) has no second comment or state push.
 
 The chief reports a stage through one tool:
 
@@ -236,6 +236,11 @@ imacs ctl '{"cmd":"stage_event","system":"linear","key":"ENG-123","stage":"merge
 Identify one target with `plan` and optional `task`, or by a linked ticket's `system` plus `id`/`key`.
 Unknown and ambiguous targets fail without mutation. Events never run commands or dispatch work.
 A command-based CI poller is a follow-up; this implementation accepts chief reports and webhook events.
+
+After a plan or task is accepted or records a stage, further external ticket movement is expected
+progress. The chief still receives the ticket event, marked `expected: true`; IMACS suppresses the
+"ticket says …" note. Active work without acceptance or stages retains its existing drift notes and
+`expected: false` events. A plan's milestone also covers its tasks.
 
 Stage comments, such as `PR opened: <url>` and `CI passed`, follow the existing comment policy and
 signature rules. Stage state names are arbitrary config keys under `[tickets.states]`; unmapped

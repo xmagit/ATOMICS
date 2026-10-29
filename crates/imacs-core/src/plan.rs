@@ -271,6 +271,30 @@ impl Plan {
         workflow.reached(&self.stages) || (!tasks.is_empty() && tasks.iter().all(|t| workflow.reached(&t.stages)))
     }
 
+    /// Plan milestones cover tasks too; compare recording order across both histories.
+    pub fn latest_stage<'a>(&'a self, task: &'a Task) -> Option<&'a crate::workflow::Stage> {
+        task.stages.last().into_iter().chain(self.stages.last()).max_by_key(|stage| stage.sequence)
+    }
+
+    /// External tickets are free to progress after acceptance or a recorded milestone.
+    pub fn ticket_progress_expected(&self, task: Option<&str>) -> bool {
+        if self.status == PlanStatus::Completed || !self.stages.is_empty() {
+            return true;
+        }
+        match task {
+            Some(id) => self
+                .tasks
+                .iter()
+                .find(|t| t.id == id)
+                .is_some_and(|t| t.status == TaskStatus::Done || !t.stages.is_empty()),
+            None => {
+                !self.tasks.is_empty()
+                    && (self.tasks.iter().all(|t| t.status == TaskStatus::Done)
+                        || self.tasks.iter().any(|t| !t.stages.is_empty()))
+            }
+        }
+    }
+
     pub fn is_open(&self) -> bool {
         !self.id.is_empty() && self.status == PlanStatus::Open
     }
@@ -529,7 +553,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        plan.stages.push(Stage { stage: "ci_passed".into(), url: None, note: None });
+        plan.stages.push(Stage { stage: "ci_passed".into(), ..Default::default() });
         assert!(!plan.finish_tasks(1, &workflow), "CI cannot bypass integration");
         plan.tasks[0].integrated = Some(plan.integration_branch());
         plan.tasks[0].integration_verified = true;

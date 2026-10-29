@@ -150,7 +150,7 @@ close_done_agents = true
 # [tickets.operations.get]
 # tool = "get_issue"
 # arguments = { id = "{key}" }
-# result = { id = "", key = "id", url = "url", title = "title", state = "status", updated_at = "updatedAt" }
+# result = { id = "", key = "id", url = "url", title = "title", state = "status", updated_at = "updatedAt", branch = "gitBranchName" }
 #
 # [tickets.operations.update_state]
 # tool = "save_issue"
