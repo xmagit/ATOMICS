@@ -39,8 +39,8 @@ impl Desktop<'_> {
     pub(super) fn top_bar(&mut self, ui: &mut egui::Ui) {
         let rect = ui.available_rect_before_wrap();
         let gap = ui.spacing().item_spacing.x;
-        let controls = measure(ui, |ui| self.top_bar_controls(ui, false));
-        let controls_with_load = measure(ui, |ui| self.top_bar_controls(ui, true));
+        let controls = measure(ui, |ui| self.top_bar_controls(ui, false, false));
+        let controls_with_load = measure(ui, |ui| self.top_bar_controls(ui, true, false));
         let full_chief = measure(ui, |ui| self.chief_pill(ui, false));
         let compact_chief = measure(ui, |ui| self.chief_pill(ui, true));
         let full_brand = measure(ui, |ui| self.top_bar_brand(ui, true));
@@ -50,10 +50,20 @@ impl Desktop<'_> {
             ui.menu_button("Tabs", |_| {});
         });
 
-        // Drop the gauge before compressing navigation. Keep all action buttons at
-        // their natural width; only the navigation and optional status may shrink.
-        let show_load = full_brand + tabs + full_chief + controls_with_load + gap * 3.0 <= rect.width();
-        let controls_width = if show_load { controls_with_load } else { controls };
+        // Once even the minimum navigation cannot fit, put the actions in a
+        // menu. All four slots then retain their measured natural minimums.
+        let actions_menu = compact_brand + min_tabs + compact_chief + controls + gap * 3.0 > rect.width();
+        let show_load =
+            !actions_menu && full_brand + tabs + full_chief + controls_with_load + gap * 3.0 <= rect.width();
+        let controls_width = if actions_menu {
+            measure(ui, |ui| {
+                ui.menu_button("Actions", |_| {});
+            })
+        } else if show_load {
+            controls_with_load
+        } else {
+            controls
+        };
         let show_agents = full_brand + min_tabs + compact_chief + controls_width + gap * 3.0 <= rect.width();
         let brand_width = if show_agents { full_brand } else { compact_brand };
         let compact = brand_width + min_tabs + full_chief + controls_width + gap * 3.0 > rect.width();
@@ -70,7 +80,14 @@ impl Desktop<'_> {
         slot(ui, "chief", rect.with_min_x(chief_left).with_max_x(chief_left + chief_width), |ui| {
             self.chief_pill(ui, compact);
         });
-        slot(ui, "actions", rect.with_min_x(controls_left), |ui| self.top_bar_controls(ui, show_load));
+        slot(ui, "actions", rect.with_min_x(controls_left), |ui| {
+            if actions_menu {
+                let response = ui.menu_button("Actions", |ui| self.top_bar_controls(ui, false, true)).response;
+                record_item(ui, "Actions", &response);
+            } else {
+                self.top_bar_controls(ui, show_load, false);
+            }
+        });
         slot(ui, "navigation", navigation, |ui| {
             self.view_tabs(ui);
             self.top_bar_notice(ui);
@@ -95,16 +112,22 @@ impl Desktop<'_> {
         ui.separator();
     }
 
-    fn top_bar_controls(&mut self, ui: &mut egui::Ui, show_load: bool) {
+    fn top_bar_controls(&mut self, ui: &mut egui::Ui, show_load: bool, in_menu: bool) {
         let response = ui.button(if self.runtime.diff_open { "Hide diff" } else { "Show diff" });
         record_item(ui, "diff", &response);
         if response.on_hover_text(&self.runtime.config.keys.toggle_diff).clicked() {
             self.runtime.diff_open = !self.runtime.diff_open;
+            if in_menu {
+                ui.close();
+            }
         }
         let response = ui.button("+ New");
         record_item(ui, "+ New", &response);
         if response.on_hover_text(&self.runtime.config.keys.new_session).clicked() {
             self.open_new_dialog(None);
+            if in_menu {
+                ui.close();
+            }
         }
         let plan = &self.runtime.plans[self.runtime.selected_plan];
         let (done, total) = (plan.count(TaskStatus::Done), plan.tasks.len());
@@ -119,6 +142,9 @@ impl Desktop<'_> {
         record_item(ui, "Plan", &response);
         if response.on_hover_text(&self.runtime.config.keys.toggle_plan).clicked() {
             self.runtime.toggle_plan();
+            if in_menu {
+                ui.close();
+            }
         }
         let response = ui.menu_button("Project", |ui| self.project_menu(ui)).response;
         record_item(ui, "Project", &response);
@@ -238,7 +264,7 @@ mod tests {
                 for dock in [ChiefDock::Floating, ChiefDock::Docked] {
                     app.runtime.store.chief_dock = Some(dock);
                     app.runtime.chief_open = true;
-                    for width in [700.0, 900.0, 1200.0, 1500.0, 2400.0, 5120.0] {
+                    for width in [480.0, 550.0, 700.0, 900.0, 1200.0, 1500.0, 2400.0, 5120.0] {
                         let (items, output) = render(app, ctx, width, vec![]);
                         let case = format!("width={width}, plans={count}, dock={dock:?}");
                         let bounds = Rect::from_min_size(pos2(10.0, 0.0), vec2(width - 20.0, 34.0)).expand(0.5);
@@ -251,7 +277,13 @@ mod tests {
                                 );
                             }
                         }
-                        for name in ["chief", "Settings", "Project", "Plan", "+ New", "diff"] {
+                        let collapsed = items.iter().any(|(name, _)| name == "Actions");
+                        let required: &[&str] = if collapsed {
+                            &["chief", "Actions", "Tabs"]
+                        } else {
+                            &["chief", "Settings", "Project", "Plan", "+ New", "diff"]
+                        };
+                        for &name in required {
                             assert_eq!(items.iter().filter(|(n, _)| n == name).count(), 1, "{case}: {name}");
                             if name != "chief" {
                                 let width = items.iter().find(|(n, _)| n == name).unwrap().1.width();
@@ -263,6 +295,12 @@ mod tests {
                         // across each other, even inside compound items such as CHIEF.
                         let mut text_rects = Vec::new();
                         for shape in &output.shapes {
+                            let painted = shape.shape.visual_bounding_rect().intersect(shape.clip_rect);
+                            let bar = Rect::from_min_size(Pos2::ZERO, vec2(width, 34.0)).expand(0.5);
+                            assert!(
+                                !painted.is_positive() || bar.contains_rect(painted),
+                                "{case}: paint outside bar {painted:?}"
+                            );
                             if let egui::Shape::Text(text) = &shape.shape {
                                 let rect = text.galley.rect.translate(text.pos.to_vec2());
                                 assert!(
@@ -303,8 +341,8 @@ mod tests {
             app.runtime.toast = None;
             app.runtime.config_error = None;
             app.runtime.hook_error = None;
-            let click = |app: &mut Desktop<'_>, label: &str| {
-                let (items, output) = render(app, ctx, 700.0, vec![]);
+            let click = |app: &mut Desktop<'_>, width: f32, label: &str| {
+                let (items, output) = render(app, ctx, width, vec![]);
                 let mut pos = items.iter().find(|(name, _)| name == label).map(|(_, r)| r.center());
                 if pos.is_none() {
                     pos = output.shapes.iter().find_map(|shape| match &shape.shape {
@@ -320,7 +358,7 @@ mod tests {
                     render(
                         app,
                         ctx,
-                        700.0,
+                        width,
                         vec![
                             egui::Event::PointerMoved(pos),
                             egui::Event::PointerButton {
@@ -335,15 +373,67 @@ mod tests {
                     .drop_without_applying_deltas();
                 }
             };
-            let was_open = app.runtime.diff_open;
-            click(app, "diff");
-            assert_ne!(app.runtime.diff_open, was_open);
-            click(app, "Tabs");
-            click(app, "● Plan 0:");
-            assert_eq!(app.runtime.selected_plan, 0);
-            assert!(app.runtime.plan_view);
-            click(app, "+ New");
-            assert!(app.client.new_dialog.is_some());
+            for width in [480.0, 550.0, 700.0] {
+                fixture(app, 6);
+                app.client.new_dialog = None;
+                let collapsed = width < 700.0;
+                let was_open = app.runtime.diff_open;
+                if collapsed {
+                    click(app, width, "Actions");
+                }
+                click(app, width, "diff");
+                assert_ne!(app.runtime.diff_open, was_open, "width={width}: diff action");
+                click(app, width, "Tabs");
+                click(app, width, "● Plan 0:");
+                assert_eq!(app.runtime.selected_plan, 0, "width={width}: Tabs selection");
+                assert!(app.runtime.plan_view);
+                if collapsed {
+                    click(app, width, "Actions");
+                }
+                click(app, width, "+ New");
+                assert!(app.client.new_dialog.is_some(), "width={width}: new action");
+                if collapsed {
+                    click(app, width, "Actions");
+                }
+                let panel_was_open = app.runtime.panel == PanelMode::Plan && app.runtime.diff_open;
+                click(app, width, "Plan");
+                assert_ne!(
+                    app.runtime.panel == PanelMode::Plan && app.runtime.diff_open,
+                    panel_was_open,
+                    "width={width}: plan action"
+                );
+                for (action, entry) in [("Project", "Open project…"), ("Settings", "Edit config")] {
+                    if collapsed {
+                        click(app, width, "Actions");
+                    }
+                    click(app, width, action);
+                    // A submenu sizes before its first paint; inspect the settled pass.
+                    render(app, ctx, width, vec![]).1.drop_without_applying_deltas();
+                    let (_, output) = render(app, ctx, width, vec![]);
+                    assert!(
+                        output
+                            .shapes
+                            .iter()
+                            .any(|shape| matches!(&shape.shape, egui::Shape::Text(t) if t.galley.text() == entry)),
+                        "width={width}: {action} menu did not open"
+                    );
+                    output.drop_without_applying_deltas();
+                    render(
+                        app,
+                        ctx,
+                        width,
+                        vec![egui::Event::Key {
+                            key: Key::Escape,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: egui::Modifiers::NONE,
+                        }],
+                    )
+                    .1
+                    .drop_without_applying_deltas();
+                }
+            }
         });
     }
 }
