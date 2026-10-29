@@ -1231,12 +1231,16 @@ impl Desktop<'_> {
             .show(ui, |ui| self.steer_bar(ui));
 
         let area = ui.available_rect_before_wrap();
-        let diff_open =
-            self.runtime.diff_open && (self.runtime.diff_target().is_some() || self.runtime.panel == PanelMode::Plan);
+        let history_board = self.runtime.plan_view
+            && self.runtime.panel == PanelMode::Plan
+            && self.runtime.plans[self.runtime.selected_plan].status != PlanStatus::Open;
+        let diff_open = !history_board
+            && self.runtime.diff_open
+            && (self.runtime.diff_target().is_some() || self.runtime.panel == PanelMode::Plan);
         let layout_config =
             layout::LayoutConfig { diff_width: self.client.split, ..self.runtime.config.layout.clone() };
-        let visible = self.runtime.visible_sessions();
-        let completed = self.runtime.completed_tasks().len();
+        let visible = if history_board { Vec::new() } else { self.runtime.visible_sessions() };
+        let completed = if history_board { 0 } else { self.runtime.completed_tasks().len() };
         let dock_width = if self.runtime.chief_open && self.runtime.chief_dock() == ChiefDock::Docked {
             self.runtime.store.chief_width.filter(|w| w.is_finite()).unwrap_or_else(|| {
                 let sidebar =
@@ -1293,6 +1297,10 @@ impl Desktop<'_> {
 
         egui::CentralPanel::default().frame(egui::Frame::new().fill(p.background)).show(ui, |ui| {
             let mut rect = ui.max_rect();
+            if history_board {
+                self.plan_panel(ui, rect);
+                return;
+            }
             let statuses: Vec<AgentStatus> = visible.iter().map(|&i| self.runtime.sessions[i].status).collect();
             let active = self.runtime.active_index().and_then(|a| visible.iter().position(|&i| i == a));
             let tiled: Vec<usize> =
