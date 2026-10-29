@@ -1,6 +1,7 @@
 //! A fake ticket system behind a stdio MCP server, for IMACS's ticket tests.
 //!
 //! `fake_ticket_server <state.json>`
+//! `fake_ticket_server --no-read` or `--stop-reading-after-initialize` stalls stdin for transport tests.
 //!
 //! It speaks two unrelated tool dialects, so tests can swap ticket systems by config
 //! alone: "card_*" tools with nested, structured results, and "issue_*" tools with
@@ -15,6 +16,11 @@ use serde_json::{Value, json};
 
 fn main() {
     let path = std::env::args().nth(1).expect("usage: fake_ticket_server <state.json>");
+    if path == "--no-read" {
+        loop {
+            std::thread::park();
+        }
+    }
     let mut out = std::io::stdout();
     for line in std::io::stdin().lock().lines() {
         let Ok(line) = line else { break };
@@ -37,6 +43,11 @@ fn main() {
         };
         let _ = writeln!(out, "{reply}");
         let _ = out.flush();
+        if path == "--stop-reading-after-initialize" && message["method"] == "initialize" {
+            loop {
+                std::thread::park();
+            }
+        }
     }
 }
 

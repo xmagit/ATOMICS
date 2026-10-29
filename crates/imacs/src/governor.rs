@@ -65,14 +65,11 @@ impl Jobserver {
         if let Some(runtime) = imacs_core::paths::runtime_dir_for(home) {
             return runtime.join("jobserver/jobserver.fifo");
         }
-        use std::hash::{DefaultHasher, Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-        home.hash(&mut hasher);
         // SAFETY: getuid has no preconditions.
         let uid = unsafe { libc::getuid() };
         std::env::temp_dir()
             .join(format!("imacs-{uid}"))
-            .join(format!("{:016x}", hasher.finish()))
+            .join(imacs_core::paths::runtime_home_hash(home))
             .join("jobserver.fifo")
     }
 
@@ -470,9 +467,11 @@ mod tests {
         assert_ne!(a, b);
         // SAFETY: getuid has no preconditions.
         let uid = unsafe { libc::getuid() };
-        let base = imacs_core::paths::runtime_dir_for(Path::new("/Users/x/.imacs"))
-            .unwrap_or_else(|| std::env::temp_dir().join(format!("imacs-{uid}")));
-        assert!(a.starts_with(base), "{}", a.display());
+        let expected = match imacs_core::paths::runtime_dir_for(Path::new("/Users/x/.imacs")) {
+            Some(runtime) => runtime.join("jobserver/jobserver.fifo"),
+            None => std::env::temp_dir().join(format!("imacs-{uid}/51d177b92c46bedb/jobserver.fifo")),
+        };
+        assert_eq!(a, expected);
         assert_eq!(a, Jobserver::path_for(Path::new("/Users/x/.imacs")));
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pool/jobs");

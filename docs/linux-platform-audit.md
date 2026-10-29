@@ -25,6 +25,8 @@ Written by GPT-6 Codex, 2026-10-29.
 
 For fresh Debian/Ubuntu installations, the README lists build libraries, Mesa runtime support and desktop portal/`xdg-open` integration. CI already runs Linux by default with its native library dependencies; macOS remains an opt-in runner.
 
+Runtime folder names now use FNV-1a 64 over the home path's raw bytes, keeping sockets and jobserver FIFOs discoverable across Rust releases. Installs that already ran the previous build get a new runtime folder name once; restart IMACS after upgrading so the app and CLI use the same folder. This also applies to the jobserver's temporary-directory fallback on both platforms.
+
 ## Validation
 
 Validated on 2026-10-29 in the merged Docker harness: Debian bookworm, Rust 1.98.0, `aarch64-unknown-linux-gnu`, two CPUs, source mounted read-only at `/repo`, build output in `/target`. `main` was already up to date; the integration merge retained host identity, path expansion tests and `config.d` merging. The image now installs Clippy and rustfmt for subsequent reviewers.

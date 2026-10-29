@@ -77,13 +77,25 @@ fn xdg_dir(name: &str) -> Option<PathBuf> {
     std::env::var_os(name).map(PathBuf::from).filter(|path| path.is_absolute())
 }
 
+/// Stable folder name shared by runtime sockets and jobserver pools.
+/// Hash the raw path bytes with FNV-1a 64 so separately built clients agree.
+pub fn runtime_home_hash(home: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut hash = 0xcbf29ce484222325u64;
+    for &byte in home.as_os_str().as_bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
 /// Per-instance runtime folder in a valid, private Linux XDG_RUNTIME_DIR.
 /// Callers create the folder as needed; missing/invalid runtime roots fall back
 /// to their established socket or temporary FIFO locations.
 pub fn runtime_dir_for(home: &Path) -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
     {
-        use std::hash::{DefaultHasher, Hash, Hasher};
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
         let base = xdg_dir("XDG_RUNTIME_DIR")?;
@@ -95,9 +107,7 @@ pub fn runtime_dir_for(home: &Path) -> Option<PathBuf> {
         {
             return None;
         }
-        let mut hasher = DefaultHasher::new();
-        home.hash(&mut hasher);
-        Some(base.join("imacs").join(format!("{:016x}", hasher.finish())))
+        Some(base.join("imacs").join(runtime_home_hash(home)))
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -256,6 +266,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn runtime_home_folder_name_is_stable() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        assert_eq!(runtime_home_hash(Path::new("/Users/x/.imacs")), "51d177b92c46bedb");
+        assert_eq!(runtime_home_hash(Path::new(OsStr::from_bytes(b"/home/\xff/.imacs"))), "f3937a555619b1fd");
+    }
+
+    #[test]
     fn state_paths_keep_existing_installs_and_macos_in_place() {
         let dir = tempfile::tempdir().unwrap();
         let xdg = dir.path().join("state");
@@ -352,6 +371,10 @@ mod tests {
         } else {
             let runtime = runtime.as_ref().unwrap();
             assert!(runtime.starts_with(home.join("runtime/imacs")));
+            assert_eq!(
+                runtime_dir_for(Path::new("/Users/x/.imacs")).unwrap(),
+                home.join("runtime/imacs/51d177b92c46bedb")
+            );
             assert_ne!(Some(runtime.clone()), runtime_dir_for(&home.join("other-instance")));
         }
         let expected = match case.as_str() {
