@@ -1,0 +1,29 @@
+FROM rust:1.98.0-bookworm
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config git ca-certificates bash \
+    libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+    libgl1-mesa-dev libasound2-dev mesa-vulkan-drivers libvulkan1 \
+    xvfb xauth dbus-x11 fonts-dejavu-core python3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -s /usr/share/vulkan/icd.d/lvp_icd.*.json /etc/vulkan/imacs-lavapipe.json
+
+# Tests create disposable repositories. Never borrow the host's identity/config.
+RUN git config --global user.name 'IMACS Linux QA' \
+    && git config --global user.email 'linux-qa@example.invalid' \
+    && git config --global --add safe.directory /repo
+
+ENV CARGO_TARGET_DIR=/target \
+    CARGO_BUILD_JOBS=2 \
+    CARGO_PROFILE_DEV_DEBUG=0 \
+    CARGO_PROFILE_TEST_DEBUG=0 \
+    RUST_TEST_THREADS=2 \
+    LIBGL_ALWAYS_SOFTWARE=1 \
+    GALLIUM_DRIVER=llvmpipe \
+    VK_ICD_FILENAMES=/etc/vulkan/imacs-lavapipe.json \
+    WGPU_BACKEND=vulkan \
+    WINIT_UNIX_BACKEND=x11 \
+    SHELL=/bin/bash
+
+WORKDIR /repo
+CMD ["bash"]

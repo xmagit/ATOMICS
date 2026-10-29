@@ -159,6 +159,42 @@ provider = "relay"
 preserve this table and its provider settings; host configuration does not implement ticket-provider behavior.
 Keep runtime state (`~/.imacs`, including sessions, sockets and plans) local to each machine.
 
+## Testing on Linux
+
+Docker Desktop (or Docker Engine on Linux) can build, test and capture IMACS without installing a Linux toolchain
+on the host. Start Docker first; `scripts/linux-qa.sh` checks `docker info` and reports if it cannot reach the daemon.
+Run from the checkout you want to test:
+
+```sh
+imacs queue --class test -- scripts/linux-qa.sh test
+imacs queue --class qa -- scripts/linux-qa.sh screenshot /tmp/imacs-linux.png
+imacs queue --class qa -- scripts/linux-qa.sh screenshot /tmp/imacs-linux-wide.png --size 1920x1080
+scripts/linux-qa.sh shell
+```
+
+`test` runs the full locked workspace suite, including doc tests, and keeps running other test targets if one fails.
+`screenshot` builds IMACS, starts a disposable project with a shell under Xvfb, waits for its isolated control socket,
+captures the window through `imacs ctl`, verifies the PNG size and exits. The default size is 1600x1000; supported
+sizes range from 480x320 to 8192x8192. The image uses Debian, Rust 1.98, Xvfb and Mesa's lavapipe Vulkan driver
+(software rendering for wgpu). No display server, GPU, agent credentials or IMACS state from the host are shared.
+
+The repository and linked-worktree git metadata are mounted read-only. Each checkout gets a separate Docker target
+volume; Cargo registry and git downloads are cached across checkouts. The image is cached by its Dockerfile checksum,
+and the builder receives only `Dockerfile.linux-qa`, never the source tree. To refresh the same image's OS packages,
+remove its `imacs-linux-qa:<checksum>` tag and rerun. No images or volumes are deleted automatically.
+
+Containers drop all Linux capabilities, so permission checks behave normally even with the image's root user.
+They default to two CPUs, two Cargo jobs, two test threads and 8 GiB of memory. Override CPU, job or memory limits
+with `IMACS_LINUX_QA_CPUS`, `IMACS_LINUX_QA_JOBS` and `IMACS_LINUX_QA_MEMORY`. The host's jobserver FIFO cannot cross
+Docker Desktop's VM boundary, so these limits apply in addition to the host queue slot. Queue commands may wait for
+a slot and a cold build can take several minutes; agents should use a long timeout or background execution and request
+access outside their sandbox if the IMACS or Docker socket is blocked.
+
+For incremental compilation, use `scripts/linux-qa.sh shell` and run `cargo check --workspace --all-targets --locked`.
+During development run only tests you change; reserve the queued full suite for the end. If using the shell for a heavy
+test run or a GUI instance, queue the shell itself with the matching class. Shell changes outside `/repo` are disposable;
+the target and Cargo caches persist.
+
 ## Troubleshooting
 
 Run `imacs doctor` to check git, Claude Code, Codex, Helix, the config, the running IMACS socket and global Claude hooks.
