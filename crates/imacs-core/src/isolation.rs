@@ -371,6 +371,19 @@ command = ["codex"]
     }
 
     #[test]
+    fn documented_examples_load_as_described() {
+        let docs = include_str!("../../../docs/isolation.md");
+        let blocks: Vec<&str> = docs.split("```toml\n").skip(1).map(|b| b.split("```").next().unwrap()).collect();
+        let config: Config = toml::from_str(blocks[0]).unwrap();
+        assert_eq!(config.isolation.mode, IsolationMode::Sandbox);
+        assert_eq!(config.isolation.sandbox.allow_hosts["~/repos/app"], ["nuget.example.com"]);
+        assert_eq!(config.isolation.mode_for(config.agent("aider").unwrap()), IsolationMode::Bare);
+        let (repo, warnings) = crate::repo_workflow::declarative(&toml::from_str(blocks[1]).unwrap());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(repo["isolation"]["mode"].as_str(), Some("sandbox"));
+    }
+
+    #[test]
     fn workspace_overrides_merge_key_by_key() {
         let mut base = IsolationConfig::default();
         base.sandbox.memory = Some("4g".into());
