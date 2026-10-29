@@ -494,6 +494,7 @@ impl State {
             report: None,
             approval: None,
             findings: None,
+            config: None,
             ticket: Some(json!({
                 "system": link.system, "id": link.id, "key": link.label(), "title": link.title, "url": link.url,
                 "from": from, "to": link.state, "means": means.map(TaskStatus::label),

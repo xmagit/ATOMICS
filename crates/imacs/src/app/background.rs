@@ -206,38 +206,7 @@ impl State {
         }
 
         if self.config_checked.elapsed() > Duration::from_secs(1) {
-            self.config_checked = Instant::now();
-            let stamp = config_fingerprints(&self.config_path);
-            self.apply_ticket_config();
-            if stamp != self.config_stamp {
-                self.config_stamp = stamp;
-                match Config::load(&self.config_path) {
-                    Ok(config) => {
-                        let syntax = Palette::from_config(&config.theme).syntax;
-                        let theme_changed = syntax != self.palette.syntax;
-                        if config.terminal.scrollback != self.config.terminal.scrollback {
-                            let terminals =
-                                self.sessions.iter().filter_map(|s| s.terminal.as_ref()).chain(self.editors.values());
-                            for terminal in terminals {
-                                terminal.set_scrollback(config.terminal.scrollback);
-                            }
-                        }
-                        self.config = config;
-                        self.config_error = None;
-                        self.palette = Arc::new(Palette::from_config(&self.config.theme));
-                        if theme_changed {
-                            self.highlighter = Arc::new(Highlighter::new(&syntax));
-                        }
-                        self.client_events.push(ClientEvent::ConfigChanged);
-                        self.apply_config();
-                        for state in self.diffs.values_mut() {
-                            state.mark_dirty();
-                        }
-                        self.toast("Config reloaded");
-                    }
-                    Err(err) => self.config_error = Some(format!("{err:#}")),
-                }
-            }
+            self.reload_config();
         }
 
         if self.worktrees_at.is_none_or(|at| at.elapsed() > WORKTREE_REFRESH) {
@@ -309,6 +278,43 @@ impl State {
             self.toast = None;
         }
         changed || before != self.runtime_view_revision()
+    }
+
+    /// Reads the config files again when they changed, and the workspace's sections.
+    pub(super) fn reload_config(&mut self) {
+        self.config_checked = Instant::now();
+        let stamp = config_fingerprints(&self.config_path);
+        self.apply_ticket_config();
+        if stamp == self.config_stamp {
+            return;
+        }
+        self.config_stamp = stamp;
+        match Config::load(&self.config_path) {
+            Ok(config) => {
+                let syntax = Palette::from_config(&config.theme).syntax;
+                let theme_changed = syntax != self.palette.syntax;
+                if config.terminal.scrollback != self.config.terminal.scrollback {
+                    let terminals =
+                        self.sessions.iter().filter_map(|s| s.terminal.as_ref()).chain(self.editors.values());
+                    for terminal in terminals {
+                        terminal.set_scrollback(config.terminal.scrollback);
+                    }
+                }
+                self.config = config;
+                self.config_error = None;
+                self.palette = Arc::new(Palette::from_config(&self.config.theme));
+                if theme_changed {
+                    self.highlighter = Arc::new(Highlighter::new(&syntax));
+                }
+                self.client_events.push(ClientEvent::ConfigChanged);
+                self.apply_config();
+                for state in self.diffs.values_mut() {
+                    state.mark_dirty();
+                }
+                self.toast("Config reloaded");
+            }
+            Err(err) => self.config_error = Some(format!("{err:#}")),
+        }
     }
 
     /// Filesystem/config and terminal fallback checks have bounded polling
@@ -547,6 +553,7 @@ impl State {
                 report: None,
                 approval: self.sessions[index].approvals.last().map(|pending| pending.request.clone()),
                 findings: None,
+                config: None,
                 ticket: None,
             });
             self.serve_waiters();

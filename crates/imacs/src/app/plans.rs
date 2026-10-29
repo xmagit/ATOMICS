@@ -317,6 +317,7 @@ impl State {
             report: Some((status.to_string(), summary.to_string(), task_id.clone())),
             approval: None,
             findings: None,
+            config: None,
             ticket: None,
         });
         self.serve_waiters();

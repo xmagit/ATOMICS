@@ -73,6 +73,7 @@ impl State {
                 report: None,
                 approval: None,
                 findings: Some(findings.clone()),
+                config: None,
                 ticket: None,
             });
             self.heartbeat.last = Some((at, findings));

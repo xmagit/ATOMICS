@@ -94,7 +94,7 @@ fn agent_tools() -> Value {
 }
 
 /// Tools only the chief's own server offers: restarting IMACS and configuring it.
-const CHIEF_ONLY: &[&str] = &["imacs_restart", "imacs_config_get"];
+const CHIEF_ONLY: &[&str] = &["imacs_restart", "imacs_config_get", "imacs_config_propose"];
 
 fn available_tools(agent: bool, chief: bool) -> Value {
     if agent {
@@ -312,12 +312,12 @@ fn tools() -> Value {
         },
         {
             "name": "imacs_wait",
-            "description": "Block until an agent finishes a turn, needs input, exits or reports, or a linked ticket changes in its system (or other `statuses`), then return those events with a `cursor`. Pass the cursor as `after` next time to only see newer events. Use this instead of polling. Heartbeat events contain fleet findings (an empty list means all good). Ticket events say which plan or task's ticket moved from which state to which, and which IMACS status that state means. Plan-session events include plan and task ids; permission events also include the approval request. `sessions` empty means any; timeout_secs defaults to 120 (max 280).",
+            "description": "Block until an agent finishes a turn, needs input, exits or reports, or a linked ticket changes in its system (or other `statuses`), then return those events with a `cursor`. Pass the cursor as `after` next time to only see newer events. Use this instead of polling. Heartbeat events contain fleet findings (an empty list means all good). Ticket events say which plan or task's ticket moved from which state to which, and which IMACS status that state means. Config events say whether the user applied or rejected a proposed config change. Plan-session events include plan and task ids; permission events also include the approval request. `sessions` empty means any; timeout_secs defaults to 120 (max 280).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "sessions": { "type": "array", "items": { "type": "string" } },
-                    "statuses": { "type": "array", "items": { "type": "string", "enum": ["working", "turn done", "needs you", "idle", "exited", "reported", "heartbeat", "ticket"] } },
+                    "statuses": { "type": "array", "items": { "type": "string", "enum": ["working", "turn done", "needs you", "idle", "exited", "reported", "heartbeat", "ticket", "config"] } },
                     "after": { "type": "integer" },
                     "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 280 }
                 }
@@ -422,6 +422,16 @@ fn config_tools() -> Value {
                 "project": { "type": "string", "description": "A folder in a project, to include that project's settings" },
                 "key": { "type": "string", "description": "Only keys under this dotted prefix, such as tickets or layout.sidebar_width" }
             } }
+        },
+        {
+            "name": "imacs_config_propose",
+            "description": "Chief only: propose a change to one config file for the user to apply. scope main is config.toml (shared by every machine that shares it), host is config.d/<host>.toml (this machine only), workspace is the active workspace's file ([tickets] and [chief] prompt only). remove takes dotted keys out first; toml then merges in: tables key by key, arrays and other values replace. IMACS checks that the result loads, then shows the user a diff with Apply and Reject, labeling settings that run commands, send credentials or instruct agents. Nothing is written before the user applies it. Returns a proposal id; the outcome (applied, rejected or failed, with the user's note) arrives as a config event in imacs_wait. Keep secrets out of the config: token_env and api_key_env name environment variables.",
+            "inputSchema": { "type": "object", "properties": {
+                "scope": { "type": "string", "enum": ["main", "host", "workspace"] },
+                "toml": { "type": "string", "description": "The change as TOML, for example \"[layout]\\nsidebar_width = 300.0\"" },
+                "remove": { "type": "array", "items": { "type": "string" }, "description": "Dotted keys to take out of the file, such as layout.sidebar_width" },
+                "reason": { "type": "string", "description": "Why, in a sentence the user reads above the diff" }
+            }, "required": ["scope"] }
         }
     ])
 }
@@ -489,11 +499,12 @@ fn request_for_tool(name: &str, mut args: Value) -> Result<ControlRequest, Strin
         "imacs_ticket_comment" => "ticket_comment",
         "imacs_ticket_event" => "ticket_event",
         "imacs_config_get" => "config_get",
+        "imacs_config_propose" => "config_propose",
         _ => return Err(format!("unknown tool {name}")),
     };
     if let Some(map) = args.as_object_mut() {
         map.insert("cmd".into(), json!(cmd));
-        if cmd == "report" {
+        if cmd == "report" || cmd == "config_propose" {
             map.insert("pane".into(), json!(std::env::var("IMACS_PANE").ok()));
         }
     }

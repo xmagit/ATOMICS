@@ -127,7 +127,7 @@ impl State {
                     }
                 }
                 let statuses = if statuses.is_empty() {
-                    vec!["turn done".into(), "needs you".into(), "exited".into(), "reported".into(), "ticket".into()]
+                    ["turn done", "needs you", "exited", "reported", "ticket", "config"].map(String::from).to_vec()
                 } else {
                     statuses
                 };
@@ -296,6 +296,12 @@ impl State {
                     board.as_deref(),
                     fields,
                 )))
+            }
+            ControlRequest::ConfigPropose { scope, toml, remove, reason, pane } => {
+                done(match self.propose_config(scope, &toml, &remove, reason, pane.as_deref()) {
+                    Ok(result) => ControlResponse::ok(result),
+                    Err(error) => ControlResponse::error(error),
+                })
             }
             ControlRequest::ConfigGet { project, key } => {
                 done(match self.config_get(project.as_deref(), key.as_deref()) {
@@ -547,6 +553,7 @@ impl State {
                     report: None,
                     approval: session.approvals.first().map(|pending| pending.request.clone()),
                     findings: None,
+                    config: None,
                     ticket: None,
                 });
             }
@@ -568,6 +575,7 @@ impl State {
                 .filter(|e| {
                     e.findings.is_some()
                         || e.ticket.is_some()
+                        || e.config.is_some()
                         || waiter.sessions.is_empty()
                         || waiter.sessions.contains(&e.session)
                 })
