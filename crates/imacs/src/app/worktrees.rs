@@ -6,16 +6,20 @@ impl State {
     pub(super) fn create_worktree(&mut self, repo: PathBuf, branch: String, start: Option<String>, launch: Launch) {
         let path = git::worktree_path(&self.config.worktree_path, &repo, &branch);
         let (tx, base_ref) = (self.worktree_tx.clone(), self.config.base_ref.clone());
+        let warm = self.config.worktrees.warm.clone();
         self.creating.push(branch.clone());
         self.toast(format!("Creating worktree {}…", paths::display(&path)));
         std::thread::spawn(move || {
             // A retried task finds its worktree from the first attempt.
             let existing = git::worktree_of(&path).and_then(|w| w.branch).is_some_and(|b| b == branch);
             let result = if existing {
-                Ok(path)
+                Ok(PreparedWorktree { path, warmed: false })
             } else {
                 git::add_worktree_from(&repo, &path, &branch, start.as_deref(), &base_ref)
-                    .map(|()| path)
+                    .map(|()| {
+                        let warmed = git::warm_worktree(&repo, &path, &warm);
+                        PreparedWorktree { path, warmed }
+                    })
                     .map_err(|e| format!("{e:#}"))
             };
             let _ = tx.send((branch, result, launch));
@@ -284,5 +288,80 @@ impl Desktop<'_> {
         if !open {
             self.runtime.worktrees_at = None;
         }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::super::tests::{repository, with_state};
+    use super::*;
+
+    #[test]
+    fn cache_warming_finishes_on_the_worktree_job_before_agent_launch() {
+        with_state(
+            "app::worktrees::tests::cache_warming_finishes_on_the_worktree_job_before_agent_launch",
+            |mut state, ctx| {
+                let (_dir, repo) = repository();
+                state.config.base_ref = "main".into();
+                state.config.agents.push(imacs_core::config::AgentConfig {
+                    name: "probe".into(),
+                    command: vec![
+                        "/bin/sh".into(),
+                        "-c".into(),
+                        "if test -f target/dependency; then cat target/dependency; else printf cold; fi > launched.tmp; mv launched.tmp launched"
+                            .into(),
+                    ],
+                    kind: AgentKind::Shell,
+                    busy_text: None,
+                });
+                for (branch, folders, expected) in [
+                    ("missing", vec!["target".into()], "cold"),
+                    ("warm", vec!["target".into()], "main cache"),
+                    ("off", vec![], "cold"),
+                    ("failed", vec!["target".into()], "cold"),
+                ] {
+                    if branch == "warm" {
+                        std::fs::create_dir(repo.join("target")).unwrap();
+                        std::fs::write(repo.join("target/dependency"), "main cache").unwrap();
+                    }
+                    if branch == "failed" {
+                        use std::os::unix::fs::PermissionsExt;
+                        std::fs::set_permissions(
+                            repo.join("target/dependency"),
+                            std::fs::Permissions::from_mode(0o000),
+                        )
+                        .unwrap();
+                    }
+                    state.config.worktrees.warm = folders;
+                    let started = Instant::now();
+                    state.create_worktree(
+                        repo.clone(),
+                        branch.into(),
+                        None,
+                        Launch { agent: "probe".into(), prompt: None, args: vec![], reply: None, task: None },
+                    );
+                    let event = state.worktree_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    let prepared = event.1.as_ref().unwrap();
+                    let path = prepared.path.clone();
+                    assert_eq!(prepared.warmed, branch == "warm");
+                    assert!(!path.join("launched").exists());
+                    if branch == "failed" {
+                        assert!(started.elapsed() < Duration::from_secs(2));
+                        assert!(!path.join("target").exists());
+                    }
+                    state.worktree_tx.send(event).unwrap();
+                    state.runtime_tick(ctx);
+                    if branch == "warm" {
+                        assert_eq!(state.toast.as_ref().unwrap().0, "warm cache from main");
+                    }
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !path.join("launched").exists() {
+                        assert!(Instant::now() < deadline, "agent never launched for {branch}");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    assert_eq!(std::fs::read_to_string(path.join("launched")).unwrap(), expected);
+                }
+            },
+        );
     }
 }

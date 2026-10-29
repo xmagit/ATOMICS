@@ -355,48 +355,56 @@ exec "$IMACS_TEST_REAL_GIT" "$@"
 
     #[test]
     fn review_cleanup_uses_base_or_integration_after_each_task_is_merged() {
-        for review_base in ["main", "imacs/plan-ship"] {
+        let (_dir, repo) = git::tests::project();
+        let one = worktree(&repo, "task-one");
+        let two = worktree(&repo, "task-two");
+        let into = worktree(&repo, "imacs/plan-ship");
+        commit(&one, "one");
+        commit(&two, "two");
+        for branch in ["task-one", "task-two"] {
+            git::merge(&into, branch).unwrap();
+            git::merge(&repo, branch).unwrap();
+        }
+        assert!(git::git(&repo, &["merge-base", "--is-ancestor", "imacs/plan-ship", "main"]).is_err());
+        // Build the shared history once. Each review still has a real, independent
+        // worktree, and both bases exercise clean and unmerged review tips.
+        let mut last_plan = None;
+        for (index, review_base) in ["main", "imacs/plan-ship"].into_iter().enumerate() {
             for review_has_work in [false, true] {
-                let (_dir, repo) = git::tests::project();
-                let one = worktree(&repo, "task-one");
-                let two = worktree(&repo, "task-two");
-                let into = worktree(&repo, "imacs/plan-ship");
-                commit(&one, "one");
-                commit(&two, "two");
-                for branch in ["task-one", "task-two"] {
-                    git::merge(&into, branch).unwrap();
-                    git::merge(&repo, branch).unwrap();
-                }
-                assert!(git::git(&repo, &["merge-base", "--is-ancestor", "imacs/plan-ship", "main"]).is_err());
-                let review = repo.with_file_name("review-ship");
-                git::add_worktree(&repo, &review, "review-ship", review_base).unwrap();
+                let branch = format!("review-{index}-{review_has_work}");
+                let review = repo.with_file_name(&branch);
+                git::add_worktree(&repo, &review, &branch, review_base).unwrap();
                 // Containment in integration also permits an older review tip.
-                commit(&into, "integration-only");
+                commit(&into, &format!("integration-{index}-{review_has_work}"));
                 if review_has_work {
                     commit(&review, "review-only");
                 }
-                let mut plan = plan(&repo, &["task-one", "task-two", "review-ship"]);
+                let mut plan = plan(&repo, &["task-one", "task-two", &branch]);
                 plan.tasks[2].id = REVIEW_TASK.into();
                 let rows = preview(&plan, "main").unwrap();
                 assert_eq!(rows.len(), 4);
-                for row in &rows {
-                    match row.branch.as_str() {
-                        "imacs/plan-ship" => assert!(row.keep.as_deref().unwrap().contains("unmerged commits")),
-                        "review-ship" if review_has_work => {
-                            assert!(row.keep.as_deref().unwrap().contains("unmerged commits"));
-                            assert!(remove(&plan, "main", row).is_err());
-                        }
-                        _ => {
-                            assert!(row.keep.is_none(), "{}: {:?}", row.branch, row.keep);
-                            remove(&plan, "main", row).unwrap();
-                        }
-                    }
+                assert!(rows.iter().filter(|row| row.branch.starts_with("task-")).all(|row| row.keep.is_none()));
+                let integration = rows.iter().find(|row| row.branch == "imacs/plan-ship").unwrap();
+                assert!(integration.keep.as_deref().unwrap().contains("unmerged commits"));
+                let row = rows.iter().find(|row| row.branch == branch).unwrap();
+                if review_has_work {
+                    assert!(row.keep.as_deref().unwrap().contains("unmerged commits"));
+                    assert!(remove(&plan, "main", row).is_err());
+                } else {
+                    assert!(row.keep.is_none());
+                    remove(&plan, "main", row).unwrap();
                 }
-                assert!(!one.exists() && !two.exists());
                 assert_eq!(review.exists(), review_has_work);
-                assert!(into.join("integration-only").exists());
+                last_plan = Some(plan);
             }
         }
+        // Revalidation after each task removal must still allow the next removal.
+        let plan = last_plan.unwrap();
+        for row in preview(&plan, "main").unwrap().iter().filter(|row| row.branch.starts_with("task-")) {
+            remove(&plan, "main", row).unwrap();
+        }
+        assert!(!one.exists() && !two.exists());
+        assert!(into.join("integration-1-true").exists());
     }
 
     #[test]

@@ -3,7 +3,7 @@ use std::process::Command;
 
 use imacs_core::{
     config::Config,
-    doctor::{approvals_check, check_line, codex_checks, plans_check, worktree_checks},
+    doctor::{approvals_check, cache_clone_check, check_line, codex_checks, plans_check, worktree_checks},
     paths,
 };
 
@@ -64,6 +64,7 @@ pub fn run() -> i32 {
         repos.sort();
         repos.dedup();
         for repo in repos {
+            println!("{}", cache_clone_check(&repo, &config.worktree_path));
             for line in worktree_checks(&repo, &config.base_ref) {
                 println!("{line}");
             }

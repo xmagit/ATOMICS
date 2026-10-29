@@ -72,8 +72,13 @@ impl State {
                 .as_ref()
                 .is_some_and(|(plan, _)| !self.plan_view || self.plans[self.selected_plan].id != *plan);
             let selection = (self.active.clone(), self.diff_root.clone(), self.focus_terminal.clone());
-            let outcome =
-                result.and_then(|path| self.start(ctx, &launch.agent, path, None, launch.args, launch.prompt));
+            let outcome = result.and_then(|PreparedWorktree { path, warmed }| {
+                let outcome = self.start(ctx, &launch.agent, path, None, launch.args, launch.prompt);
+                if warmed && outcome.is_ok() {
+                    self.toast("warm cache from main");
+                }
+                outcome
+            });
             if background {
                 (self.active, self.diff_root, self.focus_terminal) = selection;
             }

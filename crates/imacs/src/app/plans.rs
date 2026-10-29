@@ -370,7 +370,7 @@ mod tests {
                 app.runtime.selected_plan = 0;
                 app.runtime.dispatch(0, Some(plan::REVIEW_TASK)).unwrap();
                 let (branch, worktree, _) = app.runtime.worktree_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-                let worktree = worktree.unwrap();
+                let worktree = worktree.unwrap().path;
                 assert_eq!(app.runtime.plans[0].tasks[0].branch.as_deref(), Some(branch.as_str()));
                 assert_eq!(git::worktree_of(&worktree).unwrap().branch.as_deref(), Some(branch.as_str()));
                 assert_eq!(plan::load_plans(&paths::imacs_home()).unwrap().0[0].tasks[0].branch, Some(branch.clone()));

@@ -1,4 +1,4 @@
-//! Read-only diagnostics shared by the doctor command and its tests.
+//! Diagnostics shared by the doctor command and its tests.
 
 use std::path::Path;
 
@@ -91,6 +91,24 @@ pub fn plans_check(home: &Path) -> Vec<String> {
     errors
 }
 
+/// Probe the actual source/destination filesystems without keeping cache copies.
+#[cfg(feature = "native")]
+pub fn cache_clone_check(repo: &Path, template: &str) -> String {
+    let result = (|| -> anyhow::Result<_> {
+        let main = git::list_worktrees(repo)?.into_iter().next().ok_or_else(|| anyhow::anyhow!("no main checkout"))?;
+        let destination = git::worktree_path(template, &main.path, "imacs-cow-probe");
+        // Custom templates may have parents that do not exist until first launch.
+        let parent = destination.parent().and_then(|path| path.ancestors().find(|p| p.is_dir()));
+        let parent = parent.ok_or_else(|| anyhow::anyhow!("no destination folder"))?;
+        git::probe_cache_clone(&main.path, parent)
+    })();
+    check_line(
+        result.unwrap_or(false),
+        &format!("CoW cache cloning for {}", repo.display()),
+        "cache warming will be skipped; use worktrees on the same CoW filesystem as the main checkout",
+    )
+}
+
 #[cfg(feature = "native")]
 pub fn worktree_checks(repo: &Path, base_ref: &str) -> Vec<String> {
     match git::worktree_health(repo, base_ref) {
@@ -130,6 +148,24 @@ pub fn check_line(passed: bool, label: &str, hint: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(all(feature = "native", target_os = "macos"))]
+    fn cache_clone_diagnostic_probes_repo_folder_and_cleans_up() {
+        let (dir, repo) = crate::git::tests::project();
+        let template = "{repo_parent}/{repo}-{slug}";
+        let before = std::fs::read_dir(dir.path()).unwrap().count();
+        assert!(cache_clone_check(&repo, template).starts_with('✓'));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), before);
+        assert!(
+            !std::fs::read_dir(&repo).unwrap().any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".imacs-cow-"))
+        );
+        assert!(cache_clone_check(&dir.path().join("missing"), template).starts_with('✗'));
+    }
 
     #[test]
     fn codex_version_passes_or_warns_and_trust_is_explicitly_unverified() {
