@@ -140,7 +140,15 @@ impl State {
                 return;
             }
         };
-        self.pin_ticket_integration(index);
+        if let Err(err) = self.pin_ticket_integration(index) {
+            match reply {
+                Some(reply) => {
+                    let _ = reply.send(ControlOutcome::Done(ControlResponse::error(err)));
+                }
+                None => self.toast(err),
+            }
+            return;
+        }
         let into = self.plans[index].integration_branch();
         let into_path = git::worktree_path(&self.config.worktree_path, &repo, &into);
         let (tx, base_ref) = (self.integrate_tx.clone(), self.project_config(&repo).base_ref);

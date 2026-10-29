@@ -552,7 +552,7 @@ impl Desktop<'_> {
                     }
                 });
             }
-            for branch in &self.runtime.creating {
+            for (_, branch, _) in &self.runtime.creating {
                 ui.horizontal(|ui| {
                     ui.spinner();
                     ui.label(RichText::new(format!("checking out {branch}…")).color(p.muted).size(12.0));

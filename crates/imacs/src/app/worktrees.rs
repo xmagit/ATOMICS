@@ -8,7 +8,14 @@ impl State {
         let config = self.project_config(&repo);
         let (tx, base_ref) = (self.worktree_tx.clone(), config.base_ref);
         let warm = config.worktrees.warm;
-        let owners = self.branch_owners(&branch);
+        let common = match git::common_dir(&repo) {
+            Ok(common) => common,
+            Err(err) => {
+                let _ = tx.send((branch, Err(format!("{err:#}")), launch, repo));
+                return;
+            }
+        };
+        let owners = self.branch_owners(&common, &branch);
         let reuse = match owners.as_slice() {
             [(index, Some(task))] => {
                 launch.task.as_ref().is_some_and(|(plan, id)| self.plans[*index].id == *plan && id == task)
@@ -16,12 +23,17 @@ impl State {
             [(_, None)] => launch.task.is_none(),
             _ => false,
         };
-        self.creating.push(branch.clone());
+        let conflict = !owners.is_empty() && !reuse;
+        self.creating.push((common.clone(), branch.clone(), path.clone()));
         self.toast(format!("Creating worktree {}…", paths::display(&path)));
         std::thread::spawn(move || {
             // A retried task finds its worktree from the first attempt.
-            let existing = reuse && git::worktree_of(&path).and_then(|w| w.branch).is_some_and(|b| b == branch);
-            let result = if existing {
+            let existing = reuse
+                && git::common_dir(&path).is_ok_and(|dir| dir == common)
+                && git::worktree_of(&path).and_then(|w| w.branch).is_some_and(|b| b == branch);
+            let result = if conflict {
+                Err(format!("Branch {branch} is already owned by another task or plan in {}", repo.display()))
+            } else if existing {
                 Ok(PreparedWorktree { path, warmed: false })
             } else {
                 git::add_worktree_from(&repo, &path, &branch, start.as_deref(), &base_ref)
@@ -31,7 +43,7 @@ impl State {
                     })
                     .map_err(|e| format!("{e:#}"))
             };
-            let _ = tx.send((branch, result, launch));
+            let _ = tx.send((branch, result, launch, common));
         });
     }
 
