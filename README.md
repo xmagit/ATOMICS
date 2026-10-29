@@ -72,6 +72,33 @@ The config is created on first start at `~/.config/imacs/config.toml`. It is com
 and their commands, `base_ref`, layout breakpoints, fonts, colors, terminal scrollback, shortcuts, and the texts used for
 steering.
 
+### Restart onto a new build
+
+Rebuild and install into the same location first (`scripts/macos-app.sh` on macOS). The built-in chief can then call
+`imacs_restart` with an optional `reason`. It is available only in the chief's `imacs mcp --chief` server; ordinary
+orchestrators and task agents do not receive it. The equivalent local control request is:
+
+```sh
+imacs ctl '{"cmd":"restart","reason":"installed the new build"}'
+```
+
+Restart refuses and lists blockers while another agent is working or starting, an approval or question is pending,
+messages await delivery, a queue slot is held or waiting, a worktree/cleanup or integration job is running, or a plan
+brief is still focused for editing. Finish the edit and wait for agents and queued work. Idle and accepted agents
+are fine; the chief's own turn can hand off. `force: true` bypasses those busy checks and may interrupt work, but never
+bypasses saving state or validating that the installed executable exists and successfully runs `--version`.
+
+IMACS saves every plan, the session store (including Claude resume IDs and the chief's role), and the layout, then
+quits gracefully. A relauncher in its own session ignores SIGHUP, waits for the old PID to exit, and starts the same
+installation: `open -n -a` on the exact `.app` bundle on macOS, or the same binary on Linux, with the original arguments.
+The macOS path requires a `.app` bundle; a development binary outside one refuses to restart. Instance home, socket
+and config overrides are preserved, and helper output goes to `restart.log` under `IMACS_HOME`.
+
+Live sessions with resume IDs reopen automatically. The chief resumes as chief, with its dock and width preserved,
+and starts a turn asking it to call `imacs_wait`. The first wait receives a `restarted` event, even with an old cursor
+or a status filter, containing `restarted: <old build> -> <new build>, reason …`. Build identities come from
+`git describe --always --tags --dirty` at compile time, falling back to the crate version. `imacs --version` prints it.
+
 ## Troubleshooting
 
 Run `imacs doctor` to check git, Claude Code, Codex, Helix, the config, the running IMACS socket and global Claude hooks.
