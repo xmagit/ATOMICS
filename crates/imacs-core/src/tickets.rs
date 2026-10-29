@@ -330,17 +330,30 @@ impl Vars {
         self.with("board", link.map(|l| l.id.as_str())).with("board_key", link.map(TicketLink::label))
     }
 
+    /// Fills placeholders in one pass over the template, so text a value brings in,
+    /// such as a brief mentioning `{title}`, is never substituted again.
     fn render(&self, text: &str) -> Result<String, String> {
-        let mut out = text.to_string();
-        for name in PLACEHOLDERS {
-            let placeholder = format!("{{{name}}}");
-            if out.contains(&placeholder) {
-                match self.values.iter().find(|(n, _)| n == name).and_then(|(_, v)| v.as_ref()) {
-                    Some(value) => out = out.replace(&placeholder, value),
-                    None => return Err(format!("needs {placeholder}, which is unknown here")),
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(start) = rest.find('{') {
+            out.push_str(&rest[..start]);
+            let after = &rest[start + 1..];
+            let name = after.find('}').map(|end| &after[..end]).filter(|name| PLACEHOLDERS.contains(name));
+            match name {
+                Some(name) => {
+                    match self.values.iter().find(|(n, _)| *n == name).and_then(|(_, v)| v.as_ref()) {
+                        Some(value) => out.push_str(value),
+                        None => return Err(format!("needs {{{name}}}, which is unknown here")),
+                    }
+                    rest = &after[name.len() + 1..];
+                }
+                None => {
+                    out.push('{');
+                    rest = after;
                 }
             }
         }
+        out.push_str(rest);
         Ok(out)
     }
 }
@@ -883,6 +896,22 @@ mod tests {
         assert!(comment.arguments(&Vars::new("alpha").ticket(&ticket)).unwrap_err().contains("{body}"));
         assert!(config.operation("update_state").is_none());
         assert!(!TicketConfig::default().is_configured());
+    }
+
+    #[test]
+    fn inserted_values_are_never_substituted_again() {
+        let config = config(
+            "[operations.comment]\ntool = \"note\"\narguments = { text = \"{body} ({key})\", raw = \"{unknown}\" }\n",
+        );
+        let comment = config.operation("comment").unwrap();
+        let ticket = TicketLink { key: Some("AL-{id}".into()), ..link("7") };
+        let body = "Use {title} and {board} literally, and {body} too.";
+        let vars = Vars::new("alpha").ticket(&ticket).with("body", Some(body));
+        assert_eq!(
+            comment.arguments(&vars).unwrap(),
+            json!({"text": "Use {title} and {board} literally, and {body} too. (AL-{id})", "raw": "{unknown}"})
+        );
+        assert!(comment.arguments(&Vars::new("alpha").ticket(&ticket)).unwrap_err().contains("{body}"));
     }
 
     #[test]
