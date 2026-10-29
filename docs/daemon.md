@@ -275,6 +275,12 @@ filesystem changes publishing fresh diffs, held PTY input receiving its receipt,
 cleanup previews completing, and desktop-command shell launch/input delivery.
 A listener test also verifies that exit wakes a host without any client.
 Direct UI harnesses service the same action queue after a simulated frame.
+Race regressions also deliberately leave actions and client events unconsumed
+across frames: approval decisions carry stable request IDs and pending controls
+are disabled; a blocked fake native picker lets the real host keep servicing
+hooks and waits; late file-open events preserve the host's resolved target.
+Terminal regressions cover selection invalidation after output/resize and editor
+replacement at unchanged panel geometry.
 
 Queued native QA with isolated `IMACS_HOME`, `IMACS_SOCKET` and `IMACS_CONFIG`,
 verified on the GUI process with `ps eww`, passed shell input/output, fresh diff,
@@ -282,10 +288,20 @@ ctl plan persistence, heartbeat, fleet/board/chief screenshots and clean shutdow
 The screenshot harness requests paints while obscured so the existing CLI
 screenshot delay can advance. Targeted application and terminal tests pass.
 Final validation passed `cargo fmt --all -- --check`,
-`cargo clippy --workspace --all-targets -- -D warnings`, and all 302 tests through
+`cargo clippy --workspace --all-targets -- -D warnings`, and all 314 tests through
 `imacs queue --class test -- cargo test --workspace`. The separate narrow top bar
 follow-up also passed 480/550-point paint and click tests and isolated queued
 native screenshots at both widths.
+
+Plan follow-ups passed read-only completed/archived board, tab close/confirmation,
+History View/Reopen, and activity text/color tests. Urgent-plan overflow tests
+cover 480, 900, 1200 and 1400 points; 900 and wider keep both urgent plans visible,
+while the Tabs button surfaces urgent counts if folding becomes unavoidable.
+Isolated queued native QA at 1400 points verified a running plan, a needs-you
+plan, an idle plan, two completed plans and archived History. Screenshots and
+`ps eww` isolation evidence are in
+`/private/tmp/imacs-plan-ux-qa-06344607-v4/`. History View stayed read-only and
+History Reopen persisted the open status. The QA process then exited cleanly.
 
 ### Remaining for phase 3
 
