@@ -32,8 +32,8 @@ on this machine anyway, set `mode = "bare"`. `imacs doctor` shows whether sandbo
 mode = "sandbox"             # or "bare"
 
 [isolation.sandbox]
-memory = "8g"                # per sandbox; unset = half of this machine's memory
-cpus = 4                     # unset = every core
+memory = "8g"                # per sandbox; unset = 8g
+cpus = 4                     # unset = [resources] jobs ÷ test_slots, at least 2
 template = "registry.example.com/agent-sandbox:1"   # container image; unset = the agent's own
 mounts = ["~/docs"]          # extra host folders, always read-only
 network = "balanced"         # "balanced", "allow-all" or "deny-all"
@@ -50,7 +50,8 @@ isolation = "bare"           # this agent runs on this machine, whatever mode sa
 | Key | Meaning |
 | --- | --- |
 | `mode` | Where agents run, unless their own `isolation` says otherwise. |
-| `memory`, `cpus` | Limits for each sandbox, in `sbx create`'s units. |
+| `memory` | Memory for each sandbox, in `sbx create`'s units. Unset means `8g`. `""` leaves it to sbx, which gives each sandbox half of this machine's memory. |
+| `cpus` | CPUs for each sandbox. Unset means one test run's share of the compiler job pool: `[resources] jobs ÷ test_slots`, at least 2 (7 on a 16-core machine with the resource defaults). `0` leaves it to sbx, which gives each sandbox every core. |
 | `template` | Container image for every sandbox instead of the agent's own. |
 | `mounts` | Host folders each sandbox sees read-only, at the same path. |
 | `network` | The preset IMACS uses when sbx has no global network policy yet (`sbx policy init`). A policy that is already set up is left alone, since it covers every sandbox on the machine. Change it with `sbx policy`. |
@@ -183,7 +184,8 @@ mounted read-only.
 ## Limits
 
 - Sandboxed agents do not share IMACS's compiler job pool, and cannot run `imacs queue`. Their limits are
-  `cpus` and `memory`.
+  `cpus` and `memory`, which default low enough for several agents at once. sbx's own defaults, every
+  core and half the memory for each sandbox, would oversubscribe the machine.
 - Refs that `git gc` or `git pack-refs` packed on your machine are not visible inside a sandbox, because
   `packed-refs` is not mounted. Refs a fetch updates are written loose and are visible. A task's branch
   is loose until it is packed, so avoid `git gc` in a repository while sandboxed agents work in it: a

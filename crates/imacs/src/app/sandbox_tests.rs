@@ -47,6 +47,12 @@ fn sandboxed_agents_attach_through_sbx_run_and_reattach_after_a_restart() {
 
         let create = &fake::calls_to(bin.path(), &["create"])[0];
         assert_eq!(create[..3], ["create", "--name", name.as_str()]);
+        // Without settings, a sandbox gets 8g and one test run's share of the job pool.
+        let resources = &app.runtime.config.resources;
+        let cpus = (resources.jobs(app.runtime.governor.cores)
+            / resources.slots(imacs_core::governor::SlotClass::Test, app.runtime.governor.cores))
+        .max(2);
+        assert_eq!(create[4..8], ["--memory", "8g", "--cpus", cpus.to_string().as_str()], "{create:?}");
         let agent = create.iter().position(|arg| arg == "claude").unwrap();
         assert_eq!(Path::new(&create[agent + 1]), worktree.canonicalize().unwrap());
         let run = &fake::calls_to(bin.path(), &["run"])[0];

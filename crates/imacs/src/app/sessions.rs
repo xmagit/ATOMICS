@@ -198,7 +198,7 @@ impl State {
             name,
             agent: sbx_agent,
             cwd: cwd.to_path_buf(),
-            config: config.isolation.sandbox,
+            config: config.isolation.sandbox.with_defaults(&config.resources, self.governor.cores),
             exe,
             socket: paths::socket_path(),
             // Claude takes any prompt as an argument; other agents may get a brief file.

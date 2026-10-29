@@ -103,7 +103,33 @@ impl IsolationConfig {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct IsolationOverrides(pub toml::Table);
 
+/// Memory each sandbox gets unless `memory` says otherwise.
+pub const DEFAULT_MEMORY: &str = "8g";
+
 impl SandboxConfig {
+    /// CPUs for each sandbox: `cpus` when set (0 lets sbx give it every core), else one test
+    /// run's share of the compiler job pool, `jobs ÷ test_slots`, and at least 2. Sandboxes cannot
+    /// use IMACS's job pool or queue, and sbx's own default, every core for each sandbox, would
+    /// oversubscribe the machine with several agents.
+    pub fn cpus_or_default(&self, resources: &crate::governor::ResourceConfig, cores: usize) -> u32 {
+        self.cpus.unwrap_or_else(|| {
+            let share = resources.jobs(cores) / resources.slots(crate::governor::SlotClass::Test, cores);
+            u32::try_from(share).unwrap_or(u32::MAX).max(2)
+        })
+    }
+
+    /// Memory for each sandbox: `memory` when set (`""` lets sbx give it half of this machine's),
+    /// else [`DEFAULT_MEMORY`].
+    pub fn memory_or_default(&self) -> String {
+        self.memory.clone().unwrap_or_else(|| DEFAULT_MEMORY.into())
+    }
+
+    /// These settings with the CPU and memory defaults filled in, as a new sandbox gets them.
+    pub fn with_defaults(&self, resources: &crate::governor::ResourceConfig, cores: usize) -> SandboxConfig {
+        let (cpus, memory) = (self.cpus_or_default(resources, cores), self.memory_or_default());
+        SandboxConfig { cpus: Some(cpus), memory: Some(memory), ..self.clone() }
+    }
+
     /// The hosts allowed for the repository whose main checkout is `root`; keys are expanded
     /// with `expand` (`~/` paths), and every matching key adds its hosts.
     pub fn hosts_for(&self, root: &Path, expand: impl Fn(&str) -> PathBuf) -> Vec<String> {
@@ -484,6 +510,43 @@ command = ["codex"]
         let (repo, warnings) = crate::repo_workflow::declarative(&toml::from_str(blocks[1]).unwrap());
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(repo["isolation"]["mode"].as_str(), Some("sandbox"));
+    }
+
+    #[test]
+    fn sandboxes_default_to_a_test_runs_share_of_the_cores_and_8g() {
+        use crate::governor::ResourceConfig;
+        let resources = ResourceConfig::default();
+        let unset = SandboxConfig::default();
+        // jobs default to cores - 2 and test slots to one per 6 cores, at least one.
+        for (cores, cpus) in [(16, 7), (12, 5), (64, 6), (8, 6), (4, 2), (1, 2)] {
+            assert_eq!(unset.cpus_or_default(&resources, cores), cpus, "{cores} cores");
+        }
+        let custom = ResourceConfig { jobs: Some(16), test_slots: Some(3), ..ResourceConfig::default() };
+        assert_eq!(unset.cpus_or_default(&custom, 32), 5);
+        let no_pool = ResourceConfig { jobs: Some(0), ..ResourceConfig::default() };
+        assert_eq!(unset.cpus_or_default(&no_pool, 32), 2);
+        assert_eq!(unset.memory_or_default(), "8g");
+        let filled = unset.with_defaults(&resources, 16);
+        assert_eq!((filled.cpus, filled.memory.as_deref()), (Some(7), Some("8g")));
+
+        // Set values win, and 0 or "" leave the choice to sbx: create passes no flag.
+        let set = SandboxConfig { cpus: Some(4), memory: Some("16g".into()), ..SandboxConfig::default() };
+        let filled = set.with_defaults(&resources, 16);
+        assert_eq!((filled.cpus, filled.memory.as_deref()), (Some(4), Some("16g")));
+        let sbx_decides = SandboxConfig { cpus: Some(0), memory: Some(String::new()), ..SandboxConfig::default() }
+            .with_defaults(&resources, 16);
+        let spec = Spec {
+            name: "imacs-s1".into(),
+            agent: "claude",
+            workspace: "/repos/app".into(),
+            git: Vec::new(),
+            read_only: Vec::new(),
+            memory: sbx_decides.memory,
+            cpus: sbx_decides.cpus,
+            template: None,
+        };
+        let args = create_args(&spec);
+        assert!(!args.iter().any(|a| a == "--cpus" || a == "--memory"), "{args:?}");
     }
 
     #[test]

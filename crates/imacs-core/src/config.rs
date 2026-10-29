@@ -64,8 +64,8 @@ name = "claude"             # built in: claude, midnight, atomisk, paper and tid
 mode = "sandbox"
 
 [isolation.sandbox]
-# memory = "8g"              # per sandbox; unset = half of this machine's memory
-# cpus = 4                   # unset = every core
+# memory = "8g"              # per sandbox; unset = 8g; "" = sbx's default, half of this machine's memory
+# cpus = 4                   # unset = [resources] jobs ÷ test_slots, at least 2; 0 = every core
 # template = "registry.example.com/agent-sandbox:1"   # container image; unset = the agent's own
 mounts = []                  # extra host folders, mounted read-only
 network = "balanced"         # sbx's global policy, set up if it has none: "balanced", "allow-all", "deny-all"
