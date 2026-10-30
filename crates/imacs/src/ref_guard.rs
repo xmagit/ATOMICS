@@ -457,6 +457,18 @@ impl RefGuard {
                 }
                 continue;
             }
+            // A host commit may have been overwritten before any check accepted it.
+            // Preserve that newer host value, including if this restore must be retried.
+            let before = host
+                .branches
+                .iter()
+                .find(|(branch, _)| branch == &name)
+                .map(|(_, object)| RefValue::Object(object.clone()))
+                .or_else(|| before.cloned());
+            if let Some(value) = &before {
+                self.refs.insert(name.clone(), value.clone());
+            }
+            let before = before.as_ref();
             if before == after {
                 continue;
             }
@@ -727,6 +739,19 @@ fn update_refs(cwd: &Path, operations: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_preserves_a_host_commit_overwritten_before_the_check() {
+        let (dir, repo, worktree) = repository();
+        let mut guard = RefGuard::open(&worktree, dir.path().join("snapshot.json")).unwrap().unwrap();
+        git::git(&repo, &["commit", "--allow-empty", "-qm", "user commit"]).unwrap();
+        let host = git::git(&repo, &["rev-parse", "HEAD"]).unwrap();
+        let injected = git::git(&worktree, &["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "agent"]).unwrap();
+        git::git(&worktree, &["update-ref", "refs/heads/main", injected.trim()]).unwrap();
+        let alerts = guard.check(&Default::default(), &Default::default()).unwrap();
+        assert_eq!(git::git(&repo, &["rev-parse", "main"]).unwrap(), host, "{alerts:?}");
+        assert!(guard.check(&Default::default(), &Default::default()).unwrap().is_empty());
+    }
 
     #[test]
     fn prefix_host_writes_do_not_accept_unchanged_refs_or_advance_pending_baselines() {
