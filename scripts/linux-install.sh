@@ -73,4 +73,7 @@ else
     *":$bin:"*) ;;
     *) echo "Add $bin to PATH to run imacs from a terminal." ;;
   esac
+  # Use the installed path even before ~/.local/bin has been added to PATH.
+  # Keep stdin attached: setup guides first-time installation and resumes on updates.
+  "$bin/imacs" setup
 fi

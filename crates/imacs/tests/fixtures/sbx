@@ -84,11 +84,32 @@ case "$1" in
   mcp)
     if [ -e "$dir/fail-mcp-$2" ]; then cat "$dir/error-output" 2>/dev/null >&2; exit 1; fi
     case "$2" in
-      add) printf '%s\n' '[{"name":"linear","status":"needs-auth"}]' > "$dir/mcp.json" ;;
+      add)
+        case "$3" in
+          imacs-*)
+            mkdir -p "$dir/mcp-servers"
+            printf '{"name":"%s","status":"ready"}' "$3" > "$dir/mcp-servers/$3"
+            ;;
+          *) printf '%s\n' '[{"name":"linear","status":"needs-auth"}]' > "$dir/mcp.json" ;;
+        esac
+        ;;
       auth) printf '%s\n' '[{"name":"linear","status":"ready"}]' > "$dir/mcp.json" ;;
+      rm)
+        for arg in "$@"; do
+          case "$arg" in imacs-*) rm -f "$dir/mcp-servers/$arg" ;; esac
+        done
+        ;;
     esac
     if [ "$2" = ls ]; then
-      if [ -e "$dir/mcp.json" ]; then cat "$dir/mcp.json"; else printf '%s\n' '[]'; fi
+      entries=$(sed 's/^\[//; s/\]$//' "$dir/mcp.json" 2>/dev/null || true)
+      printf '[%s' "$entries"
+      sep=${entries:+,}
+      for file in "$dir/mcp-servers"/*; do
+        [ -f "$file" ] || continue
+        printf '%s%s' "$sep" "$(cat "$file")"
+        sep=,
+      done
+      printf ']\n'
     fi
     ;;
   settings)
@@ -138,7 +159,7 @@ case "$1" in
     for arg in "$@"; do
       case "$arg" in
         rm|-*) ;;
-        *) rm -f "$state/$arg" ;;
+        *) rm -f "$state/$arg" "$state/$arg.tmp" ;;
       esac
     done
     ;;
