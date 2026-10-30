@@ -444,6 +444,19 @@ pub fn shortcut(text: &str) -> Option<KeyboardShortcut> {
     Some(KeyboardShortcut::new(modifiers, key))
 }
 
+/// Consumes presses of `chord` on a digit key. Off macOS every app chord holds Shift, which
+/// turns a digit into a symbol on most layouts (Shift+1 is `!`), so the digit is matched by
+/// its physical key as well as its logical one.
+pub fn consume_digit_chord(input: &mut egui::InputState, chord: &KeyboardShortcut) -> bool {
+    let before = input.events.len();
+    input.events.retain(|event| {
+        !matches!(event, egui::Event::Key { key, physical_key, modifiers, pressed: true, .. }
+            if (*key == chord.logical_key || *physical_key == Some(chord.logical_key))
+                && modifiers.matches_logically(chord.modifiers))
+    });
+    input.events.len() < before
+}
+
 /// Display exactly the platform modifiers used to consume the configured chord.
 pub fn shortcut_label(ctx: &egui::Context, text: &str) -> String {
     shortcut(text).map(|chord| ctx.format_shortcut(&chord)).unwrap_or_else(|| text.to_string())
@@ -676,6 +689,30 @@ mod tests {
             assert!(cmd.ctrl && cmd.shift && !cmd.mac_cmd);
             assert!(!is_app_chord(&Modifiers::CTRL), "plain Ctrl must reach the terminal");
             assert_eq!(shortcut("cmd+shift+space"), shortcut("ctrl+shift+space"));
+        }
+    }
+
+    #[test]
+    fn digit_chords_match_the_physical_key_when_shift_types_a_symbol() {
+        let chord = KeyboardShortcut::new(shortcut("cmd+a").unwrap().modifiers, Key::Num1);
+        let press = |key, physical_key, modifiers| egui::Event::Key {
+            key,
+            physical_key: Some(physical_key),
+            pressed: true,
+            repeat: false,
+            modifiers,
+        };
+        let mut input = egui::InputState::default();
+        // Shift+1 arrives as `!` on most layouts; the physical key is still 1.
+        input.events = vec![press(Key::Exclamationmark, Key::Num1, chord.modifiers)];
+        assert!(consume_digit_chord(&mut input, &chord));
+        assert!(input.events.is_empty());
+        input.events = vec![press(Key::Num1, Key::Num1, chord.modifiers)];
+        assert!(consume_digit_chord(&mut input, &chord), "an unshifted digit still matches");
+        for other in [press(Key::Num2, Key::Num2, chord.modifiers), press(Key::Num1, Key::Num1, Modifiers::CTRL)] {
+            input.events = vec![other];
+            assert!(!consume_digit_chord(&mut input, &chord));
+            assert_eq!(input.events.len(), 1, "other digits and plain Ctrl stay for the terminal");
         }
     }
 }
