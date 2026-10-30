@@ -3,7 +3,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
@@ -20,6 +21,19 @@ const MAX_UNTRACKED_BYTES: u64 = 512 * 1024;
 /// the repository is big or the network slow, and stopping one halfway leaves it half done.
 const QUICK: Duration = Duration::from_secs(120);
 const SLOW: Duration = Duration::from_secs(30 * 60);
+
+/// [`QUICK`] in milliseconds, unless a test that makes git wait shortened it.
+static QUICK_MILLIS: AtomicU64 = AtomicU64::new(QUICK.as_millis() as u64);
+
+/// Shortens how long quick host git may run in this process, for a test that makes git wait.
+#[doc(hidden)]
+pub fn set_quick_timeout(limit: Duration) {
+    QUICK_MILLIS.store(limit.as_millis() as u64, Ordering::Relaxed);
+}
+
+fn quick() -> Duration {
+    Duration::from_millis(QUICK_MILLIS.load(Ordering::Relaxed))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Worktree {
@@ -53,13 +67,36 @@ fn timeout(args: &[&str]) -> Duration {
     }
     match rest {
         ["worktree", "add" | "remove", ..] | ["add" | "checkout" | "commit" | "fetch" | "merge" | "switch", ..] => SLOW,
-        _ => QUICK,
+        _ => quick(),
     }
 }
 
-/// Runs a git `command` for at most `timeout`, then kills it and everything it started. Output
-/// goes to unlinked files, so nothing git leaves running can keep this waiting for it.
-fn run(mut command: Command, args: &[&str], input: Option<&[u8]>, timeout: Duration) -> Result<String> {
+/// Whether `ancestor` is an ancestor of `descendant` in `dir`'s repository, or `None` when git
+/// answers neither, as when one of them names no commit there.
+pub fn is_ancestor(dir: &Path, ancestor: &str, descendant: &str) -> Result<Option<bool>> {
+    let args = ["merge-base", "--is-ancestor", ancestor, descendant];
+    let output = output(command(dir, &args)?, &args, None, timeout(&args))?;
+    Ok(match output.status.code() {
+        Some(0) => Some(true),
+        Some(1) => Some(false),
+        Some(_) => None,
+        None => bail!("git {} was stopped by {}", args.join(" "), output.status),
+    })
+}
+
+/// Runs a git `command` for at most `timeout`, then kills it and everything it started, and fails
+/// unless git succeeds.
+fn run(command: Command, args: &[&str], input: Option<&[u8]>, timeout: Duration) -> Result<String> {
+    let output = output(command, args, input, timeout)?;
+    if !output.status.success() {
+        bail!("git {} failed: {}", args.join(" "), String::from_utf8_lossy(&output.stderr).trim());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// [`run`], whatever git exits with. Output goes to unlinked files, so nothing git leaves running
+/// can keep this waiting for it.
+fn output(mut command: Command, args: &[&str], input: Option<&[u8]>, timeout: Duration) -> Result<Output> {
     use std::io::{Read, Seek, Write};
     use std::os::unix::process::CommandExt;
     let shown = format!("git {}", args.join(" "));
@@ -85,24 +122,22 @@ fn run(mut command: Command, args: &[&str], input: Option<&[u8]>, timeout: Durat
             bail!("{shown} did not finish within {} s, and was stopped", timeout.as_secs());
         }
     };
-    let read = |file: &mut std::fs::File| -> Result<String> {
+    let read = |file: &mut std::fs::File| -> Result<Vec<u8>> {
         let mut bytes = Vec::new();
         file.rewind()?;
         file.read_to_end(&mut bytes)?;
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
+        Ok(bytes)
     };
-    if !status.success() {
-        bail!("{shown} failed: {}", read(&mut stderr)?.trim());
-    }
-    read(&mut stdout)
+    Ok(Output { status, stdout: read(&mut stdout)?, stderr: read(&mut stderr)? })
 }
 
 /// `git -C dir args`. In a repository a sandbox works in, git runs with the locations [`pin`]ned
 /// for its folder, or checked against them for the repository's other checkouts, never the ones
 /// the folder names now; and without hooks or fsmonitor, which can name programs the sandbox wrote.
+/// Git never prompts on the terminal: in a process group of its own, reading it would stop git.
 fn command(dir: &Path, args: &[&str]) -> Result<Command> {
     let mut command = Command::new("git");
-    command.arg("-C").arg(dir).args(["-c", "core.quotepath=off"]);
+    command.arg("-C").arg(dir).args(["-c", "core.quotepath=off"]).env("GIT_TERMINAL_PROMPT", "0");
     let Some(pins) = locate(dir)? else {
         command.args(args);
         return Ok(command);
@@ -298,7 +333,7 @@ pub fn resolve_pins(dir: &Path) -> Result<GitPins> {
     let args = ["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-dir", "--git-common-dir"];
     let mut command = Command::new("git");
     command.arg("-C").arg(dir).args(["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"]).args(args);
-    let output = match run(command, &args, None, QUICK) {
+    let output = match run(command, &args, None, quick()) {
         Ok(output) => output,
         Err(error) if format!("{error:#}").contains("not a git repository") => {
             return Ok(GitPins { work_tree: std::fs::canonicalize(dir)?, git_dir: None, common_dir: None });
@@ -345,7 +380,7 @@ pub fn check_worktree_config(common: &Path) -> Result<()> {
         .arg(common.join("config"))
         .args(["--get", "extensions.worktreeConfig"])
         .current_dir(common);
-    let output = run(command, &["config", "--get", "extensions.worktreeConfig"], None, QUICK)?;
+    let output = run(command, &["config", "--get", "extensions.worktreeConfig"], None, quick())?;
     if output.trim() == "true" {
         bail!(
             "{} sets extensions.worktreeConfig, which lets a sandbox change git config that runs on this \
@@ -1344,6 +1379,48 @@ pub(crate) mod tests {
         assert_eq!(timeout(&["-c", "a=b", "worktree", "add", "x"]), SLOW);
         assert_eq!(timeout(&["merge", "--no-ff", "x"]), SLOW);
         assert_eq!(git_input(&repo, &["hash-object", "--stdin"], b"x\n").unwrap().trim().len(), 40);
+    }
+
+    #[test]
+    fn is_ancestor_maps_gits_answer_and_stops_where_git_does_not_run() {
+        let (dir, repo) = project();
+        run(&repo, &["branch", "task"]);
+        run(&repo, &["commit", "-q", "--allow-empty", "-m", "later"]);
+        assert_eq!(is_ancestor(&repo, "refs/heads/task", "refs/heads/main").unwrap(), Some(true));
+        assert_eq!(is_ancestor(&repo, "refs/heads/main", "refs/heads/task").unwrap(), Some(false));
+        assert_eq!(is_ancestor(&repo, "refs/heads/missing", "refs/heads/main").unwrap(), None);
+        assert_eq!(timeout(&["merge-base", "--is-ancestor", "a", "b"]), QUICK);
+
+        // It runs through the guarded runner, which refuses a repository a sandbox planted.
+        let worktree = repo.with_file_name("app-task");
+        add_worktree(&repo, &worktree, "sandboxed", "main").unwrap();
+        let pins = resolve_pins(&worktree).unwrap();
+        pin(pins.clone());
+        let evil = pins.git_dir.clone().unwrap().join("evil");
+        plant_hostile_git_dir(
+            &evil.join(".git"),
+            pins.common_dir.as_ref().unwrap(),
+            "refs/heads/main",
+            &dir.path().join("hook-ran"),
+        );
+        let error = is_ancestor(&evil, "refs/heads/task", "refs/heads/main").unwrap_err();
+        assert!(format!("{error:#}").contains("a git folder a sandbox writes"), "{error:#}");
+        assert_eq!(is_ancestor(&worktree, "refs/heads/task", "refs/heads/main").unwrap(), Some(true));
+        unpin(&pins.work_tree);
+    }
+
+    #[test]
+    fn host_git_never_prompts_on_the_terminal() {
+        let (_dir, repo) = project();
+        let alias = "alias.prompt-setting=!printenv GIT_TERMINAL_PROMPT";
+        assert_eq!(git(&repo, &["-c", alias, "prompt-setting"]).unwrap().trim(), "0");
+        // A credential git would have to ask for fails rather than stopping git on the terminal.
+        let input = b"protocol=https\nhost=imacs.invalid\n\n";
+        let args = ["-c", "credential.helper=", "-c", "core.askPass=", "credential", "fill"];
+        if std::env::var_os("GIT_ASKPASS").is_none() && std::env::var_os("SSH_ASKPASS").is_none() {
+            let error = git_input(&repo, &args, input).unwrap_err();
+            assert!(format!("{error:#}").contains("terminal prompts disabled"), "{error:#}");
+        }
     }
 
     #[test]

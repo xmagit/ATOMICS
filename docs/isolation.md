@@ -599,11 +599,15 @@ tests there, in a worktree that starts from the integration branch.
   - `refs/stash`, which every checkout shares, at whatever it is: it is never restored.
 
   These traces are in git folders no sandbox mounts, so an agent cannot leave them, with one exception:
-  the main checkout's HEAD log is in the shared `logs` folder, and an agent that writes it on purpose can
-  pass a move of the branch checked out there as yours. Otherwise you would lose your own commits. A
+  the main checkout's HEAD log is in the shared `logs` folder. An agent that writes it on purpose can pass
+  a move of any branch as yours, not only of the branch checked out there: forged entries can say the
+  main checkout had that branch checked out when it moved it. Otherwise you would lose your own commits. A
   branch you create other than by switching to it (`git branch x`), delete, or move while no checkout
   here has it checked out (`git branch -f`, `git update-ref`) leaves no such trace and is put back like
-  an agent's, as is a fetch with `--no-write-fetch-head`.
+  an agent's, as is a fetch with `--no-write-fetch-head`. So, for now, is the remote-tracking ref your own
+  `git push` updates (`refs/remotes/<remote>/<branch>`): a push leaves no `FETCH_HEAD`, so the next check
+  puts the ref back, keeps the pushed value in quarantine and raises an alert. The push itself stands, and
+  your next fetch sets the ref right.
 - **Nothing is deleted.** Putting a ref back keeps the value it replaces at
   `refs/imacs/quarantine/<sandbox>/<ref>@<object>`, and the alert names it: a branch the agent made is
   moved there rather than deleted, and a value restored over is kept there. If it was yours, take it back
