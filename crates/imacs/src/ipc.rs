@@ -297,6 +297,37 @@ mod tests {
     use std::io::Read;
 
     #[test]
+    fn control_socket_wakes_the_runtime_before_its_next_tick() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let wake = crate::host::Wake::default();
+        let (control, requests) = wake.channel::<ControlMessage>();
+        let channels = Channels {
+            hooks: std::sync::mpsc::channel().0.into(),
+            control,
+            usage: std::sync::mpsc::channel().0,
+            governor: Arc::new(crate::governor::Governor::new(Default::default(), None)),
+        };
+        let server = std::thread::spawn(move || {
+            handle(server, &Mutex::new(Hub::default()), &channels, &egui::Context::default()).unwrap();
+        });
+        let runtime = std::thread::spawn(move || {
+            // A long deadline makes this fail if the control path stops notifying.
+            let started = std::time::Instant::now();
+            wake.wait_until(started + Duration::from_secs(5));
+            assert!(started.elapsed() < Duration::from_secs(2));
+            let message = requests.try_recv().expect("wake must follow enqueuing the request");
+            assert!(matches!(message.request, ControlRequest::List));
+            message.reply.send(ControlOutcome::Done(ControlResponse::ok(json!([])))).unwrap();
+        });
+        writeln!(client, "{}", json!({"cmd":"list"})).unwrap();
+        let mut line = String::new();
+        BufReader::new(&client).read_line(&mut line).unwrap();
+        assert!(serde_json::from_str::<ControlResponse>(&line).unwrap().ok);
+        runtime.join().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
     fn statusline_socket_routes_account_usage_without_a_session_or_lifecycle_event() {
         let (mut client, server) = UnixStream::pair().unwrap();
         let (hooks, hook_rx) = std::sync::mpsc::channel();
