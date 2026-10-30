@@ -17,6 +17,9 @@ pub struct Entry {
     tip: String,
 }
 
+/// Why a worktree stays: git lists it from files a sandbox can write that do not lead back to it.
+const UNTRUSTED: &str = "worktree is not listed as git made it, so IMACS does not run git in it";
+
 pub fn preview(plan: &Plan, base_ref: &str) -> Result<Vec<Entry>> {
     ensure!(plan.status == PlanStatus::Completed, "Only completed plans can be cleaned up");
     let mut repos: BTreeMap<PathBuf, Vec<&Task>> = BTreeMap::new();
@@ -24,14 +27,12 @@ pub fn preview(plan: &Plan, base_ref: &str) -> Result<Vec<Entry>> {
         let Some(_) = &task.branch else { continue };
         let repo = task.repo.as_deref().map(crate::paths::expand).or_else(|| plan.project.clone());
         let repo = repo.ok_or_else(|| anyhow::anyhow!("No recorded repository for task {}", task.id))?;
-        let main = git::list_worktrees(&repo)?.into_iter().next().ok_or_else(|| anyhow::anyhow!("No main checkout"))?;
-        repos.entry(main.path).or_default().push(task);
+        repos.entry(git::main_checkout(&repo)?).or_default().push(task);
     }
     if repos.is_empty()
         && let Some(repo) = &plan.project
     {
-        let main = git::list_worktrees(repo)?.into_iter().next().ok_or_else(|| anyhow::anyhow!("No main checkout"))?;
-        repos.entry(main.path).or_default();
+        repos.entry(git::main_checkout(repo)?).or_default();
     }
     let integration = plan.integration_branch();
     let mut entries = Vec::new();
@@ -73,6 +74,8 @@ pub fn preview(plan: &Plan, base_ref: &str) -> Result<Vec<Entry>> {
             } else if let Some(h) = h {
                 if h.missing {
                     Some("worktree folder is missing".into())
+                } else if h.untrusted {
+                    Some(UNTRUSTED.into())
                 } else {
                     // Unlike the general explorer, failed status checks must fail closed here.
                     let status = git::git(&h.path, &["status", "--porcelain", "--untracked-files=all"])?;
@@ -128,11 +131,16 @@ pub fn closed_tasks(plan: &Plan) -> Result<Vec<Entry>> {
         let reference = format!("refs/heads/{branch}");
         let Ok(tip) = git::git(&repo, &["rev-parse", "--verify", &reference]) else { continue };
         let worktree = trees.iter().find(|tree| tree.branch.as_ref() == Some(branch));
+        let keep = match worktree {
+            Some(tree) if tree.path == main.path => Some("main checkout".into()),
+            Some(tree) if !tree.trusted && tree.path.exists() => Some(UNTRUSTED.into()),
+            _ => None,
+        };
         let entry = Entry {
             repo: main.path.clone(),
             branch: branch.clone(),
             worktree: worktree.map(|tree| tree.path.clone()),
-            keep: worktree.filter(|tree| tree.path == main.path).map(|_| "main checkout".into()),
+            keep,
             tip: tip.trim().into(),
         };
         if !entries.contains(&entry) {
@@ -149,7 +157,9 @@ pub fn remove_closed_task(plan: &Plan, entry: &Entry) -> Result<bool> {
         .find(|row| row.repo == entry.repo && row.branch == entry.branch)
         .ok_or_else(|| anyhow::anyhow!("Task branch no longer exists"))?;
     ensure!(current == *entry, "branch or worktree changed since preview");
-    ensure!(entry.keep.is_none(), "main checkout is protected");
+    if let Some(keep) = &entry.keep {
+        bail!("{}", if keep == UNTRUSTED { keep } else { "main checkout is protected" });
+    }
     if let Some(path) = &entry.worktree {
         ensure!(
             git::git(path, &["status", "--porcelain", "--untracked-files=all"])?.is_empty(),

@@ -47,7 +47,8 @@ struct StdioServer {
     writes: Receiver<std::io::Result<()>>,
     lines: Receiver<String>,
     stderr: Arc<Mutex<String>>,
-    stderr_done: Receiver<()>,
+    /// Disconnects once all of stderr is read.
+    stderr_read: Receiver<()>,
 }
 
 struct HttpServer {
@@ -211,8 +212,9 @@ impl StdioServer {
         });
         let stderr = Arc::new(Mutex::new(String::new()));
         let tail = stderr.clone();
-        let (drained, stderr_done) = std::sync::mpsc::channel();
+        let (read_all, stderr_read) = std::sync::mpsc::channel::<()>();
         std::thread::spawn(move || {
+            let _read_all = read_all;
             let mut buffer = [0u8; 1024];
             while let Ok(read) = stderr_pipe.read(&mut buffer) {
                 if read == 0 {
@@ -228,9 +230,8 @@ impl StdioServer {
                     tail.drain(..cut);
                 }
             }
-            let _ = drained.send(());
         });
-        Ok(StdioServer { program: program.to_string(), child, stdin: input, writes, lines, stderr, stderr_done })
+        Ok(StdioServer { program: program.to_string(), child, stdin: input, writes, lines, stderr, stderr_read })
     }
 
     fn exchange(&mut self, message: &Value, id: Option<u64>, timeout: Duration) -> Result<Option<Value>, McpError> {
@@ -288,9 +289,9 @@ impl StdioServer {
         let mut message = format!("{} {what}", self.program);
         if let Some(status) = status {
             message.push_str(&format!(" (exited: {status})"));
-            // The process can exit before the stderr reader gets scheduled. Keep
-            // its diagnostic without waiting forever on a descendant's inherited pipe.
-            let _ = self.stderr_done.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+            // Its last words can still be in the pipe after it exited. A descendant may hold the
+            // pipe open, so draining stderr shares the bounded wait for the exit status.
+            let _ = self.stderr_read.recv_timeout(deadline.saturating_duration_since(Instant::now()));
         }
         let stderr = self.stderr.lock().unwrap();
         let tail = stderr.trim();
