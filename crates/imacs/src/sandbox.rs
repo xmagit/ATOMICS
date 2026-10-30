@@ -7,6 +7,7 @@ pub mod template;
 
 use std::fs::File;
 use std::io::{Read, Seek};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -510,7 +511,7 @@ fn sbx_command(
 ) -> Result<Command> {
     let mut command = Command::new(program);
     command.args(args.iter().map(AsRef::as_ref)).stdin(Stdio::null());
-    command.stdout(stdout.try_clone()?).stderr(stderr.try_clone()?);
+    command.stdout(stdout.try_clone()?).stderr(stderr.try_clone()?).process_group(0);
     for name in ["IMACS_SOCKET", "IMACS_PANE", "IMACS_HOME", "IMACS_CONFIG"] {
         command.env_remove(name);
     }
@@ -530,7 +531,9 @@ fn wait(child: &mut std::process::Child, deadline: Instant) -> Result<Option<std
             return Ok(Some(status));
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
+            // Kill helpers too (SSH/keychain commands can outlive the sbx client).
+            // SAFETY: process_group(0) gave this child its own process group.
+            unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
             let _ = child.wait();
             return Ok(None);
         }
@@ -578,6 +581,17 @@ pub(crate) mod fake {
 mod tests {
     use super::*;
     use imacs_core::isolation::IsolationMode;
+
+    #[test]
+    fn timed_out_sbx_kills_its_helper_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("leaked-helper");
+        let script = format!("(sleep 0.3; touch '{}') & wait", marker.display());
+        let error = sbx_output("/bin/sh", &["-c", &script], false, Duration::from_millis(100)).unwrap_err();
+        assert!(error.to_string().contains("did not finish"));
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(!marker.exists(), "a timed-out sbx helper survived and kept working");
+    }
 
     fn repository() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
