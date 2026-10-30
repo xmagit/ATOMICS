@@ -113,6 +113,23 @@ impl Desktop<'_> {
                     .color(self.runtime.palette.muted),
             );
             record_item(ui, "agents", &response);
+            let names: HashSet<_> = self.runtime.sessions.iter().filter_map(|s| s.sandbox.as_ref()).collect();
+            if !names.is_empty() {
+                let sampler = &self.runtime.sandbox_usage;
+                let label = if sampler.usage.is_empty() {
+                    "VMs —".into()
+                } else {
+                    format!("VMs {}", sampler.total().label())
+                };
+                let response =
+                    ui.label(RichText::new(label).size(11.0).color(self.runtime.palette.muted)).on_hover_text(format!(
+                        "Host overhead of {}/{} sandbox VM process trees. 100% CPU = one core.{}",
+                        sampler.usage.len(),
+                        names.len(),
+                        sampler.error.as_ref().map_or(String::new(), |e| format!("\n{e}"))
+                    ));
+                record_item(ui, "sandbox-total", &response);
+            }
         }
         ui.separator();
     }

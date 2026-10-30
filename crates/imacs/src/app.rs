@@ -381,6 +381,7 @@ pub(crate) struct State {
     pending_codex: Vec<(AgentLaunch, CodexVersion)>,
     /// The `sbx` program sandboxed agents run with.
     sbx: String,
+    sandbox_usage: crate::sandbox_usage::Sampler,
     /// Sandboxed launches waiting for their sandbox.
     pending_sandbox: Vec<(AgentLaunch, Receiver<Result<(), String>>)>,
     active: Option<String>,
@@ -780,6 +781,7 @@ impl State {
             // Tests never reach the sbx installed on the machine running them.
             sbx: if cfg!(test) { "/nonexistent/imacs-test-sbx" } else { "sbx" }.into(),
             pending_sandbox: Vec::new(),
+            sandbox_usage: Default::default(),
             active: None,
             diff_open: true,
             diff_root: None,

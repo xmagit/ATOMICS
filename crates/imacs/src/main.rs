@@ -20,6 +20,7 @@ mod mcp_client;
 mod ref_guard;
 mod restart;
 mod sandbox;
+mod sandbox_usage;
 mod setup;
 mod statusline;
 mod terminal;

@@ -187,6 +187,8 @@ impl State {
             }
             self.stop_sandbox(name);
         }
+        let names = self.sessions.iter().filter_map(|s| s.sandbox.clone()).collect();
+        changed |= self.sandbox_usage.poll(names, ctx);
         self.track_busy();
         self.verify_deliveries();
         for index in 0..self.sessions.len() {
