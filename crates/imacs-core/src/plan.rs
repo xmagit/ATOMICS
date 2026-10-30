@@ -162,6 +162,9 @@ pub struct Task {
     pub status: TaskStatus,
     /// Integration branch this task was successfully merged into.
     pub integrated: Option<String>,
+    /// Verified task tip, retained when cleanup deletes the source branch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integrated_commit: Option<String>,
     /// Latest background ancestry check; rechecked after loading.
     #[serde(skip)]
     pub integration_verified: bool,
@@ -401,6 +404,26 @@ impl Plan {
 
     pub fn replace(&mut self, goal: String, mut tasks: Vec<Task>) {
         Plan::assign_task_ids(&mut tasks);
+        let specification = |task: &Task| Task {
+            id: task.id.clone(),
+            title: task.title.clone(),
+            brief: task.brief.clone(),
+            acceptance: task.acceptance.clone(),
+            depends_on: task.depends_on.clone(),
+            agent: task.agent.clone(),
+            args: task.args.clone(),
+            isolation: task.isolation,
+            repo: task.repo.clone(),
+            ..Default::default()
+        };
+        let approved = self.approved
+            && self.goal == goal
+            && self
+                .tasks
+                .iter()
+                .filter(|t| t.id != REVIEW_TASK)
+                .map(specification)
+                .eq(tasks.iter().filter(|t| t.id != REVIEW_TASK).map(specification));
         for task in tasks.iter_mut() {
             let old = self.tasks.iter().find(|t| t.id == task.id);
             task.ticket = crate::tickets::TicketLink::relink(task.ticket.take(), old.and_then(|o| o.ticket.as_ref()));
@@ -411,6 +434,7 @@ impl Plan {
                 task.report = old.report.clone();
                 task.notes = old.notes.clone();
                 task.integrated = old.integrated.clone();
+                task.integrated_commit = old.integrated_commit.clone();
                 task.dispatched_at = old.dispatched_at;
                 task.finished_at = old.finished_at;
                 task.worktree = old.worktree.clone();
@@ -427,7 +451,7 @@ impl Plan {
         }
         self.goal = goal;
         self.tasks = tasks;
-        self.approved = false;
+        self.approved = approved;
         self.add_review_task();
     }
 
@@ -531,6 +555,7 @@ impl Task {
     pub fn set_status(&mut self, status: TaskStatus) {
         if !matches!(status, TaskStatus::Review | TaskStatus::Done) {
             self.integrated = None;
+            self.integrated_commit = None;
             self.integration_verified = false;
         }
         self.status = status;
@@ -607,6 +632,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn branch_only_plan_edits_preserve_approval_but_scope_edits_require_review() {
+        let mut plan = Plan::default();
+        let mut tasks = vec![Task { id: "a".into(), title: "Implement".into(), ..Default::default() }];
+        plan.replace("Ship".into(), tasks.clone());
+        plan.approved = true;
+        tasks[0].branch = Some("feature".into());
+        plan.replace("Ship".into(), tasks.clone());
+        assert!(plan.approved);
+        tasks[0].acceptance.push("Another requirement".into());
+        plan.replace("Ship".into(), tasks);
+        assert!(!plan.approved);
+    }
+
+    #[test]
     fn accepted_tasks_without_branches_do_not_block_dependents() {
         let plan = Plan {
             tasks: vec![
@@ -618,7 +657,6 @@ mod tests {
         assert!(plan.unintegrated_dependencies(&plan.tasks[1]).is_empty());
         assert_eq!(plan.ready().iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["b"]);
     }
-
     #[cfg(feature = "native")]
     use crate::git;
 

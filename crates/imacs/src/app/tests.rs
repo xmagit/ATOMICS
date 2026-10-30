@@ -533,6 +533,7 @@ fn dispatch_requires_integrated_dependencies(app: &mut Desktop<'_>) {
         }),
     ] {
         app.runtime.finish_integration(Integrated {
+            commit: None,
             plan: app.runtime.plans[app.runtime.selected_plan].id.clone(),
             task: "a".into(),
             branch: "task-a".into(),
@@ -545,6 +546,7 @@ fn dispatch_requires_integrated_dependencies(app: &mut Desktop<'_>) {
     }
     app.runtime.plans[app.runtime.selected_plan].tasks[0].status = TaskStatus::Done;
     app.runtime.finish_integration(Integrated {
+        commit: None,
         plan: app.runtime.plans[app.runtime.selected_plan].id.clone(),
         task: "a".into(),
         branch: "task-a".into(),

@@ -402,6 +402,8 @@ With several open plans, update/dispatch/integrate require the id and errors lis
 plan’s tab, then open its **plan board** with `cmd+b` or **Plan** in the top bar. It has columns for planned, running,
 blocked, review and done. Edit briefs,
 then **Approve plan**: nothing starts before that.
+You can also approve a reviewed plan with `imacs ctl '{"cmd":"plan_approve","plan":"<id>"}'`.
+Changing only branch names keeps approval; changing the goal or task requirements requires review again.
 
 `imacs_plan_dispatch` (or **Dispatch ready** on the board) gives each ready task its own worktree and an agent whose
 first message is the brief. Every agent IMACS starts gets a `imacs_report` tool, pre-approved, to say when it is done,
