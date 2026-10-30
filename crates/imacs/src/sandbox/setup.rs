@@ -73,7 +73,7 @@ pub fn run(workspace: Option<&str>) -> Result<()> {
     use imacs_core::config::Config;
     let config = Config::load_or_create(&paths::config_file())
         .map_err(|_| anyhow::anyhow!("cannot load IMACS config; fix it before running setup"))?;
-    let config = checks::configured(&config, workspace)
+    let config = checks::setup_config(&config, workspace)
         .map_err(|_| anyhow::anyhow!("cannot load workspace isolation/ticket config; fix it before running setup"))?;
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
@@ -462,6 +462,66 @@ mod tests {
                     .all(|c| matches!(c[0].as_str(), "version" | "diagnose") || c[1] == "ls" || c[1] == "get")
             );
         }
+    }
+
+    #[test]
+    fn setup_without_a_workspace_registers_linear_for_any_saved_workspace_that_uses_it() {
+        const CHILD: &str = "IMACS_SETUP_WORKSPACE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            // Workspace files are found through IMACS_CONFIG, set for this child alone.
+            let main = imacs_core::config::Config::default();
+            let mcp = |workspace| checks::setup_config(&main, workspace).map(|sandbox| sandbox.mcp).ok();
+            println!("none={:?} plain={:?} work={:?}", mcp(None), mcp(Some("plain")), mcp(Some("work")));
+            let config = checks::setup_config(&main, None).unwrap();
+            if config.mcp.is_empty() {
+                return;
+            }
+            let (dir, sbx, keychain) = machine(Platform::Mac);
+            keychain.store(CLAUDE).unwrap();
+            let mut output = Vec::new();
+            guided(&sbx, &keychain, &config, &mut "y\ny\ny\n".as_bytes(), &mut output, false).unwrap();
+            println!(
+                "linear calls={:?}",
+                fake::calls_to(dir.path(), &["mcp"])
+                    .iter()
+                    .filter(|c| c.contains(&"linear".into()))
+                    .collect::<Vec<_>>()
+            );
+            return;
+        }
+        let dir = crate::test_support::tempdir().unwrap();
+        let workspaces = dir.path().join("config/workspaces");
+        std::fs::create_dir_all(&workspaces).unwrap();
+        std::fs::write(workspaces.join("plain.toml"), "projects = []\n").unwrap();
+        std::fs::write(workspaces.join("broken.toml"), "projects = [\n").unwrap();
+        let run = || {
+            let output = crate::test_support::output(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "sandbox::setup::tests::setup_without_a_workspace_registers_linear_for_any_saved_workspace_that_uses_it",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env("HOME", dir.path())
+                    .env("IMACS_HOME", dir.path().join("state"))
+                    .env("IMACS_CONFIG", dir.path().join("config/config.toml")),
+            );
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            stdout
+                .lines()
+                .filter(|line| line.starts_with("none=") || line.starts_with("linear calls="))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_eq!(run(), "none=Some([]) plain=Some([]) work=None");
+        // Max's daily workspace tracks its work in Linear; setup run without --workspace sees it.
+        std::fs::write(workspaces.join("work.toml"), "projects = []\n[tickets]\nsystem = \"Linear\"\n").unwrap();
+        let ran = run();
+        assert!(ran.starts_with(r#"none=Some(["linear"]) plain=Some([]) work=Some(["linear"])"#), "{ran}");
+        assert!(ran.contains(r#"["mcp", "add", "linear", "--url", "https://mcp.linear.app/mcp"]"#), "{ran}");
+        assert!(ran.contains(r#"["mcp", "auth", "linear"]"#), "{ran}");
     }
 
     #[test]

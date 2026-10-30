@@ -225,6 +225,26 @@ pub(crate) fn configured(config: &imacs_core::config::Config, workspace: Option<
     Ok(sandbox)
 }
 
+/// What `imacs setup` prepares the machine for. It runs outside IMACS, so without `--workspace` it
+/// cannot know the workspace IMACS will open: any saved workspace whose ticket profile uses Linear
+/// adds the Linear MCP server, as the main config's does. Unreadable workspaces are left to doctor.
+pub(crate) fn setup_config(config: &imacs_core::config::Config, workspace: Option<&str>) -> Result<SandboxConfig> {
+    let mut sandbox = configured(config, workspace)?;
+    let linear = |name: &String| {
+        workspace::Workspace::load(name)
+            .ok()
+            .and_then(|workspace| workspace.tickets().ok().flatten())
+            .is_some_and(|tickets| tickets.system.eq_ignore_ascii_case("linear"))
+    };
+    if workspace.is_none()
+        && !sandbox.mcp.iter().any(|name| name == "linear")
+        && workspace::Workspace::list().iter().any(linear)
+    {
+        sandbox.mcp.push("linear".into());
+    }
+    Ok(sandbox)
+}
+
 pub(super) fn host_lines() -> Vec<String> {
     host_lines_with(|name| crate::setup::find_program(name).is_some())
 }

@@ -31,8 +31,8 @@ After installing IMACS, run this in a trusted host terminal:
 
 ```sh
 imacs setup
-# With workspace-specific isolation/ticket settings:
-imacs --workspace daily setup
+# With one workspace's isolation/ticket settings:
+imacs setup --workspace daily
 ```
 
 Setup creates a missing IMACS config and checks git, Claude Code, Codex, sbx (at least
@@ -57,8 +57,9 @@ sudo apt install docker-sbx
 Setup then guides Docker browser sign-in, initializes the global network policy only if it
 is missing, stores Claude's subscription setup-token in the OS keychain, and registers its
 lookup with sbx before removing the built-in `anthropic` secret. It reads a missing OpenAI
-API key over stdin. A Linear ticket profile (including a workspace override) adds the
-`sbx mcp add linear` and `sbx mcp auth linear` steps. Browser authentication runs with private
+API key over stdin. A Linear ticket profile adds the `sbx mcp add linear` and `sbx mcp auth linear`
+steps: the named workspace's with `--workspace`, otherwise the main config's or any saved workspace's,
+since setup cannot know which workspace IMACS will open. Browser authentication runs with private
 child output; if a browser does not open, run the indicated authentication command in a host
 terminal and retry setup. It also offers to remove a stored GitHub credential and disable
 SSH forwarding, so the corresponding readiness checks can pass.
