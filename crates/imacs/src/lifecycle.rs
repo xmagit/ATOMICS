@@ -559,7 +559,7 @@ mod tests {
         std::fs::write(home.join("briefs/stale/brief.md"), "remove").unwrap();
         std::fs::write(home.join("briefs/orphan.md"), "remove").unwrap();
         // Left by an earlier run: written just now, they could share the cutoff's clock tick, and so count as new.
-        for path in [clean.clone(), home.join("briefs/stale"), home.join("briefs/orphan.md")] {
+        for path in [clean.clone(), dirty.clone(), home.join("briefs/stale"), home.join("briefs/orphan.md")] {
             let earlier = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
             std::fs::File::open(path).unwrap().set_modified(earlier).unwrap();
         }
