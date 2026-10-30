@@ -346,6 +346,8 @@ pub(crate) struct State {
     config_path: PathBuf,
     config_stamp: [Option<u64>; 3],
     repo_workflows: HashMap<PathBuf, imacs_core::repo_workflow::RepoWorkflow>,
+    /// The project each folder belongs to, asked of git once per folder.
+    project_roots: HashMap<PathBuf, PathBuf>,
     config_checked: Instant,
     config_error: Option<String>,
     /// What the theme files or `[theme]` could not apply; the rest of the theme still does.
@@ -740,6 +742,7 @@ impl State {
             palette: Arc::new(palette),
             config_stamp: config_fingerprints(&config_path),
             repo_workflows: HashMap::new(),
+            project_roots: HashMap::new(),
             config,
             config_path,
             config_checked: Instant::now(),

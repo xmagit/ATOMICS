@@ -3,7 +3,21 @@ use imacs_core::repo_workflow::RepoWorkflow;
 
 impl State {
     fn cached_repo_workflow(&self, repo: &Path) -> Option<&RepoWorkflow> {
-        self.repo_workflows.get(repo).or_else(|| self.project_of(repo).and_then(|root| self.repo_workflows.get(&root)))
+        self.repo_workflows
+            .get(repo)
+            .or_else(|| self.project_roots.get(repo).and_then(|root| self.repo_workflows.get(root)))
+            .or_else(|| self.project_of(repo).and_then(|root| self.repo_workflows.get(&root)))
+    }
+
+    /// The runtime tick holds the lock the UI waits on, so git runs once per folder, not per tick.
+    pub(super) fn resolve_project_root(&mut self, dir: &Path) -> PathBuf {
+        if let Some(root) = self.project_roots.get(dir) {
+            return root.clone();
+        }
+        let root =
+            self.project_of(dir).or_else(|| workspace::project_root(dir).ok()).unwrap_or_else(|| dir.to_path_buf());
+        self.project_roots.insert(dir.to_path_buf(), root.clone());
+        root
     }
 
     pub(super) fn project_base_ref(&self, repo: &Path) -> String {
@@ -23,8 +37,13 @@ impl State {
         if let Some(workflow) = self.cached_repo_workflow(repo) {
             return workflow.apply(&self.effective_config());
         }
-        let root =
-            self.project_of(repo).or_else(|| workspace::project_root(repo).ok()).unwrap_or_else(|| repo.to_path_buf());
+        let root = self
+            .project_roots
+            .get(repo)
+            .cloned()
+            .or_else(|| self.project_of(repo))
+            .or_else(|| workspace::project_root(repo).ok())
+            .unwrap_or_else(|| repo.to_path_buf());
         let config =
             Config { tickets: self.effective_tickets(), workflow: self.workflow().clone(), ..self.config.clone() };
         match self.repo_workflows.get(&root) {
@@ -62,17 +81,13 @@ impl State {
         roots.extend(
             self.plans.iter().flat_map(|p| p.tasks.iter()).filter_map(|t| t.repo.as_deref().map(paths::expand)),
         );
+        // Agents' folders too, so their diffs find their project's settings in the cache.
+        roots.extend(self.diffs.keys().cloned());
         roots.sort();
         roots.dedup();
         let mut roots: Vec<_> = roots
             .into_iter()
-            .map(|root| {
-                if self.repo_workflows.contains_key(&root) {
-                    root
-                } else {
-                    self.project_of(&root).or_else(|| workspace::project_root(&root).ok()).unwrap_or(root)
-                }
-            })
+            .map(|root| if self.repo_workflows.contains_key(&root) { root } else { self.resolve_project_root(&root) })
             .collect();
         roots.sort();
         roots.dedup();
@@ -143,6 +158,34 @@ mod tests {
                 std::fs::remove_file(repo.join(".imacs/config.toml")).unwrap();
                 app.runtime.reload_repo_workflows();
                 assert_eq!(app.runtime.project_config(&repo).tickets.branch.as_deref(), Some("workspace/{slug}"));
+            },
+        );
+    }
+
+    #[test]
+    fn diff_base_refs_of_agent_folders_come_from_the_cache_without_git() {
+        with_app(
+            "app::repo_workflow::tests::diff_base_refs_of_agent_folders_come_from_the_cache_without_git",
+            |app, ctx| {
+                let (_dir, repo) = repository();
+                let repo = repo.canonicalize().unwrap();
+                std::fs::create_dir(repo.join(".imacs")).unwrap();
+                std::fs::write(repo.join(".imacs/config.toml"), "base_ref = 'develop'\n").unwrap();
+                let linked = repo.parent().unwrap().join("agent");
+                git::add_worktree(&repo, &linked, "agent-task", "main").unwrap();
+                let linked = linked.canonicalize().unwrap();
+                // An agent folder outside the open projects, as when a workspace's chief runs agents elsewhere.
+                app.runtime.diffs.entry(linked.clone()).or_default();
+                app.runtime.runtime_tick(ctx);
+                app.runtime.reload_repo_workflows();
+                assert_eq!(app.runtime.project_roots[&linked], repo);
+                assert_eq!(app.runtime.project_base_ref(&linked), "develop");
+                // Every later tick answers from the cache: with git unusable the base ref is unchanged.
+                std::fs::rename(repo.join(".git"), repo.join(".git-moved")).unwrap();
+                app.runtime.runtime_tick(ctx);
+                assert_eq!(app.runtime.project_base_ref(&linked), "develop");
+                assert_eq!(app.runtime.project_config(&linked).base_ref, "develop");
+                std::fs::rename(repo.join(".git-moved"), repo.join(".git")).unwrap();
             },
         );
     }
