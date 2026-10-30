@@ -90,6 +90,11 @@ pub fn unpin(work_tree: &Path) {
     PINNED.lock().unwrap_or_else(|e| e.into_inner()).retain(|pins| pins.work_tree != work_tree);
 }
 
+/// Every pinned folder's record: the folders sandboxes work in, and so the git folders they can write.
+pub fn pinned_all() -> Vec<GitPins> {
+    PINNED.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 /// The pins of the innermost pinned folder holding `dir`, by its path as given or as it resolves.
 pub fn pinned(dir: &Path) -> Option<GitPins> {
     let pinned = PINNED.lock().unwrap_or_else(|e| e.into_inner());

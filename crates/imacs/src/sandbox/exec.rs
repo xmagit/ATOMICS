@@ -92,7 +92,7 @@ impl Exec {
         let mut child = sbx_command(&self.sbx, &args, false, &stdout, &stderr)?
             .spawn()
             .with_context(|| format!("running {}", self.sbx))?;
-        let status = wait(&mut child, started + Duration::from_secs(secs) + GRACE)?;
+        let status = wait(&mut child, started + Duration::from_secs(secs) + GRACE, None)?;
         let elapsed = started.elapsed();
         let exit_code = status.map(|status| {
             use std::os::unix::process::ExitStatusExt;

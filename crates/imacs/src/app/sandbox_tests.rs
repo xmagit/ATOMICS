@@ -108,6 +108,93 @@ fn quitting_stops_running_and_preparing_sandboxes_and_joins_cleanup() {
 }
 
 #[test]
+fn ui_paths_return_while_cleanup_is_blocked_and_their_own_work_waits_for_it() {
+    with_app(
+        "app::sandbox_tests::ui_paths_return_while_cleanup_is_blocked_and_their_own_work_waits_for_it",
+        |app, ctx| {
+            let (dir, repo) = repository();
+            let bin = crate::test_support::tempdir().unwrap();
+            app.runtime.sbx = fake::install(bin.path()).display().to_string();
+            app.runtime.config.isolation.mode = IsolationMode::Sandbox;
+            app.runtime.config.agents.iter_mut().for_each(|agent| agent.isolation = None);
+            let tree = worktree(&repo, "task");
+            // A sandboxed session that ran, so that resuming it reattaches to its sandbox.
+            let first = app.runtime.start(ctx, "claude", tree, None, vec![], None).unwrap();
+            tick_until(app, ctx, "the agent to attach", |_| bin.path().join("run-ssh").exists());
+            let cid = app.runtime.sessions[app.runtime.find(&first).unwrap()].claude_id.clone().unwrap();
+            let record = app.runtime.store.sessions.iter().find(|r| r.claude_session_id == cid).unwrap().clone();
+            finish_agents(app, ctx);
+            std::fs::remove_file(bin.path().join("run-ssh")).unwrap();
+            app.runtime.plans = vec![Plan {
+                id: "closed".into(),
+                status: PlanStatus::Archived,
+                project: Some(repo.clone()),
+                ..Plan::default()
+            }];
+
+            // Cleanup that may touch any sandbox or worktree is stuck, as one waiting on sbx would be.
+            let (release, stuck) = std::sync::mpsc::channel::<()>();
+            app.runtime.lifecycle(Scope { sandboxes: Vec::new(), worktrees: None }, move || {
+                let _ = stuck.recv();
+            });
+            let calls = fake::calls(bin.path()).len();
+            app.runtime.resume_record(ctx, record);
+            let next = dir.path().join("next");
+            let launch = Launch {
+                agent: "shell".into(),
+                prompt: None,
+                args: Vec::new(),
+                reply: None,
+                task: None,
+                isolation: None,
+            };
+            app.runtime.config.worktree_path = next.display().to_string();
+            app.runtime.create_worktree(repo.clone(), "next".into(), None, launch);
+            app.runtime.reopen_plan(0).unwrap();
+            // Each returned with the cleanup still stuck; joining it here would never have returned.
+            assert!(app.runtime.lifecycle_jobs.iter().any(|job| !job.is_finished()));
+            for _ in 0..20 {
+                app.runtime.runtime_tick(ctx);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(fake::calls(bin.path()).len(), calls, "the resumed sandbox waits for the cleanup");
+            assert!(!next.exists() && !app.runtime.creating.is_empty(), "so does the new worktree");
+
+            release.send(()).unwrap();
+            tick_until(app, ctx, "the resumed agent to attach", |_| bin.path().join("run-ssh").exists());
+            tick_until(app, ctx, "the new worktree", |app| app.runtime.creating.is_empty());
+            assert!(next.exists());
+            finish_agents(app, ctx);
+        },
+    );
+}
+
+#[test]
+fn quitting_stops_making_a_sandbox_rather_than_waiting_for_it() {
+    with_app("app::sandbox_tests::quitting_stops_making_a_sandbox_rather_than_waiting_for_it", |app, ctx| {
+        let (_dir, repo) = repository();
+        let bin = crate::test_support::tempdir().unwrap();
+        app.runtime.sbx = fake::install(bin.path()).display().to_string();
+        app.runtime.config.isolation.mode = IsolationMode::Sandbox;
+        app.runtime.config.agents.iter_mut().for_each(|agent| agent.isolation = None);
+        // sbx takes its time making the sandbox, as a first image pull can for minutes.
+        std::fs::write(bin.path().join("wait-create"), "wait").unwrap();
+        let id = app.runtime.start(ctx, "claude", repo, None, vec![], None).unwrap();
+        let name = format!("imacs-{id}");
+        tick_until(app, ctx, "sbx create", |_| bin.path().join("waiting-create").exists());
+        let quit = Instant::now();
+        app.runtime.shutdown();
+        assert!(quit.elapsed() < QUIT_WAIT * 2 + Duration::from_secs(30), "quit took {:?}", quit.elapsed());
+        assert!(app.runtime.pending_sandbox.is_empty());
+        // The preparation removed what was reserved for its sandbox; nothing is left owned.
+        assert!(!bin.path().join("sandboxes").join(&name).exists() && !bin.path().join("mcp").join(&name).exists());
+        assert!(!crate::sandbox_ownership::owned(&paths::imacs_home()).unwrap().contains_key(&name));
+        std::fs::remove_file(bin.path().join("wait-create")).unwrap();
+        app.runtime.sessions.clear();
+    });
+}
+
+#[test]
 fn plan_close_cleanup_settings_control_worktrees_and_archive_keeps_branches() {
     with_app(
         "app::sandbox_tests::plan_close_cleanup_settings_control_worktrees_and_archive_keeps_branches",

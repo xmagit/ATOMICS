@@ -22,6 +22,7 @@ use crate::diff_worker::{DiffData, DiffWorker, WorkerResult};
 use crate::governor::{Governor, Jobserver};
 use crate::highlight::Highlighter;
 use crate::ipc::{self, Channels, ControlMessage, ControlOutcome, HookMessage, Hub};
+use crate::lifecycle::Scope;
 use crate::sandbox::AgentRuntime;
 use crate::setup::{SHELL_PATH, env_var, global_hooks_installed, install_global_hooks, resolve_program};
 use crate::terminal::{Metrics, Terminal, TerminalView};
@@ -178,6 +179,11 @@ const NEEDS_INPUT_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(4);
 const DELIVERY_ATTEMPTS: u8 = 3;
 const CODEX_VERSION_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a quit waits for sandboxes being prepared, and then again for those whose creation it
+/// stopped to clean up.
+const QUIT_WAIT: Duration = Duration::from_secs(10);
+/// How long a quit waits for sandbox and worktree cleanup still running.
+const QUIT_JOBS_WAIT: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SteerTarget {
@@ -387,7 +393,7 @@ pub(crate) struct State {
     /// The `sbx` program sandboxed agents run with.
     sbx: String,
     sandbox_usage: crate::sandbox_usage::Sampler,
-    lifecycle_jobs: Vec<std::thread::JoinHandle<()>>,
+    lifecycle_jobs: Vec<crate::lifecycle::Job>,
     startup_cleanup: Option<std::thread::JoinHandle<()>>,
     shutting_down: bool,
     sandbox_check: Option<Receiver<Vec<String>>>,
@@ -988,11 +994,24 @@ impl State {
         }));
     }
 
+    /// Starts lifecycle work in the background; see [`crate::lifecycle::Job`].
+    pub(super) fn lifecycle(&mut self, scope: Scope, work: impl FnOnce() + Send + 'static) {
+        self.lifecycle_jobs.retain(|job| !job.is_finished());
+        self.lifecycle_jobs.push(crate::lifecycle::Job::spawn(scope, work));
+    }
+
+    /// The lifecycle jobs still running, for a background thread to wait for what it must.
+    pub(super) fn running_lifecycle(&mut self) -> Vec<crate::lifecycle::Job> {
+        self.lifecycle_jobs.retain(|job| !job.is_finished());
+        self.lifecycle_jobs.clone()
+    }
+
+    /// Waits for every lifecycle job. Tests only: the UI thread never waits for them, and a quit
+    /// waits a bounded time.
+    #[cfg(test)]
     fn finish_lifecycle_jobs(&mut self) {
         for job in self.lifecycle_jobs.drain(..) {
-            if job.join().is_err() {
-                eprintln!("IMACS: cleanup worker panicked");
-            }
+            job.wait();
         }
     }
 
@@ -1012,18 +1031,48 @@ impl State {
                 terminal.shutdown();
             }
         }
-        // Preparation can finish after the window closes. Wait before stopping those sandboxes.
+        // Preparation can finish after the window closes. Wait before stopping those sandboxes, but not
+        // for sbx to make one, which can take 15 minutes: that stops, and its preparation removes what
+        // sbx made of it.
         let mut names: HashSet<String> = self.sessions.iter().filter_map(|s| s.sandbox.clone()).collect();
-        for (launch, ready) in std::mem::take(&mut self.pending_sandbox) {
-            let _ = ready.recv();
-            if let AgentRuntime::Sandbox(sandbox) = launch.runtime {
-                names.insert(sandbox.name);
+        let mut pending = std::mem::take(&mut self.pending_sandbox);
+        for round in 0..2 {
+            let deadline = Instant::now() + QUIT_WAIT;
+            pending.retain(|(launch, ready)| {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = ready.recv_timeout(left) {
+                    return true;
+                }
+                if let AgentRuntime::Sandbox(sandbox) = &launch.runtime {
+                    names.insert(sandbox.name.clone());
+                }
+                false
+            });
+            // Also one a closed plan's cleanup waits for, which is not pending here.
+            if round == 0 {
+                crate::sandbox::stop_creating();
             }
         }
+        let mut notes: Vec<String> = pending
+            .iter()
+            .filter_map(|(launch, _)| match &launch.runtime {
+                AgentRuntime::Sandbox(sandbox) => {
+                    Some(format!("Sandbox {} was still being made at quit", sandbox.name))
+                }
+                AgentRuntime::Bare => None,
+            })
+            .collect();
         for name in names {
             self.stop_sandbox(name);
         }
-        self.finish_lifecycle_jobs();
+        // Work still running after that ends with IMACS, as in a crash; the next start's sweep finds
+        // what it left.
+        let deadline = Instant::now() + QUIT_JOBS_WAIT;
+        let unfinished = self.lifecycle_jobs.drain(..).filter(|job| !job.wait_until(deadline)).count();
+        if unfinished > 0 {
+            notes.push(format!("{unfinished} sandbox or worktree cleanup jobs were still running at quit"));
+        }
+        crate::lifecycle::record_leftovers(&paths::imacs_home(), &notes);
         self.check_all_refs(&self.exempt_branches());
         self.ref_checks.finish();
         if let Some(job) = self.startup_cleanup.take() {

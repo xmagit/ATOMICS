@@ -4,7 +4,6 @@ impl State {
     /// Checks out `branch` in a new worktree, from `start` (a plan's integration branch)
     /// or base_ref, and starts `launch` in it.
     pub(super) fn create_worktree(&mut self, repo: PathBuf, branch: String, start: Option<String>, launch: Launch) {
-        self.finish_lifecycle_jobs();
         let path = git::worktree_path(&self.config.worktree_path, &repo, &branch);
         let config = self.project_config(&repo);
         let (tx, base_ref) = (self.worktree_tx.clone(), config.base_ref);
@@ -27,7 +26,11 @@ impl State {
         let conflict = !owners.is_empty() && !reuse;
         self.creating.push((common.clone(), branch.clone(), path.clone()));
         self.toast(format!("Creating worktree {}…", paths::display(&path)));
+        let jobs = self.running_lifecycle();
         std::thread::spawn(move || {
+            // A cleanup may still be removing a worktree here, such as a reopened plan's. This thread
+            // waits for it, never the UI thread.
+            crate::lifecycle::wait_for(&jobs, None, Some(&path));
             // A retried task finds its worktree from the first attempt.
             let existing = reuse
                 && git::common_dir(&path).is_ok_and(|dir| dir == common)
@@ -70,7 +73,7 @@ impl State {
         cleanup.sandboxes = Default::default();
         let (tx, repo, base) = (cleanup.tx.clone(), cleanup.repo.clone(), self.project_config(&cleanup.repo).base_ref);
         let sbx = resolve_program(&self.sbx);
-        self.lifecycle_jobs.push(std::thread::spawn(move || {
+        self.lifecycle(Scope::none(), move || {
             let result = crate::sandbox::load_owned_pins(&paths::imacs_home())
                 .and_then(|()| git::worktree_health(&repo, &base))
                 .map_err(|e| format!("{e:#}"));
@@ -81,14 +84,17 @@ impl State {
                     .map_err(|e| format!("listing sandboxes: {e:#}"));
                 let _ = tx.send(CleanupEvent::Sandboxes(sandboxes));
             }
-        }));
+        });
     }
 
-    /// Runs a git maintenance command for the dialog in the background.
-    fn cleanup_git(&self, cleanup: &mut Cleanup, label: &str, args: &'static [&'static str]) {
+    /// Runs a git maintenance command for the dialog in the background. It writes `refs`, names or
+    /// prefixes ending in `/`, which ref guards then keep as IMACS's own.
+    fn cleanup_git(&self, cleanup: &mut Cleanup, label: &str, args: &'static [&'static str], refs: &[&str]) {
         cleanup.busy = Some(label.to_string());
         let (tx, repo, label) = (cleanup.tx.clone(), cleanup.repo.clone(), label.to_string());
+        let refs: Vec<String> = refs.iter().map(|name| name.to_string()).collect();
         std::thread::spawn(move || {
+            let _write = (!refs.is_empty()).then(|| crate::ref_guard::host_write_refs(&repo, refs));
             let message = match git::git(&repo, args) {
                 Ok(_) => format!("{label}: done"),
                 Err(err) => format!("{label}: {err:#}"),
@@ -351,8 +357,13 @@ impl Desktop<'_> {
             self.post(move |state| {
                 if let Some(mut cleanup) = state.cleanup.take() {
                     match action {
-                        "fetch" => state.cleanup_git(&mut cleanup, "fetch --prune", &["fetch", "--prune", "--quiet"]),
-                        "prune" => state.cleanup_git(&mut cleanup, "prune", &["worktree", "prune"]),
+                        "fetch" => state.cleanup_git(
+                            &mut cleanup,
+                            "fetch --prune",
+                            &["fetch", "--prune", "--quiet"],
+                            &["refs/remotes/", "refs/tags/"],
+                        ),
+                        "prune" => state.cleanup_git(&mut cleanup, "prune", &["worktree", "prune"], &[]),
                         "reload" => state.load_cleanup(&mut cleanup),
                         _ => {}
                     }
@@ -379,8 +390,16 @@ impl Desktop<'_> {
             cleanup.busy = Some(format!("removing {} worktrees…", targets.len()));
             let (tx, repo, delete) = (cleanup.tx.clone(), cleanup.repo.clone(), self.client.cleanup_delete_branches);
             let sbx = resolve_program(&self.runtime.sbx);
+            let scope = Scope {
+                sandboxes: targets
+                    .iter()
+                    .flat_map(|(_, _, names)| names.iter().cloned())
+                    .chain(orphans.clone())
+                    .collect(),
+                worktrees: Some(targets.iter().map(|(path, _, _)| path.clone()).collect()),
+            };
             self.post(move |state| {
-                state.lifecycle_jobs.push(std::thread::spawn(move || {
+                state.lifecycle(scope, move || {
                     let remove_sandbox = |name: String| {
                         let result =
                             crate::sandbox::remove(&paths::imacs_home(), &sbx, &name).map_err(|e| format!("{e:#}"));
@@ -412,7 +431,7 @@ impl Desktop<'_> {
                     }
                     orphans.into_iter().for_each(remove_sandbox);
                     let _ = tx.send(CleanupEvent::Finished("removal finished".into()));
-                }));
+                });
             });
         }
         self.client.cleanup_open = open;

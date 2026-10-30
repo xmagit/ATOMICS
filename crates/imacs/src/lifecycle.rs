@@ -1,6 +1,8 @@
 //! Cleanup owned resources, with failures kept visible in doctor and the cleanup dialog.
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use imacs_core::{cleanup, config::Config, git, plan::Plan, store::Store};
@@ -10,6 +12,103 @@ use crate::sandbox_ownership::{self as ownership, Resource};
 
 fn real(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Background work that stops or removes sandboxes and worktrees: a closed session's stop and final
+/// ref check, a plan's cleanup, the cleanup dialog's removals. Work that must not overlap it, such as
+/// preparing the same sandbox or making a worktree where one is being removed, waits for it on a
+/// thread of its own; the UI thread never does.
+#[derive(Clone)]
+pub struct Job {
+    done: Arc<(Mutex<bool>, Condvar)>,
+    scope: Scope,
+}
+
+/// What a [`Job`] may stop or remove. `None` is anything, for work that finds its targets as it runs.
+#[derive(Clone, Default)]
+pub struct Scope {
+    pub sandboxes: Vec<String>,
+    pub worktrees: Option<Vec<PathBuf>>,
+}
+
+impl Scope {
+    pub fn sandbox(name: String) -> Self {
+        Self { sandboxes: vec![name], worktrees: Some(Vec::new()) }
+    }
+
+    /// Work that stops or removes nothing, such as a scan.
+    pub fn none() -> Self {
+        Self { sandboxes: Vec::new(), worktrees: Some(Vec::new()) }
+    }
+}
+
+/// Marks its job done when its thread ends, also by a panic.
+struct Done(Arc<(Mutex<bool>, Condvar)>);
+
+impl Drop for Done {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("IMACS: cleanup worker panicked");
+        }
+        let (done, changed) = &*self.0;
+        *done.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        changed.notify_all();
+    }
+}
+
+impl Job {
+    pub fn spawn(scope: Scope, work: impl FnOnce() + Send + 'static) -> Self {
+        let job = Self { done: Arc::default(), scope };
+        let done = Done(job.done.clone());
+        std::thread::spawn(move || {
+            let _done = done;
+            work();
+        });
+        job
+    }
+
+    pub fn is_finished(&self) -> bool {
+        *self.done.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Whether it may stop or remove sandbox `name`, or the worktree at `path`. Compares folders by
+    /// where they lead: call it off the UI thread.
+    pub fn touches(&self, name: Option<&str>, path: Option<&Path>) -> bool {
+        let worktree = |path: &Path| match &self.scope.worktrees {
+            None => true,
+            Some(worktrees) => worktrees.iter().any(|tree| tree == path || real(tree) == real(path)),
+        };
+        name.is_some_and(|name| self.scope.sandboxes.iter().any(|other| other == name)) || path.is_some_and(worktree)
+    }
+
+    pub fn wait(&self) {
+        let (done, changed) = &*self.done;
+        let mut finished = done.lock().unwrap_or_else(|e| e.into_inner());
+        while !*finished {
+            finished = changed.wait(finished).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Waits at most until `deadline`; whether the job finished.
+    pub fn wait_until(&self, deadline: Instant) -> bool {
+        let (done, changed) = &*self.done;
+        let mut finished = done.lock().unwrap_or_else(|e| e.into_inner());
+        while !*finished {
+            let Some(left) = deadline.checked_duration_since(Instant::now()).filter(|left| !left.is_zero()) else {
+                return false;
+            };
+            finished = changed.wait_timeout(finished, left).unwrap_or_else(|e| e.into_inner()).0;
+        }
+        true
+    }
+}
+
+/// Waits, off the UI thread, for those of `jobs` that may stop or remove sandbox `name` or the
+/// worktree at `path`.
+pub fn wait_for(jobs: &[Job], name: Option<&str>, path: Option<&Path>) {
+    for job in jobs.iter().filter(|job| job.touches(name, path)) {
+        job.wait();
+    }
 }
 
 pub fn clean_plan(home: &Path, plan: &Plan, sbx: &str, protected: &[PathBuf]) -> Vec<String> {

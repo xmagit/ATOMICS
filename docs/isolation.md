@@ -360,8 +360,18 @@ tasks. Sandboxed work it checks inside the sandbox (see [Checking sandboxed work
 5. **Cleanup.** Removing a worktree in the cleanup dialog, or a completed plan's worktrees in plan
    cleanup, also removes its sandboxes (`sbx rm`) and IMACS's MCP registration for each. The worktree
    cleanup dialog also lists **sandboxes whose worktree is gone**, so you can remove orphans. IMACS only
-   lists and removes only sandboxes recorded in this home's `sandbox-ownership.json`. Quitting waits for sandbox preparation
-   and stop jobs to finish; stopped sandboxes remain available for resume.
+   lists and removes only sandboxes recorded in this home's `sandbox-ownership.json`. IMACS records a
+   sandbox and its MCP registration there before asking sbx to make them, so a crash or a timeout part
+   way leaves resources this home owns, which removal or the next startup sweep takes away.
+6. **Waiting.** Stopping, removing and cleaning up run in the background, and IMACS never waits for them
+   while you work. A start that would overlap one waits for it in its own background job: resuming a
+   session whose sandbox is still stopping, or preparing a sandbox, or making a worktree, where a cleanup is
+   removing one. Reopening a closed plan does not wait for its cleanup; a task started again waits.
+7. **Quit.** Quitting waits up to 10 seconds for sandboxes being prepared, then stops sbx making any still
+   being made (a first image pull can take minutes); their preparation removes what sbx made. It then
+   stops running and prepared sandboxes, which remain available for resume, and waits up to a minute
+   for cleanup still running. Whatever outlives that is noted in `imacs doctor` and the Clean up… dialog,
+   and the next start's sweep finds it.
 
 Completed plans automatically remove their clean task worktrees and delete task branches contained in
 the integration branch, using `git branch -d`. Archiving removes clean task worktrees and keeps their
@@ -521,11 +531,32 @@ tests there, in a worktree that starts from the integration branch.
 - **The worktree and its branch.** A sandboxed agent can change anything in its worktree, and commit.
 - **Ref recovery.** Refs live in the shared common dir. IMACS saves a host-only snapshot before a
   sandboxed agent starts, checks it at turn boundaries and on exit/close, and restores changed, deleted
-  or newly created refs outside the task branches. A persistent red board alert and a blocked report
+  or newly created refs that nothing below accounts for. A persistent red board alert and a blocked report
   announce recovery or a failed restore. The task branch, the branches of other running agents and of
   unfinished plan tasks are exempt so legitimate commits survive. A done task's branch is not: moving it
   is restored. This is recovery after a turn, not write isolation: shared refs cannot
   identify which concurrent writer moved a ref. Review the diff and branch before integrating.
+- **What this machine wrote is kept.** A check keeps, since the previous check:
+  - refs IMACS wrote itself: integrations, new task branches, cleanup, and the Clean up… dialog's
+    `fetch --prune` (`refs/remotes/` and `refs/tags/`), at the values IMACS left;
+  - a branch you moved in a checkout on this machine (commit, amend, pull, merge, rebase, reset, cherry-pick,
+    `git switch -c`), at the commit that checkout's HEAD log says it left it at. That is the main
+    checkout or any linked worktree no sandbox works in, also after switching away from the branch;
+  - remote-tracking refs and tags at an object a fetch or pull on this machine wrote to its
+    `FETCH_HEAD`, and those such a fetch may have pruned;
+  - `refs/stash`, which every checkout shares, at whatever it is: it is never restored.
+
+  These traces are in git folders no sandbox mounts, so an agent cannot leave them, with one exception:
+  the main checkout's HEAD log is in the shared `logs` folder, and an agent that writes it on purpose can
+  pass a move of the branch checked out there as yours. Otherwise you would lose your own commits. A
+  branch you create other than by switching to it (`git branch x`), delete, or move while no checkout
+  here has it checked out (`git branch -f`, `git update-ref`) leaves no such trace and is put back like
+  an agent's, as is a fetch with `--no-write-fetch-head`.
+- **Nothing is deleted.** Putting a ref back keeps the value it replaces at
+  `refs/imacs/quarantine/<sandbox>/<ref>@<object>`, and the alert names it: a branch the agent made is
+  moved there rather than deleted, and a value restored over is kept there. If it was yours, take it back
+  with `git branch -f <branch> refs/imacs/quarantine/…`, and delete the quarantine ref when you are done
+  (`git update-ref -d`). Checks do not guard `refs/imacs/quarantine/`.
 - **Objects are data.** Objects an agent writes stay on your machine, and git never executes them. Hooks
   and config, which do run on your machine, are out of reach, and git on your machine finds them through
   IMACS's record, not the files the agent can write (see
