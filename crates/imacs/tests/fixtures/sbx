@@ -10,6 +10,7 @@
 #   wait-<verb> pause that verb until the file is removed; waiting-<verb> signals readiness
 #   wait-agent pause run after attachment, before checking for the optional agent hook
 #   exec-runs    `exec` runs its command in the -w folder, stopped after its `timeout` seconds as in the VM
+#   templates    tags `template save` saved, one per line, which `template ls --json` lists
 dir=${0%/*}
 state="$dir/sandboxes"
 mkdir -p "$state"
@@ -99,8 +100,6 @@ case "$1" in
       rm)
         case "$3" in
           anthropic) touch "$dir/removed-anthropic" ;;
-          sk-ant-MISFILED-private-value) [ "$4" = --force ] && rm -f "$dir/misfiled-secret" ;;
-          sk-ant-oat01-SCOPED-private-value) [ "$4 $5 $6" = "--sandbox anthropic --force" ] && rm -f "$dir/misfiled-scoped" ;;
         esac
         ;;
     esac
@@ -209,6 +208,15 @@ case "$1" in
     if [ "$2" = save ] && ! grep -q '"status":"stopped"' "$state/$3"; then
       echo 'stop the sandbox before saving a template non-interactively' >&2
       exit 1
+    fi
+    [ "$2" = save ] && printf '%s\n' "$4" >> "$dir/templates"
+    if [ "$2" = ls ]; then
+      # A stock image, then every tag saved here, split into repository and tag like sbx's listing.
+      printf '[{"repository":"docker.io/docker/sandbox-templates","tag":"codex-docker"}'
+      if [ -e "$dir/templates" ]; then
+        while read -r tag; do printf ',{"repository":"docker.io/library/%s","tag":"%s"}' "${tag%:*}" "${tag##*:}"; done < "$dir/templates"
+      fi
+      printf ']\n'
     fi
     ;;
   exec)

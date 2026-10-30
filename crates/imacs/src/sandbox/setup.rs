@@ -165,21 +165,16 @@ fn guided(
         consent(input, output, "Remove sbx's github secret so sandbox agents cannot push as you?")?;
         safe_sbx(program, &["secret", "rm", "github", "--force"], "could not remove github secret; retry setup")?;
     }
-    let misfiled = checks::secrets(program)
-        .ok_or_else(|| anyhow::anyhow!("cannot check known secret services; retry setup"))?
-        .misfiled;
-    if !misfiled.is_empty() {
-        consent(
-            input,
-            output,
-            &format!(
-                "Remove {} from sbx? Names stay hidden: they may hold a pasted credential.",
-                checks::misfiled_text(&misfiled)
-            ),
-        )?;
-        for secret in &misfiled {
-            safe_sbx(program, &secret.remove_args(), "could not remove a misfiled secret; retry setup")?;
+    // Setup never removes these itself: `sbx secret rm <name>` would put a pasted credential in argv.
+    loop {
+        let misfiled = checks::secrets(program)
+            .ok_or_else(|| anyhow::anyhow!("cannot check known secret services; retry setup"))?
+            .misfiled;
+        if misfiled.is_empty() {
+            break;
         }
+        writeln!(output, "sbx holds {}: {}.", checks::misfiled_text(&misfiled), checks::MISFILED_HINT)?;
+        retry(input, output)?;
     }
     // Read the store again through doctor's lines: setup is not done with a secret doctor reports missing.
     if let Some(failed) =
@@ -338,11 +333,8 @@ mod tests {
     #[test]
     fn fresh_setup_reaches_green_with_claude_bare_and_reruns_without_mutations() {
         let (dir, sbx) = machine();
-        touch(
-            dir.path(),
-            &["signed-out", "no-policy", "removed-anthropic", "no-openai", "misfiled-secret", "misfiled-scoped"],
-        );
-        let (result, output) = run_setup(&sbx, false, true, &format!("y\ny\ny\n{OPENAI}\ny\ny\ny\n"));
+        touch(dir.path(), &["signed-out", "no-policy", "removed-anthropic", "no-openai"]);
+        let (result, output) = run_setup(&sbx, false, true, &format!("y\ny\ny\n{OPENAI}\ny\ny\n"));
         result.unwrap();
         assert!(
             output.lines().filter(|l| l.starts_with('✓') || l.starts_with('✗')).all(|l| l.starts_with('✓')),
@@ -350,7 +342,6 @@ mod tests {
         );
         assert!(output.contains("Claude agents run bare by default; to sandbox Claude, store an Anthropic API key"));
         assert!(output.lines().any(|l| l.starts_with("sandboxed Claude: not configured")), "{output}");
-        assert!(output.contains("Remove 2 misfiled secrets in scope anthropic, global from sbx?"), "{output}");
         let calls = fake::calls(dir.path());
         assert!(fake::calls_to(dir.path(), &["secret", "set-custom"]).is_empty());
         assert_eq!(fake::calls_to(dir.path(), &["secret", "set"]), [["secret", "set", "openai"]]);
@@ -359,16 +350,7 @@ mod tests {
             fake::calls_to(dir.path(), &["mcp", "add"])[0],
             ["mcp", "add", "linear", "--url", "https://mcp.linear.app/mcp"]
         );
-        // A misfiled name goes from the listing to `sbx secret rm` only, never to output.
-        assert_eq!(
-            fake::calls_to(dir.path(), &["secret", "rm"]),
-            [
-                vec!["secret", "rm", "sk-ant-MISFILED-private-value", "--force"],
-                vec!["secret", "rm", "sk-ant-oat01-SCOPED-private-value", "--sandbox", "anthropic", "--force"],
-            ]
-        );
-        let others: Vec<_> = calls.iter().filter(|c| !c.starts_with(&["secret".into(), "rm".into()])).collect();
-        assert!(!format!("{others:?}").contains("PRIVATE"));
+        assert!(!format!("{calls:?}").contains("PRIVATE"));
         let before = calls.len();
         run_setup(&sbx, false, true, "").0.unwrap();
         assert!(fake::calls(dir.path())[before..].iter().all(|c| matches!(
@@ -456,20 +438,24 @@ mod tests {
     }
 
     #[test]
-    fn misfiled_secrets_are_removed_only_with_consent_and_never_shown() {
+    fn misfiled_secrets_are_left_to_sbxs_own_list_and_never_reach_argv_or_output() {
         let (dir, sbx) = machine();
-        touch(dir.path(), &["misfiled-scoped"]);
-        // Declining stops setup with the entry in place.
-        let (result, output) = run_setup(&sbx, false, false, "n\n");
+        touch(dir.path(), &["misfiled-secret", "misfiled-scoped"]);
+        // Setup waits for the user's own removal, rechecking on Enter; q stops it with the entries in place.
+        let (result, output) = run_setup(&sbx, false, false, "\nq\n");
         assert!(result.is_err());
-        assert!(output.contains("Remove 1 misfiled secret in scope anthropic from sbx?"), "{output}");
-        assert!(dir.path().join("misfiled-scoped").exists());
+        let notice = "sbx holds 2 misfiled secrets in scope anthropic, global: run `sbx secret rm` in a host terminal";
+        assert_eq!(output.matches(notice).count(), 2, "{output}");
+        assert!(dir.path().join("misfiled-scoped").exists() && dir.path().join("misfiled-secret").exists());
         assert!(fake::calls_to(dir.path(), &["secret", "rm"]).is_empty());
-        // Rerun and agree: exactly that entry goes, and setup reaches green.
-        let (result, output) = run_setup(&sbx, false, false, "y\n");
+        assert!(!format!("{:?}", fake::calls(dir.path())).contains("PRIVATE"));
+        // The user removed them in sbx's list: the rerun goes on to green.
+        std::fs::remove_file(dir.path().join("misfiled-secret")).unwrap();
+        std::fs::remove_file(dir.path().join("misfiled-scoped")).unwrap();
+        let (result, output) = run_setup(&sbx, false, false, "");
         result.unwrap();
-        assert!(!dir.path().join("misfiled-scoped").exists());
         assert!(output.contains("✓ sandbox secrets filed under known services and sandboxes"), "{output}");
+        assert!(fake::calls_to(dir.path(), &["secret", "rm"]).is_empty());
     }
 
     #[test]
