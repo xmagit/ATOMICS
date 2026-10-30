@@ -53,8 +53,10 @@ fn registered_host_mcp_reports_and_scoped_ticket_requests_cross_the_stand_in_gat
         json!({"id":3,"method":"tools/call","params":{"name":"imacs_report","arguments":{"status":"done","summary":"From the VM"}}}),
         json!({"id":4,"method":"tools/call","params":{"name":"imacs_agent_ticket_get","arguments":{"plan":true}}}),
         json!({"id":5,"method":"tools/call","params":{"name":"imacs_agent_ticket_comment","arguments":{"text":"Task details"}}}),
+        json!({"id":8,"method":"tools/call","params":{"name":"imacs_mcp_connect","arguments":{"server":"linear-check","url":"https://mcp.linear.app/mcp"}}}),
         json!({"id":6,"method":"tools/call","params":{"name":"imacs_start","arguments":{}}}),
         json!({"id":7,"method":"tools/call","params":{"name":"imacs_agent_ticket_get","arguments":{"pane":"another-session"}}}),
+        json!({"id":9,"method":"tools/call","params":{"name":"imacs_mcp_connect","arguments":{"server":"linear-check","pane":"another-session"}}}),
     ];
     let mut stdin = child.child.stdin.take().unwrap();
     for call in calls {
@@ -65,6 +67,7 @@ fn registered_host_mcp_reports_and_scoped_ticket_requests_cross_the_stand_in_gat
         json!({"cmd":"report","pane":"imacs-session-a","status":"done","summary":"From the VM"}),
         json!({"cmd":"agent_ticket_get","pane":"imacs-session-a","plan":true}),
         json!({"cmd":"agent_ticket_comment","pane":"imacs-session-a","text":"Task details"}),
+        json!({"cmd":"mcp_connect","pane":"imacs-session-a","server":"linear-check","url":"https://mcp.linear.app/mcp"}),
     ] {
         let mut stream = loop {
             child.check_timeout().unwrap();
@@ -84,12 +87,12 @@ fn registered_host_mcp_reports_and_scoped_ticket_requests_cross_the_stand_in_gat
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     let replies: Vec<Value> =
         String::from_utf8(output.stdout).unwrap().lines().map(|s| serde_json::from_str(s).unwrap()).collect();
-    assert_eq!(replies.len(), 7);
-    assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 3);
-    for reply in &replies[2..5] {
+    assert_eq!(replies.len(), 9);
+    assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 4);
+    for reply in &replies[2..6] {
         assert_eq!(reply["result"]["isError"], false, "{reply}");
     }
-    for reply in &replies[5..] {
+    for reply in &replies[6..] {
         assert_eq!(reply["result"]["isError"], true, "{reply}");
     }
     assert!(
