@@ -19,6 +19,7 @@ use imacs_core::isolation::{self, Diagnosis, Listed, MIN_SBX_VERSION, SandboxCon
 use imacs_core::{git, paths, workspace};
 
 pub(crate) mod checks;
+pub mod exec;
 pub mod setup;
 pub use checks::doctor_lines;
 
@@ -578,11 +579,35 @@ fn sbx_output(
     ssh_agent: bool,
     timeout: Duration,
 ) -> Result<(std::process::ExitStatus, String, String)> {
-    let args: Vec<&str> = args.iter().map(AsRef::as_ref).collect();
-    let shown = format!("sbx {}", args.first().copied().unwrap_or_default());
+    let shown = format!("sbx {}", args.first().map_or("", AsRef::as_ref));
     let (mut stdout, mut stderr) = (capture()?, capture()?);
+    let mut child = sbx_command(program, args, ssh_agent, &stdout, &stderr)?
+        .spawn()
+        .with_context(|| format!("running {program}"))?;
+    let Some(status) = wait(&mut child, Instant::now() + timeout)? else {
+        bail!("{shown} did not finish within {} s", timeout.as_secs());
+    };
+    let read = |file: &mut File| -> Result<String> {
+        let mut text = String::new();
+        file.rewind()?;
+        file.read_to_string(&mut text)?;
+        Ok(text)
+    };
+    Ok((status, read(&mut stdout)?, read(&mut stderr)?))
+}
+
+/// `sbx args` writing to `stdout` and `stderr`, without IMACS's own environment, the SSH agent unless
+/// it is forwarded, and with the login shell's PATH.
+fn sbx_command(
+    program: &str,
+    args: &[impl AsRef<str>],
+    ssh_agent: bool,
+    stdout: &File,
+    stderr: &File,
+) -> Result<Command> {
     let mut command = Command::new(program);
-    command.args(&args).stdin(Stdio::null()).stdout(stdout.try_clone()?).stderr(stderr.try_clone()?).process_group(0);
+    command.args(args.iter().map(AsRef::as_ref)).stdin(Stdio::null());
+    command.stdout(stdout.try_clone()?).stderr(stderr.try_clone()?).process_group(0);
     for name in ["IMACS_SOCKET", "IMACS_PANE", "IMACS_HOME", "IMACS_CONFIG"] {
         command.env_remove(name);
     }
@@ -592,28 +617,24 @@ fn sbx_output(
     if let Some(path) = crate::setup::SHELL_PATH.as_ref() {
         command.env("PATH", path);
     }
-    let mut child = command.spawn().with_context(|| format!("running {program}"))?;
-    let deadline = Instant::now() + timeout;
-    let status = loop {
+    Ok(command)
+}
+
+/// The child's status, or None once it ran past `deadline` and was killed.
+fn wait(child: &mut std::process::Child, deadline: Instant) -> Result<Option<std::process::ExitStatus>> {
+    loop {
         if let Some(status) = child.try_wait()? {
-            break status;
+            return Ok(Some(status));
         }
         if Instant::now() >= deadline {
             // Kill helpers too (SSH/keychain commands can outlive the sbx client).
             // SAFETY: process_group(0) gave this child its own process group.
             unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
             let _ = child.wait();
-            bail!("{shown} did not finish within {} s", timeout.as_secs());
+            return Ok(None);
         }
         std::thread::sleep(Duration::from_millis(20));
-    };
-    let read = |file: &mut File| -> Result<String> {
-        let mut text = String::new();
-        file.rewind()?;
-        file.read_to_string(&mut text)?;
-        Ok(text)
-    };
-    Ok((status, read(&mut stdout)?, read(&mut stderr)?))
+    }
 }
 
 fn capture() -> Result<File> {

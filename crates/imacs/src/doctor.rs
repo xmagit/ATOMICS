@@ -137,8 +137,11 @@ fn report(workspace: Option<&str>, for_agent: bool, projects: &[PathBuf]) -> Rep
         if program == "codex"
             && let Some(path) = found
         {
-            lines
-                .extend(codex_checks(codex_supports_hooks(&path.to_string_lossy(), std::time::Duration::from_secs(2))));
+            // Like agent launch, tolerate a cold CLI starting while other agents compile.
+            lines.extend(codex_checks(codex_supports_hooks(
+                &path.to_string_lossy(),
+                std::time::Duration::from_secs(10),
+            )));
         }
     }
 

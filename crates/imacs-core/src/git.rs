@@ -875,9 +875,8 @@ pub(crate) mod tests {
             assert_eq!(common_dir(&folder).unwrap(), common);
             commit_all(&folder, "task work").unwrap();
             match redirect {
-                // git itself refuses a worktree whose .git file names another git folder.
-                Redirect::GitFile => assert!(remove_worktree(&repo, &folder, None, false).is_err()),
-                Redirect::WorktreeCommondir => {
+                // Clean linked checkouts restore their recorded git pointers before removal.
+                Redirect::GitFile | Redirect::WorktreeCommondir => {
                     assert_eq!(health[0].dirty_files, 1, "{health:?}");
                     remove_worktree(&repo, &folder, None, false).unwrap();
                     assert!(!folder.exists());

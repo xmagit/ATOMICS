@@ -219,6 +219,18 @@ pub fn run_args(name: &str, agent: &str, agent_args: &[String]) -> Vec<String> {
     ["run", "--name", name, agent, "--"].into_iter().map(String::from).chain(agent_args.iter().cloned()).collect()
 }
 
+/// Inside the VM, how long after its timeout a command that ignores TERM is killed.
+pub const EXEC_KILL_AFTER_SECS: u64 = 10;
+
+/// `sbx exec`: run `command` in sandbox `name`, in `workdir`, starting the sandbox when stopped.
+/// A login shell finds the toolchains a template installed. coreutils' `timeout` ends it in the VM
+/// after `secs` (exit 124): killing `sbx exec` on this machine would leave it running there.
+pub fn exec_args(name: &str, workdir: &Path, command: &str, secs: u64) -> Vec<String> {
+    let workdir = workdir.to_string_lossy();
+    let (kill_after, secs) = (EXEC_KILL_AFTER_SECS.to_string(), secs.to_string());
+    ["exec", "-w", &workdir, name, "timeout", "-k", &kill_after, &secs, "bash", "-lc", command].map(String::from).into()
+}
+
 /// How many values a dropped flag takes.
 #[derive(Clone, Copy)]
 enum Takes {
@@ -652,6 +664,22 @@ command = ["codex"]
             ["run", "--name", "imacs-s1", "claude", "--", "--resume", "abc"]
         );
         assert_eq!(run_args("imacs-s1", "shell", &[]), ["run", "--name", "imacs-s1", "shell", "--"]);
+        assert_eq!(
+            exec_args("imacs-s1", Path::new("/repos/app task"), "cargo test -p core 2>&1 | tail", 600),
+            [
+                "exec",
+                "-w",
+                "/repos/app task",
+                "imacs-s1",
+                "timeout",
+                "-k",
+                "10",
+                "600",
+                "bash",
+                "-lc",
+                "cargo test -p core 2>&1 | tail"
+            ]
+        );
         assert_eq!(
             mcp_add_args("imacs-s1", Path::new("/Apps/IMACS, beta.app/imacs"), Path::new("/run/imacs.sock")),
             [

@@ -177,14 +177,15 @@ mod tests {
     fn version_check_refuses_missing_broken_nonexecutable_and_hung_targets() {
         let dir = crate::test_support::tempdir().unwrap();
         let exe = dir.path().join("imacs");
-        assert!(check_version(&exe, Duration::from_secs(1)).unwrap_err().to_string().contains("missing"));
+        let timeout = crate::test_support::scaled_timeout(Duration::from_secs(60));
+        assert!(check_version(&exe, timeout).unwrap_err().to_string().contains("missing"));
         std::fs::write(&exe, "#!/bin/sh\nexit 0\n").unwrap();
-        assert!(check_version(&exe, Duration::from_secs(1)).is_err());
+        assert!(check_version(&exe, timeout).is_err());
         std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::write(&exe, "#!/bin/sh\ntest \"$1\" = --version\n").unwrap();
-        check_version(&exe, Duration::from_secs(1)).unwrap();
+        check_version(&exe, timeout).unwrap();
         std::fs::write(&exe, "#!/bin/sh\nexit 42\n").unwrap();
-        assert!(check_version(&exe, Duration::from_secs(1)).unwrap_err().to_string().contains("failed"));
+        assert!(check_version(&exe, timeout).unwrap_err().to_string().contains("failed"));
         std::fs::write(&exe, "#!/bin/sh\nexec sleep 30\n").unwrap();
         assert!(check_version(&exe, Duration::from_millis(30)).unwrap_err().to_string().contains("timed out"));
     }

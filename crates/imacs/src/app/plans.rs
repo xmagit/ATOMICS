@@ -476,6 +476,13 @@ impl State {
                     let branch = other.branch.clone().unwrap_or_else(|| "(not dispatched)".into());
                     brief.push_str(&format!("- {}: {} (git diff {base}...{branch})\n", other.id, other.title));
                 }
+                if sandbox.is_some() {
+                    // The chief checks sandboxed work inside sandboxes, never on the host; so does its reviewer.
+                    brief.push_str(
+                        "\nRun the plan's builds and tests yourself, here in your own sandbox: your worktree starts \
+                         from the integration branch.\n",
+                    );
+                }
             }
             let launch = Launch {
                 agent,
@@ -1026,8 +1033,15 @@ mod tests {
                     ..Plan::default()
                 }];
                 app.runtime.selected_plan = 0;
+                app.runtime.config.isolation.mode = imacs_core::isolation::IsolationMode::Sandbox;
                 app.runtime.dispatch(0, Some(plan::REVIEW_TASK)).unwrap();
-                let (branch, worktree, _, _) = app.runtime.worktree_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                let (branch, worktree, launch, _) =
+                    app.runtime.worktree_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                let brief = launch.prompt.unwrap();
+                assert!(
+                    brief.contains("Run the plan's builds and tests yourself, here in your own sandbox"),
+                    "{brief}"
+                );
                 let worktree = worktree.unwrap().path;
                 assert_eq!(app.runtime.plans[0].tasks[0].branch.as_deref(), Some(branch.as_str()));
                 assert_eq!(git::worktree_of(&worktree).unwrap().branch.as_deref(), Some(branch.as_str()));

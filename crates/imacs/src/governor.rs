@@ -221,6 +221,32 @@ impl Governor {
             .and_then(Value::as_array)
             .map(|pids| pids.iter().filter_map(Value::as_u64).map(|pid| pid as u32).collect())
             .unwrap_or_default();
+        let mut told = None;
+        let _slot = self.acquire(class, label, ancestors, |position| {
+            if position != told {
+                send(stream, &json!({ "position": position }))?;
+                told = position;
+            }
+            if hung_up(stream)? {
+                bail!("client left the queue");
+            }
+            Ok(())
+        })?;
+        send(stream, &json!({ "granted": true }))?;
+        stream.set_read_timeout(None)?;
+        let _ = std::io::copy(&mut &*stream, &mut std::io::sink());
+        Ok(())
+    }
+
+    /// Waits for a slot of `class`, which is held until the returned [`Slot`] drops. `waiting` hears
+    /// the place in line about twice a second; an error from it gives the place up.
+    pub fn acquire(
+        &self,
+        class: SlotClass,
+        label: String,
+        ancestors: Vec<u32>,
+        mut waiting: impl FnMut(Option<usize>) -> Result<()>,
+    ) -> Result<Slot<'_>> {
         let id = {
             let mut queue = self.queue.lock().unwrap();
             if self.restarting.load(Ordering::Acquire) {
@@ -228,37 +254,33 @@ impl Governor {
             }
             queue.enqueue(class, label, ancestors)
         };
-        let result = self.wait_and_hold(stream, id);
-        self.queue.lock().unwrap().release(id);
+        let slot = Slot { governor: self, id };
         self.grant();
-        result
-    }
-
-    fn wait_and_hold(&self, stream: &UnixStream, id: u64) -> Result<()> {
-        self.grant();
-        let mut told = None;
         loop {
             let position = {
                 let queue = self.queue.lock().unwrap();
                 if queue.is_running(id) {
-                    break;
+                    return Ok(slot);
                 }
                 queue.position(id)
             };
-            if position != told {
-                send(stream, &json!({ "position": position }))?;
-                told = position;
-            }
+            waiting(position)?;
             let queue = self.queue.lock().unwrap();
             drop(self.changed.wait_timeout(queue, Duration::from_millis(500)).unwrap());
-            if hung_up(stream)? {
-                bail!("client left the queue");
-            }
         }
-        send(stream, &json!({ "granted": true }))?;
-        stream.set_read_timeout(None)?;
-        let _ = std::io::copy(&mut &*stream, &mut std::io::sink());
-        Ok(())
+    }
+}
+
+/// A place in a slot queue, waiting or running, given up when dropped.
+pub struct Slot<'a> {
+    governor: &'a Governor,
+    id: u64,
+}
+
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        self.governor.queue.lock().unwrap().release(self.id);
+        self.governor.grant();
     }
 }
 
@@ -269,7 +291,7 @@ fn send(stream: &UnixStream, value: &Value) -> Result<()> {
 }
 
 /// Whether the client closed its end while it waited.
-fn hung_up(stream: &UnixStream) -> Result<bool> {
+pub(crate) fn hung_up(stream: &UnixStream) -> Result<bool> {
     stream.set_read_timeout(Some(Duration::from_millis(1)))?;
     let mut byte = [0u8; 1];
     Ok(match (&mut &*stream).read(&mut byte) {

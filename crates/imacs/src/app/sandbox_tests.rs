@@ -244,6 +244,113 @@ fn sandboxed_agents_attach_through_sbx_run_and_reattach_after_a_restart() {
 }
 
 #[test]
+fn chief_checks_run_in_the_session_sandbox_and_bare_sessions_are_refused() {
+    with_app(
+        "app::sandbox_tests::chief_checks_run_in_the_session_sandbox_and_bare_sessions_are_refused",
+        |app, ctx| {
+            let (_dir, repo) = repository();
+            let worktree = worktree(&repo, "task");
+            let bin = crate::test_support::tempdir().unwrap();
+            app.runtime.sbx = fake::install(bin.path()).display().to_string();
+            std::fs::create_dir(bin.path().join("sandboxes")).unwrap();
+            std::fs::write(bin.path().join("sandboxes/imacs-boxed"), r#"{"name":"imacs-boxed","status":"running"}"#)
+                .unwrap();
+            let home = paths::imacs_home();
+            crate::sandbox_ownership::created(&home, "imacs-boxed", crate::sandbox_ownership::Resource::Sandbox)
+                .unwrap();
+            crate::sandbox_ownership::created(&home, "imacs-boxed", crate::sandbox_ownership::Resource::Mcp).unwrap();
+            std::fs::create_dir_all(bin.path().join("mcp")).unwrap();
+            std::fs::write(bin.path().join("mcp/imacs-boxed"), "registration").unwrap();
+            let owned = std::fs::read(home.join("sandbox-ownership.json")).unwrap();
+            let session = |id: &str| super::tests::session(id, AgentKind::Claude, AgentStatus::Done, &worktree);
+            let mut boxed = session("boxed");
+            boxed.sandbox = Some("imacs-boxed".into());
+            boxed.terminal = Some(
+                Terminal::spawn(
+                    app.runtime.wake.clone(),
+                    app.runtime.palette.terminal_colors(),
+                    "/bin/sh".into(),
+                    vec!["-c".into(), "exec sleep 30".into()],
+                    &worktree,
+                    HashMap::new(),
+                    100,
+                )
+                .unwrap(),
+            );
+            let pid = boxed.terminal.as_ref().unwrap().process_id();
+            let mut chief = session("chief");
+            chief.chief = true;
+            app.runtime.sessions = vec![session("bare"), boxed, chief];
+
+            // Bare sessions and the chief work on this machine, where their checks run.
+            for id in ["bare", "chief"] {
+                let refused = request(app, json!({"cmd":"exec", "session":id, "command":"cargo test"}));
+                let error = refused.error.unwrap();
+                assert!(error.contains("runs bare") && error.contains("run the command on the host"), "{error}");
+                assert!(error.contains(&worktree.display().to_string()) && error.contains("imacs queue --class test"));
+            }
+            let empty = request(app, json!({"cmd":"exec", "session":"boxed", "command":" "}));
+            assert_eq!(empty.error.as_deref(), Some("give a command to run"));
+
+            let exec = |app: &mut Desktop<'_>, request: serde_json::Value| {
+                let (tx, rx) = channel();
+                app.runtime.control(ctx, serde_json::from_value(request).unwrap(), tx);
+                match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                    ControlOutcome::Exec { job, session, then } => (job, session, then),
+                    _ => panic!("a sandboxed session's command runs on the socket thread"),
+                }
+            };
+            let (job, session, then) = exec(
+                app,
+                json!({"cmd":"exec", "session":"boxed", "command":"cargo test", "timeout_secs":9000, "class":"qa"}),
+            );
+            assert_eq!((job.sbx.as_str(), job.sandbox.as_str()), (app.runtime.sbx.as_str(), "imacs-boxed"));
+            assert_eq!(job.workdir, worktree.canonicalize().unwrap(), "where the sandbox mounts the worktree");
+            assert_eq!((job.command.as_str(), job.class), ("cargo test", imacs_core::governor::SlotClass::Qa));
+            assert_eq!(job.timeout, Duration::from_secs(3600), "at most an hour");
+            assert_eq!(job.ancestors, [pid], "the session's tile shows the slot");
+            assert_eq!(session, json!("boxed"));
+            // Its agent still runs in the sandbox, which stays up.
+            then();
+            app.runtime.runtime_tick(ctx);
+            app.runtime.finish_lifecycle_jobs();
+            assert!(fake::calls_to(bin.path(), &["stop"]).is_empty());
+
+            // Once the agent has gone, a sandbox its check started stops again.
+            let (job, _, then) = exec(app, json!({"cmd":"exec", "session":"boxed", "command":"cargo test"}));
+            assert_eq!((job.timeout, job.class), (Duration::from_secs(600), imacs_core::governor::SlotClass::Test));
+            app.runtime.sessions[1].terminal = None;
+            then();
+            tick_until(app, ctx, "the sandbox to stop", |_| !fake::calls_to(bin.path(), &["stop"]).is_empty());
+            assert_eq!(fake::calls_to(bin.path(), &["stop"]), [["stop", "imacs-boxed"]]);
+            app.runtime.finish_lifecycle_jobs();
+            assert!(bin.path().join("sandboxes/imacs-boxed").exists(), "checks leave the sandbox resumable");
+            assert!(bin.path().join("mcp/imacs-boxed").exists());
+            assert_eq!(std::fs::read(home.join("sandbox-ownership.json")).unwrap(), owned);
+
+            // A stale session or completion cannot stop another home's sandbox.
+            let other_home = crate::test_support::tempdir().unwrap();
+            crate::sandbox_ownership::created(
+                other_home.path(),
+                "imacs-foreign",
+                crate::sandbox_ownership::Resource::Sandbox,
+            )
+            .unwrap();
+            std::fs::write(
+                bin.path().join("sandboxes/imacs-foreign"),
+                r#"{"name":"imacs-foreign","status":"running"}"#,
+            )
+            .unwrap();
+            app.runtime.exec_finished("gone", "imacs-foreign".into());
+            app.runtime.finish_lifecycle_jobs();
+            assert_eq!(fake::calls_to(bin.path(), &["stop"]), [["stop", "imacs-boxed"]]);
+            assert!(std::fs::read_to_string(bin.path().join("sandboxes/imacs-foreign")).unwrap().contains("running"));
+            app.runtime.sessions.clear();
+        },
+    );
+}
+
+#[test]
 fn sandboxed_task_args_drop_host_sandbox_flags_and_bare_ones_keep_them() {
     with_app("app::sandbox_tests::sandboxed_task_args_drop_host_sandbox_flags_and_bare_ones_keep_them", |app, ctx| {
         let (_dir, repo) = repository();
