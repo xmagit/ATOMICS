@@ -7,7 +7,7 @@
 //!   the main checkout, or a linked worktree no sandbox works in;
 //! - remote-tracking refs and tags at an object a fetch on this machine wrote to its FETCH_HEAD,
 //!   and those such a fetch may have pruned;
-//! - `refs/stash`, which every checkout shares, and the quarantine below are not guarded.
+//! - `refs/stash`, which every checkout shares, is not guarded; quarantine refs are append-only.
 //!
 //! Those traces are in git folders no sandbox mounts, except the main checkout's HEAD log, which is
 //! in the shared `logs` folder. Putting a ref back never deletes a value: one it replaces is kept at
@@ -39,8 +39,8 @@ fn shown(value: Option<&RefValue>) -> String {
     }
 }
 
-/// Refs no check puts back: the stash every checkout shares, and the values checks keep aside.
-const UNGUARDED: [&str; 2] = ["refs/stash", QUARANTINE];
+/// Refs no check puts back: the stash every checkout shares.
+const UNGUARDED: [&str; 1] = ["refs/stash"];
 const QUARANTINE: &str = "refs/imacs/quarantine/";
 
 /// Whether `pattern`, a ref name or a prefix ending in `/`, covers the ref `name`.
@@ -56,7 +56,7 @@ fn now() -> u64 {
 /// worktree's branch, a cleaned-up branch, a fetch's remote-tracking refs. A guard whose snapshot is
 /// older must neither undo nor restore them, and its check may have been queued before IMACS wrote them.
 struct HostWrites {
-    /// Writes in progress, by ref name or prefix: every check accepts these refs.
+    /// Writes in progress, by ref name or prefix: checks defer prefixes without changing their baseline.
     pending: Vec<(PathBuf, String)>,
     /// The refs each write left under its name or prefix; one it deleted is absent. A check accepts
     /// a ref still at that value and restores any other, such as an agent's.
@@ -75,35 +75,54 @@ pub fn host_write<S: AsRef<str>>(repo: &Path, branches: impl IntoIterator<Item =
 /// `refs/remotes/` for a fetch.
 pub fn host_write_refs(repo: &Path, refs: impl IntoIterator<Item = String>) -> HostWrite {
     let names: Vec<String> = refs.into_iter().collect();
+    let before = names.iter().any(|name| name.ends_with('/')).then(|| read_refs(repo).ok()).flatten();
     let mut host = HOST_WRITES.lock().unwrap_or_else(|e| e.into_inner());
     host.pending.extend(names.iter().map(|name| (repo.to_path_buf(), name.clone())));
-    HostWrite { repo: repo.to_path_buf(), names }
+    HostWrite { repo: repo.to_path_buf(), names, before }
 }
 
 /// A write by IMACS in progress; see [`host_write`]. Dropping it runs git.
 pub struct HostWrite {
     repo: PathBuf,
     names: Vec<String>,
+    before: Option<BTreeMap<String, RefValue>>,
 }
 
 impl Drop for HostWrite {
     fn drop(&mut self) {
         let values = read_refs(&self.repo).ok();
-        self.record(values.as_ref());
+        let names: Vec<_> = self
+            .names
+            .iter()
+            .flat_map(|name| {
+                if !name.ends_with('/') {
+                    return vec![name.clone()];
+                }
+                let (Some(before), Some(after)) = (&self.before, &values) else { return Vec::new() };
+                let refs: BTreeSet<_> = before.keys().chain(after.keys()).collect();
+                refs.into_iter()
+                    .filter(|other| covers(name, other) && before.get(*other) != after.get(*other))
+                    .cloned()
+                    .collect()
+            })
+            .collect();
+        self.record(values.as_ref(), &names);
         if let Some(values) = &values {
-            accept_written(&self.repo, &self.names, values);
+            accept_written(&self.repo, &names, values);
         }
     }
 }
 
 impl HostWrite {
-    fn record(&self, values: Option<&BTreeMap<String, RefValue>>) {
+    fn record(&self, values: Option<&BTreeMap<String, RefValue>>, names: &[String]) {
         let mut host = HOST_WRITES.lock().unwrap_or_else(|e| e.into_inner());
         for name in &self.names {
             if let Some(index) = host.pending.iter().position(|(repo, pending)| *repo == self.repo && pending == name) {
                 host.pending.remove(index);
             }
-            // Without the values a later check falls back to restoring, as before IMACS wrote.
+        }
+        // Without the values a later check falls back to restoring, as before IMACS wrote.
+        for name in names {
             if let Some(values) = values {
                 host.written.retain(|(repo, written, _)| !(*repo == self.repo && written == name));
                 let left = values.iter().filter(|(other, _)| covers(name, other));
@@ -204,22 +223,23 @@ impl HostLeft {
             .filter_map(|pins| pins.git_dir)
             .collect();
         let mut host = Self::default();
-        host.read_checkout(common, &common.join("logs/HEAD"), since);
+        host.read_checkout(common, &common.join("logs/HEAD"), since, false);
         let Ok(entries) = std::fs::read_dir(common.join("worktrees")) else { return host };
         for entry in entries.flatten() {
             let folder = entry.path();
             let real = folder.canonicalize().unwrap_or_else(|_| folder.clone());
             if entry.file_type().is_ok_and(|kind| kind.is_dir()) && own != Some(&real) && !sandboxed.contains(&real) {
-                host.read_checkout(&folder, &folder.join("logs/HEAD"), since);
+                host.read_checkout(&folder, &folder.join("logs/HEAD"), since, true);
             }
         }
         host
     }
 
     /// One checkout's traces since `since`: the git `folder` it writes and its HEAD `log`.
-    fn read_checkout(&mut self, folder: &Path, log: &Path, since: u64) {
+    fn read_checkout(&mut self, folder: &Path, log: &Path, since: u64, private_log: bool) {
         if let Some((bytes, modified)) = read_trace(&folder.join("FETCH_HEAD"))
             && modified >= since
+            && modified <= now()
         {
             self.fetch = true;
             let text = String::from_utf8_lossy(&bytes);
@@ -228,7 +248,12 @@ impl HostLeft {
         }
         let Some((bytes, _)) = read_trace(log) else { return };
         let text = String::from_utf8_lossy(&bytes);
-        let entries: Vec<_> = text.lines().filter_map(LogEntry::parse).filter(|entry| entry.time >= since).collect();
+        let until = now();
+        let entries: Vec<_> = text
+            .lines()
+            .filter_map(LogEntry::parse)
+            .filter(|entry| entry.time >= since && entry.time <= until)
+            .collect();
         // Newest first, from the branch HEAD is on now: before a switch, HEAD was on the branch it left.
         let mut branch = read_trace(&folder.join("HEAD"))
             .and_then(|(bytes, _)| String::from_utf8(bytes).ok()?.trim().strip_prefix("ref: ").map(str::to_string));
@@ -237,6 +262,11 @@ impl HostLeft {
             match entry.message.strip_prefix("checkout: moving from ").and_then(|rest| rest.split_once(" to ")) {
                 Some((from, _)) => {
                     self.switched.extend(branch.take().map(|to| (to, entry.new.clone())));
+                    // The main HEAD is host-only, but its log is shared with sandboxes.
+                    // A checkout message there cannot vouch for a different branch.
+                    if !private_log {
+                        break;
+                    }
                     branch = Some(format!("refs/heads/{from}"));
                 }
                 // An entry that leaves HEAD where it was, such as a stash's reset, vouches for nothing:
@@ -376,14 +406,46 @@ impl RefGuard {
         let host = HostLeft::read(&self.common, own.as_deref(), self.checked.unwrap_or(started).saturating_sub(1));
         let session = self.file.file_stem().map_or_else(|| "unknown".into(), |stem| stem.to_string_lossy());
         let names: BTreeSet<_> = self.refs.keys().chain(current.keys()).cloned().collect();
+        // A push updates a tracking ref without FETCH_HEAD. Only already accepted local
+        // tips vouch for that move; a newly injected branch must not launder it.
+        let local_tips: BTreeSet<_> = current
+            .iter()
+            .filter_map(|(name, value)| {
+                (name.starts_with("refs/heads/")
+                    && (self.refs.get(name) == Some(value)
+                        || self.branch.as_ref() == Some(name)
+                        || concurrent.contains(name)
+                        || written.left(name, Some(value))
+                        || host.left(name, self.refs.get(name), Some(value))))
+                .then_some(value)
+                .and_then(|value| match value {
+                    RefValue::Object(object) => Some(object.clone()),
+                    _ => None,
+                })
+            })
+            .collect();
         let mut alerts = Vec::new();
         for name in names {
-            let (before, after) = (self.refs.get(&name), current.get(&name));
-            let accepted = self.branch.as_ref() == Some(&name)
-                || concurrent.iter().any(|pattern| covers(pattern, &name))
-                || UNGUARDED.iter().any(|pattern| covers(pattern, &name))
-                || written.left(&name, after)
-                || host.left(&name, before, after);
+            if !name.starts_with(QUARANTINE)
+                && concurrent.iter().any(|pattern| pattern.ends_with('/') && covers(pattern, &name))
+            {
+                // A broad host write is unfinished. Its final diff will accept only refs
+                // that changed during it; do not bless unrelated pre-existing changes.
+                continue;
+            }
+            let before = self.refs.get(&name).cloned();
+            let (before, after) = (before.as_ref(), current.get(&name));
+            let accepted = if name.starts_with(QUARANTINE) {
+                before.is_none()
+            } else {
+                self.branch.as_ref() == Some(&name)
+                    || concurrent.iter().any(|pattern| covers(pattern, &name))
+                    || UNGUARDED.iter().any(|pattern| covers(pattern, &name))
+                    || written.left(&name, after)
+                    || host.left(&name, before, after)
+                    || name.starts_with("refs/remotes/")
+                        && matches!(after, Some(RefValue::Object(object)) if local_tips.contains(object))
+            };
             if accepted {
                 match after {
                     Some(value) => {
@@ -395,6 +457,18 @@ impl RefGuard {
                 }
                 continue;
             }
+            // A host commit may have been overwritten before any check accepted it.
+            // Preserve that newer host value, including if this restore must be retried.
+            let before = host
+                .branches
+                .iter()
+                .find(|(branch, _)| branch == &name)
+                .map(|(_, object)| RefValue::Object(object.clone()))
+                .or_else(|| before.cloned());
+            if let Some(value) = &before {
+                self.refs.insert(name.clone(), value.clone());
+            }
+            let before = before.as_ref();
             if before == after {
                 continue;
             }
@@ -405,6 +479,12 @@ impl RefGuard {
                 _ => None,
             };
             let result = restore(&self.cwd, &name, before, after, kept.as_deref());
+            // Protect a recovery value immediately, before another turn can overwrite it.
+            if result.is_ok()
+                && let (Some(kept), Some(value)) = (&kept, after)
+            {
+                self.refs.insert(kept.clone(), value.clone());
+            }
             alerts.push(match (result, before, kept) {
                 (Ok(()), None, Some(kept)) => format!("Restored {name}: moved it to {kept} (it pointed to {found})"),
                 (Ok(()), None, None) => format!("Restored {name}: removed it (it was {found})"),
@@ -660,6 +740,104 @@ fn update_refs(cwd: &Path, operations: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn recovery_preserves_a_host_commit_overwritten_before_the_check() {
+        let (dir, repo, worktree) = repository();
+        let mut guard = RefGuard::open(&worktree, dir.path().join("snapshot.json")).unwrap().unwrap();
+        git::git(&repo, &["commit", "--allow-empty", "-qm", "user commit"]).unwrap();
+        let host = git::git(&repo, &["rev-parse", "HEAD"]).unwrap();
+        let injected = git::git(&worktree, &["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "agent"]).unwrap();
+        git::git(&worktree, &["update-ref", "refs/heads/main", injected.trim()]).unwrap();
+        let alerts = guard.check(&Default::default(), &Default::default()).unwrap();
+        assert_eq!(git::git(&repo, &["rev-parse", "main"]).unwrap(), host, "{alerts:?}");
+        assert!(guard.check(&Default::default(), &Default::default()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn prefix_host_writes_do_not_accept_unchanged_refs_or_advance_pending_baselines() {
+        let (dir, repo, worktree) = repository();
+        let initial = git::git(&repo, &["rev-parse", "HEAD"]).unwrap();
+        git::git(&repo, &["update-ref", "refs/tags/untouched", initial.trim()]).unwrap();
+        let guard = Shared::new(RefGuard::open(&worktree, dir.path().join("snapshot.json")).unwrap().unwrap());
+        let injected = git::git(&worktree, &["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "injected"]).unwrap();
+        // This happened before the host operation; its broad prefix cannot bless it.
+        git::git(&worktree, &["update-ref", "refs/tags/untouched", injected.trim()]).unwrap();
+        let write = host_write_refs(&repo, ["refs/tags/".into()]);
+        assert!(guard.check(&Default::default()).unwrap().is_empty());
+        git::git(&repo, &["update-ref", "refs/tags/host-made", initial.trim()]).unwrap();
+        drop(write);
+        let alerts = guard.check(&Default::default()).unwrap();
+        assert!(alerts.iter().any(|a| a.contains("Restored refs/tags/untouched")), "{alerts:?}");
+        assert_eq!(git::git(&repo, &["rev-parse", "untouched"]).unwrap(), initial);
+        assert_eq!(git::git(&repo, &["rev-parse", "host-made"]).unwrap(), initial);
+    }
+
+    #[test]
+    fn quarantine_refs_allow_additions_but_restore_moves_and_deletions() {
+        let (dir, repo, worktree) = repository();
+        let mut guard = RefGuard::open(&worktree, dir.path().join("snapshot.json")).unwrap().unwrap();
+        git::git(&worktree, &["branch", "injected"]).unwrap();
+        guard.check(&Default::default(), &Default::default()).unwrap();
+        let original = git::git(&repo, &["rev-parse", "main"]).unwrap();
+        let kept = format!("{QUARANTINE}snapshot/refs/heads/injected@{}", &original[..12]);
+        git::git(&worktree, &["commit", "--allow-empty", "-qm", "next"]).unwrap();
+        let next = git::git(&worktree, &["rev-parse", "HEAD"]).unwrap();
+        git::git(&worktree, &["update-ref", &kept, next.trim()]).unwrap();
+        let alerts = guard.check(&Default::default(), &Default::default()).unwrap();
+        assert!(alerts.iter().any(|a| a.starts_with(&format!("Restored {kept}:"))), "{alerts:?}");
+        assert_eq!(git::git(&repo, &["rev-parse", &kept]).unwrap(), original);
+        git::git(&worktree, &["update-ref", "-d", &kept]).unwrap();
+        git::git(&worktree, &["update-ref", &format!("{QUARANTINE}new"), next.trim()]).unwrap();
+        let alerts = guard.check(&Default::default(), &Default::default()).unwrap();
+        assert!(alerts.iter().any(|a| a.starts_with(&format!("Restored {kept}:"))), "{alerts:?}");
+        assert_eq!(git::git(&repo, &["rev-parse", &kept]).unwrap(), original);
+        assert_eq!(git::git(&repo, &["rev-parse", &format!("{QUARANTINE}new")]).unwrap(), next);
+    }
+
+    #[test]
+    fn a_user_push_keeps_tracking_refs_only_at_accepted_local_tips() {
+        let (dir, repo, worktree) = repository();
+        let remote = dir.path().join("remote.git");
+        git::git(&repo, &["init", "--bare", remote.to_str().unwrap()]).unwrap();
+        git::git(&repo, &["remote", "add", "origin", remote.to_str().unwrap()]).unwrap();
+        git::git(&repo, &["push", "origin", "main"]).unwrap();
+        let mut guard = RefGuard::open(&worktree, dir.path().join("snapshot.json")).unwrap().unwrap();
+        git::git(&repo, &["commit", "--allow-empty", "-qm", "user work"]).unwrap();
+        let accepted = git::git(&repo, &["rev-parse", "HEAD"]).unwrap();
+        git::git(&repo, &["push", "origin", "main"]).unwrap();
+        // An unaccepted local branch cannot launder a tracking-ref move.
+        let injected = git::git(&worktree, &["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "agent work"]).unwrap();
+        git::git(&worktree, &["update-ref", "refs/heads/forged", injected.trim()]).unwrap();
+        git::git(&worktree, &["update-ref", "refs/remotes/origin/forged", injected.trim()]).unwrap();
+        let alerts = guard.check(&Default::default(), &Default::default()).unwrap();
+        assert!(!alerts.iter().any(|a| a.contains("refs/remotes/origin/main")), "{alerts:?}");
+        assert!(alerts.iter().any(|a| a.contains("Restored refs/remotes/origin/forged")), "{alerts:?}");
+        assert_eq!(git::git(&repo, &["rev-parse", "origin/main"]).unwrap(), accepted);
+    }
+
+    #[test]
+    fn shared_head_log_cannot_reattribute_other_branches_or_vouch_for_future_moves() {
+        for future in [false, true] {
+            let (dir, repo, worktree) = repository();
+            git::git(&repo, &["branch", "victim"]).unwrap();
+            let mut guard = RefGuard::open(&worktree, dir.path().join("snapshot.json")).unwrap().unwrap();
+            let initial = git::git(&repo, &["rev-parse", "main"]).unwrap().trim().to_string();
+            git::git(&worktree, &["commit", "--allow-empty", "-qm", "injected"]).unwrap();
+            let injected = git::git(&worktree, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+            let branch = if future { "main" } else { "victim" };
+            git::git(&worktree, &["update-ref", &format!("refs/heads/{branch}"), &injected]).unwrap();
+            let time = now() + if future { 3600 } else { 0 };
+            let mut forged = format!("{initial} {injected} Agent <agent@example.org> {time} +0000\tcommit: forged\n");
+            if !future {
+                forged.push_str(&format!("{injected} {initial} Agent <agent@example.org> {time} +0000\tcheckout: moving from victim to main\n"));
+            }
+            std::fs::write(repo.join(".git/logs/HEAD"), forged).unwrap();
+            let alerts = guard.check(&Default::default(), &Default::default()).unwrap();
+            assert!(alerts.iter().any(|a| a.contains(&format!("Restored refs/heads/{branch}"))), "{alerts:?}");
+            assert_eq!(git::git(&repo, &["rev-parse", branch]).unwrap().trim(), initial);
+        }
+    }
+
     fn repository() -> (crate::test_support::TempDir, PathBuf, PathBuf) {
         let dir = crate::test_support::tempdir().unwrap();
         let repo = dir.path().join("repo");
@@ -749,7 +927,7 @@ mod tests {
         // ...while you commit on main, switch away, fetch and stash in your checkout.
         git::git(&repo, &["commit", "--allow-empty", "-qm", "mine"]).unwrap();
         let mine = git::git(&repo, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
-        git::git(&repo, &["switch", "-qc", "later"]).unwrap();
+        git::add_worktree(&repo, &dir.path().join("host"), "later", "main").unwrap();
         git::git(&repo, &["fetch", "-q", "origin"]).unwrap();
         std::fs::write(repo.join("scratch"), "work in progress").unwrap();
         git::git(&repo, &["add", "scratch"]).unwrap();

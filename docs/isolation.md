@@ -436,7 +436,7 @@ Restart agents after changing these settings. With `query_read_exception = true`
 `POST /v1/apps/<application-UUID>/query` on `api.applicationinsights.io` is also a read. It grants
 no management POSTs, batch operations, ingestion, other methods or query subpaths.
 
-Agents can run KQL with ordinary REST clients. Ask Max which Application Insights **application ID**
+Agents can run KQL with ordinary REST clients. Ask the user which Application Insights **application ID**
 to use and set `APP_INSIGHTS_APP_ID` to that UUID. A GET works with the default capabilities:
 
 ```sh
@@ -466,7 +466,7 @@ Do not use `az login` or copy `~/.azure` inside a VM. Supporting Azure CLI *insi
 a placeholder token cache is deferred to a separate follow-up with its own opt-in flag; it is not
 implemented here.
 
-After Max selects an application UUID, the fixed read-only end-to-end check is:
+After the user selects an application UUID, the fixed read-only end-to-end check is:
 
 ```sh
 imacs queue --class qa -- imacs sandbox azure-check <application-UUID>
@@ -649,7 +649,10 @@ Startup runs cleanup in the background. It removes orphaned sandboxes and MCP re
 session records only when this `IMACS_HOME` recorded their creation in its ownership ledger. Other
 homes' resources and unknown `imacs-*` names are left alone, including resources from before the ledger
 existed; IMACS refuses to attach to an unowned sandbox. The sweep also removes stale briefs, unused warm worktrees, and cache clone stages older than
-a day. Resources created after startup began are left for a later sweep. Unreadable ownership records
+a day. Resources created after startup began are left for a later sweep. A reserved sandbox or MCP
+registration missing from sbx's inventory is also kept while its creator is alive or its reservation
+is less than 15 minutes old (the sandbox create limit): the daemon could still finish creating it.
+After that window and creator exit, a later sweep can clear the absent resource. Unreadable ownership records
 stop the sweep. Cleanup failures appear in the toast, `imacs doctor`, and the Clean up… dialog. On macOS, doctor
 also checks Spotlight indexing and explains how to exclude project and worktree folders.
 
@@ -840,26 +843,30 @@ tests there, in a worktree that starts from the integration branch.
     `fetch --prune` (`refs/remotes/` and `refs/tags/`), at the values IMACS left;
   - a branch you moved in a checkout on this machine (commit, amend, pull, merge, rebase, reset, cherry-pick,
     `git switch -c`), at the commit that checkout's HEAD log says it left it at. That is the main
-    checkout or any linked worktree no sandbox works in, also after switching away from the branch;
+    checkout (only its currently checked-out branch), or a linked worktree no sandbox works in,
+    including branches switched away from in that linked worktree;
   - remote-tracking refs and tags at an object a fetch or pull on this machine wrote to its
     `FETCH_HEAD`, and those such a fetch may have pruned;
   - `refs/stash`, which every checkout shares, at whatever it is: it is never restored.
 
   These traces are in git folders no sandbox mounts, so an agent cannot leave them, with one exception:
-  the main checkout's HEAD log is in the shared `logs` folder. An agent that writes it on purpose can pass
-  a move of any branch as yours, not only of the branch checked out there: forged entries can say the
-  main checkout had that branch checked out when it moved it. Otherwise you would lose your own commits. A
+  the main checkout's HEAD log is in the shared `logs` folder. A check trusts that shared log only for the
+  branch the host-only main `HEAD` names now, stopping at the latest checkout entry. It cannot attribute
+  older moves to other branches from shared checkout messages. Future-dated entries are ignored. A
+  forged log can still vouch for the branch currently checked out on main: this remains recovery, not
+  proof of its writer. If you commit on main and then switch away before the check, that old branch
+  move has no trusted trace and may be restored. A
   branch you create other than by switching to it (`git branch x`), delete, or move while no checkout
   here has it checked out (`git branch -f`, `git update-ref`) leaves no such trace and is put back like
-  an agent's, as is a fetch with `--no-write-fetch-head`. So, for now, is the remote-tracking ref your own
-  `git push` updates (`refs/remotes/<remote>/<branch>`): a push leaves no `FETCH_HEAD`, so the next check
-  puts the ref back, keeps the pushed value in quarantine and raises an alert. The push itself stands, and
-  your next fetch sets the ref right.
+  an agent's, as is a fetch with `--no-write-fetch-head`. A `git push` leaves no `FETCH_HEAD`,
+  but its remote-tracking ref (`refs/remotes/<remote>/<branch>`) is kept when it moves to the accepted
+  tip of a local branch. An unaccepted local branch cannot vouch for that move. This accepts a value,
+  not proof that a push happened.
 - **Nothing is deleted.** Putting a ref back keeps the value it replaces at
   `refs/imacs/quarantine/<sandbox>/<ref>@<object>`, and the alert names it: a branch the agent made is
   moved there rather than deleted, and a value restored over is kept there. If it was yours, take it back
-  with `git branch -f <branch> refs/imacs/quarantine/…`, and delete the quarantine ref when you are done
-  (`git update-ref -d`). Checks do not guard `refs/imacs/quarantine/`.
+  with `git branch -f <branch> refs/imacs/quarantine/…`. Checks accept new quarantine refs,
+  but restore changes or deletions of values already observed: quarantine is append-only while guarded.
 - **Objects are data.** Objects an agent writes stay on your machine, and git never executes them. Hooks
   and config, which do run on your machine, are out of reach, and git on your machine finds them through
   IMACS's record, not the files the agent can write (see
@@ -907,14 +914,13 @@ process measurements, not the configured memory/CPU limits or guest application 
 processes and `sbx run` clients are excluded. Without a matching VM process, or when sampling fails, the
 badge shows **Sandbox** alone; hover for details. The total reports how many sandbox trees were found, so partial samples are visible.
 
-The sampler assumes the PoC process shape: one VM tree per sandbox, whose VM root command contains
-the complete sandbox name `imacs-<session>` (as an argument or path component). It recognizes nerdbox,
-sailor, vfkit, qemu, cloud-hypervisor and krun VM executables, then follows child PIDs. Synthetic recorded
-`ps` fixtures cover this mapping. If sbx changes its process shape or uses opaque VM IDs, the display
-stays unavailable until that mapping is updated. That is the case with sbx v0.50.1 on macOS (checked
-end to end on 2026-10-30): each VM runs as `containerd-shim-nerdbox-v1 -namespace docker -id <container
-id>`, without the sandbox's name, so tiles show **Sandbox** without memory and CPU. The shim keeps the
-sandbox's worktree open, which a future mapping could use.
+The sampler recognizes nerdbox, sailor, vfkit, qemu, cloud-hypervisor, krun and sbx-vm executables,
+then follows their child PIDs. It matches a VM by the complete sandbox name `imacs-<session>` in its
+command, or by an open worktree path. On macOS it reads VM paths with `lsof`; on Linux it reads
+`/proc/<pid>/cwd` and `/proc/<pid>/fd`. This also handles sbx VMs whose command contains an opaque
+container ID instead of a sandbox name, such as `containerd-shim-nerdbox-v1` on macOS. Recorded `ps`
+and open-path fixtures cover both mappings. A VM with neither a matching name nor a matching worktree
+path remains unavailable in the display.
 
 ## Settings → Credentials
 

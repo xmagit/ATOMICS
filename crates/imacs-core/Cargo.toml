@@ -9,6 +9,7 @@ description.workspace = true
 [features]
 default = ["native"]
 native = ["dep:base64", "dep:dirs", "dep:ureq", "time/std", "dep:tempfile", "dep:libc"]
+test-support = []
 
 [dependencies]
 anyhow = "1.0.104"

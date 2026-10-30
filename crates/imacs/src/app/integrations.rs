@@ -19,6 +19,9 @@ impl State {
     }
 
     pub(super) fn refresh_integrations(&mut self) {
+        self.integration_retries.retain(|(plan, task), _| {
+            self.plans.iter().any(|p| p.id == *plan && p.is_open() && p.tasks.iter().any(|t| t.id == *task))
+        });
         if self.integration_dirty.swap(false, Ordering::Relaxed) {
             self.integration_revision += 1;
             for task in self.plans.iter_mut().flat_map(|p| &mut p.tasks) {
@@ -311,6 +314,27 @@ fn same_work(a: &Task, b: &Task) -> bool {
 mod tests {
     use super::super::tests::{repository, request, with_app};
     use super::*;
+
+    #[test]
+    fn retries_are_pruned_for_closed_plans_and_removed_tasks() {
+        with_app("app::integrations::tests::retries_are_pruned_for_closed_plans_and_removed_tasks", |app, _| {
+            let state = &mut app.runtime;
+            state.plans = vec![Plan {
+                id: "open".into(),
+                tasks: vec![Task { id: "keep".into(), ..Default::default() }],
+                ..Default::default()
+            }];
+            for (plan, task) in [("open", "keep"), ("open", "removed"), ("closed", "keep")] {
+                state.integration_retries.insert((plan.into(), task.into()), Instant::now());
+            }
+            state.refresh_integrations();
+            assert_eq!(state.integration_retries.len(), 1);
+            assert!(state.integration_retries.contains_key(&("open".into(), "keep".into())));
+            state.plans[0].status = PlanStatus::Completed;
+            state.refresh_integrations();
+            assert!(state.integration_retries.is_empty());
+        });
+    }
 
     #[test]
     fn deleting_an_integrated_branch_keeps_dependents_verified_after_reload() {
@@ -688,9 +712,9 @@ exec {} "$@"
     }
 
     #[test]
-    fn a_ref_git_waits_on_stops_the_check_at_its_time_limit_and_it_runs_again_later() {
+    fn a_git_object_fifo_stops_the_check_at_its_time_limit_and_it_runs_again_later() {
         with_app(
-            "app::integrations::tests::a_ref_git_waits_on_stops_the_check_at_its_time_limit_and_it_runs_again_later",
+            "app::integrations::tests::a_git_object_fifo_stops_the_check_at_its_time_limit_and_it_runs_again_later",
             |app, _| {
                 let (_dir, repo) = repository();
                 git::git(&repo, &["branch", "integration"]).unwrap();
@@ -704,8 +728,13 @@ exec {} "$@"
                 let key = (app.runtime.plans[index].id.clone(), "a".to_string());
                 app.runtime.plans[index].tasks[0].status = TaskStatus::Done;
                 app.runtime.plans[index].tasks[0].integrated = Some("integration".into());
-                // A sandbox writes the shared refs: git waits for good on a FIFO in place of a branch.
-                let fifo = repo.join(".git/refs/heads/task-a");
+                // Ref FIFOs are refused before git starts. A loose object FIFO still exercises
+                // the bounded background runner without blocking the UI.
+                git::git(&repo, &["branch", "task-a", "integration"]).unwrap();
+                let object = git::git(&repo, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+                let fifo = repo.join(".git/objects").join(&object[..2]).join(&object[2..]);
+                let saved = fifo.with_extension("saved");
+                std::fs::rename(&fifo, &saved).unwrap();
                 assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
                 let limit = Duration::from_secs(3);
                 git::set_quick_timeout(limit);
@@ -726,7 +755,7 @@ exec {} "$@"
 
                 // Once the wait is over, it runs again without a ref event, and finds the branch.
                 std::fs::remove_file(&fifo).unwrap();
-                git::git(&repo, &["branch", "task-a", "integration"]).unwrap();
+                std::fs::rename(&saved, &fifo).unwrap();
                 let at = app.runtime.integration_retries.get_mut(&key).expect("the check must be rescheduled");
                 assert!(*at > Instant::now());
                 *at = Instant::now();

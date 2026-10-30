@@ -28,7 +28,7 @@ pub use checks::doctor_lines;
 /// Most sbx commands answer within a second; this bounds a stuck daemon.
 const TIMEOUT: Duration = Duration::from_secs(60);
 /// The first sandbox of an agent pulls its image, which took 51 s on a fast connection.
-const CREATE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+pub(crate) const CREATE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// Where an agent runs.
 #[derive(Debug, Clone, PartialEq)]
@@ -251,17 +251,17 @@ fn make(
     // Ownership is reserved before sbx makes anything, as for templates: a crash or a timeout part way
     // leaves resources this home owns, which removal or the next startup sweep takes away.
     ownership::created(&job.home, &job.name, Resource::Mcp)?;
-    sbx(&job.sbx, &isolation::mcp_add_args(&job.name, &job.exe, &job.socket), ssh, TIMEOUT)
-        .context("registering IMACS's MCP server with sbx")
-        .inspect_err(|_| {
-            let _ = remove(&job.home, &job.sbx, &job.name);
-        })?;
+    let registration = sbx(&job.sbx, &isolation::mcp_add_args(&job.name, &job.exe, &job.socket), ssh, TIMEOUT);
+    ownership::removed(&job.home, &job.name, Resource::Creator)?;
+    registration.context("registering IMACS's MCP server with sbx").inspect_err(|_| {
+        let _ = remove(&job.home, &job.sbx, &job.name);
+    })?;
     ownership::created(&job.home, &job.name, Resource::Sandbox)?;
-    sbx_until(&job.sbx, &isolation::create_args(&spec), ssh, CREATE_TIMEOUT, Some(&QUITTING))
-        .context("creating the sandbox")
-        .inspect_err(|_| {
-            let _ = remove(&job.home, &job.sbx, &job.name);
-        })?;
+    let creation = sbx_until(&job.sbx, &isolation::create_args(&spec), ssh, CREATE_TIMEOUT, Some(&QUITTING));
+    ownership::removed(&job.home, &job.name, Resource::Creator)?;
+    creation.context("creating the sandbox").inspect_err(|_| {
+        let _ = remove(&job.home, &job.sbx, &job.name);
+    })?;
     let finish = || -> Result<()> {
         sbx(&job.sbx, &isolation::mcp_load_args(&job.name, &job.name), ssh, TIMEOUT)
             .context("loading IMACS's MCP server")?;
@@ -495,17 +495,23 @@ pub fn stop(home: &Path, program: &str, name: &str) -> Result<()> {
 }
 
 /// Removes a sandbox, its way to the relay and IMACS's MCP registration for it. The sandbox and the
-/// registration may be only reserved: a start that stopped before sbx made them leaves nothing to
-/// remove.
+/// registration may be only reserved: an unlisted recent or live create keeps its reservation
+/// until a later cleanup can establish that creation has ended.
 pub fn remove(home: &Path, program: &str, name: &str) -> Result<()> {
     let owned = ownership::owned(home)?.get(name).cloned().unwrap_or_default();
     if owned.sandbox {
+        if ownership::may_be_creating(&owned) && !list(program)?.iter().any(|sandbox| sandbox.name == name) {
+            // A canceled CLI can leave a create running in the daemon. Keep its VM
+            // reservation and pins, but remove an already listed MCP registration.
+            remove_mcp(home, program, name)?;
+            bail!("Sandbox {name} may still be being created; keeping its reservation for cleanup");
+        }
         if let Some(port) = owned.relay {
             // Taken away first: a sandbox sbx fails to remove keeps no way to this machine's loopback.
             let _ = sbx(program, &isolation::relay_remove_args(name, port), false, TIMEOUT);
         }
         if let Err(error) = sbx(program, &["rm", "--force", name], false, TIMEOUT)
-            && list(program)?.iter().any(|sandbox| sandbox.name == name)
+            && (list(program)?.iter().any(|sandbox| sandbox.name == name) || ownership::may_be_creating(&owned))
         {
             return Err(error);
         }
@@ -538,7 +544,7 @@ pub fn remove(home: &Path, program: &str, name: &str) -> Result<()> {
             ownership::removed(home, name, Resource::Builder)?;
         }
     }
-    Ok(())
+    ownership::removed(home, name, Resource::Creator)
 }
 
 /// Fail closed on an unreadable owned record rather than following checkout metadata.
@@ -556,11 +562,15 @@ pub fn load_owned_pins(home: &Path) -> Result<()> {
 }
 
 pub fn remove_mcp(home: &Path, program: &str, name: &str) -> Result<()> {
-    if !ownership::owned(home)?.get(name).is_some_and(|entry| entry.mcp) {
+    let owned = ownership::owned(home)?.get(name).cloned().unwrap_or_default();
+    if !owned.mcp {
         return Ok(());
     }
+    if ownership::may_be_creating(&owned) && !mcp_names(program)?.iter().any(|other| other == name) {
+        bail!("MCP {name} may still be being created; keeping its reservation for cleanup");
+    }
     if let Err(error) = sbx(program, &["mcp", "rm", "--force", name], false, TIMEOUT)
-        && mcp_names(program)?.iter().any(|other| other == name)
+        && (mcp_names(program)?.iter().any(|other| other == name) || ownership::may_be_creating(&owned))
     {
         return Err(error.context("removing the sandbox's IMACS MCP registration"));
     }
@@ -1083,8 +1093,15 @@ mod tests {
         let attempt = job(&sbx, "imacs-s1", &repo, config.clone());
         let error = format!("{:#}", prepare(&attempt).unwrap_err());
         assert!(error.contains("creating the sandbox") && error.contains("fake create failure"), "{error}");
-        assert!(ownership::owned(&attempt.home).unwrap().is_empty(), "nothing left reserved");
+        let mut owned = ownership::owned(&attempt.home).unwrap();
+        assert!(owned["imacs-s1"].sandbox, "an unlisted recent create stays reserved");
+        assert!(owned["imacs-s1"].creator.is_none(), "the creating process finished");
         std::fs::remove_file(bin.path().join("fail-rm")).unwrap();
+        // Once the create window expires, absence from inventory is conclusive.
+        owned.get_mut("imacs-s1").unwrap().created = 0;
+        std::fs::write(attempt.home.join("sandbox-ownership.json"), serde_json::to_vec(&owned).unwrap()).unwrap();
+        remove(&attempt.home, &sbx.display().to_string(), "imacs-s1").unwrap();
+        assert!(ownership::owned(&attempt.home).unwrap().is_empty());
         assert!(fake::calls_to(bin.path(), &["policy"]).is_empty());
         assert!(list(&sbx.display().to_string()).unwrap().is_empty());
         // No sandbox, no git record of it.
@@ -1351,7 +1368,8 @@ mod tests {
         remove(&home, &sbx, "imacs-b").unwrap();
         assert!(!guards.join("imacs-b.json").exists(), "the ref guard's baseline goes with its sandbox");
         assert!(guards.join("imacs-a.json").exists());
-        let calls = fake::calls(bin.path());
+        let calls: Vec<_> =
+            fake::calls(bin.path()).into_iter().filter(|args| args.iter().any(|arg| arg == "rm")).collect();
         assert_eq!(
             calls[calls.len() - 2..],
             [vec!["rm", "--force", "imacs-b"], vec!["mcp", "rm", "--force", "imacs-b"]]

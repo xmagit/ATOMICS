@@ -159,7 +159,9 @@ pub(super) fn build(
         ownership::record_pins(home, &name, &home.join("git-pins"))?;
         // The UUID name is reserved by this build's ledger before a possibly partial create.
         ownership::created(home, &name, Resource::Sandbox)?;
-        sbx(program, &isolation::create_args(&spec), false, CREATE_TIMEOUT)?;
+        let creation = sbx(program, &isolation::create_args(&spec), false, CREATE_TIMEOUT);
+        ownership::removed(home, &name, Resource::Creator)?;
+        creation?;
         let hosts = config.hosts_for(&real(&workspace::project_root(cwd)?), |p| real(&paths::expand(p)));
         if !hosts.is_empty() {
             sbx(program, &isolation::allow_hosts_args(&name, &hosts), false, TIMEOUT)?;
@@ -389,6 +391,17 @@ mod tests {
             let error = build(&home, &program, dir.path(), "codex", None, &config).unwrap_err();
             assert!(format!("{error:#}").contains(&format!("fake {verb} failure")));
             assert!(list(&program).unwrap().is_empty());
+            if verb == "create" {
+                // The CLI failed before sbx listed a VM. Keep its reservation for a
+                // possibly late daemon create, then reconcile after the create window.
+                let mut entries = ownership::owned(&home).unwrap();
+                assert_eq!(entries.len(), 1);
+                let entry = entries.values_mut().next().unwrap();
+                assert!(entry.sandbox && entry.creator.is_none() && entry.builder.is_none());
+                entry.created = 0;
+                std::fs::write(home.join("sandbox-ownership.json"), serde_json::to_vec(&entries).unwrap()).unwrap();
+                assert!(crate::lifecycle::sweep(&home, &Default::default(), &program).unwrap().is_empty());
+            }
             assert!(ownership::owned(&home).unwrap().is_empty());
             if verb != "template" {
                 assert!(fake::calls_to(dir.path(), &["template"]).is_empty());

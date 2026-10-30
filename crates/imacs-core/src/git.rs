@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
@@ -23,16 +24,21 @@ const QUICK: Duration = Duration::from_secs(120);
 const SLOW: Duration = Duration::from_secs(30 * 60);
 
 /// [`QUICK`] in milliseconds, unless a test that makes git wait shortened it.
+#[cfg(any(test, feature = "test-support"))]
 static QUICK_MILLIS: AtomicU64 = AtomicU64::new(QUICK.as_millis() as u64);
 
 /// Shortens how long quick host git may run in this process, for a test that makes git wait.
 #[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn set_quick_timeout(limit: Duration) {
     QUICK_MILLIS.store(limit.as_millis() as u64, Ordering::Relaxed);
 }
 
 fn quick() -> Duration {
-    Duration::from_millis(QUICK_MILLIS.load(Ordering::Relaxed))
+    #[cfg(any(test, feature = "test-support"))]
+    return Duration::from_millis(QUICK_MILLIS.load(Ordering::Relaxed));
+    #[cfg(not(any(test, feature = "test-support")))]
+    QUICK
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,8 +122,17 @@ fn output(mut command: Command, args: &[&str], input: Option<&[u8]>, timeout: Du
     command
         .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(stdout.try_clone()?)
-        .stderr(stderr.try_clone()?)
-        .process_group(0);
+        .stderr(stderr.try_clone()?);
+    // SAFETY: setsid is async-signal-safe. A fresh child is not a process group leader.
+    // Detaching the controlling terminal makes ssh prompts fail rather than stop on SIGTTIN.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     let mut child = command.spawn().with_context(|| format!("running {shown}"))?;
     if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
         let input = input.to_vec();
@@ -129,7 +144,7 @@ fn output(mut command: Command, args: &[&str], input: Option<&[u8]>, timeout: Du
     let status = match finished.recv_timeout(timeout) {
         Ok(status) => status.with_context(|| format!("waiting for {shown}"))?,
         Err(_) => {
-            // SAFETY: process_group(0) made git the leader of a process group of its own.
+            // SAFETY: setsid made git the leader of a process group of its own.
             unsafe { libc::kill(-group, libc::SIGKILL) };
             bail!("{shown} did not finish within {} s, and was stopped", timeout.as_secs());
         }
@@ -146,8 +161,16 @@ fn output(mut command: Command, args: &[&str], input: Option<&[u8]>, timeout: Du
 /// `git -C dir args`. In a repository a sandbox works in, git runs with the locations [`pin`]ned
 /// for its folder, or checked against them for the repository's other checkouts, never the ones
 /// the folder names now; and without hooks or fsmonitor, which can name programs the sandbox wrote.
-/// Git never prompts on the terminal: in a process group of its own, reading it would stop git.
+/// Git never prompts on the terminal: it starts in a new session without a controlling terminal.
 fn command(dir: &Path, args: &[&str]) -> Result<Command> {
+    if matches!(args.first(), Some(&"rev-parse" | &"show-ref" | &"merge-base")) {
+        for arg in args.iter().filter(|arg| arg.starts_with("refs/heads/")) {
+            let name = arg.split(['^', '~']).next().unwrap();
+            // Ref probes must refuse special loose refs before git opens them. Object and
+            // log reads are still bounded by the runner, and belong on background workers.
+            loose_ref_exists(&common_dir(dir)?, name)?;
+        }
+    }
     let mut command = Command::new("git");
     command.arg("-C").arg(dir).args(["-c", "core.quotepath=off"]).env("GIT_TERMINAL_PROMPT", "0");
     let Some(pins) = locate(dir)? else {
@@ -758,7 +781,12 @@ pub fn resolve_base(repo: &Path, base_ref: &str) -> Result<String> {
 /// Refuses branch names IMACS must never create or merge into: invalid ones, ones git
 /// would read as options, and the base branch (main, master or `base_ref`'s branch).
 pub fn check_branch_name(repo: &Path, branch: &str, base_ref: &str) -> Result<()> {
-    if branch.starts_with('-') || git(repo, &["check-ref-format", "--branch", branch]).is_err() {
+    // Validate a literal ref name: --branch expands @{-n} by reading the HEAD log,
+    // which a sandbox can replace with a FIFO, even during UI branch allocation.
+    if branch.starts_with('-')
+        || branch == "HEAD"
+        || git(repo, &["check-ref-format", &format!("refs/heads/{branch}")]).is_err()
+    {
         bail!("{branch:?} is not a valid branch name");
     }
     let base = base_ref.strip_prefix("origin/").unwrap_or(base_ref);
@@ -779,6 +807,47 @@ pub fn add_worktree(repo: &Path, path: &Path, branch: &str, base_ref: &str) -> R
 pub fn common_dir(repo: &Path) -> Result<PathBuf> {
     let common = git(repo, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
     Ok(std::fs::canonicalize(common.trim())?)
+}
+
+/// Whether a loose ref exists, refusing links, FIFOs and non-directory parents without reading it.
+fn loose_ref_exists(common: &Path, name: &str) -> Result<bool> {
+    let parts: Vec<_> = name.split('/').collect();
+    ensure!(parts.iter().all(|part| !part.is_empty() && *part != "." && *part != ".."), "invalid ref {name}");
+    let mut path = common.to_path_buf();
+    for (index, part) in parts.iter().enumerate() {
+        path.push(part);
+        let metadata = match path.symlink_metadata() {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error).with_context(|| format!("checking {}", path.display())),
+        };
+        ensure!(
+            if index + 1 == parts.len() { metadata.is_file() } else { metadata.is_dir() },
+            "{} is not a regular ref file or directory",
+            path.display()
+        );
+    }
+    Ok(true)
+}
+
+/// Branch-name occupancy for allocation. This never opens an object or reflog: git's actual
+/// ref/commit verification happens on the worktree worker, not while dispatch holds the UI lock.
+pub fn branch_ref_exists(repo: &Path, branch: &str) -> Result<bool> {
+    let name = format!("refs/heads/{branch}");
+    let common = common_dir(repo)?;
+    if loose_ref_exists(&common, &name)? {
+        return Ok(true);
+    }
+    let packed = match read_regular_file(&common.join("packed-refs"), 16 * 1024 * 1024) {
+        Ok(packed) => packed,
+        Err(error)
+            if error.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    };
+    Ok(packed.lines().any(|line| line.split_once(' ').is_some_and(|(_, candidate)| candidate == name)))
 }
 
 fn worktree_lock(repo: &Path) -> Result<Arc<Mutex<()>>> {
@@ -1085,6 +1154,53 @@ pub fn worktree_path(template: &str, repo: &Path, branch: &str) -> PathBuf {
 pub(crate) mod tests {
     use super::*;
 
+    #[test]
+    fn branch_validation_does_not_expand_checkout_history() {
+        let (_dir, repo) = project();
+        git(&repo, &["switch", "-c", "feature"]).unwrap();
+        assert!(check_branch_name(&repo, "@{-1}", "origin/main").is_err());
+        assert!(check_branch_name(&repo, "HEAD", "origin/main").is_err());
+    }
+
+    #[test]
+    fn branch_allocation_reads_names_without_opening_objects_or_logs() {
+        let (_dir, repo) = project();
+        let object = git(&repo, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        let file = repo.join(".git/objects").join(&object[..2]).join(&object[2..]);
+        std::fs::remove_file(&file).unwrap();
+        assert!(Command::new("mkfifo").arg(file).status().unwrap().success());
+        let log = repo.join(".git/logs/HEAD");
+        std::fs::remove_file(&log).unwrap();
+        assert!(Command::new("mkfifo").arg(log).status().unwrap().success());
+        assert!(branch_ref_exists(&repo, "main").unwrap());
+        assert!(!branch_ref_exists(&repo, "missing").unwrap());
+        // Packed occupancy also needs no object; loose shadowing is checked first.
+        std::fs::write(repo.join(".git/packed-refs"), format!("{object} refs/heads/packed\n")).unwrap();
+        assert!(branch_ref_exists(&repo, "packed").unwrap());
+    }
+
+    #[test]
+    fn ref_probes_refuse_non_regular_loose_branch_files_before_starting_git() {
+        let (_dir, repo) = project();
+        for name in ["fifo", "link"] {
+            let path = repo.join(".git/refs/heads").join(name);
+            if name == "fifo" {
+                assert!(Command::new("mkfifo").arg(&path).status().unwrap().success());
+            } else {
+                std::os::unix::fs::symlink("/dev/zero", &path).unwrap();
+            }
+            let full = format!("refs/heads/{name}");
+            for args in [
+                vec!["show-ref", "--verify", &full],
+                vec!["rev-parse", "--verify", &full],
+                vec!["merge-base", "--is-ancestor", &full, "HEAD"],
+            ] {
+                let result = command(&repo, &args);
+                assert!(result.is_err(), "git would read {full}: {args:?}");
+            }
+        }
+    }
+
     fn run(dir: &Path, args: &[&str]) {
         let status = Command::new("git").arg("-C").arg(dir).args(args).status().unwrap();
         assert!(status.success(), "git {args:?}");
@@ -1374,6 +1490,22 @@ pub(crate) mod tests {
             unpin(&pins.work_tree);
             assert!(promptly(&what, move || resolve_pins(&worktree)).is_err(), "{what}");
         }
+    }
+
+    #[test]
+    fn host_git_starts_without_a_controlling_terminal() {
+        const PROBE: &str = "IMACS_GIT_SESSION_PROBE";
+        if std::env::var_os(PROBE).is_some() {
+            // A new session has no controlling terminal, so ssh's /dev/tty prompt fails
+            // instead of stopping the process group until the host git timeout.
+            assert_eq!(unsafe { libc::getsid(0) }, std::process::id() as i32);
+            return;
+        }
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args(["--exact", "git::tests::host_git_starts_without_a_controlling_terminal", "--nocapture"]);
+        command.env(PROBE, "1");
+        let result = output(command, &["session probe"], None, Duration::from_secs(10)).unwrap();
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stdout));
     }
 
     #[test]

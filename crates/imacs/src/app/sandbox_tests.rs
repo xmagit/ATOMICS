@@ -185,8 +185,16 @@ fn quitting_stops_making_a_sandbox_rather_than_waiting_for_it() {
         app.runtime.shutdown();
         assert!(quit.elapsed() < QUIT_WAIT * 2 + Duration::from_secs(30), "quit took {:?}", quit.elapsed());
         assert!(app.runtime.pending_sandbox.is_empty());
-        // The preparation removed what was reserved for its sandbox; nothing is left owned.
+        // The CLI was canceled, but sbx's daemon could still finish the create. The listed
+        // registration is gone; its unlisted VM reservation stays until the create window ends.
         assert!(!bin.path().join("sandboxes").join(&name).exists() && !bin.path().join("mcp").join(&name).exists());
+        let home = paths::imacs_home();
+        let mut owned = crate::sandbox_ownership::owned(&home).unwrap();
+        assert!(owned[&name].sandbox && !owned[&name].mcp);
+        assert!(owned[&name].creator.is_none());
+        owned.get_mut(&name).unwrap().created = 0;
+        std::fs::write(home.join("sandbox-ownership.json"), serde_json::to_vec(&owned).unwrap()).unwrap();
+        assert!(crate::lifecycle::sweep(&home, &app.runtime.config, &app.runtime.sbx).unwrap().is_empty());
         assert!(!crate::sandbox_ownership::owned(&paths::imacs_home()).unwrap().contains_key(&name));
         std::fs::remove_file(bin.path().join("wait-create")).unwrap();
         app.runtime.sessions.clear();
