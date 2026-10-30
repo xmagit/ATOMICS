@@ -1880,6 +1880,7 @@ dependencies = [
  "notify-debouncer-mini",
  "png",
  "rfd",
+ "serde",
  "serde_json",
  "syntect",
  "tempfile",

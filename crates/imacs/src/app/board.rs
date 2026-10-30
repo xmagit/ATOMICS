@@ -391,7 +391,23 @@ impl Desktop<'_> {
                                                     ) {
                                                         actions.push((task.id.clone(), action));
                                                     }
-                                                    if let Some(note) = task.notes.last() {
+                                                    if let Some(alert) = &task.ref_alert {
+                                                        egui::Frame::new()
+                                                            .fill(lerp(p.panel, p.error, 0.15))
+                                                            .stroke(Stroke::new(1.0, p.error))
+                                                            .inner_margin(6)
+                                                            .show(ui, |ui| {
+                                                                ui.label(
+                                                                    RichText::new(alert)
+                                                                        .color(p.error)
+                                                                        .strong()
+                                                                        .size(12.0),
+                                                                );
+                                                                if ui.small_button("Acknowledge ref alert").clicked() {
+                                                                    actions.push((task.id.clone(), "acknowledge_refs"));
+                                                                }
+                                                            });
+                                                    } else if let Some(note) = task.notes.last() {
                                                         ui.label(
                                                             RichText::new(note).color(p.muted).italics().size(11.0),
                                                         );
@@ -535,7 +551,7 @@ impl Desktop<'_> {
                 "integrate" => {
                     self.post_plan(self.runtime.selected_plan, move |state, index| state.integrate(index, &id, None))
                 }
-                "diff" | "resume" => {
+                "diff" | "resume" | "acknowledge_refs" => {
                     if let Some(task) =
                         self.runtime.plans[self.runtime.selected_plan].tasks.iter().position(|t| t.id == id)
                     {

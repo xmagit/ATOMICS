@@ -38,6 +38,11 @@ impl State {
         }
         for index in 0..self.sessions.len() {
             let session = &mut self.sessions[index];
+            if session.sandbox.is_some() {
+                session.approvals.clear();
+                session.approval_hold = false;
+                continue;
+            }
             let pending = session.approval_hold || !session.approvals.is_empty();
             if !pending && !(check_needs_input && session.status == AgentStatus::NeedsInput) {
                 continue;

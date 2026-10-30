@@ -17,6 +17,7 @@ mod host;
 mod ipc;
 mod mcp;
 mod mcp_client;
+mod ref_guard;
 mod restart;
 mod sandbox;
 mod setup;

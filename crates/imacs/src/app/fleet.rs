@@ -163,9 +163,15 @@ impl Desktop<'_> {
                 3.5,
                 status_dot(session.status, &p, now),
             );
+            let badge_width = if session.sandbox.is_some() { 63.0 } else { 0.0 };
+            if session.sandbox.is_some() {
+                let badge = Rect::from_center_size(pos2(header.right() - 59.0, header.center().y), vec2(56.0, 17.0));
+                ui.painter().rect_filled(badge, 4.0, lerp(p.raised, p.info, 0.15));
+                ui.painter().text(badge.center(), egui::Align2::CENTER_CENTER, "sandbox", p.ui(10.0), p.info);
+            }
             let title_rect = Rect::from_min_max(
                 pos2(header.left() + 22.0, header.top()),
-                pos2(header.right() - 28.0, header.bottom()),
+                pos2(header.right() - 28.0 - badge_width, header.bottom()),
             );
             let title_response =
                 ui.interact(title_rect, ui.scope_id().with(("tile-title", &session.id)), Sense::click());
@@ -212,7 +218,9 @@ impl Desktop<'_> {
             let edge = if active { p.accent.gamma_multiply(0.7) } else { p.border };
             ui.painter().rect_stroke(tile, 2.0, Stroke::new(1.0, edge), egui::StrokeKind::Outside);
 
-            if let Some(pending) = session.approvals.first() {
+            if session.sandbox.is_none()
+                && let Some(pending) = session.approvals.first()
+            {
                 let request = &pending.request;
                 let deciding = self.client.approval_decisions.contains(&(session.id.clone(), pending.id.clone()));
                 let height = (body.height() - 220.0).clamp(110.0, 210.0).min(body.height());

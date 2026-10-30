@@ -24,6 +24,9 @@ pub(super) fn session(id: &str, kind: AgentKind, status: AgentStatus, cwd: &Path
         chief: false,
         pending: None,
         sandbox: None,
+        screen_busy: false,
+        busy_absent_since: None,
+        ref_guard: None,
     }
 }
 

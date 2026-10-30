@@ -50,6 +50,7 @@ mod plan_cleanup;
 mod plan_view;
 mod plans;
 mod projects;
+mod ref_guard;
 mod repo_workflow;
 mod restart;
 mod selfconfig;
@@ -116,6 +117,9 @@ pub struct Session {
     pending: Option<Pending>,
     /// The sandbox a sandboxed agent runs in.
     sandbox: Option<String>,
+    screen_busy: bool,
+    busy_absent_since: Option<Instant>,
+    ref_guard: Option<crate::ref_guard::RefGuard>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

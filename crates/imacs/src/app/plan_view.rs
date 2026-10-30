@@ -50,7 +50,8 @@ impl State {
         }
         let linked = |session: &&Session| !session.chief && plan.contains_session(&session.id);
         if plan.tasks.iter().any(|task| {
-            task.status == TaskStatus::Blocked
+            task.ref_alert.is_some()
+                || task.status == TaskStatus::Blocked
                 || task.status != TaskStatus::Done
                     && task.report.as_ref().is_some_and(|report| report.status == "question")
         }) || self.sessions.iter().filter(linked).any(|session| {
