@@ -610,9 +610,21 @@ impl State {
         }
         self.busy_checked = Instant::now();
         let mut finished = Vec::new();
+        let mut credential_errors = Vec::new();
         let mut ref_checks = Vec::new();
         for (index, session) in self.sessions.iter_mut().enumerate() {
             let Some(terminal) = &session.terminal else { continue };
+            if session.sandbox.is_some()
+                && let Some(reason) = credential_failure(&terminal.screen_text(60))
+            {
+                session.status = AgentStatus::NeedsInput;
+                if session.last_message.as_deref() != Some(&reason) {
+                    credential_errors.push((session.id.clone(), reason.clone()));
+                }
+                session.last_message = Some(reason);
+                session.activity.observe(session.status);
+                continue;
+            }
             // Trust and hook menus can precede hooks, including in bare Codex.
             if session.is_agent()
                 && !terminal.exited()
@@ -671,6 +683,9 @@ impl State {
         }
         for root in finished {
             self.diffs.entry(root).or_default().mark_dirty();
+        }
+        for (id, reason) in credential_errors {
+            self.report(Some(&id), "blocked", &reason);
         }
         for index in ref_checks {
             self.check_refs(index);
@@ -913,6 +928,22 @@ fn brief_file(session: &str, text: &str, sandboxed: bool) -> Result<String, Stri
 /// RUSTC_WRAPPER for sccache when it is installed and neither the user nor the project under
 /// `cwd` chose a wrapper (an exported variable would override their cargo config).
 /// An explicit instance home must also isolate mutable provider trust and settings.
+pub(super) fn credential_failure(screen: &str) -> Option<String> {
+    screen
+        .lines()
+        .rev()
+        .find(|line| {
+            let text = line.to_ascii_lowercase();
+            text.contains("authentication_failed")
+                || text.contains("authentication failed")
+                || text.contains("invalid api key")
+                || text.contains("invalid_api_key")
+                || text.contains("401")
+                    && (text.contains("error") || text.contains("unauthorized") || text.contains("http"))
+        })
+        .map(|line| format!("Credential error: {}", line.trim()))
+}
+
 fn instance_agent_env() -> Vec<(String, String)> {
     let Some(home) = std::env::var_os("IMACS_HOME").map(PathBuf::from) else { return Vec::new() };
     [("CODEX_HOME", "codex"), ("CLAUDE_CONFIG_DIR", "claude")]
@@ -1005,6 +1036,55 @@ impl Desktop<'_> {
 mod tests {
     use super::super::tests::{request, session, with_app};
     use super::*;
+
+    #[test]
+    fn sandbox_credential_errors_block_the_task_with_the_reason_even_after_exit() {
+        with_app(
+            "app::sessions::tests::sandbox_credential_errors_block_the_task_with_the_reason_even_after_exit",
+            |app, ctx| {
+                let dir = crate::test_support::tempdir().unwrap();
+                for (text, exit) in [("API Error: 401 authentication_failed", false), ("HTTP 401 Unauthorized", true)] {
+                    let terminal = Terminal::spawn(
+                        app.runtime.wake.clone(),
+                        app.runtime.palette.terminal_colors(),
+                        "/bin/sh".into(),
+                        vec![
+                            "-c".into(),
+                            format!("printf '%s' '{text}'; {}", if exit { "exit 1" } else { "exec sleep 600" }),
+                        ],
+                        dir.path(),
+                        HashMap::new(),
+                        100,
+                    )
+                    .unwrap();
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while !terminal.screen_text(60).contains(text) || exit && !terminal.exited() {
+                        assert!(Instant::now() < deadline);
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    let mut worker = session("worker", AgentKind::Claude, AgentStatus::Working, dir.path());
+                    worker.sandbox = Some("imacs-worker".into());
+                    worker.terminal = Some(terminal);
+                    app.runtime.sessions = vec![worker];
+                    app.runtime.plans[0].tasks = vec![Task {
+                        id: "a".into(),
+                        session: Some("worker".into()),
+                        status: TaskStatus::Running,
+                        ..Default::default()
+                    }];
+                    for _ in 0..2 {
+                        app.runtime.busy_checked = Instant::now() - Duration::from_secs(1);
+                        app.runtime.runtime_tick(ctx);
+                        assert_eq!(app.runtime.sessions[0].status, AgentStatus::NeedsInput);
+                    }
+                    assert_eq!(app.runtime.plans[0].tasks[0].status, TaskStatus::Blocked);
+                    assert!(app.runtime.plans[0].tasks[0].report.as_ref().unwrap().summary.contains(text));
+                    assert!(app.runtime.sessions[0].last_message.as_ref().unwrap().contains(text));
+                    app.runtime.sessions.clear();
+                }
+            },
+        );
+    }
 
     #[test]
     fn bare_codex_trust_and_hook_menus_need_input_even_with_hooks() {
