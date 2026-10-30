@@ -445,6 +445,14 @@ mod tests {
         ownership::created(&home, "imacs-starting", Resource::Sandbox).unwrap();
         std::fs::create_dir_all(home.join("briefs")).unwrap();
         std::fs::write(home.join("briefs/starting.md"), "being prepared").unwrap();
+        // Filesystem mtimes can be coarser than SystemTime::now (notably in the Linux harness).
+        // Establish the ordering explicitly instead of relying on two adjacent wall-clock reads.
+        std::fs::File::options()
+            .write(true)
+            .open(home.join("briefs/starting.md"))
+            .unwrap()
+            .set_modified(before + std::time::Duration::from_secs(1))
+            .unwrap();
         assert!(sweep_before(&home, &Config::default(), &sbx, before).unwrap().is_empty());
         assert!(bin.join("sandboxes/imacs-starting").exists() && bin.join("mcp/imacs-starting").exists());
         assert!(home.join("briefs/starting.md").exists());

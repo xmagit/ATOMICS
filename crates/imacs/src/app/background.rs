@@ -810,7 +810,7 @@ mod tests {
                 100,
             )
             .unwrap();
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
             while !terminal.screen_text(60).contains("esc to interrupt") {
                 assert!(Instant::now() < deadline);
                 std::thread::sleep(Duration::from_millis(10));
@@ -922,10 +922,14 @@ mod tests {
                     *app.runtime.watched.lock().unwrap(),
                     [(root.clone(), std::fs::canonicalize(&root).unwrap())]
                 );
-                let deadline = Instant::now() + Duration::from_secs(10);
+                let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
                 loop {
                     std::fs::write(root.join("changed.txt"), "changed").unwrap();
-                    if let Ok(changed) = app.runtime.watch_rx.recv_timeout(Duration::from_millis(100)) {
+                    if let Ok(changed) = app
+                        .runtime
+                        .watch_rx
+                        .recv_timeout(crate::test_support::scaled_timeout(Duration::from_millis(100)))
+                    {
                         assert_eq!(changed, root, "events must retain the application's worktree path");
                         break;
                     }

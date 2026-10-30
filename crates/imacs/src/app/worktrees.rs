@@ -479,7 +479,10 @@ mod tests {
                             isolation: None,
                         },
                     );
-                    let event = state.worktree_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    let event = state
+                        .worktree_rx
+                        .recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(5)))
+                        .unwrap();
                     let prepared = event.1.as_ref().unwrap();
                     let path = prepared.path.clone();
                     assert_eq!(prepared.warmed, branch == "warm" && supported);
@@ -493,7 +496,7 @@ mod tests {
                     if branch == "warm" && supported {
                         assert_eq!(state.toast.as_ref().unwrap().0, "warm cache from main");
                     }
-                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(5));
                     while !path.join("launched").exists() {
                         assert!(Instant::now() < deadline, "agent never launched for {branch}");
                         std::thread::sleep(Duration::from_millis(10));

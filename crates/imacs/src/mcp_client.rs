@@ -551,7 +551,11 @@ pub(crate) mod tests {
         assert_eq!(failed, McpError::Server("card_note failed: card_note is broken today".into()));
         client.call_tool("card_get", json!({ "card": "7" })).expect("a tool error leaves the connection usable");
 
-        let mut slow = McpClient::connect(&server, Duration::from_millis(500), |_| None).unwrap();
+        let mut slow =
+            McpClient::connect(&server, crate::test_support::scaled_timeout(Duration::from_millis(500)), |_| None)
+                .unwrap();
+        // Initialization is fixture readiness; the hung-call behavior stays at exactly 500 ms.
+        slow.timeout = Duration::from_millis(500);
         saved["hang"] = json!(["card_get"]);
         std::fs::write(&state, saved.to_string()).unwrap();
         let started = Instant::now();
@@ -628,7 +632,8 @@ pub(crate) mod tests {
     #[test]
     fn stdio_large_tool_call_after_initialize_cannot_block_the_worker() {
         let config = stdio(vec![fake_server().display().to_string(), "--stop-reading-after-initialize".into()]);
-        let mut client = McpClient::connect(&config, Duration::from_secs(2), |_| None).unwrap();
+        let mut client =
+            McpClient::connect(&config, crate::test_support::scaled_timeout(Duration::from_secs(2)), |_| None).unwrap();
         client.timeout = Duration::from_millis(300);
         let started = Instant::now();
         let error = bounded(Duration::from_secs(10), stdio_pid(&client), move || {

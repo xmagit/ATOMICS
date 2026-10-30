@@ -28,6 +28,21 @@ impl State {
     }
 
     pub(super) fn expire_approvals(&mut self, now: Instant) {
+        for approval in self.relay.take_write_approvals() {
+            let index = self.sessions.iter().position(|session| session.sandbox.as_deref() == Some(&approval.session));
+            if let Some(index) = index.filter(|_| !approval.reply.expired()) {
+                let session = &mut self.sessions[index];
+                session.approvals.push(PendingApproval {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    request: approval.request,
+                    reply: Some(approval.reply),
+                });
+                session.status = AgentStatus::NeedsInput;
+                self.last_status.remove(&session.id);
+            } else {
+                approval.reply.answer(HookReply::default());
+            }
+        }
         if now.duration_since(self.approvals_checked) < APPROVAL_CHECK_INTERVAL {
             return;
         }
@@ -39,7 +54,17 @@ impl State {
         for index in 0..self.sessions.len() {
             let session = &mut self.sessions[index];
             if session.sandbox.is_some() {
-                session.approvals.clear();
+                let had_approvals = !session.approvals.is_empty();
+                session.approvals.retain(|pending| {
+                    pending.request.tool == "Azure REST" && pending.reply.as_ref().is_some_and(|reply| !reply.expired())
+                });
+                if had_approvals && session.approvals.is_empty() {
+                    session.status = if session.terminal.as_ref().is_some_and(Terminal::exited) {
+                        AgentStatus::Exited
+                    } else {
+                        AgentStatus::Working
+                    };
+                }
                 session.approval_hold = false;
                 continue;
             }
@@ -106,8 +131,13 @@ impl State {
             return Err("stale permission decision: review the current request".into());
         }
         let reply = HookReply { stdout: Some(decision.output(message)) };
+        let azure = pending.request.tool == "Azure REST";
         let answered = pending.reply.take().is_some_and(|sender| sender.answer(reply));
         if !answered {
+            if azure {
+                session.approvals.remove(0);
+                return Err("the Azure request expired; retry the request".into());
+            }
             let Some(terminal) = &session.terminal else {
                 return Err("the permission hook has returned; answer in the agent terminal".into());
             };
@@ -124,10 +154,13 @@ impl State {
             }
         }
         let pending = session.approvals.remove(0);
-        if decision == Decision::AllowAlways {
+        if decision == Decision::AllowAlways && !azure {
             session.allowed.push(pending.request);
         }
         session.status = if session.approvals.is_empty() { AgentStatus::Working } else { AgentStatus::NeedsInput };
+        if azure && !session.approvals.is_empty() {
+            self.last_status.remove(&session.id);
+        }
         Ok(())
     }
 }
@@ -136,6 +169,86 @@ impl State {
 mod tests {
     use super::super::tests::{request, session, with_app};
     use super::*;
+
+    #[test]
+    fn azure_writes_from_sandboxes_use_the_permission_banner_and_never_persist_allow_always() {
+        with_app(
+            "app::approvals::tests::azure_writes_from_sandboxes_use_the_permission_banner_and_never_persist_allow_always",
+            |app, ctx| {
+                let dir = crate::test_support::tempdir().unwrap();
+                let upstream = crate::relay::fake::start();
+                let config = imacs_core::isolation::AzureConfig::default();
+                let azure =
+                    crate::relay::azure::Azure::new(crate::relay::azure::tests::fake(dir.path()), config.clone());
+                app.runtime.relay = Arc::new(
+                    crate::relay::Service::with_upstreams(
+                        dir.path().to_path_buf(),
+                        crate::relay::Keychain::at(Path::new("/no-keychain"), false),
+                        [("management.azure.com".into(), upstream.url)].into(),
+                    )
+                    .with_azure(azure),
+                );
+                let granted = app.runtime.relay.grant_session("imacs-worker", false, &config).unwrap().unwrap();
+                app.runtime.sessions =
+                    vec![session("worker", AgentKind::Generic, AgentStatus::Working, &app.runtime.launch_dir)];
+                app.runtime.sessions[0].sandbox = Some("imacs-worker".into());
+                for decision in [Decision::Deny, Decision::AllowAlways] {
+                    let port = granted.port;
+                    let placeholder = granted.azure.as_ref().unwrap();
+                    let request = format!(
+                        "PUT /management.azure.com/v1/models?api-version=2026 HTTP/1.1\r\nauthorization: Bearer {placeholder}\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{{}}"
+                    );
+                    let client = std::thread::spawn(move || crate::relay::fake::send(port, &request).0);
+                    let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
+                    while app.runtime.sessions[0].approvals.is_empty() {
+                        assert!(Instant::now() < deadline);
+                        app.runtime.expire_approvals(Instant::now());
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    assert_eq!(app.runtime.sessions[0].status, AgentStatus::NeedsInput);
+                    let pending = &app.runtime.sessions[0].approvals[0];
+                    let id = pending.id.clone();
+                    assert_eq!(pending.request.tool, "Azure REST");
+                    assert!(pending.request.command.as_ref().unwrap().contains("api-version=2026"));
+                    // Normal sandbox hook permissions are ignored, but a live relay approval must survive polling.
+                    app.runtime.expire_approvals(Instant::now() + Duration::from_secs(1));
+                    assert_eq!(app.runtime.sessions[0].approvals.len(), 1);
+                    let output = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1400.0, 900.0))),
+                            ..Default::default()
+                        },
+                        |ui| {
+                            egui::CentralPanel::default().show(ui, |ui| {
+                                let layout =
+                                    layout::compute(1400.0, 900.0, 1, 0, false, 0.0, &app.runtime.config.layout);
+                                app.tiles(ui, ui.max_rect(), &layout, &[0]);
+                            });
+                        },
+                    );
+                    let text: Vec<_> = output
+                        .shapes
+                        .iter()
+                        .filter_map(|shape| match &shape.shape {
+                            egui::epaint::Shape::Text(text) => Some(text.galley.text().to_string()),
+                            _ => None,
+                        })
+                        .collect();
+                    for label in ["Permission requested", "Allow", "Deny"] {
+                        assert!(text.iter().any(|text| text == label), "{text:?}");
+                    }
+                    assert!(!text.iter().any(|text| text == "Allow always"));
+                    output.drop_without_applying_deltas();
+                    app.runtime.approve(0, &id, decision, None).unwrap();
+                    let expected = if decision == Decision::Deny { 403 } else { 200 };
+                    assert!(client.join().unwrap().starts_with(&format!("HTTP/1.1 {expected}")));
+                    assert!(app.runtime.sessions[0].allowed.is_empty());
+                    assert_eq!(app.runtime.sessions[0].status, AgentStatus::Working);
+                }
+                app.runtime.relay.revoke(&granted);
+            },
+        );
+    }
 
     #[test]
     fn delayed_duplicate_decisions_cannot_approve_the_next_request() {
@@ -373,7 +486,7 @@ mod tests {
                     100,
                 )
                 .unwrap();
-                let deadline = Instant::now() + Duration::from_secs(5);
+                let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(5));
                 while !terminal.screen_text(60).contains("view all") {
                     assert!(Instant::now() < deadline);
                     std::thread::sleep(Duration::from_millis(10));
@@ -518,7 +631,7 @@ mod tests {
                 100,
             )
             .unwrap();
-            let deadline = Instant::now() + Duration::from_secs(2);
+            let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(2));
             while !terminal.screen_text(60).contains("esc to cancel") {
                 assert!(Instant::now() < deadline);
                 std::thread::sleep(Duration::from_millis(10));
@@ -654,7 +767,9 @@ mod tests {
                 assert!(wait_rx.try_recv().is_err(), "another plan's approval must not satisfy this waiter");
                 let (event, first_reply) = permission("worker-one");
                 app.runtime.on_hook(event);
-                let ControlOutcome::Done(waited) = wait_rx.recv_timeout(Duration::from_secs(2)).unwrap() else {
+                let ControlOutcome::Done(waited) =
+                    wait_rx.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(2))).unwrap()
+                else {
                     panic!("wait response")
                 };
                 let event = &waited.result["events"][0];
@@ -711,7 +826,7 @@ mod tests {
                 assert_eq!(app.runtime.sessions[0].pending.as_ref().unwrap().text, "steer-worker-one");
                 assert_eq!(app.runtime.sessions[1].held.len(), 1);
                 assert!(app.runtime.sessions[1].pending.is_none());
-                let deadline = Instant::now() + Duration::from_secs(2);
+                let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(2));
                 while !app.runtime.sessions[0].terminal.as_ref().unwrap().screen_text(20).contains("steer-worker-one") {
                     assert!(Instant::now() < deadline, "first plan's plain message was not released");
                     std::thread::sleep(Duration::from_millis(10));

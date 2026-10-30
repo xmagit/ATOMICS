@@ -10,7 +10,9 @@ use std::os::unix::net::UnixStream;
 fn response(rx: Receiver<ControlOutcome>) -> ControlResponse {
     // Some commands run git in the background (an integration takes a dozen calls), and while the
     // whole suite runs one git call can take half a second. The bound only guards against a hang.
-    let ControlOutcome::Done(response) = rx.recv_timeout(Duration::from_secs(30)).expect("host did not answer") else {
+    let ControlOutcome::Done(response) =
+        rx.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(30))).expect("host did not answer")
+    else {
         panic!("expected completed command");
     };
     assert!(response.ok, "{:?}", response.error);
@@ -22,7 +24,7 @@ fn command(host: &Host, value: serde_json::Value) -> ControlResponse {
 }
 
 fn eventually(host: &Host, check: impl Fn(&State) -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
     loop {
         if check(&host.state()) {
             break;
@@ -262,7 +264,9 @@ fn delivery_verification_times_out_without_frames() {
         });
         state.sessions = vec![worker];
         let host = state.into_host();
-        let ControlOutcome::Done(result) = received.recv_timeout(Duration::from_secs(3)).unwrap() else {
+        let ControlOutcome::Done(result) =
+            received.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(3))).unwrap()
+        else {
             panic!("delivery was not resolved");
         };
         assert!(!result.ok);
@@ -374,7 +378,7 @@ fn desktop_actions_launch_and_deliver_on_the_host_without_frames() {
                 tx.send(id).unwrap();
             }))
             .unwrap();
-        let id = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let id = rx.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(5))).unwrap();
         let session = id.clone();
         actions
             .send(Box::new(move |state| {
@@ -420,7 +424,7 @@ fn blocked_project_picker_does_not_block_hooks_or_waits() {
         let (opened_tx, opened_rx) = channel();
         let (done_tx, done_rx) = channel();
         let worker = std::thread::spawn(move || {
-            opened_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            opened_rx.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(5))).unwrap();
             hook("Stop", None);
             let reply = response(wait);
             assert_eq!(reply.result["timed_out"], false);
@@ -436,7 +440,9 @@ fn blocked_project_picker_does_not_block_hooks_or_waits() {
         ctx.run_ui(egui::RawInput::default(), |ui| {
             app.ui_with_picker(ui, |_| {
                 opened_tx.send(()).unwrap();
-                done_rx.recv_timeout(Duration::from_secs(10)).expect("runtime stalled while folder picker was open");
+                done_rx
+                    .recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(10)))
+                    .expect("runtime stalled while folder picker was open");
                 Some(repo.clone())
             });
         })

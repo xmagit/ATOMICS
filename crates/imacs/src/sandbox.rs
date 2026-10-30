@@ -18,6 +18,7 @@ use anyhow::{Context, Result, bail};
 use imacs_core::isolation::{self, Diagnosis, Listed, MIN_SBX_VERSION, SandboxConfig, Spec};
 use imacs_core::{git, paths, workspace};
 
+pub mod azure_check;
 pub(crate) mod checks;
 pub mod exec;
 pub mod relay_check;
@@ -168,7 +169,7 @@ pub fn prepare(job: &Prepare) -> Result<Option<crate::relay::Granted>> {
     let (workspace, git) = workspace(&job.cwd)?;
     // First, so a new sandbox's environment can name the relay's port.
     let granted = match &job.relay {
-        Some(relay) => relay.grant_claude(&job.name)?,
+        Some(relay) => relay.grant_session(&job.name, job.agent == "claude", &job.config.azure)?,
         None => None,
     };
     let made = make(job, &ready, existing, workspace, git, granted.as_ref());
@@ -234,7 +235,15 @@ fn make(
         memory: job.config.memory.clone(),
         cpus: job.config.cpus,
         template: job.config.template.clone(),
-        env: granted.map(|granted| isolation::claude_relay_env(granted.port)).unwrap_or_default(),
+        env: granted
+            .map(|granted| {
+                let mut env = granted.azure_env();
+                if !granted.placeholder.is_empty() {
+                    env.extend(isolation::claude_relay_env(granted.port));
+                }
+                env
+            })
+            .unwrap_or_default(),
     };
     // A registration left by an earlier attempt would make `mcp add` fail.
     remove_mcp(&job.home, &job.sbx, &job.name)?;
@@ -973,6 +982,7 @@ mod tests {
         std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keychain"), &keychain).unwrap();
         std::fs::write(bin.path().join("keychain-value"), "sk-ant-oat01-PRIVATE-token").unwrap();
         let mut job = job(&sbx, "imacs-c1", &repo, SandboxConfig::default());
+        job.config.azure.enabled = false;
         job.agent = "claude";
         let relay = |job: &mut Prepare| {
             let service = crate::relay::Service::new(job.home.clone(), crate::relay::Keychain::at(&keychain, true));

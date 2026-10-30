@@ -125,6 +125,11 @@ enum SandboxCommand {
     /// Check that sandboxed Claude answers on the Claude subscription through IMACS's relay, with no
     /// token in the VM (makes one throwaway sandbox and removes it)
     RelayCheck,
+    /// Run a fixed read-only KQL query through host az login from a throwaway sandbox
+    AzureCheck {
+        /// Application Insights application ID chosen by the user (not its ARM resource ID)
+        app_id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -204,6 +209,16 @@ fn main() -> eframe::Result {
                 std::process::exit(1);
             }
             println!("PASS relay check");
+            return Ok(());
+        }
+        Some(Command::Sandbox { command: SandboxCommand::AzureCheck { app_id } }) => {
+            match sandbox::azure_check::run(&app_id) {
+                Ok(count) => println!("PASS Azure relay check: count={count}"),
+                Err(error) => {
+                    println!("FAIL Azure relay check: {error:#}");
+                    std::process::exit(1);
+                }
+            }
             return Ok(());
         }
         Some(Command::Doctor) => std::process::exit(doctor::run(cli.workspace.as_deref())),
@@ -322,6 +337,10 @@ mod cli_tests {
         assert!(matches!(cli.command, Some(Command::Sandbox { command: SandboxCommand::Setup })));
         let cli = Cli::try_parse_from(["imacs", "sandbox", "relay-check"]).unwrap();
         assert!(matches!(cli.command, Some(Command::Sandbox { command: SandboxCommand::RelayCheck })));
+        let cli =
+            Cli::try_parse_from(["imacs", "sandbox", "azure-check", "11111111-1111-1111-1111-111111111111"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Sandbox { command: SandboxCommand::AzureCheck { .. } })));
+        assert!(Cli::try_parse_from(["imacs", "sandbox", "azure-check"]).is_err());
         for args in [
             &["imacs", "--workspace", "daily", "setup"][..],
             &["imacs", "setup", "--workspace", "daily"],

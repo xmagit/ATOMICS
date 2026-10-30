@@ -20,6 +20,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 
+pub mod azure;
+
 /// A request's line and headers.
 const MAX_HEAD: usize = 64 * 1024;
 /// A request's body, such as a long conversation with images.
@@ -38,13 +40,18 @@ pub const ANTHROPIC: &str = "api.anthropic.com";
 pub struct Credential {
     /// How errors name it, such as `Claude subscription`.
     pub label: &'static str,
-    secret: String,
+    source: Source,
     /// What a placeholder for it starts with, so clients that check a token's shape accept one.
     prefix: &'static str,
     /// Upstream hosts its requests may go to.
     pub hosts: Vec<String>,
     /// What its requests may do there; anything else is refused.
     pub rules: Vec<Rule>,
+}
+
+enum Source {
+    Static(String),
+    Azure(Arc<azure::Azure>),
 }
 
 impl std::fmt::Debug for Credential {
@@ -63,7 +70,7 @@ impl Credential {
     pub fn claude(token: String) -> Self {
         Self {
             label: "Claude subscription",
-            secret: token,
+            source: Source::Static(token),
             prefix: "sk-ant-oat01-imacs-",
             hosts: vec![ANTHROPIC.into()],
             rules: vec![
@@ -72,6 +79,16 @@ impl Credential {
                 Rule::new(ANTHROPIC, "GET", "/v1/models"),
                 Rule::new(ANTHROPIC, "GET", "/v1/models/*"),
             ],
+        }
+    }
+
+    pub fn azure(azure: Arc<azure::Azure>) -> Self {
+        Self {
+            label: "Azure CLI",
+            hosts: azure.config.resources.keys().cloned().collect(),
+            source: Source::Azure(azure),
+            prefix: "imacs-azure-",
+            rules: Vec::new(),
         }
     }
 }
@@ -105,6 +122,15 @@ impl Rule {
 struct Grant {
     session: String,
     credential: Arc<Credential>,
+    replies: Arc<Mutex<Vec<std::sync::Weak<crate::ipc::ApprovalReply>>>>,
+}
+
+impl Grant {
+    fn cancel_writes(&self) {
+        for reply in self.replies.lock().unwrap().drain(..).filter_map(|reply| reply.upgrade()) {
+            reply.answer(imacs_core::hook::HookReply::default());
+        }
+    }
 }
 
 /// The relay: a listener on this machine's loopback and the placeholders it accepts.
@@ -117,12 +143,21 @@ pub struct Relay {
 struct Inner {
     /// Placeholder → grant.
     grants: Mutex<HashMap<String, Grant>>,
+    approvals: Mutex<Vec<WriteApproval>>,
     log: Log,
     agent: ureq::Agent,
     /// Where a host is reached instead of `https://<host>`: tests point hosts at local fakes.
     upstreams: HashMap<String, String>,
     stopped: AtomicBool,
     connections: AtomicUsize,
+}
+
+/// One Azure write waiting for the same approval banner as command permissions. The full
+/// bounded request is shown for review; it is never written to the audit log.
+pub struct WriteApproval {
+    pub session: String,
+    pub request: imacs_core::approvals::ApprovalRequest,
+    pub reply: Arc<crate::ipc::ApprovalReply>,
 }
 
 impl Relay {
@@ -145,6 +180,7 @@ impl Relay {
         let config = if upstreams.is_empty() { config } else { config.proxy(None) };
         let inner = Arc::new(Inner {
             grants: Mutex::default(),
+            approvals: Mutex::default(),
             log: Log { path: log, write: Mutex::new(()) },
             agent: config.build().into(),
             upstreams,
@@ -165,21 +201,32 @@ impl Relay {
     pub fn grant(&self, session: &str, credential: Arc<Credential>) -> String {
         let random = || uuid::Uuid::new_v4().simple().to_string();
         let placeholder = format!("{}{}{}", credential.prefix, random(), random());
-        let grant = Grant { session: session.into(), credential };
+        let grant = Grant { session: session.into(), credential, replies: Arc::default() };
         self.inner.grants.lock().unwrap().insert(placeholder.clone(), grant);
         placeholder
     }
 
     /// Stops accepting `placeholder`. A request already under way finishes.
     pub fn revoke(&self, placeholder: &str) {
-        self.inner.grants.lock().unwrap().remove(placeholder);
+        if let Some(grant) = self.inner.grants.lock().unwrap().remove(placeholder) {
+            grant.cancel_writes();
+            self.inner.approvals.lock().unwrap().retain(|approval| {
+                if approval.session != grant.session {
+                    return true;
+                }
+                approval.reply.answer(imacs_core::hook::HookReply::default());
+                false
+            });
+        }
     }
 }
 
 impl Drop for Relay {
     fn drop(&mut self) {
         self.inner.stopped.store(true, Ordering::Release);
-        self.inner.grants.lock().unwrap().clear();
+        for (_, grant) in self.inner.grants.lock().unwrap().drain() {
+            grant.cancel_writes();
+        }
         // Wakes the accept loop, which then sees it has stopped.
         let _ = TcpStream::connect_timeout(&SocketAddr::from((Ipv4Addr::LOCALHOST, self.port)), Duration::from_secs(1));
         if let Some(accept) = self.accept.take() {
@@ -261,7 +308,12 @@ impl Inner {
                 let credential = &grant.credential;
                 if !credential.hosts.iter().any(|allowed| allowed.eq_ignore_ascii_case(&route.host)) {
                     Some((403, "this credential may not reach that host"))
-                } else if !credential.rules.iter().any(|rule| rule.allows(&route.host, &head.method, &route.path)) {
+                } else if !match &credential.source {
+                    Source::Static(_) => {
+                        credential.rules.iter().any(|rule| rule.allows(&route.host, &head.method, &route.path))
+                    }
+                    Source::Azure(_) => matches!(head.method.as_str(), "GET" | "POST" | "PUT" | "PATCH" | "DELETE"),
+                } {
                     Some((403, "this credential may not make that request"))
                 } else {
                     None
@@ -286,9 +338,70 @@ impl Inner {
                 return Ok(false);
             }
         };
+        if let Source::Azure(azure) = &grant.credential.source
+            && !azure.read(host, &head.method, path)
+        {
+            // A single decision authorizes only this exact buffered request, never a host or a
+            // method broadly. A missing app, a denied/expired reply, or an unreviewably large body
+            // fails closed. No token is acquired before the decision.
+            let approved = self.approve_write(grant, &head, route, &body);
+            if !approved || !self.grants.lock().unwrap().contains_key(head.placeholder().unwrap()) {
+                self.log.record(session, host, &head.method, path, 403, started.elapsed());
+                refuse(writer, 403, "Azure write was not approved")?;
+                return Ok(false);
+            }
+        }
         let (status, whole) = self.forward(&head, route, &grant.credential, body, writer);
         self.log.record(session, host, &head.method, path, status, started.elapsed());
         Ok(whole && head.keep_alive())
+    }
+
+    fn approve_write(&self, grant: &Grant, head: &Head, route: &Route, body: &[u8]) -> bool {
+        if body.len() > 16 * 1024 || head.target.len() > 16 * 1024 {
+            return false;
+        }
+        let Ok(body) = std::str::from_utf8(body) else {
+            return false;
+        };
+        let reply = Arc::new(crate::ipc::ApprovalReply::default());
+        let query = route.query.as_deref().map(|q| format!("?{q}")).unwrap_or_default();
+        let headers = head
+            .headers
+            .iter()
+            .filter(|(name, _)| forwarded(name))
+            .map(|(name, value)| format!("{name}: {value}\n"))
+            .collect::<String>();
+        let command = format!("{} https://{}{}{query}\n{headers}\n{body}", head.method, route.host, route.path);
+        if command.len() > 32 * 1024 {
+            return false;
+        }
+        let request = imacs_core::approvals::ApprovalRequest {
+            tool: "Azure REST".into(),
+            command: Some(command),
+            cwd: PathBuf::new(),
+            reason: Some("Allow this Azure request once? It can change Azure resources.".into()),
+            input: serde_json::json!({}),
+        };
+        // Register under the grants lock so revoke cannot miss a write being enqueued.
+        {
+            let grants = self.grants.lock().unwrap();
+            if !head.placeholder().is_some_and(|placeholder| grants.contains_key(placeholder)) {
+                return false;
+            }
+            let mut replies = grant.replies.lock().unwrap();
+            replies.retain(|reply| reply.strong_count() > 0);
+            replies.push(Arc::downgrade(&reply));
+            self.approvals.lock().unwrap().push(WriteApproval {
+                session: grant.session.clone(),
+                request,
+                reply: reply.clone(),
+            });
+        }
+        let answer = reply.wait(Duration::from_secs(300));
+        answer
+            .stdout
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .is_some_and(|value| value["hookSpecificOutput"]["decision"]["behavior"] == "allow")
     }
 
     /// Sends the request upstream with the real credential and streams the response back: its
@@ -308,7 +421,17 @@ impl Inner {
         for (name, value) in head.headers.iter().filter(|(name, _)| forwarded(name)) {
             request = request.header(name.as_str(), value.as_str());
         }
-        let request = request.header("authorization", format!("Bearer {}", credential.secret));
+        let secret = match &credential.source {
+            Source::Static(secret) => secret.clone(),
+            Source::Azure(azure) => match azure.token(&route.host) {
+                Ok(secret) => secret,
+                Err(reason) => {
+                    let _ = refuse(writer, 502, reason);
+                    return (502, false);
+                }
+            },
+        };
+        let request = request.header("authorization", format!("Bearer {secret}"));
         let sent = if body.is_empty() && !matches!(head.method.as_str(), "POST" | "PUT" | "PATCH") {
             request.body(()).map(|request| self.agent.run(request))
         } else {
@@ -374,9 +497,20 @@ fn stream(head: &Head, response: ureq::http::Response<ureq::Body>, writer: &mut 
 /// credential the client sent, which the relay's own replaces.
 fn forwarded(name: &str) -> bool {
     !hop_by_hop(name)
-        && !["host", "content-length", "expect", "authorization", "x-api-key", "proxy-authorization", "cookie"]
-            .iter()
-            .any(|dropped| name.eq_ignore_ascii_case(dropped))
+        && ![
+            "host",
+            "content-length",
+            "expect",
+            "authorization",
+            "x-api-key",
+            "proxy-authorization",
+            "cookie",
+            "x-http-method",
+            "x-http-method-override",
+            "x-method-override",
+        ]
+        .iter()
+        .any(|dropped| name.eq_ignore_ascii_case(dropped))
 }
 
 fn hop_by_hop(name: &str) -> bool {
@@ -699,12 +833,32 @@ pub fn valid_claude_token(token: &str) -> bool {
 #[derive(Clone, PartialEq)]
 pub struct Granted {
     pub port: u16,
+    /// Empty when the session has Azure but no Claude subscription.
     pub placeholder: String,
+    pub azure: Option<String>,
 }
 
 impl std::fmt::Debug for Granted {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Granted").field("port", &self.port).finish_non_exhaustive()
+    }
+}
+
+impl Granted {
+    /// Only a random placeholder and a relay address, safe to pass to sbx --env.
+    pub fn azure_env(&self) -> Vec<(String, String)> {
+        self.azure
+            .as_ref()
+            .map(|placeholder| {
+                vec![
+                    (
+                        "IMACS_AZURE_RELAY_URL".into(),
+                        format!("http://{}:{}", imacs_core::isolation::RELAY_HOST, self.port),
+                    ),
+                    ("IMACS_AZURE_BEARER".into(), placeholder.clone()),
+                ]
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -717,6 +871,7 @@ pub struct Service {
     upstreams: HashMap<String, String>,
     /// Where the port is kept for the next start; None for a relay that lives for one command.
     port_file: Option<PathBuf>,
+    azure: Mutex<Option<Arc<azure::Azure>>>,
 }
 
 impl std::fmt::Debug for Service {
@@ -728,18 +883,24 @@ impl std::fmt::Debug for Service {
 impl Service {
     pub fn new(home: PathBuf, keychain: Keychain) -> Self {
         let port_file = Some(home.join("relay-port"));
-        Self { home, keychain, relay: Mutex::default(), upstreams: HashMap::new(), port_file }
+        Self { home, keychain, relay: Mutex::default(), upstreams: HashMap::new(), port_file, azure: Mutex::default() }
     }
 
     /// A relay for one command, such as `imacs sandbox relay-check`, at any free port: it leaves the
     /// running app's port alone.
     pub fn transient(home: PathBuf, keychain: Keychain) -> Self {
-        Self { home, keychain, relay: Mutex::default(), upstreams: HashMap::new(), port_file: None }
+        Self { port_file: None, ..Self::new(home, keychain) }
     }
 
     #[cfg(test)]
     pub fn with_upstreams(home: PathBuf, keychain: Keychain, upstreams: HashMap<String, String>) -> Self {
         Self { upstreams, ..Self::new(home, keychain) }
+    }
+
+    #[cfg(test)]
+    pub fn with_azure(self, azure: azure::Azure) -> Self {
+        *self.azure.lock().unwrap() = Some(Arc::new(azure));
+        self
     }
 
     /// The keychain it reads the Claude subscription from.
@@ -758,7 +919,47 @@ impl Service {
         }
         let relay = relay.as_ref().unwrap();
         let placeholder = relay.grant(session, Arc::new(Credential::claude(token)));
-        Ok(Some(Granted { port: relay.port(), placeholder }))
+        Ok(Some(Granted { port: relay.port(), placeholder, azure: None }))
+    }
+
+    /// Every sandboxed agent can use Azure, independently of its model credentials. Discovery
+    /// and token acquisition run off the app state lock; tokens are acquired lazily on requests.
+    pub fn grant_session(
+        &self,
+        session: &str,
+        claude: bool,
+        config: &imacs_core::isolation::AzureConfig,
+    ) -> Result<Option<Granted>> {
+        let granted = if claude { self.grant_claude(session)? } else { None };
+        if !config.enabled {
+            return Ok(granted);
+        }
+        let mut broker = self.azure.lock().unwrap();
+        if broker.as_ref().is_none_or(|azure| &azure.config != config) {
+            *broker = azure::Azure::current(config.clone()).map(Arc::new);
+        }
+        let Some(broker) = broker.as_ref() else {
+            return Ok(granted);
+        };
+        let mut relay = self.relay.lock().unwrap();
+        if relay.is_none() {
+            *relay = Some(self.start()?);
+        }
+        let relay = relay.as_ref().unwrap();
+        let azure = Some(relay.grant(session, Arc::new(Credential::azure(broker.clone()))));
+        Ok(Some(Granted {
+            azure,
+            ..granted.unwrap_or_else(|| Granted { port: relay.port(), placeholder: String::new(), azure: None })
+        }))
+    }
+
+    pub fn take_write_approvals(&self) -> Vec<WriteApproval> {
+        self.relay
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|relay| std::mem::take(&mut *relay.inner.approvals.lock().unwrap()))
+            .unwrap_or_default()
     }
 
     /// How many placeholders the relay accepts now.
@@ -771,6 +972,9 @@ impl Service {
     pub fn revoke(&self, granted: &Granted) {
         if let Some(relay) = self.relay.lock().unwrap().as_ref() {
             relay.revoke(&granted.placeholder);
+            if let Some(azure) = &granted.azure {
+                relay.revoke(azure);
+            }
         }
     }
 
@@ -1070,7 +1274,7 @@ mod tests {
         send(relay.port(), &post("sk-ant-oat01-imacs-wrong", "/api.anthropic.com/v1/messages", "{}"));
         send(relay.port(), &post(&placeholder, "/evil.example.org/collect", "{}"));
         // A line is written once its response has gone out.
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
         while std::fs::read_to_string(&log).unwrap_or_default().lines().count() < 3 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }

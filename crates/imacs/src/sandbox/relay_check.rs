@@ -22,7 +22,12 @@ pub fn run() -> Result<()> {
         name: name.clone(),
         agent: "claude",
         cwd: folder.clone(),
-        config: SandboxConfig { memory: Some("4g".into()), cpus: Some(2), ..SandboxConfig::default() },
+        config: SandboxConfig {
+            memory: Some("4g".into()),
+            cpus: Some(2),
+            azure: imacs_core::isolation::AzureConfig { enabled: false, ..Default::default() },
+            ..SandboxConfig::default()
+        },
         warm: Vec::new(),
         exe: crate::setup::executable_path()?,
         socket: paths::socket_path(),

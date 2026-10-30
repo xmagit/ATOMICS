@@ -300,7 +300,7 @@ mod tests {
                 );
                 let index = app.runtime.selected_plan;
                 app.runtime.plans[index].tasks[0].status = TaskStatus::Done;
-                let deadline = Instant::now() + Duration::from_secs(10);
+                let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
                 let verify = |app: &mut Desktop<'_>| {
                     app.runtime.refresh_integrations();
                     while !app.runtime.integration_checks.is_empty() {
@@ -352,7 +352,7 @@ mod tests {
                     for task in &mut app.runtime.plans[index].tasks {
                         task.status = TaskStatus::Done;
                     }
-                    let deadline = Instant::now() + Duration::from_secs(10);
+                    let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
                     while app.runtime.plans[index].is_open() {
                         assert!(Instant::now() < deadline, "empty branch and review should finish");
                         app.runtime.refresh_integrations();
@@ -376,7 +376,7 @@ mod tests {
                     task.status = TaskStatus::Done;
                 }
                 app.runtime.refresh_integrations();
-                let deadline = Instant::now() + Duration::from_secs(10);
+                let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
                 while !app.runtime.integration_checks.is_empty() {
                     assert!(Instant::now() < deadline);
                     std::thread::sleep(Duration::from_millis(10));
@@ -449,7 +449,7 @@ mod tests {
                     app.runtime.watched.lock().unwrap().iter().any(|(root, _)| root == &repo),
                     "the task repository must be watched even without a live agent or visible diff"
                 );
-                let deadline = Instant::now() + Duration::from_secs(10);
+                let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
                 while !app.runtime.plans[index].tasks[0].integration_verified {
                     assert!(Instant::now() < deadline, "initial integration check did not finish");
                     std::thread::sleep(Duration::from_millis(10));
@@ -486,7 +486,7 @@ mod tests {
             // Isolate the integration refresh from other app repaint sources.
             app.runtime.ctx = egui::Context::default();
             app.runtime.refresh_integrations();
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(5));
             while !app.runtime.plans[index].tasks[0].integration_verified {
                 assert!(Instant::now() < deadline);
                 std::thread::sleep(Duration::from_millis(10));
@@ -525,7 +525,7 @@ mod tests {
             app.runtime.plans[index] = Plan::load(&path).unwrap();
             app.runtime.refresh_integrations();
             assert!(!app.runtime.integration_checks.is_empty());
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(5));
             while !app.runtime.integration_checks.is_empty() {
                 assert!(Instant::now() < deadline);
                 std::thread::sleep(Duration::from_millis(10));
@@ -625,7 +625,7 @@ exec {} "$@"
             app.runtime.plans[index].tasks[0].status = TaskStatus::Done;
             app.runtime.plans[index].tasks[0].integrated = Some("integration".into());
             app.runtime.refresh_integrations();
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(5));
             while !paths::home().join("started").exists() {
                 assert!(Instant::now() < deadline, "background git did not start");
                 std::thread::sleep(Duration::from_millis(10));
@@ -703,7 +703,7 @@ exec {} "$@"
                 git::git(&repo, &["switch", "task-a"]).unwrap();
                 git::git(&repo, &["commit", "--allow-empty", "-qm", "new work after integration"]).unwrap();
                 assert!(app.runtime.dispatch(index, Some("b")).unwrap_err().contains("integrated dependencies"));
-                let deadline = Instant::now() + Duration::from_secs(5);
+                let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(5));
                 while !app.runtime.integration_checks.is_empty() {
                     assert!(Instant::now() < deadline);
                     std::thread::sleep(Duration::from_millis(10));

@@ -401,7 +401,7 @@ mod tests {
             app.runtime.config.editor.startup_keys.clear();
             app.runtime.config.editor.open_keys.clear();
             let wait = |terminal: &Terminal, check: &dyn Fn() -> bool| {
-                let deadline = Instant::now() + Duration::from_secs(3);
+                let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(3));
                 while !check() {
                     assert!(Instant::now() < deadline, "editor did not respond: {}", terminal.screen_text(40));
                     std::thread::sleep(Duration::from_millis(5));

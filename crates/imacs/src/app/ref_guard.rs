@@ -132,7 +132,7 @@ mod tests {
                 std::fs::rename(repo.join(".git-away"), repo.join(".git")).unwrap();
                 release.send(()).unwrap();
 
-                let deadline = Instant::now() + Duration::from_secs(10);
+                let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
                 while !app.runtime.sessions[0].last_message.as_deref().is_some_and(|m| m.contains("SANDBOX REF GUARD"))
                 {
                     assert!(Instant::now() < deadline, "the check never reported");
@@ -190,7 +190,11 @@ mod tests {
                 app.runtime.plans.push(Plan { id: "second".into(), approved: true, tasks, ..Default::default() });
                 let into = app.runtime.plans[1].integration_branch();
                 app.runtime.integrate(1, "b", None);
-                let integrated = app.runtime.integrate_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+                let integrated = app
+                    .runtime
+                    .integrate_rx
+                    .recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(30)))
+                    .unwrap();
                 assert!(integrated.result.is_ok(), "{:?}", integrated.result);
                 app.runtime.finish_integration(integrated);
                 // Meanwhile the agent makes a branch of its own.
@@ -199,7 +203,7 @@ mod tests {
                 // And the next check, with both plans in place.
                 app.runtime.check_refs(0);
                 app.runtime.ref_checks.finish();
-                let deadline = Instant::now() + Duration::from_secs(10);
+                let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
                 while !app.runtime.sessions[0].last_message.as_deref().is_some_and(|m| m.contains("SANDBOX REF GUARD"))
                 {
                     assert!(Instant::now() < deadline, "the check never reported");
@@ -258,7 +262,11 @@ mod tests {
                 // IMACS makes the open plan's integration branch after both snapshots were taken.
                 let into = app.runtime.plans[1].integration_branch();
                 app.runtime.integrate(1, "b", None);
-                let integrated = app.runtime.integrate_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+                let integrated = app
+                    .runtime
+                    .integrate_rx
+                    .recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(30)))
+                    .unwrap();
                 assert!(integrated.result.is_ok(), "{:?}", integrated.result);
                 app.runtime.finish_integration(integrated);
                 let merged = git::git(&repo, &["rev-parse", &into]).unwrap().trim().to_string();
@@ -272,7 +280,7 @@ mod tests {
                 git::git(&guarded, &["update-ref", &format!("refs/heads/{into}"), &injected]).unwrap();
                 app.runtime.check_refs(0);
                 app.runtime.ref_checks.finish();
-                let deadline = Instant::now() + Duration::from_secs(10);
+                let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
                 while !app.runtime.sessions[0].last_message.as_deref().is_some_and(|m| m.contains("SANDBOX REF GUARD"))
                 {
                     assert!(Instant::now() < deadline, "the check never reported");

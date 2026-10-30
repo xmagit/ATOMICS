@@ -485,7 +485,11 @@ mod tests {
     }
 
     fn event(rx: &std::sync::mpsc::Receiver<ControlOutcome>) -> serde_json::Value {
-        let Ok(ControlOutcome::Done(response)) = rx.recv_timeout(Duration::from_secs(2)) else { panic!("no event") };
+        let Ok(ControlOutcome::Done(response)) =
+            rx.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(2)))
+        else {
+            panic!("no event")
+        };
         assert_eq!(response.result["events"][0]["status"], "config", "{}", response.result);
         response.result["events"][0]["config"].clone()
     }

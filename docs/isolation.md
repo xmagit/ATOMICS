@@ -310,6 +310,90 @@ set `mode = "bare"` or any other `[isolation.sandbox]` key. Those settings are i
 warning, because a cloned repository must not widen what an agent can reach. Review template images
 as code: their contents run inside the VM, with the worktree and git write mounts described below.
 
+## Azure and Application Insights through host `az login`
+
+On macOS and Linux, IMACS finds `az` on the interactive login-shell PATH. If installed, every
+sandboxed agent gets `IMACS_AZURE_RELAY_URL` and `IMACS_AZURE_BEARER`, a per-agent random placeholder.
+Sign in with `az login` on the host. The VM needs neither Azure CLI nor an Azure credential folder.
+The relay calls `az account get-access-token --resource <audience> --output json` on the host,
+captures stdout in a pipe, and caches tokens only in memory, shared by audience. It refreshes on
+the next request when less than two minutes remain. A failed refresh fails the request; it never
+uses a stale token. Azure CLI 2.54 or newer is required for the UTC `expires_on` timestamp
+([Azure CLI reference](https://learn.microsoft.com/en-us/cli/azure/account#az-account-get-access-token)).
+IMACS writes no Azure token cache or token-containing command capture; Azure CLI continues to own
+its existing host login cache. No real Azure token is passed to sbx, the VM, or its command line.
+
+The default hosts are `api.applicationinsights.io` (audience `https://api.applicationinsights.io`)
+and `management.azure.com` (audience `https://management.azure.com/`). GET is allowed. POST, PUT,
+PATCH and DELETE wait up to five minutes for a decision in the agent's IMACS permission banner,
+showing the exact URL, forwarded headers and body. Denial, expiry, session close or revocation
+fails closed. The banner offers **Allow** and **Deny**; decisions apply once and do not grant future
+Azure writes (the control API's `allow_always` also applies once). For reviewability, writes with bodies over 16 KiB, non-UTF-8 bodies or a combined display
+over 32 KiB are refused. Other methods are refused. Method-override headers are stripped.
+Redirects are never followed. Each request uses the existing per-agent `relay.log`: host, method,
+path and status, with no bearer, query string or body.
+
+Configure the host/workspace settings (a repository cannot grant Azure capabilities):
+
+```toml
+[isolation.sandbox.azure]
+enabled = true                         # false disables Azure for new sessions
+query_read_exception = false            # default: even POST queries need approval
+
+[isolation.sandbox.azure.resources]
+"api.applicationinsights.io" = "https://api.applicationinsights.io"
+"management.azure.com" = "https://management.azure.com/"
+# Add another explicitly trusted upstream host and its Azure token audience here.
+```
+
+Restart agents after changing these settings. With `query_read_exception = true`, exactly
+`POST /v1/apps/<application-UUID>/query` on `api.applicationinsights.io` is also a read. It grants
+no management POSTs, batch operations, ingestion, other methods or query subpaths.
+
+Agents can run KQL with ordinary REST clients. Ask Max which Application Insights **application ID**
+to use and set `APP_INSIGHTS_APP_ID` to that UUID. A GET works with the default capabilities:
+
+```sh
+curl --fail-with-body --silent --show-error --get \
+  "$IMACS_AZURE_RELAY_URL/api.applicationinsights.io/v1/apps/$APP_INSIGHTS_APP_ID/query" \
+  -H "Authorization: Bearer $IMACS_AZURE_BEARER" \
+  --data-urlencode 'query=requests | where timestamp > ago(1h) | count'
+```
+
+For POST, enable the query read exception or answer its approval in IMACS:
+
+```python
+import json, os, urllib.request
+url = (os.environ["IMACS_AZURE_RELAY_URL"] + "/api.applicationinsights.io/v1/apps/"
+       + os.environ["APP_INSIGHTS_APP_ID"] + "/query")
+request = urllib.request.Request(url,
+    data=json.dumps({"query": "requests | where timestamp > ago(1h) | count"}).encode(),
+    headers={"Authorization": "Bearer " + os.environ["IMACS_AZURE_BEARER"],
+             "Content-Type": "application/json"})
+with urllib.request.urlopen(request, timeout=360) as response:
+    result = json.load(response)
+print(result["tables"])
+```
+
+These use the documented [Application Insights query API](https://learn.microsoft.com/en-us/rest/api/application-insights/query/get).
+Do not use `az login` or copy `~/.azure` inside a VM. Supporting Azure CLI *inside* the VM through
+a placeholder token cache is deferred to a separate follow-up with its own opt-in flag; it is not
+implemented here.
+
+After Max selects an application UUID, the fixed read-only end-to-end check is:
+
+```sh
+imacs queue --class qa -- imacs sandbox azure-check <application-UUID>
+```
+
+It makes a throwaway shell sandbox with its own relay grant, runs
+`requests | where timestamp > ago(1h) | count`, validates the response and returns only its scalar count,
+checks for an Azure credential directory or JWT in the sandbox environment/persistent environment
+file, revokes the grant and removes the sandbox, network rule and temporary workspace. It prints
+only the count and a PASS status, or a redacted failure. Fake-az/fake-upstream tests cover refresh, capabilities, approvals,
+audit redaction and the placeholders given to Claude and Codex; `scripts/linux-qa.sh test` runs
+them in the Linux harness as part of the workspace suite.
+
 ## Warm templates
 
 Set `[isolation.sandbox] template = "imacs-cox:local"` in the repository's main checkout,

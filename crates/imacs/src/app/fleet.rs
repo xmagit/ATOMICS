@@ -273,9 +273,7 @@ impl Desktop<'_> {
             let edge = if active { p.accent.gamma_multiply(0.7) } else { p.border };
             ui.painter().rect_stroke(tile, 2.0, Stroke::new(1.0, edge), egui::StrokeKind::Outside);
 
-            if session.sandbox.is_none()
-                && let Some(pending) = session.approvals.first()
-            {
+            if let Some(pending) = session.approvals.first() {
                 let request = &pending.request;
                 let deciding = self.client.approval_decisions.contains(&(session.id.clone(), pending.id.clone()));
                 let height = (body.height() - 220.0).clamp(110.0, 210.0).min(body.height());
@@ -289,6 +287,9 @@ impl Desktop<'_> {
                     for (label, decision) in
                         [("Allow", Decision::Allow), ("Allow always", Decision::AllowAlways), ("Deny", Decision::Deny)]
                     {
+                        if request.tool == "Azure REST" && decision == Decision::AllowAlways {
+                            continue;
+                        }
                         let response = ui.add_enabled(!deciding, egui::Button::new(label));
                         #[cfg(test)]
                         ui.ctx().data_mut(|data| {
@@ -304,7 +305,9 @@ impl Desktop<'_> {
                 }
                 egui::ScrollArea::vertical().max_height(child.available_height()).show(&mut child, |ui| {
                     ui.label(RichText::new(request.command.as_deref().unwrap_or(&request.tool)).monospace());
-                    ui.label(format!("cwd: {}", request.cwd.display()));
+                    if !request.cwd.as_os_str().is_empty() {
+                        ui.label(format!("cwd: {}", request.cwd.display()));
+                    }
                     ui.label(request.reason.as_deref().unwrap_or("Permission requested"));
                 });
                 body = body.with_min_y(banner.bottom());
