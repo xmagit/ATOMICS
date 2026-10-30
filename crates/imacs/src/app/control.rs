@@ -72,6 +72,9 @@ impl State {
                 self.agent_ticket(pane.as_deref(), false, Some(text), reply);
                 return;
             }
+            ControlRequest::McpConnect { pane, server, url } => {
+                done(self.request_connection(pane, &server, url.as_deref()))
+            }
             ControlRequest::Restart { force, reason } => done(self.restart(force, reason)),
             ControlRequest::Approve { session, decision, message } => match self.find(&session) {
                 Some(index) => {

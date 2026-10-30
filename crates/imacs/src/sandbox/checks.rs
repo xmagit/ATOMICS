@@ -120,7 +120,7 @@ pub(super) fn sandbox_lines(program: &str, config: &SandboxConfig, claude: Claud
                             Some(_) => "unavailable",
                         };
                         lines.push(check_line(status == "ready", &format!("sandbox MCP {name}: {status} (warning if unavailable)"),
-                            &format!("register with `sbx mcp add {name} --url <server URL>`, then `sbx mcp auth {name}`; check `sbx mcp ls`")));
+                            &format!("connect it in Settings → Connections, or `sbx mcp add {name} --url <server URL>` then `sbx mcp auth {name}`; check `sbx mcp ls`")));
                     }
                 }
             }

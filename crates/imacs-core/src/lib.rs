@@ -26,6 +26,7 @@ pub mod heartbeat;
 pub mod hook;
 pub mod isolation;
 pub mod layout;
+pub mod mcp_import;
 #[cfg(feature = "native")]
 pub mod paths;
 pub mod plan;

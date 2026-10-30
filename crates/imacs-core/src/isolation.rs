@@ -431,6 +431,34 @@ pub fn mcp_add_args(name: &str, exe: &Path, socket: &Path) -> Vec<String> {
     args
 }
 
+/// `sbx mcp add` for a connection: a remote server at `url`, registered without starting its
+/// OAuth flow, which IMACS runs itself with `sbx mcp auth`.
+pub fn connection_url_args(name: &str, url: &str) -> Vec<String> {
+    ["mcp", "add", name, "--url", url, "--skip-auth"].map(String::from).into()
+}
+
+/// `sbx mcp add` for a connection's local command: sbx runs it on this machine as
+/// `exe mcp-host [--env] <name> -- <command> <args>…`, which adds the environment stored for it
+/// (`--env`) and the login shell's PATH, then runs the command in `cwd`.
+pub fn connection_command_args(
+    name: &str,
+    exe: &Path,
+    command: &str,
+    args: &[String],
+    cwd: Option<&str>,
+    env: bool,
+) -> Vec<String> {
+    let mut sbx: Vec<String> = ["mcp", "add", name, "--command"].map(String::from).into();
+    sbx.push(exe.display().to_string());
+    let host = ["mcp-host"].into_iter().chain(env.then_some("--env")).chain([name, "--", command]);
+    let host = host.map(str::to_string).chain(args.iter().cloned());
+    sbx.extend(host.map(|arg| format!("--args={}", csv_field(&arg))));
+    if let Some(cwd) = cwd {
+        sbx.extend(["--dir".to_string(), cwd.to_string()]);
+    }
+    sbx
+}
+
 /// `sbx mcp load`: give sandbox `name` a server registered with `sbx mcp add`. The sandbox
 /// keeps it, and a stopped sandbox gets it when it starts again.
 pub fn mcp_load_args(server: &str, name: &str) -> Vec<String> {
@@ -858,6 +886,35 @@ command = ["codex"]
             ]
         );
         assert_eq!(mcp_load_args(" notion", "imacs-s1"), ["mcp", "load", "notion", "--sandbox", "imacs-s1"]);
+        assert_eq!(
+            connection_url_args("notion", "https://mcp.notion.com/mcp"),
+            ["mcp", "add", "notion", "--url", "https://mcp.notion.com/mcp", "--skip-auth"]
+        );
+        let args = ["-y".to_string(), "@scope/server, beta".to_string(), "--flag".to_string()];
+        assert_eq!(
+            connection_command_args("fs", Path::new("/Apps/IMACS.app/imacs"), "npx", &args, Some("/srv/data"), true),
+            [
+                "mcp",
+                "add",
+                "fs",
+                "--command",
+                "/Apps/IMACS.app/imacs",
+                "--args=mcp-host",
+                "--args=--env",
+                "--args=fs",
+                "--args=--",
+                "--args=npx",
+                "--args=-y",
+                "--args=\"@scope/server, beta\"",
+                "--args=--flag",
+                "--dir",
+                "/srv/data",
+            ]
+        );
+        assert!(
+            !connection_command_args("fs", Path::new("/imacs"), "node", &[], None, false)
+                .contains(&"--args=--env".into())
+        );
         assert_eq!(
             allow_hosts_args("imacs-s1", &["a.example.com".into(), "b.example.com".into()]),
             ["policy", "allow", "network", "--sandbox", "imacs-s1", "a.example.com,b.example.com"]

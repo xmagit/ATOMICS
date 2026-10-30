@@ -919,6 +919,7 @@ impl Desktop<'_> {
         self.themes_menu(ui);
         self.sandbox_menu(ui);
         self.credentials_menu(ui);
+        self.connections_menu(ui);
         ui.separator();
         let keys = &self.runtime.config.keys;
         for (key, what) in [

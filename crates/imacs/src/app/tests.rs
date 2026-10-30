@@ -30,6 +30,7 @@ pub(super) fn session(id: &str, kind: AgentKind, status: AgentStatus, cwd: &Path
         ref_guard: None,
         scratch: None,
         naming: Naming::Folder,
+        mcp_needed: Vec::new(),
     }
 }
 
@@ -53,6 +54,7 @@ pub(super) fn with_state(name: &str, test: impl FnOnce(State, &egui::Context)) {
                 .current_dir(dir.path())
                 .env("IMACS_APP_TEST_CHILD", "1")
                 .env("CODEX_HOME", dir.path().join("codex"))
+                .env("CLAUDE_CONFIG_DIR", dir.path().join("claude"))
                 .env("HOME", dir.path())
                 .env("IMACS_HOME", dir.path().join("state"))
                 .env("IMACS_CONFIG", dir.path().join("config.toml"))

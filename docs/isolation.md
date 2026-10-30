@@ -188,9 +188,9 @@ sbx's `openai` secret, OAuth or API key; use sbx's interactive `sbx secret set o
 **claude.ai connectors**, the MCP servers of your claude.ai account, are not available to sandboxed
 Claude. A `claude setup-token` token has only the `user:inference` scope, and Claude lists connectors
 only with `user:mcp_servers` (its debug log says `[claudeai-mcp] Missing user:mcp_servers scope`).
-They would also need `api.anthropic.com` (`/v1/mcp_servers`) and `mcp-proxy.anthropic.com`. MCP servers
-reach sandboxed agents through sbx's MCP gateway instead (see
-[Tickets and direct Linear access](#tickets-and-direct-linear-access)).
+They would also need `api.anthropic.com` (`/v1/mcp_servers`) and `mcp-proxy.anthropic.com`, which
+the relay's rules refuse. MCP servers reach sandboxed agents through sbx's MCP gateway instead: connect
+the service's own MCP server in Settings → Connections (see [MCP connections](#mcp-connections)).
 
 Check the whole path end to end with one throwaway sandbox:
 
@@ -237,17 +237,91 @@ IMACS's ticket layer stays on the **host** in both modes. Its existing ticket co
 credentials do not need to be copied into a VM. Scoped ticket tools and reports reach the host
 through the per-sandbox IMACS MCP server.
 
-If agents also need Linear's tools directly, register and authorize the server on the host:
+If agents also need Linear's tools directly, connect `https://mcp.linear.app/mcp` in Settings →
+Connections (see [MCP connections](#mcp-connections)), or register and authorize it on the host:
 
 ```sh
 sbx mcp add linear --url https://mcp.linear.app/mcp
 sbx mcp auth linear
 ```
 
-Add `mcp = ["linear"]` to `[isolation.sandbox]` to load it into new sandboxes. Settings and doctor
-report a configured server that is missing, needs authorization, or is unavailable; they also
+Every connected server loads into every sandbox. Add `mcp = ["linear"]` to `[isolation.sandbox]` to
+also require it: a sandbox that starts without it shows a **Connect linear** banner. Settings and
+doctor report a configured server that is missing, needs authorization, or is unavailable; they also
 check registered direct servers. These checks never invoke `sbx mcp auth` themselves. MCP
 servers run with host permissions, so authorize the services you intend agents to use.
+
+## MCP connections
+
+Sandboxed agents use the MCP servers you connect in **Settings → Connections**, next to Credentials,
+on macOS and Linux. sbx's MCP gateway runs them: no server token enters a VM. The list is sbx's own
+registry (`sbx mcp ls`), without IMACS's per-sandbox `imacs-<session>` servers, and each server shows
+**connected**, **needs sign-in**, **error** (with sbx's status, such as `unsupported`) or, for a
+definition sbx does not have yet, **not connected**.
+
+- **Every sandboxed session gets every connected server**: a new sandbox, a reattached one and
+  Ungrouped scratch sessions alike (`sbx mcp load`, which a sandbox keeps and which works on a stopped
+  one). A server you connect while agents run is loaded into their sandboxes at once; their agents see
+  its tools without a restart. Loading never stops an agent: a server that is missing or waiting for
+  sign-in becomes a banner on its tile instead.
+- **Connect** is one click. For a remote server IMACS runs `sbx mcp add <name> --url <url> --skip-auth`,
+  then `sbx mcp auth <name>` with `SBX_NO_BROWSER_OPEN=1`, and opens the authorization page sbx prints
+  with `open` on macOS or `xdg-open` on Linux. Finish signing in there; IMACS waits up to ten minutes.
+  sbx's output is never shown, since it carries the OAuth state. A server that needs no sign-in is
+  connected as soon as it is registered.
+- **Command servers** run on this machine behind the gateway, with your permissions. IMACS registers
+  them as `sbx mcp add <name> --command <imacs> --args=mcp-host,…`: `imacs mcp-host` adds the
+  environment stored for the server and your login shell's PATH (so `npx` resolves as in a terminal),
+  then runs the server's own command, in its `cwd` when it has one.
+- **Disconnect** unloads the server from IMACS's sandboxes, removes its registration and OAuth
+  credential (`sbx mcp rm --force`) and its stored environment. An imported definition stays in the
+  list, ready to connect again.
+- **Add a remote server** by name and `https://` URL. A URL with credentials in it is refused.
+
+**Import from Claude Code / Codex** reads server definitions only, when you click it, and connects
+nothing: each imported server stays **not connected** until you click its Connect. It reads only the
+`mcpServers` of Claude Code's config and the `mcp_servers` of Codex's; nothing else in those files is
+kept, logged or shown:
+
+| Source | macOS | Linux |
+| --- | --- | --- |
+| Claude Code (user and project servers) | `$CLAUDE_CONFIG_DIR/.claude.json`, else `~/.claude.json` | the same |
+| Claude Code managed servers | `/Library/Application Support/ClaudeCode/managed-mcp.json` | `/etc/claude-code/managed-mcp.json` |
+| Codex | `$CODEX_HOME/config.toml`, else `~/.codex/config.toml` | the same |
+
+It never reads a token store: not `~/.claude/.credentials.json`, `~/.mcp-auth`, Codex's credential
+store or another app's keychain items. Disabled Codex servers, IDE and SDK servers and IMACS's own
+server are skipped. Names become sbx names (lowercase letters, digits, `-` and `_`); the first
+definition of a name wins. IMACS keeps the definitions in `connections.json` in its state folder, with
+no values.
+
+A definition's `env` values are treated as secrets and never shown: the list counts them. **Connect and
+store N env values** reads them from the config file again and moves them into the OS keychain's
+credential catalog (`mcp-env:<server>`, see [Settings → Credentials](#settings--credentials)), for
+`imacs mcp-host` to hand to the server's process; **Connect without them** skips them. On macOS the
+whole catalog must fit `security`'s 4 KiB input, so a server with many values may not fit; connect it
+without them then. Header values, Codex's `bearer_token_env_var`, `env_http_headers` and passed-through
+`env_vars` hold or name secrets and are not imported: the list counts them, and they can be set up with
+`sbx mcp add --header` and `sbx secret set mcp:<server>:<name>`.
+
+**A missing server is one click away.** When a sandbox starts while a registered server needs sign-in,
+or a server `mcp` lists is not registered, its tile shows **Connect <name>**; the click runs the same
+connect. An agent can ask too: the agent MCP tool `imacs_mcp_connect` takes a server name and, for a
+server IMACS does not know, its `https://` MCP URL. That only raises the banner on the agent's tile,
+saying which agent asked and showing the URL in full. Nothing is registered, authorized or loaded on
+an agent's word, since a connected server reaches every sandbox: only your click connects it. A URL
+an agent gives for a server IMACS already knows is ignored.
+
+**Bare agents** run your own Claude Code and Codex, which use the MCP servers in their own configs, the
+ones Import reads, with their own sign-in. sbx keeps a connected server's OAuth token to itself (in its
+token store or Docker's hosted MCP control plane) and hands it only to its gateway, so IMACS's relay has
+no token to put behind a placeholder, and bare agents do not get IMACS's connections.
+
+**claude.ai connectors** (Linear, Slack, Google Drive and the like in your claude.ai account) cannot be
+imported: they live in your account, not in a config file, and sandboxed Claude cannot list them
+through the relay (see [Sandboxed Claude on your subscription](#sandboxed-claude-on-your-subscription)).
+Connect the service's own MCP server by URL instead, such as `https://mcp.linear.app/mcp` or
+`https://mcp.notion.com/mcp`.
 
 ## Settings
 
@@ -262,7 +336,7 @@ template = "registry.example.com/agent-sandbox:1"   # container image; unset = t
 mounts = ["~/docs"]          # extra host folders, always read-only
 network = "balanced"         # "balanced", "allow-all" or "deny-all"
 ssh_agent = false            # let sandboxes sign with this machine's SSH agent
-mcp = ["notion"]             # MCP servers registered with `sbx mcp add`, loaded into every sandbox
+mcp = ["notion"]             # MCP servers every sandbox must have; connected ones load anyway
 allow_hosts = { "~/repos/app" = ["nuget.example.com"] }   # by repository main checkout
 
 [[agents]]
@@ -281,7 +355,7 @@ isolation = "bare"           # this agent runs on this machine, whatever mode sa
 | `network` | The preset IMACS uses when sbx has no global network policy yet (`sbx policy init`). A policy that is already set up is left alone, since it covers every sandbox on the machine. Change it with `sbx policy`. |
 | `allow_hosts` | Hosts a repository's sandboxes may reach beyond the policy, keyed by the repository's main checkout. They are added to each new sandbox (`sbx policy allow network --sandbox`). |
 | `ssh_agent` | Off by default: IMACS runs `sbx` without `SSH_AUTH_SOCK`, so there is no agent to forward. Turn it on to let sandboxed agents sign, and so push, as you. A fixed `ssh.agentSocketPath` in sbx's own settings bypasses this. |
-| `mcp` | MCP servers registered with `sbx mcp add`. IMACS loads them into each new sandbox (`sbx mcp load`). |
+| `mcp` | MCP servers every sandbox needs. Every connected server (see [MCP connections](#mcp-connections)) loads into each sandbox anyway; one listed here that is missing or waiting for sign-in shows a **Connect** banner on the agent's tile. |
 | `isolation` in `[[agents]]` | `"sandbox"` or `"bare"` for one agent. |
 | `isolation` in a plan task | `"sandbox"` or `"bare"` for one task, set by the chief in `imacs_plan_set` and shown on its board card. Use `"bare"` for work that needs this machine, such as macOS-native builds or screenshot QA. |
 | Isolation in **New session** | **Sandboxed** or **Bare** for one session, or **As configured**. `imacs_start` and `imacs ctl` take it as `isolation`. Scratch sessions in the Ungrouped tab follow the same settings as every other agent. |
@@ -629,8 +703,9 @@ mounted read-only.
 - **Reports and ticket tools.** For each sandbox, IMACS registers its MCP server with
   `sbx mcp add imacs-<session id> --command …` and loads it into the sandbox (`sbx mcp load`). The
   server runs on your machine as `imacs mcp --agent`
-  and offers the same tools as for bare agents (`imacs_report` and the agent ticket tools). It identifies
-  its session by the sandbox's name, which stays the same across IMACS restarts.
+  and offers the same tools as for bare agents (`imacs_report`, the agent ticket tools and
+  `imacs_mcp_connect`, which asks you to connect an MCP server). It identifies its session by the
+  sandbox's name, which stays the same across IMACS restarts.
 - **Status.** Hooks run `imacs hook` on your machine, and a sandbox does not have it. A sandboxed agent's
   status comes from its screen, like any agent without hooks: it is working while it shows
   `esc to interrupt`. A question it asks before its first turn, such as a choice menu, a trust, update
@@ -710,8 +785,9 @@ tests there, in a worktree that starts from the integration branch.
   live placeholder could use it too, but such a program can already read the token's keychain entry with
   `security` or `secret-tool`.
 - **What you add widens the sandbox.** `mounts` expose folders read-only. `ssh_agent = true` lets an
-  agent sign, and push, as you. Every `mcp` server runs on your machine with your permissions and can do
-  whatever its tools do.
+  agent sign, and push, as you. Every connected MCP server reaches every sandbox and can do whatever
+  its tools do with the account you signed in with; command servers run on your machine with your
+  permissions. Only your click connects one: an agent can ask, never connect.
 - **Bare agents run as you.** In bare mode, an agent can reach everything you can: your files, keys,
   network and other repositories. Use it for agents you supervise, or that sbx cannot run.
 - **Repositories only tighten.** A repository's `.imacs/config.toml` can require sandboxes, and then no

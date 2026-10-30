@@ -10,6 +10,7 @@ impl State {
         let before = self.runtime_view_revision();
         let mut changed = self.drain_actions();
         changed |= self.poll_sandbox_check();
+        changed |= self.poll_connections();
         for record in std::mem::take(&mut self.resume) {
             self.resume_record(ctx, record);
             changed = true;
@@ -69,7 +70,7 @@ impl State {
             if !self.sessions.iter().any(|s| s.id == launch.id) {
                 // Closed while its sandbox was made: leave the sandbox stopped for reuse or cleanup,
                 // or remove a scratch session's, which nothing resumes. Its placeholder goes either way.
-                if let Ok((_, Some(granted))) = &result {
+                if let Ok((_, Some(granted), _)) = &result {
                     self.relay.revoke(granted);
                 }
                 if let (Ok(_), AgentRuntime::Sandbox(sandboxed)) = (&result, &launch.runtime) {
@@ -85,7 +86,7 @@ impl State {
                 AgentRuntime::Sandbox(sandbox) => Some(sandbox.name.clone()),
                 AgentRuntime::Bare => None,
             };
-            let launched = result.and_then(|(guard, granted)| {
+            let launched = result.and_then(|(guard, granted, needed)| {
                 let (guard, alerts) = guard.unzip();
                 if let Some(alerts) = alerts.filter(|alerts| !alerts.is_empty()) {
                     self.ref_alert(&id, alerts.join("\n"));
@@ -96,6 +97,16 @@ impl State {
                     && let Some(granted) = granted
                 {
                     self.relay.revoke(&granted);
+                }
+                if launched.is_ok()
+                    && let Some(index) = self.find(&id)
+                {
+                    if !needed.is_empty() {
+                        // Its banner shows what sbx says about each server.
+                        self.refresh_connections();
+                    }
+                    self.sessions[index].mcp_needed =
+                        needed.into_iter().map(super::connections::Needed::missing).collect();
                 }
                 launched
             });
@@ -568,6 +579,7 @@ impl State {
                     ref_guard: None,
                     scratch: None,
                     naming: Naming::Folder,
+                    mcp_needed: Vec::new(),
                 });
                 if self.active.is_none() {
                     self.active = Some(format!("ext:{}", event.session_id));

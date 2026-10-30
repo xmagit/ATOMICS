@@ -58,6 +58,10 @@ the Linux desktop app. State stays in `~/.imacs` on macOS and existing installs;
   screen (`busy_text`). What needs you is counted in the top bar; `cmd+j` jumps to it.
 - **Responsive.** On a wide screen, every agent gets a tile beside the diff (10 agents fit on a 5120 px ultrawide). As the window narrows, tiles collapse into
   tabs. Below that the diff stacks above the active agent, and at the smallest size the diff takes the whole area.
+- **MCP connections that just work.** Settings → Connections imports the MCP servers Claude Code and Codex
+  use (definitions only) and connects one with a click: sbx registers it and its sign-in opens in your
+  browser. Every sandboxed session gets every connected server, and a tile whose agent needs a missing one
+  offers **Connect <name>**. See [MCP connections](docs/isolation.md#mcp-connections).
 - **Remote control and MCP.** Other agents can start, read, review and steer agents in IMACS (see below).
 
 ## Run

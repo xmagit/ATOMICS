@@ -46,6 +46,10 @@ impl State {
         {
             blockers.push("worktree cleanup job running".into());
         }
+        let connecting = self.connections.busy_names();
+        if !connecting.is_empty() {
+            blockers.push(format!("MCP connection under way: {}", connecting.join(", ")));
+        }
         if self.plan_edit_open {
             blockers.push("unsaved plan edit is open; finish editing the plan first".into());
         }

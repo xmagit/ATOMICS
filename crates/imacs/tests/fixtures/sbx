@@ -10,6 +10,12 @@
 #   wait-<verb> pause that verb until the file is removed; waiting-<verb> signals readiness
 #   wait-agent pause run after attachment, before checking for the optional agent hook
 #   exec-runs    `exec` runs its command in the -w folder, stopped after its `timeout` seconds as in the VM
+# MCP servers other than linear (kept in mcp.json) and IMACS's own live as JSON files under mcp/:
+# `mcp add --url` registers a remote one that needs authorization, `--command` a ready one, and
+# `mcp auth` prints its authorization URL as sbx 0.50 does, then marks it ready.
+#   auth-free-<name>   `mcp add` registers that remote server ready
+#   wait-authorized    `mcp auth` waits after printing its URL until the file is removed
+#   deny-auth          `mcp auth` fails after printing its URL, as a refused consent does
 dir=${0%/*}
 state="$dir/sandboxes"
 mkdir -p "$state"
@@ -115,13 +121,48 @@ case "$1" in
             printf '{"name":"%s","status":"ready","command":"%s"}' "$3" "$details" > "$dir/mcp/$3.$$.tmp"
             mv "$dir/mcp/$3.$$.tmp" "$dir/mcp/$3"
             ;;
-          *) printf '%s\n' '[{"name":"linear","status":"needs-auth"}]' > "$dir/mcp.json" ;;
+          linear) printf '%s\n' '[{"name":"linear","status":"needs-auth"}]' > "$dir/mcp.json" ;;
+          *)
+            status=ready transport='local stdio'
+            case " $* " in *" --url "*) status=needs-auth transport='remote http' ;; esac
+            [ -e "$dir/auth-free-$3" ] && status=ready
+            details=$(printf '%s' "$*" | sed 's/\\/\\\\/g; s/"/\\"/g')
+            printf '{"name":"%s","status":"%s","transport":"%s","command":"%s"}' "$3" "$status" "$transport" \
+              "$details" > "$dir/mcp/$3.$$.tmp"
+            mv "$dir/mcp/$3.$$.tmp" "$dir/mcp/$3"
+            ;;
         esac
         ;;
-      auth) printf '%s\n' '[{"name":"linear","status":"ready"}]' > "$dir/mcp.json" ;;
+      auth)
+        printf '%s\n' "${SBX_NO_BROWSER_OPEN-unset}" > "$dir/auth-no-browser"
+        printf 'OAuth scopes for MCP server "%s":\n  requested:   default\n' "$3"
+        printf 'Open this URL to authorize MCP server "%s":\n' "$3"
+        printf 'https://auth.example.com/authorize?client_id=fake&state=PRIVATE-state-%s\n' "$3"
+        if [ -e "$dir/wait-authorized" ]; then
+          : > "$dir/waiting-authorized"
+          while [ -e "$dir/wait-authorized" ]; do sleep 0.01; done
+        fi
+        if [ -e "$dir/deny-auth" ]; then echo "error: authorize MCP server \"$3\": access_denied" >&2; exit 1; fi
+        case "$3" in
+          linear) printf '%s\n' '[{"name":"linear","status":"ready"}]' > "$dir/mcp.json" ;;
+          *)
+            if [ -f "$dir/mcp/$3" ]; then
+              sed 's/"status":"needs-auth"/"status":"ready"/' "$dir/mcp/$3" > "$dir/mcp/$3.$$.tmp"
+              mv "$dir/mcp/$3.$$.tmp" "$dir/mcp/$3"
+            fi
+            ;;
+        esac
+        ;;
+      load)
+        # Like sbx, only a registered server loads.
+        if [ ! -f "$dir/mcp/$3" ] && ! grep -q "\"name\"[[:space:]]*:[[:space:]]*\"$3\"" "$dir/mcp.json" 2>/dev/null; then
+          echo "error: add \"$3\": MCP server \"$3\" is not registered" >&2
+          exit 1
+        fi
+        ;;
       rm)
         for arg in "$@"; do
-          case "$arg" in imacs-*) rm -f "$dir/mcp/$arg" ;; esac
+          case "$arg" in mcp|rm|-*|linear) ;; *) rm -f "$dir/mcp/$arg" ;; esac
         done
         ;;
     esac

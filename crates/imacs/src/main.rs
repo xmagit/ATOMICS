@@ -6,6 +6,7 @@ mod test_support;
 mod platform_tests;
 
 mod app;
+mod connections;
 mod crash;
 mod credentials;
 mod diff_view;
@@ -109,6 +110,17 @@ enum Command {
         /// Enable chief-only tools (used by the built-in chief session)
         #[arg(long, conflicts_with = "agent")]
         chief: bool,
+    },
+    /// Run a connected MCP server's command for sbx's gateway, with its stored environment
+    #[command(name = "mcp-host", hide = true)]
+    McpHost {
+        /// Add the environment stored for the server in the OS keychain
+        #[arg(long)]
+        env: bool,
+        server: String,
+        /// The server's command, after `--`
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
     },
     /// Send one control request to the running IMACS, e.g. '{"cmd":"list"}'
     Ctl { json: String },
@@ -269,6 +281,12 @@ fn main() -> eframe::Result {
         Some(Command::Mcp { agent, chief }) => {
             mcp::run(agent, chief);
             return Ok(());
+        }
+        Some(Command::McpHost { env, server, command }) => {
+            // Stdout belongs to the server's MCP channel: report only on stderr.
+            let Err(error) = connections::run_host(&server, env, &command);
+            eprintln!("imacs mcp-host: {error:#}");
+            std::process::exit(1);
         }
         Some(Command::Queue { class, command }) => {
             let class = imacs_core::governor::SlotClass::parse(&class).unwrap_or(imacs_core::governor::SlotClass::Test);

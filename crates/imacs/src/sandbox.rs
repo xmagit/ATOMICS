@@ -143,7 +143,8 @@ pub fn preflight(program: &str) -> Result<Ready, String> {
 
 /// Makes the sandbox unless it exists, which is how a session reattaches after a restart,
 /// once sbx passes [`preflight`]. A new sandbox mounts the worktree and git's write folders,
-/// gets IMACS's MCP server, the configured ones and its repository's allowed hosts. A Claude agent
+/// gets IMACS's MCP server and its repository's allowed hosts. MCP connections are loaded
+/// afterwards, for a new or reattached sandbox alike ([`crate::connections::load_into`]). A Claude agent
 /// with the subscription in the OS keychain gets a new placeholder for it, revoked again if
 /// preparation fails, and its sandbox the way to the relay.
 pub fn prepare(job: &Prepare) -> Result<Option<crate::relay::Granted>> {
@@ -257,11 +258,8 @@ fn make(
     )?;
     ownership::created(&job.home, &job.name, Resource::Sandbox)?;
     let finish = || -> Result<()> {
-        let servers = std::iter::once(job.name.as_str()).chain(job.config.mcp.iter().map(|s| s.trim()));
-        for server in servers.filter(|server| !server.is_empty()) {
-            sbx(&job.sbx, &isolation::mcp_load_args(server, &job.name), ssh, TIMEOUT)
-                .with_context(|| format!("loading MCP server {server}"))?;
-        }
+        sbx(&job.sbx, &isolation::mcp_load_args(&job.name, &job.name), ssh, TIMEOUT)
+            .context("loading IMACS's MCP server")?;
         let root = real(&workspace::project_root(&job.cwd).unwrap_or_else(|_| job.cwd.clone()));
         let hosts = job.config.hosts_for(&root, |repo| real(&paths::expand(repo)));
         if !hosts.is_empty() {
@@ -654,7 +652,7 @@ pub fn read_usage(program: &str, name: &str) -> Result<String> {
 }
 
 /// Runs `sbx args` within `timeout` and returns its output, failing when sbx does.
-fn sbx(program: &str, args: &[impl AsRef<str>], ssh_agent: bool, timeout: Duration) -> Result<String> {
+pub(crate) fn sbx(program: &str, args: &[impl AsRef<str>], ssh_agent: bool, timeout: Duration) -> Result<String> {
     let (status, out, err) = sbx_output(program, args, ssh_agent, timeout)?;
     if !status.success() {
         let shown = args.first().map_or("", AsRef::as_ref);
@@ -701,6 +699,13 @@ fn sbx_command(
     let mut command = Command::new(program);
     command.args(args.iter().map(AsRef::as_ref)).stdin(Stdio::null());
     command.stdout(stdout.try_clone()?).stderr(stderr.try_clone()?).process_group(0);
+    sbx_env(&mut command, ssh_agent);
+    Ok(command)
+}
+
+/// The environment every sbx command gets: none of IMACS's own, no SSH agent unless it is
+/// forwarded, and the login shell's PATH.
+pub(crate) fn sbx_env(command: &mut Command, ssh_agent: bool) {
     for name in ["IMACS_SOCKET", "IMACS_PANE", "IMACS_HOME", "IMACS_CONFIG"] {
         command.env_remove(name);
     }
@@ -710,7 +715,6 @@ fn sbx_command(
     if let Some(path) = crate::setup::SHELL_PATH.as_ref() {
         command.env("PATH", path);
     }
-    Ok(command)
 }
 
 /// The child's status, or None once it ran past `deadline` and was killed.
@@ -922,16 +926,7 @@ mod tests {
             .collect();
         assert_eq!(
             verbs,
-            [
-                "version",
-                "diagnose --json",
-                "ls --json",
-                "mcp add",
-                "create --name",
-                "mcp load",
-                "mcp load",
-                "policy allow"
-            ]
+            ["version", "diagnose --json", "ls --json", "mcp add", "create --name", "mcp load", "policy allow"]
         );
         let (top, git) = workspace(&worktree).unwrap();
         let expected = Spec {
@@ -954,7 +949,8 @@ mod tests {
         assert!(owned["imacs-s1"].sandbox && owned["imacs-s1"].mcp);
         assert_eq!(
             fake::calls_to(bin.path(), &["mcp", "load"]),
-            [isolation::mcp_load_args("imacs-s1", "imacs-s1"), isolation::mcp_load_args("notion", "imacs-s1")]
+            [isolation::mcp_load_args("imacs-s1", "imacs-s1")],
+            "connections load after preparation, which never fails on them"
         );
         assert_eq!(
             fake::calls_to(bin.path(), &["policy"]),
