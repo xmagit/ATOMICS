@@ -748,9 +748,12 @@ pub(crate) mod tests {
             json.lines().map(|line| format!("data: {line}")).collect::<Vec<_>>().join("\r\n")
         );
         for part in data.as_bytes().chunks(17) {
-            write!(stream, "{:x}\r\n", part.len()).unwrap();
-            stream.write_all(part).unwrap();
-            stream.write_all(b"\r\n").unwrap();
+            // Send each whole chunk together. Once the final SSE delimiter arrives,
+            // the client may close immediately; a separate trailer write would race it.
+            let mut chunk = format!("{:x}\r\n", part.len()).into_bytes();
+            chunk.extend_from_slice(part);
+            chunk.extend_from_slice(b"\r\n");
+            stream.write_all(&chunk).unwrap();
         }
     }
 
