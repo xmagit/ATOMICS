@@ -15,6 +15,11 @@ The command is `imacs`. `scripts/macos-app.sh` builds IMACS.app for the Dock; `s
 the Linux desktop app. State stays in `~/.imacs` on macOS and existing installs; new Linux installs use
 `${XDG_STATE_HOME:-~/.local/state}/imacs`. Config lives in `${XDG_CONFIG_HOME:-~/.config}/imacs`.
 
+[How IMACS works](docs/how-it-works.md) is a one-page overview of sessions, the chief, plans, isolation,
+the credential relay and cleanup. [Fresh start on Linux](docs/fresh-start-linux.md) takes a clean Ubuntu
+desktop to a working chief with sandboxed agents, and [Moving to a new machine](docs/moving-machines.md)
+says what to take along and what to set up again.
+
 ## What it does
 
 - **Agents in real terminals.** Every agent runs its own TUI in an embedded terminal, so nothing is lost compared to
@@ -83,7 +88,8 @@ scripts/macos-app.sh
 open -a IMACS --args --workspace cz3backend
 ```
 
-On Linux, install the build dependencies first (Debian/Ubuntu example), then install or update from this checkout:
+On Linux, install the build dependencies first (Debian/Ubuntu example), then install or update from this checkout.
+For a new desktop, [Fresh start on Linux](docs/fresh-start-linux.md) lists every prerequisite and check:
 
 ```sh
 sudo apt-get install build-essential pkg-config libasound2-dev libxkbcommon-dev libwayland-dev \
@@ -199,6 +205,7 @@ A workspace file can also hold its own `[tickets]` section, so work can follow L
 the main config's `[tickets]` as a whole, so copy a complete profile: the Relay or Linear block in the default
 config. See [docs/tickets.md](docs/tickets.md). Loading and saving a workspace keep the section as written.
 Keep runtime state (`~/.imacs`, including sessions, sockets and plans) local to each machine.
+[Moving to a new machine](docs/moving-machines.md) covers leaving a machine behind, including plans still in progress.
 
 ## Testing on Linux
 
@@ -480,7 +487,8 @@ systems changes only that section. Cards show each ticket's live key and state, 
 ticket states as tasks move and comments on dispatch, reports, acceptance, blocks and completion, signed with
 the reporting model. Changes made in the ticket system reach the chief as `ticket` events in `imacs_wait`.
 Failures show on the card and never block a plan. See [docs/tickets.md](docs/tickets.md) for the design, the
-config reference and examples.
+config reference and examples, with step-by-step [Relay](docs/tickets.md#step-by-step-relay) and
+[Linear](docs/tickets.md#step-by-step-linear) setups.
 
 ## Agents in sandboxes
 
