@@ -44,40 +44,7 @@ pub(super) fn sandbox_lines(program: &str, config: &SandboxConfig) -> Vec<String
                     config.network.name()
                 ),
             ));
-            let secrets = secrets(program);
-            for (present, label, hint) in [
-                (
-                    secrets.as_ref().is_some_and(|s| s.anthropic || s.oauth),
-                    "sandbox Claude secret: anthropic or CLAUDE_CODE_OAUTH_TOKEN",
-                    "run `imacs setup` for a Claude subscription",
-                ),
-                (
-                    secrets.as_ref().is_some_and(|s| s.openai),
-                    "sandbox OpenAI secret: openai",
-                    "run `sbx secret set openai` interactively",
-                ),
-                (
-                    secrets.as_ref().is_some_and(|s| !s.github),
-                    "sandbox github secret absent (warning if stored or unreadable)",
-                    "a github secret lets agents push as you; review it and remove with `sbx secret rm github` if unintended",
-                ),
-                (
-                    secrets.as_ref().is_some_and(|s| !(s.anthropic && s.oauth)),
-                    "sandbox Claude credential precedence (warning if both are stored or unreadable)",
-                    "anthropic's apiKeyHelper outranks the OAuth token; remove it with `sbx secret rm anthropic` for subscription use",
-                ),
-            ] {
-                lines.push(check_line(present, label, hint));
-            }
-            let misfiled = secrets.as_ref().map(|s| s.misfiled.as_slice()).filter(|misfiled| !misfiled.is_empty());
-            lines.push(check_line(
-                secrets.as_ref().is_some_and(|s| s.misfiled.is_empty()),
-                &match misfiled {
-                    Some(misfiled) => format!("sandbox secrets: {} (warning)", misfiled_text(misfiled)),
-                    None => "sandbox secrets filed under known services and sandboxes (warning if not)".into(),
-                },
-                "run `imacs setup` to remove them; their names stay hidden, since they may hold a pasted credential",
-            ));
+            lines.extend(secret_lines(secrets(program).as_ref()));
             let mcp = query(program, &["mcp", "ls", "--json"]);
             match mcp.as_ref().and_then(Value::as_array) {
                 None => lines.push(check_line(
@@ -126,6 +93,46 @@ pub(super) fn sandbox_lines(program: &str, config: &SandboxConfig) -> Vec<String
             lines.push(check_line(false, "Docker Sandboxes not ready for sandboxed agents (warning)", &error))
         }
     }
+    lines
+}
+
+/// Doctor's credential lines, from what sbx lists. Setup checks its own secret steps with these
+/// same lines, so the two cannot disagree about what sbx stores.
+pub(super) fn secret_lines(secrets: Option<&SecretNames>) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (present, label, hint) in [
+        (
+            secrets.is_some_and(|s| s.anthropic || s.oauth),
+            "sandbox Claude secret: anthropic or CLAUDE_CODE_OAUTH_TOKEN",
+            "run `imacs setup` for a Claude subscription",
+        ),
+        (
+            secrets.is_some_and(|s| s.openai),
+            "sandbox OpenAI secret: openai",
+            "run `sbx secret set openai` interactively",
+        ),
+        (
+            secrets.is_some_and(|s| !s.github),
+            "sandbox github secret absent (warning if stored or unreadable)",
+            "a github secret lets agents push as you; review it and remove with `sbx secret rm github` if unintended",
+        ),
+        (
+            secrets.is_some_and(|s| !(s.anthropic && s.oauth)),
+            "sandbox Claude credential precedence (warning if both are stored or unreadable)",
+            "anthropic's apiKeyHelper outranks the OAuth token; remove it with `sbx secret rm anthropic` for subscription use",
+        ),
+    ] {
+        lines.push(check_line(present, label, hint));
+    }
+    let misfiled = secrets.map(|s| s.misfiled.as_slice()).filter(|misfiled| !misfiled.is_empty());
+    lines.push(check_line(
+        secrets.is_some_and(|s| s.misfiled.is_empty()),
+        &match misfiled {
+            Some(misfiled) => format!("sandbox secrets: {} (warning)", misfiled_text(misfiled)),
+            None => "sandbox secrets filed under known services and sandboxes (warning if not)".into(),
+        },
+        "run `imacs setup` to remove them; their names stay hidden, since they may hold a pasted credential",
+    ));
     lines
 }
 

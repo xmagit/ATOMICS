@@ -74,7 +74,9 @@ A token can end up filed as a secret's name, or a service name as its sandbox sc
 with your consent, removes each one, passing its name from sbx's listing straight to `sbx secret rm`
 without ever showing it.
 
-Setup verifies every sandbox check and finishes by running `imacs doctor`. Doctor and
+After its secret steps, setup reads sbx's listing again through doctor's own credential checks and
+stops at the first warning, so it never calls done a secret doctor reports missing. It then verifies
+every sandbox check and finishes by running `imacs doctor`. Doctor and
 Settings → Sandbox show the same readiness checks, including the keychain lookup when the
 subscription route is configured. Doctor also includes independent host/workspace diagnostics
 (running IMACS, optional editors, hook trust and repository cleanup); setup does not claim to
@@ -114,8 +116,9 @@ the credential change, then reuses the `imacs-claude-setup-token` OS keychain en
 token from `claude setup-token`. Pasted input has terminal echo disabled. A pipe can supply the
 answers and token over stdin; the command accepts no token argument. The helper writes the
 keychain through stdin, discards keychain and sbx output, and registers a lookup command with
-sbx. It verifies the lookup first, then removes the built-in `anthropic` secret if present.
-If lookup verification fails, the built-in secret stays in place.
+sbx. It verifies the lookup first, then removes the built-in `anthropic` secret if present, once
+sbx lists the new route. If lookup verification fails, or sbx does not list the route, the built-in
+secret stays in place.
 
 **Remove the built-in `anthropic` secret for subscription OAuth.** Its generated `apiKeyHelper`
 outranks `CLAUDE_CODE_OAUTH_TOKEN`, so leaving both configured can make Claude use the wrong

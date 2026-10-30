@@ -244,6 +244,12 @@ fn guided(
             safe_sbx(program, &secret.remove_args(), "could not remove a misfiled secret; retry setup")?;
         }
     }
+    // Read the store again through doctor's lines: setup is not done with a secret doctor reports missing.
+    if let Some(failed) =
+        checks::secret_lines(checks::secrets(program).as_ref()).iter().find(|line| line.starts_with('✗'))
+    {
+        bail!("sbx does not list what setup stored: {failed}. Rerun `imacs setup`")
+    }
     if config.ssh_agent {
         bail!("set [isolation.sandbox] ssh_agent = false, then rerun setup")
     }
@@ -316,6 +322,10 @@ fn register(program: &str, keychain: &Keychain) -> Result<()> {
     )?;
     let secrets = checks::secrets(program)
         .ok_or_else(|| anyhow::anyhow!("could not check known secret services; retry setup"))?;
+    // Doctor's own parser must see the route before the only working credential goes.
+    if !secrets.oauth {
+        bail!("sbx accepted the subscription route but does not list it; the anthropic secret stays. Retry setup")
+    }
     if secrets.anthropic {
         safe_sbx(
             program,
@@ -572,6 +582,28 @@ mod tests {
         result.unwrap();
         assert!(!dir.path().join("misfiled-scoped").exists());
         assert!(output.contains("✓ sandbox secrets filed under known services and sandboxes"), "{output}");
+    }
+
+    #[test]
+    fn setup_rechecks_its_secret_steps_with_doctors_parser() {
+        // sbx accepts the route but does not list it: the anthropic secret must stay.
+        let (dir, sbx, keychain) = machine(Platform::Mac);
+        keychain.store(CLAUDE).unwrap();
+        std::fs::write(dir.path().join("skip-secret-write"), "").unwrap();
+        let error = run_setup(&sbx, &keychain, false, "y\n").0.unwrap_err().to_string();
+        assert!(error.contains("does not list it; the anthropic secret stays"), "{error}");
+        assert!(fake::calls_to(dir.path(), &["secret", "rm"]).is_empty());
+        assert!(checks::secrets(&sbx).unwrap().anthropic);
+
+        // A stored key sbx does not list stops setup with doctor's own line, before later steps.
+        let (dir, sbx, keychain) = machine(Platform::Mac);
+        keychain.store(CLAUDE).unwrap();
+        for marker in ["oauth", "removed-anthropic", "no-openai", "skip-secret-write"] {
+            std::fs::write(dir.path().join(marker), "").unwrap();
+        }
+        let error = run_setup(&sbx, &keychain, false, &format!("y\n{OPENAI}\n")).0.unwrap_err().to_string();
+        assert!(error.contains("sbx does not list what setup stored: ✗ sandbox OpenAI secret: openai"), "{error}");
+        assert!(fake::calls_to(dir.path(), &["settings"]).is_empty(), "SSH steps wait for the secrets");
     }
 
     #[test]
