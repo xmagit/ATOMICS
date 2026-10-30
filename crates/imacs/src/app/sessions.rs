@@ -338,6 +338,9 @@ impl State {
                 .map(|(k, v)| (k.to_string(), v))
                 .collect();
         env.insert("COLORFGBG".into(), self.palette.colorfgbg().into());
+        if sandboxed.is_none() && agent.kind != AgentKind::Shell {
+            env.extend(instance_agent_env());
+        }
         if let Some(path) = SHELL_PATH.as_ref() {
             env.insert("PATH".into(), path.clone());
         }
@@ -631,13 +634,35 @@ impl State {
         }
         self.busy_checked = Instant::now();
         let mut finished = Vec::new();
+        let mut credential_errors = Vec::new();
         let mut ref_checks = Vec::new();
         for (index, session) in self.sessions.iter_mut().enumerate() {
+            let Some(terminal) = &session.terminal else { continue };
+            if session.sandbox.is_some()
+                && let Some(reason) = credential_failure(&terminal.screen_text(60))
+            {
+                session.status = AgentStatus::NeedsInput;
+                if session.last_message.as_deref() != Some(&reason) {
+                    credential_errors.push((session.id.clone(), reason.clone()));
+                }
+                session.last_message = Some(reason);
+                session.activity.observe(session.status);
+                continue;
+            }
+            // Trust and hook menus can precede hooks, including in bare Codex.
+            if session.is_agent()
+                && !terminal.exited()
+                && matches!(session.status, AgentStatus::Starting | AgentStatus::Idle | AgentStatus::Done)
+                && imacs_core::approvals::first_run_prompt(&terminal.screen_text(60))
+            {
+                session.status = AgentStatus::NeedsInput;
+                session.activity.observe(session.status);
+                continue;
+            }
             let busy_text = self.config.agent(&session.agent).and_then(|a| a.busy_text.clone());
             let busy_text =
                 busy_text.or_else(|| (session.sandbox.is_some() && session.is_agent()).then(|| SANDBOX_BUSY.into()));
             let Some(busy_text) = busy_text else { continue };
-            let Some(terminal) = &session.terminal else { continue };
             if session.hooks_active && session.sandbox.is_none() || terminal.exited() {
                 continue;
             }
@@ -665,16 +690,6 @@ impl State {
             if session.status == AgentStatus::NeedsInput && !new_turn {
                 continue;
             }
-            // Before its first turn, a sandboxed agent may stop at a question, such as Codex's folder trust.
-            if !busy
-                && session.sandbox.is_some()
-                && matches!(session.status, AgentStatus::Starting | AgentStatus::Idle)
-                && imacs_core::approvals::first_run_prompt(&terminal.screen_text(60))
-            {
-                session.status = AgentStatus::NeedsInput;
-                session.activity.observe(session.status);
-                continue;
-            }
             session.status = match (busy, session.status) {
                 (true, AgentStatus::Done) if !new_turn => AgentStatus::Done,
                 (true, _) => AgentStatus::Working,
@@ -692,6 +707,9 @@ impl State {
         }
         for root in finished {
             self.diffs.entry(root).or_default().mark_dirty();
+        }
+        for (id, reason) in credential_errors {
+            self.report(Some(&id), "blocked", &reason);
         }
         for index in ref_checks {
             self.check_refs(index);
@@ -936,6 +954,32 @@ fn brief_file(session: &str, text: &str, sandboxed: bool) -> Result<String, Stri
 
 /// RUSTC_WRAPPER for sccache when it is installed and neither the user nor the project under
 /// `cwd` chose a wrapper (an exported variable would override their cargo config).
+/// Authentication failures must remain actionable even when the provider exits normally.
+pub(super) fn credential_failure(screen: &str) -> Option<String> {
+    screen
+        .lines()
+        .rev()
+        .find(|line| {
+            let text = line.to_ascii_lowercase();
+            text.contains("authentication_failed")
+                || text.contains("authentication failed")
+                || text.contains("invalid api key")
+                || text.contains("invalid_api_key")
+                || text.contains("401")
+                    && (text.contains("error") || text.contains("unauthorized") || text.contains("http"))
+        })
+        .map(|line| format!("Credential error: {}", line.trim()))
+}
+
+/// An explicit instance home must also isolate mutable provider trust and settings.
+fn instance_agent_env() -> Vec<(String, String)> {
+    let Some(home) = std::env::var_os("IMACS_HOME").map(PathBuf::from) else { return Vec::new() };
+    [("CODEX_HOME", "codex"), ("CLAUDE_CONFIG_DIR", "claude")]
+        .into_iter()
+        .map(|(key, dir)| (key.into(), home.join(dir).to_string_lossy().into_owned()))
+        .collect()
+}
+
 fn compile_cache_env(cwd: &Path) -> Vec<(String, String)> {
     let user_config = std::env::var_os("CARGO_HOME").map(PathBuf::from).unwrap_or_else(|| paths::home().join(".cargo"));
     let configs = cwd.ancestors().map(|dir| dir.join(".cargo")).chain([user_config]);
@@ -1020,6 +1064,153 @@ impl Desktop<'_> {
 mod tests {
     use super::super::tests::{request, session, with_app};
     use super::*;
+
+    #[test]
+    fn two_instances_do_not_overwrite_each_others_provider_trust_slots() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let user = dir.path().join("user");
+        std::fs::create_dir(&user).unwrap();
+        for instance in ["a", "b"] {
+            let home = dir.path().join(instance);
+            std::fs::create_dir(&home).unwrap();
+            let output = crate::test_support::output(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "app::sessions::tests::isolated_agents_write_provider_trust_only_inside_the_instance",
+                        "--nocapture",
+                    ])
+                    .env("IMACS_APP_TEST_CHILD", "1")
+                    .env("HOME", &user)
+                    .env("CODEX_HOME", user.join("codex"))
+                    .env("CLAUDE_CONFIG_DIR", user.join("claude"))
+                    .env("IMACS_HOME", &home)
+                    .env("IMACS_CONFIG", home.join("config.toml"))
+                    .env("IMACS_SOCKET", home.join("socket")),
+            );
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        // The provider has one trust slot per event; separate homes keep those slots separate.
+        std::fs::write(dir.path().join("a/codex/config.toml"), "instance a trust").unwrap();
+        assert_eq!(std::fs::read_to_string(dir.path().join("b/codex/config.toml")).unwrap(), "trusted\n");
+        assert!(!user.join("codex/config.toml").exists());
+        assert!(!user.join("claude/.claude.json").exists());
+    }
+
+    #[test]
+    fn sandbox_credential_errors_block_the_task_with_the_reason_even_after_exit() {
+        with_app(
+            "app::sessions::tests::sandbox_credential_errors_block_the_task_with_the_reason_even_after_exit",
+            |app, ctx| {
+                let dir = crate::test_support::tempdir().unwrap();
+                for (text, exit) in [("API Error: 401 authentication_failed", false), ("HTTP 401 Unauthorized", true)] {
+                    let terminal = Terminal::spawn(
+                        app.runtime.wake.clone(),
+                        app.runtime.palette.terminal_colors(),
+                        "/bin/sh".into(),
+                        vec![
+                            "-c".into(),
+                            format!("printf '%s' '{text}'; {}", if exit { "exit 1" } else { "exec sleep 600" }),
+                        ],
+                        dir.path(),
+                        HashMap::new(),
+                        100,
+                    )
+                    .unwrap();
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while !terminal.screen_text(60).contains(text) || exit && !terminal.exited() {
+                        assert!(Instant::now() < deadline);
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    let mut worker = session("worker", AgentKind::Claude, AgentStatus::Working, dir.path());
+                    worker.sandbox = Some("imacs-worker".into());
+                    worker.terminal = Some(terminal);
+                    app.runtime.sessions = vec![worker];
+                    app.runtime.plans[0].tasks = vec![Task {
+                        id: "a".into(),
+                        session: Some("worker".into()),
+                        status: TaskStatus::Running,
+                        ..Default::default()
+                    }];
+                    for _ in 0..2 {
+                        app.runtime.busy_checked = Instant::now() - Duration::from_secs(1);
+                        app.runtime.runtime_tick(ctx);
+                        assert_eq!(app.runtime.sessions[0].status, AgentStatus::NeedsInput);
+                    }
+                    assert_eq!(app.runtime.plans[0].tasks[0].status, TaskStatus::Blocked);
+                    assert!(app.runtime.plans[0].tasks[0].report.as_ref().unwrap().summary.contains(text));
+                    assert!(app.runtime.sessions[0].last_message.as_ref().unwrap().contains(text));
+                    app.runtime.sessions.clear();
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn bare_codex_trust_and_hook_menus_need_input_even_with_hooks() {
+        with_app("app::sessions::tests::bare_codex_trust_and_hook_menus_need_input_even_with_hooks", |app, _| {
+            let dir = crate::test_support::tempdir().unwrap();
+            for text in ["Trust this folder?", "Review hooks\n› 1. Trust hooks\n  2. Cancel"] {
+                let terminal = Terminal::spawn(
+                    app.runtime.wake.clone(),
+                    app.runtime.palette.terminal_colors(),
+                    "/bin/sh".into(),
+                    vec!["-c".into(), format!("printf '%s' '{}'; exec sleep 600", text)],
+                    dir.path(),
+                    HashMap::new(),
+                    100,
+                )
+                .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !terminal.screen_text(60).contains("Trust") {
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let mut worker = session("worker", AgentKind::Generic, AgentStatus::Idle, dir.path());
+                worker.hooks_active = true;
+                worker.terminal = Some(terminal);
+                app.runtime.sessions = vec![worker];
+                app.runtime.busy_checked = Instant::now() - Duration::from_secs(1);
+                app.runtime.track_busy();
+                assert_eq!(app.runtime.sessions[0].status, AgentStatus::NeedsInput);
+                assert!(app.runtime.sessions[0].approvals.is_empty());
+            }
+            app.runtime.sessions.clear();
+        });
+    }
+
+    #[test]
+    fn isolated_agents_write_provider_trust_only_inside_the_instance() {
+        with_app("app::sessions::tests::isolated_agents_write_provider_trust_only_inside_the_instance", |app, ctx| {
+            let dir = crate::test_support::tempdir().unwrap();
+            app.runtime.config.agents.push(imacs_core::config::AgentConfig {
+                name: "trust-probe".into(),
+                kind: AgentKind::Generic,
+                command: vec!["/bin/sh".into(), "-c".into(),
+                    "mkdir -p \"$CODEX_HOME\" \"$CLAUDE_CONFIG_DIR\"; echo trusted > \"$CODEX_HOME/config.toml\"; echo trusted > \"$CLAUDE_CONFIG_DIR/.claude.json\"".into()],
+                busy_text: None,
+                isolation: None,
+            });
+            let id = app.runtime.start(ctx, "trust-probe", dir.path().into(), None, vec![], None).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let home = paths::imacs_home();
+            while !home.join("claude/.claude.json").exists() {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(std::fs::read_to_string(home.join("codex/config.toml")).unwrap(), "trusted\n");
+            assert!(!paths::home().join(".claude.json").exists());
+            assert!(!paths::home().join(".codex/config.toml").exists());
+            // Inherited CODEX_HOME belongs to the test harness, not this instance.
+            assert!(!PathBuf::from(std::env::var_os("CODEX_HOME").unwrap()).join("config.toml").exists());
+            app.runtime.close(&id);
+        });
+    }
 
     #[test]
     fn short_messages_cannot_be_confirmed_by_agent_output() {

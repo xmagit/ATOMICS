@@ -91,6 +91,9 @@ fn installer_reaches_real_setup_from_a_fresh_home() {
     assert!(config.exists(), "the real setup creates missing configuration");
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("IMACS fresh-machine setup"), "{stdout}");
-    assert!(stdout.contains("sandbox prerequisite: secret-tool"), "{stdout}");
+    assert!(stdout.contains("Run the suggested commands in another host terminal"), "{stdout}");
+    // IMACS's credential relay reads the Claude subscription with secret-tool.
+    assert!(stdout.contains("✗ sandbox prerequisite: secret-tool"), "{stdout}");
+    assert!(stdout.contains("sudo apt-get install libsecret-tools gnome-keyring"), "{stdout}");
     assert!(home.join(".local/bin/imacs").exists(), "installation survives interrupted setup");
 }

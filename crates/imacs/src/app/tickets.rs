@@ -1667,13 +1667,13 @@ mod tests {
 
             // A webhook bridge says a ticket changed: applied at once, then read again.
             set_field(&state, "CARD-1", "title", "Write the parser, v2");
+            let reads = count(&state, "card_get");
             let event = request(
                 app,
                 json!({"cmd":"ticket_event", "system":"cards", "key":"CARD-1", "title":"Write the parser, v2"}),
             );
             assert_eq!(event.result["matched"], json!([{"plan":plan, "task":"a"}]));
             assert_eq!(link(app, index, 0).title.as_deref(), Some("Write the parser, v2"));
-            let reads = count(&state, "card_get");
             settle(app);
             assert_eq!(count(&state, "card_get"), reads + 1);
             // A webhook echoing IMACS's own push, even before the push returns, is no news.

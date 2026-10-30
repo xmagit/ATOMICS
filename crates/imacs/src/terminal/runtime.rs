@@ -337,7 +337,7 @@ mod tests {
                 let child: i32 = std::fs::read_to_string(&path).unwrap().trim().parse().unwrap();
                 assert_eq!(unsafe { libc::getpgid(child) } == pid, !job_control);
                 std::fs::remove_file(path).unwrap();
-                terminal = replace.then(&spawn);
+                terminal = replace.then(spawn);
                 let deadline = Instant::now() + Duration::from_secs(5);
                 while unsafe { libc::kill(-pid, 0) == 0 || libc::kill(child, 0) == 0 } {
                     assert!(Instant::now() < deadline, "process group {pid} survived closing");

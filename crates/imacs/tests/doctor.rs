@@ -31,7 +31,15 @@ fn setup_from_an_empty_machine_creates_config_and_gives_install_commands_without
     for tool in ["git", "claude", "codex"] {
         assert!(stdout.contains(&format!("✗ sandbox prerequisite: {tool}")), "{stdout}");
     }
-    assert!(stdout.contains(if cfg!(target_os = "macos") { "xcode-select --install" } else { "libsecret-tools" }));
+    assert!(stdout.contains(if cfg!(target_os = "macos") {
+        "xcode-select --install"
+    } else {
+        "sudo apt-get install git"
+    }));
+    // On Linux, IMACS's credential relay reads the Claude subscription with secret-tool; macOS has `security`.
+    let linux = !cfg!(target_os = "macos");
+    assert_eq!(stdout.contains("✗ sandbox prerequisite: secret-tool"), linux, "{stdout}");
+    assert_eq!(stdout.contains("sudo apt-get install libsecret-tools gnome-keyring"), linux, "{stdout}");
     assert!(String::from_utf8(output.stderr).unwrap().contains("rerun `imacs setup` to resume"));
 }
 

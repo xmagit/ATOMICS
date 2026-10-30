@@ -143,6 +143,11 @@ pub enum ControlRequest {
         #[serde(default)]
         plan: Option<String>,
     },
+    /// Approves a reviewed plan so it can dispatch tasks, as the board's Approve action does.
+    PlanApprove {
+        #[serde(default)]
+        plan: Option<String>,
+    },
     /// Changes a task's status or adds a note to it.
     PlanUpdate {
         #[serde(default)]

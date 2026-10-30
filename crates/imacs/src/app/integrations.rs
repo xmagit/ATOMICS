@@ -32,12 +32,17 @@ impl State {
                 && same_work(task, &checked.task)
             {
                 task.integration_verified = checked.valid == Some(true);
+                if checked.valid == Some(true) {
+                    task.integrated = Some(checked.into.clone());
+                    task.integrated_commit = checked.commit;
+                }
                 if checked.valid == Some(false) {
                     task.integrated = None;
+                    task.integrated_commit = None;
                 }
                 self.integration_checked
                     .insert((checked.plan, task.id.clone()), (checked.revision, checked.into, task.clone()));
-                if checked.valid == Some(false) {
+                if checked.valid.is_some() {
                     self.save_plan(index);
                 }
             }
@@ -47,7 +52,9 @@ impl State {
             let into = plan.integration_branch();
             for task in &mut plan.tasks {
                 let key = (plan.id.clone(), task.id.clone());
-                if task.integrated.as_deref() != Some(&into)
+                if task.id == plan::REVIEW_TASK
+                    || !(task.integrated.as_deref() == Some(&into)
+                        || task.status == TaskStatus::Done && task.branch.is_some())
                     || self.integration_checked.get(&key).is_some_and(|(revision, branch, checked)| {
                         *revision == self.integration_revision && branch == &into && same_work(checked, task)
                     })
@@ -72,34 +79,66 @@ impl State {
             }
         }
         if !jobs.is_empty() {
+            let jobs: Vec<_> = jobs
+                .into_iter()
+                .map(|(plan, task, into, repo)| {
+                    let base = repo.as_deref().map(|repo| self.project_config(repo).base_ref);
+                    (plan, task, into, repo, base)
+                })
+                .collect();
             let (tx, revision) = (self.integration_check_tx.clone(), self.integration_revision);
             std::thread::spawn(move || {
-                for (plan, task, into, repo) in jobs {
+                for (plan, task, into, repo, base) in jobs {
+                    let mut commit = None;
                     let valid = task
                         .branch
                         .as_deref()
                         .zip(repo)
                         .filter(|_| matches!(task.status, TaskStatus::Review | TaskStatus::Done))
                         .and_then(|(branch, repo)| {
+                            let branch_ref = format!("refs/heads/{branch}");
+                            let source = match git::git(&repo, &["rev-parse", "--verify", &branch_ref]) {
+                                Ok(tip) => tip.trim().to_string(),
+                                Err(_) => {
+                                    // Only a genuinely deleted branch may use the saved tip.
+                                    let refs =
+                                        git::git(&repo, &["for-each-ref", "--format=%(refname)", &branch_ref]).ok()?;
+                                    if refs.lines().any(|name| name == branch_ref) {
+                                        return None;
+                                    }
+                                    task.integrated_commit.clone()?
+                                }
+                            };
+                            commit = Some(source.clone());
+                            let target = format!("refs/heads/{into}");
+                            let target_exists = git::git(&repo, &["show-ref", "--verify", &target]).is_ok();
+                            let target = if target_exists { target } else { base? };
                             let output = std::process::Command::new(resolve_program("git"))
                                 .arg("-C")
-                                .arg(repo)
+                                .arg(&repo)
                                 .args(["-c", "core.quotepath=off"])
-                                .args([
-                                    "merge-base",
-                                    "--is-ancestor",
-                                    &format!("refs/heads/{branch}"),
-                                    &format!("refs/heads/{into}"),
-                                ])
+                                .args(["merge-base", "--is-ancestor", &source, &target])
                                 .output()
                                 .ok()?;
                             match output.status.code() {
-                                Some(0) => Some(true),
-                                Some(1) => Some(false),
+                                Some(0) => {
+                                    // A branch with no new commits can still have uncommitted work.
+                                    let trees = git::list_worktrees(&repo).ok()?;
+                                    let tree = trees.iter().find(|tree| tree.branch.as_deref() == Some(branch));
+                                    Some(match tree {
+                                        Some(tree) => {
+                                            git::git(&tree.path, &["status", "--porcelain", "--untracked-files=all"])
+                                                .ok()?
+                                                .is_empty()
+                                        }
+                                        None => true,
+                                    })
+                                }
+                                Some(1) if target_exists => Some(false),
                                 _ => None,
                             }
                         });
-                    let _ = tx.send(CheckedIntegration { revision, plan, task, into, valid });
+                    let _ = tx.send(CheckedIntegration { commit, revision, plan, task, into, valid });
                 }
             });
         }
@@ -160,13 +199,18 @@ impl State {
             let write = crate::ref_guard::host_write(&repo, [&branch, &into]);
             let result =
                 git::integrate(&repo, &branch, &message, &into, &into_path, &base_ref).map_err(|e| format!("{e:#}"));
+            let commit = result
+                .as_ref()
+                .ok()
+                .and_then(|_| git::git(&repo, &["rev-parse", "--verify", &format!("refs/heads/{branch}")]).ok())
+                .map(|tip| tip.trim().to_string());
             drop(write);
-            let _ = tx.send(Integrated { plan, task, branch, into, result, reply });
+            let _ = tx.send(Integrated { commit, plan, task, branch, into, result, reply });
         });
     }
 
     pub(super) fn finish_integration(&mut self, done: Integrated) {
-        let Integrated { plan, task: id, branch, into, result, reply } = done;
+        let Integrated { commit, plan, task: id, branch, into, result, reply } = done;
         let Some(index) = self.plans.iter().position(|p| p.id == plan) else { return };
         self.integrating.remove(&(plan.clone(), id.clone()));
         self.worktrees_at = None;
@@ -186,6 +230,7 @@ impl State {
                     && matches!(task.status, TaskStatus::Review | TaskStatus::Done)
                 {
                     task.integrated = Some(into.clone());
+                    task.integrated_commit = commit;
                     task.integration_verified = true;
                 }
                 let merged = merge == Merge::Merged;
@@ -239,6 +284,114 @@ fn same_work(a: &Task, b: &Task) -> bool {
 mod tests {
     use super::super::tests::{repository, request, with_app};
     use super::*;
+
+    #[test]
+    fn deleting_an_integrated_branch_keeps_dependents_verified_after_reload() {
+        with_app(
+            "app::integrations::tests::deleting_an_integrated_branch_keeps_dependents_verified_after_reload",
+            |app, _| {
+                let (_dir, repo) = repository();
+                git::git(&repo, &["branch", "task-a"]).unwrap();
+                git::git(&repo, &["branch", "integration"]).unwrap();
+                request(
+                    app,
+                    json!({"cmd":"plan_set", "goal":"Keep evidence", "integration":"integration", "tasks":[
+                {"id":"a", "repo":repo, "branch":"task-a"}, {"id":"b", "repo":repo, "depends_on":["a"]}]}),
+                );
+                let index = app.runtime.selected_plan;
+                app.runtime.plans[index].tasks[0].status = TaskStatus::Done;
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let verify = |app: &mut Desktop<'_>| {
+                    app.runtime.refresh_integrations();
+                    while !app.runtime.integration_checks.is_empty() {
+                        assert!(Instant::now() < deadline);
+                        std::thread::sleep(Duration::from_millis(10));
+                        app.runtime.refresh_integrations();
+                    }
+                };
+                verify(app);
+                let tip = app.runtime.plans[index].tasks[0].integrated_commit.clone().unwrap();
+                assert!(!tip.trim().is_empty());
+                git::git(&repo, &["branch", "-D", "task-a"]).unwrap();
+                let path = paths::imacs_home().join("plans").join(format!("{}.json", app.runtime.plans[index].id));
+                app.runtime.plans[index] = Plan::load(&path).unwrap();
+                assert!(!app.runtime.plans[index].tasks[0].integration_verified);
+                app.runtime.integration_dirty.store(true, Ordering::Relaxed);
+                verify(app);
+                assert!(app.runtime.plans[index].tasks[0].integration_verified);
+                assert_eq!(app.runtime.plans[index].ready().iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["b"]);
+                // A recreated source branch must be checked from its current tip, not saved evidence.
+                git::git(&repo, &["switch", "-c", "task-a"]).unwrap();
+                git::git(&repo, &["commit", "--allow-empty", "-qm", "new work"]).unwrap();
+                app.runtime.integration_dirty.store(true, Ordering::Relaxed);
+                verify(app);
+                assert!(!app.runtime.plans[index].tasks[0].integration_verified);
+                assert!(app.runtime.plans[index].tasks[0].integrated_commit.is_none());
+                assert!(app.runtime.plans[index].ready().is_empty());
+            },
+        );
+    }
+
+    #[test]
+    fn accepted_empty_branches_complete_but_real_changes_wait_for_integration() {
+        with_app(
+            "app::integrations::tests::accepted_empty_branches_complete_but_real_changes_wait_for_integration",
+            |app, _| {
+                let (_dir, repo) = repository();
+                app.runtime.config.cleanup.completed_plans = false;
+                app.runtime.config.base_ref = "main".into();
+                git::git(&repo, &["branch", "empty"]).unwrap();
+                git::git(&repo, &["branch", "integration"]).unwrap();
+                for into in ["integration", "not-created-yet"] {
+                    let created = request(
+                        app,
+                        json!({"cmd":"plan_set", "goal":format!("Empty {into}"), "integration":into,
+                    "tasks":[{"id":"a", "repo":repo, "branch":"empty"}]}),
+                    );
+                    let index = app.runtime.plans.iter().position(|p| p.id == created.result["plan"]).unwrap();
+                    for task in &mut app.runtime.plans[index].tasks {
+                        task.status = TaskStatus::Done;
+                    }
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while app.runtime.plans[index].is_open() {
+                        assert!(Instant::now() < deadline, "empty branch and review should finish");
+                        app.runtime.refresh_integrations();
+                        app.runtime.finish_plan_agents();
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    assert!(app.runtime.plans[index].pending_integrations().is_empty());
+                }
+                let work = repo.with_file_name("real");
+                git::add_worktree(&repo, &work, "real", "main").unwrap();
+                std::fs::write(work.join("feature"), "new work").unwrap();
+                git::git(&work, &["add", "."]).unwrap();
+                git::git(&work, &["commit", "-qm", "real change"]).unwrap();
+                let created = request(
+                    app,
+                    json!({"cmd":"plan_set", "goal":"Real changes", "integration":"integration",
+                "tasks":[{"id":"a", "repo":repo, "branch":"real"}]}),
+                );
+                let index = app.runtime.plans.iter().position(|p| p.id == created.result["plan"]).unwrap();
+                for task in &mut app.runtime.plans[index].tasks {
+                    task.status = TaskStatus::Done;
+                }
+                app.runtime.refresh_integrations();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !app.runtime.integration_checks.is_empty() {
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(10));
+                    app.runtime.refresh_integrations();
+                }
+                app.runtime.finish_plan_agents();
+                assert!(app.runtime.plans[index].is_open());
+                assert_eq!(
+                    app.runtime.plans[index].pending_integrations().iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+                    ["a"]
+                );
+                assert!(app.runtime.integrating.is_empty(), "real work must never auto-integrate");
+            },
+        );
+    }
 
     #[test]
     fn review_task_cannot_be_integrated() {
@@ -487,6 +640,7 @@ exec {} "$@"
             app.runtime
                 .integration_check_tx
                 .send(CheckedIntegration {
+                    commit: None,
                     revision: app.runtime.integration_revision - 1,
                     plan: app.runtime.plans[index].id.clone(),
                     task: checked,
@@ -531,6 +685,7 @@ exec {} "$@"
                 assert!(request(app, json!({"cmd":"plan_update", "plan":plan, "id":"a", "status":"running"})).ok);
                 assert!(app.runtime.plans[index].tasks[0].integrated.is_none());
                 app.runtime.finish_integration(Integrated {
+                    commit: None,
                     plan: plan.as_str().unwrap().into(),
                     task: "a".into(),
                     branch: "task-a".into(),
