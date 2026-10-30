@@ -24,6 +24,10 @@ pub fn clean_plan(home: &Path, plan: &Plan, sbx: &str, protected: &[PathBuf]) ->
     for entry in entries {
         let result = (|| -> Result<bool> {
             let mut names = Vec::new();
+            // Kept worktrees are never entered: not to check them, nor to stop their sandboxes.
+            if let Some(keep) = &entry.keep {
+                anyhow::bail!("kept: {keep}");
+            }
             if let Some(path) = &entry.worktree {
                 anyhow::ensure!(
                     !protected.iter().any(|root| real(root) == real(path)),
@@ -197,7 +201,8 @@ pub fn sweep_before(home: &Path, config: &Config, sbx: &str, before: std::time::
         .collect();
     for repo in repos {
         let result = (|| -> Result<()> {
-            let trees = git::list_worktrees(&repo)?;
+            // Git never runs in a worktree listed from files that do not lead back to it.
+            let trees: Vec<_> = git::list_worktrees(&repo)?.into_iter().filter(|tree| tree.trusted).collect();
             for tree in &trees {
                 sweep_warm_stages(&tree.path, &config.worktrees.warm, &mut notes)?;
             }
@@ -540,6 +545,44 @@ mod tests {
                 assert!(ownership::owned(&home).unwrap().is_empty());
             }
         }
+    }
+
+    #[test]
+    fn startup_sweep_never_enters_a_worktree_a_sandbox_lists_from_its_git_folder() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let repo = repository(dir.path());
+        let home = dir.path().join("home");
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let sbx = fake::install(&bin).display().to_string();
+        let tree = dir.path().join("task");
+        git::add_worktree(&repo, &tree, "imacs/warm-task", "main").unwrap();
+        sandbox::pin_git(&home.join("git-pins"), "imacs-task", &tree).unwrap();
+        // The VM plants a repository whose fsmonitor leaves `marker` in its worktree's read-write git
+        // folder, names it in the folder's gitdir, and gives it an old cache stage for the sweep.
+        let admin = git::pinned(&tree).unwrap().git_dir.unwrap();
+        let evil = admin.join("evil");
+        let marker = dir.path().join("executed-fsmonitor");
+        let raw = |dir: &Path, args: &[&str]| std::process::Command::new("git").arg("-C").arg(dir).args(args).output();
+        assert!(raw(&admin, &["init", "-q", "evil"]).unwrap().status.success());
+        let touch = format!("touch {}", marker.display());
+        assert!(raw(&evil, &["config", "core.fsmonitor", &touch]).unwrap().status.success());
+        std::fs::write(admin.join("gitdir"), format!("{}\n", evil.join(".git").display())).unwrap();
+        let stage = evil.join(".imacs-warm-old");
+        std::fs::create_dir(&stage).unwrap();
+        std::fs::File::open(&stage)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))
+            .unwrap();
+        git::unpin(&tree.canonicalize().unwrap()); // Simulate a newly started host.
+
+        let config = Config { repos: vec![repo.display().to_string()], ..Config::default() };
+        assert_eq!(config.worktrees.warm, ["target"]);
+        sweep(&home, &config, &sbx).unwrap();
+        assert!(!marker.exists(), "the sweep ran git in the sandbox's planted repository");
+        assert!(stage.exists() && tree.exists());
+        assert!(raw(&evil, &["status"]).unwrap().status.success() && marker.exists(), "the planted config is live");
+        git::unpin(&tree.canonicalize().unwrap());
     }
 
     #[test]

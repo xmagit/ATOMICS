@@ -293,12 +293,32 @@ impl State {
             changed |= self.reload_repo_workflows();
         }
 
-        if self.worktrees_at.is_none_or(|at| at.elapsed() > WORKTREE_REFRESH) {
+        // A refresh asked for while a listing runs starts once it is in.
+        if self.worktree_listing.is_none() && self.worktrees_at.is_none_or(|at| at.elapsed() > WORKTREE_REFRESH) {
             self.worktrees_at = Some(Instant::now());
+            let (tx, rx) = self.wake.channel();
+            let repos = self.repos.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(
+                    repos
+                        .into_iter()
+                        .map(|repo| (repo.clone(), git::list_worktrees(&repo).unwrap_or_default()))
+                        .collect(),
+                );
+            });
+            self.worktree_listing = Some(rx);
+        }
+        let listed = self.worktree_listing.as_ref().map(|listing| listing.try_recv());
+        if let Some(Ok(_) | Err(std::sync::mpsc::TryRecvError::Disconnected)) = &listed {
+            self.worktree_listing = None;
+        }
+        if let Some(Ok(listed)) = listed {
+            changed = true;
             self.worktrees.clear();
             self.worktree_project.clear();
-            for repo in self.repos.clone() {
-                for worktree in git::list_worktrees(&repo).unwrap_or_default() {
+            for (repo, worktrees) in listed {
+                // One listed from files that do not lead back to it is never opened.
+                for worktree in worktrees.into_iter().filter(|worktree| worktree.trusted) {
                     self.worktree_project.insert(worktree.path.clone(), repo.clone());
                     self.worktrees.push(worktree);
                 }
