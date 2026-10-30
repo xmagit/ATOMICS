@@ -122,8 +122,17 @@ fn output(mut command: Command, args: &[&str], input: Option<&[u8]>, timeout: Du
     command
         .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(stdout.try_clone()?)
-        .stderr(stderr.try_clone()?)
-        .process_group(0);
+        .stderr(stderr.try_clone()?);
+    // SAFETY: setsid is async-signal-safe. A fresh child is not a process group leader.
+    // Detaching the controlling terminal makes ssh prompts fail rather than stop on SIGTTIN.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     let mut child = command.spawn().with_context(|| format!("running {shown}"))?;
     if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
         let input = input.to_vec();
@@ -135,7 +144,7 @@ fn output(mut command: Command, args: &[&str], input: Option<&[u8]>, timeout: Du
     let status = match finished.recv_timeout(timeout) {
         Ok(status) => status.with_context(|| format!("waiting for {shown}"))?,
         Err(_) => {
-            // SAFETY: process_group(0) made git the leader of a process group of its own.
+            // SAFETY: setsid made git the leader of a process group of its own.
             unsafe { libc::kill(-group, libc::SIGKILL) };
             bail!("{shown} did not finish within {} s, and was stopped", timeout.as_secs());
         }
@@ -152,7 +161,7 @@ fn output(mut command: Command, args: &[&str], input: Option<&[u8]>, timeout: Du
 /// `git -C dir args`. In a repository a sandbox works in, git runs with the locations [`pin`]ned
 /// for its folder, or checked against them for the repository's other checkouts, never the ones
 /// the folder names now; and without hooks or fsmonitor, which can name programs the sandbox wrote.
-/// Git never prompts on the terminal: in a process group of its own, reading it would stop git.
+/// Git never prompts on the terminal: it starts in a new session without a controlling terminal.
 fn command(dir: &Path, args: &[&str]) -> Result<Command> {
     let mut command = Command::new("git");
     command.arg("-C").arg(dir).args(["-c", "core.quotepath=off"]).env("GIT_TERMINAL_PROMPT", "0");
@@ -1380,6 +1389,22 @@ pub(crate) mod tests {
             unpin(&pins.work_tree);
             assert!(promptly(&what, move || resolve_pins(&worktree)).is_err(), "{what}");
         }
+    }
+
+    #[test]
+    fn host_git_starts_without_a_controlling_terminal() {
+        const PROBE: &str = "IMACS_GIT_SESSION_PROBE";
+        if std::env::var_os(PROBE).is_some() {
+            // A new session has no controlling terminal, so ssh's /dev/tty prompt fails
+            // instead of stopping the process group until the host git timeout.
+            assert_eq!(unsafe { libc::getsid(0) }, std::process::id() as i32);
+            return;
+        }
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args(["--exact", "git::tests::host_git_starts_without_a_controlling_terminal", "--nocapture"]);
+        command.env(PROBE, "1");
+        let result = output(command, &["session probe"], None, Duration::from_secs(10)).unwrap();
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stdout));
     }
 
     #[test]
