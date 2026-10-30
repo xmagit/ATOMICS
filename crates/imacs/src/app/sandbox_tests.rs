@@ -204,6 +204,7 @@ fn the_cleanup_dialog_removes_a_worktrees_sandbox_and_chosen_orphans() {
                 agent: "claude",
                 cwd: path.clone(),
                 config: Default::default(),
+                warm: Vec::new(),
                 exe: "/imacs".into(),
                 socket: "/imacs.sock".into(),
                 briefs: None,

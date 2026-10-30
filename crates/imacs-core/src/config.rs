@@ -60,7 +60,7 @@ name = "claude"             # built in: claude, midnight, atomisk, paper and tid
 # Where agents run. "sandbox" gives each agent its own Docker Sandboxes microVM (sbx) that
 # sees only its worktree and git's write folders; "bare" runs agents directly on this machine.
 # An agent below, or a plan task, can set its own isolation = "bare" or "sandbox"; a repository's
-# .imacs/config.toml can only tighten this to "sandbox". See docs/isolation.md.
+# .imacs/config.toml can require "sandbox" and select its template. See docs/isolation.md.
 mode = "sandbox"
 
 [isolation.sandbox]

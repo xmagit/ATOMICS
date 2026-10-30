@@ -69,16 +69,72 @@ restart.
 `[isolation]` merges key by key, the same way a host file does. Settings apply to agents started
 afterwards. A sandbox keeps its mounts, limits and allowed hosts for its whole life.
 
-A repository's `.imacs/config.toml` can only tighten isolation:
+A repository's `.imacs/config.toml` can require isolation and select its template:
 
 ```toml
 [isolation]
 mode = "sandbox"
+
+[isolation.sandbox]
+template = "imacs-cox:local"
 ```
 
 With this setting, every agent working in that repository runs sandboxed, even under `mode = "bare"`, an agent's own
-`isolation = "bare"` or a plan task's. A repository cannot set `mode = "bare"` or any `[isolation.sandbox]` key. Those
-settings are ignored with a doctor warning, because a cloned repository must not widen what an agent can reach.
+`isolation = "bare"` or a plan task's. A repository can also set `[isolation.sandbox] template`, overriding the workspace template. It cannot
+set `mode = "bare"` or any other `[isolation.sandbox]` key. Those settings are ignored with a doctor
+warning, because a cloned repository must not widen what an agent can reach. Review template images
+as code: their contents run inside the VM, with the worktree and git write mounts described below.
+
+## Warm templates
+
+Set `[isolation.sandbox] template = "imacs-cox:local"` in the repository's main checkout,
+`.imacs/config.toml`, or in its workspace file, then build it from the checkout you want to warm:
+
+```sh
+imacs sandbox template build /path/to/cox
+imacs --workspace backend sandbox template build cz3backend --agent claude \
+  --dotnet-project soa-src/Cosmoz3.Shared/Cosmoz3.Contracts/Cosmoz3.Contracts.csproj
+```
+
+A project is a directory (including a linked worktree), or a project's basename in `--workspace`.
+Main and host settings load first, the selected workspace merges over them, and the main checkout's
+repository template wins. A workspace template applies to all its projects; use each repository's
+config for different templates in a workspace with several projects. Choose the agent image with
+`--agent codex` (default), `claude` or `shell`; use the same agent when consuming the saved template.
+Tags are local to this host and architecture. sbx recognizes saved snapshots and uses its local image
+store; it does not need a registry push. Existing agents keep their existing sandboxes.
+
+The command creates a temporary sandbox from the agent's original image, mounts the checkout and
+its git metadata read-only, and copies tracked source (including tracked local edits) into its own
+filesystem. Untracked credentials, host build output and host toolchain directories are excluded.
+It installs rustup and stable Rust for IMACS, runs `cargo check -p imacs-core` and
+`cargo test -p imacs-core --no-run`, then saves with `sbx template save`. Cargo's registry, toolchain
+and build cache live in the snapshot: the template's Cargo config uses `~/.cache/imacs/target`.
+On macOS this avoids mixing Linux and macOS artifacts in the host's `target`.
+
+For .NET, it installs the SDK pinned by `global.json`, or .NET 8 if no SDK is pinned, builds the
+selected project and captures the sandbox's NuGet package cache. The default project is
+`soa-src/Cosmoz3.Shared/Cosmoz3.Contracts/Cosmoz3.Contracts.csproj`; use `--dotnet-project` for another
+repository-relative project. SDK installation and restore need the repository's allowed network hosts.
+Private feeds require credentials provisioned inside the sandbox; IMACS never copies host NuGet
+credentials into an image. Build failures report sbx's error and do not save a template. The temporary
+sandbox is removed on success or failure; the source staging directory is removed before saving.
+
+Rebuild after changing toolchains or dependencies. Review where an image will be shared: snapshots
+contain downloaded packages and build artifacts, and can contain data written by repository build
+scripts. No IMACS MCP registration or host credentials are added to the template builder.
+
+## Linux warm folders
+
+On Linux, IMACS explicitly mounts existing directories from `[worktrees] warm` read-write, at the
+same paths inside the sandbox. These are the worktree's independent reflink copies, so one task does
+not modify another worktree's cache. Missing directories, absolute paths, parent traversal, `.git`
+components and symlinks are skipped. On macOS these mounts are omitted: its compiled artifacts are
+incompatible with the Linux VM. Other configured host mounts stay read-only.
+
+When `target` is a warm folder, `CARGO_TARGET_DIR` points to the worktree's `target`, overriding a
+saved template's internal Cargo cache. Reuse assumes matching Linux architecture, toolchain and
+system libraries; Cargo still rebuilds stale inputs. On other hosts the template supplies Linux caches.
 
 ## Agents
 
@@ -174,7 +230,7 @@ mounted read-only.
 - **Bare agents run as you.** In bare mode, an agent can reach everything you can: your files, keys,
   network and other repositories. Use it for agents you supervise, or that sbx cannot run.
 - **Repositories only tighten.** A repository's `.imacs/config.toml` can require sandboxes, and then no
-  agent or plan task there runs bare. It cannot turn them off, add mounts or hosts, or forward your SSH agent.
+  agent or plan task there runs bare. It can choose its template, but cannot turn sandboxes off, add mounts or hosts, or forward your SSH agent.
 - **The chief can mark tasks bare.** A plan task's `isolation = "bare"` runs that agent as you. You see
   it on the card when you approve the plan.
 - **sbx's machine-wide settings apply to every sandbox,** including IMACS's: the global network policy,

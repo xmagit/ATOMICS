@@ -56,6 +56,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Build repository toolchains and dependency caches into a sandbox template
+    Sandbox {
+        #[command(subcommand)]
+        command: SandboxCommand,
+    },
     /// Check required tools, configuration and integrations
     Doctor,
     /// Hook handler for Claude Code and Codex (reads the event on stdin)
@@ -102,6 +107,27 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum SandboxCommand {
+    Template {
+        #[command(subcommand)]
+        command: TemplateCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum TemplateCommand {
+    /// Save a warmed local template, using this project's configured template tag
+    Build {
+        project: String,
+        #[arg(long, default_value = "codex", value_parser = ["codex", "claude", "shell"])]
+        agent: String,
+        /// Repository-relative project to build for .NET repositories
+        #[arg(long)]
+        dotnet_project: Option<String>,
+    },
+}
+
 /// Markers of the Claude Code or Codex session IMACS may have been started from. Agents
 /// that inherit them believe they are sub-processes (Claude then stops saving
 /// transcripts, so sessions cannot be resumed).
@@ -141,6 +167,17 @@ fn main() -> eframe::Result {
         migration_errors = migration.errors;
     }
     match cli.command {
+        Some(Command::Sandbox {
+            command: SandboxCommand::Template { command: TemplateCommand::Build { project, agent, dotnet_project } },
+        }) => {
+            if let Err(error) =
+                sandbox::template::run(&project, cli.workspace.as_deref(), &agent, dotnet_project.as_deref())
+            {
+                eprintln!("{error:#}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
         Some(Command::Doctor) => std::process::exit(doctor::run(cli.workspace.as_deref())),
         Some(Command::Hook { socket, pane }) => {
             hook_client::run(socket, pane);
