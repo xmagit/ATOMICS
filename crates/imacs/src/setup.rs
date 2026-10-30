@@ -136,8 +136,13 @@ pub fn codex_supports_hooks(program: &str, timeout: std::time::Duration) -> Opti
     }
 }
 
+/// Claude Code's user settings, in `$CLAUDE_CONFIG_DIR` when it is set, as Claude Code reads them.
 fn claude_settings_path() -> PathBuf {
-    paths::home().join(".claude").join("settings.json")
+    std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
+        .unwrap_or_else(|| paths::home().join(".claude"))
+        .join("settings.json")
 }
 
 pub fn global_hooks_installed() -> bool {

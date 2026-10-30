@@ -64,7 +64,7 @@ fn write(out: &mut impl Write, value: Value) {
 
 const INSTRUCTIONS: &str = "IMACS runs coding agents (Claude Code, Codex, shells) in terminals the user watches, each in its own git worktree, and shows every worktree's diff against main. As an orchestrator: write a plan with imacs_plan_set and let the user approve it on the board, then imacs_plan_dispatch. Loop on imacs_wait instead of polling: agents report with imacs_report (status reported) or finish turns. Then read imacs_result and imacs_diff, steer with imacs_send or inline review comments (imacs_comment + imacs_send_review), and move tasks along with imacs_plan_update. Merge each accepted task into the plan's integration branch with imacs_plan_integrate before dispatching tasks that depend on it: those branch from the integration branch. For one-off work, imacs_start starts an agent directly. Several plans can run at once: retain each returned plan id and pass plan to every plan tool. Start the next plan while one finishes. The chief is never closed. With a ticket system configured, plans and tasks carry ticket links (ticket in imacs_plan_set, or imacs_ticket_link): IMACS keeps their states in step, comments on them, and reports changes made in the ticket system as ticket events in imacs_wait. The user sees everything and can steer too, so keep briefs and reviews readable.";
 
-const AGENT_INSTRUCTIONS: &str = "You run inside IMACS, where an orchestrator and the user follow your work. Call imacs_report when you finish your task (status done), when you are blocked or need a decision (blocked or question), and optionally to report progress. IMACS posts your report to the linked ticket when configured; do not post a second copy. With tickets.comments = agents, imacs_agent_ticket_get reads your task's ticket (plan=true reads its board or plan ticket), and imacs_agent_ticket_comment adds a signed comment to your own task's ticket for questions or implementation details. These tools cannot choose another task or change ticket state.";
+const AGENT_INSTRUCTIONS: &str = "You run inside IMACS, where an orchestrator and the user follow your work. Call imacs_report when you finish your task (status done), when you are blocked or need a decision (blocked or question), and optionally to report progress. IMACS posts your report to the linked ticket when configured; do not post a second copy. With tickets.comments = agents, imacs_agent_ticket_get reads your task's ticket (plan=true reads its board or plan ticket), and imacs_agent_ticket_comment adds a signed comment to your own task's ticket for questions or implementation details. These tools cannot choose another task or change ticket state. If you need an MCP server whose tools you lack, or whose tools fail with an authorization error, call imacs_mcp_connect with its name instead of asking for credentials.";
 
 fn agent_tools() -> Value {
     json!([{
@@ -90,6 +90,13 @@ fn agent_tools() -> Value {
         "inputSchema": { "type": "object", "properties": {
             "text": { "type": "string" }
         }, "required": ["text"], "additionalProperties": false }
+    }, {
+        "name": "imacs_mcp_connect",
+        "description": "Ask for an MCP server you need, such as linear or notion, when its tools are missing or fail with an authorization error. This only raises a Connect banner on your tile; only the user's click registers, authorizes or loads it. Once connected, IMACS loads it into your sandbox's gateway. Never ask for its credentials.",
+        "inputSchema": { "type": "object", "properties": {
+            "server": { "type": "string", "description": "The server's name: lowercase letters, digits, - and _" },
+            "url": { "type": "string", "description": "Its https MCP URL, when IMACS may not know the server yet" }
+        }, "required": ["server"], "additionalProperties": false }
     }])
 }
 
@@ -553,7 +560,7 @@ fn exec_text(result: &Value) -> String {
 }
 
 pub(crate) fn request_for_tool(name: &str, mut args: Value) -> Result<ControlRequest, String> {
-    if name == "imacs_agent_ticket_get" || name == "imacs_agent_ticket_comment" {
+    if name == "imacs_agent_ticket_get" || name == "imacs_agent_ticket_comment" || name == "imacs_mcp_connect" {
         return agent_ticket_request(name, args, std::env::var("IMACS_PANE").ok());
     }
     let cmd = match name {
@@ -604,6 +611,7 @@ fn agent_ticket_request(name: &str, args: Value, pane: Option<String>) -> Result
     let allowed: &[&str] = match name {
         "imacs_agent_ticket_get" => &["plan"],
         "imacs_agent_ticket_comment" => &["text"],
+        "imacs_mcp_connect" => &["server", "url"],
         _ => return Err(format!("unknown agent ticket tool {name}")),
     };
     let mut map = args.as_object().cloned().ok_or("arguments must be an object")?;
@@ -638,7 +646,20 @@ mod tests {
         ));
         let names: Vec<_> =
             agent_tools().as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
-        assert_eq!(names, ["imacs_report", "imacs_agent_ticket_get", "imacs_agent_ticket_comment"]);
+        assert_eq!(
+            names,
+            ["imacs_report", "imacs_agent_ticket_get", "imacs_agent_ticket_comment", "imacs_mcp_connect"]
+        );
+        for key in ["pane", "session", "command", "args"] {
+            let mut args = json!({"server":"linear"});
+            args[key] = json!("someone-else");
+            assert!(agent_ticket_request("imacs_mcp_connect", args, Some("own".into())).is_err(), "{key}");
+        }
+        assert!(matches!(
+            agent_ticket_request("imacs_mcp_connect", json!({"server":"linear"}), Some("own".into())).unwrap(),
+            imacs_core::control::ControlRequest::McpConnect { pane: Some(id), server, url: None }
+                if id == "own" && server == "linear"
+        ));
         for name in [
             "imacs_ticket_comment",
             "imacs_ticket_link",

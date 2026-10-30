@@ -121,18 +121,22 @@ See [Tickets](tickets.md), with step-by-step [Relay](tickets.md#step-by-step-rel
 
 ## MCP connections
 
-<!-- MCP connections: this section is filled in as that work lands. -->
+Settings → Connections lists sbx's registered servers and can import server definitions from Claude
+Code and Codex. Import connects nothing; environment values stay hidden and go to the OS keychain only
+with your consent. Clicking **Connect** registers a server and opens any sign-in page in your browser.
+Remote servers use sbx's gateway; command servers run on this machine through `imacs mcp-host`.
 
-How agents reach MCP servers other than IMACS's own is being reworked. Today:
+Every connected server loads into every sandboxed session, including Ungrouped sessions, at creation,
+reattachment or when you connect it. Missing servers show a **Connect <name>** banner. An agent's
+`imacs_mcp_connect` call only raises that banner, showing who asked and the full URL for a new server;
+only your click registers, authorizes or loads it. Disconnect unloads and removes the server.
+Registrations with the exact same remote URL share one loaded server per sandbox; Connections explains
+the alias instead of loading duplicate tool names.
 
-- Every agent IMACS starts gets IMACS's MCP server: `imacs mcp --agent` for reports and scoped ticket
-  tools, `imacs mcp --chief` for the chief. For a sandboxed agent it runs on this machine and is
-  registered with sbx as `imacs-<session id>`.
-- Sandboxed agents reach other MCP servers through sbx's gateway: register one with `sbx mcp add` and
-  name it in `[isolation.sandbox] mcp`. Such servers run on this machine with your permissions. See
-  [Tickets and direct Linear access](isolation.md#tickets-and-direct-linear-access).
-- Bare agents use the MCP servers in their own Claude or Codex configuration.
-- claude.ai connectors are not available to sandboxed Claude.
+Every agent also gets IMACS's own MCP server for reports and scoped ticket tools (and the chief's
+orchestration tools). Bare agents use the servers and sign-in in their own Claude Code or Codex
+configuration. claude.ai connectors do not reach sandboxed Claude: connect the service's own MCP URL
+instead. See [MCP connections](isolation.md#mcp-connections) for import paths, status and authentication.
 
 ## Where things live
 

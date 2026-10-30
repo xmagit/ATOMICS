@@ -264,6 +264,15 @@ pub enum ControlRequest {
         pane: Option<String>,
         text: String,
     },
+    /// A sandboxed agent asks for an MCP server it needs: a connected one is loaded into its
+    /// sandbox, any other gets a "Connect" banner on its tile (sent by `imacs mcp --agent`).
+    McpConnect {
+        pane: Option<String>,
+        server: String,
+        /// The server's https MCP URL, for one IMACS does not know yet.
+        #[serde(default)]
+        url: Option<String>,
+    },
     /// The effective configuration with each value's source, without secrets: the main
     /// config, the active workspace, and one project when given.
     ConfigGet {

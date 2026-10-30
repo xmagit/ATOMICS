@@ -41,6 +41,7 @@ mod background;
 mod board;
 mod chief;
 mod commands;
+mod connections;
 mod control;
 mod credentials;
 mod editor;
@@ -128,6 +129,8 @@ pub struct Session {
     /// The scratch folder this session works in, outside any project; it goes when the session closes.
     scratch: Option<PathBuf>,
     naming: Naming,
+    /// MCP servers this sandboxed agent needs that are not connected: its tile offers to connect them.
+    mcp_needed: Vec<connections::Needed>,
 }
 
 /// Where a session's title comes from. Only a folder's title changes by itself.
@@ -178,9 +181,9 @@ struct AgentLaunch {
     relay: Option<crate::relay::Granted>,
 }
 
-/// What preparing a sandbox gives its launch: the ref guard with what its first check found, and
-/// the session's relay placeholder.
-type Prepared = Result<(crate::ref_guard::Opened, Option<crate::relay::Granted>), String>;
+/// What preparing a sandbox gives its launch: the ref guard with what its first check found, the
+/// session's relay placeholder and the MCP servers it needs that are not connected.
+type Prepared = Result<(crate::ref_guard::Opened, Option<crate::relay::Granted>, Vec<String>), String>;
 
 struct Pending {
     text: String,
@@ -444,6 +447,8 @@ pub(crate) struct State {
     sandbox_usage: crate::sandbox_usage::Sampler,
     /// The credential relay sandboxed Claude agents reach the Claude subscription through.
     relay: Arc<crate::relay::Service>,
+    /// MCP connections: what sbx and the imported definitions say, and the work under way.
+    connections: connections::Connections,
     lifecycle_jobs: Vec<crate::lifecycle::Job>,
     startup_cleanup: Option<std::thread::JoinHandle<()>>,
     shutting_down: bool,
@@ -621,6 +626,9 @@ struct Client {
     /// The theme picker saves to this machine's config.d file instead of config.toml.
     theme_host_only: bool,
     credentials: credentials::CredentialUi,
+    /// Settings → Connections' fields for adding a remote server.
+    connection_name: String,
+    connection_url: String,
     /// Open or close the Settings menu on the next frame.
     show_settings: Option<bool>,
     voice_tx: Sender<VoiceEvent>,
@@ -667,6 +675,8 @@ impl Client {
             config_note: String::new(),
             theme_host_only: false,
             credentials: credentials::CredentialUi::default(),
+            connection_name: String::new(),
+            connection_url: String::new(),
             show_settings: None,
             voice_tx,
             voice_rx,
@@ -879,6 +889,7 @@ impl State {
             ref_checks: crate::ref_guard::Checks::new(),
             sandbox_usage: Default::default(),
             relay: Arc::new(crate::relay::Service::new(paths::imacs_home(), crate::relay::Keychain::current())),
+            connections: Default::default(),
             active: None,
             diff_open: true,
             diff_root: None,

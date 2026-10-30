@@ -155,6 +155,9 @@ impl Desktop<'_> {
         let mut rename: Option<String> = None;
         let mut resume: Option<usize> = None;
         let mut approval = None;
+        // A banner's Connect button: the server, whether to store its environment, the agent's URL.
+        let mut connect: Option<(String, bool, Option<String>)> = None;
+        let mut dismiss: Option<String> = None;
         let focus_request = self.client.focus_terminal.take();
         let now = ui.input(|i| i.time);
         let (slots_running, slots_waiting) = self.runtime.governor.snapshot();
@@ -172,6 +175,12 @@ impl Desktop<'_> {
                     .and_then(|t| t.reported_line(imacs_core::store::now()))
             } else {
                 None
+            };
+            let needed = match self.runtime.sessions[index].sandbox {
+                Some(_) => {
+                    self.connect_buttons(&self.runtime.sessions[index].mcp_needed, &self.runtime.sessions[index].title)
+                }
+                None => Vec::new(),
             };
             let session = &mut self.runtime.sessions[index];
 
@@ -312,6 +321,32 @@ impl Desktop<'_> {
                 });
                 body = body.with_min_y(banner.bottom());
             }
+            if !needed.is_empty() {
+                let shown = needed.len().min(3);
+                let banner = body.with_max_y((body.top() + 8.0 + 28.0 * shown as f32).min(body.bottom()));
+                ui.painter().rect_filled(banner, 0.0, p.panel);
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new()
+                        .id_salt(("mcp-needed", &session.id))
+                        .max_rect(banner.shrink2(vec2(8.0, 4.0))),
+                );
+                child.set_clip_rect(banner);
+                for (row, button) in needed.iter().take(shown).enumerate() {
+                    child.horizontal(|ui| {
+                        if ui.add_enabled(button.enabled, egui::Button::new(&button.label)).clicked() {
+                            connect = Some((button.name.clone(), button.store_env, button.url.clone()));
+                        }
+                        ui.label(RichText::new(&button.detail).size(11.5).color(p.muted)).on_hover_text(
+                            "This agent needs an MCP server that is not connected. Connecting it opens its sign-in \
+                             page in your browser, and every sandboxed session then gets it.",
+                        );
+                        if row == 0 && ui.small_button("×").on_hover_text("Dismiss").clicked() {
+                            dismiss = Some(session.id.clone());
+                        }
+                    });
+                }
+                body.min.y = banner.bottom();
+            }
             let term_id = ui.scope_id().with(("term", &session.id));
             if let Some(reported) = reported {
                 let banner = body.with_max_y(body.top() + 24.0);
@@ -391,6 +426,16 @@ impl Desktop<'_> {
             }
         }
 
+        if let Some((name, store_env, url)) = connect {
+            self.post(move |state| state.connect_server(&name, store_env, url));
+        }
+        if let Some(id) = dismiss {
+            self.post(move |state| {
+                if let Some(index) = state.find(&id) {
+                    state.sessions[index].mcp_needed.clear();
+                }
+            });
+        }
         let mut task_action = None;
         for (offset, (plan, task)) in self.runtime.completed_tasks().into_iter().take(layout.completed).enumerate() {
             let slot = tiled.len() + offset;

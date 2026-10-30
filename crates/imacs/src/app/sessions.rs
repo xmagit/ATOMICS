@@ -49,6 +49,7 @@ impl Session {
             ref_guard: None,
             scratch,
             naming,
+            mcp_needed: Vec::new(),
         }
     }
 
@@ -234,7 +235,13 @@ impl State {
                         {
                             relay.revoke(granted);
                         }
-                        opened.map(|opened| (opened, granted))
+                        opened.map(|opened| {
+                            // Every connected server, on a new or reattached sandbox; it never stops the agent.
+                            let (sbx, mcp) = (&job.sbx, &job.config.mcp);
+                            let needed =
+                                crate::connections::load_into(&job.home, sbx, &job.name, mcp, job.config.ssh_agent);
+                            (opened, granted, needed)
+                        })
                     });
                 let _ = tx.send(ready);
             });
@@ -255,7 +262,7 @@ impl State {
                             anyhow::anyhow!("bare relay requires a Claude subscription in Settings → Credentials")
                         })
                     })
-                    .map(|grant| (None, Some(grant)))
+                    .map(|grant| (None, Some(grant), Vec::new()))
                     .map_err(|error| error.to_string());
                 let _ = tx.send(ready);
             });

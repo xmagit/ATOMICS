@@ -1,5 +1,7 @@
 //! One OS-keychain item holds the credential catalog. Only fixed identifiers, validated hosts and
 //! status leave this module; malformed entries are counted, never quoted. No plaintext fallback.
+//! Besides relay credentials it holds MCP servers' environments (`mcp-env:<server>`), stored with
+//! the user's consent when a connection is imported and read by `imacs mcp-host` as sbx starts it.
 use std::collections::BTreeMap;
 
 use anyhow::{Result, bail};
@@ -145,6 +147,18 @@ impl Store {
                 });
             }
         }
+        for (id, entry) in &catalog.entries {
+            if let Some(server) = id.strip_prefix(MCP_ENV)
+                && valid_entry(id, entry)
+            {
+                entries.push(Status {
+                    id: id.clone(),
+                    label: format!("MCP {server} environment"),
+                    route: format!("OS keychain → imacs mcp-host → {server} on this machine (values hidden)"),
+                    present: true,
+                });
+            }
+        }
         if !entries.iter().any(|entry| entry.id.starts_with("registry:")) {
             entries.push(Status {
                 id: "registry".into(),
@@ -172,8 +186,44 @@ impl Store {
         self.save(&catalog)
     }
 
+    /// Stores the environment an MCP server's host process gets, replacing any earlier one.
+    pub fn put_mcp_env(&self, server: &str, env: &BTreeMap<String, String>) -> Result<()> {
+        let id = format!("{MCP_ENV}{server}");
+        let entry = Entry { token: serde_json::to_string(env)?, host: None };
+        if !valid_entry(&id, &entry) {
+            bail!("MCP environment for {server} is not storable (values hidden)");
+        }
+        let _lock = self.keychain.catalog_lock()?;
+        let mut catalog = self.load()?;
+        catalog.entries.insert(id, entry);
+        self.save(&catalog)
+    }
+
+    /// The environment stored for MCP server `server`, if any.
+    pub fn mcp_env(&self, server: &str) -> Result<Option<BTreeMap<String, String>>> {
+        let id = format!("{MCP_ENV}{server}");
+        Ok(self
+            .load()?
+            .entries
+            .remove(&id)
+            .filter(|entry| valid_entry(&id, entry))
+            .and_then(|entry| serde_json::from_str(&entry.token).ok()))
+    }
+
+    /// Removes MCP server `server`'s stored environment; nothing stored is fine.
+    pub fn remove_mcp_env(&self, server: &str) -> Result<()> {
+        let id = format!("{MCP_ENV}{server}");
+        if !self.load()?.entries.contains_key(&id) {
+            return Ok(());
+        }
+        self.remove(&id)
+    }
+
     pub fn remove(&self, id: &str) -> Result<()> {
-        if !KINDS.iter().any(|kind| kind.0 == id) && !id.strip_prefix("registry:").is_some_and(valid_host) {
+        if !KINDS.iter().any(|kind| kind.0 == id)
+            && !id.strip_prefix("registry:").is_some_and(valid_host)
+            && !id.strip_prefix(MCP_ENV).is_some_and(imacs_core::mcp_import::valid_name)
+        {
             bail!("unknown credential type");
         }
         let _lock = self.keychain.catalog_lock()?;
@@ -208,6 +258,8 @@ impl Store {
             ),
             "linear" => ("Linear", "api.linear.app".into(), vec![Rule::new("api.linear.app", "POST", "/graphql")]),
             "github" => ("GitHub", "api.github.com".into(), read_rules("api.github.com")),
+            // A host process's environment, not a relay credential.
+            _ if id.starts_with(MCP_ENV) => return Ok(None),
             _ if id.starts_with("registry:") => {
                 let host = entry.host.expect("validated host");
                 return Ok(Some(Credential::stored(
@@ -229,8 +281,22 @@ fn read_rules(host: &str) -> Vec<Rule> {
     ["GET", "HEAD"].into_iter().map(|method| Rule::new(host, method, "/*")).collect()
 }
 
+/// The catalog prefix of an MCP server's stored environment.
+const MCP_ENV: &str = "mcp-env:";
+
 fn valid_entry(id: &str, entry: &Entry) -> bool {
     let token = &entry.token;
+    if let Some(server) = id.strip_prefix(MCP_ENV) {
+        return entry.host.is_none()
+            && imacs_core::mcp_import::valid_name(server)
+            && token.len() <= 16 * 1024
+            && serde_json::from_str::<BTreeMap<String, String>>(token).is_ok_and(|env| {
+                !env.is_empty()
+                    && env
+                        .iter()
+                        .all(|(name, value)| imacs_core::mcp_import::valid_env_name(name) && !value.contains('\0'))
+            });
+    }
     if token.is_empty() || token.len() > 8192 || !token.bytes().all(|b| b.is_ascii_graphic()) {
         return false;
     }
@@ -369,6 +435,36 @@ pub(crate) mod tests {
                 assert!(!lines.contains("PRIVATE"));
                 assert!(store.put("openai", "sk-test", None).is_err(), "never overwrite an unreadable catalog");
             }
+        }
+    }
+
+    #[test]
+    fn credentials_hold_mcp_environments_without_showing_or_relaying_them() {
+        for mac in [true, false] {
+            let (dir, _, store) = machine(mac);
+            let env = BTreeMap::from([
+                ("GITHUB_TOKEN".to_string(), "ghp_PRIVATE value with spaces".to_string()),
+                ("MODE".to_string(), "PRIVATE-mode".to_string()),
+            ]);
+            store.put_mcp_env("github", &env).unwrap();
+            assert_eq!(store.mcp_env("github").unwrap(), Some(env));
+            assert_eq!(store.mcp_env("other").unwrap(), None);
+            let snapshot = store.snapshot().unwrap();
+            assert_eq!(snapshot.invalid, 0);
+            let entry = snapshot.entries.iter().find(|entry| entry.id == "mcp-env:github").unwrap();
+            assert!(entry.present && entry.label == "MCP github environment");
+            assert!(store.credential("mcp-env:github").unwrap().is_none(), "never a relay credential");
+            let shown = format!("{snapshot:?} {}", doctor_lines(&store).join("\n"));
+            let argv = std::fs::read_to_string(dir.path().join("keychain-argv")).unwrap();
+            assert!(!shown.contains("PRIVATE") && !argv.contains("PRIVATE"), "{shown}");
+            for (server, name) in [("imacs-s1", "A"), ("Bad Name", "A"), ("github", "1BAD"), ("github", "A=B")] {
+                let env = BTreeMap::from([(name.to_string(), "value".to_string())]);
+                assert!(store.put_mcp_env(server, &env).is_err(), "{server} {name}");
+            }
+            assert!(store.put_mcp_env("github", &BTreeMap::new()).is_err());
+            store.remove_mcp_env("github").unwrap();
+            store.remove_mcp_env("github").unwrap();
+            assert_eq!(store.mcp_env("github").unwrap(), None);
         }
     }
 
