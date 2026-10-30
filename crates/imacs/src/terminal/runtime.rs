@@ -111,9 +111,9 @@ impl Terminal {
         if focused && self.shared.typed.lock().unwrap().is_some_and(|at| at.elapsed() < Duration::from_secs(1)) {
             Duration::ZERO
         } else if focused {
-            Duration::from_millis(100)
+            Duration::from_millis(16)
         } else if visible {
-            Duration::from_millis(200)
+            Duration::from_millis(33)
         } else {
             Duration::from_millis(500)
         }
