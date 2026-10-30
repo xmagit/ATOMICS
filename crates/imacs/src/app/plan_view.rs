@@ -75,6 +75,7 @@ impl Desktop<'_> {
         self.runtime.changed_plans.remove(&self.runtime.plans[index].id);
         self.runtime.view = self.runtime.plans[index].project.clone();
         self.runtime.plan_view = true;
+        self.runtime.ungrouped = false;
         self.runtime.panel = PanelMode::Plan;
         self.runtime.diff_open = true;
         self.runtime.active = None;

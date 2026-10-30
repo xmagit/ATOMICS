@@ -17,7 +17,8 @@ pub enum ControlRequest {
         #[serde(default)]
         reason: Option<String>,
     },
-    /// Starts an agent in `folder`, or in a new worktree of `repo` on `branch`.
+    /// Starts an agent in `folder`, in a new worktree of `repo` on `branch`, or without either
+    /// in a scratch folder of its own outside any project. `isolation` overrides the settings for it.
     Start {
         agent: String,
         #[serde(default)]
@@ -30,6 +31,8 @@ pub enum ControlRequest {
         prompt: Option<String>,
         #[serde(default)]
         args: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        isolation: Option<crate::isolation::IsolationMode>,
     },
     /// Types a message and submits it, or with `raw` writes the text as-is (keys).
     Send {
@@ -421,7 +424,18 @@ mod tests {
         let request: ControlRequest = serde_json::from_str(r#"{"cmd":"send","session":"abc","text":"hi"}"#).unwrap();
         assert!(matches!(request, ControlRequest::Send { raw: false, .. }));
         let start: ControlRequest = serde_json::from_str(r#"{"cmd":"start","agent":"codex","folder":"/tmp"}"#).unwrap();
-        assert!(matches!(start, ControlRequest::Start { args, .. } if args.is_empty()));
+        assert!(matches!(start, ControlRequest::Start { args, isolation: None, .. } if args.is_empty()));
+        let scratch: ControlRequest =
+            serde_json::from_str(r#"{"cmd":"start","agent":"claude","isolation":"bare"}"#).unwrap();
+        assert!(matches!(
+            scratch,
+            ControlRequest::Start {
+                folder: None,
+                repo: None,
+                isolation: Some(crate::isolation::IsolationMode::Bare),
+                ..
+            }
+        ));
         let integrate: ControlRequest = serde_json::from_str(r#"{"cmd":"plan_integrate","id":"t1"}"#).unwrap();
         assert!(matches!(integrate, ControlRequest::PlanIntegrate { id, plan: None } if id == "t1"));
     }

@@ -11,7 +11,7 @@ use egui::{Color32, FontId, Key, Pos2, Rect, RichText, Sense, Stroke, Vec2, pos2
 use imacs_core::config::{AgentKind, ChiefDock, Config, VoiceTarget};
 use imacs_core::git::{self, Integration, Merge, Worktree, WorktreeEntry};
 use imacs_core::layout::{self, DiffPlacement, DiffSplit, Layout};
-use imacs_core::session::{AgentStatus, pick_tiled, title_for};
+use imacs_core::session::{AgentStatus, UNTITLED, pick_tiled, prompt_title, title_for};
 use imacs_core::store::{SessionRecord, Store};
 use imacs_core::{paths, steer, theme};
 use notify_debouncer_mini::notify::{RecommendedWatcher, RecursiveMode};
@@ -123,6 +123,20 @@ pub struct Session {
     screen_busy: bool,
     busy_absent_since: Option<Instant>,
     ref_guard: Option<crate::ref_guard::Shared>,
+    /// The scratch folder this session works in, outside any project; it goes when the session closes.
+    scratch: Option<PathBuf>,
+    naming: Naming,
+}
+
+/// Where a session's title comes from. Only a folder's title changes by itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Naming {
+    /// Its branch or folder name, following the session's folder.
+    Folder,
+    /// A scratch session waits for its first prompt to name it.
+    FirstPrompt,
+    /// Named by its first prompt or the user, and kept.
+    Named,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,11 +210,31 @@ enum SteerTarget {
 
 struct NewDialog {
     agent: String,
-    new_worktree: bool,
+    place: Place,
     folder: String,
     repo: String,
     branch: String,
+    /// The first prompt, which also names a scratch session.
+    prompt: String,
+    /// This session's own isolation; `None` follows the settings.
+    isolation: Option<imacs_core::isolation::IsolationMode>,
     error: Option<String>,
+}
+
+/// Where a new session works.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Place {
+    /// A new folder of its own, outside any project.
+    Scratch,
+    Folder,
+    Worktree,
+}
+
+/// A session being renamed and the title typed so far.
+struct Rename {
+    session: String,
+    title: String,
+    focus: bool,
 }
 
 /// An agent to start once its new worktree is checked out.
@@ -456,6 +490,8 @@ pub(crate) struct State {
     /// The project tab on screen; `None` shows every project.
     view: Option<PathBuf>,
     plan_view: bool,
+    /// The Ungrouped tab is on screen: every session outside a plan.
+    ungrouped: bool,
     /// The chief is shown, either floating or docked (otherwise only the pill).
     chief_open: bool,
     worktree_tx: crate::host::Sender<(String, Result<PreparedWorktree, String>, Launch, PathBuf)>,
@@ -561,6 +597,7 @@ struct Client {
     confirm_close: Option<String>,
     confirm_plan_close: Option<(String, PlanStatus)>,
     new_dialog: Option<NewDialog>,
+    rename: Option<Rename>,
     quick_open: Option<QuickOpen>,
     voice: Voice,
     /// The proposal on screen and when it appeared, which enables Apply after a moment.
@@ -608,6 +645,7 @@ impl Client {
             confirm_close: None,
             confirm_plan_close: None,
             new_dialog: None,
+            rename: None,
             quick_open: None,
             voice: Voice::Idle,
             config_seen: None,
@@ -864,6 +902,7 @@ impl State {
             changed_plans: HashSet::new(),
             view: None,
             plan_view: false,
+            ungrouped: false,
             chief_open: false,
             worktree_tx,
             worktree_rx,
@@ -987,12 +1026,16 @@ impl State {
         let (home, config, sbx, actions) =
             (paths::imacs_home(), self.config.clone(), self.sbx.clone(), self.action_tx.clone());
         let before = SystemTime::now();
+        // Read before the handoff is consumed: the scratch sessions a restart resumes keep their folders.
+        let resumed: HashSet<PathBuf> =
+            self.store.restart.iter().flat_map(|r| &r.sessions).filter_map(|r| paths::scratch_of(&r.cwd)).collect();
         self.startup_cleanup = Some(std::thread::spawn(move || {
             let sbx = resolve_program(&sbx);
-            let notes = match crate::lifecycle::sweep_before(&home, &config, &sbx, before) {
+            let mut notes = match crate::lifecycle::sweep_before(&home, &config, &sbx, before) {
                 Ok(notes) => notes,
                 Err(err) => vec![format!("Startup cleanup skipped: {err:#}")],
             };
+            notes.extend(crate::lifecycle::sweep_scratch(&home, &resumed, before));
             crate::sandbox::prune_pins(&home, &home.join("git-pins"), &sbx);
             crate::lifecycle::record_leftovers(&home, &notes);
             if !notes.is_empty() {
@@ -1027,9 +1070,14 @@ impl State {
         }
         // Preparation can finish after the window closes. Wait before stopping those sandboxes.
         let mut names: HashSet<String> = self.sessions.iter().filter_map(|s| s.sandbox.clone()).collect();
+        let mut scratch: Vec<(PathBuf, Option<String>)> =
+            self.sessions.iter().filter_map(|s| Some((s.scratch.clone()?, s.sandbox.clone()))).collect();
         for (launch, ready) in std::mem::take(&mut self.pending_sandbox) {
             let _ = ready.recv();
             if let AgentRuntime::Sandbox(sandbox) = launch.runtime {
+                if let Some(dir) = paths::scratch_of(&launch.cwd) {
+                    scratch.push((dir, Some(sandbox.name.clone())));
+                }
                 names.insert(sandbox.name);
             }
         }
@@ -1037,6 +1085,10 @@ impl State {
             self.stop_sandbox(name);
         }
         self.finish_lifecycle_jobs();
+        // Quitting ends scratch sessions for good; a restart resumes them in their folders.
+        if !self.restarting {
+            self.remove_scratch_sessions(scratch);
+        }
         self.check_all_refs(&self.exempt_branches());
         self.ref_checks.finish();
         if let Some(job) = self.startup_cleanup.take() {
@@ -1046,6 +1098,19 @@ impl State {
         if self.hook_error.is_none() {
             let _ = std::fs::remove_file(paths::socket_path());
         }
+    }
+
+    /// Removes scratch folders and the sandboxes that worked in them, once their agents are stopped.
+    fn remove_scratch_sessions(&mut self, scratch: Vec<(PathBuf, Option<String>)>) {
+        let (home, sbx) = (paths::imacs_home(), resolve_program(&self.sbx));
+        let mut notes = Vec::new();
+        for (dir, sandbox) in scratch {
+            let removed = sandbox
+                .map_or(Ok(()), |name| crate::sandbox::remove(&home, &sbx, &name))
+                .and_then(|()| crate::lifecycle::remove_scratch(&home, &dir));
+            notes.extend(removed.err().map(|err| format!("Scratch session {}: {err:#}", dir.display())));
+        }
+        crate::lifecycle::record_leftovers(&home, &notes);
     }
 }
 
@@ -1406,18 +1471,24 @@ impl Desktop<'_> {
             ui.label(RichText::new("Emacs, but for agents").color(p.muted));
             ui.label(RichText::new("an atomisk.ai project").color(p.muted).size(12.0));
             ui.add_space(14.0);
+            // The Ungrouped tab starts sessions in scratch folders of their own.
+            let folder = (!self.runtime.ungrouped).then(|| self.runtime.launch_dir.to_string_lossy().into_owned());
             ui.horizontal(|ui| {
                 for agent in self.runtime.config.agents.clone() {
                     if ui.button(format!("Start {}", agent.name)).clicked() {
                         self.runtime.client_commands.push(ControlRequest::Start {
-                            agent: agent.name.clone(), folder: Some(self.runtime.launch_dir.to_string_lossy().into_owned()),
-                            repo: None, branch: None, prompt: None, args: Vec::new(),
+                            agent: agent.name.clone(), folder: folder.clone(),
+                            repo: None, branch: None, prompt: None, args: Vec::new(), isolation: None,
                         });
                     }
                 }
             });
             ui.add_space(6.0);
-            ui.label(RichText::new(format!("in {}", paths::display(&self.runtime.launch_dir))).color(p.muted).size(12.0));
+            let place = match folder {
+                Some(_) => format!("in {}", paths::display(&self.runtime.launch_dir)),
+                None => "each in a scratch folder of its own, outside any project".into(),
+            };
+            ui.label(RichText::new(place).color(p.muted).size(12.0));
             ui.add_space(14.0);
             ui.label(RichText::new("Click an agent's title to see its worktree's diff against main.\nComment on any line and send the review straight to the agent.").color(p.muted).size(12.0));
         });
@@ -1636,3 +1707,6 @@ mod host_tests;
 
 #[cfg(test)]
 mod sandbox_tests;
+
+#[cfg(test)]
+mod ungrouped_tests;

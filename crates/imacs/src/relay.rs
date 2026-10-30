@@ -761,6 +761,12 @@ impl Service {
         Ok(Some(Granted { port: relay.port(), placeholder }))
     }
 
+    /// How many placeholders the relay accepts now.
+    #[cfg(test)]
+    pub fn live_grants(&self) -> usize {
+        self.relay.lock().unwrap().as_ref().map_or(0, |relay| relay.inner.grants.lock().unwrap().len())
+    }
+
     /// Stops accepting `granted`'s placeholder: its session closed or its agent exited.
     pub fn revoke(&self, granted: &Granted) {
         if let Some(relay) = self.relay.lock().unwrap().as_ref() {

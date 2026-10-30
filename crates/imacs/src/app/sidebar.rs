@@ -3,13 +3,37 @@ use super::*;
 #[derive(Clone)]
 enum ViewTab {
     All,
+    /// Every session outside a plan.
+    Ungrouped,
     Project(PathBuf),
     Plan(usize),
 }
 
 impl State {
+    /// Whether a session belongs to no plan's task.
+    pub(super) fn ungrouped_session(&self, session: &Session) -> bool {
+        !session.chief && !self.plans.iter().any(|plan| plan.contains_session(&session.id))
+    }
+
+    /// Shows the Ungrouped tab, keeping the active session if it is there.
+    pub(super) fn show_ungrouped(&mut self) {
+        self.plan_view = false;
+        self.view = None;
+        self.ungrouped = true;
+        if !self.active_index().is_some_and(|i| self.visible_sessions().contains(&i)) {
+            match self.visible_sessions().first().map(|&i| self.sessions[i].id.clone()) {
+                Some(id) => self.activate(&id, false),
+                None => {
+                    self.active = None;
+                    self.diff_root = None;
+                }
+            }
+        }
+    }
+
     pub(super) fn set_view(&mut self, view: Option<PathBuf>) {
         self.plan_view = false;
+        self.ungrouped = false;
         self.view = view.clone();
         let Some(project) = view else { return };
         let in_view = self.active_index().is_some_and(|i| {
@@ -63,14 +87,30 @@ fn session_row(
     let now = ui.input(|i| i.time);
     painter.circle_filled(pos2(rect.left() + 10.0, rect.top() + 13.0), 3.5, status_dot(s.status, p, now));
     let clip = painter.with_clip_rect(rect.shrink2(vec2(2.0, 0.0)));
-    clip.text(
+    // The diff stats keep their corner; a long title is cut before them.
+    let stats_left = match stats {
+        Some((add, del)) => clip
+            .text(
+                pos2(rect.right() - 6.0, rect.top() + 5.0),
+                egui::Align2::RIGHT_TOP,
+                format!("+{add} −{del}"),
+                FontId::monospace(10.5),
+                p.muted,
+            )
+            .left(),
+        None => rect.right(),
+    };
+    painter.with_clip_rect(rect.shrink2(vec2(2.0, 0.0)).with_max_x(stats_left - 6.0)).text(
         pos2(rect.left() + 20.0, rect.top() + 5.0),
         egui::Align2::LEFT_TOP,
         &s.title,
         p.ui(13.0),
         if active { p.accent } else { p.foreground },
     );
-    let mut detail = format!("{} · {}", s.agent, s.status.label());
+    let mut detail = match s.scratch {
+        Some(_) => format!("{} · scratch · {}", s.agent, s.status.label()),
+        None => format!("{} · {}", s.agent, s.status.label()),
+    };
     if s.terminal.is_none() {
         detail.push_str(" · outside");
     }
@@ -78,16 +118,6 @@ fn session_row(
         detail.push_str(" · ✔");
     }
     clip.text(pos2(rect.left() + 20.0, rect.top() + 21.0), egui::Align2::LEFT_TOP, detail, p.ui(11.0), p.muted);
-    if let Some((add, del)) = stats {
-        let text = format!("+{add} −{del}");
-        clip.text(
-            pos2(rect.right() - 6.0, rect.top() + 5.0),
-            egui::Align2::RIGHT_TOP,
-            text,
-            FontId::monospace(10.5),
-            p.muted,
-        );
-    }
     response
 }
 
@@ -153,7 +183,7 @@ impl Desktop<'_> {
     }
 
     pub(super) fn view_tabs(&mut self, ui: &mut egui::Ui) {
-        let mut tabs = vec![ViewTab::All];
+        let mut tabs = vec![ViewTab::All, ViewTab::Ungrouped];
         tabs.extend(self.runtime.repos.iter().cloned().map(ViewTab::Project));
         tabs.extend(
             self.runtime
@@ -189,8 +219,8 @@ impl Desktop<'_> {
         priority.sort_by_key(|&index| match &tabs[index] {
             ViewTab::Plan(plan) if self.runtime.plan_state(*plan) == PlanState::NeedsYou => 0,
             ViewTab::Plan(plan) if matches!(self.runtime.plan_state(*plan), PlanState::Running(_)) => 1,
-            ViewTab::All | ViewTab::Project(_) if self.view_tab_selected(&tabs[index]) => 2,
-            ViewTab::All | ViewTab::Project(_) => 3,
+            ViewTab::All | ViewTab::Ungrouped | ViewTab::Project(_) if self.view_tab_selected(&tabs[index]) => 2,
+            ViewTab::All | ViewTab::Ungrouped | ViewTab::Project(_) => 3,
             ViewTab::Plan(_) if self.view_tab_selected(&tabs[index]) => 4,
             ViewTab::Plan(plan) if self.runtime.plans[*plan].status == PlanStatus::Open => 5,
             _ => 6,
@@ -350,8 +380,11 @@ impl Desktop<'_> {
 
     fn view_tab_selected(&self, tab: &ViewTab) -> bool {
         match tab {
-            ViewTab::All => !self.runtime.plan_view && self.runtime.view.is_none(),
-            ViewTab::Project(root) => !self.runtime.plan_view && self.runtime.view.as_ref() == Some(root),
+            ViewTab::All => !self.runtime.plan_view && !self.runtime.ungrouped && self.runtime.view.is_none(),
+            ViewTab::Ungrouped => !self.runtime.plan_view && self.runtime.ungrouped,
+            ViewTab::Project(root) => {
+                !self.runtime.plan_view && !self.runtime.ungrouped && self.runtime.view.as_ref() == Some(root)
+            }
             ViewTab::Plan(index) => self.runtime.plan_view && self.runtime.selected_plan == *index,
         }
     }
@@ -363,6 +396,11 @@ impl Desktop<'_> {
             ViewTab::All => {
                 let agents = self.runtime.sessions.iter().filter(|s| !s.chief).count();
                 (format!("All · {agents}"), "All projects".into(), p.foreground)
+            }
+            ViewTab::Ungrouped => {
+                let count = self.runtime.sessions.iter().filter(|s| self.runtime.ungrouped_session(s)).count();
+                let hover = "Sessions outside any plan. New sessions start here, in scratch folders of their own";
+                (format!("Ungrouped · {count}"), hover.into(), if selected { p.accent } else { p.foreground })
             }
             ViewTab::Project(root) => {
                 let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -473,6 +511,7 @@ impl Desktop<'_> {
         if response.clicked() && !close_clicked && !over_close {
             match tab {
                 ViewTab::All => self.runtime.set_view(None),
+                ViewTab::Ungrouped => self.runtime.show_ungrouped(),
                 ViewTab::Project(root) => self.runtime.set_view(Some(root.clone())),
                 ViewTab::Plan(index) => {
                     if self.runtime.plans[*index].status == PlanStatus::Open {
@@ -529,6 +568,7 @@ impl Desktop<'_> {
             section(ui, &p, "AGENTS");
             let mut clicked: Option<String> = None;
             let mut close: Option<String> = None;
+            let mut rename: Option<String> = None;
             let visible = self.runtime.visible_sessions();
             for (index, session) in self.runtime.sessions.iter_mut().enumerate() {
                 if !visible.contains(&index) {
@@ -545,6 +585,10 @@ impl Desktop<'_> {
                     if ui.checkbox(&mut selected, "Include in “selected”").changed() {
                         if selected { self.client.selected.insert(session.id.clone()); }
                         else { self.client.selected.remove(&session.id); }
+                    }
+                    if !session.chief && ui.button("Rename…").clicked() {
+                        rename = Some(session.id.clone());
+                        ui.close();
                     }
                     if ui.button("Close").clicked() {
                         close = Some(session.id.clone());
@@ -566,6 +610,9 @@ impl Desktop<'_> {
             }
             if let Some(id) = close {
                 self.client.confirm_close = Some(id);
+            }
+            if let Some(id) = rename {
+                self.begin_rename(&id);
             }
 
             let live_ids: HashSet<&str> = self.runtime.sessions.iter().filter_map(|s| s.claude_id.as_deref()).collect();
@@ -641,7 +688,7 @@ impl Desktop<'_> {
                     if ui.button("New worktree…").clicked() {
                         self.open_new_dialog(Some(root.clone()));
                         if let Some(dialog) = &mut self.client.new_dialog {
-                            dialog.new_worktree = true;
+                            dialog.place = Place::Worktree;
                             dialog.repo = paths::display(&root);
                         }
                         ui.close();

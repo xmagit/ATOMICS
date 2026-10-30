@@ -119,6 +119,7 @@ impl State {
                     last_prompt: s.last_prompt.clone(),
                     updated: imacs_core::store::now(),
                     sandbox: s.sandbox.clone(),
+                    named: s.naming == Naming::Named,
                 })
             })
             .collect();
@@ -135,6 +136,7 @@ impl State {
             active: self.active.clone(),
             selected_plan: self.plans.get(self.selected_plan).map(|plan| plan.id.clone()),
             plan_view: self.plan_view,
+            ungrouped: self.ungrouped,
             diff_open: self.diff_open,
             diff_root: self.diff_root.clone(),
             view: self.view.clone(),
@@ -182,6 +184,7 @@ impl State {
             .and_then(|id| self.plans.iter().position(|plan| &plan.id == id))
             .unwrap_or(self.selected_plan);
         self.plan_view = restart.plan_view;
+        self.ungrouped = restart.ungrouped;
         self.diff_open = restart.diff_open;
         self.diff_root = restart.diff_root.clone();
         self.view = restart.view.clone();
@@ -198,19 +201,27 @@ impl State {
         // A prompt starts a new chief turn, so it can call imacs_wait immediately.
         let prompt = (record.chief && handoff)
             .then(|| "IMACS restarted. Call imacs_wait to receive the restart event, then carry on.".into());
-        // A resumed task agent keeps its task's isolation.
+        // A resumed task agent keeps its task's isolation; any other runs where it ran, sandboxed or
+        // bare as its session chose, since that is where its transcript is.
         let role = if record.chief {
             Role::Chief
         } else {
             let task = record.pane.as_ref().and_then(|pane| {
                 self.plans.iter().flat_map(|plan| &plan.tasks).find(|task| task.session.as_ref() == Some(pane))
             });
-            Role::Agent(task.and_then(|task| task.isolation))
+            let ran = match record.sandbox {
+                Some(_) => imacs_core::isolation::IsolationMode::Sandbox,
+                None => imacs_core::isolation::IsolationMode::Bare,
+            };
+            Role::Agent(task.and_then(|task| task.isolation).or(Some(ran)))
         };
         match self.start_as(ctx, &record.agent, record.cwd, Some(record.claude_session_id), args, prompt, role) {
             Ok(id) => {
                 if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) {
                     session.last_prompt = record.last_prompt;
+                    if record.named {
+                        session.rename(&record.title);
+                    }
                 }
                 for plan in &mut self.plans {
                     let mut changed = false;
@@ -437,6 +448,7 @@ mod tests {
                     last_prompt: Some("carry on".into()),
                     updated: 0,
                     sandbox: None,
+                    named: false,
                 };
                 app.runtime.store.chief_dock = Some(ChiefDock::Docked);
                 app.runtime.store.chief_width = Some(500.0);
@@ -484,6 +496,53 @@ mod tests {
                 assert!(reopened.restart_event.is_none());
                 assert!(Store::load(&paths::store_file()).restart.is_none());
                 reopened.shutdown();
+            },
+        );
+    }
+
+    #[test]
+    fn a_restart_resumes_scratch_sessions_in_their_folders_with_their_names() {
+        with_app(
+            "app::restart::tests::a_restart_resumes_scratch_sessions_in_their_folders_with_their_names",
+            |app, ctx| {
+                // Stands in for Claude: a resumable agent. Agents are sandboxed; this session is bare.
+                let agent = "\n[[agents]]\nname = \"stand-in\"\ncommand = [\"/bin/sh\", \"-c\", \"exec sleep 600\"]\nkind = \"claude\"\n";
+                let config = std::fs::read_to_string(paths::config_file()).unwrap();
+                let config = config.replace("mode = \"bare\"", "mode = \"sandbox\"") + agent;
+                std::fs::write(paths::config_file(), config).unwrap();
+                app.runtime.config = Config::load_or_create(&paths::config_file()).unwrap();
+                assert_eq!(app.runtime.config.isolation.mode, imacs_core::isolation::IsolationMode::Sandbox);
+                let start =
+                    json!({"cmd":"start","agent":"stand-in","prompt":"Plan the offsite agenda","isolation":"bare"});
+                let response = request(app, start);
+                assert!(response.ok, "{:?}", response.error);
+                let scratch = paths::scratch_of(Path::new(response.result["folder"].as_str().unwrap())).unwrap();
+                let orphan = paths::scratch_dir().join("orphan1");
+                std::fs::create_dir(&orphan).unwrap();
+                std::fs::File::open(&orphan)
+                    .unwrap()
+                    .set_modified(SystemTime::now() - Duration::from_secs(3600))
+                    .unwrap();
+                app.runtime.show_ungrouped();
+                app.runtime.save_restart(Some("new build".into())).unwrap();
+                app.runtime.restarting = true;
+                app.runtime.shutdown();
+                assert!(scratch.is_dir(), "a restart keeps scratch folders");
+
+                let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+                let mut reopened = State::new(&cc, Options::default(), &crate::load_icon());
+                reopened.startup_cleanup.take().unwrap().join().unwrap();
+                assert!(scratch.is_dir() && !orphan.exists(), "only the handoff's scratch folders survive startup");
+                reopened.runtime_tick(ctx);
+                let [session] = &reopened.sessions[..] else { panic!("one resumed session") };
+                assert_eq!(session.scratch.as_ref(), Some(&scratch));
+                assert_eq!(session.cwd, scratch);
+                assert_eq!(session.title, "Plan the offsite agenda");
+                assert_eq!(session.naming, Naming::Named);
+                assert!(session.sandbox.is_none() && session.terminal.is_some(), "it resumes bare, where it ran");
+                assert!(reopened.ungrouped && reopened.visible_sessions() == [0]);
+                reopened.shutdown();
+                assert!(!scratch.exists(), "quitting after the restart ends it");
             },
         );
     }

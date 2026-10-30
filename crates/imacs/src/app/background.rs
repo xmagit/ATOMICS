@@ -25,9 +25,7 @@ impl State {
                 changed = true;
                 session.worktree = worktree;
                 session.worktree_ready = None;
-                if !session.chief {
-                    session.title = title_for(session.branch(), &session.cwd);
-                }
+                session.follow_folder();
             }
         }
         for (agent, dir) in std::mem::take(&mut self.pending_open) {
@@ -69,12 +67,16 @@ impl State {
             };
             changed = true;
             if !self.sessions.iter().any(|s| s.id == launch.id) {
-                // Closed while its sandbox was made: leave the sandbox stopped for reuse or cleanup.
+                // Closed while its sandbox was made: leave the sandbox stopped for reuse or cleanup,
+                // or remove a scratch session's, which nothing resumes. Its placeholder goes either way.
                 if let Ok((_, Some(granted))) = &result {
                     self.relay.revoke(granted);
                 }
                 if let (Ok(_), AgentRuntime::Sandbox(sandboxed)) = (&result, &launch.runtime) {
-                    self.stop_sandbox(sandboxed.name.clone());
+                    match paths::scratch_of(&launch.cwd) {
+                        Some(_) => self.remove_sandbox(sandboxed.name.clone()),
+                        None => self.stop_sandbox(sandboxed.name.clone()),
+                    }
                 }
                 continue;
             }
@@ -232,9 +234,16 @@ impl State {
             }
             if let Some(title) = session.terminal.as_ref().and_then(|t| t.shared.title.lock().unwrap().take())
                 && session.kind == AgentKind::Shell
+                && session.naming == Naming::Folder
                 && !title.trim().is_empty()
             {
                 session.title = title;
+            }
+            // Sessions without hooks, sandboxed ones among them, are named after what was typed.
+            if session.naming == Naming::FirstPrompt
+                && let Some(line) = session.terminal.as_ref().and_then(|t| t.shared.submitted.lock().unwrap().take())
+            {
+                session.first_prompt(&line);
             }
         }
         if let Some(exempt) = exempt {
@@ -557,6 +566,8 @@ impl State {
                     screen_busy: false,
                     busy_absent_since: None,
                     ref_guard: None,
+                    scratch: None,
+                    naming: Naming::Folder,
                 });
                 if self.active.is_none() {
                     self.active = Some(format!("ext:{}", event.session_id));
@@ -621,7 +632,7 @@ impl State {
             session.cwd = cwd.clone();
             session.worktree_ready = None;
             session.worktree = git::worktree_of(cwd);
-            session.title = title_for(session.branch(), cwd);
+            session.follow_folder();
         }
         if let Some(status) = event.status() {
             session.status = if session.approvals.is_empty() { status } else { AgentStatus::NeedsInput };
@@ -639,6 +650,9 @@ impl State {
                     session.pending = None;
                 }
                 session.last_prompt = event.prompt.clone();
+                if let Some(prompt) = &event.prompt {
+                    session.first_prompt(prompt);
+                }
             }
             "Stop" => session.last_message = event.last_assistant_message.clone(),
             _ => {}

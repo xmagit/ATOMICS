@@ -96,10 +96,6 @@ impl Desktop<'_> {
         });
     }
 
-    pub(super) fn create_worktree(&self, repo: PathBuf, branch: String, start: Option<String>, launch: Launch) {
-        self.post(move |state| state.create_worktree(repo, branch, start, launch));
-    }
-
     pub(super) fn toggle_chief(&self, _ctx: &egui::Context) {
         self.post(|state| state.toggle_chief(&state.ctx.clone()));
     }
