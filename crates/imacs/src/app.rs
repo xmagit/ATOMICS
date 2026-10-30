@@ -41,6 +41,7 @@ mod board;
 mod chief;
 mod commands;
 mod control;
+mod credentials;
 mod editor;
 mod fleet;
 mod heartbeat;
@@ -606,6 +607,7 @@ struct Client {
     config_note: String,
     /// The theme picker saves to this machine's config.d file instead of config.toml.
     theme_host_only: bool,
+    credentials: credentials::CredentialUi,
     /// Open or close the Settings menu on the next frame.
     show_settings: Option<bool>,
     voice_tx: Sender<VoiceEvent>,
@@ -651,6 +653,7 @@ impl Client {
             config_seen: None,
             config_note: String::new(),
             theme_host_only: false,
+            credentials: credentials::CredentialUi::default(),
             show_settings: None,
             voice_tx,
             voice_rx,

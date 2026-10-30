@@ -198,16 +198,26 @@ fn azure_placeholders_reach_claude_and_codex_and_are_revoked_on_close() {
         let bin = crate::test_support::tempdir().unwrap();
         app.runtime.sbx = fake::install(bin.path()).display().to_string();
         app.runtime.config.isolation.mode = IsolationMode::Sandbox;
-        let config = imacs_core::isolation::AzureConfig::default();
-        app.runtime.config.isolation.sandbox.azure = config.clone();
+        let config = imacs_core::isolation::AzureConfig { enabled: true, ..Default::default() };
         let program = crate::relay::azure::tests::fake(bin.path());
         app.runtime.relay = Arc::new(
-            crate::relay::Service::new(
-                paths::imacs_home(),
-                crate::relay::Keychain::at(Path::new("/no-keychain"), false),
-            )
-            .with_azure(crate::relay::azure::Azure::new(program, config)),
+            crate::relay::Service::new(paths::imacs_home(), app.runtime.relay.keychain().clone())
+                .with_azure(crate::relay::azure::Azure::new(program, config.clone())),
         );
+        assert!(!app.runtime.config.isolation.sandbox.azure.enabled);
+        let off = app.runtime.start(ctx, "codex", repo.clone(), None, vec![], None).unwrap();
+        let off_name = format!("imacs-{off}");
+        tick_until(app, ctx, "the Azure-disabled sandbox to attach", |_| {
+            fake::calls_to(bin.path(), &["run"]).iter().any(|run| run.contains(&off_name))
+        });
+        for verb in ["create", "run"] {
+            let call = fake::calls_to(bin.path(), &[verb]).into_iter().find(|call| call.contains(&off_name)).unwrap();
+            assert!(!call.iter().any(|arg| arg.contains("IMACS_AZURE_")));
+        }
+        assert_eq!(app.runtime.relay.live_grants(), 0);
+        assert!(app.runtime.sessions[app.runtime.find(&off).unwrap()].relay.is_none());
+        app.runtime.close(&off);
+        app.runtime.config.isolation.sandbox.azure = config.clone();
         for agent in ["claude", "codex"] {
             let id = app.runtime.start(ctx, agent, repo.clone(), None, vec![], None).unwrap();
             let name = format!("imacs-{id}");

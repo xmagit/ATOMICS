@@ -680,11 +680,15 @@ mod isolation_tests {
                 .env("IMACS_PANE", "parent-pane")
                 .env("IMACS_HOME", "/parent/home")
                 .env("IMACS_CONFIG", "/parent/config")
+                .env("IMACS_AZURE_BEARER", "parent-placeholder")
+                .env("IMACS_AZURE_RELAY_URL", "http://parent-relay")
                 .env("TERM_PROGRAM", "imacs"),
         );
         assert!(output.status.success());
         let env = String::from_utf8(output.stdout).unwrap();
-        for key in ["IMACS_SOCKET", "IMACS_PANE", "IMACS_HOME", "IMACS_CONFIG"] {
+        for key in
+            ["IMACS_SOCKET", "IMACS_PANE", "IMACS_HOME", "IMACS_CONFIG", "IMACS_AZURE_BEARER", "IMACS_AZURE_RELAY_URL"]
+        {
             assert!(!env.lines().any(|line| line.starts_with(&format!("{key}="))), "{env}");
         }
         assert!(env.contains("TERM_PROGRAM=imacs"));

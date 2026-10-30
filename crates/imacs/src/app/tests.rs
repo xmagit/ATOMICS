@@ -81,13 +81,10 @@ pub(super) fn with_state(name: &str, test: impl FnOnce(State, &egui::Context)) {
         Options { migration_errors: vec!["Migration failed".into()], ..Options::default() },
         &crate::load_icon(),
     );
-    // Tests never read this machine's keychain: a sandboxed Claude has no subscription unless a test gives it one.
-    app.relay = Arc::new(crate::relay::Service::new(
-        paths::imacs_home(),
-        crate::relay::Keychain::at(Path::new("/nonexistent/keychain"), cfg!(target_os = "macos")),
-    ));
-    // Azure tests install their own fake az; unrelated app tests must not discover the host CLI.
-    app.config.isolation.sandbox.azure.enabled = false;
+    // Tests use an available but empty keychain. An unavailable helper now fails closed;
+    // only tests of that failure should use a missing executable.
+    let (_keychain_dir, keychain, _) = crate::credentials::tests::machine(cfg!(target_os = "macos"));
+    app.relay = Arc::new(crate::relay::Service::new(paths::imacs_home(), keychain));
     // Most tests start from an idle fixture. Tests of asynchronous startup start their
     // own gated sweep after this initial completion, rather than racing fixture setup.
     if let Some(job) = app.startup_cleanup.take() {

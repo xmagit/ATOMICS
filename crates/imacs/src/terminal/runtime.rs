@@ -84,12 +84,25 @@ pub struct Terminal {
 
 /// Remove instance routing from every terminal, including inherited bundle settings.
 pub(super) fn isolated_args(program: String, args: Vec<String>) -> Vec<String> {
-    ["-u", "IMACS_SOCKET", "-u", "IMACS_PANE", "-u", "IMACS_HOME", "-u", "IMACS_CONFIG"]
-        .into_iter()
-        .map(str::to_string)
-        .chain([program])
-        .chain(args)
-        .collect()
+    [
+        "-u",
+        "IMACS_SOCKET",
+        "-u",
+        "IMACS_PANE",
+        "-u",
+        "IMACS_HOME",
+        "-u",
+        "IMACS_CONFIG",
+        "-u",
+        "IMACS_AZURE_BEARER",
+        "-u",
+        "IMACS_AZURE_RELAY_URL",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .chain([program])
+    .chain(args)
+    .collect()
 }
 
 impl Terminal {

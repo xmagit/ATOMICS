@@ -240,6 +240,27 @@ impl State {
             self.activate(&id, false);
             return Ok(id);
         }
+        if launch.agent.kind == AgentKind::Claude && self.effective_isolation().bare_relay {
+            self.sessions.push(Session::starting(id.clone(), &launch.agent, launch.cwd.clone(), chief, &self.wake));
+            let (tx, rx) = self.wake.channel();
+            let relay = self.relay.clone();
+            let session = id.clone();
+            std::thread::spawn(move || {
+                let ready = relay
+                    .grant_claude(&session)
+                    .and_then(|grant| {
+                        grant.ok_or_else(|| {
+                            anyhow::anyhow!("bare relay requires a Claude subscription in Settings → Credentials")
+                        })
+                    })
+                    .map(|grant| (None, Some(grant)))
+                    .map_err(|error| error.to_string());
+                let _ = tx.send(ready);
+            });
+            self.pending_sandbox.push((launch, rx));
+            self.activate(&id, false);
+            return Ok(id);
+        }
         let version = if codex {
             let program = resolve_program(&launch.agent.command[0]);
             let ready = self.codex_version(ctx, program);
@@ -432,6 +453,14 @@ impl State {
         if sandboxed.is_none() && agent.kind != AgentKind::Shell {
             env.extend(instance_agent_env());
         }
+        if sandboxed.is_none()
+            && let Some(granted) = &relay
+        {
+            env.insert("CLAUDE_CODE_OAUTH_TOKEN".into(), granted.placeholder.clone());
+            env.insert("ANTHROPIC_API_KEY".into(), String::new());
+            env.insert("ANTHROPIC_AUTH_TOKEN".into(), String::new());
+            env.insert("ANTHROPIC_BASE_URL".into(), format!("http://127.0.0.1:{}/api.anthropic.com", granted.port));
+        }
         if let Some(path) = SHELL_PATH.as_ref() {
             env.insert("PATH".into(), path.clone());
         }
@@ -544,7 +573,20 @@ impl State {
             // Hooks run `imacs hook` on this machine, which a sandbox does not have.
             args.push("--settings".into());
             args.push(match sandboxed {
-                None => imacs_core::hook::session_settings(Path::new(&exe), Path::new(&socket), &id, false).to_string(),
+                None => {
+                    let mut settings =
+                        imacs_core::hook::session_settings(Path::new(&exe), Path::new(&socket), &id, false);
+                    if let Some(granted) = &relay {
+                        settings["apiKeyHelper"] = "".into();
+                        settings["env"] = json!({
+                            "ANTHROPIC_BASE_URL": format!("http://127.0.0.1:{}/api.anthropic.com", granted.port),
+                            "CLAUDE_CODE_OAUTH_TOKEN": granted.placeholder,
+                            "ANTHROPIC_API_KEY": "",
+                            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+                        });
+                    }
+                    settings.to_string()
+                }
                 // Its status line only saves the account's limits in the VM, for IMACS to read back.
                 Some(_) => match &relay {
                     Some(relay) if !relay.placeholder.is_empty() => {

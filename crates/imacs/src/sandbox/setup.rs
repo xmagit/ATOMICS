@@ -17,6 +17,7 @@ pub fn run(workspace: Option<&str>) -> Result<()> {
         output,
         "IMACS fresh-machine setup. Completed steps are reused; Ctrl-C or EOF stops safely. Rerun this command to resume."
     )?;
+    writeln!(output, "{}", crate::relay::azure::doctor_line(config.azure.enabled))?;
     // Installation, privilege elevation and group/session changes belong to the
     // user. Keep checking after they run the displayed OS-specific commands.
     let program = loop {
@@ -51,6 +52,30 @@ pub fn run(workspace: Option<&str>) -> Result<()> {
     writeln!(output, "Sandbox setup complete. Running imacs doctor (includes optional host/workspace diagnostics):")?;
     crate::doctor::run(workspace);
     Ok(())
+}
+
+/// Provisioning a named credential does not need Docker. There is deliberately no value argument.
+pub fn credential_setup(kind: &str, host: Option<&str>) -> Result<()> {
+    let stdin = std::io::stdin();
+    let mut output = std::io::stdout();
+    let store = crate::credentials::Store::new(crate::relay::Keychain::current());
+    provision_credential(&store, kind, host, &mut stdin.lock(), &mut output, stdin.is_terminal())?;
+    for line in crate::credentials::doctor_lines(&store) {
+        writeln!(output, "{line}")?;
+    }
+    Ok(())
+}
+
+fn provision_credential(
+    store: &crate::credentials::Store,
+    kind: &str,
+    host: Option<&str>,
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+    terminal: bool,
+) -> Result<()> {
+    let value = credential(input, output, "Credential value (stdin only): ", terminal)?;
+    store.put(kind, &value, host)
 }
 
 fn retry(input: &mut impl BufRead, output: &mut impl Write) -> Result<()> {
@@ -140,14 +165,22 @@ fn guided(
         result?;
     }
     if !secrets.openai {
-        consent(input, output, "Store an OpenAI API key in sbx? The key is sent over stdin.")?;
-        let mut token = credential(input, output, "OpenAI API key: ", terminal)?;
-        if token.is_empty() {
-            bail!("OpenAI key is empty; rerun setup to resume")
-        }
-        let result = private_command(program, &["secret", "set", "openai"], &format!("{token}\n"));
-        token.clear();
-        result?;
+        let store = crate::credentials::Store::new(keychain.clone());
+        let token = match store.token("openai")? {
+            Some(token) => token,
+            None => {
+                consent(
+                    input,
+                    output,
+                    "Store an OpenAI API key in the OS keychain and sbx? The key is sent over stdin.",
+                )?;
+                let token = credential(input, output, "OpenAI API key: ", terminal)?;
+                store.put("openai", &token, None)?;
+                token
+            }
+        };
+        private_command(program, &["secret", "set", "openai"], &format!("{token}\n"))?;
+        writeln!(output, "OpenAI: OS keychain for IMACS relay; sandbox Codex uses sbx's OpenAI credential proxy.")?;
     }
     let servers = checks::query(program, &["mcp", "ls", "--json"])
         .filter(|value| value.is_array())
@@ -228,12 +261,7 @@ fn store_subscription(keychain: &crate::relay::Keychain, token: &str) -> Result<
             "expected a sk-ant-oat01- token of letters, digits, hyphens and underscores, as `claude setup-token` prints it"
         )
     }
-    let (program, args, input) = keychain.store_command(token);
-    private_command(program, &args, &input)
-        .map_err(|_| anyhow::anyhow!("the OS keychain did not store the token; unlock it and retry `imacs setup`"))?;
-    if keychain.claude_token().is_none() {
-        bail!("the OS keychain entry could not be read back; unlock the keychain and retry `imacs setup`")
-    }
+    crate::credentials::Store::new(keychain.clone()).put("claude", token, None)?;
     Ok(())
 }
 
@@ -265,18 +293,107 @@ fn safe_sbx(program: &str, args: &[&str], message: &str) -> Result<()> {
     }
 }
 
+/// Failures are deliberately value-free: callers may safely map these to their own diagnostics.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum OutputError {
+    Start,
+    Read,
+    Timeout,
+    TooLarge,
+}
+
+/// Read credential helpers through bounded, nonblocking pipes only. Neither stream ever goes
+/// through a capture file. A helper (or descendant keeping a pipe open) is killed on timeout.
+pub(crate) fn private_output(
+    command: &mut Command,
+    timeout: Duration,
+) -> std::result::Result<std::process::Output, OutputError> {
+    use std::io::{ErrorKind, Read};
+    use std::os::fd::AsRawFd;
+    fn drain(reader: &mut impl Read, output: &mut Vec<u8>) -> std::result::Result<bool, OutputError> {
+        let mut buffer = [0; 8192];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => return Ok(true),
+                Ok(n) => {
+                    output.extend_from_slice(&buffer[..n]);
+                    if output.len() > 1024 * 1024 {
+                        return Err(OutputError::TooLarge);
+                    }
+                }
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(false),
+                Err(_) => return Err(OutputError::Read),
+            }
+        }
+    }
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .map_err(|_| OutputError::Start)?;
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let result = (|| {
+        for fd in [stdout.as_raw_fd(), stderr.as_raw_fd()] {
+            // SAFETY: both descriptors are live pipes owned by this function.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+                return Err(OutputError::Read);
+            }
+        }
+        let deadline = Instant::now() + timeout;
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let (mut stdout_done, mut stderr_done, mut status) = (false, false, None);
+        loop {
+            if !stdout_done {
+                stdout_done = drain(&mut stdout, &mut out)?;
+            }
+            if !stderr_done {
+                stderr_done = drain(&mut stderr, &mut err)?;
+            }
+            if status.is_none() {
+                status = child.try_wait().map_err(|_| OutputError::Read)?;
+            }
+            if stdout_done
+                && stderr_done
+                && let Some(status) = status
+            {
+                return Ok(std::process::Output { status, stdout: out, stderr: err });
+            }
+            if Instant::now() >= deadline {
+                return Err(OutputError::Timeout);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    })();
+    if result.is_err() {
+        // SAFETY: process_group(0) gave this helper and its descendants their own group.
+        unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+        let _ = child.wait();
+    }
+    result
+}
+
 /// Child output is discarded: a failed credential writer may echo its input.
 /// Browser auth can take several minutes, but a stuck helper remains bounded.
-fn private_command(program: &str, args: &[&str], input: &str) -> Result<()> {
+pub(crate) fn private_command(program: &str, args: &[&str], input: &str) -> Result<()> {
+    use std::os::fd::OwnedFd;
+    let (mut writer, reader) =
+        std::os::unix::net::UnixStream::pair().map_err(|_| anyhow::anyhow!("could not open setup input"))?;
+    writer.set_write_timeout(Some(Duration::from_secs(60)))?;
     let mut child = Command::new(program)
         .args(args)
-        .stdin(Stdio::piped())
+        .stdin(Stdio::from(OwnedFd::from(reader)))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .process_group(0)
         .spawn()
         .map_err(|_| anyhow::anyhow!("could not start setup helper; check installation and retry setup"))?;
-    let result = child.stdin.take().expect("piped stdin").write_all(input.as_bytes());
+    let result = writer.write_all(input.as_bytes());
+    drop(writer);
     let deadline = Instant::now() + CREATE_TIMEOUT;
     loop {
         match child.try_wait() {
@@ -334,6 +451,70 @@ mod tests {
     const SUBSCRIPTION: &str = "sk-ant-oat01-PRIVATE-fixture";
     const OPENAI: &str = "sk-PRIVATE-openai-fixture";
 
+    #[test]
+    fn private_output_keeps_both_streams_in_memory_and_bounds_large_or_inherited_output() {
+        let output = private_output(
+            Command::new("/bin/sh").args(["-c", "printf PRIVATE-out; printf PRIVATE-error >&2; exit 7"]),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(output.stdout, b"PRIVATE-out");
+        assert_eq!(output.stderr, b"PRIVATE-error");
+        let error =
+            private_output(Command::new("/bin/sh").args(["-c", "yes PRIVATE-error >&2"]), Duration::from_secs(5))
+                .unwrap_err();
+        assert!(matches!(error, OutputError::TooLarge));
+        assert!(!format!("{error:?}").contains("PRIVATE"));
+        let dir = crate::test_support::tempdir().unwrap();
+        let marker = dir.path().join("helper-leaked");
+        let command = format!("(sleep 0.4; touch '{}') & exit 0", marker.display());
+        assert!(matches!(
+            private_output(Command::new("/bin/sh").args(["-c", &command]), Duration::from_millis(100)),
+            Err(OutputError::Timeout)
+        ));
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn named_credentials_setup_reads_stdin_and_never_prints_values() {
+        for mac in [true, false] {
+            let (dir, _, store) = crate::credentials::tests::machine(mac);
+            for (kind, value, host) in [
+                ("claude", SUBSCRIPTION, None),
+                ("openai", OPENAI, None),
+                ("linear", "lin_api_PRIVATE-setup", None),
+                ("github", "ghp_PRIVATE-setup", None),
+                ("registry", "PRIVATE-registry", Some("registry.example.com")),
+            ] {
+                let mut output = Vec::new();
+                provision_credential(&store, kind, host, &mut format!("{value}\n").as_bytes(), &mut output, false)
+                    .unwrap();
+                let output = format!(
+                    "{}\n{}",
+                    String::from_utf8(output).unwrap(),
+                    crate::credentials::doctor_lines(&store).join("\n")
+                );
+                let argv = std::fs::read_to_string(dir.path().join("keychain-argv")).unwrap();
+                assert!(!output.contains(value) && !argv.contains(value));
+            }
+            let mut output = Vec::new();
+            assert!(
+                provision_credential(
+                    &store,
+                    "openai",
+                    None,
+                    &mut "sk-PRIVATE-truncated".as_bytes(),
+                    &mut output,
+                    false
+                )
+                .is_err()
+            );
+            assert!(!String::from_utf8(output).unwrap().contains("PRIVATE"));
+        }
+    }
+
     /// A fake sbx, with a fake keychain beside it whose entry is `keychain-value`.
     fn machine() -> (crate::test_support::TempDir, String) {
         let dir = crate::test_support::tempdir().unwrap();
@@ -388,7 +569,10 @@ mod tests {
         );
         assert!(output.contains("Claude agents run bare; sandboxed, they use your Claude subscription"), "{output}");
         assert!(output.lines().any(|l| l.starts_with("sandboxed Claude: off")), "{output}");
-        assert!(!dir.path().join("keychain-argv").exists(), "bare Claude needs no keychain");
+        assert!(
+            keychain(&sbx, cfg!(target_os = "macos")).claude_token().is_none(),
+            "bare Claude needs no subscription"
+        );
         assert!(output.contains("Remove 2 misfiled secrets in scope anthropic, global from sbx?"), "{output}");
         let calls = fake::calls(dir.path());
         assert!(fake::calls_to(dir.path(), &["secret", "set-custom"]).is_empty());
@@ -581,7 +765,12 @@ mod tests {
                     remaining.push_str(&answer);
                 }
             }
-            if !checks::secrets(&sbx).unwrap().openai {
+            if !checks::secrets(&sbx).unwrap().openai
+                && crate::credentials::Store::new(keychain(&sbx, cfg!(target_os = "macos")))
+                    .token("openai")
+                    .unwrap()
+                    .is_none()
+            {
                 remaining.push_str(&format!("y\n{OPENAI}\n"));
             }
             if !dir.path().join("mcp.json").exists() {

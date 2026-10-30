@@ -66,6 +66,7 @@ name = "claude"             # built in: claude, midnight, atomisk, paper and tid
 # An agent below, or a plan task, can set its own isolation = "bare" or "sandbox"; a repository's
 # .imacs/config.toml can require "sandbox" and select its template. See docs/isolation.md.
 mode = "sandbox"
+# bare_relay = true          # bare Claude sessions use a keychain-backed relay placeholder too
 
 [isolation.sandbox]
 # memory = "8g"              # per sandbox; unset = 8g; "" = sbx's default, half of this machine's memory
