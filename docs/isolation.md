@@ -131,18 +131,24 @@ shared folders, and only some of them are mounted:
 | Agent works in | Also mounted | Not mounted |
 | --- | --- | --- |
 | a linked worktree (every task IMACS creates) | the common dir's `objects`, `refs` and `logs`, and the worktree's own `worktrees/<id>`, read-write | the repository's `hooks`, `config` and everything else in `.git` |
-| a main checkout | nothing more; its `.git/hooks` and `.git/config` are mounted read-only over the writable checkout | |
+| a main checkout | its whole `.git` folder, read-only, as one mount over the writable checkout | |
 
-These mounts are enough to commit, branch and read history. The agent cannot add a git hook or change
-git config that would later run on your machine. Other worktrees, the rest of your home folder, the IMACS
-socket and your credentials stay outside the sandbox.
+In a linked worktree these mounts are enough to commit, branch and read history. In a main checkout the agent
+can edit files but not commit: anything less than the whole `.git` read-only would let it move `.git` aside
+and put one of its own in its place, config and all. A mount point cannot be moved, and sbx enforces
+read-only mounts on your machine's side of the share: root in the VM, which can unmount or remount them,
+still cannot write there. Tasks commit in linked worktrees anyway. A main checkout's sandbox made before
+IMACS mounted `.git` this way is refused; remove it (`sbx rm <name>`) and start the agent again.
+
+The agent cannot add a git hook or change git config that would later run on your machine. Other
+worktrees, the rest of your home folder, the IMACS socket and your credentials stay outside the sandbox.
 
 ### Git on your machine in a sandboxed folder
 
-The sandbox can still write the files that tell git where a repository is: a worktree's `.git` file, its
-`<common>/worktrees/<id>/commondir`, and a main checkout's `.git/commondir`. If git on your machine followed
-them, they could lead it to a config of the agent's own, and git would run that config's `core.fsmonitor`
-on your machine. IMACS runs git in these folders itself: it polls diffs, checks refs, cleans up worktrees,
+In a linked worktree the sandbox can still write the files that tell git where a repository is: the
+worktree's `.git` file and its `<common>/worktrees/<id>/commondir`. If git on your machine followed them,
+they could lead it to a config of the agent's own, and git would run that config's `core.fsmonitor` on your
+machine. (A main checkout's `.git/commondir` would do the same, which is one reason its `.git` is read-only.) IMACS runs git in these folders itself: it polls diffs, checks refs, cleans up worktrees,
 commits a task before merging it, and runs `imacs doctor`.
 
 So when a sandbox is made, before it runs, IMACS records where git finds the folder's repository: the work

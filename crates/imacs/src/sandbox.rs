@@ -150,7 +150,22 @@ pub fn prepare(job: &Prepare) -> Result<()> {
     // Refuses a home folder before anything is recorded for it.
     let (workspace, git) = workspace(&job.cwd)?;
     pin_git(&job.pins, &job.name, &job.cwd)?;
-    if list(&job.sbx)?.iter().any(|sandbox| sandbox.name == job.name) {
+    if let Some(existing) = list(&job.sbx)?.into_iter().find(|sandbox| sandbox.name == job.name) {
+        // A sandbox keeps its mounts for life: one made before a main checkout's .git was mounted
+        // read-only whole lets its agent replace .git, config and all.
+        let mounted = real_paths(&existing).workspaces;
+        if let Some(missing) = git
+            .iter()
+            .filter_map(|mount| mount.strip_suffix(":ro"))
+            .find(|protected| !mounted.contains(&format!("{}:ro", real(Path::new(protected)).display())))
+        {
+            bail!(
+                "sandbox {} does not mount {missing} read-only, so its agent could replace it. Remove the \
+                 sandbox (sbx rm {}) and start the agent again, or set isolation = \"bare\" on it.",
+                job.name,
+                job.name
+            );
+        }
         return Ok(());
     }
     // A machine's first sandbox needs sbx's global network policy; one already set up is left alone.
@@ -275,7 +290,9 @@ fn read_pins(dir: &Path) -> std::collections::HashMap<String, git::GitPins> {
 /// The folder a sandbox mounts read-write for `cwd`, its worktree (else `cwd` itself), and
 /// git's folders beside it. A linked worktree gets the common dir's objects, refs and logs and
 /// its own admin folder, so commits work while the repository's hooks and config stay on this
-/// machine. A checkout whose git dir lies inside it keeps that dir's hooks and config read-only.
+/// machine. A main checkout's git dir is mounted whole and read-only: a read-write checkout
+/// around anything less lets the agent replace `.git` itself, config and all, and a mount point
+/// cannot be moved. Agents there edit files; tasks commit in linked worktrees.
 pub fn workspace(cwd: &Path) -> Result<(PathBuf, Vec<String>)> {
     let args = ["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-dir", "--git-common-dir"];
     let output = git::git(cwd, &args).ok();
@@ -297,11 +314,7 @@ pub fn workspace(cwd: &Path) -> Result<(PathBuf, Vec<String>)> {
         mounts.extend(["objects", "refs", "logs"].into_iter().filter_map(|folder| existing(common.join(folder))));
         mounts.push(git_dir.to_string_lossy().into_owned());
     } else {
-        if !git_dir.starts_with(&top) {
-            mounts.push(git_dir.to_string_lossy().into_owned());
-        }
-        mounts
-            .extend(["hooks", "config"].into_iter().filter_map(|path| existing(git_dir.join(path))).map(|p| p + ":ro"));
+        mounts.push(format!("{}:ro", git_dir.display()));
     }
     Ok((top, mounts))
 }
@@ -531,10 +544,10 @@ mod tests {
         assert_eq!(mounts, expected);
         assert!(mounts.iter().all(|m| !m.contains("hooks") && !m.ends_with("config")), "{mounts:?}");
 
+        // A main checkout's whole git folder is one read-only mount point, which the agent cannot move.
         let (top, mounts) = workspace(&repo).unwrap();
         assert_eq!(top, repo.canonicalize().unwrap());
-        let git_dir = top.join(".git");
-        assert_eq!(mounts, [format!("{}/hooks:ro", git_dir.display()), format!("{}/config:ro", git_dir.display())]);
+        assert_eq!(mounts, [format!("{}:ro", top.join(".git").display())]);
 
         let plain = tempfile::tempdir().unwrap();
         assert_eq!(workspace(plain.path()).unwrap(), (plain.path().to_path_buf(), Vec::new()));
@@ -647,6 +660,35 @@ mod tests {
         assert_eq!(list(&sbx.display().to_string()).unwrap().len(), 1);
         let missing = job(&bin.path().join("missing-sbx"), "imacs-s1", &repo, SandboxConfig::default());
         assert!(prepare(&missing).is_err());
+    }
+
+    #[test]
+    fn a_main_checkouts_git_folder_is_one_read_only_mount_and_older_sandboxes_are_refused() {
+        let (_dir, repo) = repository();
+        let bin = tempfile::tempdir().unwrap();
+        let sbx = fake::install(bin.path());
+        let git_dir = repo.canonicalize().unwrap().join(".git");
+        prepare(&job(&sbx, "imacs-main", &repo, SandboxConfig::default())).unwrap();
+        let create = fake::calls_to(bin.path(), &["create"]).pop().unwrap();
+        assert_eq!(
+            create[create.len() - 2..],
+            [repo.canonicalize().unwrap().display().to_string(), format!("{}:ro", git_dir.display())]
+        );
+        prepare(&job(&sbx, "imacs-main", &repo, SandboxConfig::default())).unwrap();
+        assert_eq!(fake::calls_to(bin.path(), &["create"]).len(), 1, "it reattaches");
+
+        // A sandbox made when only hooks and config were read-only cannot be reattached to.
+        let old = format!(
+            r#"{{"name":"imacs-old","agent":"shell","status":"stopped","workspaces":["{}","{}/hooks:ro","{}/config:ro"]}}"#,
+            repo.display(),
+            git_dir.display(),
+            git_dir.display()
+        );
+        std::fs::write(bin.path().join("sandboxes/imacs-old"), old).unwrap();
+        let error = format!("{:#}", prepare(&job(&sbx, "imacs-old", &repo, SandboxConfig::default())).unwrap_err());
+        assert!(error.contains(&format!("does not mount {}", git_dir.display())), "{error}");
+        assert!(error.contains("sbx rm imacs-old"), "{error}");
+        assert_eq!(fake::calls_to(bin.path(), &["create"]).len(), 1);
     }
 
     #[test]

@@ -793,7 +793,7 @@ command = ["codex"]
             r#"[
   {"name":"imacs-live","agent":"claude","status":"running","workspaces":["/repos/app-a","/repos/app/.git/objects"]},
   {"name":"imacs-gone","agent":"codex","status":"stopped","workspaces":["/repos/app-b","/repos/app/.git/objects"]},
-  {"name":"imacs-main","agent":"shell","status":"stopped","workspaces":["/repos/app","/repos/app/.git/hooks:ro"]},
+  {"name":"imacs-main","agent":"shell","status":"stopped","workspaces":["/repos/app","/repos/app/.git:ro"]},
   {"name":"imacs-other","agent":"claude","status":"stopped","workspaces":["/repos/other-x","/repos/other/.git/objects"]},
   {"name":"poc-1","agent":"claude","status":"stopped","workspaces":["/repos/app-c","/repos/app/.git/objects"]}
 ]"#,
