@@ -116,7 +116,7 @@ impl Desktop<'_> {
             let chord = egui::KeyboardShortcut::new(shortcut("cmd+a").map(|s| s.modifiers).unwrap_or_default(), key);
             // cmd+N jumps to the Nth agent on screen and loads its diff.
             let visible = self.runtime.visible_sessions();
-            if ctx.input_mut(|i| i.consume_shortcut(&chord))
+            if ctx.input_mut(|i| crate::theme::consume_digit_chord(i, &chord))
                 && let Some(id) = visible.get(n).map(|&i| self.runtime.sessions[i].id.clone())
             {
                 self.activate(&id, true);

@@ -290,9 +290,6 @@ pub fn show(
         ui.label(egui::RichText::new(format!("+{}", prepared.additions)).color(palette.success));
         ui.label(egui::RichText::new(format!("−{}", prepared.deletions)).color(palette.error));
         ui.label(egui::RichText::new(format!("vs {} @ {short}", diff.base_ref)).color(palette.muted).monospace());
-        if state.loading {
-            ui.spinner();
-        }
         if let Some(err) = &state.error {
             ui.label(egui::RichText::new("refresh failed").color(palette.error)).on_hover_text(err);
         }
