@@ -325,6 +325,7 @@ fn private_command(program: &str, args: &[&str], input: &str) -> Result<()> {
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        .process_group(0)
         .spawn()
         .map_err(|_| anyhow::anyhow!("could not start setup helper; check installation and retry setup"))?;
     let result = child.stdin.take().expect("piped stdin").write_all(input.as_bytes());
@@ -334,7 +335,8 @@ fn private_command(program: &str, args: &[&str], input: &str) -> Result<()> {
             Ok(Some(status)) if status.success() && result.is_ok() => return Ok(()),
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
             _ => {
-                let _ = child.kill();
+                // SAFETY: the setup helper owns this process group, including its children.
+                unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
                 let _ = child.wait();
                 bail!(
                     "setup helper failed or timed out; unlock the keychain or complete browser sign-in and retry `imacs setup`"
