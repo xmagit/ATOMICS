@@ -58,8 +58,7 @@ pub fn workspaces_dir() -> PathBuf {
 pub fn project_root(dir: &Path) -> Result<PathBuf> {
     let worktree =
         git::worktree_of(dir).with_context(|| format!("{} is not inside a git repository", dir.display()))?;
-    let main = git::list_worktrees(&worktree.root).ok().and_then(|list| list.into_iter().next()).map(|w| w.path);
-    Ok(main.unwrap_or(worktree.root))
+    Ok(git::main_checkout(&worktree.root).unwrap_or(worktree.root))
 }
 
 #[cfg(feature = "native")]

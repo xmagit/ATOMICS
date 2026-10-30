@@ -415,8 +415,12 @@ read-only mounts on your machine's side of the share: root in the VM, which can 
 still cannot write there. Tasks commit in linked worktrees anyway. A main checkout's sandbox made before
 IMACS mounted `.git` this way is refused; remove it (`sbx rm <name>`) and start the agent again.
 
-The agent cannot add a git hook or change git config that would later run on your machine. Other
-worktrees, the rest of your home folder, the IMACS socket and your credentials stay outside the sandbox.
+The repository's `hooks` and `config` stay on your machine, but that alone does not keep the agent's code
+from running there. A linked worktree's sandbox writes the worktree, its own `worktrees/<id>` folder, and
+the shared objects, refs and logs, and git on your machine reads all of them: followed, they can lead it to
+a git config or a hook the agent wrote. The next section says how, and how IMACS keeps its own git from
+following them; git you run yourself is not covered. Other worktrees, the rest of your home folder, the
+IMACS socket and your credentials stay outside the sandbox.
 
 ### Git on your machine in a sandboxed folder
 
@@ -424,8 +428,22 @@ In a linked worktree the sandbox can still write the files that tell git where a
 worktree's `.git` file and its `<common>/worktrees/<id>/commondir`. If git on your machine followed them,
 they could lead it to a config of the agent's own, and git would run that config's `core.fsmonitor` on your
 machine. (A main checkout's `.git/commondir` would do the same, which is one reason its `.git` is read-only.)
-IMACS runs git in these folders itself: it polls diffs, checks refs, cleans up worktrees, commits a task
-before merging it, and runs `imacs doctor` and `imacs sandbox template build`.
+It also writes the other files there, which git on your machine reads from any checkout of the repository:
+
+- **`<common>/worktrees/<id>/gitdir`** says where the worktree is, and `git worktree list` lists whatever
+  folder it names: a repository the agent planted inside that same git folder, with a config of its own,
+  or any other folder on your machine. Git run in a planted repository runs its config's `core.fsmonitor`.
+- **`HEAD`, `commondir`, `gitdir`, `index` and `locked`** there are read without checking what they are.
+  Replaced by a FIFO, git waits on it for good; replaced by a link to `/dev/zero`, it reads without end.
+  Listing worktrees, `git status` and deleting a branch all read them.
+- **Hooks and an fsmonitor named by path in the checkout**, as `core.hooksPath = .husky` sets up, run
+  programs the agent can rewrite.
+
+IMACS runs git in these repositories itself: it polls diffs, lists worktrees, checks refs, cleans up
+worktrees, commits a task before merging it, and runs `imacs doctor` and `imacs sandbox template build`.
+Git you run yourself, and tools that run git for you, such as an editor that opens every worktree git lists,
+follow what these files say. Until the sandbox is gone, run git for a sandboxed worktree from IMACS or the
+main checkout, and never open a folder `git worktree list` names inside a `.git` folder.
 
 So when a sandbox is made, before it runs, IMACS records where git finds the folder's repository: the work
 tree, its git folder and the common dir, in `git-pins/<sandbox>.json` in IMACS's state folder, which no
@@ -454,6 +472,25 @@ before asking Git to remove a clean linked checkout. Main checkouts and dirty or
 - **A folder outside any repository stays that way.** IMACS does not run git in it or in any folder below
   it while the record exists, whatever `.git` the agent creates there. Once the sandbox is gone and the
   folder still has no repository, the record goes.
+- **Git never runs inside a recorded git folder.** IMACS refuses to run git in any folder inside a
+  recorded git folder or common dir, where the agent can plant a repository.
+- **Listed worktrees are checked before IMACS uses them.** A worktree `git worktree list` names is trusted
+  when it is the folder recorded for a sandbox of that repository, or when its `.git` names one of the
+  repository's `worktrees/<id>` folders and that folder names it back. A folder listed twice is trusted
+  neither time. Others are listed, never entered: the Clean up… dialog marks them *untrusted* and never
+  removes them, and the sidebar, the startup sweep, plan cleanup and task integration leave them alone.
+- **Every checkout of a repository with a sandbox** gets the same treatment, the main checkout and bare
+  agents' worktrees included: git runs with `GIT_DIR`, `GIT_COMMON_DIR` and `GIT_WORK_TREE` set from the
+  record or, for the repository's other checkouts, from their `.git` and the recorded common dir, and with
+  `-c core.fsmonitor=false -c core.hooksPath=/dev/null`. So no hook runs for git that IMACS runs in such a
+  repository, including your own: a `pre-commit` hook does not run when IMACS commits a task before merging it.
+- **Special files stop git.** Before git runs in a repository with a sandbox, IMACS checks that each
+  sandboxed worktree's git folder holds only files and folders. A FIFO, socket or link there stops IMACS's
+  git in that repository, with an error naming it, until you remove it; the folder also stays pinned after
+  its sandbox goes.
+- **Git has time limits.** IMACS stops git it runs after 2 minutes, or 30 for checkouts, commits, merges
+  and fetches, in case the agent swaps in such a file after the check or puts one elsewhere git reads.
+  The worktree list IMACS refreshes every 30 seconds is read off the window's thread.
 
 ### Symbolic links in a worktree
 

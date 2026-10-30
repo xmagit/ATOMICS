@@ -211,7 +211,7 @@ impl Desktop<'_> {
                     egui::Grid::new("cleanup-grid").num_columns(5).spacing([14.0, 6.0]).striped(true).show(ui, |ui| {
                         for h in rows.iter() {
                             let agent = agent_roots.contains(&h.path);
-                            let blocked = agent || h.dirty_files > 0 || h.missing;
+                            let blocked = agent || h.dirty_files > 0 || h.missing || h.untrusted;
                             if blocked {
                                 self.client.cleanup_selected.remove(&h.path);
                             }
@@ -219,6 +219,9 @@ impl Desktop<'_> {
                                 "an agent is working here"
                             } else if h.missing {
                                 "folder is gone: use prune missing"
+                            } else if h.untrusted {
+                                "git lists it from files that do not lead back to it, which a sandbox can write: \
+                                 IMACS does not run git there"
                             } else {
                                 "has uncommitted changes"
                             };
@@ -246,6 +249,9 @@ impl Desktop<'_> {
                                 if h.missing {
                                     chip(ui, "missing".into(), p.error);
                                 }
+                                if h.untrusted {
+                                    chip(ui, "untrusted".into(), p.error);
+                                }
                                 if agent {
                                     chip(ui, "● agent".into(), p.accent);
                                 }
@@ -261,7 +267,7 @@ impl Desktop<'_> {
                                 if h.upstream_gone {
                                     chip(ui, "remote gone".into(), p.success);
                                 }
-                                if !h.missing && h.dirty_files == 0 && !h.merged && !h.upstream_gone {
+                                if !h.missing && !h.untrusted && h.dirty_files == 0 && !h.merged && !h.upstream_gone {
                                     chip(ui, "unmerged".into(), p.muted);
                                 }
                             });

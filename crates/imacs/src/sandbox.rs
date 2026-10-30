@@ -514,7 +514,8 @@ pub fn for_repo(home: &Path, program: &str, repo: &Path) -> Result<RepoSandboxes
         .filter(|s| owned.get(&s.name).is_some_and(|entry| entry.sandbox))
         .map(real_paths)
         .collect();
-    let worktrees: Vec<PathBuf> = git::list_worktrees(repo)?.into_iter().map(|w| w.path).collect();
+    let worktrees: Vec<PathBuf> =
+        git::list_worktrees(repo)?.into_iter().filter(|w| w.trusted).map(|w| w.path).collect();
     let real_worktrees: Vec<PathBuf> = worktrees.iter().map(|path| real(path)).collect();
     let common = git::common_dir(repo)?;
     let (attached, orphans) = isolation::partition(&listed, &real_worktrees, &common, Path::exists);

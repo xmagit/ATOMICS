@@ -1050,3 +1050,50 @@ fn sandbox_screen_fallback_debounces_quiet_and_respects_reports_until_the_next_t
         },
     );
 }
+
+#[test]
+fn worktrees_are_listed_off_the_ui_thread_and_a_planted_one_never_shows() {
+    with_app("app::sandbox_tests::worktrees_are_listed_off_the_ui_thread_and_a_planted_one_never_shows", |app, ctx| {
+        use std::os::unix::fs::OpenOptionsExt;
+        let (_dir, repo) = repository();
+        let task = worktree(&repo, "task");
+        let peer = worktree(&repo, "peer");
+        let pins = git::resolve_pins(&task).unwrap();
+        git::pin(pins.clone());
+        // The task's sandbox names a folder in its own git folder as its worktree.
+        let admin = pins.git_dir.clone().unwrap();
+        std::fs::create_dir(admin.join("evil")).unwrap();
+        std::fs::write(admin.join("gitdir"), format!("{}\n", admin.join("evil/.git").display())).unwrap();
+        // A FIFO no check sees, as one swapped in after the check would be: git waits on it.
+        let peer_admin = git::resolve_pins(&peer).unwrap().git_dir.unwrap();
+        let fifo = peer_admin.join("locked");
+        assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        app.runtime.repos = vec![repo.clone()];
+        app.runtime.worktrees_at = None;
+        for _ in 0..3 {
+            let started = Instant::now();
+            app.runtime.runtime_tick(ctx);
+            assert!(started.elapsed() < Duration::from_secs(2), "the UI thread waited for git");
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        assert!(app.runtime.worktree_listing.is_some() && app.runtime.worktrees.is_empty());
+
+        // Its writer lets git go on; it opens without waiting for git to read.
+        let released = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (fifo, released) = (fifo.clone(), released.clone());
+            std::thread::spawn(move || {
+                while !released.load(Ordering::Relaxed) {
+                    drop(std::fs::OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open(&fifo));
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            })
+        };
+        tick_until(app, ctx, "the worktree list", |app| !app.runtime.worktrees.is_empty());
+        released.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+        let listed: Vec<_> = app.runtime.worktrees.iter().map(|w| w.branch.clone().unwrap_or_default()).collect();
+        assert_eq!(listed, ["main", "peer"], "the planted worktree must never show");
+        git::unpin(&pins.work_tree);
+    });
+}
