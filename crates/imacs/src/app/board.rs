@@ -118,6 +118,7 @@ impl Desktop<'_> {
         let mut archive = false;
         let mut approve = false;
         let mut dispatch_all = false;
+        let mut integrate_accepted = false;
         let mut close_status = None;
         let mut clean_plan = false;
         let ready = self.runtime.plans[self.runtime.selected_plan].ready().len();
@@ -182,6 +183,13 @@ impl Desktop<'_> {
         if !self.runtime.plans[self.runtime.selected_plan].tasks.is_empty() {
             ui.label(RichText::new(format!("integration branch: {integration}")).color(p.muted).size(11.5))
                 .on_hover_text("Integrated tasks are merged into it, and tasks with dependencies branch from it");
+        }
+        let pending = self.runtime.plans[self.runtime.selected_plan].pending_integrations().len();
+        if !read_only && pending > 0 {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("{pending} accepted tasks not integrated yet")).color(p.warning));
+                integrate_accepted = ui.button("Integrate").clicked();
+            });
         }
         let ticket_config = self.runtime.ticket_config();
         stage_chip(ui, self.runtime.plans[self.runtime.selected_plan].stages.last());
@@ -586,6 +594,14 @@ impl Desktop<'_> {
                 state.plans[index].approved = true;
                 state.save_plan(index);
                 state.toast("Plan approved: the orchestrator can dispatch it now");
+            });
+        }
+        if integrate_accepted {
+            self.post_plan(self.runtime.selected_plan, |state, index| {
+                let ids: Vec<_> = state.plans[index].pending_integrations().iter().map(|t| t.id.clone()).collect();
+                for id in ids {
+                    state.integrate(index, &id, None);
+                }
             });
         }
         if sync_tickets {

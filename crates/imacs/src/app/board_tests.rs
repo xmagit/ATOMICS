@@ -1,5 +1,22 @@
 use super::*;
 
+#[test]
+fn accepted_tasks_show_the_integration_count_and_action() {
+    tests::with_app("app::board_tests::accepted_tasks_show_the_integration_count_and_action", |app, ctx| {
+        app.runtime.plans[0].tasks = vec![Task {
+            id: "a".into(),
+            title: "Accepted work".into(),
+            status: TaskStatus::Done,
+            branch: Some("feature".into()),
+            ..Default::default()
+        }];
+        let rendered = frame(app, ctx, 1400.0, 0.0, vec![]);
+        let labels: Vec<_> = rendered.text.iter().map(|text| text.galley.text()).collect();
+        assert!(labels.contains(&"1 accepted tasks not integrated yet"), "{labels:?}");
+        assert!(labels.contains(&"Integrate"));
+    });
+}
+
 struct BoardFrame {
     text: Vec<egui::epaint::TextShape>,
     cards: Vec<Rect>,

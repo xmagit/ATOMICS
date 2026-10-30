@@ -242,6 +242,19 @@ impl TaskStatus {
 pub const REVIEW_TASK: &str = "review";
 
 impl Plan {
+    /// Accepted tasks whose commits still need an explicit integration decision.
+    pub fn pending_integrations(&self) -> Vec<&Task> {
+        let into = self.integration_branch();
+        self.tasks
+            .iter()
+            .filter(|task| {
+                task.id != REVIEW_TASK
+                    && task.status == TaskStatus::Done
+                    && task.branch.is_some()
+                    && !(task.integrated.as_deref() == Some(&into) && task.integration_verified)
+            })
+            .collect()
+    }
     fn stage_sequence(&self) -> u64 {
         self.stages
             .iter()
