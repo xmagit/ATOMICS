@@ -24,6 +24,7 @@ pub(super) fn session(id: &str, kind: AgentKind, status: AgentStatus, cwd: &Path
         chief: false,
         pending: None,
         sandbox: None,
+        relay: None,
         screen_busy: false,
         busy_absent_since: None,
         ref_guard: None,
@@ -78,6 +79,11 @@ pub(super) fn with_state(name: &str, test: impl FnOnce(State, &egui::Context)) {
         Options { migration_errors: vec!["Migration failed".into()], ..Options::default() },
         &crate::load_icon(),
     );
+    // Tests never read this machine's keychain: a sandboxed Claude has no subscription unless a test gives it one.
+    app.relay = Arc::new(crate::relay::Service::new(
+        paths::imacs_home(),
+        crate::relay::Keychain::at(Path::new("/nonexistent/keychain"), cfg!(target_os = "macos")),
+    ));
     // Most tests start from an idle fixture. Tests of asynchronous startup start their
     // own gated sweep after this initial completion, rather than racing fixture setup.
     if let Some(job) = app.startup_cleanup.take() {

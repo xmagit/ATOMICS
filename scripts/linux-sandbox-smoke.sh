@@ -19,6 +19,8 @@ parser.add_argument("--imacs", default="imacs", help="installed or already built
 parser.add_argument("--fake-sbx", action="store_true", help="exercise lifecycle with the test fixture, without KVM")
 parser.add_argument("--timeout", type=float, default=900, help="sandbox startup deadline in seconds")
 parser.add_argument("--latency-ms", type=float, default=1000, help="maximum ctl round trip in milliseconds")
+parser.add_argument("--skip-relay", action="store_true",
+                    help="skip sandboxed Claude through the credential relay (needs `imacs setup`'s Claude token)")
 args = parser.parse_args(sys.argv[2:])
 if sys.platform != "linux":
     parser.error("run this script on the Linux desktop (or in the Linux QA container)")
@@ -276,6 +278,15 @@ agent_nice = 0
         raise RuntimeError("network policy missing; run imacs setup first (smoke never changes global policy)")
     print(run([imacs, "doctor"], timeout=180), end="", flush=True)
     print("PASS doctor completed (review its host/setup warnings above)")
+    if args.fake_sbx or args.skip_relay:
+        print("SKIP credential relay: " + ("the fake sbx has no VM or Claude" if args.fake_sbx else "--skip-relay"))
+    else:
+        # One throwaway Claude sandbox on the subscription in the keyring; it removes itself. Its
+        # output is PASS/FAIL lines without values, so it is shown even on failure.
+        output = run([imacs, "sandbox", "relay-check"], timeout=args.timeout, check=False)
+        print(output, end="", flush=True)
+        if "PASS relay check" not in output:
+            raise RuntimeError("sandboxed Claude did not answer through the credential relay (see above)")
     run(["git", "-C", str(repo), "init", "-q", "-b", "main"])
     run(["git", "-C", str(repo), "-c", "user.name=IMACS smoke", "-c", "user.email=smoke@example.invalid",
          "commit", "--allow-empty", "-qm", "Isolated sandbox smoke repository"])

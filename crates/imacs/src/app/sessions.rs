@@ -38,6 +38,7 @@ impl Session {
             chief,
             pending: None,
             sandbox: None,
+            relay: None,
             screen_busy: false,
             busy_absent_since: None,
             ref_guard: None,
@@ -127,8 +128,18 @@ impl State {
         let runtime = job.as_ref().map_or(AgentRuntime::Bare, |job| AgentRuntime::Sandbox(job.sandboxed()));
         // Codex's hooks call IMACS on this machine, which a sandboxed Codex cannot reach.
         let codex = agent.is_codex() && job.is_none();
-        let launch =
-            AgentLaunch { id: id.clone(), agent, cwd, resume, extra_args, prompt, chief, runtime, ref_guard: None };
+        let launch = AgentLaunch {
+            id: id.clone(),
+            agent,
+            cwd,
+            resume,
+            extra_args,
+            prompt,
+            chief,
+            runtime,
+            ref_guard: None,
+            relay: None,
+        };
         if let Some(job) = job {
             self.sessions.push(Session::starting(id.clone(), &launch.agent, launch.cwd.clone(), chief, &self.wake));
             let (tx, rx) = self.wake.channel();
@@ -137,7 +148,15 @@ impl State {
             std::thread::spawn(move || {
                 let ready = crate::sandbox::prepare(&job)
                     .map_err(|err| format!("Could not start the sandbox: {err:#}"))
-                    .and_then(|()| crate::ref_guard::open_and_check(&checks, &job.cwd, snapshot, exempt));
+                    .and_then(|granted| {
+                        let opened = crate::ref_guard::open_and_check(&checks, &job.cwd, snapshot, exempt);
+                        if opened.is_err()
+                            && let (Some(relay), Some(granted)) = (&job.relay, &granted)
+                        {
+                            relay.revoke(granted);
+                        }
+                        opened.map(|opened| (opened, granted))
+                    });
                 let _ = tx.send(ready);
             });
             self.pending_sandbox.push((launch, rx));
@@ -218,6 +237,7 @@ impl State {
             // Claude takes any prompt as an argument; other agents may get a brief file.
             briefs,
             pins: paths::git_pins_dir(),
+            relay: (agent.kind == AgentKind::Claude).then(|| self.relay.clone()),
         }))
     }
 
@@ -298,7 +318,7 @@ impl State {
         launch: AgentLaunch,
         codex: Option<bool>,
     ) -> Result<String, String> {
-        let AgentLaunch { id, agent, cwd, resume, extra_args, prompt, chief, runtime, ref_guard } = launch;
+        let AgentLaunch { id, agent, cwd, resume, extra_args, prompt, chief, runtime, ref_guard, relay } = launch;
         let sandboxed = match runtime {
             AgentRuntime::Sandbox(sandboxed) => Some(sandboxed),
             AgentRuntime::Bare => None,
@@ -432,7 +452,10 @@ impl State {
             args.push(match sandboxed {
                 None => imacs_core::hook::session_settings(Path::new(&exe), Path::new(&socket), &id, false).to_string(),
                 // Its status line only saves the account's limits in the VM, for IMACS to read back.
-                Some(_) => isolation::claude_settings().to_string(),
+                Some(_) => match &relay {
+                    Some(relay) => isolation::claude_relay_settings(relay.port, &relay.placeholder).to_string(),
+                    None => isolation::claude_settings().to_string(),
+                },
             });
             let session_id = match resume {
                 Some(id) => {
@@ -499,6 +522,7 @@ impl State {
                 self.sessions[index].claude_id = claude_id;
                 self.sessions[index].sandbox = sandboxed.map(|sandboxed| sandboxed.name);
                 self.sessions[index].ref_guard = ref_guard;
+                self.sessions[index].relay = relay;
                 if chief {
                     self.hub.lock().unwrap().chief_running = true;
                 }
@@ -677,6 +701,9 @@ impl State {
     pub(super) fn close(&mut self, id: &str) {
         self.pending_questions.remove(id);
         if let Some(i) = self.sessions.iter().position(|s| s.id == id) {
+            if let Some(granted) = self.sessions[i].relay.take() {
+                self.relay.revoke(&granted);
+            }
             // Accept legitimate concurrent task commits before releasing this branch's ownership.
             let exempt = self.exempt_branches();
             let guard = self.sessions[i].ref_guard.take();

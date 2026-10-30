@@ -70,6 +70,9 @@ impl State {
             changed = true;
             if !self.sessions.iter().any(|s| s.id == launch.id) {
                 // Closed while its sandbox was made: leave the sandbox stopped for reuse or cleanup.
+                if let Ok((_, Some(granted))) = &result {
+                    self.relay.revoke(granted);
+                }
                 if let (Ok(_), AgentRuntime::Sandbox(sandboxed)) = (&result, &launch.runtime) {
                     self.stop_sandbox(sandboxed.name.clone());
                 }
@@ -80,12 +83,19 @@ impl State {
                 AgentRuntime::Sandbox(sandbox) => Some(sandbox.name.clone()),
                 AgentRuntime::Bare => None,
             };
-            let launched = result.and_then(|guard| {
+            let launched = result.and_then(|(guard, granted)| {
                 let (guard, alerts) = guard.unzip();
                 if let Some(alerts) = alerts.filter(|alerts| !alerts.is_empty()) {
                     self.ref_alert(&id, alerts.join("\n"));
                 }
-                self.launch_agent(ctx, AgentLaunch { ref_guard: guard, ..launch }, None)
+                let relay = granted.clone();
+                let launched = self.launch_agent(ctx, AgentLaunch { ref_guard: guard, relay, ..launch }, None);
+                if launched.is_err()
+                    && let Some(granted) = granted
+                {
+                    self.relay.revoke(&granted);
+                }
+                launched
             });
             if let Err(error) = launched {
                 if let Some(name) = name {
@@ -202,6 +212,9 @@ impl State {
                 // A sandbox stops once its agent exits; the next `sbx run` starts it again.
                 if session.status != AgentStatus::Exited {
                     idle.extend(session.sandbox.clone());
+                }
+                if let Some(granted) = session.relay.take() {
+                    self.relay.revoke(&granted);
                 }
                 session.status = AgentStatus::Exited;
             }
@@ -528,6 +541,7 @@ impl State {
                     chief: false,
                     pending: None,
                     sandbox: None,
+                    relay: None,
                     screen_busy: false,
                     busy_absent_since: None,
                     ref_guard: None,

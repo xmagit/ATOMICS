@@ -1034,8 +1034,6 @@ mod tests {
                 }];
                 app.runtime.selected_plan = 0;
                 app.runtime.config.isolation.mode = imacs_core::isolation::IsolationMode::Sandbox;
-                // The default claude agent is bare; this test sandboxes it.
-                app.runtime.config.agents.iter_mut().for_each(|agent| agent.isolation = None);
                 app.runtime.dispatch(0, Some(plan::REVIEW_TASK)).unwrap();
                 let (branch, worktree, launch, _) =
                     app.runtime.worktree_rx.recv_timeout(Duration::from_secs(5)).unwrap();

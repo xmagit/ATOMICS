@@ -1,4 +1,5 @@
-//! Guided, resumable host setup. Child output is private, and credentials travel over stdin.
+//! Guided, resumable host setup. Child output is private, and credentials travel over stdin. The
+//! Claude subscription token goes to the OS keychain, where IMACS's credential relay reads it.
 use super::*;
 use std::io::{BufRead, IsTerminal, Write};
 
@@ -45,7 +46,8 @@ pub fn run(workspace: Option<&str>) -> Result<()> {
         }
         retry(&mut input, &mut output)?;
     };
-    guided(&program, claude, &config, &mut input, &mut output, stdin.is_terminal())?;
+    let keychain = crate::relay::Keychain::current();
+    guided(&program, claude, &keychain, &config, &mut input, &mut output, stdin.is_terminal())?;
     writeln!(output, "Sandbox setup complete. Running imacs doctor (includes optional host/workspace diagnostics):")?;
     crate::doctor::run(workspace);
     Ok(())
@@ -72,10 +74,12 @@ fn consent(input: &mut impl BufRead, output: &mut impl Write, message: &str) -> 
     Ok(())
 }
 
-/// `claude` says whether Claude agents run sandboxed, and so need sbx's anthropic secret.
+/// `claude` says whether Claude agents run sandboxed, and so need the Claude subscription in
+/// `keychain` or an API key in sbx's anthropic secret.
 fn guided(
     program: &str,
     claude: bool,
+    keychain: &crate::relay::Keychain,
     config: &SandboxConfig,
     input: &mut impl BufRead,
     output: &mut impl Write,
@@ -107,26 +111,28 @@ fn guided(
     }
     let secrets =
         checks::secrets(program).ok_or_else(|| anyhow::anyhow!("cannot check known secret services; retry setup"))?;
-    // A Claude subscription cannot authenticate in a local sandbox: sbx v0.50.1 strips a custom
-    // OAuth route, and sends its anthropic secret as an API key (docs/isolation.md).
+    // sbx cannot pass a Claude subscription to a local sandbox; IMACS's relay does, reading it from
+    // the OS keychain (docs/isolation.md). An API key still goes to sbx's anthropic secret.
     if !claude {
         writeln!(
             output,
-            "Claude agents run bare by default; to sandbox Claude, store an Anthropic API key in sbx's built-in anthropic secret (stdin)."
+            "Claude agents run bare; sandboxed, they use your Claude subscription through IMACS's relay."
         )?;
-    } else if !secrets.anthropic {
+    } else if keychain.claude_token().is_none() && !secrets.anthropic {
         consent(
             input,
             output,
-            "Claude agents run sandboxed: store an Anthropic API key in sbx's anthropic secret? The key is sent over stdin.",
+            "Claude agents run sandboxed: keep your Claude subscription token in the OS keychain for IMACS's credential relay?",
         )?;
-        let mut token = credential(input, output, "Anthropic API key: ", terminal)?;
+        writeln!(
+            output,
+            "Run `claude setup-token` in a trusted host terminal and paste the token below; an Anthropic API key goes to sbx's anthropic secret instead. Input is hidden on a terminal."
+        )?;
+        let mut token = credential(input, output, "Claude setup-token or Anthropic API key: ", terminal)?;
         let result = if token.is_empty() {
-            Err(anyhow::anyhow!("Anthropic API key is empty; rerun setup to resume"))
+            Err(anyhow::anyhow!("the token is empty; rerun setup to resume"))
         } else if token.starts_with("sk-ant-oat") {
-            Err(anyhow::anyhow!(
-                "that is a Claude subscription token, which local sandboxes cannot use; enter an API key"
-            ))
+            store_subscription(keychain, &token)
         } else {
             private_command(program, &["secret", "set", "anthropic"], &format!("{token}\n"))
         };
@@ -181,9 +187,13 @@ fn guided(
             safe_sbx(program, &secret.remove_args(), "could not remove a misfiled secret; retry setup")?;
         }
     }
+    let route = match claude {
+        true => checks::ClaudeRoute::Sandboxed { subscription: keychain.claude_token().is_some() },
+        false => checks::ClaudeRoute::Bare,
+    };
     // Read the store again through doctor's lines: setup is not done with a secret doctor reports missing.
     if let Some(failed) =
-        checks::secret_lines(checks::secrets(program).as_ref(), claude).iter().find(|line| line.starts_with('✗'))
+        checks::secret_lines(checks::secrets(program).as_ref(), route).iter().find(|line| line.starts_with('✗'))
     {
         bail!("sbx does not list what setup stored: {failed}. Rerun `imacs setup`")
     }
@@ -201,12 +211,28 @@ fn guided(
         )?;
         safe_sbx(program, &["settings", "unset", "ssh.agentSocketPath"], "could not clear SSH socket; retry setup")?;
     }
-    let lines = checks::sandbox_lines(program, config, claude);
+    let lines = checks::sandbox_lines(program, config, route);
     for line in &lines {
         writeln!(output, "{line}")?;
     }
     if lines.iter().any(|line| line.starts_with('✗')) {
         bail!("sandbox checks still need attention; follow the hints and rerun `imacs setup`")
+    }
+    Ok(())
+}
+
+/// Keeps the Claude subscription token in the OS keychain, where IMACS's relay reads it.
+fn store_subscription(keychain: &crate::relay::Keychain, token: &str) -> Result<()> {
+    if !crate::relay::valid_claude_token(token) {
+        bail!(
+            "expected a sk-ant-oat01- token of letters, digits, hyphens and underscores, as `claude setup-token` prints it"
+        )
+    }
+    let (program, args, input) = keychain.store_command(token);
+    private_command(program, &args, &input)
+        .map_err(|_| anyhow::anyhow!("the OS keychain did not store the token; unlock it and retry `imacs setup`"))?;
+    if keychain.claude_token().is_none() {
+        bail!("the OS keychain entry could not be read back; unlock the keychain and retry `imacs setup`")
     }
     Ok(())
 }
@@ -308,10 +334,17 @@ mod tests {
     const SUBSCRIPTION: &str = "sk-ant-oat01-PRIVATE-fixture";
     const OPENAI: &str = "sk-PRIVATE-openai-fixture";
 
+    /// A fake sbx, with a fake keychain beside it whose entry is `keychain-value`.
     fn machine() -> (crate::test_support::TempDir, String) {
         let dir = crate::test_support::tempdir().unwrap();
         let sbx = fake::install(dir.path()).to_string_lossy().into_owned();
+        let keychain = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keychain");
+        std::fs::copy(keychain, dir.path().join("keychain")).unwrap();
         (dir, sbx)
+    }
+
+    fn keychain(sbx: &str, mac: bool) -> crate::relay::Keychain {
+        crate::relay::Keychain::at(&Path::new(sbx).with_file_name("keychain"), mac)
     }
 
     fn touch(dir: &Path, markers: &[&str]) {
@@ -320,11 +353,16 @@ mod tests {
         }
     }
 
-    /// Guided setup with Claude agents sandboxed or bare (the default), and Linear or not.
+    /// Guided setup with Claude agents sandboxed or bare, and Linear or not.
     fn run_setup(sbx: &str, claude: bool, linear: bool, answers: &str) -> (Result<()>, String) {
+        setup_on(sbx, cfg!(target_os = "macos"), claude, linear, answers)
+    }
+
+    /// [`run_setup`] with macOS's keychain or Linux's.
+    fn setup_on(sbx: &str, mac: bool, claude: bool, linear: bool, answers: &str) -> (Result<()>, String) {
         let config = SandboxConfig { mcp: if linear { vec!["linear".into()] } else { vec![] }, ..Default::default() };
         let mut output = Vec::new();
-        let result = guided(sbx, claude, &config, &mut answers.as_bytes(), &mut output, false);
+        let result = guided(sbx, claude, &keychain(sbx, mac), &config, &mut answers.as_bytes(), &mut output, false);
         let output = String::from_utf8(output).unwrap();
         for private in [API_KEY, SUBSCRIPTION, OPENAI, "MISFILED-private", "SCOPED-private"] {
             assert!(!output.contains(private));
@@ -348,8 +386,9 @@ mod tests {
             output.lines().filter(|l| l.starts_with('✓') || l.starts_with('✗')).all(|l| l.starts_with('✓')),
             "{output}"
         );
-        assert!(output.contains("Claude agents run bare by default; to sandbox Claude, store an Anthropic API key"));
-        assert!(output.lines().any(|l| l.starts_with("sandboxed Claude: not configured")), "{output}");
+        assert!(output.contains("Claude agents run bare; sandboxed, they use your Claude subscription"), "{output}");
+        assert!(output.lines().any(|l| l.starts_with("sandboxed Claude: off")), "{output}");
+        assert!(!dir.path().join("keychain-argv").exists(), "bare Claude needs no keychain");
         assert!(output.contains("Remove 2 misfiled secrets in scope anthropic, global from sbx?"), "{output}");
         let calls = fake::calls(dir.path());
         assert!(fake::calls_to(dir.path(), &["secret", "set-custom"]).is_empty());
@@ -379,20 +418,38 @@ mod tests {
     }
 
     #[test]
-    fn sandboxed_claude_stores_an_api_key_over_stdin_and_refuses_a_subscription_token() {
+    fn sandboxed_claude_keeps_a_subscription_token_in_the_keychain_or_an_api_key_in_sbx() {
+        for mac in [true, false] {
+            let (dir, sbx) = machine();
+            touch(dir.path(), &["removed-anthropic"]);
+            for refused in ["n\n", "y\n\n", "y\nsk-ant-oat01-not valid\n"] {
+                let error = setup_on(&sbx, mac, true, false, refused).0.unwrap_err().to_string();
+                assert!(!dir.path().join("keychain-value").exists(), "{refused:?}: {error}");
+                assert!(fake::calls_to(dir.path(), &["secret", "set"]).is_empty(), "{refused:?}: {error}");
+            }
+            let (result, output) = setup_on(&sbx, mac, true, false, &format!("y\n{SUBSCRIPTION}\n"));
+            result.unwrap();
+            assert!(output.contains("Run `claude setup-token` in a trusted host terminal"), "{output}");
+            assert_eq!(keychain(&sbx, mac).claude_token().as_deref(), Some(SUBSCRIPTION));
+            assert!(fake::calls_to(dir.path(), &["secret"]).iter().all(|call| call[1] == "ls"), "sbx gets no token");
+            let argv = std::fs::read_to_string(dir.path().join("keychain-argv")).unwrap();
+            assert!(!argv.contains(SUBSCRIPTION), "the token never is an argument: {argv}");
+            assert!(
+                output.contains("✓ sandbox Claude credential: Claude subscription through IMACS's relay"),
+                "{output}"
+            );
+            // Stored once, a rerun asks nothing.
+            setup_on(&sbx, mac, true, false, "").0.unwrap();
+        }
+        // An API key goes to sbx's anthropic secret, as before the relay.
         let (dir, sbx) = machine();
         touch(dir.path(), &["removed-anthropic"]);
-        for refused in ["n\n", "y\n\n", &format!("y\n{SUBSCRIPTION}\n")] {
-            let error = run_setup(&sbx, true, false, refused).0.unwrap_err().to_string();
-            assert!(fake::calls_to(dir.path(), &["secret", "set"]).is_empty(), "{refused:?}: {error}");
-        }
-        let error = run_setup(&sbx, true, false, &format!("y\n{SUBSCRIPTION}\n")).0.unwrap_err().to_string();
-        assert!(error.contains("subscription token, which local sandboxes cannot use"), "{error}");
         let (result, output) = run_setup(&sbx, true, false, &format!("y\n{API_KEY}\n"));
         result.unwrap();
         assert_eq!(fake::calls_to(dir.path(), &["secret", "set"]), [["secret", "set", "anthropic"]]);
         assert_eq!(std::fs::read_to_string(dir.path().join("secret-stdin")).unwrap().trim(), API_KEY);
-        assert!(output.contains("✓ sandbox Claude secret: anthropic API key"), "{output}");
+        assert!(output.contains("✓ sandbox Claude credential: anthropic API key"), "{output}");
+        assert!(!dir.path().join("keychain-value").exists());
         assert!(fake::calls_to(dir.path(), &["secret", "set-custom"]).is_empty());
     }
 
@@ -410,7 +467,7 @@ mod tests {
             }
             let (dir, sbx) = machine();
             let mut output = Vec::new();
-            guided(&sbx, false, &config, &mut "y\ny\n".as_bytes(), &mut output, false).unwrap();
+            guided(&sbx, false, &keychain(&sbx, false), &config, &mut "y\ny\n".as_bytes(), &mut output, false).unwrap();
             println!(
                 "linear calls={:?}",
                 fake::calls_to(dir.path(), &["mcp"])
@@ -477,7 +534,12 @@ mod tests {
         // A stored key sbx does not list stops setup with doctor's own line, before later steps.
         for (claude, markers, answers, line) in [
             (false, ["no-openai", "skip-secret-write"], format!("y\n{OPENAI}\n"), "✗ sandbox OpenAI secret: openai"),
-            (true, ["removed-anthropic", "skip-secret-write"], format!("y\n{API_KEY}\n"), "✗ sandbox Claude secret"),
+            (
+                true,
+                ["removed-anthropic", "skip-secret-write"],
+                format!("y\n{API_KEY}\n"),
+                "✗ sandbox Claude credential",
+            ),
         ] {
             let (dir, sbx) = machine();
             touch(dir.path(), &markers);
