@@ -362,7 +362,7 @@ Restart agents after changing these settings. With `query_read_exception = true`
 `POST /v1/apps/<application-UUID>/query` on `api.applicationinsights.io` is also a read. It grants
 no management POSTs, batch operations, ingestion, other methods or query subpaths.
 
-Agents can run KQL with ordinary REST clients. Ask Max which Application Insights **application ID**
+Agents can run KQL with ordinary REST clients. Ask the user which Application Insights **application ID**
 to use and set `APP_INSIGHTS_APP_ID` to that UUID. A GET works with the default capabilities:
 
 ```sh
@@ -392,7 +392,7 @@ Do not use `az login` or copy `~/.azure` inside a VM. Supporting Azure CLI *insi
 a placeholder token cache is deferred to a separate follow-up with its own opt-in flag; it is not
 implemented here.
 
-After Max selects an application UUID, the fixed read-only end-to-end check is:
+After the user selects an application UUID, the fixed read-only end-to-end check is:
 
 ```sh
 imacs queue --class qa -- imacs sandbox azure-check <application-UUID>
