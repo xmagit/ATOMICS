@@ -387,6 +387,24 @@ impl RefGuard {
         let host = HostLeft::read(&self.common, own.as_deref(), self.checked.unwrap_or(started).saturating_sub(1));
         let session = self.file.file_stem().map_or_else(|| "unknown".into(), |stem| stem.to_string_lossy());
         let names: BTreeSet<_> = self.refs.keys().chain(current.keys()).cloned().collect();
+        // A push updates a tracking ref without FETCH_HEAD. Only already accepted local
+        // tips vouch for that move; a newly injected branch must not launder it.
+        let local_tips: BTreeSet<_> = current
+            .iter()
+            .filter_map(|(name, value)| {
+                (name.starts_with("refs/heads/")
+                    && (self.refs.get(name) == Some(value)
+                        || self.branch.as_ref() == Some(name)
+                        || concurrent.iter().any(|pattern| covers(pattern, name))
+                        || written.left(name, Some(value))
+                        || host.left(name, self.refs.get(name), Some(value))))
+                .then_some(value)
+                .and_then(|value| match value {
+                    RefValue::Object(object) => Some(object.clone()),
+                    _ => None,
+                })
+            })
+            .collect();
         let mut alerts = Vec::new();
         for name in names {
             let (before, after) = (self.refs.get(&name), current.get(&name));
@@ -394,7 +412,9 @@ impl RefGuard {
                 || concurrent.iter().any(|pattern| covers(pattern, &name))
                 || UNGUARDED.iter().any(|pattern| covers(pattern, &name))
                 || written.left(&name, after)
-                || host.left(&name, before, after);
+                || host.left(&name, before, after)
+                || name.starts_with("refs/remotes/")
+                    && matches!(after, Some(RefValue::Object(object)) if local_tips.contains(object));
             if accepted {
                 match after {
                     Some(value) => {
@@ -670,6 +690,27 @@ fn update_refs(cwd: &Path, operations: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_user_push_keeps_tracking_refs_only_at_accepted_local_tips() {
+        let (dir, repo, worktree) = repository();
+        let remote = dir.path().join("remote.git");
+        git::git(&repo, &["init", "--bare", remote.to_str().unwrap()]).unwrap();
+        git::git(&repo, &["remote", "add", "origin", remote.to_str().unwrap()]).unwrap();
+        git::git(&repo, &["push", "origin", "main"]).unwrap();
+        let mut guard = RefGuard::open(&worktree, dir.path().join("snapshot.json")).unwrap().unwrap();
+        git::git(&repo, &["commit", "--allow-empty", "-qm", "user work"]).unwrap();
+        let accepted = git::git(&repo, &["rev-parse", "HEAD"]).unwrap();
+        git::git(&repo, &["push", "origin", "main"]).unwrap();
+        // An unaccepted local branch cannot launder a tracking-ref move.
+        let injected = git::git(&worktree, &["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "agent work"]).unwrap();
+        git::git(&worktree, &["update-ref", "refs/heads/forged", injected.trim()]).unwrap();
+        git::git(&worktree, &["update-ref", "refs/remotes/origin/forged", injected.trim()]).unwrap();
+        let alerts = guard.check(&Default::default(), &Default::default()).unwrap();
+        assert!(!alerts.iter().any(|a| a.contains("refs/remotes/origin/main")), "{alerts:?}");
+        assert!(alerts.iter().any(|a| a.contains("Restored refs/remotes/origin/forged")), "{alerts:?}");
+        assert_eq!(git::git(&repo, &["rev-parse", "origin/main"]).unwrap(), accepted);
+    }
 
     #[test]
     fn shared_head_log_cannot_reattribute_other_branches_or_vouch_for_future_moves() {
