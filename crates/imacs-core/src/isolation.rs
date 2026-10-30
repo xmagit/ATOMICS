@@ -183,6 +183,8 @@ pub struct Spec {
     pub agent: &'static str,
     pub workspace: PathBuf,
     pub git: Vec<String>,
+    /// Explicit writable cache mounts on Linux; macOS build artifacts cannot be reused in the VM.
+    pub warm: Vec<PathBuf>,
     pub read_only: Vec<PathBuf>,
     pub memory: Option<String>,
     pub cpus: Option<u32>,
@@ -201,9 +203,13 @@ pub fn create_args(spec: &Spec) -> Vec<String> {
     if let Some(template) = spec.template.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
         args.extend(["--template".into(), template.into()]);
     }
+    if let Some(target) = spec.warm.iter().find(|path| **path == spec.workspace.join("target")) {
+        args.extend(["--env".into(), format!("CARGO_TARGET_DIR={}", target.display())]);
+    }
     args.push(spec.agent.into());
     args.push(spec.workspace.to_string_lossy().into_owned());
     args.extend(spec.git.iter().cloned());
+    args.extend(spec.warm.iter().map(|path| path.to_string_lossy().into_owned()));
     args.extend(spec.read_only.iter().map(|path| format!("{}:ro", path.display())));
     args
 }
@@ -540,6 +546,7 @@ command = ["codex"]
             agent: "claude",
             workspace: "/repos/app".into(),
             git: Vec::new(),
+            warm: Vec::new(),
             read_only: Vec::new(),
             memory: sbx_decides.memory,
             cpus: sbx_decides.cpus,
@@ -554,12 +561,14 @@ command = ["codex"]
         let mut base = IsolationConfig::default();
         base.sandbox.memory = Some("4g".into());
         base.sandbox.mounts = vec!["~/docs".into()];
-        let table = toml::from_str("mode = 'bare'\n[sandbox]\ncpus = 2\nmounts = []").unwrap();
+        let table =
+            toml::from_str("mode = 'bare'\n[sandbox]\ncpus = 2\nmounts = []\ntemplate = 'workspace:local'").unwrap();
         let merged = base.with_overrides(&IsolationOverrides(table)).unwrap();
         assert_eq!(merged.mode, IsolationMode::Bare);
         assert_eq!(merged.sandbox.memory.as_deref(), Some("4g"));
         assert_eq!(merged.sandbox.cpus, Some(2));
         assert!(merged.sandbox.mounts.is_empty());
+        assert_eq!(merged.sandbox.template.as_deref(), Some("workspace:local"));
         assert!(base.with_overrides(&IsolationOverrides(toml::from_str("mode = 'open'").unwrap())).is_err());
     }
 
@@ -593,6 +602,7 @@ command = ["codex"]
             agent: "codex",
             workspace: "/repos/app-feature".into(),
             git: vec!["/repos/app/.git/objects".into(), "/repos/app/.git/worktrees/app-feature".into()],
+            warm: Vec::new(),
             read_only: vec!["/home/me/docs".into()],
             memory: None,
             cpus: None,

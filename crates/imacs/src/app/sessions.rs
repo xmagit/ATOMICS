@@ -203,6 +203,7 @@ impl State {
             name,
             agent: sbx_agent,
             cwd: cwd.to_path_buf(),
+            warm: config.worktrees.warm.clone(),
             config: config.isolation.sandbox.with_defaults(&config.resources, self.governor.cores),
             exe,
             socket: paths::socket_path(),
