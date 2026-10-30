@@ -53,6 +53,7 @@ mod projects;
 mod ref_guard;
 mod repo_workflow;
 mod restart;
+mod sandbox_settings;
 mod selfconfig;
 mod sessions;
 mod sidebar;
@@ -384,6 +385,8 @@ pub(crate) struct State {
     /// The `sbx` program sandboxed agents run with.
     sbx: String,
     sandbox_usage: crate::sandbox_usage::Sampler,
+    sandbox_check: Option<Receiver<Vec<String>>>,
+    sandbox_lines: Vec<String>,
     /// Sandboxed launches waiting for their sandbox.
     pending_sandbox: Vec<(AgentLaunch, Receiver<Result<(), String>>)>,
     active: Option<String>,
@@ -783,6 +786,8 @@ impl State {
             pending_codex: Vec::new(),
             // Tests never reach the sbx installed on the machine running them.
             sbx: if cfg!(test) { "/nonexistent/imacs-test-sbx" } else { "sbx" }.into(),
+            sandbox_check: None,
+            sandbox_lines: Vec::new(),
             pending_sandbox: Vec::new(),
             sandbox_usage: Default::default(),
             active: None,

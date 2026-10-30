@@ -58,6 +58,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Guide fresh-machine sandbox setup (safe to run again)
+    Setup,
+    /// Configure Docker Sandboxes credentials
+    Sandbox {
+        #[command(subcommand)]
+        command: SandboxCommand,
+    },
     /// Check required tools, configuration and integrations
     Doctor,
     /// Hook handler for Claude Code and Codex (reads the event on stdin)
@@ -104,6 +111,12 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum SandboxCommand {
+    /// Set up Claude subscription OAuth using the OS keychain (no token arguments)
+    Setup,
+}
+
 /// Markers of the Claude Code or Codex session IMACS may have been started from. Agents
 /// that inherit them believe they are sub-processes (Claude then stops saving
 /// transcripts, so sessions cannot be resumed).
@@ -143,6 +156,13 @@ fn main() -> eframe::Result {
         migration_errors = migration.errors;
     }
     match cli.command {
+        Some(Command::Setup | Command::Sandbox { command: SandboxCommand::Setup }) => {
+            if let Err(err) = sandbox::setup::run(cli.workspace.as_deref()) {
+                eprintln!("Sandbox setup failed: {err}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
         Some(Command::Doctor) => std::process::exit(doctor::run(cli.workspace.as_deref())),
         Some(Command::Hook { socket, pane }) => {
             hook_client::run(socket, pane);
