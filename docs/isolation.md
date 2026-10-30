@@ -266,6 +266,12 @@ definition sbx does not have yet, **not connected**.
   one). A server you connect while agents run is loaded into their sandboxes at once; their agents see
   its tools without a restart. Loading never stops an agent: a server that is missing or waiting for
   sign-in becomes a banner on its tile instead.
+- **Aliases share tools.** sbx rejects duplicate tool names, so IMACS loads a remote URL only once per
+  sandbox. If two connected registrations have the exact same URL, Connections says so and the server
+  already loaded keeps serving that sandbox, including after reattachment. Disconnecting it lets a
+  remaining connected alias take over. Different paths or query strings remain separate endpoints;
+  different services exposing the same tool names can still conflict, and a failed load keeps a
+  **Connect** banner for retrying. sbx's gateway exposes tool names, not registration-name namespaces.
 - **Connect** is one click. For a remote server IMACS runs `sbx mcp add <name> --url <url> --skip-auth`,
   then `sbx mcp auth <name>` with `SBX_NO_BROWSER_OPEN=1`, and opens the authorization page sbx prints
   with `open` on macOS or `xdg-open` on Linux. Finish signing in there; IMACS waits up to ten minutes.

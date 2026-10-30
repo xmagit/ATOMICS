@@ -238,7 +238,8 @@ impl State {
                         opened.map(|opened| {
                             // Every connected server, on a new or reattached sandbox; it never stops the agent.
                             let (sbx, mcp) = (&job.sbx, &job.config.mcp);
-                            let needed = crate::connections::load_into(sbx, &job.name, mcp, job.config.ssh_agent);
+                            let needed =
+                                crate::connections::load_into(&job.home, sbx, &job.name, mcp, job.config.ssh_agent);
                             (opened, granted, needed)
                         })
                     });

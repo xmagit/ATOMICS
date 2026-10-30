@@ -23,6 +23,7 @@ use serde_json::Value;
 
 use crate::credentials::Store;
 use crate::sandbox::sbx;
+use crate::sandbox_ownership as ownership;
 
 /// sbx answers within a second; this bounds a stuck daemon.
 const TIMEOUT: Duration = Duration::from_secs(60);
@@ -198,6 +199,14 @@ pub struct Registered {
     pub status: Status,
     /// `remote http`, `local stdio` and the like.
     pub transport: String,
+    /// Exact remote endpoint, used only to identify aliases, never displayed without redaction.
+    pub url: Option<String>,
+}
+
+impl Registered {
+    pub fn same_url(&self, other: &Self) -> bool {
+        self.url.is_some() && self.url == other.url
+    }
 }
 
 /// The servers registered with sbx, without IMACS's per-sandbox ones.
@@ -225,6 +234,14 @@ pub fn registered(program: &str) -> Result<Vec<Registered>> {
                 name: name.to_string(),
                 status,
                 transport: word(&server["transport"]).unwrap_or_default(),
+                // sbx's list omits the endpoint. Inspect only remote registrations; ignore
+                // every other field (including header and OAuth settings).
+                url: server["transport"].as_str().filter(|kind| kind.starts_with("remote ")).and_then(|_| {
+                    sbx(program, &["mcp", "inspect", name, "--json"], false, TIMEOUT)
+                        .ok()
+                        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                        .and_then(|details| details["url"].as_str().map(str::to_string))
+                }),
             })
         })
         .collect())
@@ -361,6 +378,7 @@ fn authorize_within(program: &str, name: &str, browser: &Browser, timeout: Durat
 /// What connecting a server needs.
 #[derive(Debug, Clone)]
 pub struct Connect {
+    pub home: PathBuf,
     pub sbx: String,
     pub name: String,
     /// How to register it when sbx does not have it yet.
@@ -416,53 +434,120 @@ pub fn connect(job: &Connect, store: &Store) -> Result<Vec<String>> {
         Some(Status::Error(status)) => bail!("sbx reports {} as {status}; check `sbx mcp ls`", job.name),
         None => bail!("sbx did not register {}", job.name),
     }
-    Ok(load(&job.sbx, &job.name, &job.sandboxes))
+    let servers = registered(&job.sbx)?;
+    let server =
+        servers.iter().find(|server| server.name == job.name).context("server disappeared after connecting")?;
+    Ok(job
+        .sandboxes
+        .iter()
+        .filter(|sandbox| {
+            ownership::with_connections(&job.home, sandbox, |loaded| {
+                load_server(&job.sbx, sandbox, server, &servers, loaded, false)
+            })
+            .map_or(true, |loaded| !loaded)
+        })
+        .cloned()
+        .collect())
 }
 
-/// Loads server `name` into each of `sandboxes`, returning those it could not be loaded into.
-pub fn load(program: &str, name: &str, sandboxes: &[String]) -> Vec<String> {
-    sandboxes
-        .iter()
-        .filter(|sandbox| sbx(program, &isolation::mcp_load_args(name, sandbox), false, TIMEOUT).is_err())
-        .cloned()
-        .collect()
+/// A gateway cannot serve duplicate tool names. Keep the connection already loaded for this
+/// exact URL, even when a newly connected alias sorts before it. Different URLs stay distinct.
+fn load_server(
+    program: &str,
+    sandbox: &str,
+    server: &Registered,
+    servers: &[Registered],
+    loaded: &mut Vec<String>,
+    ssh: bool,
+) -> bool {
+    loaded.retain(|name| servers.iter().any(|known| known.name == *name));
+    if loaded.iter().any(|name| {
+        servers.iter().any(|other| {
+            other.name == *name
+                && other.name != server.name
+                && other.status == Status::Connected
+                && server.same_url(other)
+        })
+    }) {
+        return true;
+    }
+    let serving = if sbx(program, &isolation::mcp_load_args(&server.name, sandbox), ssh, TIMEOUT).is_ok() {
+        server
+    } else {
+        // A pre-upgrade sandbox (or a crash before saving the ledger) can already have an
+        // alias loaded. sbx accepts loading that name again; discover it without unloading
+        // or replacing the tools the agent is using.
+        let Some(other) = servers.iter().find(|other| {
+            other.name != server.name
+                && other.status == Status::Connected
+                && server.same_url(other)
+                && sbx(program, &isolation::mcp_load_args(&other.name, sandbox), ssh, TIMEOUT).is_ok()
+        }) else {
+            return false;
+        };
+        other
+    };
+    if !loaded.contains(&serving.name) {
+        loaded.push(serving.name.clone());
+    }
+    true
 }
 
 /// Disconnects server `name`: unloads it from `sandboxes`, removes its registration and OAuth
 /// credential from sbx and its stored environment from the OS keychain.
-pub fn disconnect(program: &str, name: &str, sandboxes: &[String], store: &Store) -> Result<()> {
+pub fn disconnect(home: &Path, program: &str, name: &str, sandboxes: &[String], store: &Store) -> Result<()> {
     anyhow::ensure!(mcp_import::valid_name(name), "not a connection name IMACS manages");
     for sandbox in sandboxes {
-        // A sandbox that never had it, or is gone, has nothing to unload.
-        let _ = sbx(program, &["mcp", "unload", name, "--sandbox", sandbox], false, TIMEOUT);
+        ownership::with_connections(home, sandbox, |loaded| {
+            // A sandbox that never had it, or is gone, has nothing to unload.
+            let _ = sbx(program, &["mcp", "unload", name, "--sandbox", sandbox], false, TIMEOUT);
+            loaded.retain(|other| other != name);
+        })?;
     }
     if registered(program)?.iter().any(|server| server.name == name) {
         sbx(program, &["mcp", "rm", "--force", name], false, TIMEOUT)
             .map_err(|error| redacted(error, &format!("removing {name} from sbx")))?;
     }
-    store.remove_mcp_env(name)
+    store.remove_mcp_env(name)?;
+    // If the removed registration served another alias's URL, let that alias take over.
+    for sandbox in sandboxes {
+        let _ = load_into(home, program, sandbox, &[], false);
+    }
+    Ok(())
 }
 
 /// Loads every connected server, and each server the configuration lists, into a session's
 /// sandbox. Returns the servers it needs that are not connected: registered but waiting for
 /// authorization, or configured but unknown to sbx. Nothing here stops the agent from starting.
-pub fn load_into(program: &str, sandbox: &str, configured: &[String], ssh_agent: bool) -> Vec<String> {
+pub fn load_into(home: &Path, program: &str, sandbox: &str, configured: &[String], ssh_agent: bool) -> Vec<String> {
     let configured: Vec<&str> = configured.iter().map(|name| name.trim()).filter(|name| !name.is_empty()).collect();
     let mut needed = Vec::new();
-    let load = |name: &str, needed: &mut Vec<String>| {
-        if sbx(program, &isolation::mcp_load_args(name, sandbox), ssh_agent, TIMEOUT).is_err() {
-            needed.push(name.to_string());
-        }
-    };
     match registered(program) {
-        Ok(servers) => {
-            for server in &servers {
-                match server.status {
-                    Status::Connected => load(&server.name, &mut needed),
-                    Status::NeedsAuth => needed.push(server.name.clone()),
-                    Status::Error(_) if configured.contains(&server.name.as_str()) => needed.push(server.name.clone()),
-                    Status::Error(_) => {}
+        Ok(mut servers) => {
+            servers.sort_by(|a, b| a.name.cmp(&b.name));
+            let loaded = ownership::with_connections(home, sandbox, |loaded| {
+                for server in &servers {
+                    match server.status {
+                        Status::Connected => {
+                            if !load_server(program, sandbox, server, &servers, loaded, ssh_agent) {
+                                needed.push(server.name.clone());
+                            }
+                        }
+                        Status::NeedsAuth => needed.push(server.name.clone()),
+                        Status::Error(_) if configured.contains(&server.name.as_str()) => {
+                            needed.push(server.name.clone())
+                        }
+                        Status::Error(_) => {}
+                    }
                 }
+            });
+            if loaded.is_err() {
+                needed.extend(
+                    servers
+                        .iter()
+                        .filter(|server| server.status == Status::Connected)
+                        .map(|server| server.name.clone()),
+                );
             }
             needed.extend(
                 configured
@@ -471,8 +556,9 @@ pub fn load_into(program: &str, sandbox: &str, configured: &[String], ssh_agent:
                     .map(|name| name.to_string()),
             );
         }
-        // Without sbx's list, try what the configuration asks for.
-        Err(_) => configured.iter().for_each(|name| load(name, &mut needed)),
+        // Without endpoint metadata, loading aliases could collide. Keep existing tools and
+        // offer to retry the configured servers when sbx's registry is available again.
+        Err(_) => needed.extend(configured.iter().map(|name| name.to_string())),
     }
     needed.sort();
     needed.dedup();
@@ -679,8 +765,10 @@ pub(crate) mod tests {
         let definitions = import(&sources).definitions;
         for sandbox in ["imacs-a", "imacs-b"] {
             sbx(&program, &["create", "--name", sandbox, "claude", "/w"], false, TIMEOUT).unwrap();
+            ownership::created(home.path(), sandbox, ownership::Resource::Sandbox).unwrap();
         }
         let job = Connect {
+            home: home.path().into(),
             sbx: program.clone(),
             name: "notion".into(),
             definition: definitions.iter().find(|d| d.name == "notion").cloned(),
@@ -707,7 +795,12 @@ pub(crate) mod tests {
         let status = registered(&program).unwrap();
         assert_eq!(
             status,
-            [Registered { name: "notion".into(), status: Status::Connected, transport: "remote http".into() }]
+            [Registered {
+                name: "notion".into(),
+                status: Status::Connected,
+                transport: "remote http".into(),
+                url: Some("https://mcp.notion.com/mcp?key=PRIVATE-query".into())
+            }]
         );
 
         // Connecting again only loads: no second registration or browser page.
@@ -715,11 +808,14 @@ pub(crate) mod tests {
         assert_eq!(fake::calls_to(bin.path(), &["mcp", "add"]).len(), 1);
         assert_eq!(super::tests::opened(bin.path()).len(), 1);
 
-        disconnect(&program, "notion", &job.sandboxes, &store).unwrap();
+        disconnect(home.path(), &program, "notion", &job.sandboxes, &store).unwrap();
         assert_eq!(fake::calls_to(bin.path(), &["mcp", "unload"]).len(), 2);
-        assert_eq!(fake::calls(bin.path()).last().unwrap(), &["mcp", "rm", "--force", "notion"]);
+        assert_eq!(fake::calls_to(bin.path(), &["mcp", "rm"]), [["mcp", "rm", "--force", "notion"]]);
         assert!(registered(&program).unwrap().is_empty());
-        assert!(disconnect(&program, "imacs-a", &[], &store).is_err(), "IMACS's own servers are not connections");
+        assert!(
+            disconnect(home.path(), &program, "imacs-a", &[], &store).is_err(),
+            "IMACS's own servers are not connections"
+        );
     }
 
     #[test]
@@ -733,6 +829,7 @@ pub(crate) mod tests {
         let fs = import(&sources).definitions.into_iter().find(|d| d.name == "fs").unwrap();
         let exe = PathBuf::from("/Apps/IMACS.app/imacs");
         let mut job = Connect {
+            home: home.path().into(),
             sbx: program.clone(),
             name: "fs".into(),
             definition: Some(fs.clone()),
@@ -750,7 +847,7 @@ pub(crate) mod tests {
             [isolation::connection_command_args("fs", &exe, "npx", &args, None, false)]
         );
         assert!(opened(bin.path()).is_empty(), "a command server needs no sign-in");
-        disconnect(&program, "fs", &[], &store).unwrap();
+        disconnect(home.path(), &program, "fs", &[], &store).unwrap();
 
         job.store_env = true;
         connect(&job, &store).unwrap();
@@ -772,7 +869,7 @@ pub(crate) mod tests {
         let env = std::fs::read_to_string(&out).unwrap();
         assert!(env.contains("FS_TOKEN=PRIVATE-fs-token") && env.contains("PATH=/login/bin:/usr/bin:/bin"), "{env}");
 
-        disconnect(&program, "fs", &[], &store).unwrap();
+        disconnect(home.path(), &program, "fs", &[], &store).unwrap();
         assert_eq!(store.mcp_env("fs").unwrap(), None, "disconnecting forgets the environment");
         let error = host_command(&store, "fs", true, &command, None).unwrap_err().to_string();
         assert!(error.contains("connect it again"), "{error}");
@@ -806,22 +903,94 @@ pub(crate) mod tests {
         let bin = crate::test_support::tempdir().unwrap();
         let program = fake::install(bin.path()).display().to_string();
         std::fs::write(bin.path().join("auth-free-sentry"), "").unwrap();
+        let home = crate::test_support::tempdir().unwrap();
+        ownership::created(home.path(), "imacs-s1", ownership::Resource::Sandbox).unwrap();
         for (name, url) in [("sentry", "https://mcp.sentry.dev/mcp"), ("slack", "https://mcp.slack.com/mcp")] {
             sbx(&program, &isolation::connection_url_args(name, url), false, TIMEOUT).unwrap();
         }
         let exe = Path::new("/imacs");
         sbx(&program, &isolation::connection_command_args("fs", exe, "npx", &[], None, false), false, TIMEOUT).unwrap();
         sbx(&program, &isolation::mcp_add_args("imacs-other", exe, Path::new("/s")), false, TIMEOUT).unwrap();
-        let needed = load_into(&program, "imacs-s1", &["notion".into(), " ".into()], false);
+        let needed = load_into(home.path(), &program, "imacs-s1", &["notion".into(), " ".into()], false);
         assert_eq!(needed, ["notion", "slack"]);
         assert_eq!(
             fake::calls_to(bin.path(), &["mcp", "load"]),
             [isolation::mcp_load_args("fs", "imacs-s1"), isolation::mcp_load_args("sentry", "imacs-s1")],
             "connected servers only, never another session's IMACS server"
         );
-        // Without sbx's list it still tries what the configuration names.
+        // Without endpoint metadata, leave the gateway alone rather than risk collisions.
         std::fs::write(bin.path().join("fail-mcp-ls"), "").unwrap();
-        assert_eq!(load_into(&program, "imacs-s1", &["notion".into(), "fs".into()], false), ["notion"]);
+        assert_eq!(
+            load_into(home.path(), &program, "imacs-s1", &["notion".into(), "fs".into()], false),
+            ["fs", "notion"]
+        );
+    }
+
+    #[test]
+    fn same_url_aliases_preserve_loaded_tools_on_connect_reattach_and_disconnect() {
+        let bin = crate::test_support::tempdir().unwrap();
+        let home = crate::test_support::tempdir().unwrap();
+        let program = fake::install(bin.path()).display().to_string();
+        let (_dir, _, store) = crate::credentials::tests::machine(cfg!(target_os = "macos"));
+        let url = "https://mcp.example.com/mcp";
+        std::fs::write(bin.path().join("auth-free-service"), "").unwrap();
+        sbx(&program, &isolation::connection_url_args("service", url), false, TIMEOUT).unwrap();
+        for sandbox in ["imacs-running", "imacs-new"] {
+            ownership::created(home.path(), sandbox, ownership::Resource::Sandbox).unwrap();
+        }
+        assert!(load_into(home.path(), &program, "imacs-running", &[], false).is_empty());
+        let job = Connect {
+            home: home.path().into(),
+            sbx: program.clone(),
+            // A new alias sorts earlier, but must not replace what is serving a running agent.
+            name: "a-alias".into(),
+            definition: added("a-alias", url),
+            store_env: false,
+            sources: sources(home.path()),
+            exe: "/imacs".into(),
+            browser: browser(bin.path()),
+            sandboxes: vec!["imacs-running".into(), "imacs-new".into()],
+        };
+        assert!(connect(&job, &store).unwrap().is_empty());
+        assert_eq!(
+            fake::calls_to(bin.path(), &["mcp", "load"]),
+            [isolation::mcp_load_args("service", "imacs-running"), isolation::mcp_load_args("a-alias", "imacs-new")]
+        );
+        // The fixture reproduces sbx's real rejection if deduplication were bypassed.
+        assert!(sbx(&program, &isolation::mcp_load_args("a-alias", "imacs-running"), false, TIMEOUT).is_err());
+        for sandbox in &job.sandboxes {
+            assert!(load_into(home.path(), &program, sandbox, &["a-alias".into(), "service".into()], false).is_empty());
+        }
+        let owned = ownership::owned(home.path()).unwrap();
+        assert_eq!(owned["imacs-running"].connections, ["service"]);
+        assert_eq!(owned["imacs-new"].connections, ["a-alias"]);
+        assert!(
+            fake::calls_to(bin.path(), &["mcp", "unload"]).is_empty(),
+            "reattaching preserves the serving connection"
+        );
+        // Older sandboxes have no loaded-connection record. Recover the name already in
+        // their gateway rather than removing its tools to impose a different alias.
+        ownership::with_connections(home.path(), "imacs-running", Vec::clear).unwrap();
+        assert!(load_into(home.path(), &program, "imacs-running", &[], false).is_empty());
+        assert_eq!(ownership::owned(home.path()).unwrap()["imacs-running"].connections, ["service"]);
+        assert!(fake::calls_to(bin.path(), &["mcp", "unload"]).is_empty());
+
+        // Disconnecting the selected connection makes the remaining alias serve its URL.
+        disconnect(home.path(), &program, "service", &job.sandboxes, &store).unwrap();
+        let owned = ownership::owned(home.path()).unwrap();
+        assert_eq!(owned["imacs-running"].connections, ["a-alias"]);
+        assert_eq!(owned["imacs-new"].connections, ["a-alias"]);
+        assert_eq!(
+            registered(&program).unwrap().iter().map(|server| server.name.as_str()).collect::<Vec<_>>(),
+            ["a-alias"]
+        );
+
+        // Different endpoints on the same host are separate services, never conflated.
+        std::fs::write(bin.path().join("auth-free-other"), "").unwrap();
+        sbx(&program, &isolation::connection_url_args("other", "https://mcp.example.com/other"), false, TIMEOUT)
+            .unwrap();
+        assert!(load_into(home.path(), &program, "imacs-running", &[], false).is_empty());
+        assert_eq!(ownership::owned(home.path()).unwrap()["imacs-running"].connections, ["a-alias", "other"]);
     }
 
     #[test]

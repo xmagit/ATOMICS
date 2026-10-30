@@ -77,15 +77,17 @@ impl Connections {
         let mut rows: Vec<Row> = registered
             .into_iter()
             .flatten()
-            .map(|server| Row {
-                name: server.name.clone(),
-                status: Some(server.status.clone()),
-                detail: match self.definition(&server.name) {
+            .map(|server| {
+                let mut detail = match self.definition(&server.name) {
                     Some(definition) => format!("{} · {}", definition.display(), server.transport),
                     None => server.transport.clone(),
-                },
-                env: 0,
-                skipped: 0,
+                };
+                if let Some(other) = registered.into_iter().flatten().find(|other| {
+                    other.name != server.name && other.status == Status::Connected && server.same_url(other)
+                }) {
+                    detail.push_str(&format!(" · same URL as {}; tools loaded once per sandbox", other.name));
+                }
+                Row { name: server.name.clone(), status: Some(server.status.clone()), detail, env: 0, skipped: 0 }
             })
             .collect();
         for definition in &self.definitions {
@@ -184,6 +186,7 @@ impl State {
                     mcp::remember(&paths::imacs_home(), std::slice::from_ref(definition))?;
                 }
                 let job = mcp::Connect {
+                    home: paths::imacs_home(),
                     sbx: program,
                     name: name.clone(),
                     definition,
@@ -219,7 +222,8 @@ impl State {
         let name = name.to_string();
         self.connection_job(move || {
             let store = crate::credentials::Store::new(keychain);
-            let result = mcp::disconnect(&program, &name, &sandboxes, &store).map_err(|error| format!("{error:#}"));
+            let result = mcp::disconnect(&paths::imacs_home(), &program, &name, &sandboxes, &store)
+                .map_err(|error| format!("{error:#}"));
             Done::Disconnected(name, result)
         });
     }
@@ -261,13 +265,19 @@ impl State {
                     match result {
                         Ok(failed) => {
                             for session in &mut self.sessions {
-                                session.mcp_needed.retain(|needed| needed.name != name);
+                                if session.sandbox.as_ref().is_some_and(|sandbox| failed.contains(sandbox)) {
+                                    if !session.mcp_needed.iter().any(|needed| needed.name == name) {
+                                        session.mcp_needed.push(Needed::missing(name.clone()));
+                                    }
+                                } else {
+                                    session.mcp_needed.retain(|needed| needed.name != name);
+                                }
                             }
                             self.toast(if failed.is_empty() {
                                 format!("Connected {name}: every sandboxed session gets it")
                             } else {
                                 format!(
-                                    "Connected {name}; loading it into {} failed, restart those agents",
+                                    "Connected {name}; loading it into {} failed, retry Connect on those tiles",
                                     failed.join(", ")
                                 )
                             });

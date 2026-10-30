@@ -23,6 +23,10 @@ pub struct Owned {
     /// The relay port the sandbox's `localhost:<port>` policy rule allows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relay: Option<u16>,
+    /// Connection names successfully loaded into this sandbox. Kept across reattachment so
+    /// aliases for the same URL reuse the server already serving its tools.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub connections: Vec<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -112,7 +116,10 @@ pub fn removed(home: &Path, name: &str, resource: Resource) -> Result<()> {
     let mut ledger = Ledger::open(home)?;
     if let Some(entry) = ledger.entries.get_mut(name) {
         match resource {
-            Resource::Sandbox => entry.sandbox = false,
+            Resource::Sandbox => {
+                entry.sandbox = false;
+                entry.connections.clear();
+            }
             Resource::Mcp => entry.mcp = false,
             Resource::Pins => entry.pins = None,
             Resource::Scratch => entry.scratch = None,
@@ -146,6 +153,16 @@ pub fn record_pins(home: &Path, name: &str, dir: &Path) -> Result<()> {
     let mut ledger = Ledger::open(home)?;
     ledger.entry(name).pins = Some(dir.into());
     ledger.save()
+}
+
+/// Serialize gateway changes with the record of what was loaded, including simultaneous
+/// Connect clicks and sandbox preparation. Only worker threads take this lock.
+pub fn with_connections<T>(home: &Path, name: &str, update: impl FnOnce(&mut Vec<String>) -> T) -> Result<T> {
+    let mut ledger = Ledger::open(home)?;
+    let entry = ledger.entries.get_mut(name).filter(|entry| entry.sandbox).context("sandbox is not owned")?;
+    let result = update(&mut entry.connections);
+    ledger.save()?;
+    Ok(result)
 }
 
 /// A live CLI build has no session record; its owning process keeps it out of the sweep.

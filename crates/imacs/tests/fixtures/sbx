@@ -114,6 +114,11 @@ case "$1" in
     if [ -e "$dir/fail-mcp-$2" ]; then cat "$dir/error-output" 2>/dev/null >&2; exit 1; fi
     case "$2" in
       add)
+        previous=
+        for arg in "$@"; do
+          if [ "$previous" = --url ]; then printf '%s' "$arg" > "$dir/mcp-url-$3"; fi
+          previous=$arg
+        done
         case "$3" in
           imacs-*)
             details=$(printf '%s' "$*" | sed 's/\\/\\\\/g; s/"/\\"/g')
@@ -131,6 +136,11 @@ case "$1" in
             mv "$dir/mcp/$3.$$.tmp" "$dir/mcp/$3"
             ;;
         esac
+        ;;
+      inspect)
+        [ -f "$dir/mcp-url-$3" ] || exit 1
+        url=$(sed 's/\\/\\\\/g; s/"/\\"/g' "$dir/mcp-url-$3")
+        printf '{"name":"%s","url":"%s"}\n' "$3" "$url"
         ;;
       auth)
         printf '%s\n' "${SBX_NO_BROWSER_OPEN-unset}" > "$dir/auth-no-browser"
@@ -158,10 +168,25 @@ case "$1" in
           echo "error: add \"$3\": MCP server \"$3\" is not registered" >&2
           exit 1
         fi
+        mkdir -p "$dir/mcp-loaded/$5"
+        if [ -f "$dir/mcp-url-$3" ]; then
+          for file in "$dir/mcp-loaded/$5"/*; do
+            [ -f "$file" ] || continue
+            other=${file##*/}
+            if [ "$other" != "$3" ] && cmp -s "$dir/mcp-url-$3" "$dir/mcp-url-$other"; then
+              echo 'error: duplicate gateway tool names' >&2
+              exit 1
+            fi
+          done
+        fi
+        touch "$dir/mcp-loaded/$5/$3"
+        ;;
+      unload)
+        rm -f "$dir/mcp-loaded/$5/$3"
         ;;
       rm)
         for arg in "$@"; do
-          case "$arg" in mcp|rm|-*|linear) ;; *) rm -f "$dir/mcp/$arg" ;; esac
+          case "$arg" in mcp|rm|-*|linear) ;; *) rm -f "$dir/mcp/$arg" "$dir/mcp-url-$arg" ;; esac
         done
         ;;
     esac

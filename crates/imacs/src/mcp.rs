@@ -92,7 +92,7 @@ fn agent_tools() -> Value {
         }, "required": ["text"], "additionalProperties": false }
     }, {
         "name": "imacs_mcp_connect",
-        "description": "Ask for an MCP server you need, such as linear or notion, when its tools are missing from your session or fail with an authorization error. A server the user has connected is loaded into your sandbox at once; otherwise the user gets a Connect button and its tools appear in your session once they sign in, without a restart. Never ask for its credentials.",
+        "description": "Ask for an MCP server you need, such as linear or notion, when its tools are missing or fail with an authorization error. This only raises a Connect banner on your tile; only the user's click registers, authorizes or loads it. Once connected, IMACS loads it into your sandbox's gateway. Never ask for its credentials.",
         "inputSchema": { "type": "object", "properties": {
             "server": { "type": "string", "description": "The server's name: lowercase letters, digits, - and _" },
             "url": { "type": "string", "description": "Its https MCP URL, when IMACS may not know the server yet" }

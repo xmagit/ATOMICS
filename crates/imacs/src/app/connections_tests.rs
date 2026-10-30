@@ -295,6 +295,48 @@ fn sandboxed_sessions_get_connected_servers_and_a_banner_for_the_rest() {
 }
 
 #[test]
+fn aliases_are_explained_and_failed_loads_keep_the_retry_banner() {
+    with_app("app::connections::tests::aliases_are_explained_and_failed_loads_keep_the_retry_banner", |app, ctx| {
+        let bin = crate::test_support::tempdir().unwrap();
+        let configs = crate::test_support::tempdir().unwrap();
+        let program = machine(app, bin.path(), configs.path());
+        let url = "https://mcp.example.com/mcp";
+        for name in ["service", "service-alias"] {
+            std::fs::write(bin.path().join(format!("auth-free-{name}")), "").unwrap();
+            register(&program, name, url);
+        }
+        let (id, sandbox) = sandboxed(app, ctx, bin.path(), "Check aliases");
+        app.runtime.refresh_connections();
+        tick_until(app, ctx, "the connections list", idle);
+        let shown = panel(app, ctx, vec![]);
+        assert!(
+            shown.iter().any(|(text, _)| text.contains("same URL as service; tools loaded once per sandbox")),
+            "{shown:?}"
+        );
+        assert_eq!(
+            fake::calls_to(bin.path(), &["mcp", "load"]),
+            [isolation::mcp_load_args(&sandbox, &sandbox), isolation::mcp_load_args("service", &sandbox)]
+        );
+        let index = app.runtime.find(&id).unwrap();
+        assert!(app.runtime.sessions[index].mcp_needed.is_empty());
+
+        std::fs::write(bin.path().join("auth-free-unrelated"), "").unwrap();
+        register(&program, "unrelated", "https://other.example.com/mcp");
+        app.runtime.sessions[index].mcp_needed.push(Needed::missing("unrelated".into()));
+        std::fs::write(bin.path().join("fail-mcp-load"), "").unwrap();
+        app.runtime.connect_server("unrelated", false, None);
+        tick_until(app, ctx, "the failed load", idle);
+        let index = app.runtime.find(&id).unwrap();
+        assert_eq!(app.runtime.sessions[index].mcp_needed, [Needed::missing("unrelated".into())]);
+        assert!(app.runtime.toast.as_ref().unwrap().0.contains("retry Connect"));
+        std::fs::remove_file(bin.path().join("fail-mcp-load")).unwrap();
+        app.runtime.connect_server("unrelated", false, None);
+        tick_until(app, ctx, "the successful retry", idle);
+        assert!(app.runtime.sessions[index].mcp_needed.is_empty());
+    });
+}
+
+#[test]
 fn an_agents_request_only_raises_the_banner_and_leaves_sbx_alone() {
     with_app("app::connections::tests::an_agents_request_only_raises_the_banner_and_leaves_sbx_alone", |app, ctx| {
         let bin = crate::test_support::tempdir().unwrap();

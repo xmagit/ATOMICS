@@ -130,6 +130,8 @@ Every connected server loads into every sandboxed session, including Ungrouped s
 reattachment or when you connect it. Missing servers show a **Connect <name>** banner. An agent's
 `imacs_mcp_connect` call only raises that banner, showing who asked and the full URL for a new server;
 only your click registers, authorizes or loads it. Disconnect unloads and removes the server.
+Registrations with the exact same remote URL share one loaded server per sandbox; Connections explains
+the alias instead of loading duplicate tool names.
 
 Every agent also gets IMACS's own MCP server for reports and scoped ticket tools (and the chief's
 orchestration tools). Bare agents use the servers and sign-in in their own Claude Code or Codex
