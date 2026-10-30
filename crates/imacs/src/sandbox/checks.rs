@@ -185,6 +185,22 @@ fn secret_names(value: &Value) -> Option<SecretNames> {
             _ => {}
         }
     }
+    // sbx lists `secret set-custom` secrets apart. Read only the variable each fills and the hosts it
+    // goes to: `source` and `placeholder` can hold a credential or the command that prints one.
+    if let Some(custom) = value.get("custom_secrets") {
+        let anthropic = |target: &Value| {
+            let host = target.as_str().or_else(|| target["host"].as_str()).unwrap_or_default();
+            let host = host.strip_prefix("https://").unwrap_or(host).trim_end_matches('/');
+            host.strip_suffix(":443").unwrap_or(host).eq_ignore_ascii_case("api.anthropic.com")
+        };
+        for secret in custom.as_array()? {
+            if secret["env"] == "CLAUDE_CODE_OAUTH_TOKEN"
+                && secret["targets"].as_array().is_some_and(|targets| targets.iter().any(anthropic))
+            {
+                known.oauth = true;
+            }
+        }
+    }
     Some(known)
 }
 
@@ -507,6 +523,45 @@ mod tests {
             .oauth
         );
         assert!(secret_names(&json!({"secrets":"private-malformed-output"})).is_none());
+    }
+
+    #[test]
+    fn the_subscription_route_is_a_custom_secret_found_without_reading_its_source() {
+        let route = |env: &str, targets: Value| {
+            json!({"env": env, "kind": "command", "placeholder": "sk-ant-oat01-PRIVATE-placeholder", "refresh": null,
+                   "scope": "global", "source": "PRIVATE-source-command", "targets": targets})
+        };
+        let names = |custom: Value| {
+            secret_names(
+                &json!({"secrets":[{"type":"service","name":"openai","scope":"global"}],"custom_secrets":custom}),
+            )
+        };
+        let found = names(json!([route("CLAUDE_CODE_OAUTH_TOKEN", json!(["api.anthropic.com"]))])).unwrap();
+        assert!(found.oauth && found.openai && !found.anthropic);
+        for targets in [json!(["https://api.anthropic.com:443/"]), json!([{"host":"API.anthropic.com"}])] {
+            assert!(names(json!([route("CLAUDE_CODE_OAUTH_TOKEN", targets.clone())])).unwrap().oauth, "{targets}");
+        }
+        for (env, targets) in [
+            ("ANTHROPIC_API_KEY", json!(["api.anthropic.com"])),
+            ("CLAUDE_CODE_OAUTH_TOKEN", json!(["api.anthropic.com.example.org"])),
+            ("CLAUDE_CODE_OAUTH_TOKEN", json!("api.anthropic.com")),
+            ("CLAUDE_CODE_OAUTH_TOKEN", Value::Null),
+        ] {
+            assert!(!names(json!([route(env, targets.clone())])).unwrap().oauth, "{env} {targets}");
+        }
+        assert!(names(json!("private-malformed-output")).is_none());
+
+        // Doctor, against sbx's real envelope: the route and nothing private shows.
+        let dir = fixture();
+        let dir = dir.path();
+        std::fs::write(dir.join("oauth"), "").unwrap();
+        std::fs::write(dir.join("removed-anthropic"), "").unwrap();
+        let text = report(dir);
+        assert!(line(&text, "Claude secret:").starts_with('✓'), "{text}");
+        assert!(line(&text, "credential precedence").starts_with('✓'), "{text}");
+        assert!(!text.contains("PRIVATE"), "{text}");
+        std::fs::remove_file(dir.join("removed-anthropic")).unwrap();
+        assert!(line(&report(dir), "credential precedence").starts_with('✗'), "both routes at once");
     }
 
     #[test]

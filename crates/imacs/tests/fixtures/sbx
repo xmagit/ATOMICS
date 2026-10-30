@@ -70,8 +70,10 @@ case "$1" in
           sep=
           if [ ! -e "$dir/removed-anthropic" ]; then printf '{"type":"service","name":"anthropic","scope":"global"}'; sep=,; fi
           if [ ! -e "$dir/no-openai" ]; then printf '%s{"type":"service","name":"openai","scope":"global"}' "$sep"; sep=,; fi
-          if [ -e "$dir/oauth" ]; then printf '%s{"type":"custom","name":"CLAUDE_CODE_OAUTH_TOKEN","scope":"global"}' "$sep"; sep=,; fi
           if [ -e "$dir/misfiled-secret" ]; then printf '%s{"type":"service","name":"sk-ant-MISFILED-private-value","scope":"global"}' "$sep"; fi
+          # Like sbx 0.50, `set-custom` secrets come apart; their source and placeholder are private.
+          printf '],"custom_secrets":['
+          if [ -e "$dir/oauth" ]; then printf '{"env":"CLAUDE_CODE_OAUTH_TOKEN","kind":"command","placeholder":"sk-ant-oat01-PRIVATE-placeholder","refresh":null,"scope":"global","source":"PRIVATE-source-command","targets":["api.anthropic.com"]}'; fi
           printf ']}\n'
         fi ;;
       set-custom)
