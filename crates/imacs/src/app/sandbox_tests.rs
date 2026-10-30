@@ -207,6 +207,7 @@ fn the_cleanup_dialog_removes_a_worktrees_sandbox_and_chosen_orphans() {
                 exe: "/imacs".into(),
                 socket: "/imacs.sock".into(),
                 briefs: None,
+                pins: paths::git_pins_dir(),
             };
             crate::sandbox::prepare(&job).unwrap();
             worktrees.push(path);
@@ -280,6 +281,17 @@ fn the_cleanup_dialog_removes_a_worktrees_sandbox_and_chosen_orphans() {
         assert!(worktrees[0].exists());
         let left: Vec<String> = crate::sandbox::list(&sbx).unwrap().into_iter().map(|s| s.name).collect();
         assert_eq!(left, ["imacs-keep"]);
+        // Removed sandboxes take their git records along; the kept worktree stays pinned.
+        let records = || {
+            let mut names: Vec<_> = std::fs::read_dir(paths::git_pins_dir())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+        tick_until(app, ctx, "the removed sandboxes' git records to go", |_| records() == ["imacs-keep.json"]);
+        assert!(git::pinned(&worktrees[0]).is_some() && git::pinned(&worktrees[1]).is_none());
     });
 }
 
@@ -474,6 +486,79 @@ fn sandboxed_fake_agent_moving_main_is_restored_and_alerts_the_board() {
         assert!(alert.contains("SANDBOX REF GUARD") && alert.contains("Restored refs/heads/main"), "{alert}");
         assert!(app.runtime.plans[0].tasks[0].notes.iter().any(|note| note.contains("Restored refs/heads/main")));
         app.runtime.sessions.clear();
+    });
+}
+
+#[test]
+fn git_files_a_sandbox_redirects_never_run_its_hook_on_this_machine() {
+    with_app("app::sandbox_tests::git_files_a_sandbox_redirects_never_run_its_hook_on_this_machine", |app, ctx| {
+        for redirect in ["git-file", "worktree-commondir", "main-commondir"] {
+            let (dir, repo) = repository();
+            git::git(&repo, &["branch", "other"]).unwrap();
+            let original = git::git(&repo, &["rev-parse", "other"]).unwrap();
+            let folder = if redirect == "main-commondir" { repo.clone() } else { worktree(&repo, redirect) };
+            let marker = dir.path().join("hook-ran");
+            let bin = tempfile::tempdir().unwrap();
+            app.runtime.sbx = fake::install(bin.path()).display().to_string();
+            app.runtime.config.isolation.mode = IsolationMode::Sandbox;
+            // The agent, as its VM could: commits, moves a branch that is not its own, then plants a git
+            // folder whose config runs a hook, and points its worktree's git files at it.
+            let tamper = match redirect {
+                "git-file" => r#"printf 'gitdir: %s\n' "$evil" > .git"#,
+                _ => r#"printf '%s\n' "$evil" > "$gd/commondir""#,
+            };
+            let script = format!(
+                r#"set -e
+git commit --allow-empty -qm task
+git update-ref refs/heads/other HEAD
+gd=$(git rev-parse --path-format=absolute --git-dir)
+common=$(git rev-parse --path-format=absolute --git-common-dir)
+evil="$gd/evil"
+mkdir -p "$evil/hooks"
+ln -s "$common/objects" "$evil/objects"
+ln -s "$common/refs" "$evil/refs"
+cp "$gd/HEAD" "$evil/HEAD"
+printf '#!/bin/sh\n: > %s\n' '{marker}' > "$evil/hooks/reference-transaction"
+chmod +x "$evil/hooks/reference-transaction"
+printf '[core]\n\tfsmonitor = %s\n\thooksPath = %s\n' "$evil/hooks/reference-transaction" "$evil/hooks" > "$evil/config"
+echo new > a.txt
+{tamper}
+"#,
+                marker = marker.display()
+            );
+            std::fs::write(bin.path().join("agent"), script).unwrap();
+            let id = app.runtime.start(ctx, "codex", folder.clone(), None, vec![], Some("Do the task".into())).unwrap();
+            let name = format!("imacs-{id}");
+            // Ref recovery on exit restores the moved branch with git's update-ref.
+            tick_until(app, ctx, "ref recovery on agent exit", |app| {
+                app.runtime.sessions.iter().any(|s| {
+                    s.id == id && s.last_message.as_deref().is_some_and(|m| m.contains("Restored refs/heads/other"))
+                })
+            });
+            assert_eq!(git::git(&repo, &["rev-parse", "other"]).unwrap(), original, "{redirect}");
+            let record: git::GitPins =
+                serde_json::from_slice(&std::fs::read(paths::git_pins_dir().join(format!("{name}.json"))).unwrap())
+                    .unwrap();
+            assert_eq!(record.work_tree, folder.canonicalize().unwrap());
+            assert_eq!(record.common_dir, Some(repo.join(".git").canonicalize().unwrap()));
+
+            // The diff IMACS polls, and what worktree cleanup asks of git.
+            let diff = git::diff_against_base(&folder, "main", None).unwrap();
+            assert_eq!(diff.files.iter().map(|f| f.path()).collect::<Vec<_>>(), ["a.txt"], "{redirect}");
+            let health = git::worktree_health(&repo, "main").unwrap();
+            if redirect != "main-commondir" {
+                assert_eq!(health[0].dirty_files, 1, "{redirect}: {health:?}");
+                assert!(git::remove_worktree(&repo, &folder, None, false).is_err(), "{redirect}: uncommitted a.txt");
+            }
+            app.runtime.close(&id);
+            tick_until(app, ctx, "the final ref check", |_| !fake::calls_to(bin.path(), &["stop"]).is_empty());
+            assert!(!marker.exists(), "{redirect}: host git ran the sandbox's hook");
+
+            // Without its record, git follows the planted files to that hook.
+            let raw = std::process::Command::new("git").arg("-C").arg(&folder).args(["status"]).output().unwrap();
+            assert!(raw.status.success() && marker.exists(), "{redirect}: the planted config must be live");
+            app.runtime.sessions.clear();
+        }
     });
 }
 

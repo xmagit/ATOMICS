@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, LazyLock, Mutex};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
+use serde::{Deserialize, Serialize};
 
 use crate::diff::{FileDiff, WorktreeDiff, parse_unified};
 
@@ -27,17 +28,144 @@ pub struct WorktreeEntry {
 }
 
 pub fn git(dir: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(["-c", "core.quotepath=off"])
-        .args(args)
-        .output()
-        .with_context(|| format!("running git {}", args.join(" ")))?;
+    let output = command(dir, args)?.output().with_context(|| format!("running git {}", args.join(" ")))?;
     if !output.status.success() {
         bail!("git {} failed: {}", args.join(" "), String::from_utf8_lossy(&output.stderr).trim());
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// `git -C dir args`. In a folder a sandbox works in, git runs with the locations [`pin`]ned
+/// for it, never the ones the folder names now.
+pub fn command(dir: &Path, args: &[&str]) -> Result<Command> {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(dir).args(["-c", "core.quotepath=off"]);
+    match pinned(dir) {
+        None => {
+            command.args(args);
+        }
+        Some(GitPins { work_tree, git_dir: Some(git_dir), common_dir: Some(common_dir) }) => {
+            command.env("GIT_DIR", git_dir).env("GIT_COMMON_DIR", common_dir).env("GIT_WORK_TREE", work_tree);
+            // A submodule the sandbox adds would run git in a folder it chose, with that folder's
+            // config. Only the command-line flag overrides the `ignore` its .gitmodules can set.
+            match args.split_first() {
+                Some((&subcommand, rest)) if subcommand == "status" || subcommand == "diff" => {
+                    command.arg(subcommand).arg("--ignore-submodules=dirty").args(rest);
+                }
+                _ => {
+                    command.args(args);
+                }
+            }
+        }
+        Some(pins) => bail!(
+            "{} was outside any git repository when its sandbox started, so git does not run there",
+            pins.work_tree.display()
+        ),
+    }
+    Ok(command)
+}
+
+/// Where git finds the repository of a folder a sandbox works in, recorded when its session
+/// starts. The sandbox can write the files git otherwise reads for this: a worktree's `.git`
+/// file, its `commondir`, a main checkout's `.git/commondir`. Followed on this machine, they
+/// lead to a repository config of the sandbox's own, whose `core.fsmonitor` git runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitPins {
+    pub work_tree: PathBuf,
+    /// `None` when the folder was outside any repository: git never runs there.
+    pub git_dir: Option<PathBuf>,
+    pub common_dir: Option<PathBuf>,
+}
+
+static PINNED: LazyLock<Mutex<Vec<GitPins>>> = LazyLock::new(Mutex::default);
+
+/// From now on, git in this process runs in `pins.work_tree` with these locations.
+pub fn pin(pins: GitPins) {
+    let mut pinned = PINNED.lock().unwrap_or_else(|e| e.into_inner());
+    pinned.retain(|other| other.work_tree != pins.work_tree);
+    pinned.push(pins);
+}
+
+pub fn unpin(work_tree: &Path) {
+    PINNED.lock().unwrap_or_else(|e| e.into_inner()).retain(|pins| pins.work_tree != work_tree);
+}
+
+/// The pins of the innermost pinned folder holding `dir`, by its path as given or as it resolves.
+pub fn pinned(dir: &Path) -> Option<GitPins> {
+    let pinned = PINNED.lock().unwrap_or_else(|e| e.into_inner());
+    if pinned.is_empty() {
+        return None;
+    }
+    let real = std::fs::canonicalize(dir).ok();
+    pinned
+        .iter()
+        .filter(|pins| {
+            dir.starts_with(&pins.work_tree) || real.as_ref().is_some_and(|r| r.starts_with(&pins.work_tree))
+        })
+        .max_by_key(|pins| pins.work_tree.components().count())
+        .cloned()
+}
+
+/// Where git finds `dir`'s repository now, for [`pin`]: read it before a sandbox can write there.
+/// Refuses layouts that already point where `git worktree add` never would, and repositories
+/// with `extensions.worktreeConfig`.
+pub fn resolve_pins(dir: &Path) -> Result<GitPins> {
+    let args = ["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-dir", "--git-common-dir"];
+    let output = match git(dir, &args) {
+        Ok(output) => output,
+        Err(error) if format!("{error:#}").contains("not a git repository") => {
+            return Ok(GitPins { work_tree: std::fs::canonicalize(dir)?, git_dir: None, common_dir: None });
+        }
+        Err(error) => return Err(error),
+    };
+    let lines: Vec<&str> = output.lines().collect();
+    let [top, git_dir, common] = lines[..] else { bail!("unexpected git rev-parse output: {output}") };
+    let real = |path: &str| std::fs::canonicalize(path).with_context(|| format!("resolving {path}"));
+    let (top, git_dir, common) = (real(top)?, real(git_dir)?, real(common)?);
+    let made_by_git = if git_dir == common {
+        (git_dir == top.join(".git") || !git_dir.starts_with(&top)) && !in_writable_git_folder(&git_dir)
+    } else {
+        // `git worktree add` makes <common>/worktrees/<id>, pointing back at the worktree's .git file.
+        let back = std::fs::read_to_string(git_dir.join("gitdir")).unwrap_or_default();
+        git_dir.parent() == Some(common.join("worktrees").as_path())
+            && !common.starts_with(&top)
+            && !in_writable_git_folder(&common)
+            && std::fs::canonicalize(git_dir.join(back.trim())).ok() == Some(top.join(".git"))
+    };
+    ensure!(made_by_git, "{}'s git folder {} is not one git made for it", top.display(), git_dir.display());
+    check_worktree_config(&common)?;
+    Ok(GitPins { work_tree: top, git_dir: Some(git_dir), common_dir: Some(common) })
+}
+
+/// Whether `dir` lies in the objects, refs, logs or worktrees of another git folder: sandboxes
+/// write there, and git never puts a repository there.
+fn in_writable_git_folder(dir: &Path) -> bool {
+    dir.ancestors().skip(1).any(|ancestor| {
+        ancestor
+            .file_name()
+            .is_some_and(|name| ["objects", "refs", "logs", "worktrees"].contains(&&*name.to_string_lossy()))
+            && ancestor.parent().is_some_and(|parent| parent.join("HEAD").is_file())
+    })
+}
+
+/// With `extensions.worktreeConfig`, git reads `config.worktree` in a worktree's own git folder,
+/// which its sandbox can write, as repository config on this machine.
+pub fn check_worktree_config(common: &Path) -> Result<()> {
+    let output = Command::new("git")
+        .args(["config", "--type=bool", "--file"])
+        .arg(common.join("config"))
+        .args(["--get", "extensions.worktreeConfig"])
+        .current_dir(common)
+        .output()
+        .context("running git config")?;
+    if String::from_utf8_lossy(&output.stdout).trim() == "true" {
+        bail!(
+            "{} sets extensions.worktreeConfig, which lets a sandbox change git config that runs on this \
+             machine. Unset it, or set isolation = \"bare\" for agents in this repository.",
+            common.display()
+        );
+    }
+    Ok(())
 }
 
 /// The worktree containing `dir`, or `None` outside a git repository.
@@ -225,7 +353,21 @@ pub fn worktree_health(repo: &Path, base_ref: &str) -> Result<Vec<WorktreeHealth
 /// Removes a worktree without forcing (git refuses when it has uncommitted work),
 /// and with `delete_branch` its branch, only when git considers it merged.
 pub fn remove_worktree(repo: &Path, path: &Path, branch: Option<&str>, delete_branch: bool) -> Result<()> {
-    git(repo, &["worktree", "remove", &path.to_string_lossy()])?;
+    let path_text = path.to_string_lossy();
+    if pinned(path).is_some() && path.exists() {
+        // `worktree remove` checks for changes with a git of its own, which follows the worktree's
+        // .git file and commondir. Check with the pinned locations, as strictly, then force.
+        ensure!(
+            git(path, &["status", "--porcelain"])?.trim().is_empty(),
+            "'{path_text}' contains modified or untracked files"
+        );
+        let submodule =
+            git(path, &["ls-files", "--stage", "-z"])?.split('\0').any(|entry| entry.starts_with("160000 "));
+        ensure!(!submodule, "'{path_text}' contains submodules, which worktree removal leaves to you");
+        git(repo, &["worktree", "remove", "--force", &path_text])?;
+    } else {
+        git(repo, &["worktree", "remove", &path_text])?;
+    }
     if delete_branch && let Some(branch) = branch {
         git(repo, &["branch", "-d", branch])?;
     }
@@ -595,6 +737,152 @@ pub(crate) mod tests {
         std::fs::create_dir(&repo).unwrap();
         init(&repo);
         (dir, repo)
+    }
+
+    /// What a sandbox can plant in a git folder it writes: a git folder of its own that sees the
+    /// repository's objects and refs, with a config whose fsmonitor and hooks leave `marker`.
+    fn plant_hostile_git_dir(evil: &Path, real: &Path, head: &str, marker: &Path) {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        std::fs::create_dir_all(evil.join("hooks")).unwrap();
+        symlink(real.join("objects"), evil.join("objects")).unwrap();
+        symlink(real.join("refs"), evil.join("refs")).unwrap();
+        std::fs::write(evil.join("HEAD"), format!("ref: {head}\n")).unwrap();
+        let hook = evil.join("hooks/reference-transaction");
+        std::fs::write(&hook, format!("#!/bin/sh\n: > '{}'\n", marker.display())).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = format!(
+            "[core]\n\trepositoryformatversion = 0\n\tfsmonitor = {}\n\thooksPath = {}\n",
+            hook.display(),
+            evil.join("hooks").display()
+        );
+        std::fs::write(evil.join("config"), config).unwrap();
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum Redirect {
+        /// A linked worktree's `.git` file names a git folder of the sandbox's own.
+        GitFile,
+        /// A linked worktree's `<common>/worktrees/<id>/commondir` names another common dir.
+        WorktreeCommondir,
+        /// A main checkout's `.git/commondir` does.
+        MainCommondir,
+    }
+
+    #[test]
+    fn pinned_git_never_follows_a_sandboxs_redirects_to_its_own_config() {
+        for redirect in [Redirect::GitFile, Redirect::WorktreeCommondir, Redirect::MainCommondir] {
+            let (dir, repo) = project();
+            let marker = dir.path().join("hook-ran");
+            let folder = match redirect {
+                Redirect::MainCommondir => repo.clone(),
+                _ => {
+                    let worktree = repo.with_file_name("app-task");
+                    add_worktree(&repo, &worktree, "task", "main").unwrap();
+                    worktree
+                }
+            };
+            // Recorded when the session starts, before the sandbox has written anything.
+            let pins = resolve_pins(&folder).unwrap();
+            let (git_dir, common) = (pins.git_dir.clone().unwrap(), pins.common_dir.clone().unwrap());
+            assert_eq!(pins.work_tree, folder.canonicalize().unwrap());
+            assert_eq!(common, repo.join(".git").canonicalize().unwrap());
+
+            let evil = git_dir.join("evil");
+            let head = if matches!(redirect, Redirect::MainCommondir) { "refs/heads/main" } else { "refs/heads/task" };
+            plant_hostile_git_dir(&evil, &common, head, &marker);
+            match redirect {
+                Redirect::GitFile => std::fs::write(folder.join(".git"), format!("gitdir: {}\n", evil.display())),
+                Redirect::WorktreeCommondir | Redirect::MainCommondir => {
+                    std::fs::write(git_dir.join("commondir"), format!("{}\n", evil.display()))
+                }
+            }
+            .unwrap();
+            std::fs::write(folder.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+
+            // Unpinned, the diff IMACS polls would run the sandbox's fsmonitor, and a tampered
+            // layout no longer passes as one git made.
+            assert!(resolve_pins(&folder).is_err(), "{redirect:?}");
+            diff_against_base(&folder, "main", None).unwrap();
+            assert!(marker.exists(), "{redirect:?}: the planted config must be live for this test to mean anything");
+            std::fs::remove_file(&marker).unwrap();
+
+            pin(pins.clone());
+            let diff = diff_against_base(&folder, "main", None).unwrap();
+            assert_eq!(diff.files.iter().map(FileDiff::path).collect::<Vec<_>>(), ["a.txt"], "{redirect:?}");
+            assert_eq!(worktree_of(&folder).unwrap().branch.as_deref(), Some(&head["refs/heads/".len()..]));
+            let health = worktree_health(&repo, "main").unwrap();
+            assert_eq!(common_dir(&folder).unwrap(), common);
+            commit_all(&folder, "task work").unwrap();
+            match redirect {
+                // git itself refuses a worktree whose .git file names another git folder.
+                Redirect::GitFile => assert!(remove_worktree(&repo, &folder, None, false).is_err()),
+                Redirect::WorktreeCommondir => {
+                    assert_eq!(health[0].dirty_files, 1, "{health:?}");
+                    remove_worktree(&repo, &folder, None, false).unwrap();
+                    assert!(!folder.exists());
+                }
+                Redirect::MainCommondir => {}
+            }
+            assert!(!marker.exists(), "{redirect:?}: host git ran the sandbox's hook");
+            unpin(&pins.work_tree);
+        }
+    }
+
+    #[test]
+    fn pinned_git_never_runs_in_a_submodule_the_sandbox_adds() {
+        let (dir, repo) = project();
+        let worktree = repo.with_file_name("app-task");
+        add_worktree(&repo, &worktree, "task", "main").unwrap();
+        let pins = resolve_pins(&worktree).unwrap();
+        let marker = dir.path().join("hook-ran");
+        // A gitlink in the worktree's index, its folder's .git naming a planted git folder,
+        // and a .gitmodules asking git to look inside it.
+        let evil = pins.git_dir.clone().unwrap().join("evil");
+        plant_hostile_git_dir(&evil, pins.common_dir.as_ref().unwrap(), "refs/heads/main", &marker);
+        std::fs::create_dir(worktree.join("sub")).unwrap();
+        std::fs::write(worktree.join("sub/.git"), format!("gitdir: {}\n", evil.display())).unwrap();
+        let head = git(&repo, &["rev-parse", "main"]).unwrap();
+        git(&worktree, &["update-index", "--add", "--cacheinfo", &format!("160000,{},sub", head.trim())]).unwrap();
+        std::fs::write(
+            worktree.join(".gitmodules"),
+            "[submodule \"sub\"]\n\tpath = sub\n\turl = ./sub\n\tignore = none\n",
+        )
+        .unwrap();
+        git(&worktree, &["status", "--porcelain"]).unwrap();
+        assert!(marker.exists(), "the planted submodule must be live for this test to mean anything");
+        std::fs::remove_file(&marker).unwrap();
+
+        pin(pins.clone());
+        let diff = diff_against_base(&worktree, "main", None).unwrap();
+        assert!(diff.files.iter().any(|file| file.path() == "sub"), "the submodule itself still shows");
+        worktree_health(&repo, "main").unwrap();
+        assert!(remove_worktree(&repo, &worktree, None, false).is_err(), "untracked .gitmodules");
+        assert!(!marker.exists(), "host git ran git in the sandbox's submodule");
+        unpin(&pins.work_tree);
+    }
+
+    #[test]
+    fn pins_refuse_worktree_config_and_stop_git_outside_a_repository() {
+        let (dir, repo) = project();
+        let worktree = repo.with_file_name("app-task");
+        add_worktree(&repo, &worktree, "task", "main").unwrap();
+        run(&repo, &["config", "extensions.worktreeConfig", "true"]);
+        let error = resolve_pins(&worktree).unwrap_err();
+        assert!(format!("{error:#}").contains("extensions.worktreeConfig"), "{error:#}");
+        run(&repo, &["config", "extensions.worktreeConfig", "false"]);
+        assert!(resolve_pins(&worktree).is_ok());
+
+        // A folder outside any repository stays that way for host git, whatever .git appears in it.
+        let plain = dir.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        let pins = resolve_pins(&plain).unwrap();
+        assert_eq!((pins.git_dir.as_ref(), pins.common_dir.as_ref()), (None, None));
+        pin(pins.clone());
+        run(&plain, &["init", "-q"]);
+        assert!(git(&plain.join(".git"), &["status"]).is_err());
+        assert!(diff_against_base(&plain, "main", None).is_err());
+        unpin(&pins.work_tree);
+        assert!(git(&plain, &["status"]).is_ok());
     }
 
     #[test]

@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use anyhow::{Context, Result, bail};
 use imacs_core::git;
@@ -177,10 +177,7 @@ fn restore(cwd: &Path, name: &str, before: Option<&RefValue>, after: Option<&Ref
         (None, None) => return Ok(()),
         _ => unreachable!("symbolic refs handled above"),
     };
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(["update-ref", "--stdin"])
+    let mut child = git::command(cwd, &["update-ref", "--stdin"])?
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

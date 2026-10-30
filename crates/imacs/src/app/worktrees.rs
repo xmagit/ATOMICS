@@ -365,10 +365,14 @@ impl Desktop<'_> {
             cleanup.busy = Some(format!("removing {} worktrees…", targets.len()));
             let (tx, repo, delete) = (cleanup.tx.clone(), cleanup.repo.clone(), self.client.cleanup_delete_branches);
             let sbx = resolve_program(&self.runtime.sbx);
+            let pins = paths::git_pins_dir();
             self.post(move |_| {
                 std::thread::spawn(move || {
                     let remove_sandbox = |name: String| {
                         let result = crate::sandbox::remove(&sbx, &name).map_err(|e| format!("{e:#}"));
+                        if result.is_ok() {
+                            crate::sandbox::forget_pins(&pins, &name);
+                        }
                         let _ = tx.send(CleanupEvent::SandboxRemoved(name, result));
                     };
                     for (path, branch, sandboxes) in targets {

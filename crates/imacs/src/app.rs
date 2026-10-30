@@ -697,6 +697,8 @@ impl State {
 
     pub fn new(cc: &eframe::CreationContext<'_>, options: Options, _icon: &egui::IconData) -> State {
         std::thread::spawn(|| LazyLock::force(&SHELL_PATH));
+        // Before any git runs in a folder a sandbox has worked in.
+        crate::sandbox::load_pins(&paths::git_pins_dir());
         let config_path = paths::config_file();
         let (config, config_error) = match Config::load_or_create(&config_path) {
             Ok(config) => (config, None),

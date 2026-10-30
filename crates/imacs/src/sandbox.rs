@@ -67,6 +67,8 @@ pub struct Prepare {
     pub socket: PathBuf,
     /// A folder of this session's own, mounted read-only for its brief.
     pub briefs: Option<PathBuf>,
+    /// IMACS's records of where git finds each sandbox's repository; see [`pin_git`].
+    pub pins: PathBuf,
 }
 
 impl Prepare {
@@ -145,6 +147,9 @@ pub fn doctor_line(program: &str) -> String {
 pub fn prepare(job: &Prepare) -> Result<()> {
     let ssh = job.config.ssh_agent;
     let ready = preflight(&job.sbx).map_err(anyhow::Error::msg)?;
+    // Refuses a home folder before anything is recorded for it.
+    let (workspace, git) = workspace(&job.cwd)?;
+    pin_git(&job.pins, &job.name, &job.cwd)?;
     if list(&job.sbx)?.iter().any(|sandbox| sandbox.name == job.name) {
         return Ok(());
     }
@@ -158,7 +163,6 @@ pub fn prepare(job: &Prepare) -> Result<()> {
                 .context("setting up sbx's network policy")?;
         }
     }
-    let (workspace, git) = workspace(&job.cwd)?;
     if let Some(briefs) = &job.briefs {
         std::fs::create_dir_all(briefs).with_context(|| format!("creating {}", briefs.display()))?;
     }
@@ -201,6 +205,71 @@ pub fn prepare(job: &Prepare) -> Result<()> {
     finish().inspect_err(|_| {
         let _ = remove(&job.sbx, &job.name);
     })
+}
+
+/// Pins host git in `cwd` to IMACS's record for sandbox `name` in `dir`: the one saved when the
+/// sandbox was made, another sandbox's for the same folder, or else what git says before this
+/// sandbox has run. The record outlives restarts, and only cleanup removes it with the sandbox.
+pub fn pin_git(dir: &Path, name: &str, cwd: &Path) -> Result<()> {
+    let file = dir.join(format!("{name}.json"));
+    let pins = match std::fs::read(&file) {
+        Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| format!("reading {}", file.display()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => match git::pinned(cwd) {
+            Some(pins) => pins,
+            None => git::resolve_pins(cwd)?,
+        },
+        Err(error) => return Err(error).with_context(|| format!("reading {}", file.display())),
+    };
+    // Checked on every start: the repository's config can change while its sandbox exists.
+    if let Some(common) = &pins.common_dir {
+        git::check_worktree_config(common)?;
+    }
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let temporary = file.with_extension("json.tmp");
+    std::fs::write(&temporary, serde_json::to_vec_pretty(&pins)?)?;
+    std::fs::rename(&temporary, &file)?;
+    git::pin(pins);
+    Ok(())
+}
+
+/// Pins every folder IMACS recorded for a sandbox in `dir`, as each process that runs git in
+/// them starts.
+pub fn load_pins(dir: &Path) {
+    for pins in read_pins(dir).into_values() {
+        git::pin(pins);
+    }
+}
+
+/// Drops sandbox `name`'s record once the sandbox is removed. Its folder stays pinned while
+/// another sandbox's record covers it.
+pub fn forget_pins(dir: &Path, name: &str) {
+    let mut records = read_pins(dir);
+    let Some(pins) = records.remove(name) else { return };
+    if let Err(error) = std::fs::remove_file(dir.join(format!("{name}.json"))) {
+        eprintln!("IMACS: removing sandbox {name}'s git record failed: {error}");
+        return;
+    }
+    if !records.values().any(|other| other.work_tree == pins.work_tree) {
+        git::unpin(&pins.work_tree);
+    }
+}
+
+fn read_pins(dir: &Path) -> std::collections::HashMap<String, git::GitPins> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Default::default() };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?.strip_suffix(".json")?.to_string();
+            match std::fs::read(&path).map_err(anyhow::Error::from).and_then(|b| Ok(serde_json::from_slice(&b)?)) {
+                Ok(pins) => Some((name, pins)),
+                Err(error) => {
+                    eprintln!("IMACS: reading {} failed: {error:#}", path.display());
+                    None
+                }
+            }
+        })
+        .collect()
 }
 
 /// The folder a sandbox mounts read-write for `cwd`, its worktree (else `cwd` itself), and
@@ -437,6 +506,7 @@ mod tests {
             exe: "/Applications/IMACS.app/Contents/MacOS/imacs".into(),
             socket: "/run/user/501/imacs/imacs.sock".into(),
             briefs: None,
+            pins: sbx.with_file_name("git-pins"),
         }
     }
 

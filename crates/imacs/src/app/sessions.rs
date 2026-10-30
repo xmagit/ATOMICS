@@ -208,6 +208,7 @@ impl State {
             socket: paths::socket_path(),
             // Claude takes any prompt as an argument; other agents may get a brief file.
             briefs,
+            pins: paths::git_pins_dir(),
         }))
     }
 

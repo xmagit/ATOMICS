@@ -137,6 +137,35 @@ These mounts are enough to commit, branch and read history. The agent cannot add
 git config that would later run on your machine. Other worktrees, the rest of your home folder, the IMACS
 socket and your credentials stay outside the sandbox.
 
+### Git on your machine in a sandboxed folder
+
+The sandbox can still write the files that tell git where a repository is: a worktree's `.git` file, its
+`<common>/worktrees/<id>/commondir`, and a main checkout's `.git/commondir`. If git on your machine followed
+them, they could lead it to a config of the agent's own, and git would run that config's `core.fsmonitor`
+on your machine. IMACS runs git in these folders itself: it polls diffs, checks refs, cleans up worktrees,
+commits a task before merging it, and runs `imacs doctor`.
+
+So when a sandbox is made, before it runs, IMACS records where git finds the folder's repository: the work
+tree, its git folder and the common dir, in `git-pins/<sandbox>.json` in IMACS's state folder, which no
+sandbox mounts. From then on IMACS runs git in that folder with `GIT_DIR`, `GIT_COMMON_DIR` and
+`GIT_WORK_TREE` taken from the record, and never reads them from the folder again, also after a restart and
+for bare agents in the same folder. The record goes when cleanup removes the sandbox.
+
+- **Layouts git did not make are refused.** A git folder that does not point back at its worktree, or a
+  repository inside the worktree or inside another repository's objects, refs, logs or worktrees, stops
+  the agent from starting.
+- **`extensions.worktreeConfig` is refused.** With it, git reads `config.worktree` in the worktree's own git
+  folder, which the sandbox can write, as repository config. IMACS checks this each time a sandboxed agent
+  starts. Unset it, or set `isolation = "bare"` for agents in that repository.
+- **Submodules are not entered.** A submodule the agent adds could point git at a folder of its choosing,
+  so `git status` and `git diff` run with `--ignore-submodules=dirty`. Changes to a submodule's commit still
+  show; changes inside it do not.
+- **Worktree cleanup checks for changes with the recorded locations**, as strictly as `git worktree remove`
+  does, then removes the worktree with `--force`. `git worktree remove` would check with a git of its own
+  that follows the worktree's files. Worktrees with submodules are left to you.
+- **A folder outside any repository stays that way.** IMACS does not run git in it or in any folder below
+  it while the record exists, whatever `.git` the agent creates there.
+
 An agent started in a folder outside any repository gets that folder. IMACS refuses to sandbox an agent
 in your home folder or any folder above it, since the sandbox would mount the whole home folder
 read-write. Long briefs for agents other than Claude are written to a folder of the session's own,
@@ -169,7 +198,9 @@ mounted read-only.
   legitimate commits survive. This is recovery after a turn, not write isolation: shared refs cannot
   identify which concurrent writer moved a ref. Review the diff and branch before integrating.
 - **Objects are data.** Objects an agent writes stay on your machine, and git never executes them. Hooks
-  and config, which do run on your machine, are out of reach.
+  and config, which do run on your machine, are out of reach, and git on your machine finds them through
+  IMACS's record, not the files the agent can write (see
+  [Git on your machine in a sandboxed folder](#git-on-your-machine-in-a-sandboxed-folder)).
 - **The network** is whatever sbx's policy allows, plus `allow_hosts`. `allow-all` gives agents the
   whole internet, which an injected prompt can use to send away code from the worktree.
 - **What you add widens the sandbox.** `mounts` expose folders read-only. `ssh_agent = true` lets an
