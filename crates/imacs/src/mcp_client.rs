@@ -47,6 +47,7 @@ struct StdioServer {
     writes: Receiver<std::io::Result<()>>,
     lines: Receiver<String>,
     stderr: Arc<Mutex<String>>,
+    stderr_done: Receiver<()>,
 }
 
 struct HttpServer {
@@ -210,6 +211,7 @@ impl StdioServer {
         });
         let stderr = Arc::new(Mutex::new(String::new()));
         let tail = stderr.clone();
+        let (drained, stderr_done) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut buffer = [0u8; 1024];
             while let Ok(read) = stderr_pipe.read(&mut buffer) {
@@ -226,8 +228,9 @@ impl StdioServer {
                     tail.drain(..cut);
                 }
             }
+            let _ = drained.send(());
         });
-        Ok(StdioServer { program: program.to_string(), child, stdin: input, writes, lines, stderr })
+        Ok(StdioServer { program: program.to_string(), child, stdin: input, writes, lines, stderr, stderr_done })
     }
 
     fn exchange(&mut self, message: &Value, id: Option<u64>, timeout: Duration) -> Result<Option<Value>, McpError> {
@@ -284,7 +287,10 @@ impl StdioServer {
         }
         let mut message = format!("{} {what}", self.program);
         if let Some(status) = status {
-            message.push_str(&format!(" ({status})"));
+            message.push_str(&format!(" (exited: {status})"));
+            // The process can exit before the stderr reader gets scheduled. Keep
+            // its diagnostic without waiting forever on a descendant's inherited pipe.
+            let _ = self.stderr_done.recv_timeout(deadline.saturating_duration_since(Instant::now()));
         }
         let stderr = self.stderr.lock().unwrap();
         let tail = stderr.trim();
