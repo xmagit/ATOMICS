@@ -188,7 +188,11 @@ mounted read-only.
   its session by the sandbox's name, which stays the same across IMACS restarts.
 - **Status.** Hooks run `imacs hook` on your machine, and a sandbox does not have it. A sandboxed agent's
   status comes from its screen, like any agent without hooks: it is working while it shows
-  `esc to interrupt`.
+  `esc to interrupt`. A question it asks before its first turn, such as a choice menu, a trust, update
+  or sign-in screen, shows as needs you.
+- **Folder trust.** A new sandbox's Codex has never seen its folder, and would stop at "Trust this
+  folder?". IMACS starts sandboxed Codex with the mounted folder trusted
+  (`-c 'projects={ "<folder>" = { trust_level = "trusted" } }'`); the sandbox is the boundary.
 - **Steering and review comments.** These are typed into the tile's terminal, as for any agent.
 - **Approvals.** Sandboxed agents run unattended: Claude uses `bypassPermissions`, and Codex uses
   `approval_policy = "never"`. The VM mounts and sbx network policy replace IMACS approvals. IMACS

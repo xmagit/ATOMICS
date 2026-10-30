@@ -405,6 +405,16 @@ impl State {
                     "mcp_servers.imacs.default_tools_approval_mode=\"approve\"".to_string(),
                 ]);
             }
+            // Codex asks whether to trust a folder it has no setting for, and in a new sandbox it has
+            // none. The folder sbx mounts, as the whole table: a folder's dots would split a dotted key.
+            AgentKind::Generic if sandboxed.as_ref().is_some_and(|sandboxed| sandboxed.agent == "codex") => {
+                let mounted = match git::pinned(&cwd) {
+                    Some(pins) if pins.git_dir.is_some() => pins.work_tree,
+                    _ => cwd.clone(),
+                };
+                let folder = serde_json::to_string(&mounted.to_string_lossy()).unwrap_or_default();
+                args.extend(["-c".to_string(), format!("projects={{ {folder} = {{ trust_level = \"trusted\" }} }}")]);
+            }
             _ => {}
         }
         if agent.kind == AgentKind::Claude {
@@ -620,6 +630,16 @@ impl State {
             }
             session.screen_busy = busy;
             if session.status == AgentStatus::NeedsInput && !new_turn {
+                continue;
+            }
+            // Before its first turn, a sandboxed agent may stop at a question, such as Codex's folder trust.
+            if !busy
+                && session.sandbox.is_some()
+                && matches!(session.status, AgentStatus::Starting | AgentStatus::Idle)
+                && imacs_core::approvals::first_run_prompt(&terminal.screen_text(60))
+            {
+                session.status = AgentStatus::NeedsInput;
+                session.activity.observe(session.status);
                 continue;
             }
             session.status = match (busy, session.status) {

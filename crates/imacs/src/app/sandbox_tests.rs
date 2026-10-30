@@ -111,9 +111,11 @@ fn sandboxed_task_args_drop_host_sandbox_flags_and_bare_ones_keep_them() {
         app.runtime.start(ctx, "codex", worktree.clone(), None, task_args.clone(), Some("Do the task".into())).unwrap();
         tick_until(app, ctx, "the agent to attach", |_| bin.path().join("run-ssh").exists());
         let run = fake::calls_to(bin.path(), &["run"]).pop().unwrap();
+        let trusted =
+            format!("projects={{ {:?} = {{ trust_level = \"trusted\" }} }}", worktree.canonicalize().unwrap());
         assert_eq!(
             run[4..],
-            ["--", "--search", "-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=high", "Do the task"],
+            ["--", "--search", "-c", &trusted, "-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=high", "Do the task"],
             "{run:?}"
         );
 
@@ -559,6 +561,41 @@ echo new > a.txt
             assert!(raw.status.success() && marker.exists(), "{redirect}: the planted config must be live");
             app.runtime.sessions.clear();
         }
+    });
+}
+
+#[test]
+fn sandboxed_codex_trusts_its_folder_and_a_first_run_question_needs_you() {
+    with_app("app::sandbox_tests::sandboxed_codex_trusts_its_folder_and_a_first_run_question_needs_you", |app, ctx| {
+        let (_dir, repo) = repository();
+        let worktree = worktree(&repo, "task.v2");
+        let bin = tempfile::tempdir().unwrap();
+        app.runtime.sbx = fake::install(bin.path()).display().to_string();
+        app.runtime.config.isolation.mode = IsolationMode::Sandbox;
+        // A Codex that still asks, as one too old for the trust setting would.
+        std::fs::write(
+            bin.path().join("agent"),
+            "printf '  Trust this folder? Codex can read, edit, and run files here.\\n\\n› 1. Trust and continue\\n  2. Open restricted\\n'\nexec sleep 30\n",
+        )
+        .unwrap();
+        let id = app.runtime.start(ctx, "codex", worktree.clone(), None, vec![], Some("Do the task".into())).unwrap();
+        tick_until(app, ctx, "the agent to attach", |_| !fake::calls_to(bin.path(), &["run"]).is_empty());
+
+        // The mounted worktree is trusted up front; its dotted name stays one key of the table.
+        let run = fake::calls_to(bin.path(), &["run"]).pop().unwrap();
+        let folder = worktree.canonicalize().unwrap().display().to_string();
+        assert_eq!(run[4..7], ["--", "-c", &format!("projects={{ {folder:?} = {{ trust_level = \"trusted\" }} }}")]);
+        assert_eq!(run.last().map(String::as_str), Some("Do the task"));
+        let projects: toml::Table = toml::from_str(&run[6]).unwrap();
+        assert_eq!(projects["projects"][&folder]["trust_level"].as_str(), Some("trusted"));
+
+        // A question before the first turn needs you, instead of the tile saying idle.
+        tick_until(app, ctx, "the question to need you", |app| {
+            app.runtime.busy_checked = Instant::now() - Duration::from_secs(1);
+            app.runtime.sessions[app.runtime.find(&id).unwrap()].status == AgentStatus::NeedsInput
+        });
+        assert!(app.runtime.events.iter().any(|e| e.session == id && e.status == AgentStatus::NeedsInput));
+        app.runtime.close(&id);
     });
 }
 

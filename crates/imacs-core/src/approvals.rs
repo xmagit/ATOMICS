@@ -346,6 +346,21 @@ pub fn menu_visible(screen: &str) -> bool {
         })
 }
 
+/// A question an agent asks before its first turn and waits on: Codex's "Trust this folder?",
+/// its update and sign-in screens, Claude's folder trust, or any choice menu.
+pub fn first_run_prompt(screen: &str) -> bool {
+    const PROMPTS: &[&str] = &[
+        "trustthisfolder?",
+        "trustandcontinue",
+        "doyoutrustthefilesinthisfolder",
+        "skipuntilnextversion",
+        "signinwithchatgpt",
+        "pressentertocontinue",
+    ];
+    let compact: String = screen.chars().filter(|c| !c.is_whitespace()).flat_map(char::to_lowercase).collect();
+    menu_visible(screen) || PROMPTS.iter().any(|prompt| compact.contains(prompt))
+}
+
 /// Match a complete native menu command, expanding hidden or truncated commands first.
 pub fn menu_key(screen: &str, command: Option<&str>, decision: Decision) -> Option<String> {
     let command = command?;
@@ -753,6 +768,22 @@ mod tests {
         assert!(!menu_visible(
             "› 1. Yes, proceed\nPress enter to confirm or esc to cancel\nWorking (esc to interrupt)\n›"
         ));
+    }
+
+    #[test]
+    fn first_run_questions_are_prompts_and_an_idle_composer_is_not() {
+        for screen in [
+            "  Trust this folder? Codex can read, edit, and run files here, subject to your\n  permission settings.\n\n  Trust and continue\n  Open restricted",
+            "> You are in /repos/app\n\n  Do you trust the files in this folder?\n\n❯ 1. Yes, proceed\n  2. No, exit",
+            "✨ Update available! 0.165.0 -> 0.170.0\n\n› 1. Update now\n  2. Skip\n  3. Skip until next version",
+            "  Sign in with ChatGPT to use Codex as part of your paid plan\n\n  Press Enter to continue",
+        ] {
+            assert!(first_run_prompt(screen), "{screen}");
+        }
+        for screen in ["", "› Ask Codex to do anything", "1. A numbered answer\n2. Another\n\n› Implement {feature}"]
+        {
+            assert!(!first_run_prompt(screen), "{screen}");
+        }
     }
 
     #[test]
