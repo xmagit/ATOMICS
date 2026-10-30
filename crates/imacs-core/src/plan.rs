@@ -492,7 +492,9 @@ impl Plan {
             .iter()
             .filter(|dep| {
                 !self.tasks.iter().any(|other| {
-                    &other.id == *dep && other.integrated.as_deref() == Some(&into) && other.integration_verified
+                    &other.id == *dep
+                        && (other.branch.is_none() && other.status == TaskStatus::Done
+                            || other.integrated.as_deref() == Some(&into) && other.integration_verified)
                 })
             })
             .map(String::as_str)
@@ -603,6 +605,20 @@ pub fn short_slug(title: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepted_tasks_without_branches_do_not_block_dependents() {
+        let plan = Plan {
+            tasks: vec![
+                Task { id: "a".into(), status: TaskStatus::Done, ..Default::default() },
+                Task { id: "b".into(), depends_on: vec!["a".into()], ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        assert!(plan.unintegrated_dependencies(&plan.tasks[1]).is_empty());
+        assert_eq!(plan.ready().iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["b"]);
+    }
+
     #[cfg(feature = "native")]
     use crate::git;
 
@@ -982,6 +998,7 @@ mod tests {
     fn ready_respects_dependencies() {
         let mut plan = Plan::default();
         plan.replace("ship it".into(), vec![task("a", &[]), task("b", &["a"]), task("c", &[])]);
+        plan.task_mut("a").unwrap().branch = Some("task-a".into());
         let ready: Vec<&str> = plan.ready().iter().map(|t| t.id.as_str()).collect();
         assert_eq!(ready, ["a", "c"]);
         assert_eq!(plan.tasks.last().unwrap().id, REVIEW_TASK);

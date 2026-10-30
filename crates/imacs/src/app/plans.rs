@@ -1432,7 +1432,7 @@ mod tests {
                     app,
                     json!({
                         "cmd":"plan_set", "goal":"Compact replies", "tasks":[
-                            {"id":"a", "brief":brief},
+                            {"id":"a", "brief":brief, "branch":"task-a"},
                             {"id":"b", "depends_on":["a"]}
                         ]
                     }),
