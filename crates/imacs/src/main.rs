@@ -42,8 +42,8 @@ struct Cli {
     command: Option<Command>,
     /// Project (git repository) to open; any folder inside it or its worktrees works
     path: Option<PathBuf>,
-    /// Open a saved workspace (a set of projects)
-    #[arg(long, short)]
+    /// Open a saved workspace (a set of projects); `setup` and `doctor` take it after their name too
+    #[arg(long, short, global = true)]
     workspace: Option<String>,
     /// Start an agent on launch, as AGENT:FOLDER (repeatable), e.g. claude:~/repos/app
     #[arg(long, value_name = "AGENT:FOLDER")]
@@ -115,7 +115,7 @@ enum Command {
 
 #[derive(Subcommand)]
 enum SandboxCommand {
-    /// Set up Claude subscription OAuth using the OS keychain (no token arguments)
+    /// Set up sandboxed agents: tools, Docker sign-in, network policy and credentials (over stdin)
     Setup,
     Template {
         #[command(subcommand)]
@@ -307,6 +307,19 @@ mod cli_tests {
         assert!(matches!(cli.command, Some(Command::Setup)));
         let cli = Cli::try_parse_from(["imacs", "sandbox", "setup"]).unwrap();
         assert!(matches!(cli.command, Some(Command::Sandbox { command: SandboxCommand::Setup })));
+        for args in [
+            &["imacs", "--workspace", "daily", "setup"][..],
+            &["imacs", "setup", "--workspace", "daily"],
+            &["imacs", "sandbox", "setup", "-w", "daily"],
+            &["imacs", "doctor", "-w", "daily"],
+        ] {
+            assert_eq!(Cli::try_parse_from(args).unwrap().workspace.as_deref(), Some("daily"), "{args:?}");
+        }
+        // A queued command keeps its own flags.
+        let cli = Cli::try_parse_from(["imacs", "queue", "--class", "test", "--", "make", "-w", "x"]).unwrap();
+        assert!(cli.workspace.is_none());
+        let Some(Command::Queue { command, .. }) = cli.command else { panic!("queue command") };
+        assert_eq!(command, ["make", "-w", "x"]);
     }
 
     #[test]

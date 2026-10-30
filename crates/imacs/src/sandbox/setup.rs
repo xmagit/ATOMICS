@@ -1,79 +1,13 @@
-//! Guided, resumable host setup. Child output is private; credentials travel over
-//! stdin, and Claude's subscription token is kept in the OS keychain.
+//! Guided, resumable host setup. Child output is private, and credentials travel over stdin.
 use super::*;
 use std::io::{BufRead, IsTerminal, Write};
 
-const SERVICE: &str = "imacs-claude-setup-token";
-const ACCOUNT: &str = "imacs";
-
-#[derive(Clone, Copy)]
-enum Platform {
-    Mac,
-    Linux,
-}
-
-pub(super) struct Keychain {
-    platform: Platform,
-    program: String,
-}
-
-impl Keychain {
-    pub(super) fn current() -> Self {
-        let platform = if cfg!(target_os = "macos") { Platform::Mac } else { Platform::Linux };
-        Self {
-            platform,
-            program: if cfg!(target_os = "macos") { "/usr/bin/security" } else { "/usr/bin/secret-tool" }.into(),
-        }
-    }
-
-    fn lookup_args(&self) -> Vec<&'static str> {
-        match self.platform {
-            Platform::Mac => vec!["find-generic-password", "-a", ACCOUNT, "-s", SERVICE, "-w"],
-            Platform::Linux => vec!["lookup", "service", SERVICE, "account", ACCOUNT],
-        }
-    }
-
-    fn lookup(&self) -> String {
-        std::iter::once(self.program.as_str())
-            .chain(self.lookup_args())
-            .map(|word| format!("'{}'", word.replace('\'', "'\\''")))
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-
-    pub(super) fn available(&self) -> bool {
-        // Never show a keychain response, including errors from a locked keyring.
-        sbx_output(&self.program, &self.lookup_args(), false, TIMEOUT)
-            .is_ok_and(|(status, value, _)| status.success() && valid_token(value.trim()))
-    }
-
-    fn store_command(&self, token: &str) -> (Vec<&'static str>, String) {
-        match self.platform {
-            // security's interactive mode takes the whole command over stdin.
-            // Token validation prevents adding another security command.
-            Platform::Mac => (vec!["-i"], format!("add-generic-password -U -a {ACCOUNT} -s {SERVICE} -w {token}\n")),
-            Platform::Linux => (
-                vec!["store", "--label=IMACS Claude subscription", "service", SERVICE, "account", ACCOUNT],
-                format!("{token}\n"),
-            ),
-        }
-    }
-
-    fn store(&self, token: &str) -> Result<()> {
-        let (args, input) = self.store_command(token);
-        private_command(&self.program, &args, &input)?;
-        if !self.available() {
-            bail!("OS keychain entry could not be read; unlock the keychain and retry `imacs setup`")
-        }
-        Ok(())
-    }
-}
-
 pub fn run(workspace: Option<&str>) -> Result<()> {
     use imacs_core::config::Config;
-    let config = Config::load_or_create(&paths::config_file())
+    let main = Config::load_or_create(&paths::config_file())
         .map_err(|_| anyhow::anyhow!("cannot load IMACS config; fix it before running setup"))?;
-    let config = checks::configured(&config, workspace)
+    let claude = checks::claude_sandboxed(&main, workspace);
+    let config = checks::setup_config(&main, workspace)
         .map_err(|_| anyhow::anyhow!("cannot load workspace isolation/ticket config; fix it before running setup"))?;
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
@@ -111,7 +45,7 @@ pub fn run(workspace: Option<&str>) -> Result<()> {
         }
         retry(&mut input, &mut output)?;
     };
-    guided(&program, &Keychain::current(), &config, &mut input, &mut output, stdin.is_terminal())?;
+    guided(&program, claude, &config, &mut input, &mut output, stdin.is_terminal())?;
     writeln!(output, "Sandbox setup complete. Running imacs doctor (includes optional host/workspace diagnostics):")?;
     crate::doctor::run(workspace);
     Ok(())
@@ -138,9 +72,10 @@ fn consent(input: &mut impl BufRead, output: &mut impl Write, message: &str) -> 
     Ok(())
 }
 
+/// `claude` says whether Claude agents run sandboxed, and so need sbx's anthropic secret.
 fn guided(
     program: &str,
-    keychain: &Keychain,
+    claude: bool,
     config: &SandboxConfig,
     input: &mut impl BufRead,
     output: &mut impl Write,
@@ -172,29 +107,31 @@ fn guided(
     }
     let secrets =
         checks::secrets(program).ok_or_else(|| anyhow::anyhow!("cannot check known secret services; retry setup"))?;
-    if !secrets.oauth || secrets.anthropic || !keychain.available() {
+    // A Claude subscription cannot authenticate in a local sandbox: sbx v0.50.1 strips a custom
+    // OAuth route, and sends its anthropic secret as an API key (docs/isolation.md).
+    if !claude {
+        writeln!(
+            output,
+            "Claude agents run bare by default; to sandbox Claude, store an Anthropic API key in sbx's built-in anthropic secret (stdin)."
+        )?;
+    } else if !secrets.anthropic {
         consent(
             input,
             output,
-            "Set up Claude subscription OAuth in the OS keychain and remove the built-in anthropic secret? This changes credentials for new sandboxes.",
+            "Claude agents run sandboxed: store an Anthropic API key in sbx's anthropic secret? The key is sent over stdin.",
         )?;
-        if !keychain.available() {
-            writeln!(
-                output,
-                "Run `claude setup-token` in a trusted host terminal and paste the token below. Input is hidden on a terminal."
-            )?;
-            let mut token = credential(input, output, "Claude setup-token: ", terminal)?;
-            let result = if valid_token(&token) {
-                keychain.store(&token)
-            } else {
-                Err(anyhow::anyhow!(
-                    "expected a sk-ant-oat01- token containing only letters, digits, hyphens and underscores"
-                ))
-            };
-            token.clear();
-            result?;
-        }
-        register(program, keychain)?;
+        let mut token = credential(input, output, "Anthropic API key: ", terminal)?;
+        let result = if token.is_empty() {
+            Err(anyhow::anyhow!("Anthropic API key is empty; rerun setup to resume"))
+        } else if token.starts_with("sk-ant-oat") {
+            Err(anyhow::anyhow!(
+                "that is a Claude subscription token, which local sandboxes cannot use; enter an API key"
+            ))
+        } else {
+            private_command(program, &["secret", "set", "anthropic"], &format!("{token}\n"))
+        };
+        token.clear();
+        result?;
     }
     if !secrets.openai {
         consent(input, output, "Store an OpenAI API key in sbx? The key is sent over stdin.")?;
@@ -228,6 +165,28 @@ fn guided(
         consent(input, output, "Remove sbx's github secret so sandbox agents cannot push as you?")?;
         safe_sbx(program, &["secret", "rm", "github", "--force"], "could not remove github secret; retry setup")?;
     }
+    let misfiled = checks::secrets(program)
+        .ok_or_else(|| anyhow::anyhow!("cannot check known secret services; retry setup"))?
+        .misfiled;
+    if !misfiled.is_empty() {
+        consent(
+            input,
+            output,
+            &format!(
+                "Remove {} from sbx? Names stay hidden: they may hold a pasted credential.",
+                checks::misfiled_text(&misfiled)
+            ),
+        )?;
+        for secret in &misfiled {
+            safe_sbx(program, &secret.remove_args(), "could not remove a misfiled secret; retry setup")?;
+        }
+    }
+    // Read the store again through doctor's lines: setup is not done with a secret doctor reports missing.
+    if let Some(failed) =
+        checks::secret_lines(checks::secrets(program).as_ref(), claude).iter().find(|line| line.starts_with('✗'))
+    {
+        bail!("sbx does not list what setup stored: {failed}. Rerun `imacs setup`")
+    }
     if config.ssh_agent {
         bail!("set [isolation.sandbox] ssh_agent = false, then rerun setup")
     }
@@ -242,8 +201,7 @@ fn guided(
         )?;
         safe_sbx(program, &["settings", "unset", "ssh.agentSocketPath"], "could not clear SSH socket; retry setup")?;
     }
-    let mut lines = checks::sandbox_lines(program, config);
-    lines.push(checks::subscription_line(keychain.available()));
+    let lines = checks::sandbox_lines(program, config, claude);
     for line in &lines {
         writeln!(output, "{line}")?;
     }
@@ -274,42 +232,6 @@ fn answer(input: &mut impl BufRead) -> Result<String> {
     Ok(line.trim().to_string())
 }
 
-fn valid_token(token: &str) -> bool {
-    token.strip_prefix("sk-ant-oat01-").is_some_and(|suffix| {
-        !suffix.is_empty() && suffix.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
-    })
-}
-
-fn register(program: &str, keychain: &Keychain) -> Result<()> {
-    let lookup = keychain.lookup();
-    safe_sbx(
-        program,
-        &[
-            "secret",
-            "set-custom",
-            "--host",
-            "api.anthropic.com",
-            "--env",
-            "CLAUDE_CODE_OAUTH_TOKEN",
-            "--placeholder",
-            "sk-ant-oat01-{rand}",
-            "--command",
-            &lookup,
-        ],
-        "could not register the keychain lookup; unlock the keychain and retry setup",
-    )?;
-    let secrets = checks::secrets(program)
-        .ok_or_else(|| anyhow::anyhow!("could not check known secret services; retry setup"))?;
-    if secrets.anthropic {
-        safe_sbx(
-            program,
-            &["secret", "rm", "anthropic", "--force"],
-            "OAuth lookup registered, but removing anthropic failed; retry setup",
-        )?;
-    }
-    Ok(())
-}
-
 fn safe_sbx(program: &str, args: &[&str], message: &str) -> Result<()> {
     match sbx_output(program, args, false, TIMEOUT) {
         Ok((status, _, _)) if status.success() => Ok(()),
@@ -338,9 +260,7 @@ fn private_command(program: &str, args: &[&str], input: &str) -> Result<()> {
                 // SAFETY: the setup helper owns this process group, including its children.
                 unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
                 let _ = child.wait();
-                bail!(
-                    "setup helper failed or timed out; unlock the keychain or complete browser sign-in and retry `imacs setup`"
-                )
+                bail!("setup helper failed or timed out; complete browser sign-in and retry `imacs setup`")
             }
         }
     }
@@ -383,27 +303,30 @@ impl Drop for Echo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
-    const CLAUDE: &str = "sk-ant-oat01-PRIVATE-fixture";
+    const API_KEY: &str = "sk-ant-api03-PRIVATE-fixture";
+    const SUBSCRIPTION: &str = "sk-ant-oat01-PRIVATE-fixture";
     const OPENAI: &str = "sk-PRIVATE-openai-fixture";
 
-    fn machine(platform: Platform) -> (crate::test_support::TempDir, String, Keychain) {
+    fn machine() -> (crate::test_support::TempDir, String) {
         let dir = crate::test_support::tempdir().unwrap();
         let sbx = fake::install(dir.path()).to_string_lossy().into_owned();
-        let helper = dir.path().join("keychain with spaces");
-        std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keychain"), &helper).unwrap();
-        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let keychain = Keychain { platform, program: helper.to_string_lossy().into_owned() };
-        (dir, sbx, keychain)
+        (dir, sbx)
     }
 
-    fn run_setup(sbx: &str, keychain: &Keychain, linear: bool, answers: &str) -> (Result<()>, String) {
+    fn touch(dir: &Path, markers: &[&str]) {
+        for marker in markers {
+            std::fs::write(dir.join(marker), "").unwrap();
+        }
+    }
+
+    /// Guided setup with Claude agents sandboxed or bare (the default), and Linear or not.
+    fn run_setup(sbx: &str, claude: bool, linear: bool, answers: &str) -> (Result<()>, String) {
         let config = SandboxConfig { mcp: if linear { vec!["linear".into()] } else { vec![] }, ..Default::default() };
         let mut output = Vec::new();
-        let result = guided(sbx, keychain, &config, &mut answers.as_bytes(), &mut output, false);
+        let result = guided(sbx, claude, &config, &mut answers.as_bytes(), &mut output, false);
         let output = String::from_utf8(output).unwrap();
-        for private in [CLAUDE, OPENAI, "sk-ant-MISFILED-private-value", "PRIVATE-keychain-error"] {
+        for private in [API_KEY, SUBSCRIPTION, OPENAI, "MISFILED-private", "SCOPED-private"] {
             assert!(!output.contains(private));
             if let Err(error) = &result {
                 assert!(!error.to_string().contains(private));
@@ -413,135 +336,204 @@ mod tests {
     }
 
     #[test]
-    fn fresh_mac_and_linux_setup_reaches_green_and_reruns_without_mutations() {
-        for platform in [Platform::Mac, Platform::Linux] {
-            let (dir, sbx, keychain) = machine(platform);
-            for marker in ["signed-out", "no-policy", "no-openai", "misfiled-secret"] {
-                std::fs::write(dir.path().join(marker), "").unwrap();
+    fn fresh_setup_reaches_green_with_claude_bare_and_reruns_without_mutations() {
+        let (dir, sbx) = machine();
+        touch(
+            dir.path(),
+            &["signed-out", "no-policy", "removed-anthropic", "no-openai", "misfiled-secret", "misfiled-scoped"],
+        );
+        let (result, output) = run_setup(&sbx, false, true, &format!("y\ny\ny\n{OPENAI}\ny\ny\ny\n"));
+        result.unwrap();
+        assert!(
+            output.lines().filter(|l| l.starts_with('✓') || l.starts_with('✗')).all(|l| l.starts_with('✓')),
+            "{output}"
+        );
+        assert!(output.contains("Claude agents run bare by default; to sandbox Claude, store an Anthropic API key"));
+        assert!(output.lines().any(|l| l.starts_with("sandboxed Claude: not configured")), "{output}");
+        assert!(output.contains("Remove 2 misfiled secrets in scope anthropic, global from sbx?"), "{output}");
+        let calls = fake::calls(dir.path());
+        assert!(fake::calls_to(dir.path(), &["secret", "set-custom"]).is_empty());
+        assert_eq!(fake::calls_to(dir.path(), &["secret", "set"]), [["secret", "set", "openai"]]);
+        assert_eq!(std::fs::read_to_string(dir.path().join("secret-stdin")).unwrap().trim(), OPENAI);
+        assert_eq!(
+            fake::calls_to(dir.path(), &["mcp", "add"])[0],
+            ["mcp", "add", "linear", "--url", "https://mcp.linear.app/mcp"]
+        );
+        // A misfiled name goes from the listing to `sbx secret rm` only, never to output.
+        assert_eq!(
+            fake::calls_to(dir.path(), &["secret", "rm"]),
+            [
+                vec!["secret", "rm", "sk-ant-MISFILED-private-value", "--force"],
+                vec!["secret", "rm", "sk-ant-oat01-SCOPED-private-value", "--sandbox", "anthropic", "--force"],
+            ]
+        );
+        let others: Vec<_> = calls.iter().filter(|c| !c.starts_with(&["secret".into(), "rm".into()])).collect();
+        assert!(!format!("{others:?}").contains("PRIVATE"));
+        let before = calls.len();
+        run_setup(&sbx, false, true, "").0.unwrap();
+        assert!(fake::calls(dir.path())[before..].iter().all(|c| matches!(
+            c[0].as_str(),
+            "version" | "diagnose" | "ls"
+        ) || c[1] == "ls"
+            || c[1] == "get"));
+    }
+
+    #[test]
+    fn sandboxed_claude_stores_an_api_key_over_stdin_and_refuses_a_subscription_token() {
+        let (dir, sbx) = machine();
+        touch(dir.path(), &["removed-anthropic"]);
+        for refused in ["n\n", "y\n\n", &format!("y\n{SUBSCRIPTION}\n")] {
+            let error = run_setup(&sbx, true, false, refused).0.unwrap_err().to_string();
+            assert!(fake::calls_to(dir.path(), &["secret", "set"]).is_empty(), "{refused:?}: {error}");
+        }
+        let error = run_setup(&sbx, true, false, &format!("y\n{SUBSCRIPTION}\n")).0.unwrap_err().to_string();
+        assert!(error.contains("subscription token, which local sandboxes cannot use"), "{error}");
+        let (result, output) = run_setup(&sbx, true, false, &format!("y\n{API_KEY}\n"));
+        result.unwrap();
+        assert_eq!(fake::calls_to(dir.path(), &["secret", "set"]), [["secret", "set", "anthropic"]]);
+        assert_eq!(std::fs::read_to_string(dir.path().join("secret-stdin")).unwrap().trim(), API_KEY);
+        assert!(output.contains("✓ sandbox Claude secret: anthropic API key"), "{output}");
+        assert!(fake::calls_to(dir.path(), &["secret", "set-custom"]).is_empty());
+    }
+
+    #[test]
+    fn setup_without_a_workspace_registers_linear_for_any_saved_workspace_that_uses_it() {
+        const CHILD: &str = "IMACS_SETUP_WORKSPACE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            // Workspace files are found through IMACS_CONFIG, set for this child alone.
+            let main = imacs_core::config::Config::default();
+            let mcp = |workspace| checks::setup_config(&main, workspace).map(|sandbox| sandbox.mcp).ok();
+            println!("none={:?} plain={:?} work={:?}", mcp(None), mcp(Some("plain")), mcp(Some("work")));
+            let config = checks::setup_config(&main, None).unwrap();
+            if config.mcp.is_empty() {
+                return;
             }
-            let answers = format!("y\ny\ny\n{CLAUDE}\ny\n{OPENAI}\ny\ny\n");
-            let (result, output) = run_setup(&sbx, &keychain, true, &answers);
-            result.unwrap();
-            assert!(
-                output.lines().filter(|l| l.starts_with('✓') || l.starts_with('✗')).all(|l| l.starts_with('✓')),
-                "{output}"
-            );
-            assert!(keychain.available());
-            let calls = fake::calls(dir.path());
-            let set = calls.iter().position(|c| c.starts_with(&["secret".into(), "set-custom".into()])).unwrap();
-            let rm =
-                calls.iter().position(|c| c.starts_with(&["secret".into(), "rm".into(), "anthropic".into()])).unwrap();
-            assert!(set < rm);
-            assert_eq!(
-                calls[set],
-                [
-                    "secret",
-                    "set-custom",
-                    "--host",
-                    "api.anthropic.com",
-                    "--env",
-                    "CLAUDE_CODE_OAUTH_TOKEN",
-                    "--placeholder",
-                    "sk-ant-oat01-{rand}",
-                    "--command",
-                    &keychain.lookup()
-                ]
-            );
-            assert_eq!(
-                fake::calls_to(dir.path(), &["mcp", "add"])[0],
-                ["mcp", "add", "linear", "--url", "https://mcp.linear.app/mcp"]
-            );
-            assert_eq!(std::fs::read_to_string(dir.path().join("secret-stdin")).unwrap().trim(), OPENAI);
-            let logs = format!("{calls:?}{}", std::fs::read_to_string(dir.path().join("keychain-argv")).unwrap());
-            assert!(!logs.contains(CLAUDE) && !logs.contains(OPENAI) && !logs.contains("MISFILED"));
-            let before = calls.len();
-            run_setup(&sbx, &keychain, true, "").0.unwrap();
-            assert!(
-                fake::calls(dir.path())[before..]
+            let (dir, sbx) = machine();
+            let mut output = Vec::new();
+            guided(&sbx, false, &config, &mut "y\ny\n".as_bytes(), &mut output, false).unwrap();
+            println!(
+                "linear calls={:?}",
+                fake::calls_to(dir.path(), &["mcp"])
                     .iter()
-                    .all(|c| matches!(c[0].as_str(), "version" | "diagnose") || c[1] == "ls" || c[1] == "get")
+                    .filter(|c| c.contains(&"linear".into()))
+                    .collect::<Vec<_>>()
             );
+            return;
+        }
+        let dir = crate::test_support::tempdir().unwrap();
+        let workspaces = dir.path().join("config/workspaces");
+        std::fs::create_dir_all(&workspaces).unwrap();
+        std::fs::write(workspaces.join("plain.toml"), "projects = []\n").unwrap();
+        std::fs::write(workspaces.join("broken.toml"), "projects = [\n").unwrap();
+        let run = || {
+            let output = crate::test_support::output(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "sandbox::setup::tests::setup_without_a_workspace_registers_linear_for_any_saved_workspace_that_uses_it",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env("HOME", dir.path())
+                    .env("IMACS_HOME", dir.path().join("state"))
+                    .env("IMACS_CONFIG", dir.path().join("config/config.toml")),
+            );
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            stdout
+                .lines()
+                .filter(|line| line.starts_with("none=") || line.starts_with("linear calls="))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_eq!(run(), "none=Some([]) plain=Some([]) work=None");
+        // Max's daily workspace tracks its work in Linear; setup run without --workspace sees it.
+        std::fs::write(workspaces.join("work.toml"), "projects = []\n[tickets]\nsystem = \"Linear\"\n").unwrap();
+        let ran = run();
+        assert!(ran.starts_with(r#"none=Some(["linear"]) plain=Some([]) work=Some(["linear"])"#), "{ran}");
+        assert!(ran.contains(r#"["mcp", "add", "linear", "--url", "https://mcp.linear.app/mcp"]"#), "{ran}");
+        assert!(ran.contains(r#"["mcp", "auth", "linear"]"#), "{ran}");
+    }
+
+    #[test]
+    fn misfiled_secrets_are_removed_only_with_consent_and_never_shown() {
+        let (dir, sbx) = machine();
+        touch(dir.path(), &["misfiled-scoped"]);
+        // Declining stops setup with the entry in place.
+        let (result, output) = run_setup(&sbx, false, false, "n\n");
+        assert!(result.is_err());
+        assert!(output.contains("Remove 1 misfiled secret in scope anthropic from sbx?"), "{output}");
+        assert!(dir.path().join("misfiled-scoped").exists());
+        assert!(fake::calls_to(dir.path(), &["secret", "rm"]).is_empty());
+        // Rerun and agree: exactly that entry goes, and setup reaches green.
+        let (result, output) = run_setup(&sbx, false, false, "y\n");
+        result.unwrap();
+        assert!(!dir.path().join("misfiled-scoped").exists());
+        assert!(output.contains("✓ sandbox secrets filed under known services and sandboxes"), "{output}");
+    }
+
+    #[test]
+    fn setup_rechecks_its_secret_steps_with_doctors_parser() {
+        // A stored key sbx does not list stops setup with doctor's own line, before later steps.
+        for (claude, markers, answers, line) in [
+            (false, ["no-openai", "skip-secret-write"], format!("y\n{OPENAI}\n"), "✗ sandbox OpenAI secret: openai"),
+            (true, ["removed-anthropic", "skip-secret-write"], format!("y\n{API_KEY}\n"), "✗ sandbox Claude secret"),
+        ] {
+            let (dir, sbx) = machine();
+            touch(dir.path(), &markers);
+            let error = run_setup(&sbx, claude, false, &answers).0.unwrap_err().to_string();
+            assert!(error.contains(&format!("sbx does not list what setup stored: {line}")), "{error}");
+            assert!(fake::calls_to(dir.path(), &["settings"]).is_empty(), "SSH steps wait for the secrets");
         }
     }
 
     #[test]
-    fn interrupted_setup_reuses_keychain_and_subscription() {
-        for platform in [Platform::Mac, Platform::Linux] {
-            let (dir, sbx, keychain) = machine(platform);
-            std::fs::write(dir.path().join("no-openai"), "").unwrap();
-            assert!(run_setup(&sbx, &keychain, false, &format!("y\n{CLAUDE}\n")).0.is_err());
-            assert!(keychain.available());
-            assert!(checks::secrets(&sbx).unwrap().oauth);
-            assert!(!checks::secrets(&sbx).unwrap().anthropic);
-            run_setup(&sbx, &keychain, false, &format!("y\n{OPENAI}\n")).0.unwrap();
-            assert_eq!(fake::calls_to(dir.path(), &["secret", "set-custom"]).len(), 1);
-            assert!(fake::calls_to(dir.path(), &["mcp", "add"]).is_empty());
-        }
-    }
-
-    #[test]
-    fn failures_and_invalid_input_never_remove_existing_anthropic_or_show_values() {
-        for platform in [Platform::Mac, Platform::Linux] {
-            for marker in ["fail-keychain", "fail-secret-set-custom"] {
-                let (dir, sbx, keychain) = machine(platform);
-                std::fs::write(dir.path().join(marker), "").unwrap();
-                std::fs::write(dir.path().join("error-output"), CLAUDE).unwrap();
-                assert!(run_setup(&sbx, &keychain, false, &format!("y\n{CLAUDE}\n")).0.is_err());
-                assert!(fake::calls_to(dir.path(), &["secret", "rm"]).is_empty());
-            }
-            for input in ["n\n", "y\ninvalid-private-token\n", "y\nsk-ant-oat01-token;evil\n", "y\n", ""] {
-                let (dir, sbx, keychain) = machine(platform);
-                let (result, output) = run_setup(&sbx, &keychain, false, input);
-                assert!(result.is_err());
-                assert!(!output.contains("invalid-private-token"));
-                assert!(fake::calls_to(dir.path(), &["secret", "set-custom"]).is_empty());
-                assert!(fake::calls_to(dir.path(), &["secret", "rm"]).is_empty());
-            }
+    fn failures_and_invalid_input_never_show_values() {
+        let (dir, sbx) = machine();
+        touch(dir.path(), &["no-openai", "fail-secret-set"]);
+        std::fs::write(dir.path().join("error-output"), OPENAI).unwrap();
+        assert!(run_setup(&sbx, false, false, &format!("y\n{OPENAI}\n")).0.is_err());
+        for input in ["n\n", "y\n\n", "y\n", ""] {
+            let (dir, sbx) = machine();
+            touch(dir.path(), &["no-openai"]);
+            assert!(run_setup(&sbx, false, false, input).0.is_err(), "{input:?}");
+            assert!(fake::calls_to(dir.path(), &["secret", "set"]).is_empty());
+            assert!(fake::calls_to(dir.path(), &["secret", "rm"]).is_empty());
         }
     }
 
     #[test]
     fn version_signin_policy_openai_and_linear_failures_are_resumable() {
-        for marker in
-            ["fail-login", "fail-policy", "fail-secret-set", "fail-mcp-add", "fail-mcp-auth", "skip-secret-write"]
-        {
-            let (dir, sbx, keychain) = machine(Platform::Linux);
-            keychain.store(CLAUDE).unwrap();
-            for name in ["signed-out", "no-policy", "no-openai", marker] {
-                std::fs::write(dir.path().join(name), "").unwrap();
-            }
+        for marker in ["fail-login", "fail-policy", "fail-secret-set", "fail-mcp-add", "fail-mcp-auth"] {
+            let (dir, sbx) = machine();
+            touch(dir.path(), &["signed-out", "no-policy", "no-openai", marker]);
             std::fs::write(dir.path().join("error-output"), OPENAI).unwrap();
-            let answers = format!("y\ny\ny\ny\n{OPENAI}\ny\ny\n");
-            assert!(run_setup(&sbx, &keychain, true, &answers).0.is_err(), "{marker}");
+            let answers = format!("y\ny\ny\n{OPENAI}\ny\ny\n");
+            assert!(run_setup(&sbx, false, true, &answers).0.is_err(), "{marker}");
             std::fs::remove_file(dir.path().join(marker)).unwrap();
             // A fresh invocation re-probes the completed steps. Supply only the
             // answers needed by the state actually reached before the failure.
-            let secrets = checks::secrets(&sbx).unwrap();
             let mut remaining = String::new();
-            if dir.path().join("signed-out").exists() {
-                remaining.push_str("y\n");
+            for (marker, answer) in [("signed-out", "y\n".to_string()), ("no-policy", "y\n".to_string())] {
+                if dir.path().join(marker).exists() {
+                    remaining.push_str(&answer);
+                }
             }
-            if dir.path().join("no-policy").exists() {
-                remaining.push_str("y\n");
-            }
-            if !secrets.oauth || secrets.anthropic {
-                remaining.push_str("y\n");
-            }
-            if !secrets.openai {
+            if !checks::secrets(&sbx).unwrap().openai {
                 remaining.push_str(&format!("y\n{OPENAI}\n"));
             }
             if !dir.path().join("mcp.json").exists() {
                 remaining.push_str("y\n");
             }
             remaining.push_str("y\n");
-            run_setup(&sbx, &keychain, true, &remaining).0.unwrap();
+            run_setup(&sbx, false, true, &remaining).0.unwrap();
         }
-        let (dir, sbx, keychain) = machine(Platform::Mac);
+        let (dir, sbx) = machine();
         for version in ["v0.1.0", "private-malformed-version"] {
             std::fs::write(dir.path().join("version"), version).unwrap();
-            let error = run_setup(&sbx, &keychain, false, "").0.unwrap_err();
+            let error = run_setup(&sbx, false, false, "").0.unwrap_err();
             assert!(!error.to_string().contains(version));
-            assert!(fake::calls_to(dir.path(), &["secret", "set-custom"]).is_empty());
+            assert!(fake::calls_to(dir.path(), &["secret", "set"]).is_empty());
         }
     }
 }

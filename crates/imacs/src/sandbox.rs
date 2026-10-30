@@ -438,6 +438,12 @@ pub fn remove(home: &Path, program: &str, name: &str) -> Result<()> {
         ownership::removed(home, name, Resource::Sandbox)?;
     }
     remove_mcp(home, program, name)?;
+    // The ref guard's baseline goes with its sandbox; one made again under this name takes a new one.
+    match std::fs::remove_file(home.join("ref-guards").join(format!("{name}.json"))) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     if let Some(entry) = ownership::owned(home)?.get(name) {
         if let Some(dir) = &entry.pins {
             forget_pins(dir, name)?;
@@ -558,6 +564,25 @@ fn real(path: &Path) -> PathBuf {
 /// Whether `program` names an sbx this machine has: anything else means sandboxes cannot exist.
 pub fn installed(program: &str) -> bool {
     Path::new(program).is_absolute() && Path::new(program).is_file()
+}
+
+/// The account usage a running sandbox's agents last saw ([`isolation::usage_args`]). Its agent
+/// controls the VM, so only the first 128 KiB are read, and callers treat the rest as its claims.
+pub fn read_usage(program: &str, name: &str) -> Result<String> {
+    const LIMIT: u64 = 128 * 1024;
+    let (mut stdout, stderr) = (capture()?, capture()?);
+    let mut child = sbx_command(program, &isolation::usage_args(name), false, &stdout, &stderr)?
+        .spawn()
+        .with_context(|| format!("running {program}"))?;
+    match wait(&mut child, Instant::now() + Duration::from_secs(20))? {
+        Some(status) if status.success() => {}
+        Some(status) => bail!("sbx exec failed ({status})"),
+        None => bail!("sbx exec did not finish within 20 s"),
+    }
+    let mut bytes = Vec::new();
+    stdout.rewind()?;
+    stdout.take(LIMIT).read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Runs `sbx args` within `timeout` and returns its output, failing when sbx does.
@@ -999,7 +1024,7 @@ mod tests {
         assert_eq!(ready.version, (0, 50, 1));
         assert!(ready.diagnosis.signed_in(), "an unrelated failing check does not matter");
         assert!(
-            doctor_lines(&sbx, &SandboxConfig::default())[0]
+            doctor_lines(&sbx, &SandboxConfig::default(), true)[0]
                 .starts_with("✓ Docker Sandboxes ready (sbx v0.50.1, signed in)")
         );
         std::fs::write(bin.path().join("version"), "v0.51.2").unwrap();
@@ -1022,7 +1047,7 @@ mod tests {
         std::fs::write(bin.path().join("version"), "v0.50.1").unwrap();
         std::fs::write(bin.path().join("signed-out"), "").unwrap();
         let error = refusal(&sbx, &["not signed in", "sbx login"]);
-        let line = &doctor_lines(&sbx, &SandboxConfig::default())[0];
+        let line = &doctor_lines(&sbx, &SandboxConfig::default(), true)[0];
         assert!(line.starts_with("✗ Docker Sandboxes not ready for sandboxed agents (warning) — "), "{line}");
         assert!(line.ends_with(&error), "{line}");
         std::fs::write(bin.path().join("fail-diagnose"), "").unwrap();
@@ -1091,7 +1116,14 @@ mod tests {
         assert_eq!(found.attached.iter().map(|(_, name)| name.as_str()).collect::<Vec<_>>(), ["imacs-a"]);
         assert_eq!(found.orphans.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(), ["imacs-b"]);
 
+        let guards = home.join("ref-guards");
+        std::fs::create_dir_all(&guards).unwrap();
+        for name in ["imacs-a", "imacs-b"] {
+            std::fs::write(guards.join(format!("{name}.json")), "{}").unwrap();
+        }
         remove(&home, &sbx, "imacs-b").unwrap();
+        assert!(!guards.join("imacs-b.json").exists(), "the ref guard's baseline goes with its sandbox");
+        assert!(guards.join("imacs-a.json").exists());
         let calls = fake::calls(bin.path());
         assert_eq!(
             calls[calls.len() - 2..],
@@ -1100,6 +1132,34 @@ mod tests {
         let names: Vec<String> = list(&sbx).unwrap().into_iter().map(|s| s.name).collect();
         assert_eq!(names, ["imacs-a", "poc-1"]);
         assert!(for_repo(&home, &sbx, &repo).unwrap().orphans.is_empty());
+    }
+
+    #[test]
+    fn usage_comes_back_from_the_end_of_the_newest_rollout_in_the_sandbox() {
+        let bin = crate::test_support::tempdir().unwrap();
+        let sbx = fake::install(bin.path()).display().to_string();
+        std::fs::write(bin.path().join("exec-runs"), "").unwrap();
+        std::fs::create_dir_all(bin.path().join("sandboxes")).unwrap();
+        std::fs::write(bin.path().join("sandboxes/imacs-u"), r#"{"name":"imacs-u","status":"running"}"#).unwrap();
+        // The fake runs `exec` with HOME at its folder, as the VM's agent home.
+        let day = bin.path().join(".codex/sessions/2026/10/30");
+        std::fs::create_dir_all(&day).unwrap();
+        let event = |used: u32| {
+            format!(
+                r#"{{"timestamp":"2026-10-30T11:32:20Z","type":"event_msg","payload":{{"type":"token_count","rate_limits":{{"primary":{{"used_percent":{used},"window_minutes":10080,"resets_at":1793864523}}}}}}}}"#
+            )
+        };
+        let old = day.join("rollout-old.jsonl");
+        std::fs::write(&old, event(50) + "\n").unwrap();
+        File::options().write(true).open(&old).unwrap().set_modified(std::time::UNIX_EPOCH).unwrap();
+        std::fs::write(day.join("rollout-new.jsonl"), format!("{}\n{}\n", "x".repeat(40_000), event(12))).unwrap();
+
+        let output = read_usage(&sbx, "imacs-u").unwrap();
+        assert!(output.len() < 20_000, "the VM keeps only the end of the rollout: {} bytes", output.len());
+        let reports = crate::usage::sandbox_reports(&output, i64::MAX);
+        let [crate::usage::Report::Codex(usage)] = reports.as_slice() else { panic!("one Codex report: {output}") };
+        assert_eq!(usage.weekly.as_ref().unwrap().remaining, 88.0, "from the newest rollout");
+        assert!(read_usage(&sbx, "imacs-gone").is_err());
     }
 
     #[test]

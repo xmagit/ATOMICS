@@ -80,6 +80,8 @@ fn quitting_stops_running_and_preparing_sandboxes_and_joins_cleanup() {
         app.runtime.sbx = fake::install(bin.path()).display().to_string();
         std::fs::write(bin.path().join("run-waits"), "wait").unwrap();
         app.runtime.config.isolation.mode = IsolationMode::Sandbox;
+        // The default claude agent is bare; this test sandboxes it.
+        app.runtime.config.agents.iter_mut().for_each(|agent| agent.isolation = None);
         let running = app.runtime.start(ctx, "claude", repo.clone(), None, vec![], None).unwrap();
         tick_until(app, ctx, "running sandbox", |app| {
             app.runtime.sessions.iter().any(|s| s.id == running && s.terminal.is_some())
@@ -198,6 +200,8 @@ fn sandboxed_agents_attach_through_sbx_run_and_reattach_after_a_restart() {
         let bin = crate::test_support::tempdir().unwrap();
         app.runtime.sbx = fake::install(bin.path()).display().to_string();
         app.runtime.config.isolation.mode = IsolationMode::Sandbox;
+        // The default claude agent is bare; this test sandboxes it.
+        app.runtime.config.agents.iter_mut().for_each(|agent| agent.isolation = None);
 
         let id = app.runtime.start(ctx, "claude", worktree.clone(), None, vec![], Some("Fix the bug".into())).unwrap();
         let name = format!("imacs-{id}");
@@ -218,8 +222,10 @@ fn sandboxed_agents_attach_through_sbx_run_and_reattach_after_a_restart() {
         let run = &fake::calls_to(bin.path(), &["run"])[0];
         assert_eq!(run[..5], ["run", "--name", name.as_str(), "claude", "--"]);
         let session_id = app.runtime.sessions[index].claude_id.clone().unwrap();
-        assert_eq!(run[5..], ["--session-id", session_id.as_str(), "Fix the bug"]);
-        assert!(!run.iter().any(|arg| arg == "--settings" || arg == "--mcp-config"), "host hooks stay out: {run:?}");
+        // Its status line only saves the account's limits in the VM; host hooks and MCP config stay out.
+        let settings = imacs_core::isolation::claude_settings().to_string();
+        assert_eq!(run[5..], ["--settings", settings.as_str(), "--session-id", session_id.as_str(), "Fix the bug"]);
+        assert!(!run.iter().any(|arg| arg == "--mcp-config" || arg.contains("hook")), "host hooks stay out: {run:?}");
         assert_eq!(std::fs::read_to_string(bin.path().join("run-ssh")).unwrap().trim(), "unset");
         assert_eq!(app.runtime.sessions[index].sandbox.as_deref(), Some(name.as_str()));
         assert_eq!(app.runtime.pane_session(Some(name.clone())), Some(id.clone()), "reports find their session");
@@ -237,7 +243,20 @@ fn sandboxed_agents_attach_through_sbx_run_and_reattach_after_a_restart() {
         tick_until(app, ctx, "the resumed agent to attach", |_| bin.path().join("run-ssh").exists());
         assert_eq!(fake::calls_to(bin.path(), &["create"]).len(), 1);
         let run = fake::calls_to(bin.path(), &["run"]).pop().unwrap();
-        assert_eq!(run, ["run", "--name", name.as_str(), "claude", "--", "--resume", session_id.as_str()]);
+        assert_eq!(
+            run,
+            [
+                "run",
+                "--name",
+                name.as_str(),
+                "claude",
+                "--",
+                "--settings",
+                settings.as_str(),
+                "--resume",
+                session_id.as_str()
+            ]
+        );
         assert_eq!(app.runtime.sessions[0].sandbox.as_deref(), Some(name.as_str()));
         finish_agents(app, ctx);
     });

@@ -179,7 +179,10 @@ fn report(workspace: Option<&str>, for_agent: bool, projects: &[PathBuf]) -> Rep
             // Tests never reach the sbx installed on the machine running them.
             let sbx = if cfg!(test) { "/nonexistent/imacs-test-sbx".into() } else { resolve_program("sbx") };
             match crate::sandbox::checks::configured(config, workspace) {
-                Ok(sandbox) => lines.extend(crate::sandbox::doctor_lines(&sbx, &sandbox)),
+                Ok(sandbox) => {
+                    let claude = crate::sandbox::checks::claude_sandboxed(config, workspace);
+                    lines.extend(crate::sandbox::doctor_lines(&sbx, &sandbox, claude))
+                }
                 Err(_) => lines.push(check_line(
                     false,
                     "sandbox configuration unavailable",

@@ -1,21 +1,136 @@
 //! Host-side recovery for the shared refs a sandbox can write. This detects changes after a
 //! turn; it is not an access-control boundary or proof of which writer changed a shared ref.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::mpsc::{Sender, channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use anyhow::{Context, Result, bail};
-use imacs_core::git;
+use imacs_core::{git, paths};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-enum RefValue {
+pub(crate) enum RefValue {
     Object(String),
     Symbolic(String),
+}
+
+/// A ref's value as an alert shows it: a short object id or a symbolic target, or absent.
+fn shown(value: Option<&RefValue>) -> String {
+    match value {
+        Some(RefValue::Object(object)) => object.chars().take(12).collect(),
+        Some(RefValue::Symbolic(target)) => format!("a link to {target}"),
+        None => "absent".into(),
+    }
+}
+
+/// Refs IMACS itself writes on this machine, by repository folder: an integration's merge, a new
+/// worktree's branch, a cleaned-up branch. A guard whose snapshot is older must neither undo nor
+/// restore them, and its check may have been queued before IMACS wrote them.
+struct HostWrites {
+    /// Writes in progress: every check accepts these refs.
+    pending: Vec<(PathBuf, String)>,
+    /// The value each write left, or None where IMACS deleted the ref. A check accepts a ref still at
+    /// that value and restores any other, such as an agent's.
+    written: Vec<(PathBuf, String, Option<RefValue>)>,
+}
+
+static HOST_WRITES: Mutex<HostWrites> = Mutex::new(HostWrites { pending: Vec::new(), written: Vec::new() });
+
+/// Marks `refs/heads/<branch>` in `repo`'s repository as written by IMACS until the returned
+/// [`HostWrite`] drops, which records the values the write left. Call it before the write starts.
+pub fn host_write<S: AsRef<str>>(repo: &Path, branches: impl IntoIterator<Item = S>) -> HostWrite {
+    let names: Vec<String> = branches.into_iter().map(|branch| format!("refs/heads/{}", branch.as_ref())).collect();
+    let mut host = HOST_WRITES.lock().unwrap_or_else(|e| e.into_inner());
+    host.pending.extend(names.iter().map(|name| (repo.to_path_buf(), name.clone())));
+    HostWrite { repo: repo.to_path_buf(), names }
+}
+
+/// A write by IMACS in progress; see [`host_write`]. Dropping it runs git.
+pub struct HostWrite {
+    repo: PathBuf,
+    names: Vec<String>,
+}
+
+impl Drop for HostWrite {
+    fn drop(&mut self) {
+        let values = read_refs(&self.repo).ok();
+        self.record(values.as_ref());
+        if let Some(values) = &values {
+            accept_written(&self.repo, &self.names, values);
+        }
+    }
+}
+
+impl HostWrite {
+    fn record(&self, values: Option<&BTreeMap<String, RefValue>>) {
+        let mut host = HOST_WRITES.lock().unwrap_or_else(|e| e.into_inner());
+        for name in &self.names {
+            if let Some(index) = host.pending.iter().position(|(repo, pending)| *repo == self.repo && pending == name) {
+                host.pending.remove(index);
+            }
+            // Without the values a later check falls back to restoring, as before IMACS wrote.
+            if let Some(values) = values {
+                host.written.retain(|(repo, written, _)| !(*repo == self.repo && written == name));
+                host.written.push((self.repo.clone(), name.clone(), values.get(name).cloned()));
+            }
+        }
+    }
+}
+
+/// Every open guard, so that what IMACS writes reaches its baseline as soon as it is written.
+static OPEN: Mutex<Vec<Weak<Mutex<RefGuard>>>> = Mutex::new(Vec::new());
+
+/// Puts what IMACS just wrote into the baseline of every guard of that repository: the open ones, and
+/// the snapshots of sandboxed sessions that are not running, which they reattach with. An agent that
+/// moves such a ref afterwards is restored to IMACS's value, not to an older one.
+fn accept_written(repo: &Path, names: &[String], values: &BTreeMap<String, RefValue>) {
+    let Ok(common) = common_of(repo) else { return };
+    let open: Vec<_> = OPEN.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(Weak::upgrade).collect();
+    let mut files = HashSet::new();
+    for guard in open {
+        let mut guard = guard.lock().unwrap_or_else(|e| e.into_inner());
+        files.insert(guard.file.clone());
+        if guard.common == common {
+            let _ = guard.accept(names, values);
+        }
+    }
+    let Ok(entries) = std::fs::read_dir(paths::imacs_home().join("ref-guards")) else { return };
+    let snapshots = entries.flatten().map(|entry| entry.path());
+    for file in snapshots.filter(|file| file.extension().is_some_and(|ext| ext == "json") && !files.contains(file)) {
+        let Some(mut guard) =
+            std::fs::read(&file).ok().and_then(|bytes| serde_json::from_slice::<RefGuard>(&bytes).ok())
+        else {
+            continue;
+        };
+        if guard.common == common {
+            guard.file = file;
+            let _ = guard.accept(names, values);
+        }
+    }
+}
+
+fn common_of(cwd: &Path) -> Result<PathBuf> {
+    let common = git::git(cwd, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
+    Ok(PathBuf::from(common.trim()).canonicalize()?)
+}
+
+/// The refs IMACS is writing, and the values it left, in the repository at `common`. Runs git.
+fn host_writes(common: &Path) -> (BTreeSet<String>, BTreeMap<String, Option<RefValue>>) {
+    let (pending, written) = {
+        let host = HOST_WRITES.lock().unwrap_or_else(|e| e.into_inner());
+        (host.pending.clone(), host.written.clone())
+    };
+    let mut commons: HashMap<PathBuf, bool> = HashMap::new();
+    let mut ours = |repo: &PathBuf| {
+        *commons.entry(repo.clone()).or_insert_with(|| git::common_dir(repo).ok().as_deref() == Some(common))
+    };
+    let pending = pending.into_iter().filter(|(repo, _)| ours(repo)).map(|(_, name)| name).collect();
+    let written = written.into_iter().filter(|(repo, _, _)| ours(repo)).map(|(_, name, value)| (name, value)).collect();
+    (pending, written)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -36,8 +151,7 @@ impl RefGuard {
         if git::worktree_of(cwd).is_none() {
             return Ok(None);
         }
-        let common = git::git(cwd, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
-        let common = PathBuf::from(common.trim()).canonicalize()?;
+        let common = common_of(cwd)?;
         let mut guard = if file.exists() {
             let guard: Self = serde_json::from_slice(&std::fs::read(&file)?)?;
             if guard.common != common {
@@ -60,13 +174,19 @@ impl RefGuard {
     }
 
     /// Restore changed, deleted and newly created refs outside the task branches. Other
-    /// active tasks' branches must be exempt too: they share this same refs directory.
-    pub fn check(&mut self, concurrent: &BTreeSet<String>) -> Result<Vec<String>> {
+    /// active tasks' branches must be exempt too: they share this same refs directory. A ref still
+    /// at the value IMACS itself `written` there is accepted.
+    pub(crate) fn check(
+        &mut self,
+        concurrent: &BTreeSet<String>,
+        written: &BTreeMap<String, Option<RefValue>>,
+    ) -> Result<Vec<String>> {
         let current = read_refs(&self.cwd)?;
         let names: BTreeSet<_> = self.refs.keys().chain(current.keys()).cloned().collect();
         let mut alerts = Vec::new();
         for name in names {
-            if self.branch.as_ref() == Some(&name) || concurrent.contains(&name) {
+            let imacs = written.get(&name).is_some_and(|value| value.as_ref() == current.get(&name));
+            if self.branch.as_ref() == Some(&name) || concurrent.contains(&name) || imacs {
                 match current.get(&name) {
                     Some(value) => {
                         self.refs.insert(name, value.clone());
@@ -82,9 +202,14 @@ impl RefGuard {
                 continue;
             }
             let result = restore(&self.cwd, &name, before, after);
-            alerts.push(match result {
-                Ok(()) => format!("Restored {name}: {after:?} → {before:?}"),
-                Err(error) => format!("RESTORE FAILED for {name}: {error:#}; expected {before:?}, found {after:?}"),
+            let (expected, found) = (shown(before), shown(after));
+            alerts.push(match (result, before, after) {
+                (Ok(()), None, _) => format!("Restored {name}: removed it (it pointed to {found})"),
+                (Ok(()), _, None) => format!("Restored {name}: recreated it at {expected}"),
+                (Ok(()), _, _) => format!("Restored {name}: from {found} back to {expected}"),
+                (Err(error), _, _) => {
+                    format!("RESTORE FAILED for {name}: {error:#}; expected {expected}, found {found}")
+                }
             });
         }
         // Do not change the pinned branch if the agent switches HEAD to another task's branch.
@@ -97,6 +222,17 @@ impl RefGuard {
         }
         self.save()?;
         Ok(alerts)
+    }
+
+    /// Takes the values IMACS left in `names` as this guard's baseline for them.
+    fn accept(&mut self, names: &[String], values: &BTreeMap<String, RefValue>) -> Result<()> {
+        for name in names {
+            match values.get(name) {
+                Some(value) => self.refs.insert(name.clone(), value.clone()),
+                None => self.refs.remove(name),
+            };
+        }
+        self.save()
     }
 
     fn save(&self) -> Result<()> {
@@ -119,13 +255,20 @@ pub struct Shared {
 
 impl Shared {
     pub fn new(guard: RefGuard) -> Self {
-        Self { common: guard.common.clone(), branch: guard.branch.clone(), guard: Arc::new(Mutex::new(guard)) }
+        let (common, branch) = (guard.common.clone(), guard.branch.clone());
+        let guard = Arc::new(Mutex::new(guard));
+        let mut open = OPEN.lock().unwrap_or_else(|e| e.into_inner());
+        open.retain(|open| open.strong_count() > 0);
+        open.push(Arc::downgrade(&guard));
+        Self { common, branch, guard }
     }
 
     /// Runs git: call it on [`Checks`]' thread.
     pub fn check(&self, exempt: &Exempt) -> Result<Vec<String>> {
-        let concurrent = exempt.resolve(&self.common);
-        self.guard.lock().unwrap_or_else(|e| e.into_inner()).check(&concurrent)
+        let mut concurrent = exempt.resolve(&self.common);
+        let (pending, written) = host_writes(&self.common);
+        concurrent.extend(pending);
+        self.guard.lock().unwrap_or_else(|e| e.into_inner()).check(&concurrent, &written)
     }
 }
 
@@ -341,7 +484,7 @@ mod tests {
         git::git(&worktree, &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/heads/task"]).unwrap();
         git::git(&worktree, &["symbolic-ref", "refs/heads/dangling", "refs/heads/missing"]).unwrap();
         let mut guard = RefGuard::open(&worktree, file).unwrap().unwrap();
-        let alerts = guard.check(&BTreeSet::new()).unwrap();
+        let alerts = guard.check(&BTreeSet::new(), &BTreeMap::new()).unwrap();
         assert_eq!(alerts.len(), 6, "{alerts:?}");
         assert!(alerts.iter().all(|alert| alert.starts_with("Restored")), "{alerts:?}");
         for name in ["main", "other", "original", "origin/HEAD"] {
@@ -350,7 +493,7 @@ mod tests {
         assert_eq!(git::git(&repo, &["rev-parse", "task"]).unwrap().trim(), task);
         assert!(git::git(&repo, &["rev-parse", "--verify", "refs/tags/injected"]).is_err());
         assert!(git::git(&repo, &["symbolic-ref", "refs/heads/dangling"]).is_err());
-        assert!(guard.check(&BTreeSet::new()).unwrap().is_empty());
+        assert!(guard.check(&BTreeSet::new(), &BTreeMap::new()).unwrap().is_empty());
     }
 
     #[test]
@@ -362,15 +505,18 @@ mod tests {
         git::git(&worktree, &["commit", "--allow-empty", "-qm", "advance"]).unwrap();
         let task = git::git(&worktree, &["rev-parse", "HEAD"]).unwrap();
         git::git(&worktree, &["update-ref", "refs/heads/peer", task.trim()]).unwrap();
-        assert!(guard.check(&BTreeSet::from(["refs/heads/peer".into()])).unwrap().is_empty());
-        assert!(guard.check(&BTreeSet::new()).unwrap().is_empty(), "accepted commit survives peer exit");
+        assert!(guard.check(&BTreeSet::from(["refs/heads/peer".into()]), &BTreeMap::new()).unwrap().is_empty());
+        assert!(
+            guard.check(&BTreeSet::new(), &BTreeMap::new()).unwrap().is_empty(),
+            "accepted commit survives peer exit"
+        );
         git::git(&repo, &["update-ref", "refs/heads/main", task.trim()]).unwrap();
         let lock = repo.join(".git/refs/heads/main.lock");
         std::fs::write(&lock, "").unwrap();
-        let alerts = guard.check(&BTreeSet::new()).unwrap();
+        let alerts = guard.check(&BTreeSet::new(), &BTreeMap::new()).unwrap();
         assert!(alerts[0].contains("RESTORE FAILED"), "{alerts:?}");
         std::fs::remove_file(lock).unwrap();
-        assert!(guard.check(&BTreeSet::new()).unwrap()[0].starts_with("Restored"));
+        assert!(guard.check(&BTreeSet::new(), &BTreeMap::new()).unwrap()[0].starts_with("Restored"));
         assert_eq!(git::git(&repo, &["rev-parse", "main"]).unwrap(), initial);
     }
 }

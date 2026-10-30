@@ -54,7 +54,7 @@ the Linux desktop app. State stays in `~/.imacs` on macOS and existing installs;
 ## Run
 
 On a fresh Mac or Ubuntu machine, run `imacs setup` after installing IMACS. It guides tool
-installation, Docker sign-in, network policy, OS-keychain credentials and Linear authorization,
+installation, Docker sign-in, network policy, credentials over stdin and Linear authorization,
 and resumes completed steps on rerun. See [fresh-machine setup](docs/isolation.md#fresh-machine-one-guided-command).
 
 ```sh
@@ -462,7 +462,8 @@ config reference and examples.
 ## Agents in sandboxes
 
 By default each agent runs in its own [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) microVM,
-which sees only its worktree and git's write folders. IMACS creates the sandbox when the agent starts,
+which sees only its worktree and git's write folders. Claude agents are the exception and run bare by default:
+a Claude subscription cannot authenticate in a local sandbox. IMACS creates the sandbox when the agent starts,
 attaches the tile to it with `sbx run`, reattaches after a restart and removes it with the worktree. It
 needs `sbx` v0.50.1 or newer, signed in. Without it, sandboxed agents are refused, never started bare.
 Set `[isolation] mode = "bare"`, or `isolation = "bare"` on one agent, to run agents directly on your

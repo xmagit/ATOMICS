@@ -77,6 +77,23 @@ pub(super) fn queue_note(pid: u32, running: &[Ticket], waiting: &[Ticket]) -> Op
     Some(format!("queued for a {} slot ({place} in line)", ticket.class.name()))
 }
 
+/// Side of the sandbox mark in a tile's header badge.
+const SANDBOX_ICON: f32 = 10.0;
+
+/// The sandbox mark: a closed box, drawn as an isometric cube.
+fn sandbox_icon(painter: &egui::Painter, rect: Rect, color: Color32) {
+    let (c, r) = (rect.center(), rect.width() / 2.0);
+    let (dx, dy) = (r * 0.87, r * 0.5);
+    let corner = |x: f32, y: f32| pos2(c.x + x, c.y + y);
+    let outline =
+        vec![corner(0.0, -r), corner(dx, -dy), corner(dx, dy), corner(0.0, r), corner(-dx, dy), corner(-dx, -dy)];
+    let stroke = Stroke::new(1.2, color);
+    painter.add(egui::Shape::closed_line(outline, stroke));
+    painter.line_segment([corner(-dx, -dy), c], stroke);
+    painter.line_segment([corner(dx, -dy), c], stroke);
+    painter.line_segment([c, corner(0.0, r)], stroke);
+}
+
 impl Desktop<'_> {
     pub(super) fn tab_strip(&mut self, ui: &mut egui::Ui, rect: Rect, tiled: &[usize], visible: &[usize]) {
         let p = self.runtime.palette.clone();
@@ -166,24 +183,30 @@ impl Desktop<'_> {
             let mut badge_width = 0.0;
             if let Some(name) = &session.sandbox {
                 let usage = self.runtime.sandbox_usage.usage.get(name);
-                let text = usage.map_or_else(|| "sandbox · —".into(), |usage| format!("sandbox · {}", usage.label()));
+                let text = usage.map_or_else(|| "Sandbox".into(), |usage| format!("Sandbox · {}", usage.label()));
                 let galley = ui.fonts_mut(|f| f.layout_no_wrap(text, p.ui(10.0), p.info));
-                badge_width = galley.size().x + 15.0;
+                badge_width = galley.size().x + SANDBOX_ICON + 19.0;
                 let badge = Rect::from_min_max(
                     pos2((header.right() - 28.0 - badge_width).max(header.left() + 22.0), header.center().y - 8.5),
                     pos2(header.right() - 31.0, header.center().y + 8.5),
                 );
                 ui.painter().rect_filled(badge, 4.0, lerp(p.raised, p.info, 0.15));
-                ui.painter().with_clip_rect(badge).galley(
-                    badge.left_center() + vec2(5.0, -galley.size().y / 2.0),
-                    galley,
-                    p.info,
+                let painter = ui.painter().with_clip_rect(badge);
+                let icon = Rect::from_center_size(
+                    badge.left_center() + vec2(5.0 + SANDBOX_ICON / 2.0, 0.0),
+                    vec2(SANDBOX_ICON, SANDBOX_ICON),
                 );
-                ui.interact(badge, ui.scope_id().with(("sandbox-usage", name)), Sense::hover()).on_hover_text(
-                    self.runtime.sandbox_usage.error.as_deref().unwrap_or(
-                        "Host VM process tree: resident memory and ps CPU (100% = one core). — means no matching VM process yet."
-                    )
-                );
+                sandbox_icon(&painter, icon, p.info);
+                painter.galley(badge.left_center() + vec2(9.0 + SANDBOX_ICON, -galley.size().y / 2.0), galley, p.info);
+                let resources = match (usage, &self.runtime.sandbox_usage.error) {
+                    (Some(_), _) => "Host VM process tree: resident memory and ps CPU (100% = one core).",
+                    (None, Some(error)) => error.as_str(),
+                    (None, None) => "Its memory and CPU show here once IMACS finds the VM's host process.",
+                };
+                ui.interact(badge, ui.scope_id().with(("sandbox-usage", name)), Sense::hover()).on_hover_text(format!(
+                    "Runs sandboxed in Docker Sandboxes VM {name}: it sees its worktree and git's write folders, \
+                         not the rest of this machine.\n{resources}"
+                ));
             }
             let title_rect = Rect::from_min_max(
                 pos2(header.left() + 22.0, header.top()),

@@ -14,11 +14,12 @@ impl State {
                 return;
             }
         };
+        let claude = crate::sandbox::checks::claude_sandboxed(&self.config, self.workspace.as_deref());
         let (tx, rx) = std::sync::mpsc::channel();
         self.sandbox_check = Some(rx);
         let wake = self.wake.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(crate::sandbox::doctor_lines(&program, &config));
+            let _ = tx.send(crate::sandbox::doctor_lines(&program, &config, claude));
             wake.notify();
         });
     }
@@ -71,9 +72,7 @@ impl Desktop<'_> {
             if ui.button("Copy: imacs setup").clicked() {
                 ui.ctx().copy_text("imacs setup".into());
             }
-            ui.label(
-                "The setup helper stores tokens in the OS keychain. Ticket integrations keep running on the host.",
-            );
+            ui.label("Setup sends credentials to sbx over stdin. Ticket integrations keep running on the host.");
         });
     }
 }
