@@ -68,9 +68,10 @@ secrets are reused. No progress file contains credentials. All token input
 is hidden on a terminal; pipes can supply newline-terminated answers and credentials over
 stdin. Tokens are never command arguments, printed output, logs, or IMACS configuration.
 A token can end up filed as a secret's name, or a service name as its sandbox scope, as with
-`sbx secret set anthropic <token>`. Setup lists these misfiled secrets by count and scope only and,
-with your consent, removes each one, passing its name from sbx's listing straight to `sbx secret rm`
-without ever showing it.
+`sbx secret set anthropic <token>`. Setup lists these misfiled secrets by count and scope only, and
+waits while you remove them: run `sbx secret rm` with no arguments in a host terminal and choose each
+one from sbx's list (it lists every scope). Typing the name, as in `sbx secret rm <name> --sandbox <scope>`,
+would put the pasted credential on a command line other processes can read, so setup never runs it.
 
 After its secret steps, setup reads sbx's listing again through doctor's own credential checks and
 stops at the first warning, so it never calls done a secret doctor reports missing. It then verifies
@@ -100,7 +101,8 @@ sandboxed), `openai`, a warning for `github`, and a leftover `CLAUDE_CODE_OAUTH_
 as unused, counting global secrets only. A service secret under a
 name sbx has no service for, or in a scope that is not an existing sandbox, is a misfiled secret:
 doctor warns with their count and scopes, never their names, since sbx can store a token in the NAME
-column. Checks discard all raw credential-command errors. Do not paste
+column. A token can land in the scope column too, so a scope shows only when it is `global`, a service
+sbx knows or a sandbox `sbx ls` lists; any other scope shows as `<unrecognised scope>`. Checks discard all raw credential-command errors. Do not paste
 `sbx secret ls` output into reports. A stored `github` credential can let agents push as you.
 SSH checks also warn about sbx's global `ssh.agentForwardingEnabled` and a fixed
 `ssh.agentSocketPath`, in addition to IMACS's `ssh_agent` setting. The runtime removes
@@ -226,7 +228,10 @@ template = "imacs-cox:local"
 ```
 
 With this setting, every agent working in that repository runs sandboxed, even under `mode = "bare"`, an agent's own
-`isolation = "bare"` or a plan task's. A repository can also set `[isolation.sandbox] template`, overriding the workspace template. It cannot
+`isolation = "bare"` or a plan task's. A repository can also set `[isolation.sandbox] template`, overriding the workspace
+template, but only with a template IMACS built from that repository (see [Warm templates](#warm-templates)). A snapshot
+holds the package caches of the repository it was built from, so another tag, including a registry or stock image, is
+ignored with a doctor warning. Set those in your own or the workspace's config instead. A repository cannot
 set `mode = "bare"` or any other `[isolation.sandbox]` key. Those settings are ignored with a doctor
 warning, because a cloned repository must not widen what an agent can reach. Review template images
 as code: their contents run inside the VM, with the worktree and git write mounts described below.
@@ -249,6 +254,16 @@ config for different templates in a workspace with several projects. Choose the 
 `--agent codex` (default), `claude` or `shell`; use the same agent when consuming the saved template.
 Tags are local to this host and architecture. sbx recognizes saved snapshots and uses its local image
 store; it does not need a registry push. Existing agents keep their existing sandboxes.
+
+IMACS records which main checkout it built each tag from, in `sandbox-templates.json` under the IMACS
+home. A repository's own template takes effect only once that record names the repository, so a
+repository's config selects nothing until its template is built, and never selects another project's
+snapshot. For the same reason, building a tag that the repository's config names is refused when the tag
+was built from another repository, or when sbx already has it and IMACS did not build it from this
+repository: saving would replace another project's snapshot, or a stock image every sandbox starts from.
+Choose another tag, or remove a template that is yours to replace with `sbx template rm <tag>` first.
+A template built before IMACS kept this record needs that once. A tag from your own or the workspace's
+config is your choice and always builds; the record then names the project it was built from.
 
 The command checks the checkout as it would for an agent's sandbox: it refuses a git layout git did not
 make and `extensions.worktreeConfig`, and runs git there with the locations IMACS recorded when a sandbox
@@ -538,7 +553,7 @@ tests there, in a worktree that starts from the integration branch.
 - **Bare agents run as you.** In bare mode, an agent can reach everything you can: your files, keys,
   network and other repositories. Use it for agents you supervise, or that sbx cannot run.
 - **Repositories only tighten.** A repository's `.imacs/config.toml` can require sandboxes, and then no
-  agent or plan task there runs bare. It can choose its template, but cannot turn sandboxes off, add mounts or hosts, or forward your SSH agent.
+  agent or plan task there runs bare. It can choose a template IMACS built from it, but cannot select or overwrite another project's, turn sandboxes off, add mounts or hosts, or forward your SSH agent.
 - **The chief can mark tasks bare.** A plan task's `isolation = "bare"` runs that agent as you. You see
   it on the card when you approve the plan.
 - **sbx's machine-wide settings apply to every sandbox,** including IMACS's: the global network policy,

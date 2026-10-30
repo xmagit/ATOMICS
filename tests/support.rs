@@ -10,6 +10,11 @@ pub fn tempdir() -> io::Result<TempDir> {
     tempfile::tempdir().map(|dir| TempDir(Some(dir)))
 }
 
+#[allow(dead_code)] // Used by the Linux reflink test; this support file is shared by test crates.
+pub fn tempdir_in(parent: impl AsRef<std::path::Path>) -> io::Result<TempDir> {
+    tempfile::tempdir_in(parent).map(|dir| TempDir(Some(dir)))
+}
+
 impl TempDir {
     pub fn path(&self) -> &std::path::Path {
         self.0.as_ref().unwrap().path()

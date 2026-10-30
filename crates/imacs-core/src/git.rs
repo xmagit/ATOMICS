@@ -1046,7 +1046,7 @@ pub(crate) mod tests {
 
         // The Linux harness can repeat this test on ext4, btrfs and XFS mounts.
         let dir = match std::env::var_os("IMACS_COW_TEST_DIR") {
-            Some(parent) => tempfile::tempdir_in(parent).unwrap(),
+            Some(parent) => crate::test_support::tempdir_in(parent).unwrap(),
             None => crate::test_support::tempdir().unwrap(),
         };
         let source = dir.path().join("source");

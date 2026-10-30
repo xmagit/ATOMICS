@@ -490,6 +490,9 @@ fn bare_agents_never_touch_sbx_and_a_repository_can_only_tighten() {
         std::fs::create_dir(worktree.join(".imacs")).unwrap();
         std::fs::write(worktree.join(".imacs/config.toml"), "[isolation.sandbox]\ntemplate = \"worktree:local\"\n")
             .unwrap();
+        // The repository selects its template only once IMACS has built that tag from it.
+        let root = repo.canonicalize().unwrap();
+        imacs_core::repo_workflow::record_template(&paths::imacs_home(), "repo:local", &root).unwrap();
         let error = app.runtime.start(ctx, "bare-probe", worktree.clone(), None, vec![], None).unwrap_err();
         assert!(error.contains("requires sandboxed agents"), "{error}");
         assert!(!out.exists());
