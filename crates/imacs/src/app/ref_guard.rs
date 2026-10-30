@@ -2,10 +2,11 @@ use super::*;
 use crate::ref_guard::Exempt;
 
 impl State {
-    /// Branches whose moves are legitimate work: those of live agents, unfinished tasks, worktrees
-    /// being made and open plans' integration branches. A done task's branch is finished, and moving
-    /// it is restored. Refs IMACS writes later still count through [`crate::ref_guard::host_write`].
-    /// Runs no git: [`Exempt::resolve`] does that on the ref guard thread.
+    /// Branches whose moves are legitimate work: those of live agents, unfinished tasks and
+    /// worktrees being made. A done task's branch is finished, and moving it is restored. Refs IMACS
+    /// writes itself, such as integration branches, go through [`crate::ref_guard::host_write`]
+    /// instead, so an agent moving them is still restored. Runs no git: [`Exempt::resolve`] does that
+    /// on the ref guard thread.
     pub(super) fn exempt_branches(&self) -> Exempt {
         let mut exempt = Exempt::default();
         for session in &self.sessions {
@@ -24,13 +25,6 @@ impl State {
         }
         for (common, branch, _) in &self.creating {
             exempt.refs.push((common.clone(), format!("refs/heads/{branch}")));
-        }
-        // IMACS creates and merges into an open plan's integration branch, in its tasks' repositories.
-        for plan in self.plans.iter().filter(|plan| plan.status == PlanStatus::Open) {
-            let integration = format!("refs/heads/{}", plan.integration_branch());
-            let repos: std::collections::BTreeSet<&str> =
-                plan.tasks.iter().filter_map(|task| task.repo.as_deref()).collect();
-            exempt.folders.extend(repos.into_iter().map(|repo| (PathBuf::from(repo), integration.clone())));
         }
         exempt
     }
@@ -199,7 +193,6 @@ mod tests {
                 let integrated = app.runtime.integrate_rx.recv_timeout(Duration::from_secs(30)).unwrap();
                 assert!(integrated.result.is_ok(), "{:?}", integrated.result);
                 app.runtime.finish_integration(integrated);
-                assert!(app.runtime.exempt_branches().folders.contains(&(repo.clone(), format!("refs/heads/{into}"))));
                 // Meanwhile the agent makes a branch of its own.
                 git::git(&guarded, &["branch", "agent-made"]).unwrap();
                 release.send(()).unwrap();
@@ -220,6 +213,83 @@ mod tests {
                 assert!(alert.contains("Restored refs/heads/agent-made: removed it (it pointed to "), "{alert}");
                 assert!(!alert.contains(&into) && !alert.contains("next-task"), "no alert for IMACS's refs: {alert}");
                 assert!(!alert.contains("Object("), "plain text: {alert}");
+                app.runtime.sessions.clear();
+            },
+        );
+    }
+
+    #[test]
+    fn an_agent_moving_an_open_plans_integration_branch_is_restored_to_what_imacs_merged() {
+        with_app(
+            "app::ref_guard::tests::an_agent_moving_an_open_plans_integration_branch_is_restored_to_what_imacs_merged",
+            |app, _| {
+                use crate::ref_guard::{RefGuard, Shared};
+                let (dir, repo) = repository();
+                let worktree = |name: &str| dir.path().join(name);
+                for name in ["guarded", "closed"] {
+                    git::add_worktree(&repo, &worktree(name), name, "main").unwrap();
+                }
+                git::git(&repo, &["branch", "next-task"]).unwrap();
+                let guard = RefGuard::open(&worktree("guarded"), dir.path().join("snapshot.json")).unwrap().unwrap();
+                let mut sandboxed =
+                    session("sandboxed", AgentKind::Generic, AgentStatus::Working, &worktree("guarded"));
+                sandboxed.ref_guard = Some(Shared::new(guard));
+                app.runtime.sessions = vec![sandboxed];
+                // A sandboxed session that is not running: its snapshot waits on disk to reattach with.
+                let closed = paths::imacs_home().join("ref-guards/imacs-closed.json");
+                drop(RefGuard::open(&worktree("closed"), closed.clone()).unwrap().unwrap());
+                let task = |id: &str, branch: &str, status| Task {
+                    id: id.into(),
+                    repo: Some(repo.to_string_lossy().into_owned()),
+                    branch: Some(branch.into()),
+                    status,
+                    ..Default::default()
+                };
+                let running = Task { worktree: Some(worktree("guarded")), ..task("a", "guarded", TaskStatus::Running) };
+                app.runtime.plans = vec![
+                    Plan { id: "first".into(), tasks: vec![running], ..Default::default() },
+                    Plan {
+                        id: "second".into(),
+                        approved: true,
+                        tasks: vec![task("b", "next-task", TaskStatus::Review)],
+                        ..Default::default()
+                    },
+                ];
+                // IMACS makes the open plan's integration branch after both snapshots were taken.
+                let into = app.runtime.plans[1].integration_branch();
+                app.runtime.integrate(1, "b", None);
+                let integrated = app.runtime.integrate_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+                assert!(integrated.result.is_ok(), "{:?}", integrated.result);
+                app.runtime.finish_integration(integrated);
+                let merged = git::git(&repo, &["rev-parse", &into]).unwrap().trim().to_string();
+
+                // The agent points the integration branch, what everything ships from, at a commit of its own.
+                let guarded = worktree("guarded");
+                let injected = git::git(&guarded, &["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "injected"])
+                    .unwrap()
+                    .trim()
+                    .to_string();
+                git::git(&guarded, &["update-ref", &format!("refs/heads/{into}"), &injected]).unwrap();
+                app.runtime.check_refs(0);
+                app.runtime.ref_checks.finish();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !app.runtime.sessions[0].last_message.as_deref().is_some_and(|m| m.contains("SANDBOX REF GUARD"))
+                {
+                    assert!(Instant::now() < deadline, "the check never reported");
+                    app.runtime.drain_actions();
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                assert_eq!(git::git(&repo, &["rev-parse", &into]).unwrap().trim(), merged, "back to IMACS's merge");
+                let alert = app.runtime.sessions[0].last_message.clone().unwrap();
+                let restored =
+                    format!("Restored refs/heads/{into}: from {} back to {}", &injected[..12], &merged[..12]);
+                assert!(alert.contains(&restored), "{alert}");
+
+                // The session that was not running reattaches with IMACS's merge in its baseline.
+                let mut reattached = RefGuard::open(&worktree("closed"), closed).unwrap().unwrap();
+                let alerts = reattached.check(&Default::default(), &Default::default()).unwrap();
+                assert!(alerts.is_empty(), "{alerts:?}");
+                assert_eq!(git::git(&repo, &["rev-parse", &into]).unwrap().trim(), merged);
                 app.runtime.sessions.clear();
             },
         );

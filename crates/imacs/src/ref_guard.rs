@@ -1,15 +1,15 @@
 //! Host-side recovery for the shared refs a sandbox can write. This detects changes after a
 //! turn; it is not an access-control boundary or proof of which writer changed a shared ref.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::mpsc::{Sender, channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use anyhow::{Context, Result, bail};
-use imacs_core::git;
+use imacs_core::{git, paths};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,18 +58,64 @@ pub struct HostWrite {
 impl Drop for HostWrite {
     fn drop(&mut self) {
         let values = read_refs(&self.repo).ok();
+        self.record(values.as_ref());
+        if let Some(values) = &values {
+            accept_written(&self.repo, &self.names, values);
+        }
+    }
+}
+
+impl HostWrite {
+    fn record(&self, values: Option<&BTreeMap<String, RefValue>>) {
         let mut host = HOST_WRITES.lock().unwrap_or_else(|e| e.into_inner());
         for name in &self.names {
             if let Some(index) = host.pending.iter().position(|(repo, pending)| *repo == self.repo && pending == name) {
                 host.pending.remove(index);
             }
             // Without the values a later check falls back to restoring, as before IMACS wrote.
-            if let Some(values) = &values {
+            if let Some(values) = values {
                 host.written.retain(|(repo, written, _)| !(*repo == self.repo && written == name));
                 host.written.push((self.repo.clone(), name.clone(), values.get(name).cloned()));
             }
         }
     }
+}
+
+/// Every open guard, so that what IMACS writes reaches its baseline as soon as it is written.
+static OPEN: Mutex<Vec<Weak<Mutex<RefGuard>>>> = Mutex::new(Vec::new());
+
+/// Puts what IMACS just wrote into the baseline of every guard of that repository: the open ones, and
+/// the snapshots of sandboxed sessions that are not running, which they reattach with. An agent that
+/// moves such a ref afterwards is restored to IMACS's value, not to an older one.
+fn accept_written(repo: &Path, names: &[String], values: &BTreeMap<String, RefValue>) {
+    let Ok(common) = common_of(repo) else { return };
+    let open: Vec<_> = OPEN.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(Weak::upgrade).collect();
+    let mut files = HashSet::new();
+    for guard in open {
+        let mut guard = guard.lock().unwrap_or_else(|e| e.into_inner());
+        files.insert(guard.file.clone());
+        if guard.common == common {
+            let _ = guard.accept(names, values);
+        }
+    }
+    let Ok(entries) = std::fs::read_dir(paths::imacs_home().join("ref-guards")) else { return };
+    let snapshots = entries.flatten().map(|entry| entry.path());
+    for file in snapshots.filter(|file| file.extension().is_some_and(|ext| ext == "json") && !files.contains(file)) {
+        let Some(mut guard) =
+            std::fs::read(&file).ok().and_then(|bytes| serde_json::from_slice::<RefGuard>(&bytes).ok())
+        else {
+            continue;
+        };
+        if guard.common == common {
+            guard.file = file;
+            let _ = guard.accept(names, values);
+        }
+    }
+}
+
+fn common_of(cwd: &Path) -> Result<PathBuf> {
+    let common = git::git(cwd, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
+    Ok(PathBuf::from(common.trim()).canonicalize()?)
 }
 
 /// The refs IMACS is writing, and the values it left, in the repository at `common`. Runs git.
@@ -105,8 +151,7 @@ impl RefGuard {
         if git::worktree_of(cwd).is_none() {
             return Ok(None);
         }
-        let common = git::git(cwd, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
-        let common = PathBuf::from(common.trim()).canonicalize()?;
+        let common = common_of(cwd)?;
         let mut guard = if file.exists() {
             let guard: Self = serde_json::from_slice(&std::fs::read(&file)?)?;
             if guard.common != common {
@@ -179,6 +224,17 @@ impl RefGuard {
         Ok(alerts)
     }
 
+    /// Takes the values IMACS left in `names` as this guard's baseline for them.
+    fn accept(&mut self, names: &[String], values: &BTreeMap<String, RefValue>) -> Result<()> {
+        for name in names {
+            match values.get(name) {
+                Some(value) => self.refs.insert(name.clone(), value.clone()),
+                None => self.refs.remove(name),
+            };
+        }
+        self.save()
+    }
+
     fn save(&self) -> Result<()> {
         std::fs::create_dir_all(self.file.parent().context("ref guard snapshot has no parent")?)?;
         let temporary = self.file.with_extension("json.tmp");
@@ -199,7 +255,12 @@ pub struct Shared {
 
 impl Shared {
     pub fn new(guard: RefGuard) -> Self {
-        Self { common: guard.common.clone(), branch: guard.branch.clone(), guard: Arc::new(Mutex::new(guard)) }
+        let (common, branch) = (guard.common.clone(), guard.branch.clone());
+        let guard = Arc::new(Mutex::new(guard));
+        let mut open = OPEN.lock().unwrap_or_else(|e| e.into_inner());
+        open.retain(|open| open.strong_count() > 0);
+        open.push(Arc::downgrade(&guard));
+        Self { common, branch, guard }
     }
 
     /// Runs git: call it on [`Checks`]' thread.
