@@ -229,7 +229,7 @@ impl State {
         for name in idle {
             self.stop_sandbox(name);
         }
-        let names = self.sessions.iter().filter_map(|s| s.sandbox.clone()).collect();
+        let names = self.sessions.iter().filter_map(|s| Some((s.sandbox.clone()?, s.root()))).collect();
         changed |= self.sandbox_usage.poll(names, ctx);
         // Only sandboxes with an attached agent are running; `sbx exec` would start a stopped one.
         let live = self
