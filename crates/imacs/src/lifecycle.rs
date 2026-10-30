@@ -286,6 +286,12 @@ pub fn sweep_before(home: &Path, config: &Config, sbx: &str, cutoff: Cutoff) -> 
             Ok(list) => match sandbox::mcp_names(sbx) {
                 Ok(names) => {
                     for (name, entry) in candidates {
+                        if (entry.sandbox && !list.iter().any(|s| s.name == *name)
+                            || entry.mcp && !names.contains(name))
+                            && ownership::may_be_creating(entry)
+                        {
+                            continue;
+                        }
                         let result = (|| -> Result<()> {
                             if entry.sandbox && !list.iter().any(|s| s.name == *name) {
                                 ownership::removed(home, name, Resource::Sandbox)?;
@@ -559,6 +565,32 @@ mod tests {
         std::fs::write(a.join("sandbox-ownership.json"), "invalid ledger").unwrap();
         assert!(sweep(&a, &Config::default(), &sbx).is_err());
         assert!(bin.join("sandboxes/imacs-bench-unknown").exists());
+    }
+
+    #[test]
+    fn missing_inventory_keeps_young_or_live_creation_reservations() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let sbx = fake::install(dir.path()).display().to_string();
+        let home = dir.path().join("home");
+        for name in ["young", "live", "dead"] {
+            ownership::created(&home, name, Resource::Sandbox).unwrap();
+        }
+        let mut entries = ownership::owned(&home).unwrap();
+        entries.get_mut("live").unwrap().created = 0;
+        entries.get_mut("dead").unwrap().created = 0;
+        // The live reservation is made by this process, while a dead creator can be absent.
+        let mut json = serde_json::to_value(&entries).unwrap();
+        json["live"]["creator"] = serde_json::json!(std::process::id());
+        json["young"]["creator"] = serde_json::Value::Null;
+        json["dead"]["creator"] = serde_json::Value::Null;
+        std::fs::write(home.join("sandbox-ownership.json"), serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(sandbox::remove(&home, &sbx, "young").is_err());
+        assert!(sandbox::remove(&home, &sbx, "live").is_err());
+        assert!(sweep(&home, &Config::default(), &sbx).unwrap().is_empty());
+        let kept = ownership::owned(&home).unwrap();
+        assert!(kept.contains_key("young") && kept.contains_key("live"), "{kept:?}");
+        assert!(!kept.contains_key("dead"), "{kept:?}");
+        assert!(fake::calls_to(dir.path(), &["rm"]).is_empty());
     }
 
     #[test]

@@ -159,7 +159,9 @@ pub(super) fn build(
         ownership::record_pins(home, &name, &home.join("git-pins"))?;
         // The UUID name is reserved by this build's ledger before a possibly partial create.
         ownership::created(home, &name, Resource::Sandbox)?;
-        sbx(program, &isolation::create_args(&spec), false, CREATE_TIMEOUT)?;
+        let creation = sbx(program, &isolation::create_args(&spec), false, CREATE_TIMEOUT);
+        ownership::removed(home, &name, Resource::Creator)?;
+        creation?;
         let hosts = config.hosts_for(&real(&workspace::project_root(cwd)?), |p| real(&paths::expand(p)));
         if !hosts.is_empty() {
             sbx(program, &isolation::allow_hosts_args(&name, &hosts), false, TIMEOUT)?;

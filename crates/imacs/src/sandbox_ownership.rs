@@ -18,6 +18,8 @@ pub struct Owned {
     pub pins: Option<PathBuf>,
     pub scratch: Option<PathBuf>,
     pub builder: Option<u32>,
+    /// Process reserving a resource before sbx lists it; cleared when creation returns.
+    pub creator: Option<u32>,
     /// The relay port the sandbox's `localhost:<port>` policy rule allows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relay: Option<u16>,
@@ -31,6 +33,7 @@ pub enum Resource {
     Scratch,
     Builder,
     Relay,
+    Creator,
 }
 
 pub fn timestamp(time: SystemTime) -> u64 {
@@ -91,10 +94,12 @@ pub fn owned(home: &Path) -> Result<BTreeMap<String, Owned>> {
 pub fn created(home: &Path, name: &str, resource: Resource) -> Result<()> {
     let mut ledger = Ledger::open(home)?;
     let entry = ledger.entry(name);
+    entry.creator = Some(std::process::id());
+    entry.created = timestamp(SystemTime::now());
     match resource {
         Resource::Sandbox => entry.sandbox = true,
         Resource::Mcp => entry.mcp = true,
-        Resource::Pins | Resource::Scratch | Resource::Builder | Resource::Relay => {
+        Resource::Pins | Resource::Scratch | Resource::Builder | Resource::Relay | Resource::Creator => {
             anyhow::bail!("use the record operation for this resource")
         }
     }
@@ -112,6 +117,7 @@ pub fn removed(home: &Path, name: &str, resource: Resource) -> Result<()> {
             Resource::Scratch => entry.scratch = None,
             Resource::Builder => entry.builder = None,
             Resource::Relay => entry.relay = None,
+            Resource::Creator => entry.creator = None,
         }
         if !entry.sandbox
             && !entry.mcp
@@ -119,6 +125,7 @@ pub fn removed(home: &Path, name: &str, resource: Resource) -> Result<()> {
             && entry.scratch.is_none()
             && entry.builder.is_none()
             && entry.relay.is_none()
+            && entry.creator.is_none()
         {
             ledger.entries.remove(name);
         }
@@ -166,6 +173,17 @@ impl Drop for TemplateBuild {
 }
 
 pub fn building(entry: &Owned) -> bool {
-    entry.builder.is_some_and(|pid| unsafe { libc::kill(pid as i32, 0) } == 0
-        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
+    entry.builder.is_some_and(alive)
+}
+
+fn alive(pid: u32) -> bool {
+    pid > 0
+        && (unsafe { libc::kill(pid as i32, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
+}
+
+/// Missing from sbx's inventory is not proof a reserved create has finished.
+pub fn may_be_creating(entry: &Owned) -> bool {
+    let age = timestamp(SystemTime::now()).saturating_sub(entry.created);
+    age < crate::sandbox::CREATE_TIMEOUT.as_nanos() as u64 || entry.creator.is_some_and(alive)
 }
