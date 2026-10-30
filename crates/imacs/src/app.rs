@@ -119,7 +119,7 @@ pub struct Session {
     sandbox: Option<String>,
     screen_busy: bool,
     busy_absent_since: Option<Instant>,
-    ref_guard: Option<crate::ref_guard::RefGuard>,
+    ref_guard: Option<crate::ref_guard::Shared>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,6 +153,8 @@ struct AgentLaunch {
     prompt: Option<String>,
     chief: bool,
     runtime: AgentRuntime,
+    /// A sandboxed session's ref guard, opened and checked before its agent starts.
+    ref_guard: Option<crate::ref_guard::Shared>,
 }
 
 struct Pending {
@@ -384,8 +386,9 @@ pub(crate) struct State {
     /// The `sbx` program sandboxed agents run with.
     sbx: String,
     sandbox_usage: crate::sandbox_usage::Sampler,
-    /// Sandboxed launches waiting for their sandbox.
-    pending_sandbox: Vec<(AgentLaunch, Receiver<Result<(), String>>)>,
+    /// Sandboxed launches waiting for their sandbox, and their ref guard with what its first check found.
+    pending_sandbox: Vec<(AgentLaunch, Receiver<Result<crate::ref_guard::Opened, String>>)>,
+    ref_checks: crate::ref_guard::Checks,
     active: Option<String>,
     diff_open: bool,
     /// Worktree picked in the sidebar without an agent; the diff otherwise follows the active session.
@@ -786,6 +789,7 @@ impl State {
             // Tests never reach the sbx installed on the machine running them.
             sbx: if cfg!(test) { "/nonexistent/imacs-test-sbx" } else { "sbx" }.into(),
             pending_sandbox: Vec::new(),
+            ref_checks: crate::ref_guard::Checks::new(),
             sandbox_usage: Default::default(),
             active: None,
             diff_open: true,

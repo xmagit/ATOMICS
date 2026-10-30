@@ -1,10 +1,12 @@
 //! Host-side recovery for the shared refs a sandbox can write. This detects changes after a
 //! turn; it is not an access-control boundary or proof of which writer changed a shared ref.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::mpsc::{Sender, channel};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use imacs_core::git;
@@ -104,6 +106,101 @@ impl RefGuard {
         std::fs::rename(temporary, &self.file)?;
         Ok(())
     }
+}
+
+/// A session's guard, checked on [`Checks`]' thread: whose refs it guards is known without
+/// waiting for a check in progress.
+#[derive(Clone)]
+pub struct Shared {
+    pub common: PathBuf,
+    pub branch: Option<String>,
+    guard: Arc<Mutex<RefGuard>>,
+}
+
+impl Shared {
+    pub fn new(guard: RefGuard) -> Self {
+        Self { common: guard.common.clone(), branch: guard.branch.clone(), guard: Arc::new(Mutex::new(guard)) }
+    }
+
+    /// Runs git: call it on [`Checks`]' thread.
+    pub fn check(&self, exempt: &Exempt) -> Result<Vec<String>> {
+        let concurrent = exempt.resolve(&self.common);
+        self.guard.lock().unwrap_or_else(|e| e.into_inner()).check(&concurrent)
+    }
+}
+
+/// Branches whose moves a check accepts, gathered where git must not run: each with its
+/// repository's common dir, or with a folder whose repository [`Exempt::resolve`] asks git for.
+#[derive(Clone, Debug, Default)]
+pub struct Exempt {
+    pub refs: Vec<(PathBuf, String)>,
+    pub folders: Vec<(PathBuf, String)>,
+}
+
+impl Exempt {
+    /// The exempt refs in the repository at `common`. Runs git.
+    pub fn resolve(&self, common: &Path) -> BTreeSet<String> {
+        let mut commons: HashMap<&Path, Option<PathBuf>> = HashMap::new();
+        let mut refs: BTreeSet<String> =
+            self.refs.iter().filter(|(other, _)| other == common).map(|(_, name)| name.clone()).collect();
+        for (folder, name) in &self.folders {
+            if !refs.contains(name)
+                && commons.entry(folder).or_insert_with(|| git::common_dir(folder).ok()).as_deref() == Some(common)
+            {
+                refs.insert(name.clone());
+            }
+        }
+        refs
+    }
+}
+
+/// Ref guard checks run git, which the state lock, and so the UI, must never wait for. They
+/// run on one thread, in the order they were asked for: a check that accepts an agent's last
+/// commits must never be overtaken by a later one that no longer exempts its branch.
+#[derive(Clone)]
+pub struct Checks {
+    jobs: Sender<Box<dyn FnOnce() + Send>>,
+}
+
+impl Checks {
+    pub fn new() -> Self {
+        let (jobs, rx) = channel::<Box<dyn FnOnce() + Send>>();
+        std::thread::Builder::new()
+            .name("imacs-ref-guard".into())
+            .spawn(move || {
+                while let Ok(job) = rx.recv() {
+                    job();
+                }
+            })
+            .expect("spawn ref guard thread");
+        Self { jobs }
+    }
+
+    pub fn run(&self, job: impl FnOnce() + Send + 'static) {
+        let _ = self.jobs.send(Box::new(job));
+    }
+}
+
+/// A sandboxed session's guard, if its folder is in a repository, and what its first check found.
+pub type Opened = Option<(Shared, Vec<String>)>;
+
+/// Opens a sandboxed session's guard and checks it once before its agent gets a turn, on
+/// [`Checks`]' thread. Blocks: call it off the state lock.
+pub fn open_and_check(checks: &Checks, cwd: &Path, file: PathBuf, exempt: Exempt) -> Result<Opened, String> {
+    let Some(guard) = RefGuard::open(cwd, file).map_err(|error| format!("Could not start ref guard: {error:#}"))?
+    else {
+        return Ok(None);
+    };
+    let (guard, (done, result)) = (Shared::new(guard), channel());
+    let checked = guard.clone();
+    checks.run(move || {
+        let _ = done.send(checked.check(&exempt));
+    });
+    let alerts = result
+        .recv()
+        .map_err(|_| "ref guard thread stopped".to_string())?
+        .map_err(|error| format!("Could not check refs before starting: {error:#}"))?;
+    Ok(Some((guard, alerts)))
 }
 
 fn read_refs(cwd: &Path) -> Result<BTreeMap<String, RefValue>> {

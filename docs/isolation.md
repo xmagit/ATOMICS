@@ -202,8 +202,9 @@ mounted read-only.
 - **Ref recovery.** Refs live in the shared common dir. IMACS saves a host-only snapshot before a
   sandboxed agent starts, checks it at turn boundaries and on exit/close, and restores changed, deleted
   or newly created refs outside the task branches. A persistent red board alert and a blocked report
-  announce recovery or a failed restore. The task branch and concurrent task branches are exempt so
-  legitimate commits survive. This is recovery after a turn, not write isolation: shared refs cannot
+  announce recovery or a failed restore. The task branch, the branches of other running agents and of
+  unfinished plan tasks are exempt so legitimate commits survive. A done task's branch is not: moving it
+  is restored. This is recovery after a turn, not write isolation: shared refs cannot
   identify which concurrent writer moved a ref. Review the diff and branch before integrating.
 - **Objects are data.** Objects an agent writes stay on your machine, and git never executes them. Hooks
   and config, which do run on your machine, are out of reach, and git on your machine finds them through

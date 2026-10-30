@@ -125,13 +125,18 @@ impl State {
         let runtime = job.as_ref().map_or(AgentRuntime::Bare, |job| AgentRuntime::Sandbox(job.sandboxed()));
         // Codex's hooks call IMACS on this machine, which a sandboxed Codex cannot reach.
         let codex = agent.is_codex() && job.is_none();
-        let launch = AgentLaunch { id: id.clone(), agent, cwd, resume, extra_args, prompt, chief, runtime };
+        let launch =
+            AgentLaunch { id: id.clone(), agent, cwd, resume, extra_args, prompt, chief, runtime, ref_guard: None };
         if let Some(job) = job {
             self.sessions.push(Session::starting(id.clone(), &launch.agent, launch.cwd.clone(), chief, &self.wake));
             let (tx, rx) = self.wake.channel();
+            let (checks, exempt) = (self.ref_checks.clone(), self.exempt_branches());
+            let snapshot = paths::imacs_home().join("ref-guards").join(format!("{}.json", job.name));
             std::thread::spawn(move || {
-                let _ = tx
-                    .send(crate::sandbox::prepare(&job).map_err(|err| format!("Could not start the sandbox: {err:#}")));
+                let ready = crate::sandbox::prepare(&job)
+                    .map_err(|err| format!("Could not start the sandbox: {err:#}"))
+                    .and_then(|()| crate::ref_guard::open_and_check(&checks, &job.cwd, snapshot, exempt));
+                let _ = tx.send(ready);
             });
             self.pending_sandbox.push((launch, rx));
             self.activate(&id, false);
@@ -284,7 +289,7 @@ impl State {
         launch: AgentLaunch,
         codex: Option<bool>,
     ) -> Result<String, String> {
-        let AgentLaunch { id, agent, cwd, resume, extra_args, prompt, chief, runtime } = launch;
+        let AgentLaunch { id, agent, cwd, resume, extra_args, prompt, chief, runtime, ref_guard } = launch;
         let sandboxed = match runtime {
             AgentRuntime::Sandbox(sandboxed) => Some(sandboxed),
             AgentRuntime::Bare => None,
@@ -445,22 +450,6 @@ impl State {
             _ => None,
         };
         let nice = self.config.resources.agent_nice;
-        let mut ref_guard = match &sandboxed {
-            Some(sandbox) => crate::ref_guard::RefGuard::open(
-                &cwd,
-                paths::imacs_home().join("ref-guards").join(format!("{}.json", sandbox.name)),
-            )
-            .map_err(|error| format!("Could not start ref guard: {error:#}"))?,
-            None => None,
-        };
-        if let Some(guard) = &mut ref_guard {
-            let alerts = guard
-                .check(&self.concurrent_branches(guard))
-                .map_err(|error| format!("Could not check refs before starting: {error:#}"))?;
-            if !alerts.is_empty() {
-                self.ref_alert(&id, alerts.join("\n"));
-            }
-        }
         let (program, args) = match &sandboxed {
             Some(sandboxed) => sandboxed.command(&args),
             None if !chief && agent.kind != AgentKind::Shell && nice != 0 => (
@@ -660,12 +649,9 @@ impl State {
         self.pending_questions.remove(id);
         if let Some(i) = self.sessions.iter().position(|s| s.id == id) {
             // Accept legitimate concurrent task commits before releasing this branch's ownership.
-            for other in 0..self.sessions.len() {
-                if other != i {
-                    self.check_refs(other);
-                }
-            }
-            let branches = self.sessions[i].ref_guard.as_ref().map(|guard| self.concurrent_branches(guard));
+            let exempt = self.exempt_branches();
+            let guard = self.sessions[i].ref_guard.take();
+            self.check_all_refs(&exempt);
             let mut session = self.sessions.remove(i);
             if session.chief {
                 self.hub.lock().unwrap().chief_running = false;
@@ -677,9 +663,8 @@ impl State {
             // An exited agent's sandbox was stopped when it exited; one still preparing stops when ready.
             if let Some(name) = session.sandbox.clone() {
                 let sbx = resolve_program(&self.sbx);
-                let actions = self.action_tx.clone();
+                let (actions, checks) = (self.action_tx.clone(), self.ref_checks.clone());
                 let id = id.to_string();
-                let mut guard = session.ref_guard.take();
                 session.terminal.take();
                 std::thread::spawn(move || {
                     let stopped = crate::sandbox::stop(&sbx, &name);
@@ -688,15 +673,18 @@ impl State {
                         .map(|err| format!("Stopping sandbox FAILED: {err:#}"))
                         .into_iter()
                         .collect::<Vec<_>>();
-                    if let Some(guard) = &mut guard {
-                        match guard.check(&branches.unwrap_or_default()) {
-                            Ok(found) => alerts.extend(found),
-                            Err(err) => alerts.push(format!("Final ref guard check FAILED: {err:#}")),
+                    // The last check, once the agent cannot write any more.
+                    checks.run(move || {
+                        if let Some(guard) = guard {
+                            match guard.check(&exempt) {
+                                Ok(found) => alerts.extend(found),
+                                Err(err) => alerts.push(format!("Final ref guard check FAILED: {err:#}")),
+                            }
                         }
-                    }
-                    if !alerts.is_empty() {
-                        let _ = actions.send(Box::new(move |state| state.ref_alert(&id, alerts.join("\n"))));
-                    }
+                        if !alerts.is_empty() {
+                            let _ = actions.send(Box::new(move |state| state.ref_alert(&id, alerts.join("\n"))));
+                        }
+                    });
                 });
             }
             if session.terminal.is_none()
