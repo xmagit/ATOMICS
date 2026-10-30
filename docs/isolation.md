@@ -835,14 +835,13 @@ process measurements, not the configured memory/CPU limits or guest application 
 processes and `sbx run` clients are excluded. Without a matching VM process, or when sampling fails, the
 badge shows **Sandbox** alone; hover for details. The total reports how many sandbox trees were found, so partial samples are visible.
 
-The sampler assumes the PoC process shape: one VM tree per sandbox, whose VM root command contains
-the complete sandbox name `imacs-<session>` (as an argument or path component). It recognizes nerdbox,
-sailor, vfkit, qemu, cloud-hypervisor and krun VM executables, then follows child PIDs. Synthetic recorded
-`ps` fixtures cover this mapping. If sbx changes its process shape or uses opaque VM IDs, the display
-stays unavailable until that mapping is updated. That is the case with sbx v0.50.1 on macOS (checked
-end to end on 2026-10-30): each VM runs as `containerd-shim-nerdbox-v1 -namespace docker -id <container
-id>`, without the sandbox's name, so tiles show **Sandbox** without memory and CPU. The shim keeps the
-sandbox's worktree open, which a future mapping could use.
+The sampler recognizes nerdbox, sailor, vfkit, qemu, cloud-hypervisor, krun and sbx-vm executables,
+then follows their child PIDs. It matches a VM by the complete sandbox name `imacs-<session>` in its
+command, or by an open worktree path. On macOS it reads VM paths with `lsof`; on Linux it reads
+`/proc/<pid>/cwd` and `/proc/<pid>/fd`. This also handles sbx VMs whose command contains an opaque
+container ID instead of a sandbox name, such as `containerd-shim-nerdbox-v1` on macOS. Recorded `ps`
+and open-path fixtures cover both mappings. A VM with neither a matching name nor a matching worktree
+path remains unavailable in the display.
 
 ## Settings → Credentials
 
