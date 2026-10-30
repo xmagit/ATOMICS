@@ -390,6 +390,15 @@ pub(super) fn host_lines_with(installed: impl Fn(&str) -> bool) -> Vec<String> {
     lines
 }
 
+/// Docker Sandboxes support Ubuntu 24.04+, but sbx's static build runs on other distributions too.
+const LINUX_RELEASE: &str = "sandbox Linux: Ubuntu 24.04+ (warning if unsupported)";
+
+/// Whether setup waits on this host line: any failed check except the Linux release, which
+/// doctor reports as a warning.
+pub(super) fn blocks_setup(line: &str) -> bool {
+    line.strip_prefix("✗ ").is_some_and(|rest| !rest.starts_with(LINUX_RELEASE))
+}
+
 fn prerequisite_lines(mac: bool, installed: impl Fn(&str) -> bool) -> Vec<String> {
     // Linux's keychain tool, through which IMACS's relay reads the Claude subscription; macOS has `security`.
     let keychain = (!mac).then_some("secret-tool");
@@ -449,11 +458,7 @@ fn linux_lines(os: Option<&str>, kvm: bool, groups: Option<&str>) -> Vec<String>
             .and_then(|(major, minor)| Some((major.parse::<u32>().ok()?, minor.parse::<u32>().ok()?)))
             .is_some_and(|v| v >= (24, 4));
     vec![
-        check_line(
-            supported,
-            "sandbox Linux: Ubuntu 24.04+ (warning if unsupported)",
-            "use Ubuntu 24.04 or newer for Docker Sandboxes",
-        ),
+        check_line(supported, LINUX_RELEASE, "use Ubuntu 24.04 or newer for Docker Sandboxes"),
         check_line(
             kvm,
             "sandbox Linux: KVM available and accessible (warning if unavailable)",
@@ -686,6 +691,16 @@ mod tests {
                 .all(|l| l.starts_with('✗'))
         );
         assert!(linux_lines(None, false, None).iter().all(|l| l.starts_with('✗')));
+    }
+
+    #[test]
+    fn setup_waits_for_prerequisites_and_kvm_but_not_the_distribution() {
+        let other = linux_lines(Some("ID=cachyos\nID_LIKE=arch"), true, Some("users kvm"));
+        assert!(other[0].starts_with('✗') && !blocks_setup(&other[0]));
+        assert!(other.iter().all(|l| !blocks_setup(l)));
+        assert!(linux_lines(None, false, None)[1..].iter().all(|l| blocks_setup(l)));
+        assert!(prerequisite_lines(false, |_| false).iter().all(|l| blocks_setup(l)));
+        assert!(prerequisite_lines(false, |_| true).iter().all(|l| !blocks_setup(l)));
     }
 
     #[test]

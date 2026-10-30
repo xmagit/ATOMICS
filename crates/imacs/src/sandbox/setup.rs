@@ -26,7 +26,7 @@ pub fn run(workspace: Option<&str>) -> Result<()> {
         let path = crate::setup::login_shell_var("PATH").or_else(|| std::env::var("PATH").ok()).unwrap_or_default();
         let missing: Vec<_> = checks::host_lines_with(|name| crate::setup::find_on_path(name, &path).is_some())
             .into_iter()
-            .filter(|line| line.starts_with('✗'))
+            .filter(|line| checks::blocks_setup(line))
             .collect();
         if missing.is_empty() {
             let program = crate::setup::find_on_path("sbx", &path).map(|p| p.to_string_lossy().into_owned());
