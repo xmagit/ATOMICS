@@ -35,10 +35,8 @@ imacs setup
 imacs setup --workspace daily
 ```
 
-Setup creates a missing IMACS config and checks git, Claude Code, Codex, sbx (at least
-v0.50.1), and the OS keychain helper. It displays installation commands and waits while you
-run them in another terminal. On macOS it uses `security`; on Linux install
-`libsecret-tools` and unlock a Secret Service keyring (for example GNOME Keyring).
+Setup creates a missing IMACS config and checks git, Claude Code, Codex and sbx (at least
+v0.50.1). It displays installation commands and waits while you run them in another terminal.
 Linux also requires Ubuntu 24.04+, accessible KVM and membership of the `kvm` group.
 After changing groups, log out and back in, then rerun setup.
 
@@ -55,9 +53,9 @@ sudo apt install docker-sbx
 ```
 
 Setup then guides Docker browser sign-in, initializes the global network policy only if it
-is missing, stores Claude's subscription setup-token in the OS keychain, and registers its
-lookup with sbx before removing the built-in `anthropic` secret. It reads a missing OpenAI
-API key over stdin. A Linear ticket profile adds the `sbx mcp add linear` and `sbx mcp auth linear`
+is missing, and reads a missing OpenAI API key over stdin. Claude agents run bare by default;
+when they run sandboxed, setup asks for an Anthropic API key over stdin instead (see
+[Claude runs bare by default](#claude-runs-bare-by-default)). A Linear ticket profile adds the `sbx mcp add linear` and `sbx mcp auth linear`
 steps: the named workspace's with `--workspace`, otherwise the main config's or any saved workspace's,
 since setup cannot know which workspace IMACS will open. Browser authentication runs with private
 child output; if a browser does not open, run the indicated authentication command in a host
@@ -65,8 +63,8 @@ terminal and retry setup. It also offers to remove a stored GitHub credential an
 SSH forwarding, so the corresponding readiness checks can pass.
 
 Each change asks for confirmation. EOF, declining a step, or Ctrl-C stops setup; running it
-again checks actual state and skips completed steps. Existing unlocked Claude keychain
-entries and OpenAI secrets are reused. No progress file contains credentials. All token input
+again checks actual state and skips completed steps. Existing Anthropic and OpenAI
+secrets are reused. No progress file contains credentials. All token input
 is hidden on a terminal; pipes can supply newline-terminated answers and credentials over
 stdin. Tokens are never command arguments, printed output, logs, or IMACS configuration.
 A token can end up filed as a secret's name, or a service name as its sandbox scope, as with
@@ -77,8 +75,7 @@ without ever showing it.
 After its secret steps, setup reads sbx's listing again through doctor's own credential checks and
 stops at the first warning, so it never calls done a secret doctor reports missing. It then verifies
 every sandbox check and finishes by running `imacs doctor`. Doctor and
-Settings → Sandbox show the same readiness checks, including the keychain lookup when the
-subscription route is configured. Doctor also includes independent host/workspace diagnostics
+Settings → Sandbox show the same readiness checks. Doctor also includes independent host/workspace diagnostics
 (running IMACS, optional editors, hook trust and repository cleanup); setup does not claim to
 have resolved those warnings. Start a new sandbox after changing credentials.
 
@@ -98,8 +95,9 @@ exposes rules rather than preserving an immutable preset name: standard rules ar
 balanced, allow-all or deny-all, and changed rules as custom. Review custom rules with
 `sbx policy ls`. Checks never initialize or replace a policy or start an OAuth authorization flow.
 
-Credential checks report only known names: `anthropic`, the custom `CLAUDE_CODE_OAUTH_TOKEN`
-route, `openai`, and a warning for `github`, counting global secrets only. A service secret under a
+Credential checks report only known names: `anthropic` (checked only while Claude agents run
+sandboxed), `openai`, a warning for `github`, and a leftover `CLAUDE_CODE_OAUTH_TOKEN` custom route
+as unused, counting global secrets only. A service secret under a
 name sbx has no service for, or in a scope that is not an existing sandbox, is a misfiled secret:
 doctor warns with their count and scopes, never their names, since sbx can store a token in the NAME
 column. Checks discard all raw credential-command errors. Do not paste
@@ -108,50 +106,34 @@ SSH checks also warn about sbx's global `ssh.agentForwardingEnabled` and a fixed
 `ssh.agentSocketPath`, in addition to IMACS's `ssh_agent` setting. The runtime removes
 `SSH_AUTH_SOCK` when IMACS forwarding is off; a fixed sbx socket can bypass that protection.
 
-## Claude with a subscription
+## Claude runs bare by default
 
-Run **`imacs setup` in a trusted host terminal** (`imacs sandbox setup` is an alias). It confirms
-the credential change, then reuses the `imacs-claude-setup-token` OS keychain entry (account
-`imacs`) when readable, or asks you to paste a new
-token from `claude setup-token`. Pasted input has terminal echo disabled. A pipe can supply the
-answers and token over stdin; the command accepts no token argument. The helper writes the
-keychain through stdin, discards keychain and sbx output, and registers a lookup command with
-sbx. It verifies the lookup first, then removes the built-in `anthropic` secret if present, once
-sbx lists the new route. If lookup verification fails, or sbx does not list the route, the built-in
-secret stays in place.
+The built-in `claude` agent has `isolation = "bare"`: Claude agents run on this machine with your
+Claude login, as the chief always does, while Codex stays sandboxed. A Claude subscription cannot
+authenticate inside a local sandbox with sbx v0.50.1, as found end to end on 2026-10-30:
 
-**Remove the built-in `anthropic` secret for subscription OAuth.** Its generated `apiKeyHelper`
-outranks `CLAUDE_CODE_OAUTH_TOKEN`, so leaving both configured can make Claude use the wrong
-credential. This is a global sbx credential change and affects other sandboxes using that secret.
-Restart with a new sandbox after changing credential configuration. The helper never prints a
-token, passes one on argv, or writes one to a worktree or IMACS config.
+- **A custom route.** A `sbx secret set-custom --env CLAUDE_CODE_OAUTH_TOKEN --host api.anthropic.com`
+  secret gives the VM a placeholder (`sk-ant-oat01-` and 16 random characters). With the built-in
+  `anthropic` secret removed (`SBX_CRED_ANTHROPIC_MODE=none`), sbx's proxy strips both
+  `Authorization` and `x-api-key` from requests to api.anthropic.com and adds nothing: Claude says
+  "Not logged in" and the API answers `401 x-api-key header is required`. A daemon restart does not
+  change this.
+- **The built-in secret holding a subscription token.** Stored as sbx's `anthropic` secret, with
+  `--command` reading it from the OS keychain, the token gets `SBX_CRED_ANTHROPIC_MODE=apikey`: sbx
+  writes an `apiKeyHelper` into the VM's Claude settings, and its proxy sends the token as
+  `x-api-key`, which the API rejects with `401 invalid x-api-key`.
 
-The registration is equivalent to this on macOS (only a lookup command is on argv):
+`sbx secret set --oauth` covers only OpenAI on local sbx; Anthropic OAuth is cloud-only. Sandboxed
+Claude on a subscription is planned through an IMACS host credential relay.
 
-```sh
-sbx secret set-custom --host api.anthropic.com --env CLAUDE_CODE_OAUTH_TOKEN \
-  --placeholder 'sk-ant-oat01-{rand}' \
-  --command '/usr/bin/security find-generic-password -a imacs -s imacs-claude-setup-token -w'
-sbx secret rm anthropic
-```
-
-On Linux, install `libsecret-tools` and run with an unlocked Secret Service keychain in your
-desktop session. The lookup command is:
-
-```sh
-secret-tool lookup service imacs-claude-setup-token account imacs
-sbx secret set-custom --host api.anthropic.com --env CLAUDE_CODE_OAUTH_TOKEN \
-  --placeholder 'sk-ant-oat01-{rand}' \
-  --command '/usr/bin/secret-tool lookup service imacs-claude-setup-token account imacs'
-```
-
-To provision the Linux entry yourself, `secret-tool store --label='IMACS Claude subscription'
-service imacs-claude-setup-token account imacs` reads its value from stdin. Use a trusted terminal
-or a password-manager pipe; do not put the value in shell history. The macOS helper uses
-`security -i` with the keychain write command on stdin. Keychain access may require approval
-from your OS. Keep command helpers and their dependencies outside folders writable by agents.
-For OpenAI, use sbx's interactive `sbx secret set openai`; for an Anthropic API key instead of a
-subscription, use its interactive `sbx secret set anthropic` flow.
+To sandbox Claude meanwhile, store an Anthropic API key (`sk-ant-api…`) in sbx's built-in
+`anthropic` secret and set the claude agent's `isolation = "sandbox"` (or remove its `isolation`
+under `mode = "sandbox"`). With Claude agents sandboxed, `imacs setup` asks for the key and sends it
+to `sbx secret set anthropic` over stdin; it refuses a subscription token. Doctor and Settings →
+Sandbox then check for the `anthropic` secret. While Claude runs bare they say sandboxed Claude is
+not configured, as information rather than a warning. A config created before this default keeps its
+`[[agents]]` entry for claude: add `isolation = "bare"` to it. Codex sandboxes use sbx's `openai`
+secret, OAuth or API key; use sbx's interactive `sbx secret set openai` to change it.
 
 ## Linux hosts
 
@@ -169,8 +151,7 @@ id -Gn
 imacs doctor
 ```
 
-Load the appropriate `kvm_intel` or `kvm_amd` module if `/dev/kvm` is missing. For subscription
-credentials, install `libsecret-tools` and unlock the desktop keychain as described above.
+Load the appropriate `kvm_intel` or `kvm_amd` module if `/dev/kvm` is missing.
 
 ## Tickets and direct Linear access
 

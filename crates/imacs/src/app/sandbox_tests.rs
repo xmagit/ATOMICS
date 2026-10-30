@@ -80,6 +80,8 @@ fn quitting_stops_running_and_preparing_sandboxes_and_joins_cleanup() {
         app.runtime.sbx = fake::install(bin.path()).display().to_string();
         std::fs::write(bin.path().join("run-waits"), "wait").unwrap();
         app.runtime.config.isolation.mode = IsolationMode::Sandbox;
+        // The default claude agent is bare; this test sandboxes it.
+        app.runtime.config.agents.iter_mut().for_each(|agent| agent.isolation = None);
         let running = app.runtime.start(ctx, "claude", repo.clone(), None, vec![], None).unwrap();
         tick_until(app, ctx, "running sandbox", |app| {
             app.runtime.sessions.iter().any(|s| s.id == running && s.terminal.is_some())
@@ -198,6 +200,8 @@ fn sandboxed_agents_attach_through_sbx_run_and_reattach_after_a_restart() {
         let bin = crate::test_support::tempdir().unwrap();
         app.runtime.sbx = fake::install(bin.path()).display().to_string();
         app.runtime.config.isolation.mode = IsolationMode::Sandbox;
+        // The default claude agent is bare; this test sandboxes it.
+        app.runtime.config.agents.iter_mut().for_each(|agent| agent.isolation = None);
 
         let id = app.runtime.start(ctx, "claude", worktree.clone(), None, vec![], Some("Fix the bug".into())).unwrap();
         let name = format!("imacs-{id}");

@@ -92,7 +92,9 @@ case "$1" in
         ;;
       set)
         cat > "$dir/secret-stdin"
-        [ -e "$dir/skip-secret-write" ] || rm -f "$dir/no-openai"
+        if [ ! -e "$dir/skip-secret-write" ]; then
+          case "$3" in anthropic) rm -f "$dir/removed-anthropic" ;; *) rm -f "$dir/no-openai" ;; esac
+        fi
         ;;
       rm)
         case "$3" in

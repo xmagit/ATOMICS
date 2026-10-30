@@ -1024,7 +1024,7 @@ mod tests {
         assert_eq!(ready.version, (0, 50, 1));
         assert!(ready.diagnosis.signed_in(), "an unrelated failing check does not matter");
         assert!(
-            doctor_lines(&sbx, &SandboxConfig::default())[0]
+            doctor_lines(&sbx, &SandboxConfig::default(), true)[0]
                 .starts_with("✓ Docker Sandboxes ready (sbx v0.50.1, signed in)")
         );
         std::fs::write(bin.path().join("version"), "v0.51.2").unwrap();
@@ -1047,7 +1047,7 @@ mod tests {
         std::fs::write(bin.path().join("version"), "v0.50.1").unwrap();
         std::fs::write(bin.path().join("signed-out"), "").unwrap();
         let error = refusal(&sbx, &["not signed in", "sbx login"]);
-        let line = &doctor_lines(&sbx, &SandboxConfig::default())[0];
+        let line = &doctor_lines(&sbx, &SandboxConfig::default(), true)[0];
         assert!(line.starts_with("✗ Docker Sandboxes not ready for sandboxed agents (warning) — "), "{line}");
         assert!(line.ends_with(&error), "{line}");
         std::fs::write(bin.path().join("fail-diagnose"), "").unwrap();

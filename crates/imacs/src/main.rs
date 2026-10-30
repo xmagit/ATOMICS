@@ -115,7 +115,7 @@ enum Command {
 
 #[derive(Subcommand)]
 enum SandboxCommand {
-    /// Set up Claude subscription OAuth using the OS keychain (no token arguments)
+    /// Set up sandboxed agents: tools, Docker sign-in, network policy and credentials (over stdin)
     Setup,
     Template {
         #[command(subcommand)]

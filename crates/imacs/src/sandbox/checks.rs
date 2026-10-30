@@ -4,25 +4,31 @@ use super::*;
 use imacs_core::doctor::check_line;
 use serde_json::Value;
 
-/// Checks never include sbx's raw output or errors, even when a command fails.
-pub fn doctor_lines(program: &str, config: &SandboxConfig) -> Vec<String> {
-    let mut lines = sandbox_lines(program, config);
+/// Checks never include sbx's raw output or errors, even when a command fails. `claude` says whether
+/// Claude agents run sandboxed ([`claude_sandboxed`]), and so need sbx's anthropic secret.
+pub fn doctor_lines(program: &str, config: &SandboxConfig, claude: bool) -> Vec<String> {
+    let mut lines = sandbox_lines(program, config, claude);
     lines.extend(host_lines());
-    if secrets(program).is_some_and(|names| names.oauth) {
-        lines.push(subscription_line(setup::Keychain::current().available()));
-    }
     lines
 }
 
-pub(super) fn subscription_line(available: bool) -> String {
-    check_line(
-        available,
-        "sandbox Claude subscription token readable from OS keychain",
-        "unlock the OS keychain or rerun `imacs setup`",
-    )
+/// Whether a Claude agent runs sandboxed: its own `isolation`, else the workspace's or main `mode`.
+/// A repository can still require sandboxes for its own agents.
+pub(crate) fn claude_sandboxed(config: &imacs_core::config::Config, workspace: Option<&str>) -> bool {
+    let overrides = workspace
+        .and_then(|name| workspace::Workspace::load(name).ok())
+        .and_then(|workspace| workspace.isolation().ok().flatten());
+    let isolation = overrides
+        .and_then(|overrides| config.isolation.with_overrides(&overrides).ok())
+        .unwrap_or_else(|| config.isolation.clone());
+    config
+        .agents
+        .iter()
+        .filter(|agent| agent.kind == imacs_core::config::AgentKind::Claude)
+        .any(|agent| isolation.mode_for(agent, None) == isolation::IsolationMode::Sandbox)
 }
 
-pub(super) fn sandbox_lines(program: &str, config: &SandboxConfig) -> Vec<String> {
+pub(super) fn sandbox_lines(program: &str, config: &SandboxConfig, claude: bool) -> Vec<String> {
     let mut lines = Vec::new();
     match preflight(program) {
         Ok(ready) => {
@@ -44,7 +50,7 @@ pub(super) fn sandbox_lines(program: &str, config: &SandboxConfig) -> Vec<String
                     config.network.name()
                 ),
             ));
-            lines.extend(secret_lines(secrets(program).as_ref()));
+            lines.extend(secret_lines(secrets(program).as_ref(), claude));
             let mcp = query(program, &["mcp", "ls", "--json"]);
             match mcp.as_ref().and_then(Value::as_array) {
                 None => lines.push(check_line(
@@ -98,14 +104,22 @@ pub(super) fn sandbox_lines(program: &str, config: &SandboxConfig) -> Vec<String
 
 /// Doctor's credential lines, from what sbx lists. Setup checks its own secret steps with these
 /// same lines, so the two cannot disagree about what sbx stores.
-pub(super) fn secret_lines(secrets: Option<&SecretNames>) -> Vec<String> {
+pub(super) fn secret_lines(secrets: Option<&SecretNames>, claude: bool) -> Vec<String> {
     let mut lines = Vec::new();
+    // Local sbx cannot use a Claude subscription in a sandbox; it needs an API key (docs/isolation.md).
+    if claude {
+        lines.push(check_line(
+            secrets.is_some_and(|s| s.anthropic),
+            "sandbox Claude secret: anthropic API key",
+            "Claude agents run sandboxed: store an Anthropic API key with `imacs setup` (a subscription token does not work in a local sandbox), or set the claude agent's isolation = \"bare\"",
+        ));
+    } else {
+        lines.push(
+            "sandboxed Claude: not configured; Claude agents run bare (to sandbox Claude, store an Anthropic API key in sbx's anthropic secret)"
+                .into(),
+        );
+    }
     for (present, label, hint) in [
-        (
-            secrets.is_some_and(|s| s.anthropic || s.oauth),
-            "sandbox Claude secret: anthropic or CLAUDE_CODE_OAUTH_TOKEN",
-            "run `imacs setup` for a Claude subscription",
-        ),
         (
             secrets.is_some_and(|s| s.openai),
             "sandbox OpenAI secret: openai",
@@ -116,13 +130,14 @@ pub(super) fn secret_lines(secrets: Option<&SecretNames>) -> Vec<String> {
             "sandbox github secret absent (warning if stored or unreadable)",
             "a github secret lets agents push as you; review it and remove with `sbx secret rm github` if unintended",
         ),
-        (
-            secrets.is_some_and(|s| !(s.anthropic && s.oauth)),
-            "sandbox Claude credential precedence (warning if both are stored or unreadable)",
-            "anthropic's apiKeyHelper outranks the OAuth token; remove it with `sbx secret rm anthropic` for subscription use",
-        ),
     ] {
         lines.push(check_line(present, label, hint));
+    }
+    if secrets.is_some_and(|s| s.oauth) {
+        lines.push(
+            "sandbox CLAUDE_CODE_OAUTH_TOKEN route: registered but unused, since local sbx strips it; remove the custom secret with `sbx secret rm`"
+                .into(),
+        );
     }
     let misfiled = secrets.map(|s| s.misfiled.as_slice()).filter(|misfiled| !misfiled.is_empty());
     lines.push(check_line(
@@ -342,7 +357,7 @@ pub(super) fn host_lines_with(installed: impl Fn(&str) -> bool) -> Vec<String> {
 }
 
 fn prerequisite_lines(mac: bool, installed: impl Fn(&str) -> bool) -> Vec<String> {
-    ["git", "claude", "codex", if mac { "security" } else { "secret-tool" }]
+    ["git", "claude", "codex"]
         .into_iter()
         .map(|name| check_line(installed(name), &format!("sandbox prerequisite: {name}"), install_hint(name, mac)))
         .collect()
@@ -355,10 +370,6 @@ pub(super) fn install_hint(name: &str, mac: bool) -> &'static str {
         ("claude", _) => "install with `curl -fsSL https://claude.ai/install.sh | bash`",
         ("codex", true) => "install with `brew install --cask codex`",
         ("codex", false) => "install Node.js/npm, then `npm install -g @openai/codex`",
-        ("security", _) => "restore /usr/bin/security and unlock your macOS login keychain",
-        ("secret-tool", _) => {
-            "install with `sudo apt-get install libsecret-tools gnome-keyring`; unlock the desktop keychain"
-        }
         (_, true) => {
             "install with `brew trust docker/tap` then `brew install docker/tap/sbx` (upgrade: `brew upgrade sbx`)"
         }
@@ -421,7 +432,7 @@ mod tests {
     use serde_json::json;
 
     fn report(dir: &Path) -> String {
-        sandbox_lines(dir.join("sbx").to_str().unwrap(), &SandboxConfig::default()).join("\n")
+        sandbox_lines(dir.join("sbx").to_str().unwrap(), &SandboxConfig::default(), true).join("\n")
     }
     fn fixture() -> crate::test_support::TempDir {
         let dir = crate::test_support::tempdir().unwrap();
@@ -470,7 +481,7 @@ mod tests {
             (json!([{"name":"anthropic"},{"name":"openai"}]), true, true, false),
             (
                 json!([{"name":"CLAUDE_CODE_OAUTH_TOKEN","env":"CLAUDE_CODE_OAUTH_TOKEN","host":"api.anthropic.com"},{"name":"openai"},{"name":"github"}]),
-                true,
+                false,
                 true,
                 true,
             ),
@@ -489,12 +500,33 @@ mod tests {
             assert_eq!(line(&text, "github secret absent").starts_with('✗'), github, "{text}");
             assert!(!text.contains("sk-ant-secret-misfiled") && !text.contains("never-display-this"));
         }
+        // A leftover subscription route is reported as unused, without a warning that blocks setup.
         write(
             dir,
             "secrets.json",
             json!({"secrets":[{"type":"service","name":"anthropic"},{"type":"custom","name":"CLAUDE_CODE_OAUTH_TOKEN"}]}),
         );
-        assert!(line(&report(dir), "credential precedence").starts_with('✗'));
+        let text = report(dir);
+        assert!(line(&text, "Claude secret:").starts_with('✓'), "{text}");
+        assert!(line(&text, "CLAUDE_CODE_OAUTH_TOKEN route: registered but unused").starts_with("sandbox"), "{text}");
+    }
+
+    #[test]
+    fn claude_runs_bare_by_default_and_then_needs_no_sandbox_secret() {
+        let mut config = imacs_core::config::Config::default();
+        assert!(!claude_sandboxed(&config, None), "the default claude agent is bare");
+        config.agents.iter_mut().find(|agent| agent.name == "claude").unwrap().isolation = None;
+        assert!(claude_sandboxed(&config, None), "sandbox mode applies to an agent without its own isolation");
+        config.isolation.mode = isolation::IsolationMode::Bare;
+        assert!(!claude_sandboxed(&config, None));
+
+        let dir = fixture();
+        let dir = dir.path();
+        std::fs::write(dir.join("removed-anthropic"), "").unwrap();
+        let bare = sandbox_lines(dir.join("sbx").to_str().unwrap(), &SandboxConfig::default(), false);
+        assert!(bare.iter().any(|l| l.starts_with("sandboxed Claude: not configured; Claude agents run bare")));
+        assert!(!bare.iter().any(|l| l.contains("sandbox Claude secret")), "{bare:?}");
+        assert!(line(&report(dir), "sandbox Claude secret: anthropic API key").starts_with('✗'));
     }
 
     #[test]
@@ -510,7 +542,7 @@ mod tests {
             (json!([{"name":"linear","status":"error","error":"private-credential"}]), "unavailable"),
         ] {
             write(dir, "mcp.json", servers);
-            let text = doctor_lines(program.to_str().unwrap(), &config).join("\n");
+            let text = doctor_lines(program.to_str().unwrap(), &config, true).join("\n");
             let mcp = line(&text, "MCP linear:");
             assert!(mcp.contains(expected), "{text}");
             assert_eq!(mcp.starts_with('✓'), expected == "ready");
@@ -533,7 +565,7 @@ mod tests {
             std::fs::remove_file(dir.join(file)).unwrap();
         }
         let config = SandboxConfig { ssh_agent: true, ..Default::default() };
-        let lines = doctor_lines(dir.join("sbx").to_str().unwrap(), &config).join("\n");
+        let lines = doctor_lines(dir.join("sbx").to_str().unwrap(), &config, true).join("\n");
         assert!(line(&lines, "SSH agent forwarding").starts_with('✗'));
     }
 
@@ -598,14 +630,12 @@ mod tests {
             assert!(missing.lines().all(|line| line.starts_with('✗')));
             assert!(missing.contains("git") && missing.contains("claude") && missing.contains("codex"));
             assert!(missing.contains(if mac { "xcode-select --install" } else { "sudo apt-get install git" }));
-            assert!(missing.contains(if mac { "security" } else { "libsecret-tools" }));
             assert!(install_hint("sbx", mac).contains(if mac {
                 "brew install docker/tap/sbx"
             } else {
                 "sudo apt install docker-sbx"
             }));
-            let keychain_only = prerequisite_lines(mac, |name| name != if mac { "security" } else { "secret-tool" });
-            assert_eq!(keychain_only.iter().filter(|line| line.starts_with('✗')).count(), 1);
+            assert_eq!(prerequisite_lines(mac, |_| false).len(), 3, "no keychain helper: setup stores no token");
         }
     }
 
@@ -666,12 +696,11 @@ mod tests {
         let dir = dir.path();
         std::fs::write(dir.join("oauth"), "").unwrap();
         std::fs::write(dir.join("removed-anthropic"), "").unwrap();
+        // Local sbx strips this route (docs/isolation.md): doctor names it unused, not a credential.
         let text = report(dir);
-        assert!(line(&text, "Claude secret:").starts_with('✓'), "{text}");
-        assert!(line(&text, "credential precedence").starts_with('✓'), "{text}");
+        assert!(line(&text, "Claude secret:").starts_with('✗'), "{text}");
+        assert!(line(&text, "CLAUDE_CODE_OAUTH_TOKEN route: registered but unused").starts_with("sandbox"), "{text}");
         assert!(!text.contains("PRIVATE"), "{text}");
-        std::fs::remove_file(dir.join("removed-anthropic")).unwrap();
-        assert!(line(&report(dir), "credential precedence").starts_with('✗'), "both routes at once");
     }
 
     #[test]

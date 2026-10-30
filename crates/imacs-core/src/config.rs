@@ -83,6 +83,8 @@ mcp = []                     # MCP servers registered with `sbx mcp add`, loaded
 name = "claude"
 command = ["claude"]
 kind = "claude"
+# Bare: in a local sandbox Claude needs an Anthropic API key in sbx's anthropic secret, not a subscription.
+isolation = "bare"
 
 [[agents]]
 name = "codex"
@@ -601,7 +603,11 @@ impl Default for Config {
             theme: ThemeConfig::default(),
             isolation: crate::isolation::IsolationConfig::default(),
             agents: vec![
-                agent("claude", &["claude"], AgentKind::Claude, None),
+                // Local sbx cannot use a Claude subscription in a sandbox (docs/isolation.md).
+                AgentConfig {
+                    isolation: Some(crate::isolation::IsolationMode::Bare),
+                    ..agent("claude", &["claude"], AgentKind::Claude, None)
+                },
                 agent("codex", &["codex"], AgentKind::Generic, Some("esc to interrupt")),
                 agent("shell", &[], AgentKind::Shell, None),
             ],
