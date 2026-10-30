@@ -37,18 +37,27 @@ impl State {
         if let Some(workflow) = self.cached_repo_workflow(repo) {
             return workflow.apply(&self.effective_config());
         }
-        let root = self
-            .project_roots
-            .get(repo)
-            .cloned()
-            .or_else(|| self.project_of(repo))
-            .or_else(|| workspace::project_root(repo).ok())
-            .unwrap_or_else(|| repo.to_path_buf());
+        let root = self.project_root_of(repo);
         let config = self.effective_config();
         match self.repo_workflows.get(&root) {
             Some(workflow) => workflow.apply(&config),
             None => RepoWorkflow::read(&root).apply(&config),
         }
+    }
+
+    /// Reads the repository's settings now rather than from the cache, which can lag by a
+    /// reload: a repository that just started requiring sandboxes must never get a bare agent.
+    pub(super) fn current_project_config(&self, repo: &Path) -> Config {
+        RepoWorkflow::read(&self.project_root_of(repo)).apply(&self.effective_config())
+    }
+
+    fn project_root_of(&self, repo: &Path) -> PathBuf {
+        self.project_roots
+            .get(repo)
+            .cloned()
+            .or_else(|| self.project_of(repo))
+            .or_else(|| workspace::project_root(repo).ok())
+            .unwrap_or_else(|| repo.to_path_buf())
     }
 
     pub(super) fn plan_base_ref(&self, plan: &Plan) -> String {

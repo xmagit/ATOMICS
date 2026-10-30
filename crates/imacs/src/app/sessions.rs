@@ -175,7 +175,7 @@ impl State {
         prompt: bool,
         task: Option<IsolationMode>,
     ) -> Result<Option<crate::sandbox::Prepare>, String> {
-        let config = self.project_config(cwd);
+        let config = self.current_project_config(cwd);
         if config.isolation.mode_for(agent, task) == IsolationMode::Bare {
             return Ok(None);
         }
