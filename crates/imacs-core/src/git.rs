@@ -163,6 +163,14 @@ fn output(mut command: Command, args: &[&str], input: Option<&[u8]>, timeout: Du
 /// the folder names now; and without hooks or fsmonitor, which can name programs the sandbox wrote.
 /// Git never prompts on the terminal: it starts in a new session without a controlling terminal.
 fn command(dir: &Path, args: &[&str]) -> Result<Command> {
+    if matches!(args.first(), Some(&"rev-parse" | &"show-ref" | &"merge-base")) {
+        for arg in args.iter().filter(|arg| arg.starts_with("refs/heads/")) {
+            let name = arg.split(['^', '~']).next().unwrap();
+            // Ref probes must refuse special loose refs before git opens them. Object and
+            // log reads are still bounded by the runner, and belong on background workers.
+            loose_ref_exists(&common_dir(dir)?, name)?;
+        }
+    }
     let mut command = Command::new("git");
     command.arg("-C").arg(dir).args(["-c", "core.quotepath=off"]).env("GIT_TERMINAL_PROMPT", "0");
     let Some(pins) = locate(dir)? else {
@@ -796,6 +804,47 @@ pub fn common_dir(repo: &Path) -> Result<PathBuf> {
     Ok(std::fs::canonicalize(common.trim())?)
 }
 
+/// Whether a loose ref exists, refusing links, FIFOs and non-directory parents without reading it.
+fn loose_ref_exists(common: &Path, name: &str) -> Result<bool> {
+    let parts: Vec<_> = name.split('/').collect();
+    ensure!(parts.iter().all(|part| !part.is_empty() && *part != "." && *part != ".."), "invalid ref {name}");
+    let mut path = common.to_path_buf();
+    for (index, part) in parts.iter().enumerate() {
+        path.push(part);
+        let metadata = match path.symlink_metadata() {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error).with_context(|| format!("checking {}", path.display())),
+        };
+        ensure!(
+            if index + 1 == parts.len() { metadata.is_file() } else { metadata.is_dir() },
+            "{} is not a regular ref file or directory",
+            path.display()
+        );
+    }
+    Ok(true)
+}
+
+/// Branch-name occupancy for allocation. This never opens an object or reflog: git's actual
+/// ref/commit verification happens on the worktree worker, not while dispatch holds the UI lock.
+pub fn branch_ref_exists(repo: &Path, branch: &str) -> Result<bool> {
+    let name = format!("refs/heads/{branch}");
+    let common = common_dir(repo)?;
+    if loose_ref_exists(&common, &name)? {
+        return Ok(true);
+    }
+    let packed = match read_regular_file(&common.join("packed-refs"), 16 * 1024 * 1024) {
+        Ok(packed) => packed,
+        Err(error)
+            if error.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    };
+    Ok(packed.lines().any(|line| line.split_once(' ').is_some_and(|(_, candidate)| candidate == name)))
+}
+
 fn worktree_lock(repo: &Path) -> Result<Arc<Mutex<()>>> {
     static LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = LazyLock::new(Mutex::default);
     let common = common_dir(repo)?;
@@ -1099,6 +1148,45 @@ pub fn worktree_path(template: &str, repo: &Path, branch: &str) -> PathBuf {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn branch_allocation_reads_names_without_opening_objects_or_logs() {
+        let (_dir, repo) = project();
+        let object = git(&repo, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        let file = repo.join(".git/objects").join(&object[..2]).join(&object[2..]);
+        std::fs::remove_file(&file).unwrap();
+        assert!(Command::new("mkfifo").arg(file).status().unwrap().success());
+        let log = repo.join(".git/logs/HEAD");
+        std::fs::remove_file(&log).unwrap();
+        assert!(Command::new("mkfifo").arg(log).status().unwrap().success());
+        assert!(branch_ref_exists(&repo, "main").unwrap());
+        assert!(!branch_ref_exists(&repo, "missing").unwrap());
+        // Packed occupancy also needs no object; loose shadowing is checked first.
+        std::fs::write(repo.join(".git/packed-refs"), format!("{object} refs/heads/packed\n")).unwrap();
+        assert!(branch_ref_exists(&repo, "packed").unwrap());
+    }
+
+    #[test]
+    fn ref_probes_refuse_non_regular_loose_branch_files_before_starting_git() {
+        let (_dir, repo) = project();
+        for name in ["fifo", "link"] {
+            let path = repo.join(".git/refs/heads").join(name);
+            if name == "fifo" {
+                assert!(Command::new("mkfifo").arg(&path).status().unwrap().success());
+            } else {
+                std::os::unix::fs::symlink("/dev/zero", &path).unwrap();
+            }
+            let full = format!("refs/heads/{name}");
+            for args in [
+                vec!["show-ref", "--verify", &full],
+                vec!["rev-parse", "--verify", &full],
+                vec!["merge-base", "--is-ancestor", &full, "HEAD"],
+            ] {
+                let result = command(&repo, &args);
+                assert!(result.is_err(), "git would read {full}: {args:?}");
+            }
+        }
+    }
 
     fn run(dir: &Path, args: &[&str]) {
         let status = Command::new("git").arg("-C").arg(dir).args(args).status().unwrap();

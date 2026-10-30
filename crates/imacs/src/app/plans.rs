@@ -391,7 +391,7 @@ impl State {
             if pinned {
                 return Ok(branch);
             }
-            let exists = git::git(repo, &["show-ref", "--verify", &format!("refs/heads/{branch}")]).is_ok()
+            let exists = git::branch_ref_exists(repo, &branch).map_err(|err| format!("{err:#}"))?
                 || path.exists()
                 || reserved_path
                 || self.creating.iter().any(|(dir, name, _)| *dir == common && *name == branch);
@@ -414,9 +414,12 @@ impl State {
             plan.project.clone().or_else(|| plan.tasks.iter().find_map(|t| t.repo.as_deref().map(paths::expand)));
         let ticket_mode = self.ticket_config().is_some_and(|c| c.mode == imacs_core::tickets::TicketMode::Ticket);
         let existing = existing
-            || repo.as_deref().is_some_and(|repo| {
-                git::git(repo, &["show-ref", "--verify", &format!("refs/heads/{}", plan.integration_branch())]).is_ok()
-            });
+            || match repo.as_deref() {
+                Some(repo) => {
+                    git::branch_ref_exists(repo, &plan.integration_branch()).map_err(|err| format!("{err:#}"))?
+                }
+                None => false,
+            };
         let branch = if !existing && ticket_mode {
             repo.as_deref().and_then(|repo| self.ticket_branch(index, plan.ticket.as_ref(), repo, None))
         } else {

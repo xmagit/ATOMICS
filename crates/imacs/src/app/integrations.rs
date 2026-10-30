@@ -712,9 +712,9 @@ exec {} "$@"
     }
 
     #[test]
-    fn a_ref_git_waits_on_stops_the_check_at_its_time_limit_and_it_runs_again_later() {
+    fn a_git_object_fifo_stops_the_check_at_its_time_limit_and_it_runs_again_later() {
         with_app(
-            "app::integrations::tests::a_ref_git_waits_on_stops_the_check_at_its_time_limit_and_it_runs_again_later",
+            "app::integrations::tests::a_git_object_fifo_stops_the_check_at_its_time_limit_and_it_runs_again_later",
             |app, _| {
                 let (_dir, repo) = repository();
                 git::git(&repo, &["branch", "integration"]).unwrap();
@@ -728,8 +728,13 @@ exec {} "$@"
                 let key = (app.runtime.plans[index].id.clone(), "a".to_string());
                 app.runtime.plans[index].tasks[0].status = TaskStatus::Done;
                 app.runtime.plans[index].tasks[0].integrated = Some("integration".into());
-                // A sandbox writes the shared refs: git waits for good on a FIFO in place of a branch.
-                let fifo = repo.join(".git/refs/heads/task-a");
+                // Ref FIFOs are refused before git starts. A loose object FIFO still exercises
+                // the bounded background runner without blocking the UI.
+                git::git(&repo, &["branch", "task-a", "integration"]).unwrap();
+                let object = git::git(&repo, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+                let fifo = repo.join(".git/objects").join(&object[..2]).join(&object[2..]);
+                let saved = fifo.with_extension("saved");
+                std::fs::rename(&fifo, &saved).unwrap();
                 assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
                 let limit = Duration::from_secs(3);
                 git::set_quick_timeout(limit);
@@ -750,7 +755,7 @@ exec {} "$@"
 
                 // Once the wait is over, it runs again without a ref event, and finds the branch.
                 std::fs::remove_file(&fifo).unwrap();
-                git::git(&repo, &["branch", "task-a", "integration"]).unwrap();
+                std::fs::rename(&saved, &fifo).unwrap();
                 let at = app.runtime.integration_retries.get_mut(&key).expect("the check must be rescheduled");
                 assert!(*at > Instant::now());
                 *at = Instant::now();
