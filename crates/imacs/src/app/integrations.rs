@@ -19,6 +19,9 @@ impl State {
     }
 
     pub(super) fn refresh_integrations(&mut self) {
+        self.integration_retries.retain(|(plan, task), _| {
+            self.plans.iter().any(|p| p.id == *plan && p.is_open() && p.tasks.iter().any(|t| t.id == *task))
+        });
         if self.integration_dirty.swap(false, Ordering::Relaxed) {
             self.integration_revision += 1;
             for task in self.plans.iter_mut().flat_map(|p| &mut p.tasks) {
@@ -311,6 +314,27 @@ fn same_work(a: &Task, b: &Task) -> bool {
 mod tests {
     use super::super::tests::{repository, request, with_app};
     use super::*;
+
+    #[test]
+    fn retries_are_pruned_for_closed_plans_and_removed_tasks() {
+        with_app("app::integrations::tests::retries_are_pruned_for_closed_plans_and_removed_tasks", |app, _| {
+            let state = &mut app.runtime;
+            state.plans = vec![Plan {
+                id: "open".into(),
+                tasks: vec![Task { id: "keep".into(), ..Default::default() }],
+                ..Default::default()
+            }];
+            for (plan, task) in [("open", "keep"), ("open", "removed"), ("closed", "keep")] {
+                state.integration_retries.insert((plan.into(), task.into()), Instant::now());
+            }
+            state.refresh_integrations();
+            assert_eq!(state.integration_retries.len(), 1);
+            assert!(state.integration_retries.contains_key(&("open".into(), "keep".into())));
+            state.plans[0].status = PlanStatus::Completed;
+            state.refresh_integrations();
+            assert!(state.integration_retries.is_empty());
+        });
+    }
 
     #[test]
     fn deleting_an_integrated_branch_keeps_dependents_verified_after_reload() {
