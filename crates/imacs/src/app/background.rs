@@ -151,7 +151,15 @@ impl State {
                 return true;
             }
         }
-        for terminal in self.sessions.iter().filter_map(|s| s.terminal.as_ref()).chain(self.editors.values()) {
+        for session in &mut self.sessions {
+            let Some(terminal) = &session.terminal else { continue };
+            if terminal.shared.changed.swap(false, Ordering::AcqRel) {
+                session.activity.last_event = imacs_core::store::now();
+                let delay = terminal.repaint_delay();
+                self.output_delay = Some(self.output_delay.map_or(delay, |pending| pending.min(delay)));
+            }
+        }
+        for terminal in self.editors.values() {
             if terminal.shared.changed.swap(false, Ordering::AcqRel) {
                 let delay = terminal.repaint_delay();
                 self.output_delay = Some(self.output_delay.map_or(delay, |pending| pending.min(delay)));
@@ -174,8 +182,13 @@ impl State {
             }
         }
         for name in idle {
+            if let Some(index) = self.sessions.iter().position(|session| session.sandbox.as_ref() == Some(&name)) {
+                self.check_refs(index);
+            }
             self.stop_sandbox(name);
         }
+        let names = self.sessions.iter().filter_map(|s| s.sandbox.clone()).collect();
+        changed |= self.sandbox_usage.poll(names, ctx);
         self.track_busy();
         self.verify_deliveries();
         for index in 0..self.sessions.len() {
@@ -476,6 +489,9 @@ impl State {
                     chief: false,
                     pending: None,
                     sandbox: None,
+                    screen_busy: false,
+                    busy_absent_since: None,
+                    ref_guard: None,
                 });
                 if self.active.is_none() {
                     self.active = Some(format!("ext:{}", event.session_id));
@@ -485,6 +501,12 @@ impl State {
         };
 
         let session = &mut self.sessions[index];
+        if session.sandbox.is_some() {
+            if let Some(reply) = message.approval_reply {
+                reply.answer(HookReply::default());
+            }
+            return;
+        }
         if event.name != "SessionStart" && session.claude_id.as_ref().is_some_and(|id| id != &event.session_id) {
             return;
         }

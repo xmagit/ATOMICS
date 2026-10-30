@@ -163,9 +163,31 @@ impl Desktop<'_> {
                 3.5,
                 status_dot(session.status, &p, now),
             );
+            let mut badge_width = 0.0;
+            if let Some(name) = &session.sandbox {
+                let usage = self.runtime.sandbox_usage.usage.get(name);
+                let text = usage.map_or_else(|| "sandbox · —".into(), |usage| format!("sandbox · {}", usage.label()));
+                let galley = ui.fonts_mut(|f| f.layout_no_wrap(text, p.ui(10.0), p.info));
+                badge_width = galley.size().x + 15.0;
+                let badge = Rect::from_min_max(
+                    pos2((header.right() - 28.0 - badge_width).max(header.left() + 22.0), header.center().y - 8.5),
+                    pos2(header.right() - 31.0, header.center().y + 8.5),
+                );
+                ui.painter().rect_filled(badge, 4.0, lerp(p.raised, p.info, 0.15));
+                ui.painter().with_clip_rect(badge).galley(
+                    badge.left_center() + vec2(5.0, -galley.size().y / 2.0),
+                    galley,
+                    p.info,
+                );
+                ui.interact(badge, ui.scope_id().with(("sandbox-usage", name)), Sense::hover()).on_hover_text(
+                    self.runtime.sandbox_usage.error.as_deref().unwrap_or(
+                        "Host VM process tree: resident memory and ps CPU (100% = one core). — means no matching VM process yet."
+                    )
+                );
+            }
             let title_rect = Rect::from_min_max(
                 pos2(header.left() + 22.0, header.top()),
-                pos2(header.right() - 28.0, header.bottom()),
+                pos2(header.right() - 28.0 - badge_width, header.bottom()),
             );
             let title_response =
                 ui.interact(title_rect, ui.scope_id().with(("tile-title", &session.id)), Sense::click());
@@ -212,7 +234,9 @@ impl Desktop<'_> {
             let edge = if active { p.accent.gamma_multiply(0.7) } else { p.border };
             ui.painter().rect_stroke(tile, 2.0, Stroke::new(1.0, edge), egui::StrokeKind::Outside);
 
-            if let Some(pending) = session.approvals.first() {
+            if session.sandbox.is_none()
+                && let Some(pending) = session.approvals.first()
+            {
                 let request = &pending.request;
                 let deciding = self.client.approval_decisions.contains(&(session.id.clone(), pending.id.clone()));
                 let height = (body.height() - 220.0).clamp(110.0, 210.0).min(body.height());

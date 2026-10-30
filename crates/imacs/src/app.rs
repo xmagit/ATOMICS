@@ -50,6 +50,7 @@ mod plan_cleanup;
 mod plan_view;
 mod plans;
 mod projects;
+mod ref_guard;
 mod repo_workflow;
 mod restart;
 mod selfconfig;
@@ -116,6 +117,9 @@ pub struct Session {
     pending: Option<Pending>,
     /// The sandbox a sandboxed agent runs in.
     sandbox: Option<String>,
+    screen_busy: bool,
+    busy_absent_since: Option<Instant>,
+    ref_guard: Option<crate::ref_guard::RefGuard>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -379,6 +383,7 @@ pub(crate) struct State {
     pending_codex: Vec<(AgentLaunch, CodexVersion)>,
     /// The `sbx` program sandboxed agents run with.
     sbx: String,
+    sandbox_usage: crate::sandbox_usage::Sampler,
     /// Sandboxed launches waiting for their sandbox.
     pending_sandbox: Vec<(AgentLaunch, Receiver<Result<(), String>>)>,
     active: Option<String>,
@@ -779,6 +784,7 @@ impl State {
             // Tests never reach the sbx installed on the machine running them.
             sbx: if cfg!(test) { "/nonexistent/imacs-test-sbx" } else { "sbx" }.into(),
             pending_sandbox: Vec::new(),
+            sandbox_usage: Default::default(),
             active: None,
             diff_open: true,
             diff_root: None,

@@ -72,6 +72,11 @@ impl State {
     }
 
     pub(super) fn task_action(&mut self, index: usize, task_index: usize, action: &str) {
+        if action == "acknowledge_refs" {
+            self.plans[index].tasks[task_index].ref_alert = None;
+            self.save_plan(index);
+            return;
+        }
         if action == "resume" && self.plans[index].status != PlanStatus::Open {
             self.toast("Reopen the plan before resuming a task");
             return;
@@ -375,7 +380,14 @@ impl State {
                 .unwrap_or_else(|| format!("imacs/{}-{}-{}", self.plans[index].id, task.id, short_slug(&task.title)));
             let branch = self.available_plan_branch(index, Some(&task.id), &repo, &branch, task.branch.is_some())?;
             let agent = if task.agent.trim().is_empty() { "claude".to_string() } else { task.agent.clone() };
-            let mut brief = task.compose_brief(&self.plans[index].goal);
+            let config = self.project_config(&repo);
+            let sandbox = config
+                .agent(&agent)
+                .filter(|agent| {
+                    config.isolation.mode_for(agent, task.isolation) == imacs_core::isolation::IsolationMode::Sandbox
+                })
+                .map(|_| config.isolation.sandbox.with_defaults(&config.resources, self.governor.cores));
+            let mut brief = task.compose_brief_for(&self.plans[index].goal, sandbox.as_ref());
             if task.id == imacs_core::plan::REVIEW_TASK {
                 // The reviewer reads every task's branch from the shared repository.
                 let base = self.plan_base_ref(&self.plans[index]);
@@ -427,6 +439,18 @@ impl State {
         let found = pane.and_then(|p| self.sessions.iter().position(|s| s.id == p));
         if let Some(found) = found {
             self.sessions[found].activity.last_event = imacs_core::store::now();
+            if self.sessions[found].sandbox.is_some() && self.sessions[found].status != AgentStatus::Exited {
+                let session = &mut self.sessions[found];
+                session.status = match status {
+                    "done" => AgentStatus::Done,
+                    "question" | "blocked" => AgentStatus::NeedsInput,
+                    _ => session.status,
+                };
+                if status != "progress" {
+                    session.screen_busy = true;
+                }
+                session.activity.observe(session.status);
+            }
         }
         let session = found.map(|found| &self.sessions[found]);
         let session_id = pane.unwrap_or_default().to_string();

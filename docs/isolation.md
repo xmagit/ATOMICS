@@ -153,17 +153,21 @@ mounted read-only.
   status comes from its screen, like any agent without hooks: it is working while it shows
   `esc to interrupt`.
 - **Steering and review comments.** These are typed into the tile's terminal, as for any agent.
-- **Permission prompts.** A sandboxed agent runs under sbx's own permission settings. Its prompts appear in
-  its tile, not in IMACS's approval queue.
+- **Approvals.** Sandboxed agents run unattended: Claude uses `bypassPermissions`, and Codex uses
+  `approval_policy = "never"`. The VM mounts and sbx network policy replace IMACS approvals. IMACS
+  does not show approval banners or enqueue permission requests for these sessions.
 - **Model credentials.** These reach the agent through sbx's credential proxy, not through files in the
   sandbox.
 
 ## Trust model
 
 - **The worktree and its branch.** A sandboxed agent can change anything in its worktree, and commit.
-- **Every ref.** Refs live in the shared common dir, so an agent can move any branch of its repository,
-  including `main` and other agents' branches. IMACS never pushes or merges on its own. Review the diff
-  and the branch before you integrate, as you would for a bare agent.
+- **Ref recovery.** Refs live in the shared common dir. IMACS saves a host-only snapshot before a
+  sandboxed agent starts, checks it at turn boundaries and on exit/close, and restores changed, deleted
+  or newly created refs outside the task branches. A persistent red board alert and a blocked report
+  announce recovery or a failed restore. The task branch and concurrent task branches are exempt so
+  legitimate commits survive. This is recovery after a turn, not write isolation: shared refs cannot
+  identify which concurrent writer moved a ref. Review the diff and branch before integrating.
 - **Objects are data.** Objects an agent writes stay on your machine, and git never executes them. Hooks
   and config, which do run on your machine, are out of reach.
 - **The network** is whatever sbx's policy allows, plus `allow_hosts`. `allow-all` gives agents the
@@ -192,3 +196,18 @@ mounted read-only.
   branch packed meanwhile disappears inside the sandbox.
 - Switching modes does not move a running conversation. Sessions resumed after a switch start in the new
   mode, and a conversation that lived in a sandbox is not on your machine.
+
+## Host resource display
+
+Each sandbox tile shows the VM process tree's host resident memory (GiB) and CPU; the top bar totals
+these trees when space permits. `100% CPU` means one host core, so a multi-core VM can exceed 100%.
+IMACS samples `ps` off the UI thread every two seconds and sums each process once. These are host
+process measurements, not the configured memory/CPU limits or guest application usage. Shared daemon
+processes and `sbx run` clients are excluded. A dash means no matching VM process or sampling failed;
+hover for details. The total reports how many sandbox trees were found, so partial samples are visible.
+
+The sampler assumes the PoC process shape: one VM tree per sandbox, whose VM root command contains
+the complete sandbox name `imacs-<session>` (as an argument or path component). It recognizes nerdbox,
+sailor, vfkit, qemu, cloud-hypervisor and krun VM executables, then follows child PIDs. Synthetic recorded
+`ps` fixtures cover this mapping; validation against real sbx VMs belongs to the e2e task. If sbx changes
+its process shape or uses opaque VM IDs, the display stays unavailable until that mapping is updated.

@@ -106,11 +106,11 @@ impl State {
                         status_since: s.activity.status_since,
                         working_since: s.activity.working_since,
                         last_event: s.activity.last_event,
-                        approval: !s.approvals.is_empty(),
+                        approval: s.sandbox.is_none() && !s.approvals.is_empty(),
                         held_since: s.activity.held_since,
                         screen: String::new(),
                     },
-                    s.terminal.as_ref().map(|t| t.screen_reader(3)),
+                    s.terminal.as_ref().filter(|_| s.sandbox.is_none()).map(|t| t.screen_reader(3)),
                 )
             })
             .collect();

@@ -38,6 +38,9 @@ impl Session {
             chief,
             pending: None,
             sandbox: None,
+            screen_busy: false,
+            busy_absent_since: None,
+            ref_guard: None,
         }
     }
 
@@ -192,6 +195,8 @@ impl State {
             .and_then(|resume| self.store.sessions.iter().find(|record| record.claude_session_id == resume))
             .and_then(|record| record.sandbox.clone())
             .unwrap_or_else(|| isolation::sandbox_name(id));
+        let briefs = (prompt && agent.kind != AgentKind::Claude)
+            .then(|| paths::briefs_dir().join(name.strip_prefix(isolation::NAME_PREFIX).unwrap_or(&name)));
         let exe = crate::setup::executable_path().map_err(|err| format!("Could not locate IMACS: {err}"))?;
         Ok(Some(crate::sandbox::Prepare {
             sbx: resolve_program(&self.sbx),
@@ -202,7 +207,7 @@ impl State {
             exe,
             socket: paths::socket_path(),
             // Claude takes any prompt as an argument; other agents may get a brief file.
-            briefs: (prompt && agent.kind != AgentKind::Claude).then(|| paths::briefs_dir().join(id)),
+            briefs,
         }))
     }
 
@@ -423,7 +428,10 @@ impl State {
         args.extend(extra_args);
         let prompt = match prompt {
             Some(text) if agent.kind != AgentKind::Claude && text.len() > LONG_PROMPT => {
-                Some(brief_file(&id, &text, sandboxed.is_some())?)
+                let session = sandboxed.as_ref().map_or(id.as_str(), |sandbox| {
+                    sandbox.name.strip_prefix(isolation::NAME_PREFIX).unwrap_or(&sandbox.name)
+                });
+                Some(brief_file(session, &text, sandboxed.is_some())?)
             }
             other => other,
         };
@@ -436,6 +444,22 @@ impl State {
             _ => None,
         };
         let nice = self.config.resources.agent_nice;
+        let mut ref_guard = match &sandboxed {
+            Some(sandbox) => crate::ref_guard::RefGuard::open(
+                &cwd,
+                paths::imacs_home().join("ref-guards").join(format!("{}.json", sandbox.name)),
+            )
+            .map_err(|error| format!("Could not start ref guard: {error:#}"))?,
+            None => None,
+        };
+        if let Some(guard) = &mut ref_guard {
+            let alerts = guard
+                .check(&self.concurrent_branches(guard))
+                .map_err(|error| format!("Could not check refs before starting: {error:#}"))?;
+            if !alerts.is_empty() {
+                self.ref_alert(&id, alerts.join("\n"));
+            }
+        }
         let (program, args) = match &sandboxed {
             Some(sandboxed) => sandboxed.command(&args),
             None if !chief && agent.kind != AgentKind::Shell && nice != 0 => (
@@ -465,6 +489,7 @@ impl State {
                 self.sessions[index].terminal = Some(terminal);
                 self.sessions[index].claude_id = claude_id;
                 self.sessions[index].sandbox = sandboxed.map(|sandboxed| sandboxed.name);
+                self.sessions[index].ref_guard = ref_guard;
                 if chief {
                     self.hub.lock().unwrap().chief_running = true;
                 }
@@ -573,17 +598,42 @@ impl State {
         }
         self.busy_checked = Instant::now();
         let mut finished = Vec::new();
-        for session in &mut self.sessions {
+        let mut ref_checks = Vec::new();
+        for (index, session) in self.sessions.iter_mut().enumerate() {
             let busy_text = self.config.agent(&session.agent).and_then(|a| a.busy_text.clone());
             let busy_text =
                 busy_text.or_else(|| (session.sandbox.is_some() && session.is_agent()).then(|| SANDBOX_BUSY.into()));
             let Some(busy_text) = busy_text else { continue };
             let Some(terminal) = &session.terminal else { continue };
-            if session.hooks_active || terminal.exited() || session.status == AgentStatus::NeedsInput {
+            if session.hooks_active && session.sandbox.is_none() || terminal.exited() {
                 continue;
             }
-            let busy = terminal.screen_text(12).contains(&busy_text);
+            if session.sandbox.is_none() && session.status == AgentStatus::NeedsInput {
+                continue;
+            }
+            let screen = terminal.screen_text(12);
+            let busy = screen_busy(&screen, &busy_text);
+            if !busy && session.sandbox.is_some() {
+                if screen.trim().is_empty() && session.status == AgentStatus::Starting {
+                    continue;
+                }
+                let since = session.busy_absent_since.get_or_insert_with(Instant::now);
+                if since.elapsed() < SCREEN_QUIET {
+                    continue;
+                }
+            } else {
+                session.busy_absent_since = None;
+            }
+            let new_turn = busy && !session.screen_busy;
+            if new_turn || session.screen_busy && !busy {
+                ref_checks.push(index);
+            }
+            session.screen_busy = busy;
+            if session.status == AgentStatus::NeedsInput && !new_turn {
+                continue;
+            }
             session.status = match (busy, session.status) {
+                (true, AgentStatus::Done) if !new_turn => AgentStatus::Done,
                 (true, _) => AgentStatus::Working,
                 (false, AgentStatus::Working) => {
                     finished.push(session.root());
@@ -592,15 +642,29 @@ impl State {
                 (false, AgentStatus::Starting) => AgentStatus::Idle,
                 (false, other) => other,
             };
+            if new_turn {
+                self.pending_questions.remove(&session.id);
+            }
+            session.activity.observe(session.status);
         }
         for root in finished {
             self.diffs.entry(root).or_default().mark_dirty();
+        }
+        for index in ref_checks {
+            self.check_refs(index);
         }
     }
 
     pub(super) fn close(&mut self, id: &str) {
         self.pending_questions.remove(id);
         if let Some(i) = self.sessions.iter().position(|s| s.id == id) {
+            // Accept legitimate concurrent task commits before releasing this branch's ownership.
+            for other in 0..self.sessions.len() {
+                if other != i {
+                    self.check_refs(other);
+                }
+            }
+            let branches = self.sessions[i].ref_guard.as_ref().map(|guard| self.concurrent_branches(guard));
             let mut session = self.sessions.remove(i);
             if session.chief {
                 self.hub.lock().unwrap().chief_running = false;
@@ -610,10 +674,29 @@ impl State {
                     reply.send(ControlOutcome::Done(ControlResponse::error("message not delivered: session closed")));
             }
             // An exited agent's sandbox was stopped when it exited; one still preparing stops when ready.
-            if let Some(name) = session.sandbox.clone()
-                && session.terminal.as_ref().is_some_and(|terminal| !terminal.exited())
-            {
-                self.stop_sandbox(name);
+            if let Some(name) = session.sandbox.clone() {
+                let sbx = resolve_program(&self.sbx);
+                let actions = self.action_tx.clone();
+                let id = id.to_string();
+                let mut guard = session.ref_guard.take();
+                session.terminal.take();
+                std::thread::spawn(move || {
+                    let stopped = crate::sandbox::stop(&sbx, &name);
+                    let mut alerts = stopped
+                        .err()
+                        .map(|err| format!("Stopping sandbox FAILED: {err:#}"))
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    if let Some(guard) = &mut guard {
+                        match guard.check(&branches.unwrap_or_default()) {
+                            Ok(found) => alerts.extend(found),
+                            Err(err) => alerts.push(format!("Final ref guard check FAILED: {err:#}")),
+                        }
+                    }
+                    if !alerts.is_empty() {
+                        let _ = actions.send(Box::new(move |state| state.ref_alert(&id, alerts.join("\n"))));
+                    }
+                });
             }
             if session.terminal.is_none()
                 && let Some(cid) = session.claude_id
@@ -648,6 +731,7 @@ impl State {
     /// Sends text to a session: typed into IMACS's own terminals, queued for the
     /// next hook of sessions running elsewhere.
     pub(super) fn deliver(&mut self, index: usize, text: &str) -> Delivery {
+        self.check_refs(index);
         let session = &mut self.sessions[index];
         if session.approval_hold
             || !session.approvals.is_empty()
@@ -782,6 +866,14 @@ const LONG_PROMPT: usize = 700;
 /// What Claude Code and Codex show while they work: a sandboxed agent's status, since its hooks
 /// cannot reach IMACS.
 const SANDBOX_BUSY: &str = "esc to interrupt";
+const SCREEN_QUIET: Duration = Duration::from_millis(800);
+
+/// Footers can wrap or change case, including Codex's `esc to interrupt` and Claude's `Esc to interrupt`.
+fn screen_busy(screen: &str, busy: &str) -> bool {
+    let compact =
+        |text: &str| text.chars().filter(|c| !c.is_whitespace()).flat_map(char::to_lowercase).collect::<String>();
+    !busy.trim().is_empty() && compact(screen).contains(&compact(busy))
+}
 
 /// Writes a long prompt to a brief file and returns the short prompt that points to it. A
 /// sandboxed session's brief goes in its own folder, the one its sandbox mounts read-only.

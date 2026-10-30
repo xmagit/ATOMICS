@@ -175,6 +175,9 @@ pub struct Task {
     pub deletions: usize,
     pub report: Option<Report>,
     pub notes: Vec<String>,
+    /// A persistent host-side ref guard warning, acknowledged on the board.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ref_alert: Option<String>,
     /// The external ticket saying what this task is for.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ticket: Option<crate::tickets::TicketLink>,
@@ -521,6 +524,11 @@ impl Task {
     /// The first message an agent gets: the task, how to know it is done, and how
     /// to report back.
     pub fn compose_brief(&self, goal: &str) -> String {
+        self.compose_brief_for(goal, None)
+    }
+
+    /// `sandbox` contains the effective per-VM limits, with resource defaults filled in.
+    pub fn compose_brief_for(&self, goal: &str, sandbox: Option<&crate::isolation::SandboxConfig>) -> String {
         let mut text = format!("Task {}: {}\n", self.id, self.title);
         if !goal.trim().is_empty() {
             text.push_str(&format!("Part of: {}\n", goal.trim()));
@@ -534,7 +542,25 @@ impl Task {
                 text.push_str(&format!("- {}\n", check.trim()));
             }
         }
-        text.push_str(
+        if let Some(sandbox) = sandbox {
+            let cpus = sandbox
+                .cpus
+                .filter(|cpus| *cpus != 0)
+                .map_or_else(|| "all host CPUs (sbx default)".into(), |cpus| cpus.to_string());
+            let memory = sandbox
+                .memory
+                .as_deref()
+                .filter(|memory| !memory.is_empty())
+                .unwrap_or("half the host memory (sbx default)");
+            text.push_str(&format!(
+                "\nYou run inside a Docker Sandboxes VM with {cpus} CPUs and {memory} memory. \
+                 These per-sandbox limits bound builds, tests and QA. While you work, compile with the build tool's \
+                 check command (for example `cargo check`) and run only the tests you touch. Run the full test suite \
+                 once, at the end. Run builds, tests and QA directly inside this VM; the host's IMACS CLI and socket \
+                 are not available. Use the IMACS MCP tools to report back.\n"
+            ));
+        } else {
+            text.push_str(
             "\nThis machine is shared with other agents. While you work, compile with the build tool's check command \
              (for example `cargo check`) and run only the tests you touch. Run the full test suite once, at the end, \
              through `imacs queue --class test -- <test command>` (for .NET, \
@@ -543,6 +569,7 @@ impl Task {
              (or run them in the background) instead of the default two minutes. In a sandbox that blocks the \
              IMACS socket, request to run them outside the sandbox.\n",
         );
+        }
         text.push_str(
             "\nWork only in this worktree and do not commit unless the task says so. When you are done, \
              blocked, or have a question, call the imacs_report tool with status (done, blocked or question) \

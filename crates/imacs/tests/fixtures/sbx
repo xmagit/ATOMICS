@@ -76,6 +76,13 @@ case "$1" in
   run)
     printf '%s\n' "${SSH_AUTH_SOCK-unset}" > "$dir/run-ssh"
     printf 'attached to %s\n' "$3"
+    # A stand-in agent runs in the mounted worktree, with the same arguments.
+    if [ -f "$dir/agent" ]; then
+      name=$3
+      workspace=$(sed -n 's/.*"workspaces":\["\([^"]*\)".*/\1/p' "$state/$name")
+      cd "$workspace" || exit 1
+      exec /bin/sh "$dir/agent" "$@"
+    fi
     if [ -e "$dir/run-waits" ]; then
       exec sleep 30
     fi

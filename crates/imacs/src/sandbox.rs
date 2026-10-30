@@ -178,7 +178,11 @@ pub fn prepare(job: &Prepare) -> Result<()> {
     let _ = sbx(&job.sbx, &["mcp", "rm", "--force", &job.name], ssh, TIMEOUT);
     sbx(&job.sbx, &isolation::mcp_add_args(&job.name, &job.exe, &job.socket), ssh, TIMEOUT)
         .context("registering IMACS's MCP server with sbx")?;
-    sbx(&job.sbx, &isolation::create_args(&spec), ssh, CREATE_TIMEOUT).context("creating the sandbox")?;
+    sbx(&job.sbx, &isolation::create_args(&spec), ssh, CREATE_TIMEOUT).context("creating the sandbox").inspect_err(
+        |_| {
+            let _ = sbx(&job.sbx, &["mcp", "rm", "--force", &job.name], ssh, TIMEOUT);
+        },
+    )?;
     let finish = || -> Result<()> {
         let servers = std::iter::once(job.name.as_str()).chain(job.config.mcp.iter().map(|s| s.trim()));
         for server in servers.filter(|server| !server.is_empty()) {
@@ -247,7 +251,8 @@ pub fn stop(program: &str, name: &str) -> Result<()> {
 /// Removes a sandbox and IMACS's MCP registration for it.
 pub fn remove(program: &str, name: &str) -> Result<()> {
     sbx(program, &["rm", "--force", name], false, TIMEOUT)?;
-    let _ = sbx(program, &["mcp", "rm", "--force", name], false, TIMEOUT);
+    sbx(program, &["mcp", "rm", "--force", name], false, TIMEOUT)
+        .context("removing the sandbox's IMACS MCP registration")?;
     Ok(())
 }
 
