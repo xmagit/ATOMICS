@@ -2,8 +2,6 @@
 //! do not use sandbox::sbx_output here, which captures command output in temporary files.
 
 use std::collections::HashMap;
-use std::io::{ErrorKind, Read};
-use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -14,6 +12,52 @@ use imacs_core::isolation::AzureConfig;
 
 const REFRESH: Duration = Duration::from_secs(120);
 const TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Status contains no account identifiers or tokens, even when az prints them unexpectedly.
+#[derive(Debug, Clone, Default)]
+pub struct Status {
+    pub found: bool,
+    pub logged_in: bool,
+}
+
+pub fn status(program: Option<PathBuf>) -> Status {
+    let Some(program) = program else { return Status::default() };
+    let mut command = Command::new(program);
+    command
+        .args(["account", "show", "--output", "none", "--only-show-errors"])
+        .env("AZURE_LOGGING_ENABLE_LOG_FILE", "false")
+        .env("AZURE_CORE_COLLECT_TELEMETRY", "false")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0);
+    let Ok(mut child) = command.spawn() else { return Status { found: true, logged_in: false } };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match child.try_wait() {
+            Ok(Some(result)) => return Status { found: true, logged_in: result.success() },
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            _ => {
+                // SAFETY: the child owns this process group.
+                unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+                let _ = child.wait();
+                return Status { found: true, logged_in: false };
+            }
+        }
+    }
+}
+
+pub fn doctor_line(enabled: bool) -> String {
+    if !enabled {
+        return "Azure CLI relay: off; enable in Settings → Credentials".into();
+    }
+    let status = status(if cfg!(test) { None } else { crate::setup::find_program("az") });
+    match (status.found, status.logged_in) {
+        (false, _) => "✗ Azure CLI relay: enabled, az not found (warning); install az on the host".into(),
+        (true, false) => "✗ Azure CLI relay: enabled, not logged in (warning); run az login on the host".into(),
+        (true, true) => "✓ Azure CLI relay: enabled, az found, logged in (host login; tokens stay on host)".into(),
+    }
+}
 
 pub struct Azure {
     program: PathBuf,
@@ -81,58 +125,21 @@ impl Azure {
             .args(["account", "get-access-token", "--resource", resource, "--output", "json", "--only-show-errors"])
             .env("AZURE_LOGGING_ENABLE_LOG_FILE", "false")
             .env("AZURE_CORE_COLLECT_TELEMETRY", "false")
-            .env("AZURE_CORE_ONLY_SHOW_ERRORS", "true")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .process_group(0);
+            .env("AZURE_CORE_ONLY_SHOW_ERRORS", "true");
         if let Some(path) = crate::setup::SHELL_PATH.as_ref() {
             command.env("PATH", path);
         }
-        let mut child = command.spawn().map_err(|_| "could not start host Azure CLI")?;
-        let mut stdout = child.stdout.take().unwrap();
-        let result = (|| {
-            // Nonblocking pipe reads keep a hung CLI (or a child holding its pipe) bounded.
-            let fd = stdout.as_raw_fd();
-            if unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) } == -1 {
-                return Err("could not read Azure CLI output");
-            }
-            let deadline = Instant::now() + timeout;
-            let mut output = Vec::new();
-            let mut buffer = [0; 8192];
-            loop {
-                match stdout.read(&mut buffer) {
-                    Ok(0) => {
-                        if let Some(status) = child.try_wait().map_err(|_| "Azure CLI failed")? {
-                            return if status.success() {
-                                Ok(output)
-                            } else {
-                                Err("host Azure CLI failed; run az login on the host")
-                            };
-                        }
-                    }
-                    Ok(n) => {
-                        output.extend_from_slice(&buffer[..n]);
-                        if output.len() > 1024 * 1024 {
-                            return Err("Azure CLI output was too large");
-                        }
-                    }
-                    Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {}
-                    Err(_) => return Err("could not read Azure CLI output"),
-                }
-                if Instant::now() >= deadline {
-                    return Err("host Azure CLI timed out");
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        })();
-        if result.is_err() {
-            unsafe {
-                libc::kill(-(child.id() as i32), libc::SIGKILL);
-            }
-            let _ = child.wait();
+        use crate::sandbox::setup::{OutputError, private_output};
+        let output = private_output(&mut command, timeout).map_err(|error| match error {
+            OutputError::Start => "could not start host Azure CLI",
+            OutputError::Read => "could not read Azure CLI output",
+            OutputError::Timeout => "host Azure CLI timed out",
+            OutputError::TooLarge => "Azure CLI output was too large",
+        })?;
+        if !output.status.success() {
+            return Err("host Azure CLI failed; run az login on the host");
         }
-        result
+        Ok(output.stdout)
     }
 
     pub fn read(&self, host: &str, method: &str, path: &str) -> bool {
@@ -164,11 +171,48 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn azure_session_is_opt_in_and_status_never_includes_account_data() {
+        use super::super::Service;
+        let (dir, keychain, store) = crate::credentials::tests::machine(cfg!(target_os = "macos"));
+        let program = fake(dir.path());
+        let enabled = AzureConfig { enabled: true, ..Default::default() };
+        let service = Service::transient(dir.path().join("state"), keychain)
+            .with_azure(Azure::new(program.clone(), enabled.clone()));
+        let off = AzureConfig::default();
+        assert!(!off.enabled);
+        assert!(service.grant_session("off", false, &off).unwrap().is_none());
+        assert_eq!(service.live_grants(), 0);
+        assert!(!dir.path().join("az-argv").exists());
+        store.put("claude", "sk-ant-oat01-PRIVATE", None).unwrap();
+        let claude = service.grant_session("claude-only", true, &off).unwrap().unwrap();
+        assert!(claude.azure.is_none() && claude.azure_env().is_empty());
+        service.revoke(&claude);
+        let grant = service.grant_session("on", false, &enabled).unwrap().unwrap();
+        assert!(grant.azure.as_deref().unwrap().starts_with("imacs-azure-"));
+        assert_eq!(grant.azure_env().len(), 2);
+        assert_eq!(service.usage("Azure CLI").1, ["on"]);
+        assert!(!dir.path().join("az-argv").exists(), "granting must not fetch tokens");
+        service.revoke_azure();
+        assert!(service.usage("Azure CLI").1.is_empty());
+        let logged_in = status(Some(program.clone()));
+        assert!(logged_in.found && logged_in.logged_in);
+        std::fs::write(dir.path().join("az-fail"), "").unwrap();
+        let logged_out = status(Some(program));
+        assert!(logged_out.found && !logged_out.logged_in);
+        assert!(!status(None).found);
+        let output = format!("{logged_in:?} {logged_out:?} {}", doctor_line(false));
+        assert!(!output.contains("PRIVATE") && !output.contains("AZURE-REAL"));
+        assert!(output.contains("off"));
+        assert!(!std::fs::read_to_string(dir.path().join("az-argv")).unwrap().contains("get-access-token"));
+    }
+
+    #[test]
     fn azure_is_found_on_the_login_shell_path_on_both_hosts() {
         use std::os::unix::fs::PermissionsExt;
         const CHILD: &str = "IMACS_AZURE_DISCOVERY_CHILD";
         if std::env::var_os(CHILD).is_some() {
-            let azure = Azure::current(AzureConfig::default()).expect("az on login-shell PATH");
+            let azure =
+                Azure::current(AzureConfig { enabled: true, ..Default::default() }).expect("az on login-shell PATH");
             assert_eq!(azure.token("api.applicationinsights.io").unwrap(), "AZURE-REAL-1");
             assert!(Azure::current(AzureConfig { enabled: false, ..Default::default() }).is_none());
             return;

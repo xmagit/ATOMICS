@@ -7,6 +7,7 @@ mod platform_tests;
 
 mod app;
 mod crash;
+mod credentials;
 mod diff_view;
 mod diff_worker;
 mod doctor;
@@ -62,7 +63,14 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Guide fresh-machine sandbox setup (safe to run again)
-    Setup,
+    Setup {
+        /// Store one credential; the value is read from stdin only
+        #[arg(long, value_parser = ["claude", "openai", "linear", "github", "registry"])]
+        credential: Option<String>,
+        /// Upstream DNS host for a private registry (no URL or path)
+        #[arg(long, requires = "credential")]
+        registry_host: Option<String>,
+    },
     /// Set up Docker Sandboxes or build warm repository templates
     Sandbox {
         #[command(subcommand)]
@@ -184,7 +192,14 @@ fn main() -> eframe::Result {
         migration_errors = migration.errors;
     }
     match cli.command {
-        Some(Command::Setup | Command::Sandbox { command: SandboxCommand::Setup }) => {
+        Some(Command::Setup { credential: Some(kind), registry_host }) => {
+            if let Err(error) = sandbox::setup::credential_setup(&kind, registry_host.as_deref()) {
+                eprintln!("Credential setup failed: {error}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        Some(Command::Setup { credential: None, .. } | Command::Sandbox { command: SandboxCommand::Setup }) => {
             if let Err(err) = sandbox::setup::run(cli.workspace.as_deref()) {
                 eprintln!("Sandbox setup failed: {err}");
                 std::process::exit(1);
@@ -330,9 +345,18 @@ mod cli_tests {
     use super::*;
 
     #[test]
+    fn named_credentials_setup_has_no_value_argument() {
+        for kind in ["claude", "openai", "linear", "github", "registry"] {
+            assert!(Cli::try_parse_from(["imacs", "setup", "--credential", kind]).is_ok());
+        }
+        assert!(Cli::try_parse_from(["imacs", "setup", "--credential", "openai", "--value", "secret"]).is_err());
+        assert!(Cli::try_parse_from(["imacs", "setup", "--credential", "openai", "secret"]).is_err());
+    }
+
+    #[test]
     fn setup_and_sandbox_setup_parse() {
         let cli = Cli::try_parse_from(["imacs", "setup"]).unwrap();
-        assert!(matches!(cli.command, Some(Command::Setup)));
+        assert!(matches!(cli.command, Some(Command::Setup { credential: None, .. })));
         let cli = Cli::try_parse_from(["imacs", "sandbox", "setup"]).unwrap();
         assert!(matches!(cli.command, Some(Command::Sandbox { command: SandboxCommand::Setup })));
         let cli = Cli::try_parse_from(["imacs", "sandbox", "relay-check"]).unwrap();

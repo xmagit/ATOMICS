@@ -173,8 +173,27 @@ fn report(workspace: Option<&str>, for_agent: bool, projects: &[PathBuf]) -> Rep
             "review in IMACS's Clean up… dialog",
         ));
     }
+    let credential_keychain = if cfg!(test) {
+        crate::relay::Keychain::at(std::path::Path::new("/nonexistent/imacs-test-keychain"), cfg!(target_os = "macos"))
+    } else {
+        crate::relay::Keychain::current()
+    };
+    lines.extend(crate::credentials::doctor_lines(&crate::credentials::Store::new(credential_keychain.clone())));
     if let Ok((config, _)) = &config {
+        let azure = crate::sandbox::checks::setup_config(config, workspace)
+            .map(|sandbox| sandbox.azure.enabled)
+            .unwrap_or(false);
+        lines.push(crate::relay::azure::doctor_line(azure));
         lines.push(approvals_check(&config.approvals));
+        if let crate::sandbox::checks::ClaudeRoute::BareRelay { subscription } =
+            crate::sandbox::checks::claude_route(config, workspace, &credential_keychain)
+        {
+            lines.push(check_line(
+                subscription,
+                "bare Claude credential: OS keychain → IMACS relay",
+                "run `imacs setup --credential claude`; input is stdin only",
+            ));
+        }
         if sandboxes_wanted(config, workspace) {
             // Tests never reach the sbx installed on the machine running them.
             let sbx = if cfg!(test) { "/nonexistent/imacs-test-sbx".into() } else { resolve_program("sbx") };

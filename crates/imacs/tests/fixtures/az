@@ -12,6 +12,10 @@ if [ -f "$folder/az-invalid" ]; then
     cat "$folder/az-invalid"
     exit 0
 fi
+if [ "$1 $2" = 'account show' ]; then
+    echo 'PRIVATE ACCOUNT AND TOKEN' # Deliberately noisy: status must discard it.
+    exit 0
+fi
 expiry=$(cat "$folder/az-expiry")
 number=$(wc -l < "$folder/az-argv" | tr -d ' ')
 printf '{"accessToken":"AZURE-REAL-%s","expires_on":"%s"}\n' "$number" "$expiry"

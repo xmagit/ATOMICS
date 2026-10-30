@@ -5,6 +5,12 @@ use super::*;
 
 pub fn run(app_id: &str) -> Result<u64> {
     let app_id = uuid::Uuid::parse_str(app_id).context("expected an Application Insights application UUID")?;
+    let config = imacs_core::config::Config::load(&paths::config_file())?;
+    let mut azure = config.isolation.sandbox.azure;
+    if !azure.enabled {
+        bail!("Azure CLI relay is off; enable it in Settings → Credentials first")
+    }
+    azure.query_read_exception = true;
     let home = paths::imacs_home();
     let relay = std::sync::Arc::new(crate::relay::Service::transient(home.clone(), crate::relay::Keychain::current()));
     let name = format!("imacs-azure-check-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
@@ -16,12 +22,7 @@ pub fn run(app_id: &str) -> Result<u64> {
         name,
         agent: "shell",
         cwd: folder.clone(),
-        config: SandboxConfig {
-            memory: Some("2g".into()),
-            cpus: Some(2),
-            azure: imacs_core::isolation::AzureConfig { query_read_exception: true, ..Default::default() },
-            ..Default::default()
-        },
+        config: SandboxConfig { memory: Some("2g".into()), cpus: Some(2), azure, ..Default::default() },
         warm: Vec::new(),
         exe: crate::setup::executable_path()?,
         socket: paths::socket_path(),

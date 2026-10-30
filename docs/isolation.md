@@ -312,8 +312,8 @@ as code: their contents run inside the VM, with the worktree and git write mount
 
 ## Azure and Application Insights through host `az login`
 
-On macOS and Linux, IMACS finds `az` on the interactive login-shell PATH. If installed, every
-sandboxed agent gets `IMACS_AZURE_RELAY_URL` and `IMACS_AZURE_BEARER`, a per-agent random placeholder.
+On macOS and Linux, IMACS finds `az` on the interactive login-shell PATH. When explicitly enabled
+and installed, each sandboxed agent gets `IMACS_AZURE_RELAY_URL` and `IMACS_AZURE_BEARER`, a per-agent random placeholder.
 Sign in with `az login` on the host. The VM needs neither Azure CLI nor an Azure credential folder.
 The relay calls `az account get-access-token --resource <audience> --output json` on the host,
 captures stdout in a pipe, and caches tokens only in memory, shared by audience. It refreshes on
@@ -333,11 +333,18 @@ over 32 KiB are refused. Other methods are refused. Method-override headers are 
 Redirects are never followed. Each request uses the existing per-agent `relay.log`: host, method,
 path and status, with no bearer, query string or body.
 
+Azure is off by default: no Azure placeholder or `IMACS_AZURE_*` environment is granted until
+explicitly enabled. Settings → Credentials has an **Enable Azure CLI relay** switch that writes
+`[isolation.sandbox.azure] enabled` in the user config. It shows whether `az` is found, whether it is
+logged in, and which sessions hold Azure grants, without account identifiers or token values.
+Disabling the switch revokes current Azure placeholders. Doctor and setup report Azure as off
+until enabled. Host/workspace overrides can take precedence over the user config.
+
 Configure the host/workspace settings (a repository cannot grant Azure capabilities):
 
 ```toml
 [isolation.sandbox.azure]
-enabled = true                         # false disables Azure for new sessions
+enabled = true                         # opt in; defaults to false
 query_read_exception = false            # default: even POST queries need approval
 
 [isolation.sandbox.azure.resources]
@@ -745,3 +752,67 @@ stays unavailable until that mapping is updated. That is the case with sbx v0.50
 end to end on 2026-10-30): each VM runs as `containerd-shim-nerdbox-v1 -namespace docker -id <container
 id>`, without the sandbox's name, so tiles show **Sandbox** without memory and CPU. The shim keeps the
 sandbox's worktree open, which a future mapping could use.
+
+## Settings → Credentials
+
+IMACS keeps its credential catalog in one OS keychain item, `imacs-credentials-v1`, under account
+`imacs`. macOS uses `security`; Linux uses `secret-tool` and an unlocked Secret Service. There is
+no plaintext-file fallback. Values travel to these helpers on stdin, including macOS's interactive
+command mode. Reads drain bounded stdout/stderr pipes in memory; credential output never passes
+through temporary capture files. The JSON catalog is hex encoded for that command parser; the OS keychain supplies
+its encryption and access control. Oversized catalogs are rejected before writing (macOS
+`security -i` has a 4 KiB command limit; Linux's catalog limit is 128 KiB). IMACS reads the old `imacs-claude-setup-token` entry when no
+catalog exists and migrates it on the first edit, then deletes the legacy entry.
+
+Settings → Credentials adds, replaces and removes entries, shows presence, last relay use and the
+sessions with active placeholders, and never reads stored values into an edit field. New input is
+masked. Refresh updates this status. Replacing/removing an entry revokes its active placeholders;
+restart those sessions to obtain new placeholders. Unknown or misfiled entries are counted with
+names and values hidden, and can be removed together. An unreadable catalog is reported without
+quoting it and is never silently overwritten. Keychain operations run off the UI thread.
+
+| Credential | Relay destination | Allowed requests |
+| --- | --- | --- |
+| Claude subscription | `api.anthropic.com` | Messages, token counting and model listing |
+| OpenAI | `api.openai.com` | Responses, chat completions and model listing |
+| Linear personal API key | `api.linear.app` | `POST /graphql` (queries and mutations; raw API-key Authorization header) |
+| GitHub | `api.github.com` | GET/HEAD; provision a read-only token |
+| Private registries | One entry per explicit DNS host | GET/HEAD; Bearer authentication |
+
+These rules restrict relay requests; they do not expand the permissions of the underlying token.
+Integrations request a per-session placeholder from the relay for a catalog identifier (`claude`,
+`openai`, `linear`, `github`, or `registry:<host>`). Storing a credential does not automatically grant
+it to every session. Claude's subscription is granted automatically when it starts sandboxed.
+Sandbox Codex continues to use sbx's own OpenAI credential proxy. Guided setup saves a new OpenAI
+key to the shared catalog and provisions sbx over stdin; if sbx needs reprovisioning it reuses the
+catalog's key. Existing sbx secrets keep working.
+
+To provision any one entry without Docker setup, run one of these commands in a trusted host
+terminal and enter its value on stdin (hidden on a terminal). There is no value flag or positional
+value argument:
+
+```sh
+imacs setup --credential claude
+imacs setup --credential openai
+imacs setup --credential linear
+imacs setup --credential github
+imacs setup --credential registry --registry-host registry.example.com
+```
+
+`imacs doctor` uses this same catalog and reports only status and credential routes. Last-used
+metadata contains service labels and timestamps, never values; it is kept in
+`credential-usage.json` beside `relay.log`. Session use means an active relay grant, not proof that
+an upstream request succeeded. sbx credentials and native logins used outside the relay do not
+contribute to these timestamps.
+
+Bare Claude sessions, including the chief, can opt into placeholders too:
+
+```toml
+[isolation]
+bare_relay = true
+```
+
+They contact the relay on `127.0.0.1` and receive a placeholder in their environment and session
+settings. Inherited Anthropic API/auth keys are cleared. The token stays on the host side of the
+relay; native hooks remain enabled. A missing subscription blocks this launch instead of falling
+back to a real environment token. The default remains the native Claude login for bare sessions.

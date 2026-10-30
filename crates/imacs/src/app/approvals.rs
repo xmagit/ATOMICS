@@ -177,7 +177,7 @@ mod tests {
             |app, ctx| {
                 let dir = crate::test_support::tempdir().unwrap();
                 let upstream = crate::relay::fake::start();
-                let config = imacs_core::isolation::AzureConfig::default();
+                let config = imacs_core::isolation::AzureConfig { enabled: true, ..Default::default() };
                 let azure =
                     crate::relay::azure::Azure::new(crate::relay::azure::tests::fake(dir.path()), config.clone());
                 app.runtime.relay = Arc::new(

@@ -32,6 +32,8 @@ impl IsolationMode {
 #[serde(default)]
 pub struct IsolationConfig {
     pub mode: IsolationMode,
+    /// Bare Claude sessions may use host relay placeholders instead of real environment tokens.
+    pub bare_relay: bool,
     pub sandbox: SandboxConfig,
     /// Set by a repository's `mode = "sandbox"`: nothing runs bare there. Never read from a file.
     #[serde(skip)]
@@ -97,7 +99,7 @@ pub struct AzureConfig {
 impl Default for AzureConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             query_read_exception: false,
             resources: [
                 ("api.applicationinsights.io".into(), "https://api.applicationinsights.io".into()),

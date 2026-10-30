@@ -22,6 +22,10 @@ use anyhow::{Context, Result};
 
 pub mod azure;
 
+fn log_path(log: &std::path::Path) -> PathBuf {
+    log.with_file_name("credential-usage.json")
+}
+
 /// A request's line and headers.
 const MAX_HEAD: usize = 64 * 1024;
 /// A request's body, such as a long conversation with images.
@@ -36,11 +40,18 @@ const MAX_LOG: u64 = 4 * 1024 * 1024;
 /// The Anthropic API, which Claude Code talks to.
 pub const ANTHROPIC: &str = "api.anthropic.com";
 
+#[derive(Debug, Clone, Copy)]
+pub enum Authorization {
+    Bearer,
+    ApiKey,
+}
+
 /// A credential the relay uses for sandboxes, the hosts it may reach and what it may do there.
 pub struct Credential {
     /// How errors name it, such as `Claude subscription`.
-    pub label: &'static str,
+    pub label: String,
     source: Source,
+    authorization: Authorization,
     /// What a placeholder for it starts with, so clients that check a token's shape accept one.
     prefix: &'static str,
     /// Upstream hosts its requests may go to.
@@ -69,8 +80,9 @@ impl Credential {
     /// nothing on its account or OAuth endpoints.
     pub fn claude(token: String) -> Self {
         Self {
-            label: "Claude subscription",
+            label: "Claude subscription".into(),
             source: Source::Static(token),
+            authorization: Authorization::Bearer,
             prefix: "sk-ant-oat01-imacs-",
             hosts: vec![ANTHROPIC.into()],
             rules: vec![
@@ -84,12 +96,22 @@ impl Credential {
 
     pub fn azure(azure: Arc<azure::Azure>) -> Self {
         Self {
-            label: "Azure CLI",
+            label: "Azure CLI".into(),
+            authorization: Authorization::Bearer,
             hosts: azure.config.resources.keys().cloned().collect(),
             source: Source::Azure(azure),
             prefix: "imacs-azure-",
             rules: Vec::new(),
         }
+    }
+    pub fn stored(
+        label: String,
+        token: String,
+        hosts: Vec<String>,
+        rules: Vec<Rule>,
+        authorization: Authorization,
+    ) -> Self {
+        Self { label, source: Source::Static(token), authorization, prefix: "imacs-", hosts, rules }
     }
 }
 
@@ -150,6 +172,7 @@ struct Inner {
     upstreams: HashMap<String, String>,
     stopped: AtomicBool,
     connections: AtomicUsize,
+    usage: Mutex<HashMap<String, u64>>,
 }
 
 /// One Azure write waiting for the same approval banner as command permissions. The full
@@ -181,11 +204,17 @@ impl Relay {
         let inner = Arc::new(Inner {
             grants: Mutex::default(),
             approvals: Mutex::default(),
-            log: Log { path: log, write: Mutex::new(()) },
+            log: Log { path: log.clone(), write: Mutex::new(()) },
             agent: config.build().into(),
             upstreams,
             stopped: AtomicBool::new(false),
             connections: AtomicUsize::new(0),
+            usage: Mutex::new(
+                std::fs::read(log_path(&log))
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                    .unwrap_or_default(),
+            ),
         });
         let accepting = inner.clone();
         let accept =
@@ -351,6 +380,16 @@ impl Inner {
                 return Ok(false);
             }
         }
+        {
+            let mut usage = self.usage.lock().unwrap();
+            usage.insert(
+                grant.credential.label.clone(),
+                SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+            );
+            if let Ok(bytes) = serde_json::to_vec(&*usage) {
+                let _ = std::fs::write(log_path(&self.log.path), bytes);
+            }
+        }
         let (status, whole) = self.forward(&head, route, &grant.credential, body, writer);
         self.log.record(session, host, &head.method, path, status, started.elapsed());
         Ok(whole && head.keep_alive())
@@ -431,7 +470,11 @@ impl Inner {
                 }
             },
         };
-        let request = request.header("authorization", format!("Bearer {secret}"));
+        let authorization = match credential.authorization {
+            Authorization::Bearer => format!("Bearer {}", secret),
+            Authorization::ApiKey => secret.clone(),
+        };
+        let request = request.header("authorization", authorization);
         let sent = if body.is_empty() && !matches!(head.method.as_str(), "POST" | "PUT" | "PATCH") {
             request.body(()).map(|request| self.agent.run(request))
         } else {
@@ -560,7 +603,10 @@ impl Head {
             let (scheme, token) = value.split_once(' ')?;
             scheme.eq_ignore_ascii_case("bearer").then(|| token.trim())
         });
-        bearer.or_else(|| self.header("x-api-key").map(str::trim)).filter(|token| !token.is_empty())
+        bearer
+            .or_else(|| self.header("authorization").filter(|value| !value.chars().any(char::is_whitespace)))
+            .or_else(|| self.header("x-api-key").map(str::trim))
+            .filter(|token| !token.is_empty())
     }
 
     fn keep_alive(&self) -> bool {
@@ -745,7 +791,7 @@ impl Log {
 }
 
 /// `time` as `2026-10-30T13:45:00Z`.
-fn utc(time: SystemTime) -> String {
+pub(crate) fn utc(time: SystemTime) -> String {
     let seconds = time.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     let (days, rest) = ((seconds / 86_400) as i64, seconds % 86_400);
     // Howard Hinnant's civil_from_days.
@@ -801,24 +847,113 @@ impl Keychain {
     /// The Claude subscription token, when one is stored and looks like one. The keychain's tool
     /// can wait for the keychain to unlock: call this off the state lock.
     pub fn claude_token(&self) -> Option<String> {
-        let (status, output, _) =
-            crate::sandbox::sbx_output(&self.program, &self.lookup_args(), false, Duration::from_secs(60)).ok()?;
-        let token = output.trim();
-        (status.success() && valid_claude_token(token)).then(|| token.to_string())
+        crate::credentials::Store::new(self.clone()).token("claude").ok().flatten()
     }
 
-    /// The program and arguments that store `token`, and what they read on stdin: `security`'s
-    /// interactive mode takes the whole command there, and `secret-tool` the secret.
-    pub fn store_command(&self, token: &str) -> (&str, Vec<&'static str>, String) {
-        if self.mac {
-            // Only a valid token gets here, so it cannot add another command.
-            let input = format!("add-generic-password -U -a {ACCOUNT} -s {CLAUDE_SERVICE} -w {token}\n");
-            (&self.program, vec!["-i"], input)
-        } else {
-            let args =
-                vec!["store", "--label=IMACS Claude subscription", "service", CLAUDE_SERVICE, "account", ACCOUNT];
-            (&self.program, args, format!("{token}\n"))
+    fn output(&self, args: &[&str]) -> std::result::Result<std::process::Output, crate::sandbox::setup::OutputError> {
+        let mut command = std::process::Command::new(&self.program);
+        command.args(args);
+        for name in ["IMACS_SOCKET", "IMACS_PANE", "IMACS_HOME", "IMACS_CONFIG", "SSH_AUTH_SOCK"] {
+            command.env_remove(name);
         }
+        if let Some(path) = crate::setup::SHELL_PATH.as_ref() {
+            command.env("PATH", path);
+        }
+        crate::sandbox::setup::private_output(&mut command, Duration::from_secs(60))
+    }
+
+    pub(crate) fn legacy_token(&self) -> Option<String> {
+        let output = self.output(&self.lookup_args()).ok()?;
+        let token = std::str::from_utf8(&output.stdout).ok()?.trim();
+        (output.status.success() && !token.is_empty()).then(|| token.to_string())
+    }
+
+    pub(crate) fn read_catalog(&self) -> Result<Option<String>> {
+        let args = if self.mac {
+            vec!["find-generic-password", "-a", ACCOUNT, "-s", "imacs-credentials-v1", "-w"]
+        } else {
+            vec!["lookup", "service", "imacs-credentials-v1", "account", ACCOUNT]
+        };
+        let output =
+            self.output(&args).map_err(|_| anyhow::anyhow!("OS credential store unavailable; unlock it and retry"))?;
+        if output.status.success() {
+            let text = std::str::from_utf8(&output.stdout)
+                .map_err(|_| anyhow::anyhow!("OS credential store returned invalid data (contents hidden)"))?;
+            Ok(Some(text.trim().to_string()))
+        } else if (self.mac && output.status.code() == Some(44))
+            || (!self.mac && output.status.code() == Some(1) && output.stderr.iter().all(u8::is_ascii_whitespace))
+        {
+            Ok(None)
+        } else {
+            anyhow::bail!("OS credential store unavailable; unlock it and retry")
+        }
+    }
+
+    pub(crate) fn catalog_lock(&self) -> Result<std::fs::File> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        let directory = if cfg!(test) {
+            std::path::Path::new(&self.program).parent().unwrap().to_path_buf()
+        } else {
+            imacs_core::paths::imacs_home()
+        };
+        std::fs::create_dir_all(&directory).map_err(|_| anyhow::anyhow!("cannot lock credential store"))?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(directory.join("credentials.lock"))
+            .map_err(|_| anyhow::anyhow!("cannot lock credential store"))?;
+        // SAFETY: a live descriptor; closing the file releases the interprocess lock.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            anyhow::bail!("cannot lock credential store")
+        }
+        Ok(file)
+    }
+
+    pub(crate) fn remove_legacy(&self) -> Result<()> {
+        let args = if self.mac {
+            vec!["delete-generic-password", "-a", ACCOUNT, "-s", CLAUDE_SERVICE]
+        } else {
+            vec!["clear", "service", CLAUDE_SERVICE, "account", ACCOUNT]
+        };
+        let output =
+            self.output(&args).map_err(|_| anyhow::anyhow!("credential saved; legacy entry cleanup failed, retry"))?;
+        if output.status.success()
+            || (self.mac && output.status.code() == Some(44))
+            || (!self.mac && output.status.code() == Some(1) && output.stderr.iter().all(u8::is_ascii_whitespace))
+        {
+            return Ok(());
+        }
+        anyhow::bail!("credential saved; legacy entry cleanup failed, retry")
+    }
+
+    pub(crate) fn write_catalog(&self, encoded: &str) -> Result<()> {
+        // Hex encodes the JSON so security's interactive parser only sees letters and digits.
+        // This is transport encoding; the OS keychain supplies encryption and access control.
+        let (args, input) = if self.mac {
+            (vec!["-i"], format!("add-generic-password -U -a {ACCOUNT} -s imacs-credentials-v1 -w {encoded}\n"))
+        } else {
+            (
+                vec!["store", "--label=IMACS credentials", "service", "imacs-credentials-v1", "account", ACCOUNT],
+                format!("{encoded}\n"),
+            )
+        };
+        // security.c's MAX_LINE_LEN is 4096, including the terminating NUL. Reject before
+        // invoking it: a truncated interactive command could overwrite the current item.
+        if self.mac && input.len() >= 4096 {
+            anyhow::bail!(
+                "credential catalog exceeds macOS security's 4 KiB input limit; existing credentials are unchanged"
+            )
+        }
+        crate::sandbox::setup::private_command(&self.program, &args, &input)
+            .map_err(|_| anyhow::anyhow!("OS credential store write failed; unlock it and retry"))?;
+        if self.read_catalog()?.as_deref() != Some(encoded) {
+            anyhow::bail!("OS credential store could not verify the write")
+        }
+        Ok(())
     }
 }
 
@@ -867,6 +1002,7 @@ impl Granted {
 pub struct Service {
     home: PathBuf,
     keychain: Keychain,
+    edits: Mutex<()>,
     relay: Mutex<Option<Relay>>,
     upstreams: HashMap<String, String>,
     /// Where the port is kept for the next start; None for a relay that lives for one command.
@@ -883,7 +1019,15 @@ impl std::fmt::Debug for Service {
 impl Service {
     pub fn new(home: PathBuf, keychain: Keychain) -> Self {
         let port_file = Some(home.join("relay-port"));
-        Self { home, keychain, relay: Mutex::default(), upstreams: HashMap::new(), port_file, azure: Mutex::default() }
+        Self {
+            home,
+            keychain,
+            edits: Mutex::new(()),
+            relay: Mutex::default(),
+            upstreams: HashMap::new(),
+            port_file,
+            azure: Mutex::default(),
+        }
     }
 
     /// A relay for one command, such as `imacs sandbox relay-check`, at any free port: it leaves the
@@ -912,13 +1056,20 @@ impl Service {
     /// keychain, or None without one. Reads the keychain and may start the relay: call it off the
     /// state lock.
     pub fn grant_claude(&self, session: &str) -> Result<Option<Granted>> {
-        let Some(token) = self.keychain.claude_token() else { return Ok(None) };
+        self.grant(session, "claude")
+    }
+
+    pub fn grant(&self, session: &str, id: &str) -> Result<Option<Granted>> {
+        let _edit = self.edits.lock().unwrap();
+        let Some(credential) = crate::credentials::Store::new(self.keychain.clone()).credential(id)? else {
+            return Ok(None);
+        };
         let mut relay = self.relay.lock().unwrap();
         if relay.is_none() {
             *relay = Some(self.start()?);
         }
         let relay = relay.as_ref().unwrap();
-        let placeholder = relay.grant(session, Arc::new(Credential::claude(token)));
+        let placeholder = relay.grant(session, Arc::new(credential));
         Ok(Some(Granted { port: relay.port(), placeholder, azure: None }))
     }
 
@@ -953,6 +1104,11 @@ impl Service {
         }))
     }
 
+    pub fn revoke_azure(&self) {
+        self.revoke_credential("Azure CLI");
+        self.azure.lock().unwrap().take();
+    }
+
     pub fn take_write_approvals(&self) -> Vec<WriteApproval> {
         self.relay
             .lock()
@@ -960,6 +1116,59 @@ impl Service {
             .as_ref()
             .map(|relay| std::mem::take(&mut *relay.inner.approvals.lock().unwrap()))
             .unwrap_or_default()
+    }
+
+    /// Serializes Settings changes with grant preparation. Even an unverified write revokes
+    /// the old grants, since the keychain may have accepted the new value before reporting failure.
+    pub fn edit(&self, label: &str, update: impl FnOnce(&crate::credentials::Store) -> Result<()>) -> Result<()> {
+        let _edit = self.edits.lock().unwrap();
+        let result = update(&crate::credentials::Store::new(self.keychain.clone()));
+        self.revoke_credential(label);
+        result
+    }
+
+    /// Only status crosses into Settings; keychain I/O happens on its worker.
+    pub fn usage(&self, label: &str) -> (Option<u64>, Vec<String>) {
+        let relay = self.relay.lock().unwrap();
+        if let Some(relay) = relay.as_ref() {
+            let used = relay.inner.usage.lock().unwrap().get(label).copied();
+            let mut sessions: Vec<_> = relay
+                .inner
+                .grants
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|grant| grant.credential.label == label)
+                .map(|grant| grant.session.clone())
+                .collect();
+            sessions.sort();
+            sessions.dedup();
+            (used, sessions)
+        } else {
+            let used: HashMap<String, u64> = std::fs::read(self.home.join("credential-usage.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or_default();
+            (used.get(label).copied(), Vec::new())
+        }
+    }
+
+    /// Replacing/removing a credential immediately revokes existing placeholders for it.
+    pub fn revoke_credential(&self, label: &str) {
+        if let Some(relay) = self.relay.lock().unwrap().as_ref() {
+            let placeholders: Vec<_> = relay
+                .inner
+                .grants
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, grant)| grant.credential.label == label)
+                .map(|(placeholder, _)| placeholder.clone())
+                .collect();
+            for placeholder in placeholders {
+                relay.revoke(&placeholder);
+            }
+        }
     }
 
     /// How many placeholders the relay accepts now.
@@ -1446,13 +1655,9 @@ mod tests {
             .unwrap();
         for mac in [true, false] {
             let keychain = Keychain::at(&program, mac);
-            let (tool, args, input) = keychain.store_command(TOKEN);
-            assert_eq!(tool, program.to_str().unwrap());
-            assert!(!args.iter().any(|arg| arg.contains(TOKEN)) && input.contains(TOKEN));
-            let mut child =
-                std::process::Command::new(tool).args(&args).stdin(std::process::Stdio::piped()).spawn().unwrap();
-            child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
-            assert!(child.wait().unwrap().success());
+            crate::credentials::Store::new(keychain.clone()).put("claude", TOKEN, None).unwrap();
+            let argv = std::fs::read_to_string(dir.path().join("keychain-argv")).unwrap();
+            assert!(!argv.contains(TOKEN));
             assert_eq!(keychain.claude_token().as_deref(), Some(TOKEN));
             std::fs::write(dir.path().join("fail-keychain"), "").unwrap();
             assert_eq!(keychain.claude_token(), None);

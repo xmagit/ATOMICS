@@ -17,6 +17,8 @@ pub fn doctor_lines(program: &str, config: &SandboxConfig, claude: ClaudeRoute) 
 pub enum ClaudeRoute {
     /// They run bare, with this machine's Claude login.
     Bare,
+    /// Bare Claude explicitly uses the same host relay, including for the chief.
+    BareRelay { subscription: bool },
     /// They run sandboxed. With the Claude subscription token in the OS keychain they use it through
     /// IMACS's relay; without it, sbx's anthropic secret, which must be an API key.
     Sandboxed { subscription: bool },
@@ -32,7 +34,16 @@ pub(crate) fn claude_route(
     if claude_sandboxed(config, workspace) {
         ClaudeRoute::Sandboxed { subscription: keychain.claude_token().is_some() }
     } else {
-        ClaudeRoute::Bare
+        let isolation = workspace
+            .and_then(|name| workspace::Workspace::load(name).ok())
+            .and_then(|workspace| workspace.isolation().ok().flatten())
+            .and_then(|overrides| config.isolation.with_overrides(&overrides).ok())
+            .unwrap_or_else(|| config.isolation.clone());
+        if isolation.bare_relay {
+            ClaudeRoute::BareRelay { subscription: keychain.claude_token().is_some() }
+        } else {
+            ClaudeRoute::Bare
+        }
     }
 }
 
@@ -137,6 +148,11 @@ pub(super) fn secret_lines(secrets: Option<&SecretNames>, claude: ClaudeRoute) -
              Claude subscription through IMACS's relay)"
                 .into(),
         ),
+        ClaudeRoute::BareRelay { subscription } => lines.push(check_line(
+            subscription,
+            "bare Claude credential: Claude subscription through IMACS's relay (OS keychain)",
+            "run `imacs setup --credential claude` in a trusted host terminal; value is read from stdin",
+        )),
         ClaudeRoute::Sandboxed { subscription: true } => lines.push(check_line(
             true,
             "sandbox Claude credential: Claude subscription through IMACS's relay (OS keychain)",
