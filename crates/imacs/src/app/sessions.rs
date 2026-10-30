@@ -318,6 +318,9 @@ impl State {
                 .map(|(k, v)| (k.to_string(), v))
                 .collect();
         env.insert("COLORFGBG".into(), self.palette.colorfgbg().into());
+        if sandboxed.is_none() && agent.kind != AgentKind::Shell {
+            env.extend(instance_agent_env());
+        }
         if let Some(path) = SHELL_PATH.as_ref() {
             env.insert("PATH".into(), path.clone());
         }
@@ -909,6 +912,15 @@ fn brief_file(session: &str, text: &str, sandboxed: bool) -> Result<String, Stri
 
 /// RUSTC_WRAPPER for sccache when it is installed and neither the user nor the project under
 /// `cwd` chose a wrapper (an exported variable would override their cargo config).
+/// An explicit instance home must also isolate mutable provider trust and settings.
+fn instance_agent_env() -> Vec<(String, String)> {
+    let Some(home) = std::env::var_os("IMACS_HOME").map(PathBuf::from) else { return Vec::new() };
+    [("CODEX_HOME", "codex"), ("CLAUDE_CONFIG_DIR", "claude")]
+        .into_iter()
+        .map(|(key, dir)| (key.into(), home.join(dir).to_string_lossy().into_owned()))
+        .collect()
+}
+
 fn compile_cache_env(cwd: &Path) -> Vec<(String, String)> {
     let user_config = std::env::var_os("CARGO_HOME").map(PathBuf::from).unwrap_or_else(|| paths::home().join(".cargo"));
     let configs = cwd.ancestors().map(|dir| dir.join(".cargo")).chain([user_config]);
@@ -993,6 +1005,34 @@ impl Desktop<'_> {
 mod tests {
     use super::super::tests::{request, session, with_app};
     use super::*;
+
+    #[test]
+    fn isolated_agents_write_provider_trust_only_inside_the_instance() {
+        with_app("app::sessions::tests::isolated_agents_write_provider_trust_only_inside_the_instance", |app, ctx| {
+            let dir = crate::test_support::tempdir().unwrap();
+            app.runtime.config.agents.push(imacs_core::config::AgentConfig {
+                name: "trust-probe".into(),
+                kind: AgentKind::Generic,
+                command: vec!["/bin/sh".into(), "-c".into(),
+                    "mkdir -p \"$CODEX_HOME\" \"$CLAUDE_CONFIG_DIR\"; echo trusted > \"$CODEX_HOME/config.toml\"; echo trusted > \"$CLAUDE_CONFIG_DIR/.claude.json\"".into()],
+                busy_text: None,
+                isolation: None,
+            });
+            let id = app.runtime.start(ctx, "trust-probe", dir.path().into(), None, vec![], None).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let home = paths::imacs_home();
+            while !home.join("claude/.claude.json").exists() {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(std::fs::read_to_string(home.join("codex/config.toml")).unwrap(), "trusted\n");
+            assert!(!paths::home().join(".claude.json").exists());
+            assert!(!paths::home().join(".codex/config.toml").exists());
+            // Inherited CODEX_HOME belongs to the test harness, not this instance.
+            assert!(!PathBuf::from(std::env::var_os("CODEX_HOME").unwrap()).join("config.toml").exists());
+            app.runtime.close(&id);
+        });
+    }
 
     #[test]
     fn short_messages_cannot_be_confirmed_by_agent_output() {
