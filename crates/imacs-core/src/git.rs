@@ -781,7 +781,12 @@ pub fn resolve_base(repo: &Path, base_ref: &str) -> Result<String> {
 /// Refuses branch names IMACS must never create or merge into: invalid ones, ones git
 /// would read as options, and the base branch (main, master or `base_ref`'s branch).
 pub fn check_branch_name(repo: &Path, branch: &str, base_ref: &str) -> Result<()> {
-    if branch.starts_with('-') || git(repo, &["check-ref-format", "--branch", branch]).is_err() {
+    // Validate a literal ref name: --branch expands @{-n} by reading the HEAD log,
+    // which a sandbox can replace with a FIFO, even during UI branch allocation.
+    if branch.starts_with('-')
+        || branch == "HEAD"
+        || git(repo, &["check-ref-format", &format!("refs/heads/{branch}")]).is_err()
+    {
         bail!("{branch:?} is not a valid branch name");
     }
     let base = base_ref.strip_prefix("origin/").unwrap_or(base_ref);
@@ -1148,6 +1153,14 @@ pub fn worktree_path(template: &str, repo: &Path, branch: &str) -> PathBuf {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn branch_validation_does_not_expand_checkout_history() {
+        let (_dir, repo) = project();
+        git(&repo, &["switch", "-c", "feature"]).unwrap();
+        assert!(check_branch_name(&repo, "@{-1}", "origin/main").is_err());
+        assert!(check_branch_name(&repo, "HEAD", "origin/main").is_err());
+    }
 
     #[test]
     fn branch_allocation_reads_names_without_opening_objects_or_logs() {
