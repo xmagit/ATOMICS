@@ -356,6 +356,9 @@ Codex hooks receive the socket as an argument and find their pane from process a
 the mapped Codex session ID; Claude hooks receive socket and pane arguments. MCP servers receive
 their own routing environment. An IMACS launched from an agent therefore uses its own defaults; explicitly set
 `IMACS_HOME`, `IMACS_SOCKET` and `IMACS_CONFIG` when launching a separate test instance.
+An explicit `IMACS_HOME` also gives bare agents their own `CODEX_HOME` (`<home>/codex`) and
+`CLAUDE_CONFIG_DIR` (`<home>/claude`). Codex's per-event hook trust slots and Claude's folder trust
+then belong to that instance. Sign in separately in those provider homes when needed.
 
 ## The chief agent
 

@@ -927,7 +927,7 @@ fn brief_file(session: &str, text: &str, sandboxed: bool) -> Result<String, Stri
 
 /// RUSTC_WRAPPER for sccache when it is installed and neither the user nor the project under
 /// `cwd` chose a wrapper (an exported variable would override their cargo config).
-/// An explicit instance home must also isolate mutable provider trust and settings.
+/// Authentication failures must remain actionable even when the provider exits normally.
 pub(super) fn credential_failure(screen: &str) -> Option<String> {
     screen
         .lines()
@@ -944,6 +944,7 @@ pub(super) fn credential_failure(screen: &str) -> Option<String> {
         .map(|line| format!("Credential error: {}", line.trim()))
 }
 
+/// An explicit instance home must also isolate mutable provider trust and settings.
 fn instance_agent_env() -> Vec<(String, String)> {
     let Some(home) = std::env::var_os("IMACS_HOME").map(PathBuf::from) else { return Vec::new() };
     [("CODEX_HOME", "codex"), ("CLAUDE_CONFIG_DIR", "claude")]
@@ -1036,6 +1037,43 @@ impl Desktop<'_> {
 mod tests {
     use super::super::tests::{request, session, with_app};
     use super::*;
+
+    #[test]
+    fn two_instances_do_not_overwrite_each_others_provider_trust_slots() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let user = dir.path().join("user");
+        std::fs::create_dir(&user).unwrap();
+        for instance in ["a", "b"] {
+            let home = dir.path().join(instance);
+            std::fs::create_dir(&home).unwrap();
+            let output = crate::test_support::output(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "app::sessions::tests::isolated_agents_write_provider_trust_only_inside_the_instance",
+                        "--nocapture",
+                    ])
+                    .env("IMACS_APP_TEST_CHILD", "1")
+                    .env("HOME", &user)
+                    .env("CODEX_HOME", user.join("codex"))
+                    .env("CLAUDE_CONFIG_DIR", user.join("claude"))
+                    .env("IMACS_HOME", &home)
+                    .env("IMACS_CONFIG", home.join("config.toml"))
+                    .env("IMACS_SOCKET", home.join("socket")),
+            );
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        // The provider has one trust slot per event; separate homes keep those slots separate.
+        std::fs::write(dir.path().join("a/codex/config.toml"), "instance a trust").unwrap();
+        assert_eq!(std::fs::read_to_string(dir.path().join("b/codex/config.toml")).unwrap(), "trusted\n");
+        assert!(!user.join("codex/config.toml").exists());
+        assert!(!user.join("claude/.claude.json").exists());
+    }
 
     #[test]
     fn sandbox_credential_errors_block_the_task_with_the_reason_even_after_exit() {
