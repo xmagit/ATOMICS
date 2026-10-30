@@ -503,6 +503,9 @@ pub fn remove(home: &Path, program: &str, name: &str) -> Result<()> {
     let owned = ownership::owned(home)?.get(name).cloned().unwrap_or_default();
     if owned.sandbox {
         if ownership::may_be_creating(&owned) && !list(program)?.iter().any(|sandbox| sandbox.name == name) {
+            // A canceled CLI can leave a create running in the daemon. Keep its VM
+            // reservation and pins, but remove an already listed MCP registration.
+            remove_mcp(home, program, name)?;
             bail!("Sandbox {name} may still be being created; keeping its reservation for cleanup");
         }
         if let Some(port) = owned.relay {
