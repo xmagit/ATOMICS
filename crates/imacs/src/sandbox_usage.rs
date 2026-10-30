@@ -196,7 +196,7 @@ fn parse_with_worktrees(
                 break;
             }
         }
-        if !owners.contains_key(&p.pid) {
+        if let std::collections::hash_map::Entry::Vacant(owner) = owners.entry(p.pid) {
             let matches: Vec<_> = sandboxes
                 .iter()
                 .filter(|(_, root)| {
@@ -205,7 +205,7 @@ fn parse_with_worktrees(
                 })
                 .collect();
             if let [(name, _)] = matches.as_slice() {
-                owners.insert(p.pid, name.clone());
+                owner.insert(name.clone());
             }
         }
     }

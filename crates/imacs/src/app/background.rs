@@ -203,7 +203,7 @@ impl State {
                 let credential_error = session
                     .sandbox
                     .as_ref()
-                    .and_then(|_| session.terminal.as_ref())
+                    .and(session.terminal.as_ref())
                     .and_then(|t| super::sessions::credential_failure(&t.screen_text(60)));
                 if session.status != AgentStatus::Exited
                     && !(session.status == AgentStatus::NeedsInput && credential_error.is_some())
