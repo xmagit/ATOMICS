@@ -166,6 +166,14 @@ for bare agents in the same folder. The record goes when cleanup removes the san
 - **A folder outside any repository stays that way.** IMACS does not run git in it or in any folder below
   it while the record exists, whatever `.git` the agent creates there.
 
+### Symbolic links in a worktree
+
+An agent can make a symbolic link in its worktree that points at any file on your machine, such as a key
+or a credentials file. IMACS shows a link the way git diffs one: as its target path. In the diff, an
+untracked link is a new file whose only line is that path, and in the file viewer a link says where it
+points. IMACS never opens the file a link points to, or a path through a linked folder. This holds in every
+worktree, bare agents' too.
+
 An agent started in a folder outside any repository gets that folder. IMACS refuses to sandbox an agent
 in your home folder or any folder above it, since the sandbox would mount the whole home folder
 read-write. Long briefs for agents other than Claude are written to a folder of the session's own,

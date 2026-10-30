@@ -238,20 +238,19 @@ fn untracked_files(root: &Path, budget: Option<u64>) -> Result<(Vec<FileDiff>, b
     let mut files = Vec::new();
     let (mut kept, mut partial) = (0, false);
     for path in out.split('\0').filter(|p| !p.is_empty()).take(MAX_UNTRACKED_FILES) {
-        let full = root.join(path);
-        let Ok(meta) = std::fs::metadata(&full) else { continue };
-        if !meta.is_file() {
-            continue;
-        }
-        let content = if meta.len() <= MAX_UNTRACKED_BYTES { std::fs::read(&full).ok() } else { None };
+        let (len, content) = match read_worktree_file(root, path, MAX_UNTRACKED_BYTES) {
+            Some(WorktreeFile::Link(target)) => (target.len() as u64, Some(target.into_bytes())),
+            Some(WorktreeFile::File { len, bytes }) => (len, bytes),
+            None => continue,
+        };
         match content {
             Some(bytes) if !bytes[..bytes.len().min(8000)].contains(&0) => {
                 let text = String::from_utf8_lossy(&bytes);
-                if budget.is_some_and(|budget| kept + meta.len() > budget) {
+                if budget.is_some_and(|budget| kept + len > budget) {
                     files.push(FileDiff::untracked_omitted(path.to_string(), text.lines().count()));
                     partial = true;
                 } else {
-                    kept += meta.len();
+                    kept += len;
                     files.push(FileDiff::untracked(path.to_string(), &text));
                 }
             }
@@ -263,6 +262,47 @@ fn untracked_files(root: &Path, budget: Option<u64>) -> Result<(Vec<FileDiff>, b
         }
     }
     Ok((files, partial))
+}
+
+/// A file in a worktree, as git sees it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum WorktreeFile {
+    /// A symbolic link, shown as its target path the way git diffs one.
+    Link(String),
+    /// A regular file of `len` bytes; `None` when it is longer than the limit it was read with.
+    File { len: u64, bytes: Option<Vec<u8>> },
+}
+
+/// Reads `path` in the worktree at `root` without following a symbolic link anywhere below
+/// `root`, as git does: a sandbox can point one at any file on this machine. `None` for what
+/// git would not show as a file there: a folder, a special file, or a path through a link.
+pub fn read_worktree_file(root: &Path, path: &str, limit: u64) -> Option<WorktreeFile> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut full = root.to_path_buf();
+    let mut parts = Path::new(path).components().peekable();
+    while let Some(part) = parts.next() {
+        let std::path::Component::Normal(name) = part else { return None };
+        full.push(name);
+        let kind = full.symlink_metadata().ok()?.file_type();
+        match (kind.is_symlink(), parts.peek().is_some()) {
+            (true, false) => return Some(WorktreeFile::Link(std::fs::read_link(&full).ok()?.to_string_lossy().into())),
+            (true, true) => return None,
+            (false, true) if !kind.is_dir() => return None,
+            (false, false) if !kind.is_file() => return None,
+            _ => {}
+        }
+    }
+    // The checks above can race with the sandbox: refuse a link here, and never wait on a FIFO.
+    let file =
+        std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(&full).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    let bytes = (meta.len() <= limit && file.take(limit).read_to_end(&mut bytes).is_ok()).then_some(bytes);
+    Some(WorktreeFile::File { len: meta.len(), bytes })
 }
 
 /// The tracked files of a worktree. Untracked files only appear through the diff,
@@ -1185,6 +1225,48 @@ pub(crate) mod tests {
         assert_eq!(diff.files[2].status, crate::diff::FileStatus::Untracked);
         assert_eq!((diff.additions(), diff.deletions()), (3, 1));
         assert!(!diff.partial);
+    }
+
+    #[test]
+    fn links_in_a_worktree_show_their_target_and_are_never_read_through() {
+        use std::os::unix::fs::symlink;
+        let (dir, repo) = project();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("secret"), "host credentials\n").unwrap();
+        symlink(outside.join("secret"), repo.join("link")).unwrap();
+        symlink(&outside, repo.join("folder-link")).unwrap();
+        // A FIFO must neither show nor keep the diff waiting for a writer.
+        assert!(Command::new("mkfifo").arg(repo.join("fifo")).status().unwrap().success());
+
+        let diff = diff_against_base(&repo, "main", None).unwrap();
+        let lines = |path: &str| -> Vec<String> {
+            let file = diff.files.iter().find(|f| f.path() == path).unwrap_or_else(|| panic!("{path}: {diff:?}"));
+            file.hunks.iter().flat_map(|h| &h.lines).map(|l| l.text.clone()).collect()
+        };
+        assert_eq!(lines("link"), [outside.join("secret").display().to_string()]);
+        assert_eq!(lines("folder-link"), [outside.display().to_string()]);
+        assert!(!diff.files.iter().any(|f| f.path() == "fifo"));
+        let shown = format!("{diff:?}");
+        assert!(!shown.contains("host credentials"), "{shown}");
+
+        // The file viewer reads with the same rule, also for a folder replaced by a link.
+        let read = |path: &str, limit| read_worktree_file(&repo, path, limit);
+        assert_eq!(read("link", 1024), Some(WorktreeFile::Link(outside.join("secret").display().to_string())));
+        assert_eq!(
+            read("a.txt", 1024),
+            Some(WorktreeFile::File { len: 14, bytes: Some(b"one\ntwo\nthree\n".to_vec()) })
+        );
+        assert_eq!(read("a.txt", 4), Some(WorktreeFile::File { len: 14, bytes: None }));
+        std::fs::create_dir(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/main.rs"), "fn main() {}\n").unwrap();
+        assert!(read("src/main.rs", 1024).is_some());
+        std::fs::remove_dir_all(repo.join("src")).unwrap();
+        std::fs::write(outside.join("main.rs"), "host file\n").unwrap();
+        symlink(&outside, repo.join("src")).unwrap();
+        for path in ["src/main.rs", "folder-link/secret", "fifo", "../outside/secret", "src"] {
+            assert!(!matches!(read(path, 1024), Some(WorktreeFile::File { .. })), "{path}");
+        }
     }
 
     #[test]
