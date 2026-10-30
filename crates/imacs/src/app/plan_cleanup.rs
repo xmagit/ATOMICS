@@ -239,7 +239,9 @@ impl Desktop<'_> {
                             )));
                             continue;
                         }
+                        let write = crate::ref_guard::host_write(&entry.repo, [&entry.branch]);
                         let result = cleanup::remove(&plan, &base, &entry).map_err(|err| format!("{err:#}"));
+                        drop(write);
                         let removed = result.is_ok();
                         let _ = tx.send(Event::Removed(entry, result));
                         for name in sandboxes.into_iter().filter(|_| removed) {

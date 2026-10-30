@@ -156,8 +156,11 @@ impl State {
         let plan = self.plans[index].id.clone();
         self.integrating.insert((plan.clone(), task.clone()));
         std::thread::spawn(move || {
+            // It commits on the task branch and creates or merges into the integration branch.
+            let write = crate::ref_guard::host_write(&repo, [&branch, &into]);
             let result =
                 git::integrate(&repo, &branch, &message, &into, &into_path, &base_ref).map_err(|e| format!("{e:#}"));
+            drop(write);
             let _ = tx.send(Integrated { plan, task, branch, into, result, reply });
         });
     }

@@ -43,7 +43,9 @@ pub fn clean_plan(home: &Path, plan: &Plan, sbx: &str, protected: &[PathBuf]) ->
                     }
                 }
             }
+            let write = crate::ref_guard::host_write(&entry.repo, [&entry.branch]);
             let removed_branch = cleanup::remove_closed_task(plan, &entry);
+            drop(write);
             // A branch deletion can fail after its worktree was removed. Its sandbox must
             // still go away; otherwise its old mount could be reused by a new checkout.
             if entry.worktree.as_ref().is_some_and(|path| !path.exists()) {

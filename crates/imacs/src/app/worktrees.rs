@@ -37,6 +37,7 @@ impl State {
             } else if existing {
                 Ok(PreparedWorktree { path, warmed: false })
             } else {
+                let _write = crate::ref_guard::host_write(&repo, [&branch]);
                 git::add_worktree_from(&repo, &path, &branch, start.as_deref(), &base_ref)
                     .map(|()| {
                         let warmed = git::warm_worktree(&repo, &path, &warm);
@@ -398,6 +399,7 @@ impl Desktop<'_> {
                                     crate::sandbox::stop(&paths::imacs_home(), &sbx, name)?;
                                 }
                             }
+                            let _write = crate::ref_guard::host_write(&repo, branch.iter().filter(|_| delete));
                             git::remove_worktree(&repo, &path, branch.as_deref(), delete)
                         })()
                         .map_err(|e| format!("{e:#}"));
