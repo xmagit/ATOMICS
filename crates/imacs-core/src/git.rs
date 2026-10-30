@@ -106,18 +106,21 @@ pub fn pinned(dir: &Path) -> Option<GitPins> {
         .cloned()
 }
 
-/// Where git finds `dir`'s repository now, for [`pin`]: read it before a sandbox can write there.
-/// Refuses layouts that already point where `git worktree add` never would, and repositories
-/// with `extensions.worktreeConfig`.
+/// Where git finds `dir`'s repository now, read from the folder itself, never from a record:
+/// for [`pin`] before a sandbox can write there, or to check a record against. Refuses layouts
+/// that already point where `git worktree add` never would, and repositories with
+/// `extensions.worktreeConfig`. rev-parse runs no hooks or fsmonitor, whatever the folder says.
 pub fn resolve_pins(dir: &Path) -> Result<GitPins> {
     let args = ["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-dir", "--git-common-dir"];
-    let output = match git(dir, &args) {
-        Ok(output) => output,
-        Err(error) if format!("{error:#}").contains("not a git repository") => {
+    let output = Command::new("git").arg("-C").arg(dir).args(args).output().context("running git rev-parse")?;
+    if !output.status.success() {
+        let error = String::from_utf8_lossy(&output.stderr);
+        if error.contains("not a git repository") {
             return Ok(GitPins { work_tree: std::fs::canonicalize(dir)?, git_dir: None, common_dir: None });
         }
-        Err(error) => return Err(error),
-    };
+        bail!("git rev-parse failed in {}: {}", dir.display(), error.trim());
+    }
+    let output = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = output.lines().collect();
     let [top, git_dir, common] = lines[..] else { bail!("unexpected git rev-parse output: {output}") };
     let real = |path: &str| std::fs::canonicalize(path).with_context(|| format!("resolving {path}"));

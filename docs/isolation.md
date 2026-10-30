@@ -155,7 +155,10 @@ So when a sandbox is made, before it runs, IMACS records where git finds the fol
 tree, its git folder and the common dir, in `git-pins/<sandbox>.json` in IMACS's state folder, which no
 sandbox mounts. From then on IMACS runs git in that folder with `GIT_DIR`, `GIT_COMMON_DIR` and
 `GIT_WORK_TREE` taken from the record, and never reads them from the folder again, also after a restart and
-for bare agents in the same folder. The record goes when cleanup removes the sandbox.
+for bare agents in the same folder. The record goes with its sandbox: when cleanup removes it, when making
+it fails, and when IMACS starts and sbx no longer has it, however it was removed. A record whose folder no
+longer matches it stays, since the agent may have changed the files git would follow; IMACS logs it, and
+removing the folder (or `git-pins/<sandbox>.json`, once you have checked the folder) lets it go.
 
 - **Layouts git did not make are refused.** A git folder that does not point back at its worktree, or a
   repository inside the worktree or inside another repository's objects, refs, logs or worktrees, stops
@@ -170,7 +173,8 @@ for bare agents in the same folder. The record goes when cleanup removes the san
   does, then removes the worktree with `--force`. `git worktree remove` would check with a git of its own
   that follows the worktree's files. Worktrees with submodules are left to you.
 - **A folder outside any repository stays that way.** IMACS does not run git in it or in any folder below
-  it while the record exists, whatever `.git` the agent creates there.
+  it while the record exists, whatever `.git` the agent creates there. Once the sandbox is gone and the
+  folder still has no repository, the record goes.
 
 ### Symbolic links in a worktree
 

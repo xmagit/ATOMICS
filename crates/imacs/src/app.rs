@@ -700,8 +700,10 @@ impl State {
 
     pub fn new(cc: &eframe::CreationContext<'_>, options: Options, _icon: &egui::IconData) -> State {
         std::thread::spawn(|| LazyLock::force(&SHELL_PATH));
-        // Before any git runs in a folder a sandbox has worked in.
+        // Before any git runs in a folder a sandbox has worked in. Records of sandboxes that are gone go after.
         crate::sandbox::load_pins(&paths::git_pins_dir());
+        let sbx = if cfg!(test) { "/nonexistent/imacs-test-sbx" } else { "sbx" };
+        std::thread::spawn(move || crate::sandbox::prune_pins(&paths::git_pins_dir(), &resolve_program(sbx)));
         let config_path = paths::config_file();
         let (config, config_error) = match Config::load_or_create(&config_path) {
             Ok(config) => (config, None),
@@ -787,7 +789,7 @@ impl State {
             codex_versions: HashMap::new(),
             pending_codex: Vec::new(),
             // Tests never reach the sbx installed on the machine running them.
-            sbx: if cfg!(test) { "/nonexistent/imacs-test-sbx" } else { "sbx" }.into(),
+            sbx: sbx.into(),
             pending_sandbox: Vec::new(),
             ref_checks: crate::ref_guard::Checks::new(),
             sandbox_usage: Default::default(),

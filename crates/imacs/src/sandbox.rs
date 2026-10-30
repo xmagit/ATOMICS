@@ -200,6 +200,7 @@ pub fn prepare(job: &Prepare) -> Result<()> {
     sbx(&job.sbx, &isolation::create_args(&spec), ssh, CREATE_TIMEOUT).context("creating the sandbox").inspect_err(
         |_| {
             let _ = sbx(&job.sbx, &["mcp", "rm", "--force", &job.name], ssh, TIMEOUT);
+            forget_pins(&job.pins, &job.name);
         },
     )?;
     let finish = || -> Result<()> {
@@ -218,7 +219,9 @@ pub fn prepare(job: &Prepare) -> Result<()> {
     };
     // A half-made sandbox would be reattached to as it is: remove it so the next start makes it whole.
     finish().inspect_err(|_| {
-        let _ = remove(&job.sbx, &job.name);
+        if remove(&job.sbx, &job.name).is_ok() {
+            forget_pins(&job.pins, &job.name);
+        }
     })
 }
 
@@ -266,6 +269,31 @@ pub fn forget_pins(dir: &Path, name: &str) {
     }
     if !records.values().any(|other| other.work_tree == pins.work_tree) {
         git::unpin(&pins.work_tree);
+    }
+}
+
+/// Drops the records of sandboxes sbx no longer has, as IMACS starts: a record outliving its
+/// sandbox would keep git out of a folder for good. A folder whose git files no longer match its
+/// record stays pinned, since the sandbox may have changed them and git would follow. Without an
+/// sbx that answers, which sandboxes exist is unknown, and every record stays.
+pub fn prune_pins(dir: &Path, program: &str) {
+    if !installed(program) {
+        return;
+    }
+    let Ok(sandboxes) = list(program) else { return };
+    let names: std::collections::HashSet<String> = sandboxes.into_iter().map(|sandbox| sandbox.name).collect();
+    for (name, pins) in read_pins(dir) {
+        if names.contains(&name) {
+            continue;
+        }
+        if pins.work_tree.exists() && git::resolve_pins(&pins.work_tree).ok().as_ref() != Some(&pins) {
+            eprintln!(
+                "IMACS: keeping removed sandbox {name}'s git record: {} no longer looks as git made it",
+                pins.work_tree.display()
+            );
+            continue;
+        }
+        forget_pins(dir, &name);
     }
 }
 
@@ -646,6 +674,9 @@ mod tests {
         assert!(error.contains("creating the sandbox") && error.contains("fake create failure"), "{error}");
         assert!(fake::calls_to(bin.path(), &["policy"]).is_empty());
         assert!(list(&sbx.display().to_string()).unwrap().is_empty());
+        // No sandbox, no git record of it.
+        let record = bin.path().join("git-pins/imacs-s1.json");
+        assert!(!record.exists());
 
         // A step after create fails: the half-made sandbox goes, so the next start makes it whole.
         std::fs::remove_file(bin.path().join("fail-create")).unwrap();
@@ -654,8 +685,10 @@ mod tests {
         assert!(error.contains("allowing the repository's hosts"), "{error}");
         assert_eq!(fake::calls(bin.path()).last().unwrap(), &["mcp", "rm", "--force", "imacs-s1"]);
         assert!(list(&sbx.display().to_string()).unwrap().is_empty());
+        assert!(!record.exists());
         std::fs::remove_file(bin.path().join("fail-policy")).unwrap();
         prepare(&job(&sbx, "imacs-s1", &repo, config)).unwrap();
+        assert!(record.exists());
         assert_eq!(fake::calls_to(bin.path(), &["create"]).len(), 3, "the failed, the removed and the whole one");
         assert_eq!(list(&sbx.display().to_string()).unwrap().len(), 1);
         let missing = job(&bin.path().join("missing-sbx"), "imacs-s1", &repo, SandboxConfig::default());
@@ -689,6 +722,48 @@ mod tests {
         assert!(error.contains(&format!("does not mount {}", git_dir.display())), "{error}");
         assert!(error.contains("sbx rm imacs-old"), "{error}");
         assert_eq!(fake::calls_to(bin.path(), &["create"]).len(), 1);
+    }
+
+    #[test]
+    fn records_of_removed_sandboxes_go_unless_their_folder_changed() {
+        let (dir, repo) = repository();
+        let bin = tempfile::tempdir().unwrap();
+        let sbx = fake::install(bin.path());
+        let pins = bin.path().join("git-pins");
+        let worktree = |name: &str| {
+            let path = dir.path().join(name);
+            git::add_worktree(&repo, &path, name, "main").unwrap();
+            path
+        };
+        let live = worktree("live");
+        prepare(&job(&sbx, "imacs-live", &live, SandboxConfig::default())).unwrap();
+        // Sandboxes that are gone: a worktree as git made it, one whose .git file now names another
+        // folder, a folder outside any repository, and a folder deleted since.
+        let (clean, tampered) = (worktree("clean"), worktree("tampered"));
+        let (plain, deleted) = (dir.path().join("plain"), dir.path().join("deleted"));
+        for (name, folder) in [("clean", &clean), ("tampered", &tampered), ("plain", &plain), ("deleted", &deleted)] {
+            std::fs::create_dir_all(folder).unwrap();
+            pin_git(&pins, &format!("imacs-{name}"), folder).unwrap();
+        }
+        std::fs::write(tampered.join(".git"), format!("gitdir: {}\n", dir.path().join("elsewhere").display())).unwrap();
+        std::fs::remove_dir(&deleted).unwrap();
+        assert!(git::git(&plain, &["status"]).is_err(), "git stays out of a folder outside any repository");
+        let records = || {
+            let mut names: Vec<String> = read_pins(&pins).into_keys().collect();
+            names.sort();
+            names
+        };
+
+        // Without an sbx to ask, nothing is known to be gone.
+        prune_pins(&pins, &bin.path().join("missing-sbx").display().to_string());
+        assert_eq!(records().len(), 5);
+        prune_pins(&pins, &sbx.display().to_string());
+        assert_eq!(records(), ["imacs-live", "imacs-tampered"]);
+        assert!(git::git(&plain, &["status"]).is_err_and(|e| format!("{e:#}").contains("not a git repository")));
+        assert!(git::pinned(&clean).is_none() && git::pinned(&plain).is_none());
+        assert!(git::pinned(&live).is_some() && git::pinned(&tampered).is_some());
+        git::unpin(&git::pinned(&live).unwrap().work_tree);
+        git::unpin(&git::pinned(&tampered).unwrap().work_tree);
     }
 
     #[test]
