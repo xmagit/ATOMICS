@@ -5,6 +5,8 @@ use imacs_core::{config::Config, repo_workflow::RepoWorkflow, workspace::Workspa
 
 /// Resolve a project path, or a project's basename in the selected workspace.
 pub fn run(project: &str, workspace_name: Option<&str>, agent: &str, dotnet_project: Option<&str>) -> Result<()> {
+    // Before any git runs in a folder a sandbox has worked in.
+    load_pins(&paths::git_pins_dir());
     let mut config = Config::load(&paths::config_file())?;
     let saved = workspace_name.map(Workspace::load).transpose()?;
     if let Some(overrides) = saved.as_ref().map(Workspace::isolation).transpose()?.flatten() {
@@ -69,6 +71,11 @@ pub(super) fn build(
         sbx(program, &["policy", "init", config.network.name()], false, TIMEOUT)?;
     }
     let name = format!("imacs-template-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed));
+    // Like an agent's sandbox: the checkout's recorded or checked git locations, and git here runs with
+    // them. Its mounts are all read-only, so this builder writes no record of its own.
+    let pins = current_pins(cwd)?;
+    check_pins(&pins)?;
+    git::pin(pins);
     let (root, git) = super::workspace(cwd)?;
     // sbx requires a writable primary workspace. Give it an empty disposable folder;
     // the selected checkout and git metadata remain read-only secondary mounts.
@@ -151,6 +158,9 @@ mod tests {
         let create = calls.iter().find(|c| c[0] == "create").unwrap();
         assert!(!create.iter().any(|a| a == "--template"), "a rebuild starts from the agent's image");
         assert!(create.contains(&format!("{}:ro", repo.canonicalize().unwrap().display())));
+        // A main checkout's whole .git is one read-only mount here too.
+        assert!(create.contains(&format!("{}/.git:ro", repo.canonicalize().unwrap().display())), "{create:?}");
+        assert!(!create.iter().any(|arg| arg.contains("/.git/")), "{create:?}");
         let primary = Path::new(&create[create.iter().position(|a| a == "codex").unwrap() + 1]);
         assert!(!primary.to_string_lossy().ends_with(":ro"));
         assert!(!primary.exists(), "the disposable primary workspace is removed");
@@ -171,9 +181,31 @@ mod tests {
             exe: "/imacs".into(),
             socket: "/imacs.sock".into(),
             briefs: None,
+            pins: dir.path().join("git-pins"),
         };
         prepare(&job).unwrap();
         assert!(fake::calls_to(dir.path(), &["create"])[1].windows(2).any(|a| a == ["--template", "imacs-cox:local"]));
+    }
+
+    #[test]
+    fn a_template_build_checks_the_checkout_like_an_agents_sandbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = fake::install(dir.path()).display().to_string();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git::git(&repo, &["init", "-q"]).unwrap();
+        std::fs::write(repo.join("Cargo.toml"), "[workspace]\n").unwrap();
+        git::git(&repo, &["config", "extensions.worktreeConfig", "true"]).unwrap();
+        let config = SandboxConfig { template: Some("imacs-test:local".into()), ..Default::default() };
+        let error = format!("{:#}", build(&program, &repo, "codex", None, &config).unwrap_err());
+        assert!(error.contains("extensions.worktreeConfig"), "{error}");
+        assert!(fake::calls_to(dir.path(), &["create"]).is_empty(), "nothing is made for a refused checkout");
+
+        git::git(&repo, &["config", "extensions.worktreeConfig", "false"]).unwrap();
+        build(&program, &repo, "codex", None, &config).unwrap();
+        let pins = git::pinned(&repo).expect("git in the checkout runs with its checked locations");
+        assert_eq!(pins.common_dir, Some(repo.canonicalize().unwrap().join(".git")));
+        git::unpin(&pins.work_tree);
     }
 
     #[test]

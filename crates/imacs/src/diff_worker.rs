@@ -1,6 +1,7 @@
 //! Host diff preparation, coalescing and cache. Publishes results to the runtime.
 use crate::highlight::{Highlighter, Spans};
 use imacs_core::diff::{FileDiff, WorktreeDiff};
+use imacs_core::git::WorktreeFile;
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -142,8 +143,6 @@ impl Cache {
     }
 
     fn load_file(&mut self, root: &Path, path: &str, highlighter: &Highlighter) -> anyhow::Result<Arc<FileView>> {
-        let full = root.join(path);
-        let size = std::fs::metadata(&full)?.len();
         let empty = |note: &str| {
             Arc::new(FileView {
                 lines: Vec::new(),
@@ -152,10 +151,13 @@ impl Cache {
                 note: Some(note.to_string()),
             })
         };
-        if size > MAX_VIEW_BYTES {
-            return Ok(empty("File is too large to show."));
-        }
-        let bytes = std::fs::read(&full)?;
+        // A link is shown as where it points, never opened: in a sandbox's worktree it can point anywhere.
+        let bytes = match imacs_core::git::read_worktree_file(root, path, MAX_VIEW_BYTES) {
+            Some(WorktreeFile::Link(target)) => return Ok(empty(&format!("Symbolic link to {target}"))),
+            Some(WorktreeFile::File { bytes: Some(bytes), .. }) => bytes,
+            Some(WorktreeFile::File { bytes: None, .. }) => return Ok(empty("File is too large to show.")),
+            None => anyhow::bail!("not a file in the worktree"),
+        };
         if bytes[..bytes.len().min(8000)].contains(&0) {
             return Ok(empty("Binary file."));
         }

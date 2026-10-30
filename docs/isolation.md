@@ -260,7 +260,10 @@ config for different templates in a workspace with several projects. Choose the 
 Tags are local to this host and architecture. sbx recognizes saved snapshots and uses its local image
 store; it does not need a registry push. Existing agents keep their existing sandboxes.
 
-The command creates a temporary sandbox from the agent's original image with an empty disposable
+The command checks the checkout as it would for an agent's sandbox: it refuses a git layout git did not
+make and `extensions.worktreeConfig`, and runs git there with the locations IMACS recorded when a sandbox
+has worked in it (see [Git on your machine in a sandboxed folder](#git-on-your-machine-in-a-sandboxed-folder)).
+It then creates a temporary sandbox from the agent's original image with an empty disposable
 primary workspace (sbx requires it to be writable), mounts the checkout and
 its git metadata read-only, and copies tracked source (including tracked local edits) into its own
 filesystem. Untracked credentials, host build output and host toolchain directories are excluded.
@@ -314,8 +317,9 @@ three pre-existing stock images: `docker/sandbox-templates:claude-code-docker` (
 On Linux, IMACS explicitly mounts existing directories from `[worktrees] warm` read-write, at the
 same paths inside the sandbox. These are the worktree's independent reflink copies, so one task does
 not modify another worktree's cache. Missing directories, absolute paths, parent traversal, `.git`
-components and symlinks are skipped. On macOS these mounts are omitted: its compiled artifacts are
-incompatible with the Linux VM. Other configured host mounts stay read-only.
+components and symlinks are skipped, so in a main checkout they sit beside its read-only `.git`, never in
+it. On macOS these mounts are omitted: its compiled artifacts are incompatible with the Linux VM. Other
+configured host mounts stay read-only.
 
 When `target` is a warm folder, `CARGO_TARGET_DIR` points to the worktree's `target`, overriding a
 saved template's internal Cargo cache. Reuse assumes matching Linux architecture, toolchain and
@@ -372,11 +376,59 @@ shared folders, and only some of them are mounted:
 | Agent works in | Also mounted | Not mounted |
 | --- | --- | --- |
 | a linked worktree (every task IMACS creates) | the common dir's `objects`, `refs` and `logs`, and the worktree's own `worktrees/<id>`, read-write | the repository's `hooks`, `config` and everything else in `.git` |
-| a main checkout | nothing more; its `.git/hooks` and `.git/config` are mounted read-only over the writable checkout | |
+| a main checkout | its whole `.git` folder, read-only, as one mount over the writable checkout | |
 
-These mounts are enough to commit, branch and read history. The agent cannot add a git hook or change
-git config that would later run on your machine. Other worktrees, the rest of your home folder, the IMACS
-socket and your credentials stay outside the sandbox.
+In a linked worktree these mounts are enough to commit, branch and read history. In a main checkout the agent
+can edit files but not commit: anything less than the whole `.git` read-only would let it move `.git` aside
+and put one of its own in its place, config and all. A mount point cannot be moved, and sbx enforces
+read-only mounts on your machine's side of the share: root in the VM, which can unmount or remount them,
+still cannot write there. Tasks commit in linked worktrees anyway. A main checkout's sandbox made before
+IMACS mounted `.git` this way is refused; remove it (`sbx rm <name>`) and start the agent again.
+
+The agent cannot add a git hook or change git config that would later run on your machine. Other
+worktrees, the rest of your home folder, the IMACS socket and your credentials stay outside the sandbox.
+
+### Git on your machine in a sandboxed folder
+
+In a linked worktree the sandbox can still write the files that tell git where a repository is: the
+worktree's `.git` file and its `<common>/worktrees/<id>/commondir`. If git on your machine followed them,
+they could lead it to a config of the agent's own, and git would run that config's `core.fsmonitor` on your
+machine. (A main checkout's `.git/commondir` would do the same, which is one reason its `.git` is read-only.)
+IMACS runs git in these folders itself: it polls diffs, checks refs, cleans up worktrees, commits a task
+before merging it, and runs `imacs doctor` and `imacs sandbox template build`.
+
+So when a sandbox is made, before it runs, IMACS records where git finds the folder's repository: the work
+tree, its git folder and the common dir, in `git-pins/<sandbox>.json` in IMACS's state folder, which no
+sandbox mounts. From then on IMACS runs git in that folder with `GIT_DIR`, `GIT_COMMON_DIR` and
+`GIT_WORK_TREE` taken from the record, and never reads them from the folder again, also after a restart and
+for bare agents in the same folder. The record goes with its sandbox: when cleanup removes it, when making
+it fails, and when IMACS starts and sbx no longer has it, however it was removed. A record whose folder no
+longer matches it stays, since the agent may have changed the files git would follow; IMACS logs it, and
+removing the folder (or `git-pins/<sandbox>.json`, once you have checked the folder) lets it go.
+
+- **Layouts git did not make are refused.** A git folder that does not point back at its worktree, or a
+  repository inside the worktree or inside another repository's objects, refs, logs or worktrees, stops
+  the agent from starting.
+- **`extensions.worktreeConfig` is refused.** With it, git reads `config.worktree` in the worktree's own git
+  folder, which the sandbox can write, as repository config. IMACS checks this each time a sandboxed agent
+  starts. Unset it, or set `isolation = "bare"` for agents in that repository.
+- **Submodules are not entered.** A submodule the agent adds could point git at a folder of its choosing,
+  so `git status` and `git diff` run with `--ignore-submodules=dirty`. Changes to a submodule's commit still
+  show; changes inside it do not.
+- **Worktree cleanup checks for changes with the recorded locations**, as strictly as `git worktree remove`
+  does, then removes the worktree with `--force`. `git worktree remove` would check with a git of its own
+  that follows the worktree's files. Worktrees with submodules are left to you.
+- **A folder outside any repository stays that way.** IMACS does not run git in it or in any folder below
+  it while the record exists, whatever `.git` the agent creates there. Once the sandbox is gone and the
+  folder still has no repository, the record goes.
+
+### Symbolic links in a worktree
+
+An agent can make a symbolic link in its worktree that points at any file on your machine, such as a key
+or a credentials file. IMACS shows a link the way git diffs one: as its target path. In the diff, an
+untracked link is a new file whose only line is that path, and in the file viewer a link says where it
+points. IMACS never opens the file a link points to, or a path through a linked folder. This holds in every
+worktree, bare agents' too.
 
 An agent started in a folder outside any repository gets that folder. IMACS refuses to sandbox an agent
 in your home folder or any folder above it, since the sandbox would mount the whole home folder
@@ -392,7 +444,11 @@ mounted read-only.
   its session by the sandbox's name, which stays the same across IMACS restarts.
 - **Status.** Hooks run `imacs hook` on your machine, and a sandbox does not have it. A sandboxed agent's
   status comes from its screen, like any agent without hooks: it is working while it shows
-  `esc to interrupt`.
+  `esc to interrupt`. A question it asks before its first turn, such as a choice menu, a trust, update
+  or sign-in screen, shows as needs you.
+- **Folder trust.** A new sandbox's Codex has never seen its folder, and would stop at "Trust this
+  folder?". IMACS starts sandboxed Codex with the mounted folder trusted
+  (`-c 'projects={ "<folder>" = { trust_level = "trusted" } }'`); the sandbox is the boundary.
 - **Steering and review comments.** These are typed into the tile's terminal, as for any agent.
 - **Approvals.** Sandboxed agents run unattended: Claude uses `bypassPermissions`, and Codex uses
   `approval_policy = "never"`. The VM mounts and sbx network policy replace IMACS approvals. IMACS
@@ -406,11 +462,14 @@ mounted read-only.
 - **Ref recovery.** Refs live in the shared common dir. IMACS saves a host-only snapshot before a
   sandboxed agent starts, checks it at turn boundaries and on exit/close, and restores changed, deleted
   or newly created refs outside the task branches. A persistent red board alert and a blocked report
-  announce recovery or a failed restore. The task branch and concurrent task branches are exempt so
-  legitimate commits survive. This is recovery after a turn, not write isolation: shared refs cannot
+  announce recovery or a failed restore. The task branch, the branches of other running agents and of
+  unfinished plan tasks are exempt so legitimate commits survive. A done task's branch is not: moving it
+  is restored. This is recovery after a turn, not write isolation: shared refs cannot
   identify which concurrent writer moved a ref. Review the diff and branch before integrating.
 - **Objects are data.** Objects an agent writes stay on your machine, and git never executes them. Hooks
-  and config, which do run on your machine, are out of reach.
+  and config, which do run on your machine, are out of reach, and git on your machine finds them through
+  IMACS's record, not the files the agent can write (see
+  [Git on your machine in a sandboxed folder](#git-on-your-machine-in-a-sandboxed-folder)).
 - **The network** is whatever sbx's policy allows, plus `allow_hosts`. `allow-all` gives agents the
   whole internet, which an injected prompt can use to send away code from the worktree.
 - **What you add widens the sandbox.** `mounts` expose folders read-only. `ssh_agent = true` lets an

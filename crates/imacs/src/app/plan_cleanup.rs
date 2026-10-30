@@ -218,7 +218,10 @@ impl Desktop<'_> {
                         let _ = tx.send(Event::Removed(entry, result));
                         for name in sandboxes.into_iter().filter(|_| removed) {
                             let note = match crate::sandbox::remove(&sbx, &name) {
-                                Ok(()) => format!("Removed sandbox {name}"),
+                                Ok(()) => {
+                                    crate::sandbox::forget_pins(&paths::git_pins_dir(), &name);
+                                    format!("Removed sandbox {name}")
+                                }
                                 Err(err) => format!("Kept sandbox {name}: {err:#}"),
                             };
                             let _ = tx.send(Event::Note(note));

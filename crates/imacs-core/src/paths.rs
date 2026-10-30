@@ -232,6 +232,12 @@ pub fn briefs_dir() -> PathBuf {
     imacs_home().join("briefs")
 }
 
+/// Where git finds each sandbox's repository, recorded when the sandbox is made. No sandbox
+/// mounts it.
+pub fn git_pins_dir() -> PathBuf {
+    imacs_home().join("git-pins")
+}
+
 pub fn plan_file() -> PathBuf {
     imacs_home().join("plan.json")
 }

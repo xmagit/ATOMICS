@@ -25,6 +25,8 @@ struct Report {
 }
 
 pub fn run(workspace: Option<&str>) -> i32 {
+    // Worktree checks run git in folders sandboxes have worked in.
+    crate::sandbox::load_pins(&imacs_core::paths::git_pins_dir());
     let report = report(workspace, false, &[]);
     for line in &report.lines {
         println!("{line}");
