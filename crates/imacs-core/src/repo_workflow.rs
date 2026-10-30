@@ -564,6 +564,7 @@ stages = ["accepted", "pr_opened", "qa_passed", "merged"]
             "[isolation]\nmode = 'none'",
             "[isolation]\nmode = 1",
             "[isolation.sandbox]\nssh_agent = true\nmounts = ['/']\nallow_hosts = { '.' = ['**'] }",
+            "[isolation.sandbox.azure]\nenabled = true\nquery_read_exception = true\nresources = { 'evil.example' = 'https://management.azure.com/' }",
         ] {
             let (table, warnings) = declarative(&toml::from_str(text).unwrap());
             assert!(!warnings.is_empty(), "{text}");

@@ -149,7 +149,7 @@ mod tests {
     use super::*;
 
     fn finish(app: &mut Desktop<'_>) {
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(3));
         while app.runtime.heartbeat.pending.is_some() {
             assert!(Instant::now() < deadline, "heartbeat worker did not finish");
             std::thread::sleep(Duration::from_millis(5));
@@ -199,7 +199,9 @@ mod tests {
                 app.runtime.heartbeat();
                 assert!(app.runtime.heartbeat.pending.is_some());
                 finish(app);
-                let ControlOutcome::Done(response) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else {
+                let ControlOutcome::Done(response) =
+                    rx.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(1))).unwrap()
+                else {
                     panic!("wait did not finish")
                 };
                 assert!(response.ok);
@@ -256,7 +258,9 @@ mod tests {
                 app.runtime.heartbeat.started -= Duration::from_secs(300);
                 app.runtime.heartbeat();
                 finish(app);
-                let ControlOutcome::Done(response) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else {
+                let ControlOutcome::Done(response) =
+                    rx.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(1))).unwrap()
+                else {
                     panic!("wait did not finish")
                 };
                 assert_eq!(

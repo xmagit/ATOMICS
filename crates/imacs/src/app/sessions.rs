@@ -314,7 +314,7 @@ impl State {
             // Claude takes any prompt as an argument; other agents may get a brief file.
             briefs,
             pins: paths::git_pins_dir(),
-            relay: (agent.kind == AgentKind::Claude).then(|| self.relay.clone()),
+            relay: Some(self.relay.clone()),
         }))
     }
 
@@ -547,8 +547,10 @@ impl State {
                 None => imacs_core::hook::session_settings(Path::new(&exe), Path::new(&socket), &id, false).to_string(),
                 // Its status line only saves the account's limits in the VM, for IMACS to read back.
                 Some(_) => match &relay {
-                    Some(relay) => isolation::claude_relay_settings(relay.port, &relay.placeholder).to_string(),
-                    None => isolation::claude_settings().to_string(),
+                    Some(relay) if !relay.placeholder.is_empty() => {
+                        isolation::claude_relay_settings(relay.port, &relay.placeholder).to_string()
+                    }
+                    _ => isolation::claude_settings().to_string(),
                 },
             });
             let session_id = match resume {
@@ -587,7 +589,18 @@ impl State {
         };
         let nice = self.config.resources.agent_nice;
         let (program, args) = match &sandboxed {
-            Some(sandboxed) => sandboxed.command(&args),
+            Some(sandboxed) => {
+                let (program, mut run) = sandboxed.command(&args);
+                if let Some(relay) = &relay {
+                    let position = run.iter().position(|arg| arg == "--").unwrap_or(run.len());
+                    let env = relay
+                        .azure_env()
+                        .into_iter()
+                        .flat_map(|(name, value)| ["--env".into(), format!("{name}={value}")]);
+                    run.splice(position..position, env);
+                }
+                (program, run)
+            }
             None if !chief && agent.kind != AgentKind::Shell && nice != 0 => (
                 "nice".to_string(),
                 ["-n".to_string(), nice.to_string(), resolve_program(&program)].into_iter().chain(args).collect(),
@@ -729,6 +742,9 @@ impl State {
         let mut ref_checks = Vec::new();
         for (index, session) in self.sessions.iter_mut().enumerate() {
             let Some(terminal) = &session.terminal else { continue };
+            if !session.approvals.is_empty() {
+                continue;
+            }
             if session.sandbox.is_some()
                 && let Some(reason) = credential_failure(&terminal.screen_text(60))
             {
@@ -1254,7 +1270,7 @@ mod tests {
                         100,
                     )
                     .unwrap();
-                    let deadline = Instant::now() + Duration::from_secs(10);
+                    let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
                     while !terminal.screen_text(60).contains(text) || exit && !terminal.exited() {
                         assert!(Instant::now() < deadline);
                         std::thread::sleep(Duration::from_millis(10));
@@ -1298,7 +1314,7 @@ mod tests {
                     100,
                 )
                 .unwrap();
-                let deadline = Instant::now() + Duration::from_secs(10);
+                let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
                 while !terminal.screen_text(60).contains("Trust") {
                     assert!(Instant::now() < deadline);
                     std::thread::sleep(Duration::from_millis(10));
@@ -1329,7 +1345,7 @@ mod tests {
                 isolation: None,
             });
             let id = app.runtime.start(ctx, "trust-probe", dir.path().into(), None, vec![], None).unwrap();
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
             let home = paths::imacs_home();
             while !home.join("claude/.claude.json").exists() {
                 assert!(Instant::now() < deadline);
@@ -1405,7 +1421,7 @@ mod tests {
                 // SAFETY: querying this process's priority has no preconditions.
                 let inherited_nice = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
                 app.runtime.start(ctx, "probe", dir.path().into(), None, vec![], None).unwrap();
-                let deadline = Instant::now() + Duration::from_secs(60);
+                let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(60));
                 while !out.exists() {
                     assert!(Instant::now() < deadline, "the probe agent never wrote its environment");
                     std::thread::sleep(Duration::from_millis(20));
@@ -1450,7 +1466,7 @@ mod tests {
                 isolation: None,
             });
             app.runtime.start(ctx, "dotnet-probe", dir.path().into(), None, vec![], None).unwrap();
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
             while !out.exists() {
                 assert!(Instant::now() < deadline, "the .NET probe never wrote its environment");
                 std::thread::sleep(Duration::from_millis(20));
@@ -1505,7 +1521,7 @@ fi
             }
             let probe_dir = dir.path().to_path_buf();
             let release = std::thread::spawn(move || {
-                let deadline = Instant::now() + Duration::from_secs(5);
+                let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(5));
                 while ["one", "two"].iter().any(|name| !probe_dir.join(name).join("checks").exists()) {
                     assert!(Instant::now() < deadline, "both asynchronous version probes must start");
                     std::thread::sleep(Duration::from_millis(10));
@@ -1520,7 +1536,7 @@ fi
             assert!(Arc::ptr_eq(&one, &app.runtime.codex_version(ctx, program("one"))));
             let two = app.runtime.codex_version(ctx, program("two"));
             release.join().unwrap();
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(5));
             while one.get().is_none() || two.get().is_none() {
                 assert!(Instant::now() < deadline);
                 std::thread::sleep(Duration::from_millis(10));
@@ -1534,7 +1550,7 @@ fi
             for name in ["one", "one", "two"] {
                 ids.push(app.runtime.start(ctx, name, dir.path().into(), None, vec![], None).unwrap());
             }
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(5));
             while ids
                 .iter()
                 .any(|id| !app.runtime.sessions[app.runtime.find(id).unwrap()].terminal.as_ref().unwrap().exited())
@@ -1613,7 +1629,7 @@ fi
                     let id = app.runtime.start(ctx, "flaky", dir.path().into(), None, vec![], None).unwrap();
                     let retried = app.runtime.codex_versions[&name].clone();
                     assert!(!Arc::ptr_eq(&failed, &retried), "failed probes must not be reused as old versions");
-                    let deadline = Instant::now() + Duration::from_secs(10);
+                    let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
                     while app.runtime.sessions[app.runtime.find(&id).unwrap()]
                         .terminal
                         .as_ref()
@@ -1656,7 +1672,7 @@ fi
                     100,
                 )
                 .unwrap();
-                let deadline = Instant::now() + Duration::from_secs(5);
+                let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(5));
                 while !terminal.screen_text(60).contains("tab to queue") {
                     assert!(Instant::now() < deadline);
                     std::thread::sleep(Duration::from_millis(10));
@@ -1767,7 +1783,7 @@ fi
                     100,
                 )
                 .unwrap();
-                let deadline = Instant::now() + Duration::from_secs(10);
+                let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
                 while !terminal.screen_text(60).contains("tab to queue") {
                     assert!(Instant::now() < deadline);
                     std::thread::sleep(Duration::from_millis(10));
@@ -1894,7 +1910,12 @@ fi
             assert!(!dir.join("timed-out").exists(), "session construction waited for git on the UI thread");
             assert!(session.worktree.is_none());
             std::fs::write(dir.join("ready"), "").unwrap();
-            let worktree = session.worktree_ready.unwrap().recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+            let worktree = session
+                .worktree_ready
+                .unwrap()
+                .recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(5)))
+                .unwrap()
+                .unwrap();
             assert_eq!(worktree.branch.as_deref(), Some("feature"));
             assert_eq!(worktree.root, dir);
             return;

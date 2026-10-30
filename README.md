@@ -237,6 +237,9 @@ a slot and a cold build can take several minutes; agents should use a long timeo
 access outside their sandbox if the IMACS or Docker socket is blocked.
 
 For incremental compilation, use `scripts/linux-qa.sh shell` and run `cargo check --workspace --all-targets --locked`.
+Fixture readiness and cleanup waits share `tests/support.rs::scaled_timeout`: `IMACS_TEST_TIMEOUT_SCALE`
+is a positive multiplier (default 1), with a further ×4 when the one-minute load average exceeds the
+available core count. Deliberate timeout behavior and latency assertions retain their strict budgets.
 During development run only tests you change; reserve the queued full suite for the end. If using the shell for a heavy
 test run or a GUI instance, queue the shell itself with the matching class. Shell changes outside `/repo` are disposable;
 the target and Cargo caches persist.

@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+[ "${AZURE_LOGGING_ENABLE_LOG_FILE:-}" = false ]
+[ "${AZURE_CORE_COLLECT_TELEMETRY:-}" = false ]
+folder=$(dirname "$0")
+printf '%s\n' "$*" >> "$folder/az-argv"
+if [ -f "$folder/az-fail" ]; then
+    echo 'PRIVATE error containing AZURE-REAL' >&2
+    exit 1
+fi
+if [ -f "$folder/az-invalid" ]; then
+    cat "$folder/az-invalid"
+    exit 0
+fi
+expiry=$(cat "$folder/az-expiry")
+number=$(wc -l < "$folder/az-argv" | tr -d ' ')
+printf '{"accessToken":"AZURE-REAL-%s","expires_on":"%s"}\n' "$number" "$expiry"

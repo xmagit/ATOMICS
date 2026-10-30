@@ -86,6 +86,8 @@ pub(super) fn with_state(name: &str, test: impl FnOnce(State, &egui::Context)) {
         paths::imacs_home(),
         crate::relay::Keychain::at(Path::new("/nonexistent/keychain"), cfg!(target_os = "macos")),
     ));
+    // Azure tests install their own fake az; unrelated app tests must not discover the host CLI.
+    app.config.isolation.sandbox.azure.enabled = false;
     // Most tests start from an idle fixture. Tests of asynchronous startup start their
     // own gated sweep after this initial completion, rather than racing fixture setup.
     if let Some(job) = app.startup_cleanup.take() {
@@ -141,7 +143,7 @@ fn themes_reload_live_and_terminals_answer_the_new_colors() {
             state.runtime_tick(ctx);
         };
         let wait_for = |terminal: &Terminal, text: &str| {
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(5));
             while !terminal.screen_text(24).contains(text) {
                 assert!(Instant::now() < deadline, "terminal never showed {text}:\n{}", terminal.screen_text(24));
                 std::thread::sleep(Duration::from_millis(5));
@@ -208,7 +210,7 @@ fn review_followups() {
 pub(super) fn request(app: &mut Desktop<'_>, value: serde_json::Value) -> ControlResponse {
     let (tx, rx) = channel();
     app.runtime.control(&app.runtime.ctx.clone(), serde_json::from_value(value).unwrap(), tx);
-    match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+    match rx.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(2))).unwrap() {
         ControlOutcome::Done(response) => response,
         _ => panic!("unexpected deferred response"),
     }
@@ -348,7 +350,7 @@ fn busy_text_is_only_a_fallback(app: &mut Desktop<'_>, _ctx: &egui::Context) {
         100,
     )
     .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(2));
     while !terminal.screen_text(12).contains("esc to interrupt") {
         assert!(Instant::now() < deadline, "terminal did not produce busy text");
         std::thread::sleep(Duration::from_millis(10));

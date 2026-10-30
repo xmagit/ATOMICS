@@ -35,14 +35,27 @@ impl Drop for TempDir {
 
 pub const CHILD_TIMEOUT: Duration = Duration::from_secs(180);
 
-/// Parallel lower-priority children can wait for CPU while other agents compile. Keep a
-/// bounded hang guard, but allow up to three times the base budget on an overloaded host.
+/// A fixture's hang guard, not the behavior under test. The explicit scale defaults to one;
+/// a one-minute load average above the available core count adds a factor of four.
 pub fn scaled_timeout(base: Duration) -> Duration {
     let mut load = 0.0;
-    let cores = std::thread::available_parallelism().map_or(1, usize::from) as f64;
+    let cores = std::thread::available_parallelism().map_or(1, usize::from);
     let samples = unsafe { libc::getloadavg(&mut load, 1) };
-    let factor = if samples == 1 { (load / cores).ceil().clamp(1.0, 3.0) } else { 1.0 };
-    base.mul_f64(factor)
+    timeout_for_load(
+        base,
+        std::env::var("IMACS_TEST_TIMEOUT_SCALE").ok().as_deref(),
+        (samples == 1).then_some(load),
+        cores,
+    )
+}
+
+fn timeout_for_load(base: Duration, configured: Option<&str>, load: Option<f64>, cores: usize) -> Duration {
+    let scale = configured
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|scale| scale.is_finite() && *scale > 0.0)
+        .unwrap_or(1.0);
+    let busy = load.is_some_and(|load| load > cores.max(1) as f64);
+    Duration::try_from_secs_f64(base.as_secs_f64() * scale * if busy { 4.0 } else { 1.0 }).unwrap_or(base)
 }
 
 /// Capture to files so an inherited pipe writer cannot keep a finished test waiting for EOF.
@@ -136,6 +149,18 @@ pub fn output(command: &mut Command) -> Output {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn fixture_waits_scale_with_configuration_and_one_minute_host_load() {
+        let base = Duration::from_millis(500);
+        assert_eq!(timeout_for_load(base, None, Some(8.0), 8), base);
+        assert_eq!(timeout_for_load(base, None, Some(8.1), 8), base * 4);
+        assert_eq!(timeout_for_load(base, Some("2"), Some(8.1), 8), base * 8);
+        assert_eq!(timeout_for_load(base, Some("2.5"), None, 8), Duration::from_millis(1250));
+        for invalid in ["", "bad", "0", "-1", "NaN", "inf"] {
+            assert_eq!(timeout_for_load(base, Some(invalid), Some(0.0), 8), base);
+        }
+    }
 
     #[test]
     fn timeout_kills_and_reaps_child_with_diagnostics() {

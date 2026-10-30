@@ -740,7 +740,11 @@ mod tests {
                 },
             ];
             app.runtime.dispatch(1, Some("b")).unwrap();
-            let (allocated, prepared, _, _) = app.runtime.worktree_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let (allocated, prepared, _, _) = app
+                .runtime
+                .worktree_rx
+                .recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(5)))
+                .unwrap();
             let prepared = prepared.unwrap();
             assert_eq!(allocated, branch, "another repository must not rename this task's pinned branch");
             assert_eq!(app.runtime.plans[1].tasks[0].branch.as_deref(), Some(branch));
@@ -831,7 +835,7 @@ mod tests {
             let (done, monitor) = std::sync::mpsc::channel::<()>();
             let watchdog = std::thread::spawn(move || {
                 if matches!(
-                    monitor.recv_timeout(Duration::from_secs(5)),
+                    monitor.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(5))),
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout)
                 ) {
                     eprintln!("allocation never returns when an occupied worktree_path cannot vary with the branch");
@@ -877,7 +881,11 @@ mod tests {
                 app.runtime.creating.clear();
                 git::add_worktree(&repo, &fixed, "pinned", "main").unwrap();
                 app.runtime.dispatch(0, Some("a")).unwrap();
-                let (branch, prepared, _, _) = app.runtime.worktree_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                let (branch, prepared, _, _) = app
+                    .runtime
+                    .worktree_rx
+                    .recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(5)))
+                    .unwrap();
                 assert_eq!(branch, "pinned");
                 assert_eq!(prepared.unwrap().path, fixed);
                 app.runtime.plans[0].tasks[0].branch = None;
@@ -938,7 +946,11 @@ mod tests {
                 assert_eq!(app.runtime.dispatch(0, None).unwrap(), ["eng", "ops"]);
                 let mut trees = HashMap::new();
                 for _ in 0..2 {
-                    let (branch, result, _, _) = app.runtime.worktree_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    let (branch, result, _, _) = app
+                        .runtime
+                        .worktree_rx
+                        .recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(5)))
+                        .unwrap();
                     trees.insert(branch, result.unwrap().path);
                 }
                 let eng = "issue/42-fix-parser";
@@ -953,7 +965,11 @@ mod tests {
                 app.runtime.plans[0].tasks[0].set_status(TaskStatus::Planned);
                 app.runtime.config.tickets.branch = Some("changed/{key}".into());
                 app.runtime.dispatch(0, Some("eng")).unwrap();
-                let (branch, result, _, _) = app.runtime.worktree_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                let (branch, result, _, _) = app
+                    .runtime
+                    .worktree_rx
+                    .recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(5)))
+                    .unwrap();
                 assert_eq!(branch, eng);
                 assert_eq!(result.unwrap().path, trees[eng]);
 
@@ -971,7 +987,11 @@ mod tests {
                         isolation: None,
                     },
                 );
-                let (_, result, _, _) = app.runtime.worktree_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                let (_, result, _, _) = app
+                    .runtime
+                    .worktree_rx
+                    .recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(5)))
+                    .unwrap();
                 assert!(result.is_err());
 
                 // Reserve another plan's name and an unmanaged branch, including the next suffix.
@@ -995,7 +1015,11 @@ mod tests {
                     ..Default::default()
                 });
                 app.runtime.dispatch(1, None).unwrap();
-                let (branch, result, _, _) = app.runtime.worktree_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                let (branch, result, _, _) = app
+                    .runtime
+                    .worktree_rx
+                    .recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(5)))
+                    .unwrap();
                 assert_eq!(branch, "issue/42-fix-parser-5");
                 assert!(!trees.values().any(|path| *path == result.as_ref().unwrap().path));
                 assert_eq!(git::worktree_of(&result.unwrap().path).unwrap().branch, Some(branch));
@@ -1081,8 +1105,11 @@ mod tests {
                 app.runtime.selected_plan = 0;
                 app.runtime.config.isolation.mode = imacs_core::isolation::IsolationMode::Sandbox;
                 app.runtime.dispatch(0, Some(plan::REVIEW_TASK)).unwrap();
-                let (branch, worktree, launch, _) =
-                    app.runtime.worktree_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                let (branch, worktree, launch, _) = app
+                    .runtime
+                    .worktree_rx
+                    .recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(5)))
+                    .unwrap();
                 let brief = launch.prompt.unwrap();
                 assert!(
                     brief.contains("Run the plan's builds and tests yourself, here in your own sandbox"),
@@ -1246,7 +1273,7 @@ mod tests {
                     approval_reply: None,
                 });
                 assert!(app.runtime.find("worker").is_none(), "late shutdown hooks must not recreate a closed agent");
-                let deadline = Instant::now() + Duration::from_secs(5);
+                let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(5));
                 while std::process::Command::new("ps")
                     .args(["-p", &pid.to_string(), "-o", "pid="])
                     .output()
@@ -1372,7 +1399,7 @@ mod tests {
                 assert!(!output.exists(), "a completed plan cannot resume without an explicit reopen");
                 app.runtime.reopen_plan(index).unwrap();
                 app.runtime.task_action(index, 0, "resume");
-                let deadline = Instant::now() + Duration::from_secs(5);
+                let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(5));
                 let args = loop {
                     let args = std::fs::read_to_string(&output).unwrap_or_default();
                     if args.contains("test-model") {
@@ -1461,7 +1488,11 @@ mod tests {
                 assert_eq!(app.runtime.plans[0].tasks[0].status, TaskStatus::Blocked);
                 assert_eq!(app.runtime.plans[0].tasks[0].notes, ["the agent exited before reporting"]);
                 // Finish the worktree job before its temporary repository is removed.
-                let (_, result, _, _) = app.runtime.worktree_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                let (_, result, _, _) = app
+                    .runtime
+                    .worktree_rx
+                    .recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(5)))
+                    .unwrap();
                 result.unwrap();
             },
         );
@@ -1619,7 +1650,7 @@ mod tests {
                     assert!(app.runtime.plan_view && app.runtime.panel == PanelMode::Diff);
                     assert_eq!(app.runtime.chief_open, dock == ChiefDock::Docked);
                     assert!(!app.runtime.changed_plans.contains(&app.runtime.plans[index].id));
-                    let deadline = Instant::now() + Duration::from_secs(10);
+                    let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
                     while !app.runtime.creating.is_empty() {
                         assert!(Instant::now() < deadline);
                         app.runtime.runtime_tick(ctx);
@@ -1675,7 +1706,7 @@ mod tests {
                 assert!(app.runtime.toast.as_ref().unwrap().0.starts_with("Plan updated:"));
                 app.runtime.plans[one].approved = true;
                 assert!(request(app, json!({"cmd":"plan_dispatch", "plan":first, "id":"a"})).ok);
-                let deadline = Instant::now() + Duration::from_secs(10);
+                let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
                 while !app.runtime.creating.is_empty() {
                     assert!(Instant::now() < deadline);
                     app.runtime.runtime_tick(ctx);
@@ -1945,7 +1976,7 @@ mod tests {
                 assert!(app.runtime.changed_plans.contains(&app.runtime.plans[one].id));
                 app.runtime.selected_plan = two;
                 app.runtime.show_plan_fleet();
-                let deadline = Instant::now() + Duration::from_secs(10);
+                let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
                 while !app.runtime.creating.is_empty() && Instant::now() < deadline {
                     app.runtime.runtime_tick(ctx);
                     std::thread::sleep(Duration::from_millis(10));

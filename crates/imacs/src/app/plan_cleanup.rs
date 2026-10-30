@@ -373,7 +373,7 @@ mod tests {
                 click(app, "Clean up plan…");
                 // The preview runs several git commands per worktree; while the whole suite runs, one
                 // git call can take half a second. The bound only guards against a hang.
-                let deadline = Instant::now() + Duration::from_secs(30);
+                let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(30));
                 while app.runtime.plan_cleanup.as_ref().unwrap().busy {
                     assert!(Instant::now() < deadline);
                     app.runtime.runtime_tick(ctx);
@@ -406,7 +406,7 @@ mod tests {
                         );
                     }
                 }
-                let deadline = Instant::now() + Duration::from_secs(10);
+                let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
                 while app.runtime.plan_cleanup.as_ref().unwrap().busy {
                     assert!(Instant::now() < deadline);
                     app.runtime.runtime_tick(ctx);

@@ -1153,7 +1153,7 @@ mod tests {
         let (tx, rx) = channel();
         app.runtime.control(&app.runtime.ctx.clone(), serde_json::from_value(value).unwrap(), tx);
         settle(app);
-        match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+        match rx.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(2))).unwrap() {
             ControlOutcome::Done(response) => response,
             _ => panic!("unexpected deferred response"),
         }
@@ -1468,7 +1468,7 @@ mod tests {
 
     /// Runs ticket jobs, and the pushes they lead to, until none are left.
     fn settle(app: &mut Desktop<'_>) {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(30));
         loop {
             app.runtime.ticket_results();
             app.runtime.push_ticket_states(None);
@@ -1586,7 +1586,12 @@ mod tests {
             // Dispatching posts the brief, signed by the chief, and moves the ticket to running.
             app.runtime.plans[index].approved = true;
             app.runtime.dispatch(index, Some("a")).unwrap();
-            app.runtime.worktree_rx.recv_timeout(Duration::from_secs(10)).unwrap().1.unwrap();
+            app.runtime
+                .worktree_rx
+                .recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(10)))
+                .unwrap()
+                .1
+                .unwrap();
             settle(app);
             assert_eq!(ticket(&state, "CARD-1")["state"], "Doing");
             let dispatched = &comments(&state, "CARD-1")[0];
@@ -1641,7 +1646,9 @@ mod tests {
             set_field(&state, "CARD-2", "state", "Doing");
             app.runtime.ticket_heartbeat();
             settle(app);
-            let ControlOutcome::Done(waited) = waiter.recv_timeout(Duration::from_secs(1)).unwrap() else {
+            let ControlOutcome::Done(waited) =
+                waiter.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(1))).unwrap()
+            else {
                 panic!("wait did not finish")
             };
             let event = &waited.result["events"][0];
@@ -1731,7 +1738,12 @@ mod tests {
 
             app.runtime.plans[index].approved = true;
             app.runtime.dispatch(index, Some("a")).unwrap();
-            app.runtime.worktree_rx.recv_timeout(Duration::from_secs(10)).unwrap().1.unwrap();
+            app.runtime
+                .worktree_rx
+                .recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(10)))
+                .unwrap()
+                .1
+                .unwrap();
             settle(app);
             assert_eq!(ticket(&state, "ISS-1")["state"], "In Progress");
             assert!(comments(&state, "ISS-1")[0].contains("Dispatched task a (Add --json) to Claude"));
@@ -1835,7 +1847,8 @@ mod tests {
         with_app("app::tickets::tests::failures_show_on_the_link_and_never_block_the_plan", |app, _| {
             let dir = crate::test_support::tempdir().unwrap();
             let state = tickets_fixture(dir.path(), "CARD");
-            configure(app, CARDS, &state, |config| config.timeout_secs = 1);
+            // Startup and ordinary error replies are fixture readiness, not the timeout behavior.
+            configure(app, CARDS, &state, |_| {});
             edit_fake(&state, |fake| fake["fail"] = json!(["card_move", "card_note"]));
             let plan = request(
                 app,
@@ -1869,14 +1882,22 @@ mod tests {
                 tx,
             );
             settle(app);
-            let ControlOutcome::Done(commented) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else { panic!() };
+            let ControlOutcome::Done(commented) =
+                rx.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(1))).unwrap()
+            else {
+                panic!()
+            };
             assert!(commented.error.unwrap().contains("card_note is broken today"));
 
             edit_fake(&state, |fake| fake["fail"] = json!([]));
             let (tx, rx) = channel();
             app.runtime.sync_tickets(Some(plan.clone()), tx);
             settle(app);
-            let ControlOutcome::Done(synced) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else { panic!() };
+            let ControlOutcome::Done(synced) =
+                rx.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(1))).unwrap()
+            else {
+                panic!()
+            };
             assert!(synced.ok && synced.result["errors"] == json!([]), "{:?}", synced.result);
             // The reply waits for the retried state update and the read after it.
             let replied = &synced.result["plans"][0]["tasks"][0]["ticket"];
@@ -1885,6 +1906,10 @@ mod tests {
             assert_eq!((healed.state.as_deref(), healed.error.as_deref()), (Some("Doing"), None));
 
             // A server that stops answering times out, and the next jobs fail at once.
+            app.runtime.config.tickets.timeout_secs = 1;
+            // Use a fresh worker/connection for the deliberately short behavior deadline.
+            app.runtime.tickets.jobs.take();
+            app.runtime.apply_ticket_config();
             edit_fake(&state, |fake| fake["hang"] = json!(["card_get"]));
             let started = Instant::now();
             app.runtime.ticket_heartbeat();
@@ -1944,12 +1969,20 @@ mod tests {
                 ControlRequest::TicketComment { plan: Some(plan.clone()), task: Some("a".into()), text: "Hi".into() };
             app.runtime.control(ctx, comment, tx);
             settle(app);
-            let ControlOutcome::Done(commented) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else { panic!() };
+            let ControlOutcome::Done(commented) =
+                rx.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(1))).unwrap()
+            else {
+                panic!()
+            };
             assert!(commented.error.unwrap_or_default().contains("belongs to cards"));
             let (tx, rx) = channel();
             app.runtime.sync_tickets(Some(plan.clone()), tx);
             settle(app);
-            let ControlOutcome::Done(synced) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else { panic!() };
+            let ControlOutcome::Done(synced) =
+                rx.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(1))).unwrap()
+            else {
+                panic!()
+            };
             assert!(synced.result["errors"].to_string().contains("belongs to cards"), "{}", synced.result);
             request(app, json!({"cmd":"ticket_event", "key":"CARD-1", "state":"Gone"}));
             settle(app);
@@ -1976,7 +2009,7 @@ mod tests {
             };
             app.runtime.control(ctx, linked, tx);
             settle(app);
-            rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            rx.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(1))).unwrap();
             assert_eq!(link(app, index, 1).system, "issues");
             assert_eq!(tools(&issues), ["issue_read"]);
             configure(app, CARDS, &cards, |_| {});
@@ -2021,10 +2054,12 @@ mod tests {
                 let created = send(app, "a", None);
                 let linked = send(app, "a", Some("2"));
                 settle(app);
-                let ControlOutcome::Done(created) = created.recv_timeout(Duration::from_secs(1)).unwrap() else {
+                let ControlOutcome::Done(created) =
+                    created.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(1))).unwrap()
+                else {
                     panic!()
                 };
-                linked.recv_timeout(Duration::from_secs(1)).unwrap();
+                linked.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(1))).unwrap();
                 assert_eq!(link(app, index, 0).label(), "CARD-2", "the newer link stays");
                 assert!(created.result["errors"].to_string().contains("superseded"), "{:?}", created);
 
@@ -2034,7 +2069,7 @@ mod tests {
                 let other = tickets_fixture(&dir.path().join("issues"), "ISS");
                 configure(app, ISSUES, &other, |config| config.mode = TicketMode::Board);
                 settle(app);
-                created.recv_timeout(Duration::from_secs(1)).unwrap();
+                created.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(1))).unwrap();
                 let b = link(app, index, 1);
                 assert!(b.label().starts_with("NEW-"));
                 assert_eq!(b.system, "cards");
@@ -2065,7 +2100,7 @@ mod tests {
                 ControlRequest::TicketComment { plan: Some(plan.clone()), task: Some("a".into()), text: "Note".into() };
             app.runtime.control(ctx, comment, tx);
             settle(app);
-            rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            rx.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(1))).unwrap();
             let moved: Vec<_> = app.runtime.events.iter().filter_map(|e| e.ticket.clone()).collect();
             assert_eq!(moved.len(), 1, "the read after the comment saw someone else's change");
             assert_eq!((moved[0]["from"].as_str(), moved[0]["to"].as_str()), (Some("Doing"), Some("Stuck")));
@@ -2109,7 +2144,7 @@ mod tests {
                     .ok
                 );
                 settle(app);
-                created.recv_timeout(Duration::from_secs(1)).unwrap();
+                created.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(1))).unwrap();
                 assert_eq!(app.runtime.plans[index].tasks[0].id, "t1");
                 assert_eq!(link(app, index, 0).label(), "CARD-2", "the plan_set link stays");
             },
@@ -2150,11 +2185,19 @@ mod tests {
             ] {
                 let (tx, rx) = channel();
                 app.runtime.control(ctx, invalid, tx);
-                let ControlOutcome::Done(rejected) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else { panic!() };
+                let ControlOutcome::Done(rejected) =
+                    rx.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(1))).unwrap()
+                else {
+                    panic!()
+                };
                 assert!(!rejected.ok);
             }
             settle(app);
-            let ControlOutcome::Done(created) = created.recv_timeout(Duration::from_secs(1)).unwrap() else { panic!() };
+            let ControlOutcome::Done(created) =
+                created.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(1))).unwrap()
+            else {
+                panic!()
+            };
             assert!(created.ok && created.result["errors"] == json!([]), "{:?}", created);
             assert!(link(app, index, 0).label().starts_with("NEW-"), "the created ticket is attached");
         });
@@ -2197,7 +2240,9 @@ mod tests {
                 app.runtime.control(ctx, comment, tx);
                 configure(app, CARDS, &state, with_key("bravo-key-2e8f4a"));
                 settle(app);
-                let ControlOutcome::Done(commented) = commented.recv_timeout(Duration::from_secs(1)).unwrap() else {
+                let ControlOutcome::Done(commented) =
+                    commented.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(1))).unwrap()
+                else {
                     panic!()
                 };
                 let reply = commented.error.unwrap();
@@ -2217,7 +2262,9 @@ mod tests {
                 let (tx, synced) = channel();
                 app.runtime.sync_tickets(Some(plan.clone()), tx);
                 settle(app);
-                let ControlOutcome::Done(synced) = synced.recv_timeout(Duration::from_secs(1)).unwrap() else {
+                let ControlOutcome::Done(synced) =
+                    synced.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(1))).unwrap()
+                else {
                     panic!()
                 };
                 let errors = synced.result["errors"].to_string();
@@ -2289,7 +2336,7 @@ mod tests {
             app.runtime.control(ctx, linked, tx);
             assert_eq!(link(app, index, 2).url.as_deref(), Some("https://cards.example/3"), "cleaned as given");
             settle(app);
-            rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            rx.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(1))).unwrap();
 
             let saved =
                 std::fs::read_to_string(paths::imacs_home().join("plans").join(format!("{plan}.json"))).unwrap();
@@ -2358,7 +2405,9 @@ mod tests {
                 // A webhook's state split across lines reaches the link, the wait event and the toast.
                 let waiter = wait_for(app, ctx, &["ticket"]);
                 request(app, json!({"cmd":"ticket_event", "key":"ENG-1", "state":"Blocked by sk-split-\n 9e8d7c"}));
-                let ControlOutcome::Done(event) = waiter.recv_timeout(Duration::from_secs(1)).unwrap() else {
+                let ControlOutcome::Done(event) =
+                    waiter.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(1))).unwrap()
+                else {
                     panic!()
                 };
                 assert_eq!(link(app, index, 0).state.as_deref(), Some("Blocked by ***"));
@@ -2413,7 +2462,11 @@ mod tests {
                 ControlRequest::TicketComment { plan: Some(plan.clone()), task: Some("a".into()), text: "Hi".into() };
             app.runtime.control(ctx, comment, tx);
             settle(app);
-            let ControlOutcome::Done(commented) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else { panic!() };
+            let ControlOutcome::Done(commented) =
+                rx.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(1))).unwrap()
+            else {
+                panic!()
+            };
             let reply = commented.error.unwrap();
 
             // A token split across two content blocks, joined with a newline on the way in.
@@ -2423,7 +2476,11 @@ mod tests {
                 ControlRequest::TicketComment { plan: Some(plan.clone()), task: Some("a".into()), text: "Hi".into() };
             app.runtime.control(ctx, comment, tx);
             settle(app);
-            let ControlOutcome::Done(split) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else { panic!() };
+            let ControlOutcome::Done(split) =
+                rx.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(1))).unwrap()
+            else {
+                panic!()
+            };
             let split = split.error.unwrap();
             assert!(!split.contains("7f3a9c") && !split.contains("sk-synthe"), "{split}");
             assert!(split.contains("rejected key ***, try again"), "masked in place: {split}");
@@ -2470,7 +2527,7 @@ mod tests {
                 let (tx, rx) = channel();
                 app.runtime.control(ctx, serde_json::from_value(value).unwrap(), tx);
                 settle(app);
-                match rx.recv_timeout(Duration::from_secs(1)).unwrap() {
+                match rx.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(1))).unwrap() {
                     ControlOutcome::Done(response) => response,
                     _ => panic!("deferred"),
                 }
@@ -2620,7 +2677,7 @@ mod tests {
                     );
                     settle(app);
                     let ControlOutcome::Done(result) = waiter
-                        .recv_timeout(Duration::from_secs(1))
+                        .recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(1)))
                         .unwrap_or_else(|error| panic!("{scenario}: {error:?}"))
                     else {
                         panic!("wait reply")

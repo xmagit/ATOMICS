@@ -79,6 +79,33 @@ pub struct SandboxConfig {
     pub ssh_agent: bool,
     /// MCP servers registered with `sbx mcp add`, loaded into every sandbox.
     pub mcp: Vec<String>,
+    /// Host-side Azure CLI credentials available through the relay, never inside the VM.
+    pub azure: AzureConfig,
+}
+
+/// `[isolation.sandbox.azure]`. Repositories cannot override these credential capabilities.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AzureConfig {
+    pub enabled: bool,
+    /// Allow POST /v1/apps/<app-id>/query as a read, without write approval.
+    pub query_read_exception: bool,
+    /// Upstream host → Azure token audience. Only explicitly listed hosts are reachable.
+    pub resources: BTreeMap<String, String>,
+}
+
+impl Default for AzureConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            query_read_exception: false,
+            resources: [
+                ("api.applicationinsights.io".into(), "https://api.applicationinsights.io".into()),
+                ("management.azure.com".into(), "https://management.azure.com/".into()),
+            ]
+            .into(),
+        }
+    }
 }
 
 impl IsolationConfig {

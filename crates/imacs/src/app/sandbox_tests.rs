@@ -192,6 +192,49 @@ fn probe(name: &str, out: &Path, isolation: Option<IsolationMode>) -> imacs_core
 }
 
 #[test]
+fn azure_placeholders_reach_claude_and_codex_and_are_revoked_on_close() {
+    with_app("app::sandbox_tests::azure_placeholders_reach_claude_and_codex_and_are_revoked_on_close", |app, ctx| {
+        let (_dir, repo) = repository();
+        let bin = crate::test_support::tempdir().unwrap();
+        app.runtime.sbx = fake::install(bin.path()).display().to_string();
+        app.runtime.config.isolation.mode = IsolationMode::Sandbox;
+        let config = imacs_core::isolation::AzureConfig::default();
+        app.runtime.config.isolation.sandbox.azure = config.clone();
+        let program = crate::relay::azure::tests::fake(bin.path());
+        app.runtime.relay = Arc::new(
+            crate::relay::Service::new(
+                paths::imacs_home(),
+                crate::relay::Keychain::at(Path::new("/no-keychain"), false),
+            )
+            .with_azure(crate::relay::azure::Azure::new(program, config)),
+        );
+        for agent in ["claude", "codex"] {
+            let id = app.runtime.start(ctx, agent, repo.clone(), None, vec![], None).unwrap();
+            let name = format!("imacs-{id}");
+            tick_until(app, ctx, "the Azure-enabled sandbox to attach", |_| {
+                fake::calls_to(bin.path(), &["run"]).iter().any(|run| run.contains(&name))
+            });
+            let index = app.runtime.find(&id).unwrap();
+            let granted = app.runtime.sessions[index].relay.clone().unwrap();
+            assert!(granted.placeholder.is_empty());
+            let placeholder = granted.azure.as_ref().unwrap();
+            assert!(placeholder.starts_with("imacs-azure-"));
+            for verb in ["create", "run"] {
+                let call = fake::calls_to(bin.path(), &[verb]).into_iter().find(|call| call.contains(&name)).unwrap();
+                assert!(call.contains(&format!("IMACS_AZURE_BEARER={placeholder}")));
+                assert!(call.contains(&format!("IMACS_AZURE_RELAY_URL=http://host.docker.internal:{}", granted.port)));
+                assert!(!call.iter().any(|arg| arg.contains("AZURE-REAL")));
+            }
+            assert!(!bin.path().join("az-argv").exists(), "granting never fetches a real token");
+            assert_eq!(app.runtime.relay.live_grants(), 1);
+            app.runtime.close(&id);
+            assert_eq!(app.runtime.relay.live_grants(), 0);
+        }
+        finish_agents(app, ctx);
+    });
+}
+
+#[test]
 fn sandboxed_agents_attach_through_sbx_run_and_reattach_after_a_restart() {
     with_app("app::sandbox_tests::sandboxed_agents_attach_through_sbx_run_and_reattach_after_a_restart", |app, ctx| {
         let (_dir, repo) = repository();
@@ -545,7 +588,7 @@ fn chief_checks_run_in_the_session_sandbox_and_bare_sessions_are_refused() {
             let exec = |app: &mut Desktop<'_>, request: serde_json::Value| {
                 let (tx, rx) = channel();
                 app.runtime.control(ctx, serde_json::from_value(request).unwrap(), tx);
-                match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                match rx.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(2))).unwrap() {
                     ControlOutcome::Exec { job, session, then } => (job, session, then),
                     _ => panic!("a sandboxed session's command runs on the socket thread"),
                 }
