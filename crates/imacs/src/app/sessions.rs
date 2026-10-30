@@ -625,7 +625,7 @@ impl State {
                 session.busy_absent_since = None;
             }
             let new_turn = busy && !session.screen_busy;
-            if session.screen_busy && !busy {
+            if new_turn || session.screen_busy && !busy {
                 ref_checks.push(index);
             }
             session.screen_busy = busy;

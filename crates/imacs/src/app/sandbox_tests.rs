@@ -442,3 +442,147 @@ fn a_tasks_isolation_wins_over_the_agent_and_mode_but_never_over_a_repository() 
         },
     );
 }
+
+#[test]
+fn sandboxed_fake_agent_moving_main_is_restored_and_alerts_the_board() {
+    with_app("app::sandbox_tests::sandboxed_fake_agent_moving_main_is_restored_and_alerts_the_board", |app, ctx| {
+        let (_dir, repo) = repository();
+        let original = git::git(&repo, &["rev-parse", "main"]).unwrap();
+        let worktree = worktree(&repo, "task");
+        let bin = tempfile::tempdir().unwrap();
+        app.runtime.sbx = fake::install(bin.path()).display().to_string();
+        app.runtime.config.isolation.mode = IsolationMode::Sandbox;
+        std::fs::write(bin.path().join("agent"),
+            "git -c user.name=Test -c user.email=test@example.org commit --allow-empty -qm task\ngit update-ref refs/heads/main HEAD\n").unwrap();
+        let id = app.runtime.start(ctx, "codex", worktree.clone(), None, vec![], Some("Do the task".into())).unwrap();
+        app.runtime.plans = vec![Plan {
+            id: "guard-plan".into(),
+            tasks: vec![Task {
+                id: "task".into(),
+                session: Some(id.clone()),
+                worktree: Some(worktree.clone()),
+                branch: Some("task".into()),
+                status: TaskStatus::Running,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        tick_until(app, ctx, "ref recovery on agent exit", |app| app.runtime.plans[0].tasks[0].ref_alert.is_some());
+        assert_eq!(git::git(&repo, &["rev-parse", "main"]).unwrap(), original);
+        assert_ne!(git::git(&worktree, &["rev-parse", "HEAD"]).unwrap(), original);
+        let alert = app.runtime.plans[0].tasks[0].ref_alert.as_deref().unwrap();
+        assert!(alert.contains("SANDBOX REF GUARD") && alert.contains("Restored refs/heads/main"), "{alert}");
+        assert!(app.runtime.plans[0].tasks[0].notes.iter().any(|note| note.contains("Restored refs/heads/main")));
+        app.runtime.sessions.clear();
+    });
+}
+
+#[test]
+fn sandbox_briefs_are_mounted_read_only_and_reports_use_the_sandbox_identity() {
+    with_app(
+        "app::sandbox_tests::sandbox_briefs_are_mounted_read_only_and_reports_use_the_sandbox_identity",
+        |app, ctx| {
+            let (_dir, repo) = repository();
+            let worktree = worktree(&repo, "task");
+            let bin = tempfile::tempdir().unwrap();
+            app.runtime.sbx = fake::install(bin.path()).display().to_string();
+            app.runtime.config.isolation.mode = IsolationMode::Sandbox;
+            std::fs::write(bin.path().join("run-waits"), "").unwrap();
+            let config = app
+                .runtime
+                .config
+                .isolation
+                .sandbox
+                .with_defaults(&app.runtime.config.resources, app.runtime.governor.cores);
+            let task = Task { id: "task".into(), brief: "Read this long brief. ".repeat(80), ..Default::default() };
+            let text = task.compose_brief_for("Sandbox task", Some(&config));
+            assert!(!text.contains("imacs queue"));
+            assert!(text.contains("CPUs and 8g memory"));
+            let id = app.runtime.start(ctx, "codex", worktree, None, vec![], Some(text.clone())).unwrap();
+            tick_until(app, ctx, "the sandboxed agent", |_| bin.path().join("run-ssh").exists());
+            let name = format!("imacs-{id}");
+            let brief = paths::briefs_dir().join(&id).join("brief.md");
+            assert_eq!(std::fs::read_to_string(&brief).unwrap(), text);
+            let create = fake::calls_to(bin.path(), &["create"]).pop().unwrap();
+            assert!(create.contains(&format!("{}:ro", brief.parent().unwrap().display())), "{create:?}");
+            let run = fake::calls_to(bin.path(), &["run"]).pop().unwrap();
+            assert!(run.last().unwrap().contains(&brief.display().to_string()));
+            let report = request(app, json!({"cmd":"report", "pane":name, "status":"done", "summary":"VM finished"}));
+            assert!(report.ok, "{report:?}");
+            let session = &app.runtime.sessions[app.runtime.find(&id).unwrap()];
+            assert_eq!(session.status, AgentStatus::Done);
+            assert!(app.runtime.events.iter().any(|event| event.session == id && event.status == AgentStatus::Done));
+            assert!(session.approvals.is_empty());
+            app.runtime.close(&id);
+        },
+    );
+}
+
+#[test]
+fn sandbox_screen_fallback_debounces_quiet_and_respects_reports_until_the_next_turn() {
+    with_app(
+        "app::sandbox_tests::sandbox_screen_fallback_debounces_quiet_and_respects_reports_until_the_next_turn",
+        |app, ctx| {
+            let (_dir, repo) = repository();
+            let worktree = worktree(&repo, "task");
+            for (agent, kind) in [("claude", AgentKind::Claude), ("codex", AgentKind::Generic)] {
+                let mut session = super::tests::session(agent, kind, AgentStatus::Starting, &worktree);
+                session.agent = agent.into();
+                session.sandbox = Some(format!("imacs-{agent}"));
+                // Stale host hooks must not disable screen detection inside the VM.
+                session.hooks_active = true;
+                app.runtime.sessions = vec![session];
+                let screen = |app: &mut Desktop<'_>, text: &str| {
+                    let terminal = Terminal::spawn(
+                        app.runtime.wake.clone(),
+                        app.runtime.palette.terminal_colors(),
+                        "/bin/sh".into(),
+                        vec!["-c".into(), format!("printf '%s' '{text}'; exec sleep 30")],
+                        &worktree,
+                        HashMap::new(),
+                        100,
+                    )
+                    .unwrap();
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while !terminal.screen_text(60).contains(text) {
+                        assert!(Instant::now() < deadline, "screen did not appear");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    app.runtime.sessions[0].terminal = Some(terminal);
+                };
+                let track = |app: &mut Desktop<'_>| {
+                    app.runtime.busy_checked = Instant::now() - Duration::from_secs(1);
+                    app.runtime.track_busy();
+                };
+                screen(app, "Working (Esc to interrupt)");
+                track(app);
+                assert_eq!(app.runtime.sessions[0].status, AgentStatus::Working, "{agent}");
+                screen(app, "Ready");
+                track(app);
+                assert_eq!(app.runtime.sessions[0].status, AgentStatus::Working, "transient redraw");
+                app.runtime.sessions[0].busy_absent_since = Some(Instant::now() - Duration::from_secs(1));
+                track(app);
+                assert_eq!(app.runtime.sessions[0].status, AgentStatus::Done);
+                screen(app, "Working (esc to interrupt)");
+                track(app);
+                assert_eq!(app.runtime.sessions[0].status, AgentStatus::Working);
+                for (status, expected) in [("done", AgentStatus::Done), ("question", AgentStatus::NeedsInput)] {
+                    let pane = format!("imacs-{agent}");
+                    assert!(request(app, json!({"cmd":"report","pane":pane,"status":status,"summary":"VM report"})).ok);
+                    track(app);
+                    assert_eq!(app.runtime.sessions[0].status, expected, "stale busy footer cannot override a report");
+                }
+                screen(app, "Ready");
+                app.runtime.sessions[0].busy_absent_since = Some(Instant::now() - Duration::from_secs(1));
+                track(app);
+                assert_eq!(app.runtime.sessions[0].status, AgentStatus::NeedsInput);
+                screen(app, "Working (esc to interrupt)");
+                track(app);
+                assert_eq!(app.runtime.sessions[0].status, AgentStatus::Working, "new turn resumes screen detection");
+                app.runtime.runtime_tick(ctx);
+                assert!(app.runtime.sessions[0].approvals.is_empty());
+                app.runtime.sessions.clear();
+            }
+        },
+    );
+}

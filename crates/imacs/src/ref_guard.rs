@@ -148,6 +148,55 @@ fn read_loose(dir: &Path, prefix: &str, refs: &mut BTreeMap<String, RefValue>) -
     Ok(())
 }
 
+/// Compare-and-swap under Git's ref lock. `no-deref` prevents a malicious symbolic ref from
+/// making restoration write through to a different branch.
+fn restore(cwd: &Path, name: &str, before: Option<&RefValue>, after: Option<&RefValue>) -> Result<()> {
+    // Older Git versions have no symbolic-ref transactions. Recheck before those operations;
+    // ordinary branch/tag OIDs below use Git's atomic old-value check.
+    if matches!(before, Some(RefValue::Symbolic(_))) || matches!(after, Some(RefValue::Symbolic(_))) {
+        if read_refs(cwd)?.get(name) != after {
+            bail!("ref changed again during recovery");
+        }
+        match before {
+            Some(RefValue::Symbolic(target)) => {
+                git::git(cwd, &["symbolic-ref", name, target])?;
+            }
+            Some(RefValue::Object(object)) => {
+                git::git(cwd, &["update-ref", "--no-deref", name, object])?;
+            }
+            None => {
+                git::git(cwd, &["update-ref", "--no-deref", "-d", name])?;
+            }
+        }
+        return Ok(());
+    }
+    let operation = match (before, after) {
+        (Some(RefValue::Object(object)), Some(RefValue::Object(old))) => format!("update {name} {object} {old}"),
+        (Some(RefValue::Object(object)), None) => format!("create {name} {object}"),
+        (None, Some(RefValue::Object(old))) => format!("delete {name} {old}"),
+        (None, None) => return Ok(()),
+        _ => unreachable!("symbolic refs handled above"),
+    };
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["update-ref", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .context("opening git update-ref stdin")?
+        .write_all(format!("start\noption no-deref\n{operation}\nprepare\ncommit\n").as_bytes())?;
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,53 +270,4 @@ mod tests {
         assert!(guard.check(&BTreeSet::new()).unwrap()[0].starts_with("Restored"));
         assert_eq!(git::git(&repo, &["rev-parse", "main"]).unwrap(), initial);
     }
-}
-
-/// Compare-and-swap under Git's ref lock. `no-deref` prevents a malicious symbolic ref from
-/// making restoration write through to a different branch.
-fn restore(cwd: &Path, name: &str, before: Option<&RefValue>, after: Option<&RefValue>) -> Result<()> {
-    // Older Git versions have no symbolic-ref transactions. Recheck before those operations;
-    // ordinary branch/tag OIDs below use Git's atomic old-value check.
-    if matches!(before, Some(RefValue::Symbolic(_))) || matches!(after, Some(RefValue::Symbolic(_))) {
-        if read_refs(cwd)?.get(name) != after {
-            bail!("ref changed again during recovery");
-        }
-        match before {
-            Some(RefValue::Symbolic(target)) => {
-                git::git(cwd, &["symbolic-ref", name, target])?;
-            }
-            Some(RefValue::Object(object)) => {
-                git::git(cwd, &["update-ref", "--no-deref", name, object])?;
-            }
-            None => {
-                git::git(cwd, &["update-ref", "--no-deref", "-d", name])?;
-            }
-        }
-        return Ok(());
-    }
-    let operation = match (before, after) {
-        (Some(RefValue::Object(object)), Some(RefValue::Object(old))) => format!("update {name} {object} {old}"),
-        (Some(RefValue::Object(object)), None) => format!("create {name} {object}"),
-        (None, Some(RefValue::Object(old))) => format!("delete {name} {old}"),
-        (None, None) => return Ok(()),
-        _ => unreachable!("symbolic refs handled above"),
-    };
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(["update-ref", "--stdin"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    child
-        .stdin
-        .take()
-        .context("opening git update-ref stdin")?
-        .write_all(format!("start\noption no-deref\n{operation}\nprepare\ncommit\n").as_bytes())?;
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
-    }
-    Ok(())
 }

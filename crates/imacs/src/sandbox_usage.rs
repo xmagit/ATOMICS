@@ -160,6 +160,28 @@ pub fn parse(ps: &str, names: &[String]) -> HashMap<String, Usage> {
 mod tests {
     use super::*;
     #[test]
+    fn samples_drop_closed_sessions_and_errors_clear_stale_metrics() {
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::channel();
+        let mut sampler = Sampler { pending: Some(rx), ..Default::default() };
+        tx.send(Ok(HashMap::from([
+            ("imacs-live".into(), Usage { bytes: 1024, cpu: 3.0 }),
+            ("imacs-closed".into(), Usage { bytes: 4096, cpu: 8.0 }),
+        ])))
+        .unwrap();
+        assert!(sampler.poll(vec!["imacs-live".into()], &ctx));
+        assert_eq!(sampler.total(), Usage { bytes: 1024, cpu: 3.0 });
+        let (tx, rx) = mpsc::channel();
+        sampler.pending = Some(rx);
+        tx.send(Err("ps failed".into())).unwrap();
+        assert!(sampler.poll(vec!["imacs-live".into()], &ctx));
+        assert!(sampler.usage.is_empty());
+        assert_eq!(sampler.error.as_deref(), Some("ps failed"));
+        sampler.poll(vec![], &ctx);
+        assert!(sampler.error.is_none());
+        assert!(sampler.pending.is_none(), "no process sampling without sandbox sessions");
+    }
+    #[test]
     fn recorded_host_vm_trees_exclude_clients_and_do_not_double_count() {
         let ps = include_str!("../tests/fixtures/sandbox-ps.txt");
         let usage = parse(ps, &["imacs-a".into(), "imacs-ab".into(), "imacs-stopped".into()]);

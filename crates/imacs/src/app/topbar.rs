@@ -301,6 +301,13 @@ mod tests {
         with_app("app::topbar::tests::top_bar_items_never_overlap", |app, ctx| {
             for count in [0, 3, 6] {
                 fixture(app, count);
+                let mut vm = session("vm", AgentKind::Generic, AgentStatus::Working, Path::new("/project/IMACS"));
+                vm.sandbox = Some("imacs-vm".into());
+                app.runtime.sessions.push(vm);
+                app.runtime
+                    .sandbox_usage
+                    .usage
+                    .insert("imacs-vm".into(), crate::sandbox_usage::Usage { bytes: 1_073_741_824, cpu: 120.0 });
                 let mut action_widths = HashMap::new();
                 for dock in [ChiefDock::Floating, ChiefDock::Docked] {
                     app.runtime.store.chief_dock = Some(dock);
@@ -367,6 +374,10 @@ mod tests {
                         if width == 5120.0 {
                             assert!(!items.iter().any(|(n, _)| n == "Tabs"));
                             assert!(items.iter().any(|(n, _)| n == "load"));
+                            assert!(items.iter().any(|(n, _)| n == "sandbox-total"));
+                            assert!(output.shapes.iter().any(|s| matches!(
+                                &s.shape, egui::Shape::Text(t) if t.galley.text() == "VMs 1.0 GiB · 120% CPU"
+                            )));
                         }
                         output.drop_without_applying_deltas();
                     }
