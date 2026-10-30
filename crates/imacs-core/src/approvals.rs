@@ -423,7 +423,7 @@ mod tests {
     #[test]
     #[cfg(feature = "native")]
     fn default_policy_allows_only_worktree_reads() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         for command in ["ls -la", "cat Cargo.toml", "rg hook src", "git status --short", "git diff", "git log -5"] {
             assert!(ApprovalPolicy::default().allows(&request(command, dir.path()), dir.path()), "{command}");
         }
@@ -432,7 +432,7 @@ mod tests {
     #[test]
     #[cfg(feature = "native")]
     fn cargo_requires_an_explicit_policy_entry() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         for command in [
             "cargo build",
             "cargo test",
@@ -456,7 +456,7 @@ mod tests {
     #[test]
     #[cfg(feature = "native")]
     fn policy_judges_chains_env_and_toolchains_by_their_parts() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let mut policy = ApprovalPolicy {
             env: vec!["RUSTC_WRAPPER=".into(), "CARGO_TERM_COLOR=always".into()],
             ..ApprovalPolicy::default()
@@ -577,7 +577,7 @@ mod tests {
 
         // Isolate PATH in a child, without mutating the environment of parallel tests.
         let Some(fixture) = std::env::var_os("IMACS_APPROVAL_PATH_FIXTURE") else {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_support::tempdir().unwrap();
             for folder in ["first", "second", "configured", "linked", "worktree"] {
                 std::fs::create_dir(dir.path().join(folder)).unwrap();
             }
@@ -634,7 +634,7 @@ mod tests {
 
         // Isolate PATH in a child, without mutating the environment of parallel tests.
         let Some(fixture) = std::env::var_os("IMACS_APPROVAL_RELATIVE_PATH_FIXTURE") else {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_support::tempdir().unwrap();
             for folder in ["host", "worktree/bin"] {
                 std::fs::create_dir_all(dir.path().join(folder)).unwrap();
                 let path = dir.path().join(folder).join("cargo");
@@ -665,7 +665,7 @@ mod tests {
     #[test]
     #[cfg(feature = "native")]
     fn queued_commands_are_judged_by_what_they_run() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let policy = ApprovalPolicy { allow: vec!["cargo test".into(), "ls".into()], ..ApprovalPolicy::default() };
         let allows = |command: &str| policy.allows(&request(command, dir.path()), dir.path());
         assert!(allows("imacs queue --class test -- cargo test -p imacs-core"));
@@ -685,7 +685,7 @@ mod tests {
     #[test]
     #[cfg(feature = "native")]
     fn policy_waits_for_writes_shell_syntax_external_paths_and_execution_flags() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         for command in [
             "cargo publish",
             "rm file",
@@ -723,8 +723,8 @@ mod tests {
     #[test]
     #[cfg(feature = "native")]
     fn policy_resolves_symlinks_and_custom_prefixes() {
-        let root = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
+        let root = crate::test_support::tempdir().unwrap();
+        let outside = crate::test_support::tempdir().unwrap();
         std::os::unix::fs::symlink(outside.path(), root.path().join("escape")).unwrap();
         for command in ["cat escape/secret", "ls escape", "cat escape/../secret"] {
             assert!(!ApprovalPolicy::default().allows(&request(command, root.path()), root.path()));

@@ -34,6 +34,7 @@ impl State {
             if was_open && self.plans[index].status == PlanStatus::Completed {
                 self.ticket_plan_completed(index);
             }
+            let completed = was_open && self.plans[index].status == PlanStatus::Completed;
             let mut close = Vec::new();
             for task in &mut self.plans[index].tasks {
                 if task.finished_at.is_none() {
@@ -67,6 +68,9 @@ impl State {
             }
             if changed {
                 self.save_plan(index);
+            }
+            if completed {
+                self.cleanup_closed_plan(index);
             }
         }
     }
@@ -133,6 +137,7 @@ impl State {
         closed.save_in(&paths::imacs_home()).map_err(|err| format!("Closing plan failed: {err:#}"))?;
         self.plans[index] = closed;
         self.changed_plans.remove(&self.plans[index].id);
+        self.cleanup_closed_plan(index);
         if status == PlanStatus::Completed {
             self.ticket_plan_completed(index);
         }
@@ -153,7 +158,78 @@ impl State {
         Ok(())
     }
 
+    pub(super) fn cleanup_closed_plan(&mut self, index: usize) {
+        let plan = self.plans[index].clone();
+        let enabled = match plan.status {
+            PlanStatus::Completed => self.config.cleanup.completed_plans,
+            PlanStatus::Archived => self.config.cleanup.archived_plans,
+            PlanStatus::Open => false,
+        };
+        if !enabled {
+            return;
+        }
+        let ids: Vec<_> = plan.tasks.iter().filter_map(|task| task.session.clone()).collect();
+        for id in &ids {
+            if self.sessions.iter().any(|session| session.id == *id && session.chief)
+                || (plan.status == PlanStatus::Completed && !self.config.plan.close_done_agents)
+            {
+                continue;
+            }
+            self.remember(id);
+            self.close(id);
+        }
+        let protected: Vec<_> = self
+            .sessions
+            .iter()
+            .map(Session::root)
+            .chain(
+                self.plans
+                    .iter()
+                    .filter(|p| p.id != plan.id && p.is_open())
+                    .flat_map(|p| p.tasks.iter())
+                    .filter_map(|t| t.worktree.clone()),
+            )
+            .collect();
+        let mut preparations = Vec::new();
+        for pending in std::mem::take(&mut self.pending_sandbox) {
+            if ids.contains(&pending.0.id) && !self.sessions.iter().any(|session| session.id == pending.0.id) {
+                preparations.push(pending);
+            } else {
+                self.pending_sandbox.push(pending);
+            }
+        }
+        let sbx = resolve_program(&self.sbx);
+        let actions = self.action_tx.clone();
+        let closing = std::mem::take(&mut self.lifecycle_jobs);
+        self.lifecycle_jobs.push(std::thread::spawn(move || {
+            // Final ref-guard checks must finish before deleting any task refs.
+            for job in closing {
+                let _ = job.join();
+            }
+            for (launch, ready) in preparations {
+                let _ = ready.recv();
+                if let AgentRuntime::Sandbox(sandbox) = launch.runtime
+                    && let Err(err) = crate::sandbox::stop(&paths::imacs_home(), &sbx, &sandbox.name)
+                {
+                    crate::lifecycle::record_leftovers(
+                        &paths::imacs_home(),
+                        &[format!("Stopping sandbox {}: {err:#}", sandbox.name)],
+                    );
+                }
+            }
+            let notes = crate::lifecycle::clean_plan(&paths::imacs_home(), &plan, &sbx, &protected);
+            crate::lifecycle::record_leftovers(&paths::imacs_home(), &notes);
+            let _ = actions.send(Box::new(move |state| {
+                state.worktrees_at = None;
+                if !notes.is_empty() {
+                    state.toast(notes.join("\n"));
+                }
+            }));
+        }));
+    }
+
     pub(super) fn reopen_plan(&mut self, index: usize) -> Result<(), String> {
+        self.finish_lifecycle_jobs();
         let mut plan = self.plans[index].clone();
         plan.reopen();
         plan.save_in(&paths::imacs_home()).map_err(|err| format!("Reopening plan failed: {err:#}"))?;
@@ -946,6 +1022,8 @@ mod tests {
         with_app(
             "app::plans::tests::dispatched_review_records_branch_closes_on_acceptance_and_can_be_cleaned_up",
             |app, ctx| {
+                // Exercise the optional manual preview after disabling cleanup on completion.
+                app.runtime.config.cleanup.completed_plans = false;
                 let (_dir, repo) = repository();
                 app.runtime.plans = vec![Plan {
                     id: "review-cleanup".into(),
@@ -1019,7 +1097,7 @@ mod tests {
         with_app(
             "app::plans::tests::accepted_agents_exit_keep_results_and_complete_without_closing_chief",
             |app, _ctx| {
-                let dir = tempfile::tempdir().unwrap();
+                let dir = crate::test_support::tempdir().unwrap();
                 let root = dir.path();
                 let terminal = Terminal::spawn(
                     app.runtime.wake.clone(),
@@ -1205,7 +1283,7 @@ mod tests {
     #[test]
     fn completed_task_resume_uses_claude_or_codex_resume_and_reopens_plan() {
         with_app("app::plans::tests::completed_task_resume_uses_claude_or_codex_resume_and_reopens_plan", |app, _| {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_support::tempdir().unwrap();
             let script = dir.path().join("agent.sh");
             let output = dir.path().join("args");
             std::fs::write(&script, "output=$1\nshift\nprintf '%s\\n' \"$@\" > \"$output\"\nexec sleep 600\n").unwrap();
@@ -1777,7 +1855,7 @@ mod tests {
         with_app(
             "app::plans::tests::background_dispatch_preserves_selection_and_routes_delayed_start_failure",
             |app, ctx| {
-                let dir = tempfile::tempdir().unwrap();
+                let dir = crate::test_support::tempdir().unwrap();
                 let repo = dir.path().join("repo");
                 std::fs::create_dir(&repo).unwrap();
                 git::git(&repo, &["init", "-q", "-b", "main"]).unwrap();

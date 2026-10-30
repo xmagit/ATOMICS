@@ -179,6 +179,15 @@ impl Checks {
     pub fn run(&self, job: impl FnOnce() + Send + 'static) {
         let _ = self.jobs.send(Box::new(job));
     }
+
+    /// Wait only from shutdown or a cleanup worker, never the interactive runtime loop.
+    pub fn finish(&self) {
+        let (done, finished) = channel();
+        self.run(move || {
+            let _ = done.send(());
+        });
+        let _ = finished.recv();
+    }
 }
 
 /// A sandboxed session's guard, if its folder is in a repository, and what its first check found.
@@ -295,8 +304,8 @@ fn restore(cwd: &Path, name: &str, before: Option<&RefValue>, after: Option<&Ref
 mod tests {
     use super::*;
 
-    fn repository() -> (tempfile::TempDir, PathBuf, PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
+    fn repository() -> (crate::test_support::TempDir, PathBuf, PathBuf) {
+        let dir = crate::test_support::tempdir().unwrap();
         let repo = dir.path().join("repo");
         let worktree = dir.path().join("task");
         std::fs::create_dir(&repo).unwrap();

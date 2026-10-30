@@ -282,7 +282,7 @@ mod tests {
 
     #[test]
     fn state_paths_keep_existing_installs_and_macos_in_place() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let xdg = dir.path().join("state");
         assert_eq!(state_home(dir.path(), Some(xdg.clone()), false), dir.path().join(".imacs"));
         assert_eq!(state_home(dir.path(), Some(xdg.clone()), true), xdg.join("imacs"));
@@ -306,7 +306,7 @@ mod tests {
             for case in
                 ["new", "legacy", "explicit", "socket", "relative", "empty", "missing-runtime", "public-runtime"]
             {
-                let dir = tempfile::tempdir().unwrap();
+                let dir = crate::test_support::tempdir().unwrap();
                 let home = dir.path().join("home");
                 let runtime = home.join("runtime");
                 std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&runtime).unwrap();
@@ -438,7 +438,7 @@ mod tests {
     fn migration_with_temporary_home() {
         const CHILD: &str = "IMACS_MIGRATION_TEST_CHILD";
         if std::env::var_os(CHILD).is_none() {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_support::tempdir().unwrap();
             let output = crate::test_support::output(
                 std::process::Command::new(std::env::current_exe().unwrap())
                     .args(["--exact", "paths::tests::migration_with_temporary_home", "--nocapture"])
@@ -492,7 +492,7 @@ mod tests {
 
     #[test]
     fn stale_migration_staging_does_not_block_retry_or_get_removed() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let old = dir.path().join("cox");
         let new = dir.path().join("missing-parent/.imacs");
         std::fs::create_dir(&old).unwrap();
@@ -525,7 +525,7 @@ mod tests {
         use std::os::unix::fs::{PermissionsExt, symlink};
         use std::os::unix::net::UnixListener;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let old = dir.path().join("cox");
         let new = dir.path().join("missing-parent/imacs");
         std::fs::create_dir_all(old.join("briefs")).unwrap();

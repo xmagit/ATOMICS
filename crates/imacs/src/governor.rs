@@ -435,7 +435,7 @@ mod tests {
 
     #[test]
     fn toolchain_env_detects_sibling_projects_from_a_worktree_subdirectory() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let init = std::process::Command::new("git").args(["init", "-q"]).arg(dir.path()).status().unwrap();
         assert!(init.success());
         let nested = dir.path().join("scripts");
@@ -454,7 +454,7 @@ mod tests {
 
     #[test]
     fn jobserver_pipe_holds_its_tokens_and_resets_leaks() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         use std::os::unix::fs::{FileTypeExt, PermissionsExt};
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o750)).unwrap();
         let jobserver = Jobserver::create(&dir.path().join("pool/jobs"), 3).unwrap();
@@ -495,7 +495,7 @@ mod tests {
         };
         assert_eq!(a, expected);
         assert_eq!(a, Jobserver::path_for(Path::new("/Users/x/.imacs")));
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let path = dir.path().join("pool/jobs");
         drop(Jobserver::create(&path, 1).unwrap());
         assert!(!path.exists() && !dir.path().join("pool").exists(), "the pool and its folder go with it");
@@ -503,7 +503,7 @@ mod tests {
 
     #[test]
     fn a_pool_folder_owned_through_a_link_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("real")).unwrap();
         std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("link")).unwrap();
         assert!(Jobserver::create(&dir.path().join("link/hash/jobs"), 1).is_err());
@@ -527,7 +527,7 @@ mod tests {
 
     #[test]
     fn an_imacs_that_cannot_queue_runs_the_command_right_away() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let socket = dir.path().join("old");
         let listener = UnixListener::bind(&socket).unwrap();
         std::thread::spawn(move || {
@@ -571,7 +571,7 @@ mod tests {
 
     #[test]
     fn slots_are_held_until_the_client_hangs_up() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let socket = dir.path().join("s");
         let governor =
             Arc::new(Governor::new(ResourceConfig { test_slots: Some(1), ..ResourceConfig::default() }, None));
@@ -598,7 +598,7 @@ mod tests {
 
     #[test]
     fn the_command_runs_with_its_exit_status_without_a_running_imacs() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let missing = dir.path().join("missing.sock");
         assert_eq!(run_queued(&missing, SlotClass::Test, &["sh".into(), "-c".into(), "exit 7".into()]), 7);
         assert_eq!(run_queued(&missing, SlotClass::Test, &[]), 2);
@@ -606,7 +606,7 @@ mod tests {
 
     #[test]
     fn a_client_waiting_through_an_imacs_restart_queues_again() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let socket = dir.path().join("s");
         // A socket file with nobody listening: IMACS is restarting.
         drop(UnixListener::bind(&socket).unwrap());

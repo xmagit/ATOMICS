@@ -395,7 +395,7 @@ mod tests {
     #[test]
     fn restarted_editor_receives_geometry_at_an_unchanged_panel_size() {
         with_app("app::editor::tests::restarted_editor_receives_geometry_at_an_unchanged_panel_size", |app, ctx| {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_support::tempdir().unwrap();
             let root = dir.path();
             app.runtime.config.editor.command = vec!["/bin/sh".into(), "-c".into(), "stty -echo; printf 'ready\\n'; while read -r input; do case \"$input\" in quit) exit;; *) stty size;; esac; done".into()];
             app.runtime.config.editor.startup_keys.clear();

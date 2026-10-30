@@ -212,7 +212,7 @@ mod tests {
     fn plan_checks_are_read_only_and_report_bad_json_and_unreadable_files() {
         use std::os::unix::fs::PermissionsExt;
 
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::test_support::tempdir().unwrap();
         assert!(plans_check(home.path())[0].starts_with('✓'));
         assert!(!home.path().join("plans").exists());
         let dir = home.path().join("plans");
@@ -243,7 +243,7 @@ mod tests {
     #[test]
     #[cfg(feature = "native")]
     fn inaccessible_plans_directory_warns() {
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::test_support::tempdir().unwrap();
         std::fs::write(home.path().join("plans"), "not a directory").unwrap();
         let lines = plans_check(home.path());
         assert_eq!(lines.len(), 1);
@@ -281,7 +281,7 @@ mod tests {
     #[test]
     #[cfg(feature = "native")]
     fn worktree_scan_failure_warns_instead_of_claiming_no_cleanup_needed() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let lines = worktree_checks(dir.path(), "main");
         assert_eq!(lines.len(), 1);
         assert!(lines[0].starts_with('✗'));

@@ -4,14 +4,170 @@ use super::*;
 use crate::sandbox::fake;
 use imacs_core::isolation::IsolationMode;
 
-/// Ticks IMACS until `done`, failing after ten seconds with `what`.
+#[test]
+fn startup_cleanup_does_not_block_the_runtime_while_sbx_is_waiting() {
+    with_app("app::sandbox_tests::startup_cleanup_does_not_block_the_runtime_while_sbx_is_waiting", |app, ctx| {
+        if let Some(job) = app.runtime.startup_cleanup.take() {
+            job.join().unwrap();
+        }
+        let (_dir, repo) = repository();
+        let bin = crate::test_support::tempdir().unwrap();
+        app.runtime.sbx = fake::install(bin.path()).display().to_string();
+        let job = crate::sandbox::Prepare {
+            home: paths::imacs_home(),
+            sbx: app.runtime.sbx.clone(),
+            name: "imacs-orphan".into(),
+            agent: "shell",
+            cwd: repo,
+            config: Default::default(),
+            warm: Vec::new(),
+            pins: paths::git_pins_dir(),
+            exe: "/imacs".into(),
+            socket: paths::socket_path(),
+            briefs: None,
+        };
+        crate::sandbox::prepare(&job).unwrap();
+        let gate = bin.path().join("wait-ls");
+        std::fs::write(&gate, "wait").unwrap();
+        app.runtime.begin_startup_cleanup();
+        let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(60));
+        while !bin.path().join("waiting-ls").exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let reached_sbx = bin.path().join("waiting-ls").exists();
+        app.runtime.runtime_tick(ctx); // Must return while the sweep is blocked in sbx.
+        let still_waiting = app.runtime.startup_cleanup.as_ref().is_some_and(|job| !job.is_finished());
+        std::fs::remove_file(gate).unwrap();
+        app.runtime.startup_cleanup.take().unwrap().join().unwrap();
+        assert!(reached_sbx && still_waiting);
+        assert!(!bin.path().join("sandboxes/imacs-orphan").exists());
+        assert!(!bin.path().join("mcp/imacs-orphan").exists());
+    });
+}
+
+#[test]
+fn archiving_during_worktree_creation_does_not_launch_the_agent() {
+    with_app("app::sandbox_tests::archiving_during_worktree_creation_does_not_launch_the_agent", |app, ctx| {
+        let (dir, repo) = repository();
+        let marker = dir.path().join("agent-ran");
+        app.runtime.config.agents.push(probe("probe", &marker, Some(IsolationMode::Bare)));
+        app.runtime.plans = vec![Plan {
+            id: "late".into(),
+            project: Some(repo.clone()),
+            approved: true,
+            tasks: vec![Task { id: "a".into(), agent: "probe".into(), ..Task::default() }],
+            ..Plan::default()
+        }];
+        app.runtime.dispatch(0, Some("a")).unwrap();
+        app.runtime.close_plan(0, PlanStatus::Archived).unwrap();
+        tick_until(app, ctx, "the closed plan's worktree job", |app| app.runtime.creating.is_empty());
+        app.runtime.finish_lifecycle_jobs();
+        assert!(!marker.exists());
+        let task = &app.runtime.plans[0].tasks[0];
+        assert!(!task.worktree.as_ref().unwrap().exists());
+        assert!(
+            git::git(&repo, &["show-ref", "--verify", &format!("refs/heads/{}", task.branch.as_ref().unwrap())])
+                .is_ok()
+        );
+    });
+}
+
+#[test]
+fn quitting_stops_running_and_preparing_sandboxes_and_joins_cleanup() {
+    with_app("app::sandbox_tests::quitting_stops_running_and_preparing_sandboxes_and_joins_cleanup", |app, ctx| {
+        let (_dir, repo) = repository();
+        let bin = crate::test_support::tempdir().unwrap();
+        app.runtime.sbx = fake::install(bin.path()).display().to_string();
+        std::fs::write(bin.path().join("run-waits"), "wait").unwrap();
+        app.runtime.config.isolation.mode = IsolationMode::Sandbox;
+        let running = app.runtime.start(ctx, "claude", repo.clone(), None, vec![], None).unwrap();
+        tick_until(app, ctx, "running sandbox", |app| {
+            app.runtime.sessions.iter().any(|s| s.id == running && s.terminal.is_some())
+        });
+        let preparing = app.runtime.start(ctx, "claude", repo, None, vec![], None).unwrap();
+        assert!(!app.runtime.pending_sandbox.is_empty());
+        app.runtime.shutdown();
+        let stopped = fake::calls_to(bin.path(), &["stop"]);
+        for id in [&running, &preparing] {
+            let name = format!("imacs-{id}");
+            assert!(stopped.iter().any(|call| call == &["stop", name.as_str()]));
+            assert!(bin.path().join("sandboxes").join(name).exists(), "quit preserves resumability");
+        }
+        assert!(app.runtime.pending_sandbox.is_empty() && app.runtime.lifecycle_jobs.is_empty());
+        assert!(
+            app.runtime
+                .sessions
+                .iter()
+                .filter_map(|s| s.terminal.as_ref())
+                .all(|t| unsafe { libc::kill(-(t.process_id() as i32), 0) } != 0)
+        );
+        app.runtime.sessions.clear();
+    });
+}
+
+#[test]
+fn plan_close_cleanup_settings_control_worktrees_and_archive_keeps_branches() {
+    with_app(
+        "app::sandbox_tests::plan_close_cleanup_settings_control_worktrees_and_archive_keeps_branches",
+        |app, _ctx| {
+            let (dir, repo) = repository();
+            for (status, enabled, name) in [
+                (PlanStatus::Completed, true, "complete"),
+                (PlanStatus::Archived, true, "archive"),
+                (PlanStatus::Completed, false, "disabled"),
+                (PlanStatus::Archived, false, "archive-disabled"),
+            ] {
+                let path = dir.path().join(name);
+                git::add_worktree(&repo, &path, name, "main").unwrap();
+                let plan = Plan {
+                    id: name.into(),
+                    project: Some(repo.clone()),
+                    tasks: vec![Task {
+                        id: "a".into(),
+                        status: TaskStatus::Done,
+                        branch: Some(name.into()),
+                        worktree: Some(path.clone()),
+                        ..Task::default()
+                    }],
+                    ..Plan::default()
+                };
+                git::git(&repo, &["branch", &plan.integration_branch()]).unwrap();
+                app.runtime.plans.push(plan);
+                app.runtime.config.cleanup.completed_plans = enabled;
+                app.runtime.config.cleanup.archived_plans = enabled;
+                let index = app.runtime.plans.len() - 1;
+                app.runtime.close_plan(index, status).unwrap();
+                app.runtime.finish_lifecycle_jobs();
+                assert_eq!(path.exists(), !enabled);
+                let exists = git::git(&repo, &["show-ref", "--verify", &format!("refs/heads/{name}")]).is_ok();
+                assert_eq!(exists, !enabled || status == PlanStatus::Archived);
+            }
+        },
+    );
+}
+
+/// Bound a hang without assuming a parallel, lower-priority test gets CPU within ten seconds.
 fn tick_until(app: &mut Desktop<'_>, ctx: &egui::Context, what: &str, mut done: impl FnMut(&mut Desktop<'_>) -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(60));
     while !done(app) {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         app.runtime.runtime_tick(ctx);
-        std::thread::sleep(Duration::from_millis(10));
+        if !done(app) {
+            // Preparation, terminal output/exit and cleanup completions wake the host. The
+            // short fallback also notices fixture files written without a terminal event.
+            app.runtime.wake.wait_until(deadline.min(Instant::now() + Duration::from_millis(100)));
+        }
     }
+}
+
+/// A test must finish preparation and stop jobs before dropping the directory containing sbx.
+fn finish_agents(app: &mut Desktop<'_>, ctx: &egui::Context) {
+    let ids: Vec<_> = app.runtime.sessions.iter().map(|s| s.id.clone()).collect();
+    for id in ids {
+        app.runtime.close(&id);
+    }
+    tick_until(app, ctx, "pending sandbox preparation to finish", |app| app.runtime.pending_sandbox.is_empty());
+    app.runtime.finish_lifecycle_jobs();
 }
 
 fn worktree(repo: &Path, name: &str) -> PathBuf {
@@ -23,7 +179,11 @@ fn worktree(repo: &Path, name: &str) -> PathBuf {
 fn probe(name: &str, out: &Path, isolation: Option<IsolationMode>) -> imacs_core::config::AgentConfig {
     imacs_core::config::AgentConfig {
         name: name.into(),
-        command: vec!["/bin/sh".into(), "-c".into(), format!("pwd > {}; sleep 5", out.display())],
+        command: vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            format!("pwd > {0}.$$.tmp; mv {0}.$$.tmp {0}; printf 'probe ready\\n'; exec sleep 600", out.display()),
+        ],
         kind: AgentKind::Generic,
         busy_text: None,
         isolation,
@@ -35,7 +195,7 @@ fn sandboxed_agents_attach_through_sbx_run_and_reattach_after_a_restart() {
     with_app("app::sandbox_tests::sandboxed_agents_attach_through_sbx_run_and_reattach_after_a_restart", |app, ctx| {
         let (_dir, repo) = repository();
         let worktree = worktree(&repo, "task");
-        let bin = tempfile::tempdir().unwrap();
+        let bin = crate::test_support::tempdir().unwrap();
         app.runtime.sbx = fake::install(bin.path()).display().to_string();
         app.runtime.config.isolation.mode = IsolationMode::Sandbox;
 
@@ -71,7 +231,7 @@ fn sandboxed_agents_attach_through_sbx_run_and_reattach_after_a_restart() {
         assert_eq!(fake::calls_to(bin.path(), &["stop"]), [["stop", name.as_str()]]);
 
         // A restart resumes the session in the same sandbox, without making another.
-        app.runtime.sessions.clear();
+        finish_agents(app, ctx);
         std::fs::remove_file(bin.path().join("run-ssh")).unwrap();
         app.runtime.resume_record(ctx, record);
         tick_until(app, ctx, "the resumed agent to attach", |_| bin.path().join("run-ssh").exists());
@@ -79,7 +239,7 @@ fn sandboxed_agents_attach_through_sbx_run_and_reattach_after_a_restart() {
         let run = fake::calls_to(bin.path(), &["run"]).pop().unwrap();
         assert_eq!(run, ["run", "--name", name.as_str(), "claude", "--", "--resume", session_id.as_str()]);
         assert_eq!(app.runtime.sessions[0].sandbox.as_deref(), Some(name.as_str()));
-        app.runtime.sessions.clear();
+        finish_agents(app, ctx);
     });
 }
 
@@ -90,11 +250,18 @@ fn chief_checks_run_in_the_session_sandbox_and_bare_sessions_are_refused() {
         |app, ctx| {
             let (_dir, repo) = repository();
             let worktree = worktree(&repo, "task");
-            let bin = tempfile::tempdir().unwrap();
+            let bin = crate::test_support::tempdir().unwrap();
             app.runtime.sbx = fake::install(bin.path()).display().to_string();
             std::fs::create_dir(bin.path().join("sandboxes")).unwrap();
             std::fs::write(bin.path().join("sandboxes/imacs-boxed"), r#"{"name":"imacs-boxed","status":"running"}"#)
                 .unwrap();
+            let home = paths::imacs_home();
+            crate::sandbox_ownership::created(&home, "imacs-boxed", crate::sandbox_ownership::Resource::Sandbox)
+                .unwrap();
+            crate::sandbox_ownership::created(&home, "imacs-boxed", crate::sandbox_ownership::Resource::Mcp).unwrap();
+            std::fs::create_dir_all(bin.path().join("mcp")).unwrap();
+            std::fs::write(bin.path().join("mcp/imacs-boxed"), "registration").unwrap();
+            let owned = std::fs::read(home.join("sandbox-ownership.json")).unwrap();
             let session = |id: &str| super::tests::session(id, AgentKind::Claude, AgentStatus::Done, &worktree);
             let mut boxed = session("boxed");
             boxed.sandbox = Some("imacs-boxed".into());
@@ -146,7 +313,7 @@ fn chief_checks_run_in_the_session_sandbox_and_bare_sessions_are_refused() {
             // Its agent still runs in the sandbox, which stays up.
             then();
             app.runtime.runtime_tick(ctx);
-            std::thread::sleep(Duration::from_millis(200));
+            app.runtime.finish_lifecycle_jobs();
             assert!(fake::calls_to(bin.path(), &["stop"]).is_empty());
 
             // Once the agent has gone, a sandbox its check started stops again.
@@ -156,6 +323,28 @@ fn chief_checks_run_in_the_session_sandbox_and_bare_sessions_are_refused() {
             then();
             tick_until(app, ctx, "the sandbox to stop", |_| !fake::calls_to(bin.path(), &["stop"]).is_empty());
             assert_eq!(fake::calls_to(bin.path(), &["stop"]), [["stop", "imacs-boxed"]]);
+            app.runtime.finish_lifecycle_jobs();
+            assert!(bin.path().join("sandboxes/imacs-boxed").exists(), "checks leave the sandbox resumable");
+            assert!(bin.path().join("mcp/imacs-boxed").exists());
+            assert_eq!(std::fs::read(home.join("sandbox-ownership.json")).unwrap(), owned);
+
+            // A stale session or completion cannot stop another home's sandbox.
+            let other_home = crate::test_support::tempdir().unwrap();
+            crate::sandbox_ownership::created(
+                other_home.path(),
+                "imacs-foreign",
+                crate::sandbox_ownership::Resource::Sandbox,
+            )
+            .unwrap();
+            std::fs::write(
+                bin.path().join("sandboxes/imacs-foreign"),
+                r#"{"name":"imacs-foreign","status":"running"}"#,
+            )
+            .unwrap();
+            app.runtime.exec_finished("gone", "imacs-foreign".into());
+            app.runtime.finish_lifecycle_jobs();
+            assert_eq!(fake::calls_to(bin.path(), &["stop"]), [["stop", "imacs-boxed"]]);
+            assert!(std::fs::read_to_string(bin.path().join("sandboxes/imacs-foreign")).unwrap().contains("running"));
             app.runtime.sessions.clear();
         },
     );
@@ -166,10 +355,11 @@ fn sandboxed_task_args_drop_host_sandbox_flags_and_bare_ones_keep_them() {
     with_app("app::sandbox_tests::sandboxed_task_args_drop_host_sandbox_flags_and_bare_ones_keep_them", |app, ctx| {
         let (_dir, repo) = repository();
         let worktree = worktree(&repo, "task");
-        let bin = tempfile::tempdir().unwrap();
+        let bin = crate::test_support::tempdir().unwrap();
         app.runtime.sbx = fake::install(bin.path()).display().to_string();
         app.runtime.config.isolation.mode = IsolationMode::Sandbox;
         // The arguments IMACS plans give a Codex task, and an agent command carrying a host flag.
+        std::fs::write(bin.path().join("wait-agent"), "wait").unwrap();
         let task_args: Vec<String> = [
             "-m",
             "gpt-6.1-sol",
@@ -186,8 +376,11 @@ fn sandboxed_task_args_drop_host_sandbox_flags_and_bare_ones_keep_them() {
         .into();
         let codex = app.runtime.config.agents.iter_mut().find(|a| a.name == "codex").unwrap();
         codex.command = vec!["codex".into(), "--full-auto".into(), "--search".into()];
-        app.runtime.start(ctx, "codex", worktree.clone(), None, task_args.clone(), Some("Do the task".into())).unwrap();
-        tick_until(app, ctx, "the agent to attach", |_| bin.path().join("run-ssh").exists());
+        let sandbox_id = app
+            .runtime
+            .start(ctx, "codex", worktree.clone(), None, task_args.clone(), Some("Do the task".into()))
+            .unwrap();
+        tick_until(app, ctx, "the agent to reach its fixture hook", |_| bin.path().join("waiting-agent").exists());
         let run = fake::calls_to(bin.path(), &["run"]).pop().unwrap();
         let trusted =
             format!("projects={{ {:?} = {{ trust_level = \"trusted\" }} }}", worktree.canonicalize().unwrap());
@@ -198,10 +391,15 @@ fn sandboxed_task_args_drop_host_sandbox_flags_and_bare_ones_keep_them() {
         );
 
         // A bare agent gets every argument, as before.
-        let out = bin.path().join("args");
-        let script = bin.path().join("agent");
-        std::fs::write(&script, format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > {}.tmp\nmv {0}.tmp {0}\n", out.display()))
-            .unwrap();
+        let out = bin.path().join("bare-args");
+        // `agent` is the fake sbx's hook. Reusing that filename lets the still-starting
+        // sandbox execute the bare probe and overwrite its arguments with sbx run's args.
+        let script = bin.path().join("bare-agent.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > {}.$$.tmp\nmv {0}.$$.tmp {0}\n", out.display()),
+        )
+        .unwrap();
         std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
         app.runtime.config.agents.push(imacs_core::config::AgentConfig {
             name: "bare-agent".into(),
@@ -210,11 +408,27 @@ fn sandboxed_task_args_drop_host_sandbox_flags_and_bare_ones_keep_them() {
             busy_text: None,
             isolation: Some(IsolationMode::Bare),
         });
-        app.runtime.start(ctx, "bare-agent", worktree.clone(), None, task_args.clone(), None).unwrap();
-        tick_until(app, ctx, "the bare agent", |_| out.exists());
+        let bare_id = app.runtime.start(ctx, "bare-agent", worktree.clone(), None, task_args.clone(), None).unwrap();
+        tick_until(app, ctx, "the bare agent to finish", |app| {
+            app.runtime
+                .sessions
+                .iter()
+                .find(|s| s.id == bare_id)
+                .and_then(|s| s.terminal.as_ref())
+                .is_some_and(|t| t.exited())
+        });
+        std::fs::remove_file(bin.path().join("wait-agent")).unwrap();
+        tick_until(app, ctx, "the sandboxed agent to finish", |app| {
+            app.runtime
+                .sessions
+                .iter()
+                .find(|s| s.id == sandbox_id)
+                .and_then(|s| s.terminal.as_ref())
+                .is_some_and(|t| t.exited())
+        });
         let given: Vec<String> = std::fs::read_to_string(&out).unwrap().lines().map(String::from).collect();
         assert!(given.ends_with(&task_args), "{given:?}");
-        app.runtime.sessions.clear();
+        finish_agents(app, ctx);
     });
 }
 
@@ -223,7 +437,7 @@ fn bare_agents_never_touch_sbx_and_a_repository_can_only_tighten() {
     with_app("app::sandbox_tests::bare_agents_never_touch_sbx_and_a_repository_can_only_tighten", |app, ctx| {
         let (_dir, repo) = repository();
         let worktree = worktree(&repo, "task");
-        let bin = tempfile::tempdir().unwrap();
+        let bin = crate::test_support::tempdir().unwrap();
         app.runtime.sbx = fake::install(bin.path()).display().to_string();
         let out = bin.path().join("probe-ran");
         app.runtime.config.agents.push(probe("probe", &out, None));
@@ -270,15 +484,14 @@ fn bare_agents_never_touch_sbx_and_a_repository_can_only_tighten() {
         // A repository asking for bare is ignored: sandbox mode stays.
         std::fs::write(repo.join(".imacs/config.toml"), "[isolation]\nmode = \"bare\"\n").unwrap();
         app.runtime.config.isolation.mode = IsolationMode::Sandbox;
-        let calls = fake::calls(bin.path()).len();
         let id = app.runtime.start(ctx, "shell", worktree.clone(), None, vec![], None).unwrap();
         assert!(app.runtime.sessions[app.runtime.find(&id).unwrap()].terminal.is_none());
-        tick_until(app, ctx, "the second sandbox", |_| {
-            fake::calls(bin.path()).len() > calls + 3 && fake::calls_to(bin.path(), &["create"]).len() == 2
+        tick_until(app, ctx, "the second sandbox to attach", |app| {
+            app.runtime.sessions.iter().find(|s| s.id == id).is_some_and(|s| s.terminal.is_some())
         });
         let create = fake::calls_to(bin.path(), &["create"]).pop().unwrap();
         assert!(create.windows(2).any(|args| args == ["--template", "workspace:local"]));
-        app.runtime.sessions.clear();
+        finish_agents(app, ctx);
     });
 }
 
@@ -286,13 +499,14 @@ fn bare_agents_never_touch_sbx_and_a_repository_can_only_tighten() {
 fn the_cleanup_dialog_removes_a_worktrees_sandbox_and_chosen_orphans() {
     with_app("app::sandbox_tests::the_cleanup_dialog_removes_a_worktrees_sandbox_and_chosen_orphans", |app, ctx| {
         let (_dir, repo) = repository();
-        let bin = tempfile::tempdir().unwrap();
+        let bin = crate::test_support::tempdir().unwrap();
         let sbx = fake::install(bin.path()).display().to_string();
         app.runtime.sbx = sbx.clone();
         let mut worktrees = Vec::new();
         for name in ["keep", "done", "gone"] {
             let path = worktree(&repo, name);
             let job = crate::sandbox::Prepare {
+                home: paths::imacs_home(),
                 sbx: sbx.clone(),
                 name: format!("imacs-{name}"),
                 agent: "claude",
@@ -387,6 +601,11 @@ fn the_cleanup_dialog_removes_a_worktrees_sandbox_and_chosen_orphans() {
         };
         tick_until(app, ctx, "the removed sandboxes' git records to go", |_| records() == ["imacs-keep.json"]);
         assert!(git::pinned(&worktrees[0]).is_some() && git::pinned(&worktrees[1]).is_none());
+        tick_until(app, ctx, "cleanup to finish", |app| app.runtime.cleanup.as_ref().is_some_and(|c| c.busy.is_none()));
+        app.runtime.finish_lifecycle_jobs();
+        let fake_home = bin.path().to_path_buf();
+        drop(bin);
+        assert!(!fake_home.exists(), "the cleanup-dialog test left its fake sbx home behind");
     });
 }
 
@@ -395,7 +614,7 @@ fn a_missing_or_signed_out_sbx_refuses_the_agent_and_blocks_its_task() {
     with_app("app::sandbox_tests::a_missing_or_signed_out_sbx_refuses_the_agent_and_blocks_its_task", |app, ctx| {
         let (_dir, repo) = repository();
         let worktree = worktree(&repo, "task");
-        let bin = tempfile::tempdir().unwrap();
+        let bin = crate::test_support::tempdir().unwrap();
         let sbx = fake::install(bin.path()).display().to_string();
         std::fs::write(bin.path().join("signed-out"), "").unwrap();
         app.runtime.config.isolation.mode = IsolationMode::Sandbox;
@@ -424,11 +643,15 @@ fn a_missing_or_signed_out_sbx_refuses_the_agent_and_blocks_its_task() {
             let task = &app.runtime.plans[0].tasks[0];
             assert_eq!(task.status, TaskStatus::Blocked);
             assert!(task.notes.last().unwrap().contains(reason), "{:?}", task.notes);
-            assert!(app.runtime.toast.as_ref().unwrap().0.contains(reason));
+            // The session and task above retain the reason. A five-second toast can
+            // expire during a loaded runtime tick, so only inspect it while present.
+            if let Some((toast, _)) = &app.runtime.toast {
+                assert!(toast.contains(reason));
+            }
         }
         assert!(fake::calls_to(bin.path(), &["create"]).is_empty());
         assert!(fake::calls_to(bin.path(), &["run"]).is_empty());
-        app.runtime.sessions.clear();
+        finish_agents(app, ctx);
     });
 }
 
@@ -436,15 +659,18 @@ fn a_missing_or_signed_out_sbx_refuses_the_agent_and_blocks_its_task() {
 fn the_chief_always_runs_on_this_machine() {
     with_app("app::sandbox_tests::the_chief_always_runs_on_this_machine", |app, ctx| {
         let (_dir, repo) = repository();
-        let bin = tempfile::tempdir().unwrap();
+        let bin = crate::test_support::tempdir().unwrap();
         app.runtime.sbx = fake::install(bin.path()).display().to_string();
         app.runtime.config.isolation.mode = IsolationMode::Sandbox;
         std::fs::create_dir(repo.join(".imacs")).unwrap();
         std::fs::write(repo.join(".imacs/config.toml"), "[isolation]\nmode = \"sandbox\"\n").unwrap();
         app.runtime.view = Some(repo.clone());
         let out = bin.path().join("chief-ran");
-        app.runtime.config.chief.command =
-            vec!["/bin/sh".into(), "-c".into(), format!("pwd > {0}.tmp; mv {0}.tmp {0}; sleep 5", out.display())];
+        app.runtime.config.chief.command = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            format!("pwd > {0}.tmp; mv {0}.tmp {0}; exec sleep 600", out.display()),
+        ];
         app.runtime.config.chief.args = Vec::new();
 
         let id = app.runtime.start_chief(ctx, None).unwrap();
@@ -481,7 +707,7 @@ fn a_tasks_isolation_wins_over_the_agent_and_mode_but_never_over_a_repository() 
         "app::sandbox_tests::a_tasks_isolation_wins_over_the_agent_and_mode_but_never_over_a_repository",
         |app, ctx| {
             let (dir, repo) = repository();
-            let bin = tempfile::tempdir().unwrap();
+            let bin = crate::test_support::tempdir().unwrap();
             app.runtime.sbx = fake::install(bin.path()).display().to_string();
             app.runtime.config.isolation.mode = IsolationMode::Sandbox;
             app.runtime.config.base_ref = "main".into();
@@ -545,7 +771,7 @@ fn a_tasks_isolation_wins_over_the_agent_and_mode_but_never_over_a_repository() 
             let toast = app.runtime.toast.as_ref().unwrap().0.clone();
             assert!(toast.contains("requires sandboxed agents"), "{toast}");
             assert!(!out.exists());
-            app.runtime.sessions.clear();
+            finish_agents(app, ctx);
         },
     );
 }
@@ -556,7 +782,7 @@ fn sandboxed_fake_agent_moving_main_is_restored_and_alerts_the_board() {
         let (_dir, repo) = repository();
         let original = git::git(&repo, &["rev-parse", "main"]).unwrap();
         let worktree = worktree(&repo, "task");
-        let bin = tempfile::tempdir().unwrap();
+        let bin = crate::test_support::tempdir().unwrap();
         app.runtime.sbx = fake::install(bin.path()).display().to_string();
         app.runtime.config.isolation.mode = IsolationMode::Sandbox;
         std::fs::write(bin.path().join("agent"),
@@ -580,7 +806,7 @@ fn sandboxed_fake_agent_moving_main_is_restored_and_alerts_the_board() {
         let alert = app.runtime.plans[0].tasks[0].ref_alert.as_deref().unwrap();
         assert!(alert.contains("SANDBOX REF GUARD") && alert.contains("Restored refs/heads/main"), "{alert}");
         assert!(app.runtime.plans[0].tasks[0].notes.iter().any(|note| note.contains("Restored refs/heads/main")));
-        app.runtime.sessions.clear();
+        finish_agents(app, ctx);
     });
 }
 
@@ -593,7 +819,7 @@ fn git_files_a_sandbox_redirects_never_run_its_hook_on_this_machine() {
             let original = git::git(&repo, &["rev-parse", "other"]).unwrap();
             let folder = if redirect == "main-commondir" { repo.clone() } else { worktree(&repo, redirect) };
             let marker = dir.path().join("hook-ran");
-            let bin = tempfile::tempdir().unwrap();
+            let bin = crate::test_support::tempdir().unwrap();
             app.runtime.sbx = fake::install(bin.path()).display().to_string();
             app.runtime.config.isolation.mode = IsolationMode::Sandbox;
             // The agent, as its VM could: commits, moves a branch that is not its own, then plants a git
@@ -662,7 +888,7 @@ fn sandboxed_codex_trusts_its_folder_and_a_first_run_question_needs_you() {
     with_app("app::sandbox_tests::sandboxed_codex_trusts_its_folder_and_a_first_run_question_needs_you", |app, ctx| {
         let (_dir, repo) = repository();
         let worktree = worktree(&repo, "task.v2");
-        let bin = tempfile::tempdir().unwrap();
+        let bin = crate::test_support::tempdir().unwrap();
         app.runtime.sbx = fake::install(bin.path()).display().to_string();
         app.runtime.config.isolation.mode = IsolationMode::Sandbox;
         // A Codex that still asks, as one too old for the trust setting would.
@@ -699,7 +925,7 @@ fn sandbox_briefs_are_mounted_read_only_and_reports_use_the_sandbox_identity() {
         |app, ctx| {
             let (_dir, repo) = repository();
             let worktree = worktree(&repo, "task");
-            let bin = tempfile::tempdir().unwrap();
+            let bin = crate::test_support::tempdir().unwrap();
             app.runtime.sbx = fake::install(bin.path()).display().to_string();
             app.runtime.config.isolation.mode = IsolationMode::Sandbox;
             std::fs::write(bin.path().join("run-waits"), "").unwrap();
@@ -729,6 +955,7 @@ fn sandbox_briefs_are_mounted_read_only_and_reports_use_the_sandbox_identity() {
             assert!(app.runtime.events.iter().any(|event| event.session == id && event.status == AgentStatus::Done));
             assert!(session.approvals.is_empty());
             app.runtime.close(&id);
+            app.runtime.finish_lifecycle_jobs();
         },
     );
 }
@@ -752,16 +979,16 @@ fn sandbox_screen_fallback_debounces_quiet_and_respects_reports_until_the_next_t
                         app.runtime.wake.clone(),
                         app.runtime.palette.terminal_colors(),
                         "/bin/sh".into(),
-                        vec!["-c".into(), format!("printf '%s' '{text}'; exec sleep 30")],
+                        vec!["-c".into(), format!("printf '%s' '{text}'; exec sleep 600")],
                         &worktree,
                         HashMap::new(),
                         100,
                     )
                     .unwrap();
-                    let deadline = Instant::now() + Duration::from_secs(10);
+                    let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(60));
                     while !terminal.screen_text(60).contains(text) {
                         assert!(Instant::now() < deadline, "screen did not appear");
-                        std::thread::sleep(Duration::from_millis(10));
+                        app.runtime.wake.wait_until(deadline.min(Instant::now() + Duration::from_millis(100)));
                     }
                     app.runtime.sessions[0].terminal = Some(terminal);
                 };

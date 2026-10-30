@@ -279,6 +279,9 @@ repository-relative project. SDK installation and restore need the repository's 
 Private feeds require credentials provisioned inside the sandbox; IMACS never copies host NuGet
 credentials into an image. Build failures report sbx's error and do not save a template. The temporary
 sandbox is removed on success or failure; the source staging directory is removed before saving.
+The ownership ledger also tracks the builder's git-pin record and disposable primary workspace.
+A live builder process keeps these resources out of startup cleanup. If the process is interrupted or
+removal fails, the next sweep can remove the owned sandbox, record and workspace together.
 
 Rebuild after changing toolchains or dependencies. Review where an image will be shared: snapshots
 contain downloaded packages and build artifacts, and can contain data written by repository build
@@ -367,7 +370,28 @@ tasks. Sandboxed work it checks inside the sandbox (see [Checking sandboxed work
 5. **Cleanup.** Removing a worktree in the cleanup dialog, or a completed plan's worktrees in plan
    cleanup, also removes its sandboxes (`sbx rm`) and IMACS's MCP registration for each. The worktree
    cleanup dialog also lists **sandboxes whose worktree is gone**, so you can remove orphans. IMACS only
-   lists and removes sandboxes whose names start with `imacs-`.
+   lists and removes only sandboxes recorded in this home's `sandbox-ownership.json`. Quitting waits for sandbox preparation
+   and stop jobs to finish; stopped sandboxes remain available for resume.
+
+Completed plans automatically remove their clean task worktrees and delete task branches contained in
+the integration branch, using `git branch -d`. Archiving removes clean task worktrees and keeps their
+branches. Integration worktrees stay available. Both behaviors can be disabled independently:
+
+```toml
+[cleanup]
+completed_plans = true
+archived_plans = true
+```
+
+Dirty worktrees, main checkouts, and worktrees used by another session are kept. If
+`[plan] close_done_agents = false`, running task sessions also prevent automatic worktree removal.
+Startup runs cleanup in the background. It removes orphaned sandboxes and MCP registrations without
+session records only when this `IMACS_HOME` recorded their creation in its ownership ledger. Other
+homes' resources and unknown `imacs-*` names are left alone, including resources from before the ledger
+existed; IMACS refuses to attach to an unowned sandbox. The sweep also removes stale briefs, unused warm worktrees, and cache clone stages older than
+a day. Resources created after startup began are left for a later sweep. Unreadable ownership records
+stop the sweep. Cleanup failures appear in the toast, `imacs doctor`, and the Clean up… dialog. On macOS, doctor
+also checks Spotlight indexing and explains how to exclude project and worktree folders.
 
 ## What a sandbox sees
 
@@ -403,9 +427,12 @@ tree, its git folder and the common dir, in `git-pins/<sandbox>.json` in IMACS's
 sandbox mounts. From then on IMACS runs git in that folder with `GIT_DIR`, `GIT_COMMON_DIR` and
 `GIT_WORK_TREE` taken from the record, and never reads them from the folder again, also after a restart and
 for bare agents in the same folder. The record goes with its sandbox: when cleanup removes it, when making
-it fails, and when IMACS starts and sbx no longer has it, however it was removed. A record whose folder no
-longer matches it stays, since the agent may have changed the files git would follow; IMACS logs it, and
-removing the folder (or `git-pins/<sandbox>.json`, once you have checked the folder) lets it go.
+it fails, and when IMACS starts and sbx no longer has it, however it was removed. If removing an owned
+sandbox leaves a folder whose git metadata changed, its named record is replaced by a
+`git-pins/retained-*.json` folder record. The folder stays pinned across restarts until its metadata is
+repaired or the folder is removed; otherwise a later status scan could follow the sandbox's redirect.
+Worktree removal checks for changes using the pins and atomically restores the recorded git pointers
+before asking Git to remove a clean linked checkout. Main checkouts and dirty or locked worktrees stay.
 
 - **Layouts git did not make are refused.** A git folder that does not point back at its worktree, or a
   repository inside the worktree or inside another repository's objects, refs, logs or worktrees, stops

@@ -330,6 +330,7 @@ mod tests {
                 close_tab(app, ctx, 1);
                 click(app, ctx, "Archive plan");
                 assert_eq!(app.runtime.plans[1].status, PlanStatus::Archived);
+                assert!(app.runtime.find("c").is_none(), "archiving closes the plan's task session");
                 click(app, ctx, "History");
                 let output = render(app, ctx, vec![]);
                 let labels = text(&output).iter().map(|shape| shape.galley.text()).collect::<Vec<_>>();
@@ -348,7 +349,7 @@ mod tests {
                 history_action(app, ctx, "one", "reopen");
                 assert_eq!(app.runtime.plans[3].status, PlanStatus::Open);
                 assert_eq!(app.runtime.plans[3].tasks, tasks);
-                assert_eq!(app.runtime.sessions.len(), sessions);
+                assert_eq!(app.runtime.sessions.len(), sessions - 1);
                 assert_eq!(Plan::load(&paths::imacs_home().join("plans/one.json")).unwrap().status, PlanStatus::Open);
             },
         );

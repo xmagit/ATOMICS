@@ -433,7 +433,7 @@ mod tests {
     #[test]
     fn all_view_only_shows_completed_tiles_from_open_plans() {
         with_app("app::fleet::tests::all_view_only_shows_completed_tiles_from_open_plans", |app, _| {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_support::tempdir().unwrap();
             app.runtime.sessions.clear();
             app.runtime.plans = [PlanStatus::Open, PlanStatus::Completed, PlanStatus::Archived]
                 .into_iter()
@@ -468,7 +468,7 @@ mod tests {
         with_app(
             "app::fleet::tests::completed_task_resume_detects_codex_by_program_instead_of_agent_name",
             |app, ctx| {
-                let dir = tempfile::tempdir().unwrap();
+                let dir = crate::test_support::tempdir().unwrap();
                 for (name, program, expected) in
                     [("custom-codex", "/tools/codex", true), ("codex", "/tools/other", false)]
                 {
@@ -618,7 +618,7 @@ mod tests {
         with_app(
             "app::fleet::tests::completed_tiles_and_board_show_results_actions_and_idle_report_age",
             |app, ctx| {
-                let dir = tempfile::tempdir().unwrap();
+                let dir = crate::test_support::tempdir().unwrap();
                 let root = dir.path();
                 app.runtime.sessions =
                     (0..3).map(|i| session(&format!("live-{i}"), AgentKind::Claude, AgentStatus::Idle, root)).collect();

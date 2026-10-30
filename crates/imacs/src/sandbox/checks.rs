@@ -302,8 +302,8 @@ mod tests {
     fn report(dir: &Path) -> String {
         sandbox_lines(dir.join("sbx").to_str().unwrap(), &SandboxConfig::default()).join("\n")
     }
-    fn fixture() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
+    fn fixture() -> crate::test_support::TempDir {
+        let dir = crate::test_support::tempdir().unwrap();
         fake::install(dir.path());
         dir
     }

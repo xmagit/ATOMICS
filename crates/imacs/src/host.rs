@@ -74,6 +74,7 @@ impl Host {
 impl Drop for Host {
     fn drop(&mut self) {
         self.stop();
+        self.state.lock().unwrap().shutdown();
     }
 }
 

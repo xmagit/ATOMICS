@@ -387,6 +387,9 @@ pub(crate) struct State {
     /// The `sbx` program sandboxed agents run with.
     sbx: String,
     sandbox_usage: crate::sandbox_usage::Sampler,
+    lifecycle_jobs: Vec<std::thread::JoinHandle<()>>,
+    startup_cleanup: Option<std::thread::JoinHandle<()>>,
+    shutting_down: bool,
     sandbox_check: Option<Receiver<Vec<String>>>,
     sandbox_lines: Vec<String>,
     /// Sandboxed launches waiting for their sandbox, and their ref guard with what its first check found.
@@ -695,6 +698,12 @@ impl eframe::App for App {
     }
 }
 
+impl Drop for State {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 impl State {
     fn into_host(self) -> crate::host::Host {
         let (wake, ctx, commands) = (self.wake.clone(), self.ctx.clone(), self.control_tx.clone());
@@ -706,7 +715,6 @@ impl State {
         // Before any git runs in a folder a sandbox has worked in. Records of sandboxes that are gone go after.
         crate::sandbox::load_pins(&paths::git_pins_dir());
         let sbx = if cfg!(test) { "/nonexistent/imacs-test-sbx" } else { "sbx" };
-        std::thread::spawn(move || crate::sandbox::prune_pins(&paths::git_pins_dir(), &resolve_program(sbx)));
         let config_path = paths::config_file();
         let (config, config_error) = match Config::load_or_create(&config_path) {
             Ok(config) => (config, None),
@@ -796,6 +804,9 @@ impl State {
             sandbox_check: None,
             sandbox_lines: Vec::new(),
             pending_sandbox: Vec::new(),
+            lifecycle_jobs: Vec::new(),
+            startup_cleanup: None,
+            shutting_down: false,
             ref_checks: crate::ref_guard::Checks::new(),
             sandbox_usage: Default::default(),
             active: None,
@@ -875,6 +886,7 @@ impl State {
         app.open_initial_projects(options.projects, options.workspace);
         app.apply_config();
         if app.hook_error.is_none() {
+            app.begin_startup_cleanup();
             app.restore_restart();
         }
         // One toast for everything startup has to say, so no notice hides another.
@@ -954,7 +966,37 @@ impl State {
 }
 
 impl State {
-    fn shutdown(&mut self) {
+    fn begin_startup_cleanup(&mut self) {
+        let (home, config, sbx, actions) =
+            (paths::imacs_home(), self.config.clone(), self.sbx.clone(), self.action_tx.clone());
+        let before = SystemTime::now();
+        self.startup_cleanup = Some(std::thread::spawn(move || {
+            let sbx = resolve_program(&sbx);
+            let notes = match crate::lifecycle::sweep_before(&home, &config, &sbx, before) {
+                Ok(notes) => notes,
+                Err(err) => vec![format!("Startup cleanup skipped: {err:#}")],
+            };
+            crate::sandbox::prune_pins(&home, &home.join("git-pins"), &sbx);
+            crate::lifecycle::record_leftovers(&home, &notes);
+            if !notes.is_empty() {
+                let _ = actions.send(Box::new(move |state| state.toast(notes.join("\n"))));
+            }
+        }));
+    }
+
+    fn finish_lifecycle_jobs(&mut self) {
+        for job in self.lifecycle_jobs.drain(..) {
+            if job.join().is_err() {
+                eprintln!("IMACS: cleanup worker panicked");
+            }
+        }
+    }
+
+    pub(crate) fn shutdown(&mut self) {
+        if self.shutting_down {
+            return;
+        }
+        self.shutting_down = true;
         // macOS never returns from the event loop after Cmd+Q, so the clean exit is recorded here.
         crate::crash::exited(&paths::imacs_home());
         self.stop_tickets();
@@ -965,6 +1007,23 @@ impl State {
             if let Some(terminal) = &session.terminal {
                 terminal.shutdown();
             }
+        }
+        // Preparation can finish after the window closes. Wait before stopping those sandboxes.
+        let mut names: HashSet<String> = self.sessions.iter().filter_map(|s| s.sandbox.clone()).collect();
+        for (launch, ready) in std::mem::take(&mut self.pending_sandbox) {
+            let _ = ready.recv();
+            if let AgentRuntime::Sandbox(sandbox) = launch.runtime {
+                names.insert(sandbox.name);
+            }
+        }
+        for name in names {
+            self.stop_sandbox(name);
+        }
+        self.finish_lifecycle_jobs();
+        self.check_all_refs(&self.exempt_branches());
+        self.ref_checks.finish();
+        if let Some(job) = self.startup_cleanup.take() {
+            let _ = job.join();
         }
         // A second instance never owned the socket; removing it would cut the first off.
         if self.hook_error.is_none() {

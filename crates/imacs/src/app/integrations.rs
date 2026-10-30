@@ -404,7 +404,7 @@ mod tests {
         let name = "app::integrations::tests::integration_checks_run_in_background_and_ignore_invalidated_results";
         if std::env::var_os("IMACS_APP_TEST_CHILD").is_none() {
             use std::os::unix::fs::PermissionsExt;
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_support::tempdir().unwrap();
             let real_git = crate::setup::resolve_program("git");
             let real_git = format!("'{}'", real_git.replace('\'', "'\\''"));
             let wrapper = dir.path().join("git");

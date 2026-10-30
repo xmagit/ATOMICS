@@ -678,7 +678,7 @@ mod tests {
     #[cfg(feature = "native")]
     #[test]
     fn theme_files_load_from_the_themes_folder() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let config_file = dir.path().join("config.toml");
         let themes = themes_dir(&config_file);
         assert_eq!(themes, dir.path().join("themes"));

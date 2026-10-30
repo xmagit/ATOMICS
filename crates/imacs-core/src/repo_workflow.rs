@@ -302,8 +302,8 @@ mod tests {
     fn outside_instruction_and_config_symlinks_are_refused() {
         use std::os::unix::fs::symlink;
 
-        let dir = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
+        let outside = crate::test_support::tempdir().unwrap();
         std::fs::create_dir(dir.path().join(".imacs")).unwrap();
         std::fs::write(outside.path().join("instructions"), "outside-secret").unwrap();
         std::fs::write(outside.path().join("config"), "review_policy = 'outside-secret'").unwrap();
@@ -333,8 +333,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn outside_topics_directory_is_not_walked() {
-        let dir = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
+        let outside = crate::test_support::tempdir().unwrap();
         std::fs::write(dir.path().join("IMACS.md"), "inside instructions").unwrap();
         std::fs::write(outside.path().join("topic.md"), "outside-secret").unwrap();
         std::fs::write(outside.path().join("config.toml"), "base_ref = 'outside-secret'").unwrap();
@@ -355,7 +355,7 @@ mod tests {
     fn symlinks_within_the_canonical_checkout_are_allowed() {
         use std::os::unix::fs::symlink;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let root = dir.path().join("checkout");
         std::fs::create_dir_all(root.join("topics")).unwrap();
         std::fs::write(root.join("instructions"), "inside instructions").unwrap();
@@ -379,7 +379,7 @@ mod tests {
     fn special_files_are_refused_without_blocking() {
         use std::os::unix::{ffi::OsStrExt, net::UnixListener};
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         std::fs::create_dir(dir.path().join(".imacs")).unwrap();
         for file in ["IMACS.md", ".imacs/config.toml"] {
             let path = std::ffi::CString::new(dir.path().join(file).as_os_str().as_bytes()).unwrap();
@@ -408,7 +408,7 @@ mod tests {
 
     #[test]
     fn file_reads_are_bounded_and_oversized_files_are_omitted() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         std::fs::create_dir(dir.path().join(".imacs")).unwrap();
         std::fs::write(dir.path().join("IMACS.md"), vec![b'x'; FILE_LIMIT as usize - 1]).unwrap();
         let workflow = RepoWorkflow::read(dir.path());
@@ -443,7 +443,7 @@ mod tests {
 
     #[test]
     fn instructions_reload_by_content_and_bound_each_project() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let root = dir.path();
         std::fs::create_dir(root.join(".imacs")).unwrap();
         std::fs::write(root.join("IMACS.md"), "Use issue branches.").unwrap();

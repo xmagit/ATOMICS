@@ -11,7 +11,7 @@ use test_support::{CHILD_TIMEOUT, TestChild};
 
 #[test]
 fn statusline_forwards_live_input_and_preserves_user_stdout_even_without_imacs() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_support::tempdir().unwrap();
     let socket = dir.path().join("usage.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     listener.set_nonblocking(true).unwrap();

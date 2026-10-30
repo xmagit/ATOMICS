@@ -198,7 +198,7 @@ mod tests {
             target.validate().unwrap();
             return;
         }
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let executable = dir.path().join("imacs with spaces");
         std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
         let mut child = TestChild::spawn(
@@ -234,7 +234,7 @@ mod tests {
     fn version_probe_times_out_even_after_printing_a_valid_version() {
         use std::os::unix::fs::PermissionsExt;
         use std::time::{Duration, Instant};
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let program = dir.path().join("codex");
         std::fs::write(&program, "#!/bin/sh\nprintf 'codex-cli 0.165.0\\n'\nexec sleep 30\n").unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -250,7 +250,7 @@ mod tests {
 
     #[test]
     fn successful_version_probe_tolerates_slow_startup() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let program = dir.path().join("codex");
         std::fs::write(&program, "#!/bin/sh\nsleep 1.1\nprintf 'codex-cli 0.165.0\\n'\n").unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();

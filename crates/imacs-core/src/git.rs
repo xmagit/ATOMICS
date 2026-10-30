@@ -397,7 +397,7 @@ pub fn worktree_health(repo: &Path, base_ref: &str) -> Result<Vec<WorktreeHealth
 /// and with `delete_branch` its branch, only when git considers it merged.
 pub fn remove_worktree(repo: &Path, path: &Path, branch: Option<&str>, delete_branch: bool) -> Result<()> {
     let path_text = path.to_string_lossy();
-    if pinned(path).is_some() && path.exists() {
+    if let Some(pins) = pinned(path).filter(|_| path.exists()) {
         // `worktree remove` checks for changes with a git of its own, which follows the worktree's
         // .git file and commondir. Check with the pinned locations, as strictly, then force.
         ensure!(
@@ -407,6 +407,16 @@ pub fn remove_worktree(repo: &Path, path: &Path, branch: Option<&str>, delete_br
         let submodule =
             git(path, &["ls-files", "--stage", "-z"])?.split('\0').any(|entry| entry.starts_with("160000 "));
         ensure!(!submodule, "'{path_text}' contains submodules, which worktree removal leaves to you");
+        let git_dir = pins.git_dir.context("worktree has no pinned git directory")?;
+        let common = pins.common_dir.context("worktree has no pinned common directory")?;
+        ensure!(git_dir != common, "the main checkout cannot be removed");
+        ensure!(!git_dir.join("locked").exists(), "'{path_text}' is locked");
+        // Git validates both directions even with --force. Replace files by rename so a
+        // sandbox-created symlink cannot redirect these writes to a host file. The
+        // recorded locations are trusted; neither .git nor commondir is rediscovered.
+        replace_git_file(&pins.work_tree.join(".git"), &format!("gitdir: {}\n", git_dir.display()))?;
+        replace_git_file(&git_dir.join("commondir"), &format!("{}\n", common.display()))?;
+        replace_git_file(&git_dir.join("gitdir"), &format!("{}\n", pins.work_tree.join(".git").display()))?;
         git(repo, &["worktree", "remove", "--force", &path_text])?;
     } else {
         git(repo, &["worktree", "remove", &path_text])?;
@@ -414,6 +424,14 @@ pub fn remove_worktree(repo: &Path, path: &Path, branch: Option<&str>, delete_br
     if delete_branch && let Some(branch) = branch {
         git(repo, &["branch", "-d", branch])?;
     }
+    Ok(())
+}
+
+fn replace_git_file(path: &Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+    let mut temporary = tempfile::NamedTempFile::new_in(path.parent().context("git file has no parent")?)?;
+    temporary.write_all(contents.as_bytes())?;
+    temporary.persist(path).map_err(|error| error.error)?;
     Ok(())
 }
 
@@ -767,15 +785,15 @@ pub(crate) mod tests {
         run(p, &["commit", "-q", "-m", "base"]);
     }
 
-    fn repo() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
+    fn repo() -> crate::test_support::TempDir {
+        let dir = crate::test_support::tempdir().unwrap();
         init(dir.path());
         dir
     }
 
     /// A repository at `<tmp>/app`, so worktrees next to it are cleaned up with it.
-    pub(crate) fn project() -> (tempfile::TempDir, PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
+    pub(crate) fn project() -> (crate::test_support::TempDir, PathBuf) {
+        let dir = crate::test_support::tempdir().unwrap();
         let repo = dir.path().join("app");
         std::fs::create_dir(&repo).unwrap();
         init(&repo);
@@ -857,9 +875,8 @@ pub(crate) mod tests {
             assert_eq!(common_dir(&folder).unwrap(), common);
             commit_all(&folder, "task work").unwrap();
             match redirect {
-                // git itself refuses a worktree whose .git file names another git folder.
-                Redirect::GitFile => assert!(remove_worktree(&repo, &folder, None, false).is_err()),
-                Redirect::WorktreeCommondir => {
+                // Clean linked checkouts restore their recorded git pointers before removal.
+                Redirect::GitFile | Redirect::WorktreeCommondir => {
                     assert_eq!(health[0].dirty_files, 1, "{health:?}");
                     remove_worktree(&repo, &folder, None, false).unwrap();
                     assert!(!folder.exists());
@@ -949,7 +966,7 @@ pub(crate) mod tests {
     #[test]
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn native_clone_skips_special_files_without_copying_a_cache() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let source = dir.path().join("source");
         let destination = dir.path().join("cache");
         std::fs::create_dir(&source).unwrap();
@@ -963,7 +980,7 @@ pub(crate) mod tests {
 
     #[test]
     fn failed_or_unsupported_clone_leaves_no_cache_and_never_retries_as_a_copy() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let source = dir.path().join("source");
         let destination = dir.path().join("target");
         std::fs::create_dir(&source).unwrap();
@@ -1030,7 +1047,7 @@ pub(crate) mod tests {
         // The Linux harness can repeat this test on ext4, btrfs and XFS mounts.
         let dir = match std::env::var_os("IMACS_COW_TEST_DIR") {
             Some(parent) => tempfile::tempdir_in(parent).unwrap(),
-            None => tempfile::tempdir().unwrap(),
+            None => crate::test_support::tempdir().unwrap(),
         };
         let source = dir.path().join("source");
         let destination = dir.path().join("cache");
@@ -1322,7 +1339,7 @@ pub(crate) mod tests {
 
     #[test]
     fn repository_without_commits_diffs_against_the_empty_tree() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         run(dir.path(), &["init", "-q", "-b", "main"]);
         assert_eq!(worktree_of(dir.path()).unwrap().branch.as_deref(), Some("main"));
         std::fs::write(dir.path().join("new.rs"), "fn main() {}\n").unwrap();

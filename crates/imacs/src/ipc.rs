@@ -348,7 +348,7 @@ mod tests {
 
     #[test]
     fn exec_runs_on_the_socket_thread_in_a_slot_then_tells_the_app() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let sbx = crate::sandbox::fake::install(dir.path()).display().to_string();
         std::fs::write(dir.path().join("exec-runs"), "").unwrap();
         std::fs::create_dir(dir.path().join("sandboxes")).unwrap();

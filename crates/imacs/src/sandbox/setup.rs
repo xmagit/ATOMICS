@@ -388,8 +388,8 @@ mod tests {
     const CLAUDE: &str = "sk-ant-oat01-PRIVATE-fixture";
     const OPENAI: &str = "sk-PRIVATE-openai-fixture";
 
-    fn machine(platform: Platform) -> (tempfile::TempDir, String, Keychain) {
-        let dir = tempfile::tempdir().unwrap();
+    fn machine(platform: Platform) -> (crate::test_support::TempDir, String, Keychain) {
+        let dir = crate::test_support::tempdir().unwrap();
         let sbx = fake::install(dir.path()).to_string_lossy().into_owned();
         let helper = dir.path().join("keychain with spaces");
         std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keychain"), &helper).unwrap();

@@ -479,7 +479,7 @@ mod tests {
     #[test]
     fn screen_reader_defers_terminal_lock_to_worker() {
         let palette = Arc::new(Palette::from_config(&imacs_core::config::ThemeConfig::default()));
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let terminal = Terminal::spawn(
             crate::host::Wake::default(),
             palette.terminal_colors(),
@@ -503,8 +503,8 @@ mod tests {
         terminal.shutdown();
     }
 
-    fn selected_terminal() -> (Terminal, TerminalView, Metrics, tempfile::TempDir) {
-        let dir = tempfile::tempdir().unwrap();
+    fn selected_terminal() -> (Terminal, TerminalView, Metrics, crate::test_support::TempDir) {
+        let dir = crate::test_support::tempdir().unwrap();
         let palette = Palette::from_config(&imacs_core::config::ThemeConfig::default());
         let terminal = Terminal::spawn(crate::host::Wake::default(), palette.terminal_colors(), "/bin/sh".into(), vec!["-c".into(), "stty -echo; printf 'reviewed\\r\\n'; read -r ignored; printf 'one\\r\\ntwo\\r\\nthree\\r\\nfour\\r\\nfive\\r\\n'; exec /bin/sleep 30".into()], dir.path(), HashMap::new(), 100).unwrap();
         wait_for_text(&terminal, "reviewed");
@@ -572,7 +572,7 @@ mod tests {
             let channel = |v: u8| format!("{v:02x}{v:02x}");
             format!("rgb:{}/{}/{}!", channel(color.r()), channel(color.g()), channel(color.b()))
         };
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         // OSC 10 foreground, 11 background, 4;1 red, 12 cursor; each answer has a fixed length.
         for (query, length, light, dark) in [
             ("\\033]10;?\\007", 24, paper.foreground, claude.foreground),

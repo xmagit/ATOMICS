@@ -23,6 +23,10 @@ repos = []
 # {slug} the branch name with "/" replaced by "-". Siblings of the repo by default.
 worktree_path = "{repo_parent}/{repo}-{slug}"
 
+[cleanup]
+completed_plans = true        # remove clean task worktrees and merged task branches
+archived_plans = true         # remove clean task worktrees; keep branches
+
 [worktrees]
 # Clone existing cache folders from the main checkout before starting an agent.
 # Copy-on-write only (APFS on macOS, reflink on Linux); unsupported clones are skipped.
@@ -250,6 +254,7 @@ pub struct Config {
     pub repos: Vec<String>,
     pub worktree_path: String,
     pub worktrees: WorktreeConfig,
+    pub cleanup: CleanupConfig,
     pub layout: LayoutConfig,
     pub font: FontConfig,
     pub terminal: TerminalConfig,
@@ -266,6 +271,20 @@ pub struct Config {
     pub voice: VoiceConfig,
     pub keys: KeyConfig,
     pub tickets: crate::tickets::TicketConfig,
+}
+
+/// Automatic cleanup on plan completion and archival. Dirty worktrees are always kept.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CleanupConfig {
+    pub completed_plans: bool,
+    pub archived_plans: bool,
+}
+
+impl Default for CleanupConfig {
+    fn default() -> Self {
+        Self { completed_plans: true, archived_plans: true }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -575,6 +594,7 @@ impl Default for Config {
             repos: Vec::new(),
             worktree_path: "{repo_parent}/{repo}-{slug}".into(),
             worktrees: WorktreeConfig::default(),
+            cleanup: CleanupConfig::default(),
             layout: LayoutConfig::default(),
             font: FontConfig::default(),
             terminal: TerminalConfig::default(),
@@ -781,12 +801,22 @@ mod tests {
 
     #[cfg(feature = "native")]
     #[test]
+    fn automatic_plan_cleanup_defaults_on_and_can_be_disabled_independently() {
+        let defaults: Config = toml::from_str("").unwrap();
+        assert!(defaults.cleanup.completed_plans && defaults.cleanup.archived_plans);
+        let custom: Config = toml::from_str("[cleanup]\ncompleted_plans = false\narchived_plans = false").unwrap();
+        assert!(!custom.cleanup.completed_plans && !custom.cleanup.archived_plans);
+        let config: Config = toml::from_str(DEFAULT_CONFIG).unwrap();
+        assert!(config.cleanup.completed_plans && config.cleanup.archived_plans);
+    }
+
+    #[test]
     fn host_config_merges_keys_and_expands_paths_on_each_machine() {
         use crate::{git, paths};
         const CHILD: &str = "IMACS_HOST_CONFIG_TEST_CHILD";
         if std::env::var_os(CHILD).is_none() {
             for host in [Some("work-mac"), None] {
-                let dir = tempfile::tempdir().unwrap();
+                let dir = crate::test_support::tempdir().unwrap();
                 let mut command = std::process::Command::new(std::env::current_exe().unwrap());
                 command
                     .args(["--exact", "config::tests::host_config_merges_keys_and_expands_paths_on_each_machine"])

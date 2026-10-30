@@ -80,7 +80,7 @@ mod tests {
 
     #[test]
     fn user_statusline_follows_settings_precedence() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let project = dir.path().join("project");
         std::fs::create_dir_all(project.join(".claude")).unwrap();
         assert!(user_command(dir.path(), Some(&project)).is_none());

@@ -160,8 +160,8 @@ mod tests {
     use std::sync::Arc;
 
     /// A fake sbx that runs exec commands, with sandbox `imacs-s1`, and a worktree beside it.
-    fn setup() -> (tempfile::TempDir, String, PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
+    fn setup() -> (crate::test_support::TempDir, String, PathBuf) {
+        let dir = crate::test_support::tempdir().unwrap();
         let sbx = fake::install(dir.path()).display().to_string();
         std::fs::write(dir.path().join("exec-runs"), "").unwrap();
         std::fs::create_dir(dir.path().join("sandboxes")).unwrap();
@@ -210,7 +210,10 @@ mod tests {
         let (_dir, sbx, worktree) = setup();
         let started = Instant::now();
         let done = job(&sbx, &worktree, "echo started; exec sleep 30", 1).run(&governor(1), || false).unwrap();
-        assert!(started.elapsed() < Duration::from_secs(10), "it must not wait for the command");
+        assert!(
+            started.elapsed() < crate::test_support::scaled_timeout(Duration::from_secs(10)),
+            "it must not wait for the command"
+        );
         assert_eq!((done.exit_code, done.timed_out), (Some(124), true));
         assert_eq!(done.stdout, "started\n");
     }
@@ -242,7 +245,7 @@ mod tests {
             let (governor, job) = (governor.clone(), job(&sbx, &worktree, "TOKEN=secret cargo test -p core", 600));
             std::thread::spawn(move || job.run(&governor, || false))
         };
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(60));
         while governor.snapshot().1.is_empty() {
             assert!(Instant::now() < deadline, "the check must queue for the slot");
             std::thread::sleep(Duration::from_millis(10));
@@ -265,7 +268,7 @@ mod tests {
             let governor = governor.clone();
             std::thread::spawn(move || slow.run(&governor, || false))
         };
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(60));
         while governor.snapshot().0.is_empty() {
             assert!(Instant::now() < deadline, "the check must take a slot");
             std::thread::sleep(Duration::from_millis(10));

@@ -84,7 +84,7 @@ mod tests {
     #[test]
     fn permission_forward_waits_beyond_the_ordinary_hook_timeout() {
         let started = std::time::Instant::now();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let socket = dir.path().join("permission.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = std::thread::spawn(move || {
@@ -112,7 +112,7 @@ mod tests {
     #[test]
     fn ordinary_hook_forward_expires_without_a_reply() {
         let started = std::time::Instant::now();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let socket = dir.path().join("ordinary.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = std::thread::spawn(move || {
@@ -144,7 +144,7 @@ mod tests {
             run(Some(socket.into()), None);
             return;
         }
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let socket = dir.path().join("hook.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();

@@ -30,7 +30,7 @@ fn registered_command(args: &[String]) -> Command {
 
 #[test]
 fn registered_host_mcp_reports_and_scoped_ticket_requests_cross_the_stand_in_gateway() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_support::tempdir().unwrap();
     let socket = dir.path().join("imacs, test.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     listener.set_nonblocking(true).unwrap();
