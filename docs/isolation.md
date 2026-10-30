@@ -575,7 +575,10 @@ Startup runs cleanup in the background. It removes orphaned sandboxes and MCP re
 session records only when this `IMACS_HOME` recorded their creation in its ownership ledger. Other
 homes' resources and unknown `imacs-*` names are left alone, including resources from before the ledger
 existed; IMACS refuses to attach to an unowned sandbox. The sweep also removes stale briefs, unused warm worktrees, and cache clone stages older than
-a day. Resources created after startup began are left for a later sweep. Unreadable ownership records
+a day. Resources created after startup began are left for a later sweep. A reserved sandbox or MCP
+registration missing from sbx's inventory is also kept while its creator is alive or its reservation
+is less than 15 minutes old (the sandbox create limit): the daemon could still finish creating it.
+After that window and creator exit, a later sweep can clear the absent resource. Unreadable ownership records
 stop the sweep. Cleanup failures appear in the toast, `imacs doctor`, and the Clean up… dialog. On macOS, doctor
 also checks Spotlight indexing and explains how to exclude project and worktree folders.
 

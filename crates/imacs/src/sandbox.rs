@@ -497,8 +497,8 @@ pub fn stop(home: &Path, program: &str, name: &str) -> Result<()> {
 }
 
 /// Removes a sandbox, its way to the relay and IMACS's MCP registration for it. The sandbox and the
-/// registration may be only reserved: a start that stopped before sbx made them leaves nothing to
-/// remove.
+/// registration may be only reserved: an unlisted recent or live create keeps its reservation
+/// until a later cleanup can establish that creation has ended.
 pub fn remove(home: &Path, program: &str, name: &str) -> Result<()> {
     let owned = ownership::owned(home)?.get(name).cloned().unwrap_or_default();
     if owned.sandbox {
