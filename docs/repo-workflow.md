@@ -88,9 +88,10 @@ stages = ["accepted", "integrated", "pr_opened", "ci_passed", "security_approved
 | `workflow.done` | string | Completion milestone, overriding the workspace workflow for this project. |
 | `workflow.stages` | array of strings | Successful stages in order, starting with `accepted`; custom stages are supported. |
 | `isolation.mode` | `"sandbox"` only | Every agent in this repository runs in a sandbox, whatever the user's config or the agent's own `isolation` says. A repository can tighten isolation, never loosen it: `"bare"` is ignored with a warning. See [Agent isolation](isolation.md). |
+| `isolation.sandbox.template` | string | Image or saved local template for this repository, overriding the workspace template. See [Warm templates](isolation.md#warm-templates). |
 
 All other keys are **ignored with doctor warnings**, including `agents`, `[chief]`, `[approvals]`,
-`[tickets.server]`, ticket operations, resource settings and `[isolation.sandbox]`. Invalid value types are also ignored and
+`[tickets.server]`, ticket operations, resource settings and other `[isolation.sandbox]` keys. Invalid value types are also ignored and
 warned about; an invalid workflow is ignored as a section. A malformed or unreadable repository config is
 ignored with a warning; removing it restores workspace/main settings. Warnings include the file and key,
 without quoting rejected values.

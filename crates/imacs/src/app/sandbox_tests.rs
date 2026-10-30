@@ -167,8 +167,16 @@ fn bare_agents_never_touch_sbx_and_a_repository_can_only_tighten() {
 
         // A repository that requires sandboxes overrides the user's bare mode and the agent's own.
         app.runtime.config.isolation.mode = IsolationMode::Bare;
+        app.runtime.config.isolation.sandbox.template = Some("workspace:local".into());
         std::fs::create_dir(repo.join(".imacs")).unwrap();
-        std::fs::write(repo.join(".imacs/config.toml"), "[isolation]\nmode = \"sandbox\"\n").unwrap();
+        std::fs::write(
+            repo.join(".imacs/config.toml"),
+            "[isolation]\nmode = \"sandbox\"\n[isolation.sandbox]\ntemplate = \"repo:local\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir(worktree.join(".imacs")).unwrap();
+        std::fs::write(worktree.join(".imacs/config.toml"), "[isolation.sandbox]\ntemplate = \"worktree:local\"\n")
+            .unwrap();
         let error = app.runtime.start(ctx, "bare-probe", worktree.clone(), None, vec![], None).unwrap_err();
         assert!(error.contains("requires sandboxed agents"), "{error}");
         assert!(!out.exists());
@@ -176,6 +184,8 @@ fn bare_agents_never_touch_sbx_and_a_repository_can_only_tighten() {
         tick_until(app, ctx, "the sandboxed shell", |_| bin.path().join("run-ssh").exists());
         let run = fake::calls_to(bin.path(), &["run"]).pop().unwrap();
         assert_eq!(run, ["run", "--name", format!("imacs-{id}").as_str(), "shell", "--"]);
+        let create = fake::calls_to(bin.path(), &["create"]).pop().unwrap();
+        assert!(create.windows(2).any(|args| args == ["--template", "repo:local"]));
 
         // A repository asking for bare is ignored: sandbox mode stays.
         std::fs::write(repo.join(".imacs/config.toml"), "[isolation]\nmode = \"bare\"\n").unwrap();
@@ -183,7 +193,11 @@ fn bare_agents_never_touch_sbx_and_a_repository_can_only_tighten() {
         let calls = fake::calls(bin.path()).len();
         let id = app.runtime.start(ctx, "shell", worktree.clone(), None, vec![], None).unwrap();
         assert!(app.runtime.sessions[app.runtime.find(&id).unwrap()].terminal.is_none());
-        tick_until(app, ctx, "the second sandbox", |_| fake::calls(bin.path()).len() > calls + 3);
+        tick_until(app, ctx, "the second sandbox", |_| {
+            fake::calls(bin.path()).len() > calls + 3 && fake::calls_to(bin.path(), &["create"]).len() == 2
+        });
+        let create = fake::calls_to(bin.path(), &["create"]).pop().unwrap();
+        assert!(create.windows(2).any(|args| args == ["--template", "workspace:local"]));
         app.runtime.sessions.clear();
     });
 }
@@ -204,6 +218,7 @@ fn the_cleanup_dialog_removes_a_worktrees_sandbox_and_chosen_orphans() {
                 agent: "claude",
                 cwd: path.clone(),
                 config: Default::default(),
+                warm: Vec::new(),
                 exe: "/imacs".into(),
                 socket: "/imacs.sock".into(),
                 briefs: None,

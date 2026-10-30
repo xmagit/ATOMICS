@@ -86,11 +86,21 @@ impl RepoWorkflow {
         if let Some(workflow) = self.config.table.get("workflow") {
             config.workflow = workflow.clone().try_into().unwrap_or_default();
         }
-        // `declarative` keeps only `mode = "sandbox"`: a repository can tighten isolation, never loosen it.
+        // A repository may require sandbox mode and select its image; host access settings remain user-owned.
         if self.config.table.get("isolation").and_then(|table| table.get("mode")).and_then(toml::Value::as_str)
             == Some("sandbox")
         {
             config.require_sandbox();
+        }
+        if let Some(template) = self
+            .config
+            .table
+            .get("isolation")
+            .and_then(|table| table.get("sandbox"))
+            .and_then(|table| table.get("template"))
+            .and_then(toml::Value::as_str)
+        {
+            config.isolation.sandbox.template = Some(template.into());
         }
         config
     }
@@ -229,9 +239,13 @@ pub fn declarative(table: &toml::Table) -> (toml::Table, Vec<String>) {
                 continue;
             }
             let valid = match name.as_str() {
-                "base_ref" | "pr_title" | "review_policy" | "tickets.branch" | "workflow.done" | "isolation.mode" => {
-                    Some(value.is_str())
-                }
+                "base_ref"
+                | "pr_title"
+                | "review_policy"
+                | "tickets.branch"
+                | "workflow.done"
+                | "isolation.mode"
+                | "isolation.sandbox.template" => Some(value.is_str()),
                 "test_commands" | "qa_commands" | "worktrees.warm" | "workflow.stages" => {
                     Some(value.as_array().is_some_and(|items| items.iter().all(toml::Value::is_str)))
                 }
@@ -243,7 +257,9 @@ pub fn declarative(table: &toml::Table) -> (toml::Table, Vec<String>) {
                 } else {
                     warnings.push(format!("ignored {name}: invalid type for declarative setting"));
                 }
-            } else if matches!(name.as_str(), "tickets" | "worktrees" | "workflow" | "isolation") && value.is_table() {
+            } else if matches!(name.as_str(), "tickets" | "worktrees" | "workflow" | "isolation" | "isolation.sandbox")
+                && value.is_table()
+            {
                 let mut inner = toml::Table::new();
                 visit(value.as_table().unwrap(), &name, &mut inner, warnings);
                 if !inner.is_empty() || value.as_table().unwrap().is_empty() {
@@ -499,6 +515,24 @@ stages = ["accepted", "pr_opened", "qa_passed", "merged"]
         assert!(warnings.iter().any(|warning| warning.contains("ignored workflow")));
         let (_, warnings) = declarative(&toml::from_str("base_ref = 42\ntest_commands = 'execute me'").unwrap());
         assert_eq!(warnings.len(), 2);
+    }
+
+    #[test]
+    fn repo_template_overrides_workspace_without_widening_host_access() {
+        let mut user = crate::config::Config::default();
+        user.isolation.sandbox.template = Some("workspace:local".into());
+        let (table, warnings) = declarative(
+            &toml::from_str("[isolation.sandbox]\ntemplate = 'repo:local'\nmounts = ['/']\nssh_agent = true").unwrap(),
+        );
+        assert_eq!(warnings.len(), 2);
+        let mut repo = RepoWorkflow::default();
+        repo.config.table = table;
+        let applied = repo.apply(&user);
+        assert_eq!(applied.isolation.sandbox.template.as_deref(), Some("repo:local"));
+        assert!(applied.isolation.sandbox.mounts.is_empty());
+        assert!(!applied.isolation.sandbox.ssh_agent);
+        let (_, warnings) = declarative(&toml::from_str("[isolation.sandbox]\ntemplate = 42").unwrap());
+        assert_eq!(warnings.len(), 1);
     }
 
     #[test]

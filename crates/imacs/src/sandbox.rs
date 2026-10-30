@@ -3,6 +3,8 @@
 //! when the agent exits and removed with its worktree. The command lines come from
 //! [`imacs_core::isolation`]; this module runs them.
 
+pub mod template;
+
 use std::fs::File;
 use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
@@ -66,6 +68,7 @@ pub struct Prepare {
     pub agent: &'static str,
     pub cwd: PathBuf,
     pub config: SandboxConfig,
+    pub warm: Vec<String>,
     /// IMACS's executable and socket, for the MCP server agents report through.
     pub exe: PathBuf,
     pub socket: PathBuf,
@@ -155,6 +158,7 @@ pub fn prepare(job: &Prepare) -> Result<()> {
     let spec = Spec {
         name: job.name.clone(),
         agent: job.agent,
+        warm: warm_mounts(&workspace, &job.warm, cfg!(target_os = "linux")),
         workspace,
         git,
         read_only,
@@ -189,6 +193,38 @@ pub fn prepare(job: &Prepare) -> Result<()> {
     finish().inspect_err(|_| {
         let _ = remove(&job.sbx, &job.name);
     })
+}
+
+/// Only real directories inside this worktree may be exposed as writable caches.
+/// Explicit mounts keep sbx from filtering ignored build folders out of the workspace.
+fn warm_mounts(root: &Path, folders: &[String], linux: bool) -> Vec<PathBuf> {
+    if !linux {
+        return Vec::new();
+    }
+    let root = real(root);
+    let mut mounts = Vec::new();
+    for folder in folders {
+        let relative = Path::new(folder);
+        if relative.as_os_str().is_empty()
+            || !relative.components().all(|part| matches!(part, std::path::Component::Normal(name) if name != ".git"))
+        {
+            continue;
+        }
+        let path = root.join(relative);
+        let mut current = root.clone();
+        let no_links = relative.components().all(|part| {
+            current.push(part);
+            std::fs::symlink_metadata(&current).is_ok_and(|m| !m.file_type().is_symlink())
+        });
+        if no_links
+            && path.is_dir()
+            && path.canonicalize().is_ok_and(|resolved| resolved.starts_with(&root))
+            && !mounts.contains(&path)
+        {
+            mounts.push(path);
+        }
+    }
+    mounts
 }
 
 /// The folder a sandbox mounts read-write for `cwd`, its worktree (else `cwd` itself), and
@@ -422,10 +458,55 @@ mod tests {
             agent: "codex",
             cwd: cwd.to_path_buf(),
             config,
+            warm: Vec::new(),
             exe: "/Applications/IMACS.app/Contents/MacOS/imacs".into(),
             socket: "/run/user/501/imacs/imacs.sock".into(),
             briefs: None,
         }
+    }
+
+    #[test]
+    fn linux_mounts_only_configured_warm_directories_inside_the_worktree() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("target")).unwrap();
+        std::fs::create_dir_all(root.path().join("build/cache")).unwrap();
+        symlink(outside.path(), root.path().join("escape")).unwrap();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        symlink(root.path().join(".git"), root.path().join("git-link")).unwrap();
+        let folders = [
+            "target",
+            "build/cache",
+            "target",
+            "missing",
+            "../escape",
+            "/tmp",
+            ".git/objects",
+            "escape",
+            "git-link",
+            "",
+        ]
+        .map(String::from);
+        assert!(warm_mounts(root.path(), &folders, false).is_empty());
+        let expected = vec![real(root.path()).join("target"), real(root.path()).join("build/cache")];
+        assert_eq!(warm_mounts(root.path(), &folders, true), expected);
+        let spec = Spec {
+            name: "imacs-linux".into(),
+            agent: "codex",
+            workspace: real(root.path()),
+            git: Vec::new(),
+            warm: expected.clone(),
+            read_only: Vec::new(),
+            memory: None,
+            cpus: None,
+            template: Some("local:cache".into()),
+        };
+        let args = isolation::create_args(&spec);
+        for path in expected {
+            assert!(args.contains(&path.display().to_string()));
+        }
+        assert!(args.contains(&format!("CARGO_TARGET_DIR={}/target", real(root.path()).display())));
     }
 
     #[test]
@@ -509,6 +590,7 @@ mod tests {
             agent: "codex",
             workspace: top.clone(),
             git,
+            warm: Vec::new(),
             read_only: vec![docs.path().to_path_buf(), bin.path().join("briefs/s1")],
             memory: Some("8g".into()),
             cpus: Some(4),
