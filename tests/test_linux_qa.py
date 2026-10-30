@@ -85,12 +85,31 @@ class LinuxQaVolumes(unittest.TestCase):
         key = subprocess.run(["cksum"], input=str(self.checkout), text=True, capture_output=True, check=True).stdout.split()[0]
         self.target = "imacs-linux-qa-target-" + key
 
-    def run_runner(self, state):
+    def run_runner(self, state, *args):
         self.state.write_text(json.dumps(state))
-        result = subprocess.run(["bash", str(self.checkout / "scripts/linux-qa.sh"), "shell"],
+        result = subprocess.run(["bash", str(self.checkout / "scripts/linux-qa.sh"), *(args or ["shell"])],
                                 env=self.env, stdin=subprocess.DEVNULL, text=True, capture_output=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(self.state.read_text()), result
+
+    def test_screenshot_passes_control_requests_to_the_container_in_order(self):
+        output = self.directory / "shots" / "ungrouped.png"
+        requests = ['{"cmd":"start","agent":"shell","isolation":"bare"}', '{"cmd":"activate","session":"a b"}']
+        state, _ = self.run_runner(dict(volumes={}, calls=[]), "screenshot", str(output), "--size", "1280x800",
+                                   "--ctl", requests[0], "--ctl", requests[1])
+        run = next(call for call in state["calls"] if call[:1] == ["run"])
+        self.assertEqual(run[-5:], ["/repo/scripts/linux-qa-container.sh", "screenshot", "1280x800", *requests])
+        self.assertTrue(output.exists())
+        state, _ = self.run_runner(dict(volumes={}, calls=[]), "screenshot", str(output))
+        run = next(call for call in state["calls"] if call[:1] == ["run"])
+        self.assertEqual(run[-3:], ["/repo/scripts/linux-qa-container.sh", "screenshot", "1600x1000"])
+
+    def test_screenshot_options_need_values(self):
+        for args in (["--ctl"], ["--ctl", ""], ["--size"], ["--other", "x"]):
+            result = subprocess.run(["bash", str(self.checkout / "scripts/linux-qa.sh"), "screenshot",
+                                     str(self.directory / "out.png"), *args],
+                                    env=self.env, stdin=subprocess.DEVNULL, text=True, capture_output=True, timeout=30)
+            self.assertEqual(result.returncode, 2, args)
 
     def test_new_target_has_checkout_label_and_is_reused(self):
         state, _ = self.run_runner(dict(volumes={}, calls=[]))

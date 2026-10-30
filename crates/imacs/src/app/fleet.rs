@@ -8,6 +8,8 @@ impl State {
             .filter(|&i| {
                 if self.plan_view {
                     self.plans[self.selected_plan].contains_session(&self.sessions[i].id)
+                } else if self.ungrouped {
+                    self.ungrouped_session(&self.sessions[i])
                 } else {
                     match &self.view {
                         None => true,
@@ -19,6 +21,10 @@ impl State {
     }
 
     pub(super) fn completed_tasks(&self) -> Vec<(usize, usize)> {
+        // Completed tasks belong to plans, so the Ungrouped tab shows none.
+        if self.ungrouped && !self.plan_view {
+            return Vec::new();
+        }
         self.plans
             .iter()
             .enumerate()
@@ -146,6 +152,7 @@ impl Desktop<'_> {
         let size = vec2(rect.width() / cols as f32, rect.height() / rows as f32);
         let mut activate: Option<(String, bool)> = None;
         let mut close: Option<String> = None;
+        let mut rename: Option<String> = None;
         let mut resume: Option<usize> = None;
         let mut approval = None;
         let focus_request = self.client.focus_terminal.take();
@@ -215,9 +222,10 @@ impl Desktop<'_> {
             let title_response =
                 ui.interact(title_rect, ui.scope_id().with(("tile-title", &session.id)), Sense::click());
             let title_color = if title_response.hovered() || active { p.accent } else { p.foreground };
-            let mut subtitle = match session.branch() {
-                Some(branch) => format!("{} · {} · {}", session.agent, branch, session.status.label()),
-                None => format!("{} · {}", session.agent, session.status.label()),
+            let mut subtitle = match (&session.scratch, session.branch()) {
+                (Some(_), _) => format!("{} · scratch · {}", session.agent, session.status.label()),
+                (None, Some(branch)) => format!("{} · {} · {}", session.agent, branch, session.status.label()),
+                (None, None) => format!("{} · {}", session.agent, session.status.label()),
             };
             if let Some(note) =
                 session.terminal.as_ref().and_then(|t| queue_note(t.process_id(), &slots_running, &slots_waiting))
@@ -238,7 +246,15 @@ impl Desktop<'_> {
                 p.ui(11.5),
                 p.muted,
             );
-            if title_response.on_hover_text("Show this worktree's diff against main").clicked() {
+            let hover = if session.chief {
+                "Show this worktree's diff against main"
+            } else {
+                "Show this worktree's diff against main · double-click to rename"
+            };
+            let title_response = title_response.on_hover_text(hover);
+            if title_response.double_clicked() {
+                rename = Some(session.id.clone());
+            } else if title_response.clicked() {
                 activate = Some((session.id.clone(), true));
             }
             let close_rect = Rect::from_center_size(pos2(header.right() - 14.0, header.center().y), Vec2::splat(18.0));
@@ -406,14 +422,17 @@ impl Desktop<'_> {
         if let Some((id, open)) = activate {
             self.activate(&id, open);
         }
+        if let Some(id) = rename {
+            self.begin_rename(&id);
+        }
         if let Some(id) = close {
-            let running = self
+            // Closing a scratch session deletes its folder, so it asks even once the agent exited.
+            let ask = self
                 .sessions
                 .iter()
                 .find(|s| s.id == id)
-                .and_then(|s| s.terminal.as_ref())
-                .is_some_and(|t| !t.exited());
-            if running { self.client.confirm_close = Some(id) } else { self.close(&id) }
+                .is_some_and(|s| s.scratch.is_some() || s.terminal.as_ref().is_some_and(|t| !t.exited()));
+            if ask { self.client.confirm_close = Some(id) } else { self.close(&id) }
         }
         if let Some(index) = resume {
             let s = &self.runtime.sessions[index];
@@ -427,8 +446,13 @@ impl Desktop<'_> {
                 last_prompt: None,
                 updated: 0,
                 sandbox: s.sandbox.clone(),
+                named: s.naming == Naming::Named,
             };
             let id = s.id.clone();
+            // A resumed scratch session keeps its folder, and finds its sandbox by its record.
+            if self.runtime.sessions[index].scratch.take().is_some() && record.sandbox.is_some() {
+                self.runtime.store.upsert(record.clone());
+            }
             self.close(&id);
             self.post(move |state| state.resume.push(record));
         }

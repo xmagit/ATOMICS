@@ -709,6 +709,7 @@ fn the_chief_always_runs_on_this_machine() {
             last_prompt: None,
             updated: 0,
             sandbox: None,
+            named: false,
         };
         app.runtime.sessions.clear();
         std::fs::remove_file(&out).unwrap();
@@ -772,6 +773,7 @@ fn a_tasks_isolation_wins_over_the_agent_and_mode_but_never_over_a_repository() 
                 last_prompt: None,
                 updated: 0,
                 sandbox: None,
+                named: false,
             };
             app.runtime.close(&native);
             std::fs::remove_file(&out).unwrap();

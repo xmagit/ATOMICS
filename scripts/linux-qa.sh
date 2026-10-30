@@ -3,7 +3,8 @@
 set -euo pipefail
 
 usage() {
-    echo 'Usage: scripts/linux-qa.sh test | screenshot <out.png> [--size WxH] | shell' >&2
+    echo 'Usage: scripts/linux-qa.sh test | screenshot <out.png> [--size WxH] [--ctl JSON]... | shell' >&2
+    echo '  --ctl sends one control request (imacs ctl) to the isolated instance before the screenshot.' >&2
     exit 2
 }
 
@@ -12,6 +13,7 @@ command=${1:-}
 [[ $# -gt 0 ]] || usage
 shift
 size=1600x1000
+requests=()
 case "$command" in
     test|shell) [[ $# -eq 0 ]] || usage ;;
     screenshot)
@@ -22,10 +24,15 @@ case "$command" in
             echo 'Screenshot output must be a file, not a directory.' >&2
             exit 2
         fi
-        if [[ $# -gt 0 ]]; then
-            [[ $# -eq 2 && $1 == --size ]] || usage
-            size=$2
-        fi
+        while [[ $# -gt 0 ]]; do
+            [[ $# -ge 2 && -n $2 ]] || usage
+            case $1 in
+                --size) size=$2 ;;
+                --ctl) requests+=("$2") ;;
+                *) usage ;;
+            esac
+            shift 2
+        done
         [[ $size =~ ^([0-9]{3,4})x([0-9]{3,4})$ ]] || usage
         width=$((10#${BASH_REMATCH[1]}))
         height=$((10#${BASH_REMATCH[2]}))
@@ -103,7 +110,9 @@ case "$command" in
         mkdir -p "$(dirname "$output")"
         temporary=$(mktemp "${output}.XXXXXX")
         trap 'rm -f "$temporary"' EXIT
-        "${run[@]}" "$image" bash /repo/scripts/linux-qa-container.sh screenshot "$size" > "$temporary"
+        # macOS bash 3.2 treats an empty array as unset under set -u.
+        "${run[@]}" "$image" bash /repo/scripts/linux-qa-container.sh screenshot "$size" \
+            ${requests[@]+"${requests[@]}"} > "$temporary"
         mv -f "$temporary" "$output"
         echo "Saved Linux screenshot: $output"
         ;;

@@ -206,10 +206,11 @@ isolation = "bare"           # this agent runs on this machine, whatever mode sa
 | `mcp` | MCP servers registered with `sbx mcp add`. IMACS loads them into each new sandbox (`sbx mcp load`). |
 | `isolation` in `[[agents]]` | `"sandbox"` or `"bare"` for one agent. |
 | `isolation` in a plan task | `"sandbox"` or `"bare"` for one task, set by the chief in `imacs_plan_set` and shown on its board card. Use `"bare"` for work that needs this machine, such as macOS-native builds or screenshot QA. |
+| Isolation in **New session** | **Sandboxed** or **Bare** for one session, or **As configured**. `imacs_start` and `imacs ctl` take it as `isolation`. Scratch sessions in the Ungrouped tab follow the same settings as every other agent. |
 
-A repository that requires sandboxes wins over everything. Otherwise a plan task's `isolation` wins,
+A repository that requires sandboxes wins over everything. Otherwise a plan task's or session's `isolation` wins,
 then the agent's, then `mode`. A task keeps its isolation when it is resumed, from the board or after a
-restart.
+restart; any other session resumes where it ran, sandboxed or bare.
 
 `[isolation]` can be set in `config.toml`, in `config.d/<host>.toml`, or in a workspace file. A workspace's
 `[isolation]` merges key by key, the same way a host file does. Settings apply to agents started

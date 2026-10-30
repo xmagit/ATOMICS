@@ -26,6 +26,7 @@ case "${1:-}" in
         ;;
     screenshot)
         size=$2
+        shift 2
         # Keep build diagnostics away from stdout, which carries only PNG bytes.
         cargo build --locked -p imacs >&2
         mkdir "$qa/project"
@@ -57,6 +58,19 @@ case "${1:-}" in
             cat "$qa/app.log" >&2
             echo 'Timed out waiting for the Linux IMACS control socket.' >&2
             exit 1
+        fi
+        # Requests from --ctl set the scene, in order; each must succeed.
+        for request in "$@"; do
+            if ! timeout 30 "$CARGO_TARGET_DIR/debug/imacs" ctl "$request" > "$qa/ctl.json" \
+                || ! python3 -c 'import json,sys; sys.exit(not json.load(open(sys.argv[1])).get("ok"))' "$qa/ctl.json"; then
+                cat "$qa/ctl.json" "$qa/app.log" >&2
+                echo "Control request failed: $request" >&2
+                exit 1
+            fi
+        done
+        if [[ $# -gt 0 ]]; then
+            # Let new terminals draw their first output before the capture.
+            sleep 2
         fi
         if ! timeout 30 "$CARGO_TARGET_DIR/debug/imacs" ctl \
             "{\"cmd\":\"screenshot\",\"path\":\"$qa/screenshot.png\"}" > "$qa/screenshot.json"; then
