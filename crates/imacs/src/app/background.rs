@@ -9,6 +9,7 @@ impl State {
         }
         let before = self.runtime_view_revision();
         let mut changed = self.drain_actions();
+        changed |= self.poll_sandbox_check();
         for record in std::mem::take(&mut self.resume) {
             self.resume_record(ctx, record);
             changed = true;

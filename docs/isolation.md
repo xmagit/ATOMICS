@@ -25,6 +25,110 @@ signed in. **IMACS never falls back to bare.** If a check fails, the agent does 
 and a toast say what to do, and a plan task dispatched to it is blocked with the reason. To run agents
 on this machine anyway, set `mode = "bare"`. `imacs doctor` shows whether sandboxes are ready.
 
+## Check sandbox setup
+
+`imacs doctor` (when sandbox mode is configured) and **Settings → Sandbox** share the same
+read-only checks. Settings checks run in the background; use **Refresh sandbox checks** after
+changing sbx. They check the installed minimum version and Docker sign-in, global network policy,
+model credential names, registered MCP servers and their authorization, and SSH forwarding.
+An unrelated failed `sbx diagnose` check, such as SSH client configuration, does not hide a
+successful Authentication check. Missing setup produces warnings; doctor still only requires git
+and valid IMACS configuration. IMACS continues to refuse sandbox launches that fail its runtime
+preflight and never falls back to bare.
+
+The policy display describes the **current global rules**, not IMACS's `network` default. sbx
+exposes rules rather than preserving an immutable preset name: standard rules are reported as
+balanced, allow-all or deny-all, and changed rules as custom. Review custom rules with
+`sbx policy ls`. Checks never initialize or replace a policy or start an OAuth authorization flow.
+
+Credential checks report only known names: `anthropic`, the custom `CLAUDE_CODE_OAUTH_TOKEN`
+route, `openai`, and a warning for `github`. They discard unknown secret names and all raw
+credential-command errors: sbx can accidentally store a token in the NAME column. Do not paste
+`sbx secret ls` output into reports. A stored `github` credential can let agents push as you.
+SSH checks also warn about sbx's global `ssh.agentForwardingEnabled` and a fixed
+`ssh.agentSocketPath`, in addition to IMACS's `ssh_agent` setting. The runtime removes
+`SSH_AUTH_SOCK` when IMACS forwarding is off; a fixed sbx socket can bypass that protection.
+
+## Claude with a subscription
+
+Run **`imacs sandbox setup` in a trusted host terminal**. It confirms the credential change, then
+lets you reuse the `imacs-claude-setup-token` OS keychain entry (account `imacs`) or paste a new
+token from `claude setup-token`. Pasted input has terminal echo disabled. A pipe can supply the
+answers and token over stdin; the command accepts no token argument. The helper writes the
+keychain through stdin, discards keychain and sbx output, and registers a lookup command with
+sbx. It verifies the lookup first, then removes the built-in `anthropic` secret if present.
+If lookup verification fails, the built-in secret stays in place.
+
+**Remove the built-in `anthropic` secret for subscription OAuth.** Its generated `apiKeyHelper`
+outranks `CLAUDE_CODE_OAUTH_TOKEN`, so leaving both configured can make Claude use the wrong
+credential. This is a global sbx credential change and affects other sandboxes using that secret.
+Restart with a new sandbox after changing credential configuration. The helper never prints a
+token, passes one on argv, or writes one to a worktree or IMACS config.
+
+The registration is equivalent to this on macOS (only a lookup command is on argv):
+
+```sh
+sbx secret set-custom --host api.anthropic.com --env CLAUDE_CODE_OAUTH_TOKEN \
+  --placeholder 'sk-ant-oat01-{rand}' \
+  --command '/usr/bin/security find-generic-password -a imacs -s imacs-claude-setup-token -w'
+sbx secret rm anthropic
+```
+
+On Linux, install `libsecret-tools` and run with an unlocked Secret Service keychain in your
+desktop session. The lookup command is:
+
+```sh
+secret-tool lookup service imacs-claude-setup-token account imacs
+sbx secret set-custom --host api.anthropic.com --env CLAUDE_CODE_OAUTH_TOKEN \
+  --placeholder 'sk-ant-oat01-{rand}' \
+  --command '/usr/bin/secret-tool lookup service imacs-claude-setup-token account imacs'
+```
+
+To provision the Linux entry yourself, `secret-tool store --label='IMACS Claude subscription'
+service imacs-claude-setup-token account imacs` reads its value from stdin. Use a trusted terminal
+or a password-manager pipe; do not put the value in shell history. The macOS helper uses
+`security -i` with the keychain write command on stdin. Keychain access may require approval
+from your OS. Keep command helpers and their dependencies outside folders writable by agents.
+For OpenAI, use sbx's interactive `sbx secret set openai`; for an Anthropic API key instead of a
+subscription, use its interactive `sbx secret set anthropic` flow.
+
+## Linux hosts
+
+Use **Ubuntu 24.04 or newer**, hardware virtualization enabled in firmware, working KVM
+(`/dev/kvm`), and membership in the **kvm** group. Install the Linux sbx release from the
+[official releases](https://github.com/docker/sbx-releases), then run `sbx login`.
+Doctor and Settings check the Ubuntu version, whether KVM opens read/write and reports the
+supported API, and the current session's group membership. A device that exists but is not
+accessible is a failed check.
+
+```sh
+sudo usermod -aG kvm "$USER"
+# Log out and back in so the desktop session gets the group, then:
+id -Gn
+imacs doctor
+```
+
+Load the appropriate `kvm_intel` or `kvm_amd` module if `/dev/kvm` is missing. For subscription
+credentials, install `libsecret-tools` and unlock the desktop keychain as described above.
+
+## Tickets and direct Linear access
+
+IMACS's ticket layer stays on the **host** in both modes. Its existing ticket configuration and
+credentials do not need to be copied into a VM. Scoped ticket tools and reports reach the host
+through the per-sandbox IMACS MCP server.
+
+If agents also need Linear's tools directly, register and authorize the server on the host:
+
+```sh
+sbx mcp add linear --url https://mcp.linear.app/mcp
+sbx mcp auth linear
+```
+
+Add `mcp = ["linear"]` to `[isolation.sandbox]` to load it into new sandboxes. Settings and doctor
+report a configured server that is missing, needs authorization, or is unavailable; they also
+check registered direct servers. These checks never invoke `sbx mcp auth` themselves. MCP
+servers run with host permissions, so authorize the services you intend agents to use.
+
 ## Settings
 
 ```toml

@@ -14,6 +14,10 @@ use anyhow::{Context, Result, bail};
 use imacs_core::isolation::{self, Diagnosis, Listed, MIN_SBX_VERSION, SandboxConfig, Spec};
 use imacs_core::{git, paths, workspace};
 
+mod checks;
+pub mod setup;
+pub use checks::doctor_lines;
+
 /// Most sbx commands answer within a second; this bounds a stuck daemon.
 const TIMEOUT: Duration = Duration::from_secs(60);
 /// The first sandbox of an agent pulls its image, which took 51 s on a fast connection.
@@ -101,9 +105,9 @@ pub fn preflight(program: &str) -> Result<Ready, String> {
         ));
     }
     let output = sbx(program, &["version"], false, TIMEOUT)
-        .map_err(|err| format!("sbx did not report its version ({err:#}). Run `sbx version` to see why, {BARE}."))?;
+        .map_err(|_| format!("sbx did not report its version. Run `sbx version` to see why, {BARE}."))?;
     let version = isolation::parse_version(&output).ok_or_else(|| {
-        format!("sbx reported no version IMACS can read ({:?}). Check `sbx version`, {BARE}.", output.trim())
+        format!("sbx reported no version IMACS can read. Check `sbx version`, {BARE}.")
     })?;
     if version < MIN_SBX_VERSION {
         return Err(format!(
@@ -113,30 +117,15 @@ pub fn preflight(program: &str) -> Result<Ready, String> {
         ));
     }
     // diagnose exits non-zero when any check fails, such as an unrelated SSH setting; the report still holds.
-    let (_, output, error) = sbx_output(program, &["diagnose", "--json"], false, TIMEOUT)
-        .map_err(|err| format!("sbx diagnose did not run ({err:#}). Run `sbx diagnose` to see why, {BARE}."))?;
+    let (_, output, _) = sbx_output(program, &["diagnose", "--json"], false, TIMEOUT)
+        .map_err(|_| format!("sbx diagnose did not run. Run `sbx diagnose` to see why, {BARE}."))?;
     let diagnosis: Diagnosis = serde_json::from_str(&output).map_err(|_| {
-        let detail = [error.trim(), output.trim()].into_iter().find(|t| !t.is_empty()).unwrap_or("no output");
-        format!("sbx diagnose gave no report ({detail}). Run `sbx diagnose` to see why, {BARE}.")
+        format!("sbx diagnose gave no readable report. Run `sbx diagnose` to see why, {BARE}.")
     })?;
     if !diagnosis.signed_in() {
         return Err(format!("sbx is not signed in to Docker. Run `sbx login` in a terminal, {BARE}."));
     }
     Ok(Ready { version, diagnosis })
-}
-
-/// The doctor's line about sandboxes: a warning, since bare agents need none of this.
-pub fn doctor_line(program: &str) -> String {
-    match preflight(program) {
-        Ok(ready) => imacs_core::doctor::check_line(
-            true,
-            &format!("Docker Sandboxes ready (sbx {}, signed in)", isolation::version_text(ready.version)),
-            "",
-        ),
-        Err(error) => {
-            imacs_core::doctor::check_line(false, "Docker Sandboxes not ready for sandboxed agents (warning)", &error)
-        }
-    }
 }
 
 /// Makes the sandbox unless it exists, which is how a session reattaches after a restart,
@@ -581,7 +570,10 @@ mod tests {
         let ready = preflight(&sbx).unwrap();
         assert_eq!(ready.version, (0, 50, 1));
         assert!(ready.diagnosis.signed_in(), "an unrelated failing check does not matter");
-        assert!(doctor_line(&sbx).starts_with("✓ Docker Sandboxes ready (sbx v0.50.1, signed in)"));
+        assert!(
+            doctor_lines(&sbx, &SandboxConfig::default())[0]
+                .starts_with("✓ Docker Sandboxes ready (sbx v0.50.1, signed in)")
+        );
         std::fs::write(bin.path().join("version"), "v0.51.2").unwrap();
         assert_eq!(preflight(&sbx).unwrap().version, (0, 51, 2));
 
@@ -602,7 +594,7 @@ mod tests {
         std::fs::write(bin.path().join("version"), "v0.50.1").unwrap();
         std::fs::write(bin.path().join("signed-out"), "").unwrap();
         let error = refusal(&sbx, &["not signed in", "sbx login"]);
-        let line = doctor_line(&sbx);
+        let line = doctor_lines(&sbx, &SandboxConfig::default())[0];
         assert!(line.starts_with("✗ Docker Sandboxes not ready for sandboxed agents (warning) — "), "{line}");
         assert!(line.ends_with(&error), "{line}");
         std::fs::write(bin.path().join("fail-diagnose"), "").unwrap();

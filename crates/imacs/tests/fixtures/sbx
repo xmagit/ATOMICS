@@ -16,7 +16,7 @@ for arg in "$@"; do
 done
 printf '%s\n' "$line" >> "$dir/calls.log"
 if [ -e "$dir/fail-$1" ]; then
-  echo "fake $1 failure" >&2
+  cat "$dir/error-output" 2>/dev/null >&2 || echo "fake $1 failure" >&2
   exit 1
 fi
 case "$1" in
@@ -34,6 +34,30 @@ case "$1" in
     printf '{"name":"Authentication","status":"%s","message":"not signed in","hint":"Run sbx login"},' "$auth"
     printf '{"name":"Global network policy","status":"%s","message":"not initialized"}]}\n' "$policy"
     exit 1
+    ;;
+  policy)
+    if [ "$2" = ls ]; then
+      if [ -e "$dir/policy.json" ]; then cat "$dir/policy.json"; else
+        printf '%s\n' '{"rules":[{"id":"default-ai-services","scope":"global","resource_type":"network","status":"active","decision":"allow","provenance":{"created_via":"default"}}]}'
+      fi
+    fi
+    ;;
+  secret)
+    if [ -e "$dir/fail-secret-$2" ]; then cat "$dir/error-output" 2>/dev/null >&2; exit 1; fi
+    case "$2" in
+      ls) if [ -e "$dir/secrets.json" ]; then cat "$dir/secrets.json"; else printf '%s\n' '[{"name":"anthropic"},{"name":"openai"}]'; fi ;;
+    esac
+    ;;
+  mcp)
+    if [ "$2" = ls ]; then
+      if [ -e "$dir/mcp.json" ]; then cat "$dir/mcp.json"; else printf '%s\n' '[]'; fi
+    fi
+    ;;
+  settings)
+    case "$3" in
+      ssh.agentForwardingEnabled) cat "$dir/ssh-forwarding" 2>/dev/null || echo false ;;
+      ssh.agentSocketPath) cat "$dir/ssh-socket" 2>/dev/null || echo ;;
+    esac
     ;;
   ls)
     printf '['
