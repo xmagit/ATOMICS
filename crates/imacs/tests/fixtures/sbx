@@ -12,16 +12,20 @@ state="$dir/sandboxes"
 mkdir -p "$state"
 line=
 for arg in "$@"; do
+  arg=$(printf '%s' "$arg" | tr '\n\t' '  ')
   line="$line${line:+	}$arg"
 done
 printf '%s\n' "$line" >> "$dir/calls.log"
 if [ -e "$dir/fail-$1" ]; then
-  echo "fake $1 failure" >&2
+  cat "$dir/error-output" 2>/dev/null >&2 || echo "fake $1 failure" >&2
   exit 1
 fi
 case "$1" in
   version)
     printf 'sbx version %s 0123abcd\n' "$(cat "$dir/version" 2>/dev/null || echo v0.50.1)"
+    ;;
+  login)
+    rm -f "$dir/signed-out"
     ;;
   diagnose)
     auth=pass
@@ -34,6 +38,68 @@ case "$1" in
     printf '{"name":"Authentication","status":"%s","message":"not signed in","hint":"Run sbx login"},' "$auth"
     printf '{"name":"Global network policy","status":"%s","message":"not initialized"}]}\n' "$policy"
     exit 1
+    ;;
+  policy)
+    if [ "$2" = init ]; then rm -f "$dir/no-policy"; fi
+    if [ "$2" = ls ]; then
+      if [ -e "$dir/policy.json" ]; then cat "$dir/policy.json"; else
+        printf '%s\n' '{"rules":[{"id":"default-ai-services","scope":"global","resource_type":"network","status":"active","decision":"allow","provenance":{"created_via":"default"}}]}'
+      fi
+    fi
+    ;;
+  secret)
+    if [ -e "$dir/fail-secret-$2" ]; then cat "$dir/error-output" 2>/dev/null >&2; exit 1; fi
+    case "$2" in
+      ls)
+        if [ -e "$dir/secrets.json" ]; then cat "$dir/secrets.json"; else
+          printf '{"secrets":['
+          sep=
+          if [ ! -e "$dir/removed-anthropic" ]; then printf '{"type":"service","name":"anthropic","scope":"global"}'; sep=,; fi
+          if [ ! -e "$dir/no-openai" ]; then printf '%s{"type":"service","name":"openai","scope":"global"}' "$sep"; sep=,; fi
+          if [ -e "$dir/oauth" ]; then printf '%s{"type":"custom","name":"CLAUDE_CODE_OAUTH_TOKEN","scope":"global"}' "$sep"; sep=,; fi
+          if [ -e "$dir/misfiled-secret" ]; then printf '%s{"type":"service","name":"sk-ant-MISFILED-private-value","scope":"global"}' "$sep"; fi
+          printf ']}\n'
+        fi ;;
+      set-custom)
+        # Like real sbx, verify a command source before registering it.
+        shift 2
+        while [ $# -gt 0 ]; do
+          if [ "$1" = --command ]; then
+            /bin/sh -c "$2" > /dev/null || exit 1
+            break
+          fi
+          shift
+        done
+        [ -e "$dir/skip-secret-write" ] || touch "$dir/oauth"
+        ;;
+      set)
+        cat > "$dir/secret-stdin"
+        [ -e "$dir/skip-secret-write" ] || rm -f "$dir/no-openai"
+        ;;
+      rm)
+        case "$3" in anthropic) touch "$dir/removed-anthropic" ;; esac
+        ;;
+    esac
+    ;;
+  mcp)
+    if [ -e "$dir/fail-mcp-$2" ]; then cat "$dir/error-output" 2>/dev/null >&2; exit 1; fi
+    case "$2" in
+      add) printf '%s\n' '[{"name":"linear","status":"needs-auth"}]' > "$dir/mcp.json" ;;
+      auth) printf '%s\n' '[{"name":"linear","status":"ready"}]' > "$dir/mcp.json" ;;
+    esac
+    if [ "$2" = ls ]; then
+      if [ -e "$dir/mcp.json" ]; then cat "$dir/mcp.json"; else printf '%s\n' '[]'; fi
+    fi
+    ;;
+  settings)
+    case "$2:$3" in
+      set:ssh.agentForwardingEnabled) printf '%s\n' "$4" > "$dir/ssh-forwarding" ;;
+      unset:ssh.agentSocketPath) rm -f "$dir/ssh-socket" ;;
+    esac
+    case "$3" in
+      ssh.agentForwardingEnabled) cat "$dir/ssh-forwarding" 2>/dev/null || echo false ;;
+      ssh.agentSocketPath) cat "$dir/ssh-socket" 2>/dev/null || echo ;;
+    esac
     ;;
   ls)
     printf '['
@@ -51,13 +117,16 @@ case "$1" in
     while [ $# -gt 0 ]; do
       case "$1" in
         --name) name=$2; shift 2 ;;
-        --memory|--cpus|--template|--static-mcp) shift 2 ;;
+        --memory|--cpus|--template|--static-mcp|--env) shift 2 ;;
         --*) shift ;;
         *) break ;;
       esac
     done
     agent=$1
     shift
+    case "$1" in
+      *:ro|*:readonly) echo 'primary workspace must be read/write' >&2; exit 1 ;;
+    esac
     workspaces=
     for path in "$@"; do
       workspaces="$workspaces${workspaces:+,}\"$path\""
@@ -72,6 +141,16 @@ case "$1" in
         *) rm -f "$state/$arg" ;;
       esac
     done
+    ;;
+  stop)
+    sed 's/"status":"running"/"status":"stopped"/' "$state/$2" > "$state/$2.tmp" || exit 1
+    mv "$state/$2.tmp" "$state/$2"
+    ;;
+  template)
+    if [ "$2" = save ] && ! grep -q '"status":"stopped"' "$state/$3"; then
+      echo 'stop the sandbox before saving a template non-interactively' >&2
+      exit 1
+    fi
     ;;
   run)
     printf '%s\n' "${SSH_AUTH_SOCK-unset}" > "$dir/run-ssh"

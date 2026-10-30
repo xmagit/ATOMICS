@@ -58,6 +58,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Guide fresh-machine sandbox setup (safe to run again)
+    Setup,
+    /// Set up Docker Sandboxes or build warm repository templates
+    Sandbox {
+        #[command(subcommand)]
+        command: SandboxCommand,
+    },
     /// Check required tools, configuration and integrations
     Doctor,
     /// Hook handler for Claude Code and Codex (reads the event on stdin)
@@ -104,6 +111,29 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum SandboxCommand {
+    /// Set up Claude subscription OAuth using the OS keychain (no token arguments)
+    Setup,
+    Template {
+        #[command(subcommand)]
+        command: TemplateCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum TemplateCommand {
+    /// Save a warmed local template, using this project's configured template tag
+    Build {
+        project: String,
+        #[arg(long, default_value = "codex", value_parser = ["codex", "claude", "shell"])]
+        agent: String,
+        /// Repository-relative project to build for .NET repositories
+        #[arg(long)]
+        dotnet_project: Option<String>,
+    },
+}
+
 /// Markers of the Claude Code or Codex session IMACS may have been started from. Agents
 /// that inherit them believe they are sub-processes (Claude then stops saving
 /// transcripts, so sessions cannot be resumed).
@@ -143,6 +173,24 @@ fn main() -> eframe::Result {
         migration_errors = migration.errors;
     }
     match cli.command {
+        Some(Command::Setup | Command::Sandbox { command: SandboxCommand::Setup }) => {
+            if let Err(err) = sandbox::setup::run(cli.workspace.as_deref()) {
+                eprintln!("Sandbox setup failed: {err}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        Some(Command::Sandbox {
+            command: SandboxCommand::Template { command: TemplateCommand::Build { project, agent, dotnet_project } },
+        }) => {
+            if let Err(error) =
+                sandbox::template::run(&project, cli.workspace.as_deref(), &agent, dotnet_project.as_deref())
+            {
+                eprintln!("{error:#}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
         Some(Command::Doctor) => std::process::exit(doctor::run(cli.workspace.as_deref())),
         Some(Command::Hook { socket, pane }) => {
             hook_client::run(socket, pane);
@@ -250,6 +298,14 @@ fn load_icon() -> egui::IconData {
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+
+    #[test]
+    fn setup_and_sandbox_setup_parse() {
+        let cli = Cli::try_parse_from(["imacs", "setup"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Setup)));
+        let cli = Cli::try_parse_from(["imacs", "sandbox", "setup"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Sandbox { command: SandboxCommand::Setup })));
+    }
 
     #[test]
     fn print_hook_settings_selects_the_launch_settings() {

@@ -3,6 +3,8 @@
 //! when the agent exits and removed with its worktree. The command lines come from
 //! [`imacs_core::isolation`]; this module runs them.
 
+pub mod template;
+
 use std::fs::File;
 use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
@@ -13,6 +15,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use imacs_core::isolation::{self, Diagnosis, Listed, MIN_SBX_VERSION, SandboxConfig, Spec};
 use imacs_core::{git, paths, workspace};
+
+pub(crate) mod checks;
+pub mod setup;
+pub use checks::doctor_lines;
 
 /// Most sbx commands answer within a second; this bounds a stuck daemon.
 const TIMEOUT: Duration = Duration::from_secs(60);
@@ -62,6 +68,7 @@ pub struct Prepare {
     pub agent: &'static str,
     pub cwd: PathBuf,
     pub config: SandboxConfig,
+    pub warm: Vec<String>,
     /// IMACS's executable and socket, for the MCP server agents report through.
     pub exe: PathBuf,
     pub socket: PathBuf,
@@ -98,47 +105,31 @@ const BARE: &str = "or set [isolation] mode = \"bare\" to run agents directly on
 pub fn preflight(program: &str) -> Result<Ready, String> {
     if !installed(program) {
         return Err(format!(
-            "Docker Sandboxes (sbx) is not installed. Install it (brew install --cask docker/tap/sbx, \
-             or see https://github.com/docker/sbx-releases) and sign in with `sbx login`, {BARE}."
+            "Docker Sandboxes (sbx) is not installed. {}; sign in with `sbx login`, {BARE}.",
+            checks::install_hint("sbx", cfg!(target_os = "macos"))
         ));
     }
     let output = sbx(program, &["version"], false, TIMEOUT)
-        .map_err(|err| format!("sbx did not report its version ({err:#}). Run `sbx version` to see why, {BARE}."))?;
-    let version = isolation::parse_version(&output).ok_or_else(|| {
-        format!("sbx reported no version IMACS can read ({:?}). Check `sbx version`, {BARE}.", output.trim())
-    })?;
+        .map_err(|_| format!("sbx did not report its version. Run `sbx version` to see why, {BARE}."))?;
+    let version = isolation::parse_version(&output)
+        .ok_or_else(|| format!("sbx reported no version IMACS can read. Check `sbx version`, {BARE}."))?;
     if version < MIN_SBX_VERSION {
         return Err(format!(
-            "sbx {} is older than {}, the oldest IMACS supports. Upgrade it (brew upgrade --cask sbx), {BARE}.",
+            "sbx {} is older than {}, the oldest IMACS supports. {}; {BARE}.",
             isolation::version_text(version),
-            isolation::version_text(MIN_SBX_VERSION)
+            isolation::version_text(MIN_SBX_VERSION),
+            checks::install_hint("sbx", cfg!(target_os = "macos"))
         ));
     }
     // diagnose exits non-zero when any check fails, such as an unrelated SSH setting; the report still holds.
-    let (_, output, error) = sbx_output(program, &["diagnose", "--json"], false, TIMEOUT)
-        .map_err(|err| format!("sbx diagnose did not run ({err:#}). Run `sbx diagnose` to see why, {BARE}."))?;
-    let diagnosis: Diagnosis = serde_json::from_str(&output).map_err(|_| {
-        let detail = [error.trim(), output.trim()].into_iter().find(|t| !t.is_empty()).unwrap_or("no output");
-        format!("sbx diagnose gave no report ({detail}). Run `sbx diagnose` to see why, {BARE}.")
-    })?;
+    let (_, output, _) = sbx_output(program, &["diagnose", "--json"], false, TIMEOUT)
+        .map_err(|_| format!("sbx diagnose did not run. Run `sbx diagnose` to see why, {BARE}."))?;
+    let diagnosis: Diagnosis = serde_json::from_str(&output)
+        .map_err(|_| format!("sbx diagnose gave no readable report. Run `sbx diagnose` to see why, {BARE}."))?;
     if !diagnosis.signed_in() {
         return Err(format!("sbx is not signed in to Docker. Run `sbx login` in a terminal, {BARE}."));
     }
     Ok(Ready { version, diagnosis })
-}
-
-/// The doctor's line about sandboxes: a warning, since bare agents need none of this.
-pub fn doctor_line(program: &str) -> String {
-    match preflight(program) {
-        Ok(ready) => imacs_core::doctor::check_line(
-            true,
-            &format!("Docker Sandboxes ready (sbx {}, signed in)", isolation::version_text(ready.version)),
-            "",
-        ),
-        Err(error) => {
-            imacs_core::doctor::check_line(false, "Docker Sandboxes not ready for sandboxed agents (warning)", &error)
-        }
-    }
 }
 
 /// Makes the sandbox unless it exists, which is how a session reattaches after a restart,
@@ -186,6 +177,7 @@ pub fn prepare(job: &Prepare) -> Result<()> {
     let spec = Spec {
         name: job.name.clone(),
         agent: job.agent,
+        warm: warm_mounts(&workspace, &job.warm, cfg!(target_os = "linux")),
         workspace,
         git,
         read_only,
@@ -232,22 +224,34 @@ pub fn pin_git(dir: &Path, name: &str, cwd: &Path) -> Result<()> {
     let file = dir.join(format!("{name}.json"));
     let pins = match std::fs::read(&file) {
         Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| format!("reading {}", file.display()))?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => match git::pinned(cwd) {
-            Some(pins) => pins,
-            None => git::resolve_pins(cwd)?,
-        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => current_pins(cwd)?,
         Err(error) => return Err(error).with_context(|| format!("reading {}", file.display())),
     };
-    // Checked on every start: the repository's config can change while its sandbox exists.
-    if let Some(common) = &pins.common_dir {
-        git::check_worktree_config(common)?;
-    }
+    check_pins(&pins)?;
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let temporary = file.with_extension("json.tmp");
     std::fs::write(&temporary, serde_json::to_vec_pretty(&pins)?)?;
     std::fs::rename(&temporary, &file)?;
     git::pin(pins);
     Ok(())
+}
+
+/// Where git finds `cwd`'s repository for a sandbox about to be made: the record of a sandbox that
+/// has worked there, else what git says now, refused if git did not make that layout.
+pub(crate) fn current_pins(cwd: &Path) -> Result<git::GitPins> {
+    match git::pinned(cwd) {
+        Some(pins) => Ok(pins),
+        None => git::resolve_pins(cwd),
+    }
+}
+
+/// Checked for every sandbox made or reattached to: the repository's config can change while its
+/// sandbox exists.
+pub(crate) fn check_pins(pins: &git::GitPins) -> Result<()> {
+    match &pins.common_dir {
+        Some(common) => git::check_worktree_config(common),
+        None => Ok(()),
+    }
 }
 
 /// Pins every folder IMACS recorded for a sandbox in `dir`, as each process that runs git in
@@ -313,6 +317,38 @@ fn read_pins(dir: &Path) -> std::collections::HashMap<String, git::GitPins> {
             }
         })
         .collect()
+}
+
+/// Only real directories inside this worktree may be exposed as writable caches.
+/// Explicit mounts keep sbx from filtering ignored build folders out of the workspace.
+fn warm_mounts(root: &Path, folders: &[String], linux: bool) -> Vec<PathBuf> {
+    if !linux {
+        return Vec::new();
+    }
+    let root = real(root);
+    let mut mounts = Vec::new();
+    for folder in folders {
+        let relative = Path::new(folder);
+        if relative.as_os_str().is_empty()
+            || !relative.components().all(|part| matches!(part, std::path::Component::Normal(name) if name != ".git"))
+        {
+            continue;
+        }
+        let path = root.join(relative);
+        let mut current = root.clone();
+        let no_links = relative.components().all(|part| {
+            current.push(part);
+            std::fs::symlink_metadata(&current).is_ok_and(|m| !m.file_type().is_symlink())
+        });
+        if no_links
+            && path.is_dir()
+            && path.canonicalize().is_ok_and(|resolved| resolved.starts_with(&root))
+            && !mounts.contains(&path)
+        {
+            mounts.push(path);
+        }
+    }
+    mounts
 }
 
 /// The folder a sandbox mounts read-write for `cwd`, its worktree (else `cwd` itself), and
@@ -544,11 +580,56 @@ mod tests {
             agent: "codex",
             cwd: cwd.to_path_buf(),
             config,
+            warm: Vec::new(),
             exe: "/Applications/IMACS.app/Contents/MacOS/imacs".into(),
             socket: "/run/user/501/imacs/imacs.sock".into(),
             briefs: None,
             pins: sbx.with_file_name("git-pins"),
         }
+    }
+
+    #[test]
+    fn linux_mounts_only_configured_warm_directories_inside_the_worktree() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("target")).unwrap();
+        std::fs::create_dir_all(root.path().join("build/cache")).unwrap();
+        symlink(outside.path(), root.path().join("escape")).unwrap();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        symlink(root.path().join(".git"), root.path().join("git-link")).unwrap();
+        let folders = [
+            "target",
+            "build/cache",
+            "target",
+            "missing",
+            "../escape",
+            "/tmp",
+            ".git/objects",
+            "escape",
+            "git-link",
+            "",
+        ]
+        .map(String::from);
+        assert!(warm_mounts(root.path(), &folders, false).is_empty());
+        let expected = vec![real(root.path()).join("target"), real(root.path()).join("build/cache")];
+        assert_eq!(warm_mounts(root.path(), &folders, true), expected);
+        let spec = Spec {
+            name: "imacs-linux".into(),
+            agent: "codex",
+            workspace: real(root.path()),
+            git: Vec::new(),
+            warm: expected.clone(),
+            read_only: Vec::new(),
+            memory: None,
+            cpus: None,
+            template: Some("local:cache".into()),
+        };
+        let args = isolation::create_args(&spec);
+        for path in expected {
+            assert!(args.contains(&path.display().to_string()));
+        }
+        assert!(args.contains(&format!("CARGO_TARGET_DIR={}/target", real(root.path()).display())));
     }
 
     #[test]
@@ -632,6 +713,7 @@ mod tests {
             agent: "codex",
             workspace: top.clone(),
             git,
+            warm: Vec::new(),
             read_only: vec![docs.path().to_path_buf(), bin.path().join("briefs/s1")],
             memory: Some("8g".into()),
             cpus: Some(4),
@@ -700,14 +782,22 @@ mod tests {
         let (_dir, repo) = repository();
         let bin = tempfile::tempdir().unwrap();
         let sbx = fake::install(bin.path());
-        let git_dir = repo.canonicalize().unwrap().join(".git");
-        prepare(&job(&sbx, "imacs-main", &repo, SandboxConfig::default())).unwrap();
+        let top = repo.canonicalize().unwrap();
+        let git_dir = top.join(".git");
+        // Linux warm cache mounts sit beside the read-only .git, never inside it.
+        std::fs::create_dir(repo.join("target")).unwrap();
+        let mut main = job(&sbx, "imacs-main", &repo, SandboxConfig::default());
+        main.warm = ["target", ".git", ".git/objects"].map(String::from).into();
+        prepare(&main).unwrap();
         let create = fake::calls_to(bin.path(), &["create"]).pop().unwrap();
-        assert_eq!(
-            create[create.len() - 2..],
-            [repo.canonicalize().unwrap().display().to_string(), format!("{}:ro", git_dir.display())]
-        );
-        prepare(&job(&sbx, "imacs-main", &repo, SandboxConfig::default())).unwrap();
+        let agent = create.iter().position(|arg| arg == "codex").unwrap();
+        assert_eq!(warm_mounts(&top, &main.warm, true), [top.join("target")]);
+        let mut expected = vec![top.display().to_string(), format!("{}:ro", git_dir.display())];
+        if cfg!(target_os = "linux") {
+            expected.push(top.join("target").display().to_string());
+        }
+        assert_eq!(create[agent + 1..], expected);
+        prepare(&main).unwrap();
         assert_eq!(fake::calls_to(bin.path(), &["create"]).len(), 1, "it reattaches");
 
         // A sandbox made when only hooks and config were read-only cannot be reattached to.
@@ -773,7 +863,10 @@ mod tests {
         let ready = preflight(&sbx).unwrap();
         assert_eq!(ready.version, (0, 50, 1));
         assert!(ready.diagnosis.signed_in(), "an unrelated failing check does not matter");
-        assert!(doctor_line(&sbx).starts_with("✓ Docker Sandboxes ready (sbx v0.50.1, signed in)"));
+        assert!(
+            doctor_lines(&sbx, &SandboxConfig::default())[0]
+                .starts_with("✓ Docker Sandboxes ready (sbx v0.50.1, signed in)")
+        );
         std::fs::write(bin.path().join("version"), "v0.51.2").unwrap();
         assert_eq!(preflight(&sbx).unwrap().version, (0, 51, 2));
 
@@ -785,20 +878,21 @@ mod tests {
             error
         };
         let missing = bin.path().join("missing").display().to_string();
-        refusal(&missing, &["not installed", "brew install --cask docker/tap/sbx"]);
+        refusal(&missing, &["not installed", checks::install_hint("sbx", cfg!(target_os = "macos"))]);
         refusal("sbx-not-on-this-path", &["not installed"]);
         std::fs::write(bin.path().join("version"), "v0.49.9").unwrap();
-        refusal(&sbx, &["sbx v0.49.9 is older than v0.50.1", "brew upgrade --cask sbx"]);
+        refusal(&sbx, &["sbx v0.49.9 is older than v0.50.1", checks::install_hint("sbx", cfg!(target_os = "macos"))]);
         std::fs::write(bin.path().join("version"), "dev").unwrap();
         refusal(&sbx, &["no version IMACS can read"]);
         std::fs::write(bin.path().join("version"), "v0.50.1").unwrap();
         std::fs::write(bin.path().join("signed-out"), "").unwrap();
         let error = refusal(&sbx, &["not signed in", "sbx login"]);
-        let line = doctor_line(&sbx);
+        let line = &doctor_lines(&sbx, &SandboxConfig::default())[0];
         assert!(line.starts_with("✗ Docker Sandboxes not ready for sandboxed agents (warning) — "), "{line}");
         assert!(line.ends_with(&error), "{line}");
         std::fs::write(bin.path().join("fail-diagnose"), "").unwrap();
-        refusal(&sbx, &["sbx diagnose gave no report", "fake diagnose failure"]);
+        let error = refusal(&sbx, &["sbx diagnose gave no readable report"]);
+        assert!(!error.contains("fake diagnose failure"));
 
         // A refused sandbox is never made: preparation stops before sbx creates anything.
         std::fs::remove_file(bin.path().join("fail-diagnose")).unwrap();
@@ -806,7 +900,9 @@ mod tests {
         let error =
             format!("{:#}", prepare(&job(Path::new(&sbx), "imacs-s1", plain.path(), Default::default())).unwrap_err());
         assert!(error.contains("not signed in"), "{error}");
-        assert!(fake::calls_to(bin.path(), &["create"]).is_empty() && fake::calls_to(bin.path(), &["mcp"]).is_empty());
+        assert!(fake::calls_to(bin.path(), &["create"]).is_empty());
+        assert!(fake::calls_to(bin.path(), &["mcp", "add"]).is_empty());
+        assert!(fake::calls_to(bin.path(), &["mcp", "auth"]).is_empty());
     }
 
     #[test]

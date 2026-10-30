@@ -25,6 +25,162 @@ signed in. **IMACS never falls back to bare.** If a check fails, the agent does 
 and a toast say what to do, and a plan task dispatched to it is blocked with the reason. To run agents
 on this machine anyway, set `mode = "bare"`. `imacs doctor` shows whether sandboxes are ready.
 
+## Fresh machine: one guided command
+
+After installing IMACS, run this in a trusted host terminal:
+
+```sh
+imacs setup
+# With workspace-specific isolation/ticket settings:
+imacs --workspace daily setup
+```
+
+Setup creates a missing IMACS config and checks git, Claude Code, Codex, sbx (at least
+v0.50.1), and the OS keychain helper. It displays installation commands and waits while you
+run them in another terminal. On macOS it uses `security`; on Linux install
+`libsecret-tools` and unlock a Secret Service keyring (for example GNOME Keyring).
+Linux also requires Ubuntu 24.04+, accessible KVM and membership of the `kvm` group.
+After changing groups, log out and back in, then rerun setup.
+
+The current [Docker installation instructions](https://docs.docker.com/ai/sandboxes/install/)
+are:
+
+```sh
+# macOS (Homebrew):
+brew trust docker/tap
+brew install docker/tap/sbx
+# Ubuntu, sbx only:
+curl -fsSL https://get.docker.com | sudo REPO_ONLY=1 sh
+sudo apt install docker-sbx
+```
+
+Setup then guides Docker browser sign-in, initializes the global network policy only if it
+is missing, stores Claude's subscription setup-token in the OS keychain, and registers its
+lookup with sbx before removing the built-in `anthropic` secret. It reads a missing OpenAI
+API key over stdin. A Linear ticket profile (including a workspace override) adds the
+`sbx mcp add linear` and `sbx mcp auth linear` steps. Browser authentication runs with private
+child output; if a browser does not open, run the indicated authentication command in a host
+terminal and retry setup. It also offers to remove a stored GitHub credential and disable
+SSH forwarding, so the corresponding readiness checks can pass.
+
+Each change asks for confirmation. EOF, declining a step, or Ctrl-C stops setup; running it
+again checks actual state and skips completed steps. Existing unlocked Claude keychain
+entries and OpenAI secrets are reused. No progress file contains credentials. All token input
+is hidden on a terminal; pipes can supply newline-terminated answers and credentials over
+stdin. Tokens are never command arguments, printed output, logs, or IMACS configuration.
+Unknown secret names are ignored even if a token was accidentally filed in the NAME column.
+
+Setup verifies every sandbox check and finishes by running `imacs doctor`. Doctor and
+Settings → Sandbox show the same readiness checks, including the keychain lookup when the
+subscription route is configured. Doctor also includes independent host/workspace diagnostics
+(running IMACS, optional editors, hook trust and repository cleanup); setup does not claim to
+have resolved those warnings. Start a new sandbox after changing credentials.
+
+## Check sandbox setup
+
+`imacs doctor` (when sandbox mode is configured) and **Settings → Sandbox** share the same
+read-only checks. Settings checks run in the background; use **Refresh sandbox checks** after
+changing sbx. They check the installed minimum version and Docker sign-in, global network policy,
+model credential names, registered MCP servers and their authorization, and SSH forwarding.
+An unrelated failed `sbx diagnose` check, such as SSH client configuration, does not hide a
+successful Authentication check. Missing setup produces warnings; doctor still only requires git
+and valid IMACS configuration. IMACS continues to refuse sandbox launches that fail its runtime
+preflight and never falls back to bare.
+
+The policy display describes the **current global rules**, not IMACS's `network` default. sbx
+exposes rules rather than preserving an immutable preset name: standard rules are reported as
+balanced, allow-all or deny-all, and changed rules as custom. Review custom rules with
+`sbx policy ls`. Checks never initialize or replace a policy or start an OAuth authorization flow.
+
+Credential checks report only known names: `anthropic`, the custom `CLAUDE_CODE_OAUTH_TOKEN`
+route, `openai`, and a warning for `github`. They discard unknown secret names and all raw
+credential-command errors: sbx can accidentally store a token in the NAME column. Do not paste
+`sbx secret ls` output into reports. A stored `github` credential can let agents push as you.
+SSH checks also warn about sbx's global `ssh.agentForwardingEnabled` and a fixed
+`ssh.agentSocketPath`, in addition to IMACS's `ssh_agent` setting. The runtime removes
+`SSH_AUTH_SOCK` when IMACS forwarding is off; a fixed sbx socket can bypass that protection.
+
+## Claude with a subscription
+
+Run **`imacs setup` in a trusted host terminal** (`imacs sandbox setup` is an alias). It confirms
+the credential change, then reuses the `imacs-claude-setup-token` OS keychain entry (account
+`imacs`) when readable, or asks you to paste a new
+token from `claude setup-token`. Pasted input has terminal echo disabled. A pipe can supply the
+answers and token over stdin; the command accepts no token argument. The helper writes the
+keychain through stdin, discards keychain and sbx output, and registers a lookup command with
+sbx. It verifies the lookup first, then removes the built-in `anthropic` secret if present.
+If lookup verification fails, the built-in secret stays in place.
+
+**Remove the built-in `anthropic` secret for subscription OAuth.** Its generated `apiKeyHelper`
+outranks `CLAUDE_CODE_OAUTH_TOKEN`, so leaving both configured can make Claude use the wrong
+credential. This is a global sbx credential change and affects other sandboxes using that secret.
+Restart with a new sandbox after changing credential configuration. The helper never prints a
+token, passes one on argv, or writes one to a worktree or IMACS config.
+
+The registration is equivalent to this on macOS (only a lookup command is on argv):
+
+```sh
+sbx secret set-custom --host api.anthropic.com --env CLAUDE_CODE_OAUTH_TOKEN \
+  --placeholder 'sk-ant-oat01-{rand}' \
+  --command '/usr/bin/security find-generic-password -a imacs -s imacs-claude-setup-token -w'
+sbx secret rm anthropic
+```
+
+On Linux, install `libsecret-tools` and run with an unlocked Secret Service keychain in your
+desktop session. The lookup command is:
+
+```sh
+secret-tool lookup service imacs-claude-setup-token account imacs
+sbx secret set-custom --host api.anthropic.com --env CLAUDE_CODE_OAUTH_TOKEN \
+  --placeholder 'sk-ant-oat01-{rand}' \
+  --command '/usr/bin/secret-tool lookup service imacs-claude-setup-token account imacs'
+```
+
+To provision the Linux entry yourself, `secret-tool store --label='IMACS Claude subscription'
+service imacs-claude-setup-token account imacs` reads its value from stdin. Use a trusted terminal
+or a password-manager pipe; do not put the value in shell history. The macOS helper uses
+`security -i` with the keychain write command on stdin. Keychain access may require approval
+from your OS. Keep command helpers and their dependencies outside folders writable by agents.
+For OpenAI, use sbx's interactive `sbx secret set openai`; for an Anthropic API key instead of a
+subscription, use its interactive `sbx secret set anthropic` flow.
+
+## Linux hosts
+
+Use **Ubuntu 24.04 or newer**, hardware virtualization enabled in firmware, working KVM
+(`/dev/kvm`), and membership in the **kvm** group. Install the Linux sbx release from the
+[official releases](https://github.com/docker/sbx-releases), then run `sbx login`.
+Doctor and Settings check the Ubuntu version, whether KVM opens read/write and reports the
+supported API, and the current session's group membership. A device that exists but is not
+accessible is a failed check.
+
+```sh
+sudo usermod -aG kvm "$USER"
+# Log out and back in so the desktop session gets the group, then:
+id -Gn
+imacs doctor
+```
+
+Load the appropriate `kvm_intel` or `kvm_amd` module if `/dev/kvm` is missing. For subscription
+credentials, install `libsecret-tools` and unlock the desktop keychain as described above.
+
+## Tickets and direct Linear access
+
+IMACS's ticket layer stays on the **host** in both modes. Its existing ticket configuration and
+credentials do not need to be copied into a VM. Scoped ticket tools and reports reach the host
+through the per-sandbox IMACS MCP server.
+
+If agents also need Linear's tools directly, register and authorize the server on the host:
+
+```sh
+sbx mcp add linear --url https://mcp.linear.app/mcp
+sbx mcp auth linear
+```
+
+Add `mcp = ["linear"]` to `[isolation.sandbox]` to load it into new sandboxes. Settings and doctor
+report a configured server that is missing, needs authorization, or is unavailable; they also
+check registered direct servers. These checks never invoke `sbx mcp auth` themselves. MCP
+servers run with host permissions, so authorize the services you intend agents to use.
+
 ## Settings
 
 ```toml
@@ -69,16 +225,105 @@ restart.
 `[isolation]` merges key by key, the same way a host file does. Settings apply to agents started
 afterwards. A sandbox keeps its mounts, limits and allowed hosts for its whole life.
 
-A repository's `.imacs/config.toml` can only tighten isolation:
+A repository's `.imacs/config.toml` can require isolation and select its template:
 
 ```toml
 [isolation]
 mode = "sandbox"
+
+[isolation.sandbox]
+template = "imacs-cox:local"
 ```
 
 With this setting, every agent working in that repository runs sandboxed, even under `mode = "bare"`, an agent's own
-`isolation = "bare"` or a plan task's. A repository cannot set `mode = "bare"` or any `[isolation.sandbox]` key. Those
-settings are ignored with a doctor warning, because a cloned repository must not widen what an agent can reach.
+`isolation = "bare"` or a plan task's. A repository can also set `[isolation.sandbox] template`, overriding the workspace template. It cannot
+set `mode = "bare"` or any other `[isolation.sandbox]` key. Those settings are ignored with a doctor
+warning, because a cloned repository must not widen what an agent can reach. Review template images
+as code: their contents run inside the VM, with the worktree and git write mounts described below.
+
+## Warm templates
+
+Set `[isolation.sandbox] template = "imacs-cox:local"` in the repository's main checkout,
+`.imacs/config.toml`, or in its workspace file, then build it from the checkout you want to warm:
+
+```sh
+imacs sandbox template build /path/to/cox
+imacs --workspace backend sandbox template build cz3backend --agent claude \
+  --dotnet-project soa-src/Cosmoz3.Shared/Cosmoz3.Contracts/Cosmoz3.Contracts.csproj
+```
+
+A project is a directory (including a linked worktree), or a project's basename in `--workspace`.
+Main and host settings load first, the selected workspace merges over them, and the main checkout's
+repository template wins. A workspace template applies to all its projects; use each repository's
+config for different templates in a workspace with several projects. Choose the agent image with
+`--agent codex` (default), `claude` or `shell`; use the same agent when consuming the saved template.
+Tags are local to this host and architecture. sbx recognizes saved snapshots and uses its local image
+store; it does not need a registry push. Existing agents keep their existing sandboxes.
+
+The command checks the checkout as it would for an agent's sandbox: it refuses a git layout git did not
+make and `extensions.worktreeConfig`, and runs git there with the locations IMACS recorded when a sandbox
+has worked in it (see [Git on your machine in a sandboxed folder](#git-on-your-machine-in-a-sandboxed-folder)).
+It then creates a temporary sandbox from the agent's original image with an empty disposable
+primary workspace (sbx requires it to be writable), mounts the checkout and
+its git metadata read-only, and copies tracked source (including tracked local edits) into its own
+filesystem. Untracked credentials, host build output and host toolchain directories are excluded.
+It installs rustup and stable Rust (including rustfmt and Clippy) for IMACS, runs
+`cargo check -p imacs-core`, then stops the builder and saves with `sbx template save`. Cargo's registry, toolchain
+and build cache live in the snapshot: the template's Cargo config uses `~/.cache/imacs/target`.
+On macOS this avoids mixing Linux and macOS artifacts in the host's `target`.
+
+For .NET, it installs the SDK pinned by `global.json`, or .NET 8 if no SDK is pinned, builds the
+selected project and captures the sandbox's NuGet package cache. The default project is
+`soa-src/Cosmoz3.Shared/Cosmoz3.Contracts/Cosmoz3.Contracts.csproj`; use `--dotnet-project` for another
+repository-relative project. SDK installation and restore need the repository's allowed network hosts.
+Private feeds require credentials provisioned inside the sandbox; IMACS never copies host NuGet
+credentials into an image. Build failures report sbx's error and do not save a template. The temporary
+sandbox is removed on success or failure; the source staging directory is removed before saving.
+
+Rebuild after changing toolchains or dependencies. Review where an image will be shared: snapshots
+contain downloaded packages and build artifacts, and can contain data written by repository build
+scripts. No IMACS MCP registration or host credentials are added to the template builder.
+
+### Measured on macOS
+
+On 2026-10-30, a real sbx v0.50.1 sandbox on an Apple silicon Mac running macOS 26.5
+used 2 CPUs, 4 GiB RAM and the stock `codex-docker` image (`982f4518e7e5`). Rust was
+stable 1.99.1 for `aarch64-unknown-linux-gnu`. One sandbox ran at a time.
+
+| Step | Cold image | Saved template |
+| --- | ---: | ---: |
+| `cargo check -p imacs-core` (Bash `time`, command only) | 16.479 s | 0.128 s |
+| Full `sbx exec` (cold includes source staging and toolchain installation) | 26.099 s | 0.435 s |
+| `sbx create` | 3.570 s | 2.816 s |
+
+The cold run used the preparation script above: tracked source copied into a temporary directory,
+rustup installed inside the VM, and Cargo's cache under `~/.cache/imacs/target`, with two Cargo jobs.
+After source staging was removed, the builder was stopped (1.165 s) and saved (21.247 s) with
+`sbx template save`. The cold sandbox was removed before creating a fresh sandbox from that tag.
+The template run checked the same source from its read-only host mount at a different absolute path;
+`bash -lc` found Cargo without additional PATH setup and reused the snapshot's internal cache.
+No host `target` or toolchain cache was mounted. These are single samples on a shared machine,
+excluding sandbox creation and toolchain installation from the command-only comparison.
+
+The measurement script under `target/t6-bench/` recorded logs and `timings.json` and used an exit/signal
+trap for cleanup. Both `imacs-bench-t6-cold` and `imacs-bench-t6-warm` were removed, together with
+`imacs-bench-t6:local`. Final `sbx ls --json` returned `[]`; `sbx template ls --json` contained only the
+three pre-existing stock images: `docker/sandbox-templates:claude-code-docker` (`4a94d9144a70`),
+`docker/sandbox-templates:codex-docker` (`982f4518e7e5`) and
+`docker/sandbox-templates:shell-docker` (`b178ca62ec2e`). No secrets, settings or policies were changed.
+
+## Linux warm folders
+
+On Linux, IMACS explicitly mounts existing directories from `[worktrees] warm` read-write, at the
+same paths inside the sandbox. These are the worktree's independent reflink copies, so one task does
+not modify another worktree's cache. Missing directories, absolute paths, parent traversal, `.git`
+components and symlinks are skipped, so in a main checkout they sit beside its read-only `.git`, never in
+it. On macOS these mounts are omitted: its compiled artifacts are incompatible with the Linux VM. Other
+configured host mounts stay read-only.
+
+When `target` is a warm folder, `CARGO_TARGET_DIR` points to the worktree's `target`, overriding a
+saved template's internal Cargo cache. Reuse assumes matching Linux architecture, toolchain and
+system libraries; Cargo still rebuilds stale inputs. On other hosts the template supplies Linux caches.
 
 ## Agents
 
@@ -148,8 +393,9 @@ worktrees, the rest of your home folder, the IMACS socket and your credentials s
 In a linked worktree the sandbox can still write the files that tell git where a repository is: the
 worktree's `.git` file and its `<common>/worktrees/<id>/commondir`. If git on your machine followed them,
 they could lead it to a config of the agent's own, and git would run that config's `core.fsmonitor` on your
-machine. (A main checkout's `.git/commondir` would do the same, which is one reason its `.git` is read-only.) IMACS runs git in these folders itself: it polls diffs, checks refs, cleans up worktrees,
-commits a task before merging it, and runs `imacs doctor`.
+machine. (A main checkout's `.git/commondir` would do the same, which is one reason its `.git` is read-only.)
+IMACS runs git in these folders itself: it polls diffs, checks refs, cleans up worktrees, commits a task
+before merging it, and runs `imacs doctor` and `imacs sandbox template build`.
 
 So when a sandbox is made, before it runs, IMACS records where git finds the folder's repository: the work
 tree, its git folder and the common dir, in `git-pins/<sandbox>.json` in IMACS's state folder, which no
@@ -232,7 +478,7 @@ mounted read-only.
 - **Bare agents run as you.** In bare mode, an agent can reach everything you can: your files, keys,
   network and other repositories. Use it for agents you supervise, or that sbx cannot run.
 - **Repositories only tighten.** A repository's `.imacs/config.toml` can require sandboxes, and then no
-  agent or plan task there runs bare. It cannot turn them off, add mounts or hosts, or forward your SSH agent.
+  agent or plan task there runs bare. It can choose its template, but cannot turn sandboxes off, add mounts or hosts, or forward your SSH agent.
 - **The chief can mark tasks bare.** A plan task's `isolation = "bare"` runs that agent as you. You see
   it on the card when you approve the plan.
 - **sbx's machine-wide settings apply to every sandbox,** including IMACS's: the global network policy,

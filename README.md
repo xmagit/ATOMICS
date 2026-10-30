@@ -53,6 +53,10 @@ the Linux desktop app. State stays in `~/.imacs` on macOS and existing installs;
 
 ## Run
 
+On a fresh Mac or Ubuntu machine, run `imacs setup` after installing IMACS. It guides tool
+installation, Docker sign-in, network policy, OS-keychain credentials and Linear authorization,
+and resumes completed steps on rerun. See [fresh-machine setup](docs/isolation.md#fresh-machine-one-guided-command).
+
 ```sh
 cargo install --path crates/imacs     # or: cargo run --release -p imacs
 imacs                                 # opens the repository you are in (or your last projects)
