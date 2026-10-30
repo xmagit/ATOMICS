@@ -373,8 +373,15 @@ pub fn menu_key(screen: &str, command: Option<&str>, decision: Decision) -> Opti
     };
     let shown = menu[menu.find(line)?..].trim_start().strip_prefix('$')?;
     let shown = shown.split("\n\n").next()?;
+    // Codex 0.165 lists the choices right below the command, without a blank line.
+    let choice = |line: &str| {
+        let line = line.trim().trim_start_matches(['›', '❯', '>']).trim_start();
+        line.split_once(". ")
+            .is_some_and(|(number, _)| !number.is_empty() && number.chars().all(|c| c.is_ascii_digit()))
+    };
+    let shown = shown.lines().take_while(|line| !choice(line)).collect::<Vec<_>>().join("\n");
     let compact = |text: &str| text.chars().filter(|c| !c.is_whitespace()).collect::<String>();
-    let (shown, command) = (compact(shown), compact(command));
+    let (shown, command) = (compact(&shown), compact(command));
     let truncated_match = shown.rsplit_once("[…").is_some_and(|(prefix, marker)| {
         let lines = marker.strip_suffix("lines]⌃aviewall").or_else(|| marker.strip_suffix("lines]"));
         !prefix.is_empty()
@@ -812,6 +819,24 @@ mod tests {
         assert_eq!(menu_key(no_choice, Some("touch fixture"), Decision::Allow), None);
         let clipped = "Would you like to run the following command?\n\n  $ touch fixture\n\n› 1. Yes, proceed (y)\nPress enter to confirm or esc to cancel";
         assert_eq!(menu_key(clipped, Some("touch fixture"), Decision::Deny).as_deref(), Some("\x1b"));
+    }
+
+    #[test]
+    fn fallback_answers_choices_listed_right_below_the_command() {
+        // Codex 0.165, as seen in the e2e run: no blank line between the command and its choices.
+        let screen = "  Would you like to run the following command?\n\n  Environment: local\n\n  Reason: Allow the required check to run outside the sandbox so it can\n  access the IMACS test queue socket?\n\n  $ imacs queue --class test -- ./check.sh\n› 1. Yes, proceed (y)\n  2. Yes, and don't ask again for commands that start with `imacs queue\n     --class test -- ./check.sh` (p)\n  Press enter to confirm or esc to cancel";
+        let command = Some("imacs queue --class test -- ./check.sh");
+        assert_eq!(menu_key(screen, command, Decision::Allow).as_deref(), Some("1\r"));
+        assert_eq!(menu_key(screen, command, Decision::AllowAlways).as_deref(), Some("1\r"));
+        assert_eq!(menu_key(screen, command, Decision::Deny).as_deref(), Some("\x1b"));
+        assert_eq!(menu_key(screen, Some("imacs queue --class test -- ./other.sh"), Decision::Allow), None);
+        let wrapped = screen.replace("./check.sh\n›", "./check.sh --all\n  --verbose\n›");
+        assert_eq!(
+            menu_key(&wrapped, Some("imacs queue --class test -- ./check.sh --all --verbose"), Decision::Allow)
+                .as_deref(),
+            Some("1\r")
+        );
+        assert_eq!(menu_key(&wrapped, command, Decision::Allow), None);
     }
 
     #[test]
