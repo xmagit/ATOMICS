@@ -646,15 +646,25 @@ pub(crate) mod tests {
     fn http_server(answer: fn(&Value) -> HttpAnswer) -> (String, Receiver<String>) {
         http_connections(move |body, stream| {
             let (status, headers, text) = answer(body);
-            let mut response =
-                format!("HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n", text.len());
-            for (name, value) in headers {
-                response.push_str(&format!("{name}: {value}\r\n"));
-            }
-            response.push_str("\r\n");
-            response.push_str(&text);
-            let _ = stream.write_all(response.as_bytes());
+            let _ = respond(stream, &format!("{status} OK"), &headers, &text);
         })
+    }
+
+    /// A whole response that tells the client not to reuse the connection. These servers answer
+    /// one request per connection and then close it; a client that pooled it could send its next
+    /// request into the closing socket and be reset, which happens under load.
+    fn respond(stream: &mut TcpStream, status: &str, headers: &[(&str, String)], body: &str) -> std::io::Result<()> {
+        let mut response = format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n", body.len());
+        for (name, value) in headers {
+            response.push_str(&format!("{name}: {value}\r\n"));
+        }
+        response.push_str("\r\n");
+        response.push_str(body);
+        stream.write_all(response.as_bytes())
+    }
+
+    fn accepted(stream: &mut TcpStream) {
+        respond(stream, "202 Accepted", &[], "").unwrap();
     }
 
     fn http_connections(answer: impl Fn(&Value, &mut TcpStream) + Send + Sync + 'static) -> (String, Receiver<String>) {
@@ -755,9 +765,12 @@ pub(crate) mod tests {
             json.lines().map(|line| format!("data: {line}")).collect::<Vec<_>>().join("\r\n")
         );
         for part in data.as_bytes().chunks(17) {
-            write!(stream, "{:x}\r\n", part.len()).unwrap();
-            stream.write_all(part).unwrap();
-            stream.write_all(b"\r\n").unwrap();
+            // Send each whole chunk together. Once the final SSE delimiter arrives,
+            // the client may close immediately; a separate trailer write would race it.
+            let mut chunk = format!("{:x}\r\n", part.len()).into_bytes();
+            chunk.extend_from_slice(part);
+            chunk.extend_from_slice(b"\r\n");
+            stream.write_all(&chunk).unwrap();
         }
     }
 
@@ -767,7 +780,7 @@ pub(crate) mod tests {
         let held = streams.clone();
         let (url, _) = http_connections(move |body, stream| {
             if body.get("id").is_none() {
-                stream.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n").unwrap();
+                accepted(stream);
                 return;
             }
             held.lock().unwrap().push(stream.try_clone().unwrap());
@@ -793,10 +806,12 @@ pub(crate) mod tests {
             match body["method"].as_str() {
                 Some("initialize") => {
                     let reply = json!({"jsonrpc": "2.0", "id": body["id"], "result": {}}).to_string();
-                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: stream-session\r\nContent-Length: {}\r\n\r\n{reply}", reply.len()).unwrap();
+                    let headers =
+                        [("Content-Type", "application/json".into()), ("Mcp-Session-Id", "stream-session".into())];
+                    respond(stream, "200 OK", &headers, &reply).unwrap();
                 }
                 Some("notifications/initialized") => {
-                    stream.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n").unwrap();
+                    accepted(stream);
                 }
                 Some("tools/call") => {
                     *held.lock().unwrap() = Some((stream.try_clone().unwrap(), body["id"].clone()));
@@ -805,7 +820,7 @@ pub(crate) mod tests {
                     write_event(stream, json!({"jsonrpc": "2.0", "id": body["id"], "method": "ping"}));
                 }
                 None => {
-                    stream.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n").unwrap();
+                    accepted(stream);
                     let mut pending = held.lock().unwrap();
                     let (original, id) = pending.as_mut().unwrap();
                     if body.get("result").is_some() {

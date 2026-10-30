@@ -95,12 +95,12 @@ pub fn plans_check(home: &Path) -> Vec<String> {
 #[cfg(feature = "native")]
 pub fn cache_clone_check(repo: &Path, template: &str) -> String {
     let result = (|| -> anyhow::Result<_> {
-        let main = git::list_worktrees(repo)?.into_iter().next().ok_or_else(|| anyhow::anyhow!("no main checkout"))?;
-        let destination = git::worktree_path(template, &main.path, "imacs-cow-probe");
+        let main = git::main_checkout(repo)?;
+        let destination = git::worktree_path(template, &main, "imacs-cow-probe");
         // Custom templates may have parents that do not exist until first launch.
         let parent = destination.parent().and_then(|path| path.ancestors().find(|p| p.is_dir()));
         let parent = parent.ok_or_else(|| anyhow::anyhow!("no destination folder"))?;
-        git::probe_cache_clone(&main.path, parent)
+        git::probe_cache_clone(&main, parent)
     })();
     check_line(
         result.unwrap_or(false),

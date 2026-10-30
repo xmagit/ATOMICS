@@ -171,6 +171,8 @@ struct Pending {
 }
 
 type CodexVersion = Arc<OnceLock<Option<bool>>>;
+/// Each repository with the worktrees git lists for it.
+type ListedWorktrees = Vec<(PathBuf, Vec<WorktreeEntry>)>;
 
 const APPROVAL_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 const APPROVAL_MENU_GRACE: Duration = Duration::from_secs(1);
@@ -467,6 +469,8 @@ pub(crate) struct State {
     integration_revision: u64,
     worktrees: Vec<WorktreeEntry>,
     worktrees_at: Option<Instant>,
+    /// The worktrees of each repository, being listed off the UI thread: git can be made to wait.
+    worktree_listing: Option<Receiver<ListedWorktrees>>,
     focus_terminal: Option<String>,
     last_layout: Option<Layout>,
     watcher: Option<Debouncer<RecommendedWatcher>>,
@@ -872,6 +876,7 @@ impl State {
             integration_revision: 0,
             worktrees: Vec::new(),
             worktrees_at: None,
+            worktree_listing: None,
             focus_terminal: None,
             last_layout: None,
             watcher: None,
@@ -979,10 +984,11 @@ impl State {
     fn begin_startup_cleanup(&mut self) {
         let (home, config, sbx, actions) =
             (paths::imacs_home(), self.config.clone(), self.sbx.clone(), self.action_tx.clone());
-        let before = SystemTime::now();
+        // Before the sweep thread and restored agents start, so nothing they create is a candidate.
+        let cutoff = crate::lifecycle::Cutoff::mark(&home);
         self.startup_cleanup = Some(std::thread::spawn(move || {
             let sbx = resolve_program(&sbx);
-            let notes = match crate::lifecycle::sweep_before(&home, &config, &sbx, before) {
+            let notes = match cutoff.and_then(|cutoff| crate::lifecycle::sweep_before(&home, &config, &sbx, cutoff)) {
                 Ok(notes) => notes,
                 Err(err) => vec![format!("Startup cleanup skipped: {err:#}")],
             };

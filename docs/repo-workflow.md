@@ -88,7 +88,7 @@ stages = ["accepted", "integrated", "pr_opened", "ci_passed", "security_approved
 | `workflow.done` | string | Completion milestone, overriding the workspace workflow for this project. |
 | `workflow.stages` | array of strings | Successful stages in order, starting with `accepted`; custom stages are supported. |
 | `isolation.mode` | `"sandbox"` only | Every agent in this repository runs in a sandbox, whatever the user's config or the agent's own `isolation` says. A repository can tighten isolation, never loosen it: `"bare"` is ignored with a warning. See [Agent isolation](isolation.md). |
-| `isolation.sandbox.template` | string | Image or saved local template for this repository, overriding the workspace template. See [Warm templates](isolation.md#warm-templates). |
+| `isolation.sandbox.template` | string | Saved local template for this repository, overriding the workspace template. It applies only once `imacs sandbox template build` has built that tag from this repository; any other tag is ignored with a warning. See [Warm templates](isolation.md#warm-templates). |
 
 All other keys are **ignored with doctor warnings**, including `agents`, `[chief]`, `[approvals]`,
 `[tickets.server]`, ticket operations, resource settings and other `[isolation.sandbox]` keys. Invalid value types are also ignored and

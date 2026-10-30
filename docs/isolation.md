@@ -68,9 +68,10 @@ secrets are reused. No progress file contains credentials. All token input
 is hidden on a terminal; pipes can supply newline-terminated answers and credentials over
 stdin. Tokens are never command arguments, printed output, logs, or IMACS configuration.
 A token can end up filed as a secret's name, or a service name as its sandbox scope, as with
-`sbx secret set anthropic <token>`. Setup lists these misfiled secrets by count and scope only and,
-with your consent, removes each one, passing its name from sbx's listing straight to `sbx secret rm`
-without ever showing it.
+`sbx secret set anthropic <token>`. Setup lists these misfiled secrets by count and scope only, and
+waits while you remove them: run `sbx secret rm` with no arguments in a host terminal and choose each
+one from sbx's list (it lists every scope). Typing the name, as in `sbx secret rm <name> --sandbox <scope>`,
+would put the pasted credential on a command line other processes can read, so setup never runs it.
 
 After its secret steps, setup reads sbx's listing again through doctor's own credential checks and
 stops at the first warning, so it never calls done a secret doctor reports missing. It then verifies
@@ -100,7 +101,8 @@ sandboxed), `openai`, a warning for `github`, and a leftover `CLAUDE_CODE_OAUTH_
 as unused, counting global secrets only. A service secret under a
 name sbx has no service for, or in a scope that is not an existing sandbox, is a misfiled secret:
 doctor warns with their count and scopes, never their names, since sbx can store a token in the NAME
-column. Checks discard all raw credential-command errors. Do not paste
+column. A token can land in the scope column too, so a scope shows only when it is `global`, a service
+sbx knows or a sandbox `sbx ls` lists; any other scope shows as `<unrecognised scope>`. Checks discard all raw credential-command errors. Do not paste
 `sbx secret ls` output into reports. A stored `github` credential can let agents push as you.
 SSH checks also warn about sbx's global `ssh.agentForwardingEnabled` and a fixed
 `ssh.agentSocketPath`, in addition to IMACS's `ssh_agent` setting. The runtime removes
@@ -226,7 +228,10 @@ template = "imacs-cox:local"
 ```
 
 With this setting, every agent working in that repository runs sandboxed, even under `mode = "bare"`, an agent's own
-`isolation = "bare"` or a plan task's. A repository can also set `[isolation.sandbox] template`, overriding the workspace template. It cannot
+`isolation = "bare"` or a plan task's. A repository can also set `[isolation.sandbox] template`, overriding the workspace
+template, but only with a template IMACS built from that repository (see [Warm templates](#warm-templates)). A snapshot
+holds the package caches of the repository it was built from, so another tag, including a registry or stock image, is
+ignored with a doctor warning. Set those in your own or the workspace's config instead. A repository cannot
 set `mode = "bare"` or any other `[isolation.sandbox]` key. Those settings are ignored with a doctor
 warning, because a cloned repository must not widen what an agent can reach. Review template images
 as code: their contents run inside the VM, with the worktree and git write mounts described below.
@@ -249,6 +254,16 @@ config for different templates in a workspace with several projects. Choose the 
 `--agent codex` (default), `claude` or `shell`; use the same agent when consuming the saved template.
 Tags are local to this host and architecture. sbx recognizes saved snapshots and uses its local image
 store; it does not need a registry push. Existing agents keep their existing sandboxes.
+
+IMACS records which main checkout it built each tag from, in `sandbox-templates.json` under the IMACS
+home. A repository's own template takes effect only once that record names the repository, so a
+repository's config selects nothing until its template is built, and never selects another project's
+snapshot. For the same reason, building a tag that the repository's config names is refused when the tag
+was built from another repository, or when sbx already has it and IMACS did not build it from this
+repository: saving would replace another project's snapshot, or a stock image every sandbox starts from.
+Choose another tag, or remove a template that is yours to replace with `sbx template rm <tag>` first.
+A template built before IMACS kept this record needs that once. A tag from your own or the workspace's
+config is your choice and always builds; the record then names the project it was built from.
 
 The command checks the checkout as it would for an agent's sandbox: it refuses a git layout git did not
 make and `extensions.worktreeConfig`, and runs git there with the locations IMACS recorded when a sandbox
@@ -410,8 +425,12 @@ read-only mounts on your machine's side of the share: root in the VM, which can 
 still cannot write there. Tasks commit in linked worktrees anyway. A main checkout's sandbox made before
 IMACS mounted `.git` this way is refused; remove it (`sbx rm <name>`) and start the agent again.
 
-The agent cannot add a git hook or change git config that would later run on your machine. Other
-worktrees, the rest of your home folder, the IMACS socket and your credentials stay outside the sandbox.
+The repository's `hooks` and `config` stay on your machine, but that alone does not keep the agent's code
+from running there. A linked worktree's sandbox writes the worktree, its own `worktrees/<id>` folder, and
+the shared objects, refs and logs, and git on your machine reads all of them: followed, they can lead it to
+a git config or a hook the agent wrote. The next section says how, and how IMACS keeps its own git from
+following them; git you run yourself is not covered. Other worktrees, the rest of your home folder, the
+IMACS socket and your credentials stay outside the sandbox.
 
 ### Git on your machine in a sandboxed folder
 
@@ -419,8 +438,22 @@ In a linked worktree the sandbox can still write the files that tell git where a
 worktree's `.git` file and its `<common>/worktrees/<id>/commondir`. If git on your machine followed them,
 they could lead it to a config of the agent's own, and git would run that config's `core.fsmonitor` on your
 machine. (A main checkout's `.git/commondir` would do the same, which is one reason its `.git` is read-only.)
-IMACS runs git in these folders itself: it polls diffs, checks refs, cleans up worktrees, commits a task
-before merging it, and runs `imacs doctor` and `imacs sandbox template build`.
+It also writes the other files there, which git on your machine reads from any checkout of the repository:
+
+- **`<common>/worktrees/<id>/gitdir`** says where the worktree is, and `git worktree list` lists whatever
+  folder it names: a repository the agent planted inside that same git folder, with a config of its own,
+  or any other folder on your machine. Git run in a planted repository runs its config's `core.fsmonitor`.
+- **`HEAD`, `commondir`, `gitdir`, `index` and `locked`** there are read without checking what they are.
+  Replaced by a FIFO, git waits on it for good; replaced by a link to `/dev/zero`, it reads without end.
+  Listing worktrees, `git status` and deleting a branch all read them.
+- **Hooks and an fsmonitor named by path in the checkout**, as `core.hooksPath = .husky` sets up, run
+  programs the agent can rewrite.
+
+IMACS runs git in these repositories itself: it polls diffs, lists worktrees, checks refs, cleans up
+worktrees, commits a task before merging it, and runs `imacs doctor` and `imacs sandbox template build`.
+Git you run yourself, and tools that run git for you, such as an editor that opens every worktree git lists,
+follow what these files say. Until the sandbox is gone, run git for a sandboxed worktree from IMACS or the
+main checkout, and never open a folder `git worktree list` names inside a `.git` folder.
 
 So when a sandbox is made, before it runs, IMACS records where git finds the folder's repository: the work
 tree, its git folder and the common dir, in `git-pins/<sandbox>.json` in IMACS's state folder, which no
@@ -449,6 +482,25 @@ before asking Git to remove a clean linked checkout. Main checkouts and dirty or
 - **A folder outside any repository stays that way.** IMACS does not run git in it or in any folder below
   it while the record exists, whatever `.git` the agent creates there. Once the sandbox is gone and the
   folder still has no repository, the record goes.
+- **Git never runs inside a recorded git folder.** IMACS refuses to run git in any folder inside a
+  recorded git folder or common dir, where the agent can plant a repository.
+- **Listed worktrees are checked before IMACS uses them.** A worktree `git worktree list` names is trusted
+  when it is the folder recorded for a sandbox of that repository, or when its `.git` names one of the
+  repository's `worktrees/<id>` folders and that folder names it back. A folder listed twice is trusted
+  neither time. Others are listed, never entered: the Clean up… dialog marks them *untrusted* and never
+  removes them, and the sidebar, the startup sweep, plan cleanup and task integration leave them alone.
+- **Every checkout of a repository with a sandbox** gets the same treatment, the main checkout and bare
+  agents' worktrees included: git runs with `GIT_DIR`, `GIT_COMMON_DIR` and `GIT_WORK_TREE` set from the
+  record or, for the repository's other checkouts, from their `.git` and the recorded common dir, and with
+  `-c core.fsmonitor=false -c core.hooksPath=/dev/null`. So no hook runs for git that IMACS runs in such a
+  repository, including your own: a `pre-commit` hook does not run when IMACS commits a task before merging it.
+- **Special files stop git.** Before git runs in a repository with a sandbox, IMACS checks that each
+  sandboxed worktree's git folder holds only files and folders. A FIFO, socket or link there stops IMACS's
+  git in that repository, with an error naming it, until you remove it; the folder also stays pinned after
+  its sandbox goes.
+- **Git has time limits.** IMACS stops git it runs after 2 minutes, or 30 for checkouts, commits, merges
+  and fetches, in case the agent swaps in such a file after the check or puts one elsewhere git reads.
+  The worktree list IMACS refreshes every 30 seconds is read off the window's thread.
 
 ### Symbolic links in a worktree
 
@@ -569,7 +621,7 @@ tests there, in a worktree that starts from the integration branch.
 - **Bare agents run as you.** In bare mode, an agent can reach everything you can: your files, keys,
   network and other repositories. Use it for agents you supervise, or that sbx cannot run.
 - **Repositories only tighten.** A repository's `.imacs/config.toml` can require sandboxes, and then no
-  agent or plan task there runs bare. It can choose its template, but cannot turn sandboxes off, add mounts or hosts, or forward your SSH agent.
+  agent or plan task there runs bare. It can choose a template IMACS built from it, but cannot select or overwrite another project's, turn sandboxes off, add mounts or hosts, or forward your SSH agent.
 - **The chief can mark tasks bare.** A plan task's `isolation = "bare"` runs that agent as you. You see
   it on the card when you approve the plan.
 - **sbx's machine-wide settings apply to every sandbox,** including IMACS's: the global network policy,

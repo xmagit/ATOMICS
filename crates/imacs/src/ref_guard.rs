@@ -14,9 +14,8 @@
 //! `refs/imacs/quarantine/<sandbox>/<ref>@<object>`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -590,7 +589,8 @@ fn read_loose(dir: &Path, prefix: &str, refs: &mut BTreeMap<String, RefValue>) -
         if kind.is_dir() {
             read_loose(&entry.path(), &name, refs)?;
         } else if kind.is_file() {
-            let value = std::fs::read_to_string(entry.path())?;
+            // Checked by type above, but the sandbox can swap in a FIFO since.
+            let value = git::read_regular_file(&entry.path(), 64 * 1024)?;
             let value = value.trim();
             let value = value
                 .strip_prefix("ref: ")
@@ -651,20 +651,8 @@ fn restore(
 
 /// Runs `operations` as one `git update-ref --stdin` transaction without dereferencing.
 fn update_refs(cwd: &Path, operations: &str) -> Result<()> {
-    let mut child = git::command(cwd, &["update-ref", "--stdin"])?
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    child
-        .stdin
-        .take()
-        .context("opening git update-ref stdin")?
-        .write_all(format!("start\noption no-deref\n{operations}prepare\ncommit\n").as_bytes())?;
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
-    }
+    let input = format!("start\noption no-deref\n{operations}prepare\ncommit\n");
+    git::git_input(cwd, &["update-ref", "--stdin"], input.as_bytes())?;
     Ok(())
 }
 

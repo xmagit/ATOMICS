@@ -3,8 +3,9 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -13,6 +14,12 @@ use crate::diff::{FileDiff, WorktreeDiff, parse_unified};
 
 const MAX_UNTRACKED_FILES: usize = 300;
 const MAX_UNTRACKED_BYTES: u64 = 512 * 1024;
+
+/// How long host git may run. A sandbox can put a FIFO where git reads, and git waits on it for
+/// good. Most of what IMACS asks git is quick; checkouts, merges and fetches can take as long as
+/// the repository is big or the network slow, and stopping one halfway leaves it half done.
+const QUICK: Duration = Duration::from_secs(120);
+const SLOW: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Worktree {
@@ -25,44 +32,210 @@ pub struct Worktree {
 pub struct WorktreeEntry {
     pub path: PathBuf,
     pub branch: Option<String>,
+    /// False when the files git listed this entry from do not lead back to it as git made them,
+    /// or a sandbox can write the folder: shown, but IMACS never runs git in it or removes it.
+    pub trusted: bool,
 }
 
 pub fn git(dir: &Path, args: &[&str]) -> Result<String> {
-    let output = command(dir, args)?.output().with_context(|| format!("running git {}", args.join(" ")))?;
-    if !output.status.success() {
-        bail!("git {} failed: {}", args.join(" "), String::from_utf8_lossy(&output.stderr).trim());
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    run(command(dir, args)?, args, None, timeout(args))
 }
 
-/// `git -C dir args`. In a folder a sandbox works in, git runs with the locations [`pin`]ned
-/// for it, never the ones the folder names now.
-pub fn command(dir: &Path, args: &[&str]) -> Result<Command> {
+/// [`git`] with `input` on git's standard input.
+pub fn git_input(dir: &Path, args: &[&str], input: &[u8]) -> Result<String> {
+    run(command(dir, args)?, args, Some(input), timeout(args))
+}
+
+fn timeout(args: &[&str]) -> Duration {
+    let mut rest = args;
+    while let ["-c", _, tail @ ..] = rest {
+        rest = tail;
+    }
+    match rest {
+        ["worktree", "add" | "remove", ..] | ["add" | "checkout" | "commit" | "fetch" | "merge" | "switch", ..] => SLOW,
+        _ => QUICK,
+    }
+}
+
+/// Runs a git `command` for at most `timeout`, then kills it and everything it started. Output
+/// goes to unlinked files, so nothing git leaves running can keep this waiting for it.
+fn run(mut command: Command, args: &[&str], input: Option<&[u8]>, timeout: Duration) -> Result<String> {
+    use std::io::{Read, Seek, Write};
+    use std::os::unix::process::CommandExt;
+    let shown = format!("git {}", args.join(" "));
+    let (mut stdout, mut stderr) = (tempfile::tempfile()?, tempfile::tempfile()?);
+    command
+        .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdout(stdout.try_clone()?)
+        .stderr(stderr.try_clone()?)
+        .process_group(0);
+    let mut child = command.spawn().with_context(|| format!("running {shown}"))?;
+    if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+        let input = input.to_vec();
+        std::thread::spawn(move || stdin.write_all(&input));
+    }
+    let group = child.id() as i32;
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || done.send(child.wait()));
+    let status = match finished.recv_timeout(timeout) {
+        Ok(status) => status.with_context(|| format!("waiting for {shown}"))?,
+        Err(_) => {
+            // SAFETY: process_group(0) made git the leader of a process group of its own.
+            unsafe { libc::kill(-group, libc::SIGKILL) };
+            bail!("{shown} did not finish within {} s, and was stopped", timeout.as_secs());
+        }
+    };
+    let read = |file: &mut std::fs::File| -> Result<String> {
+        let mut bytes = Vec::new();
+        file.rewind()?;
+        file.read_to_end(&mut bytes)?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    };
+    if !status.success() {
+        bail!("{shown} failed: {}", read(&mut stderr)?.trim());
+    }
+    read(&mut stdout)
+}
+
+/// `git -C dir args`. In a repository a sandbox works in, git runs with the locations [`pin`]ned
+/// for its folder, or checked against them for the repository's other checkouts, never the ones
+/// the folder names now; and without hooks or fsmonitor, which can name programs the sandbox wrote.
+fn command(dir: &Path, args: &[&str]) -> Result<Command> {
     let mut command = Command::new("git");
     command.arg("-C").arg(dir).args(["-c", "core.quotepath=off"]);
-    match pinned(dir) {
-        None => {
-            command.args(args);
-        }
-        Some(GitPins { work_tree, git_dir: Some(git_dir), common_dir: Some(common_dir) }) => {
-            command.env("GIT_DIR", git_dir).env("GIT_COMMON_DIR", common_dir).env("GIT_WORK_TREE", work_tree);
-            // A submodule the sandbox adds would run git in a folder it chose, with that folder's
-            // config. Only the command-line flag overrides the `ignore` its .gitmodules can set.
-            match args.split_first() {
-                Some((&subcommand, rest)) if subcommand == "status" || subcommand == "diff" => {
-                    command.arg(subcommand).arg("--ignore-submodules=dirty").args(rest);
-                }
-                _ => {
-                    command.args(args);
-                }
-            }
-        }
-        Some(pins) => bail!(
+    let Some(pins) = locate(dir)? else {
+        command.args(args);
+        return Ok(command);
+    };
+    let (Some(git_dir), Some(common_dir)) = (&pins.git_dir, &pins.common_dir) else {
+        bail!(
             "{} was outside any git repository when its sandbox started, so git does not run there",
             pins.work_tree.display()
-        ),
+        )
+    };
+    command.env("GIT_DIR", git_dir).env("GIT_COMMON_DIR", common_dir).env("GIT_WORK_TREE", &pins.work_tree);
+    command.args(["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"]);
+    // A submodule the sandbox adds would run git in a folder it chose, with that folder's
+    // config. Only the command-line flag overrides the `ignore` its .gitmodules can set.
+    match args.split_first() {
+        Some((&subcommand, rest)) if subcommand == "status" || subcommand == "diff" => {
+            command.arg(subcommand).arg("--ignore-submodules=dirty").args(rest);
+        }
+        _ => {
+            command.args(args);
+        }
     }
     Ok(command)
+}
+
+/// Where host git finds `dir`'s repository, when a sandbox works in that repository: the pins of
+/// the sandbox's folder, or for another checkout of the repository the locations its `.git`
+/// names, with the common dir from the pins. `None` for a repository no sandbox works in.
+/// Refuses folders inside a pinned git dir or common dir: a sandbox writes there, and a
+/// repository it plants there has a config of its own.
+fn locate(dir: &Path) -> Result<Option<GitPins>> {
+    let pinned = PINNED.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if pinned.is_empty() {
+        return Ok(None);
+    }
+    let real = std::fs::canonicalize(dir).ok();
+    let given = || std::iter::once(dir).chain(real.as_deref());
+    if let Some(folder) = git_folders(&pinned).find(|folder| given().any(|path| path.starts_with(folder))) {
+        bail!(
+            "{} is inside {}, a git folder a sandbox writes, so git does not run there",
+            dir.display(),
+            folder.display()
+        );
+    }
+    let innermost = pinned
+        .iter()
+        .filter(|pins| given().any(|path| path.starts_with(&pins.work_tree)))
+        .max_by_key(|pins| pins.work_tree.components().count());
+    if let Some(pins) = innermost {
+        if let Some(common) = &pins.common_dir {
+            check_admin_folders(&pinned, common)?;
+        }
+        return Ok(Some(pins.clone()));
+    }
+    let Some(real) = real else { return Ok(None) };
+    let commons: Vec<&Path> = pinned.iter().filter_map(|pins| pins.common_dir.as_deref()).collect();
+    // Git's own search: the first folder up from `dir` with a `.git`.
+    let Some(top) = real.ancestors().find(|top| top.join(".git").symlink_metadata().is_ok()) else { return Ok(None) };
+    let dot_git = top.join(".git");
+    let (git_dir, common) = if dot_git.is_dir() {
+        let Some(common) = std::fs::canonicalize(&dot_git).ok().filter(|git_dir| commons.contains(&git_dir.as_path()))
+        else {
+            return Ok(None);
+        };
+        (common.clone(), common)
+    } else {
+        let Some(git_dir) = read_regular_file(&dot_git, 4096)
+            .ok()
+            .and_then(|text| text.trim().strip_prefix("gitdir: ").and_then(|to| top.join(to).canonicalize().ok()))
+        else {
+            return Ok(None);
+        };
+        let Some(common) = commons.iter().find(|common| git_dir.parent() == Some(&common.join("worktrees"))) else {
+            return Ok(None);
+        };
+        (git_dir, common.to_path_buf())
+    };
+    check_admin_folders(&pinned, &common)?;
+    Ok(Some(GitPins { work_tree: top.to_path_buf(), git_dir: Some(git_dir), common_dir: Some(common) }))
+}
+
+/// The pinned git dirs and common dirs: sandboxes write in them.
+fn git_folders(pinned: &[GitPins]) -> impl Iterator<Item = &Path> {
+    pinned.iter().flat_map(|pins| pins.git_dir.iter().chain(&pins.common_dir)).map(PathBuf::as_path)
+}
+
+/// Checks the git folder of every sandboxed worktree of the repository at `common`: git on this
+/// machine reads them all, to list worktrees or to see which branches they have checked out.
+fn check_admin_folders(pinned: &[GitPins], common: &Path) -> Result<()> {
+    for pins in pinned.iter().filter(|pins| pins.common_dir.as_deref() == Some(common)) {
+        if let Some(git_dir) = pins.git_dir.as_deref().filter(|git_dir| *git_dir != common) {
+            check_admin_folder(git_dir)?;
+        }
+    }
+    Ok(())
+}
+
+/// Refuses a worktree's git folder that holds anything but files and folders. Git reads the files
+/// in it without checking what they are: it waits for good on a FIFO a sandbox puts in place of
+/// `HEAD`, `commondir`, `gitdir`, `index` or `locked`, and reads a link to /dev/zero forever.
+fn check_admin_folder(git_dir: &Path) -> Result<()> {
+    let entries = match std::fs::read_dir(git_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", git_dir.display())),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        ensure!(
+            kind.is_file() || kind.is_dir(),
+            "{} is not a file or folder, which git would wait on or read without end, so git does not run in \
+             this repository",
+            entry.path().display()
+        );
+    }
+    Ok(())
+}
+
+/// The text of a small regular file, read without following a link at its end or waiting on a FIFO.
+pub fn read_regular_file(path: &Path, limit: u64) -> Result<String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    let meta = file.metadata()?;
+    ensure!(meta.is_file() && meta.len() <= limit, "{} is not a small regular file", path.display());
+    let mut text = String::new();
+    file.take(limit).read_to_string(&mut text)?;
+    Ok(text)
 }
 
 /// Where git finds the repository of a folder a sandbox works in, recorded when its session
@@ -116,16 +289,22 @@ pub fn pinned(dir: &Path) -> Option<GitPins> {
 /// that already point where `git worktree add` never would, and repositories with
 /// `extensions.worktreeConfig`. rev-parse runs no hooks or fsmonitor, whatever the folder says.
 pub fn resolve_pins(dir: &Path) -> Result<GitPins> {
+    // rev-parse reads the files a worktree's .git names: check them before git waits on one.
+    if let Ok(text) = read_regular_file(&dir.join(".git"), 4096)
+        && let Some(git_dir) = text.trim().strip_prefix("gitdir: ")
+    {
+        check_admin_folder(&dir.join(git_dir))?;
+    }
     let args = ["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-dir", "--git-common-dir"];
-    let output = Command::new("git").arg("-C").arg(dir).args(args).output().context("running git rev-parse")?;
-    if !output.status.success() {
-        let error = String::from_utf8_lossy(&output.stderr);
-        if error.contains("not a git repository") {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(dir).args(["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"]).args(args);
+    let output = match run(command, &args, None, QUICK) {
+        Ok(output) => output,
+        Err(error) if format!("{error:#}").contains("not a git repository") => {
             return Ok(GitPins { work_tree: std::fs::canonicalize(dir)?, git_dir: None, common_dir: None });
         }
-        bail!("git rev-parse failed in {}: {}", dir.display(), error.trim());
-    }
-    let output = String::from_utf8_lossy(&output.stdout);
+        Err(error) => return Err(error).with_context(|| format!("in {}", dir.display())),
+    };
     let lines: Vec<&str> = output.lines().collect();
     let [top, git_dir, common] = lines[..] else { bail!("unexpected git rev-parse output: {output}") };
     let real = |path: &str| std::fs::canonicalize(path).with_context(|| format!("resolving {path}"));
@@ -134,11 +313,12 @@ pub fn resolve_pins(dir: &Path) -> Result<GitPins> {
         (git_dir == top.join(".git") || !git_dir.starts_with(&top)) && !in_writable_git_folder(&git_dir)
     } else {
         // `git worktree add` makes <common>/worktrees/<id>, pointing back at the worktree's .git file.
-        let back = std::fs::read_to_string(git_dir.join("gitdir")).unwrap_or_default();
+        let back = read_regular_file(&git_dir.join("gitdir"), 4096).unwrap_or_default();
         git_dir.parent() == Some(common.join("worktrees").as_path())
             && !common.starts_with(&top)
             && !in_writable_git_folder(&common)
             && std::fs::canonicalize(git_dir.join(back.trim())).ok() == Some(top.join(".git"))
+            && check_admin_folder(&git_dir).is_ok()
     };
     ensure!(made_by_git, "{}'s git folder {} is not one git made for it", top.display(), git_dir.display());
     check_worktree_config(&common)?;
@@ -159,14 +339,14 @@ fn in_writable_git_folder(dir: &Path) -> bool {
 /// With `extensions.worktreeConfig`, git reads `config.worktree` in a worktree's own git folder,
 /// which its sandbox can write, as repository config on this machine.
 pub fn check_worktree_config(common: &Path) -> Result<()> {
-    let output = Command::new("git")
-        .args(["config", "--type=bool", "--file"])
+    let mut command = Command::new("git");
+    command
+        .args(["config", "--type=bool", "--default=false", "--file"])
         .arg(common.join("config"))
         .args(["--get", "extensions.worktreeConfig"])
-        .current_dir(common)
-        .output()
-        .context("running git config")?;
-    if String::from_utf8_lossy(&output.stdout).trim() == "true" {
+        .current_dir(common);
+    let output = run(command, &["config", "--get", "extensions.worktreeConfig"], None, QUICK)?;
+    if output.trim() == "true" {
         bail!(
             "{} sets extensions.worktreeConfig, which lets a sandbox change git config that runs on this \
              machine. Unset it, or set isolation = \"bare\" for agents in this repository.",
@@ -187,16 +367,22 @@ pub fn worktree_of(dir: &Path) -> Option<Worktree> {
     Some(Worktree { root, branch })
 }
 
+/// The worktrees of `repo`'s repository as git lists them, the main checkout first, each marked
+/// [`WorktreeEntry::trusted`] or not. Git lists a linked worktree at the folder its
+/// `<common>/worktrees/<id>/gitdir` names, a file a sandbox in that worktree can write.
 pub fn list_worktrees(repo: &Path) -> Result<Vec<WorktreeEntry>> {
     let out = git(repo, &["worktree", "list", "--porcelain"])?;
-    let mut entries = Vec::new();
-    let mut current: Option<WorktreeEntry> = None;
+    let common = common_dir(repo)?;
+    let mut entries: Vec<(WorktreeEntry, bool)> = Vec::new();
+    let mut current: Option<(WorktreeEntry, bool)> = None;
+    let mut main = true;
     for line in out.lines() {
         if let Some(path) = line.strip_prefix("worktree ") {
             entries.extend(current.take());
-            current = Some(WorktreeEntry { path: PathBuf::from(path), branch: None });
+            current = Some((WorktreeEntry { path: PathBuf::from(path), branch: None, trusted: false }, main));
+            main = false;
         } else if let Some(branch) = line.strip_prefix("branch ")
-            && let Some(entry) = current.as_mut()
+            && let Some((entry, _)) = current.as_mut()
         {
             entry.branch = Some(branch.trim_start_matches("refs/heads/").to_string());
         } else if line == "bare" {
@@ -204,7 +390,63 @@ pub fn list_worktrees(repo: &Path) -> Result<Vec<WorktreeEntry>> {
         }
     }
     entries.extend(current);
-    Ok(entries)
+    let pinned = PINNED.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let reals: Vec<Option<PathBuf>> = entries.iter().map(|(entry, _)| entry.path.canonicalize().ok()).collect();
+    Ok(entries
+        .into_iter()
+        .zip(&reals)
+        .map(|((mut entry, main), real)| {
+            // Two entries for one folder: one names it from another worktree's files. Git names
+            // the main checkout from the common dir, never from a worktree's files.
+            let once = main || reals.iter().filter(|other| *other == real).count() == 1;
+            entry.trusted =
+                once && real.as_ref().is_some_and(|real| listed_as_made(&entry.path, real, main, &common, &pinned));
+            entry
+        })
+        .collect())
+}
+
+/// Whether a listed worktree is where its repository's files say, as git made it: the folder
+/// IMACS pinned for a sandbox of this repository, or else one whose `.git` names one of the
+/// repository's worktree folders, which names it back. The main checkout's `.git` is the
+/// common dir. Folders inside a pinned git dir or common dir never are.
+fn listed_as_made(path: &Path, real: &Path, main: bool, common: &Path, pinned: &[GitPins]) -> bool {
+    if git_folders(pinned).any(|folder| path.starts_with(folder) || real.starts_with(folder)) {
+        return false;
+    }
+    let innermost = pinned
+        .iter()
+        .filter(|pins| real.starts_with(&pins.work_tree))
+        .max_by_key(|pins| pins.work_tree.components().count());
+    if let Some(pins) = innermost {
+        return pins.work_tree == real
+            && pins.common_dir.as_deref() == Some(common)
+            && (pins.git_dir.as_deref() == Some(common)) == main;
+    }
+    let dot_git = real.join(".git");
+    if main {
+        return dot_git.is_dir() && dot_git.canonicalize().is_ok_and(|git_dir| git_dir == common);
+    }
+    let Some(git_dir) = read_regular_file(&dot_git, 4096)
+        .ok()
+        .and_then(|text| text.trim().strip_prefix("gitdir: ").and_then(|to| real.join(to).canonicalize().ok()))
+    else {
+        return false;
+    };
+    git_dir.parent() == Some(common.join("worktrees").as_path())
+        && read_regular_file(&git_dir.join("gitdir"), 4096)
+            .is_ok_and(|back| git_dir.join(back.trim()).canonicalize().ok() == dot_git.canonicalize().ok())
+}
+
+/// The main checkout of `dir`'s repository, which `git worktree list` names first: its common
+/// dir's folder. Unlike the list, it needs no worktree's files, which a sandbox can write.
+pub fn main_checkout(dir: &Path) -> Result<PathBuf> {
+    let common = common_dir(dir)?;
+    match common.parent() {
+        Some(main) if common.file_name().is_some_and(|name| name == ".git") => Ok(main.to_path_buf()),
+        // A bare repository: the first checkout listed stands in for one.
+        _ => list_worktrees(dir)?.into_iter().next().map(|entry| entry.path).context("no main checkout"),
+    }
 }
 
 /// The merge-base with the first of `base_ref` and the usual fallbacks that exists.
@@ -337,6 +579,9 @@ pub struct WorktreeHealth {
     pub branch: Option<String>,
     /// Folder no longer exists; `git worktree prune` drops it.
     pub missing: bool,
+    /// Listed from files that do not lead back to it as git made them (see
+    /// [`WorktreeEntry::trusted`]): git does not run in it, so it is never removed.
+    pub untrusted: bool,
     pub dirty_files: usize,
     pub merged: bool,
     pub upstream_gone: bool,
@@ -346,7 +591,7 @@ pub struct WorktreeHealth {
 impl WorktreeHealth {
     /// Clean, and its work is in main (merged, or the PR branch was deleted).
     pub fn is_safe_to_remove(&self) -> bool {
-        !self.missing && self.dirty_files == 0 && (self.merged || self.upstream_gone)
+        !self.missing && !self.untrusted && self.dirty_files == 0 && (self.merged || self.upstream_gone)
     }
 }
 
@@ -376,7 +621,8 @@ pub fn worktree_health(repo: &Path, base_ref: &str) -> Result<Vec<WorktreeHealth
     let mut out = Vec::new();
     for entry in list_worktrees(repo)?.into_iter().skip(1) {
         let missing = !entry.path.is_dir();
-        let dirty_files = if missing {
+        let untrusted = !missing && !entry.trusted;
+        let dirty_files = if missing || untrusted {
             0
         } else {
             git(&entry.path, &["status", "--porcelain", "--untracked-files=normal"])
@@ -387,6 +633,7 @@ pub fn worktree_health(repo: &Path, base_ref: &str) -> Result<Vec<WorktreeHealth
         let is = |set: &std::collections::HashSet<String>| branch.as_ref().is_some_and(|b| set.contains(b));
         out.push(WorktreeHealth {
             missing,
+            untrusted,
             dirty_files,
             merged: is(&merged),
             upstream_gone: is(&gone),
@@ -402,6 +649,16 @@ pub fn worktree_health(repo: &Path, base_ref: &str) -> Result<Vec<WorktreeHealth
 /// and with `delete_branch` its branch, only when git considers it merged.
 pub fn remove_worktree(repo: &Path, path: &Path, branch: Option<&str>, delete_branch: bool) -> Result<()> {
     let path_text = path.to_string_lossy();
+    if path.exists() {
+        let real = path.canonicalize()?;
+        ensure!(
+            list_worktrees(repo)?
+                .iter()
+                .any(|entry| entry.trusted && entry.path.canonicalize().ok().as_ref() == Some(&real)),
+            "'{path_text}' is not listed as a worktree git made for {}",
+            repo.display()
+        );
+    }
     if let Some(pins) = pinned(path).filter(|_| path.exists()) {
         // `worktree remove` checks for changes with a git of its own, which follows the worktree's
         // .git file and commondir. Check with the pinned locations, as strictly, then force.
@@ -512,8 +769,7 @@ pub fn warm_worktree(repo: &Path, worktree: &Path, folders: &[String]) -> bool {
     if folders.is_empty() {
         return false;
     }
-    let Some(main) = list_worktrees(repo).ok().and_then(|trees| trees.into_iter().next()) else { return false };
-    let Ok(main) = main.path.canonicalize() else { return false };
+    let Ok(main) = main_checkout(repo).and_then(|main| Ok(main.canonicalize()?)) else { return false };
     let mut warmed = false;
     for folder in folders {
         let relative = Path::new(folder);
@@ -732,13 +988,19 @@ pub fn integrate(
         bail!("branch {branch} does not exist in {}", repo.display());
     }
     let linked: Vec<WorktreeEntry> = list_worktrees(repo)?.into_iter().skip(1).collect();
-    let checked_out = |name: &str| linked.iter().find(|e| e.branch.as_deref() == Some(name));
-    let committed = match checked_out(branch).filter(|e| e.path.is_dir()) {
+    let checked_out = |name: &str| -> Result<Option<&WorktreeEntry>> {
+        let entry = linked.iter().find(|e| e.branch.as_deref() == Some(name));
+        if let Some(entry) = entry.filter(|e| e.path.is_dir() && !e.trusted) {
+            bail!("{name}'s worktree {} is not listed as git made it, so IMACS does not use it", entry.path.display());
+        }
+        Ok(entry)
+    };
+    let committed = match checked_out(branch)?.filter(|e| e.path.is_dir()) {
         Some(entry) => commit_all(&entry.path, message)?,
         None => false,
     };
     ensure_branch(repo, into, base_ref)?;
-    let worktree = match checked_out(into) {
+    let worktree = match checked_out(into)? {
         Some(entry) if entry.path.is_dir() => entry.path.clone(),
         stale => {
             if stale.is_some() {
@@ -948,6 +1210,174 @@ pub(crate) mod tests {
         assert!(diff_against_base(&plain, "main", None).is_err());
         unpin(&pins.work_tree);
         assert!(git(&plain, &["status"]).is_ok());
+    }
+
+    /// `f`'s result, failing the test when it takes longer than host git ever should here.
+    fn promptly<T: Send + 'static>(what: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(f()));
+        rx.recv_timeout(std::time::Duration::from_secs(20)).unwrap_or_else(|_| panic!("{what} hung"))
+    }
+
+    #[test]
+    fn worktrees_a_sandbox_lists_from_its_git_folder_are_never_entered() {
+        for target in ["planted", "elsewhere", "main", "peer"] {
+            let (dir, repo) = project();
+            let marker = dir.path().join("hook-ran");
+            let worktree = repo.with_file_name("app-task");
+            let peer = repo.with_file_name("app-peer");
+            add_worktree(&repo, &worktree, "task", "main").unwrap();
+            add_worktree(&repo, &peer, "peer", "main").unwrap();
+            let pins = resolve_pins(&worktree).unwrap();
+            let (git_dir, common) = (pins.git_dir.clone().unwrap(), pins.common_dir.clone().unwrap());
+            pin(pins.clone());
+
+            // The sandbox writes its read-write <common>/worktrees/<id>/gitdir to name a folder of its
+            // choosing: a repository it plants in that same git folder, whose config runs a hook, an
+            // unrelated repository, or another checkout.
+            let listed = match target {
+                "planted" => {
+                    let evil = git_dir.join("evil");
+                    plant_hostile_git_dir(&evil.join(".git"), &common, "refs/heads/task", &marker);
+                    std::fs::create_dir_all(evil.join("target")).unwrap();
+                    evil
+                }
+                "elsewhere" => {
+                    let other = dir.path().join("other");
+                    std::fs::create_dir(&other).unwrap();
+                    init(&other);
+                    other
+                }
+                "main" => repo.clone(),
+                _ => peer.clone(),
+            };
+            std::fs::write(git_dir.join("gitdir"), format!("{}\n", listed.join(".git").display())).unwrap();
+            if target == "planted" {
+                let raw = Command::new("git").arg("-C").arg(&listed).arg("status").output().unwrap();
+                assert!(raw.status.success() && marker.exists(), "the planted repository must be live");
+                std::fs::remove_file(&marker).unwrap();
+            }
+
+            let entries = list_worktrees(&repo).unwrap();
+            let real = listed.canonicalize().unwrap();
+            let fake: Vec<_> = entries.iter().skip(1).filter(|e| e.path.canonicalize().unwrap() == real).collect();
+            // A checkout named twice is listed twice, and trusted neither time.
+            assert_eq!(fake.len(), if target == "peer" { 2 } else { 1 }, "{target}: {entries:?}");
+            assert!(fake.iter().all(|entry| !entry.trusted), "{target}: {entries:?}");
+            assert!(entries[0].trusted, "{target}: the main checkout is git's own: {entries:?}");
+            let peer_trusted = entries.iter().any(|e| e.trusted && e.branch.as_deref() == Some("peer"));
+            assert_eq!(peer_trusted, target != "peer", "{target}: {entries:?}");
+            if target == "planted" {
+                let error = git(&listed, &["status"]).unwrap_err();
+                assert!(format!("{error:#}").contains("a git folder a sandbox writes"), "{error:#}");
+            }
+            let health = worktree_health(&repo, "main").unwrap();
+            let row = health.iter().find(|h| h.branch.as_deref() == Some("task")).unwrap();
+            assert!(row.untrusted && !row.is_safe_to_remove(), "{target}: {health:?}");
+            assert!(remove_worktree(&repo, &listed, None, false).is_err(), "{target}");
+            assert!(listed.exists() && worktree.exists());
+            let error = integrate(&repo, "task", "task (t1)", "plan", &repo.with_file_name("app-plan"), "main");
+            assert!(format!("{:#}", error.unwrap_err()).contains("not listed as git made it"), "{target}");
+            assert_eq!(main_checkout(&worktree).unwrap(), repo.canonicalize().unwrap());
+            diff_against_base(&repo, "main", None).unwrap();
+            assert!(!marker.exists(), "{target}: host git ran the sandbox's hook");
+            unpin(&pins.work_tree);
+        }
+    }
+
+    #[test]
+    fn special_files_in_a_sandboxed_worktrees_git_folder_never_keep_host_git_waiting() {
+        for (name, kind) in [
+            ("HEAD", "fifo"),
+            ("commondir", "fifo"),
+            ("gitdir", "fifo"),
+            ("index", "fifo"),
+            ("locked", "fifo"),
+            ("HEAD", "zero"),
+        ] {
+            let (_dir, repo) = project();
+            let worktree = repo.with_file_name("app-task");
+            add_worktree(&repo, &worktree, "task", "main").unwrap();
+            let pins = resolve_pins(&worktree).unwrap();
+            pin(pins.clone());
+            let file = pins.git_dir.clone().unwrap().join(name);
+            let _ = std::fs::remove_file(&file);
+            match kind {
+                "fifo" => assert!(Command::new("mkfifo").arg(&file).status().unwrap().success()),
+                _ => std::os::unix::fs::symlink("/dev/zero", &file).unwrap(),
+            }
+            let what = format!("{name} as a {kind}");
+            let (r, w) = (repo.clone(), worktree.clone());
+            let results = promptly(&what, move || {
+                [
+                    list_worktrees(&r).map(drop),
+                    worktree_health(&r, "main").map(drop),
+                    diff_against_base(&w, "main", None).map(drop),
+                    main_checkout(&w).map(drop),
+                    git(&r, &["branch", "-d", "task"]).map(drop),
+                    git(&r, &["status"]).map(drop),
+                    resolve_pins(&w).map(drop),
+                ]
+            });
+            for result in results {
+                let error = format!("{:#}", result.unwrap_err());
+                assert!(error.contains(name), "{what}: {error}");
+            }
+            // Its git files no longer look as git made them, so the folder stays pinned once its sandbox goes.
+            unpin(&pins.work_tree);
+            assert!(promptly(&what, move || resolve_pins(&worktree)).is_err(), "{what}");
+        }
+    }
+
+    #[test]
+    fn host_git_that_waits_is_stopped_at_its_timeout() {
+        let (dir, repo) = project();
+        let fifo = dir.path().join("fifo");
+        assert!(Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        let started = std::time::Instant::now();
+        let fifo_text = fifo.display().to_string();
+        let args = ["config", "--file", &fifo_text, "--list"];
+        let error = super::run(command(&repo, &args).unwrap(), &args, None, Duration::from_millis(500)).unwrap_err();
+        assert!(format!("{error:#}").contains("did not finish within"), "{error:#}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(timeout(&["status"]), QUICK);
+        assert_eq!(timeout(&["-c", "a=b", "worktree", "add", "x"]), SLOW);
+        assert_eq!(timeout(&["merge", "--no-ff", "x"]), SLOW);
+        assert_eq!(git_input(&repo, &["hash-object", "--stdin"], b"x\n").unwrap().trim().len(), 40);
+    }
+
+    #[test]
+    fn hooks_and_fsmonitor_never_run_in_a_repository_with_a_sandbox() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, repo) = project();
+        let marker = dir.path().join("hook-ran");
+        let worktree = repo.with_file_name("app-task");
+        add_worktree(&repo, &worktree, "task", "main").unwrap();
+        // Hooks and an fsmonitor in the checkout, as tools set up: a sandbox writes them.
+        run(&repo, &["config", "core.hooksPath", ".hooks"]);
+        run(&repo, &["config", "core.fsmonitor", ".hooks/fsmonitor"]);
+        for checkout in [&repo, &worktree] {
+            std::fs::create_dir_all(checkout.join(".hooks")).unwrap();
+            for hook in ["pre-commit", "post-commit", "reference-transaction", "fsmonitor"] {
+                let path = checkout.join(".hooks").join(hook);
+                std::fs::write(&path, format!("#!/bin/sh\n: > '{}'\n", marker.display())).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        commit_all(&repo, "unsandboxed").unwrap();
+        assert!(marker.exists(), "the hooks must be live for this test to mean anything");
+        std::fs::remove_file(&marker).unwrap();
+
+        let pins = resolve_pins(&worktree).unwrap();
+        pin(pins.clone());
+        for checkout in [&worktree, &repo] {
+            std::fs::write(checkout.join("b.txt"), "change\n").unwrap();
+            git(checkout, &["status"]).unwrap();
+            commit_all(checkout, "sandboxed repository").unwrap();
+        }
+        integrate(&repo, "task", "task (t1)", "plan", &repo.with_file_name("app-plan"), "main").unwrap();
+        assert!(!marker.exists(), "host git ran a hook in a repository with a sandbox");
+        unpin(&pins.work_tree);
     }
 
     #[test]
