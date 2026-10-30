@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
@@ -23,16 +24,21 @@ const QUICK: Duration = Duration::from_secs(120);
 const SLOW: Duration = Duration::from_secs(30 * 60);
 
 /// [`QUICK`] in milliseconds, unless a test that makes git wait shortened it.
+#[cfg(any(test, feature = "test-support"))]
 static QUICK_MILLIS: AtomicU64 = AtomicU64::new(QUICK.as_millis() as u64);
 
 /// Shortens how long quick host git may run in this process, for a test that makes git wait.
 #[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn set_quick_timeout(limit: Duration) {
     QUICK_MILLIS.store(limit.as_millis() as u64, Ordering::Relaxed);
 }
 
 fn quick() -> Duration {
-    Duration::from_millis(QUICK_MILLIS.load(Ordering::Relaxed))
+    #[cfg(any(test, feature = "test-support"))]
+    return Duration::from_millis(QUICK_MILLIS.load(Ordering::Relaxed));
+    #[cfg(not(any(test, feature = "test-support")))]
+    QUICK
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
