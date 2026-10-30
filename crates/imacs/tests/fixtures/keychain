@@ -1,0 +1,20 @@
+#!/bin/sh
+# Both OS keychain protocols; fixture values stay in this temporary test directory.
+dir=${0%/*}
+printf '%s\n' "$@" >> "$dir/keychain-argv"
+if [ -e "$dir/fail-keychain" ]; then
+  echo 'sk-ant-oat01-PRIVATE-keychain-error' >&2
+  exit 1
+fi
+case "$1" in
+  -i)
+    sed 's/.* -w //' > "$dir/keychain-value"
+    ;;
+  store)
+    cat > "$dir/keychain-value"
+    ;;
+  find-generic-password|lookup)
+    cat "$dir/keychain-value" 2>/dev/null
+    ;;
+  *) exit 1 ;;
+esac
