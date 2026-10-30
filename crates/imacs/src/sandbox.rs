@@ -438,6 +438,12 @@ pub fn remove(home: &Path, program: &str, name: &str) -> Result<()> {
         ownership::removed(home, name, Resource::Sandbox)?;
     }
     remove_mcp(home, program, name)?;
+    // The ref guard's baseline goes with its sandbox; one made again under this name takes a new one.
+    match std::fs::remove_file(home.join("ref-guards").join(format!("{name}.json"))) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     if let Some(entry) = ownership::owned(home)?.get(name) {
         if let Some(dir) = &entry.pins {
             forget_pins(dir, name)?;
@@ -1091,7 +1097,14 @@ mod tests {
         assert_eq!(found.attached.iter().map(|(_, name)| name.as_str()).collect::<Vec<_>>(), ["imacs-a"]);
         assert_eq!(found.orphans.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(), ["imacs-b"]);
 
+        let guards = home.join("ref-guards");
+        std::fs::create_dir_all(&guards).unwrap();
+        for name in ["imacs-a", "imacs-b"] {
+            std::fs::write(guards.join(format!("{name}.json")), "{}").unwrap();
+        }
         remove(&home, &sbx, "imacs-b").unwrap();
+        assert!(!guards.join("imacs-b.json").exists(), "the ref guard's baseline goes with its sandbox");
+        assert!(guards.join("imacs-a.json").exists());
         let calls = fake::calls(bin.path());
         assert_eq!(
             calls[calls.len() - 2..],
