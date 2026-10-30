@@ -178,7 +178,8 @@ close_done_agents = true
 
 [resources]
 # Heavy work shared by every agent IMACS starts. Compilers share one jobserver pool, and whole
-# test runs or QA instances wait for a slot through `imacs queue --class test|qa -- <command>`.
+# test runs or QA instances wait for a slot through `imacs queue --class test|qa -- <command>`,
+# as do the chief's checks in agents' sandboxes (imacs_exec).
 # jobs = 16          # jobserver tokens; unset = cores minus 2; 0 = no pool (build scripts that run Apple make)
 # test_slots = 3     # whole test runs at once; unset = one per 6 cores
 # qa_slots = 1       # QA instances at once
@@ -306,12 +307,14 @@ Ask the user to approve it on its own plan board. Never dispatch before approval
 Include heartbeat in imacs_wait statuses. On a heartbeat with no findings, post one short line; otherwise act on the findings.
 To restart IMACS, rebuild/install first, then call imacs_restart; wait instead of forcing while agents work.
 When an event contains approval, use imacs_approve with its session id to answer that request, regardless of the selected plan tab.
-4. Verify every acceptance check yourself: run the build and tests in the task's worktree and read the diff. When \
+4. Verify every acceptance check yourself, and read the diff with imacs_diff. A sandboxed session's code (imacs_list \
+shows its sandbox) runs only in its VM: run its builds and tests with imacs_exec, which runs them in its sandbox, and \
+never run builds, tests or git in its worktree on this machine. Run a bare session's checks in its worktree. When \
 something is missing, steer with imacs_comment + imacs_send_review or imacs_send and move the task back to running. Accept \
 with imacs_plan_update (status done, a note saying what you verified).
 5. Integrate accepted work locally. Every plan ends with a review task: a fresh agent reviews all of the plan's work, \
-including yours. Send its blocking findings back to the tasks they concern, and only then ask the user to open the pull \
-requests. Never push, open pull requests or delete branches without the user's OK.
+including yours, and in sandbox mode runs its checks in its own sandbox. Send its blocking findings back to the tasks \
+they concern, and only then ask the user to open the pull requests. Never push, open pull requests or delete branches without the user's OK.
 
 Several plans may be open at once, each with its own tab, agents, approval, integration branch and final review. \
 Start the next plan while another finishes. The chief is never closed. Use imacs_plan_get without plan for summaries.
@@ -319,7 +322,7 @@ Close finished plans with imacs_plan_close (plan id, status completed or archive
 To configure IMACS itself, read imacs_config_get (and imacs_doctor when something fails) and propose changes with \
 imacs_config_propose: the user applies or rejects each one, and the outcome arrives as a config event. Never edit \
 IMACS's config files yourself.
-Agents share this machine: their compilers draw from one job pool, and full test runs and QA instances wait for a slot through `imacs queue`. Size the fleet to the machine, and keep briefs asking for targeted checks while working and one full test run at the end.
+Agents share this machine: their compilers draw from one job pool, and full test runs and QA instances wait for a slot through `imacs queue`, as imacs_exec does. Size the fleet to the machine, and keep briefs asking for targeted checks while working and one full test run at the end.
 
 Keep briefs, notes and messages short: the user reads them on the board.";
 
@@ -1006,6 +1009,7 @@ kind = "shell"
         let config: Config = toml::from_str("[chief]\nheartbeat_secs = 7").unwrap();
         assert_eq!(config.chief.heartbeat_secs, 7);
         assert!(CHIEF_PROMPT.contains("On a heartbeat with no findings, post one short line"));
+        assert!(CHIEF_PROMPT.contains("run its builds and tests with imacs_exec"));
     }
 
     #[test]

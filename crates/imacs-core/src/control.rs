@@ -55,6 +55,17 @@ pub enum ControlRequest {
         #[serde(default)]
         patch: bool,
     },
+    /// Runs a shell command in a sandboxed session's sandbox, in its worktree, once a slot of
+    /// `class` (default test) is free: the chief's checks of agent code, kept off this machine.
+    Exec {
+        session: String,
+        command: String,
+        /// How long the command may run, and how long it waits for a slot first.
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+        #[serde(default)]
+        class: Option<crate::governor::SlotClass>,
+    },
     /// Adds a review comment on a line of the session's diff; it shows in the diff
     /// panel until sent with `send_review`.
     Comment {

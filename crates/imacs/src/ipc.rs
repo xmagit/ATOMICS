@@ -82,11 +82,22 @@ impl ApprovalReply {
     }
 }
 
-/// What the app answers to a control request. Diffs are computed on the socket
-/// thread so the UI never waits on git.
+/// What the app answers to a control request. Diffs are computed, and sandbox commands run, on
+/// the socket thread so the UI never waits on git or sbx.
 pub enum ControlOutcome {
     Done(ControlResponse),
-    Diff { root: PathBuf, base_ref: String, patch: bool, session: Value },
+    Diff {
+        root: PathBuf,
+        base_ref: String,
+        patch: bool,
+        session: Value,
+    },
+    /// `then` runs once the command has, done or not.
+    Exec {
+        job: crate::sandbox::exec::Exec,
+        session: Value,
+        then: Box<dyn FnOnce() + Send>,
+    },
 }
 
 pub struct ControlMessage {
@@ -184,7 +195,7 @@ fn handle_with_wait_duration(
     }
     if value.get("cmd").is_some() {
         let response = match serde_json::from_value::<ControlRequest>(value) {
-            Ok(request) => control(request, &channels.control, ctx),
+            Ok(request) => control(request, channels, ctx, &stream),
             Err(err) => ControlResponse::error(format!("bad request: {err}")),
         };
         let mut writer = &stream;
@@ -225,9 +236,9 @@ fn handle_with_wait_duration(
     Ok(())
 }
 
-fn control(request: ControlRequest, app: &crate::host::Sender<ControlMessage>, ctx: &egui::Context) -> ControlResponse {
+fn control(request: ControlRequest, channels: &Channels, ctx: &egui::Context, stream: &UnixStream) -> ControlResponse {
     let (reply, outcome) = std::sync::mpsc::channel();
-    if app.send(ControlMessage { request, reply }).is_err() {
+    if channels.control.send(ControlMessage { request, reply }).is_err() {
         return ControlResponse::error("IMACS is shutting down");
     }
     ctx.request_repaint();
@@ -243,6 +254,19 @@ fn control(request: ControlRequest, app: &crate::host::Sender<ControlMessage>, c
                 Err(err) => ControlResponse::error(format!("{err:#}")),
             }
         }
+        Ok(ControlOutcome::Exec { job, session, then }) => {
+            let executed = job.run(&channels.governor, || crate::governor::hung_up(stream).unwrap_or(true));
+            then();
+            match executed.and_then(|done| Ok(serde_json::to_value(done)?)) {
+                Ok(mut result) => {
+                    result["session"] = session;
+                    result["sandbox"] = job.sandbox.into();
+                    result["workdir"] = job.workdir.display().to_string().into();
+                    ControlResponse::ok(result)
+                }
+                Err(err) => ControlResponse::error(format!("{err:#}")),
+            }
+        }
         Err(_) => ControlResponse::error("IMACS did not answer in time"),
     }
 }
@@ -252,7 +276,12 @@ pub fn request(request: &ControlRequest) -> Result<ControlResponse> {
     let path = imacs_core::paths::socket_path();
     let stream =
         UnixStream::connect(&path).map_err(|e| anyhow::anyhow!("IMACS is not running ({}: {e})", path.display()))?;
-    stream.set_read_timeout(Some(Duration::from_secs(320)))?;
+    // A sandbox command may wait its timeout for a slot, then run for as long.
+    let timeout = match request {
+        ControlRequest::Exec { timeout_secs, .. } => 2 * crate::sandbox::exec::timeout(*timeout_secs).as_secs() + 120,
+        _ => 320,
+    };
+    stream.set_read_timeout(Some(Duration::from_secs(timeout)))?;
     let mut writer = &stream;
     writer.write_all(serde_json::to_string(request)?.as_bytes())?;
     writer.write_all(b"\n")?;
@@ -315,6 +344,62 @@ mod tests {
         )
         .unwrap();
         assert!(usage_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn exec_runs_on_the_socket_thread_in_a_slot_then_tells_the_app() {
+        let dir = tempfile::tempdir().unwrap();
+        let sbx = crate::sandbox::fake::install(dir.path()).display().to_string();
+        std::fs::write(dir.path().join("exec-runs"), "").unwrap();
+        std::fs::create_dir(dir.path().join("sandboxes")).unwrap();
+        std::fs::write(dir.path().join("sandboxes/imacs-s1"), "{}").unwrap();
+        let workdir = dir.path().canonicalize().unwrap();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let (hooks, _) = std::sync::mpsc::channel();
+        let (control, requests) = std::sync::mpsc::channel::<ControlMessage>();
+        let (finished, then_ran) = std::sync::mpsc::channel();
+        let governor = Arc::new(crate::governor::Governor::new(imacs_core::governor::ResourceConfig::default(), None));
+        let slots = governor.clone();
+        // The app: answers with the job, and hears when it has run.
+        let app = std::thread::spawn(move || {
+            let message = requests.recv().unwrap();
+            let ControlRequest::Exec { session, command, .. } = message.request else { panic!("an exec request") };
+            let job = crate::sandbox::exec::Exec {
+                sbx,
+                sandbox: "imacs-s1".into(),
+                workdir,
+                command,
+                timeout: Duration::from_secs(60),
+                class: imacs_core::governor::SlotClass::Test,
+                ancestors: vec![],
+            };
+            let then = Box::new(move || finished.send(()).unwrap());
+            let _ = message.reply.send(ControlOutcome::Exec { job, session: json!(session), then });
+        });
+        writeln!(client, "{}", json!({"cmd":"exec", "session":"s1", "command":"echo checked; exit 2"})).unwrap();
+        let server = std::thread::spawn(move || {
+            let channels = Channels {
+                hooks: hooks.into(),
+                control: control.into(),
+                usage: std::sync::mpsc::channel().0,
+                governor,
+            };
+            handle(server, &Mutex::new(Hub::default()), &channels, &egui::Context::default()).unwrap();
+        });
+        let mut line = String::new();
+        BufReader::new(&client).read_line(&mut line).unwrap();
+        let response: ControlResponse = serde_json::from_str(&line).unwrap();
+        assert!(response.ok, "{response:?}");
+        assert_eq!(response.result["session"], "s1");
+        assert_eq!(response.result["sandbox"], "imacs-s1");
+        assert_eq!(
+            (response.result["exit_code"].clone(), response.result["stdout"].clone()),
+            (json!(2), json!("checked\n"))
+        );
+        then_ran.recv_timeout(Duration::from_secs(2)).expect("the app hears the command finished");
+        assert_eq!(slots.snapshot(), (vec![], vec![]), "the slot is free again");
+        app.join().unwrap();
+        server.join().unwrap();
     }
 
     fn event(name: &str) -> HookEvent {

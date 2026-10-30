@@ -354,6 +354,10 @@ The chief pill shows a compact age and a dot when that check found something; ho
 The chief may read, plan, review and run the plan you approved without asking. It can also answer other
 agents' permission prompts through the pre-approved `imacs_approve`, including `allow_always` for the rest
 of a session. Starting agents, typing into terminals and closing sessions still ask for permission.
+It verifies a sandboxed task inside its sandbox, with the pre-approved `imacs_exec`, which reaches no more
+than that task's agent does: agent code never runs on your machine for a check. `imacs_exec` waits for the
+same test and QA slots as `imacs queue`, and is refused for bare tasks, whose checks run on this machine; see
+[Checking sandboxed work](docs/isolation.md#checking-sandboxed-work).
 
 The chief can help configure IMACS too. `imacs_config_get` shows every effective setting and the file it comes
 from, with secrets masked; `imacs_doctor` returns the doctor's checks; `imacs_config_propose` proposes a change to
