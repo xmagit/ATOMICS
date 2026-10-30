@@ -12,7 +12,7 @@ as its state folder.
 
 | What | Why |
 | --- | --- |
-| Ubuntu 24.04 or newer, in a desktop session | Docker Sandboxes support it. Doctor warns on anything else. |
+| Ubuntu 24.04 or newer, in a desktop session | Docker Sandboxes support it. Other distributions can use sbx's static build; doctor warns, and setup carries on. |
 | Hardware virtualization, `/dev/kvm`, and your session in the `kvm` group | Every sandbox is a microVM. |
 | rustup and stable Rust | `scripts/linux-install.sh` builds IMACS from this checkout. |
 | The build libraries and a Vulkan driver | The window (eframe/wgpu) and audio. |
@@ -74,9 +74,9 @@ imacs setup                  # or: imacs setup --workspace daily
 ```
 
 Setup creates a missing config, then works through the machine in order. It shows each missing tool
-(git, claude, codex, secret-tool, sbx) and each failed Linux check (Ubuntu version, KVM, `kvm` group) with
-what to do, and waits: fix it in another terminal, then press Enter to check again, or `q` to stop. It
-goes on only when all of them pass. After that it asks before each change:
+(git, claude, codex, secret-tool, sbx) and each failed KVM check (KVM, `kvm` group) with what to do, and
+waits: fix it in another terminal, then press Enter to check again, or `q` to stop. It goes on only when
+all of them pass. A distribution other than Ubuntu 24.04+ is only a warning. After that it asks before each change:
 
 1. Docker sign-in (`sbx login`, in the browser).
 2. sbx's global network policy, only when none exists (`[isolation.sandbox] network`, balanced by default).
