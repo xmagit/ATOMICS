@@ -210,8 +210,13 @@ impl Desktop<'_> {
                 .collect();
             let (tx, plan, base) = (dialog.tx.clone(), plan.clone(), self.runtime.plan_base_ref(&plan));
             let sbx = resolve_program(&self.runtime.sbx);
+            // The sandboxes it stops are those working in these worktrees.
+            let scope = Scope {
+                sandboxes: Vec::new(),
+                worktrees: Some(targets.iter().filter_map(|e| e.worktree.clone()).collect()),
+            };
             self.post(move |state| {
-                state.lifecycle_jobs.push(std::thread::spawn(move || {
+                state.lifecycle(scope, move || {
                     for entry in targets {
                         // Which sandboxes work there is asked while the worktree is still on disk.
                         let sandboxes = match &entry.worktree {
@@ -253,7 +258,7 @@ impl Desktop<'_> {
                         }
                     }
                     let _ = tx.send(Event::Finished);
-                }));
+                });
             });
         }
         self.client.plan_cleanup_open = open;

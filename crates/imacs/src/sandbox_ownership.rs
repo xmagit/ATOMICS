@@ -82,7 +82,8 @@ pub fn owned(home: &Path) -> Result<BTreeMap<String, Owned>> {
     Ok(Ledger::open(home)?.entries)
 }
 
-/// Record only after a successful create/add, never by adopting an inventory entry.
+/// Reserve before the create/add starts, so a crash or timeout part way still leaves the resource
+/// owned; removal treats one sbx does not list as gone. Never record by adopting an inventory entry.
 pub fn created(home: &Path, name: &str, resource: Resource) -> Result<()> {
     let mut ledger = Ledger::open(home)?;
     let entry = ledger.entry(name);

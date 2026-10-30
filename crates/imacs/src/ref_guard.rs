@@ -1,10 +1,24 @@
 //! Host-side recovery for the shared refs a sandbox can write. This detects changes after a
 //! turn; it is not an access-control boundary or proof of which writer changed a shared ref.
+//!
+//! A check keeps what this machine wrote since the last one, and puts back the rest:
+//! - refs IMACS wrote itself ([`host_write`]), at the values IMACS left;
+//! - a branch a checkout on this machine moved, at the commit that checkout's HEAD log left it at:
+//!   the main checkout, or a linked worktree no sandbox works in;
+//! - remote-tracking refs and tags at an object a fetch on this machine wrote to its FETCH_HEAD,
+//!   and those such a fetch may have pruned;
+//! - `refs/stash`, which every checkout shares, and the quarantine below are not guarded.
+//!
+//! Those traces are in git folders no sandbox mounts, except the main checkout's HEAD log, which is
+//! in the shared `logs` folder. Putting a ref back never deletes a value: one it replaces is kept at
+//! `refs/imacs/quarantine/<sandbox>/<ref>@<object>`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex, Weak};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use imacs_core::{git, paths};
@@ -25,15 +39,28 @@ fn shown(value: Option<&RefValue>) -> String {
     }
 }
 
+/// Refs no check puts back: the stash every checkout shares, and the values checks keep aside.
+const UNGUARDED: [&str; 2] = ["refs/stash", QUARANTINE];
+const QUARANTINE: &str = "refs/imacs/quarantine/";
+
+/// Whether `pattern`, a ref name or a prefix ending in `/`, covers the ref `name`.
+fn covers(pattern: &str, name: &str) -> bool {
+    if pattern.ends_with('/') { name.starts_with(pattern) } else { name == pattern }
+}
+
+fn now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+
 /// Refs IMACS itself writes on this machine, by repository folder: an integration's merge, a new
-/// worktree's branch, a cleaned-up branch. A guard whose snapshot is older must neither undo nor
-/// restore them, and its check may have been queued before IMACS wrote them.
+/// worktree's branch, a cleaned-up branch, a fetch's remote-tracking refs. A guard whose snapshot is
+/// older must neither undo nor restore them, and its check may have been queued before IMACS wrote them.
 struct HostWrites {
-    /// Writes in progress: every check accepts these refs.
+    /// Writes in progress, by ref name or prefix: every check accepts these refs.
     pending: Vec<(PathBuf, String)>,
-    /// The value each write left, or None where IMACS deleted the ref. A check accepts a ref still at
-    /// that value and restores any other, such as an agent's.
-    written: Vec<(PathBuf, String, Option<RefValue>)>,
+    /// The refs each write left under its name or prefix; one it deleted is absent. A check accepts
+    /// a ref still at that value and restores any other, such as an agent's.
+    written: Vec<(PathBuf, String, BTreeMap<String, RefValue>)>,
 }
 
 static HOST_WRITES: Mutex<HostWrites> = Mutex::new(HostWrites { pending: Vec::new(), written: Vec::new() });
@@ -41,7 +68,13 @@ static HOST_WRITES: Mutex<HostWrites> = Mutex::new(HostWrites { pending: Vec::ne
 /// Marks `refs/heads/<branch>` in `repo`'s repository as written by IMACS until the returned
 /// [`HostWrite`] drops, which records the values the write left. Call it before the write starts.
 pub fn host_write<S: AsRef<str>>(repo: &Path, branches: impl IntoIterator<Item = S>) -> HostWrite {
-    let names: Vec<String> = branches.into_iter().map(|branch| format!("refs/heads/{}", branch.as_ref())).collect();
+    host_write_refs(repo, branches.into_iter().map(|branch| format!("refs/heads/{}", branch.as_ref())))
+}
+
+/// [`host_write`] for full ref names, and prefixes ending in `/` for every ref under them, such as
+/// `refs/remotes/` for a fetch.
+pub fn host_write_refs(repo: &Path, refs: impl IntoIterator<Item = String>) -> HostWrite {
+    let names: Vec<String> = refs.into_iter().collect();
     let mut host = HOST_WRITES.lock().unwrap_or_else(|e| e.into_inner());
     host.pending.extend(names.iter().map(|name| (repo.to_path_buf(), name.clone())));
     HostWrite { repo: repo.to_path_buf(), names }
@@ -73,9 +106,22 @@ impl HostWrite {
             // Without the values a later check falls back to restoring, as before IMACS wrote.
             if let Some(values) = values {
                 host.written.retain(|(repo, written, _)| !(*repo == self.repo && written == name));
-                host.written.push((self.repo.clone(), name.clone(), values.get(name).cloned()));
+                let left = values.iter().filter(|(other, _)| covers(name, other));
+                let left = left.map(|(other, value)| (other.clone(), value.clone())).collect();
+                host.written.push((self.repo.clone(), name.clone(), left));
             }
         }
+    }
+}
+
+/// What IMACS's own writes left in one repository, oldest first; see [`host_write`].
+#[derive(Default)]
+pub(crate) struct Written(Vec<(String, BTreeMap<String, RefValue>)>);
+
+impl Written {
+    /// Whether IMACS's latest write covering `name` left it at `value`.
+    fn left(&self, name: &str, value: Option<&RefValue>) -> bool {
+        self.0.iter().rev().find(|(pattern, _)| covers(pattern, name)).is_some_and(|(_, refs)| refs.get(name) == value)
     }
 }
 
@@ -116,8 +162,9 @@ fn common_of(cwd: &Path) -> Result<PathBuf> {
     Ok(PathBuf::from(common.trim()).canonicalize()?)
 }
 
-/// The refs IMACS is writing, and the values it left, in the repository at `common`. Runs git.
-fn host_writes(common: &Path) -> (BTreeSet<String>, BTreeMap<String, Option<RefValue>>) {
+/// The refs IMACS is writing, as names and prefixes, and the values it left, in the repository at
+/// `common`. Runs git.
+fn host_writes(common: &Path) -> (BTreeSet<String>, Written) {
     let (pending, written) = {
         let host = HOST_WRITES.lock().unwrap_or_else(|e| e.into_inner());
         (host.pending.clone(), host.written.clone())
@@ -127,8 +174,143 @@ fn host_writes(common: &Path) -> (BTreeSet<String>, BTreeMap<String, Option<RefV
         *commons.entry(repo.clone()).or_insert_with(|| git::common_dir(repo).ok().as_deref() == Some(common))
     };
     let pending = pending.into_iter().filter(|(repo, _)| ours(repo)).map(|(_, name)| name).collect();
-    let written = written.into_iter().filter(|(repo, _, _)| ours(repo)).map(|(_, name, value)| (name, value)).collect();
-    (pending, written)
+    let written = written.into_iter().filter(|(repo, _, _)| ours(repo)).map(|(_, name, refs)| (name, refs));
+    (pending, Written(written.collect()))
+}
+
+/// What git on this machine left since a check, read from files no sandbox writes (see the module
+/// docs). Reading them runs no git and never waits.
+#[derive(Default)]
+struct HostLeft {
+    /// Each branch a checkout here moved, with the commit it last left it at.
+    branches: BTreeSet<(String, String)>,
+    /// Each branch a checkout here switched to, at its commit then: one a switch made (`git switch -c`).
+    switched: BTreeSet<(String, String)>,
+    /// Objects fetches here wrote to FETCH_HEAD, and whether any fetch ran: it may have pruned refs.
+    fetched: BTreeSet<String>,
+    fetch: bool,
+}
+
+/// Bounds what a check reads of a HEAD log or FETCH_HEAD; the newest entries are at the end.
+const TRACE_LIMIT: u64 = 1 << 20;
+
+impl HostLeft {
+    /// The checkouts on this machine in the repository at `common`: the main checkout, and each linked
+    /// worktree but `own`, the guarded one, and those of other sandboxes, whose git folders they write.
+    fn read(common: &Path, own: Option<&Path>, since: u64) -> Self {
+        let sandboxed: Vec<PathBuf> = git::pinned_all()
+            .into_iter()
+            .filter(|pins| pins.git_dir != pins.common_dir)
+            .filter_map(|pins| pins.git_dir)
+            .collect();
+        let mut host = Self::default();
+        host.read_checkout(common, &common.join("logs/HEAD"), since);
+        let Ok(entries) = std::fs::read_dir(common.join("worktrees")) else { return host };
+        for entry in entries.flatten() {
+            let folder = entry.path();
+            let real = folder.canonicalize().unwrap_or_else(|_| folder.clone());
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) && own != Some(&real) && !sandboxed.contains(&real) {
+                host.read_checkout(&folder, &folder.join("logs/HEAD"), since);
+            }
+        }
+        host
+    }
+
+    /// One checkout's traces since `since`: the git `folder` it writes and its HEAD `log`.
+    fn read_checkout(&mut self, folder: &Path, log: &Path, since: u64) {
+        if let Some((bytes, modified)) = read_trace(&folder.join("FETCH_HEAD"))
+            && modified >= since
+        {
+            self.fetch = true;
+            let text = String::from_utf8_lossy(&bytes);
+            let objects = text.lines().filter_map(|line| line.split('\t').next()).filter(|id| is_object(id));
+            self.fetched.extend(objects.map(str::to_string));
+        }
+        let Some((bytes, _)) = read_trace(log) else { return };
+        let text = String::from_utf8_lossy(&bytes);
+        let entries: Vec<_> = text.lines().filter_map(LogEntry::parse).filter(|entry| entry.time >= since).collect();
+        // Newest first, from the branch HEAD is on now: before a switch, HEAD was on the branch it left.
+        let mut branch = read_trace(&folder.join("HEAD"))
+            .and_then(|(bytes, _)| String::from_utf8(bytes).ok()?.trim().strip_prefix("ref: ").map(str::to_string));
+        let mut moved = BTreeMap::new();
+        for entry in entries.iter().rev() {
+            match entry.message.strip_prefix("checkout: moving from ").and_then(|rest| rest.split_once(" to ")) {
+                Some((from, _)) => {
+                    self.switched.extend(branch.take().map(|to| (to, entry.new.clone())));
+                    branch = Some(format!("refs/heads/{from}"));
+                }
+                // An entry that leaves HEAD where it was, such as a stash's reset, vouches for nothing:
+                // its value is whatever the branch held then, an agent's too.
+                None if entry.old != entry.new => {
+                    if let Some(branch) = &branch {
+                        moved.entry(branch.clone()).or_insert_with(|| entry.new.clone());
+                    }
+                }
+                None => {}
+            }
+        }
+        self.branches.extend(moved);
+    }
+
+    /// Whether git on this machine left `name`, which was at `before`, at `after`.
+    fn left(&self, name: &str, before: Option<&RefValue>, after: Option<&RefValue>) -> bool {
+        let fetched = name.starts_with("refs/remotes/") || name.starts_with("refs/tags/");
+        match after {
+            Some(RefValue::Object(object)) => {
+                let pair = (name.to_string(), object.clone());
+                self.branches.contains(&pair)
+                    || (before.is_none() && self.switched.contains(&pair))
+                    || (fetched && self.fetched.contains(object))
+            }
+            Some(RefValue::Symbolic(target)) => fetched && self.fetch && target.starts_with("refs/remotes/"),
+            None => fetched && self.fetch,
+        }
+    }
+}
+
+/// One line of a reflog: `<old> <new> <name> <<email>> <time> <zone>\t<message>`.
+struct LogEntry {
+    old: String,
+    new: String,
+    time: u64,
+    message: String,
+}
+
+impl LogEntry {
+    fn parse(line: &str) -> Option<Self> {
+        let (fields, message) = line.split_once('\t').unwrap_or((line, ""));
+        let mut forward = fields.splitn(3, ' ');
+        let (old, new) = (forward.next()?, forward.next()?);
+        let mut back = fields.rsplitn(3, ' ');
+        let (_zone, time) = (back.next()?, back.next()?.parse().ok()?);
+        (is_object(old) && is_object(new)).then(|| Self {
+            old: old.into(),
+            new: new.into(),
+            time,
+            message: message.into(),
+        })
+    }
+}
+
+fn is_object(id: &str) -> bool {
+    matches!(id.len(), 40 | 64) && id.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// The end of a regular file, at most [`TRACE_LIMIT`] bytes, and when it last changed in seconds.
+/// Never follows a link at the file or waits on a FIFO.
+fn read_trace(path: &Path) -> Option<(Vec<u8>, u64)> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file =
+        std::fs::File::options().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    file.seek(SeekFrom::Start(metadata.len().saturating_sub(TRACE_LIMIT))).ok()?;
+    let mut bytes = Vec::new();
+    file.take(TRACE_LIMIT).read_to_end(&mut bytes).ok()?;
+    let modified = metadata.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    Some((bytes, modified))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -136,6 +318,9 @@ pub struct RefGuard {
     pub common: PathBuf,
     pub branch: Option<String>,
     refs: BTreeMap<String, RefValue>,
+    /// When the baseline was last taken, in seconds: host traces from then on count.
+    #[serde(default)]
+    checked: Option<u64>,
     #[serde(skip)]
     cwd: PathBuf,
     #[serde(skip)]
@@ -151,15 +336,21 @@ impl RefGuard {
         }
         let common = common_of(cwd)?;
         let mut guard = if file.exists() {
-            let guard: Self = serde_json::from_slice(&std::fs::read(&file)?)?;
+            let mut guard: Self = serde_json::from_slice(&std::fs::read(&file)?)?;
             if guard.common != common {
                 bail!("ref guard snapshot belongs to another repository");
+            }
+            // A snapshot from before IMACS kept the time was saved at its last check.
+            if guard.checked.is_none() {
+                let modified = std::fs::metadata(&file)?.modified()?;
+                guard.checked = Some(modified.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs());
             }
             guard
         } else {
             Self {
                 common,
                 branch: git::git(cwd, &["symbolic-ref", "-q", "HEAD"]).ok().map(|s| s.trim().to_string()),
+                checked: Some(now()),
                 refs: read_refs(cwd)?,
                 cwd: cwd.into(),
                 file: file.clone(),
@@ -171,21 +362,30 @@ impl RefGuard {
         Ok(Some(guard))
     }
 
-    /// Restore changed, deleted and newly created refs outside the task branches. Other
-    /// active tasks' branches must be exempt too: they share this same refs directory. A ref still
-    /// at the value IMACS itself `written` there is accepted.
-    pub(crate) fn check(
-        &mut self,
-        concurrent: &BTreeSet<String>,
-        written: &BTreeMap<String, Option<RefValue>>,
-    ) -> Result<Vec<String>> {
+    /// Restore changed, deleted and newly created refs that neither the task branches nor this
+    /// machine account for (see the module docs). Other active tasks' branches must be exempt too:
+    /// they share this same refs directory. `concurrent` holds those and the refs IMACS is writing, as
+    /// names or prefixes; a ref still at the value IMACS `written` there is accepted.
+    pub(crate) fn check(&mut self, concurrent: &BTreeSet<String>, written: &Written) -> Result<Vec<String>> {
+        let started = now();
         let current = read_refs(&self.cwd)?;
+        let own = git::git(&self.cwd, &["rev-parse", "--absolute-git-dir"])
+            .ok()
+            .and_then(|dir| PathBuf::from(dir.trim()).canonicalize().ok());
+        // A second's slack: reflogs and file times are in whole seconds.
+        let host = HostLeft::read(&self.common, own.as_deref(), self.checked.unwrap_or(started).saturating_sub(1));
+        let session = self.file.file_stem().map_or_else(|| "unknown".into(), |stem| stem.to_string_lossy());
         let names: BTreeSet<_> = self.refs.keys().chain(current.keys()).cloned().collect();
         let mut alerts = Vec::new();
         for name in names {
-            let imacs = written.get(&name).is_some_and(|value| value.as_ref() == current.get(&name));
-            if self.branch.as_ref() == Some(&name) || concurrent.contains(&name) || imacs {
-                match current.get(&name) {
+            let (before, after) = (self.refs.get(&name), current.get(&name));
+            let accepted = self.branch.as_ref() == Some(&name)
+                || concurrent.iter().any(|pattern| covers(pattern, &name))
+                || UNGUARDED.iter().any(|pattern| covers(pattern, &name))
+                || written.left(&name, after)
+                || host.left(&name, before, after);
+            if accepted {
+                match after {
                     Some(value) => {
                         self.refs.insert(name, value.clone());
                     }
@@ -195,16 +395,24 @@ impl RefGuard {
                 }
                 continue;
             }
-            let (before, after) = (self.refs.get(&name), current.get(&name));
             if before == after {
                 continue;
             }
-            let result = restore(&self.cwd, &name, before, after);
             let (expected, found) = (shown(before), shown(after));
-            alerts.push(match (result, before, after) {
-                (Ok(()), None, _) => format!("Restored {name}: removed it (it pointed to {found})"),
-                (Ok(()), _, None) => format!("Restored {name}: recreated it at {expected}"),
-                (Ok(()), _, _) => format!("Restored {name}: from {found} back to {expected}"),
+            // The value being replaced stays reachable, whoever wrote it.
+            let kept = match after {
+                Some(RefValue::Object(_)) => Some(format!("{QUARANTINE}{session}/{name}@{found}")),
+                _ => None,
+            };
+            let result = restore(&self.cwd, &name, before, after, kept.as_deref());
+            alerts.push(match (result, before, kept) {
+                (Ok(()), None, Some(kept)) => format!("Restored {name}: moved it to {kept} (it pointed to {found})"),
+                (Ok(()), None, None) => format!("Restored {name}: removed it (it was {found})"),
+                (Ok(()), _, _) if after.is_none() => format!("Restored {name}: recreated it at {expected}"),
+                (Ok(()), _, Some(kept)) => {
+                    format!("Restored {name}: from {found} back to {expected}; kept {found} at {kept}")
+                }
+                (Ok(()), _, None) => format!("Restored {name}: from {found} back to {expected}"),
                 (Err(error), _, _) => {
                     format!("RESTORE FAILED for {name}: {error:#}; expected {expected}, found {found}")
                 }
@@ -218,18 +426,17 @@ impl RefGuard {
                 git::git(&self.cwd, &["symbolic-ref", "HEAD", branch]).context("restoring task HEAD")?;
             }
         }
+        self.checked = Some(started);
         self.save()?;
         Ok(alerts)
     }
 
-    /// Takes the values IMACS left in `names` as this guard's baseline for them.
+    /// Takes the values IMACS left under `names`, ref names or prefixes, as this guard's baseline for them.
     fn accept(&mut self, names: &[String], values: &BTreeMap<String, RefValue>) -> Result<()> {
-        for name in names {
-            match values.get(name) {
-                Some(value) => self.refs.insert(name.clone(), value.clone()),
-                None => self.refs.remove(name),
-            };
-        }
+        let ours = |name: &String| names.iter().any(|pattern| covers(pattern, name));
+        self.refs.retain(|name, _| !ours(name));
+        self.refs
+            .extend(values.iter().filter(|(name, _)| ours(name)).map(|(name, value)| (name.clone(), value.clone())));
         self.save()
     }
 
@@ -396,14 +603,27 @@ fn read_loose(dir: &Path, prefix: &str, refs: &mut BTreeMap<String, RefValue>) -
     Ok(())
 }
 
-/// Compare-and-swap under Git's ref lock. `no-deref` prevents a malicious symbolic ref from
-/// making restoration write through to a different branch.
-fn restore(cwd: &Path, name: &str, before: Option<&RefValue>, after: Option<&RefValue>) -> Result<()> {
+/// Compare-and-swap under Git's ref lock, keeping the object `after` at the ref `kept`. `no-deref`
+/// prevents a malicious symbolic ref from making restoration write through to a different branch.
+fn restore(
+    cwd: &Path,
+    name: &str,
+    before: Option<&RefValue>,
+    after: Option<&RefValue>,
+    kept: Option<&str>,
+) -> Result<()> {
+    let keep = match (after, kept) {
+        (Some(RefValue::Object(object)), Some(kept)) => format!("update {kept} {object}\n"),
+        _ => String::new(),
+    };
     // Older Git versions have no symbolic-ref transactions. Recheck before those operations;
     // ordinary branch/tag OIDs below use Git's atomic old-value check.
     if matches!(before, Some(RefValue::Symbolic(_))) || matches!(after, Some(RefValue::Symbolic(_))) {
         if read_refs(cwd)?.get(name) != after {
             bail!("ref changed again during recovery");
+        }
+        if !keep.is_empty() {
+            update_refs(cwd, &keep)?;
         }
         match before {
             Some(RefValue::Symbolic(target)) => {
@@ -425,7 +645,13 @@ fn restore(cwd: &Path, name: &str, before: Option<&RefValue>, after: Option<&Ref
         (None, None) => return Ok(()),
         _ => unreachable!("symbolic refs handled above"),
     };
-    let input = format!("start\noption no-deref\n{operation}\nprepare\ncommit\n");
+    // One transaction: the value is kept aside only if the ref is put back.
+    update_refs(cwd, &format!("{keep}{operation}\n"))
+}
+
+/// Runs `operations` as one `git update-ref --stdin` transaction without dereferencing.
+fn update_refs(cwd: &Path, operations: &str) -> Result<()> {
+    let input = format!("start\noption no-deref\n{operations}prepare\ncommit\n");
     git::git_input(cwd, &["update-ref", "--stdin"], input.as_bytes())?;
     Ok(())
 }
@@ -471,7 +697,7 @@ mod tests {
         git::git(&worktree, &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/heads/task"]).unwrap();
         git::git(&worktree, &["symbolic-ref", "refs/heads/dangling", "refs/heads/missing"]).unwrap();
         let mut guard = RefGuard::open(&worktree, file).unwrap().unwrap();
-        let alerts = guard.check(&BTreeSet::new(), &BTreeMap::new()).unwrap();
+        let alerts = guard.check(&BTreeSet::new(), &Written::default()).unwrap();
         assert_eq!(alerts.len(), 6, "{alerts:?}");
         assert!(alerts.iter().all(|alert| alert.starts_with("Restored")), "{alerts:?}");
         for name in ["main", "other", "original", "origin/HEAD"] {
@@ -480,7 +706,104 @@ mod tests {
         assert_eq!(git::git(&repo, &["rev-parse", "task"]).unwrap().trim(), task);
         assert!(git::git(&repo, &["rev-parse", "--verify", "refs/tags/injected"]).is_err());
         assert!(git::git(&repo, &["symbolic-ref", "refs/heads/dangling"]).is_err());
-        assert!(guard.check(&BTreeSet::new(), &BTreeMap::new()).unwrap().is_empty());
+        // Nothing is deleted: what the agent wrote is kept aside.
+        for name in ["refs/heads/main", "refs/tags/injected"] {
+            let kept = format!("refs/imacs/quarantine/snapshot/{name}@{}", &task[..12]);
+            assert_eq!(git::git(&repo, &["rev-parse", &kept]).unwrap().trim(), task, "{alerts:?}");
+        }
+        assert!(guard.check(&BTreeSet::new(), &Written::default()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn this_machines_commits_fetches_and_stashes_survive_a_turn_and_agent_refs_are_quarantined() {
+        let (dir, repo, worktree) = repository();
+        let origin = dir.path().join("origin");
+        std::fs::create_dir(&origin).unwrap();
+        for args in [
+            &["init", "-qb", "main"][..],
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.org",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "upstream",
+            ],
+            &["tag", "v1"],
+        ] {
+            git::git(&origin, args).unwrap();
+        }
+        git::git(&repo, &["remote", "add", "origin", &origin.display().to_string()]).unwrap();
+        git::git(&repo, &["branch", "other"]).unwrap();
+        let initial = git::git(&repo, &["rev-parse", "main"]).unwrap().trim().to_string();
+        let guard = RefGuard::open(&worktree, dir.path().join("imacs-agent.json")).unwrap().unwrap();
+        let guard = Shared::new(guard);
+
+        // During the turn the agent commits, moves a branch and makes one of its own...
+        git::git(&worktree, &["commit", "--allow-empty", "-qm", "agent"]).unwrap();
+        let agent = git::git(&worktree, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        git::git(&worktree, &["update-ref", "refs/heads/other", &agent]).unwrap();
+        git::git(&worktree, &["branch", "agent-made"]).unwrap();
+        // ...while you commit on main, switch away, fetch and stash in your checkout.
+        git::git(&repo, &["commit", "--allow-empty", "-qm", "mine"]).unwrap();
+        let mine = git::git(&repo, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        git::git(&repo, &["switch", "-qc", "later"]).unwrap();
+        git::git(&repo, &["fetch", "-q", "origin"]).unwrap();
+        std::fs::write(repo.join("scratch"), "work in progress").unwrap();
+        git::git(&repo, &["add", "scratch"]).unwrap();
+        git::git(&repo, &["stash", "-q"]).unwrap();
+
+        let alerts = guard.check(&Exempt::default()).unwrap();
+        assert_eq!(alerts.len(), 2, "{alerts:?}");
+        assert_eq!(git::git(&repo, &["rev-parse", "main"]).unwrap().trim(), mine);
+        for name in ["later", "origin/main", "v1", "stash@{0}"] {
+            assert!(git::git(&repo, &["rev-parse", "--verify", name]).is_ok(), "{name}: {alerts:?}");
+        }
+        assert_eq!(git::git(&repo, &["rev-parse", "other"]).unwrap().trim(), initial);
+        assert!(git::git(&repo, &["rev-parse", "--verify", "refs/heads/agent-made"]).is_err());
+        for name in ["other", "agent-made"] {
+            let kept = format!("refs/imacs/quarantine/imacs-agent/refs/heads/{name}@{}", &agent[..12]);
+            assert_eq!(git::git(&repo, &["rev-parse", &kept]).unwrap().trim(), agent, "{alerts:?}");
+            assert!(alerts.iter().any(|alert| alert.contains(&kept)), "{alerts:?}");
+        }
+
+        // A fetch that leaves no FETCH_HEAD is IMACS's own only while IMACS says so.
+        git::git(
+            &origin,
+            &["-c", "user.name=Test", "-c", "user.email=test@example.org", "commit", "--allow-empty", "-qm", "next"],
+        )
+        .unwrap();
+        let next = git::git(&origin, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        let write = host_write_refs(&repo, ["refs/remotes/".into(), "refs/tags/".into()]);
+        git::git(&repo, &["fetch", "-q", "--no-write-fetch-head", "origin"]).unwrap();
+        drop(write);
+        assert!(guard.check(&Exempt::default()).unwrap().is_empty());
+        assert_eq!(git::git(&repo, &["rev-parse", "origin/main"]).unwrap().trim(), next);
+        git::git(
+            &origin,
+            &["-c", "user.name=Test", "-c", "user.email=test@example.org", "commit", "--allow-empty", "-qm", "last"],
+        )
+        .unwrap();
+        git::git(
+            &worktree,
+            &["fetch", "-q", "--no-write-fetch-head", &origin.display().to_string(), "+main:refs/remotes/origin/main"],
+        )
+        .unwrap();
+        let alerts = guard.check(&Exempt::default()).unwrap();
+        assert!(alerts.len() == 1 && alerts[0].contains("Restored refs/remotes/origin/main"), "{alerts:?}");
+        assert_eq!(git::git(&repo, &["rev-parse", "origin/main"]).unwrap().trim(), next);
+
+        // A stash after the agent moved your checked-out branch logs HEAD at the agent's commit,
+        // without moving it: that vouches for nothing.
+        git::git(&worktree, &["update-ref", "refs/heads/later", &agent]).unwrap();
+        std::fs::write(repo.join("scratch"), "more work").unwrap();
+        git::git(&repo, &["add", "scratch"]).unwrap();
+        git::git(&repo, &["stash", "-q"]).unwrap();
+        let alerts = guard.check(&Exempt::default()).unwrap();
+        assert!(alerts.len() == 1 && alerts[0].contains("Restored refs/heads/later"), "{alerts:?}");
+        assert_eq!(git::git(&repo, &["rev-parse", "later"]).unwrap().trim(), mine);
     }
 
     #[test]
@@ -492,18 +815,19 @@ mod tests {
         git::git(&worktree, &["commit", "--allow-empty", "-qm", "advance"]).unwrap();
         let task = git::git(&worktree, &["rev-parse", "HEAD"]).unwrap();
         git::git(&worktree, &["update-ref", "refs/heads/peer", task.trim()]).unwrap();
-        assert!(guard.check(&BTreeSet::from(["refs/heads/peer".into()]), &BTreeMap::new()).unwrap().is_empty());
+        assert!(guard.check(&BTreeSet::from(["refs/heads/peer".into()]), &Written::default()).unwrap().is_empty());
         assert!(
-            guard.check(&BTreeSet::new(), &BTreeMap::new()).unwrap().is_empty(),
+            guard.check(&BTreeSet::new(), &Written::default()).unwrap().is_empty(),
             "accepted commit survives peer exit"
         );
-        git::git(&repo, &["update-ref", "refs/heads/main", task.trim()]).unwrap();
+        // From the sandbox's worktree: the main checkout's own update-ref would leave its HEAD log a trace.
+        git::git(&worktree, &["update-ref", "refs/heads/main", task.trim()]).unwrap();
         let lock = repo.join(".git/refs/heads/main.lock");
         std::fs::write(&lock, "").unwrap();
-        let alerts = guard.check(&BTreeSet::new(), &BTreeMap::new()).unwrap();
+        let alerts = guard.check(&BTreeSet::new(), &Written::default()).unwrap();
         assert!(alerts[0].contains("RESTORE FAILED"), "{alerts:?}");
         std::fs::remove_file(lock).unwrap();
-        assert!(guard.check(&BTreeSet::new(), &BTreeMap::new()).unwrap()[0].starts_with("Restored"));
+        assert!(guard.check(&BTreeSet::new(), &Written::default()).unwrap()[0].starts_with("Restored"));
         assert_eq!(git::git(&repo, &["rev-parse", "main"]).unwrap(), initial);
     }
 }

@@ -97,8 +97,6 @@ impl State {
         prompt: Option<String>,
         role: Role,
     ) -> Result<String, String> {
-        // A previous close may still be stopping this session's resumable sandbox.
-        self.finish_lifecycle_jobs();
         let chief = role == Role::Chief;
         let agent = if chief {
             imacs_core::config::AgentConfig {
@@ -134,7 +132,11 @@ impl State {
             let (tx, rx) = self.wake.channel();
             let (checks, exempt) = (self.ref_checks.clone(), self.exempt_branches());
             let snapshot = paths::imacs_home().join("ref-guards").join(format!("{}.json", job.name));
+            let jobs = self.running_lifecycle();
             std::thread::spawn(move || {
+                // A previous close may still be stopping this session's resumable sandbox, or a cleanup
+                // removing its worktree. This thread waits for that, never the UI thread.
+                crate::lifecycle::wait_for(&jobs, Some(&job.name), Some(&job.cwd));
                 let ready = crate::sandbox::prepare(&job)
                     .map_err(|err| format!("Could not start the sandbox: {err:#}"))
                     .and_then(|()| crate::ref_guard::open_and_check(&checks, &job.cwd, snapshot, exempt));
@@ -224,8 +226,7 @@ impl State {
     /// Stops a sandbox in the background: its agent exited or its tile closed.
     pub(super) fn stop_sandbox(&mut self, name: String) {
         let sbx = resolve_program(&self.sbx);
-        self.lifecycle_jobs.retain(|job| !job.is_finished());
-        self.lifecycle_jobs.push(std::thread::spawn(move || {
+        self.lifecycle(Scope::sandbox(name.clone()), move || {
             if let Err(err) = crate::sandbox::stop(&paths::imacs_home(), &sbx, &name) {
                 eprintln!("IMACS: stopping sandbox {name} failed: {err:#}");
                 crate::lifecycle::record_leftovers(
@@ -233,7 +234,7 @@ impl State {
                     &[format!("Stopping sandbox {name}: {err:#}")],
                 );
             }
-        }));
+        });
     }
 
     /// A launch that failed after its tile appeared: the tile and a toast say why, and the
@@ -695,7 +696,7 @@ impl State {
                 let (actions, checks) = (self.action_tx.clone(), self.ref_checks.clone());
                 let id = id.to_string();
                 session.terminal.take();
-                self.lifecycle_jobs.push(std::thread::spawn(move || {
+                self.lifecycle(Scope::sandbox(name.clone()), move || {
                     let stopped = crate::sandbox::stop(&paths::imacs_home(), &sbx, &name);
                     let mut alerts = stopped
                         .err()
@@ -718,7 +719,7 @@ impl State {
                         let _ = done.send(());
                     });
                     let _ = finished.recv();
-                }));
+                });
             }
             if session.terminal.is_none()
                 && let Some(cid) = session.claude_id
