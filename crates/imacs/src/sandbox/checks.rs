@@ -191,10 +191,14 @@ pub(super) fn secret_lines(secrets: Option<&SecretNames>, claude: ClaudeRoute) -
             Some(misfiled) => format!("sandbox secrets: {} (warning)", misfiled_text(misfiled)),
             None => "sandbox secrets filed under known services and sandboxes (warning if not)".into(),
         },
-        "run `imacs setup` to remove them; their names stay hidden, since they may hold a pasted credential",
+        MISFILED_HINT,
     ));
     lines
 }
+
+/// Removing a misfiled secret by name would put a pasted credential on the command line, where other
+/// processes can read it. sbx's own list takes the choice on its terminal instead.
+pub(super) const MISFILED_HINT: &str = "run `sbx secret rm` in a host terminal and choose each from its list, which keeps a pasted credential off the command line; names stay hidden here";
 
 pub(super) fn query_version(program: &str) -> Option<(u64, u64, u64)> {
     let (status, out, _) = sbx_output(program, &["version"], false, TIMEOUT).ok()?;
@@ -262,39 +266,24 @@ pub(super) struct SecretNames {
     pub oauth: bool,
     pub openai: bool,
     pub github: bool,
-    /// Service secrets under a name sbx has no service for, or in a scope no sandbox has: usually a
-    /// credential pasted where the service or sandbox goes, as with `sbx secret set anthropic <token>`.
-    pub misfiled: Vec<Misfiled>,
+    /// The scope of each service secret under a name sbx has no service for, or in a scope no sandbox
+    /// has: usually a credential pasted where the service or sandbox goes, as with
+    /// `sbx secret set anthropic <token>`. Their names are never kept, and a scope only as [`shown_scope`].
+    pub misfiled: Vec<String>,
 }
 
-/// A misfiled secret. Its name may be a credential, so it only ever goes to `sbx secret rm`.
-pub(super) struct Misfiled {
-    pub scope: String,
-    name: String,
-}
-
-impl Misfiled {
-    /// The `sbx secret rm` arguments that remove exactly this entry, without a prompt.
-    pub(super) fn remove_args(&self) -> Vec<&str> {
-        let mut args = vec!["secret", "rm", self.name.as_str()];
-        if self.scope != "global" {
-            args.extend(["--sandbox", self.scope.as_str()]);
-        }
-        args.push("--force");
-        args
-    }
+/// What doctor and setup show for a misfiled secret's scope: a pasted credential can land there too,
+/// so only `global`, a service sbx knows or a sandbox `sbx ls` lists shows by name.
+fn shown_scope(scope: &str, sandboxes: Option<&[String]>) -> String {
+    let known = scope == "global"
+        || SERVICES.contains(&scope)
+        || sandboxes.is_some_and(|names| names.iter().any(|name| name == scope));
+    if known { scope.to_string() } else { "<unrecognised scope>".to_string() }
 }
 
 /// Misfiled secrets as doctor and setup show them: how many, and in which scopes, never a name.
-pub(super) fn misfiled_text(misfiled: &[Misfiled]) -> String {
-    // A scope is `global` or a sandbox's name, but a pasted credential can land there too.
-    let shown = |scope: &str| {
-        let plain = (1..=40).contains(&scope.len())
-            && !scope.starts_with("sk-")
-            && scope.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte));
-        if plain { scope.to_string() } else { "(not shown)".to_string() }
-    };
-    let mut scopes: Vec<String> = misfiled.iter().map(|secret| shown(&secret.scope)).collect();
+pub(super) fn misfiled_text(misfiled: &[String]) -> String {
+    let mut scopes = misfiled.to_vec();
     scopes.sort();
     scopes.dedup();
     let plural = if misfiled.len() == 1 { "" } else { "s" };
@@ -309,8 +298,8 @@ fn secret_names(value: &Value, sandboxes: Option<&[String]>) -> Option<SecretNam
         // Every scope is listed, but only global secrets serve every sandbox.
         let scope = row["scope"].as_str().unwrap_or("global");
         let Some(name) = row["name"].as_str() else { continue };
-        // Only exact, known identifiers are allowed out of this parser, and a misfiled entry's
-        // name only to remove it: unknown names can be accidentally stored credential values.
+        // Only exact, known identifiers are allowed out of this parser: unknown names and scopes can
+        // be accidentally stored credential values.
         if scope == "global" {
             match name {
                 "anthropic" => known.anthropic = true,
@@ -324,7 +313,7 @@ fn secret_names(value: &Value, sandboxes: Option<&[String]>) -> Option<SecretNam
         let unknown = !SERVICES.contains(&name) && name != "CLAUDE_CODE_OAUTH_TOKEN";
         let orphaned = scope != "global" && sandboxes.is_some_and(|names| !names.iter().any(|known| known == scope));
         if service && (unknown || orphaned) {
-            known.misfiled.push(Misfiled { scope: scope.to_string(), name: name.to_string() });
+            known.misfiled.push(shown_scope(scope, sandboxes));
         }
     }
     // sbx lists `secret set-custom` secrets apart. Read only the variable each fills and the hosts it
@@ -784,12 +773,13 @@ mod tests {
     }
 
     #[test]
-    fn misfiled_secrets_show_as_a_count_and_scopes_and_only_rm_gets_their_names() {
+    fn misfiled_secrets_show_as_a_count_and_known_scopes_and_never_a_name() {
         let sandboxes = ["imacs-live".to_string()];
         let names = secret_names(
             &json!({"secrets":[
                 {"type":"service", "scope":"global", "name":"openai"},
                 {"type":"service", "scope":"imacs-live", "name":"github"},
+                {"type":"service", "scope":"imacs-live", "name":"sk-ant-LIVE-private-value"},
                 {"type":"service", "scope":"anthropic", "name":"sk-ant-oat01-SCOPED-private-value"},
                 {"type":"service", "scope":"imacs-gone", "name":"openai"},
                 {"type":"service", "scope":"global", "name":"sk-ant-MISFILED-private-value"},
@@ -803,22 +793,18 @@ mod tests {
         // Only global secrets count; a sandbox's own github secret is its business.
         assert!(names.openai && names.oauth && !names.github && !names.anthropic);
         let text = misfiled_text(&names.misfiled);
-        assert_eq!(text, "4 misfiled secrets in scope (not shown), anthropic, global, imacs-gone");
-        assert!(!text.contains("PRIVATE"));
-        let removals: Vec<Vec<&str>> = names.misfiled.iter().map(Misfiled::remove_args).collect();
-        assert_eq!(
-            removals[0],
-            ["secret", "rm", "sk-ant-oat01-SCOPED-private-value", "--sandbox", "anthropic", "--force"]
-        );
-        assert_eq!(removals[2], ["secret", "rm", "sk-ant-MISFILED-private-value", "--force"]);
-        // Without a sandbox list a scope is trusted; a name sbx has no service for never is.
+        // A removed sandbox's name is no longer one sbx lists, so it is not shown either.
+        assert_eq!(text, "5 misfiled secrets in scope <unrecognised scope>, anthropic, global, imacs-live");
+        assert!(!text.contains("PRIVATE") && !text.contains("imacs-gone"));
+        // Without a sandbox list a scope is trusted, but only a known word shows.
         let unknown = secret_names(
             &json!({"secrets":[{"type":"service", "scope":"imacs-gone", "name":"openai"},
+                               {"type":"service", "scope":"imacs-live", "name":"sk-ant-LIVE-private-value"},
                                {"type":"service", "scope":"anthropic", "name":"sk-ant-oat01-SCOPED-private-value"}]}),
             None,
         )
         .unwrap();
-        assert_eq!(misfiled_text(&unknown.misfiled), "1 misfiled secret in scope anthropic");
+        assert_eq!(misfiled_text(&unknown.misfiled), "2 misfiled secrets in scope <unrecognised scope>, anthropic");
 
         // Doctor, against the fake sbx: Max's token-as-name in a scope named anthropic.
         let dir = fixture();
@@ -827,9 +813,48 @@ mod tests {
         let text = report(dir);
         let line = line(&text, "sandbox secrets");
         assert!(line.starts_with("✗ sandbox secrets: 1 misfiled secret in scope anthropic (warning)"), "{line}");
+        assert!(line.contains("`sbx secret rm`") && line.contains("off the command line"), "{line}");
         assert!(!text.contains("SCOPED-private"), "{text}");
         std::fs::remove_file(dir.join("misfiled-scoped")).unwrap();
         assert!(line_ok(&report(dir), "sandbox secrets filed under known services"));
+    }
+
+    #[test]
+    fn token_shaped_scopes_never_show() {
+        // Shapes that fit a sandbox name's characters: GitHub tokens (40), a Google API key (39) and
+        // a Mistral key (32). The values are made up.
+        let tokens = [
+            format!("ghp_{}", &"a1B2c3D4e5".repeat(4)[..36]),
+            format!("gho_{}", &"Z9y8X7w6V5".repeat(4)[..36]),
+            format!("AIza{}", &"Sy-Ab_12Cd".repeat(4)[..35]),
+            "q7W3e9R1t5Y2u8I4o6P0a3S7d1F9g5H2".to_string(),
+        ];
+        assert_eq!(tokens.each_ref().map(|token| token.len()), [40, 40, 39, 32]);
+        let sandboxes = ["imacs-live".to_string()];
+        for token in &tokens {
+            for listed in [Some(&sandboxes[..]), None] {
+                // As the scope of a known service, and as an unknown name in that scope.
+                let value = json!({"secrets":[{"type":"service", "scope":token, "name":"mistral"},
+                                              {"type":"service", "scope":token, "name":token},
+                                              {"type":"service", "scope":"global", "name":token}]});
+                let names = secret_names(&value, listed).unwrap();
+                let text = misfiled_text(&names.misfiled);
+                let expected = if listed.is_some() { 3 } else { 2 };
+                assert_eq!(text, format!("{expected} misfiled secrets in scope <unrecognised scope>, global"));
+                let doctor = secret_lines(Some(&names), ClaudeRoute::Sandboxed { subscription: false }).join("\n");
+                assert!(!doctor.contains(token.as_str()), "{doctor}");
+            }
+        }
+
+        // Doctor and Settings, against the fake sbx's listing.
+        let dir = fixture();
+        let dir = dir.path();
+        for token in &tokens {
+            write(dir, "secrets.json", json!({"secrets":[{"type":"service", "scope":token, "name":"openai"}]}));
+            let text = report(dir);
+            assert!(line(&text, "sandbox secrets").contains("1 misfiled secret in scope <unrecognised scope>"));
+            assert!(!text.contains(token.as_str()), "{text}");
+        }
     }
 
     fn line_ok(report: &str, label: &str) -> bool {

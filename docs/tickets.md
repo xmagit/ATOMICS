@@ -407,6 +407,65 @@ are warnings with configuration hints, preserving doctor's existing exit-code po
 closed after the check. A successful check proves tool availability, not the argument/result mapping:
 use `imacs_ticket_sync` on a linked plan to verify the latter.
 
+### Step by step: Relay
+
+1. **Install the server on this machine.** IMACS starts the ticket server itself, with your login
+   shell's `PATH`. Install your Relay MCP server so its command runs in a terminal; `relay-mcp` in the
+   profile is a placeholder for it.
+2. **Copy the profile.** Put the [Relay block](#relay-a-board-per-plan) in the workspace that should
+   follow Relay (`~/.config/imacs/workspaces/<host>/<name>.toml`), or in `config.toml`. A new
+   `config.toml` has it commented out between `BEGIN RELAY PROFILE` and `END RELAY PROFILE`.
+3. **Point it at the server.** A stdio server is `server = { command = [...] }`. It gets IMACS's
+   environment, your login shell's `PATH` and `server.env`; prefer a server that signs in on its own over
+   a token in `server.env`, which would sit in the config file. A server reached over HTTP is a URL and
+   the name of the variable holding its bearer token:
+
+   ```toml
+   [tickets.server]
+   url = "https://tickets.example.com/mcp"
+   token_env = "RELAY_TOKEN"
+   ```
+
+   Export `RELAY_TOKEN` in your login shell's startup file. IMACS reads it from its own environment or
+   that shell, never from the config, and `token_env` applies to URL servers only.
+4. **Map the tools.** Replace every tool name, argument, result path and state name with what your
+   server offers; the profile's are placeholders.
+5. **Check.** `imacs --workspace <name> doctor` prints `relay ticket MCP server starts and offers all
+   mapped tools`, or `relay ticket MCP check failed (warning)` with the reason. It never calls an
+   operation.
+6. **Use it.** Restart the chief, whose prompt is fixed when it starts. Ask it to link the board to a plan
+   (`imacs_ticket_link`), then to run `imacs_ticket_sync`: a result path that does not match fails with
+   the start of the server's answer quoted.
+
+### Step by step: Linear
+
+1. **Install Node.js**, so `npx` runs the bridge.
+2. **Copy the profile.** Put the [Linear block](#linear-an-issue-per-plan) in the workspace or
+   `config.toml` (commented out between `BEGIN LINEAR PROFILE` and `END LINEAR PROFILE` in a new
+   `config.toml`). Replace `ENG` in the `create` operation with your team's key.
+3. **Sign in through the bridge once**, in a terminal:
+
+   ```sh
+   npx -y mcp-remote https://mcp.linear.app/mcp
+   ```
+
+   It opens Linear's sign-in in your browser (through `xdg-open` on Linux) and keeps the token for later
+   runs; stop it once it has connected. IMACS then starts the same command with no browser and no
+   `token_env`. See [Linear's MCP setup](https://linear.app/docs/mcp).
+4. **Check.** `imacs --workspace <name> doctor` prints `linear ticket MCP server starts and offers all
+   mapped tools`. A bridge that was never signed in fails here, with the hint to authenticate it in a
+   terminal first.
+5. **Use it.** Restart the chief, link an issue to a plan with `ticket = { id = "ENG-123" }`, and run
+   `imacs_ticket_sync` once to check the result paths.
+6. **Optionally, Linear's own tools in sandboxes.** With a Linear profile configured, `imacs setup`
+   registers and authorizes sbx's Linear server (`sbx mcp add linear --url https://mcp.linear.app/mcp`,
+   `sbx mcp auth linear`). Add `mcp = ["linear"]` to `[isolation.sandbox]` to load it into new sandboxes.
+   Agents then use Linear with your authorization, through sbx's gateway; see [Tickets and direct Linear
+   access](isolation.md#tickets-and-direct-linear-access).
+
+The Linear profile has `comments = "chief"`, which gives agents no ticket tools. Set `"agents"` to let
+them read their ticket and comment on it (see below).
+
 ### Agent access
 
 Agents use IMACS's own MCP server. They never receive the external ticket server or its credentials.
@@ -429,6 +488,26 @@ create tickets, change their states, link tickets, or use chief tools through `m
 to the comment policy. Explicit comments are for implementation details or questions, not duplicate
 reports. Config changes are checked on each request, so the tools may be advertised while access is
 disabled.
+
+### Ticket credentials and the credential relay
+
+| Credential | Kept | Used by |
+| --- | --- | --- |
+| A stdio server's own sign-in, such as the Linear bridge's | Wherever that server keeps it, on this machine | The server IMACS starts |
+| A `token_env` bearer token | An environment variable of IMACS or your login shell | IMACS's MCP client, sent only to `url` |
+| sbx's Linear authorization | sbx, on this machine | sbx's MCP gateway, for sandboxes with `mcp = ["linear"]` |
+| A Linear API key stored with `imacs setup --credential linear` | The OS keychain | The credential relay, for sessions granted it |
+
+Ticket credentials stay out of agents: IMACS runs the ticket server on this machine, and agents reach
+tickets only through `imacs_agent_ticket_get` and `imacs_agent_ticket_comment`, scoped to their own task.
+For a sandboxed agent that MCP server runs on this machine too. Every ticket string IMACS keeps or shows
+is cleaned of the job's credentials first (see [Design](#design)).
+
+Through the [credential relay](isolation.md#settings--credentials), agents reach the Claude subscription
+(sandboxed Claude, and bare Claude with `bare_relay`) and, when enabled, Azure. Nothing ticket-related goes
+through it today: the store's Linear entry has a relay rule (`POST /graphql` on `api.linear.app`), but no
+session is granted a placeholder for it yet. Bare agents run as you, so they can read what you can,
+including a token exported in your shell's startup files or a bridge's stored sign-in.
 
 ## Tests
 

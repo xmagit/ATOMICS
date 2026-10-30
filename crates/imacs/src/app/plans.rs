@@ -201,11 +201,25 @@ impl State {
         }
         let sbx = resolve_program(&self.sbx);
         let actions = self.action_tx.clone();
-        let closing = std::mem::take(&mut self.lifecycle_jobs);
-        self.lifecycle_jobs.push(std::thread::spawn(move || {
+        // What it may stop or remove: its tasks' sandboxes, and their worktrees where IMACS put or found them.
+        let mut scope = Scope::none();
+        for task in &plan.tasks {
+            let repo = task.repo.as_deref().map(paths::expand).or_else(|| plan.project.clone());
+            let made = repo
+                .zip(task.branch.as_ref())
+                .map(|(repo, branch)| git::worktree_path(&self.config.worktree_path, &repo, branch));
+            scope.worktrees.get_or_insert_default().extend(task.worktree.iter().cloned().chain(made));
+            scope.sandboxes.extend(task.session.as_deref().map(imacs_core::isolation::sandbox_name));
+        }
+        scope.sandboxes.extend(preparations.iter().filter_map(|(launch, _)| match &launch.runtime {
+            AgentRuntime::Sandbox(sandbox) => Some(sandbox.name.clone()),
+            AgentRuntime::Bare => None,
+        }));
+        let closing = self.running_lifecycle();
+        self.lifecycle(scope, move || {
             // Final ref-guard checks must finish before deleting any task refs.
             for job in closing {
-                let _ = job.join();
+                job.wait();
             }
             for (launch, ready) in preparations {
                 let _ = ready.recv();
@@ -226,11 +240,12 @@ impl State {
                     state.toast(notes.join("\n"));
                 }
             }));
-        }));
+        });
     }
 
+    /// Never waits for the plan's cleanup: a task started again waits for it in its own worktree
+    /// and sandbox jobs.
     pub(super) fn reopen_plan(&mut self, index: usize) -> Result<(), String> {
-        self.finish_lifecycle_jobs();
         let mut plan = self.plans[index].clone();
         plan.reopen();
         plan.save_in(&paths::imacs_home()).map_err(|err| format!("Reopening plan failed: {err:#}"))?;

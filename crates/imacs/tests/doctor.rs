@@ -37,9 +37,12 @@ fn setup_from_an_empty_machine_creates_config_and_gives_install_commands_without
         "sudo apt-get install git"
     }));
     // On Linux, IMACS's credential relay reads the Claude subscription with secret-tool; macOS has `security`.
-    let linux = !cfg!(target_os = "macos");
-    assert_eq!(stdout.contains("✗ sandbox prerequisite: secret-tool"), linux, "{stdout}");
-    assert_eq!(stdout.contains("sudo apt-get install libsecret-tools gnome-keyring"), linux, "{stdout}");
+    if cfg!(target_os = "macos") {
+        assert!(!stdout.contains("secret-tool") && !stdout.contains("libsecret"), "{stdout}");
+    } else {
+        assert!(stdout.contains("✗ sandbox prerequisite: secret-tool"), "{stdout}");
+        assert!(stdout.contains("sudo apt-get install libsecret-tools gnome-keyring"), "{stdout}");
+    }
     assert!(String::from_utf8(output.stderr).unwrap().contains("rerun `imacs setup` to resume"));
 }
 

@@ -1,7 +1,9 @@
 //! Build a local sbx snapshot with Linux toolchains and dependency caches.
 
 use super::*;
-use imacs_core::{config::Config, repo_workflow::RepoWorkflow, workspace::Workspace};
+use imacs_core::repo_workflow::{self, RepoWorkflow};
+use imacs_core::{config::Config, workspace::Workspace};
+use serde_json::Value;
 
 /// Resolve a project path, or a project's basename in the selected workspace.
 pub fn run(project: &str, workspace_name: Option<&str>, agent: &str, dotnet_project: Option<&str>) -> Result<()> {
@@ -24,16 +26,69 @@ pub fn run(project: &str, workspace_name: Option<&str>, agent: &str, dotnet_proj
     };
     // Build the selected checkout, including its tracked edits; policy comes from the main checkout.
     let (cwd, _) = super::workspace(&path)?;
-    let root = workspace::project_root(&cwd)?;
-    config = RepoWorkflow::read(&root).apply(&config);
-    let config = config.isolation.sandbox.with_defaults(&config.resources, std::thread::available_parallelism()?.get());
     let program = crate::setup::resolve_program("sbx");
-    build(&paths::imacs_home(), &program, &cwd, agent, dotnet_project, &config)?;
-    println!(
-        "Saved {}. New sandboxed {agent} agents in this project use this template.",
-        config.template.as_deref().unwrap()
-    );
+    let tag = build_project(&paths::imacs_home(), &program, &cwd, agent, dotnet_project, &config)?;
+    println!("Saved {tag}. New sandboxed {agent} agents in this project use this template.");
     Ok(())
+}
+
+/// Build `cwd` with its main checkout's settings, returning the saved tag. The repository's own
+/// config may name only a tag IMACS built from it, or one sbx does not have yet: saving replaces the
+/// tag, which could be another project's snapshot or a stock image every sandbox starts from.
+fn build_project(
+    home: &Path,
+    program: &str,
+    cwd: &Path,
+    agent: &str,
+    dotnet_project: Option<&str>,
+    config: &Config,
+) -> Result<String> {
+    let root = real(&workspace::project_root(cwd)?);
+    let workflow = RepoWorkflow::read_in(&root, home);
+    let mut config = workflow.apply(config);
+    if let Some(tag) = workflow.template.as_deref().map(str::trim).filter(|tag| !tag.is_empty()) {
+        match repo_workflow::template_source(home, tag) {
+            Some(source) if source == root => {}
+            Some(source) => bail!(
+                "{tag} was built from {}; .imacs/config.toml can name only a template built from this repository, so choose another tag",
+                paths::display(&source)
+            ),
+            None => {
+                let templates = checks::query(program, &["template", "ls", "--json"]);
+                match templates.as_ref().and_then(|templates| listed(templates, tag)) {
+                    Some(false) => {}
+                    Some(true) => bail!(
+                        "sbx already has {tag}, which IMACS did not build from this repository; choose another tag in .imacs/config.toml, or remove it with `sbx template rm {tag}` if it is yours to replace"
+                    ),
+                    None => bail!("cannot list sbx templates to check that {tag} is free; retry"),
+                }
+            }
+        }
+        config.isolation.sandbox.template = Some(tag.into());
+    }
+    let config = config.isolation.sandbox.with_defaults(&config.resources, std::thread::available_parallelism()?.get());
+    build(home, program, cwd, agent, dotnet_project, &config)?;
+    Ok(config.template.unwrap())
+}
+
+/// Whether sbx's template listing has `tag`, compared by final name and tag: a registry or namespace
+/// spelled differently still names the same local image. None when the listing is unreadable.
+fn listed(templates: &Value, tag: &str) -> Option<bool> {
+    let key = |name: &str, version: &str| {
+        (name.rsplit('/').next().unwrap_or(name).to_ascii_lowercase(), version.to_ascii_lowercase())
+    };
+    let reference = tag.split('@').next().unwrap_or(tag);
+    let wanted = match reference.rsplit_once(':') {
+        Some((name, version)) if !version.contains('/') => key(name, version),
+        _ => key(reference, "latest"),
+    };
+    let templates = templates.as_array()?;
+    Some(templates.iter().any(|template| {
+        template["repository"]
+            .as_str()
+            .zip(template["tag"].as_str())
+            .is_some_and(|(name, version)| key(name, version) == wanted)
+    }))
 }
 
 pub(super) fn build(
@@ -128,6 +183,9 @@ pub(super) fn build(
         // Saving a running sandbox prompts to stop it, which fails on our null stdin.
         stop(home, program, &name).context("stopping the template sandbox before saving")?;
         sbx(program, &["template", "save", &name, tag], false, CREATE_TIMEOUT).context("saving the template")?;
+        // Only now does the tag hold this repository's snapshot, so only now may its config select it.
+        repo_workflow::record_template(home, tag, &real(&workspace::project_root(cwd)?))
+            .context("recording which repository the template was built from")?;
         Ok(())
     })();
     let cleanup = remove(home, program, &name);
@@ -241,6 +299,59 @@ mod tests {
         };
         prepare(&job).unwrap();
         assert!(fake::calls_to(dir.path(), &["create"])[1].windows(2).any(|a| a == ["--template", "imacs-cox:local"]));
+    }
+
+    #[test]
+    fn a_repository_can_neither_select_nor_overwrite_another_repositorys_template() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let program = fake::install(dir.path()).display().to_string();
+        let home = dir.path().join("state");
+        let repo = |name: &str, config: &str| {
+            let repo = dir.path().join(name);
+            std::fs::create_dir_all(repo.join(".imacs")).unwrap();
+            git::git(&repo, &["init", "-q"]).unwrap();
+            std::fs::write(repo.join("Cargo.toml"), "[workspace]\n").unwrap();
+            std::fs::write(repo.join(".imacs/config.toml"), config).unwrap();
+            repo.canonicalize().unwrap()
+        };
+        let cox = repo("cox", "[isolation.sandbox]\ntemplate = 'imacs-cox:local'\n");
+        let other = repo("other", "[isolation.sandbox]\ntemplate = 'imacs-cox:local'\n");
+        let mut user = Config::default();
+        user.isolation.sandbox.template = Some("workspace:local".into());
+        let selected = |root: &Path| RepoWorkflow::read_in(root, &home).apply(&user).isolation.sandbox.template;
+        assert_eq!(selected(&cox).as_deref(), Some("workspace:local"), "not built yet");
+        assert_eq!(build_project(&home, &program, &cox, "codex", None, &user).unwrap(), "imacs-cox:local");
+        assert_eq!(selected(&cox).as_deref(), Some("imacs-cox:local"));
+
+        // Another repository naming cox's tag keeps the workspace's template and cannot rebuild cox's.
+        assert_eq!(selected(&other).as_deref(), Some("workspace:local"));
+        let creates = fake::calls_to(dir.path(), &["create"]).len();
+        let error = format!("{:#}", build_project(&home, &program, &other, "codex", None, &user).unwrap_err());
+        assert!(error.contains("imacs-cox:local was built from") && error.contains("choose another tag"), "{error}");
+        // Nor a stock image every sandbox starts from, or a template IMACS did not build.
+        std::fs::write(dir.path().join("templates"), "imacs-cox:local\nmine:local\n").unwrap();
+        for tag in ["docker/sandbox-templates:codex-docker", "mine:local"] {
+            std::fs::write(other.join(".imacs/config.toml"), format!("[isolation.sandbox]\ntemplate = '{tag}'\n"))
+                .unwrap();
+            let error = format!("{:#}", build_project(&home, &program, &other, "codex", None, &user).unwrap_err());
+            assert!(error.contains(&format!("sbx already has {tag}")), "{error}");
+        }
+        assert_eq!(fake::calls_to(dir.path(), &["create"]).len(), creates, "nothing was built");
+        assert_eq!(selected(&cox).as_deref(), Some("imacs-cox:local"));
+
+        // A new tag is the repository's to claim, and the owner rebuilds its own.
+        std::fs::write(other.join(".imacs/config.toml"), "[isolation.sandbox]\ntemplate = 'imacs-other:local'\n")
+            .unwrap();
+        assert_eq!(build_project(&home, &program, &other, "codex", None, &user).unwrap(), "imacs-other:local");
+        assert_eq!(selected(&other).as_deref(), Some("imacs-other:local"));
+        build_project(&home, &program, &cox, "codex", None, &user).unwrap();
+
+        // The user's own config may rebuild any tag; the snapshot then holds that project's caches.
+        let plain = repo("plain", "");
+        let mut chosen = user.clone();
+        chosen.isolation.sandbox.template = Some("imacs-cox:local".into());
+        assert_eq!(build_project(&home, &program, &plain, "codex", None, &chosen).unwrap(), "imacs-cox:local");
+        assert_eq!(selected(&cox).as_deref(), Some("workspace:local"), "cox's caches are gone from it");
     }
 
     #[test]
