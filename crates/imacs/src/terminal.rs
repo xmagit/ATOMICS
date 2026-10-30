@@ -540,8 +540,17 @@ mod tests {
     fn selected_terminal() -> (Terminal, TerminalView, Metrics, crate::test_support::TempDir) {
         let dir = crate::test_support::tempdir().unwrap();
         let palette = Palette::from_config(&imacs_core::config::ThemeConfig::default());
-        let terminal = Terminal::spawn(crate::host::Wake::default(), palette.terminal_colors(), "/bin/sh".into(), vec!["-c".into(), "stty -echo; printf 'reviewed\\r\\n'; read -r ignored; printf 'one\\r\\ntwo\\r\\nthree\\r\\nfour\\r\\nfive\\r\\n'; exec /bin/sleep 30".into()], dir.path(), HashMap::new(), 100).unwrap();
-        wait_for_text(&terminal, "reviewed");
+        // The status query is a PTY barrier: the shell sees the terminal's four-byte
+        // response only after the initial output has been parsed and its Wakeup sent.
+        // Seeing "reviewed" alone can race the newline arriving in a later PTY read,
+        // whose revision would discard the selection before the test's first copy.
+        let terminal = Terminal::spawn(crate::host::Wake::default(), palette.terminal_colors(), "/bin/sh".into(), vec!["-c".into(), "stty -echo -icanon min 1 time 0; printf 'reviewed\\r\\n\\033[5n'; dd bs=1 count=4 of=/dev/null 2>/dev/null; stty icanon; : > ready; read -r ignored; printf 'one\\r\\ntwo\\r\\nthree\\r\\nfour\\r\\nfive\\r\\n'; exec /bin/sleep 30".into()], dir.path(), HashMap::new(), 100).unwrap();
+        let deadline = std::time::Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(3));
+        while !dir.path().join("ready").exists() {
+            assert!(std::time::Instant::now() < deadline, "terminal did not answer the initial status query");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(terminal.screen_text(24).contains("reviewed"));
         let metrics = Metrics { font: FontId::monospace(12.0), cell: vec2(8.0, 16.0) };
         let mut view = TerminalView::default();
         view.resize(&terminal, Rect::from_min_size(Pos2::ZERO, vec2(160.0, 64.0)), &metrics);
@@ -556,7 +565,7 @@ mod tests {
     }
 
     fn wait_for_text(terminal: &Terminal, text: &str) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let deadline = std::time::Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(3));
         while !terminal.screen_text(24).contains(text) {
             assert!(std::time::Instant::now() < deadline, "terminal did not output {text}");
             std::thread::sleep(Duration::from_millis(5));
