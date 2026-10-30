@@ -233,7 +233,7 @@ fn tools() -> Value {
         },
         {
             "name": "imacs_start",
-            "description": "Start an agent in IMACS. Give `folder` to run in an existing folder, or `repo` and `branch` to create a new git worktree for it. `prompt` is its first task; `args` are extra command-line arguments (for example [\"-m\", \"gpt-6.1-terra\"] for Codex).",
+            "description": "Start an agent in IMACS. Give `folder` to run in an existing folder, or `repo` and `branch` to create a new git worktree for it; give neither for research or a small task outside any project, in a scratch folder of its own that is removed when the session closes. `prompt` is its first task and names a scratch session; `args` are extra command-line arguments (for example [\"-m\", \"gpt-6.1-terra\"] for Codex); `isolation` overrides the settings for this session.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -242,7 +242,8 @@ fn tools() -> Value {
                     "repo": { "type": "string", "description": "Repository to branch a new worktree from" },
                     "branch": { "type": "string", "description": "Branch name for the new worktree" },
                     "prompt": { "type": "string" },
-                    "args": { "type": "array", "items": { "type": "string" } }
+                    "args": { "type": "array", "items": { "type": "string" } },
+                    "isolation": { "type": "string", "enum": ["sandbox", "bare"], "description": "Run sandboxed or bare on this machine, instead of what the settings say" }
                 },
                 "required": ["agent"]
             }

@@ -24,11 +24,20 @@ pub struct TerminalView {
     scroll_remainder: f32,
     selection: Option<Selection>,
     selection_revision: u64,
+    /// What has been typed since the last Enter.
+    line: String,
 }
 
 impl Default for TerminalView {
     fn default() -> Self {
-        Self { terminal: None, grid: (80, 24), scroll_remainder: 0.0, selection: None, selection_revision: 0 }
+        Self {
+            terminal: None,
+            grid: (80, 24),
+            scroll_remainder: 0.0,
+            selection: None,
+            selection_revision: 0,
+            line: String::new(),
+        }
     }
 }
 
@@ -49,6 +58,7 @@ impl TerminalView {
             self.grid = (0, 0);
             self.selection = None;
             self.scroll_remainder = 0.0;
+            self.line.clear();
         }
         let response = ui.interact(rect, id, Sense::click_and_drag());
         if response.clicked() || response.drag_started() {
@@ -178,9 +188,13 @@ impl TerminalView {
                     let mods = ui.input(|i| i.modifiers);
                     if !is_app_chord(&mods) && !mods.ctrl {
                         out.extend_from_slice(text.as_bytes());
+                        self.line.push_str(&text);
                     }
                 }
-                egui::Event::Paste(text) => out.extend(imacs_core::steer::paste_bytes(&text, bracketed)),
+                egui::Event::Paste(text) => {
+                    out.extend(imacs_core::steer::paste_bytes(&text, bracketed));
+                    self.line.push_str(&text);
+                }
                 egui::Event::Copy => {
                     let mut term = terminal.term.lock();
                     self.sync_selection(terminal);
@@ -196,6 +210,9 @@ impl TerminalView {
                 egui::Event::Key { key, pressed: true, modifiers, .. } if !is_app_chord(&modifiers) => {
                     if let Some(bytes) = key_bytes(key, modifiers, app_cursor) {
                         out.extend(bytes);
+                        if let Some(line) = typed_key(&mut self.line, key, modifiers) {
+                            *terminal.shared.submitted.lock().unwrap() = Some(line);
+                        }
                     }
                 }
                 _ => {}
@@ -397,6 +414,23 @@ fn key_bytes(key: Key, m: Modifiers, app_cursor: bool) -> Option<Vec<u8>> {
         _ => return None,
     };
     Some(text.into_bytes())
+}
+
+/// Follows the line being typed: Enter hands it back, unless it is empty.
+fn typed_key(line: &mut String, key: Key, m: Modifiers) -> Option<String> {
+    match key {
+        Key::Enter if m.shift || m.alt => line.push('\n'),
+        Key::Enter => return Some(std::mem::take(line)).filter(|line| !line.trim().is_empty()),
+        Key::Backspace if m.alt || m.ctrl => line.clear(),
+        Key::Backspace => {
+            line.pop();
+        }
+        // Escape, Ctrl+C and Ctrl+U throw the line away.
+        Key::Escape => line.clear(),
+        _ if m.ctrl => line.clear(),
+        _ => {}
+    }
+    None
 }
 
 fn ctrl_byte(key: Key) -> Option<u8> {
@@ -614,6 +648,21 @@ mod tests {
         assert_eq!(key_bytes(Key::C, Modifiers::CTRL, false).unwrap(), [3]);
         assert_eq!(key_bytes(Key::C, none, false), None);
         assert_eq!(key_bytes(Key::Delete, none, false).unwrap(), b"\x1b[3~");
+    }
+
+    #[test]
+    fn enter_hands_back_the_typed_line() {
+        let none = Modifiers::NONE;
+        let mut line = "summarise thx".to_string();
+        assert_eq!(typed_key(&mut line, Key::Backspace, none), None);
+        line.push_str("is");
+        assert_eq!(typed_key(&mut line, Key::Enter, Modifiers::SHIFT), None);
+        line.push_str("paper");
+        assert_eq!(typed_key(&mut line, Key::Enter, none).as_deref(), Some("summarise this\npaper"));
+        assert_eq!(typed_key(&mut line, Key::Enter, none), None, "an empty line sends nothing");
+        line.push_str("rm -rf");
+        assert_eq!(typed_key(&mut line, Key::C, Modifiers::CTRL), None);
+        assert_eq!(typed_key(&mut line, Key::Enter, none), None, "Ctrl+C dropped the line");
     }
 }
 

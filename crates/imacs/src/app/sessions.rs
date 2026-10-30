@@ -14,7 +14,12 @@ impl Session {
         std::thread::spawn(move || {
             let _ = tx.send(git::worktree_of(&dir));
         });
-        let title = if chief { "chief".into() } else { title_for(None, &cwd) };
+        let scratch = if chief { None } else { paths::scratch_of(&cwd) };
+        let (title, naming) = match (chief, &scratch) {
+            (true, _) => ("chief".into(), Naming::Named),
+            (false, Some(_)) => (UNTITLED.into(), Naming::FirstPrompt),
+            (false, None) => (title_for(None, &cwd), Naming::Folder),
+        };
         Self {
             id,
             agent: agent.name.clone(),
@@ -41,6 +46,33 @@ impl Session {
             screen_busy: false,
             busy_absent_since: None,
             ref_guard: None,
+            scratch,
+            naming,
+        }
+    }
+
+    /// Names a scratch session after its first prompt, once.
+    pub(super) fn first_prompt(&mut self, prompt: &str) {
+        if self.naming == Naming::FirstPrompt
+            && let Some(title) = prompt_title(prompt)
+        {
+            self.title = title;
+            self.naming = Naming::Named;
+        }
+    }
+
+    /// The title of a session named after its folder, once the folder or branch changes.
+    pub(super) fn follow_folder(&mut self) {
+        if self.naming == Naming::Folder {
+            self.title = title_for(self.branch(), &self.cwd);
+        }
+    }
+
+    pub(super) fn rename(&mut self, title: &str) {
+        let title = title.trim();
+        if !title.is_empty() {
+            self.title = title.to_string();
+            self.naming = Naming::Named;
         }
     }
 
@@ -86,8 +118,53 @@ impl State {
         self.start_as(ctx, agent_name, cwd, resume, extra_args, prompt, Role::Agent(None))
     }
 
+    /// Starts `agent_name` outside any project, in a new scratch folder of its own. It takes the
+    /// launch every agent takes, so it gets the isolation, credentials and MCP servers they get.
+    pub(super) fn start_scratch(
+        &mut self,
+        ctx: &egui::Context,
+        agent_name: &str,
+        args: Vec<String>,
+        prompt: Option<String>,
+        isolation: Option<IsolationMode>,
+    ) -> Result<String, String> {
+        let folder = new_scratch_folder(&paths::scratch_dir())
+            .map_err(|err| format!("Could not make a scratch folder in {}: {err}", paths::scratch_dir().display()))?;
+        // A repository of its own, without commits, so the diff panel shows everything written there.
+        if let Err(err) = git::git(&folder, &["init", "-q"]) {
+            eprintln!("IMACS: git init in {} failed: {err:#}", folder.display());
+        }
+        let started = self.start_as(ctx, agent_name, folder.clone(), None, args, prompt, Role::Agent(isolation));
+        if started.is_err() {
+            let _ = std::fs::remove_dir_all(&folder);
+        }
+        started
+    }
+
+    /// Starts an agent as `role`. A prompt names a scratch session.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn start_as(
+        &mut self,
+        ctx: &egui::Context,
+        agent_name: &str,
+        cwd: PathBuf,
+        resume: Option<String>,
+        extra_args: Vec<String>,
+        prompt: Option<String>,
+        role: Role,
+    ) -> Result<String, String> {
+        let first = prompt.clone();
+        let id = self.launch_as(ctx, agent_name, cwd, resume, extra_args, prompt, role)?;
+        if let Some(prompt) = first
+            && let Some(session) = self.sessions.iter_mut().find(|s| s.id == id)
+        {
+            session.first_prompt(&prompt);
+        }
+        Ok(id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_as(
         &mut self,
         ctx: &egui::Context,
         agent_name: &str,
@@ -232,6 +309,20 @@ impl State {
                     &paths::imacs_home(),
                     &[format!("Stopping sandbox {name}: {err:#}")],
                 );
+            }
+        }));
+    }
+
+    /// Stops and removes a sandbox in the background: a closed scratch session's.
+    pub(super) fn remove_sandbox(&mut self, name: String) {
+        let sbx = resolve_program(&self.sbx);
+        self.lifecycle_jobs.retain(|job| !job.is_finished());
+        self.lifecycle_jobs.push(std::thread::spawn(move || {
+            let home = paths::imacs_home();
+            if let Err(err) =
+                crate::sandbox::stop(&home, &sbx, &name).and_then(|()| crate::sandbox::remove(&home, &sbx, &name))
+            {
+                crate::lifecycle::record_leftovers(&home, &[format!("Removing sandbox {name}: {err:#}")]);
             }
         }));
     }
@@ -689,6 +780,9 @@ impl State {
                 let _ =
                     reply.send(ControlOutcome::Done(ControlResponse::error("message not delivered: session closed")));
             }
+            // A scratch folder goes with the last session in it, and so does its sandbox: neither is resumed.
+            let scratch =
+                session.scratch.clone().filter(|dir| !self.sessions.iter().any(|s| s.scratch.as_ref() == Some(dir)));
             // An exited agent's sandbox was stopped when it exited; one still preparing stops when ready.
             if let Some(name) = session.sandbox.clone() {
                 let sbx = resolve_program(&self.sbx);
@@ -696,12 +790,20 @@ impl State {
                 let id = id.to_string();
                 session.terminal.take();
                 self.lifecycle_jobs.push(std::thread::spawn(move || {
-                    let stopped = crate::sandbox::stop(&paths::imacs_home(), &sbx, &name);
+                    let home = paths::imacs_home();
+                    let stopped = crate::sandbox::stop(&home, &sbx, &name);
                     let mut alerts = stopped
                         .err()
                         .map(|err| format!("Stopping sandbox FAILED: {err:#}"))
                         .into_iter()
                         .collect::<Vec<_>>();
+                    if let Some(dir) = scratch {
+                        let removed = crate::sandbox::remove(&home, &sbx, &name)
+                            .and_then(|()| crate::lifecycle::remove_scratch(&home, &dir));
+                        alerts.extend(
+                            removed.err().map(|err| format!("Removing scratch session {name} FAILED: {err:#}")),
+                        );
+                    }
                     // The last check, once the agent cannot write any more.
                     let (done, finished) = std::sync::mpsc::channel();
                     checks.run(move || {
@@ -719,6 +821,15 @@ impl State {
                     });
                     let _ = finished.recv();
                 }));
+            } else if let Some(dir) = scratch {
+                // Its processes are gone once the terminal is: closing it kills the process group.
+                session.terminal.take();
+                self.lifecycle_jobs.push(std::thread::spawn(move || {
+                    let home = paths::imacs_home();
+                    if let Err(err) = crate::lifecycle::remove_scratch(&home, &dir) {
+                        crate::lifecycle::record_leftovers(&home, &[format!("Scratch folder: {err:#}")]);
+                    }
+                }));
             }
             if session.terminal.is_none()
                 && let Some(cid) = session.claude_id
@@ -733,6 +844,10 @@ impl State {
 
     pub(super) fn remember(&mut self, id: &str) {
         let Some(s) = self.sessions.iter().find(|s| s.id == id) else { return };
+        // Scratch sessions end with IMACS; only a restart's handoff brings them back.
+        if s.scratch.is_some() {
+            return;
+        }
         let Some(claude_id) = s.claude_id.clone() else { return };
         self.store.upsert(SessionRecord {
             chief: s.chief,
@@ -744,6 +859,7 @@ impl State {
             last_prompt: s.last_prompt.clone(),
             updated: 0,
             sandbox: s.sandbox.clone(),
+            named: s.naming == Naming::Named,
         });
         if let Err(err) = self.store.save(&paths::store_file()) {
             eprintln!("IMACS: saving sessions failed: {err:#}");
@@ -760,8 +876,12 @@ impl State {
             || session.pending.as_ref().is_some_and(|pending| pending.codex)
         {
             session.activity.held_since.get_or_insert_with(imacs_core::store::now);
+            session.first_prompt(text);
             session.held.push(text.to_string());
             return Delivery::Held;
+        }
+        if session.can_receive() {
+            session.first_prompt(text);
         }
         if let Some(terminal) = &session.terminal {
             if terminal.exited() {
@@ -899,6 +1019,18 @@ fn screen_busy(screen: &str, busy: &str) -> bool {
 
 /// Writes a long prompt to a brief file and returns the short prompt that points to it. A
 /// sandboxed session's brief goes in its own folder, the one its sandbox mounts read-only.
+/// A new, empty folder in `root` for one scratch session.
+fn new_scratch_folder(root: &Path) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(root)?;
+    loop {
+        let dir = root.join(&uuid::Uuid::new_v4().simple().to_string()[..8]);
+        match std::fs::create_dir(&dir) {
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            other => return other.map(|()| dir),
+        }
+    }
+}
+
 fn brief_file(session: &str, text: &str, sandboxed: bool) -> Result<String, String> {
     let dir = if sandboxed { paths::briefs_dir().join(session) } else { paths::briefs_dir() };
     std::fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;

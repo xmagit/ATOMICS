@@ -238,6 +238,23 @@ pub fn git_pins_dir() -> PathBuf {
     imacs_home().join("git-pins")
 }
 
+/// Where sessions outside any project work, each in a folder of its own that goes when it closes.
+pub fn scratch_dir() -> PathBuf {
+    imacs_home().join("scratch")
+}
+
+/// The scratch folder `dir` is or lies in.
+pub fn scratch_of(dir: &Path) -> Option<PathBuf> {
+    scratch_in(&scratch_dir(), dir)
+}
+
+fn scratch_in(root: &Path, dir: &Path) -> Option<PathBuf> {
+    match dir.strip_prefix(root).ok()?.components().next()? {
+        std::path::Component::Normal(name) => Some(root.join(name)),
+        _ => None,
+    }
+}
+
 pub fn plan_file() -> PathBuf {
     imacs_home().join("plan.json")
 }
@@ -278,6 +295,16 @@ mod tests {
 
         assert_eq!(runtime_home_hash(Path::new("/Users/x/.imacs")), "51d177b92c46bedb");
         assert_eq!(runtime_home_hash(Path::new(OsStr::from_bytes(b"/home/\xff/.imacs"))), "f3937a555619b1fd");
+    }
+
+    #[test]
+    fn scratch_folders_are_the_folders_directly_in_scratch() {
+        let root = Path::new("/state/scratch");
+        assert_eq!(scratch_in(root, &root.join("a1b2")), Some(root.join("a1b2")));
+        assert_eq!(scratch_in(root, &root.join("a1b2/notes")), Some(root.join("a1b2")));
+        assert_eq!(scratch_in(root, root), None);
+        assert_eq!(scratch_in(root, Path::new("/state/scratchpad/a1b2")), None);
+        assert_eq!(scratch_in(root, Path::new("/repos/app")), None);
     }
 
     #[test]

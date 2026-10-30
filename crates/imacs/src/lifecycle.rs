@@ -241,6 +241,43 @@ pub fn sweep_before(home: &Path, config: &Config, sbx: &str, before: std::time::
     Ok(notes)
 }
 
+/// Removes a scratch session's folder. Only a folder directly in `home`'s scratch folder is one.
+pub fn remove_scratch(home: &Path, dir: &Path) -> Result<()> {
+    anyhow::ensure!(
+        dir.parent() == Some(home.join("scratch").as_path()) && dir.file_name().is_some(),
+        "{} is not a scratch folder",
+        dir.display()
+    );
+    match std::fs::remove_dir_all(dir) {
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+            Err(err).with_context(|| format!("removing {}", dir.display()))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Removes scratch folders older than `before` that no session in `keep`, a restart's handoff, resumes.
+/// Their sessions ended when IMACS quit or crashed.
+pub fn sweep_scratch(home: &Path, keep: &HashSet<PathBuf>, before: std::time::SystemTime) -> Vec<String> {
+    let entries = match std::fs::read_dir(home.join("scratch")) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(err) => return vec![format!("Scratch folders: {err}")],
+    };
+    let mut notes = Vec::new();
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        let new = entry.metadata().and_then(|m| m.modified()).is_ok_and(|modified| modified >= before);
+        if new || keep.contains(&dir) || !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        if let Err(err) = remove_scratch(home, &dir) {
+            notes.push(format!("Scratch folder: {err:#}"));
+        }
+    }
+    notes
+}
+
 /// Cache clones are staged in .imacs-warm-* directories beside their destination.
 /// Only old stages in configured cache parents are ours; never follow cache symlinks.
 fn sweep_warm_stages(root: &Path, folders: &[String], notes: &mut Vec<String>) -> Result<()> {
@@ -427,6 +464,7 @@ mod tests {
             last_prompt: None,
             updated: 0,
             sandbox: Some("imacs-live".into()),
+            named: false,
         });
         store.save(&home.join("sessions.json")).unwrap();
         std::fs::create_dir_all(home.join("briefs/live")).unwrap();

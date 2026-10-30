@@ -20,6 +20,7 @@ impl State {
             "outside_imacs": s.terminal.is_none() && s.status != AgentStatus::Starting,
             "claude_session_id": s.claude_id,
             "sandbox": s.sandbox,
+            "scratch": s.scratch,
             "last_prompt": s.last_prompt,
             "approval": s.approvals.first().map(|p| &p.request),
             "queue": s.terminal.as_ref().and_then(|t| {
@@ -421,8 +422,8 @@ impl State {
                 self.client_events.push(ClientEvent::Viewport(egui::ViewportCommand::InnerSize(vec2(width, height))));
                 done(ControlResponse::ok(json!({ "requested": [width, height] })))
             }
-            ControlRequest::Start { agent, folder, repo, branch, prompt, args } => {
-                let folder = match (folder, repo, branch) {
+            ControlRequest::Start { agent, folder, repo, branch, prompt, args, isolation } => {
+                let started = match (folder, repo, branch) {
                     (_, Some(repo), Some(branch)) => {
                         // Checking out a big repository takes a while: do it off the UI thread
                         // and start the agent (and answer) once the worktree exists.
@@ -430,14 +431,19 @@ impl State {
                             paths::expand(&repo),
                             branch,
                             None,
-                            Launch { agent, prompt, args, reply: Some(reply), task: None, isolation: None },
+                            Launch { agent, prompt, args, reply: Some(reply), task: None, isolation },
                         );
                         return;
                     }
-                    (Some(folder), _, _) => Ok(paths::expand(&folder)),
-                    _ => Err("give a folder, or a repo and a branch for a new worktree".to_string()),
+                    (Some(folder), _, _) => {
+                        self.start_as(ctx, &agent, paths::expand(&folder), None, args, prompt, Role::Agent(isolation))
+                    }
+                    (None, Some(_), None) | (None, None, Some(_)) => {
+                        Err("give a repo and a branch for a new worktree".to_string())
+                    }
+                    (None, None, None) => self.start_scratch(ctx, &agent, args, prompt, isolation),
                 };
-                match folder.and_then(|folder| self.start(ctx, &agent, folder, None, args, prompt)) {
+                match started {
                     Ok(id) => {
                         let index = self.find(&id).expect("just started");
                         done(ControlResponse::ok(self.describe(index)))
@@ -566,6 +572,10 @@ impl State {
                 None => missing(&session),
                 Some(index) => {
                     let id = self.sessions[index].id.clone();
+                    // A session outside every plan is shown in the Ungrouped tab when the tab on screen hides it.
+                    if !self.visible_sessions().contains(&index) && self.ungrouped_session(&self.sessions[index]) {
+                        self.show_ungrouped();
+                    }
                     self.activate(&id, true);
                     done(ControlResponse::ok(json!({ "active": id })))
                 }

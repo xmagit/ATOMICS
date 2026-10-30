@@ -26,6 +26,15 @@ the Linux desktop app. State stays in `~/.imacs` on macOS and existing installs;
   right, each edited line beside what it replaced. `diff_split` under `[layout]` picks `auto`, `always` or `never`; the
   **split** toggle in the diff header overrides it until IMACS quits. Comments and double-click-to-edit work the same in
   both views.
+- **Ungrouped sessions for everything else.** Research and small tasks need no project or board. **+ New** (`cmd+t`)
+  starts a session in a scratch folder of its own under the state directory (`<state>/scratch/<id>`), in the
+  **Ungrouped** tab, which holds every session outside a plan. It takes nothing from the focused tile: no folder, no
+  title. Its first prompt names it (typed in the dialog, sent from the steer bar, or typed into its terminal); rename
+  it from its tile title (double-click) or its sidebar menu. It follows the isolation settings like any agent, and
+  the dialog can make one session bare or sandboxed. Each scratch folder is a git repository without commits, so the
+  diff panel shows everything written there and review comments reach the agent. Closing the session deletes the
+  folder and its sandbox; quitting IMACS ends scratch sessions for good, while `imacs restart` resumes them. Pick
+  **Existing folder** or **New worktree** in the dialog to work in a project instead.
 - **Projects and workspaces.** `imacs <folder>` opens the repository it is in, always through its main checkout, so a
   folder inside any worktree opens the same project. The explorer shows the main checkout's tracked files, with the
   changes of the worktree under review laid over them, plus each project's worktrees. **Project › Open project…**
@@ -200,12 +209,15 @@ Run from the checkout you want to test:
 imacs queue --class test -- scripts/linux-qa.sh test
 imacs queue --class qa -- scripts/linux-qa.sh screenshot /tmp/imacs-linux.png
 imacs queue --class qa -- scripts/linux-qa.sh screenshot /tmp/imacs-linux-wide.png --size 1920x1080
+imacs queue --class qa -- scripts/linux-qa.sh screenshot /tmp/imacs-scratch.png \
+    --ctl '{"cmd":"start","agent":"shell","isolation":"bare","prompt":"echo hi"}' --ctl '{"cmd":"activate","session":"echo hi"}'
 scripts/linux-qa.sh shell
 ```
 
 `test` runs the full locked workspace suite, including doc tests, and keeps running other test targets if one fails.
 `screenshot` builds IMACS, starts a disposable project with a shell under Xvfb, waits for its isolated control socket,
-captures the window through `imacs ctl`, verifies the PNG size and exits. The default size is 1600x1000; supported
+captures the window through `imacs ctl`, verifies the PNG size and exits. Each `--ctl` request is sent to that
+instance first, in order, to set the scene; one that fails stops the run. The default size is 1600x1000; supported
 sizes range from 480x320 to 8192x8192. The image uses Debian, Rust 1.98, Xvfb and Mesa's lavapipe Vulkan driver
 (software rendering for wgpu). No display server, GPU, agent credentials or IMACS state from the host are shared.
 
@@ -412,7 +424,7 @@ Plans are stored separately in `plans/<id>.json` under the state directory, with
 `plan.json` in that directory migrates once and is kept as `plan.json.migrated`; an old plan whose tasks are all done
 migrates as completed. Saves replace files atomically, and unreadable plan files are listed in the startup message.
 Open and completed plans get tabs; archived plans are hidden. Select a tab to see
-that plan’s sessions; `cmd+b` opens its board. Other sessions remain under All and their project tabs. Each plan has
+that plan’s sessions; `cmd+b` opens its board. Other sessions remain under All, Ungrouped and their project tabs. Each plan has
 its own approval and automatic final review. Use `imacs_plan_close {plan, status: "completed" | "archived"}` or
 **Complete plan** / **Archive plan** on the board to close it after confirmation. Reopen either kind from
 **Closed plans** beside the plan tabs; approval and task history are preserved. Its history remains available by id, and once only
@@ -604,7 +616,7 @@ codex mcp add IMACS -- imacs mcp
 
 Tools: `imacs_wait` (block until an agent finishes a turn or needs input; returns a cursor for the next call),
 `imacs_approve` (allow, allow_always or deny a pending permission request),
-`imacs_result` (an agent's last prompt, final message and screen), `imacs_list`, `imacs_start` (in a folder, or a new worktree from `repo` + `branch`), `imacs_send` (a message, or raw
+`imacs_result` (an agent's last prompt, final message and screen), `imacs_list`, `imacs_start` (in a folder, a new worktree from `repo` + `branch`, or with neither in a scratch folder; `isolation` overrides the settings for that session), `imacs_send` (a message, or raw
 keys for menus), `imacs_read` (screen text), `imacs_diff`, `imacs_comment` + `imacs_send_review`, `imacs_open` (show a file to the user), `imacs_focus`, `imacs_close`.
 Comments an agent leaves show inline in the diff panel before they are sent, so you can see what it asks for.
 
@@ -629,7 +641,7 @@ Tooltips and the settings menu show the actual platform chord, including custom 
 | `cmd+j` | next agent that needs you |
 | `cmd+l` | steer bar |
 | `cmd+shift+space` | voice: record, press again to send to the chief, `Esc` cancels |
-| `cmd+t` | new session (existing folder or new worktree) |
+| `cmd+t` | new session (scratch folder, existing folder or new worktree) |
 | `cmd+r` | refresh diff |
 | `cmd+w` | close session |
 | `cmd+1…9` | switch session |
@@ -649,5 +661,5 @@ responsive layout, the hook and control protocols, and review message compositio
 | Watching | notify (FSEvents/inotify) | Live diff for the worktree on screen; diffs of agents off screen follow their file changes within seconds, no polling |
 | IPC | Unix socket, JSON lines | One socket for hooks, `imacs ctl` and `imacs mcp`; no async runtime anywhere |
 
-Agents run as children of the IMACS process, so closing IMACS stops them. Claude sessions can be resumed from the sidebar,
+Agents run as children of the IMACS process, so closing IMACS stops them. Claude sessions in a project can be resumed from the sidebar,
 and Codex with `codex resume --last`.

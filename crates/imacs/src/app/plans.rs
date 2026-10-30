@@ -7,6 +7,7 @@ impl State {
         self.changed_plans.remove(&self.plans[self.selected_plan].id);
         self.view = self.plans[self.selected_plan].project.clone();
         self.plan_view = true;
+        self.ungrouped = false;
         self.panel = PanelMode::Diff;
         if self.chief_dock() == ChiefDock::Floating || self.last_layout.is_some_and(|layout| layout.dock_width == 0.0) {
             self.chief_open = false;

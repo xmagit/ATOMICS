@@ -28,6 +28,9 @@ pub struct SessionRecord {
     /// The sandbox a sandboxed session runs in; resuming reattaches to it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<String>,
+    /// Its title came from its first prompt or the user, so resuming keeps it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub named: bool,
 }
 
 /// One-shot handoff, written before quitting and consumed by the new process.
@@ -40,6 +43,9 @@ pub struct RestartState {
     pub active: Option<String>,
     pub selected_plan: Option<String>,
     pub plan_view: bool,
+    /// The Ungrouped tab was on screen.
+    #[serde(default)]
+    pub ungrouped: bool,
     pub diff_open: bool,
     pub diff_root: Option<PathBuf>,
     pub view: Option<PathBuf>,
@@ -127,6 +133,7 @@ mod tests {
             last_prompt: prompt.map(str::to_string),
             updated: 0,
             sandbox: None,
+            named: false,
         }
     }
 

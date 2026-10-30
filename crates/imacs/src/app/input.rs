@@ -127,15 +127,18 @@ impl Desktop<'_> {
         }
     }
 
+    /// Opens the New session dialog. A new session works in a scratch folder of its own unless
+    /// `folder` or the user picks one; it never takes the focused tile's folder by itself.
     pub(super) fn open_new_dialog(&mut self, folder: Option<PathBuf>) {
-        let folder = folder.or_else(|| self.runtime.diff_target()).unwrap_or_else(|| self.runtime.launch_dir.clone());
-        let repo = self.runtime.repos.first().cloned().unwrap_or_else(|| folder.clone());
+        let repo = self.runtime.repos.first().cloned().or_else(|| folder.clone()).unwrap_or_default();
         self.client.new_dialog = Some(NewDialog {
             agent: self.runtime.config.agents.first().map(|a| a.name.clone()).unwrap_or_default(),
-            new_worktree: false,
-            folder: paths::display(&folder),
+            place: if folder.is_some() { Place::Folder } else { Place::Scratch },
+            folder: folder.as_deref().map(paths::display).unwrap_or_default(),
             repo: paths::display(&repo),
             branch: String::new(),
+            prompt: String::new(),
+            isolation: None,
             error: None,
         });
     }
@@ -186,8 +189,8 @@ impl Desktop<'_> {
         }
         self.plan_cleanup_dialog(ctx);
         if let Some(id) = self.client.confirm_close.clone() {
-            let title = self.runtime.sessions.iter().find(|s| s.id == id).map(|s| s.title.clone());
-            let Some(title) = title else {
+            let session = self.runtime.sessions.iter().find(|s| s.id == id);
+            let Some((title, scratch)) = session.map(|s| (s.title.clone(), s.scratch.clone())) else {
                 self.client.confirm_close = None;
                 return;
             };
@@ -198,7 +201,13 @@ impl Desktop<'_> {
                 .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
                 .open(&mut open)
                 .show(ctx, |ui| {
-                    ui.label(format!("Closing “{title}” stops its process. Claude sessions can be resumed later."));
+                    ui.label(match &scratch {
+                        Some(folder) => format!(
+                            "Closing “{title}” stops its process and deletes its scratch folder {}.",
+                            paths::display(folder)
+                        ),
+                        None => format!("Closing “{title}” stops its process. Claude sessions can be resumed later."),
+                    });
                     ui.horizontal(|ui| {
                         if ui.button("Close session").clicked() {
                             self.close(&id);
@@ -214,10 +223,10 @@ impl Desktop<'_> {
             }
         }
 
+        self.rename_dialog(ctx);
         let Some(mut dialog) = self.client.new_dialog.take() else { return };
         let mut keep = true;
-        let mut start: Option<(String, PathBuf)> = None;
-        let mut create: Option<(PathBuf, String, Launch)> = None;
+        let mut start: Option<ControlRequest> = None;
         egui::Window::new("New session")
             .collapsible(false)
             .resizable(false)
@@ -233,11 +242,22 @@ impl Desktop<'_> {
                     ui.end_row();
                     ui.label("Where");
                     ui.horizontal(|ui| {
-                        ui.radio_value(&mut dialog.new_worktree, false, "Existing folder");
-                        ui.radio_value(&mut dialog.new_worktree, true, "New worktree");
+                        ui.radio_value(&mut dialog.place, Place::Scratch, "Scratch folder").on_hover_text(
+                            "A new folder of its own, outside any project, removed when the session closes",
+                        );
+                        ui.radio_value(&mut dialog.place, Place::Folder, "Existing folder");
+                        ui.radio_value(&mut dialog.place, Place::Worktree, "New worktree");
                     });
                     ui.end_row();
-                    if dialog.new_worktree {
+                    if dialog.place == Place::Scratch {
+                        ui.label("");
+                        ui.label(
+                            RichText::new(format!("in {}", paths::display(&paths::scratch_dir().join("…"))))
+                                .color(self.runtime.palette.muted)
+                                .size(11.5),
+                        );
+                        ui.end_row();
+                    } else if dialog.place == Place::Worktree {
                         ui.label("Repository");
                         ui.text_edit_singleline(&mut dialog.repo);
                         ui.end_row();
@@ -257,7 +277,7 @@ impl Desktop<'_> {
                     } else {
                         ui.label("Folder");
                         ui.horizontal(|ui| {
-                            ui.text_edit_singleline(&mut dialog.folder);
+                            ui.add(egui::TextEdit::singleline(&mut dialog.folder).hint_text("~/repos/app"));
                             ui.menu_button("▾", |ui| {
                                 let mut known: Vec<PathBuf> =
                                     self.runtime.worktrees.iter().map(|w| w.path.clone()).collect();
@@ -274,6 +294,40 @@ impl Desktop<'_> {
                         });
                         ui.end_row();
                     }
+                    if let Some(agent) = self.runtime.config.agent(&dialog.agent) {
+                        // What the settings give this agent; a repository that requires sandboxes still wins.
+                        let configured = self.runtime.effective_isolation().mode_for(agent, None);
+                        let name = |mode: Option<imacs_core::isolation::IsolationMode>| match mode {
+                            Some(imacs_core::isolation::IsolationMode::Sandbox) => "Sandboxed",
+                            Some(imacs_core::isolation::IsolationMode::Bare) => "Bare, on this machine",
+                            None => "As configured",
+                        };
+                        ui.label("Isolation");
+                        let selected = match dialog.isolation {
+                            None => format!("As configured · {}", configured.name()),
+                            mode => name(mode).to_string(),
+                        };
+                        egui::ComboBox::from_id_salt("isolation").selected_text(selected).show_ui(ui, |ui| {
+                            for mode in [
+                                None,
+                                Some(imacs_core::isolation::IsolationMode::Sandbox),
+                                Some(imacs_core::isolation::IsolationMode::Bare),
+                            ] {
+                                ui.selectable_value(&mut dialog.isolation, mode, name(mode));
+                            }
+                        });
+                        ui.end_row();
+                    }
+                    ui.label("Prompt");
+                    let prompt = ui.add(
+                        egui::TextEdit::singleline(&mut dialog.prompt)
+                            .hint_text("optional first prompt; it names a scratch session")
+                            .desired_width(320.0),
+                    );
+                    if dialog.place == Place::Scratch {
+                        prompt.request_focus();
+                    }
+                    ui.end_row();
                 });
                 if let Some(err) = &dialog.error {
                     ui.label(RichText::new(err).color(self.runtime.palette.error));
@@ -282,21 +336,9 @@ impl Desktop<'_> {
                 ui.horizontal(|ui| {
                     let enter = ui.input(|i| i.key_pressed(Key::Enter));
                     if ui.button("Start").clicked() || enter {
-                        if dialog.new_worktree {
-                            let repo = paths::expand(dialog.repo.trim());
-                            let branch = dialog.branch.trim().to_string();
-                            let launch = Launch {
-                                agent: dialog.agent.clone(),
-                                prompt: None,
-                                args: Vec::new(),
-                                reply: None,
-                                task: None,
-                                isolation: None,
-                            };
-                            create = Some((repo, branch, launch));
-                            keep = false;
-                        } else {
-                            start = Some((dialog.agent.clone(), paths::expand(dialog.folder.trim())));
+                        match new_session_request(&dialog) {
+                            Ok(request) => start = Some(request),
+                            Err(error) => dialog.error = Some(error),
                         }
                     }
                     if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
@@ -304,15 +346,83 @@ impl Desktop<'_> {
                     }
                 });
             });
-        if let Some((repo, branch, launch)) = create {
-            self.create_worktree(repo, branch, None, launch);
-        }
-        if let Some(target) = start {
-            self.post(move |state| state.pending_open.push(target));
+        if let Some(request) = start {
+            // A new session is outside any plan, so it lands in the Ungrouped tab.
+            self.runtime.show_ungrouped();
+            self.runtime.client_commands.push(request);
             keep = false;
         }
         if keep {
             self.client.new_dialog = Some(dialog);
         }
     }
+
+    fn rename_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut rename) = self.client.rename.take() else { return };
+        if !self.runtime.sessions.iter().any(|s| s.id == rename.session) {
+            return;
+        }
+        let mut keep = true;
+        egui::Window::new("Rename session")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                let field = ui.add(egui::TextEdit::singleline(&mut rename.title).desired_width(280.0));
+                if std::mem::take(&mut rename.focus) {
+                    field.request_focus();
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Rename").clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
+                        let (id, title) = (rename.session.clone(), rename.title.clone());
+                        self.post(move |state| {
+                            if let Some(session) = state.sessions.iter_mut().find(|s| s.id == id) {
+                                session.rename(&title);
+                            }
+                            state.remember(&id);
+                        });
+                        keep = false;
+                    }
+                    if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                        keep = false;
+                    }
+                });
+            });
+        if keep {
+            self.client.rename = Some(rename);
+        }
+    }
+
+    /// Opens the rename dialog for a session.
+    pub(super) fn begin_rename(&mut self, id: &str) {
+        if let Some(session) = self.runtime.sessions.iter().find(|s| s.id == id && !s.chief) {
+            self.client.rename = Some(Rename { session: id.into(), title: session.title.clone(), focus: true });
+        }
+    }
+}
+
+/// What the New session dialog starts: a scratch session, or one in a folder or new worktree.
+pub(super) fn new_session_request(dialog: &NewDialog) -> Result<ControlRequest, String> {
+    let text = |value: &str| (!value.trim().is_empty()).then(|| value.trim().to_string());
+    let (folder, repo, branch) = match dialog.place {
+        Place::Scratch => (None, None, None),
+        Place::Folder => {
+            let folder = text(&dialog.folder).ok_or("Pick a folder")?;
+            (Some(paths::expand(&folder).to_string_lossy().into_owned()), None, None)
+        }
+        Place::Worktree => {
+            let repo = text(&dialog.repo).ok_or("Pick a repository")?;
+            let branch = text(&dialog.branch).ok_or("Name the new branch")?;
+            (None, Some(paths::expand(&repo).to_string_lossy().into_owned()), Some(branch))
+        }
+    };
+    Ok(ControlRequest::Start {
+        agent: dialog.agent.clone(),
+        folder,
+        repo,
+        branch,
+        prompt: text(&dialog.prompt),
+        args: Vec::new(),
+        isolation: dialog.isolation,
+    })
 }

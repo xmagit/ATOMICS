@@ -20,6 +20,8 @@ use alacritty_terminal::vte::ansi::Rgb;
 use anyhow::Result;
 pub struct Shared {
     pub title: Mutex<Option<String>>,
+    /// The last line typed into this terminal and sent with Enter.
+    pub submitted: Mutex<Option<String>>,
     pub exited: AtomicBool,
     pub bell: AtomicBool,
     pub changed: AtomicBool,
@@ -144,6 +146,7 @@ impl Terminal {
         let process_id = pty.child().id();
         let shared = Arc::new(Shared {
             title: Mutex::new(None),
+            submitted: Mutex::new(None),
             exited: AtomicBool::new(false),
             bell: AtomicBool::new(false),
             changed: AtomicBool::new(false),
@@ -353,6 +356,7 @@ mod tests {
         let wake = crate::host::Wake::default();
         let shared = Arc::new(Shared {
             title: Mutex::new(None),
+            submitted: Mutex::new(None),
             exited: AtomicBool::new(false),
             bell: AtomicBool::new(false),
             changed: AtomicBool::new(false),
