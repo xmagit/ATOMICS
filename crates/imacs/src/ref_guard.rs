@@ -56,7 +56,7 @@ fn now() -> u64 {
 /// worktree's branch, a cleaned-up branch, a fetch's remote-tracking refs. A guard whose snapshot is
 /// older must neither undo nor restore them, and its check may have been queued before IMACS wrote them.
 struct HostWrites {
-    /// Writes in progress, by ref name or prefix: every check accepts these refs.
+    /// Writes in progress, by ref name or prefix: checks defer prefixes without changing their baseline.
     pending: Vec<(PathBuf, String)>,
     /// The refs each write left under its name or prefix; one it deleted is absent. A check accepts
     /// a ref still at that value and restores any other, such as an agent's.
@@ -75,35 +75,54 @@ pub fn host_write<S: AsRef<str>>(repo: &Path, branches: impl IntoIterator<Item =
 /// `refs/remotes/` for a fetch.
 pub fn host_write_refs(repo: &Path, refs: impl IntoIterator<Item = String>) -> HostWrite {
     let names: Vec<String> = refs.into_iter().collect();
+    let before = names.iter().any(|name| name.ends_with('/')).then(|| read_refs(repo).ok()).flatten();
     let mut host = HOST_WRITES.lock().unwrap_or_else(|e| e.into_inner());
     host.pending.extend(names.iter().map(|name| (repo.to_path_buf(), name.clone())));
-    HostWrite { repo: repo.to_path_buf(), names }
+    HostWrite { repo: repo.to_path_buf(), names, before }
 }
 
 /// A write by IMACS in progress; see [`host_write`]. Dropping it runs git.
 pub struct HostWrite {
     repo: PathBuf,
     names: Vec<String>,
+    before: Option<BTreeMap<String, RefValue>>,
 }
 
 impl Drop for HostWrite {
     fn drop(&mut self) {
         let values = read_refs(&self.repo).ok();
-        self.record(values.as_ref());
+        let names: Vec<_> = self
+            .names
+            .iter()
+            .flat_map(|name| {
+                if !name.ends_with('/') {
+                    return vec![name.clone()];
+                }
+                let (Some(before), Some(after)) = (&self.before, &values) else { return Vec::new() };
+                let refs: BTreeSet<_> = before.keys().chain(after.keys()).collect();
+                refs.into_iter()
+                    .filter(|other| covers(name, other) && before.get(*other) != after.get(*other))
+                    .cloned()
+                    .collect()
+            })
+            .collect();
+        self.record(values.as_ref(), &names);
         if let Some(values) = &values {
-            accept_written(&self.repo, &self.names, values);
+            accept_written(&self.repo, &names, values);
         }
     }
 }
 
 impl HostWrite {
-    fn record(&self, values: Option<&BTreeMap<String, RefValue>>) {
+    fn record(&self, values: Option<&BTreeMap<String, RefValue>>, names: &[String]) {
         let mut host = HOST_WRITES.lock().unwrap_or_else(|e| e.into_inner());
         for name in &self.names {
             if let Some(index) = host.pending.iter().position(|(repo, pending)| *repo == self.repo && pending == name) {
                 host.pending.remove(index);
             }
-            // Without the values a later check falls back to restoring, as before IMACS wrote.
+        }
+        // Without the values a later check falls back to restoring, as before IMACS wrote.
+        for name in names {
             if let Some(values) = values {
                 host.written.retain(|(repo, written, _)| !(*repo == self.repo && written == name));
                 let left = values.iter().filter(|(other, _)| covers(name, other));
@@ -395,7 +414,7 @@ impl RefGuard {
                 (name.starts_with("refs/heads/")
                     && (self.refs.get(name) == Some(value)
                         || self.branch.as_ref() == Some(name)
-                        || concurrent.iter().any(|pattern| covers(pattern, name))
+                        || concurrent.contains(name)
                         || written.left(name, Some(value))
                         || host.left(name, self.refs.get(name), Some(value))))
                 .then_some(value)
@@ -407,6 +426,13 @@ impl RefGuard {
             .collect();
         let mut alerts = Vec::new();
         for name in names {
+            if !name.starts_with(QUARANTINE)
+                && concurrent.iter().any(|pattern| pattern.ends_with('/') && covers(pattern, &name))
+            {
+                // A broad host write is unfinished. Its final diff will accept only refs
+                // that changed during it; do not bless unrelated pre-existing changes.
+                continue;
+            }
             let before = self.refs.get(&name).cloned();
             let (before, after) = (before.as_ref(), current.get(&name));
             let accepted = if name.starts_with(QUARANTINE) {
@@ -701,6 +727,25 @@ fn update_refs(cwd: &Path, operations: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefix_host_writes_do_not_accept_unchanged_refs_or_advance_pending_baselines() {
+        let (dir, repo, worktree) = repository();
+        let initial = git::git(&repo, &["rev-parse", "HEAD"]).unwrap();
+        git::git(&repo, &["update-ref", "refs/tags/untouched", initial.trim()]).unwrap();
+        let guard = Shared::new(RefGuard::open(&worktree, dir.path().join("snapshot.json")).unwrap().unwrap());
+        let injected = git::git(&worktree, &["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "injected"]).unwrap();
+        // This happened before the host operation; its broad prefix cannot bless it.
+        git::git(&worktree, &["update-ref", "refs/tags/untouched", injected.trim()]).unwrap();
+        let write = host_write_refs(&repo, ["refs/tags/".into()]);
+        assert!(guard.check(&Default::default()).unwrap().is_empty());
+        git::git(&repo, &["update-ref", "refs/tags/host-made", initial.trim()]).unwrap();
+        drop(write);
+        let alerts = guard.check(&Default::default()).unwrap();
+        assert!(alerts.iter().any(|a| a.contains("Restored refs/tags/untouched")), "{alerts:?}");
+        assert_eq!(git::git(&repo, &["rev-parse", "untouched"]).unwrap(), initial);
+        assert_eq!(git::git(&repo, &["rev-parse", "host-made"]).unwrap(), initial);
+    }
 
     #[test]
     fn quarantine_refs_allow_additions_but_restore_moves_and_deletions() {
