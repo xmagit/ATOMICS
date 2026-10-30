@@ -127,7 +127,14 @@ fn report(workspace: Option<&str>, for_agent: bool, projects: &[PathBuf]) -> Rep
         if sandboxes_wanted(config, workspace) {
             // Tests never reach the sbx installed on the machine running them.
             let sbx = if cfg!(test) { "/nonexistent/imacs-test-sbx".into() } else { resolve_program("sbx") };
-            lines.push(crate::sandbox::doctor_line(&sbx));
+            match crate::sandbox::checks::configured(config, workspace) {
+                Ok(sandbox) => lines.extend(crate::sandbox::doctor_lines(&sbx, &sandbox)),
+                Err(_) => lines.push(check_line(
+                    false,
+                    "sandbox configuration unavailable",
+                    "fix the workspace isolation and tickets sections",
+                )),
+            }
         }
         match ticket_config(config, workspace) {
             Ok(tickets) if !tickets.system.trim().is_empty() => lines.push(ticket_check(&tickets)),

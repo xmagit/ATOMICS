@@ -6,6 +6,36 @@ use std::os::unix::net::UnixListener;
 use std::process::Command;
 
 #[test]
+fn setup_from_an_empty_machine_creates_config_and_gives_install_commands_without_secret_arguments() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let shell = dir.path().join("shell");
+    std::fs::write(&shell, "#!/bin/sh\nprintf '__IMACS__%s__IMACS__' \"$PATH\"\n").unwrap();
+    std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let config = dir.path().join("config.toml");
+    let output = test_support::output(
+        Command::new(env!("CARGO_BIN_EXE_imacs"))
+            .arg("setup")
+            .env_clear()
+            .env("HOME", dir.path())
+            .env("SHELL", shell)
+            .env("PATH", bin)
+            .env("IMACS_HOME", dir.path().join("state"))
+            .env("IMACS_CONFIG", &config)
+            .env("IMACS_HOST", "fixture"),
+    );
+    assert!(!output.status.success(), "EOF stops setup instead of claiming success");
+    assert!(config.exists());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    for tool in ["git", "claude", "codex"] {
+        assert!(stdout.contains(&format!("✗ sandbox prerequisite: {tool}")), "{stdout}");
+    }
+    assert!(stdout.contains(if cfg!(target_os = "macos") { "xcode-select --install" } else { "libsecret-tools" }));
+    assert!(String::from_utf8(output.stderr).unwrap().contains("rerun `imacs setup` to resume"));
+}
+
+#[test]
 fn doctor_checks_real_inputs_and_only_requires_git_and_valid_config() {
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("bin");

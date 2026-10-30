@@ -58,7 +58,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Build repository toolchains and dependency caches into a sandbox template
+    /// Guide fresh-machine sandbox setup (safe to run again)
+    Setup,
+    /// Set up Docker Sandboxes or build warm repository templates
     Sandbox {
         #[command(subcommand)]
         command: SandboxCommand,
@@ -111,6 +113,8 @@ enum Command {
 
 #[derive(Subcommand)]
 enum SandboxCommand {
+    /// Set up Claude subscription OAuth using the OS keychain (no token arguments)
+    Setup,
     Template {
         #[command(subcommand)]
         command: TemplateCommand,
@@ -169,6 +173,13 @@ fn main() -> eframe::Result {
         migration_errors = migration.errors;
     }
     match cli.command {
+        Some(Command::Setup | Command::Sandbox { command: SandboxCommand::Setup }) => {
+            if let Err(err) = sandbox::setup::run(cli.workspace.as_deref()) {
+                eprintln!("Sandbox setup failed: {err}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
         Some(Command::Sandbox {
             command: SandboxCommand::Template { command: TemplateCommand::Build { project, agent, dotnet_project } },
         }) => {
@@ -287,6 +298,14 @@ fn load_icon() -> egui::IconData {
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+
+    #[test]
+    fn setup_and_sandbox_setup_parse() {
+        let cli = Cli::try_parse_from(["imacs", "setup"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Setup)));
+        let cli = Cli::try_parse_from(["imacs", "sandbox", "setup"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Sandbox { command: SandboxCommand::Setup })));
+    }
 
     #[test]
     fn print_hook_settings_selects_the_launch_settings() {
