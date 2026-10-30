@@ -69,6 +69,15 @@ pub(super) fn sandbox_lines(program: &str, config: &SandboxConfig) -> Vec<String
             ] {
                 lines.push(check_line(present, label, hint));
             }
+            let misfiled = secrets.as_ref().map(|s| s.misfiled.as_slice()).filter(|misfiled| !misfiled.is_empty());
+            lines.push(check_line(
+                secrets.as_ref().is_some_and(|s| s.misfiled.is_empty()),
+                &match misfiled {
+                    Some(misfiled) => format!("sandbox secrets: {} (warning)", misfiled_text(misfiled)),
+                    None => "sandbox secrets filed under known services and sandboxes (warning if not)".into(),
+                },
+                "run `imacs setup` to remove them; their names stay hidden, since they may hold a pasted credential",
+            ));
             let mcp = query(program, &["mcp", "ls", "--json"]);
             match mcp.as_ref().and_then(Value::as_array) {
                 None => lines.push(check_line(
@@ -163,26 +172,92 @@ fn policy_preset(value: &Value) -> Option<&'static str> {
     Some("custom (inspect `sbx policy ls`)")
 }
 
+/// The service secrets `sbx secret set` stores (sbx v0.50.1).
+const SERVICES: [&str; 13] = [
+    "anthropic",
+    "copilot",
+    "cursor",
+    "devin",
+    "droid",
+    "github",
+    "google",
+    "groq",
+    "mistral",
+    "nebius",
+    "openai",
+    "openrouter",
+    "xai",
+];
+
 #[derive(Default)]
 pub(super) struct SecretNames {
     pub anthropic: bool,
     pub oauth: bool,
     pub openai: bool,
     pub github: bool,
+    /// Service secrets under a name sbx has no service for, or in a scope no sandbox has: usually a
+    /// credential pasted where the service or sandbox goes, as with `sbx secret set anthropic <token>`.
+    pub misfiled: Vec<Misfiled>,
 }
 
-fn secret_names(value: &Value) -> Option<SecretNames> {
+/// A misfiled secret. Its name may be a credential, so it only ever goes to `sbx secret rm`.
+pub(super) struct Misfiled {
+    pub scope: String,
+    name: String,
+}
+
+impl Misfiled {
+    /// The `sbx secret rm` arguments that remove exactly this entry, without a prompt.
+    pub(super) fn remove_args(&self) -> Vec<&str> {
+        let mut args = vec!["secret", "rm", self.name.as_str()];
+        if self.scope != "global" {
+            args.extend(["--sandbox", self.scope.as_str()]);
+        }
+        args.push("--force");
+        args
+    }
+}
+
+/// Misfiled secrets as doctor and setup show them: how many, and in which scopes, never a name.
+pub(super) fn misfiled_text(misfiled: &[Misfiled]) -> String {
+    // A scope is `global` or a sandbox's name, but a pasted credential can land there too.
+    let shown = |scope: &str| {
+        let plain = (1..=40).contains(&scope.len())
+            && !scope.starts_with("sk-")
+            && scope.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte));
+        if plain { scope.to_string() } else { "(not shown)".to_string() }
+    };
+    let mut scopes: Vec<String> = misfiled.iter().map(|secret| shown(&secret.scope)).collect();
+    scopes.sort();
+    scopes.dedup();
+    let plural = if misfiled.len() == 1 { "" } else { "s" };
+    format!("{} misfiled secret{plural} in scope {}", misfiled.len(), scopes.join(", "))
+}
+
+/// `sandboxes` are the names `sbx ls` knows, or None when it could not say: a scope is then trusted.
+fn secret_names(value: &Value, sandboxes: Option<&[String]>) -> Option<SecretNames> {
     let rows = value.get("secrets").unwrap_or(value).as_array()?;
     let mut known = SecretNames::default();
     for row in rows {
-        // Only exact, known identifiers are allowed out of this parser. Never collect
-        // unknown names, which can be accidentally stored credential values.
-        match row["name"].as_str() {
-            Some("anthropic") => known.anthropic = true,
-            Some("openai") => known.openai = true,
-            Some("github") => known.github = true,
-            Some("CLAUDE_CODE_OAUTH_TOKEN") => known.oauth = true,
-            _ => {}
+        // Every scope is listed, but only global secrets serve every sandbox.
+        let scope = row["scope"].as_str().unwrap_or("global");
+        let Some(name) = row["name"].as_str() else { continue };
+        // Only exact, known identifiers are allowed out of this parser, and a misfiled entry's
+        // name only to remove it: unknown names can be accidentally stored credential values.
+        if scope == "global" {
+            match name {
+                "anthropic" => known.anthropic = true,
+                "openai" => known.openai = true,
+                "github" => known.github = true,
+                "CLAUDE_CODE_OAUTH_TOKEN" => known.oauth = true,
+                _ => {}
+            }
+        }
+        let service = row.get("type").is_none_or(|kind| kind == "service");
+        let unknown = !SERVICES.contains(&name) && name != "CLAUDE_CODE_OAUTH_TOKEN";
+        let orphaned = scope != "global" && sandboxes.is_some_and(|names| !names.iter().any(|known| known == scope));
+        if service && (unknown || orphaned) {
+            known.misfiled.push(Misfiled { scope: scope.to_string(), name: name.to_string() });
         }
     }
     // sbx lists `secret set-custom` secrets apart. Read only the variable each fills and the hosts it
@@ -195,6 +270,7 @@ fn secret_names(value: &Value) -> Option<SecretNames> {
         };
         for secret in custom.as_array()? {
             if secret["env"] == "CLAUDE_CODE_OAUTH_TOKEN"
+                && secret["scope"].as_str().is_none_or(|scope| scope == "global")
                 && secret["targets"].as_array().is_some_and(|targets| targets.iter().any(anthropic))
             {
                 known.oauth = true;
@@ -205,7 +281,9 @@ fn secret_names(value: &Value) -> Option<SecretNames> {
 }
 
 pub(super) fn secrets(program: &str) -> Option<SecretNames> {
-    query(program, &["secret", "ls", "--global", "--json"]).and_then(|v| secret_names(&v))
+    // Every scope: `sbx secret set <service> <token>` files a token as a name in a sandbox's scope.
+    let sandboxes = list(program).ok().map(|list| list.into_iter().map(|sandbox| sandbox.name).collect::<Vec<_>>());
+    query(program, &["secret", "ls", "--json"]).and_then(|v| secret_names(&v, sandboxes.as_deref()))
 }
 
 /// A Linear ticket profile also needs the sandbox gateway registration/authentication.
@@ -526,23 +604,27 @@ mod tests {
 
     #[test]
     fn real_secret_envelope_ignores_misfiled_names_and_unrelated_metadata() {
-        let names = secret_names(&json!({"secrets":[
-            {"type":"service", "scope":"global", "name":"sk-ant-MISFILED-private-value"},
-            {"type":"service", "scope":"global", "name":"openai"},
-            {"type":"custom", "scope":"global", "name":"CLAUDE_CODE_OAUTH_TOKEN"},
-            {"name":"unknown", "env":"CLAUDE_CODE_OAUTH_TOKEN", "host":"api.anthropic.com"}
-        ]}))
+        let names = secret_names(
+            &json!({"secrets":[
+                {"type":"service", "scope":"global", "name":"sk-ant-MISFILED-private-value"},
+                {"type":"service", "scope":"global", "name":"openai"},
+                {"type":"custom", "scope":"global", "name":"CLAUDE_CODE_OAUTH_TOKEN"},
+                {"name":"unknown", "env":"CLAUDE_CODE_OAUTH_TOKEN", "host":"api.anthropic.com"}
+            ]}),
+            None,
+        )
         .unwrap();
         assert!(names.openai && names.oauth);
         assert!(!names.anthropic && !names.github);
         assert!(
             !secret_names(
-                &json!({"secrets":[{"name":"unknown", "env":"CLAUDE_CODE_OAUTH_TOKEN", "host":"api.anthropic.com"}]})
+                &json!({"secrets":[{"name":"unknown", "env":"CLAUDE_CODE_OAUTH_TOKEN", "host":"api.anthropic.com"}]}),
+                None
             )
             .unwrap()
             .oauth
         );
-        assert!(secret_names(&json!({"secrets":"private-malformed-output"})).is_none());
+        assert!(secret_names(&json!({"secrets":"private-malformed-output"}), None).is_none());
     }
 
     #[test]
@@ -554,6 +636,7 @@ mod tests {
         let names = |custom: Value| {
             secret_names(
                 &json!({"secrets":[{"type":"service","name":"openai","scope":"global"}],"custom_secrets":custom}),
+                None,
             )
         };
         let found = names(json!([route("CLAUDE_CODE_OAUTH_TOKEN", json!(["api.anthropic.com"]))])).unwrap();
@@ -582,6 +665,59 @@ mod tests {
         assert!(!text.contains("PRIVATE"), "{text}");
         std::fs::remove_file(dir.join("removed-anthropic")).unwrap();
         assert!(line(&report(dir), "credential precedence").starts_with('✗'), "both routes at once");
+    }
+
+    #[test]
+    fn misfiled_secrets_show_as_a_count_and_scopes_and_only_rm_gets_their_names() {
+        let sandboxes = ["imacs-live".to_string()];
+        let names = secret_names(
+            &json!({"secrets":[
+                {"type":"service", "scope":"global", "name":"openai"},
+                {"type":"service", "scope":"imacs-live", "name":"github"},
+                {"type":"service", "scope":"anthropic", "name":"sk-ant-oat01-SCOPED-private-value"},
+                {"type":"service", "scope":"imacs-gone", "name":"openai"},
+                {"type":"service", "scope":"global", "name":"sk-ant-MISFILED-private-value"},
+                {"type":"service", "scope":"sk-ant-api03-PRIVATE-scope", "name":"anthropic"},
+                {"type":"registry", "scope":"global", "name":"ghcr.io"},
+                {"type":"custom", "scope":"global", "name":"CLAUDE_CODE_OAUTH_TOKEN"}
+            ]}),
+            Some(&sandboxes),
+        )
+        .unwrap();
+        // Only global secrets count; a sandbox's own github secret is its business.
+        assert!(names.openai && names.oauth && !names.github && !names.anthropic);
+        let text = misfiled_text(&names.misfiled);
+        assert_eq!(text, "4 misfiled secrets in scope (not shown), anthropic, global, imacs-gone");
+        assert!(!text.contains("PRIVATE"));
+        let removals: Vec<Vec<&str>> = names.misfiled.iter().map(Misfiled::remove_args).collect();
+        assert_eq!(
+            removals[0],
+            ["secret", "rm", "sk-ant-oat01-SCOPED-private-value", "--sandbox", "anthropic", "--force"]
+        );
+        assert_eq!(removals[2], ["secret", "rm", "sk-ant-MISFILED-private-value", "--force"]);
+        // Without a sandbox list a scope is trusted; a name sbx has no service for never is.
+        let unknown = secret_names(
+            &json!({"secrets":[{"type":"service", "scope":"imacs-gone", "name":"openai"},
+                               {"type":"service", "scope":"anthropic", "name":"sk-ant-oat01-SCOPED-private-value"}]}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(misfiled_text(&unknown.misfiled), "1 misfiled secret in scope anthropic");
+
+        // Doctor, against the fake sbx: Max's token-as-name in a scope named anthropic.
+        let dir = fixture();
+        let dir = dir.path();
+        std::fs::write(dir.join("misfiled-scoped"), "").unwrap();
+        let text = report(dir);
+        let line = line(&text, "sandbox secrets");
+        assert!(line.starts_with("✗ sandbox secrets: 1 misfiled secret in scope anthropic (warning)"), "{line}");
+        assert!(!text.contains("SCOPED-private"), "{text}");
+        std::fs::remove_file(dir.join("misfiled-scoped")).unwrap();
+        assert!(line_ok(&report(dir), "sandbox secrets filed under known services"));
+    }
+
+    fn line_ok(report: &str, label: &str) -> bool {
+        line(report, label).starts_with('✓')
     }
 
     #[test]

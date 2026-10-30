@@ -228,6 +228,22 @@ fn guided(
         consent(input, output, "Remove sbx's github secret so sandbox agents cannot push as you?")?;
         safe_sbx(program, &["secret", "rm", "github", "--force"], "could not remove github secret; retry setup")?;
     }
+    let misfiled = checks::secrets(program)
+        .ok_or_else(|| anyhow::anyhow!("cannot check known secret services; retry setup"))?
+        .misfiled;
+    if !misfiled.is_empty() {
+        consent(
+            input,
+            output,
+            &format!(
+                "Remove {} from sbx? Names stay hidden: they may hold a pasted credential.",
+                checks::misfiled_text(&misfiled)
+            ),
+        )?;
+        for secret in &misfiled {
+            safe_sbx(program, &secret.remove_args(), "could not remove a misfiled secret; retry setup")?;
+        }
+    }
     if config.ssh_agent {
         bail!("set [isolation.sandbox] ssh_agent = false, then rerun setup")
     }
@@ -403,7 +419,7 @@ mod tests {
         let mut output = Vec::new();
         let result = guided(sbx, keychain, &config, &mut answers.as_bytes(), &mut output, false);
         let output = String::from_utf8(output).unwrap();
-        for private in [CLAUDE, OPENAI, "sk-ant-MISFILED-private-value", "PRIVATE-keychain-error"] {
+        for private in [CLAUDE, OPENAI, "MISFILED-private", "SCOPED-private", "PRIVATE-keychain-error"] {
             assert!(!output.contains(private));
             if let Err(error) = &result {
                 assert!(!error.to_string().contains(private));
@@ -416,11 +432,12 @@ mod tests {
     fn fresh_mac_and_linux_setup_reaches_green_and_reruns_without_mutations() {
         for platform in [Platform::Mac, Platform::Linux] {
             let (dir, sbx, keychain) = machine(platform);
-            for marker in ["signed-out", "no-policy", "no-openai", "misfiled-secret"] {
+            for marker in ["signed-out", "no-policy", "no-openai", "misfiled-secret", "misfiled-scoped"] {
                 std::fs::write(dir.path().join(marker), "").unwrap();
             }
-            let answers = format!("y\ny\ny\n{CLAUDE}\ny\n{OPENAI}\ny\ny\n");
+            let answers = format!("y\ny\ny\n{CLAUDE}\ny\n{OPENAI}\ny\ny\ny\n");
             let (result, output) = run_setup(&sbx, &keychain, true, &answers);
+            assert!(output.contains("Remove 2 misfiled secrets in scope anthropic, global from sbx?"), "{output}");
             result.unwrap();
             assert!(
                 output.lines().filter(|l| l.starts_with('✓') || l.starts_with('✗')).all(|l| l.starts_with('✓')),
@@ -452,15 +469,30 @@ mod tests {
                 ["mcp", "add", "linear", "--url", "https://mcp.linear.app/mcp"]
             );
             assert_eq!(std::fs::read_to_string(dir.path().join("secret-stdin")).unwrap().trim(), OPENAI);
-            let logs = format!("{calls:?}{}", std::fs::read_to_string(dir.path().join("keychain-argv")).unwrap());
-            assert!(!logs.contains(CLAUDE) && !logs.contains(OPENAI) && !logs.contains("MISFILED"));
+            // A misfiled name goes from the listing to `sbx secret rm` only, never to output.
+            assert_eq!(
+                fake::calls_to(dir.path(), &["secret", "rm"])[1..],
+                [
+                    vec!["secret", "rm", "sk-ant-MISFILED-private-value", "--force"],
+                    vec!["secret", "rm", "sk-ant-oat01-SCOPED-private-value", "--sandbox", "anthropic", "--force"],
+                ]
+            );
+            assert!(!dir.path().join("misfiled-secret").exists() && !dir.path().join("misfiled-scoped").exists());
+            let others: Vec<_> = calls.iter().filter(|c| !c.starts_with(&["secret".into(), "rm".into()])).collect();
+            let logs = format!("{others:?}{}", std::fs::read_to_string(dir.path().join("keychain-argv")).unwrap());
+            assert!(
+                !logs.contains(CLAUDE)
+                    && !logs.contains(OPENAI)
+                    && !logs.contains("MISFILED")
+                    && !logs.contains("SCOPED")
+            );
             let before = calls.len();
             run_setup(&sbx, &keychain, true, "").0.unwrap();
-            assert!(
-                fake::calls(dir.path())[before..]
-                    .iter()
-                    .all(|c| matches!(c[0].as_str(), "version" | "diagnose") || c[1] == "ls" || c[1] == "get")
-            );
+            assert!(fake::calls(dir.path())[before..].iter().all(|c| matches!(
+                c[0].as_str(),
+                "version" | "diagnose" | "ls"
+            ) || c[1] == "ls"
+                || c[1] == "get"));
         }
     }
 
@@ -522,6 +554,24 @@ mod tests {
         assert!(ran.starts_with(r#"none=Some(["linear"]) plain=Some([]) work=Some(["linear"])"#), "{ran}");
         assert!(ran.contains(r#"["mcp", "add", "linear", "--url", "https://mcp.linear.app/mcp"]"#), "{ran}");
         assert!(ran.contains(r#"["mcp", "auth", "linear"]"#), "{ran}");
+    }
+
+    #[test]
+    fn misfiled_secrets_are_removed_only_with_consent_and_never_shown() {
+        let (dir, sbx, keychain) = machine(Platform::Mac);
+        keychain.store(CLAUDE).unwrap();
+        std::fs::write(dir.path().join("misfiled-scoped"), "").unwrap();
+        // Declining stops setup with the entry in place.
+        let (result, output) = run_setup(&sbx, &keychain, false, "y\nn\n");
+        assert!(result.is_err());
+        assert!(output.contains("Remove 1 misfiled secret in scope anthropic from sbx?"), "{output}");
+        assert!(dir.path().join("misfiled-scoped").exists());
+        assert_eq!(fake::calls_to(dir.path(), &["secret", "rm"]).len(), 1, "only the anthropic secret went");
+        // Rerun and agree: exactly that entry goes, and setup reaches green.
+        let (result, output) = run_setup(&sbx, &keychain, false, "y\n");
+        result.unwrap();
+        assert!(!dir.path().join("misfiled-scoped").exists());
+        assert!(output.contains("✓ sandbox secrets filed under known services and sandboxes"), "{output}");
     }
 
     #[test]

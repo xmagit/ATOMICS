@@ -69,7 +69,10 @@ again checks actual state and skips completed steps. Existing unlocked Claude ke
 entries and OpenAI secrets are reused. No progress file contains credentials. All token input
 is hidden on a terminal; pipes can supply newline-terminated answers and credentials over
 stdin. Tokens are never command arguments, printed output, logs, or IMACS configuration.
-Unknown secret names are ignored even if a token was accidentally filed in the NAME column.
+A token can end up filed as a secret's name, or a service name as its sandbox scope, as with
+`sbx secret set anthropic <token>`. Setup lists these misfiled secrets by count and scope only and,
+with your consent, removes each one, passing its name from sbx's listing straight to `sbx secret rm`
+without ever showing it.
 
 Setup verifies every sandbox check and finishes by running `imacs doctor`. Doctor and
 Settings → Sandbox show the same readiness checks, including the keychain lookup when the
@@ -94,8 +97,10 @@ balanced, allow-all or deny-all, and changed rules as custom. Review custom rule
 `sbx policy ls`. Checks never initialize or replace a policy or start an OAuth authorization flow.
 
 Credential checks report only known names: `anthropic`, the custom `CLAUDE_CODE_OAUTH_TOKEN`
-route, `openai`, and a warning for `github`. They discard unknown secret names and all raw
-credential-command errors: sbx can accidentally store a token in the NAME column. Do not paste
+route, `openai`, and a warning for `github`, counting global secrets only. A service secret under a
+name sbx has no service for, or in a scope that is not an existing sandbox, is a misfiled secret:
+doctor warns with their count and scopes, never their names, since sbx can store a token in the NAME
+column. Checks discard all raw credential-command errors. Do not paste
 `sbx secret ls` output into reports. A stored `github` credential can let agents push as you.
 SSH checks also warn about sbx's global `ssh.agentForwardingEnabled` and a fixed
 `ssh.agentSocketPath`, in addition to IMACS's `ssh_agent` setting. The runtime removes
