@@ -307,6 +307,9 @@ impl State {
     pub(super) fn branch_owners(&self, common: &Path, branch: &str) -> Vec<(usize, Option<&str>)> {
         let mut owners = Vec::new();
         for (index, plan) in self.plans.iter().enumerate() {
+            if plan.status == PlanStatus::Archived {
+                continue;
+            }
             let repo = plan.project.clone().or_else(|| plan.tasks.iter().find_map(|t| self.task_repo(index, t)));
             if plan.integration_branch() == branch
                 && repo.as_deref().is_some_and(|repo| git::common_dir(repo).is_ok_and(|dir| dir == common))
@@ -635,6 +638,48 @@ impl State {
 mod tests {
     use super::super::tests::{repository, request, session, with_app};
     use super::*;
+
+    #[test]
+    fn ctl_approval_survives_branch_edits_and_archives_release_branch_ownership() {
+        with_app(
+            "app::plans::tests::ctl_approval_survives_branch_edits_and_archives_release_branch_ownership",
+            |app, _| {
+                let (_dir, repo) = repository();
+                let created = request(
+                    app,
+                    json!({"cmd":"plan_set", "goal":"Approval", "integration":"shared",
+                "tasks":[{"id":"a", "title":"Implement", "repo":repo}]}),
+                );
+                let id = created.result["plan"].clone();
+                let index = app.runtime.plans.iter().position(|p| p.id == id).unwrap();
+                assert!(!app.runtime.plans[index].approved);
+                assert!(request(app, json!({"cmd":"plan_approve", "plan":id})).ok);
+                assert!(
+                    Plan::load(
+                        &paths::imacs_home().join("plans").join(format!("{}.json", app.runtime.plans[index].id))
+                    )
+                    .unwrap()
+                    .approved
+                );
+                let changed = request(
+                    app,
+                    json!({"cmd":"plan_set", "plan":id, "goal":"Approval", "integration":"renamed",
+                "tasks":[{"id":"a", "title":"Implement", "repo":repo, "branch":"worker"}]}),
+                );
+                assert_eq!(changed.result["approved"], true);
+                let common = git::common_dir(&repo).unwrap();
+                assert_eq!(app.runtime.branch_owners(&common, "renamed"), [(index, None)]);
+                app.runtime.config.cleanup.archived_plans = false;
+                assert!(request(app, json!({"cmd":"plan_close", "plan":id, "status":"archived"})).ok);
+                assert!(app.runtime.branch_owners(&common, "renamed").is_empty());
+                assert!(app.runtime.branch_owners(&common, "worker").is_empty());
+                assert!(
+                    !request(app, json!({"cmd":"plan_approve", "plan":id})).ok,
+                    "closed plans must be reopened explicitly"
+                );
+            },
+        );
+    }
 
     #[test]
     fn explicitly_reopened_plan_waits_for_fresh_lifecycle_progress() {
@@ -1180,6 +1225,7 @@ mod tests {
                     all_files: Arc::default(),
                 }));
                 app.runtime.finish_integration(Integrated {
+                    commit: None,
                     plan: "lifecycle".into(),
                     task: "code".into(),
                     branch: "code".into(),
@@ -1433,7 +1479,7 @@ mod tests {
                     app,
                     json!({
                         "cmd":"plan_set", "goal":"Compact replies", "tasks":[
-                            {"id":"a", "brief":brief},
+                            {"id":"a", "brief":brief, "branch":"task-a"},
                             {"id":"b", "depends_on":["a"]}
                         ]
                     }),
@@ -1467,6 +1513,7 @@ mod tests {
                 ] {
                     let (reply, received) = channel();
                     app.runtime.finish_integration(Integrated {
+                        commit: None,
                         plan: plan.as_str().unwrap().into(),
                         task: "a".into(),
                         branch: "task-a".into(),
@@ -1739,6 +1786,7 @@ mod tests {
                 app.runtime.integrating.insert((first_id.clone(), "a".into()));
                 app.runtime.integrating.insert((second_id.clone(), "a".into()));
                 app.runtime.finish_integration(Integrated {
+                    commit: None,
                     plan: first_id.clone(),
                     task: "a".into(),
                     branch: "first".into(),

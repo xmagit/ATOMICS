@@ -43,6 +43,7 @@ impl State {
                 Some(Some(id.as_str()))
             }
             ControlRequest::PlanUpdate { plan, .. }
+            | ControlRequest::PlanApprove { plan }
             | ControlRequest::PlanDispatch { plan, .. }
             | ControlRequest::PlanIntegrate { plan, .. }
             | ControlRequest::TicketLink { plan, .. }
@@ -209,22 +210,30 @@ impl State {
                 let unknown = self.plans[index].unknown_dependencies();
                 self.toast(if new {
                     "New plan: review and approve it on the plan board"
+                } else if self.plans[index].approved {
+                    "Plan updated: approval kept"
                 } else {
                     "Plan updated: review and approve it on its board"
                 });
                 done(ControlResponse::ok(json!({
                     "plan": self.plans[index].id,
                     "tasks": self.plans[index].tasks.len(),
-                    "approved": false,
+                    "approved": self.plans[index].approved,
                     "integration": self.plans[index].integration_branch(),
                     "unknown_dependencies": unknown,
-                    "next": "The user reviews and approves the plan on the board; then call plan_dispatch.",
+                    "next": if self.plans[index].approved { "Call plan_dispatch to start ready tasks." }
+                        else { "The user reviews and approves the plan on the board; then call plan_dispatch." },
                 })))
             }
             ControlRequest::PlanClose { plan: _, status } => match self.close_plan(target, status) {
                 Ok(()) => done(ControlResponse::ok(self.plan_mutation_json(target, None))),
                 Err(err) => done(ControlResponse::error(err)),
             },
+            ControlRequest::PlanApprove { .. } => {
+                self.plans[target].approved = true;
+                self.save_plan(target);
+                done(ControlResponse::ok(self.plan_json(target)))
+            }
             ControlRequest::PlanGet { plan: None } => done(ControlResponse::ok(json!({
                 "plans": self.plans.iter().filter(|p| p.is_open()).map(Plan::summary).collect::<Vec<_>>()
             }))),

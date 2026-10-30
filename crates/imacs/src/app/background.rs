@@ -202,10 +202,21 @@ impl State {
         for session in &mut self.sessions {
             if session.terminal.as_ref().is_some_and(Terminal::exited) {
                 // A sandbox stops once its agent exits; the next `sbx run` starts it again.
-                if session.status != AgentStatus::Exited {
+                let credential_error = session
+                    .sandbox
+                    .as_ref()
+                    .and(session.terminal.as_ref())
+                    .and_then(|t| super::sessions::credential_failure(&t.screen_text(60)));
+                if session.status != AgentStatus::Exited
+                    && !(session.status == AgentStatus::NeedsInput && credential_error.is_some())
+                {
                     idle.extend(session.sandbox.clone());
                 }
-                session.status = AgentStatus::Exited;
+                if credential_error.is_some() {
+                    session.status = AgentStatus::NeedsInput;
+                } else {
+                    session.status = AgentStatus::Exited;
+                }
             }
             if let Some(title) = session.terminal.as_ref().and_then(|t| t.shared.title.lock().unwrap().take())
                 && session.kind == AgentKind::Shell
@@ -227,7 +238,7 @@ impl State {
         for name in idle {
             self.stop_sandbox(name);
         }
-        let names = self.sessions.iter().filter_map(|s| s.sandbox.clone()).collect();
+        let names = self.sessions.iter().filter_map(|s| Some((s.sandbox.clone()?, s.root()))).collect();
         changed |= self.sandbox_usage.poll(names, ctx);
         // Only sandboxes with an attached agent are running; `sbx exec` would start a stopped one.
         let live = self

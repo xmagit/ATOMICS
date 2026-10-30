@@ -122,7 +122,24 @@ pub fn sweep_before(home: &Path, config: &Config, sbx: &str, before: std::time::
     let records: Vec<_> = store.sessions.iter().chain(store.restart.iter().flat_map(|r| r.sessions.iter())).collect();
     let mut sessions: HashSet<String> =
         records.iter().flat_map(|r| [r.pane.clone(), Some(r.claude_session_id.clone())]).flatten().collect();
-    sessions.extend(plans.iter().flat_map(|p| p.tasks.iter()).filter_map(|t| t.session.clone()));
+    // History records are resumable, but a closed plan's generated brief is no longer
+    // needed. A restart handoff can still own it while an agent is being restored.
+    for task in plans.iter().filter(|p| !p.is_open()).flat_map(|p| &p.tasks) {
+        if let Some(id) = &task.session {
+            sessions.remove(id);
+        }
+        if let Some(id) = &task.resume_id {
+            sessions.remove(id);
+        }
+    }
+    sessions.extend(
+        store
+            .restart
+            .iter()
+            .flat_map(|r| &r.sessions)
+            .flat_map(|r| [r.pane.clone(), Some(r.claude_session_id.clone())].into_iter().flatten()),
+    );
+    sessions.extend(plans.iter().filter(|p| p.is_open()).flat_map(|p| &p.tasks).filter_map(|t| t.session.clone()));
     let sandboxes: HashSet<_> = records
         .iter()
         .filter_map(|r| r.sandbox.clone())
@@ -170,7 +187,7 @@ pub fn sweep_before(home: &Path, config: &Config, sbx: &str, before: std::time::
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
             let id = name.strip_suffix(".md").unwrap_or(&name);
-            if sessions.contains(id) || sandboxes.contains(&format!("imacs-{id}")) {
+            if sessions.contains(id) {
                 continue;
             }
             let result =
@@ -431,6 +448,50 @@ mod tests {
         assert!(bin.join("sandboxes/imacs-starting").exists() && bin.join("mcp/imacs-starting").exists());
         assert!(home.join("briefs/starting.md").exists());
         assert!(fake::calls_to(&bin, &["rm"]).is_empty());
+    }
+
+    #[test]
+    fn closed_plan_briefs_are_pruned_even_while_sessions_remain_in_history() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let home = dir.path();
+        let mut plan = Plan {
+            id: "closed".into(),
+            status: PlanStatus::Completed,
+            tasks: vec![Task { id: "task".into(), session: Some("pane".into()), ..Default::default() }],
+            ..Default::default()
+        };
+        plan.save_in(home).unwrap();
+        let record = SessionRecord {
+            chief: false,
+            pane: Some("pane".into()),
+            claude_session_id: "conversation".into(),
+            agent: "claude".into(),
+            cwd: home.into(),
+            title: "task".into(),
+            last_prompt: None,
+            updated: 0,
+            sandbox: Some("imacs-pane".into()),
+            named: false,
+        };
+        let store = Store { sessions: vec![record], ..Default::default() };
+        store.save(&home.join("sessions.json")).unwrap();
+        let brief = home.join("briefs/pane/brief.md");
+        std::fs::create_dir_all(brief.parent().unwrap()).unwrap();
+        std::fs::write(&brief, "old brief").unwrap();
+        // Open tasks retain their input even when there is no live terminal.
+        plan.status = PlanStatus::Open;
+        plan.save_in(home).unwrap();
+        assert!(sweep(home, &Config::default(), "/missing/sbx").unwrap().is_empty());
+        assert!(brief.exists());
+        for status in [PlanStatus::Completed, PlanStatus::Archived] {
+            plan.status = status;
+            plan.save_in(home).unwrap();
+            std::fs::write(&brief, "old brief").unwrap();
+            assert!(sweep(home, &Config::default(), "/missing/sbx").unwrap().is_empty());
+            assert!(!brief.exists());
+            assert_eq!(Store::load(&home.join("sessions.json")).sessions.len(), 1);
+            std::fs::create_dir_all(brief.parent().unwrap()).unwrap();
+        }
     }
 
     #[test]

@@ -1045,17 +1045,18 @@ pub(crate) mod tests {
         use std::os::unix::fs::{MetadataExt, symlink};
 
         // The Linux harness can repeat this test on ext4, btrfs and XFS mounts.
-        let owned = crate::test_support::tempdir().unwrap();
-        let mounted = std::env::var_os("IMACS_COW_TEST_DIR").map(|parent| tempfile::tempdir_in(parent).unwrap());
-        let dir = mounted.as_ref().map_or(owned.path(), |dir| dir.path());
-        let source = dir.join("source");
-        let destination = dir.join("cache");
+        let dir = match std::env::var_os("IMACS_COW_TEST_DIR") {
+            Some(parent) => crate::test_support::tempdir_in(parent).unwrap(),
+            None => crate::test_support::tempdir().unwrap(),
+        };
+        let source = dir.path().join("source");
+        let destination = dir.path().join("cache");
         std::fs::create_dir_all(source.join("nested")).unwrap();
         std::fs::write(source.join("nested/data"), vec![b'+'; 8192]).unwrap();
         symlink("nested/data", source.join("link")).unwrap();
-        let supported = probe_cache_clone(&source, dir).unwrap();
+        let supported = probe_cache_clone(&source, dir.path()).unwrap();
         assert_eq!(clone_directory(&source, &destination), supported);
-        println!("Linux native cache clone supported on {}: {supported}", dir.display());
+        println!("Linux native cache clone supported on {}: {supported}", dir.path().display());
         if supported {
             assert_eq!(std::fs::read(destination.join("nested/data")).unwrap(), vec![b'+'; 8192]);
             assert_eq!(std::fs::read_link(destination.join("link")).unwrap(), Path::new("nested/data"));
@@ -1067,7 +1068,11 @@ pub(crate) mod tests {
             assert_eq!(std::fs::read(source.join("nested/data")).unwrap(), vec![b'+'; 8192]);
         } else {
             assert!(!destination.exists());
-            assert_eq!(std::fs::read_dir(dir).unwrap().count(), 1, "failed clones must leave no staging directory");
+            assert_eq!(
+                std::fs::read_dir(dir.path()).unwrap().count(),
+                1,
+                "failed clones must leave no staging directory"
+            );
         }
     }
 

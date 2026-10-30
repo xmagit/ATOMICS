@@ -249,6 +249,7 @@ struct PreparedWorktree {
 
 /// A finished plan integration, to note on its task and answer.
 struct Integrated {
+    commit: Option<String>,
     plan: String,
     task: String,
     branch: String,
@@ -258,6 +259,7 @@ struct Integrated {
 }
 
 struct CheckedIntegration {
+    commit: Option<String>,
     revision: u64,
     plan: String,
     task: Task,
