@@ -512,7 +512,7 @@ fn dispatch_requires_integrated_dependencies(app: &mut Desktop<'_>) {
         id: plan_id,
         approved: true,
         tasks: vec![
-            Task { id: "a".into(), status: TaskStatus::Done, ..Task::default() },
+            Task { id: "a".into(), branch: Some("task-a".into()), status: TaskStatus::Done, ..Task::default() },
             Task { id: "b".into(), depends_on: vec!["a".into()], ..Task::default() },
         ],
         ..Plan::default()
