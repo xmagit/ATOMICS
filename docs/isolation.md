@@ -765,15 +765,19 @@ tests there, in a worktree that starts from the integration branch.
     `fetch --prune` (`refs/remotes/` and `refs/tags/`), at the values IMACS left;
   - a branch you moved in a checkout on this machine (commit, amend, pull, merge, rebase, reset, cherry-pick,
     `git switch -c`), at the commit that checkout's HEAD log says it left it at. That is the main
-    checkout or any linked worktree no sandbox works in, also after switching away from the branch;
+    checkout (only its currently checked-out branch), or a linked worktree no sandbox works in,
+    including branches switched away from in that linked worktree;
   - remote-tracking refs and tags at an object a fetch or pull on this machine wrote to its
     `FETCH_HEAD`, and those such a fetch may have pruned;
   - `refs/stash`, which every checkout shares, at whatever it is: it is never restored.
 
   These traces are in git folders no sandbox mounts, so an agent cannot leave them, with one exception:
-  the main checkout's HEAD log is in the shared `logs` folder. An agent that writes it on purpose can pass
-  a move of any branch as yours, not only of the branch checked out there: forged entries can say the
-  main checkout had that branch checked out when it moved it. Otherwise you would lose your own commits. A
+  the main checkout's HEAD log is in the shared `logs` folder. A check trusts that shared log only for the
+  branch the host-only main `HEAD` names now, stopping at the latest checkout entry. It cannot attribute
+  older moves to other branches from shared checkout messages. Future-dated entries are ignored. A
+  forged log can still vouch for the branch currently checked out on main: this remains recovery, not
+  proof of its writer. If you commit on main and then switch away before the check, that old branch
+  move has no trusted trace and may be restored. A
   branch you create other than by switching to it (`git branch x`), delete, or move while no checkout
   here has it checked out (`git branch -f`, `git update-ref`) leaves no such trace and is put back like
   an agent's, as is a fetch with `--no-write-fetch-head`. So, for now, is the remote-tracking ref your own

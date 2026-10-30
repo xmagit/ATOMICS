@@ -204,22 +204,23 @@ impl HostLeft {
             .filter_map(|pins| pins.git_dir)
             .collect();
         let mut host = Self::default();
-        host.read_checkout(common, &common.join("logs/HEAD"), since);
+        host.read_checkout(common, &common.join("logs/HEAD"), since, false);
         let Ok(entries) = std::fs::read_dir(common.join("worktrees")) else { return host };
         for entry in entries.flatten() {
             let folder = entry.path();
             let real = folder.canonicalize().unwrap_or_else(|_| folder.clone());
             if entry.file_type().is_ok_and(|kind| kind.is_dir()) && own != Some(&real) && !sandboxed.contains(&real) {
-                host.read_checkout(&folder, &folder.join("logs/HEAD"), since);
+                host.read_checkout(&folder, &folder.join("logs/HEAD"), since, true);
             }
         }
         host
     }
 
     /// One checkout's traces since `since`: the git `folder` it writes and its HEAD `log`.
-    fn read_checkout(&mut self, folder: &Path, log: &Path, since: u64) {
+    fn read_checkout(&mut self, folder: &Path, log: &Path, since: u64, private_log: bool) {
         if let Some((bytes, modified)) = read_trace(&folder.join("FETCH_HEAD"))
             && modified >= since
+            && modified <= now()
         {
             self.fetch = true;
             let text = String::from_utf8_lossy(&bytes);
@@ -228,7 +229,12 @@ impl HostLeft {
         }
         let Some((bytes, _)) = read_trace(log) else { return };
         let text = String::from_utf8_lossy(&bytes);
-        let entries: Vec<_> = text.lines().filter_map(LogEntry::parse).filter(|entry| entry.time >= since).collect();
+        let until = now();
+        let entries: Vec<_> = text
+            .lines()
+            .filter_map(LogEntry::parse)
+            .filter(|entry| entry.time >= since && entry.time <= until)
+            .collect();
         // Newest first, from the branch HEAD is on now: before a switch, HEAD was on the branch it left.
         let mut branch = read_trace(&folder.join("HEAD"))
             .and_then(|(bytes, _)| String::from_utf8(bytes).ok()?.trim().strip_prefix("ref: ").map(str::to_string));
@@ -237,6 +243,11 @@ impl HostLeft {
             match entry.message.strip_prefix("checkout: moving from ").and_then(|rest| rest.split_once(" to ")) {
                 Some((from, _)) => {
                     self.switched.extend(branch.take().map(|to| (to, entry.new.clone())));
+                    // The main HEAD is host-only, but its log is shared with sandboxes.
+                    // A checkout message there cannot vouch for a different branch.
+                    if !private_log {
+                        break;
+                    }
                     branch = Some(format!("refs/heads/{from}"));
                 }
                 // An entry that leaves HEAD where it was, such as a stash's reset, vouches for nothing:
@@ -660,6 +671,29 @@ fn update_refs(cwd: &Path, operations: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn shared_head_log_cannot_reattribute_other_branches_or_vouch_for_future_moves() {
+        for future in [false, true] {
+            let (dir, repo, worktree) = repository();
+            git::git(&repo, &["branch", "victim"]).unwrap();
+            let mut guard = RefGuard::open(&worktree, dir.path().join("snapshot.json")).unwrap().unwrap();
+            let initial = git::git(&repo, &["rev-parse", "main"]).unwrap().trim().to_string();
+            git::git(&worktree, &["commit", "--allow-empty", "-qm", "injected"]).unwrap();
+            let injected = git::git(&worktree, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+            let branch = if future { "main" } else { "victim" };
+            git::git(&worktree, &["update-ref", &format!("refs/heads/{branch}"), &injected]).unwrap();
+            let time = now() + if future { 3600 } else { 0 };
+            let mut forged = format!("{initial} {injected} Agent <agent@example.org> {time} +0000\tcommit: forged\n");
+            if !future {
+                forged.push_str(&format!("{injected} {initial} Agent <agent@example.org> {time} +0000\tcheckout: moving from victim to main\n"));
+            }
+            std::fs::write(repo.join(".git/logs/HEAD"), forged).unwrap();
+            let alerts = guard.check(&Default::default(), &Default::default()).unwrap();
+            assert!(alerts.iter().any(|a| a.contains(&format!("Restored refs/heads/{branch}"))), "{alerts:?}");
+            assert_eq!(git::git(&repo, &["rev-parse", branch]).unwrap().trim(), initial);
+        }
+    }
+
     fn repository() -> (crate::test_support::TempDir, PathBuf, PathBuf) {
         let dir = crate::test_support::tempdir().unwrap();
         let repo = dir.path().join("repo");
@@ -749,7 +783,7 @@ mod tests {
         // ...while you commit on main, switch away, fetch and stash in your checkout.
         git::git(&repo, &["commit", "--allow-empty", "-qm", "mine"]).unwrap();
         let mine = git::git(&repo, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
-        git::git(&repo, &["switch", "-qc", "later"]).unwrap();
+        git::add_worktree(&repo, &dir.path().join("host"), "later", "main").unwrap();
         git::git(&repo, &["fetch", "-q", "origin"]).unwrap();
         std::fs::write(repo.join("scratch"), "work in progress").unwrap();
         git::git(&repo, &["add", "scratch"]).unwrap();
