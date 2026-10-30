@@ -973,10 +973,11 @@ impl State {
     fn begin_startup_cleanup(&mut self) {
         let (home, config, sbx, actions) =
             (paths::imacs_home(), self.config.clone(), self.sbx.clone(), self.action_tx.clone());
-        let before = SystemTime::now();
+        // Before the sweep thread and restored agents start, so nothing they create is a candidate.
+        let cutoff = crate::lifecycle::Cutoff::mark(&home);
         self.startup_cleanup = Some(std::thread::spawn(move || {
             let sbx = resolve_program(&sbx);
-            let notes = match crate::lifecycle::sweep_before(&home, &config, &sbx, before) {
+            let notes = match cutoff.and_then(|cutoff| crate::lifecycle::sweep_before(&home, &config, &sbx, cutoff)) {
                 Ok(notes) => notes,
                 Err(err) => vec![format!("Startup cleanup skipped: {err:#}")],
             };
