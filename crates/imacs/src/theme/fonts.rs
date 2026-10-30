@@ -126,7 +126,7 @@ mod tests {
 
     #[test]
     fn font_files_go_in_front_and_missing_fonts_keep_egui_defaults() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let defaults = FontDefinitions::default();
         let hack = defaults.font_data["Hack"].bytes().to_vec();
         let file = dir.path().join("mono.ttf");

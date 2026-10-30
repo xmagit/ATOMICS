@@ -85,7 +85,7 @@ mod tests {
 
     #[test]
     fn a_start_without_an_exit_is_reported_once() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         assert_eq!(started(dir.path()), None, "a first run has nothing to report");
         exited(dir.path());
         assert_eq!(started(dir.path()), None, "a clean exit is not reported");
@@ -98,7 +98,7 @@ mod tests {
 
     #[test]
     fn a_start_of_a_process_that_still_runs_is_not_a_crash() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let mut other = std::process::Command::new("sleep").arg("30").spawn().unwrap();
         append(dir.path(), &format!("start {}", other.id()));
         assert_eq!(started(dir.path()), None, "a running instance is not a crash");
@@ -117,7 +117,7 @@ mod tests {
             assert!(worker.join().is_err());
             return;
         }
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let output = crate::test_support::output(
             std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "crash::tests::panics_are_logged_with_their_thread", "--nocapture"])
@@ -130,7 +130,7 @@ mod tests {
 
     #[test]
     fn the_log_is_trimmed_to_its_newest_half() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         // Multi-byte characters everywhere, so a cut in the middle of one would panic.
         let line = "é→".repeat(256);
         for _ in 0..300 {

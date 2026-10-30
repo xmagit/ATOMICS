@@ -7,9 +7,12 @@
 #   no-policy    `diagnose` reports the global network policy as not set up
 #   fail-<verb>  that verb fails, e.g. fail-create
 #   run-waits    `run` keeps the agent attached instead of exiting at once
+#   wait-<verb> pause that verb until the file is removed; waiting-<verb> signals readiness
+#   wait-agent pause run after attachment, before checking for the optional agent hook
 dir=${0%/*}
 state="$dir/sandboxes"
 mkdir -p "$state"
+mkdir -p "$dir/mcp"
 line=
 for arg in "$@"; do
   line="$line${line:+	}$arg"
@@ -19,7 +22,26 @@ if [ -e "$dir/fail-$1" ]; then
   echo "fake $1 failure" >&2
   exit 1
 fi
+if [ -e "$dir/wait-$1" ]; then
+  : > "$dir/waiting-$1"
+  while [ -e "$dir/wait-$1" ]; do sleep 0.01; done
+fi
 case "$1" in
+  mcp)
+    case "$2" in
+      add) printf '%s\n' "$*" > "$dir/mcp/$3" ;;
+      ls) for file in "$dir/mcp"/*; do [ ! -f "$file" ] || printf '%s\n' "${file##*/}"; done ;;
+      rm) for arg in "$@"; do
+        case "$arg" in mcp|rm|-*) ;; *) rm -f "$dir/mcp/$arg" ;; esac
+      done ;;
+    esac
+    ;;
+  stop)
+    if [ -f "$state/$2" ]; then
+      sed 's/"status":"running"/"status":"stopped"/' "$state/$2" > "$state/$2.$$.tmp"
+      mv "$state/$2.$$.tmp" "$state/$2"
+    fi
+    ;;
   version)
     printf 'sbx version %s 0123abcd\n' "$(cat "$dir/version" 2>/dev/null || echo v0.50.1)"
     ;;
@@ -39,6 +61,7 @@ case "$1" in
     printf '['
     sep=
     for file in "$state"/*; do
+      case "$file" in *.tmp) continue ;; esac
       [ -e "$file" ] || continue
       printf '%s%s' "$sep" "$(cat "$file")"
       sep=,
@@ -63,7 +86,8 @@ case "$1" in
       workspaces="$workspaces${workspaces:+,}\"$path\""
     done
     printf '{"name":"%s","agent":"%s","status":"running","workspaces":[%s]}' "$name" "$agent" "$workspaces" \
-      > "$state/$name"
+      > "$state/$name.$$.tmp"
+    mv "$state/$name.$$.tmp" "$state/$name"
     ;;
   rm)
     for arg in "$@"; do
@@ -74,8 +98,13 @@ case "$1" in
     done
     ;;
   run)
-    printf '%s\n' "${SSH_AUTH_SOCK-unset}" > "$dir/run-ssh"
+    printf '%s\n' "${SSH_AUTH_SOCK-unset}" > "$dir/run-ssh.$$.tmp"
+    mv "$dir/run-ssh.$$.tmp" "$dir/run-ssh"
     printf 'attached to %s\n' "$3"
+    if [ -e "$dir/wait-agent" ]; then
+      : > "$dir/waiting-agent"
+      while [ -e "$dir/wait-agent" ]; do sleep 0.01; done
+    fi
     # A stand-in agent runs in the mounted worktree, with the same arguments.
     if [ -f "$dir/agent" ]; then
       name=$3
@@ -84,7 +113,7 @@ case "$1" in
       exec /bin/sh "$dir/agent" "$@"
     fi
     if [ -e "$dir/run-waits" ]; then
-      exec sleep 30
+      exec sleep 600
     fi
     ;;
 esac

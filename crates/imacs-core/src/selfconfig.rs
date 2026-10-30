@@ -1289,7 +1289,7 @@ children = [{ auth = { header = "object-secret" }, label = "public" }]
     #[test]
     fn writing_checks_the_file_backs_it_up_and_keeps_its_mode_and_link() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let file = dir.path().join("config.toml");
         std::fs::write(&file, "a = 1\n").unwrap();
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();

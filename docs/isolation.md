@@ -121,7 +121,28 @@ It needs this machine's tools: `imacs ctl`, git across repositories, builds and 
 5. **Cleanup.** Removing a worktree in the cleanup dialog, or a completed plan's worktrees in plan
    cleanup, also removes its sandboxes (`sbx rm`) and IMACS's MCP registration for each. The worktree
    cleanup dialog also lists **sandboxes whose worktree is gone**, so you can remove orphans. IMACS only
-   lists and removes sandboxes whose names start with `imacs-`.
+   lists and removes only sandboxes recorded in this home's `sandbox-ownership.json`. Quitting waits for sandbox preparation
+   and stop jobs to finish; stopped sandboxes remain available for resume.
+
+Completed plans automatically remove their clean task worktrees and delete task branches contained in
+the integration branch, using `git branch -d`. Archiving removes clean task worktrees and keeps their
+branches. Integration worktrees stay available. Both behaviors can be disabled independently:
+
+```toml
+[cleanup]
+completed_plans = true
+archived_plans = true
+```
+
+Dirty worktrees, main checkouts, and worktrees used by another session are kept. If
+`[plan] close_done_agents = false`, running task sessions also prevent automatic worktree removal.
+Startup runs cleanup in the background. It removes orphaned sandboxes and MCP registrations without
+session records only when this `IMACS_HOME` recorded their creation in its ownership ledger. Other
+homes' resources and unknown `imacs-*` names are left alone, including resources from before the ledger
+existed; IMACS refuses to attach to an unowned sandbox. The sweep also removes stale briefs, unused warm worktrees, and cache clone stages older than
+a day. Resources created after startup began are left for a later sweep. Unreadable ownership records
+stop the sweep. Cleanup failures appear in the toast, `imacs doctor`, and the Clean up… dialog. On macOS, doctor
+also checks Spotlight indexing and explains how to exclude project and worktree folders.
 
 ## What a sandbox sees
 

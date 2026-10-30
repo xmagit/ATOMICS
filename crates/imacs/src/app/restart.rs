@@ -32,6 +32,12 @@ impl State {
                 self.creating.iter().map(|(_, branch, _)| branch.as_str()).collect::<Vec<_>>().join(", ")
             ));
         }
+        if self.lifecycle_jobs.iter().any(|job| !job.is_finished()) {
+            blockers.push("session or plan cleanup running".into());
+        }
+        if self.startup_cleanup.as_ref().is_some_and(|job| !job.is_finished()) {
+            blockers.push("startup cleanup running".into());
+        }
         if !self.integrating.is_empty() || !self.integration_checks.is_empty() {
             blockers.push("integration running".into());
         }

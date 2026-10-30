@@ -201,8 +201,8 @@ fn restore(cwd: &Path, name: &str, before: Option<&RefValue>, after: Option<&Ref
 mod tests {
     use super::*;
 
-    fn repository() -> (tempfile::TempDir, PathBuf, PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
+    fn repository() -> (crate::test_support::TempDir, PathBuf, PathBuf) {
+        let dir = crate::test_support::tempdir().unwrap();
         let repo = dir.path().join("repo");
         let worktree = dir.path().join("task");
         std::fs::create_dir(&repo).unwrap();

@@ -4,7 +4,7 @@ impl State {
     // ── background events ─────────────────────────────────────────────────
 
     pub(crate) fn runtime_tick(&mut self, ctx: &egui::Context) -> bool {
-        if self.restarting {
+        if self.restarting || self.shutting_down {
             return false;
         }
         let before = self.runtime_view_revision();
@@ -75,7 +75,14 @@ impl State {
                 continue;
             }
             let id = launch.id.clone();
+            let name = match &launch.runtime {
+                AgentRuntime::Sandbox(sandbox) => Some(sandbox.name.clone()),
+                AgentRuntime::Bare => None,
+            };
             if let Err(error) = result.and_then(|()| self.launch_agent(ctx, launch, None)) {
+                if let Some(name) = name {
+                    self.stop_sandbox(name);
+                }
                 self.launch_failed(&id, error);
             }
         }
@@ -88,6 +95,18 @@ impl State {
             self.worktrees_at = None;
             if let Some(i) = self.creating.iter().position(|(repo, b, _)| *repo == common && *b == branch) {
                 self.creating.remove(i);
+            }
+            if let Some((plan_id, task_id)) = &launch.task
+                && let Some(index) = self.plans.iter().position(|p| &p.id == plan_id && !p.is_open())
+            {
+                if let Ok(prepared) = &result
+                    && let Some(task) = self.plans[index].task_mut(task_id)
+                {
+                    task.worktree = Some(prepared.path.clone());
+                    self.save_plan(index);
+                }
+                self.cleanup_closed_plan(index);
+                continue;
             }
             let background = launch
                 .task
@@ -827,7 +846,7 @@ mod tests {
         with_app(
             "app::background::tests::watcher_retries_missing_roots_and_receives_events_under_symlinked_parents",
             |app, ctx| {
-                let dir = tempfile::tempdir().unwrap();
+                let dir = crate::test_support::tempdir().unwrap();
                 let real = dir.path().join("real");
                 std::fs::create_dir(&real).unwrap();
                 let alias = dir.path().join("alias");

@@ -7,7 +7,7 @@ use std::process::Command;
 
 #[test]
 fn doctor_checks_real_inputs_and_only_requires_git_and_valid_config() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_support::tempdir().unwrap();
     let bin = dir.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
     let shell = dir.path().join("shell");

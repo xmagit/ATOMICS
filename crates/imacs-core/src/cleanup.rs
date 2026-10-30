@@ -110,6 +110,81 @@ pub fn remove(plan: &Plan, base_ref: &str, entry: &Entry) -> Result<()> {
     Ok(())
 }
 
+/// Task cleanup on close deliberately keeps the integration checkout and every unmerged branch.
+/// Archive removes only worktrees. Resolve branches from git rather than trusting saved paths.
+pub fn closed_tasks(plan: &Plan) -> Result<Vec<Entry>> {
+    ensure!(plan.status != PlanStatus::Open, "Plan is still open");
+    let mut entries = Vec::new();
+    for task in &plan.tasks {
+        let Some(branch) = &task.branch else { continue };
+        if branch == &plan.integration_branch() {
+            continue;
+        }
+        let repo = task.repo.as_deref().map(crate::paths::expand).or_else(|| plan.project.clone());
+        let repo = repo.ok_or_else(|| anyhow::anyhow!("No repository for task {}", task.id))?;
+        let trees = git::list_worktrees(&repo)?;
+        let main = trees.first().ok_or_else(|| anyhow::anyhow!("No main checkout"))?;
+        git::check_branch_name(&repo, branch, "__imacs_cleanup__")?;
+        let reference = format!("refs/heads/{branch}");
+        let Ok(tip) = git::git(&repo, &["rev-parse", "--verify", &reference]) else { continue };
+        let worktree = trees.iter().find(|tree| tree.branch.as_ref() == Some(branch));
+        let entry = Entry {
+            repo: main.path.clone(),
+            branch: branch.clone(),
+            worktree: worktree.map(|tree| tree.path.clone()),
+            keep: worktree.filter(|tree| tree.path == main.path).map(|_| "main checkout".into()),
+            tip: tip.trim().into(),
+        };
+        if !entries.contains(&entry) {
+            entries.push(entry);
+        }
+    }
+    Ok(entries)
+}
+
+/// Returns whether the branch was deleted. A successful worktree removal may retain its branch.
+pub fn remove_closed_task(plan: &Plan, entry: &Entry) -> Result<bool> {
+    let current = closed_tasks(plan)?
+        .into_iter()
+        .find(|row| row.repo == entry.repo && row.branch == entry.branch)
+        .ok_or_else(|| anyhow::anyhow!("Task branch no longer exists"))?;
+    ensure!(current == *entry, "branch or worktree changed since preview");
+    ensure!(entry.keep.is_none(), "main checkout is protected");
+    if let Some(path) = &entry.worktree {
+        ensure!(
+            git::git(path, &["status", "--porcelain", "--untracked-files=all"])?.is_empty(),
+            "uncommitted changes in {}",
+            path.display()
+        );
+        git::remove_worktree(&entry.repo, path, None, false)?;
+    }
+    if plan.status == PlanStatus::Archived {
+        return Ok(false);
+    }
+    let integration = format!("refs/heads/{}", plan.integration_branch());
+    if git::git(&entry.repo, &["merge-base", "--is-ancestor", &format!("refs/heads/{}", entry.branch), &integration])
+        .is_err()
+    {
+        return Ok(false);
+    }
+    // Give branch -d the integration branch as its temporary upstream. Never force deletion,
+    // and never depend on the user's current checkout or the task's original upstream.
+    git::git(
+        &entry.repo,
+        &[
+            "-c",
+            &format!("branch.{}.remote=.", entry.branch),
+            "-c",
+            &format!("branch.{}.merge={integration}", entry.branch),
+            "branch",
+            "-d",
+            "--",
+            &entry.branch,
+        ],
+    )?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,13 +211,57 @@ mod tests {
     }
 
     #[test]
+    fn closing_plans_removes_clean_tasks_deletes_only_merged_branches_and_archive_keeps_branches() {
+        for status in [PlanStatus::Completed, PlanStatus::Archived] {
+            let (_dir, repo) = git::tests::project();
+            let mut plan = plan(&repo, &["merged", "unmerged", "dirty"]);
+            plan.status = status;
+            let merged = worktree(&repo, "merged");
+            let unmerged = worktree(&repo, "unmerged");
+            let dirty = worktree(&repo, "dirty");
+            let integration = worktree(&repo, &plan.integration_branch());
+            commit(&merged, "merged-file");
+            git::merge(&integration, "merged").unwrap();
+            commit(&unmerged, "unmerged-file");
+            std::fs::write(dirty.join("keep"), "dirty").unwrap();
+            for entry in closed_tasks(&plan).unwrap() {
+                let result = remove_closed_task(&plan, &entry);
+                if entry.branch == "dirty" {
+                    assert!(result.is_err());
+                } else {
+                    assert_eq!(result.unwrap(), status == PlanStatus::Completed && entry.branch == "merged");
+                }
+            }
+            assert!(!merged.exists() && !unmerged.exists());
+            assert!(dirty.join("keep").exists() && integration.exists());
+            let branches = git::git(&repo, &["branch", "--format=%(refname:short)"]).unwrap();
+            assert_eq!(branches.lines().any(|b| b == "merged"), status == PlanStatus::Archived);
+            assert!(branches.lines().any(|b| b == "unmerged"));
+        }
+    }
+
+    #[test]
+    fn closing_plan_cleanup_rechecks_worktree_identity_and_new_dirt() {
+        let (_dir, repo) = git::tests::project();
+        let plan = plan(&repo, &["task"]);
+        let path = worktree(&repo, "task");
+        let entry = closed_tasks(&plan).unwrap().remove(0);
+        std::fs::write(path.join("new-work"), "keep").unwrap();
+        assert!(remove_closed_task(&plan, &entry).is_err());
+        std::fs::remove_file(path.join("new-work")).unwrap();
+        git::git(&path, &["checkout", "-b", "other"]).unwrap();
+        assert!(remove_closed_task(&plan, &entry).is_err());
+        assert!(path.exists());
+    }
+
+    #[test]
     fn branch_config_cleanup_is_independent_of_git_language() {
         use std::os::unix::fs::PermissionsExt;
         use std::process::Command;
 
         const CHILD: &str = "IMACS_CLEANUP_TEST_CHILD";
         if std::env::var_os(CHILD).is_none() {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_support::tempdir().unwrap();
             let real_git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
                 .map(|path| path.join("git"))
                 .find(|path| path.is_file())

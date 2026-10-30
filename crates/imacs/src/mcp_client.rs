@@ -495,7 +495,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_fixture_older_than_its_source_is_stale() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let (binary, source) = (dir.path().join("fake_ticket_server"), dir.path().join("fake_ticket_server.rs"));
         std::fs::write(&binary, "").unwrap();
         std::fs::write(&source, "").unwrap();
@@ -524,7 +524,7 @@ pub(crate) mod tests {
 
     #[test]
     fn stdio_calls_tools_and_separates_server_errors_from_broken_connections() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let state = fake_state(
             dir.path(),
             json!([{ "id": "7", "key": "AL-7", "board": "b1", "title": "Ship", "state": "Todo", "url": "https://t/7" }]),
@@ -556,7 +556,7 @@ pub(crate) mod tests {
 
     #[test]
     fn stdio_tolerates_banners_and_reports_how_a_server_ended() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let state = fake_state(dir.path(), json!([{ "id": "1", "key": "K-1", "state": "Open" }]));
         let noisy = format!("echo 'starting up'; exec '{}' '{}'", fake_server().display(), state.display());
         let mut client =

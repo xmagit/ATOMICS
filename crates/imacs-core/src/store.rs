@@ -132,7 +132,7 @@ mod tests {
 
     #[test]
     fn chief_preferences_survive_restart_and_old_stores_load() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let file = dir.path().join("sessions.json");
         let store = Store { chief_dock: Some(ChiefDock::Docked), chief_width: Some(720.0), ..Store::default() };
         store.save(&file).unwrap();
@@ -154,7 +154,7 @@ mod tests {
         assert_eq!(store.sessions[0].last_prompt.as_deref(), Some("first"));
         assert_eq!(store.sessions.len(), 2);
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let file = dir.path().join("s.json");
         store.save(&file).unwrap();
         assert_eq!(Store::load(&file).sessions, store.sessions);

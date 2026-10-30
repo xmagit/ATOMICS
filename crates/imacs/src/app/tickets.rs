@@ -1164,7 +1164,7 @@ mod tests {
         with_app("app::tickets::tests::shipped_profiles_work_against_the_fake_server", |app, _| {
             use crate::mcp_client::tests::example_profile;
             for name in ["RELAY", "LINEAR"] {
-                let dir = tempfile::tempdir().unwrap();
+                let dir = crate::test_support::tempdir().unwrap();
                 let state = tickets_fixture(dir.path(), "ENG");
                 let config = example_profile(name, &state);
                 let board = config.mode == TicketMode::Board;
@@ -1219,7 +1219,7 @@ mod tests {
     fn lifecycle_stages_gate_completion_and_reach_tickets_through_mcp() {
         with_app("app::tickets::tests::lifecycle_stages_gate_completion_and_reach_tickets_through_mcp", |app, ctx| {
             for gate in ["pr_opened", "ci_passed"] {
-                let dir = tempfile::tempdir().unwrap();
+                let dir = crate::test_support::tempdir().unwrap();
                 let state = tickets_fixture(dir.path(), "ENG");
                 app.runtime.plans.clear();
                 configure(app, ISSUES, &state, |config| {
@@ -1310,7 +1310,7 @@ mod tests {
     #[test]
     fn task_stage_events_are_scoped_and_custom_stages_are_config_only() {
         with_app("app::tickets::tests::task_stage_events_are_scoped_and_custom_stages_are_config_only", |app, _| {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_support::tempdir().unwrap();
             let state = tickets_fixture(dir.path(), "CARD");
             configure(app, CARDS, &state, |config| {
                 config.states.stages.insert("security_approved".into(), "Audited".into());
@@ -1363,7 +1363,7 @@ mod tests {
     fn agent_ticket_access_is_scoped_to_its_session_and_comment_policy() {
         with_app("app::tickets::tests::agent_ticket_access_is_scoped_to_its_session_and_comment_policy", |app, _| {
             use crate::mcp_client::tests::example_profile;
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_support::tempdir().unwrap();
             let state = tickets_fixture(dir.path(), "ENG");
             edit_fake(&state, |fake| {
                 fake["tickets"]
@@ -1550,7 +1550,7 @@ mod tests {
     #[test]
     fn board_mode_keeps_tickets_and_tasks_in_step_in_both_directions() {
         with_app("app::tickets::tests::board_mode_keeps_tickets_and_tasks_in_step_in_both_directions", |app, ctx| {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_support::tempdir().unwrap();
             let state = tickets_fixture(dir.path(), "CARD");
             configure(app, CARDS, &state, |_| {});
             let (repo_dir, repo) = repository();
@@ -1704,7 +1704,7 @@ mod tests {
     #[test]
     fn ticket_mode_reports_the_whole_plan_on_its_one_ticket() {
         with_app("app::tickets::tests::ticket_mode_reports_the_whole_plan_on_its_one_ticket", |app, _| {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_support::tempdir().unwrap();
             let state = fake_state(
                 dir.path(),
                 json!([{ "id": "u1", "key": "ISS-1", "board": "cli", "title": "Ship the CLI", "state": "Backlog",
@@ -1798,7 +1798,7 @@ mod tests {
                     ],
                 ),
             ] {
-                let dir = tempfile::tempdir().unwrap();
+                let dir = crate::test_support::tempdir().unwrap();
                 let state = tickets_fixture(dir.path(), prefix);
                 configure(app, text, &state, |config| config.mode = TicketMode::Board);
                 let config = app.runtime.ticket_config().unwrap();
@@ -1833,7 +1833,7 @@ mod tests {
     #[test]
     fn failures_show_on_the_link_and_never_block_the_plan() {
         with_app("app::tickets::tests::failures_show_on_the_link_and_never_block_the_plan", |app, _| {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_support::tempdir().unwrap();
             let state = tickets_fixture(dir.path(), "CARD");
             configure(app, CARDS, &state, |config| config.timeout_secs = 1);
             edit_fake(&state, |fake| fake["fail"] = json!(["card_move", "card_note"]));
@@ -1902,7 +1902,7 @@ mod tests {
     #[test]
     fn switching_systems_never_sends_old_links_to_the_new_system() {
         with_app("app::tickets::tests::switching_systems_never_sends_old_links_to_the_new_system", |app, ctx| {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_support::tempdir().unwrap();
             for system in ["cards", "issues"] {
                 std::fs::create_dir(dir.path().join(system)).unwrap();
             }
@@ -1990,7 +1990,7 @@ mod tests {
         with_app(
             "app::tickets::tests::a_late_create_never_replaces_a_newer_link_or_takes_another_system",
             |app, ctx| {
-                let dir = tempfile::tempdir().unwrap();
+                let dir = crate::test_support::tempdir().unwrap();
                 let state = tickets_fixture(dir.path(), "CARD");
                 configure(app, CARDS, &state, |_| {});
                 let plan = request(
@@ -2045,7 +2045,7 @@ mod tests {
     #[test]
     fn a_read_after_a_comment_reports_what_someone_else_changed() {
         with_app("app::tickets::tests::a_read_after_a_comment_reports_what_someone_else_changed", |app, ctx| {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_support::tempdir().unwrap();
             let state = tickets_fixture(dir.path(), "CARD");
             configure(app, CARDS, &state, |_| {});
             let plan = request(
@@ -2080,7 +2080,7 @@ mod tests {
         with_app(
             "app::tickets::tests::plan_set_supersedes_pending_creates_by_the_ids_tasks_end_up_with",
             |app, ctx| {
-                let dir = tempfile::tempdir().unwrap();
+                let dir = crate::test_support::tempdir().unwrap();
                 let state = tickets_fixture(dir.path(), "CARD");
                 configure(app, CARDS, &state, |_| {});
                 let plan =
@@ -2119,7 +2119,7 @@ mod tests {
     #[test]
     fn a_rejected_link_request_leaves_a_pending_create_alone() {
         with_app("app::tickets::tests::a_rejected_link_request_leaves_a_pending_create_alone", |app, ctx| {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_support::tempdir().unwrap();
             let state = tickets_fixture(dir.path(), "CARD");
             configure(app, CARDS, &state, |_| {});
             let plan =
@@ -2167,7 +2167,7 @@ mod tests {
             |app, ctx| {
                 const OLD_KEY: &str = "alpha-key-7c1d9e";
                 const OLD_TOKEN: &str = "alpha-token-5b6c7d";
-                let dir = tempfile::tempdir().unwrap();
+                let dir = crate::test_support::tempdir().unwrap();
                 let state = tickets_fixture(dir.path(), "CARD");
                 let with_key = |key: &'static str| {
                     move |config: &mut TicketConfig| {
@@ -2240,7 +2240,7 @@ mod tests {
             const TOKEN: &str = "sk-title-4d5e6f";
             // SAFETY: set before the ticket worker starts; nothing else reads this variable.
             unsafe { std::env::set_var("CARDS_TOKEN", TOKEN) };
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_support::tempdir().unwrap();
             let state = tickets_fixture(dir.path(), "CARD");
             set_field(&state, "CARD-1", "title", &format!("Rotate {TOKEN} today"));
             set_field(
@@ -2306,7 +2306,7 @@ mod tests {
     fn agents_read_long_descriptions_whole() {
         with_app("app::tickets::tests::agents_read_long_descriptions_whole", |app, _| {
             use crate::mcp_client::tests::example_profile;
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_support::tempdir().unwrap();
             let state = tickets_fixture(dir.path(), "ENG");
             let description = format!("{}LAST LINE: ship it", "Step by step instructions for the agent.\n".repeat(80));
             assert!(description.chars().count() > imacs_core::tickets::MAX_FIELD_CHARS);
@@ -2334,7 +2334,7 @@ mod tests {
             |app, ctx| {
                 use crate::mcp_client::tests::example_profile;
                 const TOKEN: &str = "sk-split-9e8d7c";
-                let dir = tempfile::tempdir().unwrap();
+                let dir = crate::test_support::tempdir().unwrap();
                 let state = tickets_fixture(dir.path(), "ENG");
                 edit_fake(&state, |fake| {
                     fake["tickets"][0]["title"] = json!("Rotate sk-split\n-9e8d7c now");
@@ -2385,7 +2385,7 @@ mod tests {
             const TOKEN: &str = "sk-synthetic-7f3a9c";
             // SAFETY: set before the ticket worker starts; nothing else reads this variable.
             unsafe { std::env::set_var("TRACKER_TOKEN", TOKEN) };
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_support::tempdir().unwrap();
             let state = tickets_fixture(dir.path(), "CARD");
             configure(app, CARDS, &state, |config| config.server.token_env = Some("TRACKER_TOKEN".into()));
             let echo = format!(
@@ -2464,7 +2464,7 @@ mod tests {
     fn chief_tools_link_create_and_comment_within_the_comment_policy() {
         with_app("app::tickets::tests::chief_tools_link_create_and_comment_within_the_comment_policy", |app, ctx| {
             assert!(CHIEF_ALLOWED_TOOLS.contains(&"mcp__imacs__imacs_ticket_comment"));
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_support::tempdir().unwrap();
             let state = tickets_fixture(dir.path(), "CARD");
             let call = |app: &mut Desktop<'_>, value: Value| {
                 let (tx, rx) = channel();
@@ -2561,7 +2561,7 @@ mod tests {
         with_app(
             "app::tickets::tests::ticket_progress_is_expected_after_acceptance_stages_or_plan_completion",
             |app, ctx| {
-                let dir = tempfile::tempdir().unwrap();
+                let dir = crate::test_support::tempdir().unwrap();
                 let state = tickets_fixture(dir.path(), "CARD");
                 configure(app, CARDS, &state, |_| {});
                 app.runtime.sessions.push(session("agent-a", AgentKind::Generic, AgentStatus::Idle, dir.path()));
@@ -2641,7 +2641,7 @@ mod tests {
     #[test]
     fn cards_and_the_plan_header_show_live_tickets_and_open_them() {
         with_app("app::tickets::tests::cards_and_the_plan_header_show_live_tickets_and_open_them", |app, ctx| {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_support::tempdir().unwrap();
             let state = tickets_fixture(dir.path(), "CARD");
             configure(app, CARDS, &state, |_| {});
             request(

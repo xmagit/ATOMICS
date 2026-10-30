@@ -257,7 +257,7 @@ fn completed_and_archived_boards_are_read_only_even_with_ready_tasks() {
         "app::board_tests::completed_and_archived_boards_are_read_only_even_with_ready_tasks",
         |app, ctx| {
             populate(app);
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_support::tempdir().unwrap();
             app.runtime.plans[0].tasks[4].worktree = Some(dir.path().into());
             app.runtime.plans[0].tasks[4].finished_at = Some(890);
             app.runtime.plans[0].tasks[4].resume_id = Some("resume-id".into());

@@ -97,6 +97,8 @@ impl State {
         prompt: Option<String>,
         role: Role,
     ) -> Result<String, String> {
+        // A previous close may still be stopping this session's resumable sandbox.
+        self.finish_lifecycle_jobs();
         let chief = role == Role::Chief;
         let agent = if chief {
             imacs_core::config::AgentConfig {
@@ -199,6 +201,7 @@ impl State {
             .then(|| paths::briefs_dir().join(name.strip_prefix(isolation::NAME_PREFIX).unwrap_or(&name)));
         let exe = crate::setup::executable_path().map_err(|err| format!("Could not locate IMACS: {err}"))?;
         Ok(Some(crate::sandbox::Prepare {
+            home: paths::imacs_home(),
             sbx: resolve_program(&self.sbx),
             name,
             agent: sbx_agent,
@@ -212,13 +215,18 @@ impl State {
     }
 
     /// Stops a sandbox in the background: its agent exited or its tile closed.
-    pub(super) fn stop_sandbox(&self, name: String) {
+    pub(super) fn stop_sandbox(&mut self, name: String) {
         let sbx = resolve_program(&self.sbx);
-        std::thread::spawn(move || {
-            if let Err(err) = crate::sandbox::stop(&sbx, &name) {
+        self.lifecycle_jobs.retain(|job| !job.is_finished());
+        self.lifecycle_jobs.push(std::thread::spawn(move || {
+            if let Err(err) = crate::sandbox::stop(&paths::imacs_home(), &sbx, &name) {
                 eprintln!("IMACS: stopping sandbox {name} failed: {err:#}");
+                crate::lifecycle::record_leftovers(
+                    &paths::imacs_home(),
+                    &[format!("Stopping sandbox {name}: {err:#}")],
+                );
             }
-        });
+        }));
     }
 
     /// A launch that failed after its tile appeared: the tile and a toast say why, and the
@@ -680,8 +688,8 @@ impl State {
                 let id = id.to_string();
                 let mut guard = session.ref_guard.take();
                 session.terminal.take();
-                std::thread::spawn(move || {
-                    let stopped = crate::sandbox::stop(&sbx, &name);
+                self.lifecycle_jobs.push(std::thread::spawn(move || {
+                    let stopped = crate::sandbox::stop(&paths::imacs_home(), &sbx, &name);
                     let mut alerts = stopped
                         .err()
                         .map(|err| format!("Stopping sandbox FAILED: {err:#}"))
@@ -694,9 +702,10 @@ impl State {
                         }
                     }
                     if !alerts.is_empty() {
+                        crate::lifecycle::record_leftovers(&paths::imacs_home(), &alerts);
                         let _ = actions.send(Box::new(move |state| state.ref_alert(&id, alerts.join("\n"))));
                     }
-                });
+                }));
             }
             if session.terminal.is_none()
                 && let Some(cid) = session.claude_id
@@ -1009,48 +1018,59 @@ mod tests {
     #[test]
     fn agents_share_the_job_pool_at_lower_priority() {
         with_app("app::sessions::tests::agents_share_the_job_pool_at_lower_priority", |app, ctx| {
-            let dir = tempfile::tempdir().unwrap();
-            let out = dir.path().join("probe");
-            let script = format!("ps -o nice= -p $$ > {0}.nice; env > {0}.tmp; mv {0}.tmp {0}; sleep 5", out.display());
-            app.runtime.config.agents.push(imacs_core::config::AgentConfig {
-                name: "probe".into(),
-                command: vec!["/bin/sh".into(), "-c".into(), script],
-                kind: AgentKind::Generic,
-                busy_text: None,
-                isolation: None,
-            });
-            app.runtime.config.resources.agent_nice = 7;
-            // SAFETY: querying this process's priority has no preconditions.
-            let inherited_nice = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
-            app.runtime.start(ctx, "probe", dir.path().into(), None, vec![], None).unwrap();
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while !out.exists() {
-                assert!(Instant::now() < deadline, "the probe agent never wrote its environment");
-                std::thread::sleep(Duration::from_millis(20));
+            // This closure runs in its own test process. Cover an already-niced launcher too:
+            // Darwin allows niceness 20, whereas Linux saturates at 19.
+            for saturated in [false, true] {
+                if saturated {
+                    assert_eq!(unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 20) }, 0);
+                }
+                let dir = crate::test_support::tempdir().unwrap();
+                let out = dir.path().join("probe");
+                let script = format!(
+                    "ps -o nice= -p $$ > {0}.nice; env > {0}.tmp; mv {0}.tmp {0}; exec sleep 600",
+                    out.display()
+                );
+                app.runtime.config.agents.retain(|agent| agent.name != "probe");
+                app.runtime.config.agents.push(imacs_core::config::AgentConfig {
+                    name: "probe".into(),
+                    command: vec!["/bin/sh".into(), "-c".into(), script],
+                    kind: AgentKind::Generic,
+                    busy_text: None,
+                    isolation: None,
+                });
+                app.runtime.config.resources.agent_nice = 7;
+                // SAFETY: querying this process's priority has no preconditions.
+                let inherited_nice = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+                app.runtime.start(ctx, "probe", dir.path().into(), None, vec![], None).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(60);
+                while !out.exists() {
+                    assert!(Instant::now() < deadline, "the probe agent never wrote its environment");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                let env = std::fs::read_to_string(&out).unwrap();
+                let pool = format!("-j --jobserver-auth=fifo:{}", Jobserver::path_for(&paths::imacs_home()).display());
+                assert!(env.lines().any(|line| line == format!("CARGO_MAKEFLAGS={pool}")), "{env}");
+                // MAKEFLAGS may be inherited from whatever started the tests; this pool must never be in it.
+                let pool_path = Jobserver::path_for(&paths::imacs_home()).display().to_string();
+                assert!(
+                    !env.lines().any(|line| line.starts_with("MAKEFLAGS=") && line.contains(&pool_path)),
+                    "plain make must not see the pool: {env}"
+                );
+                let exe_dir = std::env::current_exe().unwrap().parent().unwrap().display().to_string();
+                assert!(env.lines().any(|line| line.starts_with(&format!("PATH={exe_dir}:"))), "{env}");
+                assert_eq!(
+                    std::fs::read_to_string(dir.path().join("probe.nice")).unwrap().trim(),
+                    (inherited_nice + 7).min(if cfg!(target_os = "macos") { 20 } else { 19 }).to_string()
+                );
+                app.runtime.sessions.clear();
             }
-            let env = std::fs::read_to_string(&out).unwrap();
-            let pool = format!("-j --jobserver-auth=fifo:{}", Jobserver::path_for(&paths::imacs_home()).display());
-            assert!(env.lines().any(|line| line == format!("CARGO_MAKEFLAGS={pool}")), "{env}");
-            // MAKEFLAGS may be inherited from whatever started the tests; this pool must never be in it.
-            let pool_path = Jobserver::path_for(&paths::imacs_home()).display().to_string();
-            assert!(
-                !env.lines().any(|line| line.starts_with("MAKEFLAGS=") && line.contains(&pool_path)),
-                "plain make must not see the pool: {env}"
-            );
-            let exe_dir = std::env::current_exe().unwrap().parent().unwrap().display().to_string();
-            assert!(env.lines().any(|line| line.starts_with(&format!("PATH={exe_dir}:"))), "{env}");
-            assert_eq!(
-                std::fs::read_to_string(dir.path().join("probe.nice")).unwrap().trim(),
-                (inherited_nice + 7).min(19).to_string()
-            );
-            app.runtime.sessions.clear();
         });
     }
 
     #[test]
     fn dotnet_agents_get_the_budget_in_their_terminal() {
         with_app("app::sessions::tests::dotnet_agents_get_the_budget_in_their_terminal", |app, ctx| {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_support::tempdir().unwrap();
             std::fs::create_dir(dir.path().join("src")).unwrap();
             std::fs::write(dir.path().join("src/Example.csproj"), "").unwrap();
             let out = dir.path().join("env");
@@ -1086,7 +1106,7 @@ mod tests {
     fn codex_version_is_cached_per_program_without_blocking_launch() {
         with_app("app::sessions::tests::codex_version_is_cached_per_program_without_blocking_launch", |app, ctx| {
             use std::os::unix::fs::PermissionsExt;
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_support::tempdir().unwrap();
             let script = r#"#!/bin/sh
 dir=${0%/*}
 if [ "$1" = --version ]; then
@@ -1199,7 +1219,7 @@ fi
             "app::sessions::tests::failed_codex_probes_are_retried_and_recovered_launches_get_hooks",
             |app, ctx| {
                 use std::os::unix::fs::PermissionsExt;
-                let dir = tempfile::tempdir().unwrap();
+                let dir = crate::test_support::tempdir().unwrap();
                 let program = dir.path().join("codex");
                 let name = program.to_string_lossy().into_owned();
                 app.runtime.config.agents.push(imacs_core::config::AgentConfig {
@@ -1517,7 +1537,7 @@ fi
             return;
         }
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let git = dir.path().join("git");
         std::fs::write(
             &git,

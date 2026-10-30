@@ -704,7 +704,7 @@ mod tests {
         plan.tasks[0].integration_verified = false;
         #[cfg(feature = "native")]
         {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_support::tempdir().unwrap();
             plan.save_in(dir.path()).unwrap();
             assert_eq!(load_plans(dir.path()).unwrap().0, [plan.clone()]);
         }
@@ -758,7 +758,7 @@ mod tests {
     #[test]
     #[cfg(feature = "native")]
     fn migrates_once_without_overwriting_existing_or_archived_plans() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let mut old = Plan::default();
         old.replace("Ship it".into(), vec![task("a", &[])]);
         old.approved = true;
@@ -783,7 +783,7 @@ mod tests {
     #[cfg(feature = "native")]
     fn completed_legacy_plans_migrate_closed_while_unfinished_and_empty_plans_stay_open() {
         for statuses in [vec![TaskStatus::Done, TaskStatus::Done], vec![TaskStatus::Done, TaskStatus::Review], vec![]] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_support::tempdir().unwrap();
             let plan = Plan {
                 goal: "Legacy".into(),
                 tasks: statuses
@@ -806,7 +806,7 @@ mod tests {
     #[cfg(feature = "native")]
     fn saving_replaces_the_file_atomically_and_keeps_existing_data_on_failure() {
         use std::io::Read;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let path = dir.path().join("plan.json");
         let mut plan = Plan { goal: "Original".into(), ..Plan::default() };
         plan.save(&path).unwrap();
@@ -845,7 +845,7 @@ mod tests {
     #[test]
     #[cfg(feature = "native")]
     fn older_archives_without_status_load_but_do_not_get_open_tabs() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let folder = dir.path().join("plans");
         std::fs::create_dir(&folder).unwrap();
         std::fs::write(folder.join("imacs-v0.3.json"), r#"{"goal":"Old plan", "tasks":[], "approved":true}"#).unwrap();
@@ -861,7 +861,7 @@ mod tests {
     #[test]
     #[cfg(feature = "native")]
     fn storage_keeps_plans_independent_and_reports_unreadable_files() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let mut plans = Vec::new();
         for goal in ["API", "API", "UI"] {
             let mut plan = Plan { id: unique_id(goal, &plans, dir.path()), ..Plan::default() };

@@ -179,7 +179,7 @@ mod tests {
 
     #[test]
     fn poller_runs_off_thread_rechecks_and_does_not_repaint_unchanged_data() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let day = dir.path().join("2026/10/28");
         std::fs::create_dir_all(&day).unwrap();
         let path = day.join("rollout-test.jsonl");
@@ -304,7 +304,7 @@ mod tests {
 
     #[test]
     fn log_reader_uses_newest_rollout_and_bounded_tail() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let day = dir.path().join("2026/10/28");
         std::fs::create_dir_all(&day).unwrap();
         let event = json!({"timestamp":"2026-10-28T15:00:00Z","type":"event_msg","payload":{
@@ -329,7 +329,7 @@ mod tests {
 
     #[test]
     fn log_reader_keeps_a_complete_event_at_the_tail_boundary() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let day = dir.path().join("2026/10/28");
         std::fs::create_dir_all(&day).unwrap();
         let event: serde_json::Value =

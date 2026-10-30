@@ -125,7 +125,7 @@ mod tests {
 
     #[test]
     fn detached_relauncher_waits_for_old_pid_and_survives_hangup() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let marker = dir.path().join("relaunched");
         let mut old = Command::new("/bin/sleep").arg("30").spawn().unwrap();
         let target = Target {
@@ -175,7 +175,7 @@ mod tests {
 
     #[test]
     fn version_check_refuses_missing_broken_nonexecutable_and_hung_targets() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let exe = dir.path().join("imacs");
         assert!(check_version(&exe, Duration::from_secs(1)).unwrap_err().to_string().contains("missing"));
         std::fs::write(&exe, "#!/bin/sh\nexit 0\n").unwrap();

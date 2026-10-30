@@ -272,7 +272,7 @@ mod tests {
     fn dotnet_detection_finds_root_and_nested_markers() {
         for marker in ["Example.sln", "Example.slnx", "Example.csproj", "global.json"] {
             for folder in ["", "src/deep", "bin/tools"] {
-                let dir = tempfile::tempdir().unwrap();
+                let dir = crate::test_support::tempdir().unwrap();
                 let project = dir.path().join(folder);
                 std::fs::create_dir_all(&project).unwrap();
                 std::fs::write(project.join(marker), "").unwrap();
@@ -284,7 +284,7 @@ mod tests {
     #[cfg(feature = "native")]
     #[test]
     fn non_dotnet_worktrees_and_git_metadata_have_no_toolchain_env() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         for name in ["Cargo.toml", "package.json", "Something.cs", "global.json.backup"] {
             std::fs::write(dir.path().join(name), "").unwrap();
         }
@@ -294,7 +294,7 @@ mod tests {
         assert!(Toolchain::detect(&dir.path().join("missing")).is_empty());
         #[cfg(unix)]
         {
-            let external = tempfile::tempdir().unwrap();
+            let external = crate::test_support::tempdir().unwrap();
             std::fs::write(external.path().join("Outside.sln"), "").unwrap();
             std::os::unix::fs::symlink(external.path(), dir.path().join("linked")).unwrap();
             std::os::unix::fs::symlink(dir.path(), dir.path().join("loop")).unwrap();

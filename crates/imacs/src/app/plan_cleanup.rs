@@ -28,7 +28,14 @@ impl State {
     pub(super) fn open_plan_cleanup(&mut self, index: usize) {
         let (tx, rx) = self.wake.channel();
         let plan = self.plans[index].clone();
-        let mut dialog = PlanCleanup { plan, rows: Vec::new(), busy: false, log: Vec::new(), tx, rx };
+        let mut dialog = PlanCleanup {
+            plan,
+            rows: Vec::new(),
+            busy: false,
+            log: crate::lifecycle::leftovers(&paths::imacs_home()),
+            tx,
+            rx,
+        };
         self.load_plan_cleanup(&mut dialog);
         self.plan_cleanup = Some(dialog);
         self.client_events.push(ClientEvent::PlanCleanup);
@@ -201,23 +208,40 @@ impl Desktop<'_> {
                 .collect();
             let (tx, plan, base) = (dialog.tx.clone(), plan.clone(), self.runtime.plan_base_ref(&plan));
             let sbx = resolve_program(&self.runtime.sbx);
-            self.post(move |_| {
-                std::thread::spawn(move || {
+            self.post(move |state| {
+                state.lifecycle_jobs.push(std::thread::spawn(move || {
                     for entry in targets {
                         // Which sandboxes work there is asked while the worktree is still on disk.
                         let sandboxes = match &entry.worktree {
-                            Some(path) if crate::sandbox::installed(&sbx) => crate::sandbox::in_worktree(&sbx, path)
-                                .unwrap_or_else(|err| {
-                                    let _ = tx.send(Event::Note(format!("Listing sandboxes failed: {err:#}")));
-                                    Vec::new()
-                                }),
+                            Some(path) if crate::sandbox::installed(&sbx) => {
+                                match crate::sandbox::in_worktree(&paths::imacs_home(), &sbx, path) {
+                                    Ok(names) => names,
+                                    Err(err) => {
+                                        let _ = tx.send(Event::Note(format!(
+                                            "Kept {}: listing sandboxes failed: {err:#}",
+                                            entry.branch
+                                        )));
+                                        continue;
+                                    }
+                                }
+                            }
                             _ => Vec::new(),
                         };
+                        if let Some(error) = sandboxes
+                            .iter()
+                            .find_map(|name| crate::sandbox::stop(&paths::imacs_home(), &sbx, name).err())
+                        {
+                            let _ = tx.send(Event::Note(format!(
+                                "Kept {}: stopping sandbox failed: {error:#}",
+                                entry.branch
+                            )));
+                            continue;
+                        }
                         let result = cleanup::remove(&plan, &base, &entry).map_err(|err| format!("{err:#}"));
                         let removed = result.is_ok();
                         let _ = tx.send(Event::Removed(entry, result));
                         for name in sandboxes.into_iter().filter(|_| removed) {
-                            let note = match crate::sandbox::remove(&sbx, &name) {
+                            let note = match crate::sandbox::remove(&paths::imacs_home(), &sbx, &name) {
                                 Ok(()) => format!("Removed sandbox {name}"),
                                 Err(err) => format!("Kept sandbox {name}: {err:#}"),
                             };
@@ -225,7 +249,7 @@ impl Desktop<'_> {
                         }
                     }
                     let _ = tx.send(Event::Finished);
-                });
+                }));
             });
         }
         self.client.plan_cleanup_open = open;
@@ -242,7 +266,7 @@ mod tests {
         super::super::tests::with_app(
             "app::plan_cleanup::tests::completed_plan_board_previews_kept_work_and_removes_only_confirmed_entries",
             |app, ctx| {
-                let dir = tempfile::tempdir().unwrap();
+                let dir = crate::test_support::tempdir().unwrap();
                 let repo = dir.path().join("app");
                 std::fs::create_dir(&repo).unwrap();
                 for args in [

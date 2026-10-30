@@ -60,6 +60,45 @@ pub fn json(workspace: Option<&str>, projects: &[PathBuf]) -> Value {
     }))
 }
 
+#[cfg(target_os = "macos")]
+fn spotlight_check(repo: &std::path::Path) -> Option<String> {
+    let mut child = Command::new("/usr/bin/mdutil")
+        .arg("-s")
+        .arg(repo)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10))
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let output = child.wait_with_output().ok()?;
+    spotlight_line(repo, &String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn spotlight_line(repo: &std::path::Path, output: &str) -> Option<String> {
+    output.contains("Indexing enabled").then(|| {
+        check_line(
+            false,
+            &format!("project folder is indexed by Spotlight (warning): {}", repo.display()),
+            "add the project folder and its worktree parent to System Settings → Spotlight → Search Privacy",
+        )
+    })
+}
+
 /// Whether any agent would run sandboxed: `[isolation] mode`, with the workspace's merged in,
 /// or an agent's own `isolation`.
 fn sandboxes_wanted(config: &Config, workspace: Option<&str>) -> bool {
@@ -122,6 +161,13 @@ fn report(workspace: Option<&str>, for_agent: bool, projects: &[PathBuf]) -> Rep
     }
 
     lines.extend(plans_check(&paths::imacs_home()));
+    for note in crate::lifecycle::leftovers(&paths::imacs_home()) {
+        lines.push(check_line(
+            false,
+            &format!("cleanup leftover (warning): {note}"),
+            "review in IMACS's Clean up… dialog",
+        ));
+    }
     if let Ok((config, _)) = &config {
         lines.push(approvals_check(&config.approvals));
         if sandboxes_wanted(config, workspace) {
@@ -159,6 +205,10 @@ fn report(workspace: Option<&str>, for_agent: bool, projects: &[PathBuf]) -> Rep
         repos.sort();
         repos.dedup();
         for repo in repos {
+            #[cfg(target_os = "macos")]
+            if let Some(line) = spotlight_check(&repo) {
+                lines.push(line);
+            }
             let workflow = imacs_core::repo_workflow::RepoWorkflow::read(&repo);
             for warning in &workflow.warnings {
                 lines.push(check_line(
@@ -236,10 +286,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn spotlight_warning_explains_folder_exclusion() {
+        let repo = std::path::Path::new("/projects/app");
+        let line = spotlight_line(repo, "/projects/app:\n Indexing enabled.").unwrap();
+        assert!(line.contains("Spotlight") && line.contains("Search Privacy") && line.contains("/projects/app"));
+        assert!(spotlight_line(repo, "Indexing disabled.").is_none());
+        assert!(spotlight_line(repo, "Error: unknown indexing state").is_none());
+    }
+
+    #[test]
     fn ticket_workspace_overrides_main_config_as_a_whole() {
         const CHILD: &str = "IMACS_TICKET_DOCTOR_CHILD";
         if std::env::var_os(CHILD).is_none() {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_support::tempdir().unwrap();
             let output = crate::test_support::output(
                 Command::new(std::env::current_exe().unwrap())
                     .args([
@@ -296,7 +355,7 @@ mod tests {
     fn ticket_check_starts_profiles_lists_all_pages_and_reports_failures_without_writes() {
         use crate::mcp_client::tests::{example_profile, fake_state};
         use serde_json::{Value, json};
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let state = fake_state(dir.path(), json!([]));
         for name in ["RELAY", "LINEAR"] {
             let mut config = example_profile(name, &state);
@@ -331,7 +390,7 @@ mod tests {
             assert_eq!(run(None), 0);
             return;
         }
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let bin = dir.path().join("bin");
         let state = dir.path().join("state");
         let config = dir.path().join("config.toml");
@@ -462,9 +521,18 @@ mod tests {
             assert_eq!(socket["hint"], "start IMACS or check IMACS_SOCKET / IMACS_HOME");
             let codex = checks.iter().find(|c| c["check"].as_str().unwrap().starts_with("codex not found")).unwrap();
             assert_eq!(codex["warning"], true);
+            crate::lifecycle::save_leftovers(
+                &paths::imacs_home(),
+                &["Warm worktree /repo/dirty: uncommitted changes".into()],
+            )
+            .unwrap();
+            let with_leftovers = json(None, &[]);
+            assert!(with_leftovers["checks"].as_array().unwrap().iter().any(|check| check["warning"] == true
+                && check["check"].as_str().unwrap().contains("cleanup leftover")
+                && check["hint"].as_str().unwrap().contains("Clean up…")));
             return;
         }
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let bin = dir.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
         let shell = bin.join("shell");

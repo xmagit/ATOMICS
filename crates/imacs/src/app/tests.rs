@@ -34,12 +34,13 @@ pub(super) fn with_app(name: &str, test: impl FnOnce(&mut Desktop<'_>, &egui::Co
     with_state(name, |mut state, ctx| {
         let mut client = Client::new(ctx, &mut Options::default(), &crate::load_icon());
         test(&mut Desktop { runtime: &mut state, client: &mut client }, ctx);
+        state.shutdown();
     });
 }
 
 pub(super) fn with_state(name: &str, test: impl FnOnce(State, &egui::Context)) {
     if std::env::var_os("IMACS_APP_TEST_CHILD").is_none() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         use std::os::unix::fs::DirBuilderExt;
         let runtime = dir.path().join("runtime");
         std::fs::DirBuilder::new().mode(0o700).create(&runtime).unwrap();
@@ -72,11 +73,16 @@ pub(super) fn with_state(name: &str, test: impl FnOnce(State, &egui::Context)) {
     }
     let ctx = egui::Context::default();
     let cc = eframe::CreationContext::_new_kittest(ctx.clone());
-    let app = State::new(
+    let mut app = State::new(
         &cc,
         Options { migration_errors: vec!["Migration failed".into()], ..Options::default() },
         &crate::load_icon(),
     );
+    // Most tests start from an idle fixture. Tests of asynchronous startup start their
+    // own gated sweep after this initial completion, rather than racing fixture setup.
+    if let Some(job) = app.startup_cleanup.take() {
+        job.join().unwrap();
+    }
     assert_eq!(app.toast.as_ref().unwrap().0, "Migration failed");
     test(app, &ctx);
 }
@@ -200,8 +206,8 @@ pub(super) fn request(app: &mut Desktop<'_>, value: serde_json::Value) -> Contro
     }
 }
 
-pub(super) fn repository() -> (tempfile::TempDir, PathBuf) {
-    let dir = tempfile::tempdir().unwrap();
+pub(super) fn repository() -> (crate::test_support::TempDir, PathBuf) {
+    let dir = crate::test_support::tempdir().unwrap();
     let repo = dir.path().join("repo");
     std::fs::create_dir(&repo).unwrap();
     git::git(&repo, &["init", "-q", "-b", "main"]).unwrap();
@@ -212,7 +218,7 @@ pub(super) fn repository() -> (tempfile::TempDir, PathBuf) {
 }
 
 fn permission_hooks_wake_waiters_and_accept_decisions(app: &mut Desktop<'_>, ctx: &egui::Context) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_support::tempdir().unwrap();
     app.runtime.sessions = vec![session("codex", AgentKind::Generic, AgentStatus::Working, dir.path())];
     app.runtime.sessions[0].claude_id = Some("s1".into());
     let permission = |command: &str, reason: &str| {
@@ -323,7 +329,7 @@ fn busy_text_is_only_a_fallback(app: &mut Desktop<'_>, _ctx: &egui::Context) {
         busy_text: Some("esc to interrupt".into()),
         isolation: None,
     });
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_support::tempdir().unwrap();
     let terminal = Terminal::spawn(
         app.runtime.wake.clone(),
         app.runtime.palette.terminal_colors(),

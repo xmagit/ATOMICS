@@ -4,6 +4,7 @@ impl State {
     /// Checks out `branch` in a new worktree, from `start` (a plan's integration branch)
     /// or base_ref, and starts `launch` in it.
     pub(super) fn create_worktree(&mut self, repo: PathBuf, branch: String, start: Option<String>, launch: Launch) {
+        self.finish_lifecycle_jobs();
         let path = git::worktree_path(&self.config.worktree_path, &repo, &branch);
         let config = self.project_config(&repo);
         let (tx, base_ref) = (self.worktree_tx.clone(), config.base_ref);
@@ -49,27 +50,35 @@ impl State {
 
     pub(super) fn open_cleanup(&mut self, repo: PathBuf, preselect: Option<PathBuf>) {
         let (tx, rx) = self.wake.channel();
-        let mut cleanup =
-            Cleanup { repo, rows: None, sandboxes: Default::default(), busy: None, log: Vec::new(), tx, rx };
+        let mut cleanup = Cleanup {
+            repo,
+            rows: None,
+            sandboxes: Default::default(),
+            busy: None,
+            log: crate::lifecycle::leftovers(&paths::imacs_home()),
+            tx,
+            rx,
+        };
         self.load_cleanup(&mut cleanup);
         self.cleanup = Some(cleanup);
         self.client_events.push(ClientEvent::Cleanup { preselect });
     }
 
-    fn load_cleanup(&self, cleanup: &mut Cleanup) {
+    fn load_cleanup(&mut self, cleanup: &mut Cleanup) {
         cleanup.rows = None;
         cleanup.sandboxes = Default::default();
         let (tx, repo, base) = (cleanup.tx.clone(), cleanup.repo.clone(), self.project_config(&cleanup.repo).base_ref);
         let sbx = resolve_program(&self.sbx);
-        std::thread::spawn(move || {
+        self.lifecycle_jobs.push(std::thread::spawn(move || {
             let result = git::worktree_health(&repo, &base).map_err(|e| format!("{e:#}"));
             let _ = tx.send(CleanupEvent::Loaded(result));
             // Without sbx there can be no sandboxes, and nothing to say about it.
             if crate::sandbox::installed(&sbx) {
-                let sandboxes = crate::sandbox::for_repo(&sbx, &repo).map_err(|e| format!("listing sandboxes: {e:#}"));
+                let sandboxes = crate::sandbox::for_repo(&paths::imacs_home(), &sbx, &repo)
+                    .map_err(|e| format!("listing sandboxes: {e:#}"));
                 let _ = tx.send(CleanupEvent::Sandboxes(sandboxes));
             }
-        });
+        }));
     }
 
     /// Runs a git maintenance command for the dialog in the background.
@@ -328,9 +337,11 @@ impl Desktop<'_> {
                         remove = true;
                     }
                 });
-                for line in cleanup.log.iter().rev().take(6) {
-                    ui.label(RichText::new(line).color(p.muted).size(11.0));
-                }
+                egui::ScrollArea::vertical().id_salt("cleanup-log").max_height(120.0).show(ui, |ui| {
+                    for line in cleanup.log.iter().rev() {
+                        ui.label(RichText::new(line).color(p.muted).size(11.0));
+                    }
+                });
             });
 
         if let Some(action) = action {
@@ -365,25 +376,39 @@ impl Desktop<'_> {
             cleanup.busy = Some(format!("removing {} worktrees…", targets.len()));
             let (tx, repo, delete) = (cleanup.tx.clone(), cleanup.repo.clone(), self.client.cleanup_delete_branches);
             let sbx = resolve_program(&self.runtime.sbx);
-            self.post(move |_| {
-                std::thread::spawn(move || {
+            self.post(move |state| {
+                state.lifecycle_jobs.push(std::thread::spawn(move || {
                     let remove_sandbox = |name: String| {
-                        let result = crate::sandbox::remove(&sbx, &name).map_err(|e| format!("{e:#}"));
+                        let result =
+                            crate::sandbox::remove(&paths::imacs_home(), &sbx, &name).map_err(|e| format!("{e:#}"));
                         let _ = tx.send(CleanupEvent::SandboxRemoved(name, result));
                     };
-                    for (path, branch, sandboxes) in targets {
-                        let result =
-                            git::remove_worktree(&repo, &path, branch.as_deref(), delete).map_err(|e| format!("{e:#}"));
-                        let removed = result.is_ok();
+                    for (path, branch, _) in targets {
+                        let mut names = Vec::new();
+                        let result = (|| -> anyhow::Result<()> {
+                            anyhow::ensure!(
+                                git::git(&path, &["status", "--porcelain", "--untracked-files=all"])?.is_empty(),
+                                "uncommitted changes"
+                            );
+                            if crate::sandbox::installed(&sbx) {
+                                names = crate::sandbox::in_worktree(&paths::imacs_home(), &sbx, &path)?;
+                                for name in &names {
+                                    crate::sandbox::stop(&paths::imacs_home(), &sbx, name)?;
+                                }
+                            }
+                            git::remove_worktree(&repo, &path, branch.as_deref(), delete)
+                        })()
+                        .map_err(|e| format!("{e:#}"));
+                        let removed = !path.exists();
                         let _ = tx.send(CleanupEvent::Removed(path, result));
                         // A worktree's sandbox goes with it; a kept worktree keeps its sandbox.
                         if removed {
-                            sandboxes.into_iter().for_each(remove_sandbox);
+                            names.into_iter().for_each(remove_sandbox);
                         }
                     }
                     orphans.into_iter().for_each(remove_sandbox);
                     let _ = tx.send(CleanupEvent::Finished("removal finished".into()));
-                });
+                }));
             });
         }
         self.client.cleanup_open = open;

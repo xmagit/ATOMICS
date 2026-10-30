@@ -3,7 +3,42 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-pub const CHILD_TIMEOUT: Duration = Duration::from_secs(60);
+/// Unlike tempfile's best-effort Drop, test cleanup must report failures and verify removal.
+pub struct TempDir(Option<tempfile::TempDir>);
+
+pub fn tempdir() -> io::Result<TempDir> {
+    tempfile::tempdir().map(|dir| TempDir(Some(dir)))
+}
+
+impl TempDir {
+    pub fn path(&self) -> &std::path::Path {
+        self.0.as_ref().unwrap().path()
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let dir = self.0.take().unwrap();
+        let path = dir.path().to_path_buf();
+        let result = dir.close();
+        if !std::thread::panicking() {
+            result.unwrap_or_else(|err| panic!("test left temporary resources at {}: {err}", path.display()));
+            assert!(!path.exists(), "test leaked {}", path.display());
+        }
+    }
+}
+
+pub const CHILD_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Parallel lower-priority children can wait for CPU while other agents compile. Keep a
+/// bounded hang guard, but allow up to three times the base budget on an overloaded host.
+pub fn scaled_timeout(base: Duration) -> Duration {
+    let mut load = 0.0;
+    let cores = std::thread::available_parallelism().map_or(1, usize::from) as f64;
+    let samples = unsafe { libc::getloadavg(&mut load, 1) };
+    let factor = if samples == 1 { (load / cores).ceil().clamp(1.0, 3.0) } else { 1.0 };
+    base.mul_f64(factor)
+}
 
 /// Capture to files so an inherited pipe writer cannot keep a finished test waiting for EOF.
 pub struct TestChild {
@@ -16,9 +51,11 @@ pub struct TestChild {
 
 impl TestChild {
     pub fn spawn(command: &mut Command, timeout: Duration) -> io::Result<Self> {
+        let timeout = scaled_timeout(timeout);
         let stdout = tempfile::tempfile()?;
         let stderr = tempfile::tempfile()?;
-        let child = command.stdout(stdout.try_clone()?).stderr(stderr.try_clone()?).spawn()?;
+        use std::os::unix::process::CommandExt;
+        let child = command.process_group(0).stdout(stdout.try_clone()?).stderr(stderr.try_clone()?).spawn()?;
         Ok(Self { child, stdout, stderr, deadline: Instant::now() + timeout, timeout })
     }
 
@@ -29,6 +66,9 @@ impl TestChild {
     pub fn check_timeout(&mut self) -> io::Result<()> {
         if !self.remaining().is_zero() {
             return Ok(());
+        }
+        unsafe {
+            libc::kill(-(self.child.id() as i32), libc::SIGKILL);
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -71,6 +111,10 @@ impl TestChild {
 
 impl Drop for TestChild {
     fn drop(&mut self) {
+        // Descendants can retain files/sockets even after their direct parent has exited.
+        unsafe {
+            libc::kill(-(self.child.id() as i32), libc::SIGKILL);
+        }
         if !matches!(self.child.try_wait(), Ok(Some(_))) {
             let _ = self.child.kill();
             let _ = self.child.wait();
@@ -100,7 +144,7 @@ mod tests {
                 std::thread::sleep(Duration::from_secs(1));
             }
         }
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempdir().unwrap();
         let ready = dir.path().join("ready");
         let mut child = TestChild::spawn(
             Command::new(std::env::current_exe().unwrap())

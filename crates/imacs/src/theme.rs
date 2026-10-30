@@ -473,7 +473,7 @@ mod tests {
 
     #[test]
     fn theme_files_reach_the_palette_and_style() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         std::fs::write(
             dir.path().join("mine.toml"),
             "extends = \"midnight\"\nsidebar = \"#010203\"\noverlay = \"#040506\"\nseparator = \"#070809\"\nquiet = \"#0a0b0c\"\nsyntax = \"no such theme\"\nui_font = \"fonts/ui.ttf\"\nmono_font = \"IBM Plex Mono\"\nui_size = 15.6",
@@ -498,7 +498,7 @@ mod tests {
 
     #[test]
     fn proposed_themes_preview_with_their_own_colors() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         std::fs::write(dir.path().join("base.toml"), "extends = \"paper\"\nadded = \"#c8f0d0\"").unwrap();
         let text = "extends = \"base\"\nterminal = \"#fffdf6\"\naccent = \"#2a6fdb\"\non_accent = \"#fafafa\"";
         let (palette, errors) = Palette::preview("ocean", text, dir.path());

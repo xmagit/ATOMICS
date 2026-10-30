@@ -469,7 +469,7 @@ mod tests {
     #[test]
     fn expired_approvals_wait_for_menu_quiet_or_lifecycle() {
         with_app("app::approvals::tests::expired_approvals_wait_for_menu_quiet_or_lifecycle", |app, _ctx| {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_support::tempdir().unwrap();
             app.runtime.sessions = vec![session("stale", AgentKind::Generic, AgentStatus::NeedsInput, dir.path())];
             let permission = imacs_core::hook::HookEvent::from_payload(&json!({
                 "hook_event_name":"PermissionRequest", "session_id":"stale", "cwd":dir.path(),
@@ -595,7 +595,7 @@ mod tests {
                     busy_text: Some("esc to interrupt".into()),
                     isolation: None,
                 });
-                let dir = tempfile::tempdir().unwrap();
+                let dir = crate::test_support::tempdir().unwrap();
                 let mut indices = Vec::new();
                 for (goal, id) in [("One", "worker-one"), ("Two", "worker-two")] {
                     assert!(

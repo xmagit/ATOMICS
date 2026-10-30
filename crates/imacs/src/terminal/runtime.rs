@@ -74,6 +74,7 @@ impl EventListener for Listener {
 /// Native runtime handle. Dropping it shuts down the PTY, even if no view was drawn.
 pub struct Terminal {
     process_id: u32,
+    stopped: AtomicBool,
     pub(super) term: Arc<FairMutex<Term<Listener>>>,
     sender: EventLoopSender,
     pub shared: Arc<Shared>,
@@ -161,7 +162,7 @@ impl Terminal {
         let sender = event_loop.channel();
         let _ = listener.sender.set(sender.clone());
         event_loop.spawn();
-        Ok(Terminal { process_id, term, sender, shared })
+        Ok(Terminal { process_id, stopped: AtomicBool::new(false), term, sender, shared })
     }
 
     /// Colors answered to later color queries, after a theme change.
@@ -241,6 +242,47 @@ impl Terminal {
     }
 
     pub fn shutdown(&self) {
+        if self.stopped.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // alacritty creates a new session/process group with setsid before exec.
+        // Stop it before taking the descendant snapshot so the leader cannot spawn more work.
+        // Interactive shells can give jobs their own groups; those must go away too.
+        let leader = self.process_id as i32;
+        unsafe {
+            libc::kill(-leader, libc::SIGSTOP);
+        }
+        if !self.exited()
+            && let Ok(output) = std::process::Command::new("/bin/ps").args(["-axo", "pid=,ppid=,pgid="]).output()
+            && output.status.success()
+        {
+            let rows: Vec<Vec<i32>> = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(|line| line.split_whitespace().filter_map(|part| part.parse().ok()).collect())
+                .filter(|row: &Vec<i32>| row.len() == 3)
+                .collect();
+            let mut owned = std::collections::HashSet::from([leader]);
+            loop {
+                let before = owned.len();
+                for row in &rows {
+                    if owned.contains(&row[1]) {
+                        owned.insert(row[0]);
+                    }
+                }
+                if before == owned.len() {
+                    break;
+                }
+            }
+            let our_group = unsafe { libc::getpgrp() };
+            for row in rows.iter().filter(|row| owned.contains(&row[0]) && row[2] > 1 && row[2] != our_group) {
+                unsafe {
+                    libc::kill(-row[2], libc::SIGKILL);
+                }
+            }
+        }
+        unsafe {
+            libc::kill(-leader, libc::SIGKILL);
+        }
         let _ = self.sender.send(Msg::Shutdown);
     }
 
@@ -263,6 +305,48 @@ impl Drop for Terminal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closing_or_replacing_terminal_kills_its_process_group() {
+        for job_control in [false, true] {
+            let dir = crate::test_support::tempdir().unwrap();
+            let spawn = || {
+                Terminal::spawn(
+                    crate::host::Wake::default(),
+                    Vec::new(),
+                    "/bin/sh".into(),
+                    vec![
+                        if job_control { "-imc" } else { "-c" }.into(),
+                        "trap '' HUP TERM; sleep 60 & echo $! > child; wait".into(),
+                    ],
+                    dir.path(),
+                    HashMap::new(),
+                    100,
+                )
+                .unwrap()
+            };
+            let mut terminal = Some(spawn());
+            for replace in [true, false] {
+                let pid = terminal.as_ref().unwrap().process_id() as i32;
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let path = dir.path().join("child");
+                while !path.exists() {
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let child: i32 = std::fs::read_to_string(&path).unwrap().trim().parse().unwrap();
+                assert_eq!(unsafe { libc::getpgid(child) } == pid, !job_control);
+                std::fs::remove_file(path).unwrap();
+                terminal = replace.then(&spawn);
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while unsafe { libc::kill(-pid, 0) == 0 || libc::kill(child, 0) == 0 } {
+                    assert!(Instant::now() < deadline, "process group {pid} survived closing");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                assert_eq!(unsafe { libc::kill(child, 0) }, -1, "worker survived");
+            }
+        }
+    }
 
     #[test]
     fn listener_exit_wakes_the_host_without_a_client() {

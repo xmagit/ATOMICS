@@ -128,7 +128,7 @@ mod tests {
     fn legacy_workspaces_load_list_and_save_without_modifying_shared_files() {
         const CHILD: &str = "IMACS_LEGACY_WORKSPACE_TEST_CHILD";
         if std::env::var_os(CHILD).is_none() {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_support::tempdir().unwrap();
             let output = crate::test_support::output(
                 Command::new(std::env::current_exe().unwrap())
                     .args([
@@ -183,7 +183,7 @@ mod tests {
     fn workspaces_are_host_local_and_preserve_portable_paths_and_ticket_settings() {
         const CHILD: &str = "IMACS_WORKSPACE_HOST_TEST_CHILD";
         if std::env::var_os(CHILD).is_none() {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_support::tempdir().unwrap();
             for host in ["work-mac", "home-linux"] {
                 let folder = dir.path().join("config/workspaces").join(host);
                 std::fs::create_dir_all(&folder).unwrap();
@@ -242,7 +242,7 @@ custom = true
     fn saving_keeps_one_tickets_section_that_still_parses() {
         const CHILD: &str = "IMACS_WORKSPACE_TICKETS_TEST_CHILD";
         if std::env::var_os(CHILD).is_none() {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_support::tempdir().unwrap();
             let output = crate::test_support::output(
                 Command::new(std::env::current_exe().unwrap())
                     .args(["--exact", "workspace::tests::saving_keeps_one_tickets_section_that_still_parses"])
@@ -307,7 +307,7 @@ result = { key = "id", state = "status" }
 
     #[test]
     fn worktree_folders_resolve_to_the_main_checkout() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let repo = dir.path().join("app");
         std::fs::create_dir(&repo).unwrap();
         let run =

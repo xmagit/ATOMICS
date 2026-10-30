@@ -582,15 +582,15 @@ pub(crate) mod tests {
         run(p, &["commit", "-q", "-m", "base"]);
     }
 
-    fn repo() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
+    fn repo() -> crate::test_support::TempDir {
+        let dir = crate::test_support::tempdir().unwrap();
         init(dir.path());
         dir
     }
 
     /// A repository at `<tmp>/app`, so worktrees next to it are cleaned up with it.
-    pub(crate) fn project() -> (tempfile::TempDir, PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
+    pub(crate) fn project() -> (crate::test_support::TempDir, PathBuf) {
+        let dir = crate::test_support::tempdir().unwrap();
         let repo = dir.path().join("app");
         std::fs::create_dir(&repo).unwrap();
         init(&repo);
@@ -618,7 +618,7 @@ pub(crate) mod tests {
     #[test]
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn native_clone_skips_special_files_without_copying_a_cache() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let source = dir.path().join("source");
         let destination = dir.path().join("cache");
         std::fs::create_dir(&source).unwrap();
@@ -632,7 +632,7 @@ pub(crate) mod tests {
 
     #[test]
     fn failed_or_unsupported_clone_leaves_no_cache_and_never_retries_as_a_copy() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let source = dir.path().join("source");
         let destination = dir.path().join("target");
         std::fs::create_dir(&source).unwrap();
@@ -699,7 +699,7 @@ pub(crate) mod tests {
         // The Linux harness can repeat this test on ext4, btrfs and XFS mounts.
         let dir = match std::env::var_os("IMACS_COW_TEST_DIR") {
             Some(parent) => tempfile::tempdir_in(parent).unwrap(),
-            None => tempfile::tempdir().unwrap(),
+            None => crate::test_support::tempdir().unwrap(),
         };
         let source = dir.path().join("source");
         let destination = dir.path().join("cache");
@@ -949,7 +949,7 @@ pub(crate) mod tests {
 
     #[test]
     fn repository_without_commits_diffs_against_the_empty_tree() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         run(dir.path(), &["init", "-q", "-b", "main"]);
         assert_eq!(worktree_of(dir.path()).unwrap().branch.as_deref(), Some("main"));
         std::fs::write(dir.path().join("new.rs"), "fn main() {}\n").unwrap();
