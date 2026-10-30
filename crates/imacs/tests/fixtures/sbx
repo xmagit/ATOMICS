@@ -7,6 +7,7 @@
 #   no-policy    `diagnose` reports the global network policy as not set up
 #   fail-<verb>  that verb fails, e.g. fail-create
 #   run-waits    `run` keeps the agent attached instead of exiting at once
+#   exec-runs    `exec` runs its command in the -w folder, stopped after its `timeout` seconds as in the VM
 dir=${0%/*}
 state="$dir/sandboxes"
 mkdir -p "$state"
@@ -172,6 +173,35 @@ case "$1" in
       echo 'stop the sandbox before saving a template non-interactively' >&2
       exit 1
     fi
+    ;;
+  exec)
+    [ -e "$dir/exec-runs" ] || exit 0
+    shift
+    workdir=.
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -w|--workdir) workdir=$2; shift 2 ;;
+        -e|--env|-u|--user) shift 2 ;;
+        -*) shift ;;
+        *) break ;;
+      esac
+    done
+    if [ ! -e "$state/$1" ]; then echo "sandbox $1 not found" >&2; exit 125; fi
+    shift
+    cd "$workdir" || exit 125
+    # The VM's coreutils `timeout -k <grace> <seconds> <command>`, which a host may not have.
+    if [ "$1" != timeout ]; then HOME=$dir exec "$@"; fi
+    tenths=$(($4 * 10))
+    shift 4
+    HOME=$dir "$@" &
+    pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+      if [ "$tenths" -le 0 ]; then kill "$pid"; wait "$pid"; exit 124; fi
+      sleep 0.1
+      tenths=$((tenths - 1))
+    done
+    wait "$pid"
+    exit $?
     ;;
   run)
     printf '%s\n' "${SSH_AUTH_SOCK-unset}" > "$dir/run-ssh"

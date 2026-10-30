@@ -351,7 +351,8 @@ A task planned with `-m gpt-6.1-sol -c model_reasoning_effort=high -s workspace-
 runs in its sandbox with `-m gpt-6.1-sol -c model_reasoning_effort=high`. Bare agents get every argument.
 
 The chief always runs bare, whatever `mode`, a workspace or a repository says, and after a restart too.
-It needs this machine's tools: `imacs ctl`, git across repositories, builds and screenshots.
+It needs this machine's tools: `imacs ctl`, git across repositories, and builds and screenshots of bare
+tasks. Sandboxed work it checks inside the sandbox (see [Checking sandboxed work](#checking-sandboxed-work)).
 
 ## Lifecycle
 
@@ -456,6 +457,41 @@ mounted read-only.
 - **Model credentials.** These reach the agent through sbx's credential proxy, not through files in the
   sandbox.
 
+## Checking sandboxed work
+
+Builds and tests run the agent's code. For a sandboxed session the chief does not run them on your
+machine, where that code would run as you. It runs them in the session's sandbox with the chief-only
+`imacs_exec` tool, which `imacs ctl` also takes:
+
+```sh
+imacs ctl '{"cmd":"exec","session":"<id or title>","command":"cargo test -p imacs-core","timeout_secs":900}'
+```
+
+- **Where.** IMACS runs `sbx exec -w <worktree> imacs-<session id> timeout -k 10 <secs> bash -lc '<command>'`.
+  The command runs in the session's worktree, at the path the sandbox mounts it, through a login shell that
+  finds a template's toolchains. When the session's agent has exited, its sandbox is stopped: `sbx exec`
+  starts it, and IMACS stops it again afterwards. A sandbox an agent still runs in stays up.
+- **Slots.** The command waits for a test slot (`"class": "qa"` for a QA slot), the same slots `imacs queue`
+  gives whole test runs on this machine. Checks across sandboxes stay within `[resources] test_slots` and
+  `qa_slots`, together with every agent's full test runs. The session's tile shows the slot while the check
+  waits and runs.
+- **Time.** `timeout_secs` (default 600, at most 3600) bounds the wait for a slot, and then the run. In the
+  VM, coreutils' `timeout` stops the command (exit 124) and kills it 10 seconds later if it ignores that:
+  stopping `sbx exec` on your machine alone would leave the command running in the VM.
+- **What comes back.** The exit code, whether it timed out, how long it waited and ran, and the last 40,000
+  bytes of stdout and stderr, with each stream's full size. No environment is passed in, and none is logged:
+  in IMACS's slot list, the values of `NAME=value` words in a command show as `NAME=…`.
+- **Afterwards.** The command ran agent code, which can move refs, so IMACS checks the session's refs as
+  after a turn (see [Trust model](#trust-model)).
+- **Bare sessions are refused.** Their work is already on this machine: the chief runs their checks in their
+  worktree, through `imacs queue` for whole suites.
+
+The chief reads every diff through `imacs_diff`, never with git in a sandboxed worktree: IMACS runs that git
+with the locations it recorded, while git run there by hand would follow files the agent can write (see
+[Git on your machine in a sandboxed folder](#git-on-your-machine-in-a-sandboxed-folder)). In sandbox mode,
+a plan's final review task runs in a sandbox of its own, and its brief has it run the plan's builds and
+tests there, in a worktree that starts from the integration branch.
+
 ## Trust model
 
 - **The worktree and its branch.** A sandboxed agent can change anything in its worktree, and commit.
@@ -489,7 +525,8 @@ mounted read-only.
 
 - Sandboxed agents do not share IMACS's compiler job pool, and cannot run `imacs queue`. Their limits are
   `cpus` and `memory`, which default low enough for several agents at once. sbx's own defaults, every
-  core and half the memory for each sandbox, would oversubscribe the machine.
+  core and half the memory for each sandbox, would oversubscribe the machine. The chief's checks in a
+  sandbox (`imacs_exec`) do wait for IMACS's test and QA slots.
 - Refs that `git gc` or `git pack-refs` packed on your machine are not visible inside a sandbox, because
   `packed-refs` is not mounted. Refs a fetch updates are written loose and are visible. A task's branch
   is loose until it is packed, so avoid `git gc` in a repository while sandboxed agents work in it: a

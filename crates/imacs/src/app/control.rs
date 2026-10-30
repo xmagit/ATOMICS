@@ -504,6 +504,13 @@ impl State {
                     ControlOutcome::Diff { root, base_ref, patch, session: json!(self.sessions[index].id) }
                 }
             },
+            ControlRequest::Exec { session, command, timeout_secs, class } => match self.find(&session) {
+                None => missing(&session),
+                Some(index) => match self.exec(index, command, timeout_secs, class) {
+                    Ok(outcome) => outcome,
+                    Err(error) => done(ControlResponse::error(error)),
+                },
+            },
             ControlRequest::Comment { session, path, line, removed, text } => match self.find(&session) {
                 None => missing(&session),
                 Some(index) => {
@@ -577,6 +584,65 @@ impl State {
             }
         };
         let _ = reply.send(outcome);
+    }
+
+    /// `imacs_exec`: a command for a sandboxed session's sandbox, in its worktree, which the socket
+    /// thread runs once a slot is free. A bare session's work is on this machine, where the chief
+    /// runs its checks itself.
+    fn exec(
+        &self,
+        index: usize,
+        command: String,
+        timeout_secs: Option<u64>,
+        class: Option<SlotClass>,
+    ) -> Result<ControlOutcome, String> {
+        let s = &self.sessions[index];
+        let Some(sandbox) = s.sandbox.clone() else {
+            if self.pending_sandbox.iter().any(|(launch, _)| launch.id == s.id) {
+                return Err(format!("{}'s sandbox is still starting; try again once its agent runs", s.title));
+            }
+            return Err(format!(
+                "{} runs bare, on this machine, not in a sandbox: run the command on the host in {} (whole test \
+                 suites through `imacs queue --class test -- <command>`)",
+                s.title,
+                s.root().display()
+            ));
+        };
+        if command.trim().is_empty() {
+            return Err("give a command to run".into());
+        }
+        let root = s.root();
+        let job = crate::sandbox::exec::Exec {
+            sbx: resolve_program(&self.sbx),
+            sandbox: sandbox.clone(),
+            // The sandbox mounts the worktree where its links lead.
+            workdir: std::fs::canonicalize(&root).unwrap_or(root),
+            command,
+            timeout: crate::sandbox::exec::timeout(timeout_secs),
+            class: class.unwrap_or(SlotClass::Test),
+            ancestors: s.terminal.iter().map(|terminal| terminal.process_id()).collect(),
+        };
+        let (actions, id) = (self.action_tx.clone(), s.id.clone());
+        let then: Box<dyn FnOnce() + Send> = Box::new(move || {
+            let _ = actions.send(Box::new(move |state: &mut State| state.exec_finished(&id, sandbox)));
+        });
+        Ok(ControlOutcome::Exec { job, session: json!(s.id), then })
+    }
+
+    /// After a command in a sandbox: it ran agent code, which can move refs, so they are checked as
+    /// after a turn. A sandbox it started for an agent that has gone stops again.
+    pub(super) fn exec_finished(&mut self, id: &str, sandbox: String) {
+        if let Some(index) = self.sessions.iter().position(|s| s.id == id) {
+            self.check_refs(index);
+        }
+        let attached = self.sessions.iter().any(|s| {
+            s.sandbox.as_deref() == Some(sandbox.as_str()) && s.terminal.as_ref().is_some_and(|t| !t.exited())
+        }) || self.pending_sandbox.iter().any(
+            |(launch, _)| matches!(&launch.runtime, AgentRuntime::Sandbox(sandboxed) if sandboxed.name == sandbox),
+        );
+        if !attached {
+            self.stop_sandbox(sandbox);
+        }
     }
 
     /// Records status changes as events and answers waiters they satisfy.

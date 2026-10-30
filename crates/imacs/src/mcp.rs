@@ -93,8 +93,10 @@ fn agent_tools() -> Value {
     }])
 }
 
-/// Tools only the chief's own server offers: restarting IMACS and configuring it.
-const CHIEF_ONLY: &[&str] = &["imacs_restart", "imacs_config_get", "imacs_config_propose", "imacs_doctor"];
+/// Tools only the chief's own server offers: restarting IMACS, configuring it, and running commands
+/// in agents' sandboxes.
+const CHIEF_ONLY: &[&str] =
+    &["imacs_restart", "imacs_config_get", "imacs_config_propose", "imacs_doctor", "imacs_exec"];
 
 fn available_tools(agent: bool, chief: bool) -> Value {
     if agent {
@@ -413,6 +415,9 @@ fn tools() -> Value {
     if let (Some(all), Value::Array(more)) = (tools.as_array_mut(), ticket_tools(&plan)) {
         all.extend(more);
     }
+    if let Some(all) = tools.as_array_mut() {
+        all.push(exec_tool(&session));
+    }
     if let (Some(all), Value::Array(more)) = (tools.as_array_mut(), stage_tools()) {
         all.extend(more);
     }
@@ -420,6 +425,23 @@ fn tools() -> Value {
         all.extend(more);
     }
     tools
+}
+
+fn exec_tool(session: &Value) -> Value {
+    json!({
+        "name": "imacs_exec",
+        "description": "Chief only: run a shell command (bash -lc) in a sandboxed session's sandbox, in its worktree, to verify its work. Builds and tests run the agent's code: for sandboxed sessions run them here, never on this machine. Waits up to timeout_secs for a free test slot (class qa for QA instances), the same slots as `imacs queue`, then runs for at most timeout_secs (default 600, max 3600). Returns the exit code, whether it timed out, and the last 40000 bytes of stdout and stderr with their full sizes. Refused for bare sessions, whose checks run on this machine.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session": session,
+                "command": { "type": "string", "description": "For example cargo test -p imacs-core" },
+                "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 3600 },
+                "class": { "type": "string", "enum": ["test", "qa"], "description": "Slot to wait for (default test)" }
+            },
+            "required": ["session", "command"]
+        }
+    })
 }
 
 fn stage_tools() -> Value {
@@ -501,7 +523,32 @@ fn response_text(name: &str, result: &Value) -> String {
     {
         return format!("status: {}\n\n{screen}", result["status"].as_str().unwrap_or("?"));
     }
+    if name == "imacs_exec" && result.get("stdout").is_some() {
+        return exec_text(result);
+    }
     serde_json::to_string_pretty(result).unwrap_or_default()
+}
+
+/// A sandbox command's outcome as it would read in a terminal: how it ended, then each stream.
+fn exec_text(result: &Value) -> String {
+    let code = result["exit_code"].as_i64().map_or_else(|| "killed".to_string(), |code| format!("exit {code}"));
+    let ended = if result["timed_out"] == true { format!("timed out ({code})") } else { code };
+    let mut text = format!(
+        "{ended} after {} s in sandbox {} at {} (waited {} s for a {} slot)\n",
+        result["secs"],
+        result["sandbox"].as_str().unwrap_or("?"),
+        result["workdir"].as_str().unwrap_or("?"),
+        result["waited_secs"],
+        result["class"].as_str().unwrap_or("test"),
+    );
+    for stream in ["stdout", "stderr"] {
+        let shown = result[stream].as_str().unwrap_or_default();
+        text.push_str(&format!("\n--- {stream} ({} bytes)\n{shown}", result[format!("{stream}_bytes")]));
+        if !shown.is_empty() && !shown.ends_with('\n') {
+            text.push('\n');
+        }
+    }
+    text
 }
 
 pub(crate) fn request_for_tool(name: &str, mut args: Value) -> Result<ControlRequest, String> {
@@ -516,6 +563,7 @@ pub(crate) fn request_for_tool(name: &str, mut args: Value) -> Result<ControlReq
         "imacs_approve" => "approve",
         "imacs_read" => "read",
         "imacs_diff" => "diff",
+        "imacs_exec" => "exec",
         "imacs_focus" => "activate",
         "imacs_open" => "open",
         "imacs_edit" => "edit",
@@ -683,6 +731,30 @@ mod tests {
         let output: Value = serde_json::from_str(&response_text("imacs_result", &result)).unwrap();
         assert_eq!(output, result);
         assert_eq!(response_text("imacs_read", &result), "status: needs you\n\nmenu");
+    }
+
+    #[test]
+    fn exec_reads_like_a_terminal_and_is_chief_only() {
+        let result = json!({
+            "session": "s1", "sandbox": "imacs-s1", "workdir": "/repos/app-t1", "class": "test",
+            "exit_code": 124, "timed_out": true, "secs": 600.2, "waited_secs": 3.5,
+            "stdout": "running 3 tests\n", "stdout_bytes": 16, "stderr": "", "stderr_bytes": 0
+        });
+        assert_eq!(
+            response_text("imacs_exec", &result),
+            "timed out (exit 124) after 600.2 s in sandbox imacs-s1 at /repos/app-t1 (waited 3.5 s for a test slot)\n\
+             \n--- stdout (16 bytes)\nrunning 3 tests\n\n--- stderr (0 bytes)\n"
+        );
+        let request = request_for_tool("imacs_exec", json!({"session":"t1", "command":"cargo test"})).unwrap();
+        assert!(matches!(
+            request,
+            ControlRequest::Exec { session, command, timeout_secs: None, class: None } if session == "t1" && command == "cargo test"
+        ));
+        assert!(!available_tools(false, false).as_array().unwrap().iter().any(|tool| tool["name"] == "imacs_exec"));
+        assert_eq!(
+            call_agent(&json!({"name":"imacs_exec", "arguments":{"session":"t1","command":"ls"}}))["isError"],
+            true
+        );
     }
 
     #[test]

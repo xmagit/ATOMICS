@@ -85,6 +85,7 @@ fn orbit_icon(painter: &egui::Painter, rect: Rect, accent: Color32, light: Color
 /// Tools the chief may use without asking: reading, planning, reviewing, and running the
 /// plan the user approved. Starting agents, typing into terminals and closing sessions ask
 /// first. Config tools only read or propose: a proposed change waits for the user to apply it.
+/// Checks with imacs_exec run in an agent's sandbox, which reaches no more than its agent does.
 pub(super) const CHIEF_ALLOWED_TOOLS: &[&str] = &[
     "mcp__imacs__imacs_list",
     "mcp__imacs__imacs_wait",
@@ -93,6 +94,7 @@ pub(super) const CHIEF_ALLOWED_TOOLS: &[&str] = &[
     "mcp__imacs__imacs_result",
     "mcp__imacs__imacs_read",
     "mcp__imacs__imacs_diff",
+    "mcp__imacs__imacs_exec",
     "mcp__imacs__imacs_plan_get",
     "mcp__imacs__imacs_plan_close",
     "mcp__imacs__imacs_plan_set",
@@ -320,6 +322,8 @@ mod tests {
         assert!(readme.contains("`allow_always` for the rest"));
         assert!(!readme.contains("or answer other agents'"));
         assert!(readme.contains("outside Codex's sandbox"));
+        assert!(CHIEF_ALLOWED_TOOLS.contains(&"mcp__imacs__imacs_exec"));
+        assert!(readme.contains("pre-approved `imacs_exec`"));
     }
 }
 
