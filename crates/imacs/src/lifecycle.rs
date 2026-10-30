@@ -1,6 +1,8 @@
 //! Cleanup owned resources, with failures kept visible in doctor and the cleanup dialog.
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use imacs_core::{cleanup, config::Config, git, plan::Plan, store::Store};
@@ -10,6 +12,103 @@ use crate::sandbox_ownership::{self as ownership, Resource};
 
 fn real(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Background work that stops or removes sandboxes and worktrees: a closed session's stop and final
+/// ref check, a plan's cleanup, the cleanup dialog's removals. Work that must not overlap it, such as
+/// preparing the same sandbox or making a worktree where one is being removed, waits for it on a
+/// thread of its own; the UI thread never does.
+#[derive(Clone)]
+pub struct Job {
+    done: Arc<(Mutex<bool>, Condvar)>,
+    scope: Scope,
+}
+
+/// What a [`Job`] may stop or remove. `None` is anything, for work that finds its targets as it runs.
+#[derive(Clone, Default)]
+pub struct Scope {
+    pub sandboxes: Vec<String>,
+    pub worktrees: Option<Vec<PathBuf>>,
+}
+
+impl Scope {
+    pub fn sandbox(name: String) -> Self {
+        Self { sandboxes: vec![name], worktrees: Some(Vec::new()) }
+    }
+
+    /// Work that stops or removes nothing, such as a scan.
+    pub fn none() -> Self {
+        Self { sandboxes: Vec::new(), worktrees: Some(Vec::new()) }
+    }
+}
+
+/// Marks its job done when its thread ends, also by a panic.
+struct Done(Arc<(Mutex<bool>, Condvar)>);
+
+impl Drop for Done {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("IMACS: cleanup worker panicked");
+        }
+        let (done, changed) = &*self.0;
+        *done.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        changed.notify_all();
+    }
+}
+
+impl Job {
+    pub fn spawn(scope: Scope, work: impl FnOnce() + Send + 'static) -> Self {
+        let job = Self { done: Arc::default(), scope };
+        let done = Done(job.done.clone());
+        std::thread::spawn(move || {
+            let _done = done;
+            work();
+        });
+        job
+    }
+
+    pub fn is_finished(&self) -> bool {
+        *self.done.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Whether it may stop or remove sandbox `name`, or the worktree at `path`. Compares folders by
+    /// where they lead: call it off the UI thread.
+    pub fn touches(&self, name: Option<&str>, path: Option<&Path>) -> bool {
+        let worktree = |path: &Path| match &self.scope.worktrees {
+            None => true,
+            Some(worktrees) => worktrees.iter().any(|tree| tree == path || real(tree) == real(path)),
+        };
+        name.is_some_and(|name| self.scope.sandboxes.iter().any(|other| other == name)) || path.is_some_and(worktree)
+    }
+
+    pub fn wait(&self) {
+        let (done, changed) = &*self.done;
+        let mut finished = done.lock().unwrap_or_else(|e| e.into_inner());
+        while !*finished {
+            finished = changed.wait(finished).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Waits at most until `deadline`; whether the job finished.
+    pub fn wait_until(&self, deadline: Instant) -> bool {
+        let (done, changed) = &*self.done;
+        let mut finished = done.lock().unwrap_or_else(|e| e.into_inner());
+        while !*finished {
+            let Some(left) = deadline.checked_duration_since(Instant::now()).filter(|left| !left.is_zero()) else {
+                return false;
+            };
+            finished = changed.wait_timeout(finished, left).unwrap_or_else(|e| e.into_inner()).0;
+        }
+        true
+    }
+}
+
+/// Waits, off the UI thread, for those of `jobs` that may stop or remove sandbox `name` or the
+/// worktree at `path`.
+pub fn wait_for(jobs: &[Job], name: Option<&str>, path: Option<&Path>) {
+    for job in jobs.iter().filter(|job| job.touches(name, path)) {
+        job.wait();
+    }
 }
 
 pub fn clean_plan(home: &Path, plan: &Plan, sbx: &str, protected: &[PathBuf]) -> Vec<String> {
@@ -24,6 +123,10 @@ pub fn clean_plan(home: &Path, plan: &Plan, sbx: &str, protected: &[PathBuf]) ->
     for entry in entries {
         let result = (|| -> Result<bool> {
             let mut names = Vec::new();
+            // Kept worktrees are never entered: not to check them, nor to stop their sandboxes.
+            if let Some(keep) = &entry.keep {
+                anyhow::bail!("kept: {keep}");
+            }
             if let Some(path) = &entry.worktree {
                 anyhow::ensure!(
                     !protected.iter().any(|root| real(root) == real(path)),
@@ -105,12 +208,37 @@ pub fn record_leftovers(home: &Path, notes: &[String]) {
 /// A malformed ownership record fails closed, rather than treating its resources as orphans.
 #[cfg(test)]
 pub fn sweep(home: &Path, config: &Config, sbx: &str) -> Result<Vec<String>> {
-    let notes = sweep_before(home, config, sbx, std::time::SystemTime::now())?;
+    let notes = sweep_before(home, config, sbx, Cutoff::mark(home)?)?;
     record_leftovers(home, &notes);
     Ok(notes)
 }
 
-pub fn sweep_before(home: &Path, config: &Config, sbx: &str, before: std::time::SystemTime) -> Result<Vec<String>> {
+/// When a sweep starts: nothing created from then on is a candidate. The ownership ledger records
+/// clock readings, but file times come from the filesystem's clock, which on Linux trails the clock
+/// by up to a tick, so a brief written just after a clock reading can look older than it. Files are
+/// compared with a marker the filesystem stamped instead, and one as old as the marker counts as new.
+pub struct Cutoff {
+    time: std::time::SystemTime,
+    files: std::time::SystemTime,
+}
+
+impl Cutoff {
+    pub fn mark(home: &Path) -> Result<Self> {
+        std::fs::create_dir_all(home)?;
+        let marker = home.join("sweep-cutoff");
+        std::fs::write(&marker, "the last cleanup sweep's cutoff\n").context("marking the cleanup cutoff")?;
+        let files = std::fs::metadata(&marker)?.modified()?;
+        Ok(Self { time: std::time::SystemTime::now(), files })
+    }
+
+    /// The marker's file time, for comparing other file times with.
+    pub fn files(&self) -> std::time::SystemTime {
+        self.files
+    }
+}
+
+pub fn sweep_before(home: &Path, config: &Config, sbx: &str, cutoff: Cutoff) -> Result<Vec<String>> {
+    let Cutoff { time: before, files } = cutoff;
     sandbox::load_owned_pins(home)?;
     let store = match std::fs::read(home.join("sessions.json")) {
         Ok(bytes) => serde_json::from_slice::<Store>(&bytes).context("reading cleanup session ownership")?,
@@ -181,7 +309,7 @@ pub fn sweep_before(home: &Path, config: &Config, sbx: &str, before: std::time::
     if briefs.exists() {
         for entry in std::fs::read_dir(&briefs)? {
             let entry = entry?;
-            if entry.metadata()?.modified()? >= before {
+            if entry.metadata()?.modified()? >= files {
                 continue;
             }
             let path = entry.path();
@@ -214,7 +342,8 @@ pub fn sweep_before(home: &Path, config: &Config, sbx: &str, before: std::time::
         .collect();
     for repo in repos {
         let result = (|| -> Result<()> {
-            let trees = git::list_worktrees(&repo)?;
+            // Git never runs in a worktree listed from files that do not lead back to it.
+            let trees: Vec<_> = git::list_worktrees(&repo)?.into_iter().filter(|tree| tree.trusted).collect();
             for tree in &trees {
                 sweep_warm_stages(&tree.path, &config.worktrees.warm, &mut notes)?;
             }
@@ -225,7 +354,7 @@ pub fn sweep_before(home: &Path, config: &Config, sbx: &str, before: std::time::
                     .is_some_and(|b| b.starts_with("imacs/warm-") || b.starts_with("imacs-warm-"));
                 if !warm
                     || protected.contains(&real(&tree.path))
-                    || std::fs::metadata(&tree.path).and_then(|m| m.modified()).is_ok_and(|modified| modified >= before)
+                    || std::fs::metadata(&tree.path).and_then(|m| m.modified()).is_ok_and(|modified| modified >= files)
                 {
                     continue;
                 }
@@ -273,8 +402,8 @@ pub fn remove_scratch(home: &Path, dir: &Path) -> Result<()> {
     }
 }
 
-/// Removes scratch folders older than `before` that no session in `keep`, a restart's handoff, resumes.
-/// Their sessions ended when IMACS quit or crashed.
+/// Removes scratch folders older than `before`, a file time such as [`Cutoff::files`], that no session
+/// in `keep`, a restart's handoff, resumes. Their sessions ended when IMACS quit or crashed.
 pub fn sweep_scratch(home: &Path, keep: &HashSet<PathBuf>, before: std::time::SystemTime) -> Vec<String> {
     let entries = match std::fs::read_dir(home.join("scratch")) {
         Ok(entries) => entries,
@@ -439,20 +568,12 @@ mod tests {
         std::fs::create_dir(&bin).unwrap();
         let sbx = fake::install(&bin).display().to_string();
         let home = dir.path().join("home");
-        let before = std::time::SystemTime::now();
+        let before = Cutoff::mark(&home).unwrap();
         sandbox(&bin, "imacs-starting", dir.path());
         ownership::created(&home, "imacs-starting", Resource::Mcp).unwrap();
         ownership::created(&home, "imacs-starting", Resource::Sandbox).unwrap();
         std::fs::create_dir_all(home.join("briefs")).unwrap();
         std::fs::write(home.join("briefs/starting.md"), "being prepared").unwrap();
-        // Filesystem mtimes can be coarser than SystemTime::now (notably in the Linux harness).
-        // Establish the ordering explicitly instead of relying on two adjacent wall-clock reads.
-        std::fs::File::options()
-            .write(true)
-            .open(home.join("briefs/starting.md"))
-            .unwrap()
-            .set_modified(before + std::time::Duration::from_secs(1))
-            .unwrap();
         assert!(sweep_before(&home, &Config::default(), &sbx, before).unwrap().is_empty());
         assert!(bin.join("sandboxes/imacs-starting").exists() && bin.join("mcp/imacs-starting").exists());
         assert!(home.join("briefs/starting.md").exists());
@@ -487,15 +608,22 @@ mod tests {
         let brief = home.join("briefs/pane/brief.md");
         std::fs::create_dir_all(brief.parent().unwrap()).unwrap();
         std::fs::write(&brief, "old brief").unwrap();
+        // Left by an earlier run: written just now, it could share the cutoff's clock tick, and so count as new.
+        let backdate = || {
+            let earlier = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+            std::fs::File::open(brief.parent().unwrap()).unwrap().set_modified(earlier).unwrap();
+        };
         // Open tasks retain their input even when there is no live terminal.
         plan.status = PlanStatus::Open;
         plan.save_in(home).unwrap();
+        backdate();
         assert!(sweep(home, &Config::default(), "/missing/sbx").unwrap().is_empty());
         assert!(brief.exists());
         for status in [PlanStatus::Completed, PlanStatus::Archived] {
             plan.status = status;
             plan.save_in(home).unwrap();
             std::fs::write(&brief, "old brief").unwrap();
+            backdate();
             assert!(sweep(home, &Config::default(), "/missing/sbx").unwrap().is_empty());
             assert!(!brief.exists());
             assert_eq!(Store::load(&home.join("sessions.json")).sessions.len(), 1);
@@ -542,6 +670,11 @@ mod tests {
         std::fs::write(home.join("briefs/live/brief.md"), "keep").unwrap();
         std::fs::write(home.join("briefs/stale/brief.md"), "remove").unwrap();
         std::fs::write(home.join("briefs/orphan.md"), "remove").unwrap();
+        // Left by an earlier run: written just now, they could share the cutoff's clock tick, and so count as new.
+        for path in [clean.clone(), dirty.clone(), home.join("briefs/stale"), home.join("briefs/orphan.md")] {
+            let earlier = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+            std::fs::File::open(path).unwrap().set_modified(earlier).unwrap();
+        }
         let config = Config { repos: vec![repo.display().to_string()], ..Config::default() };
         let notes = sweep(&home, &config, &sbx).unwrap();
         assert!(!clean.exists());
@@ -648,6 +781,44 @@ mod tests {
                 assert!(ownership::owned(&home).unwrap().is_empty());
             }
         }
+    }
+
+    #[test]
+    fn startup_sweep_never_enters_a_worktree_a_sandbox_lists_from_its_git_folder() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let repo = repository(dir.path());
+        let home = dir.path().join("home");
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let sbx = fake::install(&bin).display().to_string();
+        let tree = dir.path().join("task");
+        git::add_worktree(&repo, &tree, "imacs/warm-task", "main").unwrap();
+        sandbox::pin_git(&home.join("git-pins"), "imacs-task", &tree).unwrap();
+        // The VM plants a repository whose fsmonitor leaves `marker` in its worktree's read-write git
+        // folder, names it in the folder's gitdir, and gives it an old cache stage for the sweep.
+        let admin = git::pinned(&tree).unwrap().git_dir.unwrap();
+        let evil = admin.join("evil");
+        let marker = dir.path().join("executed-fsmonitor");
+        let raw = |dir: &Path, args: &[&str]| std::process::Command::new("git").arg("-C").arg(dir).args(args).output();
+        assert!(raw(&admin, &["init", "-q", "evil"]).unwrap().status.success());
+        let touch = format!("touch {}", marker.display());
+        assert!(raw(&evil, &["config", "core.fsmonitor", &touch]).unwrap().status.success());
+        std::fs::write(admin.join("gitdir"), format!("{}\n", evil.join(".git").display())).unwrap();
+        let stage = evil.join(".imacs-warm-old");
+        std::fs::create_dir(&stage).unwrap();
+        std::fs::File::open(&stage)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))
+            .unwrap();
+        git::unpin(&tree.canonicalize().unwrap()); // Simulate a newly started host.
+
+        let config = Config { repos: vec![repo.display().to_string()], ..Config::default() };
+        assert_eq!(config.worktrees.warm, ["target"]);
+        sweep(&home, &config, &sbx).unwrap();
+        assert!(!marker.exists(), "the sweep ran git in the sandbox's planted repository");
+        assert!(stage.exists() && tree.exists());
+        assert!(raw(&evil, &["status"]).unwrap().status.success() && marker.exists(), "the planted config is live");
+        git::unpin(&tree.canonicalize().unwrap());
     }
 
     #[test]

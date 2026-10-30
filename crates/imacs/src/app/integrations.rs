@@ -1,5 +1,8 @@
 use super::*;
 
+/// How long a readiness check git could not finish waits before it runs again.
+const INTEGRATION_RETRY: Duration = Duration::from_secs(30);
+
 impl State {
     /// The repository a task works in.
     pub(super) fn task_repo(&self, index: usize, task: &Task) -> Option<PathBuf> {
@@ -23,7 +26,8 @@ impl State {
             }
         }
         while let Ok(checked) = self.integration_check_rx.try_recv() {
-            self.integration_checks.remove(&(checked.plan.clone(), checked.task.id.clone()));
+            let key = (checked.plan.clone(), checked.task.id.clone());
+            self.integration_checks.remove(&key);
             let Some(index) = self.plans.iter().position(|p| p.id == checked.plan && p.is_open()) else { continue };
             if self.integration_revision != checked.revision || self.plans[index].integration_branch() != checked.into {
                 continue;
@@ -40,6 +44,9 @@ impl State {
                     task.integrated = None;
                     task.integrated_commit = None;
                 }
+                if checked.retry {
+                    self.integration_retries.insert(key, Instant::now() + INTEGRATION_RETRY);
+                }
                 self.integration_checked
                     .insert((checked.plan, task.id.clone()), (checked.revision, checked.into, task.clone()));
                 if checked.valid.is_some() {
@@ -47,34 +54,36 @@ impl State {
                 }
             }
         }
-        let mut jobs = Vec::new();
-        for plan in self.plans.iter_mut().filter(|p| p.is_open()) {
-            let into = plan.integration_branch();
-            for task in &mut plan.tasks {
-                let key = (plan.id.clone(), task.id.clone());
+        let (mut jobs, now) = (Vec::new(), Instant::now());
+        for index in 0..self.plans.len() {
+            if !self.plans[index].is_open() {
+                continue;
+            }
+            let (plan, into) = (self.plans[index].id.clone(), self.plans[index].integration_branch());
+            for position in 0..self.plans[index].tasks.len() {
+                let task = &self.plans[index].tasks[position];
+                let key = (plan.clone(), task.id.clone());
+                let retry = self.integration_retries.get(&key).is_some_and(|at| *at <= now);
                 if task.id == plan::REVIEW_TASK
                     || !(task.integrated.as_deref() == Some(&into)
                         || task.status == TaskStatus::Done && task.branch.is_some())
-                    || self.integration_checked.get(&key).is_some_and(|(revision, branch, checked)| {
-                        *revision == self.integration_revision && branch == &into && same_work(checked, task)
-                    })
+                    || !retry
+                        && self.integration_checked.get(&key).is_some_and(|(revision, branch, checked)| {
+                            *revision == self.integration_revision && branch == &into && same_work(checked, task)
+                        })
                 {
                     continue;
                 }
                 if self.integration_checks.insert(key.clone()) {
+                    // The repository the task integrates into, never a sandboxed session's folder.
+                    let repo = self.task_repo(index, task);
+                    self.integration_retries.remove(&key);
+                    let task = &mut self.plans[index].tasks[position];
                     task.integration_verified = false;
-                    // Remember errors too: retry only when refs or the task change.
+                    // Remember what git answers, errors too: check again only when refs or the task
+                    // change, or after a while when git did not finish.
                     self.integration_checked.insert(key, (self.integration_revision, into.clone(), task.clone()));
-                    let repo = task
-                        .repo
-                        .as_deref()
-                        .map(paths::expand)
-                        .or_else(|| plan.project.clone())
-                        .or_else(|| {
-                            self.sessions.iter().find(|s| task.session.as_deref() == Some(&s.id)).map(Session::root)
-                        })
-                        .or_else(|| self.repos.first().cloned());
-                    jobs.push((plan.id.clone(), task.clone(), into.clone(), repo));
+                    jobs.push((plan.clone(), task.clone(), into.clone(), repo));
                 }
             }
         }
@@ -90,55 +99,27 @@ impl State {
             std::thread::spawn(move || {
                 for (plan, task, into, repo, base) in jobs {
                     let mut commit = None;
-                    let valid = task
-                        .branch
-                        .as_deref()
-                        .zip(repo)
-                        .filter(|_| matches!(task.status, TaskStatus::Review | TaskStatus::Done))
-                        .and_then(|(branch, repo)| {
-                            let branch_ref = format!("refs/heads/{branch}");
-                            let source = match git::git(&repo, &["rev-parse", "--verify", &branch_ref]) {
-                                Ok(tip) => tip.trim().to_string(),
-                                Err(_) => {
-                                    // Only a genuinely deleted branch may use the saved tip.
-                                    let refs =
-                                        git::git(&repo, &["for-each-ref", "--format=%(refname)", &branch_ref]).ok()?;
-                                    if refs.lines().any(|name| name == branch_ref) {
-                                        return None;
-                                    }
-                                    task.integrated_commit.clone()?
-                                }
-                            };
-                            commit = Some(source.clone());
-                            let target = format!("refs/heads/{into}");
-                            let target_exists = git::git(&repo, &["show-ref", "--verify", &target]).is_ok();
-                            let target = if target_exists { target } else { base? };
-                            let output = std::process::Command::new(resolve_program("git"))
-                                .arg("-C")
-                                .arg(&repo)
-                                .args(["-c", "core.quotepath=off"])
-                                .args(["merge-base", "--is-ancestor", &source, &target])
-                                .output()
-                                .ok()?;
-                            match output.status.code() {
-                                Some(0) => {
-                                    // A branch with no new commits can still have uncommitted work.
-                                    let trees = git::list_worktrees(&repo).ok()?;
-                                    let tree = trees.iter().find(|tree| tree.branch.as_deref() == Some(branch));
-                                    Some(match tree {
-                                        Some(tree) => {
-                                            git::git(&tree.path, &["status", "--porcelain", "--untracked-files=all"])
-                                                .ok()?
-                                                .is_empty()
-                                        }
-                                        None => true,
-                                    })
-                                }
-                                Some(1) if target_exists => Some(false),
-                                _ => None,
-                            }
-                        });
-                    let _ = tx.send(CheckedIntegration { commit, revision, plan, task, into, valid });
+                    let checked = match (task.branch.as_deref(), repo) {
+                        (Some(branch), Some(repo)) if matches!(task.status, TaskStatus::Review | TaskStatus::Done) => {
+                            work_in(
+                                &repo,
+                                branch,
+                                &into,
+                                base.as_deref(),
+                                task.integrated_commit.as_deref(),
+                                &mut commit,
+                            )
+                        }
+                        _ => Ok(None),
+                    };
+                    let (valid, retry) = match checked {
+                        Ok(valid) => (valid, false),
+                        Err(err) => {
+                            eprintln!("IMACS: checking whether task {} is in {into} failed: {err:#}", task.id);
+                            (None, true)
+                        }
+                    };
+                    let _ = tx.send(CheckedIntegration { commit, revision, plan, task, into, valid, retry });
                 }
             });
         }
@@ -272,6 +253,52 @@ impl State {
             let _ = reply.send(ControlOutcome::Done(response));
         }
     }
+}
+
+/// Whether a task's work is in `into`, or in `base` while `into` does not exist yet: the commit
+/// `branch` is at, or the `saved` one once the branch is deleted, with nothing uncommitted in the
+/// branch's worktree. `None` when git answers neither, an error when git did not run or finish.
+/// `commit` gets the commit it checked.
+fn work_in(
+    repo: &Path,
+    branch: &str,
+    into: &str,
+    base: Option<&str>,
+    saved: Option<&str>,
+    commit: &mut Option<String>,
+) -> anyhow::Result<Option<bool>> {
+    let branch_ref = format!("refs/heads/{branch}");
+    let source = match git::commit_of(repo, &branch_ref)? {
+        Some(tip) => tip,
+        None => {
+            // Only a genuinely deleted branch may use the saved tip.
+            let refs = git::git(repo, &["for-each-ref", "--format=%(refname)", &branch_ref])?;
+            match saved {
+                Some(saved) if !refs.lines().any(|name| name == branch_ref) => saved.to_string(),
+                _ => return Ok(None),
+            }
+        }
+    };
+    *commit = Some(source.clone());
+    let target = format!("refs/heads/{into}");
+    let target_exists = git::commit_of(repo, &target)?.is_some();
+    let Some(target) = (if target_exists { Some(target.as_str()) } else { base }) else { return Ok(None) };
+    Ok(match git::is_ancestor(repo, &source, target)? {
+        Some(true) => {
+            // A branch with no new commits can still have uncommitted work. Host git never runs in a
+            // worktree a sandbox may have moved, so its work cannot count as checked.
+            let trees = git::list_worktrees(repo)?;
+            match trees.iter().find(|tree| tree.branch.as_deref() == Some(branch)) {
+                Some(tree) if !tree.trusted => None,
+                Some(tree) => {
+                    Some(git::git(&tree.path, &["status", "--porcelain", "--untracked-files=all"])?.is_empty())
+                }
+                None => Some(true),
+            }
+        }
+        Some(false) if target_exists => Some(false),
+        _ => None,
+    })
 }
 
 /// Ticket and lifecycle metadata say nothing about a task's branch ancestry.
@@ -569,7 +596,7 @@ mod tests {
                 format!(
                     r#"#!/bin/sh
 if [ "$5" = merge-base ]; then
-  : > "$HOME/started"
+  printf %s "$GIT_TERMINAL_PROMPT" > "$HOME/started.tmp" && mv "$HOME/started.tmp" "$HOME/started"
   attempts=0
   while [ ! -e "$HOME/release" ]; do
     attempts=$((attempts + 1))
@@ -585,20 +612,14 @@ exec {} "$@"
             .unwrap();
             std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
             let path = format!("{}:{}", dir.path().display(), std::env::var("PATH").unwrap());
-            let shell = dir.path().join("shell");
-            std::fs::write(&shell, "#!/bin/sh\nprintf '__IMACS__%s__IMACS__' \"$IMACS_TEST_LOGIN_PATH\"\n").unwrap();
-            std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
             let output = crate::test_support::output(
                 std::process::Command::new(std::env::current_exe().unwrap())
                     .args(["--exact", name, "--nocapture"])
                     .current_dir(dir.path())
                     .env("IMACS_APP_TEST_CHILD", "1")
                     .env("HOME", dir.path())
-                    // The bundled app must find the wrapper through the login shell,
-                    // even when its process PATH only exposes the system git.
-                    .env("PATH", "/usr/bin:/bin")
-                    .env("IMACS_TEST_LOGIN_PATH", path)
-                    .env("SHELL", shell)
+                    // The check runs git the way IMACS runs all repository git, from its own PATH.
+                    .env("PATH", path)
                     .env("IMACS_HOME", dir.path().join("state"))
                     .env("IMACS_CONFIG", dir.path().join("config.toml"))
                     .env("IMACS_SOCKET", dir.path().join("imacs.sock")),
@@ -630,6 +651,8 @@ exec {} "$@"
                 assert!(Instant::now() < deadline, "background git did not start");
                 std::thread::sleep(Duration::from_millis(10));
             }
+            let prompt = std::fs::read_to_string(paths::home().join("started")).unwrap();
+            assert_eq!(prompt, "0", "the check must run through imacs-core's guarded git");
             assert!(app.runtime.plans[index].ready().is_empty());
             assert_eq!(app.runtime.plan_json(index)["ready"], json!([]));
             assert!(app.runtime.dispatch(index, Some("b")).is_err(), "dispatch must agree while git is blocked");
@@ -646,6 +669,7 @@ exec {} "$@"
                     task: checked,
                     into: "integration".into(),
                     valid: Some(true),
+                    retry: false,
                 })
                 .unwrap();
             app.runtime.refresh_integrations();
@@ -661,6 +685,63 @@ exec {} "$@"
             }
             assert_eq!(app.runtime.plan_json(index)["ready"], json!(["b"]));
         });
+    }
+
+    #[test]
+    fn a_ref_git_waits_on_stops_the_check_at_its_time_limit_and_it_runs_again_later() {
+        with_app(
+            "app::integrations::tests::a_ref_git_waits_on_stops_the_check_at_its_time_limit_and_it_runs_again_later",
+            |app, _| {
+                let (_dir, repo) = repository();
+                git::git(&repo, &["branch", "integration"]).unwrap();
+                request(
+                    app,
+                    json!({"cmd":"plan_set", "goal":"Waiting ref", "integration":"integration", "tasks":[
+                        {"id":"a", "repo":repo, "branch":"task-a"}, {"id":"b", "depends_on":["a"]}]}),
+                );
+                app.runtime.drain_actions();
+                let index = app.runtime.selected_plan;
+                let key = (app.runtime.plans[index].id.clone(), "a".to_string());
+                app.runtime.plans[index].tasks[0].status = TaskStatus::Done;
+                app.runtime.plans[index].tasks[0].integrated = Some("integration".into());
+                // A sandbox writes the shared refs: git waits for good on a FIFO in place of a branch.
+                let fifo = repo.join(".git/refs/heads/task-a");
+                assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+                let limit = Duration::from_secs(3);
+                git::set_quick_timeout(limit);
+                let started = Instant::now();
+                app.runtime.refresh_integrations();
+                assert!(app.runtime.integration_checks.contains(&key));
+                while !app.runtime.integration_checks.is_empty() {
+                    assert!(started.elapsed() < limit + Duration::from_secs(15), "the check outlived git's time limit");
+                    std::thread::sleep(Duration::from_millis(10));
+                    app.runtime.refresh_integrations();
+                }
+                assert!(started.elapsed() >= limit, "git must wait on the FIFO for this test to mean anything");
+                assert!(!app.runtime.plans[index].tasks[0].integration_verified);
+                assert_eq!(app.runtime.plans[index].tasks[0].integrated.as_deref(), Some("integration"));
+                assert!(app.runtime.plans[index].ready().is_empty());
+                app.runtime.refresh_integrations();
+                assert!(app.runtime.integration_checks.is_empty(), "a check git did not finish waits to run again");
+
+                // Once the wait is over, it runs again without a ref event, and finds the branch.
+                std::fs::remove_file(&fifo).unwrap();
+                git::git(&repo, &["branch", "task-a", "integration"]).unwrap();
+                let at = app.runtime.integration_retries.get_mut(&key).expect("the check must be rescheduled");
+                assert!(*at > Instant::now());
+                *at = Instant::now();
+                app.runtime.refresh_integrations();
+                assert!(app.runtime.integration_checks.contains(&key));
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !app.runtime.plans[index].tasks[0].integration_verified {
+                    assert!(Instant::now() < deadline, "the check that ran again did not finish");
+                    std::thread::sleep(Duration::from_millis(10));
+                    app.runtime.refresh_integrations();
+                }
+                assert!(!app.runtime.integration_retries.contains_key(&key));
+                assert_eq!(app.runtime.plans[index].ready().iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["b"]);
+            },
+        );
     }
 
     #[test]

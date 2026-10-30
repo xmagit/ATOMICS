@@ -15,6 +15,9 @@ pub struct RepoWorkflow {
     pub warnings: Vec<String>,
     pub fingerprint: u64,
     pub config: crate::selfconfig::Layer,
+    /// The template the repository's config asks for. `config` keeps it only when IMACS built that
+    /// tag from this repository, so a repository cannot select another project's snapshot.
+    pub template: Option<String>,
 }
 
 impl Default for RepoWorkflow {
@@ -24,6 +27,7 @@ impl Default for RepoWorkflow {
             warnings: Vec::new(),
             fingerprint: 0,
             config: crate::selfconfig::Layer::new(crate::selfconfig::Source::Repo, ".imacs/config.toml", None),
+            template: None,
         }
     }
 }
@@ -86,7 +90,8 @@ impl RepoWorkflow {
         if let Some(workflow) = self.config.table.get("workflow") {
             config.workflow = workflow.clone().try_into().unwrap_or_default();
         }
-        // A repository may require sandbox mode and select its image; host access settings remain user-owned.
+        // A repository may require sandbox mode and select a template built from it; host access
+        // settings remain user-owned.
         if self.config.table.get("isolation").and_then(|table| table.get("mode")).and_then(toml::Value::as_str)
             == Some("sandbox")
         {
@@ -107,6 +112,12 @@ impl RepoWorkflow {
 
     #[cfg(feature = "native")]
     pub fn read(root: &Path) -> Self {
+        Self::read_in(root, &crate::paths::imacs_home())
+    }
+
+    /// [`read`](Self::read), checking the repository's template against the ledger in `home`.
+    #[cfg(feature = "native")]
+    pub fn read_in(root: &Path, home: &Path) -> Self {
         use std::hash::{DefaultHasher, Hash, Hasher};
         let mut workflow = Self::default();
         let mut hash = DefaultHasher::new();
@@ -167,14 +178,71 @@ impl RepoWorkflow {
         if let Some(error) = &config.error {
             workflow.warnings.push(format!("{}: {error}; repository settings ignored", config.path));
         }
-        let (table, warnings) = declarative(&config.table);
+        let (mut table, warnings) = declarative(&config.table);
         workflow.warnings.extend(warnings.into_iter().map(|warning| format!("{}: {warning}", config.path)));
+        let sandbox =
+            table.get_mut("isolation").and_then(|table| table.get_mut("sandbox")).and_then(|t| t.as_table_mut());
+        workflow.template =
+            sandbox.as_ref().and_then(|t| t.get("template")).and_then(toml::Value::as_str).map(String::from);
+        // A snapshot holds the package caches of the repository it was built from: honour only this one's.
+        if let (Some(sandbox), Some(tag)) = (sandbox, &workflow.template)
+            && template_source(home, tag).as_deref() != Some(canonical_root.as_path())
+        {
+            sandbox.remove("template");
+            workflow.warnings.push(format!(
+                "{}: ignored isolation.sandbox.template: IMACS has not built that template from this repository; build it with `imacs sandbox template build {}`",
+                config.path,
+                crate::paths::display(root)
+            ));
+        }
         config.table = table;
         workflow.config = config;
         workflow.warnings.hash(&mut hash);
         workflow.fingerprint = hash.finish();
         workflow
     }
+}
+
+/// Under the IMACS home: the main checkout `imacs sandbox template build` last built each tag from.
+#[cfg(feature = "native")]
+const TEMPLATE_LEDGER: &str = "sandbox-templates.json";
+
+#[cfg(feature = "native")]
+type TemplateLedger = std::collections::BTreeMap<String, PathBuf>;
+
+/// The canonical main checkout IMACS last built `tag` from, if it built that tag.
+#[cfg(feature = "native")]
+pub fn template_source(home: &Path, tag: &str) -> Option<PathBuf> {
+    let ledger: TemplateLedger = serde_json::from_slice(&std::fs::read(home.join(TEMPLATE_LEDGER)).ok()?).ok()?;
+    ledger.get(tag.trim()).cloned()
+}
+
+/// Record that `tag` now holds a snapshot built from `root`, a canonical main checkout.
+#[cfg(feature = "native")]
+pub fn record_template(home: &Path, tag: &str, root: &Path) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    std::fs::create_dir_all(home)?;
+    // flock serializes builds sharing one IMACS home. Closing the file releases it.
+    let lock = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(home.join("sandbox-templates.lock"))?;
+    // SAFETY: flock takes a descriptor `lock` owns for the rest of this function.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let path = home.join(TEMPLATE_LEDGER);
+    let mut ledger: TemplateLedger = match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(std::io::Error::other)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => TemplateLedger::new(),
+        Err(error) => return Err(error),
+    };
+    ledger.insert(tag.trim().to_string(), root.to_path_buf());
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&ledger).map_err(std::io::Error::other)?)?;
+    std::fs::rename(tmp, path)
 }
 
 /// Resolve links before inspecting or opening files, or walking the topics directory.
@@ -533,6 +601,43 @@ stages = ["accepted", "pr_opened", "qa_passed", "merged"]
         assert!(!applied.isolation.sandbox.ssh_agent);
         let (_, warnings) = declarative(&toml::from_str("[isolation.sandbox]\ntemplate = 42").unwrap());
         assert_eq!(warnings.len(), 1);
+    }
+
+    #[test]
+    fn a_repository_selects_only_a_template_imacs_built_from_it() {
+        let home = crate::test_support::tempdir().unwrap();
+        let [owner, other] = [(); 2].map(|_| {
+            let dir = crate::test_support::tempdir().unwrap();
+            std::fs::create_dir(dir.path().join(".imacs")).unwrap();
+            std::fs::write(
+                dir.path().join(".imacs/config.toml"),
+                "[isolation.sandbox]\ntemplate = 'imacs-owner:local'",
+            )
+            .unwrap();
+            dir
+        });
+        let mut user = crate::config::Config::default();
+        user.isolation.sandbox.template = Some("workspace:local".into());
+        let read = |dir: &crate::test_support::TempDir| RepoWorkflow::read_in(dir.path(), home.path());
+        let selected = |dir| read(dir).apply(&user).isolation.sandbox.template.unwrap();
+        let unbuilt = read(&owner);
+        assert_eq!(unbuilt.template.as_deref(), Some("imacs-owner:local"), "template build still finds the tag");
+        assert!(unbuilt.warnings[0].contains("ignored isolation.sandbox.template"), "{:?}", unbuilt.warnings);
+        assert_eq!(selected(&owner), "workspace:local");
+
+        record_template(home.path(), "imacs-owner:local", &owner.path().canonicalize().unwrap()).unwrap();
+        let built = read(&owner);
+        assert!(built.warnings.is_empty(), "{:?}", built.warnings);
+        assert_ne!(built.fingerprint, unbuilt.fingerprint, "a running IMACS picks the build up");
+        assert_eq!(selected(&owner), "imacs-owner:local");
+        assert_eq!(selected(&other), "workspace:local", "another repository cannot select it");
+        // A stock image or registry image is no repository's build either.
+        std::fs::write(
+            other.path().join(".imacs/config.toml"),
+            "[isolation.sandbox]\ntemplate = 'docker/sandbox-templates:codex-docker'",
+        )
+        .unwrap();
+        assert_eq!(selected(&other), "workspace:local");
     }
 
     #[test]

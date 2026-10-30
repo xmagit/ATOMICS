@@ -214,7 +214,11 @@ mod tests {
                 assert!(git::git(&repo, &["rev-parse", "--verify", &format!("refs/heads/{into}")]).is_ok());
                 assert!(git::git(&repo, &["rev-parse", "--verify", "refs/heads/agent-made"]).is_err());
                 let alert = app.runtime.sessions[0].last_message.clone().unwrap();
-                assert!(alert.contains("Restored refs/heads/agent-made: removed it (it pointed to "), "{alert}");
+                // Never deleted: the agent's branch is kept aside.
+                let kept = "refs/imacs/quarantine/snapshot/refs/heads/agent-made@";
+                assert!(alert.contains(&format!("Restored refs/heads/agent-made: moved it to {kept}")), "{alert}");
+                let quarantined = git::git(&repo, &["for-each-ref", "--format=%(refname)", "refs/imacs/quarantine/"]);
+                assert!(quarantined.unwrap().contains(kept), "{alert}");
                 assert!(!alert.contains(&into) && !alert.contains("next-task"), "no alert for IMACS's refs: {alert}");
                 assert!(!alert.contains("Object("), "plain text: {alert}");
                 app.runtime.sessions.clear();

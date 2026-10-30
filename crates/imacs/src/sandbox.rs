@@ -10,7 +10,7 @@ use std::io::{Read, Seek};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::sandbox_ownership::{self as ownership, Resource};
@@ -247,15 +247,20 @@ fn make(
     };
     // A registration left by an earlier attempt would make `mcp add` fail.
     remove_mcp(&job.home, &job.sbx, &job.name)?;
-    sbx(&job.sbx, &isolation::mcp_add_args(&job.name, &job.exe, &job.socket), ssh, TIMEOUT)
-        .context("registering IMACS's MCP server with sbx")?;
+    // Ownership is reserved before sbx makes anything, as for templates: a crash or a timeout part way
+    // leaves resources this home owns, which removal or the next startup sweep takes away.
     ownership::created(&job.home, &job.name, Resource::Mcp)?;
-    sbx(&job.sbx, &isolation::create_args(&spec), ssh, CREATE_TIMEOUT).context("creating the sandbox").inspect_err(
-        |_| {
+    sbx(&job.sbx, &isolation::mcp_add_args(&job.name, &job.exe, &job.socket), ssh, TIMEOUT)
+        .context("registering IMACS's MCP server with sbx")
+        .inspect_err(|_| {
             let _ = remove(&job.home, &job.sbx, &job.name);
-        },
-    )?;
+        })?;
     ownership::created(&job.home, &job.name, Resource::Sandbox)?;
+    sbx_until(&job.sbx, &isolation::create_args(&spec), ssh, CREATE_TIMEOUT, Some(&QUITTING))
+        .context("creating the sandbox")
+        .inspect_err(|_| {
+            let _ = remove(&job.home, &job.sbx, &job.name);
+        })?;
     let finish = || -> Result<()> {
         let servers = std::iter::once(job.name.as_str()).chain(job.config.mcp.iter().map(|s| s.trim()));
         for server in servers.filter(|server| !server.is_empty()) {
@@ -491,7 +496,9 @@ pub fn stop(home: &Path, program: &str, name: &str) -> Result<()> {
     sbx(program, &["stop", name], false, TIMEOUT).map(drop)
 }
 
-/// Removes a sandbox, its way to the relay and IMACS's MCP registration for it.
+/// Removes a sandbox, its way to the relay and IMACS's MCP registration for it. The sandbox and the
+/// registration may be only reserved: a start that stopped before sbx made them leaves nothing to
+/// remove.
 pub fn remove(home: &Path, program: &str, name: &str) -> Result<()> {
     let owned = ownership::owned(home)?.get(name).cloned().unwrap_or_default();
     if owned.sandbox {
@@ -499,7 +506,11 @@ pub fn remove(home: &Path, program: &str, name: &str) -> Result<()> {
             // Taken away first: a sandbox sbx fails to remove keeps no way to this machine's loopback.
             let _ = sbx(program, &isolation::relay_remove_args(name, port), false, TIMEOUT);
         }
-        sbx(program, &["rm", "--force", name], false, TIMEOUT)?;
+        if let Err(error) = sbx(program, &["rm", "--force", name], false, TIMEOUT)
+            && list(program)?.iter().any(|sandbox| sandbox.name == name)
+        {
+            return Err(error);
+        }
         ownership::removed(home, name, Resource::Sandbox)?;
     }
     if owned.relay.is_some() {
@@ -550,8 +561,11 @@ pub fn remove_mcp(home: &Path, program: &str, name: &str) -> Result<()> {
     if !ownership::owned(home)?.get(name).is_some_and(|entry| entry.mcp) {
         return Ok(());
     }
-    sbx(program, &["mcp", "rm", "--force", name], false, TIMEOUT)
-        .context("removing the sandbox's IMACS MCP registration")?;
+    if let Err(error) = sbx(program, &["mcp", "rm", "--force", name], false, TIMEOUT)
+        && mcp_names(program)?.iter().any(|other| other == name)
+    {
+        return Err(error.context("removing the sandbox's IMACS MCP registration"));
+    }
     ownership::removed(home, name, Resource::Mcp)
 }
 
@@ -582,7 +596,8 @@ pub fn for_repo(home: &Path, program: &str, repo: &Path) -> Result<RepoSandboxes
         .filter(|s| owned.get(&s.name).is_some_and(|entry| entry.sandbox))
         .map(real_paths)
         .collect();
-    let worktrees: Vec<PathBuf> = git::list_worktrees(repo)?.into_iter().map(|w| w.path).collect();
+    let worktrees: Vec<PathBuf> =
+        git::list_worktrees(repo)?.into_iter().filter(|w| w.trusted).map(|w| w.path).collect();
     let real_worktrees: Vec<PathBuf> = worktrees.iter().map(|path| real(path)).collect();
     let common = git::common_dir(repo)?;
     let (attached, orphans) = isolation::partition(&listed, &real_worktrees, &common, Path::exists);
@@ -642,7 +657,7 @@ pub fn read_usage(program: &str, name: &str) -> Result<String> {
     let mut child = sbx_command(program, &isolation::usage_args(name), false, &stdout, &stderr)?
         .spawn()
         .with_context(|| format!("running {program}"))?;
-    match wait(&mut child, Instant::now() + Duration::from_secs(20))? {
+    match wait(&mut child, Instant::now() + Duration::from_secs(20), None)? {
         Some(status) if status.success() => {}
         Some(status) => bail!("sbx exec failed ({status})"),
         None => bail!("sbx exec did not finish within 20 s"),
@@ -655,7 +670,27 @@ pub fn read_usage(program: &str, name: &str) -> Result<String> {
 
 /// Runs `sbx args` within `timeout` and returns its output, failing when sbx does.
 fn sbx(program: &str, args: &[impl AsRef<str>], ssh_agent: bool, timeout: Duration) -> Result<String> {
-    let (status, out, err) = sbx_output(program, args, ssh_agent, timeout)?;
+    sbx_until(program, args, ssh_agent, timeout, None)
+}
+
+/// Set as IMACS quits: see [`stop_creating`].
+static QUITTING: AtomicBool = AtomicBool::new(false);
+
+/// Stops making sandboxes, which can take [`CREATE_TIMEOUT`], so that a quit does not wait for it.
+/// Each preparation then fails and removes what sbx made of its sandbox.
+pub fn stop_creating() {
+    QUITTING.store(true, Ordering::Relaxed);
+}
+
+/// [`sbx`], stopped early once `stop` is set.
+fn sbx_until(
+    program: &str,
+    args: &[impl AsRef<str>],
+    ssh_agent: bool,
+    timeout: Duration,
+    stop: Option<&AtomicBool>,
+) -> Result<String> {
+    let (status, out, err) = run(program, args, ssh_agent, timeout, stop)?;
     if !status.success() {
         let shown = args.first().map_or("", AsRef::as_ref);
         let detail = [err.trim(), out.trim()].into_iter().find(|text| !text.is_empty()).unwrap_or("no output");
@@ -672,12 +707,26 @@ pub(crate) fn sbx_output(
     ssh_agent: bool,
     timeout: Duration,
 ) -> Result<(std::process::ExitStatus, String, String)> {
+    run(program, args, ssh_agent, timeout, None)
+}
+
+/// [`sbx_output`], stopped early once `stop` is set.
+fn run(
+    program: &str,
+    args: &[impl AsRef<str>],
+    ssh_agent: bool,
+    timeout: Duration,
+    stop: Option<&AtomicBool>,
+) -> Result<(std::process::ExitStatus, String, String)> {
     let shown = format!("sbx {}", args.first().map_or("", AsRef::as_ref));
     let (mut stdout, mut stderr) = (capture()?, capture()?);
     let mut child = sbx_command(program, args, ssh_agent, &stdout, &stderr)?
         .spawn()
         .with_context(|| format!("running {program}"))?;
-    let Some(status) = wait(&mut child, Instant::now() + timeout)? else {
+    let Some(status) = wait(&mut child, Instant::now() + timeout, stop)? else {
+        if stop.is_some_and(|stop| stop.load(Ordering::Relaxed)) {
+            bail!("{shown} stopped: IMACS is quitting");
+        }
         bail!("{shown} did not finish within {} s", timeout.as_secs());
     };
     let read = |file: &mut File| -> Result<String> {
@@ -713,13 +762,17 @@ fn sbx_command(
     Ok(command)
 }
 
-/// The child's status, or None once it ran past `deadline` and was killed.
-fn wait(child: &mut std::process::Child, deadline: Instant) -> Result<Option<std::process::ExitStatus>> {
+/// The child's status, or None once it ran past `deadline`, or `stop` was set, and was killed.
+fn wait(
+    child: &mut std::process::Child,
+    deadline: Instant,
+    stop: Option<&AtomicBool>,
+) -> Result<Option<std::process::ExitStatus>> {
     loop {
         if let Some(status) = child.try_wait()? {
             return Ok(Some(status));
         }
-        if Instant::now() >= deadline {
+        if Instant::now() >= deadline || stop.is_some_and(|stop| stop.load(Ordering::Relaxed)) {
             // Kill helpers too (SSH/keychain commands can outlive the sbx client).
             // SAFETY: process_group(0) gave this child its own process group.
             unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
@@ -1029,8 +1082,13 @@ mod tests {
         let mut config = SandboxConfig::default();
         config.allow_hosts.insert(repo.display().to_string(), vec!["nuget.example.com".into()]);
         std::fs::write(bin.path().join("fail-create"), "").unwrap();
-        let error = format!("{:#}", prepare(&job(&sbx, "imacs-s1", &repo, config.clone())).unwrap_err());
+        // Ownership was reserved before create; `sbx rm` of a sandbox it never made may fail.
+        std::fs::write(bin.path().join("fail-rm"), "").unwrap();
+        let attempt = job(&sbx, "imacs-s1", &repo, config.clone());
+        let error = format!("{:#}", prepare(&attempt).unwrap_err());
         assert!(error.contains("creating the sandbox") && error.contains("fake create failure"), "{error}");
+        assert!(ownership::owned(&attempt.home).unwrap().is_empty(), "nothing left reserved");
+        std::fs::remove_file(bin.path().join("fail-rm")).unwrap();
         assert!(fake::calls_to(bin.path(), &["policy"]).is_empty());
         assert!(list(&sbx.display().to_string()).unwrap().is_empty());
         // No sandbox, no git record of it.
@@ -1052,6 +1110,60 @@ mod tests {
         assert_eq!(list(&sbx.display().to_string()).unwrap().len(), 1);
         let missing = job(&bin.path().join("missing-sbx"), "imacs-s1", &repo, SandboxConfig::default());
         assert!(prepare(&missing).is_err());
+    }
+
+    #[test]
+    fn a_crash_while_sbx_creates_leaves_owned_resources_the_next_sweep_removes() {
+        // The IMACS that crashes is a child process of its own.
+        if let Some(dir) = std::env::var_os("IMACS_CREATE_CRASH_TEST") {
+            let dir = PathBuf::from(dir);
+            let _ = prepare(&job(&dir.join("sbx"), "imacs-crashed", &dir.join("app"), SandboxConfig::default()));
+            return;
+        }
+        let (dir, _repo) = repository();
+        let sbx = fake::install(dir.path());
+        std::fs::write(dir.path().join("wait-create"), "").unwrap();
+        let mut child = crate::test_support::TestChild::spawn(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "sandbox::tests::a_crash_while_sbx_creates_leaves_owned_resources_the_next_sweep_removes",
+                    "--nocapture",
+                ])
+                .env("IMACS_CREATE_CRASH_TEST", dir.path()),
+            crate::test_support::CHILD_TIMEOUT,
+        )
+        .unwrap();
+        while !dir.path().join("waiting-create").exists() {
+            child.check_timeout().unwrap();
+            assert!(child.child.try_wait().unwrap().is_none(), "preparation ended before sbx create");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // IMACS dies while sbx creates, and sbx, in a process group of its own, finishes the sandbox.
+        drop(child);
+        std::fs::remove_file(dir.path().join("wait-create")).unwrap();
+        let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(30));
+        while !dir.path().join("sandboxes/imacs-crashed").exists() {
+            assert!(Instant::now() < deadline, "sbx never finished the sandbox");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let home = dir.path().join("home");
+        let owned = ownership::owned(&home).unwrap();
+        assert!(owned["imacs-crashed"].sandbox && owned["imacs-crashed"].mcp, "{owned:?}");
+
+        // The next start's sweep knows both as this home's, and removes them.
+        let program = sbx.display().to_string();
+        let notes = crate::lifecycle::sweep_before(
+            &home,
+            &Default::default(),
+            &program,
+            crate::lifecycle::Cutoff::mark(&home).unwrap(),
+        )
+        .unwrap();
+        assert!(notes.is_empty(), "{notes:?}");
+        assert!(!dir.path().join("sandboxes/imacs-crashed").exists());
+        assert!(!dir.path().join("mcp/imacs-crashed").exists());
+        assert!(ownership::owned(&home).unwrap().is_empty());
     }
 
     #[test]

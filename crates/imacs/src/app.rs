@@ -22,6 +22,7 @@ use crate::diff_worker::{DiffData, DiffWorker, WorkerResult};
 use crate::governor::{Governor, Jobserver};
 use crate::highlight::Highlighter;
 use crate::ipc::{self, Channels, ControlMessage, ControlOutcome, HookMessage, Hub};
+use crate::lifecycle::Scope;
 use crate::sandbox::AgentRuntime;
 use crate::setup::{SHELL_PATH, env_var, global_hooks_installed, install_global_hooks, resolve_program};
 use crate::terminal::{Metrics, Terminal, TerminalView};
@@ -193,6 +194,8 @@ struct Pending {
 }
 
 type CodexVersion = Arc<OnceLock<Option<bool>>>;
+/// Each repository with the worktrees git lists for it.
+type ListedWorktrees = Vec<(PathBuf, Vec<WorktreeEntry>)>;
 
 const APPROVAL_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 const APPROVAL_MENU_GRACE: Duration = Duration::from_secs(1);
@@ -201,6 +204,11 @@ const NEEDS_INPUT_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(4);
 const DELIVERY_ATTEMPTS: u8 = 3;
 const CODEX_VERSION_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a quit waits for sandboxes being prepared, and then again for those whose creation it
+/// stopped to clean up.
+const QUIT_WAIT: Duration = Duration::from_secs(10);
+/// How long a quit waits for sandbox and worktree cleanup still running.
+const QUIT_JOBS_WAIT: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SteerTarget {
@@ -275,6 +283,8 @@ struct CheckedIntegration {
     into: String,
     /// `None` means git could not verify ancestry; keep the integration marker.
     valid: Option<bool>,
+    /// Git did not run or finish: check again after a while, not only when refs change.
+    retry: bool,
 }
 
 /// The worktree clean-up dialog for one project.
@@ -434,7 +444,7 @@ pub(crate) struct State {
     sandbox_usage: crate::sandbox_usage::Sampler,
     /// The credential relay sandboxed Claude agents reach the Claude subscription through.
     relay: Arc<crate::relay::Service>,
-    lifecycle_jobs: Vec<std::thread::JoinHandle<()>>,
+    lifecycle_jobs: Vec<crate::lifecycle::Job>,
     startup_cleanup: Option<std::thread::JoinHandle<()>>,
     shutting_down: bool,
     sandbox_check: Option<Receiver<Vec<String>>>,
@@ -506,10 +516,13 @@ pub(crate) struct State {
     integration_check_rx: Receiver<CheckedIntegration>,
     integration_checks: HashSet<(String, String)>,
     integration_checked: HashMap<(String, String), (u64, String, Task)>,
+    integration_retries: HashMap<(String, String), Instant>,
     integration_dirty: Arc<AtomicBool>,
     integration_revision: u64,
     worktrees: Vec<WorktreeEntry>,
     worktrees_at: Option<Instant>,
+    /// The worktrees of each repository, being listed off the UI thread: git can be made to wait.
+    worktree_listing: Option<Receiver<ListedWorktrees>>,
     focus_terminal: Option<String>,
     last_layout: Option<Layout>,
     watcher: Option<Debouncer<RecommendedWatcher>>,
@@ -917,10 +930,12 @@ impl State {
             integration_check_rx,
             integration_checks: HashSet::new(),
             integration_checked: HashMap::new(),
+            integration_retries: HashMap::new(),
             integration_dirty: Arc::new(AtomicBool::new(false)),
             integration_revision: 0,
             worktrees: Vec::new(),
             worktrees_at: None,
+            worktree_listing: None,
             focus_terminal: None,
             last_layout: None,
             watcher: None,
@@ -1028,17 +1043,22 @@ impl State {
     fn begin_startup_cleanup(&mut self) {
         let (home, config, sbx, actions) =
             (paths::imacs_home(), self.config.clone(), self.sbx.clone(), self.action_tx.clone());
-        let before = SystemTime::now();
+        // Before the sweep thread and restored agents start, so nothing they create is a candidate.
+        let cutoff = crate::lifecycle::Cutoff::mark(&home);
         // Read before the handoff is consumed: the scratch sessions a restart resumes keep their folders.
         let resumed: HashSet<PathBuf> =
             self.store.restart.iter().flat_map(|r| &r.sessions).filter_map(|r| paths::scratch_of(&r.cwd)).collect();
         self.startup_cleanup = Some(std::thread::spawn(move || {
             let sbx = resolve_program(&sbx);
-            let mut notes = match crate::lifecycle::sweep_before(&home, &config, &sbx, before) {
+            let scratch_before = cutoff.as_ref().ok().map(crate::lifecycle::Cutoff::files);
+            let mut notes = match cutoff.and_then(|cutoff| crate::lifecycle::sweep_before(&home, &config, &sbx, cutoff))
+            {
                 Ok(notes) => notes,
                 Err(err) => vec![format!("Startup cleanup skipped: {err:#}")],
             };
-            notes.extend(crate::lifecycle::sweep_scratch(&home, &resumed, before));
+            if let Some(before) = scratch_before {
+                notes.extend(crate::lifecycle::sweep_scratch(&home, &resumed, before));
+            }
             crate::sandbox::prune_pins(&home, &home.join("git-pins"), &sbx);
             crate::lifecycle::record_leftovers(&home, &notes);
             if !notes.is_empty() {
@@ -1047,11 +1067,24 @@ impl State {
         }));
     }
 
+    /// Starts lifecycle work in the background; see [`crate::lifecycle::Job`].
+    pub(super) fn lifecycle(&mut self, scope: Scope, work: impl FnOnce() + Send + 'static) {
+        self.lifecycle_jobs.retain(|job| !job.is_finished());
+        self.lifecycle_jobs.push(crate::lifecycle::Job::spawn(scope, work));
+    }
+
+    /// The lifecycle jobs still running, for a background thread to wait for what it must.
+    pub(super) fn running_lifecycle(&mut self) -> Vec<crate::lifecycle::Job> {
+        self.lifecycle_jobs.retain(|job| !job.is_finished());
+        self.lifecycle_jobs.clone()
+    }
+
+    /// Waits for every lifecycle job. Tests only: the UI thread never waits for them, and a quit
+    /// waits a bounded time.
+    #[cfg(test)]
     fn finish_lifecycle_jobs(&mut self) {
         for job in self.lifecycle_jobs.drain(..) {
-            if job.join().is_err() {
-                eprintln!("IMACS: cleanup worker panicked");
-            }
+            job.wait();
         }
     }
 
@@ -1071,23 +1104,56 @@ impl State {
                 terminal.shutdown();
             }
         }
-        // Preparation can finish after the window closes. Wait before stopping those sandboxes.
+        // Preparation can finish after the window closes. Wait before stopping those sandboxes, but not
+        // for sbx to make one, which can take 15 minutes: that stops, and its preparation removes what
+        // sbx made of it.
         let mut names: HashSet<String> = self.sessions.iter().filter_map(|s| s.sandbox.clone()).collect();
         let mut scratch: Vec<(PathBuf, Option<String>)> =
             self.sessions.iter().filter_map(|s| Some((s.scratch.clone()?, s.sandbox.clone()))).collect();
-        for (launch, ready) in std::mem::take(&mut self.pending_sandbox) {
-            let _ = ready.recv();
-            if let AgentRuntime::Sandbox(sandbox) = launch.runtime {
-                if let Some(dir) = paths::scratch_of(&launch.cwd) {
-                    scratch.push((dir, Some(sandbox.name.clone())));
+        let mut pending = std::mem::take(&mut self.pending_sandbox);
+        for round in 0..2 {
+            let deadline = Instant::now() + QUIT_WAIT;
+            pending.retain(|(launch, ready)| {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = ready.recv_timeout(left) {
+                    return true;
                 }
-                names.insert(sandbox.name);
+                if let AgentRuntime::Sandbox(sandbox) = &launch.runtime {
+                    if let Some(dir) = paths::scratch_of(&launch.cwd) {
+                        scratch.push((dir, Some(sandbox.name.clone())));
+                    }
+                    names.insert(sandbox.name.clone());
+                }
+                false
+            });
+            // Also one a closed plan's cleanup waits for, which is not pending here.
+            if round == 0 {
+                crate::sandbox::stop_creating();
             }
         }
+        // A scratch folder whose sandbox is still being made goes too; its preparation removes what
+        // sbx made of the sandbox.
+        scratch.extend(pending.iter().filter_map(|(launch, _)| Some((paths::scratch_of(&launch.cwd)?, None))));
+        let mut notes: Vec<String> = pending
+            .iter()
+            .filter_map(|(launch, _)| match &launch.runtime {
+                AgentRuntime::Sandbox(sandbox) => {
+                    Some(format!("Sandbox {} was still being made at quit", sandbox.name))
+                }
+                AgentRuntime::Bare => None,
+            })
+            .collect();
         for name in names {
             self.stop_sandbox(name);
         }
-        self.finish_lifecycle_jobs();
+        // Work still running after that ends with IMACS, as in a crash; the next start's sweep finds
+        // what it left.
+        let deadline = Instant::now() + QUIT_JOBS_WAIT;
+        let unfinished = self.lifecycle_jobs.drain(..).filter(|job| !job.wait_until(deadline)).count();
+        if unfinished > 0 {
+            notes.push(format!("{unfinished} sandbox or worktree cleanup jobs were still running at quit"));
+        }
+        crate::lifecycle::record_leftovers(&paths::imacs_home(), &notes);
         // Quitting ends scratch sessions for good; a restart resumes them in their folders.
         if !self.restarting {
             self.remove_scratch_sessions(scratch);
