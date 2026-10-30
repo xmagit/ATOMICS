@@ -492,6 +492,13 @@ mounted read-only.
   does not show approval banners or enqueue permission requests for these sessions.
 - **Model credentials.** These reach the agent through sbx's credential proxy, not through files in the
   sandbox.
+- **Account usage.** The sidebar's Claude and Codex limits come from the agents' own clients, which in a
+  sandbox write them inside the VM: Codex in its usual session log, and Claude through a status line that
+  only saves its input to `/tmp/imacs-statusline.json` (IMACS gives a sandboxed Claude no other
+  settings). About once a minute, IMACS reads both back from sandboxes whose agent is attached, with one
+  `sbx exec` each: the end of the newest Codex rollout and Claude's last status line, bounded in the VM and
+  on your machine. The agent can write these files, so a report never counts as newer than the moment it
+  was read; at worst an agent misstates the limits it shows.
 
 ## Checking sandboxed work
 
@@ -572,15 +579,18 @@ tests there, in a worktree that starts from the integration branch.
 
 ## Host resource display
 
-Each sandbox tile shows the VM process tree's host resident memory (GiB) and CPU; the top bar totals
-these trees when space permits. `100% CPU` means one host core, so a multi-core VM can exceed 100%.
+Each sandbox tile's header shows a box icon and **Sandbox**, followed by the VM process tree's host
+resident memory (GiB) and CPU; the top bar totals these trees when space permits. `100% CPU` means one host core, so a multi-core VM can exceed 100%.
 IMACS samples `ps` off the UI thread every two seconds and sums each process once. These are host
 process measurements, not the configured memory/CPU limits or guest application usage. Shared daemon
-processes and `sbx run` clients are excluded. A dash means no matching VM process or sampling failed;
-hover for details. The total reports how many sandbox trees were found, so partial samples are visible.
+processes and `sbx run` clients are excluded. Without a matching VM process, or when sampling fails, the
+badge shows **Sandbox** alone; hover for details. The total reports how many sandbox trees were found, so partial samples are visible.
 
 The sampler assumes the PoC process shape: one VM tree per sandbox, whose VM root command contains
 the complete sandbox name `imacs-<session>` (as an argument or path component). It recognizes nerdbox,
 sailor, vfkit, qemu, cloud-hypervisor and krun VM executables, then follows child PIDs. Synthetic recorded
-`ps` fixtures cover this mapping; validation against real sbx VMs belongs to the e2e task. If sbx changes
-its process shape or uses opaque VM IDs, the display stays unavailable until that mapping is updated.
+`ps` fixtures cover this mapping. If sbx changes its process shape or uses opaque VM IDs, the display
+stays unavailable until that mapping is updated. That is the case with sbx v0.50.1 on macOS (checked
+end to end on 2026-10-30): each VM runs as `containerd-shim-nerdbox-v1 -namespace docker -id <container
+id>`, without the sandbox's name, so tiles show **Sandbox** without memory and CPU. The shim keeps the
+sandbox's worktree open, which a future mapping could use.

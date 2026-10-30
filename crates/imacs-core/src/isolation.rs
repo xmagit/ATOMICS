@@ -231,6 +231,31 @@ pub fn exec_args(name: &str, workdir: &Path, command: &str, secs: u64) -> Vec<St
     ["exec", "-w", &workdir, name, "timeout", "-k", &kill_after, &secs, "bash", "-lc", command].map(String::from).into()
 }
 
+/// Where a sandboxed Claude's status line leaves its last input inside the VM. That input carries the
+/// account's limits, which reach IMACS through [`usage_args`] since the VM cannot reach IMACS.
+pub const STATUSLINE_FILE: &str = "/tmp/imacs-statusline.json";
+
+/// Claude's `--settings` in a sandbox: a status line that only saves its input to [`STATUSLINE_FILE`].
+pub fn claude_settings() -> serde_json::Value {
+    let command = format!("cat > {STATUSLINE_FILE}.tmp && mv {STATUSLINE_FILE}.tmp {STATUSLINE_FILE}");
+    serde_json::json!({ "statusLine": { "type": "command", "command": command } })
+}
+
+/// Marks the start of each part of [`usage_args`]' output: `codex`, or `claude <mtime>`.
+pub const USAGE_MARK: &str = "--- imacs usage ";
+
+/// `sbx exec` arguments that print the account usage a sandbox's agents last saw, each part bounded
+/// in the VM: the end of the newest Codex rollout, and Claude's last status line input.
+pub fn usage_args(name: &str) -> Vec<String> {
+    let script = format!(
+        r#"f=$(ls -t "$HOME"/.codex/sessions/*/*/*/rollout-*.jsonl 2>/dev/null | head -n 1)
+if [ -n "$f" ]; then echo '{USAGE_MARK}codex'; tail -c 16384 "$f"; echo; fi
+s={STATUSLINE_FILE}
+if [ -f "$s" ]; then echo "{USAGE_MARK}claude $(stat -c %Y "$s")"; head -c 65536 "$s"; echo; fi"#
+    );
+    ["exec", name, "timeout", "-k", "2", "10", "sh", "-c", &script].map(String::from).into()
+}
+
 /// How many values a dropped flag takes.
 #[derive(Clone, Copy)]
 enum Takes {
@@ -654,6 +679,24 @@ command = ["codex"]
                 "codex",
             ]
         );
+    }
+
+    #[test]
+    fn a_sandboxed_claude_saves_its_status_line_input_for_usage_to_read_back() {
+        let settings = claude_settings();
+        assert_eq!(settings["statusLine"]["type"], "command");
+        let command = settings["statusLine"]["command"].as_str().unwrap();
+        assert!(command.ends_with(&format!("mv {STATUSLINE_FILE}.tmp {STATUSLINE_FILE}")), "{command}");
+        assert!(settings.get("hooks").is_none(), "a VM cannot run IMACS's hooks");
+        let args = usage_args("imacs-s1");
+        assert_eq!(args[..8], ["exec", "imacs-s1", "timeout", "-k", "2", "10", "sh", "-c"]);
+        assert_eq!(args.len(), 9);
+        for part in
+            [format!("echo '{USAGE_MARK}codex'"), format!("{USAGE_MARK}claude "), format!("s={STATUSLINE_FILE}")]
+        {
+            assert!(args[8].contains(&part), "{part} in {}", args[8]);
+        }
+        assert!(args[8].contains("tail -c 16384") && args[8].contains("head -c 65536"), "both parts are bounded");
     }
 
     #[test]

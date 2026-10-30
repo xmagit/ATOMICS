@@ -220,6 +220,14 @@ impl State {
         }
         let names = self.sessions.iter().filter_map(|s| s.sandbox.clone()).collect();
         changed |= self.sandbox_usage.poll(names, ctx);
+        // Only sandboxes with an attached agent are running; `sbx exec` would start a stopped one.
+        let live = self
+            .sessions
+            .iter()
+            .filter(|s| s.status != AgentStatus::Starting && s.terminal.as_ref().is_some_and(|t| !t.exited()))
+            .filter_map(|s| s.sandbox.clone())
+            .collect();
+        self.sandbox_pull.poll(&self.sbx, live, ctx);
         self.track_busy();
         self.verify_deliveries();
         for index in 0..self.sessions.len() {

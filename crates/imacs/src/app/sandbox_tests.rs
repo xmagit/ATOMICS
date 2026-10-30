@@ -218,8 +218,10 @@ fn sandboxed_agents_attach_through_sbx_run_and_reattach_after_a_restart() {
         let run = &fake::calls_to(bin.path(), &["run"])[0];
         assert_eq!(run[..5], ["run", "--name", name.as_str(), "claude", "--"]);
         let session_id = app.runtime.sessions[index].claude_id.clone().unwrap();
-        assert_eq!(run[5..], ["--session-id", session_id.as_str(), "Fix the bug"]);
-        assert!(!run.iter().any(|arg| arg == "--settings" || arg == "--mcp-config"), "host hooks stay out: {run:?}");
+        // Its status line only saves the account's limits in the VM; host hooks and MCP config stay out.
+        let settings = imacs_core::isolation::claude_settings().to_string();
+        assert_eq!(run[5..], ["--settings", settings.as_str(), "--session-id", session_id.as_str(), "Fix the bug"]);
+        assert!(!run.iter().any(|arg| arg == "--mcp-config" || arg.contains("hook")), "host hooks stay out: {run:?}");
         assert_eq!(std::fs::read_to_string(bin.path().join("run-ssh")).unwrap().trim(), "unset");
         assert_eq!(app.runtime.sessions[index].sandbox.as_deref(), Some(name.as_str()));
         assert_eq!(app.runtime.pane_session(Some(name.clone())), Some(id.clone()), "reports find their session");
@@ -237,7 +239,20 @@ fn sandboxed_agents_attach_through_sbx_run_and_reattach_after_a_restart() {
         tick_until(app, ctx, "the resumed agent to attach", |_| bin.path().join("run-ssh").exists());
         assert_eq!(fake::calls_to(bin.path(), &["create"]).len(), 1);
         let run = fake::calls_to(bin.path(), &["run"]).pop().unwrap();
-        assert_eq!(run, ["run", "--name", name.as_str(), "claude", "--", "--resume", session_id.as_str()]);
+        assert_eq!(
+            run,
+            [
+                "run",
+                "--name",
+                name.as_str(),
+                "claude",
+                "--",
+                "--settings",
+                settings.as_str(),
+                "--resume",
+                session_id.as_str()
+            ]
+        );
         assert_eq!(app.runtime.sessions[0].sandbox.as_deref(), Some(name.as_str()));
         finish_agents(app, ctx);
     });

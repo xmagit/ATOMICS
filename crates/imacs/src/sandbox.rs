@@ -566,6 +566,25 @@ pub fn installed(program: &str) -> bool {
     Path::new(program).is_absolute() && Path::new(program).is_file()
 }
 
+/// The account usage a running sandbox's agents last saw ([`isolation::usage_args`]). Its agent
+/// controls the VM, so only the first 128 KiB are read, and callers treat the rest as its claims.
+pub fn read_usage(program: &str, name: &str) -> Result<String> {
+    const LIMIT: u64 = 128 * 1024;
+    let (mut stdout, stderr) = (capture()?, capture()?);
+    let mut child = sbx_command(program, &isolation::usage_args(name), false, &stdout, &stderr)?
+        .spawn()
+        .with_context(|| format!("running {program}"))?;
+    match wait(&mut child, Instant::now() + Duration::from_secs(20))? {
+        Some(status) if status.success() => {}
+        Some(status) => bail!("sbx exec failed ({status})"),
+        None => bail!("sbx exec did not finish within 20 s"),
+    }
+    let mut bytes = Vec::new();
+    stdout.rewind()?;
+    stdout.take(LIMIT).read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 /// Runs `sbx args` within `timeout` and returns its output, failing when sbx does.
 fn sbx(program: &str, args: &[impl AsRef<str>], ssh_agent: bool, timeout: Duration) -> Result<String> {
     let (status, out, err) = sbx_output(program, args, ssh_agent, timeout)?;
@@ -1113,6 +1132,34 @@ mod tests {
         let names: Vec<String> = list(&sbx).unwrap().into_iter().map(|s| s.name).collect();
         assert_eq!(names, ["imacs-a", "poc-1"]);
         assert!(for_repo(&home, &sbx, &repo).unwrap().orphans.is_empty());
+    }
+
+    #[test]
+    fn usage_comes_back_from_the_end_of_the_newest_rollout_in_the_sandbox() {
+        let bin = crate::test_support::tempdir().unwrap();
+        let sbx = fake::install(bin.path()).display().to_string();
+        std::fs::write(bin.path().join("exec-runs"), "").unwrap();
+        std::fs::create_dir_all(bin.path().join("sandboxes")).unwrap();
+        std::fs::write(bin.path().join("sandboxes/imacs-u"), r#"{"name":"imacs-u","status":"running"}"#).unwrap();
+        // The fake runs `exec` with HOME at its folder, as the VM's agent home.
+        let day = bin.path().join(".codex/sessions/2026/10/30");
+        std::fs::create_dir_all(&day).unwrap();
+        let event = |used: u32| {
+            format!(
+                r#"{{"timestamp":"2026-10-30T11:32:20Z","type":"event_msg","payload":{{"type":"token_count","rate_limits":{{"primary":{{"used_percent":{used},"window_minutes":10080,"resets_at":1793864523}}}}}}}}"#
+            )
+        };
+        let old = day.join("rollout-old.jsonl");
+        std::fs::write(&old, event(50) + "\n").unwrap();
+        File::options().write(true).open(&old).unwrap().set_modified(std::time::UNIX_EPOCH).unwrap();
+        std::fs::write(day.join("rollout-new.jsonl"), format!("{}\n{}\n", "x".repeat(40_000), event(12))).unwrap();
+
+        let output = read_usage(&sbx, "imacs-u").unwrap();
+        assert!(output.len() < 20_000, "the VM keeps only the end of the rollout: {} bytes", output.len());
+        let reports = crate::usage::sandbox_reports(&output, i64::MAX);
+        let [crate::usage::Report::Codex(usage)] = reports.as_slice() else { panic!("one Codex report: {output}") };
+        assert_eq!(usage.weekly.as_ref().unwrap().remaining, 88.0, "from the newest rollout");
+        assert!(read_usage(&sbx, "imacs-gone").is_err());
     }
 
     #[test]

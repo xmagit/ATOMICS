@@ -1,8 +1,10 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use egui::{Color32, RichText, Sense, vec2};
 use imacs_core::usage::{Usage, Window, age_label, reset_label};
@@ -126,6 +128,85 @@ fn poll_codex(sessions: &Path, tx: Sender<Report>, stopped: Receiver<()>, ctx: e
             break;
         }
     }
+}
+
+/// Account usage read from running sandboxes, whose agents reach neither IMACS nor this machine's
+/// Codex logs: one `sbx exec` per sandbox, at most once per [`POLL_INTERVAL`], off the UI thread.
+pub struct SandboxPull {
+    tx: Sender<Report>,
+    pulled: Option<Instant>,
+    busy: Arc<AtomicBool>,
+}
+
+impl SandboxPull {
+    pub fn new(tx: Sender<Report>) -> Self {
+        Self { tx, pulled: None, busy: Arc::default() }
+    }
+
+    /// `names` are sandboxes whose agent is attached: `sbx exec` would start a stopped one.
+    pub fn poll(&mut self, sbx: &str, names: Vec<String>, ctx: &egui::Context) {
+        if names.is_empty()
+            || self.busy.load(Ordering::Acquire)
+            || self.pulled.is_some_and(|at| at.elapsed() < POLL_INTERVAL)
+        {
+            return;
+        }
+        self.pulled = Some(Instant::now());
+        self.busy.store(true, Ordering::Release);
+        let (tx, busy, ctx, sbx) = (self.tx.clone(), self.busy.clone(), ctx.clone(), sbx.to_string());
+        let spawned = std::thread::Builder::new().name("imacs-sandbox-usage".into()).spawn(move || {
+            let sbx = crate::setup::resolve_program(&sbx);
+            for name in names {
+                let Ok(output) = crate::sandbox::read_usage(&sbx, &name) else { continue };
+                for report in sandbox_reports(&output, now()) {
+                    let _ = tx.send(report);
+                }
+            }
+            busy.store(false, Ordering::Release);
+            ctx.request_repaint();
+        });
+        if spawned.is_err() {
+            self.busy.store(false, Ordering::Release);
+        }
+    }
+}
+
+/// Reports in [`imacs_core::isolation::usage_args`]' output. The sandbox's agent can write all of
+/// it, so nothing may claim to be newer than now: that would hide every real report after it.
+pub fn sandbox_reports(output: &str, now: i64) -> Vec<Report> {
+    let mut parts: Vec<(&str, Vec<&str>)> = Vec::new();
+    for line in output.lines() {
+        match line.strip_prefix(imacs_core::isolation::USAGE_MARK) {
+            Some(header) => parts.push((header, Vec::new())),
+            None => {
+                if let Some((_, lines)) = parts.last_mut() {
+                    lines.push(line);
+                }
+            }
+        }
+    }
+    let mut reports = Vec::new();
+    for (header, lines) in parts {
+        let mut words = header.split_whitespace();
+        match words.next() {
+            Some("codex") => {
+                if let Some(mut usage) = lines.iter().rev().find_map(|line| Usage::codex(line)) {
+                    usage.observed_at = usage.observed_at.min(now);
+                    reports.push(Report::Codex(usage));
+                }
+            }
+            Some("claude") => {
+                let Some(at) = words.next().and_then(|word| word.parse::<i64>().ok()) else { continue };
+                let Ok(payload) = serde_json::from_str::<serde_json::Value>(&lines.join("\n")) else { continue };
+                let usage = Usage::claude(&payload, at.min(now));
+                if usage.session.is_some() || usage.weekly.is_some() {
+                    reports.push(Report::Claude(usage));
+                }
+            }
+            _ => {}
+        }
+    }
+    reports
 }
 
 fn read_codex(sessions: &Path) -> Option<Usage> {
@@ -300,6 +381,43 @@ mod tests {
             }
             output.drop_without_applying_deltas();
         }
+    }
+
+    #[test]
+    fn sandbox_reports_read_both_agents_and_never_claim_to_be_newer_than_now() {
+        use imacs_core::isolation::USAGE_MARK;
+        let codex = r#"{"timestamp":"2026-10-30T11:32:20.000Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":12.0,"window_minutes":10080,"resets_at":1793864523}}}}"#;
+        let claude = r#"{"model":{"id":"claude-sonnet-5-5"},"rate_limits":{"five_hour":{"used_percentage":40,"resets_at":1793370000},"seven_day":{"used_percentage":10,"resets_at":1793800000}}}"#;
+        let now = 1_793_361_000;
+        // tail -c starts mid-line; the newest complete event wins.
+        let output = format!("{USAGE_MARK}codex\n{{\"cut off\n{codex}\n\n{USAGE_MARK}claude 1793360900\n{claude}\n");
+        let reports = sandbox_reports(&output, now);
+        let [Report::Codex(codex_usage), Report::Claude(claude_usage)] = reports.as_slice() else {
+            panic!("a Codex report, then a Claude report");
+        };
+        assert_eq!((codex_usage.weekly.as_ref().unwrap().remaining, codex_usage.observed_at), (88.0, 1_793_359_940));
+        assert_eq!(claude_usage.session.as_ref().unwrap().remaining, 60.0);
+        assert_eq!(claude_usage.weekly.as_ref().unwrap().remaining, 90.0);
+        assert_eq!(claude_usage.observed_at, 1_793_360_900, "the status line file's time, not the read's");
+
+        // The agent writes all of it: a future time would hide every real report after it.
+        let future = format!(
+            "{USAGE_MARK}codex\n{}\n{USAGE_MARK}claude 4102444800\n{claude}\n",
+            codex.replace("2026-10-30", "2099-01-01")
+        );
+        let reports = sandbox_reports(&future, now);
+        assert_eq!(reports.len(), 2);
+        for report in &reports {
+            let (Report::Codex(usage) | Report::Claude(usage)) = report;
+            assert_eq!(usage.observed_at, now);
+        }
+
+        // A mark inside a line starts nothing; parts without limits, times or JSON report nothing.
+        assert!(sandbox_reports(&format!("noise {USAGE_MARK}claude 5\n{claude}\n"), now).is_empty());
+        let empty = format!(
+            "{USAGE_MARK}claude 5\n{{\"model\":{{}}}}\n{USAGE_MARK}claude\n{claude}\n{USAGE_MARK}codex\nnot json\n"
+        );
+        assert!(sandbox_reports(&empty, now).is_empty());
     }
 
     #[test]

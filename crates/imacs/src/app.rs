@@ -404,6 +404,8 @@ pub(crate) struct State {
     hub: Arc<Mutex<Hub>>,
     hook_rx: Receiver<HookMessage>,
     usage: crate::usage::UsagePanel,
+    /// Account usage that sandboxed agents saw, read back from their VMs.
+    sandbox_pull: crate::usage::SandboxPull,
     control_rx: Receiver<ControlMessage>,
     hook_error: Option<String>,
     /// Machine-wide limits for the agents' heavy work.
@@ -731,6 +733,7 @@ impl State {
         let (control_tx, control_rx) = wake.channel();
         let (action_tx, action_rx) = wake.channel();
         let (usage, usage_tx) = crate::usage::UsagePanel::new(ctx.clone());
+        let sandbox_pull = crate::usage::SandboxPull::new(usage_tx.clone());
         let governor = Arc::new(Governor::new(config.resources.clone(), Some(ctx.clone())));
         let channels =
             Channels { hooks: hook_tx, control: control_tx.clone(), usage: usage_tx, governor: governor.clone() };
@@ -817,6 +820,7 @@ impl State {
             hub,
             hook_rx,
             usage,
+            sandbox_pull,
             control_rx,
             hook_error,
             governor,

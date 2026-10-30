@@ -428,12 +428,12 @@ impl State {
         }
         if agent.kind == AgentKind::Claude {
             // Hooks run `imacs hook` on this machine, which a sandbox does not have.
-            if sandboxed.is_none() {
-                args.push("--settings".into());
-                args.push(
-                    imacs_core::hook::session_settings(Path::new(&exe), Path::new(&socket), &id, false).to_string(),
-                );
-            }
+            args.push("--settings".into());
+            args.push(match sandboxed {
+                None => imacs_core::hook::session_settings(Path::new(&exe), Path::new(&socket), &id, false).to_string(),
+                // Its status line only saves the account's limits in the VM, for IMACS to read back.
+                Some(_) => isolation::claude_settings().to_string(),
+            });
             let session_id = match resume {
                 Some(id) => {
                     args.extend(["--resume".to_string(), id.clone()]);
