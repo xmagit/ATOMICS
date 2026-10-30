@@ -7,7 +7,7 @@
 //!   the main checkout, or a linked worktree no sandbox works in;
 //! - remote-tracking refs and tags at an object a fetch on this machine wrote to its FETCH_HEAD,
 //!   and those such a fetch may have pruned;
-//! - `refs/stash`, which every checkout shares, and the quarantine below are not guarded.
+//! - `refs/stash`, which every checkout shares, is not guarded; quarantine refs are append-only.
 //!
 //! Those traces are in git folders no sandbox mounts, except the main checkout's HEAD log, which is
 //! in the shared `logs` folder. Putting a ref back never deletes a value: one it replaces is kept at
@@ -39,8 +39,8 @@ fn shown(value: Option<&RefValue>) -> String {
     }
 }
 
-/// Refs no check puts back: the stash every checkout shares, and the values checks keep aside.
-const UNGUARDED: [&str; 2] = ["refs/stash", QUARANTINE];
+/// Refs no check puts back: the stash every checkout shares.
+const UNGUARDED: [&str; 1] = ["refs/stash"];
 const QUARANTINE: &str = "refs/imacs/quarantine/";
 
 /// Whether `pattern`, a ref name or a prefix ending in `/`, covers the ref `name`.
@@ -407,14 +407,19 @@ impl RefGuard {
             .collect();
         let mut alerts = Vec::new();
         for name in names {
-            let (before, after) = (self.refs.get(&name), current.get(&name));
-            let accepted = self.branch.as_ref() == Some(&name)
-                || concurrent.iter().any(|pattern| covers(pattern, &name))
-                || UNGUARDED.iter().any(|pattern| covers(pattern, &name))
-                || written.left(&name, after)
-                || host.left(&name, before, after)
-                || name.starts_with("refs/remotes/")
-                    && matches!(after, Some(RefValue::Object(object)) if local_tips.contains(object));
+            let before = self.refs.get(&name).cloned();
+            let (before, after) = (before.as_ref(), current.get(&name));
+            let accepted = if name.starts_with(QUARANTINE) {
+                before.is_none()
+            } else {
+                self.branch.as_ref() == Some(&name)
+                    || concurrent.iter().any(|pattern| covers(pattern, &name))
+                    || UNGUARDED.iter().any(|pattern| covers(pattern, &name))
+                    || written.left(&name, after)
+                    || host.left(&name, before, after)
+                    || name.starts_with("refs/remotes/")
+                        && matches!(after, Some(RefValue::Object(object)) if local_tips.contains(object))
+            };
             if accepted {
                 match after {
                     Some(value) => {
@@ -436,6 +441,12 @@ impl RefGuard {
                 _ => None,
             };
             let result = restore(&self.cwd, &name, before, after, kept.as_deref());
+            // Protect a recovery value immediately, before another turn can overwrite it.
+            if result.is_ok()
+                && let (Some(kept), Some(value)) = (&kept, after)
+            {
+                self.refs.insert(kept.clone(), value.clone());
+            }
             alerts.push(match (result, before, kept) {
                 (Ok(()), None, Some(kept)) => format!("Restored {name}: moved it to {kept} (it pointed to {found})"),
                 (Ok(()), None, None) => format!("Restored {name}: removed it (it was {found})"),
@@ -690,6 +701,28 @@ fn update_refs(cwd: &Path, operations: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quarantine_refs_allow_additions_but_restore_moves_and_deletions() {
+        let (dir, repo, worktree) = repository();
+        let mut guard = RefGuard::open(&worktree, dir.path().join("snapshot.json")).unwrap().unwrap();
+        git::git(&worktree, &["branch", "injected"]).unwrap();
+        guard.check(&Default::default(), &Default::default()).unwrap();
+        let original = git::git(&repo, &["rev-parse", "main"]).unwrap();
+        let kept = format!("{QUARANTINE}snapshot/refs/heads/injected@{}", &original[..12]);
+        git::git(&worktree, &["commit", "--allow-empty", "-qm", "next"]).unwrap();
+        let next = git::git(&worktree, &["rev-parse", "HEAD"]).unwrap();
+        git::git(&worktree, &["update-ref", &kept, next.trim()]).unwrap();
+        let alerts = guard.check(&Default::default(), &Default::default()).unwrap();
+        assert!(alerts.iter().any(|a| a.starts_with(&format!("Restored {kept}:"))), "{alerts:?}");
+        assert_eq!(git::git(&repo, &["rev-parse", &kept]).unwrap(), original);
+        git::git(&worktree, &["update-ref", "-d", &kept]).unwrap();
+        git::git(&worktree, &["update-ref", &format!("{QUARANTINE}new"), next.trim()]).unwrap();
+        let alerts = guard.check(&Default::default(), &Default::default()).unwrap();
+        assert!(alerts.iter().any(|a| a.starts_with(&format!("Restored {kept}:"))), "{alerts:?}");
+        assert_eq!(git::git(&repo, &["rev-parse", &kept]).unwrap(), original);
+        assert_eq!(git::git(&repo, &["rev-parse", &format!("{QUARANTINE}new")]).unwrap(), next);
+    }
 
     #[test]
     fn a_user_push_keeps_tracking_refs_only_at_accepted_local_tips() {

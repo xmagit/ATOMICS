@@ -787,8 +787,8 @@ tests there, in a worktree that starts from the integration branch.
 - **Nothing is deleted.** Putting a ref back keeps the value it replaces at
   `refs/imacs/quarantine/<sandbox>/<ref>@<object>`, and the alert names it: a branch the agent made is
   moved there rather than deleted, and a value restored over is kept there. If it was yours, take it back
-  with `git branch -f <branch> refs/imacs/quarantine/…`, and delete the quarantine ref when you are done
-  (`git update-ref -d`). Checks do not guard `refs/imacs/quarantine/`.
+  with `git branch -f <branch> refs/imacs/quarantine/…`. Checks accept new quarantine refs,
+  but restore changes or deletions of values already observed: quarantine is append-only while guarded.
 - **Objects are data.** Objects an agent writes stay on your machine, and git never executes them. Hooks
   and config, which do run on your machine, are out of reach, and git on your machine finds them through
   IMACS's record, not the files the agent can write (see
