@@ -15,12 +15,18 @@ pub struct Owned {
     pub sandbox: bool,
     pub mcp: bool,
     pub created: u64,
+    pub pins: Option<PathBuf>,
+    pub scratch: Option<PathBuf>,
+    pub builder: Option<u32>,
 }
 
 #[derive(Clone, Copy)]
 pub enum Resource {
     Sandbox,
     Mcp,
+    Pins,
+    Scratch,
+    Builder,
 }
 
 pub fn timestamp(time: SystemTime) -> u64 {
@@ -35,6 +41,11 @@ struct Ledger {
 }
 
 impl Ledger {
+    fn entry(&mut self, name: &str) -> &mut Owned {
+        self.entries
+            .entry(name.into())
+            .or_insert_with(|| Owned { created: timestamp(SystemTime::now()), ..Owned::default() })
+    }
     fn open(home: &Path) -> Result<Self> {
         std::fs::create_dir_all(home)?;
         let lock = File::options()
@@ -74,13 +85,13 @@ pub fn owned(home: &Path) -> Result<BTreeMap<String, Owned>> {
 /// Record only after a successful create/add, never by adopting an inventory entry.
 pub fn created(home: &Path, name: &str, resource: Resource) -> Result<()> {
     let mut ledger = Ledger::open(home)?;
-    let entry = ledger
-        .entries
-        .entry(name.into())
-        .or_insert_with(|| Owned { created: timestamp(SystemTime::now()), ..Owned::default() });
+    let entry = ledger.entry(name);
     match resource {
         Resource::Sandbox => entry.sandbox = true,
         Resource::Mcp => entry.mcp = true,
+        Resource::Pins | Resource::Scratch | Resource::Builder => {
+            anyhow::bail!("use the record operation for this resource")
+        }
     }
     ledger.save()
 }
@@ -92,11 +103,50 @@ pub fn removed(home: &Path, name: &str, resource: Resource) -> Result<()> {
         match resource {
             Resource::Sandbox => entry.sandbox = false,
             Resource::Mcp => entry.mcp = false,
+            Resource::Pins => entry.pins = None,
+            Resource::Scratch => entry.scratch = None,
+            Resource::Builder => entry.builder = None,
         }
-        if !entry.sandbox && !entry.mcp {
+        if !entry.sandbox && !entry.mcp && entry.pins.is_none() && entry.scratch.is_none() && entry.builder.is_none() {
             ledger.entries.remove(name);
         }
         ledger.save()?;
     }
     Ok(())
+}
+
+pub fn record_pins(home: &Path, name: &str, dir: &Path) -> Result<()> {
+    let mut ledger = Ledger::open(home)?;
+    ledger.entry(name).pins = Some(dir.into());
+    ledger.save()
+}
+
+/// A live CLI build has no session record; its owning process keeps it out of the sweep.
+pub struct TemplateBuild {
+    home: PathBuf,
+    name: String,
+}
+
+impl TemplateBuild {
+    pub fn record(home: &Path, name: &str, scratch: &Path) -> Result<Self> {
+        let mut ledger = Ledger::open(home)?;
+        let entry = ledger.entry(name);
+        entry.builder = Some(std::process::id());
+        entry.scratch = Some(scratch.into());
+        ledger.save()?;
+        Ok(Self { home: home.into(), name: name.into() })
+    }
+}
+
+impl Drop for TemplateBuild {
+    fn drop(&mut self) {
+        if let Err(error) = removed(&self.home, &self.name, Resource::Builder) {
+            eprintln!("IMACS: releasing template build ownership: {error:#}");
+        }
+    }
+}
+
+pub fn building(entry: &Owned) -> bool {
+    entry.builder.is_some_and(|pid| unsafe { libc::kill(pid as i32, 0) } == 0
+        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
 }

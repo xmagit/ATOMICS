@@ -53,6 +53,10 @@ the Linux desktop app. State stays in `~/.imacs` on macOS and existing installs;
 
 ## Run
 
+On a fresh Mac or Ubuntu machine, run `imacs setup` after installing IMACS. It guides tool
+installation, Docker sign-in, network policy, OS-keychain credentials and Linear authorization,
+and resumes completed steps on rerun. See [fresh-machine setup](docs/isolation.md#fresh-machine-one-guided-command).
+
 ```sh
 cargo install --path crates/imacs     # or: cargo run --release -p imacs
 imacs                                 # opens the repository you are in (or your last projects)
@@ -79,8 +83,10 @@ imacs --workspace daily
 scripts/linux-install.sh --uninstall  # removes the binary, desktop entry and icon; keeps config/state
 ```
 
-The installer builds a release binary for the native Linux target and atomically replaces `~/.local/bin/imacs`,
-including while IMACS is running. Add `~/.local/bin` to PATH for terminal use. The desktop entry and icon go under
+The installer builds a release binary for the native Linux target, atomically replaces `~/.local/bin/imacs`,
+including while IMACS is running, and runs the installed `imacs setup` with your terminal attached.
+Setup guides missing tools, KVM access, Docker sign-in and credentials; updates reuse completed steps.
+If setup is interrupted, rerun `imacs setup` to resume. Add `~/.local/bin` to PATH for terminal use. The desktop entry and icon go under
 `${XDG_DATA_HOME:-~/.local/share}`; rerunning updates the same files. Both Wayland and X11 are enabled. eframe supplies
 embedded fallback fonts, so the UI and terminal do not require macOS fonts; system fonts can also be used. A working
 Vulkan driver (for example Mesa's `mesa-vulkan-drivers`) supports the default wgpu renderer. File dialogs use the desktop
@@ -204,9 +210,11 @@ sizes range from 480x320 to 8192x8192. The image uses Debian, Rust 1.98, Xvfb an
 (software rendering for wgpu). No display server, GPU, agent credentials or IMACS state from the host are shared.
 
 The repository and linked-worktree git metadata are mounted read-only. Each checkout gets a separate Docker target
-volume; Cargo registry and git downloads are cached across checkouts. The image is cached by its Dockerfile checksum,
+volume labelled with its checkout path; each run removes labelled target volumes whose checkout is gone and which
+no running or stopped container uses. Unlabelled volumes and the shared Cargo registry and git volumes are kept.
+Cargo registry and git downloads are cached across checkouts. The image is cached by its Dockerfile checksum,
 and the builder receives only `Dockerfile.linux-qa`, never the source tree. To refresh the same image's OS packages,
-remove its `imacs-linux-qa:<checksum>` tag and rerun. No images or volumes are deleted automatically.
+remove its `imacs-linux-qa:<checksum>` tag and rerun. Images are kept until removed manually.
 
 Containers drop all Linux capabilities, so permission checks behave normally even with the image's root user.
 They default to two CPUs, two Cargo jobs, two test threads and 8 GiB of memory. Override CPU, job or memory limits
@@ -219,6 +227,25 @@ For incremental compilation, use `scripts/linux-qa.sh shell` and run `cargo chec
 During development run only tests you change; reserve the queued full suite for the end. If using the shell for a heavy
 test run or a GUI instance, queue the shell itself with the matching class. Shell changes outside `/repo` are disposable;
 the target and Cargo caches persist.
+
+Real Docker Sandboxes need KVM and cannot run inside this container. On the Ubuntu 24.04+ desktop,
+finish `imacs setup`, then run:
+
+```sh
+imacs queue --class qa -- scripts/linux-sandbox-smoke.sh
+# Rehearse the lifecycle without KVM (inside scripts/linux-qa.sh shell, under a QA slot):
+xvfb-run -a dbus-run-session -- scripts/linux-sandbox-smoke.sh --fake-sbx --imacs /target/debug/imacs
+```
+
+The smoke script runs doctor, starts an instance with its own `IMACS_HOME`, `IMACS_SOCKET`, `IMACS_CONFIG`,
+runtime and temporary directories, and creates two shell agents in disposable worktrees. It verifies terminal
+output and workspace file synchronization, measures 20 control round trips (maximum 1000 ms by default),
+then removes its app/helpers, sandboxes, MCP registrations, worktrees and temporary directories and checks
+for leftovers. It prints a pass/fail summary and exits nonzero on failure, including cleanup failures.
+Your normal HOME, sbx sign-in and global policy are reused; a missing policy must be initialized with setup first.
+It never removes other instances' sandboxes or MCP servers. Use `--imacs /path/to/imacs`, `--timeout 900`
+and `--latency-ms 1000` to select an already built binary or adjust the startup/latency limits. `--fake-sbx`
+uses the repository fixture and reports explicitly that VM isolation and KVM were not exercised.
 
 ## Troubleshooting
 

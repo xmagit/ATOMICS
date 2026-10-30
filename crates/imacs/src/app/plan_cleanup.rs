@@ -46,7 +46,9 @@ impl State {
         dialog.rows.clear();
         let (tx, plan, base) = (dialog.tx.clone(), dialog.plan.clone(), self.plan_base_ref(&dialog.plan));
         std::thread::spawn(move || {
-            let _ = tx.send(Event::Preview(cleanup::preview(&plan, &base).map_err(|err| format!("{err:#}"))));
+            let result =
+                crate::sandbox::load_owned_pins(&paths::imacs_home()).and_then(|()| cleanup::preview(&plan, &base));
+            let _ = tx.send(Event::Preview(result.map_err(|err| format!("{err:#}"))));
         });
     }
 

@@ -20,6 +20,7 @@ unset IMACS_PANE WAYLAND_DISPLAY
 
 case "${1:-}" in
     test)
+        python3 /repo/tests/test_linux_qa.py
         xvfb-run -a -s '-screen 0 1600x1000x24 -nolisten tcp' \
             cargo test --workspace --locked --no-fail-fast
         ;;

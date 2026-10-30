@@ -43,6 +43,31 @@ if ! docker info >/dev/null; then
     exit 1
 fi
 
+# Only our labelled target caches are eligible. Include stopped containers in the
+# usage check, and let non-forced removal protect against a container starting
+# between the check and removal. Existing unlabelled caches stay unlabelled.
+checkout_label=com.imacs.linux-qa.checkout
+volumes=$(docker volume ls --filter "label=$checkout_label" --format '{{.Name}}')
+while IFS= read -r volume; do
+    [[ $volume == imacs-linux-qa-target-* ]] || continue
+    checkout=$(docker volume inspect "$volume" --format "{{ index .Labels \"$checkout_label\" }}" 2>/dev/null) || continue
+    [[ $checkout == /* ]] || continue
+    [[ ! -e $checkout && ! -L $checkout ]] || continue
+    containers=$(docker ps -aq --filter "volume=$volume") || continue
+    [[ -z $containers ]] || continue
+    if docker volume rm "$volume" >/dev/null 2>&1; then
+        echo "Removed orphaned Linux QA target cache: $volume ($checkout)" >&2
+    else
+        echo "Kept Linux QA target cache $volume: removal failed or it is now in use." >&2
+    fi
+done <<< "$volumes"
+
+checkout_key=$(printf '%s' "$root" | cksum | awk '{print $1}')
+target_volume="imacs-linux-qa-target-$checkout_key"
+if ! docker volume inspect "$target_volume" >/dev/null 2>&1; then
+    docker volume create --label "$checkout_label=$root" "$target_volume" >/dev/null
+fi
+
 # No source is sent to the builder. A changed Dockerfile selects a fresh image;
 # unchanged runs reuse the image without resolving its base tag or running apt.
 image_key=$(cksum < "$root/Dockerfile.linux-qa" | awk '{print $1}')
@@ -53,11 +78,10 @@ fi
 
 # Targets are per checkout; the registry and git downloads are shared. Host
 # jobserver FIFOs cannot cross Docker Desktop's VM boundary, so cap jobs/CPUs.
-checkout_key=$(printf '%s' "$root" | cksum | awk '{print $1}')
 run=(docker run --rm --init --cap-drop ALL
     --cpus "${IMACS_LINUX_QA_CPUS:-2}" --memory "${IMACS_LINUX_QA_MEMORY:-8g}"
     --mount "type=bind,source=$root,target=/repo,readonly"
-    --mount "type=volume,source=imacs-linux-qa-target-$checkout_key,target=/target"
+    --mount "type=volume,source=$target_volume,target=/target"
     --mount type=volume,source=imacs-linux-qa-registry,target=/usr/local/cargo/registry
     --mount type=volume,source=imacs-linux-qa-git,target=/usr/local/cargo/git
     --env "CARGO_BUILD_JOBS=${IMACS_LINUX_QA_JOBS:-2}")

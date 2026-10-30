@@ -9,6 +9,7 @@ impl State {
         }
         let before = self.runtime_view_revision();
         let mut changed = self.drain_actions();
+        changed |= self.poll_sandbox_check();
         for record in std::mem::take(&mut self.resume) {
             self.resume_record(ctx, record);
             changed = true;
@@ -69,7 +70,7 @@ impl State {
             changed = true;
             if !self.sessions.iter().any(|s| s.id == launch.id) {
                 // Closed while its sandbox was made: leave the sandbox stopped for reuse or cleanup.
-                if let (Ok(()), AgentRuntime::Sandbox(sandboxed)) = (&result, &launch.runtime) {
+                if let (Ok(_), AgentRuntime::Sandbox(sandboxed)) = (&result, &launch.runtime) {
                     self.stop_sandbox(sandboxed.name.clone());
                 }
                 continue;
@@ -79,7 +80,14 @@ impl State {
                 AgentRuntime::Sandbox(sandbox) => Some(sandbox.name.clone()),
                 AgentRuntime::Bare => None,
             };
-            if let Err(error) = result.and_then(|()| self.launch_agent(ctx, launch, None)) {
+            let launched = result.and_then(|guard| {
+                let (guard, alerts) = guard.unzip();
+                if let Some(alerts) = alerts.filter(|alerts| !alerts.is_empty()) {
+                    self.ref_alert(&id, alerts.join("\n"));
+                }
+                self.launch_agent(ctx, AgentLaunch { ref_guard: guard, ..launch }, None)
+            });
+            if let Err(error) = launched {
                 if let Some(name) = name {
                     self.stop_sandbox(name);
                 }
@@ -184,6 +192,10 @@ impl State {
                 self.output_delay = Some(self.output_delay.map_or(delay, |pending| pending.min(delay)));
             }
         }
+        let exiting =
+            |s: &Session| s.status != AgentStatus::Exited && s.terminal.as_ref().is_some_and(Terminal::exited);
+        // Gathered while agents that just exited still count as live, so every guard accepts their last commits.
+        let exempt = self.sessions.iter().any(exiting).then(|| self.exempt_branches());
         let mut idle = Vec::new();
         for session in &mut self.sessions {
             if session.terminal.as_ref().is_some_and(Terminal::exited) {
@@ -200,10 +212,10 @@ impl State {
                 session.title = title;
             }
         }
+        if let Some(exempt) = exempt {
+            self.check_all_refs(&exempt);
+        }
         for name in idle {
-            if let Some(index) = self.sessions.iter().position(|session| session.sandbox.as_ref() == Some(&name)) {
-                self.check_refs(index);
-            }
             self.stop_sandbox(name);
         }
         let names = self.sessions.iter().filter_map(|s| s.sandbox.clone()).collect();

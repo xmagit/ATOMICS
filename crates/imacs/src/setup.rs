@@ -34,7 +34,7 @@ pub fn executable_path() -> std::io::Result<PathBuf> {
 }
 
 /// A variable as an interactive login shell sets it. `name` must be a plain identifier.
-fn login_shell_var(name: &str) -> Option<String> {
+pub(crate) fn login_shell_var(name: &str) -> Option<String> {
     let shell = shell_program();
     let out = std::process::Command::new(shell)
         .args(["-l", "-i", "-c", &format!("printf '{MARKER}%s{MARKER}' \"${name}\"")])
@@ -84,7 +84,11 @@ pub fn known_env_var(name: &str) -> Option<String> {
 
 pub fn find_program(program: &str) -> Option<PathBuf> {
     let path = SHELL_PATH.clone().or_else(|| std::env::var("PATH").ok()).unwrap_or_default();
-    std::env::split_paths(&path)
+    find_on_path(program, &path)
+}
+
+pub(crate) fn find_on_path(program: &str, path: &str) -> Option<PathBuf> {
+    std::env::split_paths(path)
         .map(|dir| dir.join(program))
         .find(|candidate| candidate.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
 }

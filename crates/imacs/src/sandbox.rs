@@ -3,8 +3,11 @@
 //! when the agent exits and removed with its worktree. The command lines come from
 //! [`imacs_core::isolation`]; this module runs them.
 
+pub mod template;
+
 use std::fs::File;
 use std::io::{Read, Seek};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,6 +17,10 @@ use crate::sandbox_ownership::{self as ownership, Resource};
 use anyhow::{Context, Result, bail};
 use imacs_core::isolation::{self, Diagnosis, Listed, MIN_SBX_VERSION, SandboxConfig, Spec};
 use imacs_core::{git, paths, workspace};
+
+pub(crate) mod checks;
+pub mod setup;
+pub use checks::doctor_lines;
 
 /// Most sbx commands answer within a second; this bounds a stuck daemon.
 const TIMEOUT: Duration = Duration::from_secs(60);
@@ -64,11 +71,14 @@ pub struct Prepare {
     pub agent: &'static str,
     pub cwd: PathBuf,
     pub config: SandboxConfig,
+    pub warm: Vec<String>,
     /// IMACS's executable and socket, for the MCP server agents report through.
     pub exe: PathBuf,
     pub socket: PathBuf,
     /// A folder of this session's own, mounted read-only for its brief.
     pub briefs: Option<PathBuf>,
+    /// IMACS's records of where git finds each sandbox's repository; see [`pin_git`].
+    pub pins: PathBuf,
 }
 
 impl Prepare {
@@ -98,47 +108,31 @@ const BARE: &str = "or set [isolation] mode = \"bare\" to run agents directly on
 pub fn preflight(program: &str) -> Result<Ready, String> {
     if !installed(program) {
         return Err(format!(
-            "Docker Sandboxes (sbx) is not installed. Install it (brew install --cask docker/tap/sbx, \
-             or see https://github.com/docker/sbx-releases) and sign in with `sbx login`, {BARE}."
+            "Docker Sandboxes (sbx) is not installed. {}; sign in with `sbx login`, {BARE}.",
+            checks::install_hint("sbx", cfg!(target_os = "macos"))
         ));
     }
     let output = sbx(program, &["version"], false, TIMEOUT)
-        .map_err(|err| format!("sbx did not report its version ({err:#}). Run `sbx version` to see why, {BARE}."))?;
-    let version = isolation::parse_version(&output).ok_or_else(|| {
-        format!("sbx reported no version IMACS can read ({:?}). Check `sbx version`, {BARE}.", output.trim())
-    })?;
+        .map_err(|_| format!("sbx did not report its version. Run `sbx version` to see why, {BARE}."))?;
+    let version = isolation::parse_version(&output)
+        .ok_or_else(|| format!("sbx reported no version IMACS can read. Check `sbx version`, {BARE}."))?;
     if version < MIN_SBX_VERSION {
         return Err(format!(
-            "sbx {} is older than {}, the oldest IMACS supports. Upgrade it (brew upgrade --cask sbx), {BARE}.",
+            "sbx {} is older than {}, the oldest IMACS supports. {}; {BARE}.",
             isolation::version_text(version),
-            isolation::version_text(MIN_SBX_VERSION)
+            isolation::version_text(MIN_SBX_VERSION),
+            checks::install_hint("sbx", cfg!(target_os = "macos"))
         ));
     }
     // diagnose exits non-zero when any check fails, such as an unrelated SSH setting; the report still holds.
-    let (_, output, error) = sbx_output(program, &["diagnose", "--json"], false, TIMEOUT)
-        .map_err(|err| format!("sbx diagnose did not run ({err:#}). Run `sbx diagnose` to see why, {BARE}."))?;
-    let diagnosis: Diagnosis = serde_json::from_str(&output).map_err(|_| {
-        let detail = [error.trim(), output.trim()].into_iter().find(|t| !t.is_empty()).unwrap_or("no output");
-        format!("sbx diagnose gave no report ({detail}). Run `sbx diagnose` to see why, {BARE}.")
-    })?;
+    let (_, output, _) = sbx_output(program, &["diagnose", "--json"], false, TIMEOUT)
+        .map_err(|_| format!("sbx diagnose did not run. Run `sbx diagnose` to see why, {BARE}."))?;
+    let diagnosis: Diagnosis = serde_json::from_str(&output)
+        .map_err(|_| format!("sbx diagnose gave no readable report. Run `sbx diagnose` to see why, {BARE}."))?;
     if !diagnosis.signed_in() {
         return Err(format!("sbx is not signed in to Docker. Run `sbx login` in a terminal, {BARE}."));
     }
     Ok(Ready { version, diagnosis })
-}
-
-/// The doctor's line about sandboxes: a warning, since bare agents need none of this.
-pub fn doctor_line(program: &str) -> String {
-    match preflight(program) {
-        Ok(ready) => imacs_core::doctor::check_line(
-            true,
-            &format!("Docker Sandboxes ready (sbx {}, signed in)", isolation::version_text(ready.version)),
-            "",
-        ),
-        Err(error) => {
-            imacs_core::doctor::check_line(false, "Docker Sandboxes not ready for sandboxed agents (warning)", &error)
-        }
-    }
 }
 
 /// Makes the sandbox unless it exists, which is how a session reattaches after a restart,
@@ -149,12 +143,39 @@ pub fn prepare(job: &Prepare) -> Result<()> {
     let ready = preflight(&job.sbx).map_err(anyhow::Error::msg)?;
     // Fail closed before making anything if this home's ledger cannot be read.
     let owned = ownership::owned(&job.home)?;
-    if list(&job.sbx)?.iter().any(|sandbox| sandbox.name == job.name) {
+    let existing = list(&job.sbx)?.into_iter().find(|sandbox| sandbox.name == job.name);
+    if existing.is_some() {
         anyhow::ensure!(
             owned.get(&job.name).is_some_and(|entry| entry.sandbox),
             "Sandbox {} is not owned by this IMACS_HOME; refusing to attach",
             job.name
         );
+    }
+    if real(&paths::home()).starts_with(real(&job.cwd)) {
+        bail!(
+            "{} holds your whole home folder; start in a project folder or set isolation = \"bare\"",
+            job.cwd.display()
+        );
+    }
+    pin_git(&job.pins, &job.name, &job.cwd)?;
+    ownership::record_pins(&job.home, &job.name, &job.pins)?;
+    let (workspace, git) = workspace(&job.cwd)?;
+    if let Some(existing) = existing {
+        // A sandbox keeps its mounts for life: one made before a main checkout's .git was mounted
+        // read-only whole lets its agent replace .git, config and all.
+        let mounted = real_paths(&existing).workspaces;
+        if let Some(missing) = git
+            .iter()
+            .filter_map(|mount| mount.strip_suffix(":ro"))
+            .find(|protected| !mounted.contains(&format!("{}:ro", real(Path::new(protected)).display())))
+        {
+            bail!(
+                "sandbox {} does not mount {missing} read-only, so its agent could replace it. Remove the \
+                 sandbox (sbx rm {}) and start the agent again, or set isolation = \"bare\" on it.",
+                job.name,
+                job.name
+            );
+        }
         return Ok(());
     }
     // A machine's first sandbox needs sbx's global network policy; one already set up is left alone.
@@ -167,7 +188,6 @@ pub fn prepare(job: &Prepare) -> Result<()> {
                 .context("setting up sbx's network policy")?;
         }
     }
-    let (workspace, git) = workspace(&job.cwd)?;
     if let Some(briefs) = &job.briefs {
         std::fs::create_dir_all(briefs).with_context(|| format!("creating {}", briefs.display()))?;
     }
@@ -176,6 +196,7 @@ pub fn prepare(job: &Prepare) -> Result<()> {
     let spec = Spec {
         name: job.name.clone(),
         agent: job.agent,
+        warm: warm_mounts(&workspace, &job.warm, cfg!(target_os = "linux")),
         workspace,
         git,
         read_only,
@@ -190,7 +211,7 @@ pub fn prepare(job: &Prepare) -> Result<()> {
     ownership::created(&job.home, &job.name, Resource::Mcp)?;
     sbx(&job.sbx, &isolation::create_args(&spec), ssh, CREATE_TIMEOUT).context("creating the sandbox").inspect_err(
         |_| {
-            let _ = remove_mcp(&job.home, &job.sbx, &job.name);
+            let _ = remove(&job.home, &job.sbx, &job.name);
         },
     )?;
     ownership::created(&job.home, &job.name, Resource::Sandbox)?;
@@ -214,10 +235,161 @@ pub fn prepare(job: &Prepare) -> Result<()> {
     })
 }
 
+/// Pins host git in `cwd` to IMACS's record for sandbox `name` in `dir`: the one saved when the
+/// sandbox was made, another sandbox's for the same folder, or else what git says before this
+/// sandbox has run. The record outlives restarts, and only cleanup removes it with the sandbox.
+pub fn pin_git(dir: &Path, name: &str, cwd: &Path) -> Result<()> {
+    let file = dir.join(format!("{name}.json"));
+    let pins = match std::fs::read(&file) {
+        Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| format!("reading {}", file.display()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => current_pins(cwd)?,
+        Err(error) => return Err(error).with_context(|| format!("reading {}", file.display())),
+    };
+    check_pins(&pins)?;
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let temporary = file.with_extension("json.tmp");
+    std::fs::write(&temporary, serde_json::to_vec_pretty(&pins)?)?;
+    std::fs::rename(&temporary, &file)?;
+    git::pin(pins);
+    Ok(())
+}
+
+/// Where git finds `cwd`'s repository for a sandbox about to be made: the record of a sandbox that
+/// has worked there, else what git says now, refused if git did not make that layout.
+pub(crate) fn current_pins(cwd: &Path) -> Result<git::GitPins> {
+    match git::pinned(cwd) {
+        Some(pins) => Ok(pins),
+        None => git::resolve_pins(cwd),
+    }
+}
+
+/// Checked for every sandbox made or reattached to: the repository's config can change while its
+/// sandbox exists.
+pub(crate) fn check_pins(pins: &git::GitPins) -> Result<()> {
+    match &pins.common_dir {
+        Some(common) => git::check_worktree_config(common),
+        None => Ok(()),
+    }
+}
+
+/// Pins every folder IMACS recorded for a sandbox in `dir`, as each process that runs git in
+/// them starts.
+pub fn load_pins(dir: &Path) {
+    for pins in read_pins(dir).into_values() {
+        git::pin(pins);
+    }
+}
+
+/// Drops sandbox `name`'s record once the sandbox is removed. Its folder stays pinned while
+/// another sandbox's record covers it.
+pub fn forget_pins(dir: &Path, name: &str) -> Result<()> {
+    let mut records = read_pins(dir);
+    let file = dir.join(format!("{name}.json"));
+    let pins: git::GitPins = match std::fs::read(&file) {
+        Ok(bytes) => serde_json::from_slice(&bytes)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    records.remove(name);
+    // Drop the VM's named record, but keep poisoned metadata pinned across scans and restarts.
+    let unsafe_folder = pins.work_tree.exists() && git::resolve_pins(&pins.work_tree).ok().as_ref() != Some(&pins);
+    if unsafe_folder {
+        let retained = dir.join(format!("retained-{}.json", paths::runtime_home_hash(&pins.work_tree)));
+        let temporary = retained.with_extension("json.tmp");
+        std::fs::write(&temporary, serde_json::to_vec_pretty(&pins)?)?;
+        std::fs::rename(temporary, retained)?;
+    }
+    std::fs::remove_file(file)?;
+    if !unsafe_folder && !records.values().any(|other| other.work_tree == pins.work_tree) {
+        git::unpin(&pins.work_tree);
+    }
+    Ok(())
+}
+
+/// Drops the records of sandboxes sbx no longer has, as IMACS starts: a record outliving its
+/// sandbox would keep git out of a folder for good. A folder whose git files no longer match its
+/// record stays pinned, since the sandbox may have changed them and git would follow. Without an
+/// sbx that answers, which sandboxes exist is unknown, and every record stays.
+pub fn prune_pins(home: &Path, dir: &Path, program: &str) {
+    if !installed(program) {
+        return;
+    }
+    let Ok(sandboxes) = list(program) else { return };
+    let Ok(owned) = ownership::owned(home) else { return };
+    let names: std::collections::HashSet<String> = sandboxes.into_iter().map(|sandbox| sandbox.name).collect();
+    for (name, pins) in read_pins(dir) {
+        if names.contains(&name) || owned.get(&name).is_some_and(ownership::building) {
+            continue;
+        }
+        if pins.work_tree.exists() && git::resolve_pins(&pins.work_tree).ok().as_ref() != Some(&pins) {
+            eprintln!(
+                "IMACS: keeping removed sandbox {name}'s git record: {} no longer looks as git made it",
+                pins.work_tree.display()
+            );
+            continue;
+        }
+        if let Err(error) = forget_pins(dir, &name) {
+            eprintln!("IMACS: removing git record {name}: {error:#}");
+        }
+    }
+}
+
+fn read_pins(dir: &Path) -> std::collections::HashMap<String, git::GitPins> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Default::default() };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?.strip_suffix(".json")?.to_string();
+            match std::fs::read(&path).map_err(anyhow::Error::from).and_then(|b| Ok(serde_json::from_slice(&b)?)) {
+                Ok(pins) => Some((name, pins)),
+                Err(error) => {
+                    eprintln!("IMACS: reading {} failed: {error:#}", path.display());
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
+/// Only real directories inside this worktree may be exposed as writable caches.
+/// Explicit mounts keep sbx from filtering ignored build folders out of the workspace.
+fn warm_mounts(root: &Path, folders: &[String], linux: bool) -> Vec<PathBuf> {
+    if !linux {
+        return Vec::new();
+    }
+    let root = real(root);
+    let mut mounts = Vec::new();
+    for folder in folders {
+        let relative = Path::new(folder);
+        if relative.as_os_str().is_empty()
+            || !relative.components().all(|part| matches!(part, std::path::Component::Normal(name) if name != ".git"))
+        {
+            continue;
+        }
+        let path = root.join(relative);
+        let mut current = root.clone();
+        let no_links = relative.components().all(|part| {
+            current.push(part);
+            std::fs::symlink_metadata(&current).is_ok_and(|m| !m.file_type().is_symlink())
+        });
+        if no_links
+            && path.is_dir()
+            && path.canonicalize().is_ok_and(|resolved| resolved.starts_with(&root))
+            && !mounts.contains(&path)
+        {
+            mounts.push(path);
+        }
+    }
+    mounts
+}
+
 /// The folder a sandbox mounts read-write for `cwd`, its worktree (else `cwd` itself), and
 /// git's folders beside it. A linked worktree gets the common dir's objects, refs and logs and
 /// its own admin folder, so commits work while the repository's hooks and config stay on this
-/// machine. A checkout whose git dir lies inside it keeps that dir's hooks and config read-only.
+/// machine. A main checkout's git dir is mounted whole and read-only: a read-write checkout
+/// around anything less lets the agent replace `.git` itself, config and all, and a mount point
+/// cannot be moved. Agents there edit files; tasks commit in linked worktrees.
 pub fn workspace(cwd: &Path) -> Result<(PathBuf, Vec<String>)> {
     let args = ["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-dir", "--git-common-dir"];
     let output = git::git(cwd, &args).ok();
@@ -239,11 +411,7 @@ pub fn workspace(cwd: &Path) -> Result<(PathBuf, Vec<String>)> {
         mounts.extend(["objects", "refs", "logs"].into_iter().filter_map(|folder| existing(common.join(folder))));
         mounts.push(git_dir.to_string_lossy().into_owned());
     } else {
-        if !git_dir.starts_with(&top) {
-            mounts.push(git_dir.to_string_lossy().into_owned());
-        }
-        mounts
-            .extend(["hooks", "config"].into_iter().filter_map(|path| existing(git_dir.join(path))).map(|p| p + ":ro"));
+        mounts.push(format!("{}:ro", git_dir.display()));
     }
     Ok((top, mounts))
 }
@@ -269,6 +437,37 @@ pub fn remove(home: &Path, program: &str, name: &str) -> Result<()> {
         ownership::removed(home, name, Resource::Sandbox)?;
     }
     remove_mcp(home, program, name)?;
+    if let Some(entry) = ownership::owned(home)?.get(name) {
+        if let Some(dir) = &entry.pins {
+            forget_pins(dir, name)?;
+            ownership::removed(home, name, Resource::Pins)?;
+        }
+        if let Some(scratch) = &entry.scratch {
+            match std::fs::remove_dir_all(scratch) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            ownership::removed(home, name, Resource::Scratch)?;
+        }
+        if entry.builder.is_some() && !ownership::building(entry) {
+            ownership::removed(home, name, Resource::Builder)?;
+        }
+    }
+    Ok(())
+}
+
+/// Fail closed on an unreadable owned record rather than following checkout metadata.
+pub fn load_owned_pins(home: &Path) -> Result<()> {
+    load_pins(&home.join("git-pins"));
+    for (name, entry) in ownership::owned(home)? {
+        if let Some(dir) = entry.pins {
+            let file = dir.join(format!("{name}.json"));
+            let pins =
+                serde_json::from_slice(&std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?)?;
+            git::pin(pins);
+        }
+    }
     Ok(())
 }
 
@@ -301,6 +500,7 @@ pub struct RepoSandboxes {
 
 /// IMACS's sandboxes of `repo`, split into those whose worktree is still there and orphans.
 pub fn for_repo(home: &Path, program: &str, repo: &Path) -> Result<RepoSandboxes> {
+    load_owned_pins(home)?;
     let owned = ownership::owned(home)?;
     let listed: Vec<Listed> = list(program)?
         .iter()
@@ -382,7 +582,7 @@ fn sbx_output(
     let shown = format!("sbx {}", args.first().copied().unwrap_or_default());
     let (mut stdout, mut stderr) = (capture()?, capture()?);
     let mut command = Command::new(program);
-    command.args(&args).stdin(Stdio::null()).stdout(stdout.try_clone()?).stderr(stderr.try_clone()?);
+    command.args(&args).stdin(Stdio::null()).stdout(stdout.try_clone()?).stderr(stderr.try_clone()?).process_group(0);
     for name in ["IMACS_SOCKET", "IMACS_PANE", "IMACS_HOME", "IMACS_CONFIG"] {
         command.env_remove(name);
     }
@@ -399,7 +599,9 @@ fn sbx_output(
             break status;
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
+            // Kill helpers too (SSH/keychain commands can outlive the sbx client).
+            // SAFETY: process_group(0) gave this child its own process group.
+            unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
             let _ = child.wait();
             bail!("{shown} did not finish within {} s", timeout.as_secs());
         }
@@ -455,6 +657,17 @@ mod tests {
     use super::*;
     use imacs_core::isolation::IsolationMode;
 
+    #[test]
+    fn timed_out_sbx_kills_its_helper_process_group() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let marker = dir.path().join("leaked-helper");
+        let script = format!("(sleep 0.3; touch '{}') & wait", marker.display());
+        let error = sbx_output("/bin/sh", &["-c", &script], false, Duration::from_millis(100)).unwrap_err();
+        assert!(error.to_string().contains("did not finish"));
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(!marker.exists(), "a timed-out sbx helper survived and kept working");
+    }
+
     fn repository() -> (crate::test_support::TempDir, PathBuf) {
         let dir = crate::test_support::tempdir().unwrap();
         let repo = dir.path().join("app");
@@ -478,10 +691,56 @@ mod tests {
             agent: "codex",
             cwd: cwd.to_path_buf(),
             config,
+            warm: Vec::new(),
             exe: "/Applications/IMACS.app/Contents/MacOS/imacs".into(),
             socket: "/run/user/501/imacs/imacs.sock".into(),
             briefs: None,
+            pins: sbx.with_file_name("git-pins"),
         }
+    }
+
+    #[test]
+    fn linux_mounts_only_configured_warm_directories_inside_the_worktree() {
+        use std::os::unix::fs::symlink;
+        let root = crate::test_support::tempdir().unwrap();
+        let outside = crate::test_support::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("target")).unwrap();
+        std::fs::create_dir_all(root.path().join("build/cache")).unwrap();
+        symlink(outside.path(), root.path().join("escape")).unwrap();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        symlink(root.path().join(".git"), root.path().join("git-link")).unwrap();
+        let folders = [
+            "target",
+            "build/cache",
+            "target",
+            "missing",
+            "../escape",
+            "/tmp",
+            ".git/objects",
+            "escape",
+            "git-link",
+            "",
+        ]
+        .map(String::from);
+        assert!(warm_mounts(root.path(), &folders, false).is_empty());
+        let expected = vec![real(root.path()).join("target"), real(root.path()).join("build/cache")];
+        assert_eq!(warm_mounts(root.path(), &folders, true), expected);
+        let spec = Spec {
+            name: "imacs-linux".into(),
+            agent: "codex",
+            workspace: real(root.path()),
+            git: Vec::new(),
+            warm: expected.clone(),
+            read_only: Vec::new(),
+            memory: None,
+            cpus: None,
+            template: Some("local:cache".into()),
+        };
+        let args = isolation::create_args(&spec);
+        for path in expected {
+            assert!(args.contains(&path.display().to_string()));
+        }
+        assert!(args.contains(&format!("CARGO_TARGET_DIR={}/target", real(root.path()).display())));
     }
 
     #[test]
@@ -505,10 +764,10 @@ mod tests {
         assert_eq!(mounts, expected);
         assert!(mounts.iter().all(|m| !m.contains("hooks") && !m.ends_with("config")), "{mounts:?}");
 
+        // A main checkout's whole git folder is one read-only mount point, which the agent cannot move.
         let (top, mounts) = workspace(&repo).unwrap();
         assert_eq!(top, repo.canonicalize().unwrap());
-        let git_dir = top.join(".git");
-        assert_eq!(mounts, [format!("{}/hooks:ro", git_dir.display()), format!("{}/config:ro", git_dir.display())]);
+        assert_eq!(mounts, [format!("{}:ro", top.join(".git").display())]);
 
         let plain = crate::test_support::tempdir().unwrap();
         assert_eq!(workspace(plain.path()).unwrap(), (plain.path().to_path_buf(), Vec::new()));
@@ -564,6 +823,7 @@ mod tests {
             agent: "codex",
             workspace: top.clone(),
             git,
+            warm: Vec::new(),
             read_only: vec![docs.path().to_path_buf(), bin.path().join("briefs/s1")],
             memory: Some("8g".into()),
             cpus: Some(4),
@@ -608,6 +868,9 @@ mod tests {
         assert!(error.contains("creating the sandbox") && error.contains("fake create failure"), "{error}");
         assert!(fake::calls_to(bin.path(), &["policy"]).is_empty());
         assert!(list(&sbx.display().to_string()).unwrap().is_empty());
+        // No sandbox, no git record of it.
+        let record = bin.path().join("git-pins/imacs-s1.json");
+        assert!(!record.exists());
 
         // A step after create fails: the half-made sandbox goes, so the next start makes it whole.
         std::fs::remove_file(bin.path().join("fail-create")).unwrap();
@@ -616,12 +879,95 @@ mod tests {
         assert!(error.contains("allowing the repository's hosts"), "{error}");
         assert_eq!(fake::calls(bin.path()).last().unwrap(), &["mcp", "rm", "--force", "imacs-s1"]);
         assert!(list(&sbx.display().to_string()).unwrap().is_empty());
+        assert!(!record.exists());
         std::fs::remove_file(bin.path().join("fail-policy")).unwrap();
         prepare(&job(&sbx, "imacs-s1", &repo, config)).unwrap();
+        assert!(record.exists());
         assert_eq!(fake::calls_to(bin.path(), &["create"]).len(), 3, "the failed, the removed and the whole one");
         assert_eq!(list(&sbx.display().to_string()).unwrap().len(), 1);
         let missing = job(&bin.path().join("missing-sbx"), "imacs-s1", &repo, SandboxConfig::default());
         assert!(prepare(&missing).is_err());
+    }
+
+    #[test]
+    fn a_main_checkouts_git_folder_is_one_read_only_mount_and_older_sandboxes_are_refused() {
+        let (_dir, repo) = repository();
+        let bin = crate::test_support::tempdir().unwrap();
+        let sbx = fake::install(bin.path());
+        let top = repo.canonicalize().unwrap();
+        let git_dir = top.join(".git");
+        // Linux warm cache mounts sit beside the read-only .git, never inside it.
+        std::fs::create_dir(repo.join("target")).unwrap();
+        let mut main = job(&sbx, "imacs-main", &repo, SandboxConfig::default());
+        main.warm = ["target", ".git", ".git/objects"].map(String::from).into();
+        prepare(&main).unwrap();
+        let create = fake::calls_to(bin.path(), &["create"]).pop().unwrap();
+        let agent = create.iter().position(|arg| arg == "codex").unwrap();
+        assert_eq!(warm_mounts(&top, &main.warm, true), [top.join("target")]);
+        let mut expected = vec![top.display().to_string(), format!("{}:ro", git_dir.display())];
+        if cfg!(target_os = "linux") {
+            expected.push(top.join("target").display().to_string());
+        }
+        assert_eq!(create[agent + 1..], expected);
+        stop(&main.home, &main.sbx, &main.name).unwrap();
+        prepare(&main).unwrap();
+        assert_eq!(fake::calls_to(bin.path(), &["create"]).len(), 1, "it reattaches");
+
+        // A sandbox made when only hooks and config were read-only cannot be reattached to.
+        let old = format!(
+            r#"{{"name":"imacs-old","agent":"shell","status":"stopped","workspaces":["{}","{}/hooks:ro","{}/config:ro"]}}"#,
+            repo.display(),
+            git_dir.display(),
+            git_dir.display()
+        );
+        std::fs::write(bin.path().join("sandboxes/imacs-old"), old).unwrap();
+        ownership::created(&main.home, "imacs-old", Resource::Sandbox).unwrap();
+        let error = format!("{:#}", prepare(&job(&sbx, "imacs-old", &repo, SandboxConfig::default())).unwrap_err());
+        assert!(error.contains(&format!("does not mount {}", git_dir.display())), "{error}");
+        assert!(error.contains("sbx rm imacs-old"), "{error}");
+        assert_eq!(fake::calls_to(bin.path(), &["create"]).len(), 1);
+    }
+
+    #[test]
+    fn records_of_removed_sandboxes_go_unless_their_folder_changed() {
+        let (dir, repo) = repository();
+        let bin = crate::test_support::tempdir().unwrap();
+        let sbx = fake::install(bin.path());
+        let pins = bin.path().join("git-pins");
+        let worktree = |name: &str| {
+            let path = dir.path().join(name);
+            git::add_worktree(&repo, &path, name, "main").unwrap();
+            path
+        };
+        let live = worktree("live");
+        prepare(&job(&sbx, "imacs-live", &live, SandboxConfig::default())).unwrap();
+        // Sandboxes that are gone: a worktree as git made it, one whose .git file now names another
+        // folder, a folder outside any repository, and a folder deleted since.
+        let (clean, tampered) = (worktree("clean"), worktree("tampered"));
+        let (plain, deleted) = (dir.path().join("plain"), dir.path().join("deleted"));
+        for (name, folder) in [("clean", &clean), ("tampered", &tampered), ("plain", &plain), ("deleted", &deleted)] {
+            std::fs::create_dir_all(folder).unwrap();
+            pin_git(&pins, &format!("imacs-{name}"), folder).unwrap();
+        }
+        std::fs::write(tampered.join(".git"), format!("gitdir: {}\n", dir.path().join("elsewhere").display())).unwrap();
+        std::fs::remove_dir(&deleted).unwrap();
+        assert!(git::git(&plain, &["status"]).is_err(), "git stays out of a folder outside any repository");
+        let records = || {
+            let mut names: Vec<String> = read_pins(&pins).into_keys().collect();
+            names.sort();
+            names
+        };
+
+        // Without an sbx to ask, nothing is known to be gone.
+        prune_pins(&bin.path().join("home"), &pins, &bin.path().join("missing-sbx").display().to_string());
+        assert_eq!(records().len(), 5);
+        prune_pins(&bin.path().join("home"), &pins, &sbx.display().to_string());
+        assert_eq!(records(), ["imacs-live", "imacs-tampered"]);
+        assert!(git::git(&plain, &["status"]).is_err_and(|e| format!("{e:#}").contains("not a git repository")));
+        assert!(git::pinned(&clean).is_none() && git::pinned(&plain).is_none());
+        assert!(git::pinned(&live).is_some() && git::pinned(&tampered).is_some());
+        git::unpin(&git::pinned(&live).unwrap().work_tree);
+        git::unpin(&git::pinned(&tampered).unwrap().work_tree);
     }
 
     #[test]
@@ -631,7 +977,10 @@ mod tests {
         let ready = preflight(&sbx).unwrap();
         assert_eq!(ready.version, (0, 50, 1));
         assert!(ready.diagnosis.signed_in(), "an unrelated failing check does not matter");
-        assert!(doctor_line(&sbx).starts_with("✓ Docker Sandboxes ready (sbx v0.50.1, signed in)"));
+        assert!(
+            doctor_lines(&sbx, &SandboxConfig::default())[0]
+                .starts_with("✓ Docker Sandboxes ready (sbx v0.50.1, signed in)")
+        );
         std::fs::write(bin.path().join("version"), "v0.51.2").unwrap();
         assert_eq!(preflight(&sbx).unwrap().version, (0, 51, 2));
 
@@ -643,20 +992,21 @@ mod tests {
             error
         };
         let missing = bin.path().join("missing").display().to_string();
-        refusal(&missing, &["not installed", "brew install --cask docker/tap/sbx"]);
+        refusal(&missing, &["not installed", checks::install_hint("sbx", cfg!(target_os = "macos"))]);
         refusal("sbx-not-on-this-path", &["not installed"]);
         std::fs::write(bin.path().join("version"), "v0.49.9").unwrap();
-        refusal(&sbx, &["sbx v0.49.9 is older than v0.50.1", "brew upgrade --cask sbx"]);
+        refusal(&sbx, &["sbx v0.49.9 is older than v0.50.1", checks::install_hint("sbx", cfg!(target_os = "macos"))]);
         std::fs::write(bin.path().join("version"), "dev").unwrap();
         refusal(&sbx, &["no version IMACS can read"]);
         std::fs::write(bin.path().join("version"), "v0.50.1").unwrap();
         std::fs::write(bin.path().join("signed-out"), "").unwrap();
         let error = refusal(&sbx, &["not signed in", "sbx login"]);
-        let line = doctor_line(&sbx);
+        let line = &doctor_lines(&sbx, &SandboxConfig::default())[0];
         assert!(line.starts_with("✗ Docker Sandboxes not ready for sandboxed agents (warning) — "), "{line}");
         assert!(line.ends_with(&error), "{line}");
         std::fs::write(bin.path().join("fail-diagnose"), "").unwrap();
-        refusal(&sbx, &["sbx diagnose gave no report", "fake diagnose failure"]);
+        let error = refusal(&sbx, &["sbx diagnose gave no readable report"]);
+        assert!(!error.contains("fake diagnose failure"));
 
         // A refused sandbox is never made: preparation stops before sbx creates anything.
         std::fs::remove_file(bin.path().join("fail-diagnose")).unwrap();
@@ -664,7 +1014,9 @@ mod tests {
         let error =
             format!("{:#}", prepare(&job(Path::new(&sbx), "imacs-s1", plain.path(), Default::default())).unwrap_err());
         assert!(error.contains("not signed in"), "{error}");
-        assert!(fake::calls_to(bin.path(), &["create"]).is_empty() && fake::calls_to(bin.path(), &["mcp"]).is_empty());
+        assert!(fake::calls_to(bin.path(), &["create"]).is_empty());
+        assert!(fake::calls_to(bin.path(), &["mcp", "add"]).is_empty());
+        assert!(fake::calls_to(bin.path(), &["mcp", "auth"]).is_empty());
     }
 
     #[test]

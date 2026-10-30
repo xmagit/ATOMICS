@@ -20,6 +20,8 @@ fn startup_cleanup_does_not_block_the_runtime_while_sbx_is_waiting() {
             agent: "shell",
             cwd: repo,
             config: Default::default(),
+            warm: Vec::new(),
+            pins: paths::git_pins_dir(),
             exe: "/imacs".into(),
             socket: paths::socket_path(),
             briefs: None,
@@ -273,9 +275,11 @@ fn sandboxed_task_args_drop_host_sandbox_flags_and_bare_ones_keep_them() {
             .unwrap();
         tick_until(app, ctx, "the agent to reach its fixture hook", |_| bin.path().join("waiting-agent").exists());
         let run = fake::calls_to(bin.path(), &["run"]).pop().unwrap();
+        let trusted =
+            format!("projects={{ {:?} = {{ trust_level = \"trusted\" }} }}", worktree.canonicalize().unwrap());
         assert_eq!(
             run[4..],
-            ["--", "--search", "-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=high", "Do the task"],
+            ["--", "--search", "-c", &trusted, "-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=high", "Do the task"],
             "{run:?}"
         );
 
@@ -350,8 +354,16 @@ fn bare_agents_never_touch_sbx_and_a_repository_can_only_tighten() {
 
         // A repository that requires sandboxes overrides the user's bare mode and the agent's own.
         app.runtime.config.isolation.mode = IsolationMode::Bare;
+        app.runtime.config.isolation.sandbox.template = Some("workspace:local".into());
         std::fs::create_dir(repo.join(".imacs")).unwrap();
-        std::fs::write(repo.join(".imacs/config.toml"), "[isolation]\nmode = \"sandbox\"\n").unwrap();
+        std::fs::write(
+            repo.join(".imacs/config.toml"),
+            "[isolation]\nmode = \"sandbox\"\n[isolation.sandbox]\ntemplate = \"repo:local\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir(worktree.join(".imacs")).unwrap();
+        std::fs::write(worktree.join(".imacs/config.toml"), "[isolation.sandbox]\ntemplate = \"worktree:local\"\n")
+            .unwrap();
         let error = app.runtime.start(ctx, "bare-probe", worktree.clone(), None, vec![], None).unwrap_err();
         assert!(error.contains("requires sandboxed agents"), "{error}");
         assert!(!out.exists());
@@ -359,6 +371,8 @@ fn bare_agents_never_touch_sbx_and_a_repository_can_only_tighten() {
         tick_until(app, ctx, "the sandboxed shell", |_| bin.path().join("run-ssh").exists());
         let run = fake::calls_to(bin.path(), &["run"]).pop().unwrap();
         assert_eq!(run, ["run", "--name", format!("imacs-{id}").as_str(), "shell", "--"]);
+        let create = fake::calls_to(bin.path(), &["create"]).pop().unwrap();
+        assert!(create.windows(2).any(|args| args == ["--template", "repo:local"]));
 
         // A repository asking for bare is ignored: sandbox mode stays.
         std::fs::write(repo.join(".imacs/config.toml"), "[isolation]\nmode = \"bare\"\n").unwrap();
@@ -368,6 +382,8 @@ fn bare_agents_never_touch_sbx_and_a_repository_can_only_tighten() {
         tick_until(app, ctx, "the second sandbox to attach", |app| {
             app.runtime.sessions.iter().find(|s| s.id == id).is_some_and(|s| s.terminal.is_some())
         });
+        let create = fake::calls_to(bin.path(), &["create"]).pop().unwrap();
+        assert!(create.windows(2).any(|args| args == ["--template", "workspace:local"]));
         finish_agents(app, ctx);
     });
 }
@@ -389,9 +405,11 @@ fn the_cleanup_dialog_removes_a_worktrees_sandbox_and_chosen_orphans() {
                 agent: "claude",
                 cwd: path.clone(),
                 config: Default::default(),
+                warm: Vec::new(),
                 exe: "/imacs".into(),
                 socket: "/imacs.sock".into(),
                 briefs: None,
+                pins: paths::git_pins_dir(),
             };
             crate::sandbox::prepare(&job).unwrap();
             worktrees.push(path);
@@ -465,10 +483,21 @@ fn the_cleanup_dialog_removes_a_worktrees_sandbox_and_chosen_orphans() {
         assert!(worktrees[0].exists());
         let left: Vec<String> = crate::sandbox::list(&sbx).unwrap().into_iter().map(|s| s.name).collect();
         assert_eq!(left, ["imacs-keep"]);
+        // Removed sandboxes take their git records along; the kept worktree stays pinned.
+        let records = || {
+            let mut names: Vec<_> = std::fs::read_dir(paths::git_pins_dir())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+        tick_until(app, ctx, "the removed sandboxes' git records to go", |_| records() == ["imacs-keep.json"]);
+        assert!(git::pinned(&worktrees[0]).is_some() && git::pinned(&worktrees[1]).is_none());
         tick_until(app, ctx, "cleanup to finish", |app| app.runtime.cleanup.as_ref().is_some_and(|c| c.busy.is_none()));
         app.runtime.finish_lifecycle_jobs();
         let fake_home = bin.path().to_path_buf();
-        drop(bin); // The shared TempDir guard fails if rm or the refreshed preview is still using it.
+        drop(bin);
         assert!(!fake_home.exists(), "the cleanup-dialog test left its fake sbx home behind");
     });
 }
@@ -671,6 +700,114 @@ fn sandboxed_fake_agent_moving_main_is_restored_and_alerts_the_board() {
         assert!(alert.contains("SANDBOX REF GUARD") && alert.contains("Restored refs/heads/main"), "{alert}");
         assert!(app.runtime.plans[0].tasks[0].notes.iter().any(|note| note.contains("Restored refs/heads/main")));
         finish_agents(app, ctx);
+    });
+}
+
+#[test]
+fn git_files_a_sandbox_redirects_never_run_its_hook_on_this_machine() {
+    with_app("app::sandbox_tests::git_files_a_sandbox_redirects_never_run_its_hook_on_this_machine", |app, ctx| {
+        for redirect in ["git-file", "worktree-commondir", "main-commondir"] {
+            let (dir, repo) = repository();
+            git::git(&repo, &["branch", "other"]).unwrap();
+            let original = git::git(&repo, &["rev-parse", "other"]).unwrap();
+            let folder = if redirect == "main-commondir" { repo.clone() } else { worktree(&repo, redirect) };
+            let marker = dir.path().join("hook-ran");
+            let bin = crate::test_support::tempdir().unwrap();
+            app.runtime.sbx = fake::install(bin.path()).display().to_string();
+            app.runtime.config.isolation.mode = IsolationMode::Sandbox;
+            // The agent, as its VM could: commits, moves a branch that is not its own, then plants a git
+            // folder whose config runs a hook, and points its worktree's git files at it.
+            let tamper = match redirect {
+                "git-file" => r#"printf 'gitdir: %s\n' "$evil" > .git"#,
+                _ => r#"printf '%s\n' "$evil" > "$gd/commondir""#,
+            };
+            let script = format!(
+                r#"set -e
+git commit --allow-empty -qm task
+git update-ref refs/heads/other HEAD
+gd=$(git rev-parse --path-format=absolute --git-dir)
+common=$(git rev-parse --path-format=absolute --git-common-dir)
+evil="$gd/evil"
+mkdir -p "$evil/hooks"
+ln -s "$common/objects" "$evil/objects"
+ln -s "$common/refs" "$evil/refs"
+cp "$gd/HEAD" "$evil/HEAD"
+printf '#!/bin/sh\n: > %s\n' '{marker}' > "$evil/hooks/reference-transaction"
+chmod +x "$evil/hooks/reference-transaction"
+printf '[core]\n\tfsmonitor = %s\n\thooksPath = %s\n' "$evil/hooks/reference-transaction" "$evil/hooks" > "$evil/config"
+echo new > a.txt
+{tamper}
+"#,
+                marker = marker.display()
+            );
+            std::fs::write(bin.path().join("agent"), script).unwrap();
+            let id = app.runtime.start(ctx, "codex", folder.clone(), None, vec![], Some("Do the task".into())).unwrap();
+            let name = format!("imacs-{id}");
+            // Ref recovery on exit restores the moved branch with git's update-ref.
+            tick_until(app, ctx, "ref recovery on agent exit", |app| {
+                app.runtime.sessions.iter().any(|s| {
+                    s.id == id && s.last_message.as_deref().is_some_and(|m| m.contains("Restored refs/heads/other"))
+                })
+            });
+            assert_eq!(git::git(&repo, &["rev-parse", "other"]).unwrap(), original, "{redirect}");
+            let record: git::GitPins =
+                serde_json::from_slice(&std::fs::read(paths::git_pins_dir().join(format!("{name}.json"))).unwrap())
+                    .unwrap();
+            assert_eq!(record.work_tree, folder.canonicalize().unwrap());
+            assert_eq!(record.common_dir, Some(repo.join(".git").canonicalize().unwrap()));
+
+            // The diff IMACS polls, and what worktree cleanup asks of git.
+            let diff = git::diff_against_base(&folder, "main", None).unwrap();
+            assert_eq!(diff.files.iter().map(|f| f.path()).collect::<Vec<_>>(), ["a.txt"], "{redirect}");
+            let health = git::worktree_health(&repo, "main").unwrap();
+            if redirect != "main-commondir" {
+                assert_eq!(health[0].dirty_files, 1, "{redirect}: {health:?}");
+                assert!(git::remove_worktree(&repo, &folder, None, false).is_err(), "{redirect}: uncommitted a.txt");
+            }
+            app.runtime.close(&id);
+            tick_until(app, ctx, "the final ref check", |_| !fake::calls_to(bin.path(), &["stop"]).is_empty());
+            assert!(!marker.exists(), "{redirect}: host git ran the sandbox's hook");
+
+            // Without its record, git follows the planted files to that hook.
+            let raw = std::process::Command::new("git").arg("-C").arg(&folder).args(["status"]).output().unwrap();
+            assert!(raw.status.success() && marker.exists(), "{redirect}: the planted config must be live");
+            app.runtime.sessions.clear();
+        }
+    });
+}
+
+#[test]
+fn sandboxed_codex_trusts_its_folder_and_a_first_run_question_needs_you() {
+    with_app("app::sandbox_tests::sandboxed_codex_trusts_its_folder_and_a_first_run_question_needs_you", |app, ctx| {
+        let (_dir, repo) = repository();
+        let worktree = worktree(&repo, "task.v2");
+        let bin = crate::test_support::tempdir().unwrap();
+        app.runtime.sbx = fake::install(bin.path()).display().to_string();
+        app.runtime.config.isolation.mode = IsolationMode::Sandbox;
+        // A Codex that still asks, as one too old for the trust setting would.
+        std::fs::write(
+            bin.path().join("agent"),
+            "printf '  Trust this folder? Codex can read, edit, and run files here.\\n\\n› 1. Trust and continue\\n  2. Open restricted\\n'\nexec sleep 30\n",
+        )
+        .unwrap();
+        let id = app.runtime.start(ctx, "codex", worktree.clone(), None, vec![], Some("Do the task".into())).unwrap();
+        tick_until(app, ctx, "the agent to attach", |_| !fake::calls_to(bin.path(), &["run"]).is_empty());
+
+        // The mounted worktree is trusted up front; its dotted name stays one key of the table.
+        let run = fake::calls_to(bin.path(), &["run"]).pop().unwrap();
+        let folder = worktree.canonicalize().unwrap().display().to_string();
+        assert_eq!(run[4..7], ["--", "-c", &format!("projects={{ {folder:?} = {{ trust_level = \"trusted\" }} }}")]);
+        assert_eq!(run.last().map(String::as_str), Some("Do the task"));
+        let projects: toml::Table = toml::from_str(&run[6]).unwrap();
+        assert_eq!(projects["projects"][&folder]["trust_level"].as_str(), Some("trusted"));
+
+        // A question before the first turn needs you, instead of the tile saying idle.
+        tick_until(app, ctx, "the question to need you", |app| {
+            app.runtime.busy_checked = Instant::now() - Duration::from_secs(1);
+            app.runtime.sessions[app.runtime.find(&id).unwrap()].status == AgentStatus::NeedsInput
+        });
+        assert!(app.runtime.events.iter().any(|e| e.session == id && e.status == AgentStatus::NeedsInput));
+        app.runtime.close(&id);
     });
 }
 

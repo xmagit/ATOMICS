@@ -14,6 +14,9 @@ fn real(path: &Path) -> PathBuf {
 
 pub fn clean_plan(home: &Path, plan: &Plan, sbx: &str, protected: &[PathBuf]) -> Vec<String> {
     let mut notes = Vec::new();
+    if let Err(error) = sandbox::load_owned_pins(home) {
+        return vec![format!("Plan cleanup skipped: {error:#}")];
+    }
     let entries = match cleanup::closed_tasks(plan) {
         Ok(entries) => entries,
         Err(err) => return vec![format!("Plan cleanup: {err:#}")],
@@ -106,6 +109,7 @@ pub fn sweep(home: &Path, config: &Config, sbx: &str) -> Result<Vec<String>> {
 }
 
 pub fn sweep_before(home: &Path, config: &Config, sbx: &str, before: std::time::SystemTime) -> Result<Vec<String>> {
+    sandbox::load_owned_pins(home)?;
     let store = match std::fs::read(home.join("sessions.json")) {
         Ok(bytes) => serde_json::from_slice::<Store>(&bytes).context("reading cleanup session ownership")?,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Store::default(),
@@ -126,7 +130,9 @@ pub fn sweep_before(home: &Path, config: &Config, sbx: &str, before: std::time::
     let owned = ownership::owned(home)?;
     let candidates: Vec<_> = owned
         .iter()
-        .filter(|(name, entry)| entry.created < ownership::timestamp(before) && !sandboxes.contains(*name))
+        .filter(|(name, entry)| {
+            entry.created < ownership::timestamp(before) && !sandboxes.contains(*name) && !ownership::building(entry)
+        })
         .collect();
     if !candidates.is_empty() && sandbox::installed(sbx) {
         match sandbox::list(sbx) {
@@ -352,6 +358,8 @@ mod tests {
             agent: "shell",
             cwd: dir.path().to_path_buf(),
             config: Default::default(),
+            warm: Vec::new(),
+            pins: a.join("git-pins"),
             exe: "/imacs".into(),
             socket: dir.path().join("unused.sock"),
             briefs: None,
@@ -468,6 +476,68 @@ mod tests {
         assert!(dir.path().join("dirty/keep").exists() && dir.path().join("busy").exists());
         assert!(!bin.join("sandboxes/imacs-clean").exists() && !bin.join("mcp/imacs-clean").exists());
         assert_eq!(fake::calls_to(&bin, &["stop"]), [["stop", "imacs-clean"]]);
+    }
+
+    #[test]
+    fn cleanup_loads_pins_before_status_and_removal_of_a_redirected_worktree() {
+        for redirect_common in [false, true] {
+            for dirty in [false, true] {
+                let dir = crate::test_support::tempdir().unwrap();
+                let repo = repository(dir.path());
+                let home = dir.path().join("home");
+                let bin = dir.path().join("bin");
+                std::fs::create_dir(&bin).unwrap();
+                let sbx = fake::install(&bin).display().to_string();
+                let tree = dir.path().join("task");
+                git::add_worktree(&repo, &tree, "task", "main").unwrap();
+                sandbox(&bin, "imacs-task", &tree);
+                ownership::created(&home, "imacs-task", Resource::Sandbox).unwrap();
+                ownership::created(&home, "imacs-task", Resource::Mcp).unwrap();
+                let pins = home.join("git-pins");
+                sandbox::pin_git(&pins, "imacs-task", &tree).unwrap();
+                ownership::record_pins(&home, "imacs-task", &pins).unwrap();
+                let evil = dir.path().join("evil");
+                std::fs::create_dir(&evil).unwrap();
+                git::git(&evil, &["init", "-q"]).unwrap();
+                let marker = dir.path().join("executed-fsmonitor");
+                git::git(&evil, &["config", "core.fsmonitor", &format!("touch {}", marker.display())]).unwrap();
+                if redirect_common {
+                    let admin = git::pinned(&tree).unwrap().git_dir.unwrap();
+                    std::fs::write(admin.join("commondir"), evil.join(".git").display().to_string()).unwrap();
+                } else {
+                    std::fs::write(tree.join(".git"), format!("gitdir: {}\n", evil.join(".git").display())).unwrap();
+                }
+                if dirty {
+                    std::fs::write(tree.join("keep"), "uncommitted").unwrap();
+                }
+                git::unpin(&tree.canonicalize().unwrap()); // Simulate a newly started host.
+                let plan = Plan {
+                    id: "pinned".into(),
+                    status: PlanStatus::Archived,
+                    project: Some(repo),
+                    tasks: vec![Task { branch: Some("task".into()), ..Task::default() }],
+                    ..Plan::default()
+                };
+                let notes = clean_plan(&home, &plan, &sbx, &[]);
+                assert!(!marker.exists(), "cleanup followed the sandbox's git config");
+                assert_eq!(tree.exists(), dirty, "{notes:?}");
+                if dirty {
+                    assert!(notes.iter().any(|note| note.contains("uncommitted")));
+                    sandbox::remove(&home, &sbx, "imacs-task").unwrap();
+                    assert!(!pins.join("imacs-task.json").exists());
+                    git::unpin(&tree.canonicalize().unwrap());
+                    sandbox::load_pins(&pins);
+                    assert!(git::pinned(&tree).is_some(), "a poisoned folder must stay pinned after its VM is gone");
+                    git::git(&tree, &["status", "--porcelain"]).unwrap();
+                    assert!(!marker.exists());
+                    git::unpin(&tree.canonicalize().unwrap());
+                } else {
+                    assert!(notes.is_empty(), "{notes:?}");
+                    assert!(!pins.join("imacs-task.json").exists());
+                }
+                assert!(ownership::owned(&home).unwrap().is_empty());
+            }
+        }
     }
 
     #[test]

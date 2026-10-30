@@ -53,6 +53,7 @@ mod projects;
 mod ref_guard;
 mod repo_workflow;
 mod restart;
+mod sandbox_settings;
 mod selfconfig;
 mod sessions;
 mod sidebar;
@@ -119,7 +120,7 @@ pub struct Session {
     sandbox: Option<String>,
     screen_busy: bool,
     busy_absent_since: Option<Instant>,
-    ref_guard: Option<crate::ref_guard::RefGuard>,
+    ref_guard: Option<crate::ref_guard::Shared>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,6 +154,8 @@ struct AgentLaunch {
     prompt: Option<String>,
     chief: bool,
     runtime: AgentRuntime,
+    /// A sandboxed session's ref guard, opened and checked before its agent starts.
+    ref_guard: Option<crate::ref_guard::Shared>,
 }
 
 struct Pending {
@@ -384,11 +387,14 @@ pub(crate) struct State {
     /// The `sbx` program sandboxed agents run with.
     sbx: String,
     sandbox_usage: crate::sandbox_usage::Sampler,
-    /// Sandboxed launches waiting for their sandbox.
-    pending_sandbox: Vec<(AgentLaunch, Receiver<Result<(), String>>)>,
     lifecycle_jobs: Vec<std::thread::JoinHandle<()>>,
     startup_cleanup: Option<std::thread::JoinHandle<()>>,
     shutting_down: bool,
+    sandbox_check: Option<Receiver<Vec<String>>>,
+    sandbox_lines: Vec<String>,
+    /// Sandboxed launches waiting for their sandbox, and their ref guard with what its first check found.
+    pending_sandbox: Vec<(AgentLaunch, Receiver<Result<crate::ref_guard::Opened, String>>)>,
+    ref_checks: crate::ref_guard::Checks,
     active: Option<String>,
     diff_open: bool,
     /// Worktree picked in the sidebar without an agent; the diff otherwise follows the active session.
@@ -706,6 +712,9 @@ impl State {
 
     pub fn new(cc: &eframe::CreationContext<'_>, options: Options, _icon: &egui::IconData) -> State {
         std::thread::spawn(|| LazyLock::force(&SHELL_PATH));
+        // Before any git runs in a folder a sandbox has worked in. Records of sandboxes that are gone go after.
+        crate::sandbox::load_pins(&paths::git_pins_dir());
+        let sbx = if cfg!(test) { "/nonexistent/imacs-test-sbx" } else { "sbx" };
         let config_path = paths::config_file();
         let (config, config_error) = match Config::load_or_create(&config_path) {
             Ok(config) => (config, None),
@@ -791,11 +800,14 @@ impl State {
             codex_versions: HashMap::new(),
             pending_codex: Vec::new(),
             // Tests never reach the sbx installed on the machine running them.
-            sbx: if cfg!(test) { "/nonexistent/imacs-test-sbx" } else { "sbx" }.into(),
+            sbx: sbx.into(),
+            sandbox_check: None,
+            sandbox_lines: Vec::new(),
             pending_sandbox: Vec::new(),
             lifecycle_jobs: Vec::new(),
             startup_cleanup: None,
             shutting_down: false,
+            ref_checks: crate::ref_guard::Checks::new(),
             sandbox_usage: Default::default(),
             active: None,
             diff_open: true,
@@ -964,6 +976,7 @@ impl State {
                 Ok(notes) => notes,
                 Err(err) => vec![format!("Startup cleanup skipped: {err:#}")],
             };
+            crate::sandbox::prune_pins(&home, &home.join("git-pins"), &sbx);
             crate::lifecycle::record_leftovers(&home, &notes);
             if !notes.is_empty() {
                 let _ = actions.send(Box::new(move |state| state.toast(notes.join("\n"))));
@@ -1007,6 +1020,8 @@ impl State {
             self.stop_sandbox(name);
         }
         self.finish_lifecycle_jobs();
+        self.check_all_refs(&self.exempt_branches());
+        self.ref_checks.finish();
         if let Some(job) = self.startup_cleanup.take() {
             let _ = job.join();
         }

@@ -70,7 +70,9 @@ impl State {
         let (tx, repo, base) = (cleanup.tx.clone(), cleanup.repo.clone(), self.project_config(&cleanup.repo).base_ref);
         let sbx = resolve_program(&self.sbx);
         self.lifecycle_jobs.push(std::thread::spawn(move || {
-            let result = git::worktree_health(&repo, &base).map_err(|e| format!("{e:#}"));
+            let result = crate::sandbox::load_owned_pins(&paths::imacs_home())
+                .and_then(|()| git::worktree_health(&repo, &base))
+                .map_err(|e| format!("{e:#}"));
             let _ = tx.send(CleanupEvent::Loaded(result));
             // Without sbx there can be no sandboxes, and nothing to say about it.
             if crate::sandbox::installed(&sbx) {

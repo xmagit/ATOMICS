@@ -870,6 +870,7 @@ impl Desktop<'_> {
         }
         ui.separator();
         self.themes_menu(ui);
+        self.sandbox_menu(ui);
         ui.separator();
         let keys = &self.runtime.config.keys;
         for (key, what) in [
