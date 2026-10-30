@@ -612,11 +612,21 @@ impl State {
         let mut finished = Vec::new();
         let mut ref_checks = Vec::new();
         for (index, session) in self.sessions.iter_mut().enumerate() {
+            let Some(terminal) = &session.terminal else { continue };
+            // Trust and hook menus can precede hooks, including in bare Codex.
+            if session.is_agent()
+                && !terminal.exited()
+                && matches!(session.status, AgentStatus::Starting | AgentStatus::Idle | AgentStatus::Done)
+                && imacs_core::approvals::first_run_prompt(&terminal.screen_text(60))
+            {
+                session.status = AgentStatus::NeedsInput;
+                session.activity.observe(session.status);
+                continue;
+            }
             let busy_text = self.config.agent(&session.agent).and_then(|a| a.busy_text.clone());
             let busy_text =
                 busy_text.or_else(|| (session.sandbox.is_some() && session.is_agent()).then(|| SANDBOX_BUSY.into()));
             let Some(busy_text) = busy_text else { continue };
-            let Some(terminal) = &session.terminal else { continue };
             if session.hooks_active && session.sandbox.is_none() || terminal.exited() {
                 continue;
             }
@@ -642,16 +652,6 @@ impl State {
             }
             session.screen_busy = busy;
             if session.status == AgentStatus::NeedsInput && !new_turn {
-                continue;
-            }
-            // Before its first turn, a sandboxed agent may stop at a question, such as Codex's folder trust.
-            if !busy
-                && session.sandbox.is_some()
-                && matches!(session.status, AgentStatus::Starting | AgentStatus::Idle)
-                && imacs_core::approvals::first_run_prompt(&terminal.screen_text(60))
-            {
-                session.status = AgentStatus::NeedsInput;
-                session.activity.observe(session.status);
                 continue;
             }
             session.status = match (busy, session.status) {
@@ -1005,6 +1005,39 @@ impl Desktop<'_> {
 mod tests {
     use super::super::tests::{request, session, with_app};
     use super::*;
+
+    #[test]
+    fn bare_codex_trust_and_hook_menus_need_input_even_with_hooks() {
+        with_app("app::sessions::tests::bare_codex_trust_and_hook_menus_need_input_even_with_hooks", |app, _| {
+            let dir = crate::test_support::tempdir().unwrap();
+            for text in ["Trust this folder?", "Review hooks\n› 1. Trust hooks\n  2. Cancel"] {
+                let terminal = Terminal::spawn(
+                    app.runtime.wake.clone(),
+                    app.runtime.palette.terminal_colors(),
+                    "/bin/sh".into(),
+                    vec!["-c".into(), format!("printf '%s' '{}'; exec sleep 600", text)],
+                    dir.path(),
+                    HashMap::new(),
+                    100,
+                )
+                .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !terminal.screen_text(60).contains("Trust") {
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let mut worker = session("worker", AgentKind::Generic, AgentStatus::Idle, dir.path());
+                worker.hooks_active = true;
+                worker.terminal = Some(terminal);
+                app.runtime.sessions = vec![worker];
+                app.runtime.busy_checked = Instant::now() - Duration::from_secs(1);
+                app.runtime.track_busy();
+                assert_eq!(app.runtime.sessions[0].status, AgentStatus::NeedsInput);
+                assert!(app.runtime.sessions[0].approvals.is_empty());
+            }
+            app.runtime.sessions.clear();
+        });
+    }
 
     #[test]
     fn isolated_agents_write_provider_trust_only_inside_the_instance() {
