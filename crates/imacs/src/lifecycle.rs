@@ -419,6 +419,7 @@ mod tests {
             exe: "/imacs".into(),
             socket: dir.path().join("unused.sock"),
             briefs: None,
+            relay: None,
         };
         assert!(sandbox::prepare(&attempt).unwrap_err().to_string().contains("not owned"));
         assert!(ownership::owned(&a).unwrap().is_empty());

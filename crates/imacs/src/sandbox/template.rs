@@ -96,6 +96,7 @@ pub(super) fn build(
         cpus: config.cpus,
         // Start from the agent image, never a stale snapshot of the template being rebuilt.
         template: None,
+        env: Vec::new(),
     };
     eprintln!("Preparing {tag} in {name} (this may take several minutes)…");
     let result = (|| -> Result<()> {
@@ -236,6 +237,7 @@ mod tests {
             socket: "/imacs.sock".into(),
             briefs: None,
             pins: dir.path().join("git-pins"),
+            relay: None,
         };
         prepare(&job).unwrap();
         assert!(fake::calls_to(dir.path(), &["create"])[1].windows(2).any(|a| a == ["--template", "imacs-cox:local"]));

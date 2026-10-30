@@ -14,11 +14,13 @@ impl State {
                 return;
             }
         };
-        let claude = crate::sandbox::checks::claude_sandboxed(&self.config, self.workspace.as_deref());
+        let (main, workspace) = (self.config.clone(), self.workspace.clone());
+        let keychain = self.relay.keychain().clone();
         let (tx, rx) = std::sync::mpsc::channel();
         self.sandbox_check = Some(rx);
         let wake = self.wake.clone();
         std::thread::spawn(move || {
+            let claude = crate::sandbox::checks::claude_route(&main, workspace.as_deref(), &keychain);
             let _ = tx.send(crate::sandbox::doctor_lines(&program, &config, claude));
             wake.notify();
         });
@@ -72,7 +74,10 @@ impl Desktop<'_> {
             if ui.button("Copy: imacs setup").clicked() {
                 ui.ctx().copy_text("imacs setup".into());
             }
-            ui.label("Setup sends credentials to sbx over stdin. Ticket integrations keep running on the host.");
+            ui.label(
+                "Setup reads credentials over stdin: the Claude subscription stays in the OS keychain for IMACS's relay, \
+                 API keys go to sbx. Ticket integrations keep running on the host.",
+            );
         });
     }
 }

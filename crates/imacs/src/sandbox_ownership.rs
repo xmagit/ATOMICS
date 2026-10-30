@@ -18,6 +18,9 @@ pub struct Owned {
     pub pins: Option<PathBuf>,
     pub scratch: Option<PathBuf>,
     pub builder: Option<u32>,
+    /// The relay port the sandbox's `localhost:<port>` policy rule allows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay: Option<u16>,
 }
 
 #[derive(Clone, Copy)]
@@ -27,6 +30,7 @@ pub enum Resource {
     Pins,
     Scratch,
     Builder,
+    Relay,
 }
 
 pub fn timestamp(time: SystemTime) -> u64 {
@@ -89,7 +93,7 @@ pub fn created(home: &Path, name: &str, resource: Resource) -> Result<()> {
     match resource {
         Resource::Sandbox => entry.sandbox = true,
         Resource::Mcp => entry.mcp = true,
-        Resource::Pins | Resource::Scratch | Resource::Builder => {
+        Resource::Pins | Resource::Scratch | Resource::Builder | Resource::Relay => {
             anyhow::bail!("use the record operation for this resource")
         }
     }
@@ -106,13 +110,27 @@ pub fn removed(home: &Path, name: &str, resource: Resource) -> Result<()> {
             Resource::Pins => entry.pins = None,
             Resource::Scratch => entry.scratch = None,
             Resource::Builder => entry.builder = None,
+            Resource::Relay => entry.relay = None,
         }
-        if !entry.sandbox && !entry.mcp && entry.pins.is_none() && entry.scratch.is_none() && entry.builder.is_none() {
+        if !entry.sandbox
+            && !entry.mcp
+            && entry.pins.is_none()
+            && entry.scratch.is_none()
+            && entry.builder.is_none()
+            && entry.relay.is_none()
+        {
             ledger.entries.remove(name);
         }
         ledger.save()?;
     }
     Ok(())
+}
+
+/// The sandbox's policy rule now lets it reach the relay at `port`.
+pub fn record_relay(home: &Path, name: &str, port: u16) -> Result<()> {
+    let mut ledger = Ledger::open(home)?;
+    ledger.entry(name).relay = Some(port);
+    ledger.save()
 }
 
 pub fn record_pins(home: &Path, name: &str, dir: &Path) -> Result<()> {

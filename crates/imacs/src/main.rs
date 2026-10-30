@@ -19,6 +19,7 @@ mod lifecycle;
 mod mcp;
 mod mcp_client;
 mod ref_guard;
+mod relay;
 mod restart;
 mod sandbox;
 mod sandbox_ownership;
@@ -121,6 +122,9 @@ enum SandboxCommand {
         #[command(subcommand)]
         command: TemplateCommand,
     },
+    /// Check that sandboxed Claude answers on the Claude subscription through IMACS's relay, with no
+    /// token in the VM (makes one throwaway sandbox and removes it)
+    RelayCheck,
 }
 
 #[derive(Subcommand)]
@@ -191,6 +195,15 @@ fn main() -> eframe::Result {
                 eprintln!("{error:#}");
                 std::process::exit(1);
             }
+            return Ok(());
+        }
+        Some(Command::Sandbox { command: SandboxCommand::RelayCheck }) => {
+            // A report of PASS and FAIL lines, none holding a value, so the failure goes with them.
+            if let Err(error) = sandbox::relay_check::run() {
+                println!("FAIL relay check: {error:#}");
+                std::process::exit(1);
+            }
+            println!("PASS relay check");
             return Ok(());
         }
         Some(Command::Doctor) => std::process::exit(doctor::run(cli.workspace.as_deref())),
@@ -307,6 +320,8 @@ mod cli_tests {
         assert!(matches!(cli.command, Some(Command::Setup)));
         let cli = Cli::try_parse_from(["imacs", "sandbox", "setup"]).unwrap();
         assert!(matches!(cli.command, Some(Command::Sandbox { command: SandboxCommand::Setup })));
+        let cli = Cli::try_parse_from(["imacs", "sandbox", "relay-check"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Sandbox { command: SandboxCommand::RelayCheck })));
         for args in [
             &["imacs", "--workspace", "daily", "setup"][..],
             &["imacs", "setup", "--workspace", "daily"],

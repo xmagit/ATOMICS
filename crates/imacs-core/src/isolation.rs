@@ -189,6 +189,8 @@ pub struct Spec {
     pub memory: Option<String>,
     pub cpus: Option<u32>,
     pub template: Option<String>,
+    /// Environment for everything in the sandbox, such as the way to IMACS's relay. Never a credential.
+    pub env: Vec<(String, String)>,
 }
 
 /// `sbx create` for `spec`: flags, the agent, then every workspace path.
@@ -205,6 +207,9 @@ pub fn create_args(spec: &Spec) -> Vec<String> {
     }
     if let Some(target) = spec.warm.iter().find(|path| **path == spec.workspace.join("target")) {
         args.extend(["--env".into(), format!("CARGO_TARGET_DIR={}", target.display())]);
+    }
+    for (name, value) in &spec.env {
+        args.extend(["--env".into(), format!("{name}={value}")]);
     }
     args.push(spec.agent.into());
     args.push(spec.workspace.to_string_lossy().into_owned());
@@ -239,6 +244,56 @@ pub const STATUSLINE_FILE: &str = "/tmp/imacs-statusline.json";
 pub fn claude_settings() -> serde_json::Value {
     let command = format!("cat > {STATUSLINE_FILE}.tmp && mv {STATUSLINE_FILE}.tmp {STATUSLINE_FILE}");
     serde_json::json!({ "statusLine": { "type": "command", "command": command } })
+}
+
+/// The Anthropic API, which Claude reaches through IMACS's relay in a sandbox.
+pub const ANTHROPIC_API: &str = "api.anthropic.com";
+
+/// How a sandbox reaches this machine's loopback: sbx's proxy takes it there for a sandbox with a
+/// `localhost:<port>` rule ([`relay_allow_args`]).
+pub const RELAY_HOST: &str = "host.docker.internal";
+
+/// The address a sandbox sends requests for `upstream` to, through IMACS's relay at `port`.
+pub fn relay_url(port: u16, upstream: &str) -> String {
+    format!("http://{RELAY_HOST}:{port}/{upstream}")
+}
+
+/// `sbx policy allow network`: let sandbox `name` reach IMACS's relay at `port` on this machine's
+/// loopback. The rule goes with the sandbox.
+pub fn relay_allow_args(name: &str, port: u16) -> Vec<String> {
+    ["policy", "allow", "network", "--sandbox", name, &format!("localhost:{port}")].map(String::from).into()
+}
+
+/// `sbx policy rm network`: take that rule away again.
+pub fn relay_remove_args(name: &str, port: u16) -> Vec<String> {
+    ["policy", "rm", "network", "--sandbox", name, "--resource", &format!("localhost:{port}"), "--force"]
+        .map(String::from)
+        .into()
+}
+
+/// The environment a sandbox gets for Claude on the relay at `port`: the Anthropic API there, and
+/// none of Claude's own traffic to api.anthropic.com beside it (bootstrap, telemetry), which would
+/// go around the relay.
+pub fn claude_relay_env(port: u16) -> Vec<(String, String)> {
+    vec![
+        ("ANTHROPIC_BASE_URL".into(), relay_url(port, ANTHROPIC_API)),
+        ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".into(), "1".into()),
+    ]
+}
+
+/// Claude's `--settings` in a sandbox whose session has a relay placeholder: [`claude_settings`],
+/// with the placeholder as its token and [`claude_relay_env`] in `env`, which win over the
+/// sandbox's environment, so a resumed session gets its new placeholder and the relay's current
+/// port. `apiKeyHelper` is cleared: sbx writes one when it holds an anthropic secret, and it would
+/// win over the placeholder.
+pub fn claude_relay_settings(port: u16, placeholder: &str) -> serde_json::Value {
+    let mut settings = claude_settings();
+    let mut env: serde_json::Map<String, serde_json::Value> =
+        claude_relay_env(port).into_iter().map(|(name, value)| (name, value.into())).collect();
+    env.insert("CLAUDE_CODE_OAUTH_TOKEN".into(), placeholder.into());
+    settings["apiKeyHelper"] = "".into();
+    settings["env"] = env.into();
+    settings
 }
 
 /// Marks the start of each part of [`usage_args`]' output: `codex`, or `claude <mtime>`.
@@ -588,6 +643,7 @@ command = ["codex"]
             memory: sbx_decides.memory,
             cpus: sbx_decides.cpus,
             template: None,
+            env: Vec::new(),
         };
         let args = create_args(&spec);
         assert!(!args.iter().any(|a| a == "--cpus" || a == "--memory"), "{args:?}");
@@ -644,6 +700,7 @@ command = ["codex"]
             memory: None,
             cpus: None,
             template: None,
+            env: Vec::new(),
         };
         assert_eq!(
             create_args(&spec),
@@ -662,6 +719,7 @@ command = ["codex"]
         spec.memory = Some("8g".into());
         spec.cpus = Some(4);
         spec.template = Some("registry.example.com/agent:1".into());
+        spec.env = claude_relay_env(47123);
         let args = create_args(&spec);
         assert_eq!(
             args[..11],
@@ -676,8 +734,40 @@ command = ["codex"]
                 "4",
                 "--template",
                 "registry.example.com/agent:1",
-                "codex",
+                "--env",
             ]
+        );
+        assert_eq!(
+            args[11..15],
+            [
+                "ANTHROPIC_BASE_URL=http://host.docker.internal:47123/api.anthropic.com",
+                "--env",
+                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
+                "codex"
+            ]
+        );
+    }
+
+    #[test]
+    fn claude_on_the_relay_gets_its_placeholder_in_settings_and_no_api_key_helper() {
+        let settings = claude_relay_settings(47123, "sk-ant-oat01-imacs-placeholder");
+        assert_eq!(settings["statusLine"], claude_settings()["statusLine"], "usage still comes back");
+        assert_eq!(settings["apiKeyHelper"], "", "sbx's helper would win over the placeholder");
+        assert_eq!(
+            settings["env"],
+            serde_json::json!({
+                "ANTHROPIC_BASE_URL": "http://host.docker.internal:47123/api.anthropic.com",
+                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+                "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-imacs-placeholder",
+            })
+        );
+        assert_eq!(
+            relay_allow_args("imacs-s1", 47123),
+            ["policy", "allow", "network", "--sandbox", "imacs-s1", "localhost:47123"]
+        );
+        assert_eq!(
+            relay_remove_args("imacs-s1", 47123),
+            ["policy", "rm", "network", "--sandbox", "imacs-s1", "--resource", "localhost:47123", "--force"]
         );
     }
 

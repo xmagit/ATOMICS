@@ -20,6 +20,7 @@ use imacs_core::{git, paths, workspace};
 
 pub(crate) mod checks;
 pub mod exec;
+pub mod relay_check;
 pub mod setup;
 pub use checks::doctor_lines;
 
@@ -80,6 +81,9 @@ pub struct Prepare {
     pub briefs: Option<PathBuf>,
     /// IMACS's records of where git finds each sandbox's repository; see [`pin_git`].
     pub pins: PathBuf,
+    /// For a Claude agent: the relay that gives it a placeholder for the Claude subscription, when
+    /// the OS keychain holds one.
+    pub relay: Option<std::sync::Arc<crate::relay::Service>>,
 }
 
 impl Prepare {
@@ -138,9 +142,10 @@ pub fn preflight(program: &str) -> Result<Ready, String> {
 
 /// Makes the sandbox unless it exists, which is how a session reattaches after a restart,
 /// once sbx passes [`preflight`]. A new sandbox mounts the worktree and git's write folders,
-/// gets IMACS's MCP server, the configured ones and its repository's allowed hosts.
-pub fn prepare(job: &Prepare) -> Result<()> {
-    let ssh = job.config.ssh_agent;
+/// gets IMACS's MCP server, the configured ones and its repository's allowed hosts. A Claude agent
+/// with the subscription in the OS keychain gets a new placeholder for it, revoked again if
+/// preparation fails, and its sandbox the way to the relay.
+pub fn prepare(job: &Prepare) -> Result<Option<crate::relay::Granted>> {
     let ready = preflight(&job.sbx).map_err(anyhow::Error::msg)?;
     // Fail closed before making anything if this home's ledger cannot be read.
     let owned = ownership::owned(&job.home)?;
@@ -161,6 +166,29 @@ pub fn prepare(job: &Prepare) -> Result<()> {
     pin_git(&job.pins, &job.name, &job.cwd)?;
     ownership::record_pins(&job.home, &job.name, &job.pins)?;
     let (workspace, git) = workspace(&job.cwd)?;
+    // First, so a new sandbox's environment can name the relay's port.
+    let granted = match &job.relay {
+        Some(relay) => relay.grant_claude(&job.name)?,
+        None => None,
+    };
+    let made = make(job, &ready, existing, workspace, git, granted.as_ref());
+    if made.is_err()
+        && let (Some(relay), Some(granted)) = (&job.relay, &granted)
+    {
+        relay.revoke(granted);
+    }
+    made.map(|()| granted)
+}
+
+fn make(
+    job: &Prepare,
+    ready: &Ready,
+    existing: Option<Listed>,
+    workspace: PathBuf,
+    git: Vec<String>,
+    granted: Option<&crate::relay::Granted>,
+) -> Result<()> {
+    let ssh = job.config.ssh_agent;
     if let Some(existing) = existing {
         // A sandbox keeps its mounts for life: one made before a main checkout's .git was mounted
         // read-only whole lets its agent replace .git, config and all.
@@ -177,7 +205,9 @@ pub fn prepare(job: &Prepare) -> Result<()> {
                 job.name
             );
         }
-        return Ok(());
+        // Made before Claude used the relay, before the relay moved to another port, or used by a Claude
+        // that no longer has a subscription to relay.
+        return relay_rule(job, granted.map(|granted| granted.port));
     }
     // A machine's first sandbox needs sbx's global network policy; one already set up is left alone.
     if !ready.diagnosis.policy_initialized() {
@@ -204,6 +234,7 @@ pub fn prepare(job: &Prepare) -> Result<()> {
         memory: job.config.memory.clone(),
         cpus: job.config.cpus,
         template: job.config.template.clone(),
+        env: granted.map(|granted| isolation::claude_relay_env(granted.port)).unwrap_or_default(),
     };
     // A registration left by an earlier attempt would make `mcp add` fail.
     remove_mcp(&job.home, &job.sbx, &job.name)?;
@@ -228,12 +259,32 @@ pub fn prepare(job: &Prepare) -> Result<()> {
             sbx(&job.sbx, &isolation::allow_hosts_args(&job.name, &hosts), ssh, TIMEOUT)
                 .context("allowing the repository's hosts")?;
         }
-        Ok(())
+        relay_rule(job, granted.map(|granted| granted.port))
     };
     // A half-made sandbox would be reattached to as it is: remove it so the next start makes it whole.
     finish().inspect_err(|_| {
         let _ = remove(&job.home, &job.sbx, &job.name);
     })
+}
+
+/// Lets the sandbox reach the relay at `port` on this machine's loopback, and nothing else there:
+/// the ownership ledger records the rule so it goes with the sandbox, and a rule for a port the relay
+/// left, or for a sandbox that no longer uses it (`None`), goes now, since another program may listen
+/// there.
+fn relay_rule(job: &Prepare, port: Option<u16>) -> Result<()> {
+    let allowed = ownership::owned(&job.home)?.get(&job.name).and_then(|entry| entry.relay);
+    if allowed == port {
+        return Ok(());
+    }
+    if let Some(old) = allowed {
+        // sbx fails when the rule is gone already; it also goes when the sandbox does.
+        let _ = sbx(&job.sbx, &isolation::relay_remove_args(&job.name, old), false, TIMEOUT);
+        ownership::removed(&job.home, &job.name, Resource::Relay)?;
+    }
+    let Some(port) = port else { return Ok(()) };
+    sbx(&job.sbx, &isolation::relay_allow_args(&job.name, port), job.config.ssh_agent, TIMEOUT)
+        .context("letting the sandbox reach IMACS's credential relay")?;
+    ownership::record_relay(&job.home, &job.name, port)
 }
 
 /// Pins host git in `cwd` to IMACS's record for sandbox `name` in `dir`: the one saved when the
@@ -431,11 +482,19 @@ pub fn stop(home: &Path, program: &str, name: &str) -> Result<()> {
     sbx(program, &["stop", name], false, TIMEOUT).map(drop)
 }
 
-/// Removes a sandbox and IMACS's MCP registration for it.
+/// Removes a sandbox, its way to the relay and IMACS's MCP registration for it.
 pub fn remove(home: &Path, program: &str, name: &str) -> Result<()> {
-    if ownership::owned(home)?.get(name).is_some_and(|entry| entry.sandbox) {
+    let owned = ownership::owned(home)?.get(name).cloned().unwrap_or_default();
+    if owned.sandbox {
+        if let Some(port) = owned.relay {
+            // Taken away first: a sandbox sbx fails to remove keeps no way to this machine's loopback.
+            let _ = sbx(program, &isolation::relay_remove_args(name, port), false, TIMEOUT);
+        }
         sbx(program, &["rm", "--force", name], false, TIMEOUT)?;
         ownership::removed(home, name, Resource::Sandbox)?;
+    }
+    if owned.relay.is_some() {
+        ownership::removed(home, name, Resource::Relay)?;
     }
     remove_mcp(home, program, name)?;
     // The ref guard's baseline goes with its sandbox; one made again under this name takes a new one.
@@ -598,7 +657,7 @@ fn sbx(program: &str, args: &[impl AsRef<str>], ssh_agent: bool, timeout: Durati
 
 /// Runs `sbx args` within `timeout`: its status, output and errors. Output goes to unlinked
 /// files, so a daemon sbx starts and that inherits them cannot keep this waiting.
-fn sbx_output(
+pub(crate) fn sbx_output(
     program: &str,
     args: &[impl AsRef<str>],
     ssh_agent: bool,
@@ -742,6 +801,7 @@ mod tests {
             socket: "/run/user/501/imacs/imacs.sock".into(),
             briefs: None,
             pins: sbx.with_file_name("git-pins"),
+            relay: None,
         }
     }
 
@@ -781,6 +841,7 @@ mod tests {
             memory: None,
             cpus: None,
             template: Some("local:cache".into()),
+            env: Vec::new(),
         };
         let args = isolation::create_args(&spec);
         for path in expected {
@@ -874,6 +935,7 @@ mod tests {
             memory: Some("8g".into()),
             cpus: Some(4),
             template: Some("registry.example.com/agent:1".into()),
+            env: Vec::new(),
         };
         assert_eq!(fake::calls_to(bin.path(), &["create"]), [isolation::create_args(&expected)]);
         assert!(bin.path().join("briefs/s1").is_dir(), "the brief folder exists before it is mounted");
@@ -900,6 +962,53 @@ mod tests {
         );
         stop(&job.home, &job.sbx, "imacs-s1").unwrap();
         assert_eq!(fake::calls(bin.path()).last().unwrap(), &["stop", "imacs-s1"]);
+    }
+
+    #[test]
+    fn a_reattached_sandbox_follows_the_relay_to_a_new_port_and_loses_its_rule_without_it() {
+        let (_dir, repo) = repository();
+        let bin = crate::test_support::tempdir().unwrap();
+        let sbx = fake::install(bin.path());
+        let keychain = bin.path().join("keychain");
+        std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keychain"), &keychain).unwrap();
+        std::fs::write(bin.path().join("keychain-value"), "sk-ant-oat01-PRIVATE-token").unwrap();
+        let mut job = job(&sbx, "imacs-c1", &repo, SandboxConfig::default());
+        job.agent = "claude";
+        let relay = |job: &mut Prepare| {
+            let service = crate::relay::Service::new(job.home.clone(), crate::relay::Keychain::at(&keychain, true));
+            job.relay = Some(std::sync::Arc::new(service));
+        };
+        relay(&mut job);
+        let first = prepare(&job).unwrap().unwrap();
+        let rules = || fake::calls_to(bin.path(), &["policy"]);
+        assert_eq!(rules(), [isolation::relay_allow_args("imacs-c1", first.port)]);
+        // The port is taken while IMACS is away: the restarted relay listens elsewhere, and the
+        // sandbox's rule follows it.
+        let taken = std::net::TcpListener::bind(("127.0.0.1", first.port)).ok();
+        drop(job.relay.take());
+        relay(&mut job);
+        let second = prepare(&job).unwrap().unwrap();
+        if taken.is_some() {
+            assert_ne!(second.port, first.port);
+            assert_eq!(
+                rules()[1..],
+                [
+                    isolation::relay_remove_args("imacs-c1", first.port),
+                    isolation::relay_allow_args("imacs-c1", second.port)
+                ]
+            );
+        }
+        assert_eq!(ownership::owned(&job.home).unwrap()["imacs-c1"].relay, Some(second.port));
+        // Started again with the same relay, nothing changes.
+        let before = rules().len();
+        prepare(&job).unwrap().unwrap();
+        assert_eq!(rules().len(), before);
+        // Without a token, Claude gets no placeholder, and its sandbox no way to this machine's loopback.
+        std::fs::remove_file(bin.path().join("keychain-value")).unwrap();
+        assert_eq!(prepare(&job).unwrap(), None);
+        assert_eq!(rules().last().unwrap(), &isolation::relay_remove_args("imacs-c1", second.port));
+        assert_eq!(ownership::owned(&job.home).unwrap()["imacs-c1"].relay, None);
+        drop(taken);
     }
 
     #[test]
@@ -1024,7 +1133,7 @@ mod tests {
         assert_eq!(ready.version, (0, 50, 1));
         assert!(ready.diagnosis.signed_in(), "an unrelated failing check does not matter");
         assert!(
-            doctor_lines(&sbx, &SandboxConfig::default(), true)[0]
+            doctor_lines(&sbx, &SandboxConfig::default(), checks::ClaudeRoute::Bare)[0]
                 .starts_with("✓ Docker Sandboxes ready (sbx v0.50.1, signed in)")
         );
         std::fs::write(bin.path().join("version"), "v0.51.2").unwrap();
@@ -1047,7 +1156,7 @@ mod tests {
         std::fs::write(bin.path().join("version"), "v0.50.1").unwrap();
         std::fs::write(bin.path().join("signed-out"), "").unwrap();
         let error = refusal(&sbx, &["not signed in", "sbx login"]);
-        let line = &doctor_lines(&sbx, &SandboxConfig::default(), true)[0];
+        let line = &doctor_lines(&sbx, &SandboxConfig::default(), checks::ClaudeRoute::Bare)[0];
         assert!(line.starts_with("✗ Docker Sandboxes not ready for sandboxed agents (warning) — "), "{line}");
         assert!(line.ends_with(&error), "{line}");
         std::fs::write(bin.path().join("fail-diagnose"), "").unwrap();

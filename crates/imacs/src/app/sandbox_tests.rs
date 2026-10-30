@@ -25,6 +25,7 @@ fn startup_cleanup_does_not_block_the_runtime_while_sbx_is_waiting() {
             exe: "/imacs".into(),
             socket: paths::socket_path(),
             briefs: None,
+            relay: None,
         };
         crate::sandbox::prepare(&job).unwrap();
         let gate = bin.path().join("wait-ls");
@@ -80,8 +81,6 @@ fn quitting_stops_running_and_preparing_sandboxes_and_joins_cleanup() {
         app.runtime.sbx = fake::install(bin.path()).display().to_string();
         std::fs::write(bin.path().join("run-waits"), "wait").unwrap();
         app.runtime.config.isolation.mode = IsolationMode::Sandbox;
-        // The default claude agent is bare; this test sandboxes it.
-        app.runtime.config.agents.iter_mut().for_each(|agent| agent.isolation = None);
         let running = app.runtime.start(ctx, "claude", repo.clone(), None, vec![], None).unwrap();
         tick_until(app, ctx, "running sandbox", |app| {
             app.runtime.sessions.iter().any(|s| s.id == running && s.terminal.is_some())
@@ -200,8 +199,6 @@ fn sandboxed_agents_attach_through_sbx_run_and_reattach_after_a_restart() {
         let bin = crate::test_support::tempdir().unwrap();
         app.runtime.sbx = fake::install(bin.path()).display().to_string();
         app.runtime.config.isolation.mode = IsolationMode::Sandbox;
-        // The default claude agent is bare; this test sandboxes it.
-        app.runtime.config.agents.iter_mut().for_each(|agent| agent.isolation = None);
 
         let id = app.runtime.start(ctx, "claude", worktree.clone(), None, vec![], Some("Fix the bug".into())).unwrap();
         let name = format!("imacs-{id}");
@@ -260,6 +257,240 @@ fn sandboxed_agents_attach_through_sbx_run_and_reattach_after_a_restart() {
         assert_eq!(app.runtime.sessions[0].sandbox.as_deref(), Some(name.as_str()));
         finish_agents(app, ctx);
     });
+}
+
+/// A subscription token in a fake keychain, and a fake Anthropic API behind the relay.
+fn subscription(app: &mut Desktop<'_>, bin: &Path) -> crate::relay::fake::Upstream {
+    let keychain = bin.join("keychain");
+    std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keychain"), &keychain).unwrap();
+    std::fs::write(bin.join("keychain-value"), SUBSCRIPTION).unwrap();
+    let upstream = crate::relay::fake::start();
+    app.runtime.relay = Arc::new(crate::relay::Service::with_upstreams(
+        paths::imacs_home(),
+        crate::relay::Keychain::at(&keychain, cfg!(target_os = "macos")),
+        HashMap::from([(crate::relay::ANTHROPIC.to_string(), upstream.url.clone())]),
+    ));
+    upstream
+}
+
+const SUBSCRIPTION: &str = "sk-ant-oat01-PRIVATE-subscription-token";
+
+/// What the relay answers a sandbox's request with `placeholder`: its status line.
+fn relay_status(port: u16, placeholder: &str) -> String {
+    let request =
+        format!("GET /api.anthropic.com/v1/models HTTP/1.1\r\nx-api-key: {placeholder}\r\nconnection: close\r\n\r\n");
+    crate::relay::fake::send(port, &request).0.lines().next().unwrap().to_string()
+}
+
+#[test]
+fn sandboxed_claude_uses_the_subscription_through_the_relay_until_its_session_ends() {
+    with_app(
+        "app::sandbox_tests::sandboxed_claude_uses_the_subscription_through_the_relay_until_its_session_ends",
+        |app, ctx| {
+            let (_dir, repo) = repository();
+            let bin = crate::test_support::tempdir().unwrap();
+            app.runtime.sbx = fake::install(bin.path()).display().to_string();
+            std::fs::write(bin.path().join("run-waits"), "").unwrap();
+            app.runtime.config.isolation.mode = IsolationMode::Sandbox;
+            let upstream = subscription(app, bin.path());
+
+            let id = app.runtime.start(ctx, "claude", repo.clone(), None, vec![], None).unwrap();
+            let name = format!("imacs-{id}");
+            tick_until(app, ctx, "the agent to attach", |_| bin.path().join("run-ssh").exists());
+            let home = paths::imacs_home();
+            let port: u16 = std::fs::read_to_string(home.join("relay-port")).unwrap().parse().unwrap();
+
+            // The sandbox is made with the way to the relay, and no token, not even a placeholder.
+            let create = &fake::calls_to(bin.path(), &["create"])[0];
+            for env in imacs_core::isolation::claude_relay_env(port) {
+                let env = format!("{}={}", env.0, env.1);
+                assert!(create.windows(2).any(|pair| pair == ["--env", env.as_str()]), "{env} in {create:?}");
+            }
+            assert!(!create.iter().any(|arg| arg.contains("sk-ant-")), "{create:?}");
+            assert!(
+                fake::calls_to(bin.path(), &["policy", "allow"])
+                    .contains(&imacs_core::isolation::relay_allow_args(&name, port))
+            );
+            assert_eq!(crate::sandbox_ownership::owned(&home).unwrap()[&name].relay, Some(port));
+
+            // The session's placeholder arrives in Claude's settings, which drop sbx's apiKeyHelper.
+            let run = fake::calls_to(bin.path(), &["run"]).pop().unwrap();
+            assert!(!run.iter().any(|arg| arg.contains(SUBSCRIPTION)), "the token stays on this machine");
+            let settings = &run[run.iter().position(|arg| arg == "--settings").unwrap() + 1];
+            let settings: serde_json::Value = serde_json::from_str(settings).unwrap();
+            assert_eq!(settings["apiKeyHelper"], "");
+            let placeholder = settings["env"]["CLAUDE_CODE_OAUTH_TOKEN"].as_str().unwrap().to_string();
+            assert_eq!(settings, imacs_core::isolation::claude_relay_settings(port, &placeholder));
+
+            // It stands for the subscription while the session lives, and not after it closes.
+            assert!(relay_status(port, &placeholder).contains(" 200 "));
+            assert_eq!(upstream.seen.lock().unwrap()[0].header("authorization"), [format!("Bearer {SUBSCRIPTION}")]);
+            app.runtime.close(&id);
+            assert!(relay_status(port, &placeholder).contains(" 401 "), "closing revokes the placeholder");
+            finish_agents(app, ctx);
+
+            // Resumed, the session gets a new placeholder in the same sandbox, whose rule stays.
+            let record =
+                app.runtime.store.sessions.iter().find(|r| r.sandbox.as_deref() == Some(&name)).unwrap().clone();
+            // This time the agent exits once the test lets it go.
+            std::fs::remove_file(bin.path().join("run-waits")).unwrap();
+            std::fs::write(bin.path().join("wait-agent"), "").unwrap();
+            app.runtime.resume_record(ctx, record);
+            tick_until(app, ctx, "the resumed agent to attach", |_| bin.path().join("waiting-agent").exists());
+            let run = fake::calls_to(bin.path(), &["run"]).pop().unwrap();
+            let settings: serde_json::Value =
+                serde_json::from_str(&run[run.iter().position(|arg| arg == "--settings").unwrap() + 1]).unwrap();
+            let resumed = settings["env"]["CLAUDE_CODE_OAUTH_TOKEN"].as_str().unwrap().to_string();
+            assert_ne!(resumed, placeholder);
+            assert!(
+                relay_status(port, &resumed).contains(" 200 ") && relay_status(port, &placeholder).contains(" 401 ")
+            );
+            assert_eq!(fake::calls_to(bin.path(), &["policy", "allow"]).len(), 1, "the rule is made once");
+            // An agent that exits loses its placeholder too.
+            std::fs::remove_file(bin.path().join("wait-agent")).unwrap();
+            tick_until(app, ctx, "the agent to exit", |app| app.runtime.sessions[0].status == AgentStatus::Exited);
+            assert!(relay_status(port, &resumed).contains(" 401 "));
+            finish_agents(app, ctx);
+
+            // Removed with its worktree's cleanup, the sandbox's rule goes with it, through the ledger.
+            crate::sandbox::remove(&home, &app.runtime.sbx, &name).unwrap();
+            assert!(
+                fake::calls_to(bin.path(), &["policy", "rm"])
+                    .contains(&imacs_core::isolation::relay_remove_args(&name, port))
+            );
+            let calls = fake::calls(bin.path());
+            let rule = calls.iter().position(|call| call.starts_with(&["policy".into(), "rm".into()])).unwrap();
+            assert!(rule < calls.iter().position(|call| call[0] == "rm").unwrap(), "the rule goes before the sandbox");
+            assert!(!crate::sandbox_ownership::owned(&home).unwrap().contains_key(&name));
+
+            // Without a stored subscription, sandboxed Claude starts as before: sbx's own credential.
+            std::fs::remove_file(bin.path().join("keychain-value")).unwrap();
+            std::fs::remove_file(bin.path().join("run-ssh")).unwrap();
+            std::fs::write(bin.path().join("run-waits"), "").unwrap();
+            let plain = app.runtime.start(ctx, "claude", repo, None, vec![], None).unwrap();
+            tick_until(app, ctx, "the plain agent to attach", |_| bin.path().join("run-ssh").exists());
+            let create = fake::calls_to(bin.path(), &["create"]).pop().unwrap();
+            assert!(!create.iter().any(|arg| arg == "--env"), "{create:?}");
+            let run = fake::calls_to(bin.path(), &["run"]).pop().unwrap();
+            assert!(run.contains(&imacs_core::isolation::claude_settings().to_string()), "{run:?}");
+            let plain = format!("imacs-{plain}");
+            assert!(!fake::calls_to(bin.path(), &["policy"]).iter().any(|call| call.contains(&plain)));
+            assert_eq!(crate::sandbox_ownership::owned(&home).unwrap()[&plain].relay, None);
+            finish_agents(app, ctx);
+        },
+    );
+}
+
+#[test]
+fn a_sandboxed_scratch_claude_gets_the_relay_and_loses_it_with_its_session() {
+    with_app(
+        "app::sandbox_tests::a_sandboxed_scratch_claude_gets_the_relay_and_loses_it_with_its_session",
+        |app, ctx| {
+            let bin = crate::test_support::tempdir().unwrap();
+            app.runtime.sbx = fake::install(bin.path()).display().to_string();
+            std::fs::write(bin.path().join("run-waits"), "").unwrap();
+            app.runtime.config.isolation.mode = IsolationMode::Sandbox;
+            let _upstream = subscription(app, bin.path());
+            let home = paths::imacs_home();
+
+            // A session outside any project takes the same launch, and the same way to the relay.
+            let response = request(app, json!({"cmd": "start", "agent": "claude", "prompt": "Read the RFC"}));
+            assert!(response.ok, "{:?}", response.error);
+            let id = response.result["id"].as_str().unwrap().to_string();
+            tick_until(app, ctx, "the scratch agent to attach", |_| bin.path().join("run-ssh").exists());
+            let index = app.runtime.find(&id).unwrap();
+            let scratch = app.runtime.sessions[index].scratch.clone().expect("a scratch session");
+            let name = format!("imacs-{id}");
+            let port: u16 = std::fs::read_to_string(home.join("relay-port")).unwrap().parse().unwrap();
+            let create = &fake::calls_to(bin.path(), &["create"])[0];
+            for (key, value) in imacs_core::isolation::claude_relay_env(port) {
+                let env = format!("{key}={value}");
+                assert!(create.windows(2).any(|pair| pair == ["--env", env.as_str()]), "{env} in {create:?}");
+            }
+            let allow = imacs_core::isolation::relay_allow_args(&name, port);
+            assert!(fake::calls_to(bin.path(), &["policy", "allow"]).contains(&allow));
+            let run = fake::calls_to(bin.path(), &["run"]).pop().unwrap();
+            let settings: serde_json::Value =
+                serde_json::from_str(&run[run.iter().position(|arg| arg == "--settings").unwrap() + 1]).unwrap();
+            let placeholder = settings["env"]["CLAUDE_CODE_OAUTH_TOKEN"].as_str().unwrap().to_string();
+            assert_eq!(settings, imacs_core::isolation::claude_relay_settings(port, &placeholder));
+            assert!(relay_status(port, &placeholder).contains(" 200 "));
+
+            // Closing it revokes the placeholder; its sandbox, rule and folder go, since nothing resumes it.
+            app.runtime.close(&id);
+            assert!(relay_status(port, &placeholder).contains(" 401 "));
+            assert_eq!(app.runtime.relay.live_grants(), 0);
+            app.runtime.finish_lifecycle_jobs();
+            assert!(!scratch.exists());
+            let remove = imacs_core::isolation::relay_remove_args(&name, port);
+            assert!(fake::calls_to(bin.path(), &["policy", "rm"]).contains(&remove));
+            assert!(fake::calls_to(bin.path(), &["rm"]).contains(&vec!["rm".into(), "--force".into(), name.clone()]));
+            assert!(!crate::sandbox_ownership::owned(&home).unwrap().contains_key(&name));
+
+            // Closed while its sandbox is made: the placeholder granted for it goes when preparation ends.
+            std::fs::write(bin.path().join("wait-create"), "").unwrap();
+            let response = request(app, json!({"cmd": "start", "agent": "claude"}));
+            let late = response.result["id"].as_str().unwrap().to_string();
+            tick_until(app, ctx, "sandbox creation to begin", |_| bin.path().join("waiting-create").exists());
+            assert_eq!(app.runtime.relay.live_grants(), 1, "granted before the sandbox is made");
+            app.runtime.close(&late);
+            std::fs::remove_file(bin.path().join("wait-create")).unwrap();
+            tick_until(app, ctx, "the late sandbox", |app| app.runtime.pending_sandbox.is_empty());
+            app.runtime.finish_lifecycle_jobs();
+            assert_eq!(app.runtime.relay.live_grants(), 0);
+            let late = format!("imacs-{late}");
+            assert!(
+                fake::calls_to(bin.path(), &["policy", "rm"])
+                    .contains(&imacs_core::isolation::relay_remove_args(&late, port))
+            );
+            assert!(!crate::sandbox_ownership::owned(&home).unwrap().contains_key(&late));
+            finish_agents(app, ctx);
+        },
+    );
+}
+
+#[test]
+fn the_relay_serves_sandboxes_while_the_state_lock_is_held_and_never_holds_it() {
+    super::tests::with_state(
+        "app::sandbox_tests::the_relay_serves_sandboxes_while_the_state_lock_is_held_and_never_holds_it",
+        |mut state, _ctx| {
+            let bin = crate::test_support::tempdir().unwrap();
+            let keychain = bin.path().join("keychain");
+            std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keychain"), &keychain).unwrap();
+            std::fs::write(bin.path().join("keychain-value"), SUBSCRIPTION).unwrap();
+            let upstream = crate::relay::fake::start();
+            state.relay = Arc::new(crate::relay::Service::with_upstreams(
+                paths::imacs_home(),
+                crate::relay::Keychain::at(&keychain, cfg!(target_os = "macos")),
+                HashMap::from([(crate::relay::ANTHROPIC.to_string(), upstream.url.clone())]),
+            ));
+            let relay = state.relay.clone();
+            let state = Arc::new(Mutex::new(state));
+
+            // The runtime or the UI holds the state lock, as during a slow tick: sandboxes still get answers.
+            let held = state.lock().unwrap();
+            let granted = relay.grant_claude("imacs-lock").unwrap().unwrap();
+            let body = r#"{"stream":true}"#;
+            let request = format!(
+                "POST /api.anthropic.com/v1/messages HTTP/1.1\r\nauthorization: Bearer {}\r\ncontent-length: {}\r\n\r\n{body}",
+                granted.placeholder,
+                body.len()
+            );
+            let (head, mut reader) = crate::relay::fake::send(granted.port, &request);
+            assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+            assert_eq!(crate::relay::fake::chunk(&mut reader), "event: message_start\ndata: {}\n\n");
+            drop(held);
+
+            // While the upstream holds the stream open, nothing in the relay holds the state lock.
+            let free = state.try_lock().is_ok();
+            upstream.release.send(()).unwrap();
+            assert_eq!(crate::relay::fake::chunk(&mut reader), "event: message_stop\ndata: {}\n\n");
+            assert!(free, "a streaming request held the state lock");
+            relay.revoke(&granted);
+            let Ok(state) = Arc::try_unwrap(state) else { panic!("the relay kept the state") };
+            state.into_inner().unwrap().shutdown();
+        },
+    );
 }
 
 #[test]
@@ -536,6 +767,7 @@ fn the_cleanup_dialog_removes_a_worktrees_sandbox_and_chosen_orphans() {
                 socket: "/imacs.sock".into(),
                 briefs: None,
                 pins: paths::git_pins_dir(),
+                relay: None,
             };
             crate::sandbox::prepare(&job).unwrap();
             worktrees.push(path);

@@ -118,6 +118,8 @@ pub struct Session {
     pending: Option<Pending>,
     /// The sandbox a sandboxed agent runs in.
     sandbox: Option<String>,
+    /// Its placeholder for the Claude subscription, revoked when its agent exits or it closes.
+    relay: Option<crate::relay::Granted>,
     screen_busy: bool,
     busy_absent_since: Option<Instant>,
     ref_guard: Option<crate::ref_guard::Shared>,
@@ -170,7 +172,13 @@ struct AgentLaunch {
     runtime: AgentRuntime,
     /// A sandboxed session's ref guard, opened and checked before its agent starts.
     ref_guard: Option<crate::ref_guard::Shared>,
+    /// A sandboxed Claude's placeholder for the Claude subscription.
+    relay: Option<crate::relay::Granted>,
 }
+
+/// What preparing a sandbox gives its launch: the ref guard with what its first check found, and
+/// the session's relay placeholder.
+type Prepared = Result<(crate::ref_guard::Opened, Option<crate::relay::Granted>), String>;
 
 struct Pending {
     text: String,
@@ -423,13 +431,15 @@ pub(crate) struct State {
     /// The `sbx` program sandboxed agents run with.
     sbx: String,
     sandbox_usage: crate::sandbox_usage::Sampler,
+    /// The credential relay sandboxed Claude agents reach the Claude subscription through.
+    relay: Arc<crate::relay::Service>,
     lifecycle_jobs: Vec<std::thread::JoinHandle<()>>,
     startup_cleanup: Option<std::thread::JoinHandle<()>>,
     shutting_down: bool,
     sandbox_check: Option<Receiver<Vec<String>>>,
     sandbox_lines: Vec<String>,
     /// Sandboxed launches waiting for their sandbox, and their ref guard with what its first check found.
-    pending_sandbox: Vec<(AgentLaunch, Receiver<Result<crate::ref_guard::Opened, String>>)>,
+    pending_sandbox: Vec<(AgentLaunch, Receiver<Prepared>)>,
     ref_checks: crate::ref_guard::Checks,
     active: Option<String>,
     diff_open: bool,
@@ -852,6 +862,7 @@ impl State {
             shutting_down: false,
             ref_checks: crate::ref_guard::Checks::new(),
             sandbox_usage: Default::default(),
+            relay: Arc::new(crate::relay::Service::new(paths::imacs_home(), crate::relay::Keychain::current())),
             active: None,
             diff_open: true,
             diff_root: None,

@@ -53,9 +53,11 @@ sudo apt install docker-sbx
 ```
 
 Setup then guides Docker browser sign-in, initializes the global network policy only if it
-is missing, and reads a missing OpenAI API key over stdin. Claude agents run bare by default;
-when they run sandboxed, setup asks for an Anthropic API key over stdin instead (see
-[Claude runs bare by default](#claude-runs-bare-by-default)). A Linear ticket profile adds the `sbx mcp add linear` and `sbx mcp auth linear`
+is missing, and reads a missing OpenAI API key over stdin. When Claude agents run sandboxed and
+neither the Claude subscription nor sbx's `anthropic` secret is stored, it asks for the token
+`claude setup-token` prints and keeps it in the OS keychain for IMACS's credential relay; an
+Anthropic API key pasted there goes to sbx's `anthropic` secret instead (see
+[Sandboxed Claude on your subscription](#sandboxed-claude-on-your-subscription)). A Linear ticket profile adds the `sbx mcp add linear` and `sbx mcp auth linear`
 steps: the named workspace's with `--workspace`, otherwise the main config's or any saved workspace's,
 since setup cannot know which workspace IMACS will open. Browser authentication runs with private
 child output; if a browser does not open, run the indicated authentication command in a host
@@ -63,8 +65,8 @@ terminal and retry setup. It also offers to remove a stored GitHub credential an
 SSH forwarding, so the corresponding readiness checks can pass.
 
 Each change asks for confirmation. EOF, declining a step, or Ctrl-C stops setup; running it
-again checks actual state and skips completed steps. Existing Anthropic and OpenAI
-secrets are reused. No progress file contains credentials. All token input
+again checks actual state and skips completed steps. An existing Claude subscription token, Anthropic
+key and OpenAI secret are reused. No progress file contains credentials. All token input
 is hidden on a terminal; pipes can supply newline-terminated answers and credentials over
 stdin. Tokens are never command arguments, printed output, logs, or IMACS configuration.
 A token can end up filed as a secret's name, or a service name as its sandbox scope, as with
@@ -95,9 +97,10 @@ exposes rules rather than preserving an immutable preset name: standard rules ar
 balanced, allow-all or deny-all, and changed rules as custom. Review custom rules with
 `sbx policy ls`. Checks never initialize or replace a policy or start an OAuth authorization flow.
 
-Credential checks report only known names: `anthropic` (checked only while Claude agents run
-sandboxed), `openai`, a warning for `github`, and a leftover `CLAUDE_CODE_OAUTH_TOKEN` custom route
-as unused, counting global secrets only. A service secret under a
+Credential checks report only known names: how sandboxed Claude authenticates (only while Claude
+agents run sandboxed: the Claude subscription in the OS keychain for IMACS's relay, else sbx's
+`anthropic` API key), `openai`, a warning for `github`, and a leftover `CLAUDE_CODE_OAUTH_TOKEN`
+custom route as unused, counting global secrets only. A service secret under a
 name sbx has no service for, or in a scope that is not an existing sandbox, is a misfiled secret:
 doctor warns with their count and scopes, never their names, since sbx can store a token in the NAME
 column. Checks discard all raw credential-command errors. Do not paste
@@ -106,34 +109,103 @@ SSH checks also warn about sbx's global `ssh.agentForwardingEnabled` and a fixed
 `ssh.agentSocketPath`, in addition to IMACS's `ssh_agent` setting. The runtime removes
 `SSH_AUTH_SOCK` when IMACS forwarding is off; a fixed sbx socket can bypass that protection.
 
-## Claude runs bare by default
+## Sandboxed Claude on your subscription
 
-The built-in `claude` agent has `isolation = "bare"`: Claude agents run on this machine with your
-Claude login, as the chief always does, while Codex stays sandboxed. A Claude subscription cannot
-authenticate inside a local sandbox with sbx v0.50.1, as found end to end on 2026-10-30:
+sbx cannot give a local sandbox a Claude subscription. With sbx v0.50.1, found end to end on
+2026-10-30:
 
 - **A custom route.** A `sbx secret set-custom --env CLAUDE_CODE_OAUTH_TOKEN --host api.anthropic.com`
-  secret gives the VM a placeholder (`sk-ant-oat01-` and 16 random characters). With the built-in
-  `anthropic` secret removed (`SBX_CRED_ANTHROPIC_MODE=none`), sbx's proxy strips both
-  `Authorization` and `x-api-key` from requests to api.anthropic.com and adds nothing: Claude says
-  "Not logged in" and the API answers `401 x-api-key header is required`. A daemon restart does not
-  change this.
-- **The built-in secret holding a subscription token.** Stored as sbx's `anthropic` secret, with
-  `--command` reading it from the OS keychain, the token gets `SBX_CRED_ANTHROPIC_MODE=apikey`: sbx
-  writes an `apiKeyHelper` into the VM's Claude settings, and its proxy sends the token as
-  `x-api-key`, which the API rejects with `401 invalid x-api-key`.
+  secret gives the VM a placeholder, but with the built-in `anthropic` secret removed
+  (`SBX_CRED_ANTHROPIC_MODE=none`), sbx's proxy strips both `Authorization` and `x-api-key` from
+  requests to api.anthropic.com and adds nothing: the API answers `401 x-api-key header is required`.
+- **The built-in secret holding a subscription token.** Stored as sbx's `anthropic` secret, the token
+  gets `SBX_CRED_ANTHROPIC_MODE=apikey`: sbx writes an `apiKeyHelper` into the VM's Claude settings,
+  and its proxy sends the token as `x-api-key`, which the API rejects with `401 invalid x-api-key`.
 
-`sbx secret set --oauth` covers only OpenAI on local sbx; Anthropic OAuth is cloud-only. Sandboxed
-Claude on a subscription is planned through an IMACS host credential relay.
+`sbx secret set --oauth` covers only OpenAI on local sbx. So IMACS relays the subscription itself, from
+this machine. Store the token once, in a trusted host terminal:
 
-To sandbox Claude meanwhile, store an Anthropic API key (`sk-ant-api…`) in sbx's built-in
-`anthropic` secret and set the claude agent's `isolation = "sandbox"` (or remove its `isolation`
-under `mode = "sandbox"`). With Claude agents sandboxed, `imacs setup` asks for the key and sends it
-to `sbx secret set anthropic` over stdin; it refuses a subscription token. Doctor and Settings →
-Sandbox then check for the `anthropic` secret. While Claude runs bare they say sandboxed Claude is
-not configured, as information rather than a warning. A config created before this default keeps its
-`[[agents]]` entry for claude: add `isolation = "bare"` to it. Codex sandboxes use sbx's `openai`
-secret, OAuth or API key; use sbx's interactive `sbx secret set openai` to change it.
+```sh
+claude setup-token     # prints a sk-ant-oat01-… token
+imacs setup            # paste it when asked: it goes to the OS keychain over stdin
+```
+
+Setup keeps it in the OS keychain under the service `imacs-claude-setup-token`, account `imacs`:
+macOS's keychain through `security`, Linux's Secret Service through `secret-tool`
+(`sudo apt install libsecret-tools`). From then on, every sandboxed Claude agent uses it:
+
+1. **The relay.** IMACS runs an HTTP relay on this machine's loopback only, `127.0.0.1:<port>`,
+   started with the first sandboxed Claude. It keeps its port in `relay-port` in IMACS's state folder
+   and listens there again after a restart when the port is free, so existing sandboxes keep their way
+   to it.
+2. **A placeholder per session.** Each time a sandboxed Claude starts or resumes, its session gets a
+   new random placeholder shaped like a subscription token (`sk-ant-oat01-imacs-…`). The relay
+   accepts it until the agent exits, its tile closes or its launch fails, then revokes it. The real
+   token stays in the relay's memory on this machine; the relay reads it from the keychain as each
+   session starts, so a new token applies to sessions started after it is stored.
+3. **The sandbox's way there.** When IMACS makes the sandbox, it sets
+   `ANTHROPIC_BASE_URL=http://host.docker.internal:<port>/api.anthropic.com` and
+   `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` in its environment, so Claude's own bootstrap and
+   telemetry calls to api.anthropic.com do not go around the relay, and adds a rule for that sandbox
+   alone: `sbx policy allow network --sandbox <name> localhost:<port>`. The ownership ledger records
+   the rule, and removing the sandbox removes it. A sandbox made before the relay moved to another port,
+   or before Claude used the relay, gets the new rule the next time it starts and loses the old one.
+   The environment holds no token.
+4. **Claude's settings.** Claude starts with `--settings` whose `env` carries the session's
+   placeholder as `CLAUDE_CODE_OAUTH_TOKEN` and the relay's current address, and with `apiKeyHelper`
+   cleared: when sbx holds an `anthropic` secret it writes an `apiKeyHelper` into the VM's Claude
+   settings, which would win over the placeholder.
+5. **Each request.** Claude sends `Authorization: Bearer <placeholder>` to the relay through sbx's
+   proxy, which passes headers unchanged and streams. The relay finds the session by its placeholder,
+   checks the credential's upstream hosts and capability rules, puts the real token in
+   `Authorization`, drops every other credential header the client sent, and forwards the request to
+   `https://api.anthropic.com` over TLS. The response streams back as it arrives: server-sent events
+   are not buffered.
+
+The Claude subscription may reach `api.anthropic.com` only, for:
+
+| Method | Path |
+| --- | --- |
+| `POST` | `/v1/messages`, `/v1/messages/count_tokens` |
+| `GET` | `/v1/models`, `/v1/models/<model>` |
+
+Anything else, such as the API's OAuth and account endpoints, gets `403`, and an unknown or revoked
+placeholder `401`. Paths with `.` or `..` segments, empty segments or percent-escapes are refused, so a
+rule's path is the path the API serves.
+
+`relay.log` in IMACS's state folder has one line per request: time, sandbox, host, method, path,
+status and duration. It never holds a header value, query string or body, and moves to `relay.log.1`
+past 4 MiB. The relay runs on threads of its own and never takes IMACS's state lock, so a slow or
+stuck request cannot hold up the app.
+
+**Without a stored subscription**, sandboxed Claude uses sbx's own `anthropic` secret, which must be an
+Anthropic API key (`sk-ant-api…`) that sbx's proxy sends as `x-api-key`. Setup stores one when you paste
+an API key instead of a setup token. Doctor and Settings → Sandbox say which route Claude takes. To run
+Claude agents on this machine instead, set the claude agent's `isolation = "bare"`. A config written while
+Claude ran bare by default may still have that line; remove it to sandbox Claude again. Codex sandboxes use
+sbx's `openai` secret, OAuth or API key; use sbx's interactive `sbx secret set openai` to change it.
+
+**claude.ai connectors**, the MCP servers of your claude.ai account, are not available to sandboxed
+Claude. A `claude setup-token` token has only the `user:inference` scope, and Claude lists connectors
+only with `user:mcp_servers` (its debug log says `[claudeai-mcp] Missing user:mcp_servers scope`).
+They would also need `api.anthropic.com` (`/v1/mcp_servers`) and `mcp-proxy.anthropic.com`. MCP servers
+reach sandboxed agents through sbx's MCP gateway instead (see
+[Tickets and direct Linear access](#tickets-and-direct-linear-access)).
+
+Check the whole path end to end with one throwaway sandbox:
+
+```sh
+imacs sandbox relay-check
+```
+
+It makes a Claude sandbox through the same steps as an agent's and checks that the sandbox reaches the
+relay, that Claude answers through it on the subscription, that nothing shaped like a Claude token in
+the VM's environment, Claude's files or `/tmp` is anything but an IMACS placeholder, and that a revoked
+placeholder is refused. Then it removes the sandbox, its rule and its folder, whatever happened. Each step
+prints a PASS line, and nothing it prints holds a value. On 2026-10-30 it passed in 18 seconds on an Apple
+silicon Mac with sbx v0.50.1 and Claude Code 2.1.306 in the VM. The same day, an interactive Claude agent
+that an isolated IMACS started with the default settings ran sandboxed and answered in its tile through the
+relay, and no process in its VM had anything but a placeholder in its environment or arguments.
 
 ## Linux hosts
 
@@ -152,6 +224,12 @@ imacs doctor
 ```
 
 Load the appropriate `kvm_intel` or `kvm_amd` module if `/dev/kvm` is missing.
+
+Sandboxed Claude uses the same relay and per-sandbox rule as on macOS, with the subscription token in
+the Secret Service through `secret-tool`, which needs an unlocked keyring in the desktop session.
+`scripts/linux-sandbox-smoke.sh` runs `imacs sandbox relay-check` against the real sbx, which shows
+whether `host.docker.internal` leads a Linux sandbox to this machine's loopback; it has not yet run on
+a Linux desktop.
 
 ## Tickets and direct Linear access
 
@@ -359,7 +437,8 @@ tasks. Sandboxed work it checks inside the sandbox (see [Checking sandboxed work
 4. **Restart.** IMACS remembers each session's sandbox. After a restart, or when you resume a session,
    the agent reattaches to the same sandbox, where its conversation lives.
 5. **Cleanup.** Removing a worktree in the cleanup dialog, or a completed plan's worktrees in plan
-   cleanup, also removes its sandboxes (`sbx rm`) and IMACS's MCP registration for each. The worktree
+   cleanup, also removes its sandboxes (`sbx rm`), each one's relay rule and IMACS's MCP registration
+   for each. The worktree
    cleanup dialog also lists **sandboxes whose worktree is gone**, so you can remove orphans. IMACS only
    lists and removes only sandboxes recorded in this home's `sandbox-ownership.json`. Quitting waits for sandbox preparation
    and stop jobs to finish; stopped sandboxes remain available for resume.
@@ -472,8 +551,9 @@ mounted read-only.
 - **Approvals.** Sandboxed agents run unattended: Claude uses `bypassPermissions`, and Codex uses
   `approval_policy = "never"`. The VM mounts and sbx network policy replace IMACS approvals. IMACS
   does not show approval banners or enqueue permission requests for these sessions.
-- **Model credentials.** These reach the agent through sbx's credential proxy, not through files in the
-  sandbox.
+- **Model credentials.** None is in the sandbox. Claude's subscription goes through IMACS's relay with a
+  placeholder (see [Sandboxed Claude on your subscription](#sandboxed-claude-on-your-subscription)); API
+  keys and Codex's credential go through sbx's credential proxy.
 - **Account usage.** The sidebar's Claude and Codex limits come from the agents' own clients, which in a
   sandbox write them inside the VM: Codex in its usual session log, and Claude through a status line that
   only saves its input to `/tmp/imacs-statusline.json` (IMACS gives a sandboxed Claude no other
@@ -533,6 +613,11 @@ tests there, in a worktree that starts from the integration branch.
   [Git on your machine in a sandboxed folder](#git-on-your-machine-in-a-sandboxed-folder)).
 - **The network** is whatever sbx's policy allows, plus `allow_hosts`. `allow-all` gives agents the
   whole internet, which an injected prompt can use to send away code from the worktree.
+- **The relay.** A sandboxed Claude can use the Claude subscription for what its rules allow, inference,
+  while its session lives, and nothing else. Its placeholder is only in its sandbox and in Claude's
+  command line on this machine. The relay listens on loopback only. A program running as you that learns a
+  live placeholder could use it too, but such a program can already read the token's keychain entry with
+  `security` or `secret-tool`.
 - **What you add widens the sandbox.** `mounts` expose folders read-only. `ssh_agent = true` lets an
   agent sign, and push, as you. Every `mcp` server runs on your machine with your permissions and can do
   whatever its tools do.

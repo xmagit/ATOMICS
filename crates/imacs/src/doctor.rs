@@ -180,7 +180,16 @@ fn report(workspace: Option<&str>, for_agent: bool, projects: &[PathBuf]) -> Rep
             let sbx = if cfg!(test) { "/nonexistent/imacs-test-sbx".into() } else { resolve_program("sbx") };
             match crate::sandbox::checks::configured(config, workspace) {
                 Ok(sandbox) => {
-                    let claude = crate::sandbox::checks::claude_sandboxed(config, workspace);
+                    // Nor this machine's keychain.
+                    let keychain = if cfg!(test) {
+                        crate::relay::Keychain::at(
+                            std::path::Path::new("/nonexistent/imacs-test-keychain"),
+                            cfg!(target_os = "macos"),
+                        )
+                    } else {
+                        crate::relay::Keychain::current()
+                    };
+                    let claude = crate::sandbox::checks::claude_route(config, workspace, &keychain);
                     lines.extend(crate::sandbox::doctor_lines(&sbx, &sandbox, claude))
                 }
                 Err(_) => lines.push(check_line(
