@@ -11,6 +11,7 @@ impl State {
         let mut changed = self.drain_actions();
         changed |= self.poll_sandbox_check();
         changed |= self.poll_connections();
+        changed |= self.github_tick();
         for record in std::mem::take(&mut self.resume) {
             self.resume_record(ctx, record);
             changed = true;
@@ -465,8 +466,12 @@ impl State {
                         terminal.set_scrollback(config.terminal.scrollback);
                     }
                 }
+                let github_changed = config.github != self.config.github;
                 self.config = config;
-                self.config_error = None;
+                self.config_error = github::config_problems(&self.config);
+                if github_changed {
+                    self.github_poll_now();
+                }
                 self.theme_error = theme_error(&theme_errors);
                 if syntax_changed {
                     self.highlighter = Arc::new(Highlighter::new(&palette.syntax));

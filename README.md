@@ -73,6 +73,12 @@ says what to take along and what to set up again.
   use (definitions only) and connects one with a click: sbx registers it and its sign-in opens in your
   browser. Every sandboxed session gets every connected server, and a tile whose agent needs a missing one
   offers **Connect <name>**. See [MCP connections](docs/isolation.md#mcp-connections).
+- **GitHub without leaving.** A git icon in the top bar counts the open pull requests of the loaded repositories
+  (yours by default). `Command+G` on macOS, `Ctrl+G` on Linux and Windows, opens the controls. They list each PR with
+  its checks, review state and mergeability. For the selected PR you can open it in the browser, review its diff
+  read-only in the diff viewer, merge it, or admin merge it when GitHub lets you bypass the rules. Workflows you
+  configure run from there too. **Connect GitHub** reuses the `gh` CLI's account after one confirmation, else signs
+  in through the browser. The token stays in the OS keychain and never reaches an agent. See [docs/github.md](docs/github.md).
 - **Remote control and MCP.** Other agents can start, read, review and steer agents in ATOMICS (see below).
 
 ## Run
@@ -120,7 +126,9 @@ portal and external files open through `xdg-open` (`xdg-utils`).
 
 The config is created on first start at `${XDG_CONFIG_HOME:-~/.config}/atomics/config.toml`. It is commented and reloads while ATOMICS runs: agents
 and their commands, `base_ref`, layout breakpoints, fonts, colors, terminal scrollback, shortcuts, and the texts used for
-steering. Themes (built-in `claude`, `midnight`, `atomisk` and the light `paper`, or your own theme files) are described
+steering. `[github]` lists extra repositories and GitHub Enterprise hosts, picks what the counter counts
+(`filter = "mine"`, `"review"` or `"all"`) and defines `[[github.actions]]` workflows with `{repo}`, `{pr}`,
+`{head_sha}`, `{head}` and `{base}` placeholders (see [docs/github.md](docs/github.md)). Themes (built-in `claude`, `midnight`, `atomisk` and the light `paper`, or your own theme files) are described
 in [docs/themes.md](docs/themes.md).
 
 On Linux, a private, user-owned `XDG_RUNTIME_DIR` holds each new install's socket and the compiler jobserver FIFO,
@@ -667,6 +675,9 @@ and `screenshot`. For example,
 
 `cmd` is Command on macOS and Ctrl+Shift on Linux, so it never collides with the terminal's plain Ctrl keys.
 For example, `cmd+p` is Ctrl+Shift+P on Linux. `cmd+shift+space` becomes Ctrl+Shift+Space (Shift is applied once).
+`primary` is Command on macOS and plain Ctrl elsewhere: `primary+g` is Command+G or Ctrl+G. Like Ctrl+1…9, ATOMICS takes it
+before a focused terminal or editor. A `github` binding that collides with another one, or with Ctrl/Command+1…9, is
+reported in the top bar and falls back to `primary+g`.
 Switching agents uses **Ctrl+1…9 on Linux** and **Command+1…9 on macOS**, including while a terminal has focus.
 The digits follow the physical keys, leaving Shift+digits available for symbols such as `!`.
 Tooltips and the settings menu show the actual platform chord, including custom bindings.
@@ -686,6 +697,7 @@ Tooltips and the settings menu show the actual platform chord, including custom 
 | `cmd+t` | new session (scratch folder, existing folder or new worktree) |
 | `cmd+r` | refresh diff |
 | `cmd+w` | close session |
+| `primary+g` (`Command+G` / `Ctrl+G`) | GitHub controls: in them `shift+↓`/`shift+↑` select the next/previous PR, PageDown/PageUp jump to the next/previous repository, Enter opens the PR, `D` loads its diff, `M` merges (after confirming), Esc closes |
 | `Command+1…9` (macOS) / `Ctrl+1…9` (Linux) | select agent 1–9 on screen and focus its diff, or its editor in editor mode |
 
 ## Design

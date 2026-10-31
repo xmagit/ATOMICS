@@ -168,6 +168,7 @@ impl Desktop<'_> {
                 ui.close();
             }
         }
+        self.github_counter(ui, in_menu);
         let response = ui.menu_button("Project", |ui| self.project_menu(ui)).response;
         record_item(ui, "Project", &response);
         if show_load {

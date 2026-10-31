@@ -432,6 +432,9 @@ pub fn shortcut(text: &str) -> Option<KeyboardShortcut> {
     if chord.cmd {
         modifiers |= if cfg!(target_os = "macos") { Modifiers::MAC_CMD } else { Modifiers::CTRL | Modifiers::SHIFT };
     }
+    if chord.primary {
+        modifiers |= if cfg!(target_os = "macos") { Modifiers::MAC_CMD } else { Modifiers::CTRL };
+    }
     if chord.ctrl {
         modifiers |= Modifiers::CTRL;
     }

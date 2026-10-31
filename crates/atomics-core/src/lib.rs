@@ -21,6 +21,7 @@ pub mod doctor;
 pub mod files;
 #[cfg(feature = "native")]
 pub mod git;
+pub mod github;
 pub mod governor;
 pub mod heartbeat;
 pub mod hook;

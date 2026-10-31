@@ -237,6 +237,24 @@ target = "chief"            # "chief", or "active" for the active agent
 # api_key_env = "OPENAI_API_KEY"           # openrouter: "OPENROUTER_API_KEY"; also read from your login shell
 # api_key = "..."                          # discouraged: keep the key in the environment variable instead
 
+[github]
+# The top-bar pull request counter and the controls modal. Connect GitHub signs in.
+enabled = true
+hosts = []                  # GitHub Enterprise hosts whose remotes count, besides github.com
+repos = []                  # more repositories: "owner/name" or "host/owner/name"
+client_id = ""              # OAuth app or GitHub App for Connect GitHub; empty = ATOMICS's app (set one for Enterprise)
+app_slug = ""               # the GitHub App's slug: offers "Install ATOMICS on <owner>" where it is missing
+filter = "mine"             # what the counter counts: "mine", "review" (requested from you) or "all"
+poll_seconds = 60
+# Workflows the modal can run; placeholders {repo} {pr} {head_sha} {head} {base}.
+# [[github.actions]]
+# label = "Release"
+# repo = "owner/name"       # empty = every listed repository
+# workflow = "release.yml"
+# ref = "{base}"            # empty = {base} for scope "pr", the default branch for "repo"
+# scope = "pr"              # "pr": on each pull request; "repo": on the repository
+# inputs = { sha = "{head_sha}", version = "" }   # empty values are asked for when you confirm
+
 [keys]
 toggle_diff = "cmd+d"
 next_attention = "cmd+j"
@@ -249,6 +267,7 @@ toggle_editor = "cmd+e"
 toggle_plan = "cmd+b"
 toggle_chief = "cmd+o"
 voice = "cmd+shift+space"
+github = "primary+g"        # the GitHub controls; primary = Command on macOS, Ctrl elsewhere
 "##;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -275,6 +294,7 @@ pub struct Config {
     pub voice: VoiceConfig,
     pub keys: KeyConfig,
     pub tickets: crate::tickets::TicketConfig,
+    pub github: crate::github::GithubConfig,
 }
 
 /// Automatic cleanup on plan completion and archival. Dirty worktrees are always kept.
@@ -591,12 +611,15 @@ pub struct KeyConfig {
     pub toggle_plan: String,
     pub toggle_chief: String,
     pub voice: String,
+    pub github: String,
 }
 
-/// A parsed shortcut such as `cmd+shift+d`. `cmd` means Command on macOS and Ctrl+Shift elsewhere.
+/// A parsed shortcut such as `cmd+shift+d`. `cmd` means Command on macOS and Ctrl+Shift elsewhere;
+/// `primary` means Command on macOS and Ctrl elsewhere, like the agent chords Ctrl/Command+1…9.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chord {
     pub cmd: bool,
+    pub primary: bool,
     pub ctrl: bool,
     pub alt: bool,
     pub shift: bool,
@@ -638,6 +661,7 @@ impl Default for Config {
             voice: VoiceConfig::default(),
             keys: KeyConfig::default(),
             tickets: crate::tickets::TicketConfig::default(),
+            github: crate::github::GithubConfig::default(),
         }
     }
 }
@@ -684,6 +708,7 @@ impl Default for KeyConfig {
             toggle_plan: "cmd+b".into(),
             toggle_chief: "cmd+o".into(),
             voice: "cmd+shift+space".into(),
+            github: "primary+g".into(),
         }
     }
 }
@@ -803,10 +828,11 @@ fn merge_tables(base: &mut toml::Table, overrides: toml::Table) {
 
 impl Chord {
     pub fn parse(text: &str) -> Option<Chord> {
-        let mut chord = Chord { cmd: false, ctrl: false, alt: false, shift: false, key: String::new() };
+        let mut chord = Chord { cmd: false, primary: false, ctrl: false, alt: false, shift: false, key: String::new() };
         for part in text.split('+').map(str::trim).filter(|p| !p.is_empty()) {
             match part.to_ascii_lowercase().as_str() {
                 "cmd" | "command" | "super" => chord.cmd = true,
+                "primary" => chord.primary = true,
                 "ctrl" | "control" => chord.ctrl = true,
                 "alt" | "option" | "opt" => chord.alt = true,
                 "shift" => chord.shift = true,
