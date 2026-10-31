@@ -397,8 +397,44 @@ failed updates.
 
 ## Chief tools
 
-The chief's prompt gains a section describing the configured system, mode, state map, comment policy and
-`workflow` text. Its tools, all pre-approved:
+When tickets are configured, the chief's prompt gains a section describing the system, mode, state map,
+comment policy and `workflow` text. The default `mode = "auto"` decides once per plan whether its ticket's
+children form a board. Ticket text is data, not instructions; the chief checks related tickets before
+planning or creating tickets to avoid duplicate work. It uses ATOMICS's tools with ATOMICS's sign-in.
+
+The following discovery tools are available only through `atomics mcp --chief`, and are pre-approved:
+
+| Tool | Operation | Reply |
+| --- | --- | --- |
+| `atomics_ticket_search {query, semantic?, take?}` | `search`, or `semantic_search` with `semantic: true` | `{cards: [...]}`; keyword by default; `take` defaults to 25 and is capped at 25. Query text, including spaces, quotes and braces, is substituted literally. |
+| `atomics_ticket_read {ticket}` | `read`, falling back to `get` | `{card: ...}` with the description, mapped comments and development links. Without `read`, body-like fields and a key/value table come from `get`. |
+| `atomics_ticket_children {ticket}` | `children` | `{cards: [...]}` of direct children, up to 25. |
+| `atomics_ticket_related {ticket}` | `related` | `{cards: [...]}` of related tickets, up to 25, including scores when mapped. |
+
+`ticket` is a key/id string (for example `"DEMO-1"`) or a link object (`{id, key?, system?}`) copied from a
+search hit. Keep both id and key when known, so profile placeholders can address either. No plan or linked
+ticket is needed. Each call runs on the ticket worker and returns mapped `TicketCard` fields with the
+link's `id`, `key`, `title`, `state` and `url` at the top level of each card. The MCP reply includes both
+JSON text and `structuredContent` with the same object. Credentials are cleaned from every field and error;
+each body is at most 64 KB, each comment's text 2 KB, and other text fields 2000 characters. Children and
+related lists are read separately with their tools. Chief search results also appear in Find with a
+"from the chief" tag; the user's query box stays as typed.
+
+Failures are normal MCP tool errors (`isError: true`):
+
+- Missing `[tickets]` names `tickets.system` and `tickets.server`.
+- An unmapped operation names `tickets.operations.search`, `.semantic_search`, `.children` or `.related`.
+  Reading requires `tickets.operations.read` or the `tickets.operations.get` fallback.
+- An expired or missing sign-in says `sign-in required; press Sign in in the Tickets panel (tickets.server)`.
+  The call never opens a browser and marks the panel as needing sign-in.
+- Empty queries/references and a zero `take` are rejected; a link naming another system is refused.
+- Transport, server and result-path errors are cleaned through the worker's credential mask.
+
+These four tools are absent from `tools/list` and refused by `tools/call` through `mcp --agent` and
+through an MCP server started without `--chief`. Workers keep their two session-scoped ticket tools
+described under [Agent access](#agent-access).
+
+The existing planning and lifecycle tools are also pre-approved for the chief:
 
 - `atomics_plan_set` takes `ticket` on the plan and on each task. An omitted ticket keeps its link; linking
   the same ticket again keeps what ATOMICS knows about it.

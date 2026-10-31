@@ -338,6 +338,22 @@ impl State {
                 self.link_ticket(target, task, ticket, create, unlink, reply);
                 return;
             }
+            ControlRequest::TicketSearch { query, semantic, take } => {
+                self.chief_ticket(crate::tickets::TicketOp::Search { query, semantic }, take, reply);
+                return;
+            }
+            ControlRequest::TicketRead { ticket } => {
+                self.chief_ticket(crate::tickets::TicketOp::ReadCard(ticket.into_link()), None, reply);
+                return;
+            }
+            ControlRequest::TicketChildren { ticket } => {
+                self.chief_ticket(crate::tickets::TicketOp::Children(ticket.into_link()), None, reply);
+                return;
+            }
+            ControlRequest::TicketRelated { ticket } => {
+                self.chief_ticket(crate::tickets::TicketOp::Related(ticket.into_link()), None, reply);
+                return;
+            }
             ControlRequest::TicketSync { plan } => {
                 self.sync_tickets(plan, reply);
                 return;

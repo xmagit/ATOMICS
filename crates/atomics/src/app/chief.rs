@@ -128,6 +128,10 @@ pub(super) const CHIEF_ALLOWED_TOOLS: &[&str] = &[
     "mcp__atomics__atomics_ticket_link",
     "mcp__atomics__atomics_ticket_sync",
     "mcp__atomics__atomics_ticket_comment",
+    "mcp__atomics__atomics_ticket_search",
+    "mcp__atomics__atomics_ticket_read",
+    "mcp__atomics__atomics_ticket_children",
+    "mcp__atomics__atomics_ticket_related",
     "mcp__atomics__atomics_config_get",
     "mcp__atomics__atomics_config_propose",
     "mcp__atomics__atomics_doctor",
@@ -331,6 +335,13 @@ impl Desktop<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ticket_tools_are_preapproved_for_the_chief() {
+        for tool in ["search", "read", "children", "related"] {
+            assert!(CHIEF_ALLOWED_TOOLS.contains(&format!("mcp__atomics__atomics_ticket_{tool}").as_str()));
+        }
+    }
 
     #[test]
     fn chief_approval_access_and_read_only_defaults_are_documented() {
