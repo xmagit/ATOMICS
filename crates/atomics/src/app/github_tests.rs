@@ -371,7 +371,8 @@ fn github_pull_request_diff_loads_read_only_into_the_diff_viewer() {
         };
         let texts = draw(app);
         assert!(texts.iter().any(|t| t == "octo/widgets#7 Pull request 7"), "{texts:?}");
-        assert!(texts.iter().any(|t| t == "feature-7 → main"));
+        assert!(texts.iter().any(|t| t == "feature-7 → main · sha-7"), "the head the diff was loaded at");
+        assert_eq!(app.runtime.github.pr_diff.as_ref().unwrap().head_sha.as_deref(), Some("sha-7"));
         assert!(texts.iter().any(|t| t.contains("new line from 7")), "the diff's lines are drawn");
         let state = &app.client.github.pr_view.as_ref().unwrap().1;
         assert_eq!(state.prepared.as_ref().unwrap().diff.files.len(), 2);
@@ -606,14 +607,32 @@ fn github_tokens_never_reach_logs_plans_doctor_or_the_screen() {
 #[test]
 fn github_shortcut_toggles_the_modal_before_the_terminal() {
     with_app("app::github::tests::github_shortcut_toggles_the_modal_before_the_terminal", |app, ctx| {
-        // Ordinary typing in the same frame; another letter, since two presses of G at once would be a repeat.
+        // Typing in the same frame; another letter, since two presses of G at once would be a repeat.
+        // Once the shortcut opens the controls they hold the keyboard; once it closes them, the
+        // terminal gets its keys back.
         let typed = vec![key(Key::H, egui::Modifiers::NONE), egui::Event::Text("h".into())];
         let mut events = vec![key(Key::G, primary())];
         events.extend(typed.clone());
-        assert_eq!(route(app, ctx, events), typed, "only the shortcut is withheld from the terminal");
+        assert!(route(app, ctx, events.clone()).is_empty(), "the open controls take the typing too");
         assert!(app.runtime.github.modal);
-        assert!(route(app, ctx, vec![key(Key::G, primary())]).is_empty());
+        assert_eq!(route(app, ctx, events), typed, "only the shortcut is withheld from the terminal");
         assert!(!app.runtime.github.modal, "pressing it again closes the modal");
+        // Letters follow the layout, like the other [keys] bindings. On Dvorak the key at QWERTY's G
+        // types I, so Ctrl/Command+I (Tab in a terminal) stays the terminal's, and the key labelled G
+        // (at QWERTY's U) opens the controls.
+        let dvorak = |key: Key, physical: Key| egui::Event::Key {
+            key,
+            physical_key: Some(physical),
+            pressed: true,
+            repeat: false,
+            modifiers: primary(),
+        };
+        assert_eq!(route(app, ctx, vec![dvorak(Key::I, Key::G)]), [dvorak(Key::I, Key::G)]);
+        assert!(!app.runtime.github.modal, "the key at G's place is not G");
+        assert!(route(app, ctx, vec![dvorak(Key::G, Key::U)]).is_empty());
+        assert!(app.runtime.github.modal, "the key labelled G opens the controls");
+        assert!(route(app, ctx, vec![dvorak(Key::G, Key::U)]).is_empty());
+        assert!(!app.runtime.github.modal);
         let plain = vec![key(Key::G, egui::Modifiers::NONE), egui::Event::Text("g".into())];
         assert_eq!(route(app, ctx, plain.clone()), plain, "a plain g is the terminal's");
         assert!(!app.runtime.github.modal);
@@ -626,6 +645,8 @@ fn github_shortcut_toggles_the_modal_before_the_terminal() {
         app.runtime.config.keys.github = "alt+g".into();
         route(app, ctx, vec![key(Key::G, egui::Modifiers::ALT)]);
         assert!(app.runtime.github.modal);
+        route(app, ctx, vec![key(Key::G, egui::Modifiers::ALT)]);
+        assert!(!app.runtime.github.modal);
         let old = key(Key::G, primary());
         assert_eq!(route(app, ctx, vec![old.clone()]), [old]);
     });
@@ -691,17 +712,45 @@ fn github_modal_keys_select_open_view_merge_and_close() {
         let remaining = route(app, ctx, vec![key(Key::D, egui::Modifiers::NONE), egui::Event::Text("d".into())]);
         assert!(remaining.is_empty(), "neither D nor its text reaches the terminal: {remaining:?}");
         assert_eq!(app.runtime.github.pr_diff.as_ref().map(|view| view.number), Some(7));
-        route(app, ctx, vec![key(Key::M, egui::Modifiers::NONE), egui::Event::Text("m".into())]);
+        // Letters follow the layout: on AZERTY the key at QWERTY's M types a comma, and M sits at its
+        // semicolon. The comma does nothing, and neither key's text reaches the terminal.
+        let typed = |key: Key, physical: Key, text: &str| {
+            let modifiers = egui::Modifiers::NONE;
+            vec![
+                egui::Event::Key { key, physical_key: Some(physical), pressed: true, repeat: false, modifiers },
+                egui::Event::Text(text.into()),
+            ]
+        };
+        assert!(route(app, ctx, typed(Key::Comma, Key::M, ",")).is_empty());
+        assert!(app.client.github.confirm.is_none(), "a comma is no M");
+        assert!(route(app, ctx, typed(Key::M, Key::Semicolon, "m")).is_empty());
         assert!(matches!(app.client.github.confirm, Some(Confirm::Merge { number: 7, admin: false, .. })));
         assert!(fake.merges().is_empty(), "M only asks");
-        // While the confirmation is up, its own window has the keys.
-        let escape = key(Key::Escape, egui::Modifiers::NONE);
-        assert_eq!(route(app, ctx, vec![escape.clone()]), std::slice::from_ref(&escape));
-        assert!(app.runtime.github.modal);
-        app.client.github.confirm = None;
-        press(app, Key::ArrowDown, egui::Modifiers::SHIFT);
-        route(app, ctx, vec![key(Key::M, egui::Modifiers::NONE)]);
+        // The confirmation holds the keyboard too: text, a paste, Backspace and Shift+↓ reach nothing.
+        let none = egui::Modifiers::NONE;
+        let typing = vec![
+            egui::Event::Text("half a prompt".into()),
+            egui::Event::Paste("pasted".into()),
+            key(Key::Backspace, none),
+            key(Key::ArrowDown, egui::Modifiers::SHIFT),
+        ];
+        assert!(route(app, ctx, typing).is_empty(), "nothing reaches the terminal behind the confirmation");
+        assert!(matches!(app.client.github.confirm, Some(Confirm::Merge { number: 7, .. })), "it stays on #7");
+        // Esc cancels the confirmation only; the agent never receives it.
+        assert!(route(app, ctx, vec![key(Key::Escape, none)]).is_empty(), "Esc is the confirmation's");
+        assert!(app.client.github.confirm.is_none() && app.runtime.github.modal);
+        assert!(fake.merges().is_empty());
+        // Enter confirms, and is not the agent's either.
+        route(app, ctx, vec![key(Key::M, none)]);
+        assert!(route(app, ctx, vec![key(Key::Enter, none)]).is_empty(), "Enter is the confirmation's");
+        assert!(app.client.github.confirm.is_none());
+        settle(app, "the merge", |app| !app.runtime.github.is_busy(&repo(), 7));
+        assert_eq!(fake.merges().iter().map(|merge| merge.1).collect::<Vec<_>>(), [7]);
+        poll(app);
+        // #7 is gone, so #8 is selected: it is blocked, so M offers no merge.
+        route(app, ctx, vec![key(Key::M, none)]);
         assert!(app.client.github.confirm.is_none(), "#8 is blocked: no merge");
+        let escape = key(Key::Escape, none);
         assert!(app.runtime.github.notice.as_deref().unwrap().contains("cannot merge yet"));
         assert!(route(app, ctx, vec![escape.clone()]).is_empty());
         assert!(!app.runtime.github.modal);
@@ -743,5 +792,90 @@ fn github_pull_request_diff_takes_the_diff_keys() {
         assert!(route_to(app, ctx, diff_view::focus_id(), page_down()).is_empty());
         assert_eq!(focused(app).as_deref(), Some("src/pr7.rs"));
         assert!(app.client.diff_views.values().all(|state| state.focused.is_none()), "no worktree diff moved");
+    });
+}
+
+#[test]
+fn github_merge_sends_the_reviewed_head_and_a_moved_branch_is_refused() {
+    with_app("app::github::tests::github_merge_sends_the_reviewed_head_and_a_moved_branch_is_refused", |app, ctx| {
+        let dir = crate::test_support::tempdir().unwrap();
+        let fake = FakeGithub::start(TOKEN);
+        pulls(&fake);
+        connect_to(app, &fake, dir.path());
+        store(app).put_github_app("github.com", TOKEN).unwrap();
+        app.runtime.github_set_modal(true);
+        poll(app);
+        app.client.github.selected = Some((repo(), 7));
+        // Without a loaded diff, Merge sends the head the list shows, and says so.
+        click(app, ctx, "Merge");
+        assert!(has(&show(app, ctx), "Head sha-7; its diff was not loaded here"));
+        app.client.github.confirm = None;
+        // View diff records the head it was loaded at.
+        let loaded = |sha: &'static str| {
+            move |app: &Desktop<'_>| {
+                app.runtime.github.pr_diff.as_ref().is_some_and(|view| view.head_sha.as_deref() == Some(sha))
+            }
+        };
+        click(app, ctx, "View diff");
+        settle(app, "the diff at sha-7", loaded("sha-7"));
+        // A push after the review: the list shows the new head, the merge still sends the reviewed one.
+        fake.push(&repo(), 7, "sha-7-pushed");
+        poll(app);
+        let row = |app: &Desktop<'_>| {
+            app.runtime.github.rows(atomics_core::github::Filter::All).into_iter().find(|row| row.pull.number == 7)
+        };
+        assert_eq!(row(app).unwrap().pull.head_sha, "sha-7-pushed");
+        click(app, ctx, "Merge");
+        let texts = show(app, ctx);
+        assert!(has(&texts, "Head sha-7, the commit whose diff you loaded"), "{texts:?}");
+        assert!(
+            texts.iter().any(|(text, _)| text.starts_with("The branch has moved to sha-7-p since")),
+            "the moved head is named: {texts:?}"
+        );
+        click(app, ctx, "Merge");
+        settle(app, "the refused merge", |app| !app.runtime.github.is_busy(&repo(), 7));
+        assert!(fake.merges().is_empty(), "nothing merged");
+        let sent: Vec<serde_json::Value> = fake
+            .seen()
+            .iter()
+            .filter(|seen| seen.method == "PUT")
+            .map(|seen| serde_json::from_str(&seen.body).unwrap())
+            .collect();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["sha"], json!("sha-7"), "the reviewed head, not the pushed one");
+        let notice = app.runtime.github.notice.clone().unwrap();
+        assert!(notice.contains("409") && notice.contains("Head branch was modified"), "{notice}");
+        assert!(row(app).is_some(), "the pull request is still open");
+        // Loading the diff again reviews the new head, which then merges.
+        click(app, ctx, "View diff");
+        settle(app, "the diff at the pushed head", loaded("sha-7-pushed"));
+        click(app, ctx, "Merge");
+        assert!(has(&show(app, ctx), "Head sha-7-p, the commit whose diff you loaded"));
+        click(app, ctx, "Merge");
+        settle(app, "the merge", |app| !app.runtime.github.is_busy(&repo(), 7));
+        let merges = fake.merges();
+        assert_eq!(merges.iter().map(|merge| merge.1).collect::<Vec<_>>(), [7]);
+        assert_eq!(merges[0].2["sha"], json!("sha-7-pushed"));
+    });
+}
+
+#[test]
+fn github_config_problems_are_reported_while_the_config_still_loads() {
+    with_app("app::github::tests::github_config_problems_are_reported_while_the_config_still_loads", |app, ctx| {
+        let path = app.runtime.config_path.clone();
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str(
+            "\n[[github.actions]]\nlabel = \"Release\"\nworkflow = \"release.yml\"\nscope = \"repo\"\ninputs = { pr = \"{pr}\" }\n",
+        );
+        std::fs::write(&path, text).unwrap();
+        app.runtime.config_checked = Instant::now() - Duration::from_secs(2);
+        app.runtime.runtime_tick(ctx);
+        assert_eq!(app.runtime.config.github.actions.len(), 1, "the config loaded and applies");
+        assert!(app.runtime.config_error.is_none(), "{:?}", app.runtime.config_error);
+        let problems = app.runtime.config_problems.clone().unwrap();
+        assert!(problems.contains("[[github.actions]] Release: {pr} needs a pull request"), "{problems}");
+        let got = app.runtime.config_get(None, None).unwrap();
+        assert_eq!(got["running_on_last_good_config"], json!(false), "the chief is not told it failed to load");
+        assert!(got["load_error"].is_null());
     });
 }

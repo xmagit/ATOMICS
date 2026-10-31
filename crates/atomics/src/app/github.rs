@@ -43,6 +43,9 @@ pub(super) struct Github {
     /// The outcome of the last action, shown in the modal.
     pub(super) notice: Option<String>,
     pub(super) pr_diff: Option<PrDiff>,
+    /// The head commit each pull request's diff was loaded at. Merge sends it, so GitHub refuses
+    /// (409) a merge whose branch moved after the diff was reviewed.
+    reviewed: BTreeMap<(RepoId, u64), String>,
     /// Tests reach a fake GitHub, a fake `gh` and a stand-in browser.
     pub(super) endpoints: Endpoints,
     pub(super) browser: Option<crate::connections::Browser>,
@@ -86,6 +89,8 @@ pub(super) struct PrDiff {
     pub title: String,
     pub head: String,
     pub base: String,
+    /// The head commit the diff on screen was loaded at.
+    pub head_sha: Option<String>,
     pub prepared: Option<Result<Arc<diff_view::Prepared>, String>>,
     /// The session and worktree it was opened over; selecting another one closes it.
     pub over: (Option<String>, Option<PathBuf>),
@@ -100,7 +105,8 @@ enum Done {
     Merged { repo: RepoId, number: u64, admin: bool, result: Result<String, String> },
     Dispatched { repo: RepoId, label: String, result: Result<String, String> },
     Runs(Vec<((RepoId, String), RunStatus)>),
-    Diff { repo: RepoId, number: u64, result: Result<Arc<diff_view::Prepared>, String> },
+    /// The diff and the head commit it was loaded at.
+    Diff { repo: RepoId, number: u64, result: Result<(Arc<diff_view::Prepared>, String), String> },
 }
 
 /// What the top-bar counter shows.
@@ -181,6 +187,22 @@ impl Github {
             }
         }
         installs
+    }
+
+    /// "Merge pull request?" for `row`, sending the head its diff was loaded at when it was, else the
+    /// head the list shows. GitHub refuses (409) a merge whose head has moved past that commit.
+    pub(super) fn merge_confirm(&self, row: &Row, method: MergeMethod, admin: bool) -> Confirm {
+        let reviewed = self.reviewed.get(&(row.repo.clone(), row.pull.number));
+        Confirm::Merge {
+            repo: row.repo.clone(),
+            number: row.pull.number,
+            title: row.pull.title.clone(),
+            method,
+            sha: reviewed.cloned().unwrap_or_else(|| row.pull.head_sha.clone()),
+            latest: row.pull.head_sha.clone(),
+            reviewed: reviewed.is_some(),
+            admin,
+        }
     }
 
     pub(super) fn is_dispatching(&self, repo: &RepoId, label: &str) -> bool {
@@ -396,10 +418,16 @@ impl State {
                 if let Some(view) =
                     self.github.pr_diff.as_mut().filter(|view| view.repo == repo && view.number == number)
                 {
-                    let failed = result.is_err();
-                    view.prepared = Some(result);
-                    if failed {
-                        self.github_poll_now();
+                    match result {
+                        Ok((prepared, sha)) => {
+                            view.head_sha = Some(sha.clone());
+                            view.prepared = Some(Ok(prepared));
+                            self.github.reviewed.insert((repo, number), sha);
+                        }
+                        Err(error) => {
+                            view.prepared = Some(Err(error));
+                            self.github_poll_now();
+                        }
                     }
                 }
             }
@@ -453,6 +481,11 @@ impl State {
                 }
             }
         }
+        // A reviewed head is kept only while its pull request is still open.
+        let lists = &self.github.lists;
+        self.github
+            .reviewed
+            .retain(|(repo, number), _| lists.get(repo).is_some_and(|l| l.pulls.iter().any(|p| p.number == *number)));
         for (repo, details) in polled.details {
             let listing = self.github.lists.entry(repo).or_default();
             match details {
@@ -656,6 +689,7 @@ impl State {
             title: pull.title.clone(),
             head: pull.head.clone(),
             base: pull.base.clone(),
+            head_sha: None,
             prepared: None,
             over: (self.active.clone(), self.diff_root.clone()),
         });
@@ -664,6 +698,9 @@ impl State {
         let (api, highlighter, number) = (self.github_api(&repo.host), self.highlighter.clone(), pull.number);
         self.github_job(move |tx| {
             let result = api().and_then(|mut signed| {
+                // The head first, then the diff: a push in between leaves the diff newer than the
+                // recorded head, so a merge of that head fails instead of merging unreviewed code.
+                let sha = signed.call(|api| api.head(&repo, number)).map_err(|error| error.to_string())?;
                 let text = signed.call(|api| api.diff(&repo, number)).map_err(|error| error.to_string())?;
                 let mut files = atomics_core::diff::parse_unified(&text);
                 files.sort_by(|a, b| a.path().cmp(b.path()));
@@ -673,7 +710,7 @@ impl State {
                     files,
                     partial: false,
                 };
-                Ok(crate::diff_worker::prepare_diff(diff, &highlighter))
+                Ok((crate::diff_worker::prepare_diff(diff, &highlighter), sha))
             });
             let _ = tx.send(Done::Diff { repo, number, result });
         });
@@ -697,7 +734,12 @@ pub(super) enum Confirm {
         number: u64,
         title: String,
         method: MergeMethod,
+        /// The head commit sent with the merge: the one whose diff was loaded, else the listed one.
         sha: String,
+        /// The head the list shows now; when it is not `sha`, GitHub will refuse the merge.
+        latest: String,
+        /// `sha` is the commit whose diff was loaded in the diff viewer.
+        reviewed: bool,
         admin: bool,
     },
     Dispatch {
@@ -747,6 +789,14 @@ pub(super) fn dispatch_confirm(repo: &RepoId, action: &Action, pull: Option<&Pul
         inputs.insert(key.clone(), value);
     }
     Ok(Confirm::Dispatch { repo: repo.clone(), action: action.clone(), git_ref, inputs, asked })
+}
+
+/// What "editor" says on a pull request diff, whose files are in no worktree here.
+pub(super) const READ_ONLY: &str = "A pull request diff is read-only; open the pull request to edit its branch";
+
+/// A commit's short form, as GitHub shows it.
+pub(super) fn short_sha(sha: &str) -> &str {
+    sha.get(..7).unwrap_or(sha)
 }
 
 /// GitHub's page for revoking an app's authorization; ATOMICS never calls the revoke API, which
@@ -997,11 +1047,14 @@ impl Desktop<'_> {
         }
     }
 
-    /// The modal's keys, taken before the terminal while it is open: Shift+↓/↑ select the next or
-    /// previous pull request, PageDown/PageUp jump to the next or previous repository's, Enter opens
-    /// it, D loads its diff, M asks to merge it, Esc closes. A text field keeps its keys.
+    /// While the controls are open they hold the keyboard, so nothing typed reaches the terminal or
+    /// editor that had focus. Shift+↓/↑ select the next or previous pull request, PageDown/PageUp
+    /// jump to the next or previous repository's, Enter opens it, D loads its diff, M asks to merge
+    /// it and Esc closes. In a confirmation, Enter confirms and Esc cancels. Letters match the key
+    /// the layout types. All other keys and text are dropped, except the application chords and
+    /// Ctrl/Command+1…9, which still work. A text field (a workflow input) keeps its keys.
     pub(super) fn github_keys(&mut self, ctx: &egui::Context) {
-        if !self.runtime.github.modal || self.client.github.confirm.is_some() || ctx.text_edit_focused() {
+        if !self.runtime.github.modal || ctx.text_edit_focused() {
             return;
         }
         #[derive(Clone, Copy, PartialEq)]
@@ -1012,45 +1065,64 @@ impl Desktop<'_> {
             Diff,
             Merge,
             Close,
+            Confirm,
+            Cancel,
         }
+        let confirming = self.client.github.confirm.is_some();
+        let agent = if cfg!(target_os = "macos") { egui::Modifiers::MAC_CMD } else { egui::Modifiers::CTRL };
         let found = ctx.input_mut(|input| {
             let mut found = None;
             input.events.retain(|event| {
-                let egui::Event::Key { key, physical_key, pressed: true, modifiers, .. } = event else { return true };
-                if found.is_some() {
-                    return true;
-                }
-                let shift = modifiers.matches_exact(egui::Modifiers::SHIFT);
-                let plain = modifiers.is_none();
-                found = match physical_key.unwrap_or(*key) {
-                    Key::ArrowDown if shift => Some(Move::Row(1)),
-                    Key::ArrowUp if shift => Some(Move::Row(-1)),
-                    Key::PageDown if plain => Some(Move::Section(1)),
-                    Key::PageUp if plain => Some(Move::Section(-1)),
-                    Key::Enter if plain => Some(Move::Open),
-                    Key::D if plain => Some(Move::Diff),
-                    Key::M if plain => Some(Move::Merge),
-                    Key::Escape if plain => Some(Move::Close),
+                let (key, physical, repeat, modifiers) = match event {
+                    // Typed or pasted text would land in the terminal behind the controls.
+                    egui::Event::Text(_) | egui::Event::Paste(_) => return false,
+                    egui::Event::Key { key, physical_key, pressed: true, repeat, modifiers } => {
+                        (*key, physical_key.unwrap_or(*key), *repeat, *modifiers)
+                    }
                     _ => return true,
                 };
+                if crate::theme::is_app_chord(&modifiers)
+                    || (crate::theme::is_digit(physical) && modifiers.matches_exact(agent))
+                {
+                    return true;
+                }
+                if found.is_none() {
+                    let shift = modifiers.matches_exact(egui::Modifiers::SHIFT);
+                    let once = modifiers.is_none() && !repeat;
+                    found = match key {
+                        Key::Escape if once => Some(if confirming { Move::Cancel } else { Move::Close }),
+                        Key::Enter if once => Some(if confirming { Move::Confirm } else { Move::Open }),
+                        _ if confirming => None,
+                        Key::ArrowDown if shift => Some(Move::Row(1)),
+                        Key::ArrowUp if shift => Some(Move::Row(-1)),
+                        Key::PageDown if modifiers.is_none() => Some(Move::Section(1)),
+                        Key::PageUp if modifiers.is_none() => Some(Move::Section(-1)),
+                        Key::D if once => Some(Move::Diff),
+                        Key::M if once => Some(Move::Merge),
+                        _ => None,
+                    };
+                }
                 false
             });
-            // The letter's text goes nowhere either, so a focused terminal does not type it.
-            if let Some(letter) = match found {
-                Some(Move::Diff) => Some("d"),
-                Some(Move::Merge) => Some("m"),
-                _ => None,
-            } {
-                input
-                    .events
-                    .retain(|event| !matches!(event, egui::Event::Text(text) if text.eq_ignore_ascii_case(letter)));
-            }
             found
         });
         let Some(found) = found else { return };
-        if found == Move::Close {
-            self.runtime.github_set_modal(false);
-            return;
+        match found {
+            Move::Close => {
+                self.runtime.github_set_modal(false);
+                return;
+            }
+            Move::Cancel => {
+                self.client.github.confirm = None;
+                return;
+            }
+            Move::Confirm => {
+                if let Some(confirm) = self.client.github.confirm.take() {
+                    self.github_run_confirmed(confirm);
+                }
+                return;
+            }
+            _ => {}
         }
         let (rows, selected) = self.github_rows();
         let Some(current) = selected else { return };
@@ -1081,14 +1153,7 @@ impl Desktop<'_> {
                 let method = self.client.github.methods.get(&row.repo).copied().filter(|m| methods.contains(m));
                 match method.or_else(|| methods.first().copied()) {
                     Some(method) if mergeable => {
-                        self.client.github.confirm = Some(Confirm::Merge {
-                            repo: row.repo.clone(),
-                            number: row.pull.number,
-                            title: row.pull.title.clone(),
-                            method,
-                            sha: row.pull.head_sha.clone(),
-                            admin: false,
-                        })
+                        self.client.github.confirm = Some(self.runtime.github.merge_confirm(&row, method, false))
                     }
                     _ => {
                         self.runtime.github.notice = Some(format!("{}#{} cannot merge yet", row.repo, row.pull.number))
@@ -1259,14 +1324,7 @@ impl Desktop<'_> {
             }
         });
         if let Some((method, admin)) = confirm {
-            self.client.github.confirm = Some(Confirm::Merge {
-                repo: repo.clone(),
-                number: pull.number,
-                title: pull.title.clone(),
-                method,
-                sha: pull.head_sha.clone(),
-                admin,
-            });
+            self.client.github.confirm = Some(self.runtime.github.merge_confirm(&row, method, admin));
         }
         let actions: Vec<Action> = (self.runtime.config.github.actions.iter())
             .filter(|action| action.scope == Scope::Pr && action.applies_to(&repo))
@@ -1348,6 +1406,10 @@ impl Desktop<'_> {
     /// Merges, admin merges and dispatches ask once, like closing a session.
     fn github_confirm_dialog(&mut self, ctx: &egui::Context) {
         let Some(mut confirm) = self.client.github.confirm.take() else { return };
+        // Closing the controls drops a confirmation they asked for.
+        if !self.runtime.github.modal {
+            return;
+        }
         let mut keep = true;
         let mut go = false;
         let title = match &confirm {
@@ -1362,9 +1424,24 @@ impl Desktop<'_> {
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 let label = match &mut confirm {
-                    Confirm::Merge { repo, number, title, method, admin, .. } => {
+                    Confirm::Merge { repo, number, title, method, sha, latest, reviewed, admin } => {
                         ui.label(format!("{repo}#{number} “{title}”"));
                         ui.label(method.label());
+                        ui.label(if *reviewed {
+                            format!("Head {}, the commit whose diff you loaded", short_sha(sha))
+                        } else {
+                            format!("Head {}; its diff was not loaded here", short_sha(sha))
+                        });
+                        if sha != latest {
+                            ui.label(
+                                RichText::new(format!(
+                                    "The branch has moved to {} since, so GitHub will refuse this merge. \
+                                     Load the diff again to review the new head.",
+                                    short_sha(latest)
+                                ))
+                                .color(self.runtime.palette.warning),
+                            );
+                        }
                         if *admin {
                             ui.label(
                                 RichText::new("This bypasses the branch rules that block it.")
@@ -1398,16 +1475,21 @@ impl Desktop<'_> {
                 });
             });
         if go {
-            match confirm {
-                Confirm::Merge { repo, number, method, sha, admin, .. } => {
-                    self.runtime.github_merge(repo, number, method, sha, admin)
-                }
-                Confirm::Dispatch { repo, action, git_ref, inputs, .. } => {
-                    self.runtime.github_dispatch(repo, action, git_ref, inputs)
-                }
-            }
+            self.github_run_confirmed(confirm);
         } else if keep {
             self.client.github.confirm = Some(confirm);
+        }
+    }
+
+    /// Runs what the user just confirmed.
+    fn github_run_confirmed(&mut self, confirm: Confirm) {
+        match confirm {
+            Confirm::Merge { repo, number, method, sha, admin, .. } => {
+                self.runtime.github_merge(repo, number, method, sha, admin)
+            }
+            Confirm::Dispatch { repo, action, git_ref, inputs, .. } => {
+                self.runtime.github_dispatch(repo, action, git_ref, inputs)
+            }
         }
     }
 
@@ -1419,7 +1501,10 @@ impl Desktop<'_> {
         };
         let key = (view.repo.clone(), view.number);
         let title = format!("{}#{} {}", view.repo, view.number, view.title);
-        let branch = format!("{} → {}", view.head, view.base);
+        let branch = match &view.head_sha {
+            Some(sha) => format!("{} → {} · {}", view.head, view.base, short_sha(sha)),
+            None => format!("{} → {}", view.head, view.base),
+        };
         let prepared = view.prepared.clone();
         if self.client.github.pr_view.as_ref().is_none_or(|(shown, _)| *shown != key) {
             self.client.github.pr_view = Some((key.clone(), DiffState::default()));
@@ -1479,9 +1564,7 @@ impl Desktop<'_> {
                     }
                 }
             }
-            DiffAction::Edit { .. } => {
-                self.runtime.toast("A pull request diff is read-only; open the pull request to edit its branch")
-            }
+            DiffAction::Edit { .. } => self.runtime.toast(READ_ONLY),
             DiffAction::Split(on) => {
                 self.client.diff_split = Some(if on { DiffSplit::Always } else { DiffSplit::Never })
             }

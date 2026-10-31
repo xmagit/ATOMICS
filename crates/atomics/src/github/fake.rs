@@ -32,6 +32,8 @@ pub struct FakePull {
     pub merge_state: String,
     pub admin: bool,
     pub draft: bool,
+    /// The head commit; `sha-<number>` until a test pushes.
+    pub head_sha: String,
     /// The head commit's check rollup: SUCCESS, FAILURE or PENDING.
     pub checks: String,
     pub diff: String,
@@ -46,6 +48,7 @@ pub fn pull(number: u64, author: &str, requested: &[&str], merge_state: &str, ad
         merge_state: merge_state.into(),
         admin,
         draft: false,
+        head_sha: format!("sha-{number}"),
         checks: if merge_state == "CLEAN" { "SUCCESS" } else { "FAILURE" }.into(),
         diff: format!(
             "diff --git a/src/pr{number}.rs b/src/pr{number}.rs\nnew file mode 100644\nindex 0000000..1111111\n--- /dev/null\n+++ b/src/pr{number}.rs\n@@ -0,0 +1,2 @@\n+// pull request {number}\n+fn changed() {{}}\ndiff --git a/README.md b/README.md\nindex 2222222..3333333 100644\n--- a/README.md\n+++ b/README.md\n@@ -1,2 +1,2 @@\n # Widgets\n-old line\n+new line from {number}\n"
@@ -106,6 +109,14 @@ impl FakeGithub {
         let entry = data.repos.entry(repo.full_name()).or_default();
         entry.0 += 1;
         entry.1.push(pull);
+    }
+
+    /// A push to pull request `number`: its head becomes `sha`, and the list's ETag changes.
+    pub fn push(&self, repo: &RepoId, number: u64, sha: &str) {
+        let mut data = self.data.lock().unwrap();
+        let (version, pulls) = data.repos.get_mut(&repo.full_name()).expect("a pull request of this repository");
+        pulls.iter_mut().find(|pull| pull.number == number).expect("the pull request").head_sha = sha.into();
+        *version += 1;
     }
 
     /// Answers 429 to everything, with `retry-after` when given.
@@ -298,7 +309,7 @@ fn respond(seen: &Seen, data: &mut Data) -> Response {
                         "html_url": format!("https://github.com/{owner}/{name}/pull/{}", pull.number),
                         "user": { "login": pull.author },
                         "draft": pull.draft,
-                        "head": { "ref": format!("feature-{}", pull.number), "sha": format!("sha-{}", pull.number) },
+                        "head": { "ref": format!("feature-{}", pull.number), "sha": pull.head_sha },
                         "base": { "ref": "main" },
                         "requested_reviewers": pull.requested.iter().map(|login| json!({ "login": login })).collect::<Vec<_>>(),
                     })
@@ -315,7 +326,12 @@ fn respond(seen: &Seen, data: &mut Data) -> Response {
                 Some(pull) if seen.header("accept").as_deref() == Some("application/vnd.github.diff") => {
                     (200, vec![("content-type", "text/plain".into())], pull.diff.clone())
                 }
-                Some(_) => json_reply(200, json!({ "number": number })),
+                Some(pull) => json_reply(
+                    200,
+                    json!({ "number": pull.number,
+                            "head": { "ref": format!("feature-{}", pull.number), "sha": pull.head_sha },
+                            "base": { "ref": "main" } }),
+                ),
                 None => json_reply(404, json!({ "message": "Not Found" })),
             }
         }
@@ -329,7 +345,7 @@ fn respond(seen: &Seen, data: &mut Data) -> Response {
                 return json_reply(404, json!({ "message": "Not Found" }));
             };
             let pull = &pulls[index];
-            if request["sha"].as_str() != Some(&format!("sha-{}", pull.number)) {
+            if request["sha"].as_str() != Some(pull.head_sha.as_str()) {
                 return json_reply(
                     409,
                     json!({ "message": "Head branch was modified. Review and try the merge again." }),

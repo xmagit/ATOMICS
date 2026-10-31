@@ -458,6 +458,39 @@ pub fn consume_physical_shortcut(input: &mut egui::InputState, chord: &KeyboardS
     input.events.len() < before
 }
 
+/// Consumes a configured chord taken before the terminal, with exactly its modifiers. A letter
+/// matches the key the keyboard layout types, as the other `[keys]` bindings do, so Ctrl+G is the
+/// key labelled G on Colemak or Dvorak too. A digit matches its physical key, like Ctrl/Command+1…9,
+/// because some layouts type digits only with Shift. Layouts without Latin letters still work:
+/// egui reports the Latin key at that position as the logical key.
+pub fn consume_chord(input: &mut egui::InputState, chord: &KeyboardShortcut) -> bool {
+    if is_digit(chord.logical_key) {
+        return consume_physical_shortcut(input, chord);
+    }
+    let before = input.events.len();
+    input.events.retain(|event| {
+        !matches!(event, egui::Event::Key { key, modifiers, pressed: true, .. }
+            if *key == chord.logical_key && modifiers.matches_exact(chord.modifiers))
+    });
+    input.events.len() < before
+}
+
+pub fn is_digit(key: Key) -> bool {
+    matches!(
+        key,
+        Key::Num0
+            | Key::Num1
+            | Key::Num2
+            | Key::Num3
+            | Key::Num4
+            | Key::Num5
+            | Key::Num6
+            | Key::Num7
+            | Key::Num8
+            | Key::Num9
+    )
+}
+
 /// Display exactly the platform modifiers used to consume the configured chord.
 pub fn shortcut_label(ctx: &egui::Context, text: &str) -> String {
     shortcut(text).map(|chord| ctx.format_shortcut(&chord)).unwrap_or_else(|| text.to_string())

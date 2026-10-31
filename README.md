@@ -74,7 +74,7 @@ says what to take along and what to set up again.
   browser. Every sandboxed session gets every connected server, and a tile whose agent needs a missing one
   offers **Connect <name>**. See [MCP connections](docs/isolation.md#mcp-connections).
 - **GitHub without leaving.** A git icon in the top bar counts the open pull requests of the loaded repositories
-  (yours by default). `Command+G` on macOS, `Ctrl+G` on Linux and Windows, opens the controls. They list each PR with
+  (yours by default). `Command+G` on macOS, `Ctrl+G` on Linux, opens the controls. They list each PR with
   its checks, review state and mergeability. For the selected PR you can open it in the browser, review its diff
   read-only in the diff viewer, merge it, or admin merge it when GitHub lets you bypass the rules. Workflows you
   configure run from there too. **Connect GitHub** reuses the `gh` CLI's account after one confirmation, else signs
@@ -676,8 +676,9 @@ and `screenshot`. For example,
 `cmd` is Command on macOS and Ctrl+Shift on Linux, so it never collides with the terminal's plain Ctrl keys.
 For example, `cmd+p` is Ctrl+Shift+P on Linux. `cmd+shift+space` becomes Ctrl+Shift+Space (Shift is applied once).
 `primary` is Command on macOS and plain Ctrl elsewhere: `primary+g` is Command+G or Ctrl+G. Like Ctrl+1…9, ATOMICS takes it
-before a focused terminal or editor. A `github` binding that collides with another one, or with Ctrl/Command+1…9, is
-reported in the top bar and falls back to `primary+g`.
+before a focused terminal or editor. Its letter follows the keyboard layout. On Linux that takes Claude Code's own Ctrl+G
+(edit the prompt in an editor), so bind `github` elsewhere, for example `cmd+g`, to keep it. A `github` binding that
+collides with another one, or with Ctrl/Command+1…9, is reported in the top bar and falls back to `primary+g`.
 Switching agents uses **Ctrl+1…9 on Linux** and **Command+1…9 on macOS**, including while a terminal has focus.
 The digits follow the physical keys, leaving Shift+digits available for symbols such as `!`.
 Tooltips and the settings menu show the actual platform chord, including custom bindings.
@@ -697,7 +698,7 @@ Tooltips and the settings menu show the actual platform chord, including custom 
 | `cmd+t` | new session (scratch folder, existing folder or new worktree) |
 | `cmd+r` | refresh diff |
 | `cmd+w` | close session |
-| `primary+g` (`Command+G` / `Ctrl+G`) | GitHub controls: in them `shift+↓`/`shift+↑` select the next/previous PR, PageDown/PageUp jump to the next/previous repository, Enter opens the PR, `D` loads its diff, `M` merges (after confirming), Esc closes |
+| `primary+g` (`Command+G` / `Ctrl+G`) | GitHub controls, which hold the keyboard while open: `shift+↓`/`shift+↑` select the next/previous PR, PageDown/PageUp jump to the next/previous repository, Enter opens the PR, `D` loads its diff, `M` merges (after confirming; Enter confirms, Esc cancels), Esc closes |
 | `Command+1…9` (macOS) / `Ctrl+1…9` (Linux) | select agent 1–9 on screen and focus its diff, or its editor in editor mode |
 
 ## Design

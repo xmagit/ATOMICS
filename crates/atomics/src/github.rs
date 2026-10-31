@@ -336,6 +336,16 @@ impl Api {
         Ok(value["message"].as_str().unwrap_or("Pull request merged").into())
     }
 
+    /// The pull request's head commit now.
+    pub fn head(&self, repo: &RepoId, number: u64) -> Result<String, ApiError> {
+        let value = self.get_json(&format!("/repos/{}/pulls/{number}", repo.full_name()))?;
+        value["head"]["sha"]
+            .as_str()
+            .filter(|sha| !sha.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| ApiError::Status(200, "no head commit in the pull request".into()))
+    }
+
     /// The pull request's diff against its merge-base, as GitHub shows it.
     pub fn diff(&self, repo: &RepoId, number: u64) -> Result<String, ApiError> {
         let url = format!("{}/repos/{}/pulls/{number}", self.rest, repo.full_name());

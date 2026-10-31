@@ -70,10 +70,11 @@ A worker thread polls each repository every `[github] poll_seconds` (default 60,
 `GET /repos/{o}/{r}/pulls?state=open&per_page=100` and `If-None-Match`. A 304 costs no rate limit and
 changes nothing. On 403 or 429 with rate-limit headers (`x-ratelimit-remaining: 0`, `retry-after`),
 it waits until `retry-after` or `x-ratelimit-reset`, otherwise backing off exponentially from 60 s to
-15 min. A 401 removes the token and shows Connect GitHub. Polling stops while the
-window is hidden. Details (checks, review state, mergeability) come from one GraphQL query per
-repository. That query runs only while the modal is open: when the modal opens, after any action, and
-on each poll whose ETag changed.
+15 min. A 401 removes the token and shows Connect GitHub. Polling goes on while the window is hidden,
+so the counter is current when it shows again. Details (checks, review state, mergeability) come from
+one GraphQL query per repository. That query runs only while the modal is open: when it opens, after
+any action, and on every poll while it stays open, because checks finish without changing the list's
+ETag. The installation coverage check runs on the same polls.
 
 ## Counter filter
 
@@ -92,15 +93,19 @@ the modal has no settings.
 **Load diff** requests `GET /repos/{o}/{r}/pulls/{n}` with `Accept: application/vnd.github.diff`. This is
 the diff GitHub shows, against the merge-base. ATOMICS parses it with `diff::parse_unified` and prepares
 it with the same highlighter the worktree diffs use. The result goes into the existing diff viewer as a
-read-only view titled `owner/name #n`, with the head → base branch:
+read-only view titled `owner/name #n`, with the head → base branch and the head commit:
 
 - review comments cannot be sent (no agent receives them);
-- "editor" and double-click show a notice instead of opening a file;
+- "editor", double-click and the `[keys] toggle_editor` shortcut show a notice instead of opening a file;
 - refresh re-fetches the diff.
+
+Before the diff, ATOMICS reads the PR's head commit (`GET /repos/{o}/{r}/pulls/{n}`) and records it as the
+reviewed head that Merge sends. Reading the head first means a push between the two requests leaves the
+recorded head older than the diff, so the merge is refused rather than merging code that was not shown.
 
 No `git fetch`, no ref and no worktree is touched, so an agent's checkout cannot change under it. The
 view closes when you select a session or worktree, close the diff, or open another PR. Diffs over
-GitHub's limit (HTTP 406) show the API's message and a link to the PR. Fetching the head into a hidden
+GitHub's limit (HTTP 406) show the API's message; **Open** shows the PR on GitHub. Fetching the head into a hidden
 ref was rejected: it needs a local clone of every listed repository, and fetching writes into a
 repository an agent may be using.
 
@@ -110,8 +115,11 @@ The GraphQL query reads `mergeCommitAllowed`, `squashMergeAllowed`, `rebaseMerge
 PR, `mergeable`, `mergeStateStatus`, `reviewDecision`, `viewerCanMergeAsAdmin` and the head commit's
 `statusCheckRollup`. **Merge** offers only the repository's allowed methods, in the order squash, merge,
 rebase. It is enabled when `mergeStateStatus` is `CLEAN`, `HAS_HOOKS` or `UNSTABLE`. It sends `PUT
-/repos/{o}/{r}/pulls/{n}/merge` with `merge_method` and `sha` (the head the user saw, so a newer push
-fails with 409 instead of merging unseen code).
+/repos/{o}/{r}/pulls/{n}/merge` with `merge_method` and `sha`. The `sha` is the head whose diff was
+loaded in the diff viewer, or the head the list shows when no diff was loaded. A push after that makes
+GitHub answer 409, so unreviewed code is never merged. The confirmation shows the commit it sends. When
+the listed head has moved past the reviewed one, it says the merge will be refused and to load the diff
+again.
 
 **Admin merge** appears only when `viewerCanMergeAsAdmin` is true and the PR is `BLOCKED` or `BEHIND`.
 GitHub sets that flag when the viewer may bypass the branch rules. Admin merge sends the same merge
@@ -134,7 +142,7 @@ inputs = { version = "", sha = "{head_sha}", pr = "{pr}" }
 
 The placeholders are `{repo}` (owner/name), `{pr}` (the number), `{head_sha}`, `{head}` (the head branch)
 and `{base}` (the base branch). `repo` scope accepts only `{repo}`. An unknown placeholder, or a PR
-placeholder in `repo` scope, is a config error shown in the top bar. An input whose value is empty is
+placeholder in `repo` scope, is a config warning shown in the top bar; the rest of the config applies. An input whose value is empty is
 asked for in the confirmation dialog. Dispatching sends `POST
 /repos/{o}/{r}/actions/workflows/{workflow}/dispatches`. Each action shows its latest run's status from
 `GET .../workflows/{workflow}/runs?per_page=1`, with a link to the run. ATOMICS ships no actions.
@@ -142,18 +150,24 @@ asked for in the confirmation dialog. Dispatching sends `POST
 ## Confirmations
 
 Merge, admin merge and dispatch each confirm once, in a dialog styled like "Close session?". The dialog
-names the repository, PR, method, or the workflow, ref and filled-in inputs. Reads never confirm:
+names the repository, PR, method and head commit, or the workflow, ref and filled-in inputs. Enter
+confirms and Esc cancels. Reads never confirm:
 listing, refreshing, open in browser and load diff. There is one in-flight action per PR. Its result
 appears in the modal and as a toast.
 
 ## Shortcut
 
-`[keys] github = "primary+g"`. `primary` is a new chord modifier: Command on macOS and Ctrl on Linux and
-Windows (`cmd` keeps meaning Ctrl+Shift off macOS). The shortcut is consumed before the terminal, like
-Ctrl/Command+1–9, so a focused agent or editor never receives it. It matches physical keys, so it
-works on any keyboard layout. Pressing it again, or Esc, closes the modal. At config load, `github` and
+`[keys] github = "primary+g"`. `primary` is a new chord modifier: Command on macOS and Ctrl on Linux
+(`cmd` keeps meaning Ctrl+Shift off macOS). The shortcut is consumed before the terminal, like
+Ctrl/Command+1–9, so a focused agent or editor never receives it. Its letter is the one the keyboard
+layout types, as for the other `[keys]` bindings, so on Dvorak or Colemak it is the key labelled G.
+Only digits match their physical keys, like Ctrl/Command+1–9. Layouts without Latin letters get the
+Latin key at that position from egui. Pressing it again, or Esc, closes the modal. On Linux, Ctrl+G is
+also Claude Code's own shortcut for editing the prompt in an external editor. Inside ATOMICS it opens
+the controls instead, unless `[keys] github` is bound elsewhere. At config load, `github` and
 every other `[keys]` binding are resolved to their platform chords. A `github` binding that does not
-parse, or equals another binding or Ctrl/Command+1–9, is reported in the top bar and falls back to
+parse, or equals another binding or Ctrl/Command+1–9, is reported in the top bar as a config warning
+(the config still loads, and the config tools do not report a load error) and falls back to
 `primary+g`. If `primary+g` is taken as well, there is no shortcut; the top-bar icon still opens the
 modal.
 
@@ -165,9 +179,13 @@ The modal follows the diff's model:
 - **PageDown/PageUp** jumps to the first PR of the next or previous repository;
 - **Enter** opens the selected PR in the browser and **D** loads its diff;
 - **M** starts a merge, which still confirms;
-- **Esc** closes the modal.
+- **Esc** closes the modal;
+- in a confirmation, **Enter** confirms and **Esc** cancels.
 
-These keys are consumed only while the modal is open, so the terminal never receives them.
+While the modal is open it holds the keyboard: these keys act, and every other key, typed text and paste
+is dropped. Nothing reaches the terminal or editor that had focus. The other ATOMICS shortcuts and
+Ctrl/Command+1–9 still work. A text field in the modal, such as a workflow input, keeps its keys. Once the
+modal closes, the terminal gets its keys back.
 
 ## UI shape
 

@@ -468,7 +468,8 @@ impl State {
                 }
                 let github_changed = config.github != self.config.github;
                 self.config = config;
-                self.config_error = github::config_problems(&self.config);
+                self.config_error = None;
+                self.config_problems = github::config_problems(&self.config);
                 if github_changed {
                     self.github_poll_now();
                 }

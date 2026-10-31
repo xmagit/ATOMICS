@@ -446,7 +446,11 @@ pub(crate) struct State {
     /// The project each folder belongs to, asked of git once per folder.
     project_roots: HashMap<PathBuf, PathBuf>,
     config_checked: Instant,
+    /// Why the config no longer loads; the last good one stays in effect.
     config_error: Option<String>,
+    /// What the loaded config asks for that cannot work (a `[github]` entry, a shortcut clash);
+    /// the rest of it applies.
+    config_problems: Option<String>,
     /// What the theme files or `[theme]` could not apply; the rest of the theme still does.
     theme_error: Option<String>,
     /// The themes the Settings menu offers, read when the config or a theme file changes.
@@ -821,12 +825,10 @@ impl State {
         let sbx = if cfg!(test) { "/nonexistent/atomics-test-sbx" } else { "sbx" };
         let config_path = paths::config_file();
         let (config, config_error) = match Config::load_or_create(&config_path) {
-            Ok(config) => {
-                let problems = github::config_problems(&config);
-                (config, problems)
-            }
+            Ok(config) => (config, None),
             Err(err) => (Config::default(), Some(format!("{err:#}"))),
         };
+        let config_problems = github::config_problems(&config);
         let ctx = cc.egui_ctx.clone();
         let (palette, theme_errors) = Palette::load(&config.theme, &theme::themes_dir(&config_path));
         palette.apply(&ctx);
@@ -901,6 +903,7 @@ impl State {
             config_path,
             config_checked: Instant::now(),
             config_error,
+            config_problems,
             theme_error,
             theme_choices: Arc::default(),
             host_theme: false,

@@ -26,9 +26,11 @@ impl Desktop<'_> {
         if pressed(&keys.focus_steer) {
             self.client.focus_steer = true;
         }
-        if pressed(&keys.toggle_editor)
-            && let Some(root) = self.runtime.diff_target()
-        {
+        let editor_pressed = pressed(&keys.toggle_editor);
+        if editor_pressed && self.runtime.panel == PanelMode::Diff && self.runtime.github_pr_diff().is_some() {
+            // A pull request's files are in no worktree here: its diff stays read-only.
+            self.runtime.toast(super::github::READ_ONLY);
+        } else if editor_pressed && let Some(root) = self.runtime.diff_target() {
             if self.runtime.panel == PanelMode::Editor {
                 self.runtime.panel = PanelMode::Diff;
             } else {
@@ -43,7 +45,7 @@ impl Desktop<'_> {
         }
         // The GitHub controls, like the agent chords, are taken before the focused terminal or editor.
         if let (Some(chord), _) = super::github::github_shortcut(&keys)
-            && ctx.input_mut(|i| crate::theme::consume_physical_shortcut(i, &chord))
+            && ctx.input_mut(|i| crate::theme::consume_chord(i, &chord))
         {
             let open = !self.runtime.github.modal;
             self.runtime.github_set_modal(open);

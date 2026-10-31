@@ -9,21 +9,24 @@ works with any GitHub repository and any GitHub Enterprise Server host. The desi
 
 A git icon in the top bar shows how many open pull requests the counter's filter counts. It is
 coloured as a warning when one of them is failing checks, and shows `–` until GitHub is connected. Click
-it, or press **Command+G** on macOS or **Ctrl+G** on Linux and Windows, to open the controls. Press it
-again or Esc to close them.
+it, or press **Command+G** on macOS or **Ctrl+G** on Linux, to open the controls. Press it again or
+Esc to close them. While they are open they take the keyboard: nothing you type reaches the agent's
+terminal or the editor behind them.
 
 The controls list every open pull request, grouped by repository. Each row shows its number and title,
 author, checks (✓ passing, ✗ failing, ● running), review state and merge state, such as `blocked` or
 `behind`. A ◆ marks the rows the counter counts. The selected pull request offers:
 
 - **Open**: the pull request in your browser.
-- **View diff**: its diff, as GitHub shows it against the merge-base, in the diff viewer. It is
-  read-only: there are no review comments, and the editor stays closed. Nothing is fetched, and no
-  branch or worktree changes. The view closes when you pick a session or worktree, close the diff, or
-  open another pull request.
+- **View diff**: its diff, as GitHub shows it against the merge-base, in the diff viewer. Its header
+  shows the head commit it was loaded at. It is read-only: there are no review comments, and the editor
+  stays closed, including through its shortcut. Nothing is fetched, and no branch or worktree changes.
+  The view closes when you pick a session or worktree, close the diff, or open another pull request.
 - **Merge**: offered with the methods the repository allows (squash, merge commit, rebase), when GitHub
-  says the pull request can merge. ATOMICS sends the head commit you saw, so a newer push makes the merge
-  fail instead of merging code you did not see.
+  says the pull request can merge. ATOMICS sends the head commit whose diff you loaded, or the head the
+  list shows if you did not load it, and the confirmation names that commit. If the branch moved after
+  you loaded the diff, GitHub refuses the merge instead of merging code you did not review. The
+  confirmation warns you first; load the diff again to review the new head.
 - **Admin merge**: shown only when GitHub reports that you may bypass the branch rules
   (`viewerCanMergeAsAdmin`) and the pull request is blocked or behind. This does what
   `gh pr merge --admin` does.
@@ -32,7 +35,8 @@ author, checks (✓ passing, ✗ failing, ● running), review state and merge s
 Workflow actions configured for a whole repository follow the list, each with its latest run's status.
 Click a status to open that run.
 
-Merges, admin merges and workflow runs each ask once before they happen. Reading never asks.
+Merges, admin merges and workflow runs each ask once before they happen: Enter confirms and Esc
+cancels. Reading never asks.
 
 ### Keys in the controls
 
@@ -44,10 +48,21 @@ Merges, admin merges and workflow runs each ask once before they happen. Reading
 | `D` | load its diff into the diff viewer |
 | `M` | merge it (asks first) |
 | Esc | close |
+| Enter / Esc in a confirmation | confirm / cancel |
 
-The shortcut is `[keys] github = "primary+g"`. `primary` is Command on macOS and Ctrl elsewhere. Like
+The other ATOMICS shortcuts and Ctrl/Command+1…9 keep working while the controls are open. A workflow
+input in a confirmation keeps its keys while you type in it.
+
+The shortcut is `[keys] github = "primary+g"`. `primary` is Command on macOS and Ctrl on Linux. Like
 Ctrl/Command+1…9, the shortcut is taken before a focused terminal or editor, so the agent never sees it.
-If you bind it to a chord another binding uses, the top bar reports the conflict and the default stays.
+Its letter follows your keyboard layout, as the other shortcuts do: on Dvorak or Colemak it is the key
+labelled G. If you bind it to a chord another binding uses, the top bar reports the conflict and the
+default stays.
+
+**On Linux this takes Claude Code's own Ctrl+G**, which opens the prompt in your editor. Inside ATOMICS,
+Ctrl+G opens the GitHub controls, and Claude Code never receives it. To give it back, bind the controls
+elsewhere, for example `[keys] github = "cmd+g"` (Ctrl+Shift+G on Linux). macOS is not affected: there
+the shortcut is Command+G.
 
 ## Connect GitHub
 
@@ -118,10 +133,11 @@ host, plus `repos`. For Enterprise hosts, ATOMICS uses `https://<host>/api/v3` a
 the device flow enabled, then set its `client_id` and, for a GitHub App, its `app_slug`. Turn off user token expiration for
 the GitHub App. The GitHub App
 needs these permissions: Pull requests (read and write), Contents (read and write, to merge), Checks
-and Commit statuses (read), Actions (read and write, to run workflows) and Metadata (read).
+and Commit statuses (read), Actions (read and write, to run workflows), Workflows (read and write, to
+merge pull requests that change `.github/workflows`) and Metadata (read).
 
 ATOMICS asks for the list of pull requests with an ETag, so an unchanged list costs no rate limit.
-Checks and mergeability are fetched only while the controls are open. When GitHub reports a rate
+Checks and mergeability are fetched only while the controls are open, on every poll while they are. When GitHub reports a rate
 limit, ATOMICS waits as long as GitHub asks before polling again, or backs off from one minute up to 15.
 
 ### Workflow actions
