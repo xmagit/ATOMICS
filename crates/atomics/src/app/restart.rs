@@ -507,6 +507,60 @@ mod tests {
     }
 
     #[test]
+    fn autostart_continues_the_configured_chief_in_its_folder_once() {
+        with_app("app::restart::tests::autostart_continues_the_configured_chief_in_its_folder_once", |app, ctx| {
+            let home = app.runtime.launch_dir.join("chief-home");
+            std::fs::create_dir_all(&home).unwrap();
+            std::fs::write(
+                paths::config_file(),
+                format!(
+                    "[chief]\ncommand = [\"/bin/sh\", \"-c\", \"exec sleep 30\"]\nargs = []\ncwd = {:?}\nresume = \"pinned-claude-id\"\nautostart = true\n",
+                    home.display().to_string()
+                ),
+            )
+            .unwrap();
+            app.runtime.shutdown();
+            let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+            let mut started = State::new(&cc, Options::default(), &crate::load_icon());
+            started.runtime_tick(ctx);
+            started.runtime_tick(ctx);
+            assert_eq!(started.sessions.iter().filter(|s| s.chief).count(), 1);
+            let chief = started.sessions.iter().find(|s| s.chief).unwrap();
+            assert_eq!(chief.claude_id.as_deref(), Some("pinned-claude-id"));
+            assert_eq!(chief.cwd, home);
+            assert!(started.chief_open);
+
+            // A restart that brings the chief back gets no second one.
+            started.store.restart = Some(RestartState {
+                old_version: "old-commit".into(),
+                sessions: vec![SessionRecord {
+                    chief: true,
+                    pane: Some("old-pane".into()),
+                    claude_session_id: "restarted-claude-id".into(),
+                    agent: "chief".into(),
+                    cwd: home.clone(),
+                    title: "chief".into(),
+                    last_prompt: None,
+                    updated: 0,
+                    sandbox: None,
+                    named: false,
+                }],
+                chief_open: true,
+                ..Default::default()
+            });
+            started.store.save(&paths::store_file()).unwrap();
+            started.shutdown();
+            let mut restarted = State::new(&cc, Options::default(), &crate::load_icon());
+            restarted.runtime_tick(ctx);
+            restarted.runtime_tick(ctx);
+            let chiefs: Vec<_> = restarted.sessions.iter().filter(|s| s.chief).collect();
+            assert_eq!(chiefs.len(), 1);
+            assert_eq!(chiefs[0].claude_id.as_deref(), Some("restarted-claude-id"));
+            restarted.shutdown();
+        });
+    }
+
+    #[test]
     fn a_restart_resumes_scratch_sessions_in_their_folders_with_their_names() {
         with_app(
             "app::restart::tests::a_restart_resumes_scratch_sessions_in_their_folders_with_their_names",

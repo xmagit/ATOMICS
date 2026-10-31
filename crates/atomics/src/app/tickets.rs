@@ -42,6 +42,8 @@ pub(super) struct Tickets {
     workspace_workflow: Option<atomics_core::workflow::Workflow>,
     /// The workspace file's `[isolation]`, merged over the main and host config's as it is read.
     workspace_isolation: Option<atomics_core::isolation::IsolationOverrides>,
+    /// The workspace file's `[chief] cwd`, `resume` and `autostart`.
+    pub(super) workspace_chief: Option<atomics_core::config::ChiefLaunch>,
     jobs: Option<std::sync::mpsc::Sender<TicketJob<Tag>>>,
     done_tx: crate::host::Sender<Done>,
     done_rx: Receiver<Done>,
@@ -85,6 +87,7 @@ impl Tickets {
             workspace_config: None,
             workspace_workflow: None,
             workspace_isolation: None,
+            workspace_chief: None,
             jobs: None,
             done_tx,
             done_rx,
@@ -135,11 +138,16 @@ impl State {
                         Ok(table) => self.tickets.workspace_isolation = table,
                         Err(err) => self.toast(format!("Workspace isolation: {}", err.message())),
                     }
+                    match workspace.chief() {
+                        Ok(chief) => self.tickets.workspace_chief = chief,
+                        Err(err) => self.toast(format!("Workspace chief: {}", err.message())),
+                    }
                 }
                 Ok(None) => {
                     self.tickets.workspace_config = None;
                     self.tickets.workspace_workflow = None;
                     self.tickets.workspace_isolation = None;
+                    self.tickets.workspace_chief = None;
                 }
                 // Broken settings keep their last good values.
                 Err(err) => self.toast(format!("Workspace tickets/workflow: {err}")),

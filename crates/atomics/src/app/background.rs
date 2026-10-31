@@ -15,6 +15,13 @@ impl State {
             self.resume_record(ctx, record);
             changed = true;
         }
+        if std::mem::take(&mut self.chief_autostart) && !self.sessions.iter().any(|s| s.chief) {
+            match self.start_chief(ctx, None) {
+                Ok(_) => self.chief_open = true,
+                Err(error) => self.toast(format!("Could not start the chief: {error}")),
+            }
+            changed = true;
+        }
         self.refresh_integrations();
         self.serve_dispatches();
         changed |= self.poll_cleanup();

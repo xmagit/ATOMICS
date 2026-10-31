@@ -215,6 +215,9 @@ args = ["--model", "claude-opus-5-5"]
 # system_prompt = "..."   # built in: plan, wait for approval, dispatch, verify, integrate
 # prompt = "..."          # your own instructions, added after the built-in prompt when the chief starts;
                           # config.d/<host>.toml and the workspace file add theirs after this one
+# cwd = "~/Projects"      # folder the chief starts in; unset = the main checkout of the project on screen
+# resume = "<id>"         # Claude session id the chief continues instead of starting a new conversation
+# autostart = false       # start the chief when ATOMICS starts
 
 [steer]
 # Added to every Claude session started or seen by ATOMICS (SessionStart hook).
@@ -366,6 +369,22 @@ pub struct ChiefConfig {
     /// others' (main, host, then the workspace's), so read them with
     /// [`crate::selfconfig::prompt_sections`]: merged, this holds only the last file's.
     pub prompt: String,
+    /// The folder the chief starts in (`~/` allowed). Unset: the main checkout of the project on screen.
+    pub cwd: Option<String>,
+    /// A Claude conversation, by session id, that the chief continues instead of starting anew.
+    pub resume: Option<String>,
+    /// Start the chief as soon as ATOMICS starts, unless a restart already brings it back.
+    pub autostart: bool,
+}
+
+/// How a workspace file starts its chief: its `[chief] cwd`, `resume` and `autostart`, each over the
+/// main and host config's. The section's `prompt` is read with the other prompt sections.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct ChiefLaunch {
+    pub cwd: Option<String>,
+    pub resume: Option<String>,
+    pub autostart: Option<bool>,
 }
 
 impl Default for ChiefConfig {
@@ -377,6 +396,9 @@ impl Default for ChiefConfig {
             args: vec!["--model".into(), "claude-opus-5-5".into()],
             system_prompt: CHIEF_PROMPT.into(),
             prompt: String::new(),
+            cwd: None,
+            resume: None,
+            autostart: false,
         }
     }
 }

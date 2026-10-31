@@ -34,6 +34,11 @@ impl Workspace {
         self.extra.get("workflow").map(|section| section.clone().try_into()).transpose()
     }
 
+    /// This workspace's `[chief] cwd`, `resume` and `autostart`.
+    pub fn chief(&self) -> Result<Option<crate::config::ChiefLaunch>, toml::de::Error> {
+        self.extra.get("chief").map(|section| section.clone().try_into()).transpose()
+    }
+
     /// This workspace's `[isolation]`. Unlike `[tickets]` it merges key by key over the main
     /// and host config's, with [`crate::isolation::IsolationConfig::with_overrides`].
     pub fn isolation(&self) -> Result<Option<crate::isolation::IsolationOverrides>, toml::de::Error> {
@@ -334,6 +339,20 @@ result = { key = "id", state = "status" }
         assert!(Workspace::default().isolation().unwrap().is_none());
         let broken: Workspace = toml::from_str("projects = []\nisolation = 'bare'").unwrap();
         assert!(broken.isolation().is_err());
+    }
+
+    #[test]
+    fn a_workspace_sets_how_its_chief_starts() {
+        let workspace: Workspace = toml::from_str(
+            "projects = []\n[chief]\nprompt = 'x'\ncwd = '~/Projects'\nresume = 'session-id'\nautostart = true\n",
+        )
+        .unwrap();
+        let chief = workspace.chief().unwrap().unwrap();
+        assert_eq!(chief.cwd.as_deref(), Some("~/Projects"));
+        assert_eq!(chief.resume.as_deref(), Some("session-id"));
+        assert_eq!(chief.autostart, Some(true));
+        let plain: Workspace = toml::from_str("projects = []\n").unwrap();
+        assert!(plain.chief().unwrap().is_none());
     }
 
     #[test]

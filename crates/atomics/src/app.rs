@@ -525,6 +525,8 @@ pub(crate) struct State {
     ungrouped: bool,
     /// The chief is shown, either floating or docked (otherwise only the pill).
     chief_open: bool,
+    /// `[chief] autostart` waits for the first background tick, after a restart's sessions resume.
+    chief_autostart: bool,
     worktree_tx: crate::host::Sender<(String, Result<PreparedWorktree, String>, Launch, PathBuf)>,
     worktree_rx: Receiver<(String, Result<PreparedWorktree, String>, Launch, PathBuf)>,
     creating: Vec<(PathBuf, String, PathBuf)>,
@@ -949,6 +951,7 @@ impl State {
             plan_view: false,
             ungrouped: false,
             chief_open: false,
+            chief_autostart: false,
             worktree_tx,
             worktree_rx,
             creating: Vec::new(),
@@ -993,6 +996,7 @@ impl State {
         if app.hook_error.is_none() {
             app.begin_startup_cleanup();
             app.restore_restart();
+            app.chief_autostart = app.chief_autostarts();
         }
         // One toast for everything startup has to say, so no notice hides another.
         notices.splice(0..0, options.migration_errors.iter().cloned());

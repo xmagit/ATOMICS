@@ -1,11 +1,26 @@
 use super::*;
 
 impl State {
-    /// Starts the chief agent in the main checkout of the project on screen.
+    /// Starts the chief agent in `[chief] cwd`, else in the main checkout of the project on screen,
+    /// continuing the `[chief] resume` conversation when one is named. The workspace file's values
+    /// win over the main and host config's.
     pub(super) fn start_chief(&mut self, ctx: &egui::Context, prompt: Option<String>) -> Result<String, String> {
-        let cwd = self.view.clone().or_else(|| self.repos.first().cloned()).unwrap_or_else(|| self.launch_dir.clone());
+        let launch = self.tickets.workspace_chief.clone().unwrap_or_default();
+        let set = |value: Option<String>| value.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+        let cwd = match set(launch.cwd).or_else(|| set(self.config.chief.cwd.clone())) {
+            Some(dir) => paths::expand(&dir),
+            None => {
+                self.view.clone().or_else(|| self.repos.first().cloned()).unwrap_or_else(|| self.launch_dir.clone())
+            }
+        };
+        let resume = set(launch.resume).or_else(|| set(self.config.chief.resume.clone()));
         let args = self.config.chief.args.clone();
-        self.start_as(ctx, "chief", cwd, None, args, prompt, Role::Chief)
+        self.start_as(ctx, "chief", cwd, resume, args, prompt, Role::Chief)
+    }
+
+    /// `[chief] autostart`, the workspace file's over the main and host config's.
+    pub(super) fn chief_autostarts(&self) -> bool {
+        self.tickets.workspace_chief.as_ref().and_then(|chief| chief.autostart).unwrap_or(self.config.chief.autostart)
     }
 
     pub(super) fn chief_dock(&self) -> ChiefDock {

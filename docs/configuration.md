@@ -12,7 +12,7 @@ a diff until you apply or reject it.
 | `default` | built into ATOMICS | everything | every setting; ATOMICS writes them, with comments, into a new `config.toml` |
 | `main` | `~/.config/atomics/config.toml` | every machine that shares the file | every setting |
 | `host` | `config.d/<host>.toml` beside it | this machine | every setting |
-| `workspace` | `workspaces/<host>/<name>.toml`, or a flat `workspaces/<name>.toml` shared by every host | the open workspace | `projects`, `[tickets]`, `[workflow]`, `[isolation]` and `[chief] prompt` |
+| `workspace` | `workspaces/<host>/<name>.toml`, or a flat `workspaces/<name>.toml` shared by every host | the open workspace | `projects`, `[tickets]`, `[workflow]`, `[isolation]`, `[chief] prompt` and how its chief starts (`[chief] cwd`, `resume`, `autostart`) |
 | `repo` | `<main checkout>/.atomics/config.toml` | one repository | allowlisted declarative workflow settings; see [Repository workflows](repo-workflow.md) |
 | `theme` | `themes/<name>.toml` beside `config.toml` | whatever selects the theme | theme tokens; see [themes](themes.md) |
 
@@ -44,6 +44,21 @@ The top bar or toast says so, and `atomics doctor` names the file. A broken repo
 with a warning; see [Repository workflows](repo-workflow.md).
 
 ## The chief's prompt
+
+Where and how the chief starts: `[chief] cwd` is its folder (`~/` allowed; unset, the main checkout of the
+project on screen), `resume` names a Claude session id it continues instead of starting a new conversation,
+and `autostart = true` starts it with ATOMICS unless a restart already brings it back. A workspace file's
+values win, so `atomics --workspace dev` can open one conversation as the chief of several projects:
+
+```toml
+# workspaces/<host>/dev.toml
+projects = ["~/Projects/relay-backend", "~/Projects/ATOMICS"]
+
+[chief]
+cwd = "~/Projects"
+resume = "aaffe6ab-0000-0000-0000-000000000000"
+autostart = true
+```
 
 The chief starts with a built-in way of working (`[chief] system_prompt` replaces it). Your own instructions
 go in `[chief] prompt`, in any of the three files. Each file's text adds to the others' instead of replacing it.
