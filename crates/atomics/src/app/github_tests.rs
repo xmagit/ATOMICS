@@ -677,6 +677,115 @@ fn github_shortcut_conflicts_are_reported_and_fall_back() {
 }
 
 #[test]
+fn github_controls_take_focus_immediately_and_restore_the_previous_pane() {
+    with_app("app::github::tests::github_controls_take_focus_immediately_and_restore_the_previous_pane", |app, ctx| {
+        let dir = crate::test_support::tempdir().unwrap();
+        let fake = FakeGithub::start(TOKEN);
+        pulls(&fake);
+        connect_to(app, &fake, dir.path());
+        store(app).put_github_app("github.com", TOKEN).unwrap();
+        poll(app);
+        let terminal = egui::Id::unique("focus-test-terminal");
+        let agent = egui::Id::unique("focus-test-agent");
+        let mut draft = String::from("keep this draft");
+        let mut run = |app: &mut Desktop<'_>, events: Vec<egui::Event>| {
+            let mut received = Vec::new();
+            ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
+                app.shortcuts(ui.ctx());
+                let response = ui.interact(ui.max_rect(), terminal, Sense::click());
+                if response.has_focus() {
+                    received = ui.input(|input| input.events.clone());
+                }
+                ui.add(egui::TextEdit::singleline(&mut draft).id(agent));
+                app.github_modal(ui.ctx());
+            })
+            .drop_without_applying_deltas();
+            received
+        };
+        run(app, vec![]);
+        for previous in [terminal, agent] {
+            for close in [key(Key::Escape, egui::Modifiers::NONE), key(Key::G, primary())] {
+                ctx.memory_mut(|memory| memory.request_focus(previous));
+                app.client.github.selected = None;
+                assert!(run(app, vec![key(Key::G, primary())]).is_empty());
+                assert!(app.runtime.github.modal);
+                assert!(
+                    ctx.memory(|memory| memory.has_focus(github_focus_id())),
+                    "controls take focus from {previous:?}, got {:?}",
+                    ctx.memory(|memory| memory.focused())
+                );
+                // Release the opening chord; subsequent keys arrive without a click or focus reset.
+                run(
+                    app,
+                    vec![egui::Event::Key {
+                        key: Key::G,
+                        physical_key: Some(Key::G),
+                        pressed: false,
+                        repeat: false,
+                        modifiers: primary(),
+                    }],
+                );
+                assert!(run(app, vec![key(Key::ArrowDown, egui::Modifiers::NONE)]).is_empty());
+                assert_eq!(app.client.github.selected, Some((repo(), 8)), "plain Down selects the next PR");
+                // Even if a background pane requests focus again, modal input stays in the controls.
+                ctx.memory_mut(|memory| memory.request_focus(previous));
+                assert!(
+                    run(
+                        app,
+                        vec![
+                            egui::Event::Text("x".into()),
+                            egui::Event::Paste("paste".into()),
+                            key(Key::Backspace, egui::Modifiers::NONE)
+                        ]
+                    )
+                    .is_empty()
+                );
+                assert!(run(app, vec![close.clone()]).is_empty(), "closing key never reaches the terminal");
+                assert!(!app.runtime.github.modal);
+                assert!(ctx.memory(|memory| memory.has_focus(previous)), "closing restores {previous:?}");
+                // Release the closing key so reopening is a fresh press.
+                if let egui::Event::Key { key, physical_key, modifiers, .. } = close {
+                    run(app, vec![egui::Event::Key { key, physical_key, modifiers, pressed: false, repeat: false }]);
+                }
+            }
+        }
+        assert_eq!(draft, "keep this draft", "the agent's draft receives no modal input");
+    });
+}
+
+#[test]
+fn github_controls_keep_workflow_input_focus() {
+    with_app("app::github::tests::github_controls_keep_workflow_input_focus", |app, ctx| {
+        app.runtime.github_set_modal(true);
+        app.client.github.confirm = Some(Confirm::Dispatch {
+            repo: repo(),
+            action: Action { label: "Release".into(), workflow: "release.yml".into(), ..Action::default() },
+            git_ref: Some("main".into()),
+            inputs: BTreeMap::from([("note".into(), "workflow draft".into())]),
+            asked: vec!["note".into()],
+        });
+        click(app, ctx, "workflow draft");
+        let focused = app.client.github.input_focus.expect("the clicked workflow input");
+        ctx.run_ui(
+            egui::RawInput {
+                events: vec![key(Key::M, egui::Modifiers::NONE), egui::Event::Text("m".into())],
+                ..Default::default()
+            },
+            |ui| {
+                app.shortcuts(ui.ctx());
+                app.github_modal(ui.ctx());
+            },
+        )
+        .drop_without_applying_deltas();
+        assert!(ctx.memory(|memory| memory.has_focus(focused)), "the input keeps focus");
+        let Some(Confirm::Dispatch { inputs, .. }) = &app.client.github.confirm else {
+            panic!("typing M must not open a merge confirmation");
+        };
+        assert!(inputs["note"].contains('m'), "M is typed into the workflow input");
+    });
+}
+
+#[test]
 fn github_modal_keys_select_open_view_merge_and_close() {
     with_app("app::github::tests::github_modal_keys_select_open_view_merge_and_close", |app, ctx| {
         let dir = crate::test_support::tempdir().unwrap();

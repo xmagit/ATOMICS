@@ -27,9 +27,11 @@ author, checks (✓ passing, ✗ failing, ● running), review state and merge s
   list shows if you did not load it, and the confirmation names that commit. If the branch moved after
   you loaded the diff, GitHub refuses the merge instead of merging code you did not review. The
   confirmation warns you first; load the diff again to review the new head.
-- **Admin merge**: shown only when GitHub reports that you may bypass the branch rules
-  (`viewerCanMergeAsAdmin`) and the pull request is blocked or behind. This does what
-  `gh pr merge --admin` does.
+- **Admin merge**: shown for a blocked or behind pull request when GitHub reports
+  `viewerCanMergeAsAdmin`, or every ruleset on its base branch lets you bypass it
+  (`current_user_can_bypass` is `always` or `pull_requests_only`). If GitHub refuses the ruleset
+  lookup with 403 or 404, it is offered only for repository admins (`viewerPermission: ADMIN`).
+  This does what `gh pr merge --admin` does.
 - The workflow actions configured for pull requests in that repository.
 
 Workflow actions configured for a whole repository follow the list, each with its latest run's status.
@@ -40,9 +42,12 @@ cancels. Reading never asks.
 
 ### Keys in the controls
 
+The controls take focus as soon as they open, so these keys work without clicking first. Esc or
+Ctrl/Command+G closes them and returns focus to the pane or field that had it before.
+
 | Key | |
 |---|---|
-| `shift+↓` / `shift+↑` | next / previous pull request, across repositories |
+| ↓ / ↑ (also with Shift) | next / previous pull request, across repositories |
 | PageDown / PageUp | the first pull request of the next / previous repository |
 | Enter | open the selected pull request in the browser |
 | `D` | load its diff into the diff viewer |

@@ -280,7 +280,7 @@ impl Api {
                 methods.push(method);
             }
         }
-        let pulls = repository["pullRequests"]["nodes"]
+        let mut pulls: BTreeMap<u64, Details> = repository["pullRequests"]["nodes"]
             .as_array()
             .into_iter()
             .flatten()
@@ -312,11 +312,71 @@ impl Api {
                 Some((pull["number"].as_u64()?, details))
             })
             .collect();
+        // A details request is one repository's part of a poll. PRs targeting the same base
+        // share this result, but the next poll must observe changes to rules or permissions.
+        let mut bypass = BTreeMap::new();
+        for pull in repository["pullRequests"]["nodes"].as_array().into_iter().flatten() {
+            let Some(details) = pull["number"].as_u64().and_then(|number| pulls.get_mut(&number)) else {
+                continue;
+            };
+            if details.admin || !matches!(details.merge_state.as_str(), "BLOCKED" | "BEHIND") {
+                continue;
+            }
+            let Some(base) = pull["baseRefName"].as_str().filter(|base| !base.is_empty()) else {
+                continue;
+            };
+            details.admin = match bypass.get(base) {
+                Some(&admin) => admin,
+                None => {
+                    let admin = match self.ruleset_bypass(repo, base) {
+                        Ok(admin) => admin,
+                        Err(ApiError::Status(403 | 404, _)) => repository["viewerPermission"] == "ADMIN",
+                        Err(error) => return Err(error),
+                    };
+                    bypass.insert(base.to_string(), admin);
+                    admin
+                }
+            };
+        }
         Ok(RepoDetails {
             methods,
             default_branch: repository["defaultBranchRef"]["name"].as_str().unwrap_or_default().into(),
             pulls,
         })
+    }
+
+    /// Every active ruleset on the base branch must allow this viewer to bypass it.
+    fn ruleset_bypass(&self, repo: &RepoId, base: &str) -> Result<bool, ApiError> {
+        let mut ids = BTreeSet::new();
+        let mut page = 1;
+        loop {
+            let value = self.get_json(&format!(
+                "/repos/{}/rules/branches/{}?per_page=100&page={page}",
+                repo.full_name(),
+                encode(base).replace('+', "%20")
+            ))?;
+            let rules = value.as_array().ok_or_else(|| ApiError::Status(200, "no branch rules in response".into()))?;
+            for rule in rules {
+                let Some(id) = rule["ruleset_id"].as_u64() else {
+                    return Ok(false);
+                };
+                ids.insert(id);
+            }
+            if rules.len() < 100 {
+                break;
+            }
+            page += 1;
+        }
+        if ids.is_empty() {
+            return Ok(false);
+        }
+        for id in ids {
+            let ruleset = self.get_json(&format!("/repos/{}/rulesets/{id}", repo.full_name()))?;
+            if !matches!(ruleset["current_user_can_bypass"].as_str(), Some("always" | "pull_requests_only")) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Merges with `method`, only if the head is still `sha`. Admin merge is this same call: GitHub
@@ -589,10 +649,10 @@ impl Signed {
 const DETAILS_QUERY: &str = "query($owner: String!, $name: String!) {
   repository(owner: $owner, name: $name) {
     defaultBranchRef { name }
-    mergeCommitAllowed squashMergeAllowed rebaseMergeAllowed
+    mergeCommitAllowed squashMergeAllowed rebaseMergeAllowed viewerPermission
     pullRequests(states: OPEN, first: 100, orderBy: {field: UPDATED_AT, direction: DESC}) {
       nodes {
-        number mergeable mergeStateStatus reviewDecision viewerCanMergeAsAdmin
+        number baseRefName mergeable mergeStateStatus reviewDecision viewerCanMergeAsAdmin
         commits(last: 1) { nodes { commit { statusCheckRollup { state contexts(first: 50) { nodes {
           __typename
           ... on CheckRun { name conclusion status }
@@ -866,6 +926,120 @@ mod tests {
         assert_eq!(details.pulls[&8].checks, CheckState::Failing);
         assert_eq!(fake.header_of_last("authorization").as_deref(), Some(format!("Bearer {TOKEN}").as_str()));
         assert_eq!(Api::at(&fake.url, Token::new("ghp_wrong")).viewer().unwrap_err(), ApiError::Unauthorized);
+    }
+
+    #[test]
+    fn github_ruleset_bypass_controls_admin_merge() {
+        for state in ["BLOCKED", "BEHIND"] {
+            for (bypass, expected) in
+                [("always", true), ("pull_requests_only", true), ("never", false), ("unknown", false)]
+            {
+                let fake = FakeGithub::start(TOKEN);
+                fake.add_pull(&repo(), fake::pull(7, "alice", &[], state, false));
+                fake.branch_rules(&repo(), "main", 200, json!([{ "ruleset_id": 42 }, { "ruleset_id": 73 }]));
+                fake.ruleset(&repo(), 42, 200, json!({ "current_user_can_bypass": "always" }));
+                fake.ruleset(&repo(), 73, 200, json!({ "current_user_can_bypass": bypass }));
+                let details = Api::at(&fake.url, Token::new(TOKEN)).details(&repo()).unwrap();
+                assert_eq!(details.pulls[&7].buttons(false).admin, expected, "{state}: {bypass}");
+            }
+        }
+    }
+
+    #[test]
+    fn github_ruleset_errors_fall_back_only_to_admin_permission() {
+        for status in [403, 404] {
+            for branch_endpoint in [false, true] {
+                for (permission, expected) in [("ADMIN", true), ("WRITE", false)] {
+                    let fake = FakeGithub::start(TOKEN);
+                    fake.add_pull(&repo(), fake::pull(7, "alice", &[], "BLOCKED", false));
+                    fake.viewer_permission(&repo(), permission);
+                    fake.branch_rules(
+                        &repo(),
+                        "main",
+                        if branch_endpoint { status } else { 200 },
+                        json!([{ "ruleset_id": 42 }]),
+                    );
+                    fake.ruleset(&repo(), 42, status, json!({ "message": "Forbidden" }));
+                    let details = Api::at(&fake.url, Token::new(TOKEN)).details(&repo()).unwrap();
+                    assert_eq!(
+                        details.pulls[&7].buttons(false).admin,
+                        expected,
+                        "{status}: {permission}, branch={branch_endpoint}"
+                    );
+                }
+            }
+        }
+        // Authentication, rate limits and server failures must still reach the existing error path.
+        for status in [401, 429, 500] {
+            let fake = FakeGithub::start(TOKEN);
+            fake.add_pull(&repo(), fake::pull(7, "alice", &[], "BLOCKED", false));
+            fake.viewer_permission(&repo(), "ADMIN");
+            fake.branch_rules(&repo(), "main", status, json!({ "message": "Unavailable" }));
+            assert!(Api::at(&fake.url, Token::new(TOKEN)).details(&repo()).is_err(), "{status}");
+        }
+    }
+
+    #[test]
+    fn github_ruleset_bypass_requires_rules_and_a_known_bypass_value() {
+        let fake = FakeGithub::start(TOKEN);
+        fake.add_pull(&repo(), fake::pull(7, "alice", &[], "BLOCKED", false));
+        fake.viewer_permission(&repo(), "ADMIN");
+        let api = Api::at(&fake.url, Token::new(TOKEN));
+        assert!(!api.details(&repo()).unwrap().pulls[&7].admin, "no rules is no bypass");
+        fake.branch_rules(&repo(), "main", 200, json!([{ "ruleset_id": 42 }]));
+        fake.ruleset(&repo(), 42, 200, json!({}));
+        assert!(!api.details(&repo()).unwrap().pulls[&7].admin, "missing bypass is no permission");
+    }
+
+    #[test]
+    fn github_ruleset_bypass_is_cached_per_base_for_one_poll() {
+        let fake = FakeGithub::start(TOKEN);
+        for number in 7..=9 {
+            let mut pull = fake::pull(number, "alice", &[], "BLOCKED", false);
+            if number == 9 {
+                pull.base = "release/1.0".into();
+            }
+            fake.add_pull(&repo(), pull);
+        }
+        for base in ["main", "release%2F1.0"] {
+            fake.branch_rules(&repo(), base, 200, json!([{ "ruleset_id": 42 }, { "ruleset_id": 42 }]));
+        }
+        fake.ruleset(&repo(), 42, 200, json!({ "current_user_can_bypass": "always" }));
+        let api = Api::at(&fake.url, Token::new(TOKEN));
+        assert!(api.details(&repo()).unwrap().pulls.values().all(|details| details.admin));
+        let seen = fake.seen();
+        assert_eq!(seen.iter().filter(|seen| seen.path.contains("/rules/branches/")).count(), 2);
+        assert_eq!(seen.iter().filter(|seen| seen.path.ends_with("/rulesets/42")).count(), 2, "distinct IDs per base");
+        fake.ruleset(&repo(), 42, 200, json!({ "current_user_can_bypass": "never" }));
+        assert!(
+            api.details(&repo()).unwrap().pulls.values().all(|details| !details.admin),
+            "the next poll refreshes permissions"
+        );
+    }
+
+    #[test]
+    fn github_ruleset_bypass_checks_every_page() {
+        let fake = FakeGithub::start(TOKEN);
+        fake.add_pull(&repo(), fake::pull(7, "alice", &[], "BLOCKED", false));
+        let mut rules = vec![json!({ "ruleset_id": 42 }); 100];
+        rules.push(json!({ "ruleset_id": 73 }));
+        fake.branch_rules(&repo(), "main", 200, json!(rules));
+        fake.ruleset(&repo(), 42, 200, json!({ "current_user_can_bypass": "always" }));
+        fake.ruleset(&repo(), 73, 200, json!({ "current_user_can_bypass": "never" }));
+        assert!(!Api::at(&fake.url, Token::new(TOKEN)).details(&repo()).unwrap().pulls[&7].admin);
+        assert_eq!(fake.seen().iter().filter(|seen| seen.path.contains("/rules/branches/")).count(), 2);
+    }
+
+    #[test]
+    fn github_rulesets_are_not_requested_unless_blocked_without_classic_bypass() {
+        let fake = FakeGithub::start(TOKEN);
+        for (number, state, admin) in
+            [(7, "CLEAN", false), (8, "DIRTY", false), (9, "BLOCKED", true), (10, "BEHIND", true)]
+        {
+            fake.add_pull(&repo(), fake::pull(number, "alice", &[], state, admin));
+        }
+        Api::at(&fake.url, Token::new(TOKEN)).details(&repo()).unwrap();
+        assert_eq!(fake.seen().len(), 1, "only the GraphQL request");
     }
 
     #[test]

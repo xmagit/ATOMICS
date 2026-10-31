@@ -27,6 +27,7 @@ impl Seen {
 #[derive(Debug, Clone)]
 pub struct FakePull {
     pub number: u64,
+    pub base: String,
     pub author: String,
     pub requested: Vec<String>,
     pub merge_state: String,
@@ -43,6 +44,7 @@ pub struct FakePull {
 pub fn pull(number: u64, author: &str, requested: &[&str], merge_state: &str, admin: bool) -> FakePull {
     FakePull {
         number,
+        base: "main".into(),
         author: author.into(),
         requested: requested.iter().map(|login| login.to_string()).collect(),
         merge_state: merge_state.into(),
@@ -69,6 +71,9 @@ struct Data {
     installations: Vec<(u64, String, Vec<String>)>,
     viewer: String,
     repos: BTreeMap<String, (u64, Vec<FakePull>)>,
+    branch_rules: BTreeMap<(String, String), (u16, Value)>,
+    rulesets: BTreeMap<(String, u64), (u16, Value)>,
+    permissions: BTreeMap<String, String>,
     seen: Vec<Seen>,
     rate_limit: Option<Option<u64>>,
     device_authorized: bool,
@@ -109,6 +114,18 @@ impl FakeGithub {
         let entry = data.repos.entry(repo.full_name()).or_default();
         entry.0 += 1;
         entry.1.push(pull);
+    }
+
+    pub fn branch_rules(&self, repo: &RepoId, base: &str, status: u16, rules: Value) {
+        self.data.lock().unwrap().branch_rules.insert((repo.full_name(), base.into()), (status, rules));
+    }
+
+    pub fn ruleset(&self, repo: &RepoId, id: u64, status: u16, ruleset: Value) {
+        self.data.lock().unwrap().rulesets.insert((repo.full_name(), id), (status, ruleset));
+    }
+
+    pub fn viewer_permission(&self, repo: &RepoId, permission: &str) {
+        self.data.lock().unwrap().permissions.insert(repo.full_name(), permission.into());
     }
 
     /// A push to pull request `number`: its head becomes `sha`, and the list's ETag changes.
@@ -291,6 +308,35 @@ fn respond(seen: &Seen, data: &mut Data) -> Response {
             }
         }
         ("POST", ["graphql"]) => graphql(seen, data),
+        ("GET", ["repos", owner, name, "rules", "branches", base]) => {
+            let (status, value) = data
+                .branch_rules
+                .get(&(format!("{owner}/{name}"), base.to_string()))
+                .cloned()
+                .unwrap_or((200, json!([])));
+            if status != 200 {
+                return json_reply(status, value);
+            }
+            let page = seen
+                .path
+                .split('?')
+                .nth(1)
+                .and_then(|query| {
+                    query
+                        .split('&')
+                        .find_map(|part| part.strip_prefix("page=").and_then(|page| page.parse::<usize>().ok()))
+                })
+                .unwrap_or(1);
+            let rules: Vec<Value> =
+                value.as_array().into_iter().flatten().skip(page.saturating_sub(1) * 100).take(100).cloned().collect();
+            json_reply(200, json!(rules))
+        }
+        ("GET", ["repos", owner, name, "rulesets", id]) => {
+            let answer =
+                id.parse::<u64>().ok().and_then(|id| data.rulesets.get(&(format!("{owner}/{name}"), id))).cloned();
+            let (status, value) = answer.unwrap_or((404, json!({ "message": "Not Found" })));
+            json_reply(status, value)
+        }
         ("GET", ["repos", owner, name]) if data.repos.contains_key(&format!("{owner}/{name}")) => {
             json_reply(200, json!({ "default_branch": "main" }))
         }
@@ -310,7 +356,7 @@ fn respond(seen: &Seen, data: &mut Data) -> Response {
                         "user": { "login": pull.author },
                         "draft": pull.draft,
                         "head": { "ref": format!("feature-{}", pull.number), "sha": pull.head_sha },
-                        "base": { "ref": "main" },
+                        "base": { "ref": pull.base },
                         "requested_reviewers": pull.requested.iter().map(|login| json!({ "login": login })).collect::<Vec<_>>(),
                     })
                 })
@@ -330,7 +376,7 @@ fn respond(seen: &Seen, data: &mut Data) -> Response {
                     200,
                     json!({ "number": pull.number,
                             "head": { "ref": format!("feature-{}", pull.number), "sha": pull.head_sha },
-                            "base": { "ref": "main" } }),
+                            "base": { "ref": pull.base } }),
                 ),
                 None => json_reply(404, json!({ "message": "Not Found" })),
             }
@@ -400,6 +446,7 @@ fn graphql(seen: &Seen, data: &Data) -> Response {
         .map(|pull| {
             json!({
                 "number": pull.number,
+                "baseRefName": pull.base,
                 "mergeable": if pull.merge_state == "DIRTY" { "CONFLICTING" } else { "MERGEABLE" },
                 "mergeStateStatus": pull.merge_state,
                 "reviewDecision": if pull.merge_state == "CLEAN" { "APPROVED" } else { "REVIEW_REQUIRED" },
@@ -418,6 +465,7 @@ fn graphql(seen: &Seen, data: &Data) -> Response {
         200,
         json!({ "data": { "repository": {
             "defaultBranchRef": { "name": "main" },
+            "viewerPermission": data.permissions.get(&repo).map(String::as_str).unwrap_or("WRITE"),
             "mergeCommitAllowed": true, "squashMergeAllowed": true, "rebaseMergeAllowed": false,
             "pullRequests": { "nodes": nodes },
         } } }),
