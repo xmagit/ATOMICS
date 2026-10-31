@@ -503,7 +503,9 @@ systems changes only that section. Cards show each ticket's live key and state, 
 ticket states as tasks move and comments on dispatch, reports, acceptance, blocks and completion, signed with
 the reporting model. Changes made in the ticket system reach the chief as `ticket` events in `atomics_wait`.
 Include `plan` in `atomics_wait` statuses to learn when the user approves a plan (board button or `atomics ctl plan_approve`), edits a task brief on the board, or closes or reopens a plan: one event with `plan` and `change` (`approved`, `edited`, `closed`, `reopened`).
-Failures show on the card and never block a plan. See [docs/tickets.md](docs/tickets.md) for the design, the
+Failures show on the card and never block a plan. The Tickets panel (`cmd+k`) finds tickets by meaning or
+keyword and reads one in full, from the same operations; see [Tickets panel](docs/tickets.md#the-tickets-panel).
+See [docs/tickets.md](docs/tickets.md) for the design, the
 config reference and examples, with step-by-step [Relay](docs/tickets.md#step-by-step-relay) and
 [Linear](docs/tickets.md#step-by-step-linear) setups.
 
@@ -679,12 +681,13 @@ Tooltips and the settings menu show the actual platform chord, including custom 
 | `shift+↓` / `shift+↑` | next / previous diff section (hunk), crossing changed files, and focus the diff (except in a text field or the editor); ↑/↓ scroll a line, PageUp/PageDown a page, Home/End the current file; Esc, typing, or clicking the terminal returns focus to it |
 | `cmd+d` | show/hide the diff |
 | `cmd+j` | next agent that needs you |
+| `cmd+k` | the Tickets panel (when `[tickets]` is set): Find, then Read; the same keys as the diff — `shift+↓/↑` next / previous result (in Read: next / previous ticket; not from a text field or the editor), `PageUp/PageDown` a page in Find and the next / previous section in Read, ↑/↓ and Home/End, `Enter` read or open, `Alt+←` back, `Tab` in the box meaning ⇄ keyword, `Esc` leaves the box, then the panel |
 | `cmd+l` | steer bar |
 | `cmd+shift+space` | voice: record, press again to send to the chief, `Esc` cancels |
 | `cmd+t` | new session (scratch folder, existing folder or new worktree) |
 | `cmd+r` | refresh diff |
 | `cmd+w` | close session |
-| `Command+1…9` (macOS) / `Ctrl+1…9` (Linux) | select agent 1–9 on screen and focus its diff, or its editor in editor mode |
+| `Command+1…9` (macOS) / `Ctrl+1…9` (Linux) | select agent 1–9 on screen and focus its diff, or its editor in editor mode; in the Tickets panel, Find stays in Find and Read shows that agent's task ticket (the chief's and untasked agents show the plan's) |
 
 ## Design
 

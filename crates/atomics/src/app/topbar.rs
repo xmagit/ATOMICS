@@ -168,6 +168,24 @@ impl Desktop<'_> {
                 ui.close();
             }
         }
+        if self.runtime.ticket_config().is_some() {
+            // A dot says the ticket system wants a sign-in.
+            let signed_out = self.runtime.tickets.panel.signin;
+            let text = RichText::new(if signed_out { "Tickets ●" } else { "Tickets" }).color(if signed_out {
+                self.runtime.palette.warning
+            } else {
+                self.runtime.palette.foreground
+            });
+            let open = self.runtime.panel == PanelMode::Tickets && self.runtime.diff_open;
+            let response = ui.selectable_label(open, text);
+            record_item(ui, "Tickets", &response);
+            if response.on_hover_text(shortcut_label(ui.ctx(), &self.runtime.config.keys.toggle_tickets)).clicked() {
+                self.runtime.toggle_tickets();
+                if in_menu {
+                    ui.close();
+                }
+            }
+        }
         let response = ui.menu_button("Project", |ui| self.project_menu(ui)).response;
         record_item(ui, "Project", &response);
         if show_load {

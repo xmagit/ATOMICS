@@ -287,6 +287,7 @@ quick_open = "cmd+p"
 toggle_editor = "cmd+e"
 toggle_plan = "cmd+b"
 toggle_chief = "cmd+o"
+toggle_tickets = "cmd+k"   # the Tickets panel (cmd+j is next_attention)
 voice = "cmd+shift+space"
 "##;
 
@@ -629,6 +630,7 @@ pub struct KeyConfig {
     pub toggle_editor: String,
     pub toggle_plan: String,
     pub toggle_chief: String,
+    pub toggle_tickets: String,
     pub voice: String,
 }
 
@@ -722,6 +724,7 @@ impl Default for KeyConfig {
             toggle_editor: "cmd+e".into(),
             toggle_plan: "cmd+b".into(),
             toggle_chief: "cmd+o".into(),
+            toggle_tickets: "cmd+k".into(),
             voice: "cmd+shift+space".into(),
         }
     }

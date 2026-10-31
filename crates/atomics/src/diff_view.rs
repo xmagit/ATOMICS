@@ -168,11 +168,7 @@ impl DiffState {
             let hi = self.hunk.unwrap_or(0).min(files[fi].hunks.len().saturating_sub(1));
             sections.iter().position(|&section| section == (fi, hi))
         });
-        let next = match current {
-            Some(i) => (i as i32 + delta).clamp(0, sections.len() as i32 - 1) as usize,
-            None if delta < 0 => sections.len() - 1,
-            None => 0,
-        };
+        let next = crate::panel_nav::step_index(current, sections.len(), delta)?;
         let (fi, hi) = sections[next];
         let file = &files[fi];
         let path = file.path().to_string();
@@ -230,49 +226,8 @@ pub struct Header<'a> {
     pub editor_shortcut: &'a str,
 }
 
-pub fn focus_id() -> egui::Id {
-    egui::Id::NULL.with("diff-keyboard")
-}
-
-/// Scroll only the focused diff; leave text fields and terminal modifiers alone.
-fn keyboard_scroll(
-    ui: &egui::Ui,
-    id: egui::Id,
-    row_h: f32,
-    file: std::ops::Range<usize>,
-    jump: Option<f32>,
-) -> Option<f32> {
-    if !ui.memory(|m| m.has_focus(focus_id())) {
-        return jump;
-    }
-    let mut offset = jump.unwrap_or_else(|| {
-        egui::scroll_area::State::load(ui.ctx(), id).map(|s| s.clamped_offset().y).unwrap_or_default()
-    });
-    let height = ui.available_height();
-    let page = (height - row_h).max(row_h);
-    let mut moved = false;
-    ui.input_mut(|i| {
-        i.events.retain(|event| {
-            let egui::Event::Key { key, pressed: true, modifiers, .. } = event else { return true };
-            if !modifiers.is_none() {
-                return true;
-            }
-            offset = match key {
-                Key::ArrowUp => offset - row_h,
-                Key::ArrowDown => offset + row_h,
-                Key::PageUp => offset - page,
-                Key::PageDown => offset + page,
-                Key::Home => file.start as f32 * row_h,
-                Key::End => (file.end as f32 * row_h - height).max(file.start as f32 * row_h),
-                _ => return true,
-            };
-            offset = offset.max(0.0);
-            moved = true;
-            false
-        });
-    });
-    if moved { Some(offset) } else { jump }
-}
+pub use crate::panel_nav::focus_id;
+use crate::panel_nav::keyboard_scroll;
 
 pub fn show(
     ui: &mut egui::Ui,
@@ -282,15 +237,7 @@ pub fn show(
     palette: &Palette,
     font: &FontId,
 ) -> DiffAction {
-    let focus = ui.interact(rect, focus_id(), Sense::focusable_noninteractive());
-    if focus.has_focus() {
-        ui.memory_mut(|m| {
-            m.set_focus_lock_filter(
-                focus_id(),
-                egui::EventFilter { vertical_arrows: true, escape: true, ..Default::default() },
-            );
-        });
-    }
+    crate::panel_nav::focusable(ui, rect);
     let mut action = DiffAction::None;
     let mut split = header.split.split(rect.width());
     ui.painter().rect_filled(rect, 0.0, palette.background);

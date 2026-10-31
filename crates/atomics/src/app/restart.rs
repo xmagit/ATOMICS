@@ -149,7 +149,7 @@ impl State {
             panel: match self.panel {
                 PanelMode::Plan => "plan",
                 PanelMode::Editor => "editor",
-                PanelMode::Diff => "diff",
+                PanelMode::Diff | PanelMode::Tickets => "diff",
             }
             .into(),
             window_size: self.ctx.input(|input| input.viewport().inner_rect.map(|rect| [rect.width(), rect.height()])),
