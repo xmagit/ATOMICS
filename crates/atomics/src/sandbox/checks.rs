@@ -809,7 +809,7 @@ mod tests {
         assert!(names.openai && names.oauth && !names.github && !names.anthropic);
         let text = misfiled_text(&names.misfiled);
         // A removed sandbox's name is no longer one sbx lists, so it is not shown either.
-        assert_eq!(text, "5 misfiled secrets in scope <unrecognised scope>, anthropic, global, atomics-live");
+        assert_eq!(text, "5 misfiled secrets in scope <unrecognised scope>, anthropic, atomics-live, global");
         assert!(!text.contains("PRIVATE") && !text.contains("atomics-gone"));
         // Without a sandbox list a scope is trusted, but only a known word shows.
         let unknown = secret_names(

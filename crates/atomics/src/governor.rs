@@ -491,7 +491,7 @@ mod tests {
         let uid = unsafe { libc::getuid() };
         let expected = match atomics_core::paths::runtime_dir_for(Path::new("/Users/x/.atomics")) {
             Some(runtime) => runtime.join("jobserver/jobserver.fifo"),
-            None => std::env::temp_dir().join(format!("atomics-{uid}/51d177b92c46bedb/jobserver.fifo")),
+            None => std::env::temp_dir().join(format!("atomics-{uid}/c32c7b261409a862/jobserver.fifo")),
         };
         assert_eq!(a, expected);
         assert_eq!(a, Jobserver::path_for(Path::new("/Users/x/.atomics")));
