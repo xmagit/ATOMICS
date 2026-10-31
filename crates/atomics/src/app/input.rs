@@ -124,6 +124,28 @@ impl Desktop<'_> {
                 self.client.focus_terminal = None;
                 if self.runtime.panel == PanelMode::Editor {
                     self.client.focus_editor = true;
+                    // A worktree's editor is started lazily. Selecting it in editor mode
+                    // must not leave the previous agent's terminal holding the keys.
+                    ctx.memory_mut(|m| {
+                        if let Some(id) = m.focused() {
+                            m.surrender_focus(id);
+                        }
+                    });
+                    if let Some(root) = self.runtime.diff_target()
+                        && !self.runtime.editors.get(&root).is_some_and(|editor| !editor.exited())
+                    {
+                        let path = self.client.editor_file.get(&root).cloned().or_else(|| {
+                            self.client.diff_views.get(&root).and_then(|state| {
+                                state.focused.clone().or_else(|| {
+                                    state
+                                        .prepared
+                                        .as_ref()
+                                        .and_then(|p| p.diff.files.first().map(|f| f.path().to_string()))
+                                })
+                            })
+                        });
+                        self.edit(ctx, &root, path.as_deref(), None);
+                    }
                 } else {
                     self.client.focus_editor = false;
                     self.runtime.panel = PanelMode::Diff;
@@ -917,6 +939,52 @@ mod tests {
             }
             diff_frame(app, ctx, vec![egui::Event::Text("editor".into())]);
             let expected = b"\x1b[6~\x1b[B\x1b[A\x1b[5~\x1b[H\x1b[F\x1beditor";
+            loop {
+                let actual = std::fs::read(second.join("editor.bin")).unwrap();
+                if actual == expected {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "editor received {actual:?}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_received(&first, b"");
+            assert_received(&second, b"");
+        });
+    }
+
+    #[test]
+    fn agent_chord_starts_and_focuses_an_editor_for_a_new_target() {
+        with_app("app::input::tests::agent_chord_starts_and_focuses_an_editor_for_a_new_target", |app, ctx| {
+            let dir = crate::test_support::tempdir().unwrap();
+            let first = dir.path().join("first");
+            let second = dir.path().join("second");
+            diff_agent(app, &first, "first");
+            diff_agent(app, &second, "second");
+            app.runtime.active = Some("first".into());
+            app.runtime.panel = PanelMode::Editor;
+            app.client.focus_terminal = Some("first".into());
+            app.runtime.config.editor.command =
+                vec!["/bin/sh".into(), "-c".into(), "stty raw -echo; printf ready; exec cat > editor.bin".into()];
+            app.runtime.config.editor.startup_keys.clear();
+            app.runtime.config.editor.open_keys.clear();
+            diff_frame(app, ctx, vec![]);
+            let modifiers = if cfg!(target_os = "macos") { egui::Modifiers::MAC_CMD } else { egui::Modifiers::CTRL };
+            let started = Instant::now();
+            diff_frame(app, ctx, vec![key(Key::Num2, Key::Num2, modifiers)]);
+            assert!(ctx.memory(|m| m.has_focus(app.client.editor_id.unwrap())));
+            assert!(app.runtime.editors.contains_key(&second));
+            let deadline = started + crate::test_support::scaled_timeout(Duration::from_secs(4));
+            while started.elapsed() < Duration::from_millis(1500) || !second.join("editor.bin").exists() {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let mut expected = std::fs::read(second.join("editor.bin")).unwrap();
+            expected.extend_from_slice(b"\x1b[6~editor");
+            diff_frame(
+                app,
+                ctx,
+                vec![key(Key::PageDown, Key::PageDown, egui::Modifiers::NONE), egui::Event::Text("editor".into())],
+            );
             loop {
                 let actual = std::fs::read(second.join("editor.bin")).unwrap();
                 if actual == expected {
