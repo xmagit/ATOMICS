@@ -554,13 +554,7 @@ impl Desktop<'_> {
                     if let Some(edited) = edited_tasks.iter().find(|t| t.id == id) {
                         let brief = edited.brief.clone();
                         self.post_plan(self.runtime.selected_plan, move |state, index| {
-                            if !state.plans[index].approved
-                                && let Some(task) = state.plans[index].task_mut(&id)
-                                && task.status == TaskStatus::Planned
-                            {
-                                task.brief = brief;
-                                state.save_plan(index);
-                            }
+                            state.edit_task_brief(index, &id, brief);
                         });
                     }
                 }
@@ -602,8 +596,7 @@ impl Desktop<'_> {
         }
         if approve {
             self.post_plan(self.runtime.selected_plan, |state, index| {
-                state.plans[index].approved = true;
-                state.save_plan(index);
+                state.approve_plan(index);
                 state.toast("Plan approved: the orchestrator can dispatch it now");
             });
         }

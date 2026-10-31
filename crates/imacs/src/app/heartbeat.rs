@@ -75,6 +75,7 @@ impl State {
                 findings: Some(findings.clone()),
                 config: None,
                 ticket: None,
+                change: None,
             });
             self.heartbeat.last = Some((at, findings));
             self.serve_waiters();

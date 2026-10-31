@@ -737,6 +737,7 @@ impl State {
                 findings: None,
                 config: None,
                 ticket: None,
+                change: None,
             });
             self.serve_waiters();
         }
