@@ -14,8 +14,8 @@ use imacs_core::layout::{self, DiffPlacement, DiffSplit, Layout};
 use imacs_core::session::{AgentStatus, UNTITLED, pick_tiled, prompt_title, title_for};
 use imacs_core::store::{SessionRecord, Store};
 use imacs_core::{paths, steer, theme};
-use notify_debouncer_mini::notify::{RecommendedWatcher, RecursiveMode};
-use notify_debouncer_mini::{DebounceEventResult, Debouncer, new_debouncer};
+use notify_debouncer_mini::notify::RecursiveMode;
+use notify_debouncer_mini::{DebounceEventResult, Debouncer, new_debouncer_opt};
 
 use crate::diff_view::{self, DiffAction, DiffState, ExplorerState, Header};
 use crate::diff_worker::{DiffData, DiffWorker, WorkerResult};
@@ -39,6 +39,7 @@ use serde_json::json;
 mod approvals;
 mod background;
 mod board;
+mod change_watcher;
 mod chief;
 mod commands;
 mod connections;
@@ -279,6 +280,8 @@ struct Integrated {
 }
 
 struct CheckedIntegration {
+    /// Which check of the task this is: one that ran past its time limit no longer counts.
+    id: u64,
     commit: Option<String>,
     revision: u64,
     plan: String,
@@ -286,8 +289,18 @@ struct CheckedIntegration {
     into: String,
     /// `None` means git could not verify ancestry; keep the integration marker.
     valid: Option<bool>,
-    /// Git did not run or finish: check again after a while, not only when refs change.
-    retry: bool,
+    /// Why git could not tell, or did not run or finish: shown on the task, and checked again after a
+    /// while, not only when refs change.
+    problem: Option<String>,
+}
+
+/// A dispatch held until the integration checks of the dependencies it waits on report.
+struct DispatchWaiter {
+    plan: String,
+    only: Option<String>,
+    /// `None` for the board's buttons, which toast an error instead.
+    reply: Option<Sender<ControlOutcome>>,
+    deadline: Instant,
 }
 
 /// The worktree clean-up dialog for one project.
@@ -519,9 +532,14 @@ pub(crate) struct State {
     integrating: HashSet<(String, String)>,
     integration_check_tx: crate::host::Sender<CheckedIntegration>,
     integration_check_rx: Receiver<CheckedIntegration>,
-    integration_checks: HashSet<(String, String)>,
+    /// Readiness checks running, each with its id and the time it counts as failed by.
+    integration_checks: HashMap<(String, String), (u64, Instant)>,
+    integration_check_id: u64,
     integration_checked: HashMap<(String, String), (u64, String, Task)>,
     integration_retries: HashMap<(String, String), Instant>,
+    /// Why the last check of a task could not tell whether it is integrated.
+    integration_problems: HashMap<(String, String), String>,
+    dispatch_waiters: Vec<DispatchWaiter>,
     integration_dirty: Arc<AtomicBool>,
     integration_revision: u64,
     worktrees: Vec<WorktreeEntry>,
@@ -530,7 +548,7 @@ pub(crate) struct State {
     worktree_listing: Option<Receiver<ListedWorktrees>>,
     focus_terminal: Option<String>,
     last_layout: Option<Layout>,
-    watcher: Option<Debouncer<RecommendedWatcher>>,
+    watcher: Option<Debouncer<change_watcher::ChangeWatcher>>,
     /// Worktrees being watched, each with its path as the file system reports it.
     watched: Arc<Mutex<Vec<(PathBuf, PathBuf)>>>,
     watch_tx: crate::host::Sender<PathBuf>,
@@ -939,9 +957,12 @@ impl State {
             integrating: HashSet::new(),
             integration_check_tx,
             integration_check_rx,
-            integration_checks: HashSet::new(),
+            integration_checks: HashMap::new(),
+            integration_check_id: 0,
             integration_checked: HashMap::new(),
             integration_retries: HashMap::new(),
+            integration_problems: HashMap::new(),
+            dispatch_waiters: Vec::new(),
             integration_dirty: Arc::new(AtomicBool::new(false)),
             integration_revision: 0,
             worktrees: Vec::new(),

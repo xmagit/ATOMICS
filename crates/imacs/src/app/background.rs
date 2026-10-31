@@ -16,6 +16,7 @@ impl State {
             changed = true;
         }
         self.refresh_integrations();
+        self.serve_dispatches();
         changed |= self.poll_cleanup();
         changed |= self.poll_plan_cleanup();
         changed |= self.usage.drain();
@@ -800,7 +801,8 @@ impl State {
                     let _ = tx.send((*root).clone());
                 }
             };
-            match new_debouncer(Duration::from_millis(250), handler) {
+            let config = notify_debouncer_mini::Config::default().with_timeout(Duration::from_millis(250));
+            match new_debouncer_opt::<_, change_watcher::ChangeWatcher>(config, handler) {
                 Ok(debouncer) => self.watcher = Some(debouncer),
                 Err(err) => eprintln!("IMACS: file watcher failed: {err}"),
             }

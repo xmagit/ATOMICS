@@ -298,7 +298,7 @@ fn tools() -> Value {
         },
         {
             "name": "imacs_plan_get",
-            "description": "Without plan, lists open plans with goal, done/total, approval and waiting tasks. With plan, returns the full plan with every task's status (planned, running, blocked, review, done), its agent session, the agent's last report, notes, whether the user approved it, and which tasks are ready to start.",
+            "description": "Without plan, lists open plans with goal, done/total, approval and waiting tasks. With plan, returns the full plan with every task's status (planned, running, blocked, review, done), its agent session, the agent's last report, notes, whether the user approved it, and which tasks are ready to start. Integrated tasks carry integration_verified, and integration_check says why one is not verified yet.",
             "inputSchema": { "type": "object", "properties": { "plan": plan } }
         },
         {
@@ -318,7 +318,7 @@ fn tools() -> Value {
         },
         {
             "name": "imacs_plan_dispatch",
-            "description": "Start one task (id) or every ready task: each gets a new worktree (from the integration branch when it has dependencies, else from main) and an agent whose first message is the task brief. Only works once the user approved the plan. Agents report back with imacs_report, which wakes imacs_wait.",
+            "description": "Start one task (id) or every ready task: each gets a new worktree (from the integration branch when it has dependencies, else from main) and an agent whose first message is the task brief. Only works once the user approved the plan. Dependencies marked integrated but not verified are checked afresh first, and the answer waits for those checks. Agents report back with imacs_report, which wakes imacs_wait.",
             "inputSchema": { "type": "object", "properties": { "plan": plan, "id": { "type": "string" } } }
         },
         {
