@@ -70,10 +70,12 @@ impl CredentialUi {
                             .map_err(|error| error.to_string())?;
                     }
                     Action::Remove(host) => {
-                        let key = if id == "registry" {
-                            format!("registry:{}", host.as_deref().unwrap_or_default())
-                        } else {
-                            id.into()
+                        let key = match id {
+                            "registry" => format!("registry:{}", host.as_deref().unwrap_or_default()),
+                            crate::credentials::GITHUB_APP => {
+                                crate::credentials::github_app_id(host.as_deref().unwrap_or_default())
+                            }
+                            _ => id.into(),
                         };
                         let label = if id == "registry" {
                             format!("Private registry ({})", host.as_deref().unwrap_or_default())
@@ -181,19 +183,25 @@ impl CredentialUi {
                     }
                 }
             });
+            let hosted = matches!(KINDS[self.selected].0, "registry" | crate::credentials::GITHUB_APP);
             if KINDS[self.selected].0 == "registry" {
                 ui.add(egui::TextEdit::singleline(&mut self.host).hint_text("registry.example.com (host only)"));
+            } else if hosted {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.host)
+                        .hint_text("GitHub Enterprise host; empty for github.com (Connect GitHub is simpler)"),
+                );
             }
             ui.add(egui::TextEdit::singleline(&mut self.value).password(true).hint_text("New value (hidden)"));
             ui.label("Stored values are never displayed. Replace/remove revokes existing session placeholders; restart those sessions.");
             ui.horizontal(|ui| {
                 if ui.add_enabled(!self.value.is_empty(), egui::Button::new("Add / replace credential")).clicked() {
-                    let host = (KINDS[self.selected].0 == "registry").then(|| self.host.clone());
+                    let host = hosted.then(|| self.host.trim().to_string());
                     action = Some(Action::Put(std::mem::take(&mut self.value), host));
                 }
                 if ui.button("Remove credential").clicked() {
                     self.value.clear();
-                    action = Some(Action::Remove((KINDS[self.selected].0 == "registry").then(|| self.host.clone())));
+                    action = Some(Action::Remove(hosted.then(|| self.host.trim().to_string())));
                 }
             });
             if self.snapshot.as_ref().is_some_and(|snapshot| snapshot.invalid > 0)

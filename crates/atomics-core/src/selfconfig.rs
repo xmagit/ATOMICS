@@ -390,14 +390,23 @@ impl Risk {
                 "chief.command",
                 "chief.args",
                 "editor",
+                "github.actions",
                 "isolation",
                 "tickets.server.command",
                 "tickets.server.env",
                 "tickets.server.url",
             ],
-            Risk::SendsCredentials => {
-                &["tickets.server.token_env", "voice.provider", "voice.base_url", "voice.api_key_env", "voice.api_key"]
-            }
+            Risk::SendsCredentials => &[
+                "github.hosts",
+                "github.repos",
+                "github.client_id",
+                "github.app_slug",
+                "tickets.server.token_env",
+                "voice.provider",
+                "voice.base_url",
+                "voice.api_key_env",
+                "voice.api_key",
+            ],
             Risk::InstructsAgents => &["chief.prompt", "chief.system_prompt", "steer", "tickets.workflow"],
         }
     }

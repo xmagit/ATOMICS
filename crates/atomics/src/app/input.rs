@@ -41,6 +41,14 @@ impl Desktop<'_> {
                 self.edit(ctx, &root, file.as_deref(), None);
             }
         }
+        // The GitHub controls, like the agent chords, are taken before the focused terminal or editor.
+        if let (Some(chord), _) = super::github::github_shortcut(&keys)
+            && ctx.input_mut(|i| crate::theme::consume_physical_shortcut(i, &chord))
+        {
+            let open = !self.runtime.github.modal;
+            self.runtime.github_set_modal(open);
+        }
+        self.github_keys(ctx);
         // Shift+↓/↑ walk changed files; PageDown/PageUp walk hunks in the focused diff.
         let editor_focused = self.client.editor_id.is_some_and(|id| ctx.memory(|m| m.has_focus(id)));
         if !ctx.text_edit_focused() && !editor_focused {
@@ -64,7 +72,22 @@ impl Desktop<'_> {
                     (0, false)
                 }
             });
+            // A pull request diff on screen takes the same keys.
             if step != 0
+                && self.runtime.panel == PanelMode::Diff
+                && self.runtime.github_pr_diff().is_some()
+                && let Some((_, state)) = self.client.github.pr_view.as_mut()
+            {
+                self.runtime.diff_open = true;
+                self.client.focus_terminal = None;
+                self.client.focus_editor = false;
+                ctx.memory_mut(|m| m.request_focus(diff_view::focus_id()));
+                if hunk {
+                    state.step_hunk(step);
+                } else {
+                    state.step(step);
+                }
+            } else if step != 0
                 && let Some(root) = self.runtime.diff_target()
             {
                 self.runtime.diff_open = true;

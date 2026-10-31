@@ -9,13 +9,31 @@ use serde::{Deserialize, Serialize};
 
 use crate::relay::{Authorization, Credential, Keychain, Rule};
 
-pub const KINDS: [(&str, &str, &str); 5] = [
+pub const KINDS: [(&str, &str, &str); 6] = [
     ("claude", "Claude subscription", "OS keychain → ATOMICS relay → api.anthropic.com (inference)"),
     ("openai", "OpenAI", "OS keychain → ATOMICS relay → api.openai.com (inference); sandbox Codex uses sbx OpenAI"),
     ("linear", "Linear", "OS keychain → ATOMICS relay → api.linear.app (GraphQL)"),
     ("github", "GitHub", "OS keychain → ATOMICS relay → api.github.com (GET/HEAD only; use a read-only token)"),
     ("registry", "Private registry", "OS keychain → ATOMICS relay → configured host (GET/HEAD only)"),
+    (
+        GITHUB_APP,
+        "GitHub app sign-in",
+        "OS keychain → ATOMICS GitHub controls on this machine (Connect GitHub; never relayed to agents)",
+    ),
 ];
+
+/// The catalog entry of the token ATOMICS's own GitHub controls use: `github-app` for github.com,
+/// `github-app:<host>` for a GitHub Enterprise host. Unlike `github`, it is never a relay credential.
+pub const GITHUB_APP: &str = "github-app";
+
+/// The catalog id of the GitHub controls' token for `host`.
+pub fn github_app_id(host: &str) -> String {
+    if host.is_empty() || host == atomics_core::github::DEFAULT_HOST {
+        GITHUB_APP.into()
+    } else {
+        format!("{GITHUB_APP}:{host}")
+    }
+}
 
 // Never Debug: this structure contains real values, including untrusted entry names.
 #[derive(Default, Serialize, Deserialize)]
@@ -25,11 +43,23 @@ struct Catalog {
     entries: BTreeMap<String, Entry>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 struct Entry {
     token: String,
     #[serde(default)]
     host: Option<String>,
+    /// When the token stops working, in Unix seconds; only on `github-app` entries, for an app
+    /// that kept token expiration on. ATOMICS never refreshes a token: that needs the app's secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expires: Option<u64>,
+}
+
+/// A GitHub controls token as stored, with when it expires (Unix seconds) if it does.
+/// Never Debug: it holds the real value.
+#[derive(Clone, PartialEq)]
+pub struct AppGrant {
+    pub token: String,
+    pub expires: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -85,7 +115,7 @@ impl Store {
         let Some(encoded) = self.keychain.read_catalog()? else {
             let mut catalog = Catalog::default();
             if let Some(token) = self.keychain.legacy_token() {
-                catalog.entries.insert("claude".into(), Entry { token, host: None });
+                catalog.entries.insert("claude".into(), Entry { token, ..Entry::default() });
             }
             return Ok(catalog);
         };
@@ -148,6 +178,18 @@ impl Store {
             }
         }
         for (id, entry) in &catalog.entries {
+            if let Some(host) = id.strip_prefix("github-app:")
+                && valid_entry(id, entry)
+            {
+                entries.push(Status {
+                    id: id.clone(),
+                    label: format!("GitHub app sign-in ({host})"),
+                    route: format!("OS keychain → ATOMICS GitHub controls → {host} (never relayed to agents)"),
+                    present: true,
+                });
+            }
+        }
+        for (id, entry) in &catalog.entries {
             if let Some(server) = id.strip_prefix(MCP_ENV)
                 && valid_entry(id, entry)
             {
@@ -175,8 +217,13 @@ impl Store {
     }
 
     pub fn put(&self, id: &str, token: &str, host: Option<&str>) -> Result<()> {
-        let id = if id == "registry" { format!("registry:{}", host.unwrap_or_default()) } else { id.into() };
-        let entry = Entry { token: token.to_string(), host: host.map(str::to_string) };
+        let (id, host) = match id {
+            "registry" => (format!("registry:{}", host.unwrap_or_default()), host),
+            // The host is part of a GitHub sign-in's id, never stored beside it.
+            GITHUB_APP => (github_app_id(host.map(str::trim).unwrap_or_default()), None),
+            _ => (id.into(), host),
+        };
+        let entry = Entry { token: token.to_string(), host: host.map(str::to_string), ..Entry::default() };
         if !valid_entry(&id, &entry) {
             bail!("credential does not match the selected service or host (value hidden)");
         }
@@ -189,7 +236,7 @@ impl Store {
     /// Stores the environment an MCP server's host process gets, replacing any earlier one.
     pub fn put_mcp_env(&self, server: &str, env: &BTreeMap<String, String>) -> Result<()> {
         let id = format!("{MCP_ENV}{server}");
-        let entry = Entry { token: serde_json::to_string(env)?, host: None };
+        let entry = Entry { token: serde_json::to_string(env)?, ..Entry::default() };
         if !valid_entry(&id, &entry) {
             bail!("MCP environment for {server} is not storable (values hidden)");
         }
@@ -219,9 +266,67 @@ impl Store {
         self.remove(&id)
     }
 
+    /// The token ATOMICS's GitHub controls use on `host`, if one is stored.
+    #[cfg(test)]
+    pub fn github_app_token(&self, host: &str) -> Result<Option<String>> {
+        self.token(&github_app_id(host))
+    }
+
+    /// Stores the GitHub controls' token for `host`, replacing any earlier one.
+    pub fn put_github_app(&self, host: &str, token: &str) -> Result<()> {
+        self.put(GITHUB_APP, token, Some(host))
+    }
+
+    /// The GitHub controls' token for `host` with its expiry, if one is stored.
+    pub fn github_app_grant(&self, host: &str) -> Result<Option<AppGrant>> {
+        let id = github_app_id(host);
+        Ok(self
+            .load()?
+            .entries
+            .remove(&id)
+            .filter(|entry| valid_entry(&id, entry))
+            .map(|entry| AppGrant { token: entry.token, expires: entry.expires }))
+    }
+
+    /// Stores a token with its expiry, as the device flow returns it, replacing any earlier one.
+    pub fn put_github_app_grant(&self, host: &str, grant: &AppGrant) -> Result<()> {
+        let id = github_app_id(host.trim());
+        let entry = Entry { token: grant.token.clone(), host: None, expires: grant.expires };
+        if !valid_entry(&id, &entry) {
+            bail!("credential does not match the selected service or host (value hidden)");
+        }
+        let _lock = self.keychain.catalog_lock()?;
+        let mut catalog = self.load()?;
+        catalog.entries.insert(id, entry);
+        self.save(&catalog)
+    }
+
+    /// Removes the GitHub controls' token for `host` only while it is still `token`, so a token
+    /// that failed never removes one a new Connect GitHub stored meanwhile.
+    pub fn remove_github_app_token(&self, host: &str, token: &str) -> Result<()> {
+        let id = github_app_id(host);
+        let _lock = self.keychain.catalog_lock()?;
+        let mut catalog = self.load()?;
+        if catalog.entries.get(&id).is_none_or(|entry| entry.token != token) {
+            return Ok(());
+        }
+        catalog.entries.remove(&id);
+        self.save(&catalog)
+    }
+
+    /// Removes the GitHub controls' token for `host`; nothing stored is fine.
+    pub fn remove_github_app(&self, host: &str) -> Result<()> {
+        let id = github_app_id(host);
+        if !self.load()?.entries.contains_key(&id) {
+            return Ok(());
+        }
+        self.remove(&id)
+    }
+
     pub fn remove(&self, id: &str) -> Result<()> {
         if !KINDS.iter().any(|kind| kind.0 == id)
             && !id.strip_prefix("registry:").is_some_and(valid_host)
+            && !id.strip_prefix("github-app:").is_some_and(valid_host)
             && !id.strip_prefix(MCP_ENV).is_some_and(atomics_core::mcp_import::valid_name)
         {
             bail!("unknown credential type");
@@ -260,6 +365,8 @@ impl Store {
             "github" => ("GitHub", "api.github.com".into(), read_rules("api.github.com")),
             // A host process's environment, not a relay credential.
             _ if id.starts_with(MCP_ENV) => return Ok(None),
+            // ATOMICS's own GitHub controls: never handed to an agent.
+            _ if id == GITHUB_APP || id.starts_with("github-app:") => return Ok(None),
             _ if id.starts_with("registry:") => {
                 let host = entry.host.expect("validated host");
                 return Ok(Some(Credential::stored(
@@ -286,6 +393,10 @@ const MCP_ENV: &str = "mcp-env:";
 
 fn valid_entry(id: &str, entry: &Entry) -> bool {
     let token = &entry.token;
+    let github_app = id == GITHUB_APP || id.strip_prefix("github-app:").is_some_and(valid_host);
+    if entry.expires.is_some() && !github_app {
+        return false;
+    }
     if let Some(server) = id.strip_prefix(MCP_ENV) {
         return entry.host.is_none()
             && atomics_core::mcp_import::valid_name(server)
@@ -308,6 +419,7 @@ fn valid_entry(id: &str, entry: &Entry) -> bool {
         "openai" => token.starts_with("sk-") && !token.starts_with("sk-ant-"),
         "linear" => token.starts_with("lin_api_"),
         "github" => token.starts_with("github_pat_") || token.starts_with("ghp_"),
+        _ if github_app => ["gho_", "ghp_", "ghu_", "github_pat_"].iter().any(|prefix| token.starts_with(prefix)),
         _ if id.starts_with("registry:") => {
             entry.host.as_deref().is_some_and(|host| valid_host(host) && id.strip_prefix("registry:") == Some(host))
         }
@@ -387,7 +499,16 @@ pub(crate) mod tests {
                 assert!(store.credential(id).unwrap().is_some());
             }
             assert_eq!(keychain.claude_token().as_deref(), Some(VALUES[0].1));
-            assert!(store.snapshot().unwrap().entries.iter().all(|entry| entry.present));
+            // Every relay credential stored above shows present; the GitHub controls' token is not stored here.
+            assert!(
+                store
+                    .snapshot()
+                    .unwrap()
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.id != GITHUB_APP)
+                    .all(|entry| entry.present)
+            );
             let output = format!(
                 "{:?}\n{}\n{:?}",
                 store.snapshot().unwrap(),
@@ -419,7 +540,7 @@ pub(crate) mod tests {
             let (dir, _, store) = machine(mac);
             let mut catalog = Catalog::default();
             for (id, value) in [("sk-PRIVATE-name", "PRIVATE-value"), ("openai", "sk-ant-oat01-PRIVATE-misfiled")] {
-                catalog.entries.insert(id.into(), Entry { token: value.into(), host: None });
+                catalog.entries.insert(id.into(), Entry { token: value.into(), ..Entry::default() });
             }
             store.save(&catalog).unwrap();
             let snapshot = store.snapshot().unwrap();
@@ -465,6 +586,56 @@ pub(crate) mod tests {
             store.remove_mcp_env("github").unwrap();
             store.remove_mcp_env("github").unwrap();
             assert_eq!(store.mcp_env("github").unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn credentials_github_app_tokens_are_separate_and_never_relayed() {
+        for mac in [true, false] {
+            let (dir, _, store) = machine(mac);
+            store.put("github", VALUES[3].1, None).unwrap();
+            store.put_github_app("github.com", "gho_PRIVATE-app").unwrap();
+            store.put(GITHUB_APP, "ghp_PRIVATE-enterprise", Some("git.example.com")).unwrap();
+            assert_eq!(store.github_app_token("github.com").unwrap().as_deref(), Some("gho_PRIVATE-app"));
+            assert_eq!(store.github_app_token("git.example.com").unwrap().as_deref(), Some("ghp_PRIVATE-enterprise"));
+            assert_eq!(store.token("github").unwrap().as_deref(), Some(VALUES[3].1), "the agents' entry is untouched");
+            assert!(store.credential(GITHUB_APP).unwrap().is_none());
+            assert!(store.credential("github-app:git.example.com").unwrap().is_none());
+            let snapshot = store.snapshot().unwrap();
+            assert_eq!(snapshot.invalid, 0);
+            assert!(snapshot.entries.iter().any(|e| e.id == GITHUB_APP && e.present));
+            assert!(snapshot.entries.iter().any(|e| e.label == "GitHub app sign-in (git.example.com)" && e.present));
+            let shown = format!("{snapshot:?} {}", doctor_lines(&store).join("\n"));
+            let argv = std::fs::read_to_string(dir.path().join("keychain-argv")).unwrap();
+            assert!(!shown.contains("PRIVATE") && !argv.contains("PRIVATE"), "{shown}");
+            assert!(store.put_github_app("github.com", "lin_api_misfiled").is_err());
+            assert!(store.put_github_app("127.0.0.1", "gho_value").is_err());
+            let grant = AppGrant { token: "ghu_PRIVATE-user".into(), expires: Some(1_000) };
+            store.put_github_app_grant("git.example.com", &grant).unwrap();
+            assert!(store.github_app_grant("git.example.com").unwrap() == Some(grant.clone()));
+            assert_eq!(store.github_app_token("git.example.com").unwrap().as_deref(), Some("ghu_PRIVATE-user"));
+            let shown = format!("{:?} {}", store.snapshot().unwrap(), doctor_lines(&store).join("\n"));
+            let argv = std::fs::read_to_string(dir.path().join("keychain-argv")).unwrap();
+            assert!(!shown.contains("PRIVATE") && !argv.contains("PRIVATE"), "{shown}");
+            assert!(store.snapshot().unwrap().invalid == 0);
+            // A failed token is removed only while it is still the stored one.
+            store.remove_github_app_token("git.example.com", "ghu_PRIVATE-other").unwrap();
+            assert!(store.github_app_grant("git.example.com").unwrap().is_some());
+            store.remove_github_app_token("git.example.com", "ghu_PRIVATE-user").unwrap();
+            assert!(store.github_app_grant("git.example.com").unwrap().is_none());
+            store.put_github_app_grant("git.example.com", &grant).unwrap();
+            // Expiry belongs to the GitHub controls' entries only.
+            let mut catalog = store.load().unwrap();
+            catalog
+                .entries
+                .insert("github".into(), Entry { token: VALUES[3].1.into(), expires: Some(1), ..Entry::default() });
+            store.save(&catalog).unwrap();
+            assert!(store.token("github").unwrap().is_none() && store.snapshot().unwrap().invalid == 1);
+            store.remove_invalid().unwrap();
+            store.remove_github_app("git.example.com").unwrap();
+            store.remove_github_app("git.example.com").unwrap();
+            assert!(store.github_app_token("git.example.com").unwrap().is_none());
+            assert!(store.github_app_token("github.com").unwrap().is_some());
         }
     }
 
