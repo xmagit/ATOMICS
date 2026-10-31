@@ -229,9 +229,12 @@ Load the appropriate `kvm_intel` or `kvm_amd` module if `/dev/kvm` is missing.
 
 Sandboxed Claude uses the same relay and per-sandbox rule as on macOS, with the subscription token in
 the Secret Service through `secret-tool`, which needs an unlocked keyring in the desktop session.
-`scripts/linux-sandbox-smoke.sh` runs `imacs sandbox relay-check` against the real sbx, which shows
-whether `host.docker.internal` leads a Linux sandbox to this machine's loopback; it has not yet run on
-a Linux desktop.
+`host.docker.internal` leads a Linux sandbox to this machine's loopback, as on macOS. On 2026-10-31
+`imacs sandbox relay-check` passed in 26 seconds on a CachyOS desktop (KDE Plasma 6.8 on Wayland,
+KWallet as the Secret Service, KVM, sbx v0.50.1): Claude's request reached Anthropic through the relay
+with status 200 in 2.8 seconds. `scripts/linux-sandbox-smoke.sh` passed there in 69 seconds: the relay
+check, two sandboxed shells in an isolated IMACS with output and file sync, control round trips of
+9.4 ms median and 17.9 ms at most, and no sandbox, MCP registration or relay rule left behind.
 
 ## Tickets and direct Linear access
 
