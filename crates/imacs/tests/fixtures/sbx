@@ -98,7 +98,11 @@ case "$1" in
         [ -e "$dir/skip-secret-write" ] || touch "$dir/oauth"
         ;;
       set)
-        cat > "$dir/secret-stdin"
+        if [ "$3:$4" = openai:--oauth ]; then
+          [ -e "$dir/skip-secret-write" ] || touch "$dir/openai-oauth"
+        else
+          cat > "$dir/secret-stdin"
+        fi
         if [ ! -e "$dir/skip-secret-write" ]; then
           case "$3" in anthropic) rm -f "$dir/removed-anthropic" ;; *) rm -f "$dir/no-openai" ;; esac
         fi
