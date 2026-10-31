@@ -87,6 +87,7 @@ impl State {
                 }
                 None => missing(&session),
             },
+            ControlRequest::Trace { session, limit } => done(self.trace_response(session.as_deref(), limit)),
             ControlRequest::List => {
                 let sessions: Vec<_> = (0..self.sessions.len()).map(|i| self.describe(i)).collect();
                 let (window, monitor) = ctx.input(|i| (i.content_rect().size(), i.viewport().monitor_size));
@@ -183,6 +184,12 @@ impl State {
                     tasks.into_iter().map(|t| Task { ticket: self.stamp_system(t.ticket.clone()), ..t }).collect();
                 self.plans[index].replace(goal, tasks);
                 let ticket = self.stamp_system(ticket);
+                if ticket
+                    .as_ref()
+                    .is_some_and(|new| self.plans[index].ticket.as_ref().is_none_or(|old| !old.same_ticket(new)))
+                {
+                    self.plans[index].ticket_mode = None;
+                }
                 self.plans[index].ticket =
                     atomics_core::tickets::TicketLink::relink(ticket, self.plans[index].ticket.as_ref());
                 if let Some(branch) = integration.filter(|b| !b.trim().is_empty()) {
@@ -330,6 +337,22 @@ impl State {
             }
             ControlRequest::TicketLink { plan: _, task, ticket, create, unlink } => {
                 self.link_ticket(target, task, ticket, create, unlink, reply);
+                return;
+            }
+            ControlRequest::TicketSearch { query, semantic, take } => {
+                self.chief_ticket(crate::tickets::TicketOp::Search { query, semantic }, take, reply);
+                return;
+            }
+            ControlRequest::TicketRead { ticket } => {
+                self.chief_ticket(crate::tickets::TicketOp::ReadCard(ticket.into_link()), None, reply);
+                return;
+            }
+            ControlRequest::TicketChildren { ticket } => {
+                self.chief_ticket(crate::tickets::TicketOp::Children(ticket.into_link()), None, reply);
+                return;
+            }
+            ControlRequest::TicketRelated { ticket } => {
+                self.chief_ticket(crate::tickets::TicketOp::Related(ticket.into_link()), None, reply);
                 return;
             }
             ControlRequest::TicketSync { plan } => {

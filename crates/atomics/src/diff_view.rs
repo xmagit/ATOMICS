@@ -158,11 +158,7 @@ impl DiffState {
             return None;
         }
         let current = self.focused.as_deref().and_then(|path| files.iter().position(|file| file.path() == path));
-        let next = match current {
-            Some(i) => (i as i32 + delta).clamp(0, files.len() as i32 - 1) as usize,
-            None if delta < 0 => files.len() - 1,
-            None => 0,
-        };
+        let next = crate::panel_nav::step_index(current, files.len(), delta)?;
         let file = &files[next];
         let path = file.path().to_string();
         self.open(&path);
@@ -191,9 +187,7 @@ impl DiffState {
         let next = match current {
             // A file header precedes its first hunk.
             Some(i) if self.hunk.is_none() && delta > 0 => i,
-            Some(i) => (i as i32 + delta).clamp(0, sections.len() as i32 - 1) as usize,
-            None if delta < 0 => sections.len() - 1,
-            None => 0,
+            _ => crate::panel_nav::step_index(current, sections.len(), delta)?,
         };
         let (fi, hi) = sections[next];
         let file = &files[fi];
@@ -252,40 +246,12 @@ pub struct Header<'a> {
     pub editor_shortcut: &'a str,
 }
 
-pub fn focus_id() -> egui::Id {
-    egui::Id::NULL.with("diff-keyboard")
-}
+pub use crate::panel_nav::focus_id;
+use crate::panel_nav::keyboard_scroll;
 
-/// Scroll only the focused diff; leave text fields and terminal modifiers alone.
-fn keyboard_scroll(ui: &egui::Ui, id: egui::Id, row_h: f32, rows: usize, jump: Option<f32>) -> Option<f32> {
-    if !ui.memory(|m| m.has_focus(focus_id())) {
-        return jump;
-    }
-    let mut offset = jump.unwrap_or_else(|| {
-        egui::scroll_area::State::load(ui.ctx(), id).map(|s| s.clamped_offset().y).unwrap_or_default()
-    });
-    let height = ui.available_height();
-    let mut moved = false;
-    ui.input_mut(|i| {
-        i.events.retain(|event| {
-            let egui::Event::Key { key, pressed: true, modifiers, .. } = event else { return true };
-            if !modifiers.is_none() {
-                return true;
-            }
-            offset = match key {
-                Key::ArrowUp => offset - row_h,
-                Key::ArrowDown => offset + row_h,
-                Key::Home => 0.0,
-                Key::End => (rows as f32 * row_h - height).max(0.0),
-                _ => return true,
-            };
-            offset = offset.max(0.0);
-            moved = true;
-            false
-        });
-    });
-    if moved { Some(offset) } else { jump }
-}
+/// The keys that scroll the focused diff. PageUp/PageDown are not among them: they walk the
+/// hunks (see the shortcuts).
+const SCROLL_KEYS: [Key; 4] = [Key::ArrowUp, Key::ArrowDown, Key::Home, Key::End];
 
 pub fn show(
     ui: &mut egui::Ui,
@@ -295,15 +261,7 @@ pub fn show(
     palette: &Palette,
     font: &FontId,
 ) -> DiffAction {
-    let focus = ui.interact(rect, focus_id(), Sense::focusable_noninteractive());
-    if focus.has_focus() {
-        ui.memory_mut(|m| {
-            m.set_focus_lock_filter(
-                focus_id(),
-                egui::EventFilter { vertical_arrows: true, escape: true, ..Default::default() },
-            );
-        });
-    }
+    crate::panel_nav::focusable(ui, rect);
     let mut action = DiffAction::None;
     let mut split = header.split.split(rect.width());
     ui.painter().rect_filled(rect, 0.0, palette.background);
@@ -506,7 +464,7 @@ pub fn show(
     };
     let scroll_id = ui.make_persistent_id(egui::IdSalt::new(("diff-rows", header.title)));
     let before = egui::scroll_area::State::load(ui.ctx(), scroll_id).map(|s| s.clamped_offset().y).unwrap_or_default();
-    if let Some(offset) = keyboard_scroll(ui, scroll_id, row_h, rows.len(), jump.map(|row| row as f32 * row_h)) {
+    if let Some(offset) = keyboard_scroll(ui, scroll_id, row_h, 0..rows.len(), &SCROLL_KEYS, jump.map(|row| row as f32 * row_h)) {
         scroll = scroll.vertical_scroll_offset(offset);
     }
     let mut clicked_line: Option<(usize, usize, usize)> = None;
@@ -778,7 +736,7 @@ fn show_file(ui: &mut egui::Ui, state: &mut DiffState, path: &str, palette: &Pal
     ui.spacing_mut().item_spacing.y = 0.0;
     let mut scroll = egui::ScrollArea::both().id_salt(("file-rows", path)).auto_shrink([false, false]);
     let scroll_id = ui.make_persistent_id(egui::IdSalt::new(("file-rows", path)));
-    if let Some(offset) = keyboard_scroll(ui, scroll_id, row_h, rows.len(), None) {
+    if let Some(offset) = keyboard_scroll(ui, scroll_id, row_h, 0..rows.len(), &SCROLL_KEYS, None) {
         scroll = scroll.vertical_scroll_offset(offset);
     }
     scroll.show_rows(ui, row_h, rows.len(), |ui, range| {

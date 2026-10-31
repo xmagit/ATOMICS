@@ -92,6 +92,10 @@ impl Desktop<'_> {
             self.plan_panel(ui, rect);
             return;
         }
+        if self.runtime.panel == PanelMode::Tickets {
+            self.tickets_panel(ui, rect);
+            return;
+        }
         if self.runtime.panel == PanelMode::Diff && self.github_pr_panel(ui, rect) {
             return;
         }

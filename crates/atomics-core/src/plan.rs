@@ -27,6 +27,9 @@ pub struct Plan {
     /// The external board (board mode) or ticket (ticket mode) this plan follows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ticket: Option<crate::tickets::TicketLink>,
+    /// The resolved ticket/board choice. Absent in older plans; never re-inferred once set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket_mode: Option<crate::tickets::TicketMode>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stages: Vec<crate::workflow::Stage>,
     /// Latest lifecycle progress consumed by the completion sweep, including while closed.
@@ -245,6 +248,24 @@ impl TaskStatus {
 pub const REVIEW_TASK: &str = "review";
 
 impl Plan {
+    pub fn ticket_mode(&self, configured: crate::tickets::TicketMode) -> crate::tickets::TicketMode {
+        self.ticket_mode.filter(|mode| *mode != crate::tickets::TicketMode::Auto).unwrap_or(configured)
+    }
+
+    /// Record the decision only after a successful children read (including an empty one).
+    pub fn resolve_ticket_mode(&mut self, configured: crate::tickets::TicketMode, has_children: bool) -> bool {
+        if self.ticket_mode.is_none_or(|mode| mode == crate::tickets::TicketMode::Auto) {
+            self.ticket_mode = Some(match configured {
+                crate::tickets::TicketMode::Auto if has_children => crate::tickets::TicketMode::Board,
+                crate::tickets::TicketMode::Auto => crate::tickets::TicketMode::Ticket,
+                mode => mode,
+            });
+            true
+        } else {
+            false
+        }
+    }
+
     /// Accepted tasks whose commits still need an explicit integration decision.
     pub fn pending_integrations(&self) -> Vec<&Task> {
         let into = self.integration_branch();

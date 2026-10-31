@@ -118,11 +118,12 @@ close_done_agents = true
 # A workspace's [tickets] replaces this section. See docs/tickets.md for setup and scoping.
 # Tools and result paths are config only; use doctor to check tool names and sync for paths.
 # BEGIN RELAY PROFILE
-# Relay: one existing board per plan (tool names are placeholders; adjust every map).
+# Relay: auto mode; legacy lifecycle maps below are placeholders to adjust.
 # [tickets]
 # system = "relay"
-# mode = "board"
+# mode = "auto"
 # comments = "agents"
+# link_url = "https://relay.atomisk.ai/tickets?selected={uuid}"
 # workflow = "Link the existing Relay board to the plan and one ticket to each task. Product writes what and why; the chief comments implementation details. ATOMICS posts signed agent reports and maps states live. Use atomics_report for reports, without a second ticket comment."
 # server = { command = ["relay-mcp"] }
 # states = { planned = "Todo", running = "In Progress" }
@@ -150,10 +151,30 @@ close_done_agents = true
 # tool = "create_ticket"
 # arguments = { board = "{board}", title = "{title}", description = "{body}" }
 # result = { id = "ticket.id", key = "ticket.key", url = "ticket.url", title = "ticket.title", state = "ticket.status" }
+#
+# [tickets.operations.semantic_search]
+# tool = "find_tickets"
+# arguments = { about = "{query}", take = 10, includeClosed = false }
+# items = "result.tickets"
+# result = { id = "id", key = "number", url = "", title = "subject", state = "status", score = "score", assignee = "assignee" }
+#
+# [tickets.operations.related]
+# tool = "find_related_tickets"
+# arguments = { ticket = "{key}", take = 10, includeClosed = false }
+# items = "result.tickets"
+# result = { id = "id", key = "number", url = "", title = "subject", state = "status", score = "score", assignee = "assignee" }
+#
+# [tickets.operations.read]
+# tool = "get_ticket"
+# arguments = { ticketNumber = "{key_number}" }
+# result = { id = "ticket.id", key = "ticket.ticketNumber", url = "url", title = "ticket.subject", state = "ticket.status", updated_at = "ticket.updatedAtUtc", parent = "ticket.parentTicketId", kind = "ticket.ticketTypeKey" }
+# body = "ticket.description"
+# comments = { items = "comments", author = "authorDisplayName", text = "body", at = "createdAtUtc", kind = "authorIdentityKind" }
+# links = { items = "ticket.developmentLinks", label = "title", url = "pullRequestUrl", status = "pullRequestStatus", ci = "continuousIntegrationStatus" }
 # END RELAY PROFILE
 #
 # BEGIN LINEAR PROFILE
-# Linear: one issue per plan (authenticate the bridge in a terminal first).
+# Linear: verify with doctor; tool names, schemas and result paths are unverified.
 # [tickets]
 # system = "linear"
 # mode = "ticket"
@@ -179,6 +200,24 @@ close_done_agents = true
 # tool = "save_issue"
 # arguments = { team = "ENG", title = "{title}", description = "{body}" }
 # result = { id = "id", key = "id", url = "url", title = "title", state = "status" }
+#
+# [tickets.operations.search]
+# tool = "list_issues"
+# arguments = { query = "{query}", limit = 25 }
+# items = "issues"
+# result = { id = "id", key = "identifier", url = "url", title = "title", state = "status", assignee = "assignee.name" }
+#
+# [tickets.operations.children]
+# tool = "list_issues"
+# arguments = { parentId = "{id}", limit = 25 }
+# items = "issues"
+# result = { id = "id", key = "identifier", url = "url", title = "title", state = "status", parent = "parentId" }
+#
+# [tickets.operations.read]
+# tool = "get_issue"
+# arguments = { id = "{key}" }
+# result = { id = "id", key = "identifier", url = "url", title = "title", state = "status", updated_at = "updatedAt", branch = "gitBranchName", assignee = "assignee.name" }
+# body = "description"
 # END LINEAR PROFILE
 
 [resources]
@@ -267,6 +306,7 @@ quick_open = "cmd+p"
 toggle_editor = "cmd+e"
 toggle_plan = "cmd+b"
 toggle_chief = "cmd+o"
+toggle_tickets = "cmd+k"   # the Tickets panel (cmd+j is next_attention)
 voice = "cmd+shift+space"
 github = "primary+g"        # the GitHub controls; primary = Command on macOS, Ctrl elsewhere
 "##;
@@ -624,6 +664,7 @@ pub struct KeyConfig {
     pub toggle_editor: String,
     pub toggle_plan: String,
     pub toggle_chief: String,
+    pub toggle_tickets: String,
     pub voice: String,
     pub github: String,
 }
@@ -721,6 +762,7 @@ impl Default for KeyConfig {
             toggle_editor: "cmd+e".into(),
             toggle_plan: "cmd+b".into(),
             toggle_chief: "cmd+o".into(),
+            toggle_tickets: "cmd+k".into(),
             voice: "cmd+shift+space".into(),
             github: "primary+g".into(),
         }
@@ -1061,20 +1103,18 @@ kind = "shell"
     #[test]
     fn ticket_profile_examples_match_the_documentation() {
         let docs = include_str!("../../../docs/tickets.md");
-        for name in ["RELAY", "LINEAR"] {
-            let block = DEFAULT_CONFIG
-                .split(&format!("# BEGIN {name} PROFILE\n"))
-                .nth(1)
-                .unwrap()
-                .split(&format!("# END {name} PROFILE"))
-                .next()
-                .unwrap();
+        let mut profiles = 0;
+        for block in DEFAULT_CONFIG.split("# BEGIN ").skip(1) {
+            let (name, block) = block.split_once('\n').unwrap();
+            let block = block.split("# END ").next().unwrap();
             let text =
                 block.lines().skip(1).map(|line| line.strip_prefix("# ").unwrap_or("")).collect::<Vec<_>>().join("\n");
             let config: Config = toml::from_str(&text).unwrap();
             assert!(config.tickets.is_configured());
             assert!(docs.contains(text.trim()), "{name} example drifted from docs/tickets.md");
+            profiles += 1;
         }
+        assert!(profiles >= 2);
     }
 
     #[test]

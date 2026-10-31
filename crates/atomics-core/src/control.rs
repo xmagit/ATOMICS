@@ -10,6 +10,13 @@ use crate::diff::{FileStatus, LineKind, WorktreeDiff};
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum ControlRequest {
     List,
+    /// The chief's cleaned MCP calls, oldest first among the newest `limit` entries.
+    Trace {
+        #[serde(default)]
+        session: Option<String>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
     /// Restart the same installation after saving state. Force bypasses busy checks only.
     Restart {
         #[serde(default)]
@@ -205,6 +212,24 @@ pub enum ControlRequest {
         #[serde(default)]
         plan: Option<String>,
         id: String,
+    },
+    /// Chief-only ticket discovery; results are cleaned cards, capped at 25.
+    TicketSearch {
+        query: String,
+        #[serde(default)]
+        semantic: bool,
+        #[serde(default)]
+        take: Option<usize>,
+    },
+    /// Chief-only full reading card, through read or the get fallback.
+    TicketRead {
+        ticket: crate::tickets::TicketReference,
+    },
+    TicketChildren {
+        ticket: crate::tickets::TicketReference,
+    },
+    TicketRelated {
+        ticket: crate::tickets::TicketReference,
     },
     /// Attaches a ticket to a plan (without `task`) or a task, creates one through the
     /// configured create operation, or with `unlink` removes the link.

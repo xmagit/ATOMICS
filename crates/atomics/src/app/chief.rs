@@ -134,6 +134,7 @@ impl State {
     pub(super) fn toggle_chief(&mut self, ctx: &egui::Context) {
         if !self.sessions.iter().any(|s| s.chief && s.terminal.as_ref().is_some_and(|t| !t.exited())) {
             self.sessions.retain(|s| !s.chief);
+            self.traces.retain(|id, _| self.sessions.iter().any(|session| session.id == *id && session.chief));
             if let Err(err) = self.start_chief(ctx, None) {
                 self.toast(err);
                 return;
@@ -193,6 +194,7 @@ fn orbit_icon(painter: &egui::Painter, rect: Rect, accent: Color32, light: Color
 /// Checks with atomics_exec run in an agent's sandbox, which reaches no more than its agent does.
 pub(super) const CHIEF_ALLOWED_TOOLS: &[&str] = &[
     "mcp__atomics__atomics_list",
+    "mcp__atomics__atomics_trace_get",
     "mcp__atomics__atomics_wait",
     "mcp__atomics__atomics_restart",
     "mcp__atomics__atomics_approve",
@@ -215,6 +217,10 @@ pub(super) const CHIEF_ALLOWED_TOOLS: &[&str] = &[
     "mcp__atomics__atomics_ticket_link",
     "mcp__atomics__atomics_ticket_sync",
     "mcp__atomics__atomics_ticket_comment",
+    "mcp__atomics__atomics_ticket_search",
+    "mcp__atomics__atomics_ticket_read",
+    "mcp__atomics__atomics_ticket_children",
+    "mcp__atomics__atomics_ticket_related",
     "mcp__atomics__atomics_config_get",
     "mcp__atomics__atomics_config_propose",
     "mcp__atomics__atomics_doctor",
@@ -534,6 +540,13 @@ mod tests {
             wake_message(3, &findings),
             "ATOMICS wake: 3 new events, 6 heartbeat findings (agent_gone, unreported, approval, held_messages, stuck_working). Call atomics_wait and act; if nothing changed, post one short line."
         );
+    }
+
+    #[test]
+    fn ticket_tools_are_preapproved_for_the_chief() {
+        for tool in ["search", "read", "children", "related"] {
+            assert!(CHIEF_ALLOWED_TOOLS.contains(&format!("mcp__atomics__atomics_ticket_{tool}").as_str()));
+        }
     }
 
     #[test]

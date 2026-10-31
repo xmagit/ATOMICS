@@ -822,6 +822,7 @@ pub(super) fn github_shortcut(
         ("toggle_editor", &keys.toggle_editor),
         ("toggle_plan", &keys.toggle_plan),
         ("toggle_chief", &keys.toggle_chief),
+        ("toggle_tickets", &keys.toggle_tickets),
         ("voice", &keys.voice),
     ]
     .into_iter()

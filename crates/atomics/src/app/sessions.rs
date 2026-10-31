@@ -588,8 +588,11 @@ impl State {
             args.push("--settings".into());
             args.push(match sandboxed {
                 None => {
-                    let mut settings =
-                        atomics_core::hook::session_settings(Path::new(&exe), Path::new(&socket), &id, false);
+                    let mut settings = if chief {
+                        atomics_core::hook::chief_session_settings(Path::new(&exe), Path::new(&socket), &id)
+                    } else {
+                        atomics_core::hook::session_settings(Path::new(&exe), Path::new(&socket), &id, false)
+                    };
                     if let Some(granted) = &relay {
                         settings["apiKeyHelper"] = "".into();
                         settings["env"] = json!({
@@ -687,6 +690,7 @@ impl State {
                 self.sessions[index].ref_guard = ref_guard;
                 self.sessions[index].relay = relay;
                 if chief {
+                    self.load_chief_trace(&id);
                     self.hub.lock().unwrap().chief_running = true;
                 }
                 if let Some(text) = shell_prompt
@@ -890,6 +894,7 @@ impl State {
             let guard = self.sessions[i].ref_guard.take();
             self.check_all_refs(&exempt);
             let mut session = self.sessions.remove(i);
+            self.traces.remove(&session.id);
             if session.chief {
                 self.hub.lock().unwrap().chief_running = false;
             }

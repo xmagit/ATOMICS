@@ -10,6 +10,13 @@ use std::time::{Duration, Instant};
 use atomics_core::tickets::McpServer;
 use serde_json::{Value, json};
 
+// `sign_in`, `sign_out` and `status` are the API the sign-in UI calls; the UI is a separate task.
+#[allow(dead_code)]
+mod oauth;
+use oauth::Session;
+#[allow(unused_imports)]
+pub use oauth::{OAuth, SIGN_IN_REQUIRED, SignInStatus, is_sign_in_required};
+
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const STDERR_TAIL: usize = 2000;
 
@@ -19,12 +26,15 @@ const STDERR_TAIL: usize = 2000;
 pub enum McpError {
     Transport(String),
     Server(String),
+    /// The server needs a person to sign in (again): never retried, never a browser by itself.
+    SignInRequired(String),
 }
 
 impl std::fmt::Display for McpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             McpError::Transport(message) | McpError::Server(message) => f.write_str(message),
+            McpError::SignInRequired(message) => write!(f, "{SIGN_IN_REQUIRED}: {message}"),
         }
     }
 }
@@ -55,6 +65,8 @@ struct HttpServer {
     agent: ureq::Agent,
     url: String,
     token: Option<String>,
+    /// Browser sign-in, when the server is configured `oauth = true`; its access token replaces `token`.
+    oauth: Option<Box<Session>>,
     session: Option<String>,
     initialized: bool,
 }
@@ -67,6 +79,18 @@ impl McpClient {
         timeout: Duration,
         env: impl Fn(&str) -> Option<String>,
     ) -> Result<McpClient, McpError> {
+        let oauth = server.uses_oauth().then(OAuth::current);
+        Self::connect_with(server, timeout, env, oauth.as_ref())
+    }
+
+    /// Like `connect`, signing in with the saved OAuth tokens of `oauth` when the server is
+    /// configured for it. It never opens a browser: a server not signed in is `SignInRequired`.
+    pub fn connect_with(
+        server: &McpServer,
+        timeout: Duration,
+        env: impl Fn(&str) -> Option<String>,
+        oauth: Option<&OAuth>,
+    ) -> Result<McpClient, McpError> {
         let transport = match (server.command.split_first(), server.url.as_deref().map(str::trim)) {
             (Some((program, args)), _) => Transport::Stdio(StdioServer::spawn(program, args, server)?),
             (None, Some(url)) if !url.is_empty() => {
@@ -74,12 +98,25 @@ impl McpClient {
                     Some(name) => Some(env(name).ok_or_else(|| McpError::Transport(format!("{name} is not set")))?),
                     None => None,
                 };
+                let session = if server.uses_oauth() {
+                    let oauth = oauth.ok_or_else(|| McpError::Transport("OAuth sign-in is unavailable".into()))?;
+                    Some(Box::new(oauth.session(server, timeout)?))
+                } else {
+                    None
+                };
                 let agent = ureq::Agent::config_builder()
                     .timeout_global(Some(timeout))
                     .http_status_as_error(false)
                     .build()
                     .into();
-                Transport::Http(HttpServer { agent, url: url.to_string(), token, session: None, initialized: false })
+                Transport::Http(HttpServer {
+                    agent,
+                    url: url.to_string(),
+                    token,
+                    oauth: session,
+                    session: None,
+                    initialized: false,
+                })
             }
             _ => return Err(McpError::Transport("no MCP server configured: set server.command or server.url".into())),
         };
@@ -100,7 +137,15 @@ impl McpClient {
         Ok(client)
     }
 
-    /// The bearer token this connection authenticated with, if any.
+    /// The OAuth access token in use, if the connection signed in that way. It changes on refresh.
+    pub fn oauth_token(&self) -> Option<&str> {
+        match &self.transport {
+            Transport::Http(server) => server.oauth.as_ref().map(|s| s.access_token()),
+            Transport::Stdio(_) => None,
+        }
+    }
+
+    /// The static bearer token this connection authenticated with, if any.
     pub fn token(&self) -> Option<&str> {
         match &self.transport {
             Transport::Http(server) => server.token.as_deref(),
@@ -316,30 +361,55 @@ impl HttpServer {
         if remaining.is_zero() {
             return Err(McpError::Transport(format!("request to {} timed out", self.url)));
         }
-        let mut request = self
-            .agent
-            .post(&self.url)
-            .config()
-            .timeout_global(Some(remaining))
-            .build()
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json, text/event-stream");
-        if let Some(token) = &self.token {
-            request = request.header("Authorization", format!("Bearer {token}"));
+        if let Some(oauth) = &mut self.oauth {
+            oauth.refresh_if_due()?;
         }
-        if let Some(session) = &self.session {
-            request = request.header("Mcp-Session-Id", session);
-        }
-        if self.initialized {
-            request = request.header("MCP-Protocol-Version", PROTOCOL_VERSION);
-        }
-        let mut response = request
-            .send(message.to_string())
-            .map_err(|err| McpError::Transport(format!("request to {} failed: {err}", self.url)))?;
+        let mut retried = false;
+        let mut response = loop {
+            let mut request = self
+                .agent
+                .post(&self.url)
+                .config()
+                .timeout_global(Some(deadline.saturating_duration_since(Instant::now())))
+                .build()
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json, text/event-stream");
+            if let Some(oauth) = &self.oauth {
+                request = request.header("Authorization", format!("Bearer {}", oauth.access_token()));
+            } else if let Some(token) = &self.token {
+                request = request.header("Authorization", format!("Bearer {token}"));
+            }
+            if let Some(session) = &self.session {
+                request = request.header("Mcp-Session-Id", session);
+            }
+            if self.initialized {
+                request = request.header("MCP-Protocol-Version", PROTOCOL_VERSION);
+            }
+            let response = request
+                .send(message.to_string())
+                .map_err(|err| McpError::Transport(format!("request to {} failed: {err}", self.url)))?;
+            // The server no longer accepts the token (revoked or expired early): refresh once and
+            // retry. A refresh that fails is SignInRequired, so this cannot loop.
+            if response.status().as_u16() == 401
+                && !retried
+                && let Some(oauth) = &mut self.oauth
+            {
+                retried = true;
+                oauth.refresh()?;
+                continue;
+            }
+            break response;
+        };
         if let Some(session) = response.headers().get("mcp-session-id").and_then(|v| v.to_str().ok()) {
             self.session = Some(session.to_string());
         }
         let status = response.status().as_u16();
+        let challenges: Vec<String> = response
+            .headers()
+            .get_all("www-authenticate")
+            .iter()
+            .filter_map(|v| v.to_str().ok().map(str::to_string))
+            .collect();
         let content_type = response
             .headers()
             .get("content-type")
@@ -351,6 +421,15 @@ impl HttpServer {
                 .body_mut()
                 .read_to_string()
                 .map_err(|err| McpError::Transport(format!("reading the answer from {} failed: {err}", self.url)))?;
+            if status == 401 && self.oauth.is_some() {
+                return Err(McpError::SignInRequired(format!("{} rejected the saved sign-in", self.url)));
+            }
+            if status == 401 && self.token.is_none() && challenges_oauth(&challenges) {
+                return Err(McpError::SignInRequired(format!(
+                    "{} asks for a sign-in: set oauth = true on the server and sign in",
+                    self.url
+                )));
+            }
             let hint = if matches!(status, 401 | 403) { " (check server.token_env)" } else { "" };
             let body: String = body.chars().take(300).collect();
             return Err(McpError::Transport(format!("{} answered HTTP {status}{hint}: {}", self.url, body.trim())));
@@ -406,6 +485,11 @@ impl HttpServer {
     }
 }
 
+/// Whether a 401 asks for OAuth: a `Bearer` challenge pointing at protected-resource metadata.
+fn challenges_oauth(challenges: &[String]) -> bool {
+    challenges.iter().any(|c| c.to_ascii_lowercase().contains("resource_metadata"))
+}
+
 fn server_reply(value: &Value) -> Option<Value> {
     let id = value.get("id")?;
     Some(if value["method"] == "ping" {
@@ -447,18 +531,36 @@ pub(crate) mod tests {
     /// Exercise the shipped commented blocks rather than maintaining test-only profiles.
     pub(crate) fn example_profile(name: &str, state: &std::path::Path) -> atomics_core::tickets::TicketConfig {
         let template = atomics_core::config::DEFAULT_CONFIG;
-        let block = template
-            .split(&format!("# BEGIN {name} PROFILE\n"))
-            .nth(1)
-            .unwrap()
-            .split(&format!("# END {name} PROFILE"))
-            .next()
-            .unwrap();
-        let text =
-            block.lines().skip(1).map(|line| line.strip_prefix("# ").unwrap_or("")).collect::<Vec<_>>().join("\n");
-        let config: atomics_core::config::Config = toml::from_str(&text).unwrap();
-        let mut tickets = config.tickets;
-        tickets.server.command = vec![fake_server().display().to_string(), state.display().to_string()];
+        let semantic = match name {
+            "meaning-example" => true,
+            "keyword-example" => false,
+            _ => panic!("unknown example profile {name}"),
+        };
+        let mut tickets = template
+            .split("# BEGIN ")
+            .skip(1)
+            .map(|block| {
+                let (_, block) = block.split_once('\n').unwrap();
+                let block = block.split("# END ").next().unwrap();
+                let text = block
+                    .lines()
+                    .skip(1)
+                    .map(|line| line.strip_prefix("# ").unwrap_or(""))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                toml::from_str::<atomics_core::config::Config>(&text).unwrap().tickets
+            })
+            .find(|config| config.operation("semantic_search").is_some() == semantic)
+            .expect("the commented examples include meaning and keyword profiles");
+        tickets.system = name.into();
+        tickets.workflow = "Example ticket workflow.".into();
+        if tickets.link_url.is_some() {
+            tickets.link_url = Some("https://tickets.example/?selected={uuid}".into());
+        }
+        tickets.server = McpServer {
+            command: vec![fake_server().display().to_string(), state.display().to_string()],
+            ..McpServer::default()
+        };
         tickets
     }
 

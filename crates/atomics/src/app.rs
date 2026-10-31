@@ -62,7 +62,9 @@ mod sessions;
 mod sidebar;
 mod themes;
 mod tickets;
+mod tickets_panel;
 mod topbar;
+mod trace;
 mod voice;
 mod workflow;
 mod worktrees;
@@ -324,6 +326,8 @@ enum PanelMode {
     Editor,
     /// The orchestrator's plan board.
     Plan,
+    /// Find and read tickets from the configured ticket system.
+    Tickets,
 }
 
 /// A status change, kept so `wait` can answer "what happened since cursor N".
@@ -484,6 +488,8 @@ pub(crate) struct State {
     /// Worktree picked in the sidebar without an agent; the diff otherwise follows the active session.
     diff_root: Option<PathBuf>,
     diffs: HashMap<PathBuf, DiffData>,
+    /// Chief-only, reduced MCP history. Never contains raw tool responses.
+    traces: HashMap<String, atomics_core::trace::TraceLog>,
     worker: DiffWorker,
     hub: Arc<Mutex<Hub>>,
     hook_rx: Receiver<HookMessage>,
@@ -929,6 +935,7 @@ impl State {
             diff_open: true,
             diff_root: None,
             diffs: HashMap::new(),
+            traces: HashMap::new(),
             worker: DiffWorker::new(wake),
             hub,
             hook_rx,
@@ -1681,7 +1688,8 @@ impl Desktop<'_> {
             && self.runtime.plans[self.runtime.selected_plan].status != PlanStatus::Open;
         let diff_open = !history_board
             && self.runtime.diff_open
-            && (self.runtime.diff_target().is_some() || self.runtime.panel == PanelMode::Plan);
+            && (self.runtime.diff_target().is_some()
+                || matches!(self.runtime.panel, PanelMode::Plan | PanelMode::Tickets));
         let layout_config =
             layout::LayoutConfig { diff_width: self.client.split, ..self.runtime.config.layout.clone() };
         let visible = if history_board { Vec::new() } else { self.runtime.visible_sessions() };

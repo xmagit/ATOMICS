@@ -89,6 +89,12 @@ impl Desktop<'_> {
                 } else {
                     state.step(step);
                 }
+            } else if step != 0 && self.runtime.panel == PanelMode::Tickets && self.runtime.diff_open {
+                // The Tickets panel takes Shift+↓/↑; it pages with PageUp/PageDown itself.
+                self.client.focus_terminal = None;
+                self.client.focus_editor = false;
+                ctx.memory_mut(|m| m.request_focus(diff_view::focus_id()));
+                self.runtime.tickets_step(step);
             } else if step != 0
                 && let Some(root) = self.runtime.diff_target()
             {
@@ -112,6 +118,27 @@ impl Desktop<'_> {
         }
         if pressed(&keys.toggle_plan) {
             self.runtime.toggle_plan();
+        }
+        if pressed(&keys.toggle_tickets) {
+            self.runtime.toggle_tickets();
+            if self.runtime.panel == PanelMode::Tickets {
+                self.client.focus_terminal = None;
+                self.client.focus_editor = false;
+                if self.runtime.tickets.panel.view == tickets_panel::TicketsView::Read {
+                    ctx.memory_mut(|m| m.request_focus(diff_view::focus_id()));
+                }
+            } else {
+                self.client.focus_terminal = self.runtime.active.clone();
+            }
+        }
+        // Alt+← goes back along the tickets read, only while the panel holds the keys.
+        if self.runtime.panel == PanelMode::Tickets
+            && self.runtime.diff_open
+            && self.runtime.tickets.panel.view == tickets_panel::TicketsView::Read
+            && ctx.memory(|m| m.has_focus(diff_view::focus_id()))
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, Key::ArrowLeft))
+        {
+            self.runtime.tickets_back();
         }
         if pressed(&keys.toggle_chief) {
             self.toggle_chief(ctx);
@@ -182,6 +209,11 @@ impl Desktop<'_> {
                         });
                         self.edit(ctx, &root, path.as_deref(), None);
                     }
+                } else if self.runtime.panel == PanelMode::Tickets {
+                    // Find stays in Find; Read shows the agent's ticket.
+                    self.client.focus_editor = false;
+                    self.runtime.tickets_retarget(&id);
+                    ctx.memory_mut(|m| m.request_focus(diff_view::focus_id()));
                 } else {
                     self.client.focus_editor = false;
                     self.runtime.panel = PanelMode::Diff;
@@ -198,7 +230,11 @@ impl Desktop<'_> {
             });
             if self.client.focus_editor {
                 ctx.memory_mut(|m| m.surrender_focus(diff_view::focus_id()));
-            } else if escape || typing || !self.runtime.diff_open || self.runtime.panel != PanelMode::Diff {
+            } else if escape
+                || typing
+                || !self.runtime.diff_open
+                || !matches!(self.runtime.panel, PanelMode::Diff | PanelMode::Tickets)
+            {
                 ctx.memory_mut(|m| m.surrender_focus(diff_view::focus_id()));
                 self.client.focus_terminal = self.runtime.active.clone();
                 // At the smallest window size the diff covers the terminal entirely.

@@ -312,13 +312,28 @@ fn ticket_check(config: &atomics_core::tickets::TicketConfig) -> String {
                 config.operation(name).filter(|op| !tools.contains(&op.tool)).map(|op| format!("{name} → {}", op.tool))
             })
             .collect();
-        if missing.is_empty() { Ok(()) } else { Err(format!("missing mapped tools: {}", missing.join(", "))) }
+        if !missing.is_empty() {
+            return Err(format!("missing mapped tools: {}", missing.join(", ")));
+        }
+        Ok(["search", "semantic_search", "children", "related", "read"]
+            .into_iter()
+            .filter_map(|name| {
+                config.operation(name).filter(|op| !tools.contains(&op.tool)).map(|op| format!("{name} → {}", op.tool))
+            })
+            .collect::<Vec<_>>())
     })();
     // Doctor output is shared in bug reports: the server's words go through the same
     // cleaner as everything else ATOMICS keeps or shows from a ticket server.
     let cleaner = atomics_core::tickets::Cleaner::of(config, crate::setup::env_var);
     let label = match &result {
-        Ok(()) => format!("{} ticket MCP server starts and offers all mapped tools", config.system),
+        Ok(notes) if notes.is_empty() => {
+            format!("{} ticket MCP server starts and offers all mapped tools", config.system)
+        }
+        Ok(notes) => format!(
+            "{} ticket MCP server starts; note: optional mapped tools unavailable: {}",
+            config.system,
+            cleaner.error(&notes.join(", "))
+        ),
         Err(error) => format!("{} ticket MCP check failed (warning): {}", config.system, cleaner.error(error)),
     };
     check_line(
@@ -389,6 +404,32 @@ mod tests {
     }
 
     #[test]
+    fn ticket_check_notes_missing_optional_workspace_operations() {
+        use crate::mcp_client::tests::{example_profile, fake_state};
+        let dir = crate::test_support::tempdir().unwrap();
+        let state = fake_state(dir.path(), serde_json::json!([]));
+        let mut config = example_profile("keyword-example", &state);
+        for name in ["search", "semantic_search", "children", "related", "read"] {
+            let operation = atomics_core::tickets::Operation { tool: format!("missing_{name}"), ..Default::default() };
+            match name {
+                "search" => config.operations.search = Some(operation),
+                "semantic_search" => config.operations.semantic_search = Some(operation),
+                "children" => config.operations.children = Some(operation),
+                "related" => config.operations.related = Some(operation),
+                _ => config.operations.read = Some(operation),
+            }
+            let line = ticket_check(&config);
+            assert!(
+                line.starts_with('✓') && line.contains("note:") && line.contains(&format!("{name} → missing_{name}")),
+                "{line}"
+            );
+            assert!(!line.contains("warning"));
+        }
+        let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(state).unwrap()).unwrap();
+        assert_eq!(value["calls"], serde_json::json!([]));
+    }
+
+    #[test]
     fn ticket_check_never_prints_the_servers_credentials() {
         let mut config: atomics_core::tickets::TicketConfig = toml::from_str("system = \"echo\"").unwrap();
         config.server.command = vec![
@@ -408,7 +449,7 @@ mod tests {
         use serde_json::{Value, json};
         let dir = crate::test_support::tempdir().unwrap();
         let state = fake_state(dir.path(), json!([]));
-        for name in ["RELAY", "LINEAR"] {
+        for name in ["meaning-example", "keyword-example"] {
             let mut config = example_profile(name, &state);
             let mut value: Value = serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
             value["page_size"] = json!(2);
@@ -421,7 +462,7 @@ mod tests {
             let failed = ticket_check(&config);
             assert!(failed.starts_with('✗') && failed.contains("starting"), "{failed}");
         }
-        let mut config = example_profile("RELAY", &state);
+        let mut config = example_profile("meaning-example", &state);
         config.timeout_secs = 1;
         let mut value: Value = serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
         value["list_hang"] = json!(true);

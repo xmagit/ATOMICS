@@ -666,6 +666,8 @@ fn github_shortcut_conflicts_are_reported_and_fall_back() {
     assert!(problem.as_deref().unwrap().contains("the agent chord for agent 1; using primary+g"), "{problem:?}");
     let other = atomics_core::config::KeyConfig { github: keys.toggle_diff.clone(), ..keys.clone() };
     assert!(github_shortcut(&other).1.unwrap().contains("is already [keys] toggle_diff"));
+    let tickets = atomics_core::config::KeyConfig { github: keys.toggle_tickets.clone(), ..keys.clone() };
+    assert!(github_shortcut(&tickets).1.unwrap().contains("is already [keys] toggle_tickets"));
     let taken = atomics_core::config::KeyConfig { toggle_diff: "primary+g".into(), ..keys.clone() };
     let (chord, problem) = github_shortcut(&taken);
     assert!(chord.is_none() && problem.unwrap().ends_with("no GitHub shortcut"));

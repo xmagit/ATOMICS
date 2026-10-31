@@ -122,6 +122,83 @@ fn session_row(
     response
 }
 
+/// What a plan's tab shows: its ticket's key with progress when it has one, else its goal.
+pub(super) fn plan_tab_name(plan: &Plan) -> String {
+    let Some(ticket) = plan.ticket.as_ref() else { return plan.goal.clone() };
+    if plan.status == PlanStatus::Open && plan.tasks.is_empty() {
+        return format!("{} · planning…", ticket.label());
+    }
+    let done = plan.count(TaskStatus::Done);
+    format!("{} · {done}/{}", ticket.label(), plan.tasks.len())
+}
+
+impl Desktop<'_> {
+    /// The TICKETS section: a plan's ticket tree in its view, else Find and the last tickets read.
+    fn tickets_section(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let Some(config) = self.runtime.ticket_config() else { return };
+        let mut open: Option<atomics_core::tickets::TicketLink> = None;
+        let mut find = false;
+        section(ui, p, "TICKETS");
+        let plan = self.runtime.plan_view.then(|| &self.runtime.plans[self.runtime.selected_plan]);
+        let row = |ui: &mut egui::Ui, depth: usize, link: &atomics_core::tickets::TicketLink, status: Option<TaskStatus>| {
+            let dot = match (&link.state, status) {
+                (Some(state), _) => config.states.status_of(state).map_or(p.muted, |s| super::board::task_color(s, p)),
+                (None, Some(status)) => super::board::task_color(status, p),
+                (None, None) => p.muted,
+            };
+            let mut text = egui::text::LayoutJob::default();
+            text.append("● ", 0.0, egui::TextFormat { font_id: p.ui(10.0), color: dot, ..Default::default() });
+            text.append(
+                &format!("{} {}", link.label(), link.title.as_deref().unwrap_or("")),
+                0.0,
+                egui::TextFormat { font_id: p.ui(12.0), color: p.foreground, ..Default::default() },
+            );
+            ui.horizontal(|ui| {
+                ui.add_space(depth as f32 * 12.0);
+                ui.add(egui::Button::selectable(false, text).truncate()).on_hover_text(link.title.as_deref().unwrap_or(""))
+            })
+            .inner
+            .clicked()
+        };
+        match plan.and_then(|plan| plan.ticket.as_ref().map(|ticket| (plan, ticket))) {
+            Some((plan, ticket)) => {
+                if row(ui, 0, ticket, None) {
+                    open = Some(ticket.clone());
+                }
+                for task in &plan.tasks {
+                    if let Some(link) = &task.ticket
+                        && row(ui, 1, link, Some(task.status))
+                    {
+                        open = Some(link.clone());
+                    }
+                }
+                for item in self.runtime.tickets.boards.get(&plan.id).into_iter().flatten() {
+                    let tasked = plan.tasks.iter().any(|t| t.ticket.as_ref().is_some_and(|l| l.same_ticket(item)));
+                    if !tasked && row(ui, 1, item, None) {
+                        open = Some(item.clone());
+                    }
+                }
+            }
+            None => {
+                if ui.add(egui::Button::selectable(false, RichText::new("Find tickets…").size(12.0))).clicked() {
+                    find = true;
+                }
+                for link in &self.runtime.tickets.panel.recent {
+                    if row(ui, 0, link, None) {
+                        open = Some(link.clone());
+                    }
+                }
+            }
+        }
+        ui.add_space(10.0);
+        if find {
+            self.runtime.show_find();
+        } else if let Some(link) = open {
+            self.runtime.open_ticket(link, tickets_panel::Nav::Fresh);
+        }
+    }
+}
+
 impl Desktop<'_> {
     /// Tabs share a bounded navigation slot. First shorten labels, then move
     /// excess tabs into a menu, keeping the selected tab in the visible row.
@@ -471,7 +548,7 @@ impl Desktop<'_> {
                 let plan = &self.runtime.plans[*index];
                 let state = self.runtime.plan_state(*index);
                 let marker = if self.runtime.changed_plans.contains(&plan.id) { " *" } else { "" };
-                let mut name: String = plan.goal.chars().take(28).collect();
+                let mut name: String = plan_tab_name(plan).chars().take(28).collect();
                 if state.urgency() > 0
                     && let Some(width) = width
                 {
@@ -622,6 +699,7 @@ impl Desktop<'_> {
         let sessions_height = if files_root.is_some() { (total * 0.46).max(150.0) } else { total };
         ui.add_space(6.0);
         egui::ScrollArea::vertical().id_salt("sidebar").max_height(sessions_height).auto_shrink([false, true]).show(ui, |ui| {
+            self.tickets_section(ui, &p);
             section(ui, &p, "AGENTS");
             let mut clicked: Option<String> = None;
             let mut close: Option<String> = None;

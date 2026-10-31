@@ -402,6 +402,7 @@ impl Risk {
                 "github.client_id",
                 "github.app_slug",
                 "tickets.server.token_env",
+                "tickets.server.oauth",
                 "voice.provider",
                 "voice.base_url",
                 "voice.api_key_env",
