@@ -876,7 +876,7 @@ impl Keychain {
         }
     }
 
-    fn read_item(&self, service: &str, account: &str) -> Result<Option<String>> {
+    pub(crate) fn read_item(&self, service: &str, account: &str) -> Result<Option<String>> {
         let args = if self.mac {
             vec!["find-generic-password", "-a", account, "-s", service, "-w"]
         } else {
@@ -939,29 +939,54 @@ impl Keychain {
     }
 
     pub(crate) fn write_catalog(&self, encoded: &str) -> Result<()> {
-        // Hex encodes the JSON so security's interactive parser only sees letters and digits.
-        // This is transport encoding; the OS keychain supplies encryption and access control.
+        self.write_item("atomics-credentials-v1", ACCOUNT, "ATOMICS credentials", encoded)
+    }
+
+    /// Writes one keychain item and reads it back. `encoded` is hex, so security's interactive
+    /// parser only sees letters and digits; the OS keychain supplies encryption and access control.
+    pub(crate) fn write_item(&self, service: &str, account: &str, label: &str, encoded: &str) -> Result<()> {
         let (args, input) = if self.mac {
-            (vec!["-i"], format!("add-generic-password -U -a {ACCOUNT} -s atomics-credentials-v1 -w {encoded}\n"))
+            (vec!["-i".to_string()], format!("add-generic-password -U -a {account} -s {service} -w {encoded}\n"))
         } else {
             (
-                vec!["store", "--label=ATOMICS credentials", "service", "atomics-credentials-v1", "account", ACCOUNT],
+                ["store", &format!("--label={label}"), "service", service, "account", account]
+                    .map(str::to_string)
+                    .to_vec(),
                 format!("{encoded}\n"),
             )
         };
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
         // security.c's MAX_LINE_LEN is 4096, including the terminating NUL. Reject before
         // invoking it: a truncated interactive command could overwrite the current item.
         if self.mac && input.len() >= 4096 {
             anyhow::bail!(
-                "credential catalog exceeds macOS security's 4 KiB input limit; existing credentials are unchanged"
+                "credential item exceeds macOS security's 4 KiB input limit; existing credentials are unchanged"
             )
         }
         crate::sandbox::setup::private_command(&self.program, &args, &input)
             .map_err(|_| anyhow::anyhow!("OS credential store write failed; unlock it and retry"))?;
-        if self.read_catalog()?.as_deref() != Some(encoded) {
+        if self.read_item(service, account)?.as_deref() != Some(encoded) {
             anyhow::bail!("OS credential store could not verify the write")
         }
         Ok(())
+    }
+
+    /// Deletes one keychain item; an absent item is fine.
+    pub(crate) fn remove_item(&self, service: &str, account: &str) -> Result<()> {
+        let args = if self.mac {
+            vec!["delete-generic-password", "-a", account, "-s", service]
+        } else {
+            vec!["clear", "service", service, "account", account]
+        };
+        let output =
+            self.output(&args).map_err(|_| anyhow::anyhow!("OS credential store unavailable; unlock it and retry"))?;
+        if output.status.success()
+            || (self.mac && output.status.code() == Some(44))
+            || (!self.mac && output.status.code() == Some(1) && output.stderr.iter().all(u8::is_ascii_whitespace))
+        {
+            return Ok(());
+        }
+        anyhow::bail!("OS credential store unavailable; unlock it and retry")
     }
 }
 

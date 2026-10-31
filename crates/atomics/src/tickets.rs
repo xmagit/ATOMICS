@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use atomics_core::tickets::{self, McpServer, TicketConfig, TicketLink, Vars};
 use serde_json::Value;
 
-use crate::mcp_client::{McpClient, McpError};
+use crate::mcp_client::{McpClient, McpError, OAuth};
 
 /// After a connection failure, jobs fail at once for this long instead of each
 /// waiting for a server that is down.
@@ -50,11 +50,21 @@ pub struct TicketJob<T> {
 
 /// Starts the worker. Each finished job comes back on `done` with its tag.
 pub fn spawn<T: Send + 'static>(done: crate::host::Sender<(T, Result<TicketOutput, String>)>) -> Sender<TicketJob<T>> {
+    spawn_with(done, OAuth::current())
+}
+
+/// Like `spawn`, with the keychain and browser that sign-in uses. The worker only reads saved
+/// sign-ins: a job against a server that is not signed in fails with "sign-in required" and never
+/// opens the browser; signing in is the user's act (`OAuth::sign_in`).
+pub fn spawn_with<T: Send + 'static>(
+    done: crate::host::Sender<(T, Result<TicketOutput, String>)>,
+    oauth: OAuth,
+) -> Sender<TicketJob<T>> {
     let (tx, rx) = std::sync::mpsc::channel::<TicketJob<T>>();
     std::thread::Builder::new()
         .name("atomics-tickets".into())
         .spawn(move || {
-            let mut worker = Worker::default();
+            let mut worker = Worker { oauth: Some(oauth), ..Worker::default() };
             while let Ok(job) = rx.recv() {
                 worker.prepare(&job.config);
                 let result = worker.run(&job.config, job.op);
@@ -80,6 +90,8 @@ struct Worker {
     cleaner: tickets::Cleaner,
     /// Variables recently found set nowhere.
     missing: std::collections::HashMap<String, Instant>,
+    /// Where saved browser sign-ins are read from.
+    oauth: Option<OAuth>,
 }
 
 impl Worker {
@@ -96,6 +108,9 @@ impl Worker {
         {
             cleaner = cleaner.with(used.clone());
             self.client = None;
+        }
+        if let Some((_, _, client)) = &self.client {
+            cleaner = cleaner.with(client.oauth_token().map(str::to_string));
         }
         self.cleaner = cleaner;
     }
@@ -189,7 +204,8 @@ impl Worker {
             let env = |name: &str| {
                 if bearer.as_deref() == Some(name) { token.clone() } else { crate::setup::env_var(name) }
             };
-            match McpClient::connect(&config.server, timeout, env) {
+            let oauth = config.server.uses_oauth().then_some(()).and(self.oauth.as_ref());
+            match McpClient::connect_with(&config.server, timeout, env, oauth) {
                 Ok(client) => {
                     let used = client.token().map(str::to_string);
                     self.client = Some((config.server.clone(), used, client));
@@ -198,7 +214,12 @@ impl Worker {
             }
         }
         let (_, _, client) = self.client.as_mut().expect("connected");
-        match client.call_tool(&operation.tool, arguments) {
+        let result = client.call_tool(&operation.tool, arguments);
+        // A refresh during the call may have changed the access token: clean for the current one.
+        if let Some(token) = client.oauth_token() {
+            self.cleaner = std::mem::take(&mut self.cleaner).with([token.to_string()]);
+        }
+        match result {
             Ok(result) => {
                 self.down = None;
                 Ok(atomics_core::tickets::tool_output(&result))
@@ -210,6 +231,10 @@ impl Worker {
     /// The backoff remembers the failure cleaned with this job's secrets: a later job may
     /// run with others.
     fn broken(&mut self, server: &McpServer, err: McpError) -> String {
+        if matches!(err, McpError::SignInRequired(_)) {
+            // No backoff: once the user signs in, the next job reconnects with the new tokens.
+            self.client = None;
+        }
         if let McpError::Transport(message) = &err {
             self.client = None;
             self.down = Some((server.clone(), Instant::now(), self.cleaner.error(message)));
@@ -280,6 +305,32 @@ mod tests {
             }
         });
         (url, tokens)
+    }
+
+    #[test]
+    fn a_job_against_a_server_that_is_not_signed_in_fails_without_opening_a_browser() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, keychain, _) = crate::credentials::tests::machine(false);
+        let marker = dir.path().join("browser-opened");
+        let browser = dir.path().join("browser");
+        std::fs::write(&browser, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+        std::fs::set_permissions(&browser, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let oauth = OAuth::new(keychain, crate::connections::Browser::at(browser.display().to_string()));
+        let config: TicketConfig = toml::from_str(
+            "system = \"echo\"\nserver = { url = \"http://127.0.0.1:9/mcp\", oauth = true }\n\
+             [operations.comment]\ntool = \"note\"\narguments = { body = \"{body}\" }",
+        )
+        .unwrap();
+        let (done, results) = crate::host::Wake::default().channel();
+        let jobs = spawn_with(done, oauth);
+        for tag in 0..2 {
+            let op = TicketOp::Comment(TicketLink { id: "1".into(), ..TicketLink::default() }, "Hi".into());
+            jobs.send(TicketJob { config: Arc::new(config.clone()), op, tag }).unwrap();
+            let (_, result) = results.recv_timeout(Duration::from_secs(10)).unwrap();
+            let error = result.err().unwrap();
+            assert!(crate::mcp_client::is_sign_in_required(&error), "{error}");
+        }
+        assert!(!marker.exists(), "the worker never opens the browser");
     }
 
     #[test]

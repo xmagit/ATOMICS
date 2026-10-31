@@ -25,12 +25,21 @@ catalog=false
 case "$*" in *atomics-credentials-v1*) catalog=true ;; esac
 file="$dir/keychain-value"
 if $catalog; then file="$dir/keychain-catalog"; fi
+# MCP OAuth sign-in items: one file per account (a kind and a digest).
+oauth_account() {
+  while [ $# -gt 1 ]; do
+    case "$1" in -a|account) echo "$2"; return ;; esac
+    shift
+  done
+}
+case "$*" in *atomics-mcp-oauth-v1*) file="$dir/keychain-oauth-$(oauth_account "$@")" ;; esac
 # The catalog's item from before the rename to ATOMICS.
 case "$*" in *imacs-credentials-v1*) file="$dir/keychain-catalog-imacs" ;; esac
 case "$1" in
   -i)
     read -r command
     case "$command" in *atomics-credentials-v1*) file="$dir/keychain-catalog" ;; esac
+    case "$command" in *atomics-mcp-oauth-v1*) file="$dir/keychain-oauth-$(oauth_account $command)" ;; esac
     printf '%s\n' "${command##* -w }" > "$file"
     ;;
   store)

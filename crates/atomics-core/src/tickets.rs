@@ -211,6 +211,10 @@ pub struct McpServer {
     /// read (blank means none), so every reader looks up the same name.
     #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "variable_name")]
     pub token_env: Option<String>,
+    /// Sign in to `url` with browser OAuth (MCP authorization spec). The tokens live in the OS
+    /// keychain, never in the config. Ignored when `token_env` is set.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub oauth: bool,
 }
 
 impl McpServer {
@@ -219,6 +223,11 @@ impl McpServer {
     pub fn bearer_env(&self) -> Option<&str> {
         let http = self.command.is_empty() && self.url.as_deref().is_some_and(|url| !url.trim().is_empty());
         self.token_env.as_deref().filter(|_| http)
+    }
+
+    /// Whether a connection signs in with OAuth: an HTTP server with `oauth` set and no static token.
+    pub fn uses_oauth(&self) -> bool {
+        self.oauth && self.bearer_env().is_none() && self.command.is_empty()
     }
 }
 

@@ -262,7 +262,7 @@ impl Browser {
         Self { program: program.into() }
     }
 
-    fn open(&self, url: &str) -> Result<()> {
+    pub(crate) fn open(&self, url: &str) -> Result<()> {
         let mut command = Command::new(&self.program);
         command.arg(url).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
         if let Some(path) = crate::setup::SHELL_PATH.as_ref() {
