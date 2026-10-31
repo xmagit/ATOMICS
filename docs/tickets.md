@@ -16,7 +16,7 @@ with an MCP server, changes only the config.
   the `id` stays what the link was made with, because that is what the operations address. ATOMICS also keeps
   `synced_at` (when it last read the ticket), `pushed_state` (the state it last set) and `error` (why the
   last ticket operation failed).
-- **Two shapes of work.** In `board` mode, a board created in the ticket system maps to one plan, and its
+- **Two shapes of work.** The default `auto` mode decides once per plan: children make it a board; otherwise it is one ticket. The resolved choice is saved as `Plan.ticket_mode`, so later child or profile changes never flip it. In `board` mode, a board created in the ticket system maps to one plan, and its
   tickets map to the plan's tasks. The ticket says *what* to do; the task brief says *how*. In `ticket`
   mode, one ticket maps to one plan, and the plan's progress is reported on that ticket.
 - **ATOMICS's status is authoritative.** ATOMICS pushes a state when its own task status changes, never because the
@@ -64,9 +64,10 @@ chief starts, so restart the chief after changing ticket settings or the declara
 | Key | Meaning |
 | --- | --- |
 | `system` | The system's name, shown on cards and to the chief. Empty turns tickets off. |
-| `mode` | `"board"` (default): a board is a plan, its tickets are tasks. `"ticket"`: a ticket is a plan. |
+| `mode` | `"auto"` (default): children make a board, otherwise one ticket. `"board"` and `"ticket"` force a shape. The resolved choice is stored per plan. |
 | `comments` | Who comments: `"agents"` (default) for agents' reports plus ATOMICS's lifecycle notes, `"chief"` for lifecycle notes and the chief's own comments only, `"off"` for none. |
 | `branch` | Optional branch template: `{key}`, `{key_lower}`, `{key_number}` (numeric suffix of the key), `{slug}` (ticket title), `{branch}` (system suggestion). |
+| `link_url` | Optional URL template used when a card has no URL, e.g. `https://tickets.example/?selected={uuid}`. Uses the ticket placeholders below. |
 | `workflow` | Free text added to the chief's prompt: how your team works with tickets. |
 | `timeout_secs` | Longest wait for one MCP request (default 30). |
 | `server` | The MCP server; see below. |
@@ -129,6 +130,11 @@ result = { id = "uuid", key = "id", url = "url", title = "title", state = "statu
 
 | Operation | Used for | Placeholders |
 | --- | --- | --- |
+| `search` (optional) | Keyword search; `items` selects the hit array. | `{query}` |
+| `semantic_search` (optional) | Meaning search with optional scores; `items` selects the hit array. | `{query}` |
+| `children` (optional) | Direct children; also used when board mode has no `list` mapping. | `{id}`, `{key}`, `{key_number}`, `{uuid}` |
+| `related` (optional) | Related matches, with optional scores. These are never treated as children. | `{id}`, `{key}`, `{key_number}`, `{uuid}` |
+| `read` (optional) | Full display card with body, comments and development links; falls back to the complete `get` result. | `{id}`, `{key}`, `{key_number}`, `{uuid}` |
 | `get` | Reading one ticket: on plan load, on the heartbeat, after each push, after a `ticket_event`. | `{id}`, `{key}` |
 | `list` | Board mode: reading a plan's whole board in one call. `items` is the JSON path of the ticket array. | `{board}`, `{board_key}` |
 | `update_state` | Moving a ticket as its task moves. | `{id}`, `{key}`, `{state}` |
@@ -140,6 +146,17 @@ plan's link: the board in board mode, the plan's ticket in ticket mode. Placehol
 string, and arguments may be numbers, booleans, arrays and tables. A placeholder whose value is unknown
 fails the operation with a message naming it; other text in braces is left alone.
 
+`{query}` is the search text exactly as supplied, including quotes and whitespace. Substitution makes one
+pass: `{id}` or `{query}` inside a query stays literal, and values become JSON strings without concatenation.
+`{key_number}` is the trailing numeric component (`EX-11967` → `11967`). `{uuid}` is the link's `id` only
+when it is a UUID; a link containing only a key fails with an error naming `{uuid}`. The three placeholders
+work in every operation. Numeric arguments such as `take = 10` stay numeric; a placeholder inside a TOML
+string stays a string. Use `{key_number}` for servers accepting a bare ticket number as text.
+
+Board reads prefer `list` and otherwise call `children`, supplying both the parent's ticket placeholders and
+`{board}` / `{board_key}`. Auto mode resolves only after a successful list/children result, including an empty
+list. Without either mapping it resolves to ticket mode. Transport failures leave the decision pending.
+
 **Results.** The paths read from the tool result's `structuredContent` when it has one. Otherwise ATOMICS
 parses its text content as JSON, and failing that uses the text itself. Paths are dot-separated keys and
 array indexes (`status.name`, `issues.0.id`, also `$.issues[0].id`). An empty path leaves a field unread.
@@ -147,6 +164,42 @@ A path that is not set reads the field of the same name (`id`, `key`, `url`, `ti
 `updated_at`). Numbers and booleans become text. A path that stops at an object shows that object on the
 card, so it is easy to spot and fix. When none of the paths match, the error quotes the start of the
 result, which tells you where the fields really are. `atomics_ticket_sync` is a quick way to see it.
+
+### Display result paths
+
+The existing link fields remain unchanged. These optional `result` paths default to empty (unread):
+
+| Path | Value |
+| --- | --- |
+| `score` | JSON number, used for relevance |
+| `snippet` | Text under a search hit |
+| `assignee` | Display name; explicit null means unassigned, an absent path means unknown |
+| `parent` | Parent key or id |
+| `kind` | Raw type name, such as epic or task |
+| `author_kind` | Raw author identity kind |
+
+A read operation also maps its body, comments and development links. Paths within comments and links are
+relative to each item; their `items` paths and `body` are relative to the whole tool output:
+
+```toml
+[tickets.operations.read]
+tool = "read_work_item"
+arguments = { id = "{id}" }
+result = { id = "ticket.id", key = "ticket.key", title = "ticket.title", state = "ticket.state" }
+body = "ticket.description"
+comments = { items = "comments", author = "author", text = "body", at = "created_at", kind = "identity_kind" }
+links = { items = "ticket.links", label = "title", url = "url", status = "status", ci = "ci" }
+```
+
+These fields form in-memory `TicketCard`, `Comment` and `DevLink` values; descriptions, comments, search
+results and related lists are never saved in plan files. Every field passes through the job's `Cleaner`
+before leaving the worker. Display fields keep the existing 2000-character bound; reading bodies keep at
+most 64 KiB and comment text at most 2 KiB, after masking credentials. Scoped agent reads still return
+whole cleaned strings. Cards also clean bearer/basic credentials and credential-bearing URLs in free text.
+
+Without `read`, the card uses the complete `get` output: string fields called `description`, `body` or
+`content` become markdown, and remaining fields become a key/value table. Mapped optional operations
+whose tools are absent produce doctor notes; they do not make an otherwise usable profile fail.
 
 ## What happens when
 
@@ -296,16 +349,21 @@ atomics ctl '{"cmd":"ticket_event","board":"board-7"}'
 
 ### Relay: a board per plan
 
-The board is created in Relay first, and the plan hooks into it. Relay's exact tool names are not known yet: every tool name, argument, result path and state below
-is an editable placeholder. Use the names your Relay MCP server lists. The `get` operation must accept
-both a ticket id and the board id if agents need to read the plan link. Run doctor to check the mapped
-tools, then sync to check the result paths. No provider code needs changing.
+The new `semantic_search`, `related` and `read` mappings follow the live MCP shapes checked on
+2026-10-31. Search and related have no snippet or URL today; `link_url` supplies the URL. No children
+operation is mapped: Relay needs RELAY-11954 first, and related matches are never children.
+
+The older `get`, `list`, update, comment and create mappings below remain illustrative placeholders from
+the lifecycle example. Replace them with your server's tools and argument schemas before use; remove
+`list` until a real children operation is available, so auto mode resolves to ticket mode. The fake server
+supports these legacy maps for regression tests. Run doctor for tool names and sync for result paths.
 
 ```toml
 [tickets]
 system = "relay"
-mode = "board"
+mode = "auto"
 comments = "agents"
+link_url = "https://relay.atomisk.ai/tickets?selected={uuid}"
 workflow = "Link the existing Relay board to the plan and one ticket to each task. Product writes what and why; the chief comments implementation details. ATOMICS posts signed agent reports and maps states live. Use atomics_report for reports, without a second ticket comment."
 server = { command = ["relay-mcp"] }
 states = { planned = "Todo", running = "In Progress" }
@@ -333,13 +391,34 @@ arguments = { ticket = "{id}", body = "{body}" }
 tool = "create_ticket"
 arguments = { board = "{board}", title = "{title}", description = "{body}" }
 result = { id = "ticket.id", key = "ticket.key", url = "ticket.url", title = "ticket.title", state = "ticket.status" }
+
+[tickets.operations.semantic_search]
+tool = "find_tickets"
+arguments = { about = "{query}", take = 10, includeClosed = false }
+items = "result.tickets"
+result = { id = "id", key = "number", url = "", title = "subject", state = "status", score = "score", assignee = "assignee" }
+
+[tickets.operations.related]
+tool = "find_related_tickets"
+arguments = { ticket = "{key}", take = 10, includeClosed = false }
+items = "result.tickets"
+result = { id = "id", key = "number", url = "", title = "subject", state = "status", score = "score", assignee = "assignee" }
+
+[tickets.operations.read]
+tool = "get_ticket"
+arguments = { ticketNumber = "{key_number}" }
+result = { id = "ticket.id", key = "ticket.ticketNumber", url = "url", title = "ticket.subject", state = "ticket.status", updated_at = "ticket.updatedAtUtc", parent = "ticket.parentTicketId", kind = "ticket.ticketTypeKey" }
+body = "ticket.description"
+comments = { items = "comments", author = "authorDisplayName", text = "body", at = "createdAtUtc", kind = "authorIdentityKind" }
+links = { items = "ticket.developmentLinks", label = "title", url = "pullRequestUrl", status = "pullRequestStatus", ci = "continuousIntegrationStatus" }
 ```
 
 ### Linear: an issue per plan
 
-Linear's MCP server addresses issues by identifier (`ENG-123`) and accepts a state type, name or id when
-saving. Check the result paths against your server with one `atomics_ticket_sync`: the error quotes the
-result if they do not match.
+**Verify with doctor.** No sign-in is available in the sandbox. These tool names, argument schemas and
+result paths remain unverified, including the `parentId` filter for children. Check live `tools/list` and
+`inputSchema` before using the profile, then check result paths with sync. Linear has no mapped semantic
+search or related operation here. `read` shows the description only: comments require a second tool call.
 
 ```toml
 [tickets]
@@ -367,6 +446,24 @@ arguments = { issueId = "{key}", body = "{body}" }
 tool = "save_issue"
 arguments = { team = "ENG", title = "{title}", description = "{body}" }
 result = { id = "id", key = "id", url = "url", title = "title", state = "status" }
+
+[tickets.operations.search]
+tool = "list_issues"
+arguments = { query = "{query}", limit = 25 }
+items = "issues"
+result = { id = "id", key = "identifier", url = "url", title = "title", state = "status", assignee = "assignee.name" }
+
+[tickets.operations.children]
+tool = "list_issues"
+arguments = { parentId = "{id}", limit = 25 }
+items = "issues"
+result = { id = "id", key = "identifier", url = "url", title = "title", state = "status", parent = "parentId" }
+
+[tickets.operations.read]
+tool = "get_issue"
+arguments = { id = "{key}" }
+result = { id = "id", key = "identifier", url = "url", title = "title", state = "status", updated_at = "updatedAt", branch = "gitBranchName", assignee = "assignee.name" }
+body = "description"
 ```
 
 ### Let PR automation own review and done
@@ -523,8 +620,8 @@ file. The tests in `crates/atomics/src/app/tickets.rs` drive ATOMICS against it:
 - failures shown on the card, timeouts and the backoff;
 - the board's chips and header;
 - the same steps against both dialects, where only the config differs;
-- the actual Relay and Linear examples extracted from the default template, with the server command
-  replaced by the fixture;
+- the documented example profiles extracted from the default template, with neutral test names
+  (`meaning-example` and `keyword-example`) and the server replaced by the fixture;
 - agent session scoping and denied reads/comments without external calls;
 - doctor startup, missing tools, pagination, and workspace precedence.
 
@@ -537,3 +634,17 @@ cargo test -p atomics ticket
 ```
 
 Run the complete suite through `atomics queue --class test -- cargo test --workspace`.
+
+## Fake server fixture
+
+Build with `cargo build -p atomics --example fake_ticket_server`. Point a stdio profile at
+`target/debug/examples/fake_ticket_server` with a new state-file path as its argument. A missing file is
+seeded with the demo epic DEMO-1 and children DEMO-2 through DEMO-5, markdown bodies,
+authored comments, scores, snippets and a PR/CI link. New tickets continue at DEMO-6. Existing state files
+are preserved.
+
+The fixture speaks three configurable dialects: nested structured `card_*` tools, flat JSON-text
+`issue_*` tools, and JSON-text `find_tickets` / `find_keyword_tickets`, `get_children`,
+`find_related_tickets`, `get_ticket`. All three support query-filtered search, direct children, related
+matches and full reads. The fixture's `get_children` and keyword search demonstrate capabilities; they
+are not claims about any live server. Calls remain recorded in the state file for assertions.

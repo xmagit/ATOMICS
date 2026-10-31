@@ -198,15 +198,17 @@ impl Desktop<'_> {
             let plan = &self.runtime.plans[self.runtime.selected_plan];
             ui.horizontal_wrapped(|ui| {
                 let system = ticket_config.as_ref().map_or(link.system.as_str(), |c| c.system.as_str());
-                let what = match ticket_config.as_ref().map(|c| c.mode) {
+                let what = match ticket_config.as_ref().map(|c| plan.ticket_mode(c.mode)) {
                     Some(atomics_core::tickets::TicketMode::Board) => "board",
+                    Some(atomics_core::tickets::TicketMode::Auto) => "auto",
                     _ => "ticket",
                 };
                 ui.label(RichText::new(format!("{system} {what}")).color(p.muted).size(11.5));
                 let means = ticket_config
                     .as_ref()
                     .filter(|c| {
-                        c.mode == atomics_core::tickets::TicketMode::Ticket && !plan.ticket_progress_expected(None)
+                        plan.ticket_mode(c.mode) == atomics_core::tickets::TicketMode::Ticket
+                            && !plan.ticket_progress_expected(None)
                     })
                     .and_then(|c| c.states.status_of(link.state.as_deref()?))
                     .map(|ticket| (ticket, atomics_core::tickets::plan_status(plan)));

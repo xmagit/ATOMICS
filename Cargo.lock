@@ -525,6 +525,7 @@ dependencies = [
  "toml",
  "toml_edit",
  "ureq",
+ "uuid",
 ]
 
 [[package]]

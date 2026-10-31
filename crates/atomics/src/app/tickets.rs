@@ -268,10 +268,13 @@ impl State {
         let addressed = match &op {
             TicketOp::Get(link)
             | TicketOp::Read(link)
+            | TicketOp::ReadCard(link)
+            | TicketOp::Children(link)
+            | TicketOp::Related(link)
             | TicketOp::List(link)
             | TicketOp::UpdateState(link, _)
             | TicketOp::Comment(link, _) => Some(link),
-            TicketOp::Create { .. } => None,
+            TicketOp::Create { .. } | TicketOp::Search { .. } => None,
         };
         // Callers already leave other systems' links alone; nothing may reach them anyway.
         if let Some(mismatch) = addressed.and_then(|link| config.mismatch(link)) {
@@ -305,10 +308,16 @@ impl State {
         for index in plans {
             let id = self.plans[index].id.clone();
             let board = self.plans[index].ticket.clone().filter(|link| self.accepted(&config, link, batch));
-            let listed = config.mode == TicketMode::Board && config.operation("list").is_some() && board.is_some();
+            let mut mode = self.plans[index].ticket_mode(config.mode);
+            if board.is_some() && (mode != TicketMode::Auto || config.list_operation().is_none()) {
+                let resolved = self.plans[index].resolve_ticket_mode(config.mode, false);
+                mode = self.plans[index].ticket_mode(config.mode);
+                if resolved { self.save_plan(index); }
+            }
+            let listed = mode != TicketMode::Ticket && config.list_operation().is_some() && board.is_some();
             match board {
                 Some(board) if listed => self.queue_read(&config, (id.clone(), None), TicketOp::List(board), batch),
-                Some(link) if config.mode == TicketMode::Ticket => {
+                Some(link) if mode == TicketMode::Ticket => {
                     self.queue_read(&config, (id.clone(), None), TicketOp::Get(link), batch)
                 }
                 _ => {}
@@ -327,7 +336,7 @@ impl State {
 
     fn queue_read(&mut self, config: &Arc<TicketConfig>, key: LinkKey, op: TicketOp, batch: Option<u64>) {
         let (kind, ticket, operation) = match &op {
-            TicketOp::List(link) => (Kind::List, link.id.clone(), "list"),
+            TicketOp::List(link) => (Kind::List, link.id.clone(), config.list_operation().unwrap_or("list")),
             TicketOp::Get(link) => (Kind::Refresh, link.id.clone(), "get"),
             _ => return,
         };
@@ -406,6 +415,11 @@ impl State {
                         synced_at: Some(atomics_core::store::now()),
                         ..created
                     };
+                    if tag.key.1.is_none()
+                        && let Some(plan) = self.plans.iter_mut().find(|plan| plan.id == tag.key.0)
+                    {
+                        plan.ticket_mode = None;
+                    }
                     if let Some(slot) = self.link_slot(&tag.key) {
                         *slot = Some(created);
                         self.save_plan_id(&tag.key.0);
@@ -512,6 +526,20 @@ impl State {
 
     fn take_board(&mut self, tag: &Tag, items: Vec<TicketLink>) {
         let Some(index) = self.plans.iter().position(|p| p.id == tag.key.0) else { return };
+        // Ignore a children read that completed after this plan was relinked.
+        if self.live_link(tag, false).is_none() {
+            return;
+        }
+        let Some(config) = self.ticket_config().filter(|c| c.system == tag.system) else { return };
+        self.plans[index].resolve_ticket_mode(config.mode, !items.is_empty());
+        if self.plans[index].ticket_mode(config.mode) == TicketMode::Ticket {
+            self.tickets.boards.remove(&tag.key.0);
+            self.save_plan(index);
+            if let Some(link) = self.plans[index].ticket.clone() {
+                self.queue_read(&config, tag.key.clone(), TicketOp::Get(link), tag.batch);
+            }
+            return;
+        }
         if let Some(board) = self.live_link(tag, true) {
             board.synced_at = Some(atomics_core::store::now());
             board.error = None;
@@ -609,7 +637,7 @@ impl State {
                 };
                 links.push(((plan.id.clone(), Some(task.id.clone())), task.status, link, desired));
             }
-            if config.mode == TicketMode::Ticket
+            if plan.ticket_mode(config.mode) == TicketMode::Ticket
                 && let Some(link) = &plan.ticket
             {
                 let status = ticket::plan_status(plan);
@@ -654,7 +682,7 @@ impl State {
             return Some(((plan.id.clone(), Some(task.id.clone())), link.clone()));
         }
         let config = self.ticket_config()?;
-        let link = plan.ticket.clone().filter(|_| config.mode == TicketMode::Ticket)?;
+        let link = plan.ticket.clone().filter(|_| plan.ticket_mode(config.mode) == TicketMode::Ticket)?;
         Some(((plan.id.clone(), None), link))
     }
 
@@ -749,10 +777,10 @@ impl State {
         let mut matched: Vec<LinkKey> = Vec::new();
         let mut boards: Vec<String> = Vec::new();
         let config = self.ticket_config();
-        let board_mode = config.as_ref().is_some_and(|c| c.mode == TicketMode::Board);
         // An event naming no system comes from the configured one: other systems' links stay as they are.
         let ours = |link: &&TicketLink| system.is_some() || config.as_ref().is_none_or(|c| c.accepts(link));
         for plan in self.plans.iter().filter(|p| !p.id.is_empty() && p.status != PlanStatus::Archived) {
+            let board_mode = config.as_ref().is_some_and(|c| plan.ticket_mode(c.mode) != TicketMode::Ticket);
             if let Some(link) = plan.ticket.as_ref().filter(ours) {
                 if board_mode && (link.matches(system, board, board) || link.matches(system, id, key)) {
                     boards.push(plan.id.clone());
@@ -926,6 +954,9 @@ impl State {
                 }
                 self.relinked(key.clone());
                 let old = self.link(&key).cloned();
+                if key.1.is_none() && old.as_ref().is_none_or(|old| !old.same_ticket(&link)) {
+                    self.plans[index].ticket_mode = None;
+                }
                 let link = TicketLink::relink(self.stamp_system(Some(link)), old.as_ref());
                 if let Some(slot) = self.link_slot(&key) {
                     *slot = link;
@@ -935,11 +966,11 @@ impl State {
                 if let (Some(config), Some(link)) = (config, self.link(&key).cloned())
                     && self.accepted(&config, &link, Some(batch))
                 {
-                    let op = match &key.1 {
-                        None if config.mode == TicketMode::Board => TicketOp::List(link),
-                        _ => TicketOp::Get(link),
-                    };
-                    self.queue_read(&config, key, op, Some(batch));
+                    if key.1.is_none() {
+                        self.refresh_tickets(Some(&key.0), Some(batch));
+                    } else {
+                        self.queue_read(&config, key, TicketOp::Get(link), Some(batch));
+                    }
                 }
                 self.settle_batch(batch);
             }
@@ -1172,14 +1203,85 @@ mod tests {
     }
 
     #[test]
+    fn ticket_auto_mode_stores_the_first_successful_children_decision() {
+        with_app("app::tickets::tests::ticket_auto_mode_stores_the_first_successful_children_decision", |app, _| {
+            let dir = crate::test_support::tempdir().unwrap();
+            let state = tickets_fixture(dir.path(), "CARD");
+            configure(app, CARDS, &state, |config| {
+                config.mode = TicketMode::Auto;
+                config.operations.children = config.operations.list.take();
+            });
+            let board = request(
+                app,
+                json!({"cmd":"plan_set", "goal":"A board", "ticket":{"id":"b1"},
+                "tasks":[{"id":"a", "title":"Parser", "ticket":{"id":"1"}}]}),
+            )
+            .result["plan"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            settle(app);
+            let board_index = app.runtime.plans.iter().position(|p| p.id == board).unwrap();
+            assert_eq!(app.runtime.plans[board_index].ticket_mode, Some(TicketMode::Board));
+            assert_eq!(app.runtime.tickets.boards[&board].len(), 3);
+            edit_fake(&state, |fake| {
+                for ticket in fake["tickets"].as_array_mut().unwrap() {
+                    ticket["board"] = json!("elsewhere");
+                }
+            });
+            assert!(ticket_request(app, json!({"cmd":"ticket_sync", "plan":board})).ok);
+            assert_eq!(app.runtime.plans[board_index].ticket_mode, Some(TicketMode::Board));
+            let one = request(app, json!({"cmd":"plan_set", "goal":"One ticket", "ticket":{"id":"1"}, "tasks":[]}))
+                .result["plan"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            settle(app);
+            let index = app.runtime.plans.iter().position(|p| p.id == one).unwrap();
+            assert_eq!(app.runtime.plans[index].ticket_mode, Some(TicketMode::Ticket));
+            assert_eq!(app.runtime.plans[index].ticket.as_ref().unwrap().title.as_deref(), Some("Write the parser"));
+            edit_fake(&state, |fake| fake["tickets"][1]["board"] = json!("1"));
+            assert!(ticket_request(app, json!({"cmd":"ticket_sync", "plan":one})).ok);
+            assert_eq!(app.runtime.plans[index].ticket_mode, Some(TicketMode::Ticket));
+            let saved: Plan = serde_json::from_str(
+                &std::fs::read_to_string(paths::atomics_home().join("plans").join(format!("{one}.json"))).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(saved.ticket_mode, Some(TicketMode::Ticket));
+            // A new link permits a new decision; relinking the same ticket preserves it.
+            assert!(ticket_request(app, json!({"cmd":"ticket_link", "plan":one, "ticket":{"id":"1"}})).ok);
+            assert_eq!(app.runtime.plans[index].ticket_mode, Some(TicketMode::Ticket));
+            edit_fake(&state, |fake| fake["tickets"][2]["board"] = json!("2"));
+            assert!(ticket_request(app, json!({"cmd":"ticket_link", "plan":one, "ticket":{"id":"2"}})).ok);
+            assert_eq!(app.runtime.plans[index].ticket_mode, Some(TicketMode::Board));
+            edit_fake(&state, |fake| fake["fail"] = json!(["card_list"]));
+            let pending =
+                request(app, json!({"cmd":"plan_set", "goal":"Pending children", "ticket":{"id":"b1"}, "tasks":[]}))
+                    .result["plan"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+            settle(app);
+            let pending_index = app.runtime.plans.iter().position(|p| p.id == pending).unwrap();
+            assert_eq!(app.runtime.plans[pending_index].ticket_mode, None);
+            edit_fake(&state, |fake| {
+                fake["fail"] = json!([]);
+                fake["tickets"][0]["board"] = json!("b1");
+            });
+            assert!(ticket_request(app, json!({"cmd":"ticket_sync", "plan":pending})).ok);
+            assert_eq!(app.runtime.plans[pending_index].ticket_mode, Some(TicketMode::Board));
+        });
+    }
+
+    #[test]
     fn shipped_profiles_work_against_the_fake_server() {
         with_app("app::tickets::tests::shipped_profiles_work_against_the_fake_server", |app, _| {
             use crate::mcp_client::tests::example_profile;
-            for name in ["RELAY", "LINEAR"] {
+            for name in ["meaning-example", "keyword-example"] {
                 let dir = crate::test_support::tempdir().unwrap();
                 let state = tickets_fixture(dir.path(), "ENG");
                 let config = example_profile(name, &state);
-                let board = config.mode == TicketMode::Board;
+                let board = config.mode != TicketMode::Ticket;
                 app.runtime.plans.clear();
                 app.runtime.config.tickets = config.clone();
                 app.runtime.apply_ticket_config();
@@ -1219,7 +1321,7 @@ mod tests {
                     json!({"cmd":"ticket_link", "plan":plan, "task":"review", "create":{"title":"Review", "body":"Review the implementation"}}),
                 );
                 assert!(created.ok, "{:?}", created.error);
-                assert!(created.result["ticket"]["id"].as_str().unwrap().starts_with(if board { "n" } else { "NEW-" }));
+                assert!(created.result["ticket"]["id"].as_str().unwrap().starts_with(if board { "n" } else { "DEMO-" }));
                 assert!(request(app, json!({"cmd":"plan_update", "plan":plan, "id":"review", "status":"done"})).ok);
                 settle(app);
                 assert_eq!(ticket(&state, "ENG-1")["state"], "In Progress");
@@ -1384,7 +1486,7 @@ mod tests {
                     .push(json!({"id":"b1", "key":"BOARD", "title":"Board details", "description":"Plan context"}));
                 fake["tickets"][0]["description"] = json!("Task implementation details");
             });
-            app.runtime.config.tickets = example_profile("RELAY", &state);
+            app.runtime.config.tickets = example_profile("meaning-example", &state);
             app.runtime.apply_ticket_config();
             let plan = request(app, json!({"cmd":"plan_set", "goal":"Own plan", "ticket":{"id":"b1"}, "tasks":[
                 {"id":"a", "title":"Own task", "agent":"codex", "args":["-m","gpt-6.1-sol","-c","model_reasoning_effort=high"], "ticket":{"id":"1"}},
@@ -1465,7 +1567,7 @@ mod tests {
             // The existing report path still posts exactly once, independently of explicit comments.
             app.runtime.sessions.iter_mut().find(|s| s.id == "agent-a").unwrap().chief = false;
             app.runtime.plans[own].tasks[0].ticket =
-                Some(TicketLink { system: "relay".into(), id: "1".into(), ..TicketLink::default() });
+                Some(TicketLink { system: "meaning-example".into(), id: "1".into(), ..TicketLink::default() });
             app.runtime.report(Some("agent-a"), "done", "Finished once");
             settle(app);
             assert_eq!(comments(&state, "ENG-1").iter().filter(|c| c.contains("Finished once")).count(), 1);
@@ -2083,7 +2185,7 @@ mod tests {
                 settle(app);
                 created.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(1))).unwrap();
                 let b = link(app, index, 1);
-                assert!(b.label().starts_with("NEW-"));
+                assert!(b.label().starts_with("DEMO-"));
                 assert_eq!(b.system, "cards");
             },
         );
@@ -2211,7 +2313,7 @@ mod tests {
                 panic!()
             };
             assert!(created.ok && created.result["errors"] == json!([]), "{:?}", created);
-            assert!(link(app, index, 0).label().starts_with("NEW-"), "the created ticket is attached");
+            assert!(link(app, index, 0).label().starts_with("DEMO-"), "the created ticket is attached");
         });
     }
 
@@ -2370,7 +2472,7 @@ mod tests {
             let description = format!("{}LAST LINE: ship it", "Step by step instructions for the agent.\n".repeat(80));
             assert!(description.chars().count() > atomics_core::tickets::MAX_FIELD_CHARS);
             edit_fake(&state, |fake| fake["tickets"][0]["description"] = json!(description));
-            app.runtime.config.tickets = example_profile("RELAY", &state);
+            app.runtime.config.tickets = example_profile("meaning-example", &state);
             app.runtime.apply_ticket_config();
             request(
                 app,
@@ -2399,7 +2501,7 @@ mod tests {
                     fake["tickets"][0]["title"] = json!("Rotate sk-split\n-9e8d7c now");
                     fake["tickets"][0]["fields"] = json!({ TOKEN: "rejected", "note": "key sk-split-\r\n9e8d7c" });
                 });
-                let mut config = example_profile("RELAY", &state);
+                let mut config = example_profile("meaning-example", &state);
                 config.server.env.insert("API_KEY".into(), TOKEN.into());
                 app.runtime.config.tickets = config;
                 app.runtime.apply_ticket_config();
@@ -2569,7 +2671,7 @@ mod tests {
                 json!({"cmd":"ticket_link", "plan":plan, "task":"b", "create":{"title":"Write docs", "body":"The README"}}),
             );
             let key = created.result["ticket"]["key"].as_str().unwrap().to_string();
-            assert!(key.starts_with("NEW-"));
+            assert!(key.starts_with("DEMO-"));
             assert_eq!(ticket(&state, &key)["board"], "b1");
             assert_eq!(link(app, index, 1).title.as_deref(), Some("Write docs"));
 
