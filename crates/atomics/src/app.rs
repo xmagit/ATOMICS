@@ -66,6 +66,7 @@ mod tickets_panel;
 mod tickets_signin;
 mod topbar;
 mod trace;
+mod trace_lane;
 mod voice;
 mod workflow;
 mod worktrees;
@@ -491,6 +492,8 @@ pub(crate) struct State {
     diffs: HashMap<PathBuf, DiffData>,
     /// Chief-only, reduced MCP history. Never contains raw tool responses.
     traces: HashMap<String, atomics_core::trace::TraceLog>,
+    /// The trace lane's view state: collapse, height, selected card.
+    lane: trace_lane::Lane,
     worker: DiffWorker,
     hub: Arc<Mutex<Hub>>,
     hook_rx: Receiver<HookMessage>,
@@ -937,6 +940,7 @@ impl State {
             diff_root: None,
             diffs: HashMap::new(),
             traces: HashMap::new(),
+            lane: Default::default(),
             worker: DiffWorker::new(wake),
             hub,
             hook_rx,

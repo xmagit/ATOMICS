@@ -308,6 +308,37 @@ impl State {
         self.serve_waiters();
     }
 
+    /// An empty, unapproved plan carrying `link` and its mode decision, so the tab (and
+    /// "planning…") appears at once and the chief completes this plan by id. Returns its index.
+    pub(super) fn precreate_ticket_plan(
+        &mut self,
+        link: atomics_core::tickets::TicketLink,
+        mode: atomics_core::tickets::TicketMode,
+    ) -> usize {
+        let goal = match link.title.as_deref().filter(|title| !title.is_empty()) {
+            Some(title) => format!("{}: {title}", link.label()),
+            None => link.label().to_string(),
+        };
+        let id = plan::unique_id(&goal, &self.plans, &paths::atomics_home());
+        let project = self
+            .diff_target()
+            .and_then(|target| self.project_of(&target))
+            .or_else(|| self.view.clone())
+            .or_else(|| self.repos.first().cloned());
+        self.plans.push(Plan {
+            id: id.clone(),
+            goal,
+            project,
+            ticket: Some(link),
+            ticket_mode: Some(mode),
+            ..Plan::default()
+        });
+        let index = self.plans.len() - 1;
+        self.save_plan(index);
+        self.refresh_tickets(Some(&id), None);
+        index
+    }
+
     pub(super) fn save_plan(&self, index: usize) {
         if self.plans[index].id.is_empty() {
             return;

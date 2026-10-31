@@ -66,22 +66,9 @@ impl Desktop<'_> {
         let quoted = format!("“{}”", truncate(&text, 60));
         match self.runtime.config.voice.target {
             VoiceTarget::Chief => self.post(move |state| {
-                let started = match state.sessions.iter().position(|s| s.chief && s.can_receive()) {
-                    Some(index) => {
-                        state.deliver(index, &text);
-                        Ok(())
-                    }
-                    None => {
-                        state.sessions.retain(|s| !s.chief);
-                        state.start_chief(&state.ctx.clone(), Some(text.clone())).map(|_| ())
-                    }
-                };
+                let started = state.send_to_chief(&text);
                 match started {
-                    Ok(()) => {
-                        state.chief_open = true;
-                        state.focus_terminal = state.sessions.iter().find(|s| s.chief).map(|s| s.id.clone());
-                        state.toast(format!("Sent to the chief: {quoted}"));
-                    }
+                    Ok(()) => state.toast(format!("Sent to the chief: {quoted}")),
                     Err(error) => state.client_events.push(ClientEvent::VoiceFailed { text, error }),
                 }
             }),

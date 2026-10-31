@@ -103,6 +103,27 @@ pub(super) fn task_color(status: TaskStatus, p: &Palette) -> Color32 {
     }
 }
 
+/// The plan header's mode: what the plan does with its ticket. In auto mode the decision made
+/// when the plan was created is named, and an undecided plan says so.
+pub(super) fn mode_label(plan: &Plan, config: &atomics_core::tickets::TicketConfig) -> String {
+    use atomics_core::tickets::TicketMode;
+    let mode = match plan.ticket_mode(config.mode) {
+        TicketMode::Board => "board",
+        TicketMode::Ticket => "ticket",
+        TicketMode::Auto => return "auto (deciding…)".into(),
+    };
+    if config.mode == TicketMode::Auto { format!("{mode} (auto)") } else { mode.into() }
+}
+
+/// Board mode: how many of the plan's tasks follow a ticket, e.g. "4 of 6 tasks tracked".
+pub(super) fn tracked_label(plan: &Plan, config: &atomics_core::tickets::TicketConfig) -> Option<String> {
+    if plan.ticket_mode(config.mode) != atomics_core::tickets::TicketMode::Board || plan.tasks.is_empty() {
+        return None;
+    }
+    let tracked = plan.tasks.iter().filter(|task| task.ticket.is_some()).count();
+    Some(format!("{tracked} of {} tasks tracked", plan.tasks.len()))
+}
+
 impl Desktop<'_> {
     pub(super) fn plan_panel(&mut self, ui: &mut egui::Ui, rect: Rect) {
         let p = self.runtime.palette.clone();
@@ -198,11 +219,7 @@ impl Desktop<'_> {
             let plan = &self.runtime.plans[self.runtime.selected_plan];
             ui.horizontal_wrapped(|ui| {
                 let system = ticket_config.as_ref().map_or(link.system.as_str(), |c| c.system.as_str());
-                let what = match ticket_config.as_ref().map(|c| plan.ticket_mode(c.mode)) {
-                    Some(atomics_core::tickets::TicketMode::Board) => "board",
-                    Some(atomics_core::tickets::TicketMode::Auto) => "auto",
-                    _ => "ticket",
-                };
+                let what = ticket_config.as_ref().map_or("ticket".to_string(), |c| mode_label(plan, c));
                 ui.label(RichText::new(format!("{system} {what}")).color(p.muted).size(11.5));
                 let means = ticket_config
                     .as_ref()
@@ -215,6 +232,9 @@ impl Desktop<'_> {
                 ui.vertical(|ui| ticket_chip(ui, &link, means, ticket_config.as_deref(), &p));
                 if let Some(title) = &link.title {
                     ui.label(RichText::new(title).color(p.foreground).size(11.5));
+                }
+                if let Some(tracked) = ticket_config.as_ref().and_then(|c| tracked_label(plan, c)) {
+                    ui.label(RichText::new(tracked).color(p.muted).size(11.5));
                 }
                 if let Some(items) = self.runtime.tickets.boards.get(&plan.id) {
                     let planned = |item: &atomics_core::tickets::TicketLink| {

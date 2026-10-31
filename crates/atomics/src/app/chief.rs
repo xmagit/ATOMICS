@@ -131,6 +131,26 @@ impl State {
         }
     }
 
+    /// Sends `text` to the chief, starting it with `text` as its first prompt when it is not
+    /// running, and opens its window with the terminal focused.
+    pub(super) fn send_to_chief(&mut self, text: &str) -> Result<(), String> {
+        match self.sessions.iter().position(|s| s.chief && s.can_receive()) {
+            Some(index) => {
+                if self.deliver(index, text) == Delivery::Unavailable {
+                    return Err("The chief cannot receive messages right now".into());
+                }
+            }
+            None => {
+                self.sessions.retain(|s| !s.chief);
+                let ctx = self.ctx.clone();
+                self.start_chief(&ctx, Some(text.to_string()))?;
+            }
+        }
+        self.chief_open = true;
+        self.focus_terminal = self.sessions.iter().find(|s| s.chief).map(|s| s.id.clone());
+        Ok(())
+    }
+
     pub(super) fn toggle_chief(&mut self, ctx: &egui::Context) {
         if !self.sessions.iter().any(|s| s.chief && s.terminal.as_ref().is_some_and(|t| !t.exited())) {
             self.sessions.retain(|s| !s.chief);
@@ -408,6 +428,10 @@ impl Desktop<'_> {
         let metrics = self.metrics(ui);
         let rect = ui.available_rect_before_wrap();
         ui.allocate_rect(rect, Sense::hover());
+        // The trace lane sits under the terminal while the chief has ticket calls to show.
+        let lane_height = self.lane_height(rect.height());
+        let lane = (lane_height > 0.0).then(|| rect.with_min_y(rect.bottom() - lane_height));
+        let rect = lane.map_or(rect, |lane| rect.with_max_y(lane.top()));
         let session = &mut self.runtime.sessions[index];
         let focus = self.client.focus_terminal.as_deref() == Some(session.id.as_str());
         if let Some(terminal) = &mut session.terminal {
@@ -417,6 +441,10 @@ impl Desktop<'_> {
                 self.client.focus_terminal = None;
             }
             self.client.terminal_views.entry(id).or_default().show(terminal, ui, rect, id, &metrics, &p);
+        }
+        if let Some(lane) = lane {
+            self.trace_lane(ui, lane, self.runtime.chief_dock() == ChiefDock::Docked);
+            super::trace_lane::lane_divider(ui, lane, &mut self.runtime.lane.height, &p);
         }
     }
 }

@@ -7,10 +7,11 @@ use super::*;
 use crate::markdown::{self, Block, Inline};
 use crate::panel_nav;
 use crate::tickets::{TicketOp, TicketOutput};
-use atomics_core::tickets::{TicketCard, TicketConfig, TicketLink};
+use atomics_core::tickets::{TicketCard, TicketConfig, TicketLink, TicketMode};
 use egui::text::{LayoutJob, TextWrapping};
 
 const ROW_H: f32 = 58.0;
+const ECHO_H: f32 = 22.0;
 const LINE_H: f32 = 18.0;
 const RECENT: usize = 5;
 const COMMENT_LINES: usize = 12;
@@ -146,7 +147,45 @@ pub(super) struct TicketsPanel {
     /// The ticket system said it needs a sign-in.
     pub signin: bool,
     pub focus_query: bool,
+    /// The Plan with chief dialog, while it is open.
+    pub dialog: Option<PlanDialog>,
+    /// Plans whose Plan with chief message the chief has received.
+    pub planning: HashSet<String>,
     seq: u64,
+}
+
+/// The Plan with chief dialog: the ticket, whether to plan it alone, and the user's own words.
+pub(super) struct PlanDialog {
+    pub link: TicketLink,
+    pub ticket_only: bool,
+    pub extra: String,
+    pub error: Option<String>,
+    focused: bool,
+}
+
+/// What pressing Plan with chief did.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(super) enum PlanStart {
+    /// A new plan was made and the chief has the message.
+    Started(String),
+    /// The ticket already has an open plan; nothing new was made.
+    Existing(String),
+    /// The ticket system needs a sign-in first; nothing was made or sent.
+    SignIn,
+}
+
+/// The mode a plan for this ticket gets: forced by the profile, else decided by the children
+/// (auto). `None` while the children are still being read.
+pub(super) fn plan_mode(config: &TicketConfig, children: &Part, ticket_only: bool) -> Option<TicketMode> {
+    if ticket_only {
+        return Some(TicketMode::Ticket);
+    }
+    match (config.mode, children) {
+        (TicketMode::Auto, Part::Loading) => None,
+        (TicketMode::Auto, Part::Loaded(items)) if !items.is_empty() => Some(TicketMode::Board),
+        (TicketMode::Auto, _) => Some(TicketMode::Ticket),
+        (mode, _) => Some(mode),
+    }
 }
 
 /// How opening a ticket changes the breadcrumbs.
@@ -166,6 +205,7 @@ pub(super) enum Act {
     Back,
     Browser(String),
     FindView,
+    Plan,
 }
 
 impl TicketsPanel {
@@ -263,7 +303,7 @@ pub(super) fn relative_score(score: f64, low: f64, high: f64) -> f32 {
     if high <= low { 1.0 } else { (0.1 + 0.9 * (score - low) / (high - low)).clamp(0.0, 1.0) as f32 }
 }
 
-fn score_range(cards: &[TicketCard]) -> Option<(f64, f64)> {
+pub(super) fn score_range(cards: &[TicketCard]) -> Option<(f64, f64)> {
     let mut scores = cards.iter().filter_map(|c| c.score).filter(|s| s.is_finite());
     let first = scores.next()?;
     Some(scores.fold((first, first), |(low, high), s| (low.min(s), high.max(s))))
@@ -434,6 +474,81 @@ impl State {
         }
     }
 
+    /// Opens the Plan with chief dialog for the ticket Read shows.
+    pub(super) fn open_plan_dialog(&mut self) {
+        let Some(link) = self.tickets.panel.read.as_ref().map(|read| read.card.link.clone()) else { return };
+        let link = self.cleaner().link(link);
+        self.tickets.panel.dialog =
+            Some(PlanDialog { link, ticket_only: false, extra: String::new(), error: None, focused: false });
+    }
+
+    /// Whether the ticket system needs a sign-in before anything is sent: the sign-in state
+    /// (`SignState`, read from the keychain when not yet polled) is not signed in, or the worker
+    /// said a sign-in is required.
+    fn plan_needs_sign_in(&self, config: &TicketConfig) -> bool {
+        use crate::ticket_signin::SignState;
+        let state = match self.tickets.sign.state() {
+            Some(state) => state.clone(),
+            None => SignState::of(&self.tickets.sign.oauth(), &config.server),
+        };
+        self.tickets.panel.signin || state != SignState::SignedIn
+    }
+
+    /// Plan with chief: precreates the plan with the ticket link and the mode decision, starts the
+    /// chief if needed and sends it the §6.2 message. Signed out, it shows the sign-in state and
+    /// sends nothing. A ticket that already has an open plan gets no second plan.
+    pub(super) fn plan_with_chief(
+        &mut self,
+        link: TicketLink,
+        mode: TicketMode,
+        extra: &str,
+    ) -> Result<PlanStart, String> {
+        let Some(config) = self.ticket_config() else { return Err("Tickets are not configured".into()) };
+        if self.plan_needs_sign_in(&config) {
+            let panel = &mut self.tickets.panel;
+            panel.signin = true;
+            panel.dialog = None;
+            self.panel = PanelMode::Tickets;
+            self.diff_open = true;
+            self.toast(format!("Sign in to {} first", config.system));
+            return Ok(PlanStart::SignIn);
+        }
+        let Some(link) = self.stamp_system(Some(link)) else { return Err("No ticket to plan".into()) };
+        let existing = self
+            .plans
+            .iter()
+            .position(|plan| plan.is_open() && plan.ticket.as_ref().is_some_and(|t| t.same_ticket(&link)));
+        let (index, fresh) = match existing {
+            Some(index) => (index, false),
+            None => (self.precreate_ticket_plan(link.clone(), mode), true),
+        };
+        let id = self.plans[index].id.clone();
+        self.selected_plan = index;
+        self.show_plan_fleet();
+        // The plan board stays behind the ticket; the chief's window is what opens.
+        self.panel = PanelMode::Tickets;
+        if !fresh && (!self.plans[index].tasks.is_empty() || self.tickets.panel.planning.contains(&id)) {
+            self.show_chief();
+            self.toast(format!("{} already has a plan", link.label()));
+            return Ok(PlanStart::Existing(id));
+        }
+        let board = self.plans[index].ticket_mode(config.mode) == TicketMode::Board;
+        let own = self.plans[index].ticket.clone().unwrap_or(link);
+        let message = atomics_core::tickets::plan_message(&atomics_core::tickets::PlanRequest {
+            system: &config.system,
+            key: own.label(),
+            title: own.title.as_deref().unwrap_or(""),
+            url: own.url.as_deref(),
+            board,
+            plan_id: &id,
+            extra,
+        });
+        self.send_to_chief(&message)?;
+        self.tickets.panel.planning.insert(id.clone());
+        self.toast(format!("Planning {} with the chief", own.label()));
+        Ok(if fresh { PlanStart::Started(id) } else { PlanStart::Existing(id) })
+    }
+
     pub(super) fn panel_result(&mut self, job: Job, seq: u64, result: Result<TicketOutput, String>) {
         let result = result.map_err(|error| (crate::mcp_client::is_sign_in_required(&error), self.scrub(&error)));
         let panel = &mut self.tickets.panel;
@@ -485,11 +600,11 @@ impl State {
     }
 }
 
-fn state_color(config: &TicketConfig, state: &str, p: &Palette) -> Color32 {
+pub(super) fn state_color(config: &TicketConfig, state: &str, p: &Palette) -> Color32 {
     config.states.status_of(state).map_or(p.muted, |status| super::board::task_color(status, p))
 }
 
-fn fit(ui: &egui::Ui, text: &str, font: FontId, color: Color32, width: f32) -> Arc<egui::Galley> {
+pub(super) fn fit(ui: &egui::Ui, text: &str, font: FontId, color: Color32, width: f32) -> Arc<egui::Galley> {
     let mut job = LayoutJob::simple_singleline(text.replace('\n', " "), font, color);
     job.wrap =
         TextWrapping { max_width: width.max(1.0), max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
@@ -497,7 +612,15 @@ fn fit(ui: &egui::Ui, text: &str, font: FontId, color: Color32, width: f32) -> A
 }
 
 /// Paints a state chip at `at` and returns the x where the next thing may start.
-fn chip(ui: &egui::Ui, painter: &egui::Painter, at: Pos2, text: &str, color: Color32, limit: f32, p: &Palette) -> f32 {
+pub(super) fn chip(
+    ui: &egui::Ui,
+    painter: &egui::Painter,
+    at: Pos2,
+    text: &str,
+    color: Color32,
+    limit: f32,
+    p: &Palette,
+) -> f32 {
     let galley = fit(ui, text, p.ui(11.0), color, limit - at.x - 10.0);
     let rect = Rect::from_min_size(at, galley.size() + vec2(10.0, 2.0));
     painter.rect_filled(rect, 8.0, lerp(p.raised, color, 0.12));
@@ -572,10 +695,24 @@ impl Desktop<'_> {
         panel_nav::focusable(ui, rect);
         let p = self.runtime.palette.clone();
         ui.painter().rect_filled(rect, 0.0, p.background);
+        // The chief's newest trace card, one line, opens the chief.
+        let echo = self.runtime.lane_echo();
+        let body = if echo.is_some() { rect.with_max_y(rect.bottom() - ECHO_H) } else { rect };
+        if let Some(echo) = echo {
+            let strip = Rect::from_min_max(pos2(rect.left(), rect.bottom() - ECHO_H), rect.right_bottom());
+            let response = ui.interact(strip, egui::Id::NULL.with("tickets-echo"), Sense::click());
+            ui.painter().line_segment([strip.left_top(), strip.right_top()], Stroke::new(1.0, p.border));
+            let galley =
+                fit(ui, &echo, p.ui(11.5), if response.hovered() { p.accent } else { p.muted }, strip.width() - 20.0);
+            ui.painter().galley(strip.left_center() + vec2(10.0, -galley.size().y / 2.0), galley, p.muted);
+            if response.on_hover_text("Open the chief").clicked() {
+                self.runtime.show_chief();
+            }
+        }
         let mut child =
-            ui.new_child(egui::UiBuilder::new().id_salt("tickets-panel").max_rect(rect.shrink2(vec2(10.0, 6.0))));
+            ui.new_child(egui::UiBuilder::new().id_salt("tickets-panel").max_rect(body.shrink2(vec2(10.0, 6.0))));
         let ui = &mut child;
-        ui.set_clip_rect(ui.clip_rect().intersect(rect));
+        ui.set_clip_rect(ui.clip_rect().intersect(body));
         let config = self.runtime.ticket_config();
         let mut acts = Vec::new();
         let system = config.as_ref().map_or("", |c| c.system.as_str()).to_string();
@@ -633,6 +770,7 @@ impl Desktop<'_> {
                 Act::Open(link, nav) => self.runtime.open_ticket(*link, nav),
                 Act::Back => self.runtime.tickets_back(),
                 Act::FindView => self.runtime.show_find(),
+                Act::Plan => self.runtime.open_plan_dialog(),
                 Act::Browser(url) => {
                     let url = self.runtime.cleaner().url(&url);
                     if markdown::web_url(&url).is_some() {
@@ -640,6 +778,79 @@ impl Desktop<'_> {
                     }
                 }
             }
+        }
+    }
+
+    /// The Plan with chief dialog: a small modal over the panel, built like the new-session dialog.
+    pub(super) fn plan_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.runtime.tickets.panel.dialog.take() else { return };
+        let Some(config) = self.runtime.ticket_config() else { return };
+        let p = self.runtime.palette.clone();
+        let children = self.runtime.tickets.panel.read.as_ref().map_or(Part::Unmapped, |read| read.children.clone());
+        let count = children.items().len();
+        let mut keep = true;
+        let mut go = false;
+        egui::Window::new(format!("Plan {} with the chief?", dialog.link.label()))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_max_width(440.0);
+                if let Some(title) = &dialog.link.title {
+                    ui.add(egui::Label::new(RichText::new(title).strong()).wrap());
+                }
+                let mode = plan_mode(&config, &children, dialog.ticket_only);
+                let text = match mode {
+                    None => "Reading the ticket's children…".to_string(),
+                    Some(TicketMode::Board) => format!(
+                        "{count} child ticket{} will become task{} (board).",
+                        if count == 1 { "" } else { "s" },
+                        if count == 1 { "" } else { "s" }
+                    ),
+                    Some(_) => "Ticket mode: one plan; progress is reported on this ticket.".to_string(),
+                };
+                ui.label(RichText::new(text).color(p.muted).size(11.5));
+                if config.mode != TicketMode::Ticket && count > 0 {
+                    ui.checkbox(&mut dialog.ticket_only, "one plan for this ticket only (ticket mode)");
+                }
+                ui.add_space(4.0);
+                ui.label("Extra instructions for the chief (optional)");
+                let edit = ui.add(
+                    egui::TextEdit::singleline(&mut dialog.extra)
+                        .char_limit(atomics_core::tickets::PLAN_EXTRA_MAX)
+                        .desired_width(f32::INFINITY),
+                );
+                if !std::mem::replace(&mut dialog.focused, true) {
+                    edit.request_focus();
+                }
+                ui.label(
+                    RichText::new("The chief reads the ticket, proposes a plan and waits for your approval.")
+                        .color(p.muted)
+                        .size(11.5),
+                );
+                if let Some(error) = &dialog.error {
+                    ui.label(RichText::new(error).color(p.error));
+                }
+                ui.horizontal(|ui| {
+                    let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if ui.add_enabled(mode.is_some(), egui::Button::new("Plan with chief ⏎")).clicked()
+                        || (enter && mode.is_some())
+                    {
+                        go = true;
+                    }
+                    if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        keep = false;
+                    }
+                });
+            });
+        if go && let Some(mode) = plan_mode(&config, &children, dialog.ticket_only) {
+            match self.runtime.plan_with_chief(dialog.link.clone(), mode, &dialog.extra) {
+                Ok(_) => keep = false,
+                Err(error) => dialog.error = Some(error),
+            }
+        }
+        if keep && !self.runtime.tickets.panel.signin {
+            self.runtime.tickets.panel.dialog = Some(dialog);
         }
     }
 
@@ -765,6 +976,7 @@ impl Desktop<'_> {
     fn read_view(&mut self, ui: &mut egui::Ui, config: &TicketConfig, p: &Palette, acts: &mut Vec<Act>) {
         use egui::Key;
         let cleaner = self.runtime.cleaner();
+        let plan_key = self.runtime.config.keys.plan_with_chief.clone();
         let panel = &mut self.runtime.tickets.panel;
         let crumbs: Vec<String> = panel.crumbs.iter().map(|l| l.label().to_string()).collect();
         let Some(read) = panel.read.as_mut() else {
@@ -781,6 +993,9 @@ impl Desktop<'_> {
                 && ui.button("Open in browser").clicked()
             {
                 acts.push(Act::Browser(url.clone()));
+            }
+            if ui.button("Plan with chief").on_hover_text(shortcut_label(ui.ctx(), &plan_key)).clicked() {
+                acts.push(Act::Plan);
             }
             let trail = crumbs.iter().map(String::as_str).chain([read.link.label()]).collect::<Vec<_>>().join(" › ");
             ui.label(RichText::new(trail).size(11.5).color(p.muted));
@@ -1607,29 +1822,34 @@ mod tests {
         });
     }
 
+    /// The meaning-search example profile against the fake server, with a children operation.
+    fn fake_profile(app: &mut Desktop<'_>, dir: &Path) {
+        let state = dir.join("fake.json");
+        let mut config = example_profile("meaning-example", &state);
+        config.server.command = vec![fake_server().display().to_string(), state.display().to_string()];
+        // The shipped meaning profile leaves the snippet unmapped; Find shows it when mapped.
+        config.operations.semantic_search.as_mut().unwrap().result.snippet = "snippet".into();
+        // The shipped meaning profile maps no children operation either.
+        config.operations.children = Some(
+            toml::from_str(
+                r#"
+                tool = "get_children"
+                arguments = { ticket = "{key}" }
+                items = "result.tickets"
+                result = { id = "id", key = "number", title = "subject", state = "status", assignee = "assignee" }
+                "#,
+            )
+            .unwrap(),
+        );
+        app.runtime.config.tickets = config;
+        app.runtime.apply_ticket_config();
+    }
+
     #[test]
     fn the_panel_finds_and_reads_against_the_fake_server() {
         with_app("app::tickets_panel::tests::the_panel_finds_and_reads_against_the_fake_server", |app, ctx| {
             let dir = crate::test_support::tempdir().unwrap();
-            let state = dir.path().join("fake.json");
-            let mut config = example_profile("meaning-example", &state);
-            config.server.command = vec![fake_server().display().to_string(), state.display().to_string()];
-            // The shipped meaning profile leaves the snippet unmapped; Find shows it when mapped.
-            config.operations.semantic_search.as_mut().unwrap().result.snippet = "snippet".into();
-            // The shipped meaning profile maps no children operation either.
-            config.operations.children = Some(
-                toml::from_str(
-                    r#"
-                    tool = "get_children"
-                    arguments = { ticket = "{key}" }
-                    items = "result.tickets"
-                    result = { id = "id", key = "number", title = "subject", state = "status", assignee = "assignee" }
-                    "#,
-                )
-                .unwrap(),
-            );
-            app.runtime.config.tickets = config;
-            app.runtime.apply_ticket_config();
+            fake_profile(app, dir.path());
             app.runtime.panel = PanelMode::Tickets;
             app.runtime.diff_open = true;
             app.runtime.tickets.panel.query = "personal-agent ticket workspace".into();
@@ -1828,5 +2048,201 @@ mod tests {
         assert_eq!(super::super::sidebar::plan_tab_name(&plan), "DEMO-7 · planning…");
         plan.tasks = vec![Task { status: TaskStatus::Done, ..Default::default() }, Task::default()];
         assert_eq!(super::super::sidebar::plan_tab_name(&plan), "DEMO-7 · 1/2");
+    }
+
+    /// A chief whose messages queue in the hub, where the test reads what it was sent.
+    fn quiet_chief(app: &mut Desktop<'_>) {
+        let root = app.runtime.launch_dir.clone();
+        let mut chief = session("chief", AgentKind::Claude, AgentStatus::Idle, &root);
+        chief.chief = true;
+        app.runtime.sessions = vec![chief];
+    }
+
+    fn sent_to_chief(app: &Desktop<'_>) -> Vec<String> {
+        app.runtime.hub.lock().unwrap().outbox.get("chief").cloned().unwrap_or_default()
+    }
+
+    /// Searches and reads the fake server's epic, as a user would, until Read shows its children.
+    fn read_epic(app: &mut Desktop<'_>, dir: &Path) -> TicketLink {
+        fake_profile(app, dir);
+        app.runtime.panel = PanelMode::Tickets;
+        app.runtime.diff_open = true;
+        app.runtime.tickets.panel.query = "personal-agent ticket workspace".into();
+        app.runtime.tickets_search();
+        settle(app);
+        let epic =
+            app.runtime.tickets.panel.find.results.iter().find(|c| c.link.label() == "DEMO-1").unwrap().link.clone();
+        app.runtime.open_ticket(epic.clone(), Nav::Fresh);
+        settle(app);
+        assert_eq!(app.runtime.tickets.panel.read.as_ref().unwrap().children.items().len(), 4);
+        epic
+    }
+
+    fn plan_chord() -> egui::Modifiers {
+        crate::theme::shortcut("cmd+enter").unwrap().modifiers
+    }
+
+    fn press(key: Key, modifiers: egui::Modifiers) -> Vec<egui::Event> {
+        vec![
+            egui::Event::ModifiersChanged(modifiers),
+            egui::Event::Key { key, physical_key: Some(key), pressed: true, repeat: false, modifiers },
+        ]
+    }
+
+    fn dialog_frame(app: &mut Desktop<'_>, ctx: &egui::Context, events: Vec<egui::Event>) -> egui::FullOutput {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 800.0))),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                app.shortcuts(ui.ctx());
+                app.diff_panel(ui, Rect::from_min_max(pos2(0.0, 0.0), pos2(1000.0, 760.0)));
+                app.plan_dialog(ui.ctx());
+            },
+        );
+        output.textures_delta.clear();
+        app.runtime.drain_actions();
+        output
+    }
+
+    #[test]
+    fn plan_with_chief_precreates_the_plan_and_sends_the_message_without_the_ticket_body() {
+        with_app(
+            "app::tickets_panel::tests::plan_with_chief_precreates_the_plan_and_sends_the_message_without_the_ticket_body",
+            |app, ctx| {
+                let dir = crate::test_support::tempdir().unwrap();
+                quiet_chief(app);
+                let epic = read_epic(app, dir.path());
+                let body = app.runtime.tickets.panel.read.as_ref().unwrap().card.body.clone().unwrap();
+                assert!(body.contains("## Goal"));
+                let before = app.runtime.plans.len();
+
+                // Cmd/Ctrl+Enter in Read opens the dialog; Enter in it plans.
+                ctx.memory_mut(|m| m.request_focus(diff_view::focus_id()));
+                dialog_frame(app, ctx, vec![]);
+                dialog_frame(app, ctx, press(Key::Enter, plan_chord()));
+                assert!(app.runtime.tickets.panel.dialog.is_some());
+                let text = texts(&dialog_frame(app, ctx, vec![])).join("\n");
+                assert!(text.contains("4 child tickets will become tasks"), "{text}");
+                dialog_frame(app, ctx, press(Key::Enter, egui::Modifiers::NONE));
+                assert!(app.runtime.tickets.panel.dialog.is_none());
+
+                assert_eq!(app.runtime.plans.len(), before + 1);
+                let plan = app.runtime.plans.last().unwrap().clone();
+                assert!(plan.tasks.is_empty() && !plan.approved);
+                assert_eq!(plan.ticket.as_ref().map(|t| t.label()), Some("DEMO-1"));
+                assert_eq!(plan.ticket_mode, Some(TicketMode::Board));
+                assert_eq!(super::super::sidebar::plan_tab_name(&plan), "DEMO-1 · planning…");
+                assert!(
+                    atomics_core::plan::Plan::load(
+                        &paths::atomics_home().join("plans").join(format!("{}.json", plan.id))
+                    )
+                    .is_ok()
+                );
+                assert!(app.runtime.chief_open && app.runtime.panel == PanelMode::Tickets);
+
+                let sent = sent_to_chief(app);
+                assert_eq!(sent.len(), 1);
+                let expected = atomics_core::tickets::plan_message(&atomics_core::tickets::PlanRequest {
+                    system: &app.runtime.ticket_config().unwrap().system,
+                    key: "DEMO-1",
+                    title: epic.title.as_deref().unwrap(),
+                    url: plan.ticket.as_ref().and_then(|t| t.url.as_deref()),
+                    board: true,
+                    plan_id: &plan.id,
+                    extra: "",
+                });
+                assert_eq!(sent[0], expected);
+                assert!(sent[0].contains(&format!("plan id {}.", plan.id)) && sent[0].contains("Mode: board"));
+                for line in body.lines().filter(|l| l.len() > 12 && !epic.title.as_deref().unwrap().contains(*l)) {
+                    assert!(!sent[0].contains(line), "the ticket's text rode in the message: {line}");
+                }
+
+                // A second press finds the open plan: no second plan, no second message.
+                ctx.memory_mut(|m| m.request_focus(diff_view::focus_id()));
+                dialog_frame(app, ctx, press(Key::Enter, plan_chord()));
+                dialog_frame(app, ctx, press(Key::Enter, egui::Modifiers::NONE));
+                assert_eq!(app.runtime.plans.len(), before + 1);
+                assert_eq!(sent_to_chief(app).len(), 1);
+                let again = app.runtime.plan_with_chief(epic, TicketMode::Board, "").unwrap();
+                assert_eq!(again, PlanStart::Existing(plan.id.clone()));
+                assert_eq!(app.runtime.plans.len(), before + 1);
+                assert_eq!(sent_to_chief(app).len(), 1);
+            },
+        );
+    }
+
+    #[test]
+    fn plan_with_chief_carries_the_users_words_and_ticket_only_mode() {
+        with_app(
+            "app::tickets_panel::tests::plan_with_chief_carries_the_users_words_and_ticket_only_mode",
+            |app, _| {
+                let dir = crate::test_support::tempdir().unwrap();
+                quiet_chief(app);
+                let epic = read_epic(app, dir.path());
+                let read = app.runtime.tickets.panel.read.as_ref().unwrap();
+                let config = app.runtime.ticket_config().unwrap();
+                assert_eq!(plan_mode(&config, &read.children, false), Some(TicketMode::Board));
+                assert_eq!(plan_mode(&config, &read.children, true), Some(TicketMode::Ticket));
+                assert_eq!(plan_mode(&config, &Part::Loading, false), None);
+                assert_eq!(plan_mode(&config, &Part::Loaded(Vec::new()), false), Some(TicketMode::Ticket));
+                let forced = TicketConfig { mode: TicketMode::Board, ..(*config).clone() };
+                assert_eq!(plan_mode(&forced, &Part::Unmapped, false), Some(TicketMode::Board));
+                let start = app.runtime.plan_with_chief(epic, TicketMode::Ticket, "Keep it\nsmall").unwrap();
+                let PlanStart::Started(id) = start else { panic!("{start:?}") };
+                let plan = app.runtime.plans.iter().find(|p| p.id == id).unwrap();
+                assert_eq!(plan.ticket_mode, Some(TicketMode::Ticket));
+                let sent = sent_to_chief(app);
+                assert!(sent[0].contains("Mode: ticket (one plan for this ticket)\n"));
+                assert!(sent[0].contains("Extra instructions from the user: Keep it small\n"));
+            },
+        );
+    }
+
+    #[test]
+    fn plan_with_chief_signed_out_shows_the_sign_in_state_and_sends_nothing() {
+        with_app(
+            "app::tickets_panel::tests::plan_with_chief_signed_out_shows_the_sign_in_state_and_sends_nothing",
+            |app, ctx| {
+                quiet_chief(app);
+                open_panel(app, ctx, TicketsView::Read);
+                let link = TicketLink {
+                    system: "demo".into(),
+                    id: "1".into(),
+                    key: Some("DEMO-1".into()),
+                    ..Default::default()
+                };
+                app.runtime.tickets.panel.signin = true;
+                let before = app.runtime.plans.len();
+                assert_eq!(app.runtime.plan_with_chief(link, TicketMode::Ticket, "").unwrap(), PlanStart::SignIn);
+                assert_eq!(app.runtime.plans.len(), before);
+                assert!(sent_to_chief(app).is_empty());
+                assert!(app.runtime.tickets.panel.signin && app.runtime.panel == PanelMode::Tickets);
+                let text = texts(&frame(app, ctx, vec![])).join("\n");
+                assert!(text.contains("demo is not signed in"), "{text}");
+            },
+        );
+    }
+
+    #[test]
+    fn plan_with_chief_names_the_auto_decision_in_the_board_header() {
+        let auto = TicketConfig { system: "demo".into(), mode: TicketMode::Auto, ..Default::default() };
+        let mut plan = Plan { ticket_mode: Some(TicketMode::Board), ..Default::default() };
+        assert_eq!(super::super::board::mode_label(&plan, &auto), "board (auto)");
+        assert_eq!(super::super::board::tracked_label(&plan, &auto), None);
+        plan.tasks = vec![
+            Task { ticket: Some(TicketLink { id: "1".into(), ..Default::default() }), ..Default::default() },
+            Task::default(),
+        ];
+        assert_eq!(super::super::board::tracked_label(&plan, &auto).as_deref(), Some("1 of 2 tasks tracked"));
+        plan.ticket_mode = Some(TicketMode::Ticket);
+        assert_eq!(super::super::board::mode_label(&plan, &auto), "ticket (auto)");
+        assert_eq!(super::super::board::tracked_label(&plan, &auto), None);
+        plan.ticket_mode = None;
+        assert_eq!(super::super::board::mode_label(&plan, &auto), "auto (deciding…)");
+        let forced = TicketConfig { mode: TicketMode::Board, ..auto };
+        assert_eq!(super::super::board::mode_label(&Plan::default(), &forced), "board");
     }
 }

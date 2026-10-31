@@ -414,6 +414,13 @@ to reset it. Mode and width are remembered; `[chief] dock = "floating"` (or `"do
 `cmd+o` shows or hides either mode. On narrow windows the chief floats instead, then docks again when the window widens.
 `cmd+shift+space` dictates to it.
 
+When the chief works on tickets, a **trace lane** under its terminal shows each call as a card instead of JSON: searches,
+reads, children, related tickets and the plan it builds, each with a spinner, then a check or a cross. Click a ticket in it
+to read it in the Tickets panel. **Plan with chief** (a button in the Tickets panel's Read view, `cmd+enter`) creates an
+empty plan with the ticket's link and sends the chief a message with the ticket's key, title, URL and plan id (never its
+text), and the plan's tab says `planning…` until the chief's `atomics_plan_set` fills it. See
+[Tickets](docs/tickets.md#plan-with-chief).
+
 Every `[chief] heartbeat_secs` (default 300 seconds), ATOMICS checks every open plan for missing or exited
 agents, running tasks whose agent has been idle or turn-done for over ten minutes without reporting since that
 status began, pending approvals or Codex menus, messages held for over a minute, and working agents without an event for fifteen minutes. Include
@@ -709,7 +716,8 @@ Tooltips and the settings menu show the actual platform chord, including custom 
 | `↓` / `↑`, `Home` / `End` | scroll a line, or go to the top / bottom of the focused diff; Esc, typing, or clicking the terminal returns focus to it |
 | `cmd+d` | show/hide the diff |
 | `cmd+j` | next agent that needs you |
-| `cmd+k` | the Tickets panel (when `[tickets]` is set): Find, then Read; the same keys as the diff — `shift+↓/↑` next / previous result (in Read: next / previous ticket; not from a text field or the editor), `PageUp/PageDown` a page in Find and the next / previous section in Read, ↑/↓ and Home/End, `Enter` read or open, `Alt+←` back, `Tab` in the box meaning ⇄ keyword, `Esc` leaves the box, then the panel |
+| `cmd+k` | the Tickets panel (when `[tickets]` is set): Find, then Read; the same keys as the diff — `shift+↓/↑` next / previous result (in Read: next / previous ticket; not from a text field or the editor), `PageUp/PageDown` a page in Find and the next / previous section in Read, ↑/↓ and Home/End, `Enter` read or open, `Alt+←` back, `Tab` in the box meaning ⇄ keyword, `Esc` leaves the box, then the panel; the chief's trace lane takes `shift+↓/↑` and the page keys when you click it |
+| `cmd+enter` | in a ticket the Tickets panel is reading: Plan with chief |
 | `cmd+l` | steer bar |
 | `cmd+shift+space` | voice: record, press again to send to the chief, `Esc` cancels |
 | `cmd+t` | new session (scratch folder, existing folder or new worktree) |
