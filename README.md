@@ -450,7 +450,7 @@ Plans are stored separately in `plans/<id>.json` under the state directory, with
 `plan.json` in that directory migrates once and is kept as `plan.json.migrated`; an old plan whose tasks are all done
 migrates as completed. Saves replace files atomically, and unreadable plan files are listed in the startup message.
 Open and completed plans get tabs; archived plans are hidden. Select a tab to see
-that plan’s sessions; `cmd+b` opens its board. Other sessions remain under All, Ungrouped and their project tabs. Each plan has
+that plan’s sessions; `cmd+b` opens its board. Other sessions remain under All, Ungrouped and the Repos dropdown. Each plan has
 its own approval and automatic final review. Use `atomics_plan_close {plan, status: "completed" | "archived"}` or
 **Complete plan** / **Archive plan** on the board to close it after confirmation. Reopen either kind from
 **Closed plans** beside the plan tabs; approval and task history are preserved. Its history remains available by id, and once only
@@ -477,10 +477,13 @@ finish within 150 s, says why on the task card and in `atomics_plan_get`, and ru
 such dependencies afresh and answers once their checks have.
 
 Each open plan has a **short name · done/total** tab with a status dot (working, needs you, all done).
+The bar starts with All, Ungrouped and one **Repos** dropdown listing every open project with its session count
+and total changed lines (additions plus deletions) across those sessions. Its button shows the selected project's name
+in a project view, otherwise **Repos · total changes**. Tabs that do not fit remain available in the Tabs menu.
 Dispatching the selected plan returns from its board to its fleet and minimizes a floating chief; a docked chief
 stays beside the fleet. Updating or dispatching another plan marks its tab with `*` and preserves the selected
 view and chief. Creating a new plan selects its tab. Each fleet shows only sessions linked to that plan’s tasks.
-Click the plan tab later to return to that overview, or choose All or a project tab to see other sessions.
+Click the plan tab later to return to that overview, or choose All or a project from Repos to see other sessions.
 
 Accepting an integrated task closes its agent; tasks without a branch, including the final review, close on acceptance.
 Its completed tile fills an otherwise empty grid cell, showing the duration, last report, diff size, **diff** and

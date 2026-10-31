@@ -267,8 +267,43 @@ mod tests {
         (items, output)
     }
 
+    fn click(app: &mut Desktop<'_>, ctx: &egui::Context, width: f32, label: &str) {
+        let (items, output) = render(app, ctx, width, vec![]);
+        let mut pos = items.iter().find(|(name, _)| name == label).map(|(_, r)| r.center());
+        if pos.is_none() {
+            pos = output.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text().starts_with(label) => {
+                    Some(text.pos + text.galley.rect.center().to_vec2())
+                }
+                _ => None,
+            });
+        }
+        let pos = pos.unwrap_or_else(|| panic!("missing {label}: {items:?}"));
+        output.drop_without_applying_deltas();
+        for pressed in [true, false] {
+            render(
+                app,
+                ctx,
+                width,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            )
+            .1
+            .drop_without_applying_deltas();
+        }
+    }
+
     fn fixture(app: &mut Desktop<'_>, count: usize) {
-        app.runtime.repos = vec![PathBuf::from("/project/ATOMICS")];
+        app.runtime.repos = std::iter::once(PathBuf::from("/project/ATOMICS"))
+            .chain((1..8).map(|i| PathBuf::from(format!("/project/repo-{i}"))))
+            .collect();
         app.runtime.plans = (0..count)
             .map(|i| Plan {
                 id: format!("plan-{i}"),
@@ -373,6 +408,8 @@ mod tests {
                         }
                         if width == 5120.0 {
                             assert!(!items.iter().any(|(n, _)| n == "Tabs"));
+                            assert_eq!(items.iter().filter(|(n, _)| n.starts_with("Repos ·")).count(), 1);
+                            assert!(!items.iter().any(|(n, _)| n.starts_with("repo-")));
                             assert!(items.iter().any(|(n, _)| n == "load"));
                             assert!(items.iter().any(|(n, _)| n == "sandbox-total"));
                             assert!(output.shapes.iter().any(|s| matches!(
@@ -478,68 +515,118 @@ mod tests {
     }
 
     #[test]
+    fn project_views_are_reachable_through_repos_and_show_the_selected_project() {
+        with_app(
+            "app::topbar::tests::project_views_are_reachable_through_repos_and_show_the_selected_project",
+            |app, ctx| {
+                for width in [480.0, 1700.0] {
+                    fixture(app, 3);
+                    let root = PathBuf::from("/project/repo-1");
+                    let worktree = PathBuf::from("/worktrees/repo-1-task");
+                    app.runtime.worktree_project.insert(worktree.clone(), root.clone());
+                    for (id, path, additions, deletions) in [
+                        ("main", root.clone(), 10, 2),
+                        ("task", worktree, 4, 1),
+                        ("other", PathBuf::from("/project/repo-2"), 2, 3),
+                        ("chief", PathBuf::from("/project/ATOMICS"), 100, 200),
+                    ] {
+                        if id != "chief" {
+                            app.runtime.sessions.push(session(id, AgentKind::Generic, AgentStatus::Idle, &path));
+                        }
+                        app.runtime.diffs.entry(path).or_default().prepared = Some(Arc::new(diff_view::Prepared {
+                            diff: atomics_core::diff::WorktreeDiff::default(),
+                            highlights: vec![],
+                            longest_line: 0,
+                            additions,
+                            deletions,
+                            all_files: Arc::default(),
+                        }));
+                    }
+                    app.runtime.active = Some("other".into());
+                    app.runtime.view = None;
+                    let (items, output) = render(app, ctx, width, vec![]);
+                    let repos_visible = items.iter().any(|(name, _)| name == "Repos · 22");
+                    assert!(!items.iter().any(|(name, _)| name.starts_with("repo-")));
+                    output.drop_without_applying_deltas();
+                    if !repos_visible {
+                        click(app, ctx, width, "Tabs");
+                    }
+                    click(app, ctx, width, "Repos · 22");
+                    // A submenu sizes before its first paint.
+                    render(app, ctx, width, vec![]).1.drop_without_applying_deltas();
+                    let (_, output) = render(app, ctx, width, vec![]);
+                    for label in [
+                        "repo-1 · 2 sessions · 17 changes",
+                        "repo-2 · 1 sessions · 5 changes",
+                        "repo-7 · 0 sessions · 0 changes",
+                    ] {
+                        assert!(
+                            output.shapes.iter().any(
+                                |shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == label)
+                            ),
+                            "width={width}: missing {label}"
+                        );
+                    }
+                    output.drop_without_applying_deltas();
+                    click(app, ctx, width, "repo-1 · 2 sessions · 17 changes");
+                    assert_eq!(app.runtime.view.as_ref(), Some(&root));
+                    assert!(!app.runtime.plan_view);
+                    assert!(!app.runtime.ungrouped);
+                    assert_eq!(app.runtime.active.as_deref(), Some("main"));
+                    assert_eq!(app.runtime.visible_sessions(), [1, 2]);
+                    let (items, output) = render(app, ctx, width, vec![]);
+                    let repos_visible = items.iter().any(|(name, _)| name == "repo-1");
+                    output.drop_without_applying_deltas();
+                    if !repos_visible {
+                        click(app, ctx, width, "Tabs");
+                    }
+                    click(app, ctx, width, "repo-1");
+                    render(app, ctx, width, vec![]).1.drop_without_applying_deltas();
+                    click(app, ctx, width, "repo-7 · 0 sessions · 0 changes");
+                    assert_eq!(app.runtime.view.as_deref(), Some(Path::new("/project/repo-7")));
+                    assert!(app.runtime.active.is_none());
+                    assert_eq!(app.runtime.diff_root.as_deref(), Some(Path::new("/project/repo-7")));
+                    if width == 1700.0 {
+                        let (items, output) = render(app, ctx, width, vec![]);
+                        assert!(items.iter().any(|(name, _)| name == "repo-7"));
+                        output.drop_without_applying_deltas();
+                    }
+                }
+            },
+        );
+    }
+
+    #[test]
     fn overflow_tabs_and_actions_remain_clickable() {
         with_app("app::topbar::tests::overflow_tabs_and_actions_remain_clickable", |app, ctx| {
             fixture(app, 6);
             app.runtime.toast = None;
             app.runtime.config_error = None;
             app.runtime.hook_error = None;
-            let click = |app: &mut Desktop<'_>, width: f32, label: &str| {
-                let (items, output) = render(app, ctx, width, vec![]);
-                let mut pos = items.iter().find(|(name, _)| name == label).map(|(_, r)| r.center());
-                if pos.is_none() {
-                    pos = output.shapes.iter().find_map(|shape| match &shape.shape {
-                        egui::Shape::Text(text) if text.galley.text().starts_with(label) => {
-                            Some(text.pos + text.galley.rect.center().to_vec2())
-                        }
-                        _ => None,
-                    });
-                }
-                let pos = pos.unwrap_or_else(|| panic!("missing {label}: {items:?}"));
-                output.drop_without_applying_deltas();
-                for pressed in [true, false] {
-                    render(
-                        app,
-                        ctx,
-                        width,
-                        vec![
-                            egui::Event::PointerMoved(pos),
-                            egui::Event::PointerButton {
-                                pos,
-                                button: egui::PointerButton::Primary,
-                                pressed,
-                                modifiers: egui::Modifiers::NONE,
-                            },
-                        ],
-                    )
-                    .1
-                    .drop_without_applying_deltas();
-                }
-            };
             for width in [480.0, 550.0, 700.0] {
                 fixture(app, 6);
                 app.client.new_dialog = None;
                 let collapsed = width < 700.0;
                 let was_open = app.runtime.diff_open;
                 if collapsed {
-                    click(app, width, "Actions");
+                    click(app, ctx, width, "Actions");
                 }
-                click(app, width, "diff");
+                click(app, ctx, width, "diff");
                 assert_ne!(app.runtime.diff_open, was_open, "width={width}: diff action");
-                click(app, width, "Tabs");
-                click(app, width, "Plan 0:");
+                click(app, ctx, width, "Tabs");
+                click(app, ctx, width, "Plan 0:");
                 assert_eq!(app.runtime.selected_plan, 0, "width={width}: Tabs selection");
                 assert!(app.runtime.plan_view);
                 if collapsed {
-                    click(app, width, "Actions");
+                    click(app, ctx, width, "Actions");
                 }
-                click(app, width, "+ New");
+                click(app, ctx, width, "+ New");
                 assert!(app.client.new_dialog.is_some(), "width={width}: new action");
                 if collapsed {
-                    click(app, width, "Actions");
+                    click(app, ctx, width, "Actions");
                 }
                 let panel_was_open = app.runtime.panel == PanelMode::Plan && app.runtime.diff_open;
-                click(app, width, "Plan");
+                click(app, ctx, width, "Plan");
                 assert_ne!(
                     app.runtime.panel == PanelMode::Plan && app.runtime.diff_open,
                     panel_was_open,
@@ -547,9 +634,9 @@ mod tests {
                 );
                 for (action, entry) in [("Project", "Open project…"), ("Settings", "Edit config")] {
                     if collapsed {
-                        click(app, width, "Actions");
+                        click(app, ctx, width, "Actions");
                     }
-                    click(app, width, action);
+                    click(app, ctx, width, action);
                     // A submenu sizes before its first paint; inspect the settled pass.
                     render(app, ctx, width, vec![]).1.drop_without_applying_deltas();
                     let (_, output) = render(app, ctx, width, vec![]);

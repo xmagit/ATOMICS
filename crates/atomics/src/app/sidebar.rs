@@ -5,6 +5,7 @@ enum ViewTab {
     All,
     /// Every session outside a plan.
     Ungrouped,
+    Repos,
     Project(PathBuf),
     Plan(usize),
 }
@@ -183,8 +184,7 @@ impl Desktop<'_> {
     }
 
     pub(super) fn view_tabs(&mut self, ui: &mut egui::Ui) {
-        let mut tabs = vec![ViewTab::All, ViewTab::Ungrouped];
-        tabs.extend(self.runtime.repos.iter().cloned().map(ViewTab::Project));
+        let mut tabs = vec![ViewTab::All, ViewTab::Ungrouped, ViewTab::Repos];
         tabs.extend(
             self.runtime
                 .plans
@@ -219,8 +219,8 @@ impl Desktop<'_> {
         priority.sort_by_key(|&index| match &tabs[index] {
             ViewTab::Plan(plan) if self.runtime.plan_state(*plan) == PlanState::NeedsYou => 0,
             ViewTab::Plan(plan) if matches!(self.runtime.plan_state(*plan), PlanState::Running(_)) => 1,
-            ViewTab::All | ViewTab::Ungrouped | ViewTab::Project(_) if self.view_tab_selected(&tabs[index]) => 2,
-            ViewTab::All | ViewTab::Ungrouped | ViewTab::Project(_) => 3,
+            ViewTab::All | ViewTab::Ungrouped | ViewTab::Repos if self.view_tab_selected(&tabs[index]) => 2,
+            ViewTab::All | ViewTab::Ungrouped | ViewTab::Repos => 3,
             ViewTab::Plan(_) if self.view_tab_selected(&tabs[index]) => 4,
             ViewTab::Plan(plan) if self.runtime.plans[*plan].status == PlanStatus::Open => 5,
             _ => 6,
@@ -382,6 +382,7 @@ impl Desktop<'_> {
         match tab {
             ViewTab::All => !self.runtime.plan_view && !self.runtime.ungrouped && self.runtime.view.is_none(),
             ViewTab::Ungrouped => !self.runtime.plan_view && self.runtime.ungrouped,
+            ViewTab::Repos => !self.runtime.plan_view && !self.runtime.ungrouped && self.runtime.view.is_some(),
             ViewTab::Project(root) => {
                 !self.runtime.plan_view && !self.runtime.ungrouped && self.runtime.view.as_ref() == Some(root)
             }
@@ -389,7 +390,61 @@ impl Desktop<'_> {
         }
     }
 
+    fn project_summary(&self, root: &Path) -> (usize, usize) {
+        self.runtime
+            .sessions
+            .iter()
+            .filter(|s| !s.chief && self.runtime.project_of(&s.root()).as_deref() == Some(root))
+            .fold((0, 0), |(count, changes), session| {
+                let size = self.runtime.diffs.get(&session.root()).and_then(|d| d.prepared.as_ref());
+                (count + 1, changes + size.map_or(0, |diff| diff.additions + diff.deletions))
+            })
+    }
+
+    fn repos_tab(&mut self, ui: &mut egui::Ui, width: Option<f32>) {
+        let selected = self.view_tab_selected(&ViewTab::Repos);
+        let label = if selected {
+            self.runtime
+                .view
+                .as_ref()
+                .and_then(|root| root.file_name())
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            let changes: usize = self.runtime.repos.iter().map(|root| self.project_summary(root).1).sum();
+            format!("Repos · {changes}")
+        };
+        let color = if selected { self.runtime.palette.accent } else { self.runtime.palette.foreground };
+        let mut menu = |ui: &mut egui::Ui| {
+            ui.menu_button(RichText::new(&label).font(self.runtime.palette.ui(12.5)).color(color), |ui| {
+                for root in self.runtime.repos.clone() {
+                    self.view_tab(ui, &ViewTab::Project(root), None, None);
+                }
+            })
+            .response
+        };
+        let response = match width {
+            Some(width) => {
+                ui.allocate_ui_with_layout(vec2(width, ui.spacing().interact_size.y), *ui.layout(), |ui| {
+                    ui.set_min_width(width);
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                    menu(ui)
+                })
+                .inner
+            }
+            None => menu(ui),
+        };
+        if width.is_some() {
+            super::topbar::record_item(ui, &label, &response);
+        }
+    }
+
     fn view_tab(&mut self, ui: &mut egui::Ui, tab: &ViewTab, width: Option<f32>, natural_width: Option<f32>) {
+        if matches!(tab, ViewTab::Repos) {
+            self.repos_tab(ui, width);
+            return;
+        }
         let p = self.runtime.palette.clone();
         let selected = self.view_tab_selected(tab);
         let (label, hover, color) = match tab {
@@ -404,13 +459,14 @@ impl Desktop<'_> {
             }
             ViewTab::Project(root) => {
                 let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                let count = self
-                    .sessions
-                    .iter()
-                    .filter(|s| !s.chief && self.runtime.project_of(&s.root()).as_ref() == Some(root))
-                    .count();
-                (format!("{name} · {count}"), paths::display(root), if selected { p.accent } else { p.foreground })
+                let (count, changes) = self.project_summary(root);
+                (
+                    format!("{name} · {count} sessions · {changes} changes"),
+                    paths::display(root),
+                    if selected { p.accent } else { p.foreground },
+                )
             }
+            ViewTab::Repos => unreachable!(),
             ViewTab::Plan(index) => {
                 let plan = &self.runtime.plans[*index];
                 let state = self.runtime.plan_state(*index);
@@ -513,6 +569,7 @@ impl Desktop<'_> {
                 ViewTab::All => self.runtime.set_view(None),
                 ViewTab::Ungrouped => self.runtime.show_ungrouped(),
                 ViewTab::Project(root) => self.runtime.set_view(Some(root.clone())),
+                ViewTab::Repos => unreachable!(),
                 ViewTab::Plan(index) => {
                     if self.runtime.plans[*index].status == PlanStatus::Open {
                         self.runtime.selected_plan = *index;
@@ -949,6 +1006,7 @@ mod tests {
         with_app(
             "app::sidebar::tests::clicking_plan_tabs_and_approving_boards_targets_only_the_selected_plan",
             |app, ctx| {
+                app.runtime.repos = (0..8).map(|i| PathBuf::from(format!("/project/repo-{i}"))).collect();
                 for goal in ["Atlas", "Beacon"] {
                     assert!(
                         request(
@@ -1024,6 +1082,8 @@ mod tests {
                 };
                 for (goal, index, visible) in [("Atlas", one, 0), ("Beacon", two, 1)] {
                     let text = frame(app, vec![]);
+                    assert!(text.iter().any(|(t, _)| t == "Repos · 0"));
+                    assert!(!text.iter().any(|(t, _)| t.starts_with("repo-")));
                     assert!(!text.iter().any(|(t, _)| t.contains("Archived")));
                     assert!(text.iter().any(|(t, _)| t.starts_with("✓ Completed")));
                     let pos = text.iter().find(|(t, _)| t.starts_with(&format!("● {goal} ·"))).unwrap().1;
