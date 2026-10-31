@@ -138,11 +138,65 @@ follows the standards:
    credential catalog because macOS's `security` takes 4 KiB per write: a few signed-in servers would crowd out the
    catalog, and every refresh would rewrite it.
 
-The API for a sign-in UI is `OAuth::sign_in(server)`, `sign_out(server)` and `status(server)` (signed in, needs
-sign-in, or the keychain's error) in `mcp_client.rs`. `sign_out` deletes the server's token items and keeps its
-registered client. **The ticket worker never opens a browser:** a job against a server that is not signed in fails with
+**The ticket worker never opens a browser:** a job against a server that is not signed in fails with
 `sign-in required: <url> needs a sign-in`, and the UI offers the sign-in. A server with `oauth` unset that answers
-`401` with `resource_metadata` fails the same way, with a hint to set `oauth = true`.
+`401` with `resource_metadata` fails the same way, with a hint to set `oauth = true`. Needing a sign-in is a **state**,
+not a failure: the worker does not back off from it, and the next job after a sign-in connects at once.
+
+#### The sign-in in the app
+
+Open the Tickets panel (`cmd+j` / `ctrl+j`), the Tickets entry in the Actions menu, or the first search. Until the
+server is signed in the panel shows a banner, "relay is not signed in", with **Sign in with the browser**; a dot on
+the Tickets entry says the same.
+
+1. **Sign in** opens the default browser (`open` on macOS, `xdg-open` on Linux, `cmd /c start` on Windows). The banner
+   reads "Waiting for the browser…" with **Cancel** and the time left (five minutes). Back in ATOMICS it becomes the
+   chip `relay · signed in` with **Sign out**, and the query box is focused.
+2. **No browser here** (SSH, a Linux machine with no `DISPLAY`/`WAYLAND_DISPLAY`, or a browser that failed to open):
+   the banner shows the authorization link with **Copy link** and a paste box at once. Open the link on any machine and
+   sign in. The browser then lands on `http://127.0.0.1:<port>/callback?code=…&state=…`, which does not load there:
+   paste that address (or just its query) and press **Use it**. ATOMICS checks `state` (and the issuer) before it
+   exchanges the code. A wrong address is refused with a short reason and the sign-in keeps waiting. No port
+   forwarding is needed. On a machine with a browser the same box appears under **No browser here?**.
+3. **Sign out** (the chip, or Actions → "Tickets: sign out of …") asks the authorization server to revoke the refresh and
+   access tokens (RFC 7009) when its metadata has a `revocation_endpoint`, then deletes the saved sign-in and drops
+   the worker's connection. A revocation that fails is shown; the local sign-out always completes.
+4. **Expiry.** The access token is refreshed 60 seconds before it expires and once after a `401`; the refresh token is
+   stored again whenever the server rotates it. When the server refuses the saved sign-in (`invalid_grant`) or gave no
+   refresh token, the sign-in is cleared and the banner shows again: "sign-in required". A network failure is
+   a transport error with the usual 15-second backoff, not a sign-out.
+
+From a terminal:
+
+```sh
+atomics tickets login    # opens the browser; without one, prints the link and reads the pasted address from stdin
+atomics tickets logout   # revoke where the server allows it, then forget the sign-in on this machine
+```
+
+Both read `[tickets.server]` of the config (add `--workspace NAME` for a workspace's). `atomics doctor` lists
+`✓ credential MCP sign-in (<host>): present; OS keychain → ATOMICS → that server only (values hidden)`, or says it is
+absent. No command, line of output, error, log or plan file ever holds a token, a client id or an endpoint.
+
+#### One sign-in or two
+
+The panel asks for **one** sign-in, the one above. It is ATOMICS's own, kept in this machine's OS keychain, and it is
+what the ticket worker, the chief's `atomics_ticket_*` tools and the agents' scoped ticket tools use. Agents (bare or in
+a sandbox) never hold it: they ask ATOMICS, which calls the server.
+
+A second, independent sign-in exists for sandboxed agents that use the server's *own* tools directly through sbx's MCP
+gateway (`sbx mcp auth`, [Connections](isolation.md#mcp-connections)). It is optional and never part of the first
+run: once signed in, Actions → "Tickets: let sandboxed agents use … own tools" runs the existing Connect. The two
+are not shared on purpose. A token belongs to one resource and one client; handing the refresh token to sbx would give
+another process a rotating secret it could rotate under ATOMICS (signing the other out), and revoking one must not stop
+the other. A chief that has the server in Claude Code's own MCP config has a third sign-in; it is Claude Code's.
+
+#### SSH
+
+On a machine you reach over SSH, run `atomics tickets login` there, open the printed link in the browser on your own
+computer, sign in, and paste the address the browser ends on (it will say it cannot connect; that is expected). The
+sign-in is per machine, as the keychain is. With the app running over SSH, use the banner's paste box the same way.
+Prefer a tunnel instead? The sign-in listens on a fixed loopback port while it can (reused from the saved client), so
+`ssh -L <port>:127.0.0.1:<port>` makes the browser's final redirect reach it with nothing to paste.
 
 ### Ticket-aware branches
 

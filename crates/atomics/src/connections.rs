@@ -247,7 +247,17 @@ pub fn registered(program: &str) -> Result<Vec<Registered>> {
         .collect())
 }
 
-/// How ATOMICS opens an authorization page: `open` on macOS, `xdg-open` on Linux.
+/// The program that opens a page on Windows: `cmd /c start "" "<url>"`.
+const WINDOWS_START: &str = "cmd";
+
+/// The arguments cmd.exe gets to open `url`, quoted as one piece so `&` and `?` in the address stay in it.
+/// An address with a quote or a control character is refused instead of escaped.
+pub(crate) fn windows_start_args(url: &str) -> Option<String> {
+    (!url.chars().any(|c| c == '"' || c.is_control()) && url.starts_with("http"))
+        .then(|| format!("/c start \"\" \"{url}\""))
+}
+
+/// How ATOMICS opens an authorization page: `open` on macOS, `xdg-open` on Linux, `cmd /c start` on Windows.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Browser {
     program: String,
@@ -255,7 +265,13 @@ pub struct Browser {
 
 impl Browser {
     pub fn current() -> Self {
-        Self::at(if cfg!(target_os = "macos") { "open" } else { "xdg-open" })
+        Self::at(if cfg!(target_os = "macos") {
+            "open"
+        } else if cfg!(windows) {
+            WINDOWS_START
+        } else {
+            "xdg-open"
+        })
     }
 
     pub fn at(program: impl Into<String>) -> Self {
@@ -264,7 +280,16 @@ impl Browser {
 
     pub fn open(&self, url: &str) -> Result<()> {
         let mut command = Command::new(&self.program);
-        command.arg(url).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        if self.program == WINDOWS_START {
+            let line = windows_start_args(url).context("not an address to open")?;
+            #[cfg(windows)]
+            std::os::windows::process::CommandExt::raw_arg(&mut command, line);
+            #[cfg(not(windows))]
+            command.arg(line);
+        } else {
+            command.arg(url);
+        }
+        command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
         if let Some(path) = crate::setup::SHELL_PATH.as_ref() {
             command.env("PATH", path);
         }
@@ -630,6 +655,17 @@ pub(crate) mod tests {
     use super::*;
     use crate::sandbox::fake;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn windows_opens_an_address_with_cmd_start_quoted_as_one_piece() {
+        assert_eq!(
+            windows_start_args("https://a.example/authorize?x=1&state=2").unwrap(),
+            "/c start \"\" \"https://a.example/authorize?x=1&state=2\""
+        );
+        assert!(windows_start_args("https://a.example/\" & calc").is_none());
+        assert!(windows_start_args("calc.exe").is_none());
+        assert!(windows_start_args("https://a.example/\n").is_none());
+    }
 
     /// A browser that records each URL it is asked to open in `opened` beside it.
     pub fn browser(dir: &Path) -> Browser {
