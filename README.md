@@ -554,8 +554,10 @@ Agents share the machine, and IMACS keeps that in check for every agent it start
 - **One compiler job pool.** IMACS owns a GNU make jobserver (a named pipe in a private folder under Linux's
   `XDG_RUNTIME_DIR`, or the user's temporary directory otherwise) with `jobs` tokens, cores minus 2 by default, and hands it to every agent terminal as
   `CARGO_MAKEFLAGS`. cargo takes a token per job, so ten agents building at once share those jobs instead of each
-  using every core. On Linux, Codex also gets `--add-dir` for this instance's private XDG runtime `jobserver/` subdirectory so its
-  sandboxed compilers can open the FIFO. `MAKEFLAGS` is left alone, since `make` before GNU make 4.4 misreads a pipe jobserver. A job
+  using every core. On Linux, Codex also gets this instance's private XDG runtime `jobserver/` subdirectory as a
+  workspace-write writable root (`-c sandbox_workspace_write.writable_roots=[…]`), so its sandboxed compilers can open
+  the FIFO; unlike `--add-dir`, that never stops Codex in a folder it has not trusted yet. The setting replaces
+  `writable_roots` from your own Codex config for IMACS's sessions. `MAKEFLAGS` is left alone, since `make` before GNU make 4.4 misreads a pipe jobserver. A job
   killed while holding a token never returns it, so whenever no compiler or build script runs, IMACS resets the
   pool to full. cargo passes the pool on to build scripts, and a build script that runs Apple's `make` 3.81 (some
   `-sys` crates, vendored OpenSSL) stops with "invalid --jobserver-fds"; set `jobs = 0` to turn the pool off, or put
