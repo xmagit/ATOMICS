@@ -219,7 +219,8 @@ impl State {
             };
             Role::Agent(task.and_then(|task| task.isolation).or(Some(ran)))
         };
-        match self.start_as(ctx, &record.agent, record.cwd, Some(record.claude_session_id), args, prompt, role) {
+        let cwd = if record.chief { self.chief_cwd().unwrap_or(record.cwd) } else { record.cwd };
+        match self.start_as(ctx, &record.agent, cwd, Some(record.claude_session_id), args, prompt, role) {
             Ok(id) => {
                 if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) {
                     session.last_prompt = record.last_prompt;
@@ -538,7 +539,8 @@ mod tests {
                     pane: Some("old-pane".into()),
                     claude_session_id: "restarted-claude-id".into(),
                     agent: "chief".into(),
-                    cwd: home.clone(),
+                    // Where its shell last was: the restart still resumes it in `[chief] cwd`.
+                    cwd: started.launch_dir.clone(),
                     title: "chief".into(),
                     last_prompt: None,
                     updated: 0,
@@ -556,6 +558,7 @@ mod tests {
             let chiefs: Vec<_> = restarted.sessions.iter().filter(|s| s.chief).collect();
             assert_eq!(chiefs.len(), 1);
             assert_eq!(chiefs[0].claude_id.as_deref(), Some("restarted-claude-id"));
+            assert_eq!(chiefs[0].cwd, home);
             restarted.shutdown();
         });
     }

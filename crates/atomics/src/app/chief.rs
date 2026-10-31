@@ -5,17 +5,20 @@ impl State {
     /// continuing the `[chief] resume` conversation when one is named. The workspace file's values
     /// win over the main and host config's.
     pub(super) fn start_chief(&mut self, ctx: &egui::Context, prompt: Option<String>) -> Result<String, String> {
+        let cwd = self.chief_cwd().unwrap_or_else(|| {
+            self.view.clone().or_else(|| self.repos.first().cloned()).unwrap_or_else(|| self.launch_dir.clone())
+        });
         let launch = self.tickets.workspace_chief.clone().unwrap_or_default();
-        let set = |value: Option<String>| value.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
-        let cwd = match set(launch.cwd).or_else(|| set(self.config.chief.cwd.clone())) {
-            Some(dir) => paths::expand(&dir),
-            None => {
-                self.view.clone().or_else(|| self.repos.first().cloned()).unwrap_or_else(|| self.launch_dir.clone())
-            }
-        };
-        let resume = set(launch.resume).or_else(|| set(self.config.chief.resume.clone()));
+        let resume = setting(launch.resume).or_else(|| setting(self.config.chief.resume.clone()));
         let args = self.config.chief.args.clone();
         self.start_as(ctx, "chief", cwd, resume, args, prompt, Role::Chief)
+    }
+
+    /// `[chief] cwd`, the workspace file's over the main and host config's. A restart resumes the
+    /// chief there too: the folder its hooks last reported follows wherever its shell went.
+    pub(super) fn chief_cwd(&self) -> Option<PathBuf> {
+        let launch = self.tickets.workspace_chief.as_ref().and_then(|chief| chief.cwd.clone());
+        setting(launch).or_else(|| setting(self.config.chief.cwd.clone())).map(|dir| paths::expand(&dir))
     }
 
     /// `[chief] autostart`, the workspace file's over the main and host config's.
@@ -400,4 +403,9 @@ mod chief_tests {
         frame(vec![button(end, true)]);
         assert_eq!(frame(vec![button(end, false)]), (None, true));
     }
+}
+
+/// A set config value: trimmed, and unset when empty.
+fn setting(value: Option<String>) -> Option<String> {
+    value.map(|value| value.trim().to_string()).filter(|value| !value.is_empty())
 }
