@@ -466,8 +466,11 @@ branch into the integration branch. The merge happens in a worktree of its own n
 first use like any other worktree, so your main checkout is never touched. On a conflict the merge is aborted and the
 task stays in review with a note listing the conflicted files. Tasks without dependencies branch from `base_ref`;
 tasks with dependencies branch from the integration branch, so integrate accepted tasks before dispatching the tasks
-that build on them. Returning a task to running clears its integration marker. Background checks verify that each marked task branch tip is an ancestor of the integration branch. The board
-and dispatch use the same verified readiness, so new commits must be integrated too.
+that build on them. Returning a task to running clears its integration marker. Background checks verify that each marked
+task's branch tip is in the integration branch with nothing left uncommitted, again whenever a ref changes, so new commits
+must be integrated too. The board and dispatch use the same verified readiness. A check that cannot tell, or does not
+finish within 150 s, says why on the task card and in `imacs_plan_get`, and runs again within 30 s. Dispatching checks
+such dependencies afresh and answers once their checks have.
 
 Each open plan has a **short name · done/total** tab with a status dot (working, needs you, all done).
 Dispatching the selected plan returns from its board to its fleet and minimizes a floating chief; a docked chief
@@ -681,7 +684,7 @@ responsive layout, the hook and control protocols, and review message compositio
 | Git | `git` CLI | Exact porcelain semantics, and picks up `core.fsmonitor`/`untrackedCache` on large repositories |
 | Highlighting | syntect + bat's grammars (two-face), Oniguruma | Works line by line, which suits hunks that start mid-file; Oniguruma is ~3× faster and ~4× smaller than fancy-regex |
 | Word diff | similar | Code-aware tokens, so `compute(1)` → `compute(2)` marks only the number |
-| Watching | notify (FSEvents/inotify) | Live diff for the worktree on screen; diffs of agents off screen follow their file changes within seconds, no polling |
+| Watching | notify (FSEvents/inotify), changes only | Live diff for the worktree on screen; diffs of agents off screen follow their file changes within seconds, no polling |
 | IPC | Unix socket, JSON lines | One socket for hooks, `imacs ctl` and `imacs mcp`; no async runtime anywhere |
 
 Agents run as children of the IMACS process, so closing IMACS stops them. Claude sessions in a project can be resumed from the sidebar,

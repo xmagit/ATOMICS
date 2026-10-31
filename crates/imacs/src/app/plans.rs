@@ -274,6 +274,16 @@ impl State {
         value["workflow"] = json!(self.plan_workflow(&self.plans[index]));
         value["ready"] = json!(self.plans[index].ready().iter().map(|t| &t.id).collect::<Vec<_>>());
         value["integration"] = json!(self.plans[index].integration_branch());
+        if let Some(tasks) = value["tasks"].as_array_mut() {
+            for (task, value) in self.plans[index].tasks.iter().zip(tasks) {
+                if task.integrated.is_some() {
+                    value["integration_verified"] = json!(task.integration_verified);
+                }
+                if let Some(note) = self.integration_check_note(index, task) {
+                    value["integration_check"] = json!(note);
+                }
+            }
+        }
         if let Some(board) = self.ticket_summary(&self.plans[index].id).and_then(|s| s.get("board").cloned()) {
             value["ticket_board"] = board;
         }
@@ -450,15 +460,22 @@ impl State {
         let ready: Vec<Task> =
             self.plans[index].ready().into_iter().filter(|t| only.is_none_or(|id| t.id == id)).cloned().collect();
         if ready.is_empty() {
-            if let Some(task) = self.plans[index].tasks.iter().find(|task| {
+            let plan = &self.plans[index];
+            if let Some(task) = plan.tasks.iter().find(|task| {
                 only.is_none_or(|id| task.id == id)
                     && task.status == TaskStatus::Planned
-                    && !self.plans[index].unintegrated_dependencies(task).is_empty()
+                    && !plan.unintegrated_dependencies(task).is_empty()
             }) {
+                let note = |id: &str| self.integration_check_note(index, plan.tasks.iter().find(|t| t.id == id)?);
+                let dependencies: Vec<String> = plan
+                    .unintegrated_dependencies(task)
+                    .into_iter()
+                    .map(|id| note(id).map_or_else(|| id.to_string(), |note| format!("{id} ({note})")))
+                    .collect();
                 return Err(format!(
                     "Task {} needs integrated dependencies: {}. Use imacs_plan_integrate on them first.",
                     task.id,
-                    self.plans[index].unintegrated_dependencies(task).join(", ")
+                    dependencies.join(", ")
                 ));
             }
             return Err(match only {

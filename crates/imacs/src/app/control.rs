@@ -319,10 +319,11 @@ impl State {
                     Err(error) => ControlResponse::error(error),
                 })
             }
-            ControlRequest::PlanDispatch { plan: _, id } => match self.dispatch(target, id.as_deref()) {
-                Ok(started) => done(ControlResponse::ok(json!({ "started": started }))),
-                Err(err) => done(ControlResponse::error(err)),
-            },
+            ControlRequest::PlanDispatch { plan: _, id } => {
+                // It answers once the checks of the dependencies it waits on have.
+                self.dispatch_when_checked(target, id, Some(reply));
+                return;
+            }
             ControlRequest::PlanIntegrate { plan: _, id } => {
                 // Committing and merging can take a while: answer once it is done.
                 self.integrate(target, &id, Some(reply));
