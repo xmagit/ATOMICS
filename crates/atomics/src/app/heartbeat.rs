@@ -7,6 +7,10 @@ pub(super) struct Activity {
     pub working_since: Option<u64>,
     pub last_event: u64,
     pub held_since: Option<u64>,
+    /// The last turn end or wake, measured independently of wall-clock changes.
+    pub wake_since: Option<Instant>,
+    /// Unlike the wake deadline, this boundary is unchanged by an automatic wake.
+    pub turn_ended: Option<Instant>,
 }
 
 impl Default for Activity {
@@ -18,13 +22,25 @@ impl Default for Activity {
             working_since: None,
             last_event: now,
             held_since: None,
+            wake_since: None,
+            turn_ended: None,
         }
     }
 }
 
 impl Activity {
     pub fn observe(&mut self, status: AgentStatus) {
+        self.observe_at(status, Instant::now());
+    }
+
+    fn observe_at(&mut self, status: AgentStatus, now: Instant) {
         if self.status != status {
+            if !matches!(status, AgentStatus::Idle | AgentStatus::Done) {
+                self.wake_since = None;
+            } else if !matches!(self.status, AgentStatus::Idle | AgentStatus::Done) {
+                self.wake_since = Some(now);
+                self.turn_ended = Some(now);
+            }
             self.status_since = atomics_core::store::now();
             if status == AgentStatus::Working
                 && (self.working_since.is_none() || self.status != AgentStatus::NeedsInput)
@@ -174,6 +190,32 @@ mod tests {
         activity.observe(AgentStatus::Working);
         assert!(activity.working_since.unwrap() > 1);
         assert_eq!(activity.working_since, Some(activity.status_since));
+    }
+
+    #[test]
+    fn chief_wake_timer_resets_on_turn_start_and_restarts_at_turn_end() {
+        let now = Instant::now();
+        let mut activity = Activity::default();
+        activity.observe_at(AgentStatus::Idle, now);
+        assert_eq!(activity.wake_since, Some(now));
+        activity.wake_since = Some(now + Duration::from_secs(180)); // A wake was sent.
+        activity.observe_at(AgentStatus::Idle, now + Duration::from_secs(181));
+        assert_eq!(activity.wake_since, Some(now + Duration::from_secs(180)));
+        assert_eq!(activity.turn_ended, Some(now), "a wake must not clear native input history");
+        activity.observe_at(AgentStatus::Working, now + Duration::from_secs(182));
+        assert_eq!(activity.wake_since, None);
+        activity.observe_at(AgentStatus::NeedsInput, now + Duration::from_secs(190));
+        activity.observe_at(AgentStatus::Working, now + Duration::from_secs(200));
+        assert_eq!(activity.wake_since, None);
+        activity.observe_at(AgentStatus::Done, now + Duration::from_secs(500));
+        assert_eq!(activity.wake_since, Some(now + Duration::from_secs(500)));
+        assert_eq!(activity.turn_ended, Some(now + Duration::from_secs(500)));
+        activity.observe_at(AgentStatus::Idle, now + Duration::from_secs(510));
+        assert_eq!(activity.wake_since, Some(now + Duration::from_secs(500)));
+        // A complete turn between runtime ticks still resets the timer through hook observations.
+        activity.observe_at(AgentStatus::Working, now + Duration::from_secs(520));
+        activity.observe_at(AgentStatus::Done, now + Duration::from_secs(521));
+        assert_eq!(activity.wake_since, Some(now + Duration::from_secs(521)));
     }
 
     #[test]

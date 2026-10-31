@@ -14,6 +14,7 @@ mod markdown;
 mod panel_nav;
 mod diff_worker;
 mod doctor;
+mod github;
 mod governor;
 mod highlight;
 mod hook_client;

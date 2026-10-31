@@ -438,7 +438,15 @@ impl Desktop<'_> {
                 });
             }
             let rows = (lane.content_h / LINE_H).ceil() as usize;
-            let jump = panel_nav::keyboard_scroll_for(ui, focus_id(), scroll_id, LINE_H, 0..rows, jump);
+            let jump = panel_nav::keyboard_scroll_for(
+                ui,
+                focus_id(),
+                scroll_id,
+                LINE_H,
+                0..rows,
+                &panel_nav::SCROLL_KEYS,
+                jump,
+            );
             let mut area = egui::ScrollArea::vertical()
                 .id_salt("trace-lane-scroll")
                 .auto_shrink([false, false])

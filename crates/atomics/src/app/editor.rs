@@ -96,6 +96,9 @@ impl Desktop<'_> {
             self.tickets_panel(ui, rect);
             return;
         }
+        if self.runtime.panel == PanelMode::Diff && self.github_pr_panel(ui, rect) {
+            return;
+        }
         let Some(root) = self.runtime.diff_target() else { return };
         // What changed sits right next to the diff/editor, in both modes.
         let rect = if rect.width() >= 760.0 {

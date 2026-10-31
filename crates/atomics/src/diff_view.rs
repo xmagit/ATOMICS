@@ -34,7 +34,7 @@ pub struct DiffState {
     pub viewing: Option<String>,
     pub file: Option<Arc<FileView>>,
     pub file_error: Option<String>,
-    /// The file last opened from the changed-files list or the explorer.
+    /// The file last opened or reached by scrolling the diff.
     pub focused: Option<String>,
 }
 
@@ -149,10 +149,26 @@ impl DiffState {
         self.file_error = None;
     }
 
+    /// Moves to the next (`+1`) or previous (`-1`) changed file and jumps to its header.
+    /// Returns the file and the first line it changes.
+    pub fn step(&mut self, delta: i32) -> Option<(String, Option<u32>)> {
+        let prepared = self.prepared.clone()?;
+        let files = &prepared.diff.files;
+        if files.is_empty() {
+            return None;
+        }
+        let current = self.focused.as_deref().and_then(|path| files.iter().position(|file| file.path() == path));
+        let next = crate::panel_nav::step_index(current, files.len(), delta)?;
+        let file = &files[next];
+        let path = file.path().to_string();
+        self.open(&path);
+        Some((path, first_change(file)))
+    }
+
     /// Moves to the next (`+1`) or previous (`-1`) hunk, crossing file boundaries.
     /// Files without hunks still have one stop at their header.
     /// Returns the file and the first line the selected hunk changes.
-    pub fn step(&mut self, delta: i32) -> Option<(String, Option<u32>)> {
+    pub fn step_hunk(&mut self, delta: i32) -> Option<(String, Option<u32>)> {
         let prepared = self.prepared.clone()?;
         let files = &prepared.diff.files;
         if files.is_empty() {
@@ -168,7 +184,11 @@ impl DiffState {
             let hi = self.hunk.unwrap_or(0).min(files[fi].hunks.len().saturating_sub(1));
             sections.iter().position(|&section| section == (fi, hi))
         });
-        let next = crate::panel_nav::step_index(current, sections.len(), delta)?;
+        let next = match current {
+            // A file header precedes its first hunk.
+            Some(i) if self.hunk.is_none() && delta > 0 => i,
+            _ => crate::panel_nav::step_index(current, sections.len(), delta)?,
+        };
         let (fi, hi) = sections[next];
         let file = &files[fi];
         let path = file.path().to_string();
@@ -228,6 +248,10 @@ pub struct Header<'a> {
 
 pub use crate::panel_nav::focus_id;
 use crate::panel_nav::keyboard_scroll;
+
+/// The keys that scroll the focused diff. PageUp/PageDown are not among them: they walk the
+/// hunks (see the shortcuts).
+const SCROLL_KEYS: [Key; 4] = [Key::ArrowUp, Key::ArrowDown, Key::Home, Key::End];
 
 pub fn show(
     ui: &mut egui::Ui,
@@ -438,17 +462,9 @@ pub fn show(
             state.top.filter(|&(_, was)| was != split).and_then(|(line, _)| rows.iter().position(|r| r.shows(line)))
         }
     };
-    let current = state
-        .focused
-        .as_deref()
-        .and_then(|path| diff.files.iter().position(|file| file.path() == path))
-        .or_else(|| state.top.map(|((fi, _, _), _)| fi))
-        .unwrap_or(0)
-        .min(file_rows.len() - 1);
-    let file = file_rows[current]..file_rows.get(current + 1).copied().unwrap_or(rows.len());
     let scroll_id = ui.make_persistent_id(egui::IdSalt::new(("diff-rows", header.title)));
     let before = egui::scroll_area::State::load(ui.ctx(), scroll_id).map(|s| s.clamped_offset().y).unwrap_or_default();
-    if let Some(offset) = keyboard_scroll(ui, scroll_id, row_h, file, jump.map(|row| row as f32 * row_h)) {
+    if let Some(offset) = keyboard_scroll(ui, scroll_id, row_h, 0..rows.len(), &SCROLL_KEYS, jump.map(|row| row as f32 * row_h)) {
         scroll = scroll.vertical_scroll_offset(offset);
     }
     let mut clicked_line: Option<(usize, usize, usize)> = None;
@@ -617,12 +633,17 @@ pub fn show(
         top
     });
     state.top = shown.inner.map(|line| (line, split));
-    if jump.is_none()
-        && shown.state.clamped_offset().y != before
-        && let Some((fi, hi, _)) = shown.inner
-    {
-        state.focused = Some(diff.files[fi].path().to_string());
-        state.hunk = Some(hi);
+    if jump.is_none() && shown.state.clamped_offset().y != before {
+        // Use the viewport's top row, rather than the virtualizer's extra visible lines.
+        let top = (shown.state.clamped_offset().y / row_h) as usize;
+        if let Some((fi, hi)) = rows[..=top.min(rows.len() - 1)].iter().rev().find_map(|row| match *row {
+            Row::File(fi) => Some((fi, None)),
+            Row::Hunk(fi, hi) => Some((fi, Some(hi))),
+            _ => row.line().map(|(fi, hi, _)| (fi, Some(hi))),
+        }) {
+            state.focused = Some(diff.files[fi].path().to_string());
+            state.hunk = hi;
+        }
     }
 
     if let Some(path) = toggle
@@ -715,7 +736,7 @@ fn show_file(ui: &mut egui::Ui, state: &mut DiffState, path: &str, palette: &Pal
     ui.spacing_mut().item_spacing.y = 0.0;
     let mut scroll = egui::ScrollArea::both().id_salt(("file-rows", path)).auto_shrink([false, false]);
     let scroll_id = ui.make_persistent_id(egui::IdSalt::new(("file-rows", path)));
-    if let Some(offset) = keyboard_scroll(ui, scroll_id, row_h, 0..rows.len(), None) {
+    if let Some(offset) = keyboard_scroll(ui, scroll_id, row_h, 0..rows.len(), &SCROLL_KEYS, None) {
         scroll = scroll.vertical_scroll_offset(offset);
     }
     scroll.show_rows(ui, row_h, rows.len(), |ui, range| {
@@ -1226,7 +1247,31 @@ mod tests {
     }
 
     #[test]
-    fn shift_arrows_walk_hunks_across_files_in_both_directions() {
+    fn shift_arrows_skip_hunks_and_always_land_on_file_headers() {
+        let mut state = state_with(&["a.rs", "b.rs"]);
+        let prepared = Arc::get_mut(state.prepared.as_mut().unwrap()).unwrap();
+        let hunk = prepared.diff.files[0].hunks[0].clone();
+        prepared.diff.files[0].hunks.push(hunk);
+        state.open("a.rs");
+        state.hunk = Some(1);
+        assert_eq!(state.step(1).unwrap().0, "b.rs");
+        assert!(matches!(state.scroll_to, Some(ScrollTarget::File(1))));
+        assert_eq!(state.step(-1).unwrap().0, "a.rs");
+        assert!(matches!(state.scroll_to, Some(ScrollTarget::File(0))));
+        assert!(state.hunk.is_none());
+        let mut backwards = state_with(&["first", "last"]);
+        assert_eq!(backwards.step(-1).unwrap().0, "last");
+        let mut single = state_with(&["only"]);
+        for delta in [1, -1, 1] {
+            single.hunk = Some(0);
+            assert_eq!(single.step(delta).unwrap().0, "only");
+            assert!(matches!(single.scroll_to, Some(ScrollTarget::File(0))));
+            assert!(single.hunk.is_none());
+        }
+    }
+
+    #[test]
+    fn page_keys_walk_hunks_across_files_in_both_directions() {
         let mut state = state_with(&["a.rs", "binary", "c.rs"]);
         let prepared = Arc::get_mut(state.prepared.as_mut().unwrap()).unwrap();
         let mut second = prepared.diff.files[0].hunks[0].clone();
@@ -1249,14 +1294,16 @@ mod tests {
             (-1, "a.rs", Some(1)),
             (-1, "a.rs", Some(1)),
         ] {
-            assert_eq!(state.step(delta), Some((path.into(), line)));
+            assert_eq!(state.step_hunk(delta), Some((path.into(), line)));
             assert_eq!(state.focused.as_deref(), Some(path));
             assert!(!state.collapsed.contains(path));
         }
         assert!(matches!(state.scroll_to, Some(ScrollTarget::Hunk(0, 0))));
         state.open("c.rs");
-        assert_eq!(state.step(-1), Some(("binary".into(), None)));
+        assert_eq!(state.step_hunk(-1), Some(("binary".into(), None)));
         let mut backwards = state_with(&["first", "last"]);
-        assert_eq!(backwards.step(-1).unwrap().0, "last");
+        assert_eq!(backwards.step_hunk(-1).unwrap().0, "last");
+        assert!(DiffState::default().step_hunk(1).is_none());
+        assert!(state_with(&[]).step_hunk(-1).is_none());
     }
 }

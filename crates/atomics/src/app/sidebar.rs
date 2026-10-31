@@ -1064,6 +1064,7 @@ impl Desktop<'_> {
             (&keys.focus_steer, "steer bar"),
             (&keys.new_session, "new session"),
             (&keys.voice, "voice: record, send (Esc cancels)"),
+            (&keys.github, "GitHub controls"),
         ] {
             ui.label(RichText::new(format!("{}  {what}", shortcut_label(ui.ctx(), key))).size(12.0).monospace());
         }

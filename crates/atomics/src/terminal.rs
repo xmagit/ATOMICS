@@ -189,11 +189,17 @@ impl TerminalView {
                     if !is_app_chord(&mods) && !mods.ctrl {
                         out.extend_from_slice(text.as_bytes());
                         self.line.push_str(&text);
+                        if !text.is_empty() {
+                            terminal.record_input(std::time::Instant::now(), false);
+                        }
                     }
                 }
                 egui::Event::Paste(text) => {
                     out.extend(atomics_core::steer::paste_bytes(&text, bracketed));
                     self.line.push_str(&text);
+                    if !text.is_empty() {
+                        terminal.record_input(std::time::Instant::now(), false);
+                    }
                 }
                 egui::Event::Copy => {
                     let mut term = terminal.term.lock();
@@ -210,6 +216,10 @@ impl TerminalView {
                 egui::Event::Key { key, pressed: true, modifiers, .. } if !is_app_chord(&modifiers) => {
                     if let Some(bytes) = key_bytes(key, modifiers, app_cursor) {
                         out.extend(bytes);
+                        terminal.record_input(
+                            std::time::Instant::now(),
+                            key == Key::Enter && !modifiers.shift && !modifiers.alt,
+                        );
                         if let Some(line) = typed_key(&mut self.line, key, modifiers) {
                             *terminal.shared.submitted.lock().unwrap() = Some(line);
                         }
@@ -219,7 +229,6 @@ impl TerminalView {
             }
         }
         if !out.is_empty() {
-            terminal.typed();
             let mut term = terminal.term.lock();
             term.scroll_display(Scroll::Bottom);
             self.selection = None;
@@ -509,6 +518,75 @@ pub(crate) fn color_query_args(query: &str, reply_len: usize) -> Vec<String> {
 mod tests {
     use super::*;
     use std::{collections::HashMap, sync::Arc, time::Duration};
+
+    #[test]
+    fn chief_input_tracking_follows_keystrokes_pastes_and_enter() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let terminal = Terminal::spawn(
+            crate::host::Wake::default(),
+            Vec::new(),
+            "/bin/cat".into(),
+            vec![],
+            dir.path(),
+            HashMap::new(),
+            100,
+        )
+        .unwrap();
+        let ctx = egui::Context::default();
+        let mut view = TerminalView::default();
+        let ended = Some(std::time::Instant::now() - Duration::from_secs(1));
+        let enter = |modifiers| egui::Event::Key {
+            key: Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        };
+        for (events, empty) in [
+            (vec![egui::Event::Text("draft".into())], false),
+            (vec![enter(Modifiers::SHIFT)], false),
+            (vec![enter(Modifiers::NONE)], true),
+            (vec![egui::Event::Paste("pasted\ntext".into())], false),
+            (vec![enter(Modifiers::NONE)], true),
+            (vec![enter(Modifiers::NONE), egui::Event::Text("next draft".into())], false),
+        ] {
+            ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| view.handle_keys(&terminal, ui))
+                .drop_without_applying_deltas();
+            assert_eq!(terminal.input_empty_since(ended), empty);
+            assert!(terminal.last_typed().is_some());
+        }
+    }
+
+    #[test]
+    fn chief_input_fallback_ignores_dim_and_colored_suggestions() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let terminal = Terminal::spawn(
+            crate::host::Wake::default(),
+            Vec::new(),
+            "/bin/sleep".into(),
+            vec!["30".into()],
+            dir.path(),
+            HashMap::new(),
+            100,
+        )
+        .unwrap();
+        let mut parser: alacritty_terminal::vte::ansi::Processor = alacritty_terminal::vte::ansi::Processor::new();
+        for (prompt, empty) in [
+            ("❯ \x1b[2mrun the full suite once more\x1b[0m", true),
+            ("\x1b[32m❯ \x1b[90mrun tests > /tmp/result\x1b[0m", true),
+            ("❯ \x1b[38;2;128;128;128mrun tests\x1b[0m", true),
+            ("❯ native-looking draft", false),
+            ("❯\r\n  second draft line\r\n────", false),
+            ("unknown screen", true),
+        ] {
+            parser.advance(&mut *terminal.term.lock(), format!("\x1b[2J\x1b[H{prompt}").as_bytes());
+            assert_eq!(terminal.input_empty_since(None), empty, "{prompt:?}");
+        }
+        // Once input is known, screen contents never override the recorded submit.
+        terminal.record_input(std::time::Instant::now(), true);
+        parser.advance(&mut *terminal.term.lock(), b"\x1b[2J\x1b[H> unstyled suggestion");
+        assert!(terminal.input_empty_since(None));
+    }
 
     #[test]
     fn screen_reader_defers_terminal_lock_to_worker() {

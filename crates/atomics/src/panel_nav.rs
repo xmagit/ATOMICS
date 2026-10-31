@@ -24,10 +24,6 @@ pub fn focusable(ui: &egui::Ui, rect: egui::Rect) -> egui::Response {
     focus
 }
 
-/// The keys the panels navigate with.
-pub const NAV_KEYS: [Key; 7] =
-    [Key::ArrowUp, Key::ArrowDown, Key::PageUp, Key::PageDown, Key::Home, Key::End, Key::Enter];
-
 /// Takes the unmodified navigation keys pressed this frame, only while the panel has the
 /// focus: text fields, the editor and terminal modifiers are left alone.
 pub fn take_keys(ui: &egui::Ui, keys: &[Key]) -> Vec<Key> {
@@ -64,16 +60,21 @@ pub fn consume_bare(ui: &egui::Ui, key: Key) -> bool {
     })
 }
 
-/// Scrolls the focused panel by rows: a line for the arrows, a page for PageUp/PageDown,
-/// `rows` bounds Home and End. Returns the new offset when a key moved it, else `jump`.
+/// The keys that scroll a panel by rows.
+pub const SCROLL_KEYS: [Key; 6] = [Key::ArrowUp, Key::ArrowDown, Key::PageUp, Key::PageDown, Key::Home, Key::End];
+
+/// Scrolls the focused panel by rows with `keys`, a part of [`SCROLL_KEYS`]: a line for the
+/// arrows, a page for PageUp/PageDown, `rows` bounds Home and End. Returns the new offset
+/// when a key moved it, else `jump`.
 pub fn keyboard_scroll(
     ui: &egui::Ui,
     id: egui::Id,
     row_h: f32,
     rows: std::ops::Range<usize>,
+    keys: &[Key],
     jump: Option<f32>,
 ) -> Option<f32> {
-    keyboard_scroll_for(ui, focus_id(), id, row_h, rows, jump)
+    keyboard_scroll_for(ui, focus_id(), id, row_h, rows, keys, jump)
 }
 
 /// `keyboard_scroll` for another keyboard target.
@@ -83,6 +84,7 @@ pub fn keyboard_scroll_for(
     id: egui::Id,
     row_h: f32,
     rows: std::ops::Range<usize>,
+    keys: &[Key],
     jump: Option<f32>,
 ) -> Option<f32> {
     if !ui.memory(|m| m.has_focus(focus)) {
@@ -94,14 +96,15 @@ pub fn keyboard_scroll_for(
     let height = ui.available_height();
     let page = (height - row_h).max(row_h);
     let mut moved = false;
-    for key in take_keys_for(ui, focus, &NAV_KEYS[..6]) {
+    for key in take_keys_for(ui, focus, keys) {
         offset = match key {
             Key::ArrowUp => offset - row_h,
             Key::ArrowDown => offset + row_h,
             Key::PageUp => offset - page,
             Key::PageDown => offset + page,
             Key::Home => rows.start as f32 * row_h,
-            _ => (rows.end as f32 * row_h - height).max(rows.start as f32 * row_h),
+            Key::End => (rows.end as f32 * row_h - height).max(rows.start as f32 * row_h),
+            _ => continue,
         };
         offset = offset.max(0.0);
         moved = true;

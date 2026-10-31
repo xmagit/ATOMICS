@@ -186,6 +186,7 @@ impl Desktop<'_> {
                 }
             }
         }
+        self.github_counter(ui, in_menu);
         let response = ui.menu_button("Project", |ui| self.project_menu(ui)).response;
         record_item(ui, "Project", &response);
         if show_load {
@@ -225,6 +226,9 @@ impl Desktop<'_> {
         }
         if let Some(err) = &self.runtime.config_error {
             notices.push(format!("config error: {err}"));
+        }
+        if let Some(problems) = &self.runtime.config_problems {
+            notices.push(format!("config: {problems}"));
         }
         if let Some(err) = &self.runtime.theme_error {
             notices.push(format!("theme: {err}"));

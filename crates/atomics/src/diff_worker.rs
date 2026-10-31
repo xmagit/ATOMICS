@@ -96,6 +96,22 @@ impl DiffWorker {
     }
 }
 
+/// A diff that came from elsewhere, such as a pull request's diff from GitHub, prepared like a
+/// worktree's: highlighted, measured and counted. It has no worktree, so no file list.
+pub fn prepare_diff(diff: WorktreeDiff, highlighter: &Highlighter) -> Arc<Prepared> {
+    let highlights = diff.files.iter().map(|file| Arc::new(highlighter.file(file))).collect();
+    let longest_line = diff
+        .files
+        .iter()
+        .flat_map(|f| f.hunks.iter().flat_map(|h| h.lines.iter()))
+        .map(|l| l.text.chars().count() + l.text.matches('\t').count() * 3)
+        .chain(diff.files.iter().map(|f| f.path().len() + 20))
+        .max()
+        .unwrap_or(0);
+    let (additions, deletions) = (diff.additions(), diff.deletions());
+    Arc::new(Prepared { diff, highlights, longest_line, additions, deletions, all_files: Arc::default() })
+}
+
 /// What the worker keeps between jobs, so a refresh only redoes what changed.
 #[derive(Default)]
 struct Cache {
