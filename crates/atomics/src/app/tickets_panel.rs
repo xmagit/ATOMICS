@@ -743,7 +743,7 @@ impl Desktop<'_> {
                 current
             });
         }
-        let jump = panel_nav::keyboard_scroll(ui, scroll_id, ROW_H, 0..n, jump);
+        let jump = panel_nav::keyboard_scroll(ui, scroll_id, ROW_H, 0..n, &panel_nav::SCROLL_KEYS, jump);
         let mut area = egui::ScrollArea::vertical().id_salt("tickets-find").auto_shrink([false, false]);
         if let Some(offset) = jump {
             area = area.vertical_scroll_offset(offset);
@@ -841,7 +841,7 @@ impl Desktop<'_> {
         let read = panel.read.as_mut().expect("checked above");
         let scroll_id = ui.make_persistent_id(egui::IdSalt::new("tickets-read"));
         let rows = (read.content_h / LINE_H).ceil() as usize;
-        let jump = panel_nav::keyboard_scroll(ui, scroll_id, LINE_H, 0..rows, None);
+        let jump = panel_nav::keyboard_scroll(ui, scroll_id, LINE_H, 0..rows, &panel_nav::SCROLL_KEYS, None);
         let mut area = egui::ScrollArea::vertical().id_salt("tickets-read").auto_shrink([false, false]);
         if let Some(offset) = jump {
             area = area.vertical_scroll_offset(offset);

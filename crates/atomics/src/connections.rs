@@ -278,7 +278,7 @@ impl Browser {
         Self { program: program.into() }
     }
 
-    pub(crate) fn open(&self, url: &str) -> Result<()> {
+    pub fn open(&self, url: &str) -> Result<()> {
         let mut command = Command::new(&self.program);
         if self.program == WINDOWS_START {
             let line = windows_start_args(url).context("not an address to open")?;

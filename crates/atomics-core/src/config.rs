@@ -248,6 +248,7 @@ startup_keys = [":theme base16_transparent\r"]
 [chief]
 # The chief agent (cmd+o), floating or docked beside the agents.
 heartbeat_secs = 300         # fleet checks, delivered through atomics_wait
+wake_secs = 180              # wake an idle chief while work is open; 0 = off, minimum 30
 dock = "floating"   # "floating" or "docked"
 command = ["claude"]
 args = ["--model", "claude-opus-5-5"]
@@ -276,6 +277,24 @@ target = "chief"            # "chief", or "active" for the active agent
 # api_key_env = "OPENAI_API_KEY"           # openrouter: "OPENROUTER_API_KEY"; also read from your login shell
 # api_key = "..."                          # discouraged: keep the key in the environment variable instead
 
+[github]
+# The top-bar pull request counter and the controls modal. Connect GitHub signs in.
+enabled = true
+hosts = []                  # GitHub Enterprise hosts whose remotes count, besides github.com
+repos = []                  # more repositories: "owner/name" or "host/owner/name"
+client_id = ""              # OAuth app or GitHub App for Connect GitHub; empty = ATOMICS's app (set one for Enterprise)
+app_slug = ""               # the GitHub App's slug: offers "Install ATOMICS on <owner>" where it is missing
+filter = "mine"             # what the counter counts: "mine", "review" (requested from you) or "all"
+poll_seconds = 60
+# Workflows the modal can run; placeholders {repo} {pr} {head_sha} {head} {base}.
+# [[github.actions]]
+# label = "Release"
+# repo = "owner/name"       # empty = every listed repository
+# workflow = "release.yml"
+# ref = "{base}"            # empty = {base} for scope "pr", the default branch for "repo"
+# scope = "pr"              # "pr": on each pull request; "repo": on the repository
+# inputs = { sha = "{head_sha}", version = "" }   # empty values are asked for when you confirm
+
 [keys]
 toggle_diff = "cmd+d"
 next_attention = "cmd+j"
@@ -289,6 +308,7 @@ toggle_plan = "cmd+b"
 toggle_chief = "cmd+o"
 toggle_tickets = "cmd+k"   # the Tickets panel (cmd+j is next_attention)
 voice = "cmd+shift+space"
+github = "primary+g"        # the GitHub controls; primary = Command on macOS, Ctrl elsewhere
 "##;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -315,6 +335,7 @@ pub struct Config {
     pub voice: VoiceConfig,
     pub keys: KeyConfig,
     pub tickets: crate::tickets::TicketConfig,
+    pub github: crate::github::GithubConfig,
 }
 
 /// Automatic cleanup on plan completion and archival. Dirty worktrees are always kept.
@@ -368,6 +389,7 @@ Without a plan id, atomics_plan_set creates a separate plan. Keep its returned i
 Ask the user to approve it on its own plan board. Never dispatch before approval.
 3. atomics_plan_dispatch, then loop on atomics_wait (never sleep or poll). On reported or turn done, read atomics_result and atomics_diff.
 Include heartbeat and plan in atomics_wait statuses. A plan event (change approved, edited, closed or reopened) means the user acted on the board: on approved, dispatch without waiting to be told. On a heartbeat with no findings, post one short line; otherwise act on the findings.
+While work is open, ATOMICS wakes you when idle every [chief] wake_secs with an `ATOMICS wake:` line: call atomics_wait and act; if nothing changed, post one short line.
 To restart ATOMICS, rebuild/install first, then call atomics_restart; wait instead of forcing while agents work.
 When an event contains approval, use atomics_approve with its session id to answer that request, regardless of the selected plan tab.
 4. Verify every acceptance check yourself, and read the diff with atomics_diff. A sandboxed session's code (atomics_list \
@@ -401,6 +423,9 @@ pub enum ChiefDock {
 #[serde(default)]
 pub struct ChiefConfig {
     pub heartbeat_secs: u64,
+    /// Wake an idle chief while work is open; zero disables wakes, otherwise at least 30 seconds.
+    #[serde(deserialize_with = "deserialize_wake_secs")]
+    pub wake_secs: u64,
     pub dock: ChiefDock,
     pub command: Vec<String>,
     pub args: Vec<String>,
@@ -431,6 +456,7 @@ impl Default for ChiefConfig {
     fn default() -> Self {
         Self {
             heartbeat_secs: 300,
+            wake_secs: 180,
             dock: ChiefDock::Floating,
             command: vec!["claude".into()],
             args: vec!["--model".into(), "claude-opus-5-5".into()],
@@ -441,6 +467,14 @@ impl Default for ChiefConfig {
             autostart: false,
         }
     }
+}
+
+fn deserialize_wake_secs<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+    let secs = u64::deserialize(deserializer)?;
+    if secs != 0 && secs < 30 {
+        return Err(serde::de::Error::custom("chief.wake_secs must be 0 (off) or at least 30 seconds"));
+    }
+    Ok(secs)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -632,12 +666,15 @@ pub struct KeyConfig {
     pub toggle_chief: String,
     pub toggle_tickets: String,
     pub voice: String,
+    pub github: String,
 }
 
-/// A parsed shortcut such as `cmd+shift+d`. `cmd` means Command on macOS and Ctrl+Shift elsewhere.
+/// A parsed shortcut such as `cmd+shift+d`. `cmd` means Command on macOS and Ctrl+Shift elsewhere;
+/// `primary` means Command on macOS and Ctrl elsewhere, like the agent chords Ctrl/Command+1…9.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chord {
     pub cmd: bool,
+    pub primary: bool,
     pub ctrl: bool,
     pub alt: bool,
     pub shift: bool,
@@ -679,6 +716,7 @@ impl Default for Config {
             voice: VoiceConfig::default(),
             keys: KeyConfig::default(),
             tickets: crate::tickets::TicketConfig::default(),
+            github: crate::github::GithubConfig::default(),
         }
     }
 }
@@ -726,6 +764,7 @@ impl Default for KeyConfig {
             toggle_chief: "cmd+o".into(),
             toggle_tickets: "cmd+k".into(),
             voice: "cmd+shift+space".into(),
+            github: "primary+g".into(),
         }
     }
 }
@@ -845,10 +884,11 @@ fn merge_tables(base: &mut toml::Table, overrides: toml::Table) {
 
 impl Chord {
     pub fn parse(text: &str) -> Option<Chord> {
-        let mut chord = Chord { cmd: false, ctrl: false, alt: false, shift: false, key: String::new() };
+        let mut chord = Chord { cmd: false, primary: false, ctrl: false, alt: false, shift: false, key: String::new() };
         for part in text.split('+').map(str::trim).filter(|p| !p.is_empty()) {
             match part.to_ascii_lowercase().as_str() {
                 "cmd" | "command" | "super" => chord.cmd = true,
+                "primary" => chord.primary = true,
                 "ctrl" | "control" => chord.ctrl = true,
                 "alt" | "option" | "opt" => chord.alt = true,
                 "shift" => chord.shift = true,
@@ -1103,6 +1143,35 @@ kind = "shell"
         assert_eq!(config.chief.heartbeat_secs, 7);
         assert!(CHIEF_PROMPT.contains("On a heartbeat with no findings, post one short line"));
         assert!(CHIEF_PROMPT.contains("run its builds and tests with atomics_exec"));
+    }
+
+    #[test]
+    fn chief_wake_interval_defaults() {
+        assert_eq!(Config::default().chief.wake_secs, 180);
+        assert_eq!(toml::from_str::<Config>("").unwrap().chief.wake_secs, 180);
+        assert_eq!(toml::from_str::<Config>("[chief]\nheartbeat_secs = 7").unwrap().chief.wake_secs, 180);
+        assert_eq!(toml::from_str::<Config>(DEFAULT_CONFIG).unwrap().chief.wake_secs, 180);
+        assert!(CHIEF_PROMPT.contains("every [chief] wake_secs with an `ATOMICS wake:` line"));
+    }
+
+    #[test]
+    fn chief_wake_interval_parses() {
+        for secs in [0, 30, 60, 180, 3600] {
+            let config: Config = toml::from_str(&format!("[chief]\nwake_secs = {secs}")).unwrap();
+            assert_eq!(config.chief.wake_secs, secs);
+        }
+    }
+
+    #[test]
+    fn chief_wake_interval_validates_minimum() {
+        for secs in 1..30 {
+            let table = toml::from_str(&format!("[chief]\nwake_secs = {secs}")).unwrap();
+            let err = Config::from_tables([table]).unwrap_err();
+            assert!(err.to_string().contains("chief.wake_secs must be 0 (off) or at least 30 seconds"));
+        }
+        for value in ["-1", "30.0", "\"180\""] {
+            assert!(toml::from_str::<Config>(&format!("[chief]\nwake_secs = {value}")).is_err());
+        }
     }
 
     #[test]

@@ -45,6 +45,7 @@ mod control;
 mod credentials;
 mod editor;
 mod fleet;
+mod github;
 mod heartbeat;
 mod input;
 mod integrations;
@@ -450,7 +451,11 @@ pub(crate) struct State {
     /// The project each folder belongs to, asked of git once per folder.
     project_roots: HashMap<PathBuf, PathBuf>,
     config_checked: Instant,
+    /// Why the config no longer loads; the last good one stays in effect.
     config_error: Option<String>,
+    /// What the loaded config asks for that cannot work (a `[github]` entry, a shortcut clash);
+    /// the rest of it applies.
+    config_problems: Option<String>,
     /// What the theme files or `[theme]` could not apply; the rest of the theme still does.
     theme_error: Option<String>,
     /// The themes the Settings menu offers, read when the config or a theme file changes.
@@ -469,6 +474,8 @@ pub(crate) struct State {
     relay: Arc<crate::relay::Service>,
     /// MCP connections: what sbx and the imported definitions say, and the work under way.
     connections: connections::Connections,
+    /// The GitHub counter and controls: what the API last said, sign-in and actions under way.
+    github: github::Github,
     lifecycle_jobs: Vec<crate::lifecycle::Job>,
     startup_cleanup: Option<std::thread::JoinHandle<()>>,
     shutting_down: bool,
@@ -521,6 +528,8 @@ pub(crate) struct State {
     last_status: HashMap<String, AgentStatus>,
     waiters: Vec<Waiter>,
     heartbeat: heartbeat::Heartbeat,
+    /// Events already summarized in the last automatic chief wake.
+    chief_wake_cursor: u64,
     tickets: tickets::Tickets,
     plans: Vec<Plan>,
     selected_plan: usize,
@@ -653,6 +662,8 @@ struct Client {
     /// The theme picker saves to this machine's config.d file instead of config.toml.
     theme_host_only: bool,
     credentials: credentials::CredentialUi,
+    /// The GitHub modal's selection and confirmation, and the pull request diff's view state.
+    github: github::GithubUi,
     /// Settings → Connections' fields for adding a remote server.
     connection_name: String,
     connection_url: String,
@@ -702,6 +713,7 @@ impl Client {
             config_note: String::new(),
             theme_host_only: false,
             credentials: credentials::CredentialUi::default(),
+            github: github::GithubUi::default(),
             connection_name: String::new(),
             connection_url: String::new(),
             show_settings: None,
@@ -825,6 +837,7 @@ impl State {
             Ok(config) => (config, None),
             Err(err) => (Config::default(), Some(format!("{err:#}"))),
         };
+        let config_problems = github::config_problems(&config);
         let ctx = cc.egui_ctx.clone();
         let (palette, theme_errors) = Palette::load(&config.theme, &theme::themes_dir(&config_path));
         palette.apply(&ctx);
@@ -899,6 +912,7 @@ impl State {
             config_path,
             config_checked: Instant::now(),
             config_error,
+            config_problems,
             theme_error,
             theme_choices: Arc::default(),
             host_theme: false,
@@ -917,6 +931,7 @@ impl State {
             sandbox_usage: Default::default(),
             relay: Arc::new(crate::relay::Service::new(paths::atomics_home(), crate::relay::Keychain::current())),
             connections: Default::default(),
+            github: Default::default(),
             active: None,
             diff_open: true,
             diff_root: None,
@@ -951,6 +966,7 @@ impl State {
             last_status: HashMap::new(),
             waiters: Vec::new(),
             heartbeat: heartbeat::Heartbeat::default(),
+            chief_wake_cursor: 0,
             tickets,
             plans,
             selected_plan,
@@ -1806,6 +1822,7 @@ impl Desktop<'_> {
         self.runtime.desktop_split = self.client.split;
         self.runtime.desktop_diff_split = self.client.diff_split;
         self.dialogs(&ctx);
+        self.github_modal(&ctx);
     }
 }
 

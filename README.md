@@ -73,6 +73,12 @@ says what to take along and what to set up again.
   use (definitions only) and connects one with a click: sbx registers it and its sign-in opens in your
   browser. Every sandboxed session gets every connected server, and a tile whose agent needs a missing one
   offers **Connect <name>**. See [MCP connections](docs/isolation.md#mcp-connections).
+- **GitHub without leaving.** A git icon in the top bar counts the open pull requests of the loaded repositories
+  (yours by default). `Command+G` on macOS, `Ctrl+G` on Linux, opens the controls. They list each PR with
+  its checks, review state and mergeability. For the selected PR you can open it in the browser, review its diff
+  read-only in the diff viewer, merge it, or admin merge it when GitHub lets you bypass the rules. Workflows you
+  configure run from there too. **Connect GitHub** reuses the `gh` CLI's account after one confirmation, else signs
+  in through the browser. The token stays in the OS keychain and never reaches an agent. See [docs/github.md](docs/github.md).
 - **Remote control and MCP.** Other agents can start, read, review and steer agents in ATOMICS (see below).
 
 ## Run
@@ -120,7 +126,9 @@ portal and external files open through `xdg-open` (`xdg-utils`).
 
 The config is created on first start at `${XDG_CONFIG_HOME:-~/.config}/atomics/config.toml`. It is commented and reloads while ATOMICS runs: agents
 and their commands, `base_ref`, layout breakpoints, fonts, colors, terminal scrollback, shortcuts, and the texts used for
-steering. Themes (built-in `claude`, `midnight`, `atomisk` and the light `paper`, or your own theme files) are described
+steering. `[github]` lists extra repositories and GitHub Enterprise hosts, picks what the counter counts
+(`filter = "mine"`, `"review"` or `"all"`) and defines `[[github.actions]]` workflows with `{repo}`, `{pr}`,
+`{head_sha}`, `{head}` and `{base}` placeholders (see [docs/github.md](docs/github.md)). Themes (built-in `claude`, `midnight`, `atomisk` and the light `paper`, or your own theme files) are described
 in [docs/themes.md](docs/themes.md).
 
 On Linux, a private, user-owned `XDG_RUNTIME_DIR` holds each new install's socket and the compiler jobserver FIFO,
@@ -412,6 +420,15 @@ status began, pending approvals or Codex menus, messages held for over a minute,
 `heartbeat` in `atomics_wait` statuses to receive one fleet event with a `findings` list; an empty list means all good.
 The chief pill shows a compact age and a dot when that check found something; hover for the full local check time.
 
+Every `[chief] wake_secs` (default 180 seconds; `0` disables it, otherwise at least 30), ATOMICS can also wake
+an idle or turn-done chief while an open plan has a running or review task, or another agent session exists.
+It sends one line: `ATOMICS wake: <n> new events, <m> heartbeat findings (<short kinds>). Call atomics_wait and act; if nothing changed, post one short line.`
+The counts summarize events since the previous wake and the latest heartbeat findings. A wake waits for a full
+interval after the chief's turn ends or the previous wake. Working turns reset the timer. Pending permissions,
+typing in the chief terminal within the last 60 seconds, or an unfinished prompt suppress the wake.
+Pending input is tracked from native keystrokes and pastes since the last turn ended or submit (Enter), so
+Claude's suggested prompts do not suppress wakes. Without input history, the screen fallback ignores styled suggestions.
+
 The chief may read, plan, review and run the plan you approved without asking. It can also answer other
 agents' permission prompts through the pre-approved `atomics_approve`, including `allow_always` for the rest
 of a session. Starting agents, typing into terminals and closing sessions still ask for permission.
@@ -674,6 +691,10 @@ and `screenshot`. For example,
 
 `cmd` is Command on macOS and Ctrl+Shift on Linux, so it never collides with the terminal's plain Ctrl keys.
 For example, `cmd+p` is Ctrl+Shift+P on Linux. `cmd+shift+space` becomes Ctrl+Shift+Space (Shift is applied once).
+`primary` is Command on macOS and plain Ctrl elsewhere: `primary+g` is Command+G or Ctrl+G. Like Ctrl+1…9, ATOMICS takes it
+before a focused terminal or editor. Its letter follows the keyboard layout. On Linux that takes Claude Code's own Ctrl+G
+(edit the prompt in an editor), so bind `github` elsewhere, for example `cmd+g`, to keep it. A `github` binding that
+collides with another one, or with Ctrl/Command+1…9, is reported in the top bar and falls back to `primary+g`.
 Switching agents uses **Ctrl+1…9 on Linux** and **Command+1…9 on macOS**, including while a terminal has focus.
 The digits follow the physical keys, leaving Shift+digits available for symbols such as `!`.
 Tooltips and the settings menu show the actual platform chord, including custom bindings.
@@ -683,7 +704,9 @@ Tooltips and the settings menu show the actual platform chord, including custom 
 | `cmd+p` | go to file |
 | `cmd+e` | diff ⇄ editor |
 | `cmd+b` | plan board |
-| `shift+↓` / `shift+↑` | next / previous diff section (hunk), crossing changed files, and focus the diff (except in a text field or the editor); ↑/↓ scroll a line, PageUp/PageDown a page, Home/End the current file; Esc, typing, or clicking the terminal returns focus to it |
+| `shift+↓` / `shift+↑` | next / previous changed file, scrolling to its header and focusing the diff (except in a text field or the editor) |
+| `PageDown` / `PageUp` | next / previous hunk in the focused diff, continuing across changed files |
+| `↓` / `↑`, `Home` / `End` | scroll a line, or go to the top / bottom of the focused diff; Esc, typing, or clicking the terminal returns focus to it |
 | `cmd+d` | show/hide the diff |
 | `cmd+j` | next agent that needs you |
 | `cmd+k` | the Tickets panel (when `[tickets]` is set): Find, then Read; the same keys as the diff — `shift+↓/↑` next / previous result (in Read: next / previous ticket; not from a text field or the editor), `PageUp/PageDown` a page in Find and the next / previous section in Read, ↑/↓ and Home/End, `Enter` read or open, `Alt+←` back, `Tab` in the box meaning ⇄ keyword, `Esc` leaves the box, then the panel |
@@ -692,6 +715,7 @@ Tooltips and the settings menu show the actual platform chord, including custom 
 | `cmd+t` | new session (scratch folder, existing folder or new worktree) |
 | `cmd+r` | refresh diff |
 | `cmd+w` | close session |
+| `primary+g` (`Command+G` / `Ctrl+G`) | GitHub controls, which hold the keyboard while open: `shift+↓`/`shift+↑` select the next/previous PR, PageDown/PageUp jump to the next/previous repository, Enter opens the PR, `D` loads its diff, `M` merges (after confirming; Enter confirms, Esc cancels), Esc closes |
 | `Command+1…9` (macOS) / `Ctrl+1…9` (Linux) | select agent 1–9 on screen and focus its diff, or its editor in editor mode; in the Tickets panel, Find stays in Find and Read shows that agent's task ticket (the chief's and untasked agents show the plan's) |
 
 ## Design

@@ -186,6 +186,7 @@ impl Desktop<'_> {
                 }
             }
         }
+        self.github_counter(ui, in_menu);
         if in_menu && let Some(server) = self.runtime.sign_server() {
             let system = self.runtime.ticket_config().map(|c| c.system.clone()).unwrap_or_default();
             let signed_in = self.runtime.tickets.sign.state() == Some(&crate::ticket_signin::SignState::SignedIn)
@@ -246,6 +247,9 @@ impl Desktop<'_> {
         }
         if let Some(err) = &self.runtime.config_error {
             notices.push(format!("config error: {err}"));
+        }
+        if let Some(problems) = &self.runtime.config_problems {
+            notices.push(format!("config: {problems}"));
         }
         if let Some(err) = &self.runtime.theme_error {
             notices.push(format!("theme: {err}"));

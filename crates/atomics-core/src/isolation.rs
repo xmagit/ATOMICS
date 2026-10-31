@@ -269,10 +269,14 @@ pub fn exec_args(name: &str, workdir: &Path, command: &str, secs: u64) -> Vec<St
 /// account's limits, which reach ATOMICS through [`usage_args`] since the VM cannot reach ATOMICS.
 pub const STATUSLINE_FILE: &str = "/tmp/atomics-statusline.json";
 
-/// Claude's `--settings` in a sandbox: a status line that only saves its input to [`STATUSLINE_FILE`].
+/// Claude's `--settings` in a sandbox: reads anywhere in the VM and a status line saved to [`STATUSLINE_FILE`].
 pub fn claude_settings() -> serde_json::Value {
     let command = format!("cat > {STATUSLINE_FILE}.tmp && mv {STATUSLINE_FILE}.tmp {STATUSLINE_FILE}");
-    serde_json::json!({ "statusLine": { "type": "command", "command": command } })
+    // The VM is the boundary, so file tools can read outside their working directories without asking.
+    serde_json::json!({
+        "permissions": { "allow": ["Read(//**)"] },
+        "statusLine": { "type": "command", "command": command },
+    })
 }
 
 /// The Anthropic API, which Claude reaches through ATOMICS's relay in a sandbox.
@@ -826,6 +830,20 @@ command = ["codex"]
             relay_remove_args("atomics-s1", 47123),
             ["policy", "rm", "network", "--sandbox", "atomics-s1", "--resource", "localhost:47123", "--force"]
         );
+    }
+
+    #[test]
+    fn sandboxed_claude_allows_reads_anywhere_in_the_vm_but_bare_does_not() {
+        for settings in [claude_settings(), claude_relay_settings(47123, "placeholder")] {
+            assert_eq!(settings["permissions"]["allow"], serde_json::json!(["Read(//**)"]));
+        }
+        let bare = crate::hook::session_settings(
+            Path::new("/usr/bin/atomics"),
+            Path::new("/tmp/atomics.sock"),
+            "pane-1",
+            false,
+        );
+        assert!(bare.get("permissions").is_none(), "bare Claude keeps its existing read permissions");
     }
 
     #[test]
