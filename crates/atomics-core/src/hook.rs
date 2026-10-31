@@ -42,6 +42,8 @@ pub struct HookEvent {
     pub message: Option<String>,
     pub tool_name: Option<String>,
     pub tool_input: Value,
+    pub tool_use_id: Option<String>,
+    pub tool_response: Value,
     pub last_assistant_message: Option<String>,
     pub stop_hook_active: bool,
 }
@@ -62,6 +64,8 @@ impl HookEvent {
             message: text("message"),
             tool_name: text("tool_name"),
             tool_input: payload.get("tool_input").cloned().unwrap_or(Value::Null),
+            tool_use_id: text("tool_use_id"),
+            tool_response: payload.get("tool_response").cloned().unwrap_or(Value::Null),
             last_assistant_message: text("last_assistant_message"),
             stop_hook_active: payload.get("stop_hook_active").and_then(Value::as_bool).unwrap_or(false),
         })
@@ -154,6 +158,15 @@ pub fn session_settings(atomics_exe: &Path, socket: &Path, pane: &str, codex: bo
             "command": format!("{} statusline --socket {}", shell_quote(&atomics_exe.to_string_lossy()), shell_quote(&socket.to_string_lossy()))
         });
     }
+    settings
+}
+
+/// Only chief sessions pay for MCP start hooks; ordinary Claude sessions keep EVENTS.
+pub fn chief_session_settings(atomics_exe: &Path, socket: &Path, pane: &str) -> Value {
+    let mut settings = session_settings(atomics_exe, socket, pane, false);
+    let mut groups = settings["hooks"]["PostToolUse"].clone();
+    groups[0]["matcher"] = json!("mcp__.*");
+    settings["hooks"]["PreToolUse"] = groups;
     settings
 }
 
@@ -261,6 +274,28 @@ fn shell_quote(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chief_mcp_pre_hooks_are_session_local_and_do_not_change_status() {
+        let chief = chief_session_settings(Path::new("atomics"), Path::new("own.sock"), "chief");
+        assert_eq!(chief["hooks"]["PreToolUse"][0]["matcher"], "mcp__.*");
+        assert!(chief["hooks"]["PreToolUse"][0]["hooks"][0]["command"].as_str().unwrap().contains("--pane chief"));
+        assert!(
+            session_settings(Path::new("atomics"), Path::new("own.sock"), "worker", false)["hooks"]
+                .get("PreToolUse")
+                .is_none()
+        );
+        assert!(claude_settings(Path::new("atomics"))["hooks"].get("PreToolUse").is_none());
+        let payload = json!({"hook_event_name":"PostToolUse", "session_id":"chief", "tool_name":"mcp__example__read", "tool_use_id":"toolu_one", "tool_response":{"structuredContent":{"id":"1"}}});
+        let event = HookEvent::from_payload(&payload).unwrap();
+        assert_eq!(event.tool_use_id.as_deref(), Some("toolu_one"));
+        assert_eq!(event.tool_response["structuredContent"]["id"], "1");
+        assert_eq!(event.status(), Some(AgentStatus::Working));
+        let missing =
+            HookEvent::from_payload(&json!({"hook_event_name":"PostToolUse", "session_id":"worker"})).unwrap();
+        assert_eq!(missing.tool_response, Value::Null);
+        assert_eq!(missing.tool_use_id, None);
+    }
 
     #[test]
     fn session_hooks_route_explicitly_and_codex_overrides_are_valid_toml() {

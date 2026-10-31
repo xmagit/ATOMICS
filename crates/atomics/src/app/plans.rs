@@ -170,6 +170,7 @@ impl State {
         if !enabled {
             return;
         }
+        self.remove_plan_trace(&plan.id);
         let ids: Vec<_> = plan.tasks.iter().filter_map(|task| task.session.clone()).collect();
         for id in &ids {
             if self.sessions.iter().any(|session| session.id == *id && session.chief)

@@ -1,0 +1,108 @@
+{
+  "provenance": "Response fields extracted and sanitized from the live get_ticket 11967 call on 2026-10-31. Each is wrapped in the documented PostToolUse MCP envelope, with array, structured-content, JSON-string and error transport variants. These envelopes are examples, not recordings of a chief session. The separately recorded codex-0.165-hooks.json verifies real hook field names.",
+  "expected_key": "RELAY-11967",
+  "profile": {
+    "system": "example",
+    "operations": {
+      "read": {
+        "tool": "get_ticket",
+        "result": {
+          "id": "row.id",
+          "key": "row.number",
+          "title": "row.subject",
+          "state": "row.status",
+          "url": "row.url"
+        },
+        "body": "ticket.description"
+      }
+    }
+  },
+  "events": [
+    {
+      "hook_event_name": "PostToolUse",
+      "session_id": "example-chief-session",
+      "cwd": "/example/worktree",
+      "tool_name": "mcp__example__get_ticket",
+      "tool_input": {
+        "ticketNumber": 11967
+      },
+      "tool_use_id": "toolu_example_0",
+      "tool_response": [
+        {
+          "type": "text",
+          "text": "{\"found\": true, \"childCount\": 0, \"row\": {\"id\": \"01000000-a1eb-0108-2559-08df376c0aa5\", \"number\": \"RELAY-11967\", \"status\": \"Backlog\", \"subject\": \"ATOMICS ticket workspace: sign in with OAuth, search by meaning, read and plan from tickets, chief's tool calls on screen\", \"type\": \"subtask\", \"updatedAtUtc\": \"2026-10-31T16:28:53.643212+00:00\", \"url\": \"https://relay.atomisk.ai/tickets?selected=01000000-a1eb-0108-2559-08df376c0aa5\"}, \"ticket\": {\"id\": \"01000000-a1eb-0108-2559-08df376c0aa5\", \"ticketNumber\": \"RELAY-11967\", \"subject\": \"ATOMICS ticket workspace: sign in with OAuth, search by meaning, read and plan from tickets, chief's tool calls on screen\", \"description\": \"The chief's tool calls appear as ticket cards.\", \"status\": \"Backlog\"}, \"comments\": []}"
+        }
+      ]
+    },
+    {
+      "hook_event_name": "PostToolUse",
+      "session_id": "example-chief-session",
+      "cwd": "/example/worktree",
+      "tool_name": "mcp__example__get_ticket",
+      "tool_input": {
+        "ticketNumber": 11967
+      },
+      "tool_use_id": "toolu_example_1",
+      "tool_response": {
+        "structuredContent": {
+          "found": true,
+          "childCount": 0,
+          "row": {
+            "id": "01000000-a1eb-0108-2559-08df376c0aa5",
+            "number": "RELAY-11967",
+            "status": "Backlog",
+            "subject": "ATOMICS ticket workspace: sign in with OAuth, search by meaning, read and plan from tickets, chief's tool calls on screen",
+            "type": "subtask",
+            "updatedAtUtc": "2026-10-31T16:28:53.643212+00:00",
+            "url": "https://relay.atomisk.ai/tickets?selected=01000000-a1eb-0108-2559-08df376c0aa5"
+          },
+          "ticket": {
+            "id": "01000000-a1eb-0108-2559-08df376c0aa5",
+            "ticketNumber": "RELAY-11967",
+            "subject": "ATOMICS ticket workspace: sign in with OAuth, search by meaning, read and plan from tickets, chief's tool calls on screen",
+            "description": "The chief's tool calls appear as ticket cards.",
+            "status": "Backlog"
+          },
+          "comments": []
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "{\"found\": true, \"childCount\": 0, \"row\": {\"id\": \"01000000-a1eb-0108-2559-08df376c0aa5\", \"number\": \"RELAY-11967\", \"status\": \"Backlog\", \"subject\": \"ATOMICS ticket workspace: sign in with OAuth, search by meaning, read and plan from tickets, chief's tool calls on screen\", \"type\": \"subtask\", \"updatedAtUtc\": \"2026-10-31T16:28:53.643212+00:00\", \"url\": \"https://relay.atomisk.ai/tickets?selected=01000000-a1eb-0108-2559-08df376c0aa5\"}, \"ticket\": {\"id\": \"01000000-a1eb-0108-2559-08df376c0aa5\", \"ticketNumber\": \"RELAY-11967\", \"subject\": \"ATOMICS ticket workspace: sign in with OAuth, search by meaning, read and plan from tickets, chief's tool calls on screen\", \"description\": \"The chief's tool calls appear as ticket cards.\", \"status\": \"Backlog\"}, \"comments\": []}"
+          }
+        ]
+      }
+    },
+    {
+      "hook_event_name": "PostToolUse",
+      "session_id": "example-chief-session",
+      "cwd": "/example/worktree",
+      "tool_name": "mcp__example__get_ticket",
+      "tool_input": {
+        "ticketNumber": 11967
+      },
+      "tool_use_id": "toolu_example_2",
+      "tool_response": "{\"found\": true, \"childCount\": 0, \"row\": {\"id\": \"01000000-a1eb-0108-2559-08df376c0aa5\", \"number\": \"RELAY-11967\", \"status\": \"Backlog\", \"subject\": \"ATOMICS ticket workspace: sign in with OAuth, search by meaning, read and plan from tickets, chief's tool calls on screen\", \"type\": \"subtask\", \"updatedAtUtc\": \"2026-10-31T16:28:53.643212+00:00\", \"url\": \"https://relay.atomisk.ai/tickets?selected=01000000-a1eb-0108-2559-08df376c0aa5\"}, \"ticket\": {\"id\": \"01000000-a1eb-0108-2559-08df376c0aa5\", \"ticketNumber\": \"RELAY-11967\", \"subject\": \"ATOMICS ticket workspace: sign in with OAuth, search by meaning, read and plan from tickets, chief's tool calls on screen\", \"description\": \"The chief's tool calls appear as ticket cards.\", \"status\": \"Backlog\"}, \"comments\": []}"
+    },
+    {
+      "hook_event_name": "PostToolUse",
+      "session_id": "example-chief-session",
+      "cwd": "/example/worktree",
+      "tool_name": "mcp__example__get_ticket",
+      "tool_input": {
+        "ticketNumber": 11967
+      },
+      "tool_use_id": "toolu_example_3",
+      "tool_response": {
+        "isError": true,
+        "content": [
+          {
+            "type": "text",
+            "text": "unauthorized: sign in required"
+          }
+        ]
+      }
+    }
+  ],
+  "expected_id": "01000000-a1eb-0108-2559-08df376c0aa5"
+}

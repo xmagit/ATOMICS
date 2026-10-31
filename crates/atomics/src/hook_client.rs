@@ -16,7 +16,8 @@ pub fn run(socket: Option<std::path::PathBuf>, pane: Option<String>) {
     if std::io::stdin().read_to_string(&mut input).is_err() {
         return;
     }
-    let Ok(payload) = serde_json::from_str::<serde_json::Value>(&input) else { return };
+    let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(&input) else { return };
+    cap_tool_response(&mut payload);
     let ancestors = if pane.is_none()
         && payload.get("hook_event_name").and_then(serde_json::Value::as_str) == Some("SessionStart")
     {
@@ -29,6 +30,36 @@ pub fn run(socket: Option<std::path::PathBuf>, pane: Option<String>) {
         print!("{stdout}");
         let _ = std::io::stdout().flush();
     }
+}
+
+const MAX_TOOL_RESPONSE_BYTES: usize = 256 * 1024;
+
+/// Keep a UTF-8 head and an explicit marker, including JSON escaping in the wire cap.
+fn cap_tool_response(payload: &mut serde_json::Value) {
+    let Some(response) = payload.get_mut("tool_response") else { return };
+    let serialized = response.to_string();
+    if serialized.len() <= MAX_TOOL_RESPONSE_BYTES {
+        return;
+    }
+    let (mut low, mut high) = (0, serialized.len().min(MAX_TOOL_RESPONSE_BYTES));
+    while low < high {
+        let mid = (low + high).div_ceil(2);
+        let mut cut = mid;
+        while !serialized.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let candidate =
+            serde_json::json!({"head": &serialized[..cut], "truncated": true, "original_bytes": serialized.len()});
+        if candidate.to_string().len() <= MAX_TOOL_RESPONSE_BYTES {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    while !serialized.is_char_boundary(low) {
+        low -= 1;
+    }
+    *response = serde_json::json!({"head": &serialized[..low], "truncated": true, "original_bytes": serialized.len()});
 }
 
 /// The parent processes of this one, nearest first, so ATOMICS can tell which pane started it.
@@ -73,6 +104,26 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
     use std::process::{Command, Stdio};
+
+    #[test]
+    fn hook_trace_response_cap_counts_escaping_and_keeps_a_utf8_head() {
+        for response in [
+            serde_json::json!("é\"\n".repeat(300_000)),
+            serde_json::json!({"content":[{"type":"text", "text":"big ".repeat(100_000)}]}),
+        ] {
+            let original = response.to_string();
+            let mut payload = serde_json::json!({"tool_response": response, "tool_use_id":"unchanged"});
+            cap_tool_response(&mut payload);
+            assert!(payload["tool_response"].to_string().len() <= MAX_TOOL_RESPONSE_BYTES);
+            assert_eq!(payload["tool_response"]["truncated"], true);
+            assert!(original.starts_with(payload["tool_response"]["head"].as_str().unwrap()));
+            assert_eq!(payload["tool_use_id"], "unchanged");
+        }
+        let mut small = serde_json::json!({"tool_response":{"structuredContent":{"id":"one"}}});
+        let original = small.clone();
+        cap_tool_response(&mut small);
+        assert_eq!(small, original);
+    }
 
     #[test]
     fn process_ancestry_includes_the_real_parent() {

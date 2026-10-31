@@ -395,9 +395,9 @@ impl State {
                         self.tickets_found(&query, cards.clone(), true);
                         self.tickets.panel.find.ran = Some((query, *semantic));
                     }
-                    Ok(json!({ "cards": cards }))
+                    Ok(ticket::cards_reply(&cards))
                 }
-                Ok(TicketOutput::Card(card)) => Ok(json!({ "card": card })),
+                Ok(TicketOutput::Card(card)) => Ok(ticket::card_reply(&card)),
                 Ok(_) => Err("unexpected ticket card result".into()),
                 Err(error) if crate::mcp_client::is_sign_in_required(&error) => {
                     self.tickets.panel.signin = true;

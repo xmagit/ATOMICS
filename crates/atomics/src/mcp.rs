@@ -96,6 +96,7 @@ fn agent_tools() -> Value {
 
 /// Tools only the chief's own server offers.
 const CHIEF_ONLY: &[&str] = &[
+    "atomics_trace_get",
     "atomics_restart",
     "atomics_config_get",
     "atomics_config_propose",
@@ -174,6 +175,13 @@ fn ticket_tools(plan: &Value) -> Value {
     let ticket_ref = |what: &str| json!({ "type": "string", "description": what });
     json!([
         {
+            "name": "atomics_trace_get",
+            "description": "Read the chief's cleaned MCP trace. Returns the newest limit entries (default 20, maximum 200), oldest first. Raw tool results and credentials are never included.",
+            "inputSchema": {"type": "object", "properties": {
+                "session": {"type": "string", "description": "Chief session; defaults to the running chief"},
+                "limit": {"type": "integer", "minimum": 0, "maximum": 200}
+            }, "additionalProperties": false}
+        }, {
             "name": "atomics_ticket_search",
             "description": "Chief only: find tickets through the configured search operation, or semantic_search when semantic=true. Returns cleaned cards (at most 25); no plan or ticket link is needed. Missing mappings and sign-in required are tool errors.",
             "annotations": { "readOnlyHint": true },
@@ -616,6 +624,7 @@ pub(crate) fn request_for_tool(name: &str, mut args: Value) -> Result<ControlReq
     }
     let cmd = match name {
         "atomics_list" => "list",
+        "atomics_trace_get" => "trace",
         "atomics_restart" => "restart",
         "atomics_start" => "start",
         "atomics_send" => "send",
@@ -684,6 +693,28 @@ fn tool_error(message: String) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn trace_tool_is_chief_only_and_maps_to_the_control_reader() {
+        for (agent, chief, visible) in [(true, false, false), (false, false, false), (false, true, true)] {
+            let listed = super::available_tools(agent, chief);
+            assert_eq!(listed.as_array().unwrap().iter().any(|tool| tool["name"] == "atomics_trace_get"), visible);
+            if !visible {
+                assert_eq!(
+                    super::call_for_role(&serde_json::json!({"name":"atomics_trace_get"}), agent, chief)["isError"],
+                    true
+                );
+            }
+        }
+        match super::request_for_tool("atomics_trace_get", serde_json::json!({"limit":20})).unwrap() {
+            atomics_core::control::ControlRequest::Trace { session, limit } => {
+                assert_eq!(session, None);
+                assert_eq!(limit, Some(20));
+            }
+            _ => panic!("wrong trace command"),
+        }
+        assert!(super::request_for_tool("atomics_trace_get", serde_json::json!({"limit":-1})).is_err());
+    }
+
     #[test]
     fn ticket_tools_are_chief_only_and_map_to_control_requests() {
         use super::*;

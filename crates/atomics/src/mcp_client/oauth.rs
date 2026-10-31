@@ -113,6 +113,15 @@ impl OAuth {
         }
     }
 
+    /// Credentials used by the current sign-in, for the ticket/trace cleaner only.
+    /// This never refreshes, opens a browser, or returns keychain errors containing data.
+    pub(crate) fn secrets(&self, server: &McpServer) -> Vec<String> {
+        server_key(server)
+            .and_then(|key| self.load(&key).ok().flatten())
+            .map(|(tokens, access)| tokens.refresh_token.into_iter().chain(access.map(|access| access.token)).collect())
+            .unwrap_or_default()
+    }
+
     /// Forgets the server's tokens. The registered client stays cached for the next sign-in.
     pub fn sign_out(&self, server: &McpServer) -> Result<(), McpError> {
         let key = server_key(server).ok_or_else(|| McpError::Server("no MCP server url to sign out of".into()))?;

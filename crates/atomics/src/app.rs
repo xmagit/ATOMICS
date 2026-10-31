@@ -63,6 +63,7 @@ mod themes;
 mod tickets;
 mod tickets_panel;
 mod topbar;
+mod trace;
 mod voice;
 mod workflow;
 mod worktrees;
@@ -480,6 +481,8 @@ pub(crate) struct State {
     /// Worktree picked in the sidebar without an agent; the diff otherwise follows the active session.
     diff_root: Option<PathBuf>,
     diffs: HashMap<PathBuf, DiffData>,
+    /// Chief-only, reduced MCP history. Never contains raw tool responses.
+    traces: HashMap<String, atomics_core::trace::TraceLog>,
     worker: DiffWorker,
     hub: Arc<Mutex<Hub>>,
     hook_rx: Receiver<HookMessage>,
@@ -917,6 +920,7 @@ impl State {
             diff_open: true,
             diff_root: None,
             diffs: HashMap::new(),
+            traces: HashMap::new(),
             worker: DiffWorker::new(wake),
             hub,
             hook_rx,

@@ -417,6 +417,48 @@ pub struct TicketCard {
     pub fields: BTreeMap<String, String>,
 }
 
+/// The shared wire codec for chief ticket replies and their trace cards.
+pub fn card_reply(card: &TicketCard) -> Value {
+    serde_json::json!({"card": card})
+}
+
+pub fn cards_reply(cards: &[TicketCard]) -> Value {
+    serde_json::json!({"cards": cards})
+}
+
+pub fn reply_cards(reply: &Value) -> Result<Vec<TicketCard>, String> {
+    if let Some(cards) = reply.get("cards").and_then(Value::as_array) {
+        cards
+            .iter()
+            .take(25)
+            .cloned()
+            .map(serde_json::from_value)
+            .collect::<Result<_, _>>()
+            .map_err(|_| "result paths do not match ticket cards".to_string())
+    } else if let Some(card) = reply.get("card") {
+        serde_json::from_value(card.clone())
+            .map(|card| vec![card])
+            .map_err(|_| "result paths do not match a ticket card".to_string())
+    } else if let Some(ticket) = reply.get("ticket").filter(|value| !value.is_null()) {
+        serde_json::from_value::<TicketLink>(ticket.clone())
+            .map(|link| vec![TicketCard { link, ..TicketCard::default() }])
+            .map_err(|_| "result paths do not match a ticket link".to_string())
+    } else if let Some(tasks) = reply.get("tasks").and_then(Value::as_array) {
+        tasks
+            .iter()
+            .filter_map(|task| task.get("ticket").filter(|value| !value.is_null()))
+            .take(25)
+            .map(|ticket| {
+                serde_json::from_value::<TicketLink>(ticket.clone())
+                    .map(|link| TicketCard { link, ..TicketCard::default() })
+            })
+            .collect::<Result<_, _>>()
+            .map_err(|_| "result paths do not match ticket links".to_string())
+    } else {
+        Err("result paths do not match ticket cards".into())
+    }
+}
+
 fn assignee_value<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<Option<String>>, D::Error> {
     Option::<String>::deserialize(deserializer).map(Some)
 }
@@ -879,7 +921,7 @@ pub fn secrets_of(config: &TicketConfig, env: impl FnMut(&str) -> Option<String>
 /// Whether an environment variable or argument name looks like it holds a credential.
 pub fn secret_name(name: &str) -> bool {
     let name = name.to_ascii_uppercase();
-    ["TOKEN", "KEY", "SECRET", "PASSWORD", "AUTH", "CREDENTIAL"].iter().any(|s| name.contains(s))
+    ["TOKEN", "KEY", "SECRET", "PASSWORD", "PASSWD", "AUTH", "CREDENTIAL", "COOKIE"].iter().any(|s| name.contains(s))
 }
 
 /// What replaces an error whose credential could not be masked in place.
@@ -909,12 +951,19 @@ pub struct Cleaner {
 impl Cleaner {
     /// Every display-card field is cleaned before bounding, including long reading text.
     pub fn card(&self, mut card: TicketCard) -> TicketCard {
-        let text = |text: &str| {
-            self.text(&redact_runs(&redact_query(&redact_userinfo(&redact_credentials(text)), credential_param)))
-        };
+        let text = |text: &str| self.redacted(text);
         let field = |value: Option<String>| value.map(|value| bound(&text(&value), MAX_FIELD_CHARS));
         card.link = self.link(card.link);
-        card.link.system = self.field(&card.link.system);
+        card.link.system = bound(&text(&card.link.system), MAX_FIELD_CHARS);
+        // UUID identifiers are structured references, rather than token-like free text.
+        // Known credentials are still masked by link(), before this distinction.
+        if uuid::Uuid::parse_str(&card.link.id).is_err() {
+            card.link.id = bound(&text(&card.link.id), MAX_FIELD_CHARS);
+        }
+        card.link.key = field(card.link.key);
+        card.link.title = field(card.link.title);
+        card.link.state = field(card.link.state);
+        card.link.branch = field(card.link.branch);
         card.snippet = field(card.snippet);
         card.assignee = card.assignee.map(field);
         card.parent = card.parent.map(|parent| self.field(&parent));
@@ -936,7 +985,10 @@ impl Cleaner {
         card.fields = card
             .fields
             .into_iter()
-            .map(|(key, value)| (self.field(&key), bound(&text(&value), MAX_FIELD_CHARS)))
+            .map(|(key, value)| {
+                let value = if secret_name(&key) { "[redacted]".into() } else { bound(&text(&value), MAX_FIELD_CHARS) };
+                (bound(&text(&key), MAX_FIELD_CHARS), value)
+            })
             .collect();
         card.children = card.children.into_iter().map(|card| self.card(card)).collect();
         card.related = card.related.into_iter().map(|card| self.card(card)).collect();
@@ -977,6 +1029,12 @@ impl Cleaner {
     /// Text cleaned without a bound, for payloads such as agent reads that need it whole.
     pub fn text(&self, text: &str) -> String {
         self.masked(text).unwrap_or_else(|| WITHHELD_FIELD.into())
+    }
+
+    /// Display text with the same credential heuristics as errors, without an error's bound.
+    pub fn redacted(&self, text: &str) -> String {
+        let masked = self.text(text);
+        self.text(&redact_runs(&redact_query(&redact_userinfo(&redact_credentials(&masked)), secret_param)))
     }
 
     /// An error message: field rules, then bearer and basic credentials, `Authorization`
@@ -1209,6 +1267,7 @@ const CREDENTIAL_PARAMS: &[&str] = &[
     "x-amz-signature",
     "x-amz-credential",
     "x-amz-security-token",
+    "cookie",
 ];
 
 fn credential_param(name: &str) -> bool {
@@ -1219,9 +1278,21 @@ fn credential_param(name: &str) -> bool {
 /// Parameter names that may carry credentials, for error text, where masking a public
 /// value costs nothing.
 fn secret_param(name: &str) -> bool {
-    const SECRET: &[&str] =
-        &["token", "key", "secret", "password", "passwd", "pwd", "auth", "sig", "credential", "session", "code"];
-    let name = name.to_ascii_lowercase();
+    const SECRET: &[&str] = &[
+        "token",
+        "key",
+        "secret",
+        "password",
+        "passwd",
+        "pwd",
+        "auth",
+        "sig",
+        "credential",
+        "session",
+        "code",
+        "cookie",
+    ];
+    let name = percent_decode(name).to_ascii_lowercase();
     SECRET.iter().any(|secret| name.contains(secret))
 }
 
@@ -1407,11 +1478,11 @@ fn redact_userinfo(text: &str) -> String {
 fn redact_query(text: &str, secret: fn(&str) -> bool) -> String {
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
-    while let Some(found) = text[i..].find(['?', '&']) {
+    while let Some(found) = text[i..].find(['?', '&', '#']) {
         let name_start = i + found + 1;
         out.push_str(&text[i..name_start]);
         let name_end = text[name_start..]
-            .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '[' | ']')))
+            .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '[' | ']' | '%')))
             .map_or(text.len(), |end| name_start + end);
         if text[name_end..].starts_with('=') && secret(&text[name_start..name_end]) {
             out.push_str(&text[name_start..=name_end]);
