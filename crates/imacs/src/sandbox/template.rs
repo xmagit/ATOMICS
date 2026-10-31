@@ -6,7 +6,13 @@ use imacs_core::{config::Config, workspace::Workspace};
 use serde_json::Value;
 
 /// Resolve a project path, or a project's basename in the selected workspace.
-pub fn run(project: &str, workspace_name: Option<&str>, agent: &str, dotnet_project: Option<&str>) -> Result<()> {
+pub fn run(
+    project: &str,
+    workspace_name: Option<&str>,
+    agent: &str,
+    dotnet_project: Option<&str>,
+    rust_package: Option<&str>,
+) -> Result<()> {
     // Before any git runs in a folder a sandbox has worked in.
     load_pins(&paths::git_pins_dir());
     let mut config = Config::load(&paths::config_file())?;
@@ -27,7 +33,7 @@ pub fn run(project: &str, workspace_name: Option<&str>, agent: &str, dotnet_proj
     // Build the selected checkout, including its tracked edits; policy comes from the main checkout.
     let (cwd, _) = super::workspace(&path)?;
     let program = crate::setup::resolve_program("sbx");
-    let tag = build_project(&paths::imacs_home(), &program, &cwd, agent, dotnet_project, &config)?;
+    let tag = build_project(&paths::imacs_home(), &program, &cwd, agent, dotnet_project, rust_package, &config)?;
     println!("Saved {tag}. New sandboxed {agent} agents in this project use this template.");
     Ok(())
 }
@@ -41,6 +47,7 @@ fn build_project(
     cwd: &Path,
     agent: &str,
     dotnet_project: Option<&str>,
+    rust_package: Option<&str>,
     config: &Config,
 ) -> Result<String> {
     let root = real(&workspace::project_root(cwd)?);
@@ -67,7 +74,7 @@ fn build_project(
         config.isolation.sandbox.template = Some(tag.into());
     }
     let config = config.isolation.sandbox.with_defaults(&config.resources, std::thread::available_parallelism()?.get());
-    build(home, program, cwd, agent, dotnet_project, &config)?;
+    build(home, program, cwd, agent, dotnet_project, rust_package, &config)?;
     Ok(config.template.unwrap())
 }
 
@@ -91,12 +98,40 @@ fn listed(templates: &Value, tag: &str) -> Option<bool> {
     }))
 }
 
+fn dotnet_target(cwd: &Path, selected: Option<&str>) -> Result<String> {
+    let project = match selected {
+        Some(project) => project.to_string(),
+        None => {
+            let mut solutions = Vec::new();
+            for entry in std::fs::read_dir(cwd)? {
+                let path = entry?.path();
+                if path.is_file() && path.extension().is_some_and(|ext| ext == "sln" || ext == "slnx") {
+                    solutions.push(path.file_name().unwrap().to_string_lossy().into_owned());
+                }
+            }
+            if solutions.len() != 1 {
+                bail!("pass --dotnet-project: expected exactly one .sln or .slnx at the repository root");
+            }
+            solutions.remove(0)
+        }
+    };
+    let path = Path::new(&project);
+    if path.extension().is_none_or(|ext| ext != "csproj" && ext != "sln" && ext != "slnx")
+        || !path.components().all(|part| matches!(part, std::path::Component::Normal(_)))
+        || !cwd.join(path).is_file()
+    {
+        bail!("no .NET project at {project}; pass --dotnet-project with a repository-relative .csproj, .sln or .slnx");
+    }
+    Ok(project)
+}
+
 pub(super) fn build(
     home: &Path,
     program: &str,
     cwd: &Path,
     agent: &str,
     dotnet_project: Option<&str>,
+    rust_package: Option<&str>,
     config: &SandboxConfig,
 ) -> Result<()> {
     let tag = config
@@ -106,16 +141,7 @@ pub(super) fn build(
         .filter(|s| !s.is_empty())
         .context("set [isolation.sandbox] template in the workspace or .imacs/config.toml before building")?;
     let kind = if cwd.join("Cargo.toml").is_file() { "rust" } else { "dotnet" };
-    let project = dotnet_project.unwrap_or("soa-src/Cosmoz3.Shared/Cosmoz3.Contracts/Cosmoz3.Contracts.csproj");
-    if kind == "dotnet"
-        && (Path::new(project).extension().is_none_or(|ext| ext != "csproj")
-            || !Path::new(project).components().all(|part| matches!(part, std::path::Component::Normal(_)))
-            || !cwd.join(project).is_file())
-    {
-        bail!(
-            "no Rust workspace or .NET project at {project}; pass --dotnet-project with a repository-relative .csproj"
-        );
-    }
+    let project = if kind == "dotnet" { dotnet_target(cwd, dotnet_project)? } else { String::new() };
     let agent = match agent {
         "codex" => "codex",
         "claude" => "claude",
@@ -176,8 +202,9 @@ pub(super) fn build(
             "imacs-template".into(),
             root.display().to_string(),
             kind.into(),
-            project.into(),
+            project,
             jobs,
+            rust_package.unwrap_or_default().into(),
         ];
         let output = sbx(program, &args, false, Duration::from_secs(60 * 30))
             .context("warming template toolchains and dependencies")?;
@@ -224,6 +251,7 @@ mod tests {
                 &build_repo,
                 "codex",
                 None,
+                None,
                 &SandboxConfig { template: Some("imacs-active:local".into()), ..Default::default() },
             )
         });
@@ -266,7 +294,7 @@ mod tests {
             ..Default::default()
         };
         let home = dir.path().join("state");
-        build(&home, &program, &repo, "codex", None, &config).unwrap();
+        build(&home, &program, &repo, "codex", None, None, &config).unwrap();
         assert!(ownership::owned(&home).unwrap().is_empty());
         let calls = fake::calls(dir.path());
         let create = calls.iter().find(|c| c[0] == "create").unwrap();
@@ -281,8 +309,8 @@ mod tests {
         let name = &create[2];
         let exec = calls.iter().find(|c| c[0] == "exec").unwrap();
         assert_eq!(&exec[..4], ["exec", name, "bash", "-lc"]);
-        assert!(exec[4].contains("cargo check -p imacs-core"));
-        assert_eq!(&exec[7..], ["rust", "soa-src/Cosmoz3.Shared/Cosmoz3.Contracts/Cosmoz3.Contracts.csproj", "2"]);
+        assert!(exec[4].contains("cargo check --workspace"));
+        assert_eq!(&exec[7..], ["rust", "", "2", ""]);
         assert!(calls.contains(&vec!["template".into(), "save".into(), name.clone(), "imacs-cox:local".into()]));
         assert_eq!(calls.last().unwrap(), &["rm", "--force", name]);
         let job = Prepare {
@@ -322,20 +350,21 @@ mod tests {
         user.isolation.sandbox.template = Some("workspace:local".into());
         let selected = |root: &Path| RepoWorkflow::read_in(root, &home).apply(&user).isolation.sandbox.template;
         assert_eq!(selected(&cox).as_deref(), Some("workspace:local"), "not built yet");
-        assert_eq!(build_project(&home, &program, &cox, "codex", None, &user).unwrap(), "imacs-cox:local");
+        assert_eq!(build_project(&home, &program, &cox, "codex", None, None, &user).unwrap(), "imacs-cox:local");
         assert_eq!(selected(&cox).as_deref(), Some("imacs-cox:local"));
 
         // Another repository naming cox's tag keeps the workspace's template and cannot rebuild cox's.
         assert_eq!(selected(&other).as_deref(), Some("workspace:local"));
         let creates = fake::calls_to(dir.path(), &["create"]).len();
-        let error = format!("{:#}", build_project(&home, &program, &other, "codex", None, &user).unwrap_err());
+        let error = format!("{:#}", build_project(&home, &program, &other, "codex", None, None, &user).unwrap_err());
         assert!(error.contains("imacs-cox:local was built from") && error.contains("choose another tag"), "{error}");
         // Nor a stock image every sandbox starts from, or a template IMACS did not build.
         std::fs::write(dir.path().join("templates"), "imacs-cox:local\nmine:local\n").unwrap();
         for tag in ["docker/sandbox-templates:codex-docker", "mine:local"] {
             std::fs::write(other.join(".imacs/config.toml"), format!("[isolation.sandbox]\ntemplate = '{tag}'\n"))
                 .unwrap();
-            let error = format!("{:#}", build_project(&home, &program, &other, "codex", None, &user).unwrap_err());
+            let error =
+                format!("{:#}", build_project(&home, &program, &other, "codex", None, None, &user).unwrap_err());
             assert!(error.contains(&format!("sbx already has {tag}")), "{error}");
         }
         assert_eq!(fake::calls_to(dir.path(), &["create"]).len(), creates, "nothing was built");
@@ -344,15 +373,15 @@ mod tests {
         // A new tag is the repository's to claim, and the owner rebuilds its own.
         std::fs::write(other.join(".imacs/config.toml"), "[isolation.sandbox]\ntemplate = 'imacs-other:local'\n")
             .unwrap();
-        assert_eq!(build_project(&home, &program, &other, "codex", None, &user).unwrap(), "imacs-other:local");
+        assert_eq!(build_project(&home, &program, &other, "codex", None, None, &user).unwrap(), "imacs-other:local");
         assert_eq!(selected(&other).as_deref(), Some("imacs-other:local"));
-        build_project(&home, &program, &cox, "codex", None, &user).unwrap();
+        build_project(&home, &program, &cox, "codex", None, None, &user).unwrap();
 
         // The user's own config may rebuild any tag; the snapshot then holds that project's caches.
         let plain = repo("plain", "");
         let mut chosen = user.clone();
         chosen.isolation.sandbox.template = Some("imacs-cox:local".into());
-        assert_eq!(build_project(&home, &program, &plain, "codex", None, &chosen).unwrap(), "imacs-cox:local");
+        assert_eq!(build_project(&home, &program, &plain, "codex", None, None, &chosen).unwrap(), "imacs-cox:local");
         assert_eq!(selected(&cox).as_deref(), Some("workspace:local"), "cox's caches are gone from it");
     }
 
@@ -367,12 +396,12 @@ mod tests {
         git::git(&repo, &["config", "extensions.worktreeConfig", "true"]).unwrap();
         let config = SandboxConfig { template: Some("imacs-test:local".into()), ..Default::default() };
         let home = dir.path().join("state");
-        let error = format!("{:#}", build(&home, &program, &repo, "codex", None, &config).unwrap_err());
+        let error = format!("{:#}", build(&home, &program, &repo, "codex", None, None, &config).unwrap_err());
         assert!(error.contains("extensions.worktreeConfig"), "{error}");
         assert!(fake::calls_to(dir.path(), &["create"]).is_empty(), "nothing is made for a refused checkout");
 
         git::git(&repo, &["config", "extensions.worktreeConfig", "false"]).unwrap();
-        build(&home, &program, &repo, "codex", None, &config).unwrap();
+        build(&home, &program, &repo, "codex", None, None, &config).unwrap();
         let pins = git::pinned(&repo).expect("git in the checkout runs with its checked locations");
         assert_eq!(pins.common_dir, Some(repo.canonicalize().unwrap().join(".git")));
         git::unpin(&pins.work_tree);
@@ -388,7 +417,7 @@ mod tests {
             std::fs::write(dir.path().join(format!("fail-{verb}")), "").unwrap();
             let config = SandboxConfig { template: Some("imacs-test:local".into()), ..Default::default() };
             let home = dir.path().join("state");
-            let error = build(&home, &program, dir.path(), "codex", None, &config).unwrap_err();
+            let error = build(&home, &program, dir.path(), "codex", None, None, &config).unwrap_err();
             assert!(format!("{error:#}").contains(&format!("fake {verb} failure")));
             assert!(list(&program).unwrap().is_empty());
             if verb == "create" {
@@ -420,7 +449,7 @@ mod tests {
         }
         let config = SandboxConfig { template: Some("imacs-test:local".into()), ..Default::default() };
         let home = dir.path().join("state");
-        let error = build(&home, &program, dir.path(), "codex", None, &config).unwrap_err();
+        let error = build(&home, &program, dir.path(), "codex", None, None, &config).unwrap_err();
         let message = format!("{error:#}");
         assert!(message.contains("fake exec failure") && message.contains("fake rm failure"), "{message}");
         let name = &fake::calls_to(dir.path(), &["create"])[0][2];
@@ -435,6 +464,45 @@ mod tests {
     }
 
     #[test]
+    fn dotnet_selects_one_root_solution_and_validates_explicit_paths() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let root = dir.path();
+        assert!(dotnet_target(root, None).unwrap_err().to_string().contains("--dotnet-project"));
+        std::fs::create_dir(root.join("nested")).unwrap();
+        std::fs::write(root.join("nested/Other.sln"), "").unwrap();
+        for extension in ["sln", "slnx"] {
+            let name = format!("App.{extension}");
+            std::fs::write(root.join(&name), "").unwrap();
+            assert_eq!(dotnet_target(root, None).unwrap(), name);
+            assert_eq!(dotnet_target(root, Some(&name)).unwrap(), name);
+            std::fs::write(root.join("Other.sln"), "").unwrap();
+            assert!(dotnet_target(root, None).unwrap_err().to_string().contains("--dotnet-project"));
+            assert_eq!(dotnet_target(root, Some(&name)).unwrap(), name);
+            std::fs::remove_file(root.join("Other.sln")).unwrap();
+            std::fs::remove_file(root.join(name)).unwrap();
+        }
+        std::fs::create_dir(root.join("Directory.sln")).unwrap();
+        assert!(dotnet_target(root, None).is_err());
+        std::fs::write(root.join("nested/App.csproj"), "").unwrap();
+        assert_eq!(dotnet_target(root, Some("nested/App.csproj")).unwrap(), "nested/App.csproj");
+        for invalid in ["../App.sln", "/App.sln", "nested/../nested/App.csproj", "missing.sln", "Cargo.toml"] {
+            assert!(dotnet_target(root, Some(invalid)).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn rust_package_is_passed_to_the_builder() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let program = fake::install(dir.path()).display().to_string();
+        git::git(dir.path(), &["init", "-q"]).unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "").unwrap();
+        let config = SandboxConfig { template: Some("imacs-rust:local".into()), ..Default::default() };
+        build(&dir.path().join("state"), &program, dir.path(), "codex", None, Some("app-core"), &config).unwrap();
+        let exec = &fake::calls_to(dir.path(), &["exec"])[0];
+        assert_eq!(&exec[7..], ["rust", "", "2", "app-core"]);
+    }
+
+    #[test]
     fn dotnet_build_uses_the_selected_project_and_requires_a_template_tag() {
         let dir = crate::test_support::tempdir().unwrap();
         let program = fake::install(dir.path()).display().to_string();
@@ -442,16 +510,18 @@ mod tests {
         std::fs::write(dir.path().join("App.csproj"), "<Project />").unwrap();
         let config = SandboxConfig { template: Some("imacs-dotnet:local".into()), ..Default::default() };
         let home = dir.path().join("state");
-        build(&home, &program, dir.path(), "claude", Some("App.csproj"), &config).unwrap();
+        build(&home, &program, dir.path(), "claude", Some("App.csproj"), None, &config).unwrap();
         let exec = &fake::calls_to(dir.path(), &["exec"])[0];
-        assert_eq!(&exec[7..], ["dotnet", "App.csproj", "2"]);
-        assert!(build(&home, &program, dir.path(), "codex", Some("App.csproj"), &SandboxConfig::default()).is_err());
+        assert_eq!(&exec[7..], ["dotnet", "App.csproj", "2", ""]);
+        assert!(
+            build(&home, &program, dir.path(), "codex", Some("App.csproj"), None, &SandboxConfig::default()).is_err()
+        );
     }
 
     #[test]
     fn preparation_stages_tracked_edits_and_removes_source_even_when_the_build_fails() {
         use std::os::unix::fs::PermissionsExt;
-        for succeeds in [true, false] {
+        for (succeeds, package) in [(true, ""), (true, "app-core"), (false, "")] {
             let dir = crate::test_support::tempdir().unwrap();
             let repo = dir.path().join("repo");
             let home = dir.path().join("home");
@@ -472,7 +542,7 @@ mod tests {
                 (
                     "cargo",
                     format!(
-                        "#!/bin/sh\nset -eu\ntest \"$(cat tracked)\" = edited\ntest ! -e deleted\ntest ! -e credentials\npwd > \"$HOME/stage\"\ncp \"$HOME/.cargo/config.toml\" \"$HOME/saved-config\"\nexit {}\n",
+                        "#!/bin/sh\nset -eu\ntest \"$(cat tracked)\" = edited\ntest ! -e deleted\ntest ! -e credentials\nprintf '%s\\n' \"$@\" > \"$HOME/check-args\"\npwd > \"$HOME/stage\"\ncp \"$HOME/.cargo/config.toml\" \"$HOME/saved-config\"\nexit {}\n",
                         if succeeds { 0 } else { 17 }
                     ),
                 ),
@@ -484,12 +554,16 @@ mod tests {
             let output = Command::new("bash")
                 .args(["-c", include_str!("template.sh"), "imacs-template"])
                 .arg(&repo)
-                .args(["rust", "", "2"])
+                .args(["rust", "", "2", package])
                 .env("HOME", &home)
                 .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
                 .output()
                 .unwrap();
             assert_eq!(output.status.code(), Some(if succeeds { 0 } else { 17 }), "{output:?}");
+            assert_eq!(
+                std::fs::read_to_string(home.join("check-args")).unwrap(),
+                if package.is_empty() { "check\n--workspace\n" } else { "check\n-p\napp-core\n" }
+            );
             let staged = std::fs::read_to_string(home.join("stage")).unwrap();
             assert!(!Path::new(staged.trim()).parent().unwrap().exists(), "source staging must be removed");
             let config = std::fs::read_to_string(home.join("saved-config")).unwrap();
@@ -578,25 +652,28 @@ mod cli_tests {
             "sandbox",
             "template",
             "build",
-            "cz3backend",
+            "app",
             "--agent",
             "claude",
             "--dotnet-project",
             "App.csproj",
+            "--rust-package",
+            "app-core",
         ])
         .unwrap();
         assert_eq!(cli.workspace.as_deref(), Some("backend"));
         let Some(crate::Command::Sandbox {
             command:
                 crate::SandboxCommand::Template {
-                    command: crate::TemplateCommand::Build { project, agent, dotnet_project },
+                    command: crate::TemplateCommand::Build { project, agent, dotnet_project, rust_package },
                 },
         }) = cli.command
         else {
             panic!("template build command")
         };
-        assert_eq!(project, "cz3backend");
+        assert_eq!(project, "app");
         assert_eq!(agent, "claude");
         assert_eq!(dotnet_project.as_deref(), Some("App.csproj"));
+        assert_eq!(rust_package.as_deref(), Some("app-core"));
     }
 }

@@ -51,6 +51,7 @@ says what to take along and what to set up again.
   that line. Inlay hints, code actions and go-to-definition come from your language servers; the **inlay hints**
   button toggles them. One editor runs per worktree and keeps its state while you switch back to the diff. Neovim
   works too; see `[editor]` in the config.
+  When the configured program is `hx` and only `helix` is on PATH, editor launch and doctor use `helix`.
 - **Worktree clean-up.** **clean up…** in the explorer checks every worktree for uncommitted work, merged branches
   and deleted remote branches (completed PRs). **select safe** picks the ones that can go. Removal never forces, so
   worktrees with uncommitted work are kept, and branches are deleted only when git considers them merged.
@@ -278,7 +279,7 @@ uses the repository fixture and reports explicitly that VM isolation and KVM wer
 
 ## Troubleshooting
 
-Run `imacs doctor` to check git, Claude Code, Codex, Helix, the config, the running IMACS socket and global Claude hooks.
+Run `imacs doctor` to check git, Claude Code, Codex, the configured editor, the config, the running IMACS socket and global Claude hooks.
 It also checks Codex hook support (0.165+), reports hook trust as unverified with `/hooks` instructions, reads plan files,
 warns about cargo entries in `[approvals].allow`, and lists merged worktrees safe to review for cleanup. It changes nothing.
 Each failed check includes a hint. Missing git or an unreadable or invalid config returns exit code 1; missing

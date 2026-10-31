@@ -55,7 +55,7 @@ impl State {
         match Terminal::spawn(
             self.wake.clone(),
             self.palette.terminal_colors(),
-            resolve_program(program),
+            crate::setup::editor_program(program),
             args,
             root,
             env,

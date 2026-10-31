@@ -162,6 +162,9 @@ enum TemplateCommand {
         /// Repository-relative project to build for .NET repositories
         #[arg(long)]
         dotnet_project: Option<String>,
+        /// Rust package to check (defaults to the whole workspace)
+        #[arg(long)]
+        rust_package: Option<String>,
     },
 }
 
@@ -219,11 +222,18 @@ fn main() -> eframe::Result {
             return Ok(());
         }
         Some(Command::Sandbox {
-            command: SandboxCommand::Template { command: TemplateCommand::Build { project, agent, dotnet_project } },
+            command:
+                SandboxCommand::Template {
+                    command: TemplateCommand::Build { project, agent, dotnet_project, rust_package },
+                },
         }) => {
-            if let Err(error) =
-                sandbox::template::run(&project, cli.workspace.as_deref(), &agent, dotnet_project.as_deref())
-            {
+            if let Err(error) = sandbox::template::run(
+                &project,
+                cli.workspace.as_deref(),
+                &agent,
+                dotnet_project.as_deref(),
+                rust_package.as_deref(),
+            ) {
                 eprintln!("{error:#}");
                 std::process::exit(1);
             }
