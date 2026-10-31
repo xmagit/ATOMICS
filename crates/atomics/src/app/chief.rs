@@ -47,6 +47,7 @@ impl State {
     pub(super) fn toggle_chief(&mut self, ctx: &egui::Context) {
         if !self.sessions.iter().any(|s| s.chief && s.terminal.as_ref().is_some_and(|t| !t.exited())) {
             self.sessions.retain(|s| !s.chief);
+            self.traces.retain(|id, _| self.sessions.iter().any(|session| session.id == *id && session.chief));
             if let Err(err) = self.start_chief(ctx, None) {
                 self.toast(err);
                 return;
@@ -106,6 +107,7 @@ fn orbit_icon(painter: &egui::Painter, rect: Rect, accent: Color32, light: Color
 /// Checks with atomics_exec run in an agent's sandbox, which reaches no more than its agent does.
 pub(super) const CHIEF_ALLOWED_TOOLS: &[&str] = &[
     "mcp__atomics__atomics_list",
+    "mcp__atomics__atomics_trace_get",
     "mcp__atomics__atomics_wait",
     "mcp__atomics__atomics_restart",
     "mcp__atomics__atomics_approve",

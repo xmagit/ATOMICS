@@ -767,3 +767,45 @@ The fixture speaks three configurable dialects: nested structured `card_*` tools
 `find_related_tickets`, `get_ticket`. All three support query-filtered search, direct children, related
 matches and full reads. The fixture's `get_children` and keyword search demonstrate capabilities; they
 are not claims about any live server. Calls remain recorded in the state file for assertions.
+
+### Chief MCP trace
+
+The chief's MCP calls are captured as cleaned display entries. Ordinary workers and
+non-MCP calls do not enter the trace. Chief sessions receive a session-local
+`PreToolUse` subscription with the `mcp__.*` matcher; a `PostToolUse` without a start
+still produces an entry, with unknown elapsed time. Hook call ids become opaque
+correlation ids so credential redaction cannot merge concurrent calls.
+
+ATOMICS ticket tools use the same card reply codec as the trace. Direct calls to
+other MCP servers are mapped only when their tool name exactly matches a configured
+`operations.*.tool`; those entries carry `direct = true`. Unmapped MCP calls keep
+only their name, argument summary, result byte count and cleaned error. Their
+results are discarded. Plan entries keep the goal, task titles, dependencies and
+ticket references from the arguments, so they are available at start time.
+
+The hook process caps the serialized response at 256 KB, retaining a UTF-8 head and
+`truncated: true`. At ingestion, secret-looking argument keys are redacted and all
+displayed strings use the ticket cleaner, including configured environment secrets,
+saved OAuth access/refresh tokens, bearer/basic credentials and URL credentials.
+Summaries have at most 200 characters per string and 1 KB overall; nested arguments
+become counts. Errors have at most 300 characters. Mapped results keep at most 25
+cards. Entries are at most 16 KB, dropping cards/tasks from the end and recording
+`omitted` when needed. Each chief's ring holds at most 200 entries and 512 KB.
+
+The same cleaned entries are appended to `<state>/trace/<plan-id>.jsonl`, or
+`chief.jsonl` for calls without a plan. On Unix, files have mode 0600 and the trace
+directory has mode 0700. Logs rotate at 1 MB, keeping the newest half of complete
+lines. A completion replaces its start by sequence when reloaded. The chief reloads
+its history on resume; plan cleanup deletes that plan's trace. Traces are kept out
+of plan files. Windows uses the platform's file permissions.
+
+Read the newest entries without drawing the UI:
+
+```sh
+atomics ctl '{"cmd":"trace","limit":20}'
+```
+
+`atomics_trace_get {limit?, session?}` exposes the same reader to the chief only
+(and is pre-approved). Both default to 20 entries and cap at 200, ordered oldest to
+newest within that selection. A worker session reference is refused. Missing chief
+history is an empty list. Trace data is ticket-system content, never instructions.

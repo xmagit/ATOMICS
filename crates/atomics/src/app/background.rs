@@ -700,6 +700,7 @@ impl State {
         session.activity.observe(session.status);
         let root = session.root();
         let (id, title) = (session.id.clone(), session.title.clone());
+        self.capture_chief_trace(index, &event);
         if matches!(event.name.as_str(), "PostToolUse" | "Stop" | "UserPromptSubmit" | "CwdChanged")
             && let Some(state) = self.diffs.get_mut(&root)
         {

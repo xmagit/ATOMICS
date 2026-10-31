@@ -10,6 +10,13 @@ use crate::diff::{FileStatus, LineKind, WorktreeDiff};
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum ControlRequest {
     List,
+    /// The chief's cleaned MCP calls, oldest first among the newest `limit` entries.
+    Trace {
+        #[serde(default)]
+        session: Option<String>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
     /// Restart the same installation after saving state. Force bypasses busy checks only.
     Restart {
         #[serde(default)]

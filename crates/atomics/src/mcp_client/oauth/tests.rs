@@ -498,3 +498,31 @@ fn metadata_over_plain_http_to_another_host_is_refused() {
     assert!(parse_secure("http://127.0.0.1:9/x").is_ok());
     assert!(parse_secure("http://auth.example/x").is_err());
 }
+
+#[test]
+fn trace_cleaner_reads_access_and_refresh_secrets_without_refreshing() {
+    let (_dir, oauth) = machine();
+    let server = McpServer { url: Some("https://tickets.example/mcp".into()), ..Default::default() };
+    let key = server_key(&server).unwrap();
+    oauth
+        .save(
+            &key,
+            &Tokens {
+                issuer: "https://tickets.example".into(),
+                client_id: "public-client".into(),
+                token_endpoint: "https://tickets.example/token".into(),
+                resource: server.url.clone().unwrap(),
+                refresh_token: Some("refresh-trace-secret".into()),
+            },
+            &Access { token: "access-trace-secret".into(), expires_at: 0 },
+        )
+        .unwrap();
+    let secrets = oauth.secrets(&server);
+    assert_eq!(secrets.len(), 2);
+    let cleaner = atomics_core::tickets::Cleaner::new(secrets);
+    let clean = cleaner.redacted("access-trace-secret refresh-trace-secret");
+    assert!(!clean.contains("access-trace-secret"));
+    assert!(!clean.contains("refresh-trace-secret"));
+    oauth.sign_out(&server).unwrap();
+    assert!(oauth.secrets(&server).is_empty());
+}
