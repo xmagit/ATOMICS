@@ -1,6 +1,93 @@
 use super::*;
+use atomics_core::heartbeat::{Finding, Kind};
+
+struct WakeConditions {
+    wake_secs: u64,
+    status: Option<AgentStatus>,
+    work_open: bool,
+    approval_pending: bool,
+    input_age: Option<Duration>,
+    input_empty: bool,
+    elapsed: Option<Duration>,
+}
+
+impl WakeConditions {
+    fn should_wake(&self) -> bool {
+        self.wake_secs != 0
+            && matches!(self.status, Some(AgentStatus::Idle | AgentStatus::Done))
+            && self.work_open
+            && !self.approval_pending
+            && self.input_age.is_none_or(|age| age >= Duration::from_secs(60))
+            && self.input_empty
+            && self.elapsed.is_some_and(|elapsed| elapsed >= Duration::from_secs(self.wake_secs))
+    }
+}
+
+fn wake_message(events: usize, findings: &[Finding]) -> String {
+    let kinds: Vec<_> = [
+        (Kind::AgentGone, "agent_gone"),
+        (Kind::Unreported, "unreported"),
+        (Kind::Approval, "approval"),
+        (Kind::HeldMessages, "held_messages"),
+        (Kind::StuckWorking, "stuck_working"),
+    ]
+    .into_iter()
+    .filter_map(|(kind, label)| findings.iter().any(|finding| finding.kind == kind).then_some(label))
+    .collect();
+    let kinds = if kinds.is_empty() { "none".into() } else { kinds.join(", ") };
+    format!(
+        "ATOMICS wake: {events} new events, {} heartbeat findings ({kinds}). Call atomics_wait and act; if nothing changed, post one short line.",
+        findings.len()
+    )
+}
+
+fn chief_work_open(plans: &[Plan], sessions: &[Session]) -> bool {
+    plans.iter().any(|plan| {
+        plan.is_open() && plan.tasks.iter().any(|task| matches!(task.status, TaskStatus::Running | TaskStatus::Review))
+    }) || sessions.iter().any(|s| !s.chief && s.is_agent())
+}
 
 impl State {
+    /// Runs on the host's background tick, including while the chief is hidden or no client is drawing.
+    pub(super) fn wake_chief(&mut self) {
+        if self.config.chief.wake_secs == 0 {
+            return;
+        }
+        let Some(index) = self.sessions.iter().position(|s| s.chief) else { return };
+        let chief = &self.sessions[index];
+        if !matches!(chief.status, AgentStatus::Idle | AgentStatus::Done) {
+            return;
+        }
+        let Some(terminal) = chief.terminal.as_ref().filter(|t| !t.exited()) else { return };
+        // Another message must be picked up before adding an automatic one.
+        if chief.pending.is_some() || !chief.held.is_empty() {
+            return;
+        }
+        let screen = terminal.screen_text(60);
+        let conditions = WakeConditions {
+            wake_secs: self.config.chief.wake_secs,
+            status: Some(chief.status),
+            work_open: chief_work_open(&self.plans, &self.sessions),
+            approval_pending: chief.approval_hold
+                || !chief.approvals.is_empty()
+                || atomics_core::approvals::menu_visible(&screen),
+            input_age: terminal.last_typed().map(|at| at.elapsed()),
+            input_empty: terminal.input_empty_since(chief.activity.turn_ended),
+            elapsed: chief.activity.wake_since.map(|at| at.elapsed()),
+        };
+        if !conditions.should_wake() {
+            return;
+        }
+        let events =
+            self.events.iter().filter(|event| event.seq > self.chief_wake_cursor && event.session != chief.id).count();
+        let findings = self.heartbeat.last.as_ref().map_or(&[][..], |(_, findings)| findings.as_slice());
+        let message = wake_message(events, findings);
+        if matches!(self.deliver(index, &message), Delivery::Sent | Delivery::Pending) {
+            self.sessions[index].activity.wake_since = Some(Instant::now());
+            self.chief_wake_cursor = self.event_seq;
+        }
+    }
+
     /// Starts the chief agent in `[chief] cwd`, else in the main checkout of the project on screen,
     /// continuing the `[chief] resume` conversation when one is named. The workspace file's values
     /// win over the main and host config's.
@@ -331,6 +418,123 @@ impl Desktop<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn eligible() -> WakeConditions {
+        WakeConditions {
+            wake_secs: 180,
+            status: Some(AgentStatus::Idle),
+            work_open: true,
+            approval_pending: false,
+            input_age: None,
+            input_empty: true,
+            elapsed: Some(Duration::from_secs(180)),
+        }
+    }
+
+    #[test]
+    fn wakes_idle_or_turn_done_even_without_new_events_or_findings() {
+        for status in [AgentStatus::Idle, AgentStatus::Done] {
+            assert!(WakeConditions { status: Some(status), ..eligible() }.should_wake());
+        }
+    }
+
+    #[test]
+    fn wake_disabled() {
+        assert!(!WakeConditions { wake_secs: 0, ..eligible() }.should_wake());
+    }
+
+    #[test]
+    fn wake_requires_chief_session() {
+        assert!(!WakeConditions { status: None, ..eligible() }.should_wake());
+    }
+
+    #[test]
+    fn wake_never_interrupts_working_chief() {
+        assert!(!WakeConditions { status: Some(AgentStatus::Working), ..eligible() }.should_wake());
+    }
+
+    #[test]
+    fn wake_suppressed_while_starting_exited_or_needing_input() {
+        for status in [AgentStatus::Starting, AgentStatus::Exited, AgentStatus::NeedsInput] {
+            assert!(!WakeConditions { status: Some(status), ..eligible() }.should_wake());
+        }
+    }
+
+    #[test]
+    fn wake_requires_open_work() {
+        assert!(!WakeConditions { work_open: false, ..eligible() }.should_wake());
+    }
+
+    #[test]
+    fn wake_suppressed_by_pending_permission_or_approval() {
+        assert!(!WakeConditions { approval_pending: true, ..eligible() }.should_wake());
+    }
+
+    #[test]
+    fn wake_suppressed_for_sixty_seconds_after_typing() {
+        assert!(!WakeConditions { input_age: Some(Duration::from_millis(59_999)), ..eligible() }.should_wake());
+        assert!(WakeConditions { input_age: Some(Duration::from_secs(60)), ..eligible() }.should_wake());
+    }
+
+    #[test]
+    fn wake_suppressed_by_unsubmitted_input() {
+        assert!(!WakeConditions { input_empty: false, ..eligible() }.should_wake());
+    }
+
+    #[test]
+    fn wake_waits_full_interval_after_turn_end_or_last_wake() {
+        assert!(!WakeConditions { elapsed: Some(Duration::from_millis(179_999)), ..eligible() }.should_wake());
+        assert!(!WakeConditions { elapsed: None, ..eligible() }.should_wake());
+        assert!(eligible().should_wake());
+    }
+
+    #[test]
+    fn wake_work_includes_running_review_or_non_chief_agents() {
+        use super::super::tests::session;
+        assert!(!chief_work_open(&[], &[]));
+        for status in
+            [TaskStatus::Planned, TaskStatus::Blocked, TaskStatus::Done, TaskStatus::Running, TaskStatus::Review]
+        {
+            let mut plan =
+                Plan { id: "open".into(), tasks: vec![Task { status, ..Task::default() }], ..Plan::default() };
+            assert_eq!(
+                chief_work_open(std::slice::from_ref(&plan), &[]),
+                matches!(status, TaskStatus::Running | TaskStatus::Review)
+            );
+            plan.status = PlanStatus::Completed;
+            assert!(!chief_work_open(&[plan], &[]));
+        }
+        let mut agent = session("agent", AgentKind::Generic, AgentStatus::Idle, Path::new("/tmp"));
+        assert!(chief_work_open(&[], std::slice::from_ref(&agent)));
+        agent.chief = true;
+        assert!(!chief_work_open(&[], std::slice::from_ref(&agent)));
+        agent.chief = false;
+        agent.kind = AgentKind::Shell;
+        assert!(!chief_work_open(&[], &[agent]));
+    }
+
+    #[test]
+    fn wake_line_is_exact_and_summarizes_unique_short_kinds() {
+        assert_eq!(
+            wake_message(0, &[]),
+            "ATOMICS wake: 0 new events, 0 heartbeat findings (none). Call atomics_wait and act; if nothing changed, post one short line."
+        );
+        let findings: Vec<_> = [
+            Kind::StuckWorking,
+            Kind::AgentGone,
+            Kind::AgentGone,
+            Kind::Approval,
+            Kind::Unreported,
+            Kind::HeldMessages,
+        ]
+        .into_iter()
+        .map(|kind| Finding { plan: "plan".into(), task: "task".into(), session: None, kind })
+        .collect();
+        assert_eq!(
+            wake_message(3, &findings),
+            "ATOMICS wake: 3 new events, 6 heartbeat findings (agent_gone, unreported, approval, held_messages, stuck_working). Call atomics_wait and act; if nothing changed, post one short line."
+        );
+    }
 
     #[test]
     fn chief_approval_access_and_read_only_defaults_are_documented() {

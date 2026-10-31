@@ -209,6 +209,7 @@ startup_keys = [":theme base16_transparent\r"]
 [chief]
 # The chief agent (cmd+o), floating or docked beside the agents.
 heartbeat_secs = 300         # fleet checks, delivered through atomics_wait
+wake_secs = 180              # wake an idle chief while work is open; 0 = off, minimum 30
 dock = "floating"   # "floating" or "docked"
 command = ["claude"]
 args = ["--model", "claude-opus-5-5"]
@@ -348,6 +349,7 @@ Without a plan id, atomics_plan_set creates a separate plan. Keep its returned i
 Ask the user to approve it on its own plan board. Never dispatch before approval.
 3. atomics_plan_dispatch, then loop on atomics_wait (never sleep or poll). On reported or turn done, read atomics_result and atomics_diff.
 Include heartbeat and plan in atomics_wait statuses. A plan event (change approved, edited, closed or reopened) means the user acted on the board: on approved, dispatch without waiting to be told. On a heartbeat with no findings, post one short line; otherwise act on the findings.
+While work is open, ATOMICS wakes you when idle every [chief] wake_secs with an `ATOMICS wake:` line: call atomics_wait and act; if nothing changed, post one short line.
 To restart ATOMICS, rebuild/install first, then call atomics_restart; wait instead of forcing while agents work.
 When an event contains approval, use atomics_approve with its session id to answer that request, regardless of the selected plan tab.
 4. Verify every acceptance check yourself, and read the diff with atomics_diff. A sandboxed session's code (atomics_list \
@@ -381,6 +383,9 @@ pub enum ChiefDock {
 #[serde(default)]
 pub struct ChiefConfig {
     pub heartbeat_secs: u64,
+    /// Wake an idle chief while work is open; zero disables wakes, otherwise at least 30 seconds.
+    #[serde(deserialize_with = "deserialize_wake_secs")]
+    pub wake_secs: u64,
     pub dock: ChiefDock,
     pub command: Vec<String>,
     pub args: Vec<String>,
@@ -411,6 +416,7 @@ impl Default for ChiefConfig {
     fn default() -> Self {
         Self {
             heartbeat_secs: 300,
+            wake_secs: 180,
             dock: ChiefDock::Floating,
             command: vec!["claude".into()],
             args: vec!["--model".into(), "claude-opus-5-5".into()],
@@ -421,6 +427,14 @@ impl Default for ChiefConfig {
             autostart: false,
         }
     }
+}
+
+fn deserialize_wake_secs<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+    let secs = u64::deserialize(deserializer)?;
+    if secs != 0 && secs < 30 {
+        return Err(serde::de::Error::custom("chief.wake_secs must be 0 (off) or at least 30 seconds"));
+    }
+    Ok(secs)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1089,6 +1103,35 @@ kind = "shell"
         assert_eq!(config.chief.heartbeat_secs, 7);
         assert!(CHIEF_PROMPT.contains("On a heartbeat with no findings, post one short line"));
         assert!(CHIEF_PROMPT.contains("run its builds and tests with atomics_exec"));
+    }
+
+    #[test]
+    fn chief_wake_interval_defaults() {
+        assert_eq!(Config::default().chief.wake_secs, 180);
+        assert_eq!(toml::from_str::<Config>("").unwrap().chief.wake_secs, 180);
+        assert_eq!(toml::from_str::<Config>("[chief]\nheartbeat_secs = 7").unwrap().chief.wake_secs, 180);
+        assert_eq!(toml::from_str::<Config>(DEFAULT_CONFIG).unwrap().chief.wake_secs, 180);
+        assert!(CHIEF_PROMPT.contains("every [chief] wake_secs with an `ATOMICS wake:` line"));
+    }
+
+    #[test]
+    fn chief_wake_interval_parses() {
+        for secs in [0, 30, 60, 180, 3600] {
+            let config: Config = toml::from_str(&format!("[chief]\nwake_secs = {secs}")).unwrap();
+            assert_eq!(config.chief.wake_secs, secs);
+        }
+    }
+
+    #[test]
+    fn chief_wake_interval_validates_minimum() {
+        for secs in 1..30 {
+            let table = toml::from_str(&format!("[chief]\nwake_secs = {secs}")).unwrap();
+            let err = Config::from_tables([table]).unwrap_err();
+            assert!(err.to_string().contains("chief.wake_secs must be 0 (off) or at least 30 seconds"));
+        }
+        for value in ["-1", "30.0", "\"180\""] {
+            assert!(toml::from_str::<Config>(&format!("[chief]\nwake_secs = {value}")).is_err());
+        }
     }
 
     #[test]

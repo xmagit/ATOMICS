@@ -34,6 +34,14 @@ fn eventually(host: &Host, check: impl Fn(&State) -> bool) {
     }
 }
 
+fn wait_for_terminal_text(terminal: &Terminal, text: &str) {
+    let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(3));
+    while !terminal.screen_text(60).contains(text) {
+        assert!(Instant::now() < deadline, "terminal did not show {text}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 fn hook(name: &str, tool: Option<&str>) -> HookReply {
     let stream = UnixStream::connect(paths::socket_path()).unwrap();
     stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -150,6 +158,135 @@ fn heartbeat_fires_without_frames() {
         assert_eq!(reply.result["events"][0]["status"], "heartbeat");
         assert!(host.state().heartbeat.last.is_some());
     });
+}
+
+#[test]
+fn chief_wake_submits_one_line_without_frames_and_preserves_drafts() {
+    with_state("app::host_tests::chief_wake_submits_one_line_without_frames_and_preserves_drafts", |mut state, _| {
+        let dir = paths::atomics_home();
+        let received = dir.join("wake.txt");
+        let mut chief = session("chief", AgentKind::Claude, AgentStatus::Done, &dir);
+        chief.chief = true;
+        chief.activity.observe(AgentStatus::Done);
+        chief.activity.wake_since = Some(Instant::now() - Duration::from_secs(180));
+        chief.terminal = Some(
+            Terminal::spawn(
+                state.wake.clone(),
+                Vec::new(),
+                "/bin/sh".into(),
+                vec![
+                    "-c".into(),
+                    "printf '❯ draft'; read -r line; printf '%s\\n' \"$line\" >> wake.txt; exec sleep 30".into(),
+                ],
+                &dir,
+                HashMap::new(),
+                100,
+            )
+            .unwrap(),
+        );
+        wait_for_terminal_text(chief.terminal.as_ref().unwrap(), "❯ draft");
+        state.sessions = vec![chief, session("worker", AgentKind::Generic, AgentStatus::Working, &dir)];
+        let host = state.into_host();
+        eventually(&host, |state| state.sessions[0].terminal.as_ref().unwrap().screen_text(60).contains("❯ draft"));
+        {
+            let state = host.state();
+            assert!(!received.exists(), "a draft must not receive a wake");
+            assert_eq!(state.chief_wake_cursor, 0);
+        }
+        {
+            let mut state = host.state();
+            // Replace the fixture with an empty prompt; no client input buffer or frame is involved.
+            state.sessions[0].terminal = Some(
+                Terminal::spawn(
+                    state.wake.clone(),
+                    Vec::new(),
+                    "/bin/sh".into(),
+                    vec![
+                        "-c".into(),
+                        "printf '❯ '; while read -r line; do printf '%s\\n' \"$line\" >> wake.txt; done".into(),
+                    ],
+                    &dir,
+                    HashMap::new(),
+                    100,
+                )
+                .unwrap(),
+            );
+        }
+        eventually(&host, |_| std::fs::read_to_string(&received).is_ok_and(|line| line.ends_with('\n')));
+        let line = std::fs::read_to_string(&received).unwrap();
+        assert_eq!(
+            line,
+            "ATOMICS wake: 1 new events, 0 heartbeat findings (none). Call atomics_wait and act; if nothing changed, post one short line.\n"
+        );
+        assert_eq!(line.lines().count(), 1);
+        {
+            let state = host.state();
+            assert!(state.chief_wake_cursor > 0);
+            assert!(state.sessions[0].activity.wake_since.unwrap().elapsed() < Duration::from_secs(10));
+        }
+        assert_eq!(std::fs::read_to_string(&received).unwrap(), line);
+    });
+}
+
+fn chief_suggestion_case(name: &str, input: &[bool], expect_wake: bool) {
+    with_state(name, |mut state, _| {
+        let dir = paths::atomics_home();
+        let received = dir.join("wake.txt");
+        let now = Instant::now();
+        let mut chief = session("chief", AgentKind::Claude, AgentStatus::Done, &dir);
+        chief.chief = true;
+        chief.activity.observe(AgentStatus::Done);
+        chief.activity.turn_ended = Some(now - Duration::from_secs(180));
+        chief.activity.wake_since = chief.activity.turn_ended;
+        let terminal = Terminal::spawn(
+            state.wake.clone(),
+            Vec::new(),
+            "/bin/sh".into(),
+            vec!["-c".into(), "printf '❯ \\033[2;90mrun the full suite once more\\033[0m'; while read -r line; do printf '%s\\n' \"$line\" >> wake.txt; done".into()],
+            &dir,
+            HashMap::new(),
+            100,
+        ).unwrap();
+        for (i, submitted) in input.iter().enumerate() {
+            // Native input after the turn ended, aged past the independent 60-second cooldown.
+            terminal.record_input(now - Duration::from_secs(62 - i as u64), *submitted);
+        }
+        wait_for_terminal_text(&terminal, "run the full suite once more");
+        chief.terminal = Some(terminal);
+        state.sessions = vec![chief, session("worker", AgentKind::Generic, AgentStatus::Working, &dir)];
+        let host = state.into_host();
+        eventually(&host, |state| {
+            state.event_seq >= 2
+                && state.sessions[0].terminal.as_ref().unwrap().screen_text(60).contains("run the full suite once more")
+        });
+        if expect_wake {
+            eventually(&host, |_| std::fs::read_to_string(&received).is_ok_and(|line| line.ends_with('\n')));
+            assert!(std::fs::read_to_string(&received).unwrap().starts_with("ATOMICS wake:"));
+            assert!(host.state().chief_wake_cursor > 0);
+        } else {
+            assert!(!received.exists(), "native draft must suppress the wake even when the screen shows a suggestion");
+            assert_eq!(host.state().chief_wake_cursor, 0);
+        }
+    });
+}
+
+#[test]
+fn chief_suggestion_without_user_keystrokes_still_wakes() {
+    chief_suggestion_case("app::host_tests::chief_suggestion_without_user_keystrokes_still_wakes", &[], true);
+}
+
+#[test]
+fn chief_keystrokes_since_turn_end_without_enter_suppress_wake() {
+    chief_suggestion_case(
+        "app::host_tests::chief_keystrokes_since_turn_end_without_enter_suppress_wake",
+        &[false],
+        false,
+    );
+}
+
+#[test]
+fn chief_wakes_resume_after_user_submits() {
+    chief_suggestion_case("app::host_tests::chief_wakes_resume_after_user_submits", &[false, true], true);
 }
 
 #[test]

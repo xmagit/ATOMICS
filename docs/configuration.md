@@ -45,6 +45,19 @@ with a warning; see [Repository workflows](repo-workflow.md).
 
 ## The chief's prompt
 
+`[chief] wake_secs` wakes an idle or turn-done chief every 180 seconds by default; set it to `0` to disable,
+or to at least `30` seconds. Set it in `config.toml` or this host's `config.d/<host>.toml`.
+Work is open when an open plan has a running or review task, or a non-chief agent session exists.
+A wake waits a full interval after the last turn ended or the last wake; starting a turn resets the timer.
+It is suppressed while the chief works, has a pending permission or approval, has received terminal typing in
+the last 60 seconds, or has native keystrokes or a paste pending since its last turn ended or last submit (Enter).
+Suggested prompts do not count as user input. Before any native input history exists, the terminal screen is a
+fallback that ignores styled or dim suggestion text.
+The single line is `ATOMICS wake: <n> new events, <m> heartbeat findings (<short kinds>). Call atomics_wait and act; if nothing changed, post one short line.`
+Events are counted since the previous wake; findings and their short kinds come from the latest fleet check
+(`none` when empty). `[chief] heartbeat_secs` separately controls that check (default 300 seconds), delivered
+through `atomics_wait`.
+
 Where and how the chief starts: `[chief] cwd` is its folder (`~/` allowed; unset, the main checkout of the
 project on screen), `resume` names a Claude session id it continues instead of starting a new conversation,
 and `autostart = true` starts it with ATOMICS unless a restart already brings it back. A workspace file's
