@@ -395,9 +395,14 @@ impl Risk {
                 "tickets.server.env",
                 "tickets.server.url",
             ],
-            Risk::SendsCredentials => {
-                &["tickets.server.token_env", "voice.provider", "voice.base_url", "voice.api_key_env", "voice.api_key"]
-            }
+            Risk::SendsCredentials => &[
+                "tickets.server.token_env",
+                "tickets.server.oauth",
+                "voice.provider",
+                "voice.base_url",
+                "voice.api_key_env",
+                "voice.api_key",
+            ],
             Risk::InstructsAgents => &["chief.prompt", "chief.system_prompt", "steer", "tickets.workflow"],
         }
     }

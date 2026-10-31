@@ -219,6 +219,50 @@ impl Store {
         self.remove(&id)
     }
 
+    /// The JSON text of MCP OAuth item `slot`, if any.
+    pub fn oauth_item(&self, slot: &str) -> Result<Option<String>> {
+        check_slot(slot)?;
+        let Some(encoded) = self.keychain.read_item(MCP_OAUTH, slot)? else { return Ok(None) };
+        let invalid = || anyhow::anyhow!("OS credential item is malformed (contents hidden); sign in again");
+        if encoded.len() > 16 * 1024 || !encoded.len().is_multiple_of(2) {
+            return Err(invalid());
+        }
+        let bytes: Vec<u8> = encoded
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| {
+                let digit = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
+                Some(digit(pair[0])? * 16 + digit(pair[1])?)
+            })
+            .collect::<Option<_>>()
+            .ok_or_else(invalid)?;
+        String::from_utf8(bytes).map(Some).map_err(|_| invalid())
+    }
+
+    /// Stores `json` as MCP OAuth item `slot`, replacing any earlier one.
+    pub fn put_oauth_item(&self, slot: &str, json: &str) -> Result<()> {
+        use std::fmt::Write;
+        check_slot(slot)?;
+        let mut encoded = String::new();
+        for byte in json.bytes() {
+            write!(encoded, "{byte:02x}")?;
+        }
+        if encoded.len() > 16 * 1024 {
+            bail!("sign-in item is too large to store (value hidden)");
+        }
+        let _lock = self.keychain.catalog_lock()?;
+        self.keychain.write_item(MCP_OAUTH, slot, "ATOMICS MCP sign-in", &encoded)
+    }
+
+    /// Removes MCP OAuth item `slot`; nothing stored is fine.
+    pub fn remove_oauth_item(&self, slot: &str) -> Result<()> {
+        check_slot(slot)?;
+        let _lock = self.keychain.catalog_lock()?;
+        self.keychain.remove_item(MCP_OAUTH, slot)
+    }
+
     pub fn remove(&self, id: &str) -> Result<()> {
         if !KINDS.iter().any(|kind| kind.0 == id)
             && !id.strip_prefix("registry:").is_some_and(valid_host)
@@ -279,6 +323,22 @@ impl Store {
 
 fn read_rules(host: &str) -> Vec<Rule> {
     ["GET", "HEAD"].into_iter().map(|method| Rule::new(host, method, "/*")).collect()
+}
+
+/// The keychain service of MCP OAuth sign-in items. Each slot (a kind and a digest of the server or
+/// authorization server it belongs to) is an item of its own instead of an entry in the shared
+/// catalog: macOS's security(1) accepts at most 4 KiB per write, so a few signed-in servers would
+/// crowd out the catalog's other credentials, every token refresh would rewrite all of them, and
+/// signing out of one server would have to edit the others. The access token is its own slot so a
+/// long one and the refresh token do not share that limit. The value is hex-encoded JSON, as in the
+/// catalog.
+const MCP_OAUTH: &str = "atomics-mcp-oauth-v1";
+
+fn check_slot(slot: &str) -> Result<()> {
+    if slot.is_empty() || slot.len() > 100 || !slot.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        bail!("not a sign-in item name");
+    }
+    Ok(())
 }
 
 /// The catalog prefix of an MCP server's stored environment.

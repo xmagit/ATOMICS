@@ -489,6 +489,7 @@ dependencies = [
  "alacritty_terminal",
  "anyhow",
  "atomics-core",
+ "base64 0.22.1",
  "clap",
  "cpal",
  "eframe",
@@ -498,6 +499,7 @@ dependencies = [
  "notify",
  "png",
  "rfd",
+ "ring",
  "serde",
  "serde_json",
  "syntect",
@@ -505,6 +507,7 @@ dependencies = [
  "toml",
  "two-face",
  "ureq",
+ "url",
  "uuid",
 ]
 

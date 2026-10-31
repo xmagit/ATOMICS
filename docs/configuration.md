@@ -150,7 +150,7 @@ diff:
 | Label | Settings |
 | --- | --- |
 | runs commands | `agents`, `approvals`, `chief.command`, `chief.args`, `editor`, `isolation`, `tickets.server.command`, `tickets.server.env`, `tickets.server.url` |
-| sends credentials | `tickets.server.token_env`, `voice.provider`, `voice.base_url`, `voice.api_key_env`, `voice.api_key` |
+| sends credentials | `tickets.server.token_env`, `tickets.server.oauth`, `voice.provider`, `voice.base_url`, `voice.api_key_env`, `voice.api_key` |
 | instructs agents | `chief.prompt`, `chief.system_prompt`, `steer`, `tickets.workflow` |
 
 A theme change also shows the theme itself above the diff: bars, agent rows, a terminal with its ANSI colors, a
@@ -203,6 +203,8 @@ file. Waiting proposals block `atomics_restart` and do not survive a restart.
 - **Keep secrets in the environment.** The chief runs as you, and its own tools can read files you can read,
   subject to its permission prompts. Masking keeps secrets out of ATOMICS's answers; it cannot make a file
   private. Put tokens in environment variables and name them with `token_env` and `api_key_env`.
+  `tickets.server.oauth = true` signs in to a URL server with browser OAuth instead; its tokens live only in the OS
+  keychain, never in a config file (see [tickets](tickets.md#signing-in-with-oauth)).
 - **The diff is yours.** It shows the whole file, secrets included, on your screen only. The backup holds the old
   file with the same permissions.
 - **Editing by hand still works.** ATOMICS reloads files you save yourself. A proposal made before your edit fails

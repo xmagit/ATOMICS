@@ -104,6 +104,45 @@ command = ["npx", "-y", "mcp-remote", "https://mcp.linear.app/mcp"]
 The bridge opens the browser on first use and stores the token for later runs. Run the command once in a
 terminal to sign in before ATOMICS needs it.
 
+### Signing in with OAuth
+
+A URL server that follows the [MCP authorization spec](https://modelcontextprotocol.io/specification/2025-06-18/basic/authorization)
+can sign in from ATOMICS itself, with no bridge and no token in your environment. Set `oauth = true`:
+
+```toml
+[tickets.server]
+url = "https://tickets.example.com/mcp"
+oauth = true
+```
+
+`oauth` is ignored when `token_env` is set, and applies to URL servers only. ATOMICS knows no server by name; it
+follows the standards:
+
+1. **Discovery.** An unauthenticated request answered `401` with `WWW-Authenticate: Bearer resource_metadata="…"`
+   (or, if the server says nothing, its `/.well-known/oauth-protected-resource`) names the protected-resource
+   metadata (RFC 9728). Its `resource` must be the server URL. `authorization_servers[0]` is read through
+   `/.well-known/oauth-authorization-server` (RFC 8414), or `openid-configuration`; the metadata's `issuer` must match.
+   Metadata and endpoints must be `https` (plain `http` only to this machine).
+2. **Registration.** A public client is registered dynamically (RFC 7591, `token_endpoint_auth_method=none`) with the
+   redirect `http://127.0.0.1:<port>/callback`. The `client_id` is kept per authorization server and reused while
+   its loopback port is free.
+3. **Authorization.** The system browser (`open`, or `xdg-open`) gets an S256 PKCE request with `state` and
+   `resource` set to the server URL (RFC 8707). A listener on 127.0.0.1 takes one callback within five minutes and
+   checks `state` and `iss`.
+4. **Tokens.** The code is exchanged, and the access token is sent as the bearer on every MCP call. It is refreshed
+   before it expires and once after a `401`; the refresh token rotates when the server rotates it. A refusal
+   clears the saved sign-in and the call fails with `sign-in required: …`. It is never retried in a loop.
+5. **Storage.** Tokens and the `client_id` are OS-keychain items only (service `atomics-mcp-oauth-v1`, one item per
+   server or authorization server), never in the config, a file, the log or an error. They are separate from the
+   credential catalog because macOS's `security` takes 4 KiB per write: a few signed-in servers would crowd out the
+   catalog, and every refresh would rewrite it.
+
+The API for a sign-in UI is `OAuth::sign_in(server)`, `sign_out(server)` and `status(server)` (signed in, needs
+sign-in, or the keychain's error) in `mcp_client.rs`. `sign_out` deletes the server's token items and keeps its
+registered client. **The ticket worker never opens a browser:** a job against a server that is not signed in fails with
+`sign-in required: <url> needs a sign-in`, and the UI offers the sign-in. A server with `oauth` unset that answers
+`401` with `resource_metadata` fails the same way, with a hint to set `oauth = true`.
+
 ### Ticket-aware branches
 
 Set `branch = "issue/{key_number}-{slug}"`, or `branch = "{branch}"` to use the system's suggestion.

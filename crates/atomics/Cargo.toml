@@ -25,6 +25,10 @@ serde_json = "1.0.154"
 serde = { version = "1.0.229", features = ["derive"] }
 uuid = { version = "1.29.0", features = ["v4"] }
 # The ticket layer's MCP client speaks streamable HTTP too.
+# Browser sign-in for those servers (MCP authorization spec): S256 PKCE, URLs and base64url.
+ring = "0.17.14"
+url = "2.5.8"
+base64 = "0.22.1"
 ureq = { version = "3.5.0", default-features = false, features = ["rustls"] }
 syntect = { version = "5.3.0", default-features = false, features = ["default-onig"] }
 two-face = { version = "0.5.2", default-features = false, features = ["syntect-onig"] }
