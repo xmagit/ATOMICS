@@ -84,32 +84,34 @@ fn serve(listener: TcpListener, handler: impl Fn(&Req) -> Resp + Send + Sync + '
 }
 
 #[derive(Default)]
-struct State {
-    registrations: Vec<Value>,
-    clients: HashMap<String, String>,
-    codes: HashMap<String, (String, String, String)>,
-    access: HashSet<String>,
-    refresh: HashSet<String>,
-    counter: u32,
-    expires_in: u64,
-    authorize_urls: Vec<String>,
-    token_requests: Vec<HashMap<String, String>>,
-    list_auth: Vec<String>,
-    state_override: Option<String>,
-    iss_override: Option<String>,
-    metadata_issuer: Option<String>,
-    oidc_only: bool,
-    no_challenge: bool,
+pub(crate) struct State {
+    pub(crate) registrations: Vec<Value>,
+    pub(crate) clients: HashMap<String, String>,
+    pub(crate) codes: HashMap<String, (String, String, String)>,
+    pub(crate) access: HashSet<String>,
+    pub(crate) refresh: HashSet<String>,
+    pub(crate) counter: u32,
+    pub(crate) expires_in: u64,
+    pub(crate) authorize_urls: Vec<String>,
+    pub(crate) token_requests: Vec<HashMap<String, String>>,
+    pub(crate) list_auth: Vec<String>,
+    pub(crate) state_override: Option<String>,
+    pub(crate) iss_override: Option<String>,
+    pub(crate) metadata_issuer: Option<String>,
+    pub(crate) oidc_only: bool,
+    pub(crate) no_challenge: bool,
+    pub(crate) revoked: Vec<HashMap<String, String>>,
+    pub(crate) revoke_status: Option<u16>,
 }
 
-struct Fake {
+pub(crate) struct Fake {
     as_url: String,
-    mcp_url: String,
-    state: Mutex<State>,
+    pub(crate) mcp_url: String,
+    pub(crate) state: Mutex<State>,
 }
 
 impl Fake {
-    fn start() -> Arc<Fake> {
+    pub(crate) fn start() -> Arc<Fake> {
         let ((as_listener, as_url), (mcp_listener, mcp_base)) = (bind(), bind());
         let fake = Arc::new(Fake {
             as_url,
@@ -123,7 +125,7 @@ impl Fake {
         fake
     }
 
-    fn server(&self) -> McpServer {
+    pub(crate) fn server(&self) -> McpServer {
         McpServer { url: Some(self.mcp_url.clone()), oauth: true, ..McpServer::default() }
     }
 
@@ -142,6 +144,7 @@ impl Fake {
                         "authorization_endpoint": format!("{}/authorize", self.as_url),
                         "token_endpoint": format!("{}/token", self.as_url),
                         "registration_endpoint": format!("{}/register", self.as_url),
+                        "revocation_endpoint": format!("{}/revoke", self.as_url),
                         "code_challenge_methods_supported": ["S256"],
                         "authorization_response_iss_parameter_supported": true,
                     }),
@@ -182,6 +185,13 @@ impl Fake {
                     .append_pair("state", &state)
                     .append_pair("iss", &iss);
                 Resp(302, vec![("Location", target.to_string())], String::new())
+            }
+            ("POST", "/revoke") => {
+                let form = r.form();
+                st.access.remove(&form["token"]);
+                st.refresh.remove(&form["token"]);
+                st.revoked.push(form);
+                Resp(st.revoke_status.unwrap_or(200), vec![], String::new())
             }
             ("POST", "/token") => {
                 let form = r.form();
@@ -252,13 +262,17 @@ impl Fake {
                     json!({ "jsonrpc": "2.0", "id": body["id"], "result": { "tools": [{ "name": "search" }] } }),
                 )
             }
+            "tools/call" => json_resp(
+                200,
+                json!({ "jsonrpc": "2.0", "id": body["id"], "result": { "content": [{ "type": "text", "text": "{}" }] } }),
+            ),
             _ => Resp(202, vec![], String::new()),
         }
     }
 }
 
 /// The browser: follow the authorization URL's redirect to the loopback callback.
-fn browse(url: &str) {
+pub(crate) fn browse(url: &str) {
     let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).max_redirects(0).build().into();
     let response = agent.get(url).call().unwrap();
     if let Some(location) = response.headers().get("location").and_then(|v| v.to_str().ok()) {
@@ -266,13 +280,13 @@ fn browse(url: &str) {
     }
 }
 
-fn open_in_browser(url: &str) -> anyhow::Result<()> {
+pub(crate) fn open_in_browser(url: &str) -> anyhow::Result<()> {
     let url = url.to_string();
     std::thread::spawn(move || browse(&url));
     Ok(())
 }
 
-fn machine() -> (crate::test_support::TempDir, OAuth) {
+pub(crate) fn machine() -> (crate::test_support::TempDir, OAuth) {
     let (dir, keychain, _) = crate::credentials::tests::machine(false);
     let oauth = OAuth::new(keychain, Browser::at("unused-browser")).with_callback_timeout(Duration::from_secs(10));
     (dir, oauth)
@@ -513,6 +527,7 @@ fn trace_cleaner_reads_access_and_refresh_secrets_without_refreshing() {
                 token_endpoint: "https://tickets.example/token".into(),
                 resource: server.url.clone().unwrap(),
                 refresh_token: Some("refresh-trace-secret".into()),
+                revocation_endpoint: None,
             },
             &Access { token: "access-trace-secret".into(), expires_at: 0 },
         )

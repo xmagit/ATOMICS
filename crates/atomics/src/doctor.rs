@@ -227,7 +227,13 @@ fn report(workspace: Option<&str>, for_agent: bool, projects: &[PathBuf]) -> Rep
             }
         }
         match ticket_config(config, workspace) {
-            Ok(tickets) if !tickets.system.trim().is_empty() => lines.push(ticket_check(&tickets)),
+            Ok(tickets) if !tickets.system.trim().is_empty() => {
+                lines.extend(crate::ticket_signin::doctor_line(
+                    &crate::mcp_client::OAuth::new(credential_keychain.clone(), crate::connections::Browser::current()),
+                    &tickets,
+                ));
+                lines.push(ticket_check(&tickets))
+            }
             Ok(_) => {}
             Err(error) => {
                 let error = match workspace.and_then(|name| Workspace::file(name).ok()).filter(|_| for_agent) {
@@ -289,6 +295,11 @@ fn report(workspace: Option<&str>, for_agent: bool, projects: &[PathBuf]) -> Rep
     }
 
     Report { lines, git_ok, config_ok: config.is_ok() }
+}
+
+/// The effective `[tickets]` of the main config and the workspace, for commands outside the app.
+pub(crate) fn ticket_config_for(workspace: Option<&str>) -> anyhow::Result<atomics_core::tickets::TicketConfig> {
+    ticket_config(&Config::load(&paths::config_file())?, workspace)
 }
 
 fn ticket_config(config: &Config, workspace: Option<&str>) -> anyhow::Result<atomics_core::tickets::TicketConfig> {

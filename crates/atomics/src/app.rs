@@ -63,6 +63,7 @@ mod sidebar;
 mod themes;
 mod tickets;
 mod tickets_panel;
+mod tickets_signin;
 mod topbar;
 mod trace;
 mod voice;

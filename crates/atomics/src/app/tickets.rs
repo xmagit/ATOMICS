@@ -51,7 +51,7 @@ pub(super) struct Tickets {
     workspace_isolation: Option<atomics_core::isolation::IsolationOverrides>,
     /// The workspace file's `[chief] cwd`, `resume` and `autostart`.
     pub(super) workspace_chief: Option<atomics_core::config::ChiefLaunch>,
-    jobs: Option<std::sync::mpsc::Sender<TicketJob<Tag>>>,
+    pub(super) jobs: Option<std::sync::mpsc::Sender<TicketJob<Tag>>>,
     done_tx: crate::host::Sender<Done>,
     done_rx: Receiver<Done>,
     /// Jobs sent and not yet answered.
@@ -70,6 +70,8 @@ pub(super) struct Tickets {
     generations: HashMap<LinkKey, u64>,
     /// What the Tickets panel shows.
     pub(super) panel: super::tickets_panel::TicketsPanel,
+    /// Sign-in state and jobs of the ticket server.
+    pub(super) sign: super::tickets_signin::SignUi,
 }
 
 /// A control request answered once all of its ticket jobs are done.
@@ -109,6 +111,7 @@ impl Tickets {
             next_batch: 0,
             generations: HashMap::new(),
             panel: Default::default(),
+            sign: super::tickets_signin::SignUi::new(wake),
         }
     }
 }
@@ -292,7 +295,11 @@ impl State {
             return;
         }
         let done = self.tickets.done_tx.clone();
-        let jobs = self.tickets.jobs.get_or_insert_with(|| crate::tickets::spawn(done));
+        let oauth = self.tickets.sign.override_oauth_ref();
+        let jobs = self.tickets.jobs.get_or_insert_with(|| match oauth {
+            Some(oauth) => crate::tickets::spawn_with(done, oauth),
+            None => crate::tickets::spawn(done),
+        });
         self.tickets.pending += 1;
         if let Err(unsent) = jobs.send(TicketJob { config: config.clone(), op, tag }) {
             // A worker that stopped is started again for the next job; this one fails.

@@ -822,4 +822,29 @@ pub(crate) mod tests {
             assert!(!output.contains(VALUES[3].1) && !output.contains(&grant.placeholder));
         }
     }
+
+    #[test]
+    fn mcp_oauth_items_stay_outside_the_catalog_and_the_relay_and_their_values_stay_hidden() {
+        for mac in [true, false] {
+            let (dir, _, store) = machine(mac);
+            let secret = r#"{"refresh_token":"PRIVATE-oauth-refresh"}"#;
+            store.put_oauth_item("tokens-0123abcd", secret).unwrap();
+            assert_eq!(store.oauth_item("tokens-0123abcd").unwrap().as_deref(), Some(secret));
+            // Not a catalog entry: no snapshot line, nothing the relay could offer a session.
+            let snapshot = store.snapshot().unwrap();
+            assert_eq!(snapshot.invalid, 0);
+            let lines = doctor_lines(&store).join("\n");
+            assert!(!lines.contains("PRIVATE") && !lines.contains("oauth"), "{lines}");
+            assert!(store.credential("mcp-oauth:0123abcd").unwrap().is_none());
+            assert!(store.remove("mcp-oauth:0123abcd").is_err());
+            // Item names are fixed-charset: nothing untrusted becomes a keychain name.
+            for bad in ["", "a b", "a/../b", "tokens;rm", &"x".repeat(101)] {
+                assert!(store.put_oauth_item(bad, secret).is_err() && store.oauth_item(bad).is_err());
+            }
+            let argv = std::fs::read_to_string(dir.path().join("keychain-argv")).unwrap();
+            assert!(!argv.contains("PRIVATE"));
+            store.remove_oauth_item("tokens-0123abcd").unwrap();
+            assert!(store.oauth_item("tokens-0123abcd").unwrap().is_none());
+        }
+    }
 }

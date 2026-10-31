@@ -202,6 +202,7 @@ impl State {
             self.finish_integration(integrated);
         }
         changed |= self.ticket_results();
+        changed |= self.poll_signin();
         self.expire_approvals(Instant::now());
         while let Ok(message) = self.control_rx.try_recv() {
             changed = true;
