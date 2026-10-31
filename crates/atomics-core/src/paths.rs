@@ -174,7 +174,12 @@ pub fn migrate_old_names() -> Migration {
     for (old, new) in pairs {
         if old.is_dir() && !new.exists() {
             match move_directory(&old, &new) {
-                Ok(method) => result.moved.push(format!("{method} {} → {}", display(&old), display(&new))),
+                Ok(method) => {
+                    result.moved.push(format!("{method} {} → {}", display(&old), display(&new)));
+                    if let Err(err) = rewrite_moved_paths(&old, &new) {
+                        result.errors.push(format!("Could not update paths in {}: {err}", display(&new)));
+                    }
+                }
                 Err(err) => {
                     result.errors.push(format!("Could not migrate {} to {}: {err:#}", display(&old), display(&new)))
                 }
@@ -182,6 +187,31 @@ pub fn migrate_old_names() -> Migration {
         }
     }
     result
+}
+
+/// State records (the sandbox ledger, sessions, plans, git pins) name files under the state folder by
+/// absolute path; after a move, point those at the new place.
+fn rewrite_moved_paths(old: &Path, new: &Path) -> std::io::Result<()> {
+    let (Some(old), Some(new)) = (old.to_str(), new.to_str()) else { return Ok(()) };
+    let root = Path::new(new);
+    for dir in [root.to_path_buf(), root.join("plans"), root.join("git-pins")] {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for path in entries.flatten().map(|entry| entry.path()) {
+            if path.extension().is_none_or(|ext| ext != "json") || !path.is_file() {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path)?;
+            let updated = text
+                .replace(&format!("\"{old}/"), &format!("\"{new}/"))
+                .replace(&format!("\"{old}\""), &format!("\"{new}\""));
+            if updated != text {
+                let temporary = path.with_extension("json.migration");
+                std::fs::write(&temporary, updated)?;
+                std::fs::rename(&temporary, &path)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn move_directory(old: &Path, new: &Path) -> anyhow::Result<&'static str> {
@@ -504,8 +534,16 @@ mod tests {
         std::fs::create_dir_all(&config).unwrap();
         std::fs::write(legacy.join("plan.json"), "plan").unwrap();
         std::fs::write(config.join("config.toml"), "config").unwrap();
+        let ledger =
+            format!("{{\"pins\": \"{0}/git-pins\", \"home\": \"{0}\", \"other\": \"{0}x\"}}", legacy.display());
+        std::fs::write(legacy.join("sandbox-ownership.json"), &ledger).unwrap();
         let result = migrate_old_names();
         assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let moved = atomics_home().display().to_string();
+        assert_eq!(
+            std::fs::read_to_string(atomics_home().join("sandbox-ownership.json")).unwrap(),
+            format!("{{\"pins\": \"{moved}/git-pins\", \"home\": \"{moved}\", \"other\": \"{}x\"}}", legacy.display())
+        );
         assert_eq!(result.moved.len(), 2);
         assert_eq!(std::fs::read_to_string(plan_file()).unwrap(), "plan");
         assert_eq!(std::fs::read_to_string(config_file()).unwrap(), "config");
