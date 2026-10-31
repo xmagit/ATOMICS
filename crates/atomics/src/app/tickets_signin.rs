@@ -43,6 +43,7 @@ impl SignUi {
         self.oauth.clone().unwrap_or_else(OAuth::current)
     }
 
+    #[cfg(test)]
     pub(super) fn override_oauth(&mut self, oauth: OAuth) {
         self.oauth = Some(oauth);
         self.state = None;
@@ -190,7 +191,7 @@ impl Desktop<'_> {
         let host = ticket_signin::host_of(&config.server);
         ui.add_space(10.0);
         if !config.server.uses_oauth() {
-            ui.label(RichText::new(format!("{} needs a sign-in", config.system)).strong().color(p.warning));
+            ui.label(RichText::new(format!("{} is not signed in", config.system)).strong().color(p.warning));
             ui.label("Set oauth = true under [tickets.server] to sign in with the browser from here.");
             if ui.small_button("Try again").clicked() {
                 self.runtime.tickets.panel.signin = false;
@@ -201,7 +202,8 @@ impl Desktop<'_> {
             self.signing_in(ui, p);
             return;
         }
-        ui.label(RichText::new(format!("Sign in to {} to search, read and plan from its tickets.", config.system)).strong());
+        ui.label(RichText::new(format!("{} is not signed in", config.system)).strong().color(p.warning));
+        ui.label(format!("Sign in to {} to search, read and plan from its tickets.", config.system));
         ui.add_space(6.0);
         ui.horizontal_wrapped(|ui| {
             if ui.button("Sign in with the browser").clicked() {
@@ -314,7 +316,7 @@ mod tests {
 
     fn pump(app: &mut Desktop<'_>, until: impl Fn(&State) -> bool) {
         let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(20));
-        while !until(&app.runtime) {
+        while !until(app.runtime) {
             app.runtime.poll_signin();
             assert!(Instant::now() < deadline, "timed out");
             std::thread::sleep(Duration::from_millis(5));

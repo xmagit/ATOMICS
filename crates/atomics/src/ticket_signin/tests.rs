@@ -39,6 +39,14 @@ fn announced(job: &mut SignInJob) -> String {
     })
 }
 
+/// Waits for what the sign-in reported (a wrong paste, a browser that failed) while it keeps waiting.
+fn reported(job: &mut SignInJob, what: impl Fn(&Progress) -> Option<String>) -> String {
+    until(|| {
+        assert!(job.poll().is_none(), "the sign-in must keep waiting");
+        what(&job.progress)
+    })
+}
+
 fn finished(job: &mut SignInJob) -> Result<(), String> {
     until(|| job.poll())
 }
@@ -111,7 +119,7 @@ fn only_the_query_of_the_address_is_enough_and_a_wrong_issuer_is_refused() {
     let mut job = start(&oauth, &server);
     let end = browser_end(&announced(&mut job));
     job.paste(&end.replace(&end[..end.find('?').unwrap()], "").replace("iss=", "iss=https%3A%2F%2Fother.example&x="));
-    until(|| job.progress.rejected.clone());
+    reported(&mut job, |p| p.rejected.clone());
     assert!(job.progress.rejected.as_deref().unwrap().contains("issuer mismatch"));
     job.paste(end.split_once('?').unwrap().1);
     finished(&mut job).unwrap();
@@ -136,7 +144,7 @@ fn a_browser_that_cannot_open_leaves_the_address_to_paste() {
     // `machine` has a browser program that does not exist.
     let mut job = SignInJob::start(oauth.clone(), server.clone(), true, &crate::host::Wake::default());
     let url = announced(&mut job);
-    until(|| job.progress.browser_failed.clone());
+    reported(&mut job, |p| p.browser_failed.clone());
     job.paste(&browser_end(&url));
     finished(&mut job).unwrap();
 }
@@ -244,14 +252,15 @@ fn no_token_or_client_secret_reaches_doctor_output_plan_files_errors_or_messages
     job.paste(&end.replace("code=", "code=SECRET-CODE&state=x&c="));
     job.paste(&end.replace("/callback", "/elsewhere"));
     job.paste("code=ABC");
-    until(|| job.progress.rejected.clone().filter(|why| why.contains("state")));
+    reported(&mut job, |p| p.rejected.clone().filter(|why| why.contains("state")));
     outputs.push(job.progress.rejected.clone().unwrap());
     job.paste(&end);
     finished(&mut job).unwrap();
 
-    outputs.push(doctor_line(&oauth, &config).unwrap());
-    assert!(outputs[1].starts_with("✓ credential MCP sign-in (127.0.0.1): present"), "{}", outputs[1]);
-    assert!(outputs[1].ends_with("(values hidden)"));
+    let line = doctor_line(&oauth, &config).unwrap();
+    assert!(line.starts_with("✓ credential MCP sign-in (127.0.0.1): present"), "{line}");
+    assert!(line.ends_with("(values hidden)"));
+    outputs.push(line);
     outputs.push(format!("{:?}", SignState::of(&oauth, &server)));
 
     // Secrets as the server and the keychain hold them.
