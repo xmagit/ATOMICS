@@ -93,7 +93,7 @@ fn stage_chip(ui: &mut egui::Ui, stage: Option<&atomics_core::workflow::Stage>) 
     }
 }
 
-fn task_color(status: TaskStatus, p: &Palette) -> Color32 {
+pub(super) fn task_color(status: TaskStatus, p: &Palette) -> Color32 {
     match status {
         TaskStatus::Planned => p.muted,
         TaskStatus::Running => p.accent,

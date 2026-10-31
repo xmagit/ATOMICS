@@ -29,6 +29,8 @@ enum Kind {
     Comment,
     /// Creating a ticket for a slot, at the slot's generation when requested.
     Create(u64),
+    /// A read for the Tickets panel, at the panel's request number when sent.
+    Panel(super::tickets_panel::Job, u64),
 }
 
 type Done = (Tag, Result<TicketOutput, String>);
@@ -61,6 +63,8 @@ pub(super) struct Tickets {
     /// How often each slot's link was set by request, so a late create result never
     /// replaces a link set after it was asked for.
     generations: HashMap<LinkKey, u64>,
+    /// What the Tickets panel shows.
+    pub(super) panel: super::tickets_panel::TicketsPanel,
 }
 
 /// A control request answered once all of its ticket jobs are done.
@@ -99,6 +103,7 @@ impl Tickets {
             batches: HashMap::new(),
             next_batch: 0,
             generations: HashMap::new(),
+            panel: Default::default(),
         }
     }
 }
@@ -261,7 +266,7 @@ impl State {
         }
     }
 
-    fn send_ticket(&mut self, config: &Arc<TicketConfig>, op: TicketOp, tag: Tag) {
+    pub(super) fn send_ticket(&mut self, config: &Arc<TicketConfig>, op: TicketOp, tag: Tag) {
         if let Some(batch) = tag.batch.and_then(|id| self.tickets.batches.get_mut(&id)) {
             batch.pending += 1;
         }
@@ -358,7 +363,22 @@ impl State {
         changed
     }
 
+    /// A tag for a job whose answer belongs to the Tickets panel alone.
+    pub(super) fn panel_tag(&self, config: &TicketConfig, job: super::tickets_panel::Job, seq: u64) -> Tag {
+        Tag {
+            key: (String::new(), None),
+            ticket: String::new(),
+            system: config.system.clone(),
+            kind: Kind::Panel(job, seq),
+            batch: None,
+        }
+    }
+
     fn finish_ticket(&mut self, tag: Tag, result: Result<TicketOutput, String>) {
+        if let Kind::Panel(job, seq) = tag.kind {
+            self.panel_result(job, seq, result);
+            return;
+        }
         match &tag.kind {
             Kind::Refresh | Kind::List => {
                 self.tickets.refreshing.remove(&tag.key);
@@ -366,7 +386,7 @@ impl State {
             Kind::State(_) => {
                 self.tickets.pushing.remove(&tag.key);
             }
-            Kind::Read | Kind::Comment | Kind::Create(_) => {}
+            Kind::Read | Kind::Comment | Kind::Create(_) | Kind::Panel(..) => {}
         }
         let error = match (tag.kind.clone(), result) {
             (Kind::Read, Ok(TicketOutput::Read(value))) => {
@@ -436,6 +456,7 @@ impl State {
                     }
                     Kind::Comment => "commenting failed".into(),
                     Kind::Create(_) => "creating the ticket failed".into(),
+                    Kind::Panel(..) => "reading tickets failed".into(),
                 };
                 let message = format!("{what}: {err}");
                 if !matches!(kind, Kind::Create(_)) {
@@ -456,7 +477,7 @@ impl State {
     }
 
     /// Where ticket errors are stored on a link or returned to a caller.
-    fn scrub(&self, error: &str) -> String {
+    pub(super) fn scrub(&self, error: &str) -> String {
         self.cleaner().error(error)
     }
 

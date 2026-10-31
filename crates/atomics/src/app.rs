@@ -61,6 +61,7 @@ mod sessions;
 mod sidebar;
 mod themes;
 mod tickets;
+mod tickets_panel;
 mod topbar;
 mod voice;
 mod workflow;
@@ -323,6 +324,8 @@ enum PanelMode {
     Editor,
     /// The orchestrator's plan board.
     Plan,
+    /// Find and read tickets from the configured ticket system.
+    Tickets,
 }
 
 /// A status change, kept so `wait` can answer "what happened since cursor N".
@@ -1665,7 +1668,8 @@ impl Desktop<'_> {
             && self.runtime.plans[self.runtime.selected_plan].status != PlanStatus::Open;
         let diff_open = !history_board
             && self.runtime.diff_open
-            && (self.runtime.diff_target().is_some() || self.runtime.panel == PanelMode::Plan);
+            && (self.runtime.diff_target().is_some()
+                || matches!(self.runtime.panel, PanelMode::Plan | PanelMode::Tickets));
         let layout_config =
             layout::LayoutConfig { diff_width: self.client.split, ..self.runtime.config.layout.clone() };
         let visible = if history_board { Vec::new() } else { self.runtime.visible_sessions() };

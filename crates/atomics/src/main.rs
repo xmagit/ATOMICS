@@ -10,6 +10,8 @@ mod connections;
 mod crash;
 mod credentials;
 mod diff_view;
+mod markdown;
+mod panel_nav;
 mod diff_worker;
 mod doctor;
 mod governor;

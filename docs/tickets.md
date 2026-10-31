@@ -240,6 +240,50 @@ Without `read`, the card uses the complete `get` output: string fields called `d
 `content` become markdown, and remaining fields become a key/value table. Mapped optional operations
 whose tools are absent produce doctor notes; they do not make an otherwise usable profile fail.
 
+## The Tickets panel
+
+`cmd+k` (Ctrl+Shift+K elsewhere; `cmd+j` already jumps to the next agent that needs you) shows the Tickets
+panel in the diff's slot. It appears when `[tickets]` is configured and has two views. The key is
+`[keys] toggle_tickets`.
+
+**Find** has a query box and, when both `search` and `semantic_search` are mapped, a *meaning / keyword*
+toggle (`Tab` in the box). Each result shows its key, title, state chip, assignee and kind, a score bar when
+the result has a `score`, and the `snippet` line when it is mapped. The bar is relative: it is scaled from the
+lowest to the highest score of that result set (one result, or equal scores, fill the bar) and the raw number
+is printed beside it; scores of different searches are not comparable. State chips use the system's own names
+and are coloured only for states in `[tickets.states]`. A system with only `search` shows the same list
+without bars or toggle.
+
+**Read** shows one ticket: the description as markdown (headings, lists, code, bold, inline code and links;
+images are links), then comments (long ones are cut to 12 lines; `Enter` expands), **Children** and
+**Related** from the `children` and `related` operations, and development links as chips in the header. A
+section whose operation is not mapped says so in one muted line instead of disappearing silently. Ticket text
+is data: links open in the browser only as cleaned `http(s)` addresses, and nothing in a ticket is executed or
+sent anywhere. Without a `read` operation the panel reads with `get`, and shows its unmapped fields as a table.
+Opening a child or related ticket adds it to the breadcrumbs.
+
+| Keys | In Find | In Read |
+| --- | --- | --- |
+| `cmd+k` | open / close the panel | same |
+| `Ctrl+1…9` (`Cmd+1…9`) | select agent N; Find stays in Find | select agent N and show its task's ticket (the chief and untasked agents show the plan's) |
+| `Shift+↓` / `Shift+↑` | next / previous result | next / previous ticket: the following result, or on a trail of opened tickets (`↑` only) the one before. Ignored in a text field and in the editor |
+| `↑` `↓` | move the selection (`↓` in the box enters the list) | scroll a line |
+| `PageUp` / `PageDown` | scroll a page | next / previous section: description parts, comments, each child, each related ticket |
+| `Home` / `End` | first / last result | top / bottom |
+| `Enter` | search (in the box), read (on a result) | open the selected child or related ticket; expand a comment |
+| `Alt+←` | | back along the breadcrumbs, then to the results |
+| `Tab` (in the box) | toggle meaning / keyword | |
+| `Esc` | leave the box; again, return to the terminal | return to the terminal |
+
+The sidebar gets a **TICKETS** section: in a plan's view its ticket tree (the plan's ticket, each task's
+ticket and, in board mode, the board's tickets without a task), elsewhere a *Find tickets…* row and the last
+five tickets read. A click opens the ticket in Read. A plan's tab shows its ticket's key and progress
+(`KEY · 2/6`, or `KEY · planning…` while it has no tasks) instead of its goal.
+
+When the ticket system says it needs a sign-in, the panel shows a "not signed in" banner (and a dot on the
+top-bar entry) instead of an error. Signing in from the panel arrives with the sign-in task; until then the
+button is disabled.
+
 ## What happens when
 
 | When | What ATOMICS does |
