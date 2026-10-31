@@ -60,6 +60,9 @@ impl Desktop<'_> {
             {
                 self.runtime.diff_open = true;
                 self.runtime.panel = PanelMode::Diff;
+                self.client.focus_terminal = None;
+                self.client.focus_editor = false;
+                ctx.memory_mut(|m| m.request_focus(diff_view::focus_id()));
                 if let Some((path, _)) = self.client.diff_views.entry(root.clone()).or_default().step(step) {
                     self.open_file(&root, &path);
                 }
@@ -106,13 +109,38 @@ impl Desktop<'_> {
         {
             let modifiers = if cfg!(target_os = "macos") { egui::Modifiers::MAC_CMD } else { egui::Modifiers::CTRL };
             let chord = egui::KeyboardShortcut::new(modifiers, key);
-            // Command+N on macOS, Ctrl+N elsewhere: focus the Nth visible agent and its diff.
+            // Command+N on macOS, Ctrl+N elsewhere: focus the Nth agent's diff or editor.
             let visible = self.runtime.visible_sessions();
             if ctx.input_mut(|i| crate::theme::consume_physical_shortcut(i, &chord))
                 && let Some(id) = visible.get(n).map(|&i| self.runtime.sessions[i].id.clone())
             {
                 self.activate(&id, true);
-                self.runtime.panel = PanelMode::Diff;
+                self.client.focus_terminal = None;
+                if self.runtime.panel == PanelMode::Editor {
+                    self.client.focus_editor = true;
+                } else {
+                    self.client.focus_editor = false;
+                    self.runtime.panel = PanelMode::Diff;
+                    ctx.memory_mut(|m| m.request_focus(diff_view::focus_id()));
+                }
+            }
+        }
+        if ctx.memory(|m| m.has_focus(diff_view::focus_id())) {
+            let escape = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape));
+            let typing = ctx.input(|i| {
+                i.events
+                    .iter()
+                    .any(|e| matches!(e, egui::Event::Text(text) | egui::Event::Paste(text) if !text.is_empty()))
+            });
+            if self.client.focus_editor {
+                ctx.memory_mut(|m| m.surrender_focus(diff_view::focus_id()));
+            } else if escape || typing || !self.runtime.diff_open || self.runtime.panel != PanelMode::Diff {
+                ctx.memory_mut(|m| m.surrender_focus(diff_view::focus_id()));
+                self.client.focus_terminal = self.runtime.active.clone();
+                // At the smallest window size the diff covers the terminal entirely.
+                if self.runtime.last_layout.is_some_and(|l| l.diff == DiffPlacement::Full) {
+                    self.runtime.diff_open = false;
+                }
             }
         }
     }
@@ -450,12 +478,14 @@ mod tests {
         ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
             app.shortcuts(ui.ctx());
             ui.interact(ui.max_rect(), focused, Sense::click());
+            ui.interact(ui.max_rect(), diff_view::focus_id(), Sense::focusable_noninteractive());
             // TerminalView reads this queue after the application shortcuts.
             remaining = ui.input(|input| input.events.clone());
         })
         .drop_without_applying_deltas();
         ctx.run_ui(egui::RawInput { events: releases, ..Default::default() }, |ui| {
             ui.interact(ui.max_rect(), focused, Sense::click());
+            ui.interact(ui.max_rect(), diff_view::focus_id(), Sense::focusable_noninteractive());
         })
         .drop_without_applying_deltas();
         app.runtime.drain_actions();
@@ -501,7 +531,14 @@ mod tests {
                     route(app, ctx, focused, vec![key(Key::Exclamationmark, digit, modifiers), ordinary.clone()]);
                 assert_eq!(app.runtime.active.as_deref(), Some(format!("agent-{}", n + 1).as_str()));
                 assert_eq!(app.runtime.diff_target(), Some(project.join(format!("task-{}", n + 1))));
-                assert!(app.runtime.diff_open && app.runtime.panel == PanelMode::Diff);
+                assert!(app.runtime.diff_open);
+                if n % 3 == 1 {
+                    assert!(app.runtime.panel == PanelMode::Editor && app.client.focus_editor);
+                } else {
+                    assert!(app.runtime.panel == PanelMode::Diff);
+                    assert!(ctx.memory(|m| m.has_focus(diff_view::focus_id())));
+                }
+                assert!(app.client.focus_terminal.is_none());
                 assert_eq!(remaining, [ordinary], "only the agent shortcut is withheld from the terminal");
             }
             let symbols =
@@ -558,7 +595,7 @@ mod tests {
                 assert_eq!(app.client.diff_views[&root].focused.as_deref(), Some(path));
                 assert!(app.runtime.diff_open && app.runtime.panel == PanelMode::Diff);
                 assert_eq!(remaining, [ordinary], "Shift+arrows must not reach the focused agent terminal");
-                assert!(ctx.memory(|memory| memory.has_focus(terminal)));
+                assert!(ctx.memory(|memory| memory.has_focus(diff_view::focus_id())));
             }
             for focused in [editor, egui::Id::NULL.with("text-field")] {
                 if focused != editor {
@@ -572,6 +609,303 @@ mod tests {
             }
             let modified = key(Key::ArrowDown, Key::ArrowDown, egui::Modifiers::SHIFT | egui::Modifiers::ALT);
             assert_eq!(route(app, ctx, terminal, vec![modified.clone()]), [modified]);
+        });
+    }
+
+    fn diff_agent(app: &mut Desktop<'_>, root: &Path, id: &str) {
+        std::fs::create_dir_all(root).unwrap();
+        let terminal = Terminal::spawn(
+            app.runtime.wake.clone(),
+            app.runtime.palette.terminal_colors(),
+            "/bin/sh".into(),
+            vec!["-c".into(), "stty raw -echo; printf ready; exec cat > input.bin".into()],
+            root,
+            HashMap::new(),
+            100,
+        )
+        .unwrap();
+        let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(3));
+        while !terminal.screen_text(24).contains("ready") || !root.join("input.bin").exists() {
+            assert!(Instant::now() < deadline, "terminal did not start");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut agent = session(id, AgentKind::Generic, AgentStatus::Working, root);
+        agent.terminal = Some(terminal);
+        app.runtime.sessions.push(agent);
+        let text = (0..120).map(|n| format!("line {n}\n")).collect::<String>();
+        app.runtime.diffs.entry(root.to_path_buf()).or_default().prepared = Some(Arc::new(diff_view::Prepared {
+            diff: atomics_core::diff::WorktreeDiff {
+                files: ["first.rs", "second.rs"]
+                    .into_iter()
+                    .map(|path| atomics_core::diff::FileDiff::untracked(path.into(), &text))
+                    .collect(),
+                ..Default::default()
+            },
+            highlights: vec![],
+            longest_line: 8,
+            additions: 240,
+            deletions: 0,
+            all_files: Arc::default(),
+        }));
+        app.runtime.ungrouped = true;
+    }
+
+    /// Exercise the real terminal and diff widgets in the desktop's paint order.
+    fn diff_frame(app: &mut Desktop<'_>, ctx: &egui::Context, events: Vec<egui::Event>) -> f32 {
+        let releases = events
+            .iter()
+            .filter_map(|e| match e {
+                egui::Event::Key { key, physical_key, modifiers, .. } => Some(egui::Event::Key {
+                    key: *key,
+                    physical_key: *physical_key,
+                    pressed: false,
+                    repeat: false,
+                    modifiers: *modifiers,
+                }),
+                _ => None,
+            })
+            .collect();
+        let mut offset = 0.0;
+        for events in [events, releases] {
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1500.0, 800.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    app.sync_diffs();
+                    app.apply_client_events(ui.ctx());
+                    app.shortcuts(ui.ctx());
+                    let layout = layout::compute(
+                        480.0,
+                        760.0,
+                        app.runtime.sessions.len(),
+                        0,
+                        false,
+                        0.0,
+                        &app.runtime.config.layout,
+                    );
+                    let tiled = (0..layout.tiled).collect::<Vec<_>>();
+                    app.tiles(ui, Rect::from_min_size(Pos2::ZERO, vec2(480.0, 760.0)), &layout, &tiled);
+                    app.diff_panel(ui, Rect::from_min_max(pos2(480.0, 0.0), pos2(1500.0, 760.0)));
+                    let title = &app.runtime.sessions[app.runtime.active_index().unwrap()].title;
+                    let scroll_id = ui
+                        .scope_id()
+                        .with(egui::IdSalt::new("diff-panel"))
+                        .with(egui::IdSalt::new(("diff-rows", title.as_str())));
+                    if app.runtime.panel == PanelMode::Diff {
+                        offset = egui::scroll_area::State::load(ctx, scroll_id)
+                            .expect("diff scroll area must be rendered")
+                            .clamped_offset()
+                            .y;
+                    }
+                },
+            )
+            .drop_without_applying_deltas();
+            app.runtime.drain_actions();
+        }
+        offset
+    }
+
+    fn assert_received(root: &Path, expected: &[u8]) {
+        let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(3));
+        loop {
+            let actual = std::fs::read(root.join("input.bin")).unwrap();
+            if actual == expected {
+                return;
+            }
+            assert!(Instant::now() < deadline, "terminal received {actual:?}, expected {expected:?}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn assert_diff_keys(app: &mut Desktop<'_>, ctx: &egui::Context, root: &Path) {
+        assert!(ctx.memory(|m| m.has_focus(diff_view::focus_id())));
+        app.client.diff_views.get_mut(root).unwrap().open("first.rs");
+        let press = |app: &mut Desktop<'_>, key_code| {
+            diff_frame(app, ctx, vec![key(key_code, key_code, egui::Modifiers::NONE)])
+        };
+        let down = press(app, Key::PageDown);
+        assert!(down > 500.0, "PageDown must scroll the diff by a page: {down}");
+        assert!(std::fs::read(root.join("input.bin")).unwrap().is_empty());
+        let line_down = press(app, Key::ArrowDown);
+        let line_up = press(app, Key::ArrowUp);
+        assert!(line_down > down && line_down - down < 40.0);
+        assert!((line_up - down).abs() < 1.0);
+        let end = press(app, Key::End);
+        assert!(end > down);
+        assert_eq!(press(app, Key::Home), 0.0);
+        assert!(press(app, Key::PageDown) > 0.0);
+        assert_eq!(press(app, Key::PageUp), 0.0);
+        press(app, Key::Escape);
+        assert!(!ctx.memory(|m| m.has_focus(diff_view::focus_id())));
+        diff_frame(app, ctx, vec![egui::Event::Text("escape returned".into())]);
+        assert_received(root, b"escape returned");
+
+        diff_frame(app, ctx, vec![key(Key::ArrowDown, Key::ArrowDown, egui::Modifiers::SHIFT)]);
+        assert!(ctx.memory(|m| m.has_focus(diff_view::focus_id())));
+        let second_start = press(app, Key::Home);
+        assert!(second_start > end, "Home must use the current file");
+        assert!(press(app, Key::End) > second_start);
+        diff_frame(
+            app,
+            ctx,
+            vec![key(Key::Exclamationmark, Key::Num1, egui::Modifiers::SHIFT), egui::Event::Text("!å".into())],
+        );
+        assert!(!ctx.memory(|m| m.has_focus(diff_view::focus_id())));
+        assert_received(root, "escape returned!å".as_bytes());
+
+        diff_frame(app, ctx, vec![key(Key::ArrowUp, Key::ArrowUp, egui::Modifiers::SHIFT)]);
+        let pos = pos2(100.0, 100.0 + app.runtime.active_index().unwrap() as f32 * 380.0);
+        diff_frame(
+            app,
+            ctx,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        diff_frame(
+            app,
+            ctx,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(!ctx.memory(|m| m.has_focus(diff_view::focus_id())));
+        diff_frame(app, ctx, vec![egui::Event::Text("click".into())]);
+        assert_received(root, "escape returned!åclick".as_bytes());
+    }
+
+    #[test]
+    fn shift_arrow_focus_routes_diff_keys_and_returns_terminal_input() {
+        with_app("app::input::tests::shift_arrow_focus_routes_diff_keys_and_returns_terminal_input", |app, ctx| {
+            for split in [DiffSplit::Never, DiffSplit::Always] {
+                app.runtime.sessions.clear();
+                let dir = crate::test_support::tempdir().unwrap();
+                diff_agent(app, dir.path(), "agent");
+                app.runtime.active = Some("agent".into());
+                app.client.diff_split = Some(split);
+                app.client.focus_terminal = Some("agent".into());
+                diff_frame(app, ctx, vec![]);
+                diff_frame(app, ctx, vec![key(Key::ArrowDown, Key::ArrowDown, egui::Modifiers::SHIFT)]);
+                assert_diff_keys(app, ctx, dir.path());
+            }
+        });
+    }
+
+    #[test]
+    fn agent_chord_focuses_selected_diff_and_routes_page_down() {
+        with_app("app::input::tests::agent_chord_focuses_selected_diff_and_routes_page_down", |app, ctx| {
+            for split in [DiffSplit::Never, DiffSplit::Always] {
+                app.runtime.sessions.clear();
+                let dir = crate::test_support::tempdir().unwrap();
+                let first = dir.path().join("first");
+                let second = dir.path().join("second");
+                diff_agent(app, &first, "first");
+                diff_agent(app, &second, "second");
+                app.runtime.active = Some("first".into());
+                app.client.diff_split = Some(split);
+                app.client.focus_terminal = Some("first".into());
+                diff_frame(app, ctx, vec![]);
+                let modifiers =
+                    if cfg!(target_os = "macos") { egui::Modifiers::MAC_CMD } else { egui::Modifiers::CTRL };
+                diff_frame(app, ctx, vec![key(Key::Num2, Key::Num2, modifiers)]);
+                assert_eq!(app.runtime.active.as_deref(), Some("second"));
+                assert_eq!(app.runtime.diff_target().as_deref(), Some(second.as_path()));
+                assert_diff_keys(app, ctx, &second);
+                assert_received(&first, b"");
+            }
+        });
+    }
+
+    #[test]
+    fn agent_chord_focuses_editor_and_preserves_its_keys() {
+        with_app("app::input::tests::agent_chord_focuses_editor_and_preserves_its_keys", |app, ctx| {
+            let dir = crate::test_support::tempdir().unwrap();
+            let first = dir.path().join("first");
+            let second = dir.path().join("second");
+            diff_agent(app, &first, "first");
+            diff_agent(app, &second, "second");
+            let editor = Terminal::spawn(
+                app.runtime.wake.clone(),
+                app.runtime.palette.terminal_colors(),
+                "/bin/sh".into(),
+                vec!["-c".into(), "stty raw -echo; printf ready; exec cat > editor.bin".into()],
+                &second,
+                HashMap::new(),
+                100,
+            )
+            .unwrap();
+            let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(3));
+            while !editor.screen_text(24).contains("ready") || !second.join("editor.bin").exists() {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            app.runtime.editors.insert(second.clone(), editor);
+            app.runtime.active = Some("first".into());
+            diff_frame(app, ctx, vec![key(Key::ArrowDown, Key::ArrowDown, egui::Modifiers::SHIFT)]);
+            app.runtime.panel = PanelMode::Editor;
+            let modifiers = if cfg!(target_os = "macos") { egui::Modifiers::MAC_CMD } else { egui::Modifiers::CTRL };
+            diff_frame(
+                app,
+                ctx,
+                vec![key(Key::Num2, Key::Num2, modifiers), key(Key::PageDown, Key::PageDown, egui::Modifiers::NONE)],
+            );
+            assert_eq!(app.runtime.active.as_deref(), Some("second"));
+            assert!(app.runtime.panel == PanelMode::Editor);
+            assert!(ctx.memory(|m| m.has_focus(app.client.editor_id.unwrap())));
+            for code in [Key::ArrowDown, Key::ArrowUp, Key::PageUp, Key::Home, Key::End, Key::Escape] {
+                diff_frame(app, ctx, vec![key(code, code, egui::Modifiers::NONE)]);
+            }
+            diff_frame(app, ctx, vec![egui::Event::Text("editor".into())]);
+            let expected = b"\x1b[6~\x1b[B\x1b[A\x1b[5~\x1b[H\x1b[F\x1beditor";
+            loop {
+                let actual = std::fs::read(second.join("editor.bin")).unwrap();
+                if actual == expected {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "editor received {actual:?}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_received(&first, b"");
+            assert_received(&second, b"");
+        });
+    }
+
+    #[test]
+    fn typing_in_a_full_diff_reveals_terminal_without_losing_text() {
+        with_app("app::input::tests::typing_in_a_full_diff_reveals_terminal_without_losing_text", |app, ctx| {
+            let dir = crate::test_support::tempdir().unwrap();
+            diff_agent(app, dir.path(), "agent");
+            app.runtime.active = Some("agent".into());
+            let mut frame = |events| {
+                ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(600.0, 400.0))),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| app.paint(ui),
+                )
+                .drop_without_applying_deltas();
+                app.runtime.drain_actions();
+            };
+            frame(vec![key(Key::ArrowDown, Key::ArrowDown, egui::Modifiers::SHIFT)]);
+            frame(vec![]);
+            assert!(ctx.memory(|m| m.has_focus(diff_view::focus_id())));
+            frame(vec![egui::Event::Text("small window".into())]);
+            assert!(!app.runtime.diff_open);
+            assert_received(dir.path(), b"small window");
         });
     }
 }

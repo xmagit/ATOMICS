@@ -203,6 +203,50 @@ pub struct Header<'a> {
     pub editor_shortcut: &'a str,
 }
 
+pub fn focus_id() -> egui::Id {
+    egui::Id::NULL.with("diff-keyboard")
+}
+
+/// Scroll only the focused diff; leave text fields and terminal modifiers alone.
+fn keyboard_scroll(
+    ui: &egui::Ui,
+    id: egui::Id,
+    row_h: f32,
+    file: std::ops::Range<usize>,
+    jump: Option<f32>,
+) -> Option<f32> {
+    if !ui.memory(|m| m.has_focus(focus_id())) {
+        return jump;
+    }
+    let mut offset = jump.unwrap_or_else(|| {
+        egui::scroll_area::State::load(ui.ctx(), id).map(|s| s.clamped_offset().y).unwrap_or_default()
+    });
+    let height = ui.available_height();
+    let page = (height - row_h).max(row_h);
+    let mut moved = false;
+    ui.input_mut(|i| {
+        i.events.retain(|event| {
+            let egui::Event::Key { key, pressed: true, modifiers, .. } = event else { return true };
+            if !modifiers.is_none() {
+                return true;
+            }
+            offset = match key {
+                Key::ArrowUp => offset - row_h,
+                Key::ArrowDown => offset + row_h,
+                Key::PageUp => offset - page,
+                Key::PageDown => offset + page,
+                Key::Home => file.start as f32 * row_h,
+                Key::End => (file.end as f32 * row_h - height).max(file.start as f32 * row_h),
+                _ => return true,
+            };
+            offset = offset.max(0.0);
+            moved = true;
+            false
+        });
+    });
+    if moved { Some(offset) } else { jump }
+}
+
 pub fn show(
     ui: &mut egui::Ui,
     rect: Rect,
@@ -211,6 +255,15 @@ pub fn show(
     palette: &Palette,
     font: &FontId,
 ) -> DiffAction {
+    let focus = ui.interact(rect, focus_id(), Sense::focusable_noninteractive());
+    if focus.has_focus() {
+        ui.memory_mut(|m| {
+            m.set_focus_lock_filter(
+                focus_id(),
+                egui::EventFilter { vertical_arrows: true, escape: true, ..Default::default() },
+            );
+        });
+    }
     let mut action = DiffAction::None;
     let mut split = header.split.split(rect.width());
     ui.painter().rect_filled(rect, 0.0, palette.background);
@@ -408,8 +461,17 @@ pub fn show(
             state.top.filter(|&(_, was)| was != split).and_then(|(line, _)| rows.iter().position(|r| r.shows(line)))
         }
     };
-    if let Some(row) = jump {
-        scroll = scroll.vertical_scroll_offset(row as f32 * row_h);
+    let current = state
+        .focused
+        .as_deref()
+        .and_then(|path| diff.files.iter().position(|file| file.path() == path))
+        .or_else(|| state.top.map(|((fi, _, _), _)| fi))
+        .unwrap_or(0)
+        .min(file_rows.len() - 1);
+    let file = file_rows[current]..file_rows.get(current + 1).copied().unwrap_or(rows.len());
+    let scroll_id = ui.make_persistent_id(egui::IdSalt::new(("diff-rows", header.title)));
+    if let Some(offset) = keyboard_scroll(ui, scroll_id, row_h, file, jump.map(|row| row as f32 * row_h)) {
+        scroll = scroll.vertical_scroll_offset(offset);
     }
     let mut clicked_line: Option<(usize, usize, usize)> = None;
     let mut edit_line: Option<(String, Option<u32>)> = None;
@@ -666,58 +728,58 @@ fn show_file(ui: &mut egui::Ui, state: &mut DiffState, path: &str, palette: &Pal
     let (mut commit, mut cancel) = (false, false);
 
     ui.spacing_mut().item_spacing.y = 0.0;
-    egui::ScrollArea::both().id_salt(("file-rows", path)).auto_shrink([false, false]).show_rows(
-        ui,
-        row_h,
-        rows.len(),
-        |ui, range| {
-            for row in &rows[range] {
-                let (rect, response) = ui.allocate_exact_size(vec2(content_w, row_h), Sense::click());
-                let painter = ui.painter();
-                let text_pos = |x: f32| pos2(rect.left() + x, rect.top() + 1.5);
-                match *row {
-                    Row::FileLine(i) => {
-                        if response.hovered() {
-                            painter.rect_filled(rect, 0.0, palette.hover());
-                            painter.text(
-                                text_pos(char_w * 7.0),
-                                egui::Align2::LEFT_TOP,
-                                "💬",
-                                font.clone(),
-                                palette.accent,
-                            );
-                        }
-                        let number = format!("{:>6}", i + 1);
-                        painter.text(text_pos(0.0), egui::Align2::LEFT_TOP, number, font.clone(), palette.muted);
-                        let spans = file.highlights.get(i).map(Vec::as_slice).unwrap_or(&[]);
-                        let job = line_job(&file.lines[i], spans, &[], palette.background, font, palette);
-                        let galley = ui.fonts_mut(|f| f.layout_job(job));
-                        ui.painter().galley(text_pos(gutter), galley, palette.foreground);
-                        if response.double_clicked() {
-                            double_clicked = Some(i);
-                        } else if response.clicked() {
-                            clicked = Some(i);
-                        }
+    let mut scroll = egui::ScrollArea::both().id_salt(("file-rows", path)).auto_shrink([false, false]);
+    let scroll_id = ui.make_persistent_id(egui::IdSalt::new(("file-rows", path)));
+    if let Some(offset) = keyboard_scroll(ui, scroll_id, row_h, 0..rows.len(), None) {
+        scroll = scroll.vertical_scroll_offset(offset);
+    }
+    scroll.show_rows(ui, row_h, rows.len(), |ui, range| {
+        for row in &rows[range] {
+            let (rect, response) = ui.allocate_exact_size(vec2(content_w, row_h), Sense::click());
+            let painter = ui.painter();
+            let text_pos = |x: f32| pos2(rect.left() + x, rect.top() + 1.5);
+            match *row {
+                Row::FileLine(i) => {
+                    if response.hovered() {
+                        painter.rect_filled(rect, 0.0, palette.hover());
+                        painter.text(
+                            text_pos(char_w * 7.0),
+                            egui::Align2::LEFT_TOP,
+                            "💬",
+                            font.clone(),
+                            palette.accent,
+                        );
                     }
-                    Row::Comment(i) => {
-                        let comment = &state.comments[i];
-                        comment_row(painter, rect, response.hovered(), gutter, char_w, comment, font, palette);
-                        if response.clicked() {
-                            delete = Some(i);
-                        }
+                    let number = format!("{:>6}", i + 1);
+                    painter.text(text_pos(0.0), egui::Align2::LEFT_TOP, number, font.clone(), palette.muted);
+                    let spans = file.highlights.get(i).map(Vec::as_slice).unwrap_or(&[]);
+                    let job = line_job(&file.lines[i], spans, &[], palette.background, font, palette);
+                    let galley = ui.fonts_mut(|f| f.layout_job(job));
+                    ui.painter().galley(text_pos(gutter), galley, palette.foreground);
+                    if response.double_clicked() {
+                        double_clicked = Some(i);
+                    } else if response.clicked() {
+                        clicked = Some(i);
                     }
-                    Row::Editor => {
-                        if let Some(editor) = state.editor.as_mut() {
-                            let (c, x) = editor_row(ui, rect, gutter, char_w, editor, font);
-                            commit |= c;
-                            cancel |= x;
-                        }
-                    }
-                    _ => {}
                 }
+                Row::Comment(i) => {
+                    let comment = &state.comments[i];
+                    comment_row(painter, rect, response.hovered(), gutter, char_w, comment, font, palette);
+                    if response.clicked() {
+                        delete = Some(i);
+                    }
+                }
+                Row::Editor => {
+                    if let Some(editor) = state.editor.as_mut() {
+                        let (c, x) = editor_row(ui, rect, gutter, char_w, editor, font);
+                        commit |= c;
+                        cancel |= x;
+                    }
+                }
+                _ => {}
             }
-        },
-    );
+        }
+    });
 
     if let Some(i) = delete {
         state.comments.remove(i);

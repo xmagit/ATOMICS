@@ -362,15 +362,16 @@ impl Desktop<'_> {
             }
             match &mut session.terminal {
                 Some(terminal) => {
+                    // Focus before reading this frame's events, including the key that left the diff.
+                    if focus_request.as_deref() == Some(session.id.as_str()) {
+                        ui.memory_mut(|m| m.request_focus(term_id));
+                    }
                     let response = self
                         .client
                         .terminal_views
                         .entry(term_id)
                         .or_default()
                         .show(terminal, ui, body, term_id, &metrics, &p);
-                    if focus_request.as_deref() == Some(session.id.as_str()) {
-                        response.request_focus();
-                    }
                     if (response.clicked() || response.gained_focus()) && !active {
                         activate = Some((session.id.clone(), false));
                     }

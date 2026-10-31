@@ -319,11 +319,11 @@ impl Desktop<'_> {
         let focus = self.client.focus_terminal.as_deref() == Some(session.id.as_str());
         if let Some(terminal) = &mut session.terminal {
             let id = egui::Id::NULL.with(("chief-term", &session.id));
-            let response = self.client.terminal_views.entry(id).or_default().show(terminal, ui, rect, id, &metrics, &p);
             if focus {
-                response.request_focus();
+                ui.memory_mut(|m| m.request_focus(id));
                 self.client.focus_terminal = None;
             }
+            self.client.terminal_views.entry(id).or_default().show(terminal, ui, rect, id, &metrics, &p);
         }
     }
 }

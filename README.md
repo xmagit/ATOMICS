@@ -674,7 +674,7 @@ Tooltips and the settings menu show the actual platform chord, including custom 
 | `cmd+p` | go to file |
 | `cmd+e` | diff ⇄ editor |
 | `cmd+b` | plan board |
-| `shift+↓` / `shift+↑` | next / previous changed file (from anywhere but a text field or the editor) |
+| `shift+↓` / `shift+↑` | next / previous changed file and focus the diff (except in a text field or the editor); ↑/↓ scroll a line, PageUp/PageDown a page, Home/End the current file; Esc, typing, or clicking the terminal returns focus to it |
 | `cmd+d` | show/hide the diff |
 | `cmd+j` | next agent that needs you |
 | `cmd+l` | steer bar |
@@ -682,7 +682,7 @@ Tooltips and the settings menu show the actual platform chord, including custom 
 | `cmd+t` | new session (scratch folder, existing folder or new worktree) |
 | `cmd+r` | refresh diff |
 | `cmd+w` | close session |
-| `Command+1…9` (macOS) / `Ctrl+1…9` (Linux) | focus agent 1–9 on screen and show its diff |
+| `Command+1…9` (macOS) / `Ctrl+1…9` (Linux) | select agent 1–9 on screen and focus its diff, or its editor in editor mode |
 
 ## Design
 

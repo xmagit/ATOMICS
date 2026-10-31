@@ -222,11 +222,10 @@ impl Desktop<'_> {
         self.client.editor_id = Some(id);
         match self.runtime.editors.get_mut(root).filter(|e| !e.exited()) {
             Some(editor) => {
-                let response =
-                    self.client.terminal_views.entry(id).or_default().show(editor, ui, body, id, &metrics, &p);
                 if std::mem::take(&mut self.client.focus_editor) {
-                    response.request_focus();
+                    ui.memory_mut(|m| m.request_focus(id));
                 }
+                self.client.terminal_views.entry(id).or_default().show(editor, ui, body, id, &metrics, &p);
             }
             None => {
                 self.runtime.editors.remove(root);
