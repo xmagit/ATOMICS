@@ -538,10 +538,17 @@ impl State {
                 let quoted = |text: &str| serde_json::to_string(text).unwrap_or_default();
                 // Linux runtime storage is outside Codex's workspace and /tmp
                 // writable roots. Its compilers must be able to open our FIFO.
+                // A writable root, unlike --add-dir, applies only once Codex writes
+                // the workspace: in a folder it does not trust yet, Codex 0.166 quits
+                // on --add-dir before it can ask for trust.
                 if self.jobserver.is_some()
                     && let Some(runtime) = paths::runtime_dir_for(&paths::imacs_home())
                 {
-                    args.extend(["--add-dir".to_string(), runtime.join("jobserver").to_string_lossy().into_owned()]);
+                    let pool = runtime.join("jobserver");
+                    args.extend([
+                        "-c".to_string(),
+                        format!("sandbox_workspace_write.writable_roots=[{}]", quoted(&pool.to_string_lossy())),
+                    ]);
                 }
                 if codex == Some(true) {
                     if !args.iter().any(|arg| arg == "--no-daemon") {
@@ -1625,17 +1632,18 @@ fi
                 let args: Vec<_> = args.lines().collect();
                 if let Some(runtime) = paths::runtime_dir_for(&paths::imacs_home()) {
                     let pool = runtime.join("jobserver");
-                    assert!(args.windows(2).any(|pair| pair == ["--add-dir", pool.to_str().unwrap()]));
+                    let roots = format!("sandbox_workspace_write.writable_roots=[{:?}]", pool.to_str().unwrap());
+                    assert!(args.windows(2).any(|pair| pair == ["-c", roots.as_str()]));
+                    // Codex 0.166 quits on --add-dir in a folder it does not trust yet.
+                    assert!(!args.contains(&"--add-dir"));
                     // The default socket is a sibling of jobserver/, even when
                     // this test instance uses an explicit IMACS_SOCKET override.
-                    for pair in args.windows(2).filter(|pair| pair[0] == "--add-dir") {
-                        let writable = Path::new(pair[1]);
-                        assert!(!runtime.join("imacs.sock").starts_with(writable));
-                        assert!(!paths::socket_path().starts_with(writable));
-                        assert!(Jobserver::path_for(&paths::imacs_home()).starts_with(writable));
-                    }
+                    let writable = pool.as_path();
+                    assert!(!runtime.join("imacs.sock").starts_with(writable));
+                    assert!(!paths::socket_path().starts_with(writable));
+                    assert!(Jobserver::path_for(&paths::imacs_home()).starts_with(writable));
                 } else {
-                    assert!(!args.contains(&"--add-dir"));
+                    assert!(!args.iter().any(|arg| arg.starts_with("sandbox_workspace_write.")));
                 }
             }
             app.runtime.sessions.clear();
