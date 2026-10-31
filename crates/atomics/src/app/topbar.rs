@@ -186,6 +186,27 @@ impl Desktop<'_> {
                 }
             }
         }
+        if in_menu && let Some(server) = self.runtime.sign_server() {
+            let system = self.runtime.ticket_config().map(|c| c.system.clone()).unwrap_or_default();
+            let signed_in = self.runtime.tickets.sign.state() == Some(&crate::ticket_signin::SignState::SignedIn)
+                && !self.runtime.tickets.panel.signin;
+            let label = if signed_in { format!("Tickets: sign out of {system}") } else { format!("Tickets: sign in to {system}") };
+            if ui.button(label).clicked() {
+                if signed_in {
+                    self.runtime.start_sign_out();
+                } else {
+                    self.runtime.show_signin();
+                }
+                ui.close();
+            }
+            if signed_in
+                && server.url.is_some()
+                && ui.button(format!("Tickets: let sandboxed agents use {system}'s own tools")).clicked()
+            {
+                self.runtime.connect_ticket_server();
+                ui.close();
+            }
+        }
         let response = ui.menu_button("Project", |ui| self.project_menu(ui)).response;
         record_item(ui, "Project", &response);
         if show_load {

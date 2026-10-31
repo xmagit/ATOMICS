@@ -32,6 +32,7 @@ mod setup;
 mod statusline;
 mod terminal;
 mod theme;
+mod ticket_signin;
 mod tickets;
 mod usage;
 mod voice;
@@ -82,6 +83,11 @@ enum Command {
     },
     /// Check required tools, configuration and integrations
     Doctor,
+    /// Sign in to or out of the ticket system's MCP server (browser OAuth)
+    Tickets {
+        #[command(subcommand)]
+        command: TicketsCommand,
+    },
     /// Hook handler for Claude Code and Codex (reads the event on stdin)
     Hook {
         #[arg(long)]
@@ -135,6 +141,15 @@ enum Command {
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum TicketsCommand {
+    /// Sign in with the browser; on a machine without one, open the printed address elsewhere and paste back
+    /// the address the browser ends on
+    Login,
+    /// Revoke the sign-in where the server allows it and forget it on this machine
+    Logout,
 }
 
 #[derive(Subcommand)]
@@ -277,6 +292,9 @@ fn main() -> eframe::Result {
                 }
             }
             return Ok(());
+        }
+        Some(Command::Tickets { command }) => {
+            std::process::exit(ticket_signin::run_cli(matches!(command, TicketsCommand::Login), cli.workspace.as_deref()))
         }
         Some(Command::Doctor) => std::process::exit(doctor::run(cli.workspace.as_deref())),
         Some(Command::Hook { socket, pane }) => {

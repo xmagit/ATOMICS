@@ -589,15 +589,21 @@ impl Desktop<'_> {
             };
             ui.label(RichText::new(title).strong().color(p.foreground));
             if !system.is_empty() {
-                let (dot, text) = if self.runtime.tickets.panel.signin {
-                    (p.warning, format!("{system} · not signed in"))
+                let oauth_in = self.runtime.sign_server().is_some()
+                    && self.runtime.tickets.sign.state() == Some(&crate::ticket_signin::SignState::SignedIn);
+                if oauth_in && !self.runtime.tickets.panel.signin {
+                    self.signed_in_chip(ui, &p, &system);
                 } else {
-                    (p.success, system.clone())
-                };
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new(text).size(11.5).color(p.muted));
-                    ui.label(RichText::new("●").size(10.0).color(dot));
-                });
+                    let (dot, text) = if self.runtime.tickets.panel.signin {
+                        (p.warning, format!("{system} · not signed in"))
+                    } else {
+                        (p.success, system.clone())
+                    };
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(RichText::new(text).size(11.5).color(p.muted));
+                        ui.label(RichText::new("●").size(10.0).color(dot));
+                    });
+                }
             }
         });
         ui.separator();
@@ -610,6 +616,10 @@ impl Desktop<'_> {
             return;
         };
         if self.runtime.tickets.panel.signin {
+            self.signin_banner(ui, &config, &p);
+            return;
+        }
+        if self.runtime.tickets.sign.job.is_some() {
             self.signin_banner(ui, &config, &p);
             return;
         }
@@ -630,18 +640,6 @@ impl Desktop<'_> {
                     }
                 }
             }
-        }
-    }
-
-    /// Until the sign-in task lands, the panel only says the system needs a sign-in.
-    fn signin_banner(&mut self, ui: &mut egui::Ui, config: &TicketConfig, p: &Palette) {
-        ui.add_space(10.0);
-        ui.label(RichText::new(format!("{} is not signed in", config.system)).strong().color(p.warning));
-        ui.label("Sign in to search, read and plan from its tickets.");
-        ui.add_enabled(false, egui::Button::new("Sign in with the browser"))
-            .on_disabled_hover_text("Signing in from this panel is not available yet.");
-        if ui.small_button("Try again").clicked() {
-            self.runtime.tickets.panel.signin = false;
         }
     }
 

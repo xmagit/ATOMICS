@@ -9,6 +9,8 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use atomics_core::tickets::McpServer;
@@ -44,6 +46,38 @@ pub fn is_sign_in_required(error: &str) -> bool {
     error.starts_with(SIGN_IN_REQUIRED)
 }
 
+/// What a sign-in tells the person running it while it waits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignInEvent {
+    /// The authorization address, for the browser here or for any other machine's.
+    Authorize(String),
+    /// The browser could not be opened; the address can still be opened by hand.
+    BrowserFailed(String),
+    /// A pasted address was refused; the sign-in keeps waiting.
+    PasteRejected(String),
+}
+
+/// How a person steers one sign-in: cancel it, paste the address the browser ended on, and watch it.
+pub struct SignInControl<'a> {
+    pub cancel: &'a AtomicBool,
+    pub paste: &'a Receiver<String>,
+    pub notify: &'a dyn Fn(SignInEvent),
+    /// Open the browser here. Off on a machine that has none: the address is shown instead.
+    pub open_browser: bool,
+    /// Whether anything reads `paste`.
+    pub can_paste: bool,
+}
+
+/// What signing out did at the authorization server (RFC 7009).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Revocation {
+    Revoked,
+    /// The server publishes no revocation endpoint, or nothing was signed in.
+    NotOffered,
+    /// The local sign-out completed; the server could not be told. Free of any token.
+    Failed(String),
+}
+
 /// The sign-in API: `sign_in`, `sign_out` and `status` for one server, backed by the OS keychain.
 #[derive(Clone)]
 pub struct OAuth {
@@ -61,6 +95,9 @@ struct Tokens {
     resource: String,
     #[serde(default)]
     refresh_token: Option<String>,
+    /// RFC 7009, when the authorization server publishes one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    revocation_endpoint: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -82,6 +119,7 @@ struct AuthServer {
     authorization_endpoint: Url,
     token_endpoint: Url,
     registration_endpoint: Option<Url>,
+    revocation_endpoint: Option<Url>,
     iss_in_response: bool,
 }
 
@@ -122,22 +160,49 @@ impl OAuth {
             .unwrap_or_default()
     }
 
-    /// Forgets the server's tokens. The registered client stays cached for the next sign-in.
-    pub fn sign_out(&self, server: &McpServer) -> Result<(), McpError> {
+    /// Forgets the server's tokens, after telling the authorization server to revoke them (RFC 7009)
+    /// when it has an endpoint for that. The sign-out always completes locally; a revocation that
+    /// failed is reported, never fatal. The registered client stays cached for the next sign-in.
+    pub fn sign_out(&self, server: &McpServer) -> Result<Revocation, McpError> {
         let key = server_key(server).ok_or_else(|| McpError::Server("no MCP server url to sign out of".into()))?;
-        self.clear(&key)
+        let revocation = match self.load(&key) {
+            Ok(Some((tokens, access))) => revoke(&tokens, access.as_ref()),
+            _ => Revocation::NotOffered,
+        };
+        self.clear(&key)?;
+        Ok(revocation)
     }
 
-    /// Opens the system browser, waits for the authorization to come back and stores the tokens.
-    pub fn sign_in(&self, server: &McpServer, timeout: Duration) -> Result<(), McpError> {
-        self.sign_in_via(server, timeout, &|url| self.browser.open(url))
-    }
-
+    #[cfg(test)]
     pub(crate) fn sign_in_via(
         &self,
         server: &McpServer,
         timeout: Duration,
         open: &dyn Fn(&str) -> anyhow::Result<()>,
+    ) -> Result<(), McpError> {
+        let (cancel, (_keep, paste)) = (AtomicBool::new(false), std::sync::mpsc::channel());
+        let control = SignInControl { cancel: &cancel, paste: &paste, notify: &|_| {}, open_browser: true, can_paste: false };
+        self.sign_in_controlled(server, timeout, open, &control)
+    }
+
+    /// Signs in on a person's terms: the address is announced first, the browser is optional, a failed
+    /// browser leaves the address to open by hand, and the person may cancel or paste the address the
+    /// browser ended on.
+    pub(crate) fn sign_in_with(
+        &self,
+        server: &McpServer,
+        timeout: Duration,
+        control: &SignInControl,
+    ) -> Result<(), McpError> {
+        self.sign_in_controlled(server, timeout, &|url| self.browser.open(url), control)
+    }
+
+    fn sign_in_controlled(
+        &self,
+        server: &McpServer,
+        timeout: Duration,
+        open: &dyn Fn(&str) -> anyhow::Result<()>,
+        control: &SignInControl,
     ) -> Result<(), McpError> {
         let url = server.url.as_deref().map(str::trim).filter(|u| !u.is_empty());
         let url = url.ok_or_else(|| McpError::Server("sign-in needs an HTTP server: set server.url".into()))?;
@@ -189,8 +254,18 @@ impl OAuth {
                 query.append_pair("scope", scope);
             }
         }
-        open(authorize.as_str()).map_err(|err| McpError::Server(format!("could not open the browser: {err}")))?;
-        let code = await_callback(&listener, &state, &auth, self.callback_timeout)?;
+        (control.notify)(SignInEvent::Authorize(authorize.to_string()));
+        if control.open_browser
+            && let Err(err) = open(authorize.as_str())
+        {
+            let message = format!("could not open the browser: {err}");
+            (control.notify)(SignInEvent::BrowserFailed(message.clone()));
+            // Where the answer can be pasted back, the address announced above still works by hand.
+            if !control.can_paste {
+                return Err(McpError::Server(message));
+            }
+        }
+        let code = await_callback(&listener, &state, &auth, self.callback_timeout, control)?;
 
         // 4. Code exchange.
         let form = [
@@ -213,6 +288,7 @@ impl OAuth {
             token_endpoint: auth.token_endpoint.to_string(),
             resource: canonical_resource(&resource),
             refresh_token: grant.refresh_token,
+            revocation_endpoint: auth.revocation_endpoint.as_ref().map(Url::to_string),
         };
         self.save(&key, &tokens, &grant.access)
     }
@@ -513,6 +589,7 @@ fn authorization_server(agent: &ureq::Agent, issuer: &str) -> Result<AuthServer,
             authorization_endpoint: endpoint("authorization_endpoint")?,
             token_endpoint: endpoint("token_endpoint")?,
             registration_endpoint: meta["registration_endpoint"].as_str().and_then(|u| parse_secure(u).ok()),
+            revocation_endpoint: meta["revocation_endpoint"].as_str().and_then(|u| parse_secure(u).ok()),
             iss_in_response: meta["authorization_response_iss_parameter_supported"].as_bool() == Some(true),
         });
     }
@@ -553,10 +630,20 @@ fn await_callback(
     state: &str,
     auth: &AuthServer,
     timeout: Duration,
+    control: &SignInControl,
 ) -> Result<String, McpError> {
     listener.set_nonblocking(true).map_err(|e| McpError::Transport(e.to_string()))?;
     let deadline = Instant::now() + timeout;
     loop {
+        if control.cancel.load(Ordering::Relaxed) {
+            return Err(McpError::Server("sign-in cancelled".into()));
+        }
+        while let Ok(pasted) = control.paste.try_recv() {
+            match pasted_code(&pasted, state, auth) {
+                Ok(code) => return Ok(code),
+                Err(message) => (control.notify)(SignInEvent::PasteRejected(message)),
+            }
+        }
         let mut stream = match listener.accept() {
             Ok((stream, _)) => stream,
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
@@ -577,25 +664,7 @@ fn await_callback(
             continue;
         }
         let param = |name: &str| url.query_pairs().find(|(k, _)| k == name).map(|(_, v)| v.into_owned());
-        let verdict = (|| {
-            if param("state").as_deref() != Some(state) {
-                return Err("the sign-in answer did not match this request (state mismatch)".to_string());
-            }
-            match param("iss") {
-                Some(iss) if iss.trim_end_matches('/') != auth.issuer.trim_end_matches('/') => {
-                    return Err("the sign-in answer came from another authorization server (issuer mismatch)".into());
-                }
-                None if auth.iss_in_response => {
-                    return Err("the sign-in answer did not name its issuer (issuer mismatch)".into());
-                }
-                _ => {}
-            }
-            if let Some(error) = param("error") {
-                let error: String = error.chars().filter(|c| c.is_ascii_graphic()).take(60).collect();
-                return Err(format!("the authorization server answered {error}"));
-            }
-            param("code").filter(|c| !c.is_empty()).ok_or_else(|| "the sign-in answer had no code".to_string())
-        })();
+        let verdict = answer_code(param, state, auth);
         return match verdict {
             Ok(code) => {
                 let _ = page(&mut stream, "200 OK", "Signed in. You can close this tab and return to ATOMICS.");
@@ -606,6 +675,75 @@ fn await_callback(
                 Err(McpError::Server(message))
             }
         };
+    }
+}
+
+/// The code of an authorization answer, after checking `state` and `iss`. The messages are free of
+/// anything the answer carried.
+fn answer_code(param: impl Fn(&str) -> Option<String>, state: &str, auth: &AuthServer) -> Result<String, String> {
+    if param("state").as_deref() != Some(state) {
+        return Err("the sign-in answer did not match this request (state mismatch)".to_string());
+    }
+    match param("iss") {
+        Some(iss) if iss.trim_end_matches('/') != auth.issuer.trim_end_matches('/') => {
+            return Err("the sign-in answer came from another authorization server (issuer mismatch)".into());
+        }
+        None if auth.iss_in_response => {
+            return Err("the sign-in answer did not name its issuer (issuer mismatch)".into());
+        }
+        _ => {}
+    }
+    if let Some(error) = param("error") {
+        let error: String = error.chars().filter(|c| c.is_ascii_graphic()).take(60).collect();
+        return Err(format!("the authorization server answered {error}"));
+    }
+    param("code").filter(|c| !c.is_empty()).ok_or_else(|| "the sign-in answer had no code".to_string())
+}
+
+/// The code in an address pasted back from a browser on another machine: the whole
+/// `http://127.0.0.1:<port>/callback?code=…&state=…`, or just its query.
+fn pasted_code(pasted: &str, state: &str, auth: &AuthServer) -> Result<String, String> {
+    let text = pasted.trim();
+    let query = if text.contains("://") {
+        let url = Url::parse(text).map_err(|_| "that is not an address".to_string())?;
+        if url.path() != "/callback" {
+            return Err("that is not the address the browser ended on (it ends in /callback?code=…)".into());
+        }
+        url.query().unwrap_or_default().to_string()
+    } else {
+        text.rsplit_once('?').map_or(text, |(_, query)| query).trim_start_matches('?').to_string()
+    };
+    let pairs: Vec<(String, String)> = url::form_urlencoded::parse(query.as_bytes()).into_owned().collect();
+    answer_code(|name| pairs.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone()), state, auth)
+}
+
+/// RFC 7009: asks the authorization server to forget the refresh and access tokens. Best effort.
+fn revoke(tokens: &Tokens, access: Option<&Access>) -> Revocation {
+    let Some(endpoint) = tokens.revocation_endpoint.as_deref().and_then(|e| parse_secure(e).ok()) else {
+        return Revocation::NotOffered;
+    };
+    let agent = agent(Duration::from_secs(10));
+    let mut failed = false;
+    let sent = [
+        tokens.refresh_token.as_deref().map(|t| ("refresh_token", t)),
+        access.map(|a| a.token.as_str()).filter(|t| !t.is_empty()).map(|t| ("access_token", t)),
+    ];
+    let mut any = false;
+    for (hint, token) in sent.into_iter().flatten() {
+        any = true;
+        let form = [("token", token), ("token_type_hint", hint), ("client_id", tokens.client_id.as_str())];
+        let body = url::form_urlencoded::Serializer::new(String::new()).extend_pairs(form).finish();
+        let answer = agent
+            .post(endpoint.as_str())
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .send(body);
+        // RFC 7009 §2.2: 200 even for an unknown token. Anything else is a failure to report.
+        failed |= !matches!(answer, Ok(ref r) if r.status().is_success());
+    }
+    match (any, failed) {
+        (false, _) => Revocation::NotOffered,
+        (true, false) => Revocation::Revoked,
+        (true, true) => Revocation::Failed("the authorization server did not confirm the revocation".into()),
     }
 }
 
@@ -714,4 +852,4 @@ fn auth_param(challenge: &str, name: &str) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

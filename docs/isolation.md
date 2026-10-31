@@ -242,6 +242,12 @@ check, two sandboxed shells in an isolated ATOMICS with output and file sync, co
 
 ## Tickets and direct Linear access
 
+**One sign-in or two.** A ticket server that signs in with OAuth (`oauth = true`, [tickets.md](tickets.md#the-sign-in-in-the-app))
+needs one sign-in for everything ATOMICS does with tickets: ATOMICS's own, kept in the host's OS keychain and used on
+the host by the ticket worker, the chief's tools and the agents' scoped ticket tools. No sandbox or VM receives it. A
+sandboxed agent that should call the server's *own* tools directly through sbx's MCP gateway needs a second,
+independent sign-in (`sbx mcp auth`, kept by sbx on the host); ATOMICS offers it as a quiet extra and never requires it.
+
 ATOMICS's ticket layer stays on the **host** in both modes. Its existing ticket configuration and
 credentials do not need to be copied into a VM. Scoped ticket tools and reports reach the host
 through the per-sandbox ATOMICS MCP server.

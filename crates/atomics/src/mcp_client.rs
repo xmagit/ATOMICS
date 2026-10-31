@@ -10,12 +10,11 @@ use std::time::{Duration, Instant};
 use atomics_core::tickets::McpServer;
 use serde_json::{Value, json};
 
-// `sign_in`, `sign_out` and `status` are the API the sign-in UI calls; the UI is a separate task.
-#[allow(dead_code)]
 mod oauth;
 use oauth::Session;
-#[allow(unused_imports)]
-pub use oauth::{OAuth, SIGN_IN_REQUIRED, SignInStatus, is_sign_in_required};
+pub use oauth::{OAuth, Revocation, SIGN_IN_REQUIRED, SignInControl, SignInEvent, SignInStatus, is_sign_in_required};
+#[cfg(test)]
+pub(crate) use oauth::tests::{Fake as FakeOAuthServer, browse as oauth_test_browse, machine as oauth_test_machine};
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const STDERR_TAIL: usize = 2000;
