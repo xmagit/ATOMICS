@@ -26,7 +26,7 @@ personal_dotnet = Path.home() / ".dotnet/dotnet"
 DOTNET = os.environ.get("DOTNET") or (str(personal_dotnet) if personal_dotnet.is_file() else shutil.which("dotnet"))
 if not DOTNET:
     raise SystemExit("Install .NET SDK 9 or set DOTNET to its executable before running this benchmark.")
-ROOT = options.reuse_root or Path(tempfile.mkdtemp(prefix="imacs-dotnet-budget-"))
+ROOT = options.reuse_root or Path(tempfile.mkdtemp(prefix="atomics-dotnet-budget-"))
 KEYS = (
     "DOTNET_PROCESSOR_COUNT", "MSBUILDDISABLENODEREUSE",
     "DOTNET_CLI_USE_MSBUILD_SERVER", "UseSharedCompilation", "BuildInParallel",
@@ -35,7 +35,7 @@ KEYS = (
 BASE = {k: v for k, v in os.environ.items() if k not in KEYS}
 BASE.update(DOTNET_CLI_TELEMETRY_OPTOUT="1", DOTNET_NOLOGO="1")
 # A private Roslyn pipe prevents reusing another agent's compiler server.
-BASE["SharedCompilationId"] = "imacs-budget-" + uuid.uuid4().hex
+BASE["SharedCompilationId"] = "atomics-budget-" + uuid.uuid4().hex
 BASE["MSBUILDNODEHANDSHAKESALT"] = BASE["SharedCompilationId"]
 
 

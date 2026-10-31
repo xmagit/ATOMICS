@@ -1,0 +1,11 @@
+  PID  PPID     RSS  %CPU COMMAND
+  302   301    1024   1.0 /usr/bin/virtiofsd --socket /run/vm.sock
+  300   100 1048576 150.0 /opt/sbx/containerd-shim-nerdbox-v1 -namespace docker -id atomics-a
+  301   300    2048   2.0 /opt/sbx/sailor --vm atomics-a
+  400   100  524288   3.0 /opt/sbx/vfkit --name=atomics-ab
+  500     1    1024  50.0 /opt/bin/sbx run --name atomics-a codex --
+  501   500    1024  10.0 /usr/bin/ssh atomics-a
+  600     1  900000  10.0 /opt/sbx/vfkit --name=other-sandbox
+  700     1    1000   1.0 /bin/echo atomics-a
+  800   801    1000   1.0 unrelated
+  801   800    1000   1.0 unrelated

@@ -10,7 +10,7 @@ import tempfile
 import unittest
 
 
-LABEL = "com.imacs.linux-qa.checkout"
+LABEL = "com.atomics.linux-qa.checkout"
 FAKE_DOCKER = r'''
 import json
 import os
@@ -23,7 +23,7 @@ args = sys.argv[1:]
 state["calls"].append(args)
 status = 0
 if args[:2] == ["volume", "ls"]:
-    assert args[2:] == ["--filter", "label=com.imacs.linux-qa.checkout", "--format", "{{.Name}}"]
+    assert args[2:] == ["--filter", "label=com.atomics.linux-qa.checkout", "--format", "{{.Name}}"]
     for name, checkout in state["volumes"].items():
         if checkout is not None:
             print(name)
@@ -32,12 +32,12 @@ elif args[:2] == ["volume", "inspect"]:
     if name not in state["volumes"] or name in state.get("inspect_failures", []):
         status = 1
     elif "--format" in args:
-        assert args[3:] == ["--format", '{{ index .Labels "com.imacs.linux-qa.checkout" }}']
+        assert args[3:] == ["--format", '{{ index .Labels "com.atomics.linux-qa.checkout" }}']
         print(state["volumes"][name] or "<no value>")
 elif args[:2] == ["volume", "create"]:
     assert args[2] == "--label"
     key, checkout = args[3].split("=", 1)
-    assert key == "com.imacs.linux-qa.checkout"
+    assert key == "com.atomics.linux-qa.checkout"
     state["volumes"].setdefault(args[4], checkout)
 elif args[:1] == ["ps"]:
     assert args[1:3] == ["-aq", "--filter"]
@@ -66,7 +66,7 @@ sys.exit(status)
 
 class LinuxQaVolumes(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory(prefix="imacs-linux-qa-test-")
+        self.temporary = tempfile.TemporaryDirectory(prefix="atomics-linux-qa-test-")
         self.addCleanup(self.temporary.cleanup)
         self.directory = Path(self.temporary.name)
         self.checkout = self.directory / "checkout with spaces"
@@ -83,7 +83,7 @@ class LinuxQaVolumes(unittest.TestCase):
         self.env = dict(os.environ, DOCKER_TEST_STATE=str(self.state),
                         PATH=str(tools) + os.pathsep + os.environ["PATH"])
         key = subprocess.run(["cksum"], input=str(self.checkout), text=True, capture_output=True, check=True).stdout.split()[0]
-        self.target = "imacs-linux-qa-target-" + key
+        self.target = "atomics-linux-qa-target-" + key
 
     def run_runner(self, state, *args):
         self.state.write_text(json.dumps(state))
@@ -124,34 +124,34 @@ class LinuxQaVolumes(unittest.TestCase):
         broken = self.directory / "offline symlink"
         broken.symlink_to(self.directory / "offline mount")
         volumes = {
-            "imacs-linux-qa-target-orphan": missing,
-            "imacs-linux-qa-target-live": str(existing),
-            "imacs-linux-qa-target-broken-link": str(broken),
-            "imacs-linux-qa-target-running": missing,
-            "imacs-linux-qa-target-stopped": missing,
-            "imacs-linux-qa-target-unlabelled": None,
-            "imacs-linux-qa-target-relative": "relative/checkout",
-            "imacs-linux-qa-target-empty": "",
-            "imacs-linux-qa-target-inspect-error": missing,
-            "imacs-linux-qa-target-ps-error": missing,
-            "imacs-linux-qa-target-race": missing,
-            "imacs-linux-qa-registry": missing,
-            "imacs-linux-qa-git": missing,
+            "atomics-linux-qa-target-orphan": missing,
+            "atomics-linux-qa-target-live": str(existing),
+            "atomics-linux-qa-target-broken-link": str(broken),
+            "atomics-linux-qa-target-running": missing,
+            "atomics-linux-qa-target-stopped": missing,
+            "atomics-linux-qa-target-unlabelled": None,
+            "atomics-linux-qa-target-relative": "relative/checkout",
+            "atomics-linux-qa-target-empty": "",
+            "atomics-linux-qa-target-inspect-error": missing,
+            "atomics-linux-qa-target-ps-error": missing,
+            "atomics-linux-qa-target-race": missing,
+            "atomics-linux-qa-registry": missing,
+            "atomics-linux-qa-git": missing,
             "someone-elses-volume": missing,
         }
         state, result = self.run_runner(dict(
             volumes=volumes, calls=[],
-            containers={"imacs-linux-qa-target-running": "running", "imacs-linux-qa-target-stopped": "stopped"},
-            inspect_failures=["imacs-linux-qa-target-inspect-error"],
-            ps_failures=["imacs-linux-qa-target-ps-error"],
-            rm_failures=["imacs-linux-qa-target-race"],
+            containers={"atomics-linux-qa-target-running": "running", "atomics-linux-qa-target-stopped": "stopped"},
+            inspect_failures=["atomics-linux-qa-target-inspect-error"],
+            ps_failures=["atomics-linux-qa-target-ps-error"],
+            rm_failures=["atomics-linux-qa-target-race"],
         ))
         expected = dict(volumes)
-        del expected["imacs-linux-qa-target-orphan"]
+        del expected["atomics-linux-qa-target-orphan"]
         expected[self.target] = str(self.checkout)
         self.assertEqual(state["volumes"], expected)
         removals = [call[2] for call in state["calls"] if call[:2] == ["volume", "rm"]]
-        self.assertEqual(removals, ["imacs-linux-qa-target-orphan", "imacs-linux-qa-target-race"])
+        self.assertEqual(removals, ["atomics-linux-qa-target-orphan", "atomics-linux-qa-target-race"])
         self.assertIn("Removed orphaned Linux QA target cache", result.stderr)
         self.assertEqual(result.stdout, "", "cleanup must not corrupt screenshot output")
 

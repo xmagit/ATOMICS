@@ -42,7 +42,7 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
       - name: Check browser core
-        run: cargo check -p imacs-core --target wasm32-unknown-unknown --no-default-features
+        run: cargo check -p atomics-core --target wasm32-unknown-unknown --no-default-features
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: |

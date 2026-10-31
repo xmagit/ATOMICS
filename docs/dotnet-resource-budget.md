@@ -101,27 +101,27 @@ See [runtime CPU setting](https://devblogs.microsoft.com/dotnet/announcing-net-6
 [NUnit defaults](https://docs.nunit.org/articles/nunit/writing-tests/attributes/levelofparallelism.html)
 and [xUnit defaults](https://xunit.net/docs/running-tests-in-parallel).
 
-IMACS does not export guessed `MaxCpuCount`, `NumberOfTestWorkers` or
+ATOMICS does not export guessed `MaxCpuCount`, `NumberOfTestWorkers` or
 `MaxParallelThreads` environment properties, inject a `.runsettings` file, or
 export `VSTestCLIRunSettings`. The latter is also repurposed as application
 arguments by Microsoft.Testing.Platform, so injecting VSTest settings would break
 some .NET projects. See [VSTest/MTP compatibility](https://learn.microsoft.com/en-us/dotnet/core/testing/unit-testing-with-dotnet-test).
-Whole suites still use `imacs queue --class test -- dotnet test`; queue slots limit
+Whole suites still use `atomics queue --class test -- dotnet test`; queue slots limit
 simultaneous commands, while the inherited CPU budget limits processor-based
 defaults within each command.
 
 ## Reproduce
 
-From this worktree, outside a sandbox that blocks `ps` or the IMACS socket:
+From this worktree, outside a sandbox that blocks `ps` or the ATOMICS socket:
 
 ```sh
 python3 scripts/dotnet-budget-bench.py
-imacs queue --class test -- python3 scripts/dotnet-test-budget-probe.py
+atomics queue --class test -- python3 scripts/dotnet-test-budget-probe.py
 ```
 
 Both scripts leave generated projects and per-run logs in the temporary directory
 they print. The build script also saves JSON results. They pin the SDK version
 measured here, and perform ordinary restore/build operations only in those
 temporary projects. Initial raw build logs/results were under
-`$TMPDIR/imacs-dotnet-budget-5zumaqh1`; test logs were under
-`$TMPDIR/imacs-dotnet-tests-yntfd3n4` (temporary evidence, not required to reproduce).
+`$TMPDIR/atomics-dotnet-budget-5zumaqh1`; test logs were under
+`$TMPDIR/atomics-dotnet-tests-yntfd3n4` (temporary evidence, not required to reproduce).

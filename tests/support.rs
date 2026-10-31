@@ -43,7 +43,7 @@ pub fn scaled_timeout(base: Duration) -> Duration {
     let samples = unsafe { libc::getloadavg(&mut load, 1) };
     timeout_for_load(
         base,
-        std::env::var("IMACS_TEST_TIMEOUT_SCALE").ok().as_deref(),
+        std::env::var("ATOMICS_TEST_TIMEOUT_SCALE").ok().as_deref(),
         (samples == 1).then_some(load),
         cores,
     )
@@ -164,7 +164,7 @@ mod tests {
 
     #[test]
     fn timeout_kills_and_reaps_child_with_diagnostics() {
-        if let Some(ready) = std::env::var_os("IMACS_TIMEOUT_TEST_READY") {
+        if let Some(ready) = std::env::var_os("ATOMICS_TIMEOUT_TEST_READY") {
             println!("child stdout before blocking");
             eprintln!("child stderr before blocking");
             io::stdout().flush().unwrap();
@@ -179,7 +179,7 @@ mod tests {
         let mut child = TestChild::spawn(
             Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "test_support::tests::timeout_kills_and_reaps_child_with_diagnostics", "--nocapture"])
-                .env("IMACS_TIMEOUT_TEST_READY", &ready),
+                .env("ATOMICS_TIMEOUT_TEST_READY", &ready),
             CHILD_TIMEOUT,
         )
         .unwrap();
@@ -197,7 +197,7 @@ mod tests {
 
     #[test]
     fn captures_successful_child_output() {
-        if std::env::var_os("IMACS_CAPTURE_TEST_CHILD").is_some() {
+        if std::env::var_os("ATOMICS_CAPTURE_TEST_CHILD").is_some() {
             println!("captured stdout");
             eprintln!("captured stderr");
             return;
@@ -205,7 +205,7 @@ mod tests {
         let output = output(
             Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "test_support::tests::captures_successful_child_output", "--nocapture"])
-                .env("IMACS_CAPTURE_TEST_CHILD", "1"),
+                .env("ATOMICS_CAPTURE_TEST_CHILD", "1"),
         );
         assert!(output.status.success());
         assert!(String::from_utf8_lossy(&output.stdout).contains("captured stdout"));

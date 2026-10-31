@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run through `imacs queue --class test -- python3 scripts/dotnet-test-budget-probe.py`.
+"""Run through `atomics queue --class test -- python3 scripts/dotnet-test-budget-probe.py`.
 
 Measure default NUnit/xUnit workers using sleeping tests in independent fixtures.
 Only generated projects in a temporary directory are built or tested.
@@ -18,7 +18,7 @@ import time
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--reuse-root", type=Path, help="only probe VSTest using earlier generated projects")
 options = parser.parse_args()
-root = (options.reuse_root or Path(tempfile.mkdtemp(prefix="imacs-dotnet-tests-"))).resolve()
+root = (options.reuse_root or Path(tempfile.mkdtemp(prefix="atomics-dotnet-tests-"))).resolve()
 personal_dotnet = Path.home() / ".dotnet/dotnet"
 dotnet = os.environ.get("DOTNET") or (str(personal_dotnet) if personal_dotnet.is_file() else shutil.which("dotnet"))
 if not dotnet:
@@ -61,7 +61,7 @@ public static class Probe {
         Thread.Sleep(200);
         lock (Gate) {
             active--;
-            File.WriteAllText(Environment.GetEnvironmentVariable("IMACS_PROBE_OUTPUT"),
+            File.WriteAllText(Environment.GetEnvironmentVariable("ATOMICS_PROBE_OUTPUT"),
                 $"{Environment.ProcessorCount},{peak}");
         }
     }
@@ -78,7 +78,7 @@ public static class Probe {
         env | {"DOTNET_PROCESSOR_COUNT": "2"}, project / "build.log")
     for processors in [None, "5", "2", "1"]:
         output = project / f"workers-{processors}.txt"
-        variables = env | {"IMACS_PROBE_OUTPUT": str(output)}
+        variables = env | {"ATOMICS_PROBE_OUTPUT": str(output)}
         if processors:
             variables["DOTNET_PROCESSOR_COUNT"] = processors
         start = time.monotonic()

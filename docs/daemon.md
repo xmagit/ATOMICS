@@ -8,7 +8,7 @@ The desktop application remains usable at every phase below.
 
 ## Ownership and current source map
 
-Paths in the next two lists are relative to `crates/imacs/src/`.
+Paths in the next two lists are relative to `crates/atomics/src/`.
 These are existing files and types; the split describes responsibilities to extract from them.
 
 - `app.rs` and `app/*.rs`: move the runtime parts of `App` and `Session` to the host: agent launch and resume,
@@ -29,7 +29,7 @@ These are existing files and types; the split describes responsibilities to extr
   `ControlOutcome` and `ApprovalReply`. Hook replies and control requests work without any client.
   Preserve ancestry/pane routing, queued external-session messages and approval expiry semantics.
 - `hook_client.rs` and `mcp.rs`: remain native CLI adapters to the host's local socket.
-  Keep the restricted `imacs mcp --agent` report surface distinct from the chief's control tools.
+  Keep the restricted `atomics mcp --agent` report surface distinct from the chief's control tools.
 - `setup.rs` and `doctor.rs`: native program discovery, version probing, hook installation and diagnostics.
   `main.rs`: separate native CLI dispatch and host startup from window/browser startup.
 
@@ -45,7 +45,7 @@ The client keeps these responsibilities:
 - `voice.rs`: native microphone capture through `Recorder` stays on the native client; the browser
   uses its microphone permission flow. Audio upload and transcription are optional negotiated features.
 
-Paths below are relative to `crates/imacs-core/src/`, which is UI-free and builds for wasm32 with `--no-default-features`.
+Paths below are relative to `crates/atomics-core/src/`, which is UI-free and builds for wasm32 with `--no-default-features`.
 The default `native` feature enables filesystem, process and other native helpers.
 
 - Host: `git.rs` (`Worktree`, `WorktreeEntry`, `Integration`, `Merge`), filesystem operations in
@@ -67,7 +67,7 @@ shared pointers or fields that must remain private. Explicit wire projections se
 ## Client protocol
 
 Serve versioned static client assets and a same-origin WebSocket endpoint from the host.
-Start with JSON text messages and the `imacs.v1` WebSocket subprotocol, over WSS for remote use.
+Start with JSON text messages and the `atomics.v1` WebSocket subprotocol, over WSS for remote use.
 The following lowercase names are proposed wire tags, not existing Rust types or commands.
 Each envelope carries `kind`, `request_id` when correlated, and a negotiated major/minor version.
 Host messages carry a boot `epoch`; IDs and revisions are opaque strings, including sequence numbers,
@@ -191,8 +191,8 @@ Agent hooks and MCP use that socket inside the user's environment; do not publis
 Run one non-root host per user/pod with a stable UID and no display server, GPU or Docker socket.
 Persist a private user home and repositories/worktrees on user-scoped volumes, at stable absolute paths
 so git worktree metadata and recorded cwd values remain valid across pod replacement.
-Set `IMACS_HOME=/data/imacs`, `IMACS_CONFIG=/data/config/imacs/config.toml` and
-`IMACS_SOCKET=/run/imacs/imacs.sock` explicitly. The socket and PID/lease files are ephemeral.
+Set `ATOMICS_HOME=/data/atomics`, `ATOMICS_CONFIG=/data/config/atomics/config.toml` and
+`ATOMICS_SOCKET=/run/atomics/atomics.sock` explicitly. The socket and PID/lease files are ephemeral.
 Persist `sessions.json`, `plans/`, `briefs/`, saved workspaces and the operation journal with restrictive modes.
 Use atomic replacement for records and backups; version on-disk changes and test restoration before rollout.
 Enforce one writer per volume with a host lock and deployment fencing; a rolling update must not start
@@ -232,13 +232,13 @@ Bound scrollback, disk/log growth, child processes and CPU/memory; alert before 
    Exercise token refresh, backup restore, termination grace and single-writer fencing before Kubernetes rollout.
 
 Each gate needs regression tests with the implementation phase; this document adds no runtime behavior.
-Use an isolated `IMACS_HOME`, `IMACS_SOCKET` and `IMACS_CONFIG` for UI checks, verify the process environment
-with `ps eww <pid>` on macOS or `ps eww -p <pid>` on Linux, and never run migration experiments against the user's running IMACS instance.
+Use an isolated `ATOMICS_HOME`, `ATOMICS_SOCKET` and `ATOMICS_CONFIG` for UI checks, verify the process environment
+with `ps eww <pid>` on macOS or `ps eww -p <pid>` on Linux, and never run migration experiments against the user's running ATOMICS instance.
 
 ## Phase 2 complete: in-process native host
 
 `host::Host` owns the native runtime model and services it on the
-`imacs-runtime` thread. Hook/control requests, terminal events, worktree discovery,
+`atomics-runtime` thread. Hook/control requests, terminal events, worktree discovery,
 filesystem notifications, diff/file results, integrations, heartbeat and cleanup
 results wake its condition variable directly. Approvals, delivery verification,
 waiters, fallback status checks, configuration and diff scheduling use host deadlines.
@@ -282,14 +282,14 @@ hooks and waits; late file-open events preserve the host's resolved target.
 Terminal regressions cover selection invalidation after output/resize and editor
 replacement at unchanged panel geometry.
 
-Queued native QA with isolated `IMACS_HOME`, `IMACS_SOCKET` and `IMACS_CONFIG`,
+Queued native QA with isolated `ATOMICS_HOME`, `ATOMICS_SOCKET` and `ATOMICS_CONFIG`,
 verified on the GUI process with `ps eww`, passed shell input/output, fresh diff,
 ctl plan persistence, heartbeat, fleet/board/chief screenshots and clean shutdown.
 The screenshot harness requests paints while obscured so the existing CLI
 screenshot delay can advance. Targeted application and terminal tests pass.
 Final validation passed `cargo fmt --all -- --check`,
 `cargo clippy --workspace --all-targets -- -D warnings`, and all 314 tests through
-`imacs queue --class test -- cargo test --workspace`. The separate narrow top bar
+`atomics queue --class test -- cargo test --workspace`. The separate narrow top bar
 follow-up also passed 480/550-point paint and click tests and isolated queued
 native screenshots at both widths.
 
@@ -300,7 +300,7 @@ while the Tabs button surfaces urgent counts if folding becomes unavoidable.
 Isolated queued native QA at 1400 points verified a running plan, a needs-you
 plan, an idle plan, two completed plans and archived History. Screenshots and
 `ps eww` isolation evidence are in
-`/private/tmp/imacs-plan-ux-qa-06344607-v4/`. History View stayed read-only and
+`/private/tmp/atomics-plan-ux-qa-06344607-v4/`. History View stayed read-only and
 History Reopen persisted the open status. The QA process then exited cleanly.
 
 ### Remaining for phase 3

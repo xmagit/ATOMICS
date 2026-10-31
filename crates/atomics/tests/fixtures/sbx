@@ -1,0 +1,341 @@
+#!/bin/sh
+# A fake Docker Sandboxes CLI. Every call is appended to calls.log beside this script, one call per
+# line with its arguments separated by tabs. Sandboxes live as JSON files under sandboxes/, so
+# `ls --json` lists what `create` made and `rm` removed. Files beside the script change behavior:
+#   version      the version `sbx version` prints (default v0.50.1)
+#   signed-out   `diagnose` reports Authentication failing
+#   no-policy    `diagnose` reports the global network policy as not set up
+#   fail-<verb>  that verb fails, e.g. fail-create
+#   run-waits    `run` keeps the agent attached instead of exiting at once
+#   wait-<verb> pause that verb until the file is removed; waiting-<verb> signals readiness
+#   wait-agent pause run after attachment, before checking for the optional agent hook
+#   exec-runs    `exec` runs its command in the -w folder, stopped after its `timeout` seconds as in the VM
+#   templates    tags `template save` saved, one per line, which `template ls --json` lists
+# MCP servers other than linear (kept in mcp.json) and ATOMICS's own live as JSON files under mcp/:
+# `mcp add --url` registers a remote one that needs authorization, `--command` a ready one, and
+# `mcp auth` prints its authorization URL as sbx 0.50 does, then marks it ready.
+#   auth-free-<name>   `mcp add` registers that remote server ready
+#   wait-authorized    `mcp auth` waits after printing its URL until the file is removed
+#   deny-auth          `mcp auth` fails after printing its URL, as a refused consent does
+dir=${0%/*}
+state="$dir/sandboxes"
+mkdir -p "$state"
+mkdir -p "$dir/mcp"
+line=
+for arg in "$@"; do
+  arg=$(printf '%s' "$arg" | tr '\n\t' '  ')
+  line="$line${line:+	}$arg"
+done
+printf '%s\n' "$line" >> "$dir/calls.log"
+if [ -e "$dir/fail-$1" ]; then
+  cat "$dir/error-output" 2>/dev/null >&2 || echo "fake $1 failure" >&2
+  exit 1
+fi
+if [ -e "$dir/wait-$1" ]; then
+  : > "$dir/waiting-$1"
+  while [ -e "$dir/wait-$1" ]; do sleep 0.01; done
+fi
+case "$1" in
+  stop)
+    if [ -f "$state/$2" ]; then
+      sed 's/"status":"running"/"status":"stopped"/' "$state/$2" > "$state/$2.$$.tmp"
+      mv "$state/$2.$$.tmp" "$state/$2"
+    fi
+    ;;
+  version)
+    printf 'sbx version %s 0123abcd\n' "$(cat "$dir/version" 2>/dev/null || echo v0.50.1)"
+    ;;
+  login)
+    rm -f "$dir/signed-out"
+    ;;
+  diagnose)
+    auth=pass
+    [ -e "$dir/signed-out" ] && auth=fail
+    policy=pass
+    [ -e "$dir/no-policy" ] && policy=fail
+    # Like sbx, a failing check (here always the SSH one) makes diagnose exit 1 after its report.
+    printf '{"version":"1.0","checks":[{"name":"Binary version","status":"pass"},'
+    printf '{"name":"SSH client config","status":"fail","message":"unmanaged Host stanza"},'
+    printf '{"name":"Authentication","status":"%s","message":"not signed in","hint":"Run sbx login"},' "$auth"
+    printf '{"name":"Global network policy","status":"%s","message":"not initialized"}]}\n' "$policy"
+    exit 1
+    ;;
+  policy)
+    if [ "$2" = init ]; then rm -f "$dir/no-policy"; fi
+    if [ "$2" = ls ]; then
+      if [ -e "$dir/policy.json" ]; then cat "$dir/policy.json"; else
+        printf '%s\n' '{"rules":[{"id":"default-ai-services","scope":"global","resource_type":"network","status":"active","decision":"allow","provenance":{"created_via":"default"}}]}'
+      fi
+    fi
+    ;;
+  secret)
+    if [ -e "$dir/fail-secret-$2" ]; then cat "$dir/error-output" 2>/dev/null >&2; exit 1; fi
+    case "$2" in
+      ls)
+        if [ -e "$dir/secrets.json" ]; then cat "$dir/secrets.json"; else
+          printf '{"secrets":['
+          sep=
+          if [ ! -e "$dir/removed-anthropic" ]; then printf '{"type":"service","name":"anthropic","scope":"global"}'; sep=,; fi
+          if [ ! -e "$dir/no-openai" ]; then printf '%s{"type":"service","name":"openai","scope":"global"}' "$sep"; sep=,; fi
+          if [ -e "$dir/misfiled-secret" ]; then printf '%s{"type":"service","name":"sk-ant-MISFILED-private-value","scope":"global"}' "$sep"; sep=,; fi
+          # `sbx secret set anthropic <token>`: the token became the name, in a scope named anthropic.
+          if [ -e "$dir/misfiled-scoped" ]; then printf '%s{"type":"service","name":"sk-ant-oat01-SCOPED-private-value","scope":"anthropic"}' "$sep"; fi
+          # Like sbx 0.50, `set-custom` secrets come apart; their source and placeholder are private.
+          printf '],"custom_secrets":['
+          if [ -e "$dir/oauth" ]; then printf '{"env":"CLAUDE_CODE_OAUTH_TOKEN","kind":"command","placeholder":"sk-ant-oat01-PRIVATE-placeholder","refresh":null,"scope":"global","source":"PRIVATE-source-command","targets":["api.anthropic.com"]}'; fi
+          printf ']}\n'
+        fi ;;
+      set-custom)
+        # Like real sbx, verify a command source before registering it.
+        shift 2
+        while [ $# -gt 0 ]; do
+          if [ "$1" = --command ]; then
+            /bin/sh -c "$2" > /dev/null || exit 1
+            break
+          fi
+          shift
+        done
+        [ -e "$dir/skip-secret-write" ] || touch "$dir/oauth"
+        ;;
+      set)
+        if [ "$3:$4" = openai:--oauth ]; then
+          [ -e "$dir/skip-secret-write" ] || touch "$dir/openai-oauth"
+        else
+          cat > "$dir/secret-stdin"
+        fi
+        if [ ! -e "$dir/skip-secret-write" ]; then
+          case "$3" in anthropic) rm -f "$dir/removed-anthropic" ;; *) rm -f "$dir/no-openai" ;; esac
+        fi
+        ;;
+      rm)
+        case "$3" in
+          anthropic) touch "$dir/removed-anthropic" ;;
+        esac
+        ;;
+    esac
+    ;;
+  mcp)
+    if [ -e "$dir/fail-mcp-$2" ]; then cat "$dir/error-output" 2>/dev/null >&2; exit 1; fi
+    case "$2" in
+      add)
+        previous=
+        for arg in "$@"; do
+          if [ "$previous" = --url ]; then printf '%s' "$arg" > "$dir/mcp-url-$3"; fi
+          previous=$arg
+        done
+        case "$3" in
+          atomics-*)
+            details=$(printf '%s' "$*" | sed 's/\\/\\\\/g; s/"/\\"/g')
+            printf '{"name":"%s","status":"ready","command":"%s"}' "$3" "$details" > "$dir/mcp/$3.$$.tmp"
+            mv "$dir/mcp/$3.$$.tmp" "$dir/mcp/$3"
+            ;;
+          linear) printf '%s\n' '[{"name":"linear","status":"needs-auth"}]' > "$dir/mcp.json" ;;
+          *)
+            status=ready transport='local stdio'
+            case " $* " in *" --url "*) status=needs-auth transport='remote http' ;; esac
+            [ -e "$dir/auth-free-$3" ] && status=ready
+            details=$(printf '%s' "$*" | sed 's/\\/\\\\/g; s/"/\\"/g')
+            printf '{"name":"%s","status":"%s","transport":"%s","command":"%s"}' "$3" "$status" "$transport" \
+              "$details" > "$dir/mcp/$3.$$.tmp"
+            mv "$dir/mcp/$3.$$.tmp" "$dir/mcp/$3"
+            ;;
+        esac
+        ;;
+      inspect)
+        [ -f "$dir/mcp-url-$3" ] || exit 1
+        url=$(sed 's/\\/\\\\/g; s/"/\\"/g' "$dir/mcp-url-$3")
+        printf '{"name":"%s","url":"%s"}\n' "$3" "$url"
+        ;;
+      auth)
+        printf '%s\n' "${SBX_NO_BROWSER_OPEN-unset}" > "$dir/auth-no-browser"
+        printf 'OAuth scopes for MCP server "%s":\n  requested:   default\n' "$3"
+        printf 'Open this URL to authorize MCP server "%s":\n' "$3"
+        printf 'https://auth.example.com/authorize?client_id=fake&state=PRIVATE-state-%s\n' "$3"
+        if [ -e "$dir/wait-authorized" ]; then
+          : > "$dir/waiting-authorized"
+          while [ -e "$dir/wait-authorized" ]; do sleep 0.01; done
+        fi
+        if [ -e "$dir/deny-auth" ]; then echo "error: authorize MCP server \"$3\": access_denied" >&2; exit 1; fi
+        case "$3" in
+          linear) printf '%s\n' '[{"name":"linear","status":"ready"}]' > "$dir/mcp.json" ;;
+          *)
+            if [ -f "$dir/mcp/$3" ]; then
+              sed 's/"status":"needs-auth"/"status":"ready"/' "$dir/mcp/$3" > "$dir/mcp/$3.$$.tmp"
+              mv "$dir/mcp/$3.$$.tmp" "$dir/mcp/$3"
+            fi
+            ;;
+        esac
+        ;;
+      load)
+        # Like sbx, only a registered server loads.
+        if [ ! -f "$dir/mcp/$3" ] && ! grep -q "\"name\"[[:space:]]*:[[:space:]]*\"$3\"" "$dir/mcp.json" 2>/dev/null; then
+          echo "error: add \"$3\": MCP server \"$3\" is not registered" >&2
+          exit 1
+        fi
+        mkdir -p "$dir/mcp-loaded/$5"
+        if [ -f "$dir/mcp-url-$3" ]; then
+          for file in "$dir/mcp-loaded/$5"/*; do
+            [ -f "$file" ] || continue
+            other=${file##*/}
+            if [ "$other" != "$3" ] && cmp -s "$dir/mcp-url-$3" "$dir/mcp-url-$other"; then
+              echo 'error: duplicate gateway tool names' >&2
+              exit 1
+            fi
+          done
+        fi
+        touch "$dir/mcp-loaded/$5/$3"
+        ;;
+      unload)
+        rm -f "$dir/mcp-loaded/$5/$3"
+        ;;
+      rm)
+        for arg in "$@"; do
+          case "$arg" in mcp|rm|-*|linear) ;; *) rm -f "$dir/mcp/$arg" "$dir/mcp-url-$arg" ;; esac
+        done
+        ;;
+    esac
+    if [ "$2" = ls ]; then
+      if [ "$3" = --quiet ]; then
+        if [ -f "$dir/mcp.json" ]; then
+          tr '{' '\n' < "$dir/mcp.json" | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+        fi
+        for file in "$dir/mcp"/*; do
+          case "$file" in *.tmp) continue ;; esac
+          [ ! -f "$file" ] || printf '%s\n' "${file##*/}"
+        done
+        exit 0
+      fi
+      entries=$(sed 's/^\[//; s/\]$//' "$dir/mcp.json" 2>/dev/null || true)
+      printf '[%s' "$entries"
+      sep=${entries:+,}
+      for file in "$dir/mcp"/*; do
+        case "$file" in *.tmp) continue ;; esac
+        [ -f "$file" ] || continue
+        value=$(cat "$file")
+        case "$value" in
+          \{*) printf '%s%s' "$sep" "$value" ;;
+          *) printf '%s{"name":"%s","status":"ready"}' "$sep" "${file##*/}" ;;
+        esac
+        sep=,
+      done
+      printf ']\n'
+    fi
+    ;;
+  settings)
+    case "$2:$3" in
+      set:ssh.agentForwardingEnabled) printf '%s\n' "$4" > "$dir/ssh-forwarding" ;;
+      unset:ssh.agentSocketPath) rm -f "$dir/ssh-socket" ;;
+    esac
+    case "$3" in
+      ssh.agentForwardingEnabled) cat "$dir/ssh-forwarding" 2>/dev/null || echo false ;;
+      ssh.agentSocketPath) cat "$dir/ssh-socket" 2>/dev/null || echo ;;
+    esac
+    ;;
+  ls)
+    printf '['
+    sep=
+    for file in "$state"/*; do
+      case "$file" in *.tmp) continue ;; esac
+      [ -e "$file" ] || continue
+      printf '%s%s' "$sep" "$(cat "$file")"
+      sep=,
+    done
+    printf ']\n'
+    ;;
+  create)
+    shift
+    name=
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --name) name=$2; shift 2 ;;
+        --memory|--cpus|--template|--static-mcp|--env) shift 2 ;;
+        --*) shift ;;
+        *) break ;;
+      esac
+    done
+    agent=$1
+    shift
+    case "$1" in
+      *:ro|*:readonly) echo 'primary workspace must be read/write' >&2; exit 1 ;;
+    esac
+    workspaces=
+    for path in "$@"; do
+      workspaces="$workspaces${workspaces:+,}\"$path\""
+    done
+    printf '{"name":"%s","agent":"%s","status":"running","workspaces":[%s]}' "$name" "$agent" "$workspaces" \
+      > "$state/$name.$$.tmp"
+    mv "$state/$name.$$.tmp" "$state/$name"
+    ;;
+  rm)
+    for arg in "$@"; do
+      case "$arg" in
+        rm|-*) ;;
+        *) rm -f "$state/$arg" "$state/$arg.tmp" ;;
+      esac
+    done
+    ;;
+  template)
+    if [ "$2" = save ] && ! grep -q '"status":"stopped"' "$state/$3"; then
+      echo 'stop the sandbox before saving a template non-interactively' >&2
+      exit 1
+    fi
+    [ "$2" = save ] && printf '%s\n' "$4" >> "$dir/templates"
+    if [ "$2" = ls ]; then
+      # A stock image, then every tag saved here, split into repository and tag like sbx's listing.
+      printf '[{"repository":"docker.io/docker/sandbox-templates","tag":"codex-docker"}'
+      if [ -e "$dir/templates" ]; then
+        while read -r tag; do printf ',{"repository":"docker.io/library/%s","tag":"%s"}' "${tag%:*}" "${tag##*:}"; done < "$dir/templates"
+      fi
+      printf ']\n'
+    fi
+    ;;
+  exec)
+    [ -e "$dir/exec-runs" ] || exit 0
+    shift
+    workdir=.
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -w|--workdir) workdir=$2; shift 2 ;;
+        -e|--env|-u|--user) shift 2 ;;
+        -*) shift ;;
+        *) break ;;
+      esac
+    done
+    if [ ! -e "$state/$1" ]; then echo "sandbox $1 not found" >&2; exit 125; fi
+    shift
+    cd "$workdir" || exit 125
+    # The VM's coreutils `timeout -k <grace> <seconds> <command>`, which a host may not have.
+    if [ "$1" != timeout ]; then HOME=$dir exec "$@"; fi
+    tenths=$(($4 * 10))
+    shift 4
+    HOME=$dir "$@" &
+    pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+      if [ "$tenths" -le 0 ]; then kill "$pid"; wait "$pid"; exit 124; fi
+      sleep 0.1
+      tenths=$((tenths - 1))
+    done
+    wait "$pid"
+    exit $?
+    ;;
+  run)
+    printf '%s\n' "${SSH_AUTH_SOCK-unset}" > "$dir/run-ssh.$$.tmp"
+    mv "$dir/run-ssh.$$.tmp" "$dir/run-ssh"
+    printf 'attached to %s\n' "$3"
+    if [ -e "$dir/wait-agent" ]; then
+      : > "$dir/waiting-agent"
+      while [ -e "$dir/wait-agent" ]; do sleep 0.01; done
+    fi
+    # A stand-in agent runs in the mounted worktree, with the same arguments.
+    if [ -f "$dir/agent" ]; then
+      name=$3
+      workspace=$(sed -n 's/.*"workspaces":\["\([^"]*\)".*/\1/p' "$state/$name")
+      cd "$workspace" || exit 1
+      exec /bin/sh "$dir/agent" "$@"
+    fi
+    if [ -e "$dir/run-waits" ]; then
+      exec sleep 600
+    fi
+    ;;
+esac
+exit 0

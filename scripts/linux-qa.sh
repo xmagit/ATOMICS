@@ -1,10 +1,10 @@
 #!/bin/bash
-# Host-side Docker runner. Heavy commands belong inside `imacs queue` (see README).
+# Host-side Docker runner. Heavy commands belong inside `atomics queue` (see README).
 set -euo pipefail
 
 usage() {
     echo 'Usage: scripts/linux-qa.sh test | screenshot <out.png> [--size WxH] [--ctl JSON]... | shell' >&2
-    echo '  --ctl sends one control request (imacs ctl) to the isolated instance before the screenshot.' >&2
+    echo '  --ctl sends one control request (atomics ctl) to the isolated instance before the screenshot.' >&2
     exit 2
 }
 
@@ -53,10 +53,10 @@ fi
 # Only our labelled target caches are eligible. Include stopped containers in the
 # usage check, and let non-forced removal protect against a container starting
 # between the check and removal. Existing unlabelled caches stay unlabelled.
-checkout_label=com.imacs.linux-qa.checkout
+checkout_label=com.atomics.linux-qa.checkout
 volumes=$(docker volume ls --filter "label=$checkout_label" --format '{{.Name}}')
 while IFS= read -r volume; do
-    [[ $volume == imacs-linux-qa-target-* ]] || continue
+    [[ $volume == atomics-linux-qa-target-* ]] || continue
     checkout=$(docker volume inspect "$volume" --format "{{ index .Labels \"$checkout_label\" }}" 2>/dev/null) || continue
     [[ $checkout == /* ]] || continue
     [[ ! -e $checkout && ! -L $checkout ]] || continue
@@ -70,7 +70,7 @@ while IFS= read -r volume; do
 done <<< "$volumes"
 
 checkout_key=$(printf '%s' "$root" | cksum | awk '{print $1}')
-target_volume="imacs-linux-qa-target-$checkout_key"
+target_volume="atomics-linux-qa-target-$checkout_key"
 if ! docker volume inspect "$target_volume" >/dev/null 2>&1; then
     docker volume create --label "$checkout_label=$root" "$target_volume" >/dev/null
 fi
@@ -78,7 +78,7 @@ fi
 # No source is sent to the builder. A changed Dockerfile selects a fresh image;
 # unchanged runs reuse the image without resolving its base tag or running apt.
 image_key=$(cksum < "$root/Dockerfile.linux-qa" | awk '{print $1}')
-image="imacs-linux-qa:$image_key"
+image="atomics-linux-qa:$image_key"
 if ! docker image inspect "$image" >/dev/null 2>&1; then
     docker build -t "$image" - < "$root/Dockerfile.linux-qa"
 fi
@@ -86,12 +86,12 @@ fi
 # Targets are per checkout; the registry and git downloads are shared. Host
 # jobserver FIFOs cannot cross Docker Desktop's VM boundary, so cap jobs/CPUs.
 run=(docker run --rm --init --cap-drop ALL
-    --cpus "${IMACS_LINUX_QA_CPUS:-2}" --memory "${IMACS_LINUX_QA_MEMORY:-8g}"
+    --cpus "${ATOMICS_LINUX_QA_CPUS:-2}" --memory "${ATOMICS_LINUX_QA_MEMORY:-8g}"
     --mount "type=bind,source=$root,target=/repo,readonly"
     --mount "type=volume,source=$target_volume,target=/target"
-    --mount type=volume,source=imacs-linux-qa-registry,target=/usr/local/cargo/registry
-    --mount type=volume,source=imacs-linux-qa-git,target=/usr/local/cargo/git
-    --env "CARGO_BUILD_JOBS=${IMACS_LINUX_QA_JOBS:-2}")
+    --mount type=volume,source=atomics-linux-qa-registry,target=/usr/local/cargo/registry
+    --mount type=volume,source=atomics-linux-qa-git,target=/usr/local/cargo/git
+    --env "CARGO_BUILD_JOBS=${ATOMICS_LINUX_QA_JOBS:-2}")
 
 # Linked worktrees have an absolute .git pointer outside the checkout. Supply
 # that metadata read-only too, so build.rs and cargo/git inspection still work.

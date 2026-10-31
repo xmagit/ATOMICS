@@ -1,8 +1,8 @@
 # Themes
 
-Every color and font in IMACS comes from a theme. Five themes are built in, theme files beside the config
+Every color and font in ATOMICS comes from a theme. Five themes are built in, theme files beside the config
 can add more, and `[theme]` in the config picks one and can override any part of it. Pick one in
-Settings → Themes, or save a theme file or the config: either applies while IMACS runs.
+Settings → Themes, or save a theme file or the config: either applies while ATOMICS runs.
 
 ```toml
 [theme]
@@ -23,7 +23,7 @@ accent = "#9fd6ae"        # optional: any token set here wins over the theme
 | `tide` | Light: paper with a clear blue accent `#2f6fdb` and GitHub's syntax colors. |
 
 The built-in themes are ordinary theme files that set every token. They are in
-[crates/imacs-core/themes](../crates/imacs-core/themes), and make good starting points.
+[crates/atomics-core/themes](../crates/atomics-core/themes), and make good starting points.
 
 ## Picking a theme
 
@@ -42,11 +42,11 @@ the list.
 ## Theme files
 
 A theme file is `themes/<name>.toml` in the folder that holds `config.toml`, so normally
-`~/.config/imacs/themes/<name>.toml` (with `IMACS_CONFIG`, the `themes/` folder beside that file). Names use
+`~/.config/atomics/themes/<name>.toml` (with `ATOMICS_CONFIG`, the `themes/` folder beside that file). Names use
 letters, digits, `-` and `_`. A file sets any tokens and inherits the rest:
 
 ```toml
-# ~/.config/imacs/themes/dusk.toml
+# ~/.config/atomics/themes/dusk.toml
 extends = "midnight"      # a built-in theme or another theme file
 accent = "#e0a458"
 on_accent = "#16181d"
@@ -61,7 +61,7 @@ cursor = "#e0a458"
 - Chains can be as long as needed, up to 16 themes; a cycle is reported.
 - Tokens set inline in `[theme]` win over every file.
 
-Problems are shown in the top bar as `theme: …`, and IMACS keeps going: an unknown key or a
+Problems are shown in the top bar as `theme: …`, and ATOMICS keeps going: an unknown key or a
 value that is not a color is left out, so the rest of the file still applies. A file that is not TOML, or a
 theme that does not exist, falls back to `claude`.
 
@@ -107,10 +107,10 @@ The other 240 terminal colors are the standard xterm cube and gray ramp.
 `ui_font` and `mono_font` take an installed family name, such as `"Inter"` or `"IBM Plex Mono"`, or a font
 file (`.ttf`, `.otf` or `.ttc`): an absolute path, a `~/` path, or a path relative to the `themes/` folder.
 Families are found through the system's font list on a background thread, and the regular face is used.
-A family that is not installed, or a file that cannot be read, keeps IMACS's built-in fonts, which also stay
+A family that is not installed, or a file that cannot be read, keeps ATOMICS's built-in fonts, which also stay
 behind a theme font for any character it lacks.
 
-The atomisk theme asks for Inter and IBM Plex Mono. Both are under the SIL Open Font License; IMACS does not
+The atomisk theme asks for Inter and IBM Plex Mono. Both are under the SIL Open Font License; ATOMICS does not
 ship them. Install them, or download them and point the theme at the files:
 
 ```toml
@@ -138,20 +138,20 @@ instead get `15;0` in dark themes and `0;15` in light ones, set when the termina
 
 ## Themes from the chief
 
-The chief can write a theme for you. `imacs_config_get` lists the theme on screen, the built-in themes, the
-theme files and every token. `imacs_config_propose` with `scope = "theme"` and `theme = "<name>"` proposes
-`themes/<name>.toml`: the `toml` holds tokens, merged into the file if it exists. IMACS checks it strictly, as
+The chief can write a theme for you. `atomics_config_get` lists the theme on screen, the built-in themes, the
+theme files and every token. `atomics_config_propose` with `scope = "theme"` and `theme = "<name>"` proposes
+`themes/<name>.toml`: the `toml` holds tokens, merged into the file if it exists. ATOMICS checks it strictly, as
 it would not check a file you write: an unknown key, a value that is not usable, an unknown syntax theme, or an
 `extends` that is missing or circular refuses the change. The proposal opens like any config change, with the
 theme drawn above the diff in its own colors, so you can judge it before you apply it. Applying writes the
-file (backing up an existing one); if the theme is the one on screen, IMACS switches to it at once. Showing a
+file (backing up an existing one); if the theme is the one on screen, ATOMICS switches to it at once. Showing a
 different theme is a separate proposal of `[theme] name` in the `main` or `host` scope. See
-[configuration](configuration.md#imacs_config_propose).
+[configuration](configuration.md#atomics_config_propose).
 
 ## For developers
 
-UI code takes every color from `Palette` (crates/imacs/src/theme.rs). A test fails on `Color32` constants,
-gray and alpha helpers, or constructors with literal channels anywhere else in the imacs crate; derive a
+UI code takes every color from `Palette` (crates/atomics/src/theme.rs). A test fails on `Color32` constants,
+gray and alpha helpers, or constructors with literal channels anywhere else in the atomics crate; derive a
 shade from tokens with `lerp` or `gamma_multiply` instead, or add a token. A new token needs a field in
-`ThemeTokens` (crates/imacs-core/src/theme.rs) and its `color_tokens!` list, a value in each built-in theme,
+`ThemeTokens` (crates/atomics-core/src/theme.rs) and its `color_tokens!` list, a value in each built-in theme,
 a `Palette` field, and a row in the table above; the tests check that the built-in themes set every token.

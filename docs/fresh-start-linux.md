@@ -1,11 +1,11 @@
 # Fresh start on Linux
 
 This page takes a clean Ubuntu desktop to a running chief with sandboxed agents. Each step ends with a
-check. [How IMACS works](how-it-works.md) explains the pieces; if you are bringing an existing setup from
+check. [How ATOMICS works](how-it-works.md) explains the pieces; if you are bringing an existing setup from
 another machine, read [Moving to a new machine](moving-machines.md) on the old one first.
 
-Paths below assume a new Linux install: config in `~/.config/imacs` and state in `~/.local/state/imacs`
-(`$XDG_CONFIG_HOME` and `$XDG_STATE_HOME` move them). If `~/.imacs` already exists, IMACS keeps using it
+Paths below assume a new Linux install: config in `~/.config/atomics` and state in `~/.local/state/atomics`
+(`$XDG_CONFIG_HOME` and `$XDG_STATE_HOME` move them). If `~/.atomics` already exists, ATOMICS keeps using it
 as its state folder.
 
 ## 1. Prerequisites
@@ -14,9 +14,9 @@ as its state folder.
 | --- | --- |
 | Ubuntu 24.04 or newer, in a desktop session | Docker Sandboxes support it. Other distributions can use sbx's static build; doctor warns, and setup carries on. |
 | Hardware virtualization, `/dev/kvm`, and your session in the `kvm` group | Every sandbox is a microVM. |
-| rustup and stable Rust | `scripts/linux-install.sh` builds IMACS from this checkout. |
+| rustup and stable Rust | `scripts/linux-install.sh` builds ATOMICS from this checkout. |
 | The build libraries and a Vulkan driver | The window (eframe/wgpu) and audio. |
-| `secret-tool` and an unlocked Secret Service keyring | IMACS's credential store. There is no plaintext fallback. |
+| `secret-tool` and an unlocked Secret Service keyring | ATOMICS's credential store. There is no plaintext fallback. |
 | `xdg-open` (`xdg-utils`) and the desktop portal | Opening files, ticket links and sign-in pages; file dialogs. |
 | Docker Sandboxes, `sbx` v0.50.1 or newer | Sandboxed agents. |
 | git, Claude Code, Codex | The agents and the chief. |
@@ -33,7 +33,7 @@ sudo usermod -aG kvm "$USER"   # then log out and back in
 id -Gn                         # must list kvm
 ```
 
-`imacs setup` (step 3) checks the rest and prints the install command for anything missing:
+`atomics setup` (step 3) checks the rest and prints the install command for anything missing:
 `curl -fsSL https://claude.ai/install.sh | bash` for Claude Code, Node.js/npm and then
 `npm install -g @openai/codex` for Codex, and for sbx:
 
@@ -50,27 +50,27 @@ Optional:
 - Azure CLI 2.54 or newer, only if you enable Azure (step 7).
 - Docker Engine, only for the container QA harness in [Testing on Linux](../README.md#testing-on-linux).
 - A btrfs or reflink-enabled XFS filesystem for your repositories. New worktrees then start with a warm
-  `target/`; on ext4 IMACS skips warming and agents build cold (see
+  `target/`; on ext4 ATOMICS skips warming and agents build cold (see
   [Running many agents](../README.md#running-many-agents)).
 
-## 2. Install IMACS
+## 2. Install ATOMICS
 
 Clone this repository, then from the checkout:
 
 ```sh
 scripts/linux-install.sh
-imacs --version
+atomics --version
 ```
 
-The installer builds a release binary for the native target and atomically replaces `~/.local/bin/imacs`,
-even while IMACS runs. It installs a desktop entry and icon under `~/.local/share`, then runs
-`imacs setup` in your terminal. Add `~/.local/bin` to `PATH` if it says so.
+The installer builds a release binary for the native target and atomically replaces `~/.local/bin/atomics`,
+even while ATOMICS runs. It installs a desktop entry and icon under `~/.local/share`, then runs
+`atomics setup` in your terminal. Add `~/.local/bin` to `PATH` if it says so.
 `scripts/linux-install.sh --uninstall` removes the binary, desktop entry and icon, and keeps config and state.
 
-## 3. Run `imacs setup`
+## 3. Run `atomics setup`
 
 ```sh
-imacs setup                  # or: imacs setup --workspace daily
+atomics setup                  # or: atomics setup --workspace daily
 ```
 
 Setup creates a missing config, then works through the machine in order. It shows each missing tool
@@ -82,7 +82,7 @@ all of them pass. A distribution other than Ubuntu 24.04+ is only a warning. Aft
 2. sbx's global network policy, only when none exists (`[isolation.sandbox] network`, balanced by default).
 3. Claude. Claude agents run sandboxed by default. While neither a subscription token nor sbx's
    `anthropic` secret is stored, setup asks for the token `claude setup-token` prints and keeps it in the
-   OS keychain for IMACS's credential relay. An Anthropic API key pasted there goes to sbx's
+   OS keychain for ATOMICS's credential relay. An Anthropic API key pasted there goes to sbx's
    `anthropic` secret instead.
 4. ChatGPT account sign-in (`sbx secret set openai --oauth`) for sandboxed Codex, when sbx has no
    `openai` secret. Declining offers an OpenAI API key instead, stored in the keychain and sbx.
@@ -91,7 +91,7 @@ all of them pass. A distribution other than Ubuntu 24.04+ is only a warning. Aft
    Linear. See [Tickets](tickets.md#step-by-step-linear).
 6. Removing sbx's `github` secret and misfiled secrets, and turning off SSH agent forwarding.
 
-It then rechecks everything and runs `imacs doctor`. Values travel over stdin, hidden on a terminal, and
+It then rechecks everything and runs `atomics doctor`. Values travel over stdin, hidden on a terminal, and
 never appear in arguments, output, logs or config. Ctrl-C, EOF or declining another step stops setup, and
 running it again resumes where it stopped. [Fresh machine: one guided
 command](isolation.md#fresh-machine-one-guided-command) has the details.
@@ -101,69 +101,69 @@ stdin only; there is no flag or argument that takes it:
 
 ```sh
 claude setup-token                    # prints a sk-ant-oat01-… token
-imacs setup --credential claude       # paste it
-imacs setup --credential openai
-imacs setup --credential linear
-imacs setup --credential github
-imacs setup --credential registry --registry-host registry.example.com
+atomics setup --credential claude       # paste it
+atomics setup --credential openai
+atomics setup --credential linear
+atomics setup --credential github
+atomics setup --credential registry --registry-host registry.example.com
 ```
 
 Without `secret-tool`, or with the keyring locked, these fail with `OS credential store unavailable;
-unlock it and retry`. **Settings → Credentials** in IMACS shows and edits the same store. See
+unlock it and retry`. **Settings → Credentials** in ATOMICS shows and edits the same store. See
 [Settings → Credentials](isolation.md#settings--credentials).
 
-## 4. Check with `imacs doctor`
+## 4. Check with `atomics doctor`
 
 ```sh
-imacs doctor
-imacs doctor -w daily        # with a workspace's isolation and ticket settings
+atomics doctor
+atomics doctor -w daily        # with a workspace's isolation and ticket settings
 ```
 
 Doctor changes nothing. It prints the machine's `Host:` name and the config files it loaded, then a line
 per check: `✓` passed, `✗` failed with a hint. It exits with 1 only when git is missing or the config does
-not load; everything else is a warning. On a new desktop, expect these until you start IMACS or opt in:
+not load; everything else is a warning. On a new desktop, expect these until you start ATOMICS or opt in:
 
-- `IMACS running` (start it in step 9) and `global Claude hooks installed` (optional, `imacs install-hooks`).
+- `ATOMICS running` (start it in step 9) and `global Claude hooks installed` (optional, `atomics install-hooks`).
 - `hx not found` without Helix.
 - `CoW cache cloning … cache warming will be skipped` on ext4.
 - `Azure CLI relay: off` until step 7.
 
 The sandbox checks should all pass: `Docker Sandboxes ready`, the network policy, `sandbox Claude
-credential: Claude subscription through IMACS's relay (OS keychain)`, the OpenAI secret, MCP, SSH
+credential: Claude subscription through ATOMICS's relay (OS keychain)`, the OpenAI secret, MCP, SSH
 forwarding, the prerequisites and the three `sandbox Linux:` checks. `credential store` must not warn.
 
 ## 5. Build a warm template (optional)
 
 A template is a saved sandbox snapshot with the toolchain, package caches and a first build in it, so
 sandboxed agents start warm. Tags are local to this machine; build them again after moving. Name the tag
-in the workspace file (or a repository's `.imacs/config.toml`), then build from the project's checkout:
+in the workspace file (or a repository's `.atomics/config.toml`), then build from the project's checkout:
 
 ```toml
-# ~/.config/imacs/workspaces/<host>/daily.toml
+# ~/.config/atomics/workspaces/<host>/daily.toml
 [isolation.sandbox]
 template = "myproject:local"
 ```
 
 ```sh
-imacs --workspace daily sandbox template build myproject --agent codex
+atomics --workspace daily sandbox template build myproject --agent codex
 # or by folder:
-imacs sandbox template build ~/repos/myproject --agent claude
+atomics sandbox template build ~/repos/myproject --agent claude
 ```
 
 Use the agent your sandboxed tasks run as. Without a tag the command stops with `set
-[isolation.sandbox] template in the workspace or .imacs/config.toml before building`. For a Rust
-repository the template runs `cargo check -p imacs-core` (it is made for this repository); for .NET pass
+[isolation.sandbox] template in the workspace or .atomics/config.toml before building`. For a Rust
+repository the template runs `cargo check -p atomics-core` (it is made for this repository); for .NET pass
 `--dotnet-project`. See [Warm templates](isolation.md#warm-templates).
 
-## 6. Check the relay: `imacs sandbox relay-check`
+## 6. Check the relay: `atomics sandbox relay-check`
 
 ```sh
-imacs sandbox relay-check
+atomics sandbox relay-check
 ```
 
 It makes one throwaway Claude sandbox through the same steps as an agent's, checks that the sandbox
 reaches the relay, that Claude answers through it on your subscription, that nothing in the VM looks like
-a Claude token except IMACS placeholders, and that a revoked placeholder is refused. It always removes the
+a Claude token except ATOMICS placeholders, and that a revoked placeholder is refused. It always removes the
 sandbox, its network rule and its folder, and ends with `PASS relay check` or a `FAIL` line. No line holds
 a value.
 
@@ -171,7 +171,7 @@ This is the first thing to try on a new Linux desktop. It passed in 26 seconds o
 (see [Linux hosts](isolation.md#linux-hosts)). If it fails at the reachability step, the message names
 the sandbox and port: check that `sbx policy ls <sandbox>` lists `localhost:<port>`, and whether
 `host.docker.internal` leads the VM to this machine's loopback. If it says the keychain holds no token,
-store one with `imacs setup --credential claude`. See [Sandboxed Claude on your subscription](isolation.md#sandboxed-claude-on-your-subscription).
+store one with `atomics setup --credential claude`. See [Sandboxed Claude on your subscription](isolation.md#sandboxed-claude-on-your-subscription).
 
 ## 7. Azure (opt-in)
 
@@ -181,11 +181,11 @@ an Azure credential in the VM. It is off until you turn it on:
 1. Install the Azure CLI (2.54 or newer) and run `az login` on the host.
 2. Turn on **Enable Azure CLI relay** in Settings → Credentials, or set `[isolation.sandbox.azure]
    enabled = true` in `config.toml` or this machine's `config.d/<host>.toml`.
-3. `imacs doctor` should say `✓ Azure CLI relay: enabled, az found, logged in`.
+3. `atomics doctor` should say `✓ Azure CLI relay: enabled, az found, logged in`.
 4. Run the read-only check with an Application Insights application ID you choose:
 
    ```sh
-   imacs queue --class qa -- imacs sandbox azure-check <application-UUID>
+   atomics queue --class qa -- atomics sandbox azure-check <application-UUID>
    ```
 
    It prints `PASS Azure relay check: count=<n>`. While Azure is off it stops with `Azure CLI relay is off;
@@ -200,30 +200,30 @@ Insights through host `az login`](isolation.md#azure-and-application-insights-th
 From this checkout:
 
 ```sh
-imacs queue --class qa -- scripts/linux-sandbox-smoke.sh
+atomics queue --class qa -- scripts/linux-sandbox-smoke.sh
 ```
 
-The script runs doctor and `imacs sandbox relay-check`, then starts an isolated IMACS (its own state,
+The script runs doctor and `atomics sandbox relay-check`, then starts an isolated ATOMICS (its own state,
 socket, config, runtime and temporary folders) with two sandboxed shells in disposable worktrees. It checks
 terminal output, file sync and control latency, removes everything it made, and checks for leftovers. It
-ends with `PASS Linux sandbox smoke (real sbx)`. `--skip-relay` leaves out the relay check; `--imacs`,
+ends with `PASS Linux sandbox smoke (real sbx)`. `--skip-relay` leaves out the relay check; `--atomics`,
 `--timeout` and `--latency-ms` are described in [Testing on Linux](../README.md#testing-on-linux).
-Without a running IMACS, `imacs queue` runs the command at once.
+Without a running ATOMICS, `atomics queue` runs the command at once.
 
-## 9. Start IMACS and the chief
+## 9. Start ATOMICS and the chief
 
 The chief runs bare, on this machine, with your own Claude Code login. Sign in once in a terminal:
 run `claude` and follow the prompt. (With `[isolation] bare_relay = true` bare Claude sessions, the chief
 included, use the subscription in the keychain through the relay instead.)
 
 ```sh
-imacs ~/repos/myproject        # or start IMACS from the desktop entry
-imacs --workspace daily        # after saving a workspace (Project › Open project…, then save)
+atomics ~/repos/myproject        # or start ATOMICS from the desktop entry
+atomics --workspace daily        # after saving a workspace (Project › Open project…, then save)
 ```
 
 Click **CHIEF** in the top bar, or press Ctrl+Shift+O (`cmd+o`; on Linux `cmd` is Ctrl+Shift). The chief
-starts in the project's main checkout with every IMACS tool. A good first request is to run
-`imacs_doctor` and read the result with you. From there it writes plans that wait for your approval on the
+starts in the project's main checkout with every ATOMICS tool. A good first request is to run
+`atomics_doctor` and read the result with you. From there it writes plans that wait for your approval on the
 board; see [The chief agent](../README.md#the-chief-agent).
 
 ## 10. Restart onto a new build
@@ -233,52 +233,52 @@ git pull
 scripts/linux-install.sh
 ```
 
-Then ask the chief to restart (it calls `imacs_restart`), or run:
+Then ask the chief to restart (it calls `atomics_restart`), or run:
 
 ```sh
-imacs ctl '{"cmd":"restart","reason":"installed the new build"}'
+atomics ctl '{"cmd":"restart","reason":"installed the new build"}'
 ```
 
 Restart refuses, and lists what blocks it, while agents work, an approval is pending or queued work
-runs; wait for those rather than forcing. IMACS saves its plans and sessions, quits, and starts the same
-binary with the same arguments. The chief resumes, and its next `imacs_wait` gets a `restarted` event
-naming the old and new build; `imacs --version` prints the build too. On a machine where setup is
-complete, the installer's final `imacs setup` asks nothing. If it stops with `setup input ended`, the new
-binary is already installed: run `imacs setup` in a terminal. See [Restart onto a new
+runs; wait for those rather than forcing. ATOMICS saves its plans and sessions, quits, and starts the same
+binary with the same arguments. The chief resumes, and its next `atomics_wait` gets a `restarted` event
+naming the old and new build; `atomics --version` prints the build too. On a machine where setup is
+complete, the installer's final `atomics setup` asks nothing. If it stops with `setup input ended`, the new
+binary is already installed: run `atomics setup` in a terminal. See [Restart onto a new
 build](../README.md#restart-onto-a-new-build).
 
 ## 11. Verify cleanup
 
-IMACS removes what it makes. Completing a plan, **Clean up plan…** and the **clean up…** dialog remove
+ATOMICS removes what it makes. Completing a plan, **Clean up plan…** and the **clean up…** dialog remove
 worktrees together with their sandboxes, MCP registrations and relay rules. Closing a scratch session
 removes its folder and sandbox. The next start sweeps whatever a crash left. To check by hand, once the
 work you started is closed:
 
 ```sh
-sbx ls                                    # imacs-<session id> only for sessions you can still resume
-sbx mcp ls                                # imacs-<session id> for those same sessions, plus servers you added
+sbx ls                                    # atomics-<session id> only for sessions you can still resume
+sbx mcp ls                                # atomics-<session id> for those same sessions, plus servers you added
 git -C ~/repos/myproject worktree list    # the main checkout, plus worktrees of open plans and sessions
-ls ~/.local/state/imacs/scratch           # one folder per open Ungrouped session
-imacs doctor                              # "cleanup leftover (warning)" names anything not removed
+ls ~/.local/state/atomics/scratch           # one folder per open Ungrouped session
+atomics doctor                              # "cleanup leftover (warning)" names anything not removed
 ```
 
-- A stopped `imacs-<session id>` sandbox is kept on purpose while its worktree exists, so the session
+- A stopped `atomics-<session id>` sandbox is kept on purpose while its worktree exists, so the session
   can resume. Removing the worktree (plan cleanup or **clean up…**) removes it.
-- `imacs-template-…`, `imacs-relay-check-…` and `imacs-azure-check-…` exist only while those commands run.
+- `atomics-template-…`, `atomics-relay-check-…` and `atomics-azure-check-…` exist only while those commands run.
   The two checks leave an empty `relay-check/` folder in the state folder.
 - Scratch folders go when their session closes; quitting ends scratch sessions, and the next start
   removes their folders (a restart resumes them instead).
-- IMACS only removes resources this state folder recorded in `sandbox-ownership.json`. Sandboxes of
-  another IMACS home, such as a smoke test's, are left alone.
+- ATOMICS only removes resources this state folder recorded in `sandbox-ownership.json`. Sandboxes of
+  another ATOMICS home, such as a smoke test's, are left alone.
 
 See [Lifecycle](isolation.md#lifecycle) for the full rules.
 
 ## Still macOS-only or not yet verified on Linux
 
-- **App bundle.** `scripts/macos-app.sh` builds `IMACS.app` on macOS only; Linux uses
+- **App bundle.** `scripts/macos-app.sh` builds `ATOMICS.app` on macOS only; Linux uses
   `scripts/linux-install.sh` and its desktop entry. Restart works on both: the bundle on macOS, the same
   binary on Linux.
-- **Sandboxed agents on Linux.** `imacs sandbox relay-check` and the real-sbx smoke test pass on a Linux
+- **Sandboxed agents on Linux.** `atomics sandbox relay-check` and the real-sbx smoke test pass on a Linux
   desktop (see [Verified](#verified)). Warm template timings and an interactive Claude agent running
   sandboxed in its tile have only run on macOS.
 - **Sandbox memory and CPU on tiles.** The sampler finds each sandbox's VM process by its name or by the
@@ -286,7 +286,7 @@ See [Lifecycle](isolation.md#lifecycle) for the full rules.
   has not been checked, and without a match the tile shows **Sandbox** alone.
 - **Spotlight.** Doctor's indexing check exists on macOS only.
 - **Microphone.** macOS asks for permission; Linux records from the default input device.
-- **Wayland.** IMACS is built with Wayland and X11 support. The smoke test's instance ran on KDE
+- **Wayland.** ATOMICS is built with Wayland and X11 support. The smoke test's instance ran on KDE
   Plasma's Wayland session; other compositors have not been tried.
 - **Credentials.** macOS's keychain is always there; Linux needs `secret-tool` and an unlocked Secret
   Service in the desktop session, so an SSH-only session cannot read or store credentials.
@@ -295,16 +295,16 @@ See [Lifecycle](isolation.md#lifecycle) for the full rules.
 
 On 2026-10-30 these steps were run against the code in the Linux QA container (Debian bookworm, Rust 1.98,
 no KVM, no sbx, no Secret Service, a fresh `HOME`): `scripts/linux-install.sh` install and uninstall;
-`imacs setup` listing the missing prerequisites with their install commands; `imacs setup --credential`
-refusing a value flag and failing without a keyring; `imacs doctor`; `imacs sandbox relay-check`,
-`imacs sandbox azure-check` and `imacs sandbox template build` stopping with the messages above; `imacs
-queue` without a running IMACS; `scripts/linux-sandbox-smoke.sh --fake-sbx`; and the git bundle steps in
+`atomics setup` listing the missing prerequisites with their install commands; `atomics setup --credential`
+refusing a value flag and failing without a keyring; `atomics doctor`; `atomics sandbox relay-check`,
+`atomics sandbox azure-check` and `atomics sandbox template build` stopping with the messages above; `atomics
+queue` without a running ATOMICS; `scripts/linux-sandbox-smoke.sh --fake-sbx`; and the git bundle steps in
 [Moving to a new machine](moving-machines.md). Steps that need KVM, a real sbx, a keyring, Claude or Azure
 were checked against the code only.
 
 On 2026-10-31, on a CachyOS desktop (Intel i7-8700, KDE Plasma 6.8 on Wayland, KWallet as the Secret
-Service, KVM, sbx v0.50.1 signed in, the Claude subscription token stored by `imacs setup`):
-`imacs sandbox relay-check` passed in 26 seconds, and `imacs queue --class qa --
+Service, KVM, sbx v0.50.1 signed in, the Claude subscription token stored by `atomics setup`):
+`atomics sandbox relay-check` passed in 26 seconds, and `atomics queue --class qa --
 scripts/linux-sandbox-smoke.sh` ended with `PASS Linux sandbox smoke (real sbx)` in 69 seconds, with
 control round trips of 9.4 ms median and 17.9 ms at most. Afterwards `sbx ls`, `sbx mcp ls` and `sbx policy
 ls` showed nothing either had made. Doctor warns that CachyOS is not Ubuntu 24.04+; both passed

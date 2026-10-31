@@ -1,12 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["crates/imacs-core", "crates/imacs"]
+members = ["crates/atomics-core", "crates/atomics"]
 
 [workspace.package]
 edition = "2024"
 version = "0.1.0"
 license = "MIT"
-repository = "https://github.com/xmagit/IMACS"
+repository = "https://github.com/xmagit/ATOMICS"
 description = "Review-first workspace for coding agents"
 
 [profile.release]

@@ -1,0 +1,49 @@
+#!/bin/sh
+# Both OS keychain protocols; fixture values stay in this temporary test directory.
+dir=${0%/*}
+printf '%s\n' "$@" >> "$dir/keychain-argv"
+# fstat sees unlinked capture files too; directory scans after exit would miss them.
+case "$1" in
+  find-generic-password|lookup)
+    if [ -e "$dir/check-output-pipes" ]; then
+      python3 - "$dir/keychain-output-fds" <<'PYTHON'
+import os, stat, sys
+pipes = [stat.S_ISFIFO(os.fstat(fd).st_mode) for fd in (1, 2)]
+with open(sys.argv[1], 'a') as report:
+    report.write(' '.join(map(str, pipes)) + '\n')
+assert all(pipes), 'keychain output must use pipes, never capture files'
+PYTHON
+      [ $? -eq 0 ] || exit 92
+    fi
+    ;;
+esac
+if [ -e "$dir/fail-keychain" ]; then
+  echo 'sk-ant-oat01-PRIVATE-keychain-error' >&2
+  exit 1
+fi
+catalog=false
+case "$*" in *atomics-credentials-v1*) catalog=true ;; esac
+file="$dir/keychain-value"
+if $catalog; then file="$dir/keychain-catalog"; fi
+# The catalog's item from before the rename to ATOMICS.
+case "$*" in *imacs-credentials-v1*) file="$dir/keychain-catalog-imacs" ;; esac
+case "$1" in
+  -i)
+    read -r command
+    case "$command" in *atomics-credentials-v1*) file="$dir/keychain-catalog" ;; esac
+    printf '%s\n' "${command##* -w }" > "$file"
+    ;;
+  store)
+    cat > "$file"
+    ;;
+  find-generic-password|lookup)
+    if [ ! -e "$file" ]; then
+      if [ "$1" = find-generic-password ]; then exit 44; else exit 1; fi
+    fi
+    cat "$file"
+    ;;
+  delete-generic-password|clear)
+    rm -f "$file"
+    ;;
+  *) exit 1 ;;
+esac
