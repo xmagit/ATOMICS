@@ -206,6 +206,24 @@ pub enum ControlRequest {
         plan: Option<String>,
         id: String,
     },
+    /// Chief-only ticket discovery; results are cleaned cards, capped at 25.
+    TicketSearch {
+        query: String,
+        #[serde(default)]
+        semantic: bool,
+        #[serde(default)]
+        take: Option<usize>,
+    },
+    /// Chief-only full reading card, through read or the get fallback.
+    TicketRead {
+        ticket: crate::tickets::TicketReference,
+    },
+    TicketChildren {
+        ticket: crate::tickets::TicketReference,
+    },
+    TicketRelated {
+        ticket: crate::tickets::TicketReference,
+    },
     /// Attaches a ticket to a plan (without `task`) or a task, creates one through the
     /// configured create operation, or with `unlink` removes the link.
     TicketLink {
