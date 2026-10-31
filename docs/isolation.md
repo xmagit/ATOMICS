@@ -161,6 +161,8 @@ macOS's keychain through `security`, Linux's Secret Service through `secret-tool
    placeholder as `CLAUDE_CODE_OAUTH_TOKEN` and the relay's current address, and with `apiKeyHelper`
    cleared: when sbx holds an `anthropic` secret it writes an `apiKeyHelper` into the VM's Claude
    settings, which would win over the placeholder.
+   All sandboxed Claude settings include `permissions.allow = ["Read(//**)"]`, so file tools can read
+   anywhere inside the VM, including `/tmp`, without asking: the VM is the boundary.
 5. **Each request.** Claude sends `Authorization: Bearer <placeholder>` to the relay through sbx's
    proxy, which passes headers unchanged and streams. The relay finds the session by its placeholder,
    checks the credential's upstream hosts and capability rules, puts the real token in
@@ -801,9 +803,9 @@ mounted read-only.
   keys and Codex's credential go through sbx's credential proxy.
 - **Account usage.** The sidebar's Claude and Codex limits come from the agents' own clients, which in a
   sandbox write them inside the VM: Codex in its usual session log, and Claude through a status line that
-  only saves its input to `/tmp/atomics-statusline.json` (ATOMICS gives a sandboxed Claude no other
-  settings). About once a minute, ATOMICS reads both back from sandboxes whose agent is attached, with one
-  `sbx exec` each: the end of the newest Codex rollout and Claude's last status line, bounded in the VM and
+  only saves its input to `/tmp/atomics-statusline.json`. About once a minute, ATOMICS reads both back
+  from sandboxes whose agent is attached, with one `sbx exec` each: the end of the newest Codex rollout
+  and Claude's last status line, bounded in the VM and
   on your machine. The agent can write these files, so a report never counts as newer than the moment it
   was read; at worst an agent misstates the limits it shows.
 
