@@ -41,18 +41,27 @@ impl Desktop<'_> {
                 self.edit(ctx, &root, file.as_deref(), None);
             }
         }
-        // Shift+↓/↑ walk the hunks from anywhere but a text field or the editor.
+        // Shift+↓/↑ walk changed files; PageDown/PageUp walk hunks in the focused diff.
         let editor_focused = self.client.editor_id.is_some_and(|id| ctx.memory(|m| m.has_focus(id)));
         if !ctx.text_edit_focused() && !editor_focused {
-            let step = ctx.input_mut(|i| {
+            let diff_focused = self.runtime.diff_open
+                && self.runtime.panel == PanelMode::Diff
+                && ctx.memory(|m| m.has_focus(diff_view::focus_id()));
+            let (step, hunk) = ctx.input_mut(|i| {
                 let down = egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, Key::ArrowDown);
                 let up = egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, Key::ArrowUp);
+                let page_down = egui::KeyboardShortcut::new(egui::Modifiers::NONE, Key::PageDown);
+                let page_up = egui::KeyboardShortcut::new(egui::Modifiers::NONE, Key::PageUp);
                 if crate::theme::consume_physical_shortcut(i, &down) {
-                    1
+                    (1, false)
                 } else if crate::theme::consume_physical_shortcut(i, &up) {
-                    -1
+                    (-1, false)
+                } else if diff_focused && crate::theme::consume_physical_shortcut(i, &page_down) {
+                    (1, true)
+                } else if diff_focused && crate::theme::consume_physical_shortcut(i, &page_up) {
+                    (-1, true)
                 } else {
-                    0
+                    (0, false)
                 }
             });
             if step != 0
@@ -63,8 +72,10 @@ impl Desktop<'_> {
                 self.client.focus_terminal = None;
                 self.client.focus_editor = false;
                 ctx.memory_mut(|m| m.request_focus(diff_view::focus_id()));
-                if self.client.diff_views.entry(root.clone()).or_default().step(step).is_some() {
-                    // Keep the host in diff mode without reopening the file over the hunk jump.
+                let state = self.client.diff_views.entry(root.clone()).or_default();
+                let target = if hunk { state.step_hunk(step) } else { state.step(step) };
+                if target.is_some() {
+                    // Keep the host in diff mode without reopening the file over the jump.
                     self.post(move |runtime| {
                         let data = runtime.diffs.entry(root).or_default();
                         data.viewing = None;
@@ -630,13 +641,24 @@ mod tests {
                     egui::text_edit::TextEditState::default().store(ctx, focused);
                 }
                 app.runtime.panel = PanelMode::Editor;
-                let event = key(Key::ArrowDown, Key::ArrowDown, egui::Modifiers::SHIFT);
-                assert_eq!(route(app, ctx, focused, vec![event.clone()]), [event]);
+                for code in [Key::ArrowDown, Key::ArrowUp, Key::PageDown, Key::PageUp] {
+                    let modifiers = if matches!(code, Key::ArrowDown | Key::ArrowUp) {
+                        egui::Modifiers::SHIFT
+                    } else {
+                        egui::Modifiers::NONE
+                    };
+                    let event = key(code, code, modifiers);
+                    assert_eq!(route(app, ctx, focused, vec![event.clone()]), [event]);
+                }
                 assert_eq!(app.client.diff_views[&root].focused.as_deref(), Some("first.rs"));
                 assert!(app.runtime.panel == PanelMode::Editor);
             }
             let modified = key(Key::ArrowDown, Key::ArrowDown, egui::Modifiers::SHIFT | egui::Modifiers::ALT);
             assert_eq!(route(app, ctx, terminal, vec![modified.clone()]), [modified]);
+            for code in [Key::PageDown, Key::PageUp] {
+                let event = key(code, code, egui::Modifiers::NONE);
+                assert_eq!(route(app, ctx, terminal, vec![event.clone()]), [event]);
+            }
         });
     }
 
@@ -676,6 +698,16 @@ mod tests {
             all_files: Arc::default(),
         }));
         app.runtime.ungrouped = true;
+    }
+
+    fn add_diff_hunk(app: &mut Desktop<'_>, root: &Path, file: usize) {
+        let prepared = Arc::get_mut(app.runtime.diffs.get_mut(root).unwrap().prepared.as_mut().unwrap()).unwrap();
+        let mut hunk = prepared.diff.files[file].hunks[0].clone();
+        hunk.new_start = 1000;
+        for line in &mut hunk.lines {
+            line.new_no = line.new_no.map(|n| n + 999);
+        }
+        prepared.diff.files[file].hunks.push(hunk);
     }
 
     /// Exercise the real terminal and diff widgets in the desktop's paint order.
@@ -755,7 +787,7 @@ mod tests {
             diff_frame(app, ctx, vec![key(key_code, key_code, egui::Modifiers::NONE)])
         };
         let down = press(app, Key::PageDown);
-        assert!(down > 500.0, "PageDown must scroll the diff by a page: {down}");
+        assert!(down > 0.0 && down < 40.0, "PageDown from a file header must reach its first hunk: {down}");
         assert!(std::fs::read(root.join("input.bin")).unwrap().is_empty());
         let line_down = press(app, Key::ArrowDown);
         let line_up = press(app, Key::ArrowUp);
@@ -764,18 +796,18 @@ mod tests {
         let end = press(app, Key::End);
         assert!(end > down);
         assert_eq!(press(app, Key::Home), 0.0);
-        assert!(press(app, Key::PageDown) > 0.0);
-        assert_eq!(press(app, Key::PageUp), 0.0);
+        assert_eq!(press(app, Key::PageDown), down);
+        assert_eq!(press(app, Key::PageUp), down, "PageUp stops at the first hunk of the diff");
         press(app, Key::Escape);
         assert!(!ctx.memory(|m| m.has_focus(diff_view::focus_id())));
         diff_frame(app, ctx, vec![egui::Event::Text("escape returned".into())]);
         assert_received(root, b"escape returned");
 
-        diff_frame(app, ctx, vec![key(Key::ArrowDown, Key::ArrowDown, egui::Modifiers::SHIFT)]);
+        let second_start = diff_frame(app, ctx, vec![key(Key::ArrowDown, Key::ArrowDown, egui::Modifiers::SHIFT)]);
         assert!(ctx.memory(|m| m.has_focus(diff_view::focus_id())));
-        let second_start = press(app, Key::Home);
-        assert!(second_start > end, "Home must use the current file");
-        assert!(press(app, Key::End) > second_start);
+        assert!(second_start > down);
+        assert_eq!(press(app, Key::Home), 0.0, "Home reaches the top from the second file");
+        assert_eq!(press(app, Key::End), end, "End reaches the bottom from either file");
         diff_frame(
             app,
             ctx,
@@ -815,8 +847,8 @@ mod tests {
     }
 
     #[test]
-    fn shift_arrow_focus_routes_diff_keys_and_returns_terminal_input() {
-        with_app("app::input::tests::shift_arrow_focus_routes_diff_keys_and_returns_terminal_input", |app, ctx| {
+    fn shift_arrows_focus_routes_diff_keys_and_returns_terminal_input() {
+        with_app("app::input::tests::shift_arrows_focus_routes_diff_keys_and_returns_terminal_input", |app, ctx| {
             for split in [DiffSplit::Never, DiffSplit::Always] {
                 app.runtime.sessions.clear();
                 let dir = crate::test_support::tempdir().unwrap();
@@ -857,42 +889,142 @@ mod tests {
     }
 
     #[test]
-    fn shift_arrows_focus_each_hunk_before_crossing_files() {
-        with_app("app::input::tests::shift_arrows_focus_each_hunk_before_crossing_files", |app, ctx| {
+    fn shift_arrows_skip_hunks_and_scroll_to_changed_file_headers() {
+        with_app("app::input::tests::shift_arrows_skip_hunks_and_scroll_to_changed_file_headers", |app, ctx| {
             for split in [DiffSplit::Never, DiffSplit::Always] {
                 app.runtime.sessions.clear();
                 let dir = crate::test_support::tempdir().unwrap();
                 let root = dir.path();
                 diff_agent(app, root, "agent");
-                let prepared =
-                    Arc::get_mut(app.runtime.diffs.get_mut(root).unwrap().prepared.as_mut().unwrap()).unwrap();
-                let mut hunk = prepared.diff.files[0].hunks[0].clone();
-                hunk.new_start = 1000;
-                for line in &mut hunk.lines {
-                    line.new_no = line.new_no.map(|n| n + 999);
-                }
-                prepared.diff.files[0].hunks.push(hunk);
+                add_diff_hunk(app, root, 0);
+                add_diff_hunk(app, root, 1);
                 app.runtime.active = Some("agent".into());
                 app.client.diff_split = Some(split);
                 // Navigation also leaves a whole-file preview without a later OpenFile resetting the jump.
                 app.runtime.diffs.get_mut(root).unwrap().viewing = Some("unchanged.rs".into());
+                app.sync_diffs();
+                app.client.diff_views.get_mut(root).unwrap().open("unchanged.rs");
                 let press =
                     |app: &mut Desktop<'_>, code| diff_frame(app, ctx, vec![key(code, code, egui::Modifiers::SHIFT)]);
                 let first = press(app, Key::ArrowDown);
+                assert_eq!(first, 0.0);
                 assert_eq!(app.client.diff_views[root].focused.as_deref(), Some("first.rs"));
-                let second = press(app, Key::ArrowDown);
+                // A jump from the first hunk skips the remaining hunks of this file.
+                let page = |app: &mut Desktop<'_>| {
+                    diff_frame(app, ctx, vec![key(Key::PageDown, Key::PageDown, egui::Modifiers::NONE)])
+                };
+                let first_hunk = page(app);
+                let next_file = press(app, Key::ArrowDown);
+                assert!(next_file > first_hunk + 2000.0);
+                assert_eq!(app.client.diff_views[root].focused.as_deref(), Some("second.rs"));
+                assert_eq!(diff_frame(app, ctx, vec![]), next_file, "repaints must retain the file jump");
+                // Both directions land at headers, including at the ends of the file list.
+                page(app);
+                page(app);
+                assert_eq!(press(app, Key::ArrowDown), next_file);
+                assert_eq!(press(app, Key::ArrowUp), first);
+                assert_eq!(app.client.diff_views[root].focused.as_deref(), Some("first.rs"));
+                page(app);
+                let last_hunk = page(app);
+                assert!(last_hunk > first_hunk + 1000.0);
+                diff_frame(app, ctx, vec![key(Key::ArrowDown, Key::ArrowDown, egui::Modifiers::NONE)]);
+                assert_eq!(press(app, Key::ArrowDown), next_file, "the current line within a hunk is irrelevant");
+                assert_eq!(press(app, Key::ArrowUp), first);
+                page(app);
+                page(app);
+                assert_eq!(press(app, Key::ArrowUp), first, "the first file clamps to its header");
+                assert!(ctx.memory(|m| m.has_focus(diff_view::focus_id())));
+                assert!(app.runtime.diffs[root].viewing.is_none());
+                assert_received(root, b"");
+            }
+        });
+    }
+
+    #[test]
+    fn page_keys_step_hunks_and_cross_changed_files() {
+        with_app("app::input::tests::page_keys_step_hunks_and_cross_changed_files", |app, ctx| {
+            for split in [DiffSplit::Never, DiffSplit::Always] {
+                app.runtime.sessions.clear();
+                let dir = crate::test_support::tempdir().unwrap();
+                let root = dir.path();
+                diff_agent(app, root, "agent");
+                add_diff_hunk(app, root, 0);
+                add_diff_hunk(app, root, 1);
+                app.runtime.active = Some("agent".into());
+                app.client.diff_split = Some(split);
+                diff_frame(app, ctx, vec![key(Key::ArrowDown, Key::ArrowDown, egui::Modifiers::SHIFT)]);
+                let press =
+                    |app: &mut Desktop<'_>, code| diff_frame(app, ctx, vec![key(code, code, egui::Modifiers::NONE)]);
+                let first = press(app, Key::PageDown);
+                assert!(first > 0.0 && first < 40.0, "the first stop is a hunk, after the file header");
+                let second = press(app, Key::PageDown);
                 assert!(second > first + 1000.0);
                 assert_eq!(app.client.diff_views[root].focused.as_deref(), Some("first.rs"));
                 assert_eq!(diff_frame(app, ctx, vec![]), second, "repaints must retain the hunk jump");
-                let next_file = press(app, Key::ArrowDown);
-                assert!(next_file > second);
+                let next_file = press(app, Key::PageDown);
+                assert!(next_file > second + 1000.0);
                 assert_eq!(app.client.diff_views[root].focused.as_deref(), Some("second.rs"));
-                assert_eq!(press(app, Key::ArrowUp), second);
+                let last = press(app, Key::PageDown);
+                assert!(last > next_file + 1000.0);
+                assert_eq!(press(app, Key::PageDown), last);
+                assert_eq!(press(app, Key::PageUp), next_file);
+                assert_eq!(press(app, Key::PageUp), second, "PageUp crosses to the previous file's last hunk");
                 assert_eq!(app.client.diff_views[root].focused.as_deref(), Some("first.rs"));
-                assert_eq!(press(app, Key::ArrowUp), first);
-                assert_eq!(press(app, Key::ArrowUp), first);
-                assert!(ctx.memory(|m| m.has_focus(diff_view::focus_id())));
+                assert_eq!(press(app, Key::PageUp), first);
+                assert_eq!(press(app, Key::PageUp), first);
+                let line = press(app, Key::ArrowDown);
+                assert!(line > first && line - first < 40.0);
+                assert_eq!(press(app, Key::PageDown), second, "line scrolling retains the current hunk");
+                let end = press(app, Key::End);
+                assert!(end > last, "End reaches the bottom of the whole diff");
+                assert_eq!(press(app, Key::PageUp), next_file);
+                assert_eq!(press(app, Key::Home), 0.0);
+                assert_eq!(press(app, Key::PageDown), first);
+                assert_eq!(press(app, Key::End), end);
+                app.runtime.diffs.get_mut(root).unwrap().viewing = Some("unchanged.rs".into());
+                app.client.diff_views.get_mut(root).unwrap().open("unchanged.rs");
+                assert_eq!(press(app, Key::PageDown), first, "PageDown also leaves a whole-file preview");
                 assert!(app.runtime.diffs[root].viewing.is_none());
+                assert_eq!(diff_frame(app, ctx, vec![]), first);
+                assert!(ctx.memory(|m| m.has_focus(diff_view::focus_id())));
+                assert_received(root, b"");
+            }
+        });
+    }
+
+    #[test]
+    fn shift_arrows_and_page_keys_in_a_single_file_diff() {
+        with_app("app::input::tests::shift_arrows_and_page_keys_in_a_single_file_diff", |app, ctx| {
+            for split in [DiffSplit::Never, DiffSplit::Always] {
+                app.runtime.sessions.clear();
+                let dir = crate::test_support::tempdir().unwrap();
+                let root = dir.path();
+                diff_agent(app, root, "agent");
+                Arc::get_mut(app.runtime.diffs.get_mut(root).unwrap().prepared.as_mut().unwrap())
+                    .unwrap()
+                    .diff
+                    .files
+                    .truncate(1);
+                add_diff_hunk(app, root, 0);
+                app.runtime.active = Some("agent".into());
+                app.client.diff_split = Some(split);
+                let shift =
+                    |app: &mut Desktop<'_>, code| diff_frame(app, ctx, vec![key(code, code, egui::Modifiers::SHIFT)]);
+                let press =
+                    |app: &mut Desktop<'_>, code| diff_frame(app, ctx, vec![key(code, code, egui::Modifiers::NONE)]);
+                assert_eq!(shift(app, Key::ArrowDown), 0.0);
+                let first = press(app, Key::PageDown);
+                let second = press(app, Key::PageDown);
+                assert!(second > first + 1000.0);
+                assert_eq!(press(app, Key::PageDown), second);
+                assert_eq!(press(app, Key::PageUp), first);
+                assert_eq!(press(app, Key::PageUp), first);
+                for code in [Key::ArrowDown, Key::ArrowUp] {
+                    assert_eq!(press(app, Key::PageDown), second);
+                    assert_eq!(shift(app, code), 0.0, "Shift+arrows always return to the only file's header");
+                    assert_eq!(press(app, Key::PageDown), first);
+                }
+                assert_eq!(app.client.diff_views[root].focused.as_deref(), Some("first.rs"));
                 assert_received(root, b"");
             }
         });

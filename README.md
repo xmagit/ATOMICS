@@ -676,7 +676,9 @@ Tooltips and the settings menu show the actual platform chord, including custom 
 | `cmd+p` | go to file |
 | `cmd+e` | diff ⇄ editor |
 | `cmd+b` | plan board |
-| `shift+↓` / `shift+↑` | next / previous diff section (hunk), crossing changed files, and focus the diff (except in a text field or the editor); ↑/↓ scroll a line, PageUp/PageDown a page, Home/End the current file; Esc, typing, or clicking the terminal returns focus to it |
+| `shift+↓` / `shift+↑` | next / previous changed file, scrolling to its header and focusing the diff (except in a text field or the editor) |
+| `PageDown` / `PageUp` | next / previous hunk in the focused diff, continuing across changed files |
+| `↓` / `↑`, `Home` / `End` | scroll a line, or go to the top / bottom of the focused diff; Esc, typing, or clicking the terminal returns focus to it |
 | `cmd+d` | show/hide the diff |
 | `cmd+j` | next agent that needs you |
 | `cmd+l` | steer bar |
