@@ -118,6 +118,10 @@ impl Terminal {
         *self.shared.typed.lock().unwrap() = Some(Instant::now());
     }
 
+    pub fn last_typed(&self) -> Option<Instant> {
+        *self.shared.typed.lock().unwrap()
+    }
+
     /// Output cadence is a host decision informed by native-client visibility.
     /// These hints expire by wall clock, independently of egui frame counters.
     pub fn repaint_delay(&self) -> Duration {

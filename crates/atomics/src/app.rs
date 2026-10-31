@@ -514,6 +514,8 @@ pub(crate) struct State {
     last_status: HashMap<String, AgentStatus>,
     waiters: Vec<Waiter>,
     heartbeat: heartbeat::Heartbeat,
+    /// Events already summarized in the last automatic chief wake.
+    chief_wake_cursor: u64,
     tickets: tickets::Tickets,
     plans: Vec<Plan>,
     selected_plan: usize,
@@ -943,6 +945,7 @@ impl State {
             last_status: HashMap::new(),
             waiters: Vec::new(),
             heartbeat: heartbeat::Heartbeat::default(),
+            chief_wake_cursor: 0,
             tickets,
             plans,
             selected_plan,

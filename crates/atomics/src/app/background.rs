@@ -289,6 +289,7 @@ impl State {
         self.record_events();
         self.sync_plan();
         self.heartbeat();
+        self.wake_chief();
         while let Ok(result) = self.worker.rx.try_recv() {
             changed = true;
             match result {

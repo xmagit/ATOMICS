@@ -153,6 +153,73 @@ fn heartbeat_fires_without_frames() {
 }
 
 #[test]
+fn chief_wake_submits_one_line_without_frames_and_preserves_drafts() {
+    with_state("app::host_tests::chief_wake_submits_one_line_without_frames_and_preserves_drafts", |mut state, _| {
+        let dir = paths::atomics_home();
+        let received = dir.join("wake.txt");
+        let mut chief = session("chief", AgentKind::Claude, AgentStatus::Done, &dir);
+        chief.chief = true;
+        chief.activity.observe(AgentStatus::Done);
+        chief.activity.wake_since = Some(Instant::now() - Duration::from_secs(180));
+        chief.terminal = Some(
+            Terminal::spawn(
+                state.wake.clone(),
+                Vec::new(),
+                "/bin/sh".into(),
+                vec![
+                    "-c".into(),
+                    "printf '❯ draft'; read -r line; printf '%s\\n' \"$line\" >> wake.txt; exec sleep 30".into(),
+                ],
+                &dir,
+                HashMap::new(),
+                100,
+            )
+            .unwrap(),
+        );
+        state.sessions = vec![chief, session("worker", AgentKind::Generic, AgentStatus::Working, &dir)];
+        let host = state.into_host();
+        eventually(&host, |state| state.sessions[0].terminal.as_ref().unwrap().screen_text(60).contains("❯ draft"));
+        {
+            let state = host.state();
+            assert!(!received.exists(), "a draft must not receive a wake");
+            assert_eq!(state.chief_wake_cursor, 0);
+        }
+        {
+            let mut state = host.state();
+            // Replace the fixture with an empty prompt; no client input buffer or frame is involved.
+            state.sessions[0].terminal = Some(
+                Terminal::spawn(
+                    state.wake.clone(),
+                    Vec::new(),
+                    "/bin/sh".into(),
+                    vec![
+                        "-c".into(),
+                        "printf '❯ '; while read -r line; do printf '%s\\n' \"$line\" >> wake.txt; done".into(),
+                    ],
+                    &dir,
+                    HashMap::new(),
+                    100,
+                )
+                .unwrap(),
+            );
+        }
+        eventually(&host, |_| std::fs::read_to_string(&received).is_ok_and(|line| line.ends_with('\n')));
+        let line = std::fs::read_to_string(&received).unwrap();
+        assert_eq!(
+            line,
+            "ATOMICS wake: 1 new events, 0 heartbeat findings (none). Call atomics_wait and act; if nothing changed, post one short line.\n"
+        );
+        assert_eq!(line.lines().count(), 1);
+        {
+            let state = host.state();
+            assert!(state.chief_wake_cursor > 0);
+            assert!(state.sessions[0].activity.wake_since.unwrap().elapsed() < Duration::from_secs(10));
+        }
+        assert_eq!(std::fs::read_to_string(&received).unwrap(), line);
+    });
+}
+
+#[test]
 fn plan_is_saved_without_frames() {
     with_state("app::host_tests::plan_is_saved_without_frames", |state, _| {
         let _host = state.into_host();

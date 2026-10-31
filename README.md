@@ -412,6 +412,13 @@ status began, pending approvals or Codex menus, messages held for over a minute,
 `heartbeat` in `atomics_wait` statuses to receive one fleet event with a `findings` list; an empty list means all good.
 The chief pill shows a compact age and a dot when that check found something; hover for the full local check time.
 
+Every `[chief] wake_secs` (default 180 seconds; `0` disables it, otherwise at least 30), ATOMICS can also wake
+an idle or turn-done chief while an open plan has a running or review task, or another agent session exists.
+It sends one line: `ATOMICS wake: <n> new events, <m> heartbeat findings (<short kinds>). Call atomics_wait and act; if nothing changed, post one short line.`
+The counts summarize events since the previous wake and the latest heartbeat findings. A wake waits for a full
+interval after the chief's turn ends or the previous wake. Working turns reset the timer. Pending permissions,
+typing in the chief terminal within the last 60 seconds, or an unfinished prompt suppress the wake.
+
 The chief may read, plan, review and run the plan you approved without asking. It can also answer other
 agents' permission prompts through the pre-approved `atomics_approve`, including `allow_always` for the rest
 of a session. Starting agents, typing into terminals and closing sessions still ask for permission.
