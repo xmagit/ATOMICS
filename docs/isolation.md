@@ -496,8 +496,8 @@ Set `[isolation.sandbox] template = "imacs-cox:local"` in the repository's main 
 
 ```sh
 imacs sandbox template build /path/to/cox
-imacs --workspace backend sandbox template build cz3backend --agent claude \
-  --dotnet-project soa-src/Cosmoz3.Shared/Cosmoz3.Contracts/Cosmoz3.Contracts.csproj
+imacs --workspace backend sandbox template build app --agent claude \
+  --dotnet-project src/App/App.csproj
 ```
 
 A project is a directory (including a linked worktree), or a project's basename in `--workspace`.
@@ -525,15 +525,16 @@ It then creates a temporary sandbox from the agent's original image with an empt
 primary workspace (sbx requires it to be writable), mounts the checkout and
 its git metadata read-only, and copies tracked source (including tracked local edits) into its own
 filesystem. Untracked credentials, host build output and host toolchain directories are excluded.
-It installs rustup and stable Rust (including rustfmt and Clippy) for IMACS, runs
-`cargo check -p imacs-core`, then stops the builder and saves with `sbx template save`. Cargo's registry, toolchain
+It installs rustup and stable Rust (including rustfmt and Clippy), runs
+`cargo check --workspace` (or `cargo check -p <name>` with `--rust-package <name>`;
+for IMACS itself, use `--rust-package imacs-core`), then stops the builder and saves with `sbx template save`. Cargo's registry, toolchain
 and build cache live in the snapshot: the template's Cargo config uses `~/.cache/imacs/target`.
 On macOS this avoids mixing Linux and macOS artifacts in the host's `target`.
 
 For .NET, it installs the SDK pinned by `global.json`, or .NET 8 if no SDK is pinned, builds the
-selected project and captures the sandbox's NuGet package cache. The default project is
-`soa-src/Cosmoz3.Shared/Cosmoz3.Contracts/Cosmoz3.Contracts.csproj`; use `--dotnet-project` for another
-repository-relative project. SDK installation and restore need the repository's allowed network hosts.
+selected project and captures the sandbox's NuGet package cache. Without `--dotnet-project`,
+it selects the single `.sln` or `.slnx` at the repository root; otherwise it asks for
+`--dotnet-project`. An explicit path must be repository-relative and end in `.csproj`, `.sln` or `.slnx`. SDK installation and restore need the repository's allowed network hosts.
 Private feeds require credentials provisioned inside the sandbox; IMACS never copies host NuGet
 credentials into an image. Build failures report sbx's error and do not save a template. The temporary
 sandbox is removed on success or failure; the source staging directory is removed before saving.

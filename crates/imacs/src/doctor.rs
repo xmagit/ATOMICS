@@ -127,8 +127,15 @@ fn report(workspace: Option<&str>, for_agent: bool, projects: &[PathBuf]) -> Rep
     let git = git_version.map(|version| format!("git found ({version})")).unwrap_or_else(|| "git not found".into());
     lines.push(check_line(git_ok, &git, "install git and add it to your login-shell PATH"));
 
-    for program in ["claude", "codex", "hx"] {
-        let found = find_program(program);
+    let config_path = paths::config_file();
+    let config = Config::load_with_sources(&config_path);
+    let editor = config.as_ref().ok().and_then(|(config, _)| config.editor.command.first());
+    for program in [Some("claude"), Some("codex"), editor.map(String::as_str)].into_iter().flatten() {
+        let found = if Some(program) == editor.map(String::as_str) {
+            crate::setup::editor_on_path(program, find_program)
+        } else {
+            find_program(program)
+        };
         let label = match &found {
             Some(path) => format!("{program} found on login-shell PATH ({})", path.display()),
             None => format!("{program} not found on login-shell PATH (warning)"),
@@ -145,9 +152,7 @@ fn report(workspace: Option<&str>, for_agent: bool, projects: &[PathBuf]) -> Rep
         }
     }
 
-    let config_path = paths::config_file();
     lines.push(format!("Host: {}", paths::host_name()));
-    let config = Config::load_with_sources(&config_path);
     let label = match &config {
         Ok(_) => format!("config parses ({})", config_path.display()),
         // TOML errors quote the failing line, which may hold a secret: agents get file and line only.
@@ -636,5 +641,22 @@ mod tests {
         assert_eq!(exit_code(false, true), 1);
         assert_eq!(exit_code(true, false), 1);
         assert_eq!(exit_code(false, false), 1);
+    }
+}
+
+#[cfg(test)]
+mod editor_tests {
+    use crate::setup::editor_on_path;
+    use std::path::PathBuf;
+
+    #[test]
+    fn helix_fallback_respects_the_configured_program_and_prefers_hx() {
+        let helix = |name: &str| (name == "helix").then(|| PathBuf::from("/bin/helix"));
+        assert_eq!(editor_on_path("hx", helix), Some(PathBuf::from("/bin/helix")));
+        assert_eq!(editor_on_path("nvim", helix), None);
+        assert_eq!(editor_on_path("/custom/hx", helix), None);
+        assert_eq!(editor_on_path("hx", |_| None), None);
+        assert_eq!(editor_on_path("hx", |name| Some(PathBuf::from(name))), Some(PathBuf::from("hx")));
+        assert_eq!(editor_on_path("nvim", |name| Some(PathBuf::from(name))), Some(PathBuf::from("nvim")));
     }
 }

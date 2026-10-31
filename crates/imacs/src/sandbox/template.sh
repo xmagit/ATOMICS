@@ -3,6 +3,7 @@ source_dir=$1
 kind=$2
 project=$3
 jobs=$4
+rust_package=${5:-}
 stage=$(mktemp -d /tmp/imacs-template.XXXXXX)
 trap 'rm -rf "$stage"' EXIT
 # Copy tracked files, including local edits, without local credentials or host build output.
@@ -26,11 +27,15 @@ if [ "$kind" = rust ]; then
     rustup default stable
     mkdir -p "$HOME/.cargo" "$HOME/.cache/imacs/target"
     printf '[build]\ntarget-dir = "%s/.cache/imacs/target"\njobs = %s\n' "$HOME" "$jobs" > "$HOME/.cargo/config.toml"
-    cargo check -p imacs-core
+    if [ -n "$rust_package" ]; then
+        cargo check -p "$rust_package"
+    else
+        cargo check --workspace
+    fi
 else
     mkdir -p "$HOME/.dotnet"
     curl --fail --location https://dot.net/v1/dotnet-install.sh -o "$stage/dotnet-install.sh"
-    # global.json wins; cz3backend currently targets net8.0 when it has no SDK pin.
+    # Use global.json when present, otherwise install the fallback SDK.
     if [ -f global.json ]; then
         bash "$stage/dotnet-install.sh" --jsonfile global.json --install-dir "$HOME/.dotnet"
     else
