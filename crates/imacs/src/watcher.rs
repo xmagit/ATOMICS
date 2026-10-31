@@ -2,6 +2,7 @@
 //! watches folder by folder (inotify), folders whose churn never changes a diff are left out,
 //! so a build writing thousands of files into `target/` never reaches IMACS.
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Mutex, Weak};
@@ -185,7 +186,8 @@ impl Shared {
             .iter()
             .filter_map(|(root, real)| Some((root, path.strip_prefix(real).ok()?)))
             .min_by_key(|(_, relative)| relative.components().count())?;
-        (!relative.iter().any(|part| IGNORED_DIRS.iter().any(|dir| part == *dir))).then_some(root)
+        let mut parent = None;
+        (!relative.iter().any(|part| ignored(part, parent.replace(part)))).then_some(root)
     }
 
     /// Whether a worktree holding `folder` wants it watched.
@@ -224,6 +226,7 @@ impl Shared {
 /// `.git` where branches move (its top level, `refs/` and each linked worktree's `HEAD`).
 fn watched_folder(relative: &Path) -> bool {
     let mut parts = relative.iter();
+    let mut parent = None;
     while let Some(part) = parts.next() {
         if part == ".git" {
             return match parts.next() {
@@ -233,11 +236,17 @@ fn watched_folder(relative: &Path) -> bool {
                 Some(_) => false,
             };
         }
-        if IGNORED_DIRS.iter().any(|dir| part == *dir) {
+        if ignored(part, parent.replace(part)) {
             return false;
         }
     }
     true
+}
+
+/// Whether a folder named `part`, inside `parent`, is ignored. `src/bin` holds Rust's extra
+/// binaries, so it is watched although `bin` is .NET's build output elsewhere.
+fn ignored(part: &OsStr, parent: Option<&OsStr>) -> bool {
+    IGNORED_DIRS.iter().any(|dir| part == *dir) && !(part == "bin" && parent.is_some_and(|parent| parent == "src"))
 }
 
 fn is_ref(path: &Path) -> bool {
@@ -338,6 +347,15 @@ mod tests {
         assert!(quiet.is_empty(), "reading a file is not a change: {quiet:?}");
         std::fs::write(&head, "ref: refs/heads/other\n").unwrap();
         assert_eq!(settled(&changes, scaled_timeout(Duration::from_secs(10))), [Change::Refs]);
+    }
+
+    #[test]
+    fn rusts_src_bin_is_watched_though_bin_elsewhere_is_build_output() {
+        assert!(watched_folder(Path::new("src/bin")));
+        assert!(watched_folder(Path::new("crates/app/src/bin/tool")));
+        assert!(!watched_folder(Path::new("App/bin")));
+        assert!(!watched_folder(Path::new("App/bin/Debug")));
+        assert!(!watched_folder(Path::new("src/bin/target")));
     }
 
     #[test]
