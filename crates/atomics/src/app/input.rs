@@ -45,9 +45,11 @@ impl Desktop<'_> {
         let editor_focused = self.client.editor_id.is_some_and(|id| ctx.memory(|m| m.has_focus(id)));
         if !ctx.text_edit_focused() && !editor_focused {
             let step = ctx.input_mut(|i| {
-                if i.consume_key(egui::Modifiers::SHIFT, Key::ArrowDown) {
+                let down = egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, Key::ArrowDown);
+                let up = egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, Key::ArrowUp);
+                if crate::theme::consume_physical_shortcut(i, &down) {
                     1
-                } else if i.consume_key(egui::Modifiers::SHIFT, Key::ArrowUp) {
+                } else if crate::theme::consume_physical_shortcut(i, &up) {
                     -1
                 } else {
                     0
@@ -57,20 +59,9 @@ impl Desktop<'_> {
                 && let Some(root) = self.runtime.diff_target()
             {
                 self.runtime.diff_open = true;
-                if self.runtime.panel == PanelMode::Plan {
-                    self.runtime.panel = PanelMode::Diff;
-                }
-                let moved = self.client.diff_views.entry(root.clone()).or_default().step(step);
-                if self.runtime.panel != PanelMode::Editor
-                    && let Some((path, _)) = &moved
-                {
-                    self.open_file(&root, path);
-                }
-                if self.runtime.panel == PanelMode::Editor
-                    && let Some((path, line)) = moved
-                {
-                    self.edit(ctx, &root, Some(&path), line);
-                    self.client.focus_editor = false;
+                self.runtime.panel = PanelMode::Diff;
+                if let Some((path, _)) = self.client.diff_views.entry(root.clone()).or_default().step(step) {
+                    self.open_file(&root, &path);
                 }
             }
         }
@@ -113,16 +104,15 @@ impl Desktop<'_> {
                 .into_iter()
                 .enumerate()
         {
-            let chord = egui::KeyboardShortcut::new(shortcut("cmd+a").map(|s| s.modifiers).unwrap_or_default(), key);
-            // cmd+N jumps to the Nth agent on screen and loads its diff.
+            let modifiers = if cfg!(target_os = "macos") { egui::Modifiers::MAC_CMD } else { egui::Modifiers::CTRL };
+            let chord = egui::KeyboardShortcut::new(modifiers, key);
+            // Command+N on macOS, Ctrl+N elsewhere: focus the Nth visible agent and its diff.
             let visible = self.runtime.visible_sessions();
-            if ctx.input_mut(|i| crate::theme::consume_digit_chord(i, &chord))
+            if ctx.input_mut(|i| crate::theme::consume_physical_shortcut(i, &chord))
                 && let Some(id) = visible.get(n).map(|&i| self.runtime.sessions[i].id.clone())
             {
                 self.activate(&id, true);
-                if self.runtime.panel == PanelMode::Plan {
-                    self.runtime.panel = PanelMode::Diff;
-                }
+                self.runtime.panel = PanelMode::Diff;
             }
         }
     }
@@ -425,4 +415,163 @@ pub(super) fn new_session_request(dialog: &NewDialog) -> Result<ControlRequest, 
         args: Vec::new(),
         isolation: dialog.isolation,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{session, with_app};
+    use super::*;
+
+    fn key(key: Key, physical_key: Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key { key, physical_key: Some(physical_key), pressed: true, repeat: false, modifiers }
+    }
+
+    fn route(
+        app: &mut Desktop<'_>,
+        ctx: &egui::Context,
+        focused: egui::Id,
+        events: Vec<egui::Event>,
+    ) -> Vec<egui::Event> {
+        ctx.memory_mut(|memory| memory.request_focus(focused));
+        let releases = events
+            .iter()
+            .filter_map(|event| match event {
+                egui::Event::Key { key, physical_key, modifiers, .. } => Some(egui::Event::Key {
+                    key: *key,
+                    physical_key: *physical_key,
+                    pressed: false,
+                    repeat: false,
+                    modifiers: *modifiers,
+                }),
+                _ => None,
+            })
+            .collect();
+        let mut remaining = Vec::new();
+        ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
+            app.shortcuts(ui.ctx());
+            ui.interact(ui.max_rect(), focused, Sense::click());
+            // TerminalView reads this queue after the application shortcuts.
+            remaining = ui.input(|input| input.events.clone());
+        })
+        .drop_without_applying_deltas();
+        ctx.run_ui(egui::RawInput { events: releases, ..Default::default() }, |ui| {
+            ui.interact(ui.max_rect(), focused, Sense::click());
+        })
+        .drop_without_applying_deltas();
+        app.runtime.drain_actions();
+        remaining
+    }
+
+    #[test]
+    fn agent_shortcuts_route_physical_digits_before_terminal_input() {
+        with_app("app::input::tests::agent_shortcuts_route_physical_digits_before_terminal_input", |app, ctx| {
+            let project = PathBuf::from("/project");
+            app.runtime.repos = vec![project.clone(), PathBuf::from("/other")];
+            app.runtime.view = Some(project.clone());
+            app.runtime.plan_view = false;
+            app.runtime.ungrouped = false;
+            app.runtime.sessions = vec![session("chief", AgentKind::Generic, AgentStatus::Idle, &project)];
+            app.runtime.sessions[0].chief = true;
+            app.runtime.sessions.push(session("hidden", AgentKind::Generic, AgentStatus::Idle, Path::new("/other")));
+            for n in 1..=9 {
+                app.runtime.sessions.push(session(
+                    &format!("agent-{n}"),
+                    AgentKind::Generic,
+                    AgentStatus::Working,
+                    &project.join(format!("task-{n}")),
+                ));
+            }
+            let focused = egui::Id::NULL.with("agent-terminal");
+            let modifiers = (if cfg!(target_os = "macos") { egui::Modifiers::MAC_CMD } else { egui::Modifiers::CTRL })
+                | egui::Modifiers::COMMAND;
+            for (n, digit) in
+                [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9]
+                    .into_iter()
+                    .enumerate()
+            {
+                app.runtime.active = Some("hidden".into());
+                app.runtime.diff_open = false;
+                app.runtime.panel = match n % 3 {
+                    0 => PanelMode::Diff,
+                    1 => PanelMode::Editor,
+                    _ => PanelMode::Plan,
+                };
+                let ordinary = key(Key::C, Key::C, egui::Modifiers::CTRL);
+                let remaining =
+                    route(app, ctx, focused, vec![key(Key::Exclamationmark, digit, modifiers), ordinary.clone()]);
+                assert_eq!(app.runtime.active.as_deref(), Some(format!("agent-{}", n + 1).as_str()));
+                assert_eq!(app.runtime.diff_target(), Some(project.join(format!("task-{}", n + 1))));
+                assert!(app.runtime.diff_open && app.runtime.panel == PanelMode::Diff);
+                assert_eq!(remaining, [ordinary], "only the agent shortcut is withheld from the terminal");
+            }
+            let symbols =
+                vec![key(Key::Exclamationmark, Key::Num1, egui::Modifiers::SHIFT), egui::Event::Text("!".into())];
+            assert_eq!(route(app, ctx, focused, symbols.clone()), symbols);
+            assert_eq!(app.runtime.active.as_deref(), Some("agent-9"));
+            if cfg!(target_os = "linux") {
+                let old = key(Key::Exclamationmark, Key::Num1, egui::Modifiers::CTRL | egui::Modifiers::SHIFT);
+                assert_eq!(route(app, ctx, focused, vec![old.clone()]), [old]);
+                assert_eq!(app.runtime.active.as_deref(), Some("agent-9"));
+            }
+        });
+    }
+
+    #[test]
+    fn shift_arrows_navigate_the_diff_before_terminal_input() {
+        with_app("app::input::tests::shift_arrows_navigate_the_diff_before_terminal_input", |app, ctx| {
+            let root = PathBuf::from("/project");
+            app.runtime.sessions = vec![session("agent", AgentKind::Generic, AgentStatus::Working, &root)];
+            app.runtime.active = Some("agent".into());
+            app.runtime.diffs.entry(root.clone()).or_default().prepared = Some(Arc::new(diff_view::Prepared {
+                diff: atomics_core::diff::WorktreeDiff {
+                    files: ["first.rs", "second.rs"]
+                        .into_iter()
+                        .map(|path| atomics_core::diff::FileDiff {
+                            old_path: None,
+                            new_path: Some(path.into()),
+                            status: atomics_core::diff::FileStatus::Added,
+                            binary: false,
+                            hunks: vec![],
+                            omitted: 0,
+                        })
+                        .collect(),
+                    ..Default::default()
+                },
+                highlights: vec![],
+                longest_line: 0,
+                additions: 0,
+                deletions: 0,
+                all_files: Arc::default(),
+            }));
+            app.sync_diffs();
+            let terminal = egui::Id::NULL.with("agent-terminal");
+            let editor = egui::Id::NULL.with("editor-terminal");
+            app.client.editor_id = Some(editor);
+            for (arrow, path) in
+                [(Key::ArrowDown, "first.rs"), (Key::ArrowDown, "second.rs"), (Key::ArrowUp, "first.rs")]
+            {
+                app.runtime.diff_open = false;
+                app.runtime.panel = PanelMode::Editor;
+                let ordinary = key(Key::ArrowRight, Key::ArrowRight, egui::Modifiers::NONE);
+                let remaining =
+                    route(app, ctx, terminal, vec![key(arrow, arrow, egui::Modifiers::SHIFT), ordinary.clone()]);
+                assert_eq!(app.client.diff_views[&root].focused.as_deref(), Some(path));
+                assert!(app.runtime.diff_open && app.runtime.panel == PanelMode::Diff);
+                assert_eq!(remaining, [ordinary], "Shift+arrows must not reach the focused agent terminal");
+                assert!(ctx.memory(|memory| memory.has_focus(terminal)));
+            }
+            for focused in [editor, egui::Id::NULL.with("text-field")] {
+                if focused != editor {
+                    egui::text_edit::TextEditState::default().store(ctx, focused);
+                }
+                app.runtime.panel = PanelMode::Editor;
+                let event = key(Key::ArrowDown, Key::ArrowDown, egui::Modifiers::SHIFT);
+                assert_eq!(route(app, ctx, focused, vec![event.clone()]), [event]);
+                assert_eq!(app.client.diff_views[&root].focused.as_deref(), Some("first.rs"));
+                assert!(app.runtime.panel == PanelMode::Editor);
+            }
+            let modified = key(Key::ArrowDown, Key::ArrowDown, egui::Modifiers::SHIFT | egui::Modifiers::ALT);
+            assert_eq!(route(app, ctx, terminal, vec![modified.clone()]), [modified]);
+        });
+    }
 }

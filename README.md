@@ -665,6 +665,8 @@ and `screenshot`. For example,
 
 `cmd` is Command on macOS and Ctrl+Shift on Linux, so it never collides with the terminal's plain Ctrl keys.
 For example, `cmd+p` is Ctrl+Shift+P on Linux. `cmd+shift+space` becomes Ctrl+Shift+Space (Shift is applied once).
+Switching agents uses **Ctrl+1…9 on Linux** and **Command+1…9 on macOS**, including while a terminal has focus.
+The digits follow the physical keys, leaving Shift+digits available for symbols such as `!`.
 Tooltips and the settings menu show the actual platform chord, including custom bindings.
 
 | Key | |
@@ -680,7 +682,7 @@ Tooltips and the settings menu show the actual platform chord, including custom 
 | `cmd+t` | new session (scratch folder, existing folder or new worktree) |
 | `cmd+r` | refresh diff |
 | `cmd+w` | close session |
-| `cmd+1…9` | switch session |
+| `Command+1…9` (macOS) / `Ctrl+1…9` (Linux) | focus agent 1–9 on screen and show its diff |
 
 ## Design
 
