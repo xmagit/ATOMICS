@@ -334,10 +334,12 @@ struct StatusEvent {
     ticket: Option<serde_json::Value>,
     /// Set when the user applied or rejected a proposed config change.
     config: Option<serde_json::Value>,
+    /// Set when a plan was approved, edited, closed or reopened.
+    change: Option<&'static str>,
 }
 
 impl StatusEvent {
-    /// What `wait` matches on: the agent's status, "reported", "heartbeat", "ticket" or "config".
+    /// What `wait` matches on: the agent's status, "reported", "heartbeat", "ticket", "config" or "plan".
     fn kind(&self) -> &str {
         if self.findings.is_some() {
             "heartbeat"
@@ -345,6 +347,8 @@ impl StatusEvent {
             "ticket"
         } else if self.config.is_some() {
             "config"
+        } else if self.change.is_some() {
+            "plan"
         } else if self.report.is_some() {
             "reported"
         } else {
@@ -367,6 +371,9 @@ impl StatusEvent {
         }
         if let Some(config) = &self.config {
             value["config"] = config.clone();
+        }
+        if let Some(change) = self.change {
+            value["change"] = json!(change);
         }
         if let Some(request) = &self.approval {
             value["approval"] = json!(request);

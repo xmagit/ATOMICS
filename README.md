@@ -490,6 +490,7 @@ or the config maps each generic operation (get, list, update state, comment, cre
 systems changes only that section. Cards show each ticket's live key and state, and a click opens it. IMACS moves
 ticket states as tasks move and comments on dispatch, reports, acceptance, blocks and completion, signed with
 the reporting model. Changes made in the ticket system reach the chief as `ticket` events in `imacs_wait`.
+Include `plan` in `imacs_wait` statuses to learn when the user approves a plan (board button or `imacs ctl plan_approve`), edits a task brief on the board, or closes or reopens a plan: one event with `plan` and `change` (`approved`, `edited`, `closed`, `reopened`).
 Failures show on the card and never block a plan. See [docs/tickets.md](docs/tickets.md) for the design, the
 config reference and examples, with step-by-step [Relay](docs/tickets.md#step-by-step-relay) and
 [Linear](docs/tickets.md#step-by-step-linear) setups.

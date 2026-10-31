@@ -138,6 +138,7 @@ impl State {
         closed.save_in(&paths::imacs_home()).map_err(|err| format!("Closing plan failed: {err:#}"))?;
         self.plans[index] = closed;
         self.changed_plans.remove(&self.plans[index].id);
+        self.plan_event(index, "closed");
         self.cleanup_closed_plan(index);
         if status == PlanStatus::Completed {
             self.ticket_plan_completed(index);
@@ -252,12 +253,58 @@ impl State {
         self.plans[index] = plan;
         self.integration_revision += 1;
         let id = self.plans[index].id.clone();
+        self.plan_event(index, "reopened");
         self.refresh_tickets(Some(&id), None);
         self.selected_plan = index;
         self.show_plan_fleet();
         self.panel = PanelMode::Plan;
         self.diff_open = true;
         Ok(())
+    }
+
+    /// Approves the plan; one `plan` event the first time.
+    pub(super) fn approve_plan(&mut self, index: usize) {
+        let newly = !self.plans[index].approved;
+        self.plans[index].approved = true;
+        self.save_plan(index);
+        if newly {
+            self.plan_event(index, "approved");
+        }
+    }
+
+    /// The board's brief edit: only a planned task of an unapproved plan, and only a real change.
+    pub(super) fn edit_task_brief(&mut self, index: usize, id: &str, brief: String) {
+        if self.plans[index].approved {
+            return;
+        }
+        let Some(task) = self.plans[index].task_mut(id) else { return };
+        if task.status != TaskStatus::Planned || task.brief == brief {
+            return;
+        }
+        task.brief = brief;
+        self.save_plan(index);
+        self.plan_event(index, "edited");
+    }
+
+    /// A plan milestone for `imacs_wait`: `change` is approved, edited, closed or reopened.
+    pub(super) fn plan_event(&mut self, index: usize, change: &'static str) {
+        self.event_seq += 1;
+        self.events.push(StatusEvent {
+            seq: self.event_seq,
+            session: String::new(),
+            title: self.plans[index].goal.clone(),
+            status: AgentStatus::Idle,
+            at: imacs_core::store::now(),
+            plan: Some(self.plans[index].id.clone()),
+            task: None,
+            report: None,
+            approval: None,
+            findings: None,
+            ticket: None,
+            config: None,
+            change: Some(change),
+        });
+        self.serve_waiters();
     }
 
     pub(super) fn save_plan(&self, index: usize) {
@@ -597,6 +644,7 @@ impl State {
             findings: None,
             config: None,
             ticket: None,
+            change: None,
         });
         self.serve_waiters();
         if let Some((index, id)) = &owner {
@@ -656,6 +704,71 @@ impl State {
 mod tests {
     use super::super::tests::{repository, request, session, with_app};
     use super::*;
+
+    #[test]
+    fn plan_events_reach_only_waiters_asking_for_them() {
+        with_app("app::plans::tests::plan_events_reach_only_waiters_asking_for_them", |app, ctx| {
+            let (_dir, repo) = repository();
+            let wait = |app: &mut Desktop<'_>, statuses: &[&str]| {
+                let (tx, rx) = std::sync::mpsc::channel();
+                app.runtime.control(
+                    ctx,
+                    ControlRequest::Wait {
+                        sessions: vec![],
+                        statuses: statuses.iter().map(|s| s.to_string()).collect(),
+                        after: Some(app.runtime.event_seq),
+                        timeout_secs: Some(30),
+                    },
+                    tx,
+                );
+                rx
+            };
+            let events = |rx: std::sync::mpsc::Receiver<ControlOutcome>| {
+                let ControlOutcome::Done(response) = rx.try_recv().expect("waiter answered") else { panic!("wait") };
+                response.result["events"].as_array().unwrap().clone()
+            };
+            for (goal, board) in [("Ctl", false), ("Board", true)] {
+                let id = request(
+                    app,
+                    json!({"cmd":"plan_set", "goal":goal, "tasks":[{"id":"a", "title":"A", "brief":"old", "repo":repo}]}),
+                )
+                .result["plan"]
+                    .clone();
+                let index = app.runtime.plans.iter().position(|p| p.id == id).unwrap();
+                let plan = wait(app, &["plan"]);
+                let other = wait(app, &["turn done", "reported"]);
+                if board {
+                    app.runtime.edit_task_brief(index, "a", "new".into());
+                    let edited = events(plan);
+                    assert_eq!(edited.len(), 1);
+                    assert_eq!(edited[0]["status"], "plan");
+                    assert_eq!(edited[0]["change"], "edited");
+                    assert_eq!(edited[0]["plan"], id);
+                    app.runtime.edit_task_brief(index, "a", "new".into());
+                    let plan = wait(app, &["plan"]);
+                    app.runtime.approve_plan(index);
+                    app.runtime.approve_plan(index);
+                    let approved = events(plan);
+                    assert_eq!(approved.len(), 1, "approving twice is one event");
+                    assert_eq!(approved[0]["change"], "approved");
+                } else {
+                    assert!(request(app, json!({"cmd":"plan_approve", "plan":id})).ok);
+                    let approved = events(plan);
+                    assert_eq!(approved.len(), 1);
+                    assert_eq!(approved[0]["status"], "plan");
+                    assert_eq!(approved[0]["change"], "approved");
+                    assert_eq!(approved[0]["plan"], id);
+                }
+                assert!(other.try_recv().is_err(), "a waiter not asking for plan gets none");
+                let plan = wait(app, &["plan"]);
+                assert!(request(app, json!({"cmd":"plan_close", "plan":id, "status":"archived"})).ok);
+                assert_eq!(events(plan)[0]["change"], "closed");
+                let plan = wait(app, &["plan"]);
+                app.runtime.reopen_plan(index).unwrap();
+                assert_eq!(events(plan)[0]["change"], "reopened");
+            }
+        });
+    }
 
     #[test]
     fn ctl_approval_survives_branch_edits_and_archives_release_branch_ownership() {
