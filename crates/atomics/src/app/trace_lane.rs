@@ -37,6 +37,8 @@ pub(super) struct Lane {
     pub cleared: u64,
     reveal: bool,
     content_h: f32,
+    /// The lane had the keyboard focus when it was last drawn.
+    pub had_focus: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -363,6 +365,7 @@ impl Desktop<'_> {
         ui.set_clip_rect(ui.clip_rect().intersect(rect));
         let running = entries.iter().any(|entry| entry.state == TraceState::Running);
         let focused = ui.memory(|m| m.has_focus(focus_id()));
+        lane.had_focus = focused;
         ui.horizontal(|ui| {
             ui.set_height(HEAD_H - 2.0);
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
@@ -793,7 +796,7 @@ mod tests {
         ctx: &egui::Context,
         events: Vec<egui::Event>,
     ) -> (egui::FullOutput, Vec<(Pos2, String)>) {
-        let output = ctx.run_ui(
+        let mut output = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(900.0, 700.0))),
                 events,
@@ -804,6 +807,7 @@ mod tests {
                 app.chief_content(ui);
             },
         );
+        output.textures_delta.clear();
         app.runtime.drain_actions();
         let texts = output
             .shapes
@@ -867,6 +871,12 @@ mod tests {
                 assert_eq!(views[0].open, Some(0));
                 assert_eq!(views[4].meta, "2 tasks");
 
+                // Scroll the search card into view; the lane otherwise sticks to the newest card.
+                app.runtime.lane.selected = app.runtime.lane_entries().first().map(|e| e.seq);
+                app.runtime.lane.reveal = true;
+                for _ in 0..4 {
+                    chief_texts(app, ctx, vec![]);
+                }
                 let (_, texts) = chief_texts(app, ctx, vec![]);
                 let all = texts.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>().join("\n");
                 for expected in
@@ -884,7 +894,13 @@ mod tests {
                 assert!(app.runtime.lane_echo().unwrap().starts_with("chief · plan epic"));
 
                 // A click on "open ↗" of the search card reads its first result in the panel.
-                let open = texts.iter().find(|(_, t)| t == "open ↗").expect("open link").0;
+                let search_y = texts.iter().find(|(_, t)| t.contains("search by meaning")).unwrap().0.y;
+                let open = texts
+                    .iter()
+                    .filter(|(_, t)| t == "open ↗")
+                    .min_by(|a, b| (a.0.y - search_y).abs().total_cmp(&(b.0.y - search_y).abs()))
+                    .expect("open link")
+                    .0;
                 let click = open + vec2(4.0, 4.0);
                 let button = |pressed| egui::Event::PointerButton {
                     pos: click,

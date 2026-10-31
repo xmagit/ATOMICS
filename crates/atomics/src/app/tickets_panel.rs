@@ -992,9 +992,7 @@ impl Desktop<'_> {
             {
                 acts.push(Act::Browser(url.clone()));
             }
-            if ui.button("Plan with chief")
-                .on_hover_text(shortcut_label(ui.ctx(), &plan_key))
-                .clicked() {
+            if ui.button("Plan with chief").on_hover_text(shortcut_label(ui.ctx(), &plan_key)).clicked() {
                 acts.push(Act::Plan);
             }
             let trail = crumbs.iter().map(String::as_str).chain([read.link.label()]).collect::<Vec<_>>().join(" › ");
@@ -2090,7 +2088,7 @@ mod tests {
     }
 
     fn dialog_frame(app: &mut Desktop<'_>, ctx: &egui::Context, events: Vec<egui::Event>) -> egui::FullOutput {
-        let output = ctx.run_ui(
+        let mut output = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 800.0))),
                 events,
@@ -2102,6 +2100,7 @@ mod tests {
                 app.plan_dialog(ui.ctx());
             },
         );
+        output.textures_delta.clear();
         app.runtime.drain_actions();
         output
     }
@@ -2145,7 +2144,7 @@ mod tests {
                 let sent = sent_to_chief(app);
                 assert_eq!(sent.len(), 1);
                 let expected = atomics_core::tickets::plan_message(&atomics_core::tickets::PlanRequest {
-                    system: "demo",
+                    system: &app.runtime.ticket_config().unwrap().system,
                     key: "DEMO-1",
                     title: epic.title.as_deref().unwrap(),
                     url: plan.ticket.as_ref().and_then(|t| t.url.as_deref()),
@@ -2155,7 +2154,7 @@ mod tests {
                 });
                 assert_eq!(sent[0], expected);
                 assert!(sent[0].contains(&format!("plan id {}.", plan.id)) && sent[0].contains("Mode: board"));
-                for line in body.lines().filter(|l| l.len() > 12) {
+                for line in body.lines().filter(|l| l.len() > 12 && !epic.title.as_deref().unwrap().contains(*l)) {
                     assert!(!sent[0].contains(line), "the ticket's text rode in the message: {line}");
                 }
 

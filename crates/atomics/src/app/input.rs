@@ -233,9 +233,12 @@ impl Desktop<'_> {
                 }
             }
         }
-        if ctx.memory(|m| m.has_focus(trace_lane::focus_id()))
+        // Escape from the trace lane returns to the terminal. egui may already have dropped the
+        // focus on that Escape, so the lane remembers that it had it last frame.
+        if (self.runtime.lane.had_focus || ctx.memory(|m| m.has_focus(trace_lane::focus_id())))
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape))
         {
+            self.runtime.lane.had_focus = false;
             ctx.memory_mut(|m| m.surrender_focus(trace_lane::focus_id()));
             self.client.focus_terminal = self.runtime.chief_session_id().map(str::to_string);
         }
