@@ -14,8 +14,6 @@ use imacs_core::layout::{self, DiffPlacement, DiffSplit, Layout};
 use imacs_core::session::{AgentStatus, UNTITLED, pick_tiled, prompt_title, title_for};
 use imacs_core::store::{SessionRecord, Store};
 use imacs_core::{paths, steer, theme};
-use notify_debouncer_mini::notify::RecursiveMode;
-use notify_debouncer_mini::{DebounceEventResult, Debouncer, new_debouncer_opt};
 
 use crate::diff_view::{self, DiffAction, DiffState, ExplorerState, Header};
 use crate::diff_worker::{DiffData, DiffWorker, WorkerResult};
@@ -28,6 +26,7 @@ use crate::setup::{SHELL_PATH, env_var, global_hooks_installed, install_global_h
 use crate::terminal::{Metrics, Terminal, TerminalView};
 use crate::theme::{Palette, lerp, shortcut, shortcut_label};
 use crate::voice::{MAX_RECORDING, Recorder};
+use crate::watcher::{Change, Watcher};
 use imacs_core::approvals::{ApprovalRequest, Decision};
 use imacs_core::control::{ControlRequest, ControlResponse};
 use imacs_core::governor::{SlotClass, Ticket};
@@ -39,7 +38,6 @@ use serde_json::json;
 mod approvals;
 mod background;
 mod board;
-mod change_watcher;
 mod chief;
 mod commands;
 mod connections;
@@ -81,9 +79,6 @@ const FALLBACK_REFRESH: Duration = Duration::from_secs(30);
 const PULSE_STEP: Duration = Duration::from_millis(250);
 /// Untracked content kept for a diff off screen; the rest is counted, not loaded.
 const OFF_SCREEN_UNTRACKED: u64 = 1024 * 1024;
-
-/// Folders whose churn (builds, dependencies, git internals) never changes the diff.
-const IGNORED_DIRS: &[&str] = &[".git", "node_modules", "target", "bin", "obj", ".idea", ".vs", "dist"];
 
 #[derive(Default)]
 pub struct Options {
@@ -555,9 +550,7 @@ pub(crate) struct State {
     worktree_listing: Option<Receiver<ListedWorktrees>>,
     focus_terminal: Option<String>,
     last_layout: Option<Layout>,
-    watcher: Option<Debouncer<change_watcher::ChangeWatcher>>,
-    /// Worktrees being watched, each with its path as the file system reports it.
-    watched: Arc<Mutex<Vec<(PathBuf, PathBuf)>>>,
+    watcher: Option<Watcher>,
     watch_tx: crate::host::Sender<PathBuf>,
     watch_rx: Receiver<PathBuf>,
     toast: Option<(String, Instant)>,
@@ -978,7 +971,6 @@ impl State {
             focus_terminal: None,
             last_layout: None,
             watcher: None,
-            watched: Arc::default(),
             watch_tx,
             watch_rx,
             toast: None,

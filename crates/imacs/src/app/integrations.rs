@@ -832,7 +832,7 @@ mod tests {
                 app.runtime.diff_root = None;
                 app.runtime.runtime_tick(ctx);
                 assert!(
-                    app.runtime.watched.lock().unwrap().iter().any(|(root, _)| root == &repo),
+                    app.runtime.watcher.as_ref().is_some_and(|watcher| watcher.roots().contains(&repo)),
                     "the task repository must be watched even without a live agent or visible diff"
                 );
                 let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));

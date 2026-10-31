@@ -764,72 +764,33 @@ impl State {
         }
         wanted.sort();
         wanted.dedup();
-        let current: Vec<PathBuf> = self.watched.lock().unwrap().iter().map(|(root, _)| root.clone()).collect();
-        if current == wanted {
+        if self.watcher.as_ref().map_or(&[][..], Watcher::roots) == wanted {
             return;
         }
         if self.watcher.is_none() {
-            let (tx, watched) = (self.watch_tx.clone(), self.watched.clone());
-            let integration_dirty = self.integration_dirty.clone();
-            let wake = self.wake.clone();
-            let handler = move |result: DebounceEventResult| {
-                let Ok(events) = result else { return };
-                let watched = watched.lock().unwrap();
-                let mut changed: Vec<&PathBuf> = Vec::new();
-                for event in &events {
-                    if event.path.components().any(|c| c.as_os_str() == ".git")
-                        && (event.path.components().any(|c| c.as_os_str() == "refs")
-                            || event.path.file_name().is_some_and(|n| n == "HEAD" || n == "packed-refs"))
-                    {
-                        integration_dirty.store(true, Ordering::Relaxed);
-                        wake.notify();
-                        continue;
-                    }
-                    // The innermost worktree, for worktrees inside another.
-                    let Some((root, relative)) = watched
-                        .iter()
-                        .filter_map(|(root, real)| Some((root, event.path.strip_prefix(real).ok()?)))
-                        .min_by_key(|(_, relative)| relative.components().count())
-                    else {
-                        continue;
-                    };
-                    let ignored = relative.components().any(|c| IGNORED_DIRS.iter().any(|d| c.as_os_str() == *d));
-                    if !ignored && !changed.contains(&root) {
-                        changed.push(root);
-                    }
-                }
-                for root in &changed {
-                    let _ = tx.send((*root).clone());
+            let (tx, integration_dirty, wake) =
+                (self.watch_tx.clone(), self.integration_dirty.clone(), self.wake.clone());
+            let on_change = move |change| match change {
+                Change::Files(root) => drop(tx.send(root)),
+                Change::Refs => {
+                    integration_dirty.store(true, Ordering::Relaxed);
+                    wake.notify();
                 }
             };
-            let config = notify_debouncer_mini::Config::default().with_timeout(Duration::from_millis(250));
-            match new_debouncer_opt::<_, change_watcher::ChangeWatcher>(config, handler) {
-                Ok(debouncer) => self.watcher = Some(debouncer),
+            match Watcher::new(on_change) {
+                Ok(watcher) => self.watcher = Some(watcher),
                 Err(err) => eprintln!("IMACS: file watcher failed: {err}"),
             }
         }
-        if let Some(debouncer) = &mut self.watcher {
-            let watcher = debouncer.watcher();
-            for root in current.iter().filter(|root| !wanted.contains(root)) {
-                if let Some((_, real)) = self.watched.lock().unwrap().iter().find(|(path, _)| path == root) {
-                    let _ = watcher.unwatch(real);
-                }
-            }
-            self.watched.lock().unwrap().retain(|(root, _)| wanted.contains(root));
-            for root in wanted.iter().filter(|root| !current.contains(root)) {
-                let Ok(real) = std::fs::canonicalize(root) else { continue };
-                if watcher.watch(&real, RecursiveMode::Recursive).is_ok() {
-                    self.watched.lock().unwrap().push((root.clone(), real));
-                }
-            }
-            self.watched.lock().unwrap().sort();
+        if let Some(watcher) = &mut self.watcher {
+            watcher.set_roots(&wanted);
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{request, session, with_app};
+    use super::super::tests::{repository, request, session, with_app};
     use super::*;
 
     #[test]
@@ -950,13 +911,11 @@ mod tests {
                 app.runtime.sessions.clear();
                 app.runtime.plans.clear();
                 app.runtime.watch(ctx, Some(&root));
-                assert!(app.runtime.watched.lock().unwrap().is_empty(), "a failed watch must remain pending");
+                let watched = |app: &Desktop<'_>| app.runtime.watcher.as_ref().unwrap().roots().to_vec();
+                assert!(watched(app).is_empty(), "a failed watch must remain pending");
                 std::fs::create_dir(&root).unwrap();
                 app.runtime.watch(ctx, Some(&root));
-                assert_eq!(
-                    *app.runtime.watched.lock().unwrap(),
-                    [(root.clone(), std::fs::canonicalize(&root).unwrap())]
-                );
+                assert_eq!(watched(app), std::slice::from_ref(&root));
                 let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
                 loop {
                     std::fs::write(root.join("changed.txt"), "changed").unwrap();
@@ -971,9 +930,36 @@ mod tests {
                     assert!(Instant::now() < deadline, "no event for symlinked worktree");
                 }
                 app.runtime.watch(ctx, None);
-                assert!(app.runtime.watched.lock().unwrap().is_empty());
+                assert!(watched(app).is_empty());
             },
         );
+    }
+
+    #[test]
+    fn ref_updates_mark_integrations_dirty() {
+        with_app("app::background::tests::ref_updates_mark_integrations_dirty", |app, ctx| {
+            let (_dir, repo) = repository();
+            app.runtime.sessions.clear();
+            app.runtime.plans.clear();
+            app.runtime.watch(ctx, Some(&repo));
+            // The last one moves a branch inside a refs folder created after watching began.
+            for args in [
+                &["branch", "feature/one"][..],
+                &["commit", "--allow-empty", "-qm", "second"],
+                &["update-ref", "refs/heads/feature/one", "HEAD"],
+            ] {
+                // Earlier commands settle first, so only this one can mark integrations dirty.
+                std::thread::sleep(crate::test_support::scaled_timeout(Duration::from_millis(750)));
+                app.runtime.integration_dirty.store(false, Ordering::Relaxed);
+                git::git(&repo, args).unwrap();
+                let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
+                while !app.runtime.integration_dirty.load(Ordering::Relaxed) {
+                    assert!(Instant::now() < deadline, "git {} must mark integrations dirty", args.join(" "));
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            app.runtime.watch(ctx, None);
+        });
     }
 
     #[test]

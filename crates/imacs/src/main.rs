@@ -33,6 +33,7 @@ mod theme;
 mod tickets;
 mod usage;
 mod voice;
+mod watcher;
 
 use std::path::PathBuf;
 
