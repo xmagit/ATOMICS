@@ -53,7 +53,10 @@ sudo apt install docker-sbx
 ```
 
 Setup then guides Docker browser sign-in, initializes the global network policy only if it
-is missing, and reads a missing OpenAI API key over stdin. When Claude agents run sandboxed and
+is missing, and offers ChatGPT account sign-in for sandboxed Codex with
+`sbx secret set openai --oauth` when sbx has no `openai` secret. Declining offers an OpenAI API
+key over stdin instead, stored in the OS keychain and sbx. Declining both continues the remaining
+setup steps; sandboxed Codex cannot authenticate until one of these is configured. When Claude agents run sandboxed and
 neither the Claude subscription nor sbx's `anthropic` secret is stored, it asks for the token
 `claude setup-token` prints and keeps it in the OS keychain for IMACS's credential relay; an
 Anthropic API key pasted there goes to sbx's `anthropic` secret instead (see
@@ -64,7 +67,7 @@ child output; if a browser does not open, run the indicated authentication comma
 terminal and retry setup. It also offers to remove a stored GitHub credential and disable
 SSH forwarding, so the corresponding readiness checks can pass.
 
-Each change asks for confirmation. EOF, declining a step, or Ctrl-C stops setup; running it
+Each change asks for confirmation. EOF, declining another step, or Ctrl-C stops setup; running it
 again checks actual state and skips completed steps. An existing Claude subscription token, Anthropic
 key and OpenAI secret are reused. No progress file contains credentials. All token input
 is hidden on a terminal; pipes can supply newline-terminated answers and credentials over
@@ -76,7 +79,8 @@ one from sbx's list (it lists every scope). Typing the name, as in `sbx secret r
 would put the pasted credential on a command line other processes can read, so setup never runs it.
 
 After its secret steps, setup reads sbx's listing again through doctor's own credential checks and
-stops at the first warning, so it never calls done a secret doctor reports missing. It then verifies
+stops at the first failed check, except for an explicitly declined OpenAI credential, which remains
+visible as missing. It then verifies
 every sandbox check and finishes by running `imacs doctor`. Doctor and
 Settings → Sandbox show the same readiness checks. Doctor also includes independent host/workspace diagnostics
 (running IMACS, optional editors, hook trust and repository cleanup); setup does not claim to
@@ -958,7 +962,7 @@ These rules restrict relay requests; they do not expand the permissions of the u
 Integrations request a per-session placeholder from the relay for a catalog identifier (`claude`,
 `openai`, `linear`, `github`, or `registry:<host>`). Storing a credential does not automatically grant
 it to every session. Claude's subscription is granted automatically when it starts sandboxed.
-Sandbox Codex continues to use sbx's own OpenAI credential proxy. Guided setup saves a new OpenAI
+Sandbox Codex continues to use sbx's own OpenAI credential proxy. If you choose the API key option, guided setup saves a new OpenAI
 key to the shared catalog and provisions sbx over stdin; if sbx needs reprovisioning it reuses the
 catalog's key. Existing sbx secrets keep working.
 

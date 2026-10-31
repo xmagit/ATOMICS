@@ -90,6 +90,12 @@ fn retry(input: &mut impl BufRead, output: &mut impl Write) -> Result<()> {
     Ok(())
 }
 
+fn optional_consent(input: &mut impl BufRead, output: &mut impl Write, message: &str) -> Result<bool> {
+    write!(output, "{message} [y/N] ")?;
+    output.flush()?;
+    Ok(answer(input)?.eq_ignore_ascii_case("y"))
+}
+
 fn consent(input: &mut impl BufRead, output: &mut impl Write, message: &str) -> Result<()> {
     write!(output, "{message} [y/N] ")?;
     output.flush()?;
@@ -164,24 +170,57 @@ fn guided(
         token.clear();
         result?;
     }
+    let mut openai_declined = false;
     if !secrets.openai {
-        let store = crate::credentials::Store::new(keychain.clone());
-        let token = match store.token("openai")? {
-            Some(token) => token,
-            None => {
-                consent(
-                    input,
-                    output,
-                    "Store an OpenAI API key in the OS keychain and sbx? The key is sent over stdin.",
-                )?;
-                let token = credential(input, output, "OpenAI API key: ", terminal)?;
-                store.put("openai", &token, None)?;
-                token
+        if optional_consent(
+            input,
+            output,
+            "Sign in to OpenAI with your ChatGPT account for sandboxed Codex (sbx secret set openai --oauth)?",
+        )? {
+            private_command(program, &["secret", "set", "openai", "--oauth"], "")?;
+            if !checks::secrets(program)
+                .ok_or_else(|| anyhow::anyhow!("cannot check known secret services; retry setup"))?
+                .openai
+            {
+                bail!(
+                    "OpenAI sign-in incomplete; run `sbx secret set openai --oauth` in a host terminal and retry setup"
+                )
             }
-        };
-        private_command(program, &["secret", "set", "openai"], &format!("{token}\n"))?;
-        writeln!(output, "OpenAI: OS keychain for IMACS relay; sandbox Codex uses sbx's OpenAI credential proxy.")?;
+        } else {
+            let store = crate::credentials::Store::new(keychain.clone());
+            let token = match store.token("openai")? {
+                Some(token) => Some(token),
+                None => {
+                    if optional_consent(
+                        input,
+                        output,
+                        "Store an OpenAI API key in the OS keychain and sbx? The key is sent over stdin.",
+                    )? {
+                        let token = credential(input, output, "OpenAI API key: ", terminal)?;
+                        store.put("openai", &token, None)?;
+                        Some(token)
+                    } else {
+                        None
+                    }
+                }
+            };
+            if let Some(token) = token {
+                private_command(program, &["secret", "set", "openai"], &format!("{token}\n"))?;
+                writeln!(
+                    output,
+                    "OpenAI: OS keychain for IMACS relay; sandbox Codex uses sbx's OpenAI credential proxy."
+                )?;
+            } else {
+                openai_declined = true;
+                writeln!(
+                    output,
+                    "Sandboxed Codex will not authenticate until you run `sbx secret set openai --oauth` or store an OpenAI API key with `imacs setup`."
+                )?;
+            }
+        }
     }
+    let blocks_completion =
+        |line: &str| line.starts_with('✗') && !(openai_declined && line.starts_with("✗ sandbox OpenAI secret:"));
     let servers = checks::query(program, &["mcp", "ls", "--json"])
         .filter(|value| value.is_array())
         .ok_or_else(|| anyhow::anyhow!("cannot read sandbox MCP status; retry setup"))?;
@@ -219,9 +258,9 @@ fn guided(
         true => checks::ClaudeRoute::Sandboxed { subscription: keychain.claude_token().is_some() },
         false => checks::ClaudeRoute::Bare,
     };
-    // Read the store again through doctor's lines: setup is not done with a secret doctor reports missing.
+    // Recheck stored secrets through doctor's lines; only an explicitly declined OpenAI credential is optional.
     if let Some(failed) =
-        checks::secret_lines(checks::secrets(program).as_ref(), route).iter().find(|line| line.starts_with('✗'))
+        checks::secret_lines(checks::secrets(program).as_ref(), route).iter().find(|line| blocks_completion(line))
     {
         bail!("sbx does not list what setup stored: {failed}. Rerun `imacs setup`")
     }
@@ -243,7 +282,7 @@ fn guided(
     for line in &lines {
         writeln!(output, "{line}")?;
     }
-    if lines.iter().any(|line| line.starts_with('✗')) {
+    if lines.iter().any(|line| blocks_completion(line)) {
         bail!("sandbox checks still need attention; follow the hints and rerun `imacs setup`")
     }
     Ok(())
@@ -553,7 +592,7 @@ mod tests {
     fn fresh_setup_reaches_green_with_claude_bare_and_reruns_without_mutations() {
         let (dir, sbx) = machine();
         touch(dir.path(), &["signed-out", "no-policy", "removed-anthropic", "no-openai"]);
-        let (result, output) = run_setup(&sbx, false, true, &format!("y\ny\ny\n{OPENAI}\ny\ny\n"));
+        let (result, output) = run_setup(&sbx, false, true, &format!("y\ny\nn\ny\n{OPENAI}\ny\ny\n"));
         result.unwrap();
         assert!(
             output.lines().filter(|l| l.starts_with('✓') || l.starts_with('✗')).all(|l| l.starts_with('✓')),
@@ -581,6 +620,41 @@ mod tests {
             "version" | "diagnose" | "ls"
         ) || c[1] == "ls"
             || c[1] == "get"));
+    }
+
+    #[test]
+    fn openai_oauth_signin_is_rechecked_and_reused() {
+        let (dir, sbx) = machine();
+        touch(dir.path(), &["no-openai"]);
+        run_setup(&sbx, false, false, "y\n").0.unwrap();
+        assert_eq!(fake::calls_to(dir.path(), &["secret", "set"]), [["secret", "set", "openai", "--oauth"]]);
+        assert!(dir.path().join("openai-oauth").exists());
+        assert!(!dir.path().join("secret-stdin").exists());
+        assert!(!dir.path().join("keychain-value").exists());
+        run_setup(&sbx, false, false, "").0.unwrap();
+        assert_eq!(fake::calls_to(dir.path(), &["secret", "set"]).len(), 1);
+
+        let (dir, sbx) = machine();
+        touch(dir.path(), &["no-openai", "skip-secret-write"]);
+        let error = run_setup(&sbx, false, false, "y\n").0.unwrap_err();
+        assert!(error.to_string().contains("OpenAI sign-in incomplete"));
+    }
+
+    #[test]
+    fn declining_both_openai_options_continues_through_linear_and_ssh_hardening() {
+        let (dir, sbx) = machine();
+        touch(dir.path(), &["no-openai"]);
+        std::fs::write(dir.path().join("ssh-forwarding"), "true").unwrap();
+        std::fs::write(dir.path().join("ssh-socket"), "/private/socket").unwrap();
+        let (result, output) = run_setup(&sbx, false, true, "n\nn\ny\ny\ny\n");
+        result.unwrap();
+        assert!(output.contains("Sandboxed Codex will not authenticate until"));
+        assert!(output.contains("✗ sandbox OpenAI secret:"));
+        assert!(!checks::secrets(&sbx).unwrap().openai);
+        assert!(fake::calls_to(dir.path(), &["secret", "set"]).is_empty());
+        assert_eq!(fake::calls_to(dir.path(), &["mcp", "auth"]), [["mcp", "auth", "linear"]]);
+        assert_eq!(checks::setting(&sbx, "ssh.agentForwardingEnabled").as_deref(), Some("false"));
+        assert_eq!(checks::setting(&sbx, "ssh.agentSocketPath").as_deref(), Some(""));
     }
 
     #[test]
@@ -703,7 +777,7 @@ mod tests {
     fn setup_rechecks_its_secret_steps_with_doctors_parser() {
         // A stored key sbx does not list stops setup with doctor's own line, before later steps.
         for (claude, markers, answers, line) in [
-            (false, ["no-openai", "skip-secret-write"], format!("y\n{OPENAI}\n"), "✗ sandbox OpenAI secret: openai"),
+            (false, ["no-openai", "skip-secret-write"], format!("n\ny\n{OPENAI}\n"), "✗ sandbox OpenAI secret: openai"),
             (
                 true,
                 ["removed-anthropic", "skip-secret-write"],
@@ -724,8 +798,8 @@ mod tests {
         let (dir, sbx) = machine();
         touch(dir.path(), &["no-openai", "fail-secret-set"]);
         std::fs::write(dir.path().join("error-output"), OPENAI).unwrap();
-        assert!(run_setup(&sbx, false, false, &format!("y\n{OPENAI}\n")).0.is_err());
-        for input in ["n\n", "y\n\n", "y\n", ""] {
+        assert!(run_setup(&sbx, false, false, &format!("n\ny\n{OPENAI}\n")).0.is_err());
+        for input in ["n\n", "n\ny\n\n", "n\ny\n", ""] {
             let (dir, sbx) = machine();
             touch(dir.path(), &["no-openai"]);
             assert!(run_setup(&sbx, false, false, input).0.is_err(), "{input:?}");
@@ -740,7 +814,7 @@ mod tests {
             let (dir, sbx) = machine();
             touch(dir.path(), &["signed-out", "no-policy", "no-openai", marker]);
             std::fs::write(dir.path().join("error-output"), OPENAI).unwrap();
-            let answers = format!("y\ny\ny\n{OPENAI}\ny\ny\n");
+            let answers = format!("y\ny\nn\ny\n{OPENAI}\ny\ny\n");
             assert!(run_setup(&sbx, false, true, &answers).0.is_err(), "{marker}");
             std::fs::remove_file(dir.path().join(marker)).unwrap();
             // A fresh invocation re-probes the completed steps. Supply only the
@@ -751,13 +825,15 @@ mod tests {
                     remaining.push_str(&answer);
                 }
             }
-            if !checks::secrets(&sbx).unwrap().openai
-                && crate::credentials::Store::new(keychain(&sbx, cfg!(target_os = "macos")))
+            if !checks::secrets(&sbx).unwrap().openai {
+                remaining.push_str("n\n");
+                if crate::credentials::Store::new(keychain(&sbx, cfg!(target_os = "macos")))
                     .token("openai")
                     .unwrap()
                     .is_none()
-            {
-                remaining.push_str(&format!("y\n{OPENAI}\n"));
+                {
+                    remaining.push_str(&format!("y\n{OPENAI}\n"));
+                }
             }
             if !dir.path().join("mcp.json").exists() {
                 remaining.push_str("y\n");

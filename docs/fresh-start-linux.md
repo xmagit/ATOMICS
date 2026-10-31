@@ -84,13 +84,15 @@ all of them pass. A distribution other than Ubuntu 24.04+ is only a warning. Aft
    `anthropic` secret is stored, setup asks for the token `claude setup-token` prints and keeps it in the
    OS keychain for IMACS's credential relay. An Anthropic API key pasted there goes to sbx's
    `anthropic` secret instead.
-4. An OpenAI API key, when sbx has no `openai` secret: into the keychain and to sbx, for sandboxed Codex.
+4. ChatGPT account sign-in (`sbx secret set openai --oauth`) for sandboxed Codex, when sbx has no
+   `openai` secret. Declining offers an OpenAI API key instead, stored in the keychain and sbx.
+   Declining both continues setup; sandboxed Codex cannot authenticate until you configure one.
 5. sbx's Linear MCP server (`sbx mcp add linear`, `sbx mcp auth linear`) when a ticket profile uses
    Linear. See [Tickets](tickets.md#step-by-step-linear).
 6. Removing sbx's `github` secret and misfiled secrets, and turning off SSH agent forwarding.
 
 It then rechecks everything and runs `imacs doctor`. Values travel over stdin, hidden on a terminal, and
-never appear in arguments, output, logs or config. Ctrl-C, EOF or a declined step stops setup, and
+never appear in arguments, output, logs or config. Ctrl-C, EOF or declining another step stops setup, and
 running it again resumes where it stopped. [Fresh machine: one guided
 command](isolation.md#fresh-machine-one-guided-command) has the details.
 
