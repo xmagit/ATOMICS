@@ -18,7 +18,7 @@ eframe = { version = "0.37.0", features = ["wayland", "x11", "default_fonts"] }
 egui = "0.37"
 # Finds theme fonts by family name; eframe already builds it with these features.
 fontique = { version = "0.11.1", default-features = false, features = ["system", "fontconfig-dlopen"] }
-notify-debouncer-mini = "0.7.0"
+notify = "8.2.1"
 png = "0.18.1"
 rfd = "0.17.2"
 serde_json = "1.0.154"

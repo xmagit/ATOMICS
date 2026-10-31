@@ -681,7 +681,7 @@ responsive layout, the hook and control protocols, and review message compositio
 | Git | `git` CLI | Exact porcelain semantics, and picks up `core.fsmonitor`/`untrackedCache` on large repositories |
 | Highlighting | syntect + bat's grammars (two-face), Oniguruma | Works line by line, which suits hunks that start mid-file; Oniguruma is ~3× faster and ~4× smaller than fancy-regex |
 | Word diff | similar | Code-aware tokens, so `compute(1)` → `compute(2)` marks only the number |
-| Watching | notify (FSEvents/inotify) | Live diff for the worktree on screen; diffs of agents off screen follow their file changes within seconds, no polling |
+| Watching | notify (FSEvents/inotify) | Live diff for the worktree on screen; diffs of agents off screen follow their file changes within seconds, no polling. With inotify, build, dependency and git folders (`target/`, `node_modules/`, `bin/`, `obj/`, `.git` beyond its refs) are never watched |
 | IPC | Unix socket, JSON lines | One socket for hooks, `imacs ctl` and `imacs mcp`; no async runtime anywhere |
 
 Agents run as children of the IMACS process, so closing IMACS stops them. Claude sessions in a project can be resumed from the sidebar,
