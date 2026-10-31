@@ -275,6 +275,8 @@ struct Integrated {
 }
 
 struct CheckedIntegration {
+    /// Which check of the task this is: one that ran past its time limit no longer counts.
+    id: u64,
     commit: Option<String>,
     revision: u64,
     plan: String,
@@ -282,8 +284,18 @@ struct CheckedIntegration {
     into: String,
     /// `None` means git could not verify ancestry; keep the integration marker.
     valid: Option<bool>,
-    /// Git did not run or finish: check again after a while, not only when refs change.
-    retry: bool,
+    /// Why git could not tell, or did not run or finish: shown on the task, and checked again after a
+    /// while, not only when refs change.
+    problem: Option<String>,
+}
+
+/// A dispatch held until the integration checks of the dependencies it waits on report.
+struct DispatchWaiter {
+    plan: String,
+    only: Option<String>,
+    /// `None` for the board's buttons, which toast an error instead.
+    reply: Option<Sender<ControlOutcome>>,
+    deadline: Instant,
 }
 
 /// The worktree clean-up dialog for one project.
@@ -330,10 +342,12 @@ struct StatusEvent {
     ticket: Option<serde_json::Value>,
     /// Set when the user applied or rejected a proposed config change.
     config: Option<serde_json::Value>,
+    /// Set when a plan was approved, edited, closed or reopened.
+    change: Option<&'static str>,
 }
 
 impl StatusEvent {
-    /// What `wait` matches on: the agent's status, "reported", "heartbeat", "ticket" or "config".
+    /// What `wait` matches on: the agent's status, "reported", "heartbeat", "ticket", "config" or "plan".
     fn kind(&self) -> &str {
         if self.findings.is_some() {
             "heartbeat"
@@ -341,6 +355,8 @@ impl StatusEvent {
             "ticket"
         } else if self.config.is_some() {
             "config"
+        } else if self.change.is_some() {
+            "plan"
         } else if self.report.is_some() {
             "reported"
         } else {
@@ -363,6 +379,9 @@ impl StatusEvent {
         }
         if let Some(config) = &self.config {
             value["config"] = config.clone();
+        }
+        if let Some(change) = self.change {
+            value["change"] = json!(change);
         }
         if let Some(request) = &self.approval {
             value["approval"] = json!(request);
@@ -515,9 +534,14 @@ pub(crate) struct State {
     integrating: HashSet<(String, String)>,
     integration_check_tx: crate::host::Sender<CheckedIntegration>,
     integration_check_rx: Receiver<CheckedIntegration>,
-    integration_checks: HashSet<(String, String)>,
+    /// Readiness checks running, each with its id and the time it counts as failed by.
+    integration_checks: HashMap<(String, String), (u64, Instant)>,
+    integration_check_id: u64,
     integration_checked: HashMap<(String, String), (u64, String, Task)>,
     integration_retries: HashMap<(String, String), Instant>,
+    /// Why the last check of a task could not tell whether it is integrated.
+    integration_problems: HashMap<(String, String), String>,
+    dispatch_waiters: Vec<DispatchWaiter>,
     integration_dirty: Arc<AtomicBool>,
     integration_revision: u64,
     worktrees: Vec<WorktreeEntry>,
@@ -933,9 +957,12 @@ impl State {
             integrating: HashSet::new(),
             integration_check_tx,
             integration_check_rx,
-            integration_checks: HashSet::new(),
+            integration_checks: HashMap::new(),
+            integration_check_id: 0,
             integration_checked: HashMap::new(),
             integration_retries: HashMap::new(),
+            integration_problems: HashMap::new(),
+            dispatch_waiters: Vec::new(),
             integration_dirty: Arc::new(AtomicBool::new(false)),
             integration_revision: 0,
             worktrees: Vec::new(),

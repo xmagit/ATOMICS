@@ -125,7 +125,7 @@ impl Desktop<'_> {
         if self
             .runtime
             .integration_checks
-            .iter()
+            .keys()
             .any(|(plan, _)| plan == &self.runtime.plans[self.runtime.selected_plan].id)
         {
             ui.label(RichText::new("Checking integration freshness…").color(p.muted));
@@ -273,6 +273,15 @@ impl Desktop<'_> {
                     .map(|stage| (task.id.clone(), stage.clone()))
             })
             .collect();
+        let integration_notes: HashMap<String, (String, bool)> = self.runtime.plans[self.runtime.selected_plan]
+            .tasks
+            .iter()
+            .filter_map(|task| {
+                let note = self.runtime.integration_check_note(self.runtime.selected_plan, task)?;
+                let checking = self.runtime.integration_checks.contains_key(&(plan_id.clone(), task.id.clone()));
+                Some((task.id.clone(), (note, checking)))
+            })
+            .collect();
         let expected_tasks: std::collections::HashSet<_> = self.runtime.plans[self.runtime.selected_plan]
             .tasks
             .iter()
@@ -360,6 +369,10 @@ impl Desktop<'_> {
                                                             )
                                                             .truncate(),
                                                         );
+                                                    }
+                                                    if let Some((note, checking)) = integration_notes.get(&task.id) {
+                                                        let color = if *checking { p.muted } else { p.warning };
+                                                        ui.label(RichText::new(note).color(color).size(11.0));
                                                     }
                                                     if !task.depends_on.is_empty() {
                                                         ui.label(
@@ -541,20 +554,12 @@ impl Desktop<'_> {
                     if let Some(edited) = edited_tasks.iter().find(|t| t.id == id) {
                         let brief = edited.brief.clone();
                         self.post_plan(self.runtime.selected_plan, move |state, index| {
-                            if !state.plans[index].approved
-                                && let Some(task) = state.plans[index].task_mut(&id)
-                                && task.status == TaskStatus::Planned
-                            {
-                                task.brief = brief;
-                                state.save_plan(index);
-                            }
+                            state.edit_task_brief(index, &id, brief);
                         });
                     }
                 }
                 "start" => self.post_plan(self.runtime.selected_plan, move |state, index| {
-                    if let Err(err) = state.dispatch(index, Some(&id)) {
-                        state.toast(err);
-                    }
+                    state.dispatch_when_checked(index, Some(id), None)
                 }),
                 "integrate" => {
                     self.post_plan(self.runtime.selected_plan, move |state, index| state.integrate(index, &id, None))
@@ -591,8 +596,7 @@ impl Desktop<'_> {
         }
         if approve {
             self.post_plan(self.runtime.selected_plan, |state, index| {
-                state.plans[index].approved = true;
-                state.save_plan(index);
+                state.approve_plan(index);
                 state.toast("Plan approved: the orchestrator can dispatch it now");
             });
         }
@@ -611,11 +615,7 @@ impl Desktop<'_> {
             });
         }
         if dispatch_all {
-            self.post_plan(self.runtime.selected_plan, |state, index| {
-                if let Err(err) = state.dispatch(index, None) {
-                    state.toast(err);
-                }
-            });
+            self.post_plan(self.runtime.selected_plan, |state, index| state.dispatch_when_checked(index, None, None));
         }
         if let Some(session) = open_session {
             self.activate(&session, true);

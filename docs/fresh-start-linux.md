@@ -165,11 +165,11 @@ a Claude token except IMACS placeholders, and that a revoked placeholder is refu
 sandbox, its network rule and its folder, and ends with `PASS relay check` or a `FAIL` line. No line holds
 a value.
 
-This is the first thing to try on a new Linux desktop: the relay has run end to end on macOS, but not yet
-on Linux. If it fails at the reachability step, the message names the sandbox and port: check that
-`sbx policy ls <sandbox>` lists `localhost:<port>`, and whether `host.docker.internal` leads the VM to this
-machine's loopback. If it says the keychain holds no token, store one with `imacs setup --credential
-claude`. See [Sandboxed Claude on your subscription](isolation.md#sandboxed-claude-on-your-subscription).
+This is the first thing to try on a new Linux desktop. It passed in 26 seconds on a CachyOS desktop
+(see [Linux hosts](isolation.md#linux-hosts)). If it fails at the reachability step, the message names
+the sandbox and port: check that `sbx policy ls <sandbox>` lists `localhost:<port>`, and whether
+`host.docker.internal` leads the VM to this machine's loopback. If it says the keychain holds no token,
+store one with `imacs setup --credential claude`. See [Sandboxed Claude on your subscription](isolation.md#sandboxed-claude-on-your-subscription).
 
 ## 7. Azure (opt-in)
 
@@ -276,15 +276,16 @@ See [Lifecycle](isolation.md#lifecycle) for the full rules.
 - **App bundle.** `scripts/macos-app.sh` builds `IMACS.app` on macOS only; Linux uses
   `scripts/linux-install.sh` and its desktop entry. Restart works on both: the bundle on macOS, the same
   binary on Linux.
-- **Relay and real sandboxes on Linux.** `imacs sandbox relay-check`, the real-sbx smoke test, warm
-  template timings and the sandboxed Claude end-to-end run have only run on macOS. In particular,
-  whether `host.docker.internal` reaches this machine's loopback from a Linux sandbox is unverified.
+- **Sandboxed agents on Linux.** `imacs sandbox relay-check` and the real-sbx smoke test pass on a Linux
+  desktop (see [Verified](#verified)). Warm template timings and an interactive Claude agent running
+  sandboxed in its tile have only run on macOS.
 - **Sandbox memory and CPU on tiles.** The sampler finds each sandbox's VM process by its name or by the
   worktree it holds open (through `lsof`). Recorded process listings cover this; a real sbx VM on Linux
   has not been checked, and without a match the tile shows **Sandbox** alone.
 - **Spotlight.** Doctor's indexing check exists on macOS only.
 - **Microphone.** macOS asks for permission; Linux records from the default input device.
-- **Wayland.** IMACS is built with Wayland and X11 support; only X11 has been exercised.
+- **Wayland.** IMACS is built with Wayland and X11 support. The smoke test's instance ran on KDE
+  Plasma's Wayland session; other compositors have not been tried.
 - **Credentials.** macOS's keychain is always there; Linux needs `secret-tool` and an unlocked Secret
   Service in the desktop session, so an SSH-only session cannot read or store credentials.
 
@@ -298,3 +299,11 @@ refusing a value flag and failing without a keyring; `imacs doctor`; `imacs sand
 queue` without a running IMACS; `scripts/linux-sandbox-smoke.sh --fake-sbx`; and the git bundle steps in
 [Moving to a new machine](moving-machines.md). Steps that need KVM, a real sbx, a keyring, Claude or Azure
 were checked against the code only.
+
+On 2026-10-31, on a CachyOS desktop (Intel i7-8700, KDE Plasma 6.8 on Wayland, KWallet as the Secret
+Service, KVM, sbx v0.50.1 signed in, the Claude subscription token stored by `imacs setup`):
+`imacs sandbox relay-check` passed in 26 seconds, and `imacs queue --class qa --
+scripts/linux-sandbox-smoke.sh` ended with `PASS Linux sandbox smoke (real sbx)` in 69 seconds, with
+control round trips of 9.4 ms median and 17.9 ms at most. Afterwards `sbx ls`, `sbx mcp ls` and `sbx policy
+ls` showed nothing either had made. Doctor warns that CachyOS is not Ubuntu 24.04+; both passed
+regardless. Azure was not tried.

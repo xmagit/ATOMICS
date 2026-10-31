@@ -322,6 +322,25 @@ mod tests {
     }
 
     #[test]
+    fn reading_a_ref_is_no_change_and_writing_one_is() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let root = dir.path().join("worktree");
+        std::fs::create_dir_all(root.join(".git/refs/heads")).unwrap();
+        let head = root.join(".git/HEAD");
+        std::fs::write(&head, "ref: refs/heads/main\n").unwrap();
+        let (tx, changes) = channel();
+        let mut watcher = Watcher::new(move |change| drop(tx.send(change))).unwrap();
+        watcher.set_roots(std::slice::from_ref(&root));
+        for _ in 0..3 {
+            std::fs::read_to_string(&head).unwrap();
+        }
+        let quiet = settled(&changes, scaled_timeout(SETTLE * 4));
+        assert!(quiet.is_empty(), "reading a file is not a change: {quiet:?}");
+        std::fs::write(&head, "ref: refs/heads/other\n").unwrap();
+        assert_eq!(settled(&changes, scaled_timeout(Duration::from_secs(10))), [Change::Refs]);
+    }
+
+    #[test]
     fn only_the_parts_of_git_where_branches_move_are_watched() {
         for (folder, watched) in [
             ("src/app", true),

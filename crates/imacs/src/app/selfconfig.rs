@@ -303,6 +303,7 @@ impl State {
             findings: None,
             ticket: None,
             config: Some(outcome),
+            change: None,
         });
         self.serve_waiters();
     }

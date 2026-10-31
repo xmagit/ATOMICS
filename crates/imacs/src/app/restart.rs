@@ -316,7 +316,9 @@ mod tests {
                 app.runtime.integrating.insert(("plan".into(), "task".into()));
                 refused(app, "integration");
                 app.runtime.integrating.clear();
-                app.runtime.integration_checks.insert(("plan".into(), "task".into()));
+                app.runtime
+                    .integration_checks
+                    .insert(("plan".into(), "task".into()), (1, Instant::now() + Duration::from_secs(60)));
                 refused(app, "integration");
                 app.runtime.integration_checks.clear();
                 app.runtime.plan_edit_open = true;

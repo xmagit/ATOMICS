@@ -559,6 +559,7 @@ impl State {
                 "system": link.system, "id": link.id, "key": link.label(), "title": link.title, "url": link.url,
                 "from": from, "to": link.state, "means": means.map(TaskStatus::label), "expected": expected,
             })),
+            change: None,
         });
         self.serve_waiters();
         let system = config.map(|c| c.system.clone()).unwrap_or_default();

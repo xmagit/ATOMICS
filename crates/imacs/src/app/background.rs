@@ -16,6 +16,7 @@ impl State {
             changed = true;
         }
         self.refresh_integrations();
+        self.serve_dispatches();
         changed |= self.poll_cleanup();
         changed |= self.poll_plan_cleanup();
         changed |= self.usage.drain();
@@ -736,6 +737,7 @@ impl State {
                 findings: None,
                 config: None,
                 ticket: None,
+                change: None,
             });
             self.serve_waiters();
         }

@@ -40,6 +40,10 @@ env.pop("IMACS_PANE", None)
 for key in list(env):
     if key.startswith("GIT_"):
         env.pop(key)
+# Wayland finds a relative display in XDG_RUNTIME_DIR, which the instance gets its own copy of.
+display = env.get("WAYLAND_DISPLAY", "")
+if display and not os.path.isabs(display) and os.path.isabs(env.get("XDG_RUNTIME_DIR", "")):
+    env["WAYLAND_DISPLAY"] = os.path.join(env["XDG_RUNTIME_DIR"], display)
 env.update(IMACS_HOME=str(root / "state"), IMACS_CONFIG=str(root / "config.toml"),
            IMACS_SOCKET=str(root / "ctl.sock"), XDG_RUNTIME_DIR=str(root / "runtime"),
            TMPDIR=str(root / "tmp"), GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",

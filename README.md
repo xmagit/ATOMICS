@@ -271,7 +271,7 @@ the Claude subscription through IMACS's credential relay, with no token in the V
 output and workspace file synchronization, measures 20 control round trips (maximum 1000 ms by default),
 then removes its app/helpers, sandboxes, MCP registrations, worktrees and temporary directories and checks
 for leftovers. It prints a pass/fail summary and exits nonzero on failure, including cleanup failures.
-Your normal HOME, sbx sign-in and global policy are reused; a missing policy must be initialized with setup first.
+Your normal HOME, desktop display (Wayland or X11), sbx sign-in and global policy are reused; a missing policy must be initialized with setup first.
 It never removes other instances' sandboxes or MCP servers. Use `--imacs /path/to/imacs`, `--timeout 900`
 and `--latency-ms 1000` to select an already built binary or adjust the startup/latency limits. `--fake-sbx`
 uses the repository fixture and reports explicitly that VM isolation and KVM were not exercised.
@@ -466,8 +466,11 @@ branch into the integration branch. The merge happens in a worktree of its own n
 first use like any other worktree, so your main checkout is never touched. On a conflict the merge is aborted and the
 task stays in review with a note listing the conflicted files. Tasks without dependencies branch from `base_ref`;
 tasks with dependencies branch from the integration branch, so integrate accepted tasks before dispatching the tasks
-that build on them. Returning a task to running clears its integration marker. Background checks verify that each marked task branch tip is an ancestor of the integration branch. The board
-and dispatch use the same verified readiness, so new commits must be integrated too.
+that build on them. Returning a task to running clears its integration marker. Background checks verify that each marked
+task's branch tip is in the integration branch with nothing left uncommitted, again whenever a ref changes, so new commits
+must be integrated too. The board and dispatch use the same verified readiness. A check that cannot tell, or does not
+finish within 150 s, says why on the task card and in `imacs_plan_get`, and runs again within 30 s. Dispatching checks
+such dependencies afresh and answers once their checks have.
 
 Each open plan has a **short name · done/total** tab with a status dot (working, needs you, all done).
 Dispatching the selected plan returns from its board to its fleet and minimizes a floating chief; a docked chief
@@ -490,6 +493,7 @@ or the config maps each generic operation (get, list, update state, comment, cre
 systems changes only that section. Cards show each ticket's live key and state, and a click opens it. IMACS moves
 ticket states as tasks move and comments on dispatch, reports, acceptance, blocks and completion, signed with
 the reporting model. Changes made in the ticket system reach the chief as `ticket` events in `imacs_wait`.
+Include `plan` in `imacs_wait` statuses to learn when the user approves a plan (board button or `imacs ctl plan_approve`), edits a task brief on the board, or closes or reopens a plan: one event with `plan` and `change` (`approved`, `edited`, `closed`, `reopened`).
 Failures show on the card and never block a plan. See [docs/tickets.md](docs/tickets.md) for the design, the
 config reference and examples, with step-by-step [Relay](docs/tickets.md#step-by-step-relay) and
 [Linear](docs/tickets.md#step-by-step-linear) setups.
@@ -681,7 +685,7 @@ responsive layout, the hook and control protocols, and review message compositio
 | Git | `git` CLI | Exact porcelain semantics, and picks up `core.fsmonitor`/`untrackedCache` on large repositories |
 | Highlighting | syntect + bat's grammars (two-face), Oniguruma | Works line by line, which suits hunks that start mid-file; Oniguruma is ~3× faster and ~4× smaller than fancy-regex |
 | Word diff | similar | Code-aware tokens, so `compute(1)` → `compute(2)` marks only the number |
-| Watching | notify (FSEvents/inotify) | Live diff for the worktree on screen; diffs of agents off screen follow their file changes within seconds, no polling. With inotify, build, dependency and git folders (`target/`, `node_modules/`, `bin/`, `obj/`, `.git` beyond its refs) are never watched |
+| Watching | notify (FSEvents/inotify), changes only | Live diff for the worktree on screen; diffs of agents off screen follow their file changes within seconds, no polling. With inotify, build, dependency and git folders (`target/`, `node_modules/`, `bin/`, `obj/`, `.git` beyond its refs) are never watched |
 | IPC | Unix socket, JSON lines | One socket for hooks, `imacs ctl` and `imacs mcp`; no async runtime anywhere |
 
 Agents run as children of the IMACS process, so closing IMACS stops them. Claude sessions in a project can be resumed from the sidebar,

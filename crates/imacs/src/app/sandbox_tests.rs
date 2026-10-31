@@ -243,7 +243,12 @@ fn plan_close_cleanup_settings_control_worktrees_and_archive_keeps_branches() {
 }
 
 /// Bound a hang without assuming a parallel, lower-priority test gets CPU within ten seconds.
-fn tick_until(app: &mut Desktop<'_>, ctx: &egui::Context, what: &str, mut done: impl FnMut(&mut Desktop<'_>) -> bool) {
+pub(super) fn tick_until(
+    app: &mut Desktop<'_>,
+    ctx: &egui::Context,
+    what: &str,
+    mut done: impl FnMut(&mut Desktop<'_>) -> bool,
+) {
     let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(60));
     while !done(app) {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
@@ -257,7 +262,7 @@ fn tick_until(app: &mut Desktop<'_>, ctx: &egui::Context, what: &str, mut done: 
 }
 
 /// A test must finish preparation and stop jobs before dropping the directory containing sbx.
-fn finish_agents(app: &mut Desktop<'_>, ctx: &egui::Context) {
+pub(super) fn finish_agents(app: &mut Desktop<'_>, ctx: &egui::Context) {
     let ids: Vec<_> = app.runtime.sessions.iter().map(|s| s.id.clone()).collect();
     for id in ids {
         app.runtime.close(&id);

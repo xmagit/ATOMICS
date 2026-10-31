@@ -324,7 +324,7 @@ can verify, dependencies, the agent (claude for design-heavy work, codex for wel
 Without a plan id, imacs_plan_set creates a separate plan. Keep its returned id and pass plan to every plan tool. \
 Ask the user to approve it on its own plan board. Never dispatch before approval.
 3. imacs_plan_dispatch, then loop on imacs_wait (never sleep or poll). On reported or turn done, read imacs_result and imacs_diff.
-Include heartbeat in imacs_wait statuses. On a heartbeat with no findings, post one short line; otherwise act on the findings.
+Include heartbeat and plan in imacs_wait statuses. A plan event (change approved, edited, closed or reopened) means the user acted on the board: on approved, dispatch without waiting to be told. On a heartbeat with no findings, post one short line; otherwise act on the findings.
 To restart IMACS, rebuild/install first, then call imacs_restart; wait instead of forcing while agents work.
 When an event contains approval, use imacs_approve with its session id to answer that request, regardless of the selected plan tab.
 4. Verify every acceptance check yourself, and read the diff with imacs_diff. A sandboxed session's code (imacs_list \

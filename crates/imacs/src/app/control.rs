@@ -233,8 +233,7 @@ impl State {
                 Err(err) => done(ControlResponse::error(err)),
             },
             ControlRequest::PlanApprove { .. } => {
-                self.plans[target].approved = true;
-                self.save_plan(target);
+                self.approve_plan(target);
                 done(ControlResponse::ok(self.plan_json(target)))
             }
             ControlRequest::PlanGet { plan: None } => done(ControlResponse::ok(json!({
@@ -319,10 +318,11 @@ impl State {
                     Err(error) => ControlResponse::error(error),
                 })
             }
-            ControlRequest::PlanDispatch { plan: _, id } => match self.dispatch(target, id.as_deref()) {
-                Ok(started) => done(ControlResponse::ok(json!({ "started": started }))),
-                Err(err) => done(ControlResponse::error(err)),
-            },
+            ControlRequest::PlanDispatch { plan: _, id } => {
+                // It answers once the checks of the dependencies it waits on have.
+                self.dispatch_when_checked(target, id, Some(reply));
+                return;
+            }
             ControlRequest::PlanIntegrate { plan: _, id } => {
                 // Committing and merging can take a while: answer once it is done.
                 self.integrate(target, &id, Some(reply));
@@ -697,6 +697,7 @@ impl State {
                     findings: None,
                     config: None,
                     ticket: None,
+                    change: None,
                 });
             }
         }
@@ -718,6 +719,7 @@ impl State {
                     e.findings.is_some()
                         || e.ticket.is_some()
                         || e.config.is_some()
+                        || e.change.is_some()
                         || waiter.sessions.is_empty()
                         || waiter.sessions.contains(&e.session)
                 })
