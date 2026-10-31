@@ -271,7 +271,7 @@ the Claude subscription through IMACS's credential relay, with no token in the V
 output and workspace file synchronization, measures 20 control round trips (maximum 1000 ms by default),
 then removes its app/helpers, sandboxes, MCP registrations, worktrees and temporary directories and checks
 for leftovers. It prints a pass/fail summary and exits nonzero on failure, including cleanup failures.
-Your normal HOME, sbx sign-in and global policy are reused; a missing policy must be initialized with setup first.
+Your normal HOME, desktop display (Wayland or X11), sbx sign-in and global policy are reused; a missing policy must be initialized with setup first.
 It never removes other instances' sandboxes or MCP servers. Use `--imacs /path/to/imacs`, `--timeout 900`
 and `--latency-ms 1000` to select an already built binary or adjust the startup/latency limits. `--fake-sbx`
 uses the repository fixture and reports explicitly that VM isolation and KVM were not exercised.
