@@ -55,7 +55,10 @@ impl Desktop<'_> {
                     0
                 }
             });
-            if step != 0 && self.runtime.panel == PanelMode::Tickets && self.runtime.diff_open {
+            if step != 0 && ctx.memory(|m| m.has_focus(trace_lane::focus_id())) {
+                // The trace lane has the focus: Shift+↓/↑ step its cards.
+                self.runtime.lane_step(step);
+            } else if step != 0 && self.runtime.panel == PanelMode::Tickets && self.runtime.diff_open {
                 self.client.focus_terminal = None;
                 self.client.focus_editor = false;
                 ctx.memory_mut(|m| m.request_focus(diff_view::focus_id()));
@@ -81,6 +84,15 @@ impl Desktop<'_> {
         }
         if pressed(&keys.toggle_plan) {
             self.runtime.toggle_plan();
+        }
+        // Plan with chief, from a ticket the panel is reading.
+        if self.runtime.panel == PanelMode::Tickets
+            && self.runtime.diff_open
+            && self.runtime.tickets.panel.view == tickets_panel::TicketsView::Read
+            && ctx.memory(|m| m.has_focus(diff_view::focus_id()))
+            && pressed(&keys.plan_with_chief)
+        {
+            self.runtime.open_plan_dialog();
         }
         if pressed(&keys.toggle_tickets) {
             self.runtime.toggle_tickets();
@@ -183,6 +195,12 @@ impl Desktop<'_> {
                     ctx.memory_mut(|m| m.request_focus(diff_view::focus_id()));
                 }
             }
+        }
+        if ctx.memory(|m| m.has_focus(trace_lane::focus_id()))
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape))
+        {
+            ctx.memory_mut(|m| m.surrender_focus(trace_lane::focus_id()));
+            self.client.focus_terminal = self.runtime.chief_session_id().map(str::to_string);
         }
         if ctx.memory(|m| m.has_focus(diff_view::focus_id())) {
             let escape = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape));
@@ -305,6 +323,7 @@ impl Desktop<'_> {
         }
 
         self.rename_dialog(ctx);
+        self.plan_dialog(ctx);
         let Some(mut dialog) = self.client.new_dialog.take() else { return };
         let mut keep = true;
         let mut start: Option<ControlRequest> = None;

@@ -31,8 +31,13 @@ pub const NAV_KEYS: [Key; 7] =
 /// Takes the unmodified navigation keys pressed this frame, only while the panel has the
 /// focus: text fields, the editor and terminal modifiers are left alone.
 pub fn take_keys(ui: &egui::Ui, keys: &[Key]) -> Vec<Key> {
+    take_keys_for(ui, focus_id(), keys)
+}
+
+/// `take_keys` for another keyboard target, such as the chief's trace lane.
+pub fn take_keys_for(ui: &egui::Ui, focus: egui::Id, keys: &[Key]) -> Vec<Key> {
     let mut taken = Vec::new();
-    if !ui.memory(|m| m.has_focus(focus_id())) {
+    if !ui.memory(|m| m.has_focus(focus)) {
         return taken;
     }
     ui.input_mut(|i| {
@@ -68,7 +73,19 @@ pub fn keyboard_scroll(
     rows: std::ops::Range<usize>,
     jump: Option<f32>,
 ) -> Option<f32> {
-    if !ui.memory(|m| m.has_focus(focus_id())) {
+    keyboard_scroll_for(ui, focus_id(), id, row_h, rows, jump)
+}
+
+/// `keyboard_scroll` for another keyboard target.
+pub fn keyboard_scroll_for(
+    ui: &egui::Ui,
+    focus: egui::Id,
+    id: egui::Id,
+    row_h: f32,
+    rows: std::ops::Range<usize>,
+    jump: Option<f32>,
+) -> Option<f32> {
+    if !ui.memory(|m| m.has_focus(focus)) {
         return jump;
     }
     let mut offset = jump.unwrap_or_else(|| {
@@ -77,7 +94,7 @@ pub fn keyboard_scroll(
     let height = ui.available_height();
     let page = (height - row_h).max(row_h);
     let mut moved = false;
-    for key in take_keys(ui, &NAV_KEYS[..6]) {
+    for key in take_keys_for(ui, focus, &NAV_KEYS[..6]) {
         offset = match key {
             Key::ArrowUp => offset - row_h,
             Key::ArrowDown => offset + row_h,

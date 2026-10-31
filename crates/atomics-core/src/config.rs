@@ -288,6 +288,7 @@ toggle_editor = "cmd+e"
 toggle_plan = "cmd+b"
 toggle_chief = "cmd+o"
 toggle_tickets = "cmd+k"   # the Tickets panel (cmd+j is next_attention)
+plan_with_chief = "cmd+enter"   # in a ticket the Tickets panel reads
 voice = "cmd+shift+space"
 "##;
 
@@ -631,6 +632,7 @@ pub struct KeyConfig {
     pub toggle_plan: String,
     pub toggle_chief: String,
     pub toggle_tickets: String,
+    pub plan_with_chief: String,
     pub voice: String,
 }
 
@@ -725,6 +727,7 @@ impl Default for KeyConfig {
             toggle_plan: "cmd+b".into(),
             toggle_chief: "cmd+o".into(),
             toggle_tickets: "cmd+k".into(),
+            plan_with_chief: "cmd+enter".into(),
             voice: "cmd+shift+space".into(),
         }
     }
