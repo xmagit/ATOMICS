@@ -183,6 +183,12 @@ impl State {
                     tasks.into_iter().map(|t| Task { ticket: self.stamp_system(t.ticket.clone()), ..t }).collect();
                 self.plans[index].replace(goal, tasks);
                 let ticket = self.stamp_system(ticket);
+                if ticket
+                    .as_ref()
+                    .is_some_and(|new| self.plans[index].ticket.as_ref().is_none_or(|old| !old.same_ticket(new)))
+                {
+                    self.plans[index].ticket_mode = None;
+                }
                 self.plans[index].ticket =
                     atomics_core::tickets::TicketLink::relink(ticket, self.plans[index].ticket.as_ref());
                 if let Some(branch) = integration.filter(|b| !b.trim().is_empty()) {

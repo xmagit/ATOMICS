@@ -363,7 +363,7 @@ impl State {
         let config = self.project_config(repo).tickets;
         let plan_ticket = link.is_none();
         let link = link.or_else(|| {
-            (config.mode == atomics_core::tickets::TicketMode::Ticket)
+            (self.plans[index].ticket_mode(config.mode) == atomics_core::tickets::TicketMode::Ticket)
                 .then_some(self.plans[index].ticket.as_ref())
                 .flatten()
         })?;
@@ -469,7 +469,8 @@ impl State {
             plan.integration.is_some() || plan.tasks.iter().any(|t| t.branch.is_some() || t.integrated.is_some());
         let repo =
             plan.project.clone().or_else(|| plan.tasks.iter().find_map(|t| t.repo.as_deref().map(paths::expand)));
-        let ticket_mode = self.ticket_config().is_some_and(|c| c.mode == atomics_core::tickets::TicketMode::Ticket);
+        let ticket_mode =
+            self.ticket_config().is_some_and(|c| plan.ticket_mode(c.mode) == atomics_core::tickets::TicketMode::Ticket);
         let existing = existing
             || match repo.as_deref() {
                 Some(repo) => {

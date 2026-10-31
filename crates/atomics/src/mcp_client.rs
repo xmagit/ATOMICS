@@ -531,18 +531,36 @@ pub(crate) mod tests {
     /// Exercise the shipped commented blocks rather than maintaining test-only profiles.
     pub(crate) fn example_profile(name: &str, state: &std::path::Path) -> atomics_core::tickets::TicketConfig {
         let template = atomics_core::config::DEFAULT_CONFIG;
-        let block = template
-            .split(&format!("# BEGIN {name} PROFILE\n"))
-            .nth(1)
-            .unwrap()
-            .split(&format!("# END {name} PROFILE"))
-            .next()
-            .unwrap();
-        let text =
-            block.lines().skip(1).map(|line| line.strip_prefix("# ").unwrap_or("")).collect::<Vec<_>>().join("\n");
-        let config: atomics_core::config::Config = toml::from_str(&text).unwrap();
-        let mut tickets = config.tickets;
-        tickets.server.command = vec![fake_server().display().to_string(), state.display().to_string()];
+        let semantic = match name {
+            "meaning-example" => true,
+            "keyword-example" => false,
+            _ => panic!("unknown example profile {name}"),
+        };
+        let mut tickets = template
+            .split("# BEGIN ")
+            .skip(1)
+            .map(|block| {
+                let (_, block) = block.split_once('\n').unwrap();
+                let block = block.split("# END ").next().unwrap();
+                let text = block
+                    .lines()
+                    .skip(1)
+                    .map(|line| line.strip_prefix("# ").unwrap_or(""))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                toml::from_str::<atomics_core::config::Config>(&text).unwrap().tickets
+            })
+            .find(|config| config.operation("semantic_search").is_some() == semantic)
+            .expect("the commented examples include meaning and keyword profiles");
+        tickets.system = name.into();
+        tickets.workflow = "Example ticket workflow.".into();
+        if tickets.link_url.is_some() {
+            tickets.link_url = Some("https://tickets.example/?selected={uuid}".into());
+        }
+        tickets.server = McpServer {
+            command: vec![fake_server().display().to_string(), state.display().to_string()],
+            ..McpServer::default()
+        };
         tickets
     }
 

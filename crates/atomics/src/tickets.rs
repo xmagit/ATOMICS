@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
-use atomics_core::tickets::{self, McpServer, TicketConfig, TicketLink, Vars};
+use atomics_core::tickets::{self, McpServer, TicketCard, TicketConfig, TicketLink, Vars};
 use serde_json::Value;
 
 use crate::mcp_client::{McpClient, McpError, OAuth};
@@ -20,6 +20,18 @@ const BACKOFF: Duration = Duration::from_secs(15);
 const MISSING_ENV: Duration = Duration::from_secs(60);
 
 pub enum TicketOp {
+    // Consumers are added by the chief-tools and Tickets-panel tasks.
+    #[allow(dead_code)]
+    Search {
+        query: String,
+        semantic: bool,
+    },
+    #[allow(dead_code)]
+    Children(TicketLink),
+    #[allow(dead_code)]
+    Related(TicketLink),
+    #[allow(dead_code)]
+    ReadCard(TicketLink),
     Get(TicketLink),
     /// Read full ticket details for a scoped agent request, without refreshing other links.
     Read(TicketLink),
@@ -35,6 +47,10 @@ pub enum TicketOp {
 }
 
 pub enum TicketOutput {
+    #[allow(dead_code)]
+    Cards(Vec<TicketCard>),
+    #[allow(dead_code)]
+    Card(Box<TicketCard>),
     Ticket(TicketLink),
     Read(Value),
     Tickets(Vec<TicketLink>),
@@ -137,6 +153,10 @@ impl Worker {
             TicketOutput::Ticket(ticket) => TicketOutput::Ticket(link(ticket)),
             TicketOutput::Tickets(tickets) => TicketOutput::Tickets(tickets.into_iter().map(link).collect()),
             TicketOutput::Read(value) => TicketOutput::Read(self.cleaner.value(value)),
+            TicketOutput::Card(card) => TicketOutput::Card(Box::new(self.cleaner.card(*card))),
+            TicketOutput::Cards(cards) => {
+                TicketOutput::Cards(cards.into_iter().map(|card| self.cleaner.card(card)).collect())
+            }
             TicketOutput::Pushed(read) => TicketOutput::Pushed(read.map(|read| read.map(link).map_err(error))),
         })
     }
@@ -144,14 +164,40 @@ impl Worker {
     fn run(&mut self, config: &TicketConfig, op: TicketOp) -> Result<TicketOutput, String> {
         let system = config.system.as_str();
         match op {
+            TicketOp::Search { query, semantic } => {
+                let name = if semantic { "semantic_search" } else { "search" };
+                self.cards(config, name, &Vars::new(system).query(&query))
+            }
+            TicketOp::Children(link) | TicketOp::Related(link) | TicketOp::ReadCard(link) if !config.accepts(&link) => {
+                Err(config.mismatch(&link).expect("mismatch"))
+            }
+            TicketOp::Children(link) => self.cards(config, "children", &Vars::new(system).ticket(&link)),
+            TicketOp::Related(link) => self.cards(config, "related", &Vars::new(system).ticket(&link)),
+            TicketOp::ReadCard(link) => {
+                let name = if config.operation("read").is_some() { "read" } else { "get" };
+                let output = self.call(config, name, &Vars::new(system).ticket(&link))?;
+                let operation = config.operation(name).expect("called");
+                let card = if name == "read" {
+                    operation.card(&output, system)?
+                } else {
+                    operation.fallback_card(&output, system)?
+                };
+                Ok(TicketOutput::Card(Box::new(config.card_url(card)?)))
+            }
             TicketOp::Read(link) => self.call(config, "get", &Vars::new(system).ticket(&link)).map(TicketOutput::Read),
             TicketOp::Get(link) => {
                 let output = self.call(config, "get", &Vars::new(system).ticket(&link))?;
-                Ok(TicketOutput::Ticket(config.operation("get").expect("called").ticket(&output, system)?))
+                Ok(TicketOutput::Ticket(
+                    config.link_url(config.operation("get").expect("called").ticket(&output, system)?)?,
+                ))
             }
             TicketOp::List(board) => {
-                let output = self.call(config, "list", &Vars::new(system).board(Some(&board)))?;
-                Ok(TicketOutput::Tickets(config.operation("list").expect("called").tickets(&output, system)?))
+                let name = config.list_operation().unwrap_or("list");
+                let output = self.call(config, name, &Vars::new(system).ticket(&board).board(Some(&board)))?;
+                let links = config.operation(name).expect("called").tickets(&output, system)?;
+                Ok(TicketOutput::Tickets(
+                    links.into_iter().map(|link| config.link_url(link)).collect::<Result<_, _>>()?,
+                ))
             }
             TicketOp::UpdateState(link, state) => {
                 self.call(config, "update_state", &Vars::new(system).ticket(&link).with("state", Some(&state)))?;
@@ -169,9 +215,15 @@ impl Worker {
                 if created.id.is_empty() {
                     return Err("the create operation's result has no id: set operations.create.result.id".into());
                 }
-                Ok(TicketOutput::Ticket(created))
+                Ok(TicketOutput::Ticket(config.link_url(created)?))
             }
         }
+    }
+
+    fn cards(&mut self, config: &TicketConfig, name: &str, vars: &Vars) -> Result<TicketOutput, String> {
+        let output = self.call(config, name, vars)?;
+        let cards = config.operation(name).expect("called").cards(&output, &config.system)?;
+        Ok(TicketOutput::Cards(cards.into_iter().map(|card| config.card_url(card)).collect::<Result<_, _>>()?))
     }
 
     /// The ticket right after a push, so the card shows what the system now says.
@@ -250,6 +302,168 @@ mod tests {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
     use std::sync::mpsc::Receiver;
+
+    fn card_profile(dialect: &str, path: &std::path::Path) -> TicketConfig {
+        let (get, search, semantic, children, related, args, items, row, one, body, comments, links) = match dialect {
+            "card" => (
+                "card_get",
+                "card_search",
+                "card_semantic_search",
+                "card_children",
+                "card_related",
+                json!({"card":"{id}"}),
+                "cards",
+                json!({"id":"ref", "key":"code", "title":"name", "state":"column.title", "url":"href", "score":"rank", "snippet":"excerpt", "assignee":"owner", "parent":"parent", "kind":"type"}),
+                "card",
+                "card.body",
+                "card.notes",
+                "card.development",
+            ),
+            "issue" => (
+                "issue_read",
+                "issue_search",
+                "issue_semantic_search",
+                "issue_children",
+                "issue_related",
+                json!({"id":"{key}"}),
+                "issues",
+                json!({"id":"uuid", "key":"id", "title":"title", "state":"status", "url":"url", "score":"score", "snippet":"snippet", "assignee":"assignee", "parent":"parent", "kind":"kind"}),
+                "",
+                "description",
+                "comments",
+                "links",
+            ),
+            _ => (
+                "get_ticket",
+                "find_keyword_tickets",
+                "find_tickets",
+                "get_children",
+                "find_related_tickets",
+                json!({"ticket":"{uuid}"}),
+                "result.tickets",
+                json!({"id":"id", "key":"number", "title":"subject", "state":"status", "url":"", "score":"score", "snippet":"snippet", "assignee":"assignee", "parent":"parentTicketId", "kind":"type"}),
+                "ticket",
+                "ticket.description",
+                "comments",
+                "ticket.developmentLinks",
+            ),
+        };
+        let operation =
+            |tool: &str, arguments: Value| json!({"tool":tool, "arguments":arguments, "items":items, "result":row});
+        let mut read =
+            operation(get, if dialect == "find" { json!({"ticketNumber":"{key_number}"}) } else { args.clone() });
+        // The full result uses the same base fields, nested for two dialects.
+        let paths = read["result"].as_object_mut().unwrap();
+        for path in paths.values_mut() {
+            let name = path.as_str().unwrap();
+            if !one.is_empty() && !name.is_empty() {
+                *path = json!(format!("{one}.{name}"));
+            }
+        }
+        if dialect == "find" {
+            read["result"]["kind"] = json!("ticket.ticketTypeKey");
+            read["result"]["url"] = json!("url");
+        }
+        read["body"] = json!(body);
+        read["comments"] = json!({"items":comments, "author":"authorDisplayName", "text":"body", "at":"createdAtUtc", "kind":"authorIdentityKind"});
+        read["links"] = json!({"items":links, "label":"title", "url":"pullRequestUrl", "status":"pullRequestStatus", "ci":"continuousIntegrationStatus"});
+        let mut get_mapping = read.clone();
+        get_mapping["body"] = json!("");
+        get_mapping["comments"] = json!({});
+        get_mapping["links"] = json!({});
+        serde_json::from_value(json!({
+            "system":dialect,
+            "server":{"command":[crate::mcp_client::tests::fake_server(), path], "env":{"API_KEY":"test-secret-7c2d"}},
+            "link_url":"https://tickets.example/?selected={uuid}",
+            "operations": {
+                "search":operation(search, json!({"query":"{query}"})),
+                "semantic_search":operation(semantic, if dialect == "find" {json!({"about":"{query}", "take":25})} else {json!({"query":"{query}"})}),
+                "children":operation(children, args.clone()), "related":operation(related, args),
+                "read":read, "get":get_mapping
+            }
+        })).unwrap()
+    }
+
+    #[test]
+    fn ticket_ops_example_server_search_children_related_and_read_across_three_dialects() {
+        for dialect in ["card", "issue", "find"] {
+            let dir = crate::test_support::tempdir().unwrap();
+            // A missing state file seeds the demo epic and its four children.
+            let path = dir.path().join("demo.json");
+            let config = card_profile(dialect, &path);
+            let mut worker = Worker::default();
+            worker.prepare(&config);
+            let mut run = |config: &TicketConfig, op| {
+                worker.prepare(config);
+                let result = worker.run(config, op);
+                worker.clean(result).unwrap()
+            };
+            let epic = TicketLink {
+                system: dialect.into(),
+                id: "00000000-0000-4000-8000-000000000001".into(),
+                key: Some("DEMO-1".into()),
+                ..Default::default()
+            };
+            for semantic in [false, true] {
+                let TicketOutput::Cards(cards) =
+                    run(&config, TicketOp::Search { query: "browser OAuth".into(), semantic })
+                else {
+                    panic!("cards")
+                };
+                assert_eq!(cards.len(), 1, "{dialect}");
+                assert_eq!(cards[0].link.label(), "DEMO-2");
+                assert!(cards[0].score.unwrap() > 0.7);
+                assert_eq!(cards[0].assignee, Some(Some("Demo User".into())));
+                assert_eq!(cards[0].kind.as_deref(), Some("task"));
+                assert!(cards[0].link.url.is_some());
+            }
+            let TicketOutput::Cards(children) = run(&config, TicketOp::Children(epic.clone())) else {
+                panic!("children")
+            };
+            assert_eq!(children.len(), 4);
+            assert!(children.iter().all(|card| card.parent.as_deref() == Some(&epic.id)));
+            let TicketOutput::Cards(related) = run(&config, TicketOp::Related(children[0].link.clone())) else {
+                panic!("related")
+            };
+            assert_eq!(related.len(), 3);
+            let TicketOutput::Card(read) = run(&config, TicketOp::ReadCard(children[0].link.clone())) else {
+                panic!("read")
+            };
+            assert!(read.body.unwrap().contains("## Goal"));
+            assert_eq!(read.comments[0].kind.as_deref(), Some("Agent"));
+            assert_eq!(read.links[0].ci.as_deref(), Some("Passed"));
+            let mut fallback = config.clone();
+            fallback.operations.read = None;
+            let TicketOutput::Card(read) = run(&fallback, TicketOp::ReadCard(epic.clone())) else { panic!("fallback") };
+            assert!(read.body.unwrap().contains("## Acceptance"));
+            assert!(!read.fields.is_empty());
+            // List falls back to the configured direct-children operation.
+            let TicketOutput::Tickets(list) = run(&config, TicketOp::List(epic.clone())) else { panic!("list") };
+            assert_eq!(list.len(), 4);
+            let mut state: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let literal = "  {id} \"quoted\" {query}  ";
+            state["tickets"][0]["snippet"] = json!(format!("{literal} test-secret-7c2d"));
+            state["tickets"][0]["description"] = json!(format!("test-secret-7c2d {}", "long body ".repeat(8000)));
+            state["tickets"][0]["comments"][0]["body"] = json!("test-secret-7c2d in a comment");
+            std::fs::write(&path, state.to_string()).unwrap();
+            for semantic in [false, true] {
+                let TicketOutput::Cards(cards) = run(&config, TicketOp::Search { query: literal.into(), semantic })
+                else {
+                    panic!("literal")
+                };
+                assert_eq!(cards.len(), 1);
+                assert!(cards[0].snippet.as_ref().unwrap().contains("***"));
+                assert!(!serde_json::to_string(&cards).unwrap().contains("test-secret-7c2d"));
+                let calls: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+                let args = &calls["calls"].as_array().unwrap().last().unwrap()["arguments"];
+                assert_eq!(args.get("about").unwrap_or(&args["query"]), literal);
+            }
+            let TicketOutput::Card(read) = run(&config, TicketOp::ReadCard(epic)) else { panic!("cleaned read") };
+            assert!(read.body.as_ref().unwrap().len() <= tickets::MAX_BODY_BYTES);
+            assert_eq!(read.comments[0].text, "*** in a comment");
+            assert!(!serde_json::to_string(&read).unwrap().contains("test-secret-7c2d"));
+        }
+    }
 
     /// A streamable HTTP MCP server whose every tool call fails, echoing the bearer token it
     /// was called with and the one its previous call had. Each call's token goes to the receiver.
