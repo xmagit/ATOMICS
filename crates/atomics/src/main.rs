@@ -198,6 +198,23 @@ fn main() -> eframe::Result {
             // SAFETY: runs first thing in main, before any other thread exists.
             unsafe { std::env::remove_var(var) };
         }
+    }
+    // Everything a person runs moves the old places first, so that setup (the installer's first
+    // step) finds the old config instead of creating a new one. What agents call inside a live
+    // session never moves state out from under it.
+    let in_session = matches!(
+        cli.command,
+        Some(
+            Command::Hook { .. }
+                | Command::Statusline { .. }
+                | Command::HooksJson { .. }
+                | Command::Mcp { .. }
+                | Command::McpHost { .. }
+                | Command::Queue { .. }
+                | Command::Ctl { .. }
+        )
+    );
+    if !in_session {
         let migration = atomics_core::paths::migrate_old_names();
         for moved in migration.moved {
             eprintln!("atomics: {moved}");
