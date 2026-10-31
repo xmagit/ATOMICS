@@ -55,6 +55,8 @@ says what to take along and what to set up again.
   button toggles them. One editor runs per worktree and keeps its state while you switch back to the diff. Neovim
   works too; see `[editor]` in the config.
   When the configured program is `hx` and only `helix` is on PATH, editor launch and doctor use `helix`.
+  Helix's gutter compares tracked files with HEAD; ATOMICS reviews against the merge-base. Committed branch
+  changes and untracked files can therefore have no Helix marker. See [Helix diff gutters](docs/helix-diff-gutter.md).
 - **Worktree clean-up.** **clean up…** in the explorer checks every worktree for uncommitted work, merged branches
   and deleted remote branches (completed PRs). **select safe** picks the ones that can go. Removal never forces, so
   worktrees with uncommitted work are kept, and branches are deleted only when git considers them merged.

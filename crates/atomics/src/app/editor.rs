@@ -357,7 +357,7 @@ impl Desktop<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::with_app;
+    use super::super::tests::{repository, with_app};
     use super::*;
 
     #[test]
@@ -389,6 +389,57 @@ mod tests {
             app.runtime.diffs.get_mut(&root).unwrap().edit_comments(before, after);
             assert_eq!(app.runtime.diffs[&root].comments, vec![comment.clone(), comment.clone(), comment]);
         });
+    }
+
+    #[test]
+    fn helix_diff_gutter_uses_head_in_a_linked_worktree_with_startup_theme() {
+        with_app(
+            "app::editor::tests::helix_diff_gutter_uses_head_in_a_linked_worktree_with_startup_theme",
+            |app, ctx| {
+                let Some(helix) = crate::setup::find_program("hx").or_else(|| crate::setup::find_program("helix"))
+                else {
+                    eprintln!("Helix is not installed; skipping the native diff-gutter smoke test");
+                    return;
+                };
+                let (dir, repo) = repository();
+                std::fs::write(repo.join("sample.txt"), "first\noriginal\nlast\n").unwrap();
+                git::git(&repo, &["add", "sample.txt"]).unwrap();
+                git::git(&repo, &["commit", "-qm", "tracked sample"]).unwrap();
+                let root = dir.path().join("linked");
+                git::git(&repo, &["worktree", "add", "--detach", root.to_str().unwrap()]).unwrap();
+                std::fs::write(root.join("sample.txt"), "first\nmodified\nlast\n").unwrap();
+                let log = dir.path().join("helix.log");
+                app.runtime.config.editor.command =
+                    vec![helix.to_string_lossy().into_owned(), "--log".into(), log.to_string_lossy().into_owned()];
+                let check = |app: &mut Desktop<'_>, path: &str, marker: bool| {
+                    app.runtime.editors.remove(&root);
+                    app.runtime.edit(ctx, &root, Some(path), None);
+                    let terminal = &app.runtime.editors[&root];
+                    // The normal startup sequence applies the theme after 900 ms, with pauses
+                    // between commands. Inspect the screen after it has settled.
+                    let started = Instant::now();
+                    let deadline = started + crate::test_support::scaled_timeout(Duration::from_secs(5));
+                    loop {
+                        let screen = terminal.screen_text(24);
+                        if started.elapsed() >= Duration::from_secs(2)
+                            && screen.contains(path)
+                            && screen.contains("modified")
+                        {
+                            assert_eq!(screen.contains('▍'), marker, "{screen}");
+                            break;
+                        }
+                        assert!(Instant::now() < deadline, "Helix did not open {path}: {screen}");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                };
+                check(app, "sample.txt", true);
+                git::git(&root, &["add", "sample.txt"]).unwrap();
+                git::git(&root, &["commit", "-qm", "committed change"]).unwrap();
+                check(app, "sample.txt", false);
+                std::fs::write(root.join("untracked.txt"), "first\nmodified\nlast\n").unwrap();
+                check(app, "untracked.txt", false);
+            },
+        );
     }
 
     #[test]
