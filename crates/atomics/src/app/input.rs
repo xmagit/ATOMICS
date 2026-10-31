@@ -41,7 +41,7 @@ impl Desktop<'_> {
                 self.edit(ctx, &root, file.as_deref(), None);
             }
         }
-        // Shift+↓/↑ walk the changed files from anywhere but a text field or the editor.
+        // Shift+↓/↑ walk the hunks from anywhere but a text field or the editor.
         let editor_focused = self.client.editor_id.is_some_and(|id| ctx.memory(|m| m.has_focus(id)));
         if !ctx.text_edit_focused() && !editor_focused {
             let step = ctx.input_mut(|i| {
@@ -63,8 +63,14 @@ impl Desktop<'_> {
                 self.client.focus_terminal = None;
                 self.client.focus_editor = false;
                 ctx.memory_mut(|m| m.request_focus(diff_view::focus_id()));
-                if let Some((path, _)) = self.client.diff_views.entry(root.clone()).or_default().step(step) {
-                    self.open_file(&root, &path);
+                if self.client.diff_views.entry(root.clone()).or_default().step(step).is_some() {
+                    // Keep the host in diff mode without reopening the file over the hunk jump.
+                    self.post(move |runtime| {
+                        let data = runtime.diffs.entry(root).or_default();
+                        data.viewing = None;
+                        data.file = None;
+                        data.file_error = None;
+                    });
                 }
             }
         }
@@ -824,6 +830,48 @@ mod tests {
                 assert_eq!(app.runtime.diff_target().as_deref(), Some(second.as_path()));
                 assert_diff_keys(app, ctx, &second);
                 assert_received(&first, b"");
+            }
+        });
+    }
+
+    #[test]
+    fn shift_arrows_focus_each_hunk_before_crossing_files() {
+        with_app("app::input::tests::shift_arrows_focus_each_hunk_before_crossing_files", |app, ctx| {
+            for split in [DiffSplit::Never, DiffSplit::Always] {
+                app.runtime.sessions.clear();
+                let dir = crate::test_support::tempdir().unwrap();
+                let root = dir.path();
+                diff_agent(app, root, "agent");
+                let prepared =
+                    Arc::get_mut(app.runtime.diffs.get_mut(root).unwrap().prepared.as_mut().unwrap()).unwrap();
+                let mut hunk = prepared.diff.files[0].hunks[0].clone();
+                hunk.new_start = 1000;
+                for line in &mut hunk.lines {
+                    line.new_no = line.new_no.map(|n| n + 999);
+                }
+                prepared.diff.files[0].hunks.push(hunk);
+                app.runtime.active = Some("agent".into());
+                app.client.diff_split = Some(split);
+                // Navigation also leaves a whole-file preview without a later OpenFile resetting the jump.
+                app.runtime.diffs.get_mut(root).unwrap().viewing = Some("unchanged.rs".into());
+                let press =
+                    |app: &mut Desktop<'_>, code| diff_frame(app, ctx, vec![key(code, code, egui::Modifiers::SHIFT)]);
+                let first = press(app, Key::ArrowDown);
+                assert_eq!(app.client.diff_views[root].focused.as_deref(), Some("first.rs"));
+                let second = press(app, Key::ArrowDown);
+                assert!(second > first + 1000.0);
+                assert_eq!(app.client.diff_views[root].focused.as_deref(), Some("first.rs"));
+                assert_eq!(diff_frame(app, ctx, vec![]), second, "repaints must retain the hunk jump");
+                let next_file = press(app, Key::ArrowDown);
+                assert!(next_file > second);
+                assert_eq!(app.client.diff_views[root].focused.as_deref(), Some("second.rs"));
+                assert_eq!(press(app, Key::ArrowUp), second);
+                assert_eq!(app.client.diff_views[root].focused.as_deref(), Some("first.rs"));
+                assert_eq!(press(app, Key::ArrowUp), first);
+                assert_eq!(press(app, Key::ArrowUp), first);
+                assert!(ctx.memory(|m| m.has_focus(diff_view::focus_id())));
+                assert!(app.runtime.diffs[root].viewing.is_none());
+                assert_received(root, b"");
             }
         });
     }
