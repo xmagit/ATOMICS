@@ -9,6 +9,8 @@ pub(super) struct Activity {
     pub held_since: Option<u64>,
     /// The last turn end or wake, measured independently of wall-clock changes.
     pub wake_since: Option<Instant>,
+    /// Unlike the wake deadline, this boundary is unchanged by an automatic wake.
+    pub turn_ended: Option<Instant>,
 }
 
 impl Default for Activity {
@@ -21,6 +23,7 @@ impl Default for Activity {
             last_event: now,
             held_since: None,
             wake_since: None,
+            turn_ended: None,
         }
     }
 }
@@ -36,6 +39,7 @@ impl Activity {
                 self.wake_since = None;
             } else if !matches!(self.status, AgentStatus::Idle | AgentStatus::Done) {
                 self.wake_since = Some(now);
+                self.turn_ended = Some(now);
             }
             self.status_since = atomics_core::store::now();
             if status == AgentStatus::Working
@@ -197,6 +201,7 @@ mod tests {
         activity.wake_since = Some(now + Duration::from_secs(180)); // A wake was sent.
         activity.observe_at(AgentStatus::Idle, now + Duration::from_secs(181));
         assert_eq!(activity.wake_since, Some(now + Duration::from_secs(180)));
+        assert_eq!(activity.turn_ended, Some(now), "a wake must not clear native input history");
         activity.observe_at(AgentStatus::Working, now + Duration::from_secs(182));
         assert_eq!(activity.wake_since, None);
         activity.observe_at(AgentStatus::NeedsInput, now + Duration::from_secs(190));
@@ -204,6 +209,7 @@ mod tests {
         assert_eq!(activity.wake_since, None);
         activity.observe_at(AgentStatus::Done, now + Duration::from_secs(500));
         assert_eq!(activity.wake_since, Some(now + Duration::from_secs(500)));
+        assert_eq!(activity.turn_ended, Some(now + Duration::from_secs(500)));
         activity.observe_at(AgentStatus::Idle, now + Duration::from_secs(510));
         assert_eq!(activity.wake_since, Some(now + Duration::from_secs(500)));
         // A complete turn between runtime ticks still resets the timer through hook observations.

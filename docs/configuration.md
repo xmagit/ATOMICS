@@ -50,7 +50,9 @@ or to at least `30` seconds. Set it in `config.toml` or this host's `config.d/<h
 Work is open when an open plan has a running or review task, or a non-chief agent session exists.
 A wake waits a full interval after the last turn ended or the last wake; starting a turn resets the timer.
 It is suppressed while the chief works, has a pending permission or approval, has received terminal typing in
-the last 60 seconds, or has a nonempty or unrecognized prompt line on its terminal screen.
+the last 60 seconds, or has native keystrokes or a paste pending since its last turn ended or last submit (Enter).
+Suggested prompts do not count as user input. Before any native input history exists, the terminal screen is a
+fallback that ignores styled or dim suggestion text.
 The single line is `ATOMICS wake: <n> new events, <m> heartbeat findings (<short kinds>). Call atomics_wait and act; if nothing changed, post one short line.`
 Events are counted since the previous wake; findings and their short kinds come from the latest fleet check
 (`none` when empty). `[chief] heartbeat_secs` separately controls that check (default 300 seconds), delivered

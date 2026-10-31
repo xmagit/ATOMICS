@@ -418,6 +418,8 @@ It sends one line: `ATOMICS wake: <n> new events, <m> heartbeat findings (<short
 The counts summarize events since the previous wake and the latest heartbeat findings. A wake waits for a full
 interval after the chief's turn ends or the previous wake. Working turns reset the timer. Pending permissions,
 typing in the chief terminal within the last 60 seconds, or an unfinished prompt suppress the wake.
+Pending input is tracked from native keystrokes and pastes since the last turn ended or submit (Enter), so
+Claude's suggested prompts do not suppress wakes. Without input history, the screen fallback ignores styled suggestions.
 
 The chief may read, plan, review and run the plan you approved without asking. It can also answer other
 agents' permission prompts through the pre-approved `atomics_approve`, including `allow_always` for the rest

@@ -16,8 +16,26 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
 use alacritty_terminal::tty;
-use alacritty_terminal::vte::ansi::Rgb;
+use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 use anyhow::Result;
+
+#[derive(Clone, Copy, Default)]
+struct InputHistory {
+    last_typed: Option<Instant>,
+    draft_at: Option<Instant>,
+}
+
+impl InputHistory {
+    fn record(&mut self, at: Instant, submitted: bool) {
+        self.last_typed = Some(at);
+        self.draft_at = (!submitted).then_some(at);
+    }
+
+    fn empty_since(self, turn_ended: Option<Instant>) -> Option<bool> {
+        self.last_typed.map(|_| self.draft_at.is_none_or(|draft| turn_ended.is_some_and(|ended| draft <= ended)))
+    }
+}
+
 pub struct Shared {
     pub title: Mutex<Option<String>>,
     /// The last line typed into this terminal and sent with Enter.
@@ -30,7 +48,7 @@ pub struct Shared {
     wake: crate::host::Wake,
     size: Mutex<WindowSize>,
     shown: Mutex<Option<(Instant, bool)>>,
-    typed: Mutex<Option<Instant>>,
+    input: Mutex<InputHistory>,
     /// The theme's 256 colors, foreground, background and cursor, answered to OSC 4/10/11/12.
     colors: Mutex<Vec<Rgb>>,
 }
@@ -114,12 +132,61 @@ impl Terminal {
         *self.shared.shown.lock().unwrap() = Some((Instant::now(), focused));
     }
 
-    pub fn typed(&self) {
-        *self.shared.typed.lock().unwrap() = Some(Instant::now());
+    /// Native keystrokes and pastes are authoritative; a plain Enter clears the pending draft.
+    pub fn record_input(&self, at: Instant, submitted: bool) {
+        self.shared.input.lock().unwrap().record(at, submitted);
     }
 
     pub fn last_typed(&self) -> Option<Instant> {
-        *self.shared.typed.lock().unwrap()
+        self.shared.input.lock().unwrap().last_typed
+    }
+
+    pub fn input_empty_since(&self, turn_ended: Option<Instant>) -> bool {
+        if let Some(empty) = self.shared.input.lock().unwrap().empty_since(turn_ended) {
+            return empty;
+        }
+        // Before native input is observed, ignore suggestions rendered with styling or a custom color.
+        let term = self.term.lock();
+        let grid = term.grid();
+        let lines: Vec<String> = (0..grid.screen_lines())
+            .map(|r| {
+                let row = &grid[Line(r as i32)];
+                let first = (0..grid.columns()).find(|&c| {
+                    let ch = row[Column(c)].c;
+                    ch != '\0' && !ch.is_whitespace()
+                });
+                (0..grid.columns())
+                    .filter(|&c| !row[Column(c)].flags.contains(Flags::WIDE_CHAR_SPACER))
+                    .map(|c| {
+                        let cell = &row[Column(c)];
+                        let marker = Some(c) == first && matches!(cell.c, '❯' | '›' | '>' | '─' | '━' | '═' | '╰');
+                        let styled = cell.fg != Color::Named(NamedColor::Foreground)
+                            || cell.flags.intersects(
+                                Flags::DIM
+                                    | Flags::BOLD_ITALIC
+                                    | Flags::ALL_UNDERLINES
+                                    | Flags::INVERSE
+                                    | Flags::HIDDEN
+                                    | Flags::STRIKEOUT,
+                            );
+                        if cell.c == '\0' || styled && !marker { ' ' } else { cell.c }
+                    })
+                    .collect()
+            })
+            .collect();
+        let Some((index, prompt)) = lines
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, line)| line.trim_start().strip_prefix(['❯', '›', '>']).map(|prompt| (i, prompt)))
+        else {
+            return true;
+        };
+        prompt.trim().is_empty()
+            && lines[index + 1..]
+                .iter()
+                .take_while(|line| !line.trim_start().starts_with(['─', '━', '═', '╰']))
+                .all(|line| line.trim().is_empty())
     }
 
     /// Output cadence is a host decision informed by native-client visibility.
@@ -128,7 +195,7 @@ impl Terminal {
         let shown = *self.shared.shown.lock().unwrap();
         let visible = shown.is_some_and(|(at, _)| at.elapsed() < Duration::from_millis(500));
         let focused = visible && shown.is_some_and(|(_, focused)| focused);
-        if focused && self.shared.typed.lock().unwrap().is_some_and(|at| at.elapsed() < Duration::from_secs(1)) {
+        if focused && self.last_typed().is_some_and(|at| at.elapsed() < Duration::from_secs(1)) {
             Duration::ZERO
         } else if focused {
             Duration::from_millis(16)
@@ -172,7 +239,7 @@ impl Terminal {
             wake,
             size: Mutex::new(size),
             shown: Mutex::new(None),
-            typed: Mutex::new(None),
+            input: Mutex::new(InputHistory::default()),
             colors: Mutex::new(colors),
         });
         let listener = Listener { sender: Arc::new(OnceLock::new()), shared: shared.clone() };
@@ -327,6 +394,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn chief_input_history_clears_only_at_submit_or_turn_end() {
+        let now = Instant::now();
+        let mut input = InputHistory::default();
+        assert_eq!(input.empty_since(Some(now)), None);
+        input.record(now + Duration::from_secs(1), false);
+        assert_eq!(input.empty_since(Some(now)), Some(false));
+        input.record(now + Duration::from_secs(2), true);
+        assert_eq!(input.empty_since(Some(now)), Some(true));
+        input.record(now + Duration::from_secs(3), false);
+        assert_eq!(input.empty_since(Some(now)), Some(false));
+        assert_eq!(input.empty_since(Some(now + Duration::from_secs(4))), Some(true));
+    }
+
+    #[test]
     fn closing_or_replacing_terminal_kills_its_process_group() {
         for job_control in [false, true] {
             let dir = crate::test_support::tempdir().unwrap();
@@ -382,7 +463,7 @@ mod tests {
             wake: wake.clone(),
             size: Mutex::new(WindowSize { num_lines: 24, num_cols: 80, cell_width: 8, cell_height: 16 }),
             shown: Mutex::new(None),
-            typed: Mutex::new(None),
+            input: Mutex::new(InputHistory::default()),
             colors: Mutex::new(Vec::new()),
         });
         let listener = Listener { sender: Arc::new(OnceLock::new()), shared: shared.clone() };

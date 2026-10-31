@@ -23,25 +23,6 @@ impl WakeConditions {
     }
 }
 
-/// Require a visible, empty prompt; an unknown screen is unsafe to type into.
-/// Check continuation rows too, so a multiline draft with an empty first row is preserved.
-fn chief_input_empty(screen: &str) -> bool {
-    let lines: Vec<_> = screen.lines().collect();
-    let Some((index, prompt)) = lines
-        .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(i, line)| line.trim_start().strip_prefix(['❯', '›', '>']).map(|prompt| (i, prompt)))
-    else {
-        return false;
-    };
-    prompt.trim().is_empty()
-        && lines[index + 1..]
-            .iter()
-            .take_while(|line| !line.trim_start().starts_with(['─', '━', '═', '╰']))
-            .all(|line| line.trim().is_empty())
-}
-
 fn wake_message(events: usize, findings: &[Finding]) -> String {
     let kinds: Vec<_> = [
         (Kind::AgentGone, "agent_gone"),
@@ -91,7 +72,7 @@ impl State {
                 || !chief.approvals.is_empty()
                 || atomics_core::approvals::menu_visible(&screen),
             input_age: terminal.last_typed().map(|at| at.elapsed()),
-            input_empty: chief_input_empty(&screen),
+            input_empty: terminal.input_empty_since(chief.activity.turn_ended),
             elapsed: chief.activity.wake_since.map(|at| at.elapsed()),
         };
         if !conditions.should_wake() {
@@ -505,17 +486,6 @@ mod tests {
         assert!(!WakeConditions { elapsed: Some(Duration::from_millis(179_999)), ..eligible() }.should_wake());
         assert!(!WakeConditions { elapsed: None, ..eligible() }.should_wake());
         assert!(eligible().should_wake());
-    }
-
-    #[test]
-    fn wake_uses_visible_prompt_line_including_multiline_drafts() {
-        for screen in ["❯", "response\n❯ \n────────\n? for shortcuts", "›  ", ">\n\n"] {
-            assert!(chief_input_empty(screen), "{screen:?}");
-        }
-        for screen in ["", "response only", "❯ unsent draft", "❯\n  second draft line\n────", "❯\n❯ draft"]
-        {
-            assert!(!chief_input_empty(screen), "{screen:?}");
-        }
     }
 
     #[test]
