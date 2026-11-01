@@ -796,8 +796,20 @@ impl RemoteErrors {
                 (RemoteError::Invalid, &self.invalid),
                 (RemoteError::Unreadable, &self.unreadable),
             ];
-            return lists.into_iter().find(|(_, codes)| codes.iter().any(|c| c.trim() == code)).map(|(class, _)| class);
+            let class =
+                lists.into_iter().find(|(_, codes)| codes.iter().any(|c| c.trim() == code)).map(|(class, _)| class);
+            // A server may give a reused event id the code of the sequence race; its message tells them apart.
+            return match class {
+                Some(RemoteError::Conflict) => Some(
+                    Self::by_message(message).filter(|c| *c == RemoteError::Reused).unwrap_or(RemoteError::Conflict),
+                ),
+                other => other,
+            };
         }
+        Self::by_message(message)
+    }
+
+    fn by_message(message: &str) -> Option<RemoteError> {
         let message = message.to_lowercase().replace('\u{2019}', "'");
         ERROR_MESSAGES.iter().find(|(_, fragment)| message.contains(fragment)).map(|(class, _)| *class)
     }
@@ -2867,6 +2879,15 @@ mod tests {
         let error = r#"post failed: {"error":{"code":"sequence_used","message":"The item conversation has ended."}}"#;
         assert_eq!(coded.classify(error), Some(RemoteError::Conflict), "the code wins over the message");
         assert_eq!(coded.classify(r#"post failed: {"error":{"code":"other"}}"#), None);
+        // Relay gives a reused event id the race's code: the message refines the class.
+        let relay =
+            RemoteErrors { code: "code".into(), conflict: vec!["sequence_conflict".into()], ..Default::default() };
+        let reused =
+            r#"failed: This event id was already used for other content; use a new id. {"code":"sequence_conflict"}"#;
+        let race = r#"failed: Another event took this event's id or sequence at the same time; retry it. {"code":"sequence_conflict"}"#;
+        assert_eq!(relay.classify(reused), Some(RemoteError::Reused));
+        assert_eq!(relay.classify(race), Some(RemoteError::Conflict));
+        assert_eq!(relay.classify(r#"failed: {"code":"sequence_conflict"}"#), Some(RemoteError::Conflict));
         assert_eq!(coded.classify("post failed: The item conversation has ended."), Some(RemoteError::Ended));
         let config: TicketConfig = toml::from_str(
             "system = \"example\"\n[remote]\nerrors = { code = \"code\", content_refused = [\"refused\"], ended = [\"ended\"], conflict = [\"conflict\"], unreadable = [\"unreadable\"] }",

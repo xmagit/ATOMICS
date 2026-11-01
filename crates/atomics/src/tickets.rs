@@ -2479,11 +2479,19 @@ pub(crate) mod tests {
         );
         let mut message = coded.clone();
         message.remote.errors = tickets::RemoteErrors::default();
+        let mut relay = coded.clone();
+        relay.remote.errors = tickets::RemoteErrors {
+            code: "code".into(),
+            conflict: vec!["sequence_conflict".into()],
+            ..Default::default()
+        };
         let mut worker = Worker::default();
         worker.prepare(&coded);
         for (config, fail_message, code) in [
             (&coded, "nothing a message fragment matches", Some("event_id_reused")),
             (&message, "This event id was already used for other content.", None),
+            // Relay's shape: the race's code with the reuse message.
+            (&relay, "This event id was already used for other content; use a new id.", Some("sequence_conflict")),
         ] {
             set(&path, |state| {
                 state["fail"] = json!(["conversation_post"]);
@@ -2494,6 +2502,12 @@ pub(crate) mod tests {
             assert!(messages[0].starts_with("Remote write dropped"), "{code:?}: {messages:?}");
             assert!(RemoteState::load(home, "lanes").unwrap().outbox.is_empty(), "{code:?}");
         }
+        // The plain race with the same code is still retried.
+        set(&path, |state| {
+            state["fail_message"] = json!("Another event took this event's id or sequence at the same time; retry it.");
+        });
+        assert!(outbox(&mut worker, &relay, home, Some(post(&relay, "raced"))).is_empty());
+        assert_eq!(RemoteState::load(home, "lanes").unwrap().outbox.len(), 1, "kept for a retry");
     }
 
     #[test]
