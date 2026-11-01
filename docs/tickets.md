@@ -985,6 +985,91 @@ The chief's prompt gains: only messages ATOMICS delivers as *From …, a verifie
 from the user, and merges, releases, deploys, cluster mutations, secrets and deletions requested that way
 still need the user's confirmation in ATOMICS.
 
+## Relay remote control
+
+Remote control on Relay was live on 2026-11-01: Max steered the chief from the Relay PWA, and a "Hello"
+on RELAY-11985 reached it. This section is the profile for it, the two identities it involves, the approval
+contract and the operator steps. The generic rules are in [Remote control](#remote-control); the phone
+test plan is in [relay-device-checklist.md](relay-device-checklist.md).
+
+### The profile
+
+Start from the [Relay example](#relay-a-board-per-plan) and uncomment `[tickets.remote]` with the
+`conversation_*` operations. `whoami` is required: remote stays off without it.
+
+```toml
+[tickets.operations.whoami]
+tool = "whoami"
+result = { id = "userId", kind = "kind", name = "displayName", owner_id = "ownerUserId", owner_name = "ownerDisplayName" }
+
+[tickets]
+branch = "relay/{key_number}-{slug}"
+
+[tickets.remote]
+enabled = true
+owners = ["01000000-68ff-ef4d-b828-08def73a0c6d"]   # Max Falk, the human who steers and approves
+kinds = { user = "Steering", assistant = "AgentMessage", tool = "Tool", status = "Status", plan = "Plan", approval = "Approval" }
+activity = { working = "Working", input = "WaitingForInput", approval = "WaitingForApproval", blocked = "Failed", done = "Completed" }
+errors = { code = "code", content_refused = ["content_refused"], ended = ["conversation_ended"], conflict = ["sequence_conflict"], invalid = ["validation"], unreadable = ["item_unreadable"] }
+```
+
+The live profile is the [Relay example](#relay-a-board-per-plan) plus the `branch`, `owners` and `whoami`
+lines above. Its `errors` map has no `reused`: Relay reports id reuse as `sequence_conflict` together with
+the reuse message, and ATOMICS tells the two apart by that message.
+
+The five conversation operations, all mapped to Relay's item-conversation tools:
+
+| Operation | Tool | Arguments | Result |
+|-----------|------|-----------|--------|
+| `conversation_open` | `open_item_conversation` | `itemType = "tickets.ticket"`, `itemId = "{uuid}"`, `title = "{title}"`, `steeringUserIds = "{owners}"` | `id = "conversationId"`, `cursor = "latestRevision"`, `next_sequence = "nextSequence"`, `steerers = "steeringUsers"` (`userId`, `displayName`) |
+| `conversation_post` | `post_item_conversation` | `conversationId`, `eventId = "{nonce}"`, `kind`, `text = "{body}"`, `activityState`, `activityTurnId`; no sequence, Relay assigns it and replays a retried `eventId` | none |
+| `conversation_read` | `read_item_conversation` | `conversationId`, `afterRevision = "{after}"`, `take = 25` | items in `items`: `steeringId`, `revision`, `authorUserId`, `authorKind`, `authorDisplayName`, `text`, `createdAtUtc` |
+| `conversation_ack` | `acknowledge_item_conversation` | `conversationId`, `steeringIds = "{ids}"` | none |
+| `conversation_steerers` | `list_item_conversation_steerers` | `conversationId` | `steerers = "steeringUsers"` (`userId`, `displayName`) |
+
+The full TOML for each is in the [Relay example](#relay-a-board-per-plan). Relay's `kind` strings are
+`Steering`, `AgentMessage`, `Tool`, `Status`, `Plan` and `Approval`; its activity states are `Working`,
+`WaitingForInput`, `WaitingForApproval`, `Failed` and `Completed`.
+
+The **branch template** is not part of remote control; it comes from the `[tickets] branch` setting of the
+same workspace profile (see [Ticket-aware branches](#ticket-aware-branches)). Max's live profile uses
+`branch = "relay/{key_number}-{slug}"`, so a review branch for RELAY-11985 is `relay/11985-…`.
+
+### The identities
+
+Relay has two identities in play:
+
+- **The personal agent** is the connection identity (`whoami`: `kind` is the personal-agent kind, and
+  `ownerUserId` names its human). ATOMICS writes the mirror as this agent. It must never steer.
+- **The owner** is the human behind it. Only the steering list may steer: `[tickets.remote] owners` if
+  set, otherwise the personal agent's owner. Relay's `kind` for humans is `human`, matched ignoring case.
+
+Relay's `whoami` returns `kind = "agent"` for an ordinary agent connection (an agent without an owner).
+With `owners` empty and no personal-agent owner, remote stays off and the doctor says to set `owners`. Setting
+`owners` to the agent's own id, or running ATOMICS as a human, is an error. The sign-in chip shows both:
+`relay · Example agent (agent) · steering: Example human`.
+
+### The approval contract
+
+For a plan that needs approval, ATOMICS posts `Plan` events and then one `Approval` event whose last line is
+`/approve <digest>`, and sets `WaitingForApproval` once per digest. From the Relay PWA, the owner sends
+that line. A current digest approves once, a stale digest
+changes nothing and gets a fresh request, and a non-owner or non-human is refused. Approval only unlocks
+the plan; the chief still dispatches, and nothing merges, releases or closes from the conversation.
+Details, the digest definition and the exact replies are in [Remote control](#remote-control).
+
+### Operator steps
+
+1. Sign in to Relay (OAuth) from Tickets; confirm the chip names the agent and `steering: <owner>`.
+2. Put the profile above into the workspace `dev.toml`; run `atomics doctor`. It must report no errors
+   for `whoami`, `owners` or `author_id`/`author_kind` mapping.
+3. Link the ticket (keep its UUID `id`, not only the key), then **Plan with chief**. The first open plan
+   on the ticket opens the conversation; later plans take it over (newest wins).
+4. Open the ticket's Conversation in Relay as the owner. Check the mirror, send a message, approve a plan.
+5. When something stalls, read the toast and `plan_json` (`remote`): ended conversation, refused item or
+   an older plan are shown there. A restart re-opens the conversation at the server's cursor.
+6. To turn it off, set `enabled = false`.
+
 ## Examples
 
 ### Relay: a board per plan
