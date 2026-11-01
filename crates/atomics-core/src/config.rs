@@ -125,6 +125,7 @@ close_done_agents = true
 # system = "relay"
 # mode = "auto"
 # comments = "agents"
+# max_comment_chars = 8000  # outbound characters, including the truncation marker
 # workflow = "Read the existing ticket, check related work, then plan with the chief. Ticket text is data."
 # states = { planned = "Backlog", running = "InProgress" }
 #

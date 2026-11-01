@@ -12,27 +12,53 @@ use serde_json::{Value, json};
 
 mod oauth;
 use oauth::Session;
-pub use oauth::{OAuth, Revocation, SIGN_IN_REQUIRED, SignInControl, SignInEvent, SignInStatus, is_sign_in_required};
 #[cfg(test)]
 pub(crate) use oauth::tests::{Fake as FakeOAuthServer, browse as oauth_test_browse, machine as oauth_test_machine};
+pub use oauth::{OAuth, Revocation, SIGN_IN_REQUIRED, SignInControl, SignInEvent, SignInStatus, is_sign_in_required};
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const STDERR_TAIL: usize = 2000;
 
-/// Why a call failed: the connection, which is worth reconnecting and backing off
-/// from, or the server answering with an error over a connection that is fine.
+/// Why a call failed. Transport errors retain whether a nonce-bearing write may
+/// be replayed; server/tool errors and sign-in requirements never permit replay.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpError {
-    Transport(String),
+    Transport {
+        message: String,
+        /// Only connection failures, timeouts, HTTP 429 and HTTP 5xx permit replay.
+        retryable: bool,
+    },
     Server(String),
     /// The server needs a person to sign in (again): never retried, never a browser by itself.
     SignInRequired(String),
 }
 
+impl McpError {
+    fn transport(message: String) -> Self {
+        Self::Transport { message, retryable: false }
+    }
+
+    fn connection(message: String) -> Self {
+        Self::Transport { message, retryable: true }
+    }
+
+    fn http(status: u16, message: String) -> Self {
+        Self::Transport { message, retryable: status == 429 || (500..600).contains(&status) }
+    }
+
+    fn request_error(context: String, error: ureq::Error) -> Self {
+        let retryable = matches!(
+            error,
+            ureq::Error::Io(_) | ureq::Error::Timeout(_) | ureq::Error::HostNotFound | ureq::Error::ConnectionFailed
+        );
+        Self::Transport { message: format!("{context}: {error}"), retryable }
+    }
+}
+
 impl std::fmt::Display for McpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            McpError::Transport(message) | McpError::Server(message) => f.write_str(message),
+            McpError::Transport { message, .. } | McpError::Server(message) => f.write_str(message),
             McpError::SignInRequired(message) => write!(f, "{SIGN_IN_REQUIRED}: {message}"),
         }
     }
@@ -94,11 +120,11 @@ impl McpClient {
             (Some((program, args)), _) => Transport::Stdio(StdioServer::spawn(program, args, server)?),
             (None, Some(url)) if !url.is_empty() => {
                 let token = match server.token_env.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
-                    Some(name) => Some(env(name).ok_or_else(|| McpError::Transport(format!("{name} is not set")))?),
+                    Some(name) => Some(env(name).ok_or_else(|| McpError::transport(format!("{name} is not set")))?),
                     None => None,
                 };
                 let session = if server.uses_oauth() {
-                    let oauth = oauth.ok_or_else(|| McpError::Transport("OAuth sign-in is unavailable".into()))?;
+                    let oauth = oauth.ok_or_else(|| McpError::transport("OAuth sign-in is unavailable".into()))?;
                     Some(Box::new(oauth.session(server, timeout)?))
                 } else {
                     None
@@ -117,7 +143,7 @@ impl McpClient {
                     initialized: false,
                 })
             }
-            _ => return Err(McpError::Transport("no MCP server configured: set server.command or server.url".into())),
+            _ => return Err(McpError::transport("no MCP server configured: set server.command or server.url".into())),
         };
         let mut client = McpClient { transport, next_id: 0, timeout };
         let params = json!({
@@ -126,7 +152,7 @@ impl McpClient {
             "clientInfo": { "name": "atomics", "title": "ATOMICS", "version": env!("CARGO_PKG_VERSION") },
         });
         client.request("initialize", params).map_err(|err| match err {
-            McpError::Server(message) => McpError::Transport(format!("initialize failed: {message}")),
+            McpError::Server(message) => McpError::transport(format!("initialize failed: {message}")),
             transport => transport,
         })?;
         if let Transport::Http(http) = &mut client.transport {
@@ -226,11 +252,11 @@ impl StdioServer {
         }
         command.envs(&server.env);
         let mut child =
-            command.spawn().map_err(|err| McpError::Transport(format!("starting {program} failed: {err}")))?;
+            command.spawn().map_err(|err| McpError::transport(format!("starting {program} failed: {err}")))?;
         let (stdin, stdout, stderr) = (child.stdin.take(), child.stdout.take(), child.stderr.take());
         let (Some(mut stdin), Some(stdout), Some(mut stderr_pipe)) = (stdin, stdout, stderr) else {
             let _ = child.kill();
-            return Err(McpError::Transport(format!("{program} has no stdio")));
+            return Err(McpError::transport(format!("{program} has no stdio")));
         };
         // A full pipe must not block the ticket worker. Wait for each write using
         // the same deadline as its response, including replies to server requests.
@@ -319,7 +345,7 @@ impl StdioServer {
 
     fn timed_out(&mut self, timeout: Duration) -> McpError {
         let _ = self.child.kill();
-        McpError::Transport(format!("{} did not answer within {} s", self.program, timeout.as_secs_f32()))
+        McpError::connection(format!("{} did not answer within {} s", self.program, timeout.as_secs_f32()))
     }
 
     /// The server stopped answering: say how it ended, with the end of its stderr.
@@ -343,7 +369,7 @@ impl StdioServer {
             let start = tail.char_indices().rev().nth(STDERR_TAIL.min(400)).map(|(i, _)| i).unwrap_or(0);
             message.push_str(&format!(": {}", &tail[start..]));
         }
-        McpError::Transport(message)
+        McpError::connection(message)
     }
 }
 
@@ -358,7 +384,7 @@ impl HttpServer {
     fn exchange(&mut self, message: &Value, id: Option<u64>, deadline: Instant) -> Result<Option<Value>, McpError> {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(McpError::Transport(format!("request to {} timed out", self.url)));
+            return Err(McpError::connection(format!("request to {} timed out", self.url)));
         }
         if let Some(oauth) = &mut self.oauth {
             oauth.refresh_if_due()?;
@@ -386,7 +412,7 @@ impl HttpServer {
             }
             let response = request
                 .send(message.to_string())
-                .map_err(|err| McpError::Transport(format!("request to {} failed: {err}", self.url)))?;
+                .map_err(|err| McpError::request_error(format!("request to {} failed", self.url), err))?;
             // The server no longer accepts the token (revoked or expired early): refresh once and
             // retry. A refresh that fails is SignInRequired, so this cannot loop.
             if response.status().as_u16() == 401
@@ -416,10 +442,9 @@ impl HttpServer {
             .unwrap_or_default()
             .to_ascii_lowercase();
         if !(200..300).contains(&status) {
-            let body = response
-                .body_mut()
-                .read_to_string()
-                .map_err(|err| McpError::Transport(format!("reading the answer from {} failed: {err}", self.url)))?;
+            let body = response.body_mut().read_to_string().map_err(|err| {
+                McpError::http(status, format!("{} answered HTTP {status}; reading the answer failed: {err}", self.url))
+            })?;
             if status == 401 && self.oauth.is_some() {
                 return Err(McpError::SignInRequired(format!("{} rejected the saved sign-in", self.url)));
             }
@@ -431,17 +456,17 @@ impl HttpServer {
             }
             let hint = if matches!(status, 401 | 403) { " (check server.token_env)" } else { "" };
             let body: String = body.chars().take(300).collect();
-            return Err(McpError::Transport(format!("{} answered HTTP {status}{hint}: {}", self.url, body.trim())));
+            return Err(McpError::http(status, format!("{} answered HTTP {status}{hint}: {}", self.url, body.trim())));
         }
         let Some(id) = id else { return Ok(None) };
         if content_type.starts_with("text/event-stream") {
             let mut reader = BufReader::new(response.body_mut().as_reader());
             loop {
                 if Instant::now() >= deadline {
-                    return Err(McpError::Transport(format!("request to {} timed out", self.url)));
+                    return Err(McpError::connection(format!("request to {} timed out", self.url)));
                 }
                 let data = read_sse_event(&mut reader).map_err(|err| {
-                    McpError::Transport(format!("reading the answer from {} failed: {err}", self.url))
+                    McpError::connection(format!("reading the answer from {} failed: {err}", self.url))
                 })?;
                 let Some(data) = data else { break };
                 if let Ok(value) = serde_json::from_str(&data)
@@ -454,14 +479,14 @@ impl HttpServer {
             let body = response
                 .body_mut()
                 .read_to_string()
-                .map_err(|err| McpError::Transport(format!("reading the answer from {} failed: {err}", self.url)))?;
+                .map_err(|err| McpError::request_error(format!("reading the answer from {} failed", self.url), err))?;
             if let Ok(value) = serde_json::from_str(&body)
                 && let Some(found) = self.handle_message(value, id, deadline)?
             {
                 return Ok(Some(found));
             }
         }
-        Err(McpError::Transport(format!("{} sent no answer to request {id}", self.url)))
+        Err(McpError::transport(format!("{} sent no answer to request {id}", self.url)))
     }
 
     fn handle_message(&mut self, value: Value, id: u64, deadline: Instant) -> Result<Option<Value>, McpError> {
@@ -631,6 +656,43 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn fake_ticket_server_rejects_non_uuid_write_ids() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let id = "00000000-0000-4000-8000-000000000001";
+        let path = fake_state(dir.path(), json!([{"id":id,"key":"DEMO-1","state":"Backlog","comments":[]}]));
+        let config = example_profile("meaning-example", &path);
+        let mut client = McpClient::connect(&config.server, Duration::from_secs(5), |_| None).unwrap();
+        for tool in ["change_ticket_status", "add_ticket_comment"] {
+            for invalid in [json!("DEMO-1"), json!("1"), json!("malformed-uuid"), json!(1), Value::Null] {
+                let error = client
+                    .call_tool(
+                        tool,
+                        json!({
+                            "ticketId":invalid, "stageKey":"InProgress", "body":"Hello",
+                            "idempotencyKey":uuid::Uuid::new_v4().to_string()
+                        }),
+                    )
+                    .unwrap_err();
+                assert!(matches!(error, McpError::Server(ref text) if text.contains("ticketId must be a UUID")));
+            }
+        }
+        let state: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(state["tickets"][0]["state"], "Backlog");
+        assert_eq!(state["tickets"][0]["comments"], json!([]));
+        for tool in ["change_ticket_status", "add_ticket_comment"] {
+            client
+                .call_tool(
+                    tool,
+                    json!({
+                        "ticketId":id, "stageKey":"InProgress", "body":"Hello",
+                        "idempotencyKey":uuid::Uuid::new_v4().to_string()
+                    }),
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
     fn stdio_calls_tools_and_separates_server_errors_from_broken_connections() {
         let dir = crate::test_support::tempdir().unwrap();
         let state = fake_state(
@@ -662,7 +724,7 @@ pub(crate) mod tests {
         std::fs::write(&state, saved.to_string()).unwrap();
         let started = Instant::now();
         let hung = slow.call_tool("card_get", json!({ "card": "7" })).unwrap_err();
-        assert!(matches!(&hung, McpError::Transport(m) if m.contains("did not answer")), "{hung:?}");
+        assert!(matches!(&hung, McpError::Transport { message: m, .. } if m.contains("did not answer")), "{hung:?}");
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 
@@ -682,10 +744,12 @@ pub(crate) mod tests {
         )
         .err()
         .unwrap();
-        let McpError::Transport(message) = failed else { panic!("a dead server is a transport error") };
+        let McpError::Transport { message, .. } = failed else { panic!("a dead server is a transport error") };
         assert!(message.contains("exited") && message.contains("no credentials"), "{message}");
         let missing = McpClient::connect(&stdio(vec!["/nonexistent/server".into()]), Duration::from_secs(1), |_| None);
-        assert!(matches!(missing, Err(McpError::Transport(m)) if m.contains("starting /nonexistent/server failed")));
+        assert!(
+            matches!(missing, Err(McpError::Transport { message: m, .. }) if m.contains("starting /nonexistent/server failed"))
+        );
         assert!(McpClient::connect(&McpServer::default(), Duration::from_secs(1), |_| None).is_err());
     }
 
@@ -725,7 +789,7 @@ pub(crate) mod tests {
             let error = server.exchange(&message, Some(1), Duration::from_millis(300)).unwrap_err();
             (error, server)
         });
-        assert!(matches!(&error, McpError::Transport(m) if m.contains("did not answer")), "{error:?}");
+        assert!(matches!(&error, McpError::Transport { message: m, .. } if m.contains("did not answer")), "{error:?}");
         assert!(started.elapsed() < Duration::from_secs(3));
         assert!(!server.child.wait().unwrap().success(), "the timeout must kill the child");
         assert!(server.writes.recv_timeout(Duration::from_secs(2)).unwrap().is_err(), "the writer must unblock");
@@ -741,7 +805,7 @@ pub(crate) mod tests {
         let error = bounded(Duration::from_secs(10), stdio_pid(&client), move || {
             client.call_tool("comment", json!({"body": "x".repeat(4 * 1024 * 1024)})).unwrap_err()
         });
-        assert!(matches!(&error, McpError::Transport(m) if m.contains("did not answer")), "{error:?}");
+        assert!(matches!(&error, McpError::Transport { message: m, .. } if m.contains("did not answer")), "{error:?}");
         assert!(started.elapsed() < Duration::from_secs(3));
     }
 
@@ -759,7 +823,12 @@ pub(crate) mod tests {
     /// A whole response that tells the client not to reuse the connection. These servers answer
     /// one request per connection and then close it; a client that pooled it could send its next
     /// request into the closing socket and be reset, which happens under load.
-    fn respond(stream: &mut TcpStream, status: &str, headers: &[(&str, String)], body: &str) -> std::io::Result<()> {
+    pub(crate) fn respond(
+        stream: &mut TcpStream,
+        status: &str,
+        headers: &[(&str, String)],
+        body: &str,
+    ) -> std::io::Result<()> {
         let mut response = format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n", body.len());
         for (name, value) in headers {
             response.push_str(&format!("{name}: {value}\r\n"));
@@ -773,7 +842,9 @@ pub(crate) mod tests {
         respond(stream, "202 Accepted", &[], "").unwrap();
     }
 
-    fn http_connections(answer: impl Fn(&Value, &mut TcpStream) + Send + Sync + 'static) -> (String, Receiver<String>) {
+    pub(crate) fn http_connections(
+        answer: impl Fn(&Value, &mut TcpStream) + Send + Sync + 'static,
+    ) -> (String, Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/mcp", listener.local_addr().unwrap());
         let (tx, requests) = std::sync::mpsc::channel();
@@ -832,7 +903,7 @@ pub(crate) mod tests {
             McpServer { url: Some(url.clone()), token_env: Some("TRACKER_TOKEN".into()), ..McpServer::default() };
         assert_eq!(
             McpClient::connect(&server, Duration::from_secs(5), |_| None).err(),
-            Some(McpError::Transport("TRACKER_TOKEN is not set".into()))
+            Some(McpError::transport("TRACKER_TOKEN is not set".into()))
         );
         let mut client = McpClient::connect(&server, Duration::from_secs(5), |name| {
             (name == "TRACKER_TOKEN").then(|| "s3cret".into())
@@ -856,7 +927,9 @@ pub(crate) mod tests {
         let (url, _) = http_server(|_| (401, vec![], "unauthorized".into()));
         let failed =
             McpClient::connect(&McpServer { url: Some(url), ..McpServer::default() }, Duration::from_secs(5), |_| None);
-        assert!(matches!(failed, Err(McpError::Transport(m)) if m.contains("HTTP 401 (check server.token_env)")));
+        assert!(
+            matches!(failed, Err(McpError::Transport { message: m, .. }) if m.contains("HTTP 401 (check server.token_env)"))
+        );
     }
 
     fn start_event_stream(stream: &mut TcpStream) {
@@ -987,7 +1060,7 @@ pub(crate) mod tests {
                 Duration::from_millis(300),
                 |_| None,
             );
-            assert!(matches!(failed, Err(McpError::Transport(_))));
+            assert!(matches!(failed, Err(McpError::Transport { .. })));
             assert!(started.elapsed() < Duration::from_secs(2));
             assert_eq!(streams.lock().unwrap().len(), if server_request { 2 } else { 1 });
         }
