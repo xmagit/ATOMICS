@@ -7,7 +7,7 @@
 //! logged, printed, put in an error, or written to disk. Nothing in this module opens a browser
 //! except `OAuth::sign_in`, which a person asks for.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
@@ -30,6 +30,9 @@ use crate::credentials::Store;
 const REFRESH_SKEW: Duration = Duration::from_secs(60);
 /// How long the browser has to come back.
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
+/// How long one connection to the loopback listener has to send its request head. Short, because
+/// the listener reads connections one at a time.
+const CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(2);
 /// What a failed or refused sign-in says first; the ticket worker's errors start with it too.
 pub const SIGN_IN_REQUIRED: &str = "sign-in required";
 
@@ -165,6 +168,8 @@ impl OAuth {
     /// failed is reported, never fatal. The registered client stays cached for the next sign-in.
     pub fn sign_out(&self, server: &McpServer) -> Result<Revocation, McpError> {
         let key = server_key(server).ok_or_else(|| McpError::Server("no MCP server url to sign out of".into()))?;
+        // A refresh in another ATOMICS finishes first, or it would store its tokens after this cleared them.
+        let _lock = self.store.oauth_lock(&key).map_err(storage)?;
         let revocation = match self.load(&key) {
             Ok(Some((tokens, access))) => revoke(&tokens, access.as_ref()),
             _ => Revocation::NotOffered,
@@ -181,7 +186,8 @@ impl OAuth {
         open: &dyn Fn(&str) -> anyhow::Result<()>,
     ) -> Result<(), McpError> {
         let (cancel, (_keep, paste)) = (AtomicBool::new(false), std::sync::mpsc::channel());
-        let control = SignInControl { cancel: &cancel, paste: &paste, notify: &|_| {}, open_browser: true, can_paste: false };
+        let control =
+            SignInControl { cancel: &cancel, paste: &paste, notify: &|_| {}, open_browser: true, can_paste: false };
         self.sign_in_controlled(server, timeout, open, &control)
     }
 
@@ -290,6 +296,7 @@ impl OAuth {
             refresh_token: grant.refresh_token,
             revocation_endpoint: auth.revocation_endpoint.as_ref().map(Url::to_string),
         };
+        let _lock = self.store.oauth_lock(&key).map_err(storage)?;
         self.save(&key, &tokens, &grant.access)
     }
 
@@ -360,15 +367,28 @@ impl Session {
 
     /// Refreshes when the access token is missing or about to expire.
     pub(crate) fn refresh_if_due(&mut self) -> Result<(), McpError> {
-        let due = self.access.token.is_empty() || self.access.expires_at <= unix_now() + REFRESH_SKEW.as_secs();
-        if due { self.refresh() } else { Ok(()) }
+        if due(&self.access) { self.refresh() } else { Ok(()) }
     }
 
     /// Exchanges the refresh token for a new pair, stores it, and uses it. The refresh token may
     /// rotate; the new one is stored before the old one is dropped. A refusal clears the sign-in
     /// and says `SignInRequired`; a network failure leaves it for the next try.
+    ///
+    /// Other ATOMICS processes refresh the same sign-in: each refresh holds the server's sign-in lock
+    /// and starts from what the keychain holds then, so a refresh token is spent once. When another
+    /// process refreshed while this one waited, its access token is used and nothing is sent.
     pub(crate) fn refresh(&mut self) -> Result<(), McpError> {
         let need = |why: &str| McpError::SignInRequired(format!("{} {why}", self.url));
+        let _lock = self.oauth.store.oauth_lock(&self.key).map_err(storage)?;
+        let (tokens, access) = self.oauth.load(&self.key).map_err(storage)?.ok_or_else(|| need("needs a sign-in"))?;
+        self.tokens = tokens;
+        if let Some(access) = access
+            && access.token != self.access.token
+            && !due(&access)
+        {
+            self.access = access;
+            return Ok(());
+        }
         let Some(refresh_token) = self.tokens.refresh_token.clone() else {
             let _ = self.oauth.clear(&self.key);
             return Err(need("needs a sign-in again: its token expired and the server gave no refresh token"));
@@ -395,6 +415,11 @@ impl Session {
             Err(TokenError::Transport(err)) => Err(err),
         }
     }
+}
+
+/// Whether an access token is missing or about to expire.
+fn due(access: &Access) -> bool {
+    access.token.is_empty() || access.expires_at <= unix_now() + REFRESH_SKEW.as_secs()
 }
 
 fn storage(err: anyhow::Error) -> McpError {
@@ -624,7 +649,10 @@ fn register(agent: &ureq::Agent, auth: &AuthServer, redirect_uri: &str) -> Resul
     }
 }
 
-/// Takes one callback on the loopback listener: the code, after checking `state` and `iss`.
+/// Waits on the loopback listener for this sign-in's callback: the code, after checking `state` and
+/// `iss`. A request for another address, or a callback whose `state` is not this sign-in's (a stale tab,
+/// another program), gets a short error page and the wait goes on until the timeout. A callback with
+/// the right `state` decides: its code, or its error.
 fn await_callback(
     listener: &TcpListener,
     state: &str,
@@ -634,6 +662,7 @@ fn await_callback(
 ) -> Result<String, McpError> {
     listener.set_nonblocking(true).map_err(|e| McpError::Transport(e.to_string()))?;
     let deadline = Instant::now() + timeout;
+    let mut stray = false;
     loop {
         if control.cancel.load(Ordering::Relaxed) {
             return Err(McpError::Server("sign-in cancelled".into()));
@@ -648,7 +677,9 @@ fn await_callback(
             Ok((stream, _)) => stream,
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                 if Instant::now() >= deadline {
-                    return Err(McpError::Server("sign-in timed out: the browser did not come back".into()));
+                    let ignored =
+                        if stray { " (an answer for another request was ignored: state mismatch)" } else { "" };
+                    return Err(McpError::Server(format!("sign-in timed out: the browser did not come back{ignored}")));
                 }
                 std::thread::sleep(Duration::from_millis(20));
                 continue;
@@ -656,16 +687,25 @@ fn await_callback(
             Err(err) => return Err(McpError::Transport(format!("sign-in callback failed: {err}"))),
         };
         let _ = stream.set_nonblocking(false);
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-        let Some(target) = request_target(&mut stream) else { continue };
+        // A client that does not read its answer cannot hold the listener either.
+        let _ = stream.set_write_timeout(Some(CALLBACK_READ_TIMEOUT));
+        let Some(target) = request_target(&mut stream, CALLBACK_READ_TIMEOUT) else { continue };
         let Ok(url) = Url::parse(&format!("http://127.0.0.1{target}")) else { continue };
         if url.path() != "/callback" {
             let _ = page(&mut stream, "404 Not Found", "Not found.");
             continue;
         }
         let param = |name: &str| url.query_pairs().find(|(k, _)| k == name).map(|(_, v)| v.into_owned());
-        let verdict = answer_code(param, state, auth);
-        return match verdict {
+        if param("state").as_deref() != Some(state) {
+            stray = true;
+            let _ = page(
+                &mut stream,
+                "400 Bad Request",
+                "This answer is not for the sign-in ATOMICS is waiting for. Return to ATOMICS and use its newest sign-in link.",
+            );
+            continue;
+        }
+        return match answer_code(param, state, auth) {
             Ok(code) => {
                 let _ = page(&mut stream, "200 OK", "Signed in. You can close this tab and return to ATOMICS.");
                 Ok(code)
@@ -733,10 +773,8 @@ fn revoke(tokens: &Tokens, access: Option<&Access>) -> Revocation {
         any = true;
         let form = [("token", token), ("token_type_hint", hint), ("client_id", tokens.client_id.as_str())];
         let body = url::form_urlencoded::Serializer::new(String::new()).extend_pairs(form).finish();
-        let answer = agent
-            .post(endpoint.as_str())
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .send(body);
+        let answer =
+            agent.post(endpoint.as_str()).header("Content-Type", "application/x-www-form-urlencoded").send(body);
         // RFC 7009 §2.2: 200 even for an unknown token. Anything else is a failure to report.
         failed |= !matches!(answer, Ok(ref r) if r.status().is_success());
     }
@@ -747,18 +785,27 @@ fn revoke(tokens: &Tokens, access: Option<&Access>) -> Revocation {
     }
 }
 
-/// The request target of a GET, with the rest of the head read off.
-fn request_target(stream: &mut TcpStream) -> Option<String> {
-    let mut reader = BufReader::new(stream.try_clone().ok()?.take(16 * 1024));
-    let mut first = String::new();
-    reader.read_line(&mut first).ok()?;
-    loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line).ok()? == 0 || line == "\r\n" || line == "\n" {
-            break;
+/// The request target of a GET, with the rest of the head read off within `limit` in all: a client
+/// that trickles bytes is dropped as surely as one that sends none.
+fn request_target(stream: &mut TcpStream, limit: Duration) -> Option<String> {
+    let deadline = Instant::now() + limit;
+    let mut head = Vec::new();
+    let mut buffer = [0u8; 1024];
+    while !head.ends_with(b"\r\n\r\n") && !head.ends_with(b"\n\n") {
+        let left = deadline.checked_duration_since(Instant::now()).filter(|left| !left.is_zero())?;
+        stream.set_read_timeout(Some(left)).ok()?;
+        let read = stream.read(&mut buffer).ok().filter(|&read| read > 0)?;
+        head.extend_from_slice(&buffer[..read]);
+        if head.len() > 16 * 1024 {
+            return None;
+        }
+        // A GET has no body; what follows the head is not read.
+        if let Some(end) = head.windows(4).position(|w| w == b"\r\n\r\n") {
+            head.truncate(end + 4);
         }
     }
-    let mut parts = first.split_whitespace();
+    let first = head.split(|&b| b == b'\n').next()?;
+    let mut parts = std::str::from_utf8(first).ok()?.split_whitespace();
     (parts.next()? == "GET").then(|| parts.next().map(str::to_string)).flatten()
 }
 

@@ -454,6 +454,9 @@ OAuth uses separate OS-keychain items under service `atomics-mcp-oauth-v1`, keye
 resource/issuer hash: registration, access token and rotating refresh metadata. This supersedes the
 proposal to put `mcp-oauth:<key>` entries in the credential catalog. macOS's per-write size limit would
 otherwise make several sign-ins crowd out the catalog. There is no plaintext fallback.
+Review fix F2: values over one item's limit are stored as alternating-generation chunk items behind a head
+item with a digest, and refresh is serialized per server with a lock file next to the config (see
+[Storage](../tickets.md#signing-in-with-oauth)).
 
 The worker and trace cleaner read the saved OAuth secrets as well as configured environment secrets.
 Doctor reports presence with values hidden. Agents receive ATOMICS's scoped tools, never OAuth tokens.

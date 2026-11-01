@@ -898,27 +898,25 @@ impl Keychain {
     }
 
     pub(crate) fn catalog_lock(&self) -> Result<std::fs::File> {
-        use std::os::fd::AsRawFd;
-        use std::os::unix::fs::OpenOptionsExt;
         let directory = if cfg!(test) {
             std::path::Path::new(&self.program).parent().unwrap().to_path_buf()
         } else {
             atomics_core::paths::atomics_home()
         };
-        std::fs::create_dir_all(&directory).map_err(|_| anyhow::anyhow!("cannot lock credential store"))?;
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(directory.join("credentials.lock"))
-            .map_err(|_| anyhow::anyhow!("cannot lock credential store"))?;
-        // SAFETY: a live descriptor; closing the file releases the interprocess lock.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            anyhow::bail!("cannot lock credential store")
-        }
-        Ok(file)
+        lock_file(&directory, "credentials.lock").map_err(|_| anyhow::anyhow!("cannot lock credential store"))
+    }
+
+    /// Serializes one MCP server's sign-in, refresh and sign-out across every ATOMICS process of this
+    /// user. It lives next to the config rather than in an ATOMICS home: sessions with different homes
+    /// share the one keychain, and so the one rotating refresh token.
+    pub(crate) fn sign_in_lock(&self, key: &str) -> Result<std::fs::File> {
+        let directory = if cfg!(test) {
+            std::path::Path::new(&self.program).parent().unwrap().to_path_buf()
+        } else {
+            let config = atomics_core::paths::config_file();
+            config.parent().map_or_else(atomics_core::paths::atomics_home, std::path::Path::to_path_buf)
+        };
+        lock_file(&directory, &format!("mcp-oauth-{key}.lock")).map_err(|_| anyhow::anyhow!("cannot lock the sign-in"))
     }
 
     pub(crate) fn remove_legacy(&self) -> Result<()> {
@@ -988,6 +986,19 @@ impl Keychain {
         }
         anyhow::bail!("OS credential store unavailable; unlock it and retry")
     }
+}
+
+/// An exclusive lock on `directory/name`, waiting for it; closing the file releases it. `File::lock`
+/// is `flock` on Unix and `LockFileEx` on Windows, so it holds across processes on every platform.
+fn lock_file(directory: &std::path::Path, name: &str) -> std::io::Result<std::fs::File> {
+    std::fs::create_dir_all(directory)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).read(true).write(true).truncate(false);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let file = options.open(directory.join(name))?;
+    file.lock()?;
+    Ok(file)
 }
 
 /// Whether `token` looks like a `claude setup-token` token.

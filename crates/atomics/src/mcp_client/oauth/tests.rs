@@ -102,6 +102,8 @@ pub(crate) struct State {
     pub(crate) no_challenge: bool,
     pub(crate) revoked: Vec<HashMap<String, String>>,
     pub(crate) revoke_status: Option<u16>,
+    /// How long the token endpoint takes to answer.
+    pub(crate) token_delay: Duration,
 }
 
 pub(crate) struct Fake {
@@ -142,6 +144,10 @@ impl Fake {
     }
 
     fn authorization_server(&self, r: &Req) -> Resp {
+        if r.path == "/token" {
+            let delay = self.state.lock().unwrap().token_delay;
+            std::thread::sleep(delay);
+        }
         let mut st = self.state.lock().unwrap();
         let path = r.path.split('?').next().unwrap();
         match (r.method.as_str(), path) {
@@ -502,9 +508,13 @@ fn a_state_mismatch_an_issuer_mismatch_and_foreign_metadata_are_rejected() {
     let (_dir, oauth) = machine();
     let server = fake.server();
 
+    // A forged state is not this sign-in's answer: it is ignored, and the wait runs out.
     fake.state.lock().unwrap().state_override = Some("forged-state".into());
-    let error = sign_in(&oauth, &server).unwrap_err();
-    assert!(matches!(&error, McpError::Server(m) if m.contains("state mismatch")), "{error:?}");
+    let error = sign_in(&oauth.clone().with_callback_timeout(Duration::from_millis(500)), &server).unwrap_err();
+    assert!(
+        matches!(&error, McpError::Server(m) if m.contains("timed out") && m.contains("state mismatch")),
+        "{error:?}"
+    );
 
     {
         let mut st = fake.state.lock().unwrap();
@@ -525,6 +535,80 @@ fn a_state_mismatch_an_issuer_mismatch_and_foreign_metadata_are_rejected() {
     // Nothing was exchanged or stored along the way.
     assert!(fake.state.lock().unwrap().token_requests.is_empty());
     assert_eq!(oauth.status(&server), SignInStatus::NeedsSignIn);
+}
+
+#[test]
+fn a_stray_callback_and_a_silent_connection_do_not_end_the_sign_in() {
+    let fake = Fake::start();
+    let (_dir, oauth) = machine();
+    let server = fake.server();
+    let strays = Arc::new(Mutex::new(Vec::new()));
+    let seen = strays.clone();
+    let open = move |url: &str| -> anyhow::Result<()> {
+        let authorize = Url::parse(url).unwrap();
+        let redirect = authorize.query_pairs().find(|(k, _)| k == "redirect_uri").unwrap().1.into_owned();
+        let (url, seen) = (url.to_string(), seen.clone());
+        std::thread::spawn(move || {
+            // A connection that never sends a byte, held open for the whole sign-in.
+            let port = Url::parse(&redirect).unwrap().port().unwrap();
+            let _silent = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+            for stray in [format!("{redirect}?code=stolen&state=wrong"), format!("{redirect}?code=stolen")] {
+                let mut response = agent.get(&stray).call().unwrap();
+                let body = response.body_mut().read_to_string().unwrap();
+                seen.lock().unwrap().push((response.status().as_u16(), body));
+            }
+            browse(&url);
+        });
+        Ok(())
+    };
+    let started = Instant::now();
+    oauth.sign_in_via(&server, Duration::from_secs(10), &open).unwrap();
+    assert!(started.elapsed() < Duration::from_secs(8), "the silent connection held the listener");
+    assert_eq!(oauth.status(&server), SignInStatus::SignedIn);
+    let strays = strays.lock().unwrap();
+    assert_eq!(strays.len(), 2);
+    assert!(strays.iter().all(|(status, body)| *status == 400 && body.contains("newest sign-in link")), "{strays:?}");
+    // Only the real answer's code was exchanged.
+    let st = fake.state.lock().unwrap();
+    assert!(st.token_requests.iter().all(|r| r["code"] != "stolen"));
+}
+
+#[test]
+fn concurrent_refreshers_spend_a_rotating_refresh_token_once() {
+    let fake = Fake::start();
+    let (_dir, oauth) = machine();
+    let server = fake.server();
+    fake.state.lock().unwrap().expires_in = 30;
+    sign_in(&oauth, &server).unwrap();
+    let first = stored_refresh_token(&oauth, &server);
+    {
+        let mut st = fake.state.lock().unwrap();
+        st.expires_in = 3600;
+        // Without the lock both refreshers would be inside the token request together.
+        st.token_delay = Duration::from_millis(300);
+    }
+    // Two ATOMICS processes: separate clients over the one keychain, each holding its own lock file.
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let refreshers: Vec<_> = (0..2)
+        .map(|_| {
+            let (oauth, server, barrier) = (oauth.clone(), server.clone(), barrier.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                oauth.session(&server, Duration::from_secs(5)).map(|session| session.access_token().to_string())
+            })
+        })
+        .collect();
+    let tokens: Vec<String> = refreshers.into_iter().map(|t| t.join().unwrap().unwrap()).collect();
+    assert_eq!(tokens[0], tokens[1], "the second refresher used the first one's tokens");
+    assert_eq!(oauth.status(&server), SignInStatus::SignedIn);
+    let st = fake.state.lock().unwrap();
+    let refreshes: Vec<_> = st.token_requests.iter().filter(|r| r["grant_type"] == "refresh_token").collect();
+    assert_eq!(refreshes.len(), 1, "one refresh token, spent once");
+    assert_eq!(refreshes[0]["refresh_token"], first);
+    assert!(st.access.contains(&tokens[0]));
+    drop(st);
+    assert_ne!(stored_refresh_token(&oauth, &server), first);
 }
 
 #[test]
