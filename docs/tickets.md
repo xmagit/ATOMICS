@@ -772,7 +772,26 @@ idle_poll_secs = 60
 `kinds` and `activity` translate ATOMICS's roles and states into the server's vocabulary; the defaults are
 ATOMICS's own names, so a profile sets its system's values. `[tickets.remote]` is part of `[tickets]` and
 follows the same workspace precedence. `user_turns`, `tools` and `min_interval_ms` configure the mirror of
-the chief's session, which a later step adds.
+the chief's session.
+
+The mirror sends only the chief's submitted prompts, final answers and one tool block per turn. Text
+already delivered from this conversation is not echoed. Tool blocks contain reduced trace operation,
+argument summary, state and elapsed time; `cards` includes up to five ticket keys and titles per entry,
+`names` omits cards, and `off` omits tool blocks. Each block includes at most ten entries. Workers, raw tool
+responses, terminals, files and diffs are never mirrored. Text passes the trace Cleaner after current OAuth
+credentials resolve, including token and URL credential masks, before entering the per-plan outbox.
+
+Events contain at most 2000 Unicode characters; long turns end with “(… N more characters in ATOMICS)”. All
+posts use the durable outbox and are spaced by `min_interval_ms`. At 50 pending mirror events, tool blocks
+give way first, then old turns become “(N turns skipped)”. After 1000 posts per plan per UTC day, mirroring
+pauses with a toast and resumes the next day. Status, plan and approval events survive these mirror limits.
+A content refusal produces “(withheld: the ticket system refused this text)” once; that replacement cannot
+produce another replacement.
+
+Permission notifications and pending chief permission prompts set `input` once, a blocked task sets
+`blocked`, approval sets `approval`, and the next chief turn sets `working`. A finished plan queues `done`
+and ends its conversation; polling stops. Status messages contain fixed copy, never permission commands or
+worker text. Remote steering still cannot answer permission menus or authorize sensitive operations.
 
 **Two identities.** The connection identity, read with `whoami`, is any agent. Only the steering list may
 steer: `owners` when set, otherwise the owner of a personal agent. Ticket fields such as assignee or

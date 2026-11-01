@@ -84,19 +84,31 @@ impl State {
 
     pub(super) fn capture_chief_trace(&mut self, index: usize, event: &atomics_core::hook::HookEvent) {
         // Called only after on_hook's session-id, sandbox and stale-event checks.
-        if !self.sessions[index].chief
-            || !matches!(event.name.as_str(), "PreToolUse" | "PostToolUse")
-            || !event.tool_name.as_deref().is_some_and(|name| name.starts_with("mcp__"))
-        {
+        let tool = matches!(event.name.as_str(), "PreToolUse" | "PostToolUse")
+            && event.tool_name.as_deref().is_some_and(|name| name.starts_with("mcp__"));
+        let config = self.ticket_config();
+        let turn = config.as_ref().is_some_and(|c| c.remote.enabled)
+            && matches!(event.name.as_str(), "UserPromptSubmit" | "Stop" | "Notification" | "PermissionRequest");
+        if !self.sessions[index].chief || !(tool || turn) {
             return;
         }
         let id = self.sessions[index].id.clone();
-        let config = self.ticket_config();
+        if event.name == "UserPromptSubmit" {
+            self.tickets.remote.chief_plan =
+                self.plans.get(self.selected_plan).filter(|p| p.is_open() && !p.id.is_empty()).map(|p| p.id.clone());
+        }
         let plan = event
             .tool_input
             .get("plan")
             .and_then(serde_json::Value::as_str)
             .and_then(|id| self.plans.iter().find(|plan| plan.id == id && plan.is_open()))
+            .or_else(|| {
+                self.tickets
+                    .remote
+                    .chief_plan
+                    .as_ref()
+                    .and_then(|id| self.plans.iter().find(|p| &p.id == id && p.is_open()))
+            })
             .or_else(|| self.plans.get(self.selected_plan).filter(|plan| plan.is_open() && !plan.id.is_empty()))
             .map(|plan| plan.id.clone());
         let at = std::time::SystemTime::now()
@@ -124,14 +136,18 @@ impl State {
             return;
         }
         self.load_chief_trace_with(id, cleaner);
-        let Some(entry) = self.traces.entry(id.into()).or_default().ingest_for_plan(event, config, cleaner, at, plan)
-        else {
-            return;
-        };
-        let saved = trace::disk::path(&paths::atomics_home(), entry.plan_id.as_deref())
-            .and_then(|path| trace::disk::append(&path, entry));
-        if saved.is_err() {
-            self.toast("Could not save chief trace");
+        let entry =
+            self.traces.entry(id.into()).or_default().ingest_for_plan(event, config, cleaner, at, plan).cloned();
+        if let Some(entry) = &entry {
+            let saved = trace::disk::path(&paths::atomics_home(), entry.plan_id.as_deref())
+                .and_then(|path| trace::disk::append(&path, entry));
+            if saved.is_err() {
+                self.toast("Could not save chief trace");
+            }
+        }
+        // A credential job from an old profile must not mirror into a new connection.
+        if config == self.ticket_config().as_deref() {
+            self.mirror_hook(event, plan, cleaner, entry);
         }
     }
 

@@ -16,6 +16,41 @@ pub const MAX_ENTRIES: usize = 200;
 pub const MAX_CARDS: usize = 25;
 pub const MAX_DISK_BYTES: usize = 1024 * 1024;
 
+/// The conversation server counts Unicode characters, including the omission note.
+pub fn cap_block(text: &str) -> String {
+    let count = text.chars().count();
+    if count <= 2000 {
+        return text.into();
+    }
+    let mut keep = 2000;
+    loop {
+        let note = format!("(… {} more characters in ATOMICS)", count - keep);
+        let next = 2000 - note.chars().count();
+        if next == keep {
+            return format!("{}{note}", text.chars().take(keep).collect::<String>());
+        }
+        keep = next;
+    }
+}
+
+/// Render only reduced trace fields. Errors, plans, URLs and raw responses are excluded.
+/// Callers implement `tools = names` by clearing cards on their copy of each entry.
+pub fn render_block(entries: &[TraceEntry]) -> String {
+    let mut lines = Vec::new();
+    for entry in entries.iter().take(10) {
+        let elapsed = entry.elapsed_ms.map(|ms| format!(" · {ms} ms")).unwrap_or_default();
+        lines.push(format!("{:?} {} · {} · {:?}{elapsed}", entry.op, entry.tool, entry.summary, entry.state));
+        for card in entry.cards.iter().take(5) {
+            lines.push(format!(
+                "  {} · {}",
+                card.link.key.as_deref().unwrap_or(&card.link.id),
+                card.link.title.as_deref().unwrap_or("")
+            ));
+        }
+    }
+    cap_block(&lines.join("\n"))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TraceOp {
@@ -673,6 +708,34 @@ mod tests {
             ..Default::default()
         });
         config
+    }
+
+    #[test]
+    fn trace_mirror_block_limits_entries_cards_and_unicode_characters() {
+        let mut entry = ingest(
+            &event("PostToolUse", "a", "mcp__atomics__atomics_ticket_read", json!({"query":"safe"}), json!({})),
+            None,
+            &Cleaner::default(),
+            10,
+        )
+        .unwrap();
+        entry.cards = (0..9).map(card).collect();
+        entry.elapsed_ms = Some(12);
+        let block = render_block(&[entry.clone()]);
+        assert!(block.contains("Read") && block.contains("Ok") && block.contains("12 ms"));
+        assert!(block.contains("DEMO-4") && !block.contains("DEMO-5"));
+        entry.cards.clear();
+        entry.summary.clear();
+        assert_eq!(render_block(&vec![entry; 15]).lines().count(), 10);
+        for length in [2000, 2001, 2964, 3000, 10000] {
+            let text = "é".repeat(length);
+            let capped = cap_block(&text);
+            assert_eq!(capped.chars().count(), 2000);
+            if length > 2000 {
+                let kept = capped.chars().take_while(|c| *c == 'é').count();
+                assert!(capped.ends_with(&format!("(… {} more characters in ATOMICS)", length - kept)));
+            }
+        }
     }
 
     #[test]

@@ -43,6 +43,7 @@ impl State {
                 approval.reply.answer(HookReply::default());
             }
         }
+        self.mirror_pending_permission();
         if now.duration_since(self.approvals_checked) < APPROVAL_CHECK_INTERVAL {
             return;
         }
