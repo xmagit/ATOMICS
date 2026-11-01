@@ -238,6 +238,8 @@ impl State {
         let open: Vec<(String, ticket::TicketLink)> =
             linked.iter().map(|(index, link)| (self.plans[*index].id.clone(), link.clone())).collect();
         let mut jobs = Vec::new();
+        // Plans whose link can't be opened as it is: (plan, link, reason, said already).
+        let mut unfit: Vec<(String, ticket::TicketLink, String, bool)> = Vec::new();
         for (plan, link, goal) in followed {
             let remote = &mut self.tickets.remote;
             let entry = remote.plans.entry(plan.clone()).or_default();
@@ -251,6 +253,15 @@ impl State {
             }
             if entry.conversation.is_none() || entry.owners != owners {
                 if entry.open_after.is_some_and(|at| now < at) && entry.owners == owners {
+                    continue;
+                }
+                // A link made with the ticket's key can't fill {uuid}: the system's id is read
+                // through `get` and stored first, and the reason is told once.
+                if let Some(why) = config.unfit_id("conversation_open", &link) {
+                    entry.open_after = Some(now + REOPEN_AFTER);
+                    let said = entry.error.as_ref() == Some(&why);
+                    entry.error = Some(why.clone());
+                    unfit.push((plan, link, why, said));
                     continue;
                 }
                 entry.opening = true;
@@ -300,6 +311,12 @@ impl State {
                 };
                 jobs.push((plan, op, RemoteJob::Poll));
             }
+        }
+        for (plan, link, why, said) in unfit {
+            if !said {
+                self.toast(format!("Remote conversation for {plan}: {why}"));
+            }
+            self.queue_read(&config, (plan, None), TicketOp::Get(link), None);
         }
         for (plan, op, job) in jobs {
             let tag = super::tickets::remote_tag(&plan, &config, job, epoch);
@@ -1904,6 +1921,122 @@ mod tests {
             assert_eq!(all.len(), 2, "s-3 is not skipped and s-2 is not repeated: {all:?}");
             assert!(all[1].ends_with("next"), "{all:?}");
         });
+    }
+
+    #[test]
+    fn remote_a_restart_between_the_owner_closing_and_the_successor_opening_skips_nothing() {
+        with_app(
+            "app::remote::tests::remote_a_restart_between_the_owner_closing_and_the_successor_opening_skips_nothing",
+            |app, _| {
+                let dir = crate::test_support::tempdir().unwrap();
+                let path = remote_app(app, dir.path(), |_| {});
+                let config = app.runtime.ticket_config().unwrap();
+                // The successor's open fails while the owner is still open.
+                set(&path, |state| state["fail"] = json!(["conversation_open"]));
+                app.runtime.plans.push(Plan {
+                    id: "newer-plan".into(),
+                    goal: "Newer goal".into(),
+                    approved: true,
+                    ticket: link(&config, TICKET, "DEMO-1"),
+                    created_at: now_ms(),
+                    ..Default::default()
+                });
+                settle(app, 3);
+                assert!(app.runtime.tickets.remote.plans["newer-plan"].conversation.is_none());
+                assert_eq!(RemoteState::load(&paths::atomics_home(), "newer-plan").unwrap().takeover, ["remote-plan"]);
+                // Steering written in the gap, the owner closes, and the app restarts.
+                set(&path, |state| {
+                    state["fail"] = json!([]);
+                    state["steering"].as_array_mut().unwrap().push(steering("s-2", 2, "human-1", "Human", "status?"));
+                });
+                let owner = app.runtime.plans.iter().position(|p| p.id == "remote-plan").unwrap();
+                app.runtime.plans[owner].status = PlanStatus::Archived;
+                app.runtime.tickets.remote.reset();
+                settle(app, 3);
+                assert!(
+                    app.runtime.tickets.remote.plans["newer-plan"].conversation.is_some(),
+                    "{:?}",
+                    app.runtime.toast
+                );
+                poll_all(app);
+                let all = sent(app);
+                assert_eq!(all.len(), 1, "{all:?}");
+                assert!(all[0].ends_with("status?"), "{all:?}");
+            },
+        );
+    }
+
+    #[test]
+    fn remote_a_reopened_owner_takes_the_conversation_back_from_the_successor_without_repeats() {
+        with_app(
+            "app::remote::tests::remote_a_reopened_owner_takes_the_conversation_back_from_the_successor_without_repeats",
+            |app, _| {
+                let dir = crate::test_support::tempdir().unwrap();
+                let path = remote_app(app, dir.path(), |_| {});
+                let config = app.runtime.ticket_config().unwrap();
+                app.runtime.plans.push(Plan {
+                    id: "newer-plan".into(),
+                    goal: "Newer goal".into(),
+                    approved: true,
+                    ticket: link(&config, TICKET, "DEMO-1"),
+                    created_at: now_ms(),
+                    ..Default::default()
+                });
+                settle(app, 3);
+                set(&path, |state| {
+                    state["steering"].as_array_mut().unwrap().push(steering("s-2", 2, "human-1", "Human", "status?"));
+                });
+                poll_all(app);
+                assert_eq!(sent(app).len(), 1, "the successor delivers s-2");
+                // The owner is closed while the successor holds the conversation, then reopened
+                // as the successor closes.
+                let owner = app.runtime.plans.iter().position(|p| p.id == "remote-plan").unwrap();
+                app.runtime.plans[owner].status = PlanStatus::Archived;
+                settle(app, 2);
+                set(&path, |state| {
+                    state["steering"].as_array_mut().unwrap().push(steering("s-3", 3, "human-1", "Human", "next"));
+                });
+                app.runtime.plans[owner].status = PlanStatus::Open;
+                let newer = app.runtime.plans.iter().position(|p| p.id == "newer-plan").unwrap();
+                app.runtime.plans[newer].status = PlanStatus::Archived;
+                settle(app, 3);
+                assert_eq!(app.runtime.tickets.remote.plans.keys().collect::<Vec<_>>(), ["remote-plan"]);
+                assert!(app.runtime.tickets.remote.plans["remote-plan"].conversation.is_some());
+                poll_all(app);
+                let all = sent(app);
+                assert_eq!(all.len(), 2, "s-2 not again, s-3 not skipped: {all:?}");
+                assert!(all[1].ends_with("next"), "{all:?}");
+            },
+        );
+    }
+
+    #[test]
+    fn remote_a_plan_linked_by_key_resolves_the_systems_id_before_opening_and_a_refusal_is_toasted() {
+        with_app(
+            "app::remote::tests::remote_a_plan_linked_by_key_resolves_the_systems_id_before_opening_and_a_refusal_is_toasted",
+            |app, _| {
+                let dir = crate::test_support::tempdir().unwrap();
+                let path = remote_app(app, dir.path(), |_| {});
+                set(&path, |state| {
+                    state["tickets"] = json!([{"id":TICKET, "key":"DEMO-1", "title":"Ticket", "state":"Open"}]);
+                });
+                let opens = calls(&path, "conversation_open");
+                let index = app.runtime.plans.iter().position(|p| p.id == "remote-plan").unwrap();
+                app.runtime.plans[index].ticket.as_mut().unwrap().id = "DEMO-1".into();
+                app.runtime.tickets.remote.reset();
+                settle(app, 1);
+                let toast = app.runtime.toast.clone().unwrap().0;
+                assert!(toast.contains("remote-plan") && toast.contains("UUID"), "{toast}");
+                assert_eq!(calls(&path, "conversation_open"), opens, "not opened with a key");
+                settle(app, 2);
+                let link = app.runtime.plans[index].ticket.clone().unwrap();
+                assert_eq!((link.id.as_str(), link.key.as_deref()), (TICKET, Some("DEMO-1")));
+                app.runtime.tickets.remote.plans.get_mut("remote-plan").unwrap().open_after = None;
+                settle(app, 3);
+                assert_eq!(calls(&path, "conversation_open"), opens + 1, "opened once the id is the system's");
+                assert!(app.runtime.tickets.remote.plans["remote-plan"].conversation.is_some());
+            },
+        );
     }
 
     #[test]

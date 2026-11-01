@@ -416,15 +416,20 @@ ATOMICS tells these refusals apart with `[tickets.remote] errors`:
 
 ```toml
 [tickets.remote]
-errors = { code = "code", content_refused = ["…"], ended = ["…"], conflict = ["…"], invalid = ["…"], unreadable = ["…"] }
+errors = { code = "code", content_refused = ["…"], ended = ["…"], conflict = ["…"], reused = ["…"], invalid = ["…"], unreadable = ["…"] }
 ```
 
 When `code` names a JSON path and the tool error holds a JSON object with a value there, that code is
 compared with the lists. ATOMICS classifies a tool error's text together with its `structuredContent` as
 JSON, so `code = "code"` reads Relay's `structuredContent.code`; users see only the text (the JSON's `message`
-when the text is empty), never the JSON. An error without a code, and an unlisted code, is an ordinary failure. Without `code`, or for an error
-without one, ATOMICS matches the messages in `atomics_core::tickets::ERROR_MESSAGES` (case-insensitive
+when the text is empty), never the JSON. An error without a code, and an unlisted code, is an ordinary
+failure. `reused` lists the codes of an event id already used for other content, which never succeeds and
+is dropped even for a post without a sequence. Without `code`, or for an error without one, ATOMICS matches the messages in `atomics_core::tickets::ERROR_MESSAGES` (case-insensitive
 fragments, such as "can no longer read the conversation's item" and "another event already holds this sequence").
+A plan linked by a ticket key is resolved through `get` first when an operation needs `{uuid}`: the system's
+id replaces the key, which stays as the label, and a refused open says why. The previous owner of a
+conversation is saved in the successor's sidecar when its open starts, so a restart before the open succeeds
+still continues from where that owner stopped.
 Each plan holds at most 200 pending writes; tool blocks are evicted first. If no tool block can be removed,
 the new write is rejected with a visible error, preserving existing status, plan and approval events.
 
