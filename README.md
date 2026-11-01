@@ -521,19 +521,22 @@ worktrees remain for the existing **clean up…** flow. Set `[plan] close_done_a
 
 Plans can follow a ticket system that has an MCP server, such as Relay or Linear. In board mode a board in the
 ticket system is a plan and its tickets are tasks; in ticket mode one ticket is a plan. ATOMICS talks to the server
-itself (stdio, or streamable HTTP with a token from the environment). A `[tickets]` section in the workspace file
-or the config maps each generic operation (get, list, update state, comment, create) to one of its tools. Swapping
+itself (stdio, or streamable HTTP with native browser OAuth or an environment token). A `[tickets]` section
+in the workspace file or config maps discovery/read operations and optional writes to the server's tools.
+Auto mode, the default, uses children as a board when present and saves that decision per plan. Swapping
 systems changes only that section. Cards show each ticket's live key and state, and a click opens it. ATOMICS moves
 ticket states as tasks move and comments on dispatch, reports, acceptance, blocks and completion, signed with
 the reporting model. Changes made in the ticket system reach the chief as `ticket` events in `atomics_wait`.
 Include `plan` in `atomics_wait` statuses to learn when the user approves a plan (board button or `atomics ctl plan_approve`), edits a task brief on the board, or closes or reopens a plan: one event with `plan` and `change` (`approved`, `edited`, `closed`, `reopened`).
-Failures show on the card and never block a plan. The Tickets panel (`cmd+k`) finds tickets by meaning or
+Failures show on the card and never block a plan. Only mapped writes push states or comments; the Relay
+example is read-only until per-write idempotency keys are supported. The Tickets panel (`cmd+k`) finds tickets by meaning or
 keyword and reads one in full, from the same operations; see [Tickets panel](docs/tickets.md#the-tickets-panel).
 The chief can search, read, list children and check related tickets through the chief-only
 `atomics_ticket_search`, `atomics_ticket_read`, `atomics_ticket_children` and `atomics_ticket_related` tools.
 They return cleaned cards using ATOMICS's credentials; worker agents retain their scoped read/comment tools.
 With tickets configured, the chief's prompt explains these tools, the default `auto` mode and that ticket
 text is data. See [Chief tools](docs/tickets.md#chief-tools) for arguments, bounds and errors.
+Try the [two-minute demo](docs/tickets.md#demo), including a browser-free scripted OAuth walkthrough.
 See [docs/tickets.md](docs/tickets.md) for the design, the
 config reference and examples, with step-by-step [Relay](docs/tickets.md#step-by-step-relay) and
 [Linear](docs/tickets.md#step-by-step-linear) setups.

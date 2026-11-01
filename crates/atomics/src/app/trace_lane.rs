@@ -609,7 +609,7 @@ mod tests {
     use super::super::tests::{session, with_app};
     use super::*;
     use crate::ipc::HookMessage;
-    use crate::mcp_client::tests::{example_profile, fake_server};
+    use crate::mcp_client::tests::example_profile;
     use atomics_core::trace::{TracePhase, TracePlan, TraceTask};
     use serde_json::{Value, json};
 
@@ -774,19 +774,7 @@ mod tests {
 
     fn fake_profile(app: &mut Desktop<'_>, dir: &Path) {
         let state = dir.join("fake.json");
-        let mut config = example_profile("meaning-example", &state);
-        config.server.command = vec![fake_server().display().to_string(), state.display().to_string()];
-        config.operations.children = Some(
-            toml::from_str(
-                r#"
-                tool = "get_children"
-                arguments = { ticket = "{key}" }
-                items = "result.tickets"
-                result = { id = "id", key = "number", title = "subject", state = "status", assignee = "assignee" }
-                "#,
-            )
-            .unwrap(),
-        );
+        let config = example_profile("meaning-example", &state);
         app.runtime.config.tickets = config;
         app.runtime.apply_ticket_config();
     }

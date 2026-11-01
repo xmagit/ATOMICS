@@ -1,7 +1,8 @@
 # Decision: the ticket workspace (RELAY-11967, task d1)
 
-Status: proposed, for Max's review. Nothing here is built. This is a design; no builds or tests were run
-for it.
+Status: implemented through T7 (2026-11-01); focused demo and ticket acceptance checks are recorded in
+T7's report. The final review owns the full suite. macOS/Windows manual sign-in remains a release check.
+The resolved choices and current example-profile caveats below supersede the original proposal.
 
 Sources checked for this design:
 
@@ -44,25 +45,29 @@ chief is docked on the right, closed to a pill until it is used. Times are targe
 
 | Time | On screen | What happens underneath |
 | --- | --- | --- |
-| 0:00 | Press `cmd+j` (`ctrl+j`). The panel shows **Tickets**: a query box, a banner "relay is not signed in" and a **Sign in** button. | Worker found no token: `AuthRequired`, shown as state, not as an error. |
+| 0:00 | Press `cmd+k` (Ctrl+Shift+K on Linux/Windows). The panel shows **Tickets**: a query box, a banner "relay is not signed in" and a **Sign in** button. | Worker found no token: `AuthRequired`, shown as state, not as an error. |
 | 0:08 | Click **Sign in**. The default browser opens on Relay's consent page. The banner says "waiting for the browser…" with a Cancel. | i1's flow: discovery from the 401, DCR, PKCE, loopback redirect. |
-| 0:25 | Back in ATOMICS the banner turns into a chip: `relay · signed in as Max Claude`. The query box is focused. | Token stored in the OS keychain. |
+| 0:25 | Back in ATOMICS the banner turns into a chip: `relay · signed in`. The query box is focused. | Token stored in the OS keychain. |
 | 0:30 | Type `link relay and atomics, personal agent sign-in`, press Enter. After a second, 5 results with relevance bars; RELAY-11953 is first at 0.82. Each row: key, title, state chip, assignee, score bar, and a snippet when the server provides one. | `semantic_search` operation. |
 | 0:45 | `↓` to RELAY-11953, Enter. The panel switches to the reading view: header, markdown description with Goal / Decisions / Work / Order headings, comments, **Children (4)** and **Related (5)**. | `read`, `children` and `related` run in parallel on the worker; sections fill as each returns. |
-| 1:00 | `Shift+↓` steps from section to section, `PageDown` scrolls, as in the diff. The sidebar shows the same tree: epic, children, state dots. | Reading is local once loaded. |
+| 1:00 | `PageDown` steps from section to section, `PageDown` scrolls, as in the diff. The sidebar shows the same tree: epic, children, state dots. | Reading is local once loaded. |
 | 1:10 | Press **Plan with chief** (`cmd+enter`). A one-line confirm "Plan RELAY-11953 with 4 child tickets as tasks?" appears; Enter. The plan tab `RELAY-11953 · planning…` appears in the tab bar. The chief window opens. | A message is sent to the chief (section 6). An empty plan with the ticket link is created at once. |
 | 1:15 | The **trace lane** in the chief window fills, live: a spinner card "read RELAY-11953", which settles into a ticket card with its state, 4 children and 3 comments; then a "children" card listing 4 tickets; then a "related" card with 5 scored tickets. | PreToolUse starts a card; PostToolUse completes it. Results parsed through the profile. |
 | 1:35 | A **plan card**: "atomics_plan_set · 6 tasks", with titles and dependency arrows, and the link `RELAY-11953`. The tab changes to `RELAY-11953 · 0/6 · needs you`. | `atomics_plan_set` mapped to a plan card. |
 | 1:45 | Click the tab. The board shows 6 task cards, four of them with ticket chips (`RELAY-11952`, `11954`, `11955`, `11956`), and **Approve plan**. | Existing board. |
 | 1:55 | Approve. Agents start; chips move to In Progress; the Relay tickets move with them. | Existing lifecycle. |
 
-Two honesty notes:
+Current demo caveats (updated for T7):
 
-- **Children at 0:45** need Relay's list-children tool (RELAY-11954, not built: today `get_ticket` returns
-  `parentTicketId` and no children). Until then the demo shows the same flow with the fake server's epic, and
-  on Relay the children section says "this server offers no children operation". Related tickets are
-  semantic matches, never presented as children.
-- **Sign-in at 0:08** needs Relay's OAuth (RELAY-11952, "Deploying" at the time of writing) and i1.
+- The deterministic recording uses DEMO-1 with four children and four related matches, five search
+  hits and a scripted six-task plan. See [the runnable Demo](../tickets.md#demo). Fake search filters
+  words and returns seeded scores; production ordering and task counts vary.
+- Relay sign-in needs its OAuth deployment (RELAY-11952); children use `list_ticket_children`
+  (RELAY-11954), now declared by the connected gateway. Search needs relay-backend #752 live.
+- The current Relay example maps reads only. State/comment writes need a fresh `idempotencyKey`
+  per event (RELAY-11955 A1), so approving with that profile does not move external states or post reports.
+- A sandbox cannot open its host's browser. The test uses fake OAuth through the paste path; SSH users
+  open the authorization URL elsewhere and paste the final callback into ATOMICS.
 
 ---
 
@@ -72,7 +77,7 @@ Two honesty notes:
 
 | Surface | Today | Change |
 | --- | --- | --- |
-| Panel (`PanelMode`, `app.rs:321`) | `Diff`, `Editor`, `Plan` | Add `Tickets`, with two sub-views: **Find** and **Read**. Toggle key `toggle_tickets`, default `cmd+j` (check for conflicts when implementing). |
+| Panel (`PanelMode`, `app.rs:321`) | `Diff`, `Editor`, `Plan` | Add `Tickets`, with two sub-views: **Find** and **Read**. Toggle key `toggle_tickets`, default `cmd+k` (`cmd+j` remains next_attention). |
 | Top bar | Brand, view tabs, chief pill, actions | A **Tickets** entry in the actions slot (and the Actions overflow menu). It shows the sign-in state as a dot. |
 | Tab bar (`view_tabs`) | All, Ungrouped, Repos, one tab per plan | Unchanged structure; a plan with a ticket shows its **key** and progress instead of a long goal: `RELAY-11953 · 2/6`. Agents stay grouped under their plan's tab as now. While the chief plans: `RELAY-11953 · planning…`. |
 | Sidebar | Agents, explorer | A **TICKETS** section above the agents in plan views: the plan's ticket tree (ticket, children, state dots, the task's agent status). In All view: Find row and the last 5 tickets read. Click opens Read. |
@@ -80,7 +85,7 @@ Two honesty notes:
 | Chief window (`chief_content`) | Header + terminal | A **trace lane** below the terminal, collapsible, draggable height. In the docked column cards collapse to one line each. |
 | Editor | Helix in a PTY | "Open in editor" on a ticket writes a read-only markdown snapshot to the state folder and opens it with the existing `edit()` path, so editor search and yank work on a ticket. Optional, last task. |
 
-The reading surface reuses what the diff already gives: focus id, row-based scroll state, `Shift+↑/↓`
+The reading surface reuses what the diff already gives: focus id, row-based scroll state, `PageUp/PageDown`
 section stepping (`input.rs`), and PageUp/PageDown/Home/End (`diff_view.rs`). A ticket is rendered as a
 document of **sections**: description headings, each comment, the children block, the related block. Sections
 are what hunks are to a diff. Markdown rendering uses egui's text layout with headings, lists, code blocks,
@@ -90,11 +95,11 @@ bold, inline code and links; images are links.
 
 | Keys | In Find | In Read |
 | --- | --- | --- |
-| `cmd+j` / `ctrl+j` | Open or close the panel | Same |
+| `cmd+k` (Ctrl+Shift+K on Linux/Windows) | Open or close the panel | Same |
 | `Ctrl+1…9` (`Cmd+1…9` on macOS) | Unchanged: select agent N. Find stays in Find. | Select agent N and **retarget Read to that agent's task ticket** (the chief and untasked agents show the plan's ticket). Numbering is the same visible-agent numbering. |
-| `Shift+↓` / `Shift+↑` | Next / previous result (works from anywhere except a text field) | Next / previous section, crossing from description to comments to children to related |
+| `Shift+↓` / `Shift+↑` | Next / previous result (outside a text field/editor) | Next / previous result ticket; on a breadcrumb trail, `↑` goes back |
 | `↑` `↓` | Move the selection (from the query box, `↓` enters the list) | Scroll a line |
-| `PageUp` / `PageDown` | Scroll the results a page | Scroll a page |
+| `PageUp` / `PageDown` | Scroll the results a page | Previous / next section (description, comments, children, related) |
 | `Home` / `End` | First / last result | Top / bottom of the ticket |
 | `Enter` | Search (in the box), read (on a result) | Open the selected child or related ticket |
 | `Alt+←` | – | Back to the results |
@@ -131,7 +136,7 @@ Widths are for a ~110-column window. The chief is docked in the examples that ne
 │      [ http://127.0.0.1:53682/callback?code=…&state=…                          ] [Use it]    │
 
  signed in:
-┌ TICKETS ─────────────────────────────────── relay ● signed in as Max Claude  [Sign out] ┐
+┌ TICKETS ─────────────────────────────────── relay ● signed in  [Sign out] ┐
 ```
 
 The paste box is hidden unless the machine looks headless (no `DISPLAY` or `WAYLAND_DISPLAY` on Linux, or
@@ -140,7 +145,7 @@ The paste box is hidden unless the machine looks headless (no `DISPLAY` or `WAYL
 #### Search and results
 
 ```
-┌ TICKETS ── Find ───────────────────────────────────────── relay ● signed in as Max Claude ┐
+┌ TICKETS ── Find ───────────────────────────────────────── relay ● signed in ┐
 │ [ link relay and atomics, personal agent sign-in                    ]  (•) meaning ( ) keyword│
 │ 5 tickets by meaning · include closed [ ]                                                    │
 ├──────────────────────────────────────────────────────────────────────────────────────────────┤
@@ -168,7 +173,7 @@ The paste box is hidden unless the machine looks headless (no `DISPLAY` or `WAYL
 - **State chips use the system's own names** (`InReview`, `Deploying`), colored only when the profile's
   `states` map one to an ATOMICS status; unmapped states are neutral. Nothing guesses meaning from names.
 - **Assignee** is shown when the result carries one; `unassigned` is shown only for an explicit null.
-- **Snippet** line appears only when the profile maps `snippet`. Relay does not return one today (section 7).
+- **Snippet** line appears only when the profile maps `snippet`. Relay maps this field when the deployed server returns one (section 7).
 - **Keyword-only systems** show the same list without bars, and without the toggle.
 - **Chief searches appear here too.** When the chief runs a search, the list switches to its results with a
   "from the chief" tag and the query; the user's own box is untouched until they type.
@@ -298,7 +303,7 @@ operations are named here so profiles can use them: `record_stage` (post a devel
 | Placeholder | Value | Why |
 | --- | --- | --- |
 | `{query}` | The search text, as typed, never trimmed of inner text. Substituted in one pass like the others, so a query containing `{id}` stays literal. | Search |
-| `{key_number}` | The trailing digits of the key (`RELAY-11967` → `11967`). Already exists for branch templates; promoted to a general placeholder. | Relay's `get_ticket` takes the bare number |
+| `{key_number}` | The trailing digits of the key (`RELAY-11967` → `11967`). Already exists for branch templates; promoted to a general placeholder. | Servers that accept only a bare number |
 | `{uuid}` | The link's `id` when it parses as a UUID, else unknown (the operation fails naming `{uuid}`). | Relay's `get_ticket_by_id` takes a UUID |
 
 Numeric arguments stay literal (`take = 10`), as today. The query box never builds arguments by string
@@ -307,7 +312,7 @@ concatenation: values go in as JSON strings.
 Note on ids. A hit from search carries the system's own id (a UUID for Relay) and its key. A link made from
 a hit takes `id = <that id>`, `key = <key>`. A link the chief makes from only a key has `id = key`. Profiles
 should address tickets by whichever of `{key}`, `{key_number}` or `{uuid}` the tool accepts and works for
-both, which is why `{key_number}` exists: Relay's `get_ticket` works for both kinds of link.
+both, which is why `{key_number}` exists: Relay's current `get_ticket { ticket = "{key}" }` accepts both bare numbers and full keys.
 
 ### 3.3 Result field paths
 
@@ -343,7 +348,7 @@ If `read` is not mapped, the reading view renders `get`'s full result: string fi
 never profiled for reading still reads sensibly.
 
 A `[tickets] link_url` template (`https://host/tickets?selected={uuid}`) fills `url` when a result has none.
-Relay's search results carry no URL today; asking Relay for one is item 4 in section 7.
+The current Relay example maps the returned `url`; the original ask for one is recorded in section 7.
 
 ### 3.4 Modes
 
@@ -355,51 +360,35 @@ behaves as **ticket** mode. The decision is stored on the plan as it is made, so
 
 ### 3.5 Degradation table
 
-Legend: **●** works today, **◐** partly, **○** not offered. "Fake (now)" is
-`examples/fake_ticket_server.rs` as it is at `a66cc24`; "Fake (planned)" is what task 1 adds so the whole
-flow is testable without any real system.
+Legend: **●** supported by the profile/server contract; **◐** conditional or unverified; **○** not mapped.
+Updated 2026-11-01: Relay read schemas are exposed by the connected gateway and `get_ticket 11967`
+was read live. Search requires relay-backend #752 deployed; a schema is not deployment verification.
+A live Linear `tools/list` returned HTTP 401, so its schemas and result paths remain unverified.
 
-Relay's column is from live calls on 2026-10-31. **Linear's column is from third-party catalogs** (Linear's own
-documentation lists no tool names; its MCP page confirms the endpoint, OAuth 2.1 with dynamic registration and
-a read-only mode): the tool names `get_issue`, `list_issues`, `save_issue`, `list_comments`, `save_comment`,
-`list_issue_statuses`, `list_projects` and others, but no argument schemas. Everything marked *verify* must
-be checked against Linear's real `tools/list` and `inputSchema` when task 1 is built; the profile is the only
-place that can be wrong, which is the point of the design.
+| Feature | Operation | Relay example | Linear example (unverified) | Fake server |
+| --- | --- | --- | --- | --- |
+| Keyword search | `search` | ○ meaning only | ◐ `list_issues` with `query` | ● query-filtered |
+| Meaning search and score bars | `semantic_search`, `score` | ◐ `find_tickets {about, take, includeClosed}` → `result.tickets`; #752 needed | ○ | ● seeded scores |
+| Snippet | `snippet` | ◐ mapped when returned | ○ | ● |
+| Key, title, state, URL, assignee, kind | result paths | ● consistent rows; `row.*` on get/read | ◐ verify fields | ● |
+| Description and comments | `read` | ● `ticket.description`, `comments` | ◐ description only; comments need another call | ● |
+| Direct children | `children` | ◐ `list_ticket_children {ticket, take}` → `children`; endpoint needs RELAY-11954 | ◐ verify `parentId` | ● four children |
+| Related matches | `related` | ● `find_related_tickets {ticket}` → `result.tickets` | ○ | ● |
+| PR/CI links | `read.links` | ● `ticket.developmentLinks` | ○ | ● |
+| State/comment/create writes | optional writes | ○ idempotency keys required (RELAY-11955 A1) | ◐ verify `save_issue`, `save_comment` | ● fixture write dialects |
+| Development stage writes | `record_stage` | ○ | ○ | ○ |
+| Account identity in sign-in chip | `whoami` | ○ not mapped; shows signed in | ○ | ○ |
+| Sign-in | native OAuth or bridge | ◐ OAuth deployment required | ◐ OAuth or stdio bridge | ● fake OAuth in scripted demo; stdio interactively |
 
-| Feature | Operation | Relay (live) | Linear (documented names) | Fake (now) | Fake (planned) |
-| --- | --- | --- | --- | --- | --- |
-| Find by keyword | `search` | ◐ `find_tickets` is semantic only; no keyword mode, so Relay's `search` and `semantic_search` are the same tool | ◐ `list_issues` with a text filter (*verify* the argument name) | ◐ `issue_search` returns a whole board, ignores any query | ● returns hits matching the query |
-| Find by meaning, with score | `semantic_search` | ● `find_tickets {about, take, includeClosed}` → `result.tickets[].score` (0.67–0.90 seen) | ○ no semantic search | ○ | ● scores |
-| Relevance bar | `score` | ● | ○ | ○ | ● |
-| Snippet under a hit | `snippet` | ○ not returned (ask in §7) | ○ | ○ | ● |
-| Key, title, state in a hit | `id` `key` `title` `state` | ● `id`, `number`, `subject`, `status` | ● (*verify* names: likely `id`, `identifier`, `title`, `state`/`status`) | ● | ● |
-| Assignee name in a hit | `assignee` | ● `assignee` (name or null) in search and related | ◐ in `list_issues` (*verify*) | ○ | ● |
-| URL in a hit | `url` | ○ none in search/related; present in `get_ticket` (top-level `url`) → use `link_url` | ● | ● | ● |
-| Read: description (markdown) | `read` | ● `ticket.description` | ● `get_issue` (description) | ◐ plain | ● |
-| Read: comments with authors | `read` | ● `comments[]` with `authorDisplayName`, `authorIdentityKind`, `body`, `createdAtUtc`, newest first, paged by `commentsBeforeSequence` | ◐ `list_comments` is a second call (`read` would need `get` + comments; v1 shows the description only) | ◐ | ● |
-| Assignee name on a single ticket | `assignee` | ◐ `get_ticket` returns `assigneeUserId` only, no name (ask in §7) | ● (*verify*) | ○ | ● |
-| Children of a ticket | `children` | ○ `get_ticket` has `parentTicketId` and `treePath` but no list of children; RELAY-11954 adds the tool | ◐ `list_issues` with a parent filter (*verify* `parentId`) | ○ | ● |
-| Related tickets | `related` | ● `find_related_tickets {ticket, take, includeClosed}` with scores | ○ (issue relations only if `get_issue` returns them; *verify*) | ○ | ● |
-| Development links (PR, CI) | `read.links` | ● `developmentLinks[]` | ◐ attachments on `get_issue` (*verify*) | ○ | ● |
-| Branch suggestion | `branch` | ○ | ● `gitBranchName` | ○ | ◐ |
-| Move state, comment, create | existing ops | ● `change_ticket_status`, `add_ticket_comment`, `create_ticket` (names to confirm in the profile) | ● `save_issue`, `save_comment` | ● | ● |
-| Record dev stage | `record_stage` | ○ until RELAY-11954 | ○ | ○ | ◐ |
-| Identity chip | `whoami` | ○ (ask in §7; token claims may suffice) | ○ | ○ | ○ |
-| Sign-in | OAuth | ● after RELAY-11952 | ● OAuth 2.1 with DCR; `/mcp` over streamable HTTP | n/a (stdio) | n/a |
-
-What the user sees on each system:
-
-- **Relay:** meaning search with relative score bars, state and assignee, full description and comments,
-  related tickets, development links. Children appear once RELAY-11954 ships.
-- **Linear:** a keyword list with state and assignee, description, optional children if the parent filter
-  exists. No score bars, no Related section. The flow is complete: find, read, plan, board.
-- **Fake server:** everything, deterministically, for tests and for the demo recording without network.
+The same Find → Read → Plan → board flow uses only mapped capabilities. Related matches never become
+children. Missing operations leave a muted capability hint; no unsupported feature is inferred from a
+server's name. The [current example profiles](../tickets.md#examples) carry deployment and paging caveats.
 
 ---
 
 ## 4. OAuth in ATOMICS's own client
 
-i1 builds the client side in `mcp_client.rs` (discovery from the 401 `resource_metadata`, RFC 8414 metadata,
+i1 built the client side in `mcp_client.rs` (discovery from the 401 `resource_metadata`, RFC 8414 metadata,
 dynamic registration, PKCE over a loopback redirect, tokens in the keychain, refresh, sign-out). This section
 fixes what the *app* needs from it and the decisions around it, so d1 does not redo i1. The first step of
 every dependent task is to read what i1 actually merged and use its names; the capabilities required are:
@@ -418,9 +407,8 @@ every dependent task is to read what i1 actually merged and use its names; the c
   (`/.well-known/oauth-authorization-server`, falling back to OIDC discovery for servers that only publish
   that).
 - Dynamic registration (RFC 7591) as a public client (`token_endpoint_auth_method = "none"`), with
-  `client_name` set to `ATOMICS (<hostname>)` so a server that lists connected clients (Relay's agent page,
-  RELAY-11952) shows which machine is which. Where the server has no registration endpoint, a configured
-  `oauth_client_id` is used.
+  `client_name` set to `ATOMICS` so a server that lists connected clients (Relay's agent page,
+  RELAY-11952) shows which machine is which. The native flow requires dynamic client registration; a server without it needs a pre-authenticated bridge.
 - Authorization code with PKCE `S256` (RFC 7636), a random `state` that is verified, and the `resource`
   parameter (RFC 8707) in **both** the authorization and token requests, with the MCP server's canonical URI
   (no trailing slash, no fragment). Sent even if the server ignores it.
@@ -460,34 +448,16 @@ The chief itself is a Claude Code session; if the user has also added the server
 config, that is a third, independent sign-in and none of ATOMICS's business. The chief prompt tells it to use
 `atomics_ticket_*` for tickets.
 
-### 4.3 Token storage within `credentials.rs`'s rules
+### 4.3 Token storage (implemented i1/T2)
 
-`credentials.rs` keeps one keychain item (the catalog), accepts only fixed identifiers, validates every entry
-(`valid_entry`), never prints values, counts malformed entries instead of quoting them, and has no plaintext
-fallback. OAuth tokens fit as one more kind of entry, modeled on `mcp-env:<server>`:
+OAuth uses separate OS-keychain items under service `atomics-mcp-oauth-v1`, keyed by the canonical
+resource/issuer hash: registration, access token and rotating refresh metadata. This supersedes the
+proposal to put `mcp-oauth:<key>` entries in the credential catalog. macOS's per-write size limit would
+otherwise make several sign-ins crowd out the catalog. There is no plaintext fallback.
 
-- **Id:** `mcp-oauth:<key>` where `<key>` is the first 16 hex digits of SHA-256 of the canonical resource URI.
-  A fixed-charset id means no untrusted text becomes a catalog name. `remove` accepts the prefix with a valid
-  hex key.
-- **Entry:** `token` holds a JSON object `{resource, issuer, token_endpoint, revocation_endpoint?, client_id,
-  client_secret?, redirect_port, access_token, access_expires_at, refresh_token?, scope?, account?}`;
-  `host` holds the display host, validated like registry hosts or `localhost`/`127.0.0.1` for local servers.
-- **`valid_entry`** accepts it only when the JSON parses, `resource` re-hashes to the id's key, the endpoints
-  are `https://` (or loopback `http://` for a local server), the object is at most 16 KB, and no value
-  contains NUL, like the `MCP_ENV` rule. The generic 8192-byte, ASCII-graphic rule applies to the other
-  kinds and is bypassed for this prefix the way `MCP_ENV` bypasses it.
-- **Status line:** `✓ credential MCP sign-in (relay.atomisk.ai): present; OS keychain → ATOMICS → that server only
-  (values hidden)`. `doctor_lines` and `Snapshot` list it. Nothing prints a token, client id, endpoint or
-  account.
-- **Not a relay credential:** like `MCP_ENV`, `credential()` returns `None` for the prefix, so the credential
-  relay never offers it to a session.
-- **Writes** go through `catalog_lock`; the client re-reads inside the lock before it refreshes, so a refresh
-  already done by another thread is used instead of being repeated. The access token is held in memory by the
-  worker as well, so a normal call never touches the keychain.
-- **Secrets cleaning:** `tickets::secrets_of` gains the access token, refresh token and client secret of the
-  server's entry. Anything the worker returns, errors included, is cleaned with them, the same way a
-  `token_env` value is.
-- **Catalog size:** about 1–3 KB per server against the 128 KB cap; no change needed.
+The worker and trace cleaner read the saved OAuth secrets as well as configured environment secrets.
+Doctor reports presence with values hidden. Agents receive ATOMICS's scoped tools, never OAuth tokens.
+See [Signing in with OAuth](../tickets.md#signing-in-with-oauth) for refresh, sign-out and SSH behavior.
 
 ### 4.4 Refresh, sign-out, expiry
 
@@ -500,7 +470,7 @@ fallback. OAuth tokens fit as one more kind of entry, modeled on `mcp-env:<serve
   explicit request for it (a tool that returns "sign in required; press Sign in in the Tickets panel" and
   rings the existing needs-attention indicator), or `atomics tickets login` do.
 - **Sign-out** (panel button, Actions menu, `atomics tickets logout`): best-effort RFC 7009 revocation when the
-  metadata has `revocation_endpoint`, then delete the catalog entry and drop the worker's connection.
+  metadata has `revocation_endpoint`, then delete the saved token entries and drop the worker's connection.
   A revocation failure is shown but the local sign-out always completes.
 - **Config change:** a different `server.url` is a different entry; the old entry is left, listed in
   doctor, and removable.
@@ -603,7 +573,7 @@ exactly like card text on the board.
 
 ```
 name = mcp__<server>__<tool>
-if server == ATOMICS's own:   tool atomics_ticket_search   → Search / SemanticSearch (from args.mode)
+if server == ATOMICS's own:   tool atomics_ticket_search   → Search / SemanticSearch (from args.semantic)
                               atomics_ticket_read          → Read
                               atomics_ticket_children      → Children
                               atomics_ticket_related       → Related
@@ -681,7 +651,10 @@ tree), ATOMICS only reads them.
 
 ---
 
-## 7. Relay-side asks
+## 7. Relay-side asks (original proposal, 2026-10-31)
+
+Historical requests: the current gateway schemas and profile are summarized in §3.5; these observations
+are not current deployment claims.
 
 Short ticket texts, ready to paste. Relay's MCP server is the product here: each ask removes a degradation
 in §3.5 and needs no ATOMICS code.
@@ -716,7 +689,8 @@ in §3.5 and needs no ATOMICS code.
 
 ## 8. Implementation tasks
 
-Rules for all tasks: no Relay names in ATOMICS code (they appear only in the example profile and in docs and
+Original implementation task breakdown (the T7 brief overrides host queue/full-suite commands in
+this sandbox; final review owns the full suite). Rules for all tasks: no Relay names in ATOMICS code (they appear only in the example profile and in docs and
 test fixtures named as examples); egui; works on macOS, Linux and Windows; reuse the seams named above; each
 task lands its docs and tests with the capability; no new window; use `cargo check -p <crate>` while
 working and the focused test filter below; run the full suite once at the end through
@@ -950,14 +924,16 @@ by the existing platform tests plus a manual run of the sign-in on each before r
 
 ---
 
-## Decisions still open for Max
+## Decisions and remaining verification
 
-1. **Default key** `cmd+j` for the Tickets panel (check against current bindings).
-2. **`mode = "auto"` as the default** for new profiles, with per-plan storage. The alternative is to keep two
-   global modes and make "Plan with chief" ask each time.
-3. **Chief-only trace in v1.** Workers' tool calls are not captured. Capturing them is possible later with the same
-   machinery, at the cost of PreToolUse hooks on every agent.
-4. **Whether to ask Relay for the stand-out asks first** (§7 items 1–4): they decide how much of the demo works
-   on Relay on day one rather than on the fake server.
-5. **Linear's tool schemas** are unverified; T1 verifies them against a live `tools/list` before the profile is
-   published.
+1. **Keys:** Tickets uses `cmd+k` (Ctrl+Shift+K on Linux/Windows); `cmd+j` stays `next_attention`.
+   Plan with chief uses `cmd+enter`. Read uses PageUp/PageDown for sections and Shift+arrows for tickets.
+2. **Mode:** `mode = "auto"` is the default for new profiles; the resolved choice is saved per plan.
+3. **Trace:** chief-only in v1. Worker calls are not captured.
+4. **Relay:** the current read-only example and deployment/write caveats are in `docs/tickets.md`.
+   Section 7 records the original upstream asks; exposed schemas now include keys, consistent rows,
+   snippets, children and `whoami`, but deployment must be checked per endpoint.
+5. **Linear:** live `tools/list` on 2026-11-01 returned HTTP 401. No authorized schemas were available;
+   the example remains marked unverified, including children and writes.
+6. **Release:** final review runs the full suite. Manual native sign-in on macOS and Windows remains
+   necessary before release; the scripted fake demo runs without a display on Linux.

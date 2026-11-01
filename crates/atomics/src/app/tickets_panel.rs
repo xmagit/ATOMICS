@@ -1288,7 +1288,7 @@ mod tests {
     use super::super::editor::save_png;
     use super::super::tests::{session, with_app};
     use super::*;
-    use crate::mcp_client::tests::{example_profile, fake_server};
+    use crate::mcp_client::tests::example_profile;
     use egui::Key;
 
     fn key(code: Key, modifiers: egui::Modifiers) -> egui::Event {
@@ -1825,22 +1825,7 @@ mod tests {
     /// The meaning-search example profile against the fake server, with a children operation.
     fn fake_profile(app: &mut Desktop<'_>, dir: &Path) {
         let state = dir.join("fake.json");
-        let mut config = example_profile("meaning-example", &state);
-        config.server.command = vec![fake_server().display().to_string(), state.display().to_string()];
-        // The shipped meaning profile leaves the snippet unmapped; Find shows it when mapped.
-        config.operations.semantic_search.as_mut().unwrap().result.snippet = "snippet".into();
-        // The shipped meaning profile maps no children operation either.
-        config.operations.children = Some(
-            toml::from_str(
-                r#"
-                tool = "get_children"
-                arguments = { ticket = "{key}" }
-                items = "result.tickets"
-                result = { id = "id", key = "number", title = "subject", state = "status", assignee = "assignee" }
-                "#,
-            )
-            .unwrap(),
-        );
+        let config = example_profile("meaning-example", &state);
         app.runtime.config.tickets = config;
         app.runtime.apply_ticket_config();
     }
@@ -2245,4 +2230,6 @@ mod tests {
         let forced = TicketConfig { mode: TicketMode::Board, ..auto };
         assert_eq!(super::super::board::mode_label(&Plan::default(), &forced), "board");
     }
+
+    include!("ticket_demo.rs");
 }

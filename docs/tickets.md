@@ -1,13 +1,112 @@
 # Tickets
 
 ATOMICS plans can follow an external ticket system. A plan and each of its tasks can carry a ticket link.
-ATOMICS reads those tickets live and shows them on the board. It moves their states as the work moves,
-comments on them as agents report, and tells the chief when someone changes a ticket.
+ATOMICS reads those tickets live and shows them on the board. When write operations are mapped, it moves
+their states as the work moves and comments as agents report. It tells the chief when someone changes a ticket.
 
 One generic layer serves every system. ATOMICS reaches the ticket system's MCP server itself. A per-workspace
 `[tickets]` config says which MCP tool implements each generic operation and where the tool's result keeps
 each field. Nothing in ATOMICS knows any particular system: swapping Relay for Linear, or for anything else
 with an MCP server, changes only the config.
+
+## Demo
+
+With a built binary, this takes about two minutes. The fixture keeps its tickets locally. The interactive chief needs
+its usual model sign-in; the scripted version below substitutes a chief and a fake keychain, and needs
+neither a browser, a display nor a model account.
+
+### Fake server
+
+From a checkout, build the fixture once (outside the two-minute walkthrough):
+
+```sh
+CARGO_BUILD_JOBS=2 cargo build -p atomics --example fake_ticket_server
+```
+
+On macOS/Linux, paste this into a terminal at the checkout root. It creates an isolated config and state;
+use your installed `atomics` desktop binary, or `target/debug/atomics` if already built:
+
+```sh
+demo_dir=$(mktemp -d)
+cat > "$demo_dir/config.toml" <<EOF
+[tickets]
+system = "demo"
+mode = "auto"
+comments = "off"
+server = { command = ["$(pwd)/target/debug/examples/fake_ticket_server", "$demo_dir/tickets.json"] }
+
+[tickets.operations.get]
+tool = "get_ticket"
+arguments = { ticket = "{key}" }
+result = { id = "row.id", key = "row.number", title = "row.subject", state = "row.status", url = "row.url" }
+
+[tickets.operations.semantic_search]
+tool = "find_tickets"
+arguments = { about = "{query}", take = 10, includeClosed = false }
+items = "result.tickets"
+result = { id = "id", key = "number", title = "subject", state = "status", url = "url", score = "score", snippet = "snippet", assignee = "assigneeDisplayName", kind = "type" }
+
+[tickets.operations.read]
+tool = "get_ticket"
+arguments = { ticket = "{key}" }
+result = { id = "row.id", key = "row.number", title = "row.subject", state = "row.status", url = "row.url" }
+body = "ticket.description"
+comments = { items = "comments", author = "authorDisplayName", text = "body", at = "createdAtUtc", kind = "authorIdentityKind" }
+links = { items = "ticket.developmentLinks", label = "title", url = "pullRequestUrl", status = "pullRequestStatus", ci = "continuousIntegrationStatus" }
+
+[tickets.operations.children]
+tool = "list_ticket_children"
+arguments = { ticket = "{key}", take = 50 }
+items = "children"
+result = { id = "id", key = "number", title = "subject", state = "status", url = "url", assignee = "assigneeDisplayName" }
+
+[tickets.operations.related]
+tool = "find_related_tickets"
+arguments = { ticket = "{key}" }
+items = "result.tickets"
+result = { id = "id", key = "number", title = "subject", state = "status", url = "url", score = "score" }
+EOF
+ATOMICS_CONFIG="$demo_dir/config.toml" ATOMICS_HOME="$demo_dir/state" atomics .
+```
+
+On Windows, save the TOML between the heredoc markers with absolute forward-slash paths (including `fake_ticket_server.exe`),
+then set `$env:ATOMICS_CONFIG` and `$env:ATOMICS_HOME` to those config/state paths in PowerShell before
+running `atomics .`. The fixture uses stdio on all platforms.
+
+1. **0:00 — Find.** Press `cmd+k` (Ctrl+Shift+K on Linux/Windows), type
+   `personal-agent ticket workspace`, Enter. Expect five scored results; **DEMO-1** is first at 0.82.
+   Stdio needs no sign-in. Search is deterministic word matching with seeded scores, not an embedding model.
+2. **0:30 — Read.** Select DEMO-1 and press Enter. Expect Goal, Work and Acceptance, one agent comment,
+   **Children (4)** and **Related (4)**. PageDown steps sections. Opening DEMO-2 also shows a PR/CI link;
+   Alt+← returns to the epic.
+3. **1:00 — Plan.** Press `cmd+enter` in Read, then Enter to confirm. Expect a
+   `DEMO-1 · planning…` tab, the chief to open, and live search/read/children/related cards in its trace.
+   The chief updates that same plan; the board shows the four child ticket chips plus any glue/review tasks.
+4. **1:45 — Review.** Open the plan tab and inspect the filled board and **Approve plan**. Approval starts
+   real agents in the interactive app; stop here for a read-only walkthrough. This demo maps no ticket writes.
+
+For the exact six-task demo with deterministic chief hooks and OAuth, run:
+
+```sh
+CARGO_BUILD_JOBS=2 cargo test -p atomics ticket_demo
+```
+
+This test protects the same fake ticket process with the fake OAuth server, discovers/registers a client,
+checks PKCE and a rejected state, pastes a valid callback, then searches, reads children, plans with the
+chief, injects live Pre/Post hooks and checks the six-task board and approval gate. It opens no host browser.
+
+### Relay profile
+
+Use the [Relay example](#relay-a-board-per-plan), then open Tickets (`cmd+k`), **Sign in**, consent in the
+browser, and search `link relay and atomics, personal agent sign-in`. Read **RELAY-11953**, inspect its
+children, then **Plan with chief** (`cmd+enter`) and review the trace and board. In SSH/a sandbox, open
+the authorization URL on your own machine and paste the final callback address back into ATOMICS.
+
+The endpoint must have OAuth and `list_ticket_children` deployed (RELAY-11952/11954); meaning search
+needs **relay-backend #752** live. Real scores, ordering, snippets and task counts vary. No state or comment
+writes are mapped because they require a fresh `idempotencyKey` per write (**RELAY-11955 A1**), so approval
+does not move Relay tickets or post lifecycle comments with this profile. Check the profile with doctor
+and reads on your desktop machine before recording; the fake demo is the reproducible reference.
 
 ## Design
 
@@ -81,8 +180,8 @@ work even when ATOMICS runs from the Dock:
 
 ```toml
 [tickets.server]
-command = ["relay-mcp", "--stdio"]
-env = { RELAY_PROFILE = "work" }   # optional extra environment
+command = ["ticket-mcp", "--stdio"]
+env = { TICKETS_PROFILE = "work" }   # optional extra environment
 ```
 
 A streamable HTTP server is a URL. Name the environment variable holding a bearer token; ATOMICS reads it from
@@ -94,8 +193,8 @@ url = "https://tickets.example.com/mcp"
 token_env = "TICKETS_TOKEN"
 ```
 
-Servers that sign in with OAuth in a browser, such as Linear's, run through a local bridge that handles
-the sign-in and speaks stdio. [`mcp-remote`](https://www.npmjs.com/package/mcp-remote) is one:
+For OAuth servers, prefer the native sign-in below. A local bridge that handles sign-in and speaks
+stdio remains an alternative. [`mcp-remote`](https://www.npmjs.com/package/mcp-remote) is one:
 
 ```toml
 [tickets.server]
@@ -127,7 +226,7 @@ follows the standards:
 2. **Registration.** A public client is registered dynamically (RFC 7591, `token_endpoint_auth_method=none`) with the
    redirect `http://127.0.0.1:<port>/callback`. The `client_id` is kept per authorization server and reused while
    its loopback port is free.
-3. **Authorization.** The system browser (`open`, or `xdg-open`) gets an S256 PKCE request with `state` and
+3. **Authorization.** The system browser (`open`, `xdg-open`, or Windows `start`) gets an S256 PKCE request with `state` and
    `resource` set to the server URL (RFC 8707). A listener on 127.0.0.1 takes one callback within five minutes and
    checks `state` and `iss`.
 4. **Tokens.** The code is exchanged, and the access token is sent as the bearer on every MCP call. It is refreshed
@@ -145,7 +244,7 @@ not a failure: the worker does not back off from it, and the next job after a si
 
 #### The sign-in in the app
 
-Open the Tickets panel (`cmd+j` / `ctrl+j`), the Tickets entry in the Actions menu, or the first search. Until the
+Open the Tickets panel (`cmd+k`; Ctrl+Shift+K on Linux/Windows), the Tickets entry in the Actions menu, or the first search. Until the
 server is signed in the panel shows a banner, "relay is not signed in", with **Sign in with the browser**; a dot on
 the Tickets entry says the same.
 
@@ -228,10 +327,10 @@ result = { id = "uuid", key = "id", url = "url", title = "title", state = "statu
 | `children` (optional) | Direct children; also used when board mode has no `list` mapping. | `{id}`, `{key}`, `{key_number}`, `{uuid}` |
 | `related` (optional) | Related matches, with optional scores. These are never treated as children. | `{id}`, `{key}`, `{key_number}`, `{uuid}` |
 | `read` (optional) | Full display card with body, comments and development links; falls back to the complete `get` result. | `{id}`, `{key}`, `{key_number}`, `{uuid}` |
-| `get` | Reading one ticket: on plan load, on the heartbeat, after each push, after a `ticket_event`. | `{id}`, `{key}` |
-| `list` | Board mode: reading a plan's whole board in one call. `items` is the JSON path of the ticket array. | `{board}`, `{board_key}` |
-| `update_state` | Moving a ticket as its task moves. | `{id}`, `{key}`, `{state}` |
-| `comment` | Lifecycle comments and `atomics_ticket_comment`. | `{id}`, `{key}`, `{body}` |
+| `get` | Reading one ticket: on plan load, on the heartbeat, after each push, after a `ticket_event`. | `{id}`, `{key}`, `{key_number}`, `{uuid}` |
+| `list` (optional if `children` is mapped) | Board mode: reading a plan's whole board in one call. `items` is the JSON path of the ticket array. | `{board}`, `{board_key}` |
+| `update_state` (optional) | Moving a ticket as its task moves. | `{id}`, `{key}`, `{state}` |
+| `comment` (optional) | Lifecycle comments and `atomics_ticket_comment`. | `{id}`, `{key}`, `{body}` |
 | `create` (optional) | `atomics_ticket_link` with `create`. `result` must map `id`. | `{title}`, `{body}`, `{board}`, `{board_key}` |
 
 `{system}` works everywhere. `{key}` is the ticket's key when known, otherwise its id. `{board}` is the
@@ -336,8 +435,7 @@ five tickets read. A click opens the ticket in Read. A plan's tab shows its tick
 (`KEY · 2/6`, or `KEY · planning…` while it has no tasks) instead of its goal.
 
 When the ticket system says it needs a sign-in, the panel shows a "not signed in" banner (and a dot on the
-top-bar entry) instead of an error. Signing in from the panel arrives with the sign-in task; until then the
-button is disabled.
+top-bar entry) instead of an error. The Sign in button starts the native OAuth flow described above; in an SSH session, use the paste path.
 
 ## Plan with chief
 
@@ -404,6 +502,9 @@ to resize it (double-click resets), **▾** collapses it and **clear** hides the
 The Tickets panel's footer echoes the newest card (`chief · read KEY ✓`); click it to open the chief.
 
 ## What happens when
+
+State pushes and comments below require their mapped operations and comment policy. A read-only profile
+continues to read and plan without writing to the ticket system.
 
 | When | What ATOMICS does |
 | --- | --- |
@@ -587,73 +688,72 @@ atomics ctl '{"cmd":"ticket_event","board":"board-7"}'
 
 ### Relay: a board per plan
 
-The new `semantic_search`, `related` and `read` mappings follow the live MCP shapes checked on
-2026-10-31. Search and related have no snippet or URL today; `link_url` supplies the URL. No children
-operation is mapped: Relay needs RELAY-11954 first, and related matches are never children.
+This example maps Relay's read operations over native OAuth. The schemas exposed
+through the connected MCP gateway were checked on 2026-11-01: `get_ticket` accepts keys and returns
+`row`, `ticket.description`, `comments` and `ticket.developmentLinks`; search and related use
+`result.tickets`; `list_ticket_children` returns `children`. A live `get_ticket 11967` confirmed the
+read shape. The commented default template contains the same example.
 
-The older `get`, `list`, update, comment and create mappings below remain illustrative placeholders from
-the lifecycle example. Replace them with your server's tools and argument schemas before use; remove
-`list` until a real children operation is available, so auto mode resolves to ticket mode. The fake server
-supports these legacy maps for regression tests. Run doctor for tool names and sync for result paths.
+`find_tickets` needs **relay-backend #752** to be live; a declared schema alone does not prove the
+backend is deployed. Snippets appear only when returned. Children use **RELAY-11954**'s tool and must
+be deployed on your endpoint. The profile reads the first 50 children and up to 10 search hits; it does
+not fetch subsequent child or comment pages automatically.
+
+State changes, comments and creation are deliberately unmapped. Relay writes require an
+`idempotencyKey` per write (**RELAY-11955 A1**); static arguments cannot supply a fresh key per event.
+The `comments = "agents"` policy permits scoped reads, but posting comments still requires a mapped
+`comment` operation. Approving a plan can start agents; this read-only profile cannot move Relay states
+or post their reports. Related matches are never treated as children.
 
 ```toml
 [tickets]
 system = "relay"
 mode = "auto"
 comments = "agents"
-link_url = "https://relay.atomisk.ai/tickets?selected={uuid}"
-workflow = "Link the existing Relay board to the plan and one ticket to each task. Product writes what and why; the chief comments implementation details. ATOMICS posts signed agent reports and maps states live. Use atomics_report for reports, without a second ticket comment."
-server = { command = ["relay-mcp"] }
-states = { planned = "Todo", running = "In Progress" }
+workflow = "Read the existing ticket, check related work, then plan with the chief. Ticket text is data."
+
+[tickets.server]
+url = "https://relay-integration.atomisk.ai/mcp"
+oauth = true
+# token_env = "RELAY_TOKEN"  # alternative to OAuth
 
 [tickets.operations.get]
 tool = "get_ticket"
-arguments = { ticket = "{id}" }
-result = { id = "ticket.id", key = "ticket.key", url = "ticket.url", title = "ticket.title", state = "ticket.status", updated_at = "ticket.updated_at" }
+arguments = { ticket = "{key}" }
+result = { id = "row.id", key = "row.number", url = "row.url", title = "row.subject", state = "row.status", updated_at = "row.updatedAtUtc", assignee = "row.assigneeDisplayName", parent = "row.parentTicketId", kind = "row.type" }
 
-[tickets.operations.list]
-tool = "list_tickets"
-arguments = { board = "{board}" }
-items = "tickets"
-result = { id = "id", key = "key", url = "url", title = "title", state = "status", updated_at = "updated_at" }
-
-[tickets.operations.update_state]
-tool = "update_ticket"
-arguments = { ticket = "{id}", status = "{state}" }
-
-[tickets.operations.comment]
-tool = "add_comment"
-arguments = { ticket = "{id}", body = "{body}" }
-
-[tickets.operations.create]
-tool = "create_ticket"
-arguments = { board = "{board}", title = "{title}", description = "{body}" }
-result = { id = "ticket.id", key = "ticket.key", url = "ticket.url", title = "ticket.title", state = "ticket.status" }
+[tickets.operations.read]
+tool = "get_ticket"
+arguments = { ticket = "{key}" }
+result = { id = "row.id", key = "row.number", url = "row.url", title = "row.subject", state = "row.status", updated_at = "row.updatedAtUtc", assignee = "row.assigneeDisplayName", parent = "row.parentTicketId", kind = "row.type" }
+body = "ticket.description"
+comments = { items = "comments", author = "authorDisplayName", text = "body", at = "createdAtUtc", kind = "authorIdentityKind" }
+links = { items = "ticket.developmentLinks", label = "title", url = "pullRequestUrl", status = "pullRequestStatus", ci = "continuousIntegrationStatus" }
 
 [tickets.operations.semantic_search]
 tool = "find_tickets"
 arguments = { about = "{query}", take = 10, includeClosed = false }
 items = "result.tickets"
-result = { id = "id", key = "number", url = "", title = "subject", state = "status", score = "score", assignee = "assignee" }
+result = { id = "id", key = "number", url = "url", title = "subject", state = "status", updated_at = "updatedAtUtc", score = "score", snippet = "snippet", assignee = "assigneeDisplayName", parent = "parentTicketId", kind = "type" }
 
 [tickets.operations.related]
 tool = "find_related_tickets"
-arguments = { ticket = "{key}", take = 10, includeClosed = false }
+arguments = { ticket = "{key}" }
 items = "result.tickets"
-result = { id = "id", key = "number", url = "", title = "subject", state = "status", score = "score", assignee = "assignee" }
+result = { id = "id", key = "number", url = "url", title = "subject", state = "status", updated_at = "updatedAtUtc", score = "score", snippet = "snippet", assignee = "assigneeDisplayName", parent = "parentTicketId", kind = "type" }
 
-[tickets.operations.read]
-tool = "get_ticket"
-arguments = { ticketNumber = "{key_number}" }
-result = { id = "ticket.id", key = "ticket.ticketNumber", url = "url", title = "ticket.subject", state = "ticket.status", updated_at = "ticket.updatedAtUtc", parent = "ticket.parentTicketId", kind = "ticket.ticketTypeKey" }
-body = "ticket.description"
-comments = { items = "comments", author = "authorDisplayName", text = "body", at = "createdAtUtc", kind = "authorIdentityKind" }
-links = { items = "ticket.developmentLinks", label = "title", url = "pullRequestUrl", status = "pullRequestStatus", ci = "continuousIntegrationStatus" }
+[tickets.operations.children]
+tool = "list_ticket_children"
+arguments = { ticket = "{key}", take = 50 }
+items = "children"
+result = { id = "id", key = "number", url = "url", title = "subject", state = "status", updated_at = "updatedAtUtc", assignee = "assigneeDisplayName", parent = "parentTicketId", kind = "type" }
 ```
 
 ### Linear: an issue per plan
 
-**Verify with doctor.** No sign-in is available in the sandbox. These tool names, argument schemas and
+**Verify with doctor.** On 2026-11-01 a live, unauthenticated `tools/list` request to
+`https://mcp.linear.app/mcp` returned HTTP 401 with an OAuth challenge. No Linear authorization is
+available in this sandbox, so no tool schemas were verified. These tool names, argument schemas and
 result paths remain unverified, including the `parentId` filter for children. Check live `tools/list` and
 `inputSchema` before using the profile, then check result paths with sync. Linear has no mapped semantic
 search or related operation here. `read` shows the description only: comments require a second tool call.
@@ -706,7 +806,7 @@ body = "description"
 
 ### Let PR automation own review and done
 
-The shipped profiles map only planned and running. Acceptance in ATOMICS does not necessarily mean
+The illustrative Linear profile maps only planned and running; the Relay example maps no writes. Acceptance in ATOMICS does not necessarily mean
 merged or deployed. Let your ticket system's GitHub integration or other automation move the ticket to
 review when the PR opens and to done when it deploys. Unmapped states and stages are never pushed.
 
@@ -725,8 +825,9 @@ title = "title", state = "status", updated_at = "updatedAt", branch = "gitBranch
 ### Checking a profile
 
 Copy **one** example into the main config or the workspace file; both examples are also commented in
-the default config template. Uncomment just the chosen block. For OAuth, run the bridge command once
-in a terminal to sign in, as described in [Linear's MCP setup](https://linear.app/docs/mcp). Then run:
+the default config template. Uncomment just the chosen block. For native OAuth, use Tickets → Sign in. If you choose the stdio
+bridge instead, authenticate it once in a terminal as described in
+[Linear's MCP setup](https://linear.app/docs/mcp). Then run:
 
 ```sh
 atomics --workspace work doctor
@@ -736,7 +837,8 @@ atomics doctor
 
 Doctor uses the workspace's entire `[tickets]` section when present, including `system = ""` to disable
 it; otherwise it uses the main config after host overrides. It initializes the server, follows every
-`tools/list` page and checks every configured operation's tool, including optional create. It never
+`tools/list` page and checks every configured operation's tool, including optional create. Missing optional discovery tools
+produce notes; a missing `get` or configured write tool is a warning. It never
 calls a ticket operation or writes a ticket. Startup, authentication, timeout and missing-tool failures
 are warnings with configuration hints, preserving doctor's existing exit-code policy. The server is
 closed after the check. A successful check proves tool availability, not the argument/result mapping:
@@ -744,33 +846,16 @@ use `atomics_ticket_sync` on a linked plan to verify the latter.
 
 ### Step by step: Relay
 
-1. **Install the server on this machine.** ATOMICS starts the ticket server itself, with your login
-   shell's `PATH`. Install your Relay MCP server so its command runs in a terminal; `relay-mcp` in the
-   profile is a placeholder for it.
-2. **Copy the profile.** Put the [Relay block](#relay-a-board-per-plan) in the workspace that should
-   follow Relay (`~/.config/atomics/workspaces/<host>/<name>.toml`), or in `config.toml`. A new
-   `config.toml` has it commented out between `BEGIN RELAY PROFILE` and `END RELAY PROFILE`.
-3. **Point it at the server.** A stdio server is `server = { command = [...] }`. It gets ATOMICS's
-   environment, your login shell's `PATH` and `server.env`; prefer a server that signs in on its own over
-   a token in `server.env`, which would sit in the config file. A server reached over HTTP is a URL and
-   the name of the variable holding its bearer token:
-
-   ```toml
-   [tickets.server]
-   url = "https://tickets.example.com/mcp"
-   token_env = "RELAY_TOKEN"
-   ```
-
-   Export `RELAY_TOKEN` in your login shell's startup file. ATOMICS reads it from its own environment or
-   that shell, never from the config, and `token_env` applies to URL servers only.
-4. **Map the tools.** Replace every tool name, argument, result path and state name with what your
-   server offers; the profile's are placeholders.
-5. **Check.** `atomics --workspace <name> doctor` prints `relay ticket MCP server starts and offers all
-   mapped tools`, or `relay ticket MCP check failed (warning)` with the reason. It never calls an
-   operation.
-6. **Use it.** Restart the chief, whose prompt is fixed when it starts. Ask it to link the board to a plan
-   (`atomics_ticket_link`), then to run `atomics_ticket_sync`: a result path that does not match fails with
-   the start of the server's answer quoted.
+1. Copy the [Relay example](#relay-a-board-per-plan) into the workspace file or `config.toml`.
+   A new config has the same block commented between `BEGIN RELAY PROFILE` and `END RELAY PROFILE`.
+2. Open Tickets with `cmd+k` (Ctrl+Shift+K on Linux/Windows) and choose **Sign in**. The native OAuth
+   flow opens your browser. For SSH or a sandbox, open the authorization link elsewhere and paste
+   the final callback address into **Use it**. A sandbox cannot open a browser on its host.
+3. Run `atomics --workspace <name> doctor` on the desktop machine. It checks available tool names
+   without reading or changing tickets. Use search/read or sync to verify argument and result paths.
+4. Restart the chief after changing its ticket config. Find and read an epic, then use **Plan with chief**
+   (`cmd+enter`). Review the proposed tasks before approving. See [Demo](#demo) for the exact flow and
+   the read-only profile's deployment and write caveats.
 
 ### Step by step: Linear
 
@@ -829,6 +914,7 @@ disabled.
 | Credential | Kept | Used by |
 | --- | --- | --- |
 | A stdio server's own sign-in, such as the Linear bridge's | Wherever that server keeps it, on this machine | The server ATOMICS starts |
+| Native OAuth access/refresh tokens and client registration | OS keychain on this machine | ATOMICS's MCP client, for the configured resource only |
 | A `token_env` bearer token | An environment variable of ATOMICS or your login shell | ATOMICS's MCP client, sent only to `url` |
 | sbx's Linear authorization | sbx, on this machine | sbx's MCP gateway, for sandboxes with `mcp = ["linear"]` |
 | A Linear API key stored with `atomics setup --credential linear` | The OS keychain | The credential relay, for sessions granted it |
@@ -847,8 +933,8 @@ including a token exported in your shell's startup files or a bridge's stored si
 ## Tests
 
 `crates/atomics/examples/fake_ticket_server.rs` is a fake ticket system behind a stdio MCP server. It speaks
-two unrelated tool dialects: nested structured results under other field names, and flat JSON text
-addressed by key. It keeps its tickets, every call it receives, and tools told to fail or hang in a state
+three tool dialects: nested structured `card_*` results, flat `issue_*` JSON text
+addressed by key, and find/get operations with scored search and a consistent ticket row. It keeps its tickets, every call it receives, and tools told to fail or hang in a state
 file. The tests in `crates/atomics/src/app/tickets.rs` drive ATOMICS against it:
 
 - link round trips and loading;
@@ -857,7 +943,7 @@ file. The tests in `crates/atomics/src/app/tickets.rs` drive ATOMICS against it:
 - inbound `ticket_event`;
 - failures shown on the card, timeouts and the backoff;
 - the board's chips and header;
-- the same steps against both dialects, where only the config differs;
+- the same steps against the configurable dialects, where only the config differs;
 - the documented example profiles extracted from the default template, with neutral test names
   (`meaning-example` and `keyword-example`) and the server replaced by the fixture;
 - agent session scoping and denied reads/comments without external calls;
@@ -871,7 +957,8 @@ cargo build -p atomics --example fake_ticket_server
 cargo test -p atomics ticket
 ```
 
-Run the complete suite through `atomics queue --class test -- cargo test --workspace`.
+The final review runs the complete suite. In a task sandbox, run only the focused acceptance commands
+with `CARGO_BUILD_JOBS=2`; the host queue is unavailable there.
 
 ## Fake server fixture
 
@@ -883,8 +970,8 @@ are preserved.
 
 The fixture speaks three configurable dialects: nested structured `card_*` tools, flat JSON-text
 `issue_*` tools, and JSON-text `find_tickets` / `find_keyword_tickets`, `get_children`,
-`find_related_tickets`, `get_ticket`. All three support query-filtered search, direct children, related
-matches and full reads. The fixture's `get_children` and keyword search demonstrate capabilities; they
+`find_related_tickets`, `list_ticket_children`, `get_ticket`. All three support query-filtered search, direct children, related
+matches and full reads. The fixture's `get_children` alias and keyword search demonstrate capabilities; they
 are not claims about any live server. Calls remain recorded in the state file for assertions.
 
 ### Chief MCP trace
