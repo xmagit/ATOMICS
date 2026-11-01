@@ -31,8 +31,8 @@ pub struct RemoteState {
     /// doesn't post the Plan and Approval events again.
     pub requested_digest: Option<String>,
     /// Plans that owned this ticket's conversation until this one took it, recorded when the
-    /// takeover starts and cleared once the open succeeds: a restart before then, or a plan
-    /// deleted in the meantime, still hands the conversation's cursor over.
+    /// takeover starts and cleared once the open succeeds: a restart before then still hands
+    /// the conversation's cursor over.
     pub takeover: Vec<String>,
 }
 

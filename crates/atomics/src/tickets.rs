@@ -702,6 +702,8 @@ impl Worker {
         let every = state.conversation.as_deref() == Some(conversation.id.as_str());
         let (their_cursor, their_seen) =
             RemoteState::used_cursor(home, plan, &conversation.id, &peers, every).map_err(|e| e.to_string())?;
+        // A reset recovers from the server's cursor: no other sidecar's cursor pushes it back.
+        let their_cursor = their_cursor.filter(|_| !reset);
         if state.conversation.as_deref() != Some(conversation.id.as_str()) {
             // A new conversation starts at the server's newest revision: nothing written
             // before remote was on, or before a lost sidecar, is ever delivered. Taken over from
@@ -2490,7 +2492,7 @@ pub(crate) mod tests {
         for (config, fail_message, code) in [
             (&coded, "nothing a message fragment matches", Some("event_id_reused")),
             (&message, "This event id was already used for other content.", None),
-            // Relay's shape: the race's code with the reuse message.
+            // A server's shape: the race's code with the reuse message.
             (&relay, "This event id was already used for other content; use a new id.", Some("sequence_conflict")),
         ] {
             set(&path, |state| {
@@ -2744,5 +2746,38 @@ pub(crate) mod tests {
         assert!(poll(&mut worker, "fresh").is_empty(), "steering written while remote was off is not pasted");
         add("after", 3);
         assert_eq!(poll(&mut worker, "fresh"), ["after"]);
+    }
+
+    #[test]
+    fn remote_a_reset_open_ignores_other_sidecars_cursors() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let home = dir.path();
+        let path = crate::mcp_client::tests::fake_state(home, json!([]));
+        let item = |id: &str, revision: u64| json!({"id":id, "revision":revision, "author_id":"human-1", "author_kind":"Human", "author":"Example human", "text":id, "at":"now"});
+        set(&path, |state| state["steering"] = json!([item("old", 1)]));
+        let config = conversation_profile("", &path);
+        let mut worker = Worker::default();
+        worker.prepare(&config);
+        let open = |worker: &mut Worker, plan: &str, reset: bool| {
+            let op = TicketOp::RemoteOpen {
+                home: home.into(),
+                plan: plan.into(),
+                link: TicketLink { id: "00000000-0000-4000-8000-000000000001".into(), ..Default::default() },
+                title: "Goal".into(),
+                owners: vec!["human-1".into()],
+                recover: false,
+                reset,
+                peers: Vec::new(),
+            };
+            worker.run(&config, op).unwrap();
+        };
+        open(&mut worker, "current", false);
+        open(&mut worker, "stale", false);
+        // A closed plan's sidecar on the same conversation holds a cursor beyond the server's.
+        let mut stale = RemoteState::load(home, "stale").unwrap();
+        stale.cursor = Some(json!(9));
+        stale.save(home, "stale").unwrap();
+        open(&mut worker, "current", true);
+        assert_eq!(RemoteState::load(home, "current").unwrap().cursor, Some(json!(1)), "the server's cursor");
     }
 }

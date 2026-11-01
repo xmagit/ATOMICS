@@ -911,7 +911,7 @@ steering one plan already handled is never delivered again, and none written sin
 own sidecar already names the conversation takes the furthest cursor and the union of seen ids across every
 sidecar on it, closed plans included; that only holds steering back. Any other closed plan's leftover sidecar
 hands nothing over, so a plan opening the conversation with no previous owner starts at the server's newest
-revision. Anything else the server
+revision. An owner deleted, or archived while ATOMICS was off, hands nothing over either, and steering written in that gap stays unread. Anything else the server
 needs, such as Relay's item type `tickets.ticket`, is a literal in the profile's arguments. The server may refuse some
 ids; ATOMICS then shows which and uses the server's list. Opening is idempotent; ATOMICS opens again after
 the steering list changes, and reads `conversation_steerers` after opening and every 10 minutes. A new
@@ -1007,7 +1007,7 @@ branch = "relay/{key_number}-{slug}"
 
 [tickets.remote]
 enabled = true
-owners = ["01000000-68ff-ef4d-b828-08def73a0c6d"]   # Max Falk, the human who steers and approves
+owners = ["<your user id>"]   # the human who steers and approves
 kinds = { user = "Steering", assistant = "AgentMessage", tool = "Tool", status = "Status", plan = "Plan", approval = "Approval" }
 activity = { working = "Working", input = "WaitingForInput", approval = "WaitingForApproval", blocked = "Failed", done = "Completed" }
 errors = { code = "code", content_refused = ["content_refused"], ended = ["conversation_ended"], conflict = ["sequence_conflict"], invalid = ["validation"], unreadable = ["item_unreadable"] }
@@ -1067,7 +1067,7 @@ Details, the digest definition and the exact replies are in [Remote control](#re
    on the ticket opens the conversation; later plans take it over (newest wins).
 4. Open the ticket's Conversation in Relay as the owner. Check the mirror, send a message, approve a plan.
 5. When something stalls, read the toast and `plan_json` (`remote`): ended conversation, refused item or
-   an older plan are shown there. A restart re-opens the conversation at the server's cursor.
+   an older plan are shown there. A restart continues from the sidecar's cursor and the previous owners; only a brand-new conversation starts at the server's newest revision.
 6. To turn it off, set `enabled = false`.
 
 ## Examples

@@ -235,7 +235,7 @@ errors = { code = "" }             # optional: how refusals are told apart, by t
 ```
 
 `errors` names the JSON path of an error code in a tool error's `structuredContent` and lists the codes
-(`content_refused`, `ended`, `conflict`, `invalid`, `unreadable`); without it the known messages decide.
+(`content_refused`, `ended`, `conflict`, `reused`, `invalid`, `unreadable`); without it the known messages decide.
 `kinds` and `activity` map ATOMICS's roles and states to the server's vocabulary, so the Relay values live
 only in the profile. The section follows the same workspace precedence as the rest of `[tickets]`.
 

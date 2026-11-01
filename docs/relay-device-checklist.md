@@ -25,7 +25,7 @@ results; reply to it with the table for each device.
 | 4 | Send a second message while the chief is busy. | It is queued/delivered once, never twice. Quit and restart ATOMICS mid-delivery if you can: a "may not have reached the chief" note, no repaste. | | |
 | 5 | Plan approval: ask the chief to plan so a plan is unapproved. | Plan events (one per task, `t1 · Title` …) then an Approval event ending `/approve <12 hex>`. | | |
 | 6 | Send the `/approve <digest>` line (or tap Approve if the PWA shows one). | "Approved by <you> from the conversation; the chief is dispatching"; the board shows the plan approved; the chief dispatches. | | |
-| 7 | Send `/approve 000000000000` on another unapproved plan (stale digest). | "This plan changed; the new digest is …" and a fresh request; nothing approved; chief sees nothing. | | |
+| 7 | Send `/approve 000000000000` on the newest plan, with a stale digest. | "This plan changed; the new digest is …" and a fresh request; nothing approved; chief sees nothing. | | |
 | 8 | Notification: make the plan wait for approval (step 5) with the app in the background. | One notification for WaitingForApproval, not repeated for the same digest. | | |
 | 9 | Notification: make a task fail (e.g. a task that exits non-zero). | One notification for Failed; the conversation shows the blocked status. | | |
 | 10 | Let the plan complete (approve, let tasks finish, accept). | Completed activity; the conversation ends; the PWA shows it ended; ATOMICS stops polling and shows no error. | | |

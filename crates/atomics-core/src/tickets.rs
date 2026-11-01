@@ -2879,7 +2879,7 @@ mod tests {
         let error = r#"post failed: {"error":{"code":"sequence_used","message":"The item conversation has ended."}}"#;
         assert_eq!(coded.classify(error), Some(RemoteError::Conflict), "the code wins over the message");
         assert_eq!(coded.classify(r#"post failed: {"error":{"code":"other"}}"#), None);
-        // Relay gives a reused event id the race's code: the message refines the class.
+        // A server gives a reused event id the race's code: the message refines the class.
         let relay =
             RemoteErrors { code: "code".into(), conflict: vec!["sequence_conflict".into()], ..Default::default() };
         let reused =
