@@ -1617,6 +1617,11 @@ mod tests {
             for name in ["meaning-example", "keyword-example"] {
                 let dir = crate::test_support::tempdir().unwrap();
                 let state = tickets_fixture(dir.path(), "ENG");
+                edit_fake(&state, |fake| {
+                    fake["tickets"].as_array_mut().unwrap().push(json!({
+                        "id":"b1", "key":"ENG-100", "title":"Example epic", "state":"Todo", "kind":"epic"
+                    }));
+                });
                 let config = example_profile(name, &state);
                 let board = config.mode != TicketMode::Ticket;
                 app.runtime.plans.clear();
@@ -1637,6 +1642,24 @@ mod tests {
                 assert_eq!(fetched.state.as_deref(), Some("Todo"));
                 assert_eq!(fetched.label(), "ENG-1");
                 assert_eq!(app.runtime.tickets.boards.contains_key(&plan), board);
+                if board {
+                    // This shipped example is read-only until per-write idempotency keys are supported.
+                    assert!(config.operations.update_state.is_none());
+                    assert!(config.operations.comment.is_none());
+                    assert!(config.operations.create.is_none());
+                    assert!(ticket_request(app, json!({"cmd":"ticket_children", "ticket":"ENG-100"})).ok);
+                    let denied = ticket_request(
+                        app,
+                        json!({"cmd":"ticket_comment", "plan":plan,
+                        "task":"a", "text":"Unmapped write"}),
+                    );
+                    assert!(!denied.ok);
+                    assert!(comments(&state, "ENG-1").is_empty());
+                    assert!(request(app, json!({"cmd":"plan_update", "plan":plan,"id":"a","status":"running"})).ok);
+                    settle(app);
+                    assert_eq!(ticket(&state, "ENG-1")["state"], "Todo");
+                    continue;
+                }
                 assert!(
                     ticket_request(
                         app,
@@ -1828,6 +1851,16 @@ mod tests {
                 fake["tickets"][0]["description"] = json!("Task implementation details");
             });
             app.runtime.config.tickets = example_profile("meaning-example", &state);
+            // Exercise the generic writable fixture separately from the read-only shipped example.
+            app.runtime.config.tickets.operations.comment = Some(
+                toml::from_str(
+                    r#"
+                tool = "add_comment"
+                arguments = { ticket = "{id}", body = "{body}" }
+            "#,
+                )
+                .unwrap(),
+            );
             app.runtime.apply_ticket_config();
             let plan = request(app, json!({"cmd":"plan_set", "goal":"Own plan", "ticket":{"id":"b1"}, "tasks":[
                 {"id":"a", "title":"Own task", "agent":"codex", "args":["-m","gpt-6.1-sol","-c","model_reasoning_effort=high"], "ticket":{"id":"1"}},

@@ -67,6 +67,7 @@ const TOOLS: &[&str] = &[
     "find_keyword_tickets",
     "find_related_tickets",
     "get_children",
+    "list_ticket_children",
     "card_get",
     "card_list",
     "card_move",
@@ -156,6 +157,8 @@ fn call(path: &str, params: &Value) -> Result<Value, String> {
         "get_children" => {
             text(json!({"result":{"tickets": children(&state, &args["ticket"]).map(found_ticket).collect::<Vec<_>>()}}))
         }
+        "list_ticket_children" => text(json!({"children": children(&state, &args["ticket"])
+            .take(args["take"].as_u64().unwrap_or(50).min(50) as usize).map(found_ticket).collect::<Vec<_>>()})),
         "card_get" => structured(json!({ "card": card(find(&state, &args["card"])?) })),
         "card_list" => structured(json!({ "cards": on_board(&state, &args["board"]).map(card).collect::<Vec<_>>() })),
         "card_move" => {
@@ -180,7 +183,8 @@ fn call(path: &str, params: &Value) -> Result<Value, String> {
         "issue_create" => text(issue(&create(&mut state, &args["project"], &args["title"]))),
         "get_ticket" => {
             let ticket = find(&state, args.get("ticketNumber").unwrap_or(&args["ticket"]))?;
-            text(json!({"ticket": full_ticket(ticket), "url": ticket["url"], "comments": ticket["comments"]}))
+            text(json!({"row": found_ticket(ticket), "ticket": full_ticket(ticket), "url": ticket["url"],
+                "comments": ticket["comments"], "childCount": children(&state, &ticket["id"]).count()}))
         }
         "list_tickets" => {
             structured(json!({"tickets": on_board(&state, &args["board"]).map(full_ticket).collect::<Vec<_>>() }))
@@ -345,6 +349,8 @@ fn related<'a>(state: &'a Value, reference: &Value) -> Result<impl Iterator<Item
 fn found_ticket(ticket: &Value) -> Value {
     json!({"id":ticket["id"], "number":ticket["key"], "subject":ticket["title"], "status":ticket["state"],
         "score":ticket["score"], "snippet":ticket["snippet"], "assignee":ticket["assignee"],
+        "assigneeDisplayName":ticket["assignee"], "url":ticket["url"],
+        "updatedAtUtc":format!("rev-{}", ticket["rev"].as_u64().unwrap_or(0)),
         "parentTicketId":ticket["parent"], "type":ticket["kind"]})
 }
 

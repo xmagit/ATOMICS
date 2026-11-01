@@ -108,15 +108,27 @@ pub(crate) struct Fake {
     as_url: String,
     pub(crate) mcp_url: String,
     pub(crate) state: Mutex<State>,
+    tickets: Option<Mutex<McpClient>>,
 }
 
 impl Fake {
     pub(crate) fn start() -> Arc<Fake> {
+        Self::start_with(None)
+    }
+
+    /// Protect the real stdio ticket fixture with this server's OAuth flow. The demo must use
+    /// the sign-in's bearer for its searches and reads, rather than switching servers after login.
+    pub(crate) fn start_with_tickets(client: McpClient) -> Arc<Fake> {
+        Self::start_with(Some(Mutex::new(client)))
+    }
+
+    fn start_with(tickets: Option<Mutex<McpClient>>) -> Arc<Fake> {
         let ((as_listener, as_url), (mcp_listener, mcp_base)) = (bind(), bind());
         let fake = Arc::new(Fake {
             as_url,
             mcp_url: format!("{mcp_base}/mcp"),
             state: Mutex::new(State { expires_in: 3600, ..State::default() }),
+            tickets,
         });
         let a = fake.clone();
         serve(as_listener, move |r| a.authorization_server(r));
@@ -253,6 +265,26 @@ impl Fake {
             return Resp(401, headers, "unauthorized".into());
         }
         let body: Value = serde_json::from_str(&r.body).unwrap();
+        if let Some(tickets) = &self.tickets {
+            // Authentication above applies to every forwarded request. Serialize calls because the
+            // fixture records them in one state file, just as the ticket worker serializes jobs.
+            drop(st);
+            let mut client = tickets.lock().unwrap();
+            let result = match body["method"].as_str().unwrap() {
+                "tools/list" => client.request("tools/list", body["params"].clone()),
+                "tools/call" => client.request("tools/call", body["params"].clone()),
+                "initialize" => Ok(json!({})),
+                _ => return Resp(202, vec![], String::new()),
+            };
+            return match result {
+                Ok(result) => json_resp(200, json!({"jsonrpc":"2.0", "id":body["id"], "result":result})),
+                Err(error) => json_resp(
+                    200,
+                    json!({"jsonrpc":"2.0", "id":body["id"],
+                    "error":{"code":-32603, "message":error.to_string()}}),
+                ),
+            };
+        }
         match body["method"].as_str().unwrap() {
             "initialize" => json_resp(200, json!({ "jsonrpc": "2.0", "id": body["id"], "result": {} })),
             "tools/list" => {
