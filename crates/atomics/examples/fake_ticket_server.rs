@@ -149,7 +149,12 @@ fn call(path: &str, params: &Value) -> Result<Value, String> {
             _ => vec![format!("{name} is broken today")],
         };
         let content: Vec<Value> = blocks.into_iter().map(|text| json!({ "type": "text", "text": text })).collect();
-        return Ok(json!({ "isError": true, "content": content }));
+        let mut result = json!({ "isError": true, "content": content });
+        // `fail_code` adds a coded error, as the reference conversation server returns it.
+        if let Some(code) = state["fail_code"].as_str() {
+            result["structuredContent"] = json!({ "code": code, "message": result["content"][0]["text"] });
+        }
+        return Ok(result);
     }
     // Persist successful replies so retries after a lost reply cannot duplicate a write.
     let key = args["idempotencyKey"].as_str().or_else(|| args["eventId"].as_str()).or_else(|| args["nonce"].as_str());
@@ -199,9 +204,9 @@ fn call(path: &str, params: &Value) -> Result<Value, String> {
     } else if generic.starts_with("conversation_") {
         let result = match conversation(&mut state, name, generic, args) {
             Ok(result) => result,
-            Err(error) => {
+            Err(message) => {
                 save(path, &state);
-                return Err(error);
+                return Ok(conversation_error(message));
             }
         };
         if name.starts_with("card_") { structured(result) } else { text(result) }
@@ -332,6 +337,24 @@ fn call(path: &str, params: &Value) -> Result<Value, String> {
     Ok(result)
 }
 
+/// A refused conversation call as the reference server returns it: a tool error with its
+/// text and a `structuredContent` code.
+fn conversation_error(message: String) -> Value {
+    let code = if message.contains("read") || message.contains("does not exist") {
+        "item_unreadable"
+    } else if message.contains("has ended") {
+        "conversation_ended"
+    } else if message.contains("sequence") {
+        "sequence_conflict"
+    } else if message.contains("credential") || message.contains("summary is required") {
+        "content_refused"
+    } else {
+        "validation"
+    };
+    json!({ "isError": true, "content": [{ "type": "text", "text": message }],
+        "structuredContent": { "code": code, "message": message } })
+}
+
 /// One ticket-linked conversation per state file. `steering` holds what humans and others
 /// wrote, as `{id, revision, author_id, author_kind, author, text, at}`; `cursor` is the newest
 /// revision `conversation_open` reports (default: the newest in `steering`); ids in
@@ -373,7 +396,7 @@ fn conversation(state: &mut Value, name: &str, generic: &str, args: &Value) -> R
         }
     };
     if generic == "conversation_post" && state["ended"] == true && id == main {
-        return Err("The item conversation has ended.".into());
+        return Err("The item conversation has ended; open a new one to continue.".into());
     }
     let push = |state: &mut Value, key: &str, value: Value| {
         if !state[key].is_array() {
@@ -465,7 +488,10 @@ fn conversation(state: &mut Value, name: &str, generic: &str, args: &Value) -> R
                 let event = arg(&["eventId", "nonce"]).unwrap_or(Value::Null);
                 match state["sequences"][&id].get(&seq) {
                     Some(previous) if *previous != event => {
-                        return Err("An agent session event sequence was already used.".into());
+                        return Err(
+                            "Another event already holds this sequence; omit the sequence to have the next one assigned."
+                                .into(),
+                        );
                     }
                     _ => state["sequences"][&id][&seq] = event,
                 }

@@ -657,8 +657,8 @@ impl Default for RemoteConfig {
 }
 
 /// `[tickets.remote] errors`: how the conversation operations' refusals are told apart.
-/// With `code` set, the code at that JSON path of an error whose text holds a JSON object
-/// is compared with the lists. Otherwise, or when an error carries no code, the messages in
+/// With `code` set, the code at that JSON path of a JSON object in the error (a tool error's
+/// `structuredContent` follows its text) is compared with the lists. Otherwise, or when an error carries no code, the messages in
 /// `ERROR_MESSAGES` are matched.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -686,31 +686,38 @@ pub enum RemoteError {
     Unreadable,
 }
 
-/// Lowercase message fragments, checked in order when no error code decides.
+/// Lowercase message fragments, checked in order when no error code decides: the reference
+/// conversation server's texts, then generic words.
 pub const ERROR_MESSAGES: &[(RemoteError, &str)] = &[
     (RemoteError::Unreadable, "can no longer read the conversation's item"),
     (RemoteError::Unreadable, "the item does not exist, or this agent can't read it"),
+    (RemoteError::Unreadable, "the conversation does not exist, or belongs to another agent"),
     (RemoteError::Ended, "conversation has ended"),
-    (RemoteError::Ended, "the conversation does not exist, or belongs to another agent"),
     (RemoteError::ContentRefused, "credential"),
+    (RemoteError::ContentRefused, "a safe observable summary is required"),
     (RemoteError::ContentRefused, "text refused"),
     (RemoteError::ContentRefused, "content refused"),
-    (RemoteError::Conflict, "event sequence was already used"),
-    (RemoteError::Conflict, "already used for different content"),
+    (RemoteError::Conflict, "another event already holds this sequence"),
+    (RemoteError::Conflict, "another event took this event's id or sequence at the same time"),
+    (RemoteError::Conflict, "this event id was already used for other content"),
     (RemoteError::Conflict, "conflict"),
-    (RemoteError::Invalid, "a safe observable summary is required"),
+    (RemoteError::Invalid, "an item conversation event needs an id"),
+    (RemoteError::Invalid, "activity is invalid"),
+    (RemoteError::Invalid, "the event kind is not one of the listed kinds"),
+    (RemoteError::Invalid, "each steering id must name steering of this conversation"),
+    (RemoteError::Invalid, "name between one and ten steering humans"),
     (RemoteError::Invalid, "validation"),
     (RemoteError::Invalid, "invalid params"),
 ];
 
 impl RemoteErrors {
     pub fn classify(&self, message: &str) -> Option<RemoteError> {
+        // The code may follow text that has braces of its own: the first object holding one wins.
         if !self.code.trim().is_empty()
-            && let Some(code) = message
-                .find('{')
-                .and_then(|at| serde_json::Deserializer::from_str(&message[at..]).into_iter::<Value>().next())
-                .and_then(Result::ok)
-                .and_then(|value| json_path(&value, self.code.trim()).and_then(scalar))
+            && let Some(code) = message.match_indices('{').find_map(|(at, _)| {
+                let value = serde_json::Deserializer::from_str(&message[at..]).into_iter::<Value>().next()?.ok()?;
+                json_path(&value, self.code.trim()).and_then(scalar)
+            })
         {
             let lists = [
                 (RemoteError::ContentRefused, &self.content_refused),
@@ -2691,13 +2698,28 @@ mod tests {
         let errors = RemoteErrors::default();
         let table = [
             ("The observable session text is invalid or contains credential-shaped data.", RemoteError::ContentRefused),
-            ("A safe observable summary is required.", RemoteError::Invalid),
-            ("The item conversation has ended.", RemoteError::Ended),
-            ("An agent session event sequence was already used.", RemoteError::Conflict),
-            ("An agent session event sequence was already used in this attempt.", RemoteError::Conflict),
-            ("An agent session event identifier was already used for different content.", RemoteError::Conflict),
+            ("A safe observable summary is required.", RemoteError::ContentRefused),
+            ("The item conversation has ended; open a new one to continue.", RemoteError::Ended),
+            (
+                "Another event already holds this sequence; omit the sequence to have the next one assigned.",
+                RemoteError::Conflict,
+            ),
+            (
+                "Another event took this event\u{2019}s id or sequence at the same time; retry it.",
+                RemoteError::Conflict,
+            ),
+            ("Another event took this event's id or sequence at the same time; retry it.", RemoteError::Conflict),
+            ("This event id was already used for other content.", RemoteError::Conflict),
+            (
+                "An item conversation event needs an id, a kind, text and, when given, a sequence from 1.",
+                RemoteError::Invalid,
+            ),
+            ("The event activity is invalid.", RemoteError::Invalid),
+            ("The event kind is not one of the listed kinds.", RemoteError::Invalid),
+            ("Each steering id must name steering of this conversation.", RemoteError::Invalid),
+            ("Name between one and ten steering humans.", RemoteError::Invalid),
             ("This agent can no longer read the conversation's item.", RemoteError::Unreadable),
-            ("The conversation does not exist, or belongs to another agent.", RemoteError::Ended),
+            ("The conversation does not exist, or belongs to another agent.", RemoteError::Unreadable),
             ("The item does not exist, or this agent can't read it.", RemoteError::Unreadable),
         ];
         for (message, class) in table {
@@ -2720,6 +2742,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.remote.errors.classify(r#"failed: {"code":"unreadable"}"#), Some(RemoteError::Unreadable));
+        // The reference server's codes, as the MCP client appends structuredContent to a tool error's text.
+        let config: TicketConfig = toml::from_str(
+            "system = \"example\"\n[remote]\nerrors = { code = \"code\", content_refused = [\"content_refused\"], ended = [\"conversation_ended\"], conflict = [\"sequence_conflict\"], invalid = [\"validation\"], unreadable = [\"item_unreadable\"] }",
+        )
+        .unwrap();
+        for (code, class) in [
+            ("content_refused", RemoteError::ContentRefused),
+            ("conversation_ended", RemoteError::Ended),
+            ("sequence_conflict", RemoteError::Conflict),
+            ("validation", RemoteError::Invalid),
+            ("item_unreadable", RemoteError::Unreadable),
+        ] {
+            // A text with braces of its own, and a message the fallback would class differently.
+            let error = format!(
+                r#"post_item_conversation failed: {{see docs}} The item conversation has ended. {{"code":"{code}","message":"The item conversation has ended."}}"#
+            );
+            assert_eq!(config.remote.errors.classify(&error), Some(class), "{code}");
+        }
     }
 
     #[test]

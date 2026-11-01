@@ -157,6 +157,8 @@ pub const DELIVERED_TEXT: &str = "delivered to the chief";
 pub const HELD_TEXT: &str = "held until the permission prompt in ATOMICS is answered";
 pub const UNDELIVERED_TEXT: &str = "not delivered: the chief cannot receive messages";
 pub const RESTARTED_TEXT: &str = "may not have reached the chief because ATOMICS restarted; send it again if needed";
+/// Starts the outbox message saying the plan's own conversation refused a write as ended.
+pub const CONVERSATION_ENDED: &str = "The ticket system ended the remote conversation";
 /// At most this many deliveries a minute per plan; the rest wait in order.
 pub const DELIVERIES_PER_MINUTE: usize = 10;
 /// Polls an unavailable chief gets before an item is given up.
@@ -542,7 +544,17 @@ impl Worker {
                 state.save(home, plan).map_err(|e| e.to_string())?;
             }
             let vars = write.vars.clone().with("nonce", Some(&write.nonce));
-            match self.call(config, &write.op, &vars) {
+            let result = self.call(config, &write.op, &vars);
+            // A server assigning sequences itself can race over one: a conflict on a post sent
+            // without a sequence is transient.
+            if self.refusal == Some(RemoteError::Conflict)
+                && write.op == "conversation_post"
+                && config.operation(&write.op).is_some_and(|op| !op.uses_placeholder("seq"))
+            {
+                self.refusal = None;
+            }
+            let conversation = write.vars.get("conversation").and_then(Value::as_str);
+            match result {
                 Ok(_) => {
                     state.outbox.remove(index);
                     if write.op == "conversation_post" {
@@ -565,6 +577,17 @@ impl Worker {
                         replacement.next_at = 0;
                         state.outbox.insert(index, replacement);
                     }
+                }
+                // The plan's own conversation ended: its writes are dropped and the app stops
+                // polling and opens it again, as after a lost read.
+                Err(error)
+                    if self.refusal == Some(RemoteError::Ended)
+                        && conversation.is_some()
+                        && conversation == state.conversation.as_deref() =>
+                {
+                    let ended = state.conversation.clone();
+                    state.outbox.retain(|w| w.vars.get("conversation").and_then(Value::as_str) != ended.as_deref());
+                    say(messages, format!("{CONVERSATION_ENDED}: {error}"));
                 }
                 // An ended conversation, a validation error or a used sequence fails the same way again.
                 Err(error) if self.refusal.is_some() => {
@@ -620,11 +643,15 @@ impl Worker {
                 messages.push(format!("A remote message {RESTARTED_TEXT}"));
             }
         }
+        // Another plan on the same ticket may have followed this conversation: one conversation per ticket.
+        let (their_cursor, their_seen) =
+            RemoteState::used_cursor(home, plan, &conversation.id).map_err(|e| e.to_string())?;
         if state.conversation.as_deref() != Some(conversation.id.as_str()) {
             // A new conversation starts at the server's newest revision: nothing written
-            // before remote was on, or before a lost sidecar, is ever delivered. Its events start at 1.
+            // before remote was on, or before a lost sidecar, is ever delivered. Taken over from
+            // another plan, it starts where that plan stopped. Its events start at 1.
             state.conversation = Some(conversation.id.clone());
-            state.cursor = conversation.cursor.clone();
+            state.cursor = their_cursor.clone().or_else(|| conversation.cursor.clone());
             state.retries.clear();
             state.requested_digest = None;
             state.next_seq = 1;
@@ -635,7 +662,13 @@ impl Worker {
                 state.requested_digest = None;
             }
         }
-        // Another plan on the same ticket may have posted here since: one conversation per ticket.
+        // Taken back: what the other plan handled since is neither delivered again nor skipped.
+        if their_cursor.is_some() && tickets::seq_after(their_cursor.as_ref(), state.cursor.as_ref()) {
+            state.cursor = their_cursor;
+        }
+        for id in their_seen {
+            state.remember(id);
+        }
         state.next_seq =
             state.next_seq.max(RemoteState::used_seq(home, plan, &conversation.id).map_err(|e| e.to_string())?);
         if let Some(next) = conversation.next_seq {
@@ -2111,10 +2144,10 @@ pub(crate) mod tests {
         assert!(RemoteState::load(home, "lanes").unwrap().outbox.is_empty());
         // The reference server's final refusals are dropped after one call, never retried.
         for message in [
-            "The item conversation has ended.",
-            "An agent session event sequence was already used.",
-            "An agent session event identifier was already used for different content.",
-            "A safe observable summary is required.",
+            "The item conversation has ended; open a new one to continue.",
+            "Another event already holds this sequence; omit the sequence to have the next one assigned.",
+            "This event id was already used for other content.",
+            "The event kind is not one of the listed kinds.",
             "The conversation does not exist, or belongs to another agent.",
         ] {
             set(&path, |state| {
@@ -2220,7 +2253,200 @@ pub(crate) mod tests {
             write: Some(Box::new(post(&config, "stale"))),
         };
         let TicketOutput::Outbox(messages) = worker.run(&config, op).unwrap() else { panic!("outbox") };
-        assert!(messages[0].contains("An agent session event sequence was already used."), "{messages:?}");
+        assert!(messages[0].contains("Another event already holds this sequence"), "{messages:?}");
         assert!(RemoteState::load(home, "unmapped").unwrap().outbox.is_empty());
+    }
+
+    fn reference_codes() -> tickets::RemoteErrors {
+        tickets::RemoteErrors {
+            code: "code".into(),
+            content_refused: vec!["content_refused".into()],
+            ended: vec!["conversation_ended".into()],
+            conflict: vec!["sequence_conflict".into()],
+            invalid: vec!["validation".into()],
+            unreadable: vec!["item_unreadable".into()],
+        }
+    }
+
+    #[test]
+    fn remote_coded_refusals_are_classified_and_an_unsequenced_conflict_is_retried() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let home = dir.path();
+        let path = crate::mcp_client::tests::fake_state(home, json!([]));
+        let mut config = remote_profile("", &path);
+        config.remote.errors = reference_codes();
+        let mut worker = Worker::default();
+        worker.prepare(&config);
+        let posts = || {
+            server(&path)["calls"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|c| c["tool"] == "conversation_post")
+                .map(|c| c["arguments"].clone())
+                .collect::<Vec<_>>()
+        };
+        // Only the code says the text was refused: the post is replaced once by the withheld note.
+        set(&path, |state| {
+            state["fail"] = json!(["conversation_post"]);
+            state["fail_message"] = json!("nothing a message fragment matches");
+            state["fail_code"] = json!("content_refused");
+        });
+        let messages = outbox(&mut worker, &config, home, Some(post(&config, "secret")));
+        assert!(messages.iter().any(|m| m.contains("Remote text withheld")), "{messages:?}");
+        let sent = posts();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[1]["text"], WITHHELD_TEXT);
+        assert!(RemoteState::load(home, "lanes").unwrap().outbox.is_empty());
+        // A conflict on a post that sent a sequence is final.
+        set(&path, |state| {
+            state["fail_message"] =
+                json!("Another event already holds this sequence; omit the sequence to have the next one assigned.");
+            state["fail_code"] = json!("sequence_conflict");
+        });
+        let messages = outbox(&mut worker, &config, home, Some(post(&config, "sequenced")));
+        assert!(messages[0].starts_with("Remote write dropped"), "{messages:?}");
+        assert!(RemoteState::load(home, "lanes").unwrap().outbox.is_empty());
+        // Without a sequence the server assigns it, and its conflict is a race to retry.
+        let mut unsequenced = config.clone();
+        unsequenced.operations.conversation_post = Some(
+            serde_json::from_value(json!({"tool":"conversation_post",
+                "arguments":{"conversation":"{conversation}", "eventId":"{nonce}", "text":"{body}"}}))
+            .unwrap(),
+        );
+        set(&path, |state| {
+            state["fail_message"] = json!("Another event took this event's id or sequence at the same time; retry it.");
+        });
+        let messages = outbox(&mut worker, &unsequenced, home, Some(post(&config, "raced")));
+        assert!(messages.is_empty(), "{messages:?}");
+        let pending = RemoteState::load(home, "lanes").unwrap();
+        assert_eq!((pending.outbox.len(), pending.outbox[0].attempts), (1, 1), "kept for a retry");
+        let nonce = pending.outbox[0].nonce.clone();
+        set(&path, |state| state["fail"] = json!([]));
+        let mut due = pending;
+        due.outbox[0].next_at = 0;
+        due.save(home, "lanes").unwrap();
+        assert!(outbox(&mut worker, &unsequenced, home, None).is_empty());
+        assert!(RemoteState::load(home, "lanes").unwrap().outbox.is_empty());
+        let last = posts().pop().unwrap();
+        assert_eq!((last["eventId"].as_str(), last.get("sequence")), (Some(nonce.as_str()), None), "the same event");
+    }
+
+    #[test]
+    fn remote_a_post_refused_as_ended_drops_the_conversations_writes_and_says_so() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let home = dir.path();
+        let path = crate::mcp_client::tests::fake_state(home, json!([]));
+        let mut config = conversation_profile("", &path);
+        config.remote.errors = reference_codes();
+        let mut worker = Worker::default();
+        worker.prepare(&config);
+        let open = TicketOp::RemoteOpen {
+            home: home.into(),
+            plan: "lanes".into(),
+            link: TicketLink { id: "00000000-0000-4000-8000-000000000001".into(), ..Default::default() },
+            title: "Goal".into(),
+            owners: vec!["human-1".into()],
+            recover: false,
+            reset: false,
+        };
+        worker.run(&config, open).unwrap();
+        // A write to a conversation the plan no longer follows is only dropped.
+        set(&path, |state| {
+            state["fail"] = json!(["conversation_post"]);
+            state["fail_message"] = json!("The item conversation has ended; open a new one to continue.");
+            state["fail_code"] = json!("conversation_ended");
+        });
+        let mut old = post(&config, "to the old one");
+        old.vars = old.vars.with("conversation", Some("conversation-0"));
+        let messages = outbox(&mut worker, &config, home, Some(old));
+        assert!(messages[0].starts_with("Remote write dropped"), "{messages:?}");
+        // The plan's own conversation ended: every write queued for it goes, and the app is told.
+        set(&path, |state| {
+            state["fail"] = json!([]);
+            state["ended"] = json!(true);
+        });
+        let mut state = RemoteState::load(home, "lanes").unwrap();
+        let vars = Vars::new(&config.system).with("conversation", Some("conversation-1")).typed("ids", json!(["s-1"]));
+        let mut ack = PendingWrite::new("conversation_ack", uuid::Uuid::new_v4().to_string(), vars);
+        ack.next_at = u64::MAX;
+        state.queue(home, "lanes", ack).unwrap();
+        let messages = outbox(&mut worker, &config, home, Some(post(&config, "after the end")));
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(messages[0].starts_with(CONVERSATION_ENDED), "{messages:?}");
+        assert!(messages[0].contains("has ended"), "{messages:?}");
+        assert!(RemoteState::load(home, "lanes").unwrap().outbox.is_empty());
+    }
+
+    #[test]
+    fn remote_steering_is_neither_pasted_twice_nor_skipped_when_plans_take_a_conversation_over() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let home = dir.path();
+        let path = crate::mcp_client::tests::fake_state(home, json!([]));
+        let item = |id: &str, revision: u64| json!({"id":id, "revision":revision, "author_id":"human-1", "author_kind":"Human", "author":"Example human", "text":id, "at":"now"});
+        set(&path, |state| state["steering"] = json!([item("old", 1)]));
+        let config = conversation_profile("", &path);
+        let mut worker = Worker::default();
+        worker.prepare(&config);
+        let whoami = tickets::Whoami { id: "agent-1".into(), kind: "personalAgent".into(), ..Default::default() };
+        let open = |worker: &mut Worker, plan: &str| {
+            let op = TicketOp::RemoteOpen {
+                home: home.into(),
+                plan: plan.into(),
+                link: TicketLink { id: "00000000-0000-4000-8000-000000000001".into(), ..Default::default() },
+                title: "Goal".into(),
+                owners: vec!["human-1".into()],
+                recover: false,
+                reset: false,
+            };
+            worker.run(&config, op).unwrap();
+        };
+        let deliver = |worker: &mut Worker, plan: &str| -> Vec<String> {
+            let poll = TicketOp::RemotePoll {
+                home: home.into(),
+                plan: plan.into(),
+                whoami: Box::new(whoami.clone()),
+                owners: vec!["human-1".into()],
+            };
+            let TicketOutput::Remote(RemoteOutput::Polled { deliver, .. }) = worker.run(&config, poll).unwrap() else {
+                panic!("poll")
+            };
+            let ids = deliver.iter().map(|item| item.id.clone()).collect();
+            for item in deliver {
+                let settle = TicketOp::RemoteSettle {
+                    home: home.into(),
+                    plan: plan.into(),
+                    item: Box::new(item),
+                    outcome: RemoteOutcome::Delivered,
+                };
+                worker.run(&config, settle).unwrap();
+            }
+            ids
+        };
+        let add = |id: &str, revision: u64| {
+            set(&path, |state| state["steering"].as_array_mut().unwrap().push(item(id, revision)))
+        };
+        open(&mut worker, "older");
+        add("s-2", 2);
+        assert_eq!(deliver(&mut worker, "older"), ["s-2"]);
+        // Written before the newer plan opens, after the older one's cursor: the newer plan
+        // starts where the older stopped, not at the server's newest revision.
+        add("s-3", 3);
+        open(&mut worker, "newer");
+        assert_eq!(deliver(&mut worker, "newer"), ["s-3"], "s-2 not again, s-3 not skipped");
+        // Taken back, the older plan skips what the newer one handled.
+        add("s-4", 4);
+        open(&mut worker, "older");
+        let older = RemoteState::load(home, "older").unwrap();
+        assert_eq!(older.cursor, Some(json!(3)));
+        assert!(older.seen.contains(&"s-3".to_string()));
+        assert_eq!(deliver(&mut worker, "older"), ["s-4"], "s-3 not again, s-4 not skipped");
+        // And over to the newer plan once more.
+        add("s-5", 5);
+        open(&mut worker, "newer");
+        assert_eq!(deliver(&mut worker, "newer"), ["s-5"]);
+        let pasted: Vec<_> =
+            server(&path)["acks"].as_array().unwrap().iter().map(|ack| ack["ids"][0].clone()).collect();
+        assert_eq!(pasted, [json!("s-2"), json!("s-3"), json!("s-4"), json!("s-5")], "each acknowledged once");
     }
 }

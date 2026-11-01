@@ -163,8 +163,8 @@ New optional operations:
 | Operation | When | Placeholders | Result paths |
 | --- | --- | --- | --- |
 | `whoami` | sign-in, config reload | none | `id`, `kind`, `name`, `owner_id`, `owner_name` |
-| `conversation_open` | remote turned on for a plan with a ticket; idempotent | `{uuid}` / `{id}`, `{title}`, `{owners}` | `id`, `cursor`, `steerers` (items: `steerer_id`, `steerer_name`) |
-| `conversation_post` | every mirror, status, plan and approval event | `{conversation}`, `{nonce}`, `{seq}`, `{kind}`, `{body}`, `{activity}`, `{turn}` | none |
+| `conversation_open` | remote turned on for a plan with a ticket; idempotent | `{uuid}` / `{id}`, `{title}`, `{owners}` | `id`, `cursor`, `steerers` (items: `steerer_id`, `steerer_name`), optional `next_sequence` |
+| `conversation_post` | every mirror, status, plan and approval event | `{conversation}`, `{nonce}`, optional `{seq}`, `{kind}`, `{body}`, `{activity}`, `{turn}` | none |
 | `conversation_read` | polling | `{conversation}`, `{after}` | `items` with `id`, `seq`, `author_id`, `author_kind`, `author`, `text`, `at` |
 | `conversation_ack` | after delivery | `{conversation}`, `{ids}` | none |
 | `conversation_steerers` | after opening, then every 10 minutes | `{conversation}` | as `conversation_open` |
@@ -192,11 +192,12 @@ result = { id = "userId", kind = "kind", name = "displayName", owner_id = "owner
 [tickets.operations.conversation_open]
 tool = "open_item_conversation"
 arguments = { itemType = "tickets.ticket", itemId = "{uuid}", title = "{title}", steeringUserIds = "{owners}" }
-result = { id = "conversationId", cursor = "latestRevision", steerers = "steeringUsers", steerer_id = "userId", steerer_name = "displayName" }
+result = { id = "conversationId", cursor = "latestRevision", next_sequence = "nextSequence", steerers = "steeringUsers", steerer_id = "userId", steerer_name = "displayName" }
 
 [tickets.operations.conversation_post]
 tool = "post_item_conversation"
-arguments = { conversationId = "{conversation}", eventId = "{nonce}", sequence = "{seq}", kind = "{kind}", text = "{body}", activityState = "{activity}", activityTurnId = "{turn}" }
+# No sequence: Relay assigns it and replays a retried eventId; nextSequence is informational.
+arguments = { conversationId = "{conversation}", eventId = "{nonce}", kind = "{kind}", text = "{body}", activityState = "{activity}", activityTurnId = "{turn}" }
 
 [tickets.operations.conversation_read]
 tool = "read_item_conversation"

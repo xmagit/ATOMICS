@@ -541,11 +541,7 @@ impl State {
         }
         if tag.kind == Kind::Outbox {
             match result {
-                Ok(TicketOutput::Outbox(messages)) => {
-                    for message in messages {
-                        self.toast(message);
-                    }
-                }
+                Ok(TicketOutput::Outbox(messages)) => self.remote_outbox_messages(&tag.key.0, messages),
                 Err(error) => self.toast(format!("Remote outbox: {error}")),
                 _ => {}
             }

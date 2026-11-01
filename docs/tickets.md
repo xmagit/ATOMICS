@@ -380,6 +380,8 @@ steerer; `conversation_read` maps `items` and, in each item, `id`, `seq`, `autho
 `author`, `text` and `at`. `cursor` and `seq` keep the JSON type the server returns. `conversation_open`
 may also map `next_sequence`, the event sequence the server expects next (a number, or digits as text);
 when the result has it, the plan's next post uses it, after any sequences already reserved by queued writes.
+`{seq}` is optional: a server that assigns sequences itself and replays a retried event id, as Relay does,
+needs only `{nonce}`. The Relay profile sends no sequence and maps `next_sequence = "nextSequence"`.
 
 When an argument's entire string is exactly `{seq}`, `{after}`, `{owners}` or `{ids}`, substitution preserves
 its JSON type: sequence is a number, cursor retains the server's type, and owners and ids are arrays of
@@ -404,7 +406,10 @@ drain in a lane of their own, so a post waiting to be retried never holds an ack
 whose text is blank after cleaning is never queued. Content refusals are not retried: one new event replaces
 refused text with `(withheld: the ticket system refused this text)`. A refused replacement stops. A write
 refused because the conversation ended, the arguments failed validation or the sequence or event id was
-already used is final: it is dropped with a toast and never retried.
+already used is final: it is dropped with a toast and never retried. Two exceptions: a sequence conflict on
+a post sent without `{seq}` is the server's own race over the sequence it assigns, so it is retried like a
+transport failure; and a write to the plan's current conversation refused as ended stops remote control as a
+lost read does (see Polling), dropping that conversation's queued writes.
 
 ATOMICS tells these refusals apart with `[tickets.remote] errors`:
 
@@ -413,10 +418,11 @@ ATOMICS tells these refusals apart with `[tickets.remote] errors`:
 errors = { code = "code", content_refused = ["…"], ended = ["…"], conflict = ["…"], invalid = ["…"], unreadable = ["…"] }
 ```
 
-When `code` names a JSON path and the tool's error text holds a JSON object with a value there, that code
-is compared with the lists, and an unlisted code is an ordinary failure. Without `code`, or for an error
+When `code` names a JSON path and the tool error holds a JSON object with a value there, that code is
+compared with the lists. ATOMICS appends a tool error's `structuredContent` to its text as JSON, so
+`code = "code"` reads Relay's `structuredContent.code`; it, and an unlisted code is an ordinary failure. Without `code`, or for an error
 without one, ATOMICS matches the messages in `atomics_core::tickets::ERROR_MESSAGES` (case-insensitive
-fragments, such as "can no longer read the conversation's item" and "event sequence was already used").
+fragments, such as "can no longer read the conversation's item" and "another event already holds this sequence").
 Each plan holds at most 200 pending writes; tool blocks are evicted first. If no tool block can be removed,
 the new write is rejected with a visible error, preserving existing status, plan and approval events.
 
@@ -838,7 +844,8 @@ system the newest open plan linked to it owns the remote; plans older than that 
 `conversation_open` with the ticket, the plan goal's first non-empty line as `{title}` (trimmed, without
 control characters, cut to 200 UTF-16 code units; the ticket key when the goal is empty) and the steering
 list as `{owners}`. A plan taking over a conversation another plan wrote to continues after that plan's
-sequences. Anything else the server
+sequences, and after the furthest cursor any plan's sidecar holds there, with the ids those sidecars saw:
+steering one plan already handled is never delivered again, and none written since is skipped. Anything else the server
 needs, such as Relay's item type `tickets.ticket`, is a literal in the profile's arguments. The server may refuse some
 ids; ATOMICS then shows which and uses the server's list. Opening is idempotent; ATOMICS opens again after
 the steering list changes, and reads `conversation_steerers` after opening and every 10 minutes. A new
@@ -851,7 +858,8 @@ an open approval request), otherwise every `idle_poll_secs`. A 429, a 5xx or a l
 5 minutes. Polling stops when the plan completes or is archived, or remote is turned off. When a read says
 the conversation ended or the connection can no longer read the conversation's item, polling stops with a
 toast and a `remote` note in `plan_json`; ATOMICS opens it again every `idle_poll_secs` (at least 60 s), and
-a successful open starts again at the server's cursor and sequence.
+a successful open starts again at the server's cursor and sequence. A post or acknowledgement refused
+because the conversation ended does the same.
 
 **Verdict.** An item reaches the chief only when its `author_id` is on the steering list, its `author_kind`
 equals `human_kind` ignoring ASCII case (a missing kind fails), the author is not the signed-in identity,
@@ -966,13 +974,15 @@ result = { id = "userId", kind = "kind", name = "displayName", owner_id = "owner
 # enabled = true
 # kinds = { user = "Steering", assistant = "AgentMessage", tool = "Tool", status = "Status", plan = "Plan", approval = "Approval" }
 # activity = { working = "Working", input = "WaitingForInput", approval = "WaitingForApproval", blocked = "Failed", done = "Completed" }
+# errors = { code = "code", content_refused = ["content_refused"], ended = ["conversation_ended"], conflict = ["sequence_conflict"], invalid = ["validation"], unreadable = ["item_unreadable"] }
 # [tickets.operations.conversation_open]
 # tool = "open_item_conversation"
 # arguments = { itemType = "tickets.ticket", itemId = "{uuid}", title = "{title}", steeringUserIds = "{owners}" }
-# result = { id = "conversationId", cursor = "latestRevision", steerers = "steeringUsers", steerer_id = "userId", steerer_name = "displayName" }
+# result = { id = "conversationId", cursor = "latestRevision", next_sequence = "nextSequence", steerers = "steeringUsers", steerer_id = "userId", steerer_name = "displayName" }
 # [tickets.operations.conversation_post]
 # tool = "post_item_conversation"
-# arguments = { conversationId = "{conversation}", eventId = "{nonce}", sequence = "{seq}", kind = "{kind}", text = "{body}", activityState = "{activity}", activityTurnId = "{turn}" }
+# # No sequence: Relay assigns it, and replays a retried eventId.
+# arguments = { conversationId = "{conversation}", eventId = "{nonce}", kind = "{kind}", text = "{body}", activityState = "{activity}", activityTurnId = "{turn}" }
 # [tickets.operations.conversation_read]
 # tool = "read_item_conversation"
 # arguments = { conversationId = "{conversation}", afterRevision = "{after}", take = 25 }

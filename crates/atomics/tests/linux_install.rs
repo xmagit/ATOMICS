@@ -76,6 +76,18 @@ fn installer_reaches_real_setup_from_a_fresh_home() {
     script(&bin.join("shell"), "#!/bin/sh\nprintf '__ATOMICS__%s__ATOMICS__' \"$PATH\"\n");
     std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_atomics"), target.join("fixture-linux-native/release/atomics"))
         .unwrap();
+    // PATH holds stubs and the installer's own tools only: what else the host has, such as
+    // secret-tool, must not change what setup reports.
+    let system = dir.path().join("system");
+    std::fs::create_dir_all(&system).unwrap();
+    for tool in ["sh", "uname", "dirname", "sed", "mkdir", "mktemp", "install", "mv", "rm", "chmod", "cat"] {
+        let found = ["/usr/bin", "/bin"]
+            .iter()
+            .map(|dir| Path::new(dir).join(tool))
+            .find(|path| path.exists())
+            .unwrap_or_else(|| panic!("the installer needs {tool}"));
+        std::os::unix::fs::symlink(found, system.join(tool)).unwrap();
+    }
     let config = home.join("config.toml");
     let output = test_support::output(
         Command::new("sh")
@@ -83,7 +95,7 @@ fn installer_reaches_real_setup_from_a_fresh_home() {
             .env("HOME", &home)
             .env("XDG_DATA_HOME", home.join("data"))
             .env("CARGO_TARGET_DIR", target)
-            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("PATH", format!("{}:{}", bin.display(), system.display()))
             .env("SHELL", bin.join("shell"))
             .env("ATOMICS_HOME", home.join("state"))
             .env("ATOMICS_CONFIG", &config),

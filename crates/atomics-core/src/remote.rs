@@ -68,6 +68,10 @@ pub struct PendingWrite {
     pub skipped_turns: u64,
     /// A refused replacement must never produce another replacement.
     pub withheld: bool,
+    /// The plan digest this post requests approval of, saved as `requested_digest` in the
+    /// same sidecar write that queues the post. Never stored with the write itself.
+    #[serde(skip)]
+    pub requests: Option<String>,
 }
 
 impl PendingWrite {
@@ -199,14 +203,13 @@ impl RemoteState {
         Ok(())
     }
 
-    /// The first sequence a plan may use in `conversation`: past every sequence another plan's
-    /// sidecar reserved there (the server keeps one conversation per item, ATOMICS one sidecar
-    /// per plan), else 1.
+    /// Other plans' sidecars on `conversation`. The server keeps one conversation per item,
+    /// ATOMICS one sidecar per plan.
     #[cfg(feature = "native")]
-    pub fn used_seq(home: &std::path::Path, plan: &str, conversation: &str) -> anyhow::Result<u64> {
-        let mut next = 1;
+    fn others(home: &std::path::Path, plan: &str, conversation: &str) -> anyhow::Result<Vec<RemoteState>> {
         let own = Self::path(home, plan)?;
-        let Ok(entries) = std::fs::read_dir(home.join("plans")) else { return Ok(next) };
+        let Ok(entries) = std::fs::read_dir(home.join("plans")) else { return Ok(Vec::new()) };
+        let mut others = Vec::new();
         for entry in entries.flatten() {
             let path = entry.path();
             if path == own || !path.file_name().is_some_and(|name| name.to_string_lossy().ends_with(".remote.json")) {
@@ -220,10 +223,38 @@ impl RemoteState {
                 continue;
             };
             if other.conversation.as_deref() == Some(conversation) {
-                next = next.max(other.next_seq);
+                others.push(other);
             }
         }
-        Ok(next)
+        Ok(others)
+    }
+
+    /// The first sequence a plan may use in `conversation`: past every sequence another plan's
+    /// sidecar reserved there, else 1.
+    #[cfg(feature = "native")]
+    pub fn used_seq(home: &std::path::Path, plan: &str, conversation: &str) -> anyhow::Result<u64> {
+        Ok(Self::others(home, plan, conversation)?.iter().map(|other| other.next_seq).fold(1, u64::max))
+    }
+
+    /// The furthest cursor other plans' sidecars hold on `conversation`, and the steering ids
+    /// they saw: a plan taking the conversation (back) neither delivers again what another
+    /// plan handled nor skips what was written since.
+    #[cfg(feature = "native")]
+    pub fn used_cursor(
+        home: &std::path::Path,
+        plan: &str,
+        conversation: &str,
+    ) -> anyhow::Result<(Option<Value>, Vec<String>)> {
+        let (mut cursor, mut seen) = (None::<Value>, Vec::new());
+        for other in Self::others(home, plan, conversation)? {
+            if let Some(theirs) = other.cursor.filter(|c| !c.is_null())
+                && crate::tickets::seq_after(Some(&theirs), cursor.as_ref())
+            {
+                cursor = Some(theirs);
+            }
+            seen.extend(other.seen);
+        }
+        Ok((cursor, seen))
     }
 
     /// Reserve and persist a post sequence before its write is added to the outbox.
@@ -242,6 +273,9 @@ impl RemoteState {
             self.next_seq = self.next_seq.checked_add(1).ok_or_else(|| anyhow::anyhow!("remote sequence exhausted"))?;
             self.save(home, plan)?;
             write.vars = write.vars.typed("seq", Value::from(sequence));
+        }
+        if let Some(digest) = write.requests.take() {
+            self.requested_digest = Some(digest);
         }
         let dropped = self.enqueue(write).map_err(anyhow::Error::msg)?;
         self.save(home, plan)?;
@@ -342,5 +376,25 @@ mod tests {
             assert_eq!(write.retry(100), attempt < 10);
             assert_eq!(write.next_at, 100 + (1u64 << attempt).min(300));
         }
+    }
+
+    #[test]
+    fn a_requested_digest_is_saved_with_the_post_that_requests_it() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let home = dir.path();
+        let mut state = RemoteState::default();
+        let mut write = PendingWrite::new("conversation_post", "approval".into(), Vars::default());
+        write.requests = Some("digest-1".into());
+        state.queue(home, "plan", write).unwrap();
+        let saved = RemoteState::load(home, "plan").unwrap();
+        assert_eq!(saved.requested_digest.as_deref(), Some("digest-1"));
+        assert_eq!(saved.outbox.len(), 1);
+        assert_eq!(saved.outbox[0].requests, None);
+        let raw: Value =
+            serde_json::from_slice(&std::fs::read(RemoteState::path(home, "plan").unwrap()).unwrap()).unwrap();
+        assert!(raw["outbox"][0].get("requests").is_none(), "never stored with the write");
+        // A post requesting nothing leaves the digest alone.
+        state.queue(home, "plan", PendingWrite::new("conversation_post", "status".into(), Vars::default())).unwrap();
+        assert_eq!(RemoteState::load(home, "plan").unwrap().requested_digest.as_deref(), Some("digest-1"));
     }
 }

@@ -145,13 +145,15 @@ close_done_agents = true
 # # enabled = true
 # # kinds = { user = "Steering", assistant = "AgentMessage", tool = "Tool", status = "Status", plan = "Plan", approval = "Approval" }
 # # activity = { working = "Working", input = "WaitingForInput", approval = "WaitingForApproval", blocked = "Failed", done = "Completed" }
+# # errors = { code = "code", content_refused = ["content_refused"], ended = ["conversation_ended"], conflict = ["sequence_conflict"], invalid = ["validation"], unreadable = ["item_unreadable"] }
 # # [tickets.operations.conversation_open]
 # # tool = "open_item_conversation"
 # # arguments = { itemType = "tickets.ticket", itemId = "{uuid}", title = "{title}", steeringUserIds = "{owners}" }
-# # result = { id = "conversationId", cursor = "latestRevision", steerers = "steeringUsers", steerer_id = "userId", steerer_name = "displayName" }
+# # result = { id = "conversationId", cursor = "latestRevision", next_sequence = "nextSequence", steerers = "steeringUsers", steerer_id = "userId", steerer_name = "displayName" }
 # # [tickets.operations.conversation_post]
 # # tool = "post_item_conversation"
-# # arguments = { conversationId = "{conversation}", eventId = "{nonce}", sequence = "{seq}", kind = "{kind}", text = "{body}", activityState = "{activity}", activityTurnId = "{turn}" }
+# # # No sequence: Relay assigns it, and replays a retried eventId.
+# # arguments = { conversationId = "{conversation}", eventId = "{nonce}", kind = "{kind}", text = "{body}", activityState = "{activity}", activityTurnId = "{turn}" }
 # # [tickets.operations.conversation_read]
 # # tool = "read_item_conversation"
 # # arguments = { conversationId = "{conversation}", afterRevision = "{after}", take = 25 }

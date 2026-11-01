@@ -178,7 +178,8 @@ impl McpClient {
         }
     }
 
-    /// Calls a tool and returns its result. A result flagged `isError` is an error.
+    /// Calls a tool and returns its result. A result flagged `isError` is an error; its
+    /// `structuredContent`, such as an error code, follows the text as JSON.
     pub fn call_tool(&mut self, name: &str, arguments: Value) -> Result<Value, McpError> {
         let result = self.request("tools/call", json!({ "name": name, "arguments": arguments }))?;
         if result.get("isError").and_then(Value::as_bool) == Some(true) {
@@ -190,10 +191,12 @@ impl McpClient {
                 .filter_map(|item| item.get("text").and_then(Value::as_str))
                 .collect::<Vec<_>>()
                 .join("\n");
-            return Err(McpError::Server(format!(
-                "{name} failed: {}",
-                if text.trim().is_empty() { "no details" } else { text.trim() }
-            )));
+            let mut message =
+                format!("{name} failed: {}", if text.trim().is_empty() { "no details" } else { text.trim() });
+            if let Some(structured) = result.get("structuredContent").filter(|value| value.is_object()) {
+                message = format!("{message} {structured}");
+            }
+            return Err(McpError::Server(message));
         }
         Ok(result)
     }
@@ -751,6 +754,32 @@ pub(crate) mod tests {
             matches!(missing, Err(McpError::Transport { message: m, .. }) if m.contains("starting /nonexistent/server failed"))
         );
         assert!(McpClient::connect(&McpServer::default(), Duration::from_secs(1), |_| None).is_err());
+    }
+
+    #[test]
+    fn a_tool_error_keeps_its_structured_content_after_the_text() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let state = fake_state(dir.path(), json!([]));
+        let mut fake: Value = serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+        fake["fail"] = json!(["conversation_post"]);
+        fake["fail_message"] = json!("The item conversation has ended; open a new one to continue.");
+        fake["fail_code"] = json!("conversation_ended");
+        std::fs::write(&state, fake.to_string()).unwrap();
+        let server = stdio(vec![fake_server().display().to_string(), state.display().to_string()]);
+        let mut client = McpClient::connect(&server, Duration::from_secs(10), |_| None).unwrap();
+        let Err(McpError::Server(message)) = client.call_tool("conversation_post", json!({})) else {
+            panic!("a tool error")
+        };
+        assert_eq!(
+            message,
+            r#"conversation_post failed: The item conversation has ended; open a new one to continue. {"code":"conversation_ended","message":"The item conversation has ended; open a new one to continue."}"#
+        );
+        let errors = atomics_core::tickets::RemoteErrors {
+            code: "code".into(),
+            ended: vec!["conversation_ended".into()],
+            ..Default::default()
+        };
+        assert_eq!(errors.classify(&message), Some(atomics_core::tickets::RemoteError::Ended));
     }
 
     /// Runs `call` on a thread of its own and fails the test when it has not returned within

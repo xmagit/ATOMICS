@@ -3,7 +3,7 @@
 //! what verified steering humans write to the chief with recorded intent. The sidecar is
 //! only ever written on the ticket worker; this side decides when, and does the pasting.
 use super::*;
-use crate::tickets::{RemoteOutcome, RemoteOutput, TicketOp, TicketOutput};
+use crate::tickets::{CONVERSATION_ENDED, RemoteOutcome, RemoteOutput, TicketOp, TicketOutput};
 use atomics_core::tickets::{self as ticket, RemoteConfig, RemoteStatus, Steerer, SteeringItem, TicketConfig};
 use std::collections::{BTreeMap, VecDeque};
 
@@ -293,7 +293,7 @@ impl State {
 
     /// Every post goes through the worker's durable outbox, including approval replies.
     fn remote_post(&mut self, index: usize, kind: &str, body: &str, activity: Option<&str>, turn: &str) {
-        self.remote_write(index, kind, body, activity, turn, false, false);
+        self.remote_write(index, kind, body, activity, turn, false, false, None);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -306,6 +306,7 @@ impl State {
         turn: &str,
         mirror: bool,
         tool: bool,
+        requests: Option<String>,
     ) {
         let Some(config) = self.ticket_config() else { return };
         // The server refuses blank text; such a post would only wait in the outbox.
@@ -327,6 +328,7 @@ impl State {
             atomics_core::remote::PendingWrite::new("conversation_post", uuid::Uuid::new_v4().to_string(), vars);
         write.mirror = mirror;
         write.tool = tool;
+        write.requests = requests;
         self.send_ticket(
             &config,
             TicketOp::Outbox { home: paths::atomics_home(), plan: plan.clone(), write: Some(Box::new(write)) },
@@ -415,6 +417,7 @@ impl State {
                             &turn,
                             true,
                             false,
+                            None,
                         );
                     }
                 }
@@ -432,6 +435,7 @@ impl State {
                         &turn,
                         true,
                         false,
+                        None,
                     );
                 }
                 if !entries.is_empty() {
@@ -444,6 +448,7 @@ impl State {
                         &turn,
                         true,
                         true,
+                        None,
                     );
                 }
             }
@@ -471,10 +476,6 @@ impl State {
         }
         entry.requested_digest = Some(digest.clone());
         entry.approval_open = true;
-        let id = plan.id.clone();
-        self.remote_requested(&id, Some(digest.clone()));
-        let plan = &self.plans[index];
-        let Some(entry) = self.tickets.remote.plans.get_mut(&plan.id) else { return };
         entry.activity = Some("approval".into());
         entry.next_poll = None;
         let turn = format!("approval:{}:{digest}", plan.id);
@@ -500,16 +501,20 @@ impl State {
         for body in bodies {
             self.remote_post(index, &config.remote.kinds.plan, &body, None, &turn);
         }
-        self.remote_post(
+        // The sidecar records the digest in the same write that queues this request.
+        self.remote_write(
             index,
             &config.remote.kinds.approval,
             &approval,
             Some(&config.remote.activity.approval),
             &turn,
+            false,
+            false,
+            Some(digest),
         );
     }
 
-    /// Saves the requested digest in the sidecar, in order with the writes that follow.
+    /// Clears or sets the requested digest in the sidecar, in order with the writes that follow.
     fn remote_requested(&mut self, plan: &str, digest: Option<String>) {
         let Some(config) = self.ticket_config() else { return };
         self.send_ticket(
@@ -657,9 +662,7 @@ impl State {
                                 refused.join(", ")
                             ));
                         }
-                        for message in messages {
-                            self.toast(message);
-                        }
+                        self.remote_outbox_messages(&plan, messages);
                         if let Some(index) = self.plans.iter().position(|p| p.id == plan) {
                             self.remote_request_approval(index, false);
                         }
@@ -747,13 +750,25 @@ impl State {
                 }
                 self.remote_deliver(&plan, &config, deliver, current);
             }
-            (RemoteJob::Settle, Ok(RemoteOutput::Settled(messages))) => {
-                for message in messages {
-                    self.toast(message);
-                }
-            }
+            (RemoteJob::Settle, Ok(RemoteOutput::Settled(messages))) => self.remote_outbox_messages(&plan, messages),
             (RemoteJob::Settle, Err(error)) => self.toast(format!("Remote conversation for {plan}: {error}")),
             (RemoteJob::Settle, Ok(_)) => {}
+        }
+    }
+
+    /// Toasts the outbox's messages. One saying the plan's own conversation refused a write as
+    /// ended stops remote control as a lost read does.
+    pub(super) fn remote_outbox_messages(&mut self, plan: &str, messages: Vec<String>) {
+        for message in messages {
+            if message.starts_with(CONVERSATION_ENDED)
+                && let Some(config) = self.ticket_config()
+                && let Some(entry) = self.tickets.remote.plans.get_mut(plan)
+            {
+                entry.error = Some(message);
+                self.remote_lost(plan, true, &config);
+            } else {
+                self.toast(message);
+            }
         }
     }
 
@@ -1883,5 +1898,35 @@ mod tests {
                 assert_eq!(last_activity, Some("approval"), "the approval request stays open");
             },
         );
+    }
+
+    #[test]
+    fn remote_a_post_refused_as_ended_stops_polling_then_reopens_slowly() {
+        with_app("app::remote::tests::remote_a_post_refused_as_ended_stops_polling_then_reopens_slowly", |app, _| {
+            let dir = crate::test_support::tempdir().unwrap();
+            let path = remote_app(app, dir.path(), |_| {});
+            let index = app.runtime.plans.iter().position(|p| p.id == "remote-plan").unwrap();
+            set(&path, |state| state["ended"] = json!(true));
+            app.runtime.remote_post(index, "status", "after the end", None, "turn");
+            settle(app, 3);
+            let entry = &app.runtime.tickets.remote.plans["remote-plan"];
+            assert!(entry.conversation.is_none(), "stopped");
+            assert!(entry.open_after.unwrap() > Instant::now() + Duration::from_secs(50), "slow cadence");
+            let toast = app.runtime.toast.clone().unwrap().0;
+            assert!(toast.contains("paused") && toast.contains("has ended"), "{toast}");
+            assert!(app.runtime.plan_json(index)["remote"].as_str().unwrap().contains("paused"));
+            let reads = calls(&path, "conversation_read");
+            settle(app, 3);
+            assert_eq!(calls(&path, "conversation_read"), reads, "polling stopped");
+            assert!(app.runtime.tickets.remote.plans["remote-plan"].conversation.is_none(), "no early reopen");
+            app.runtime.tickets.remote.plans.get_mut("remote-plan").unwrap().open_after = Some(Instant::now());
+            settle(app, 3);
+            assert_eq!(
+                app.runtime.tickets.remote.plans["remote-plan"].conversation.as_deref(),
+                Some("conversation-2"),
+                "the server's new conversation"
+            );
+            assert!(app.runtime.remote_note("remote-plan").is_none());
+        });
     }
 }
