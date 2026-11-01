@@ -50,6 +50,7 @@ impl Desktop<'_> {
             let open = !self.runtime.github.modal;
             self.runtime.github_set_modal(open);
         }
+        self.github_focus(ctx);
         self.github_keys(ctx);
         // Shift+↓/↑ walk changed files; PageDown/PageUp walk hunks in the focused diff.
         let editor_focused = self.client.editor_id.is_some_and(|id| ctx.memory(|m| m.has_focus(id)));

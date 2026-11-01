@@ -755,6 +755,10 @@ pub(super) enum Confirm {
 /// screen, and the diff viewer's state for the pull request diff.
 #[derive(Default)]
 pub(super) struct GithubUi {
+    /// Focus before opening the controls; the outer Option records that they took it.
+    return_focus: Option<Option<egui::Id>>,
+    /// A workflow input that may keep its keyboard focus inside the controls.
+    input_focus: Option<egui::Id>,
     pub selected: Option<(RepoId, u64)>,
     pub methods: BTreeMap<RepoId, MergeMethod>,
     pub confirm: Option<Confirm>,
@@ -876,7 +880,41 @@ fn paint_git_icon(painter: &egui::Painter, center: Pos2, color: Color32) {
     }
 }
 
+fn github_focus_id() -> egui::Id {
+    egui::Id::unique("github-controls-focus")
+}
+
 impl Desktop<'_> {
+    /// Take focus as soon as the controls open, before the terminal or editor sees input.
+    pub(super) fn github_focus(&mut self, ctx: &egui::Context) {
+        if self.runtime.github.modal {
+            if self.client.github.return_focus.is_none() {
+                self.client.github.return_focus = Some(ctx.memory(|memory| memory.focused()));
+                self.client.focus_terminal = None;
+                self.client.focus_editor = false;
+                self.client.focus_steer = false;
+            }
+            if !self.client.github.input_focus.is_some_and(|id| ctx.memory(|memory| memory.has_focus(id))) {
+                ctx.memory_mut(|memory| memory.request_focus(github_focus_id()));
+                ctx.memory_mut(|memory| {
+                    memory.set_focus_lock_filter(
+                        github_focus_id(),
+                        egui::EventFilter { tab: true, horizontal_arrows: true, vertical_arrows: true, escape: true },
+                    );
+                });
+            }
+        } else if let Some(previous) = self.client.github.return_focus.take() {
+            ctx.memory_mut(|memory| {
+                if let Some(focused) = memory.focused() {
+                    memory.surrender_focus(focused);
+                }
+                if let Some(previous) = previous {
+                    memory.request_focus(previous);
+                }
+            });
+        }
+    }
+
     /// The top-bar counter: a git icon and the open pull requests the filter counts.
     pub(super) fn github_counter(&mut self, ui: &mut egui::Ui, in_menu: bool) {
         let counter = self.runtime.github.counter(&self.runtime.config.github);
@@ -908,6 +946,7 @@ impl Desktop<'_> {
         if response.on_hover_text(hover).clicked() {
             let open = !self.runtime.github.modal;
             self.runtime.github_set_modal(open);
+            self.github_focus(ui.ctx());
             if in_menu {
                 ui.close();
             }
@@ -915,6 +954,7 @@ impl Desktop<'_> {
     }
 
     pub(super) fn github_modal(&mut self, ctx: &egui::Context) {
+        self.github_focus(ctx);
         self.github_confirm_dialog(ctx);
         if !self.runtime.github.modal {
             return;
@@ -927,6 +967,7 @@ impl Desktop<'_> {
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .open(&mut open)
             .show(ctx, |ui| {
+                ui.interact(ui.max_rect(), github_focus_id(), Sense::focusable_noninteractive());
                 ui.set_width(560.0);
                 self.github_header(ui, &p);
                 if !self.runtime.github.repos().is_empty() && self.runtime.github.signed_in_hosts().is_empty() {
@@ -945,6 +986,8 @@ impl Desktop<'_> {
         if !open {
             self.runtime.github_set_modal(false);
         }
+        // A new window's invisible sizing pass may discard its widget's focus registration.
+        self.github_focus(ctx);
     }
 
     fn github_header(&mut self, ui: &mut egui::Ui, p: &Palette) {
@@ -1049,13 +1092,15 @@ impl Desktop<'_> {
     }
 
     /// While the controls are open they hold the keyboard, so nothing typed reaches the terminal or
-    /// editor that had focus. Shift+↓/↑ select the next or previous pull request, PageDown/PageUp
+    /// editor that had focus. ↓/↑ (also with Shift) select the next or previous pull request, PageDown/PageUp
     /// jump to the next or previous repository's, Enter opens it, D loads its diff, M asks to merge
     /// it and Esc closes. In a confirmation, Enter confirms and Esc cancels. Letters match the key
     /// the layout types. All other keys and text are dropped, except the application chords and
     /// Ctrl/Command+1…9, which still work. A text field (a workflow input) keeps its keys.
     pub(super) fn github_keys(&mut self, ctx: &egui::Context) {
-        if !self.runtime.github.modal || ctx.text_edit_focused() {
+        if !self.runtime.github.modal
+            || self.client.github.input_focus.is_some_and(|id| ctx.memory(|memory| memory.has_focus(id)))
+        {
             return;
         }
         #[derive(Clone, Copy, PartialEq)]
@@ -1094,8 +1139,8 @@ impl Desktop<'_> {
                         Key::Escape if once => Some(if confirming { Move::Cancel } else { Move::Close }),
                         Key::Enter if once => Some(if confirming { Move::Confirm } else { Move::Open }),
                         _ if confirming => None,
-                        Key::ArrowDown if shift => Some(Move::Row(1)),
-                        Key::ArrowUp if shift => Some(Move::Row(-1)),
+                        Key::ArrowDown if shift || modifiers.is_none() => Some(Move::Row(1)),
+                        Key::ArrowUp if shift || modifiers.is_none() => Some(Move::Row(-1)),
                         Key::PageDown if modifiers.is_none() => Some(Move::Section(1)),
                         Key::PageUp if modifiers.is_none() => Some(Move::Section(-1)),
                         Key::D if once => Some(Move::Diff),
@@ -1111,6 +1156,7 @@ impl Desktop<'_> {
         match found {
             Move::Close => {
                 self.runtime.github_set_modal(false);
+                self.github_focus(ctx);
                 return;
             }
             Move::Cancel => {
@@ -1406,6 +1452,7 @@ impl Desktop<'_> {
 
     /// Merges, admin merges and dispatches ask once, like closing a session.
     fn github_confirm_dialog(&mut self, ctx: &egui::Context) {
+        self.client.github.input_focus = None;
         let Some(mut confirm) = self.client.github.confirm.take() else { return };
         // Closing the controls drops a confirmation they asked for.
         if !self.runtime.github.modal {
@@ -1458,7 +1505,10 @@ impl Desktop<'_> {
                             for (key, value) in inputs.iter_mut() {
                                 ui.label(key.as_str());
                                 if asked.contains(key) {
-                                    ui.text_edit_singleline(value);
+                                    let response = ui.text_edit_singleline(value);
+                                    if response.has_focus() {
+                                        self.client.github.input_focus = Some(response.id);
+                                    }
                                 } else {
                                     ui.label(RichText::new(value.as_str()).monospace());
                                 }
