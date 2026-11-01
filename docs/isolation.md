@@ -250,6 +250,13 @@ the host by the ticket worker, the chief's tools and the agents' scoped ticket t
 sandboxed agent that should call the server's *own* tools directly through sbx's MCP gateway needs a second,
 independent sign-in (`sbx mcp auth`, kept by sbx on the host); ATOMICS offers it as a quiet extra and never requires it.
 
+That sign-in is a set of OS-keychain items on the host (service `atomics-mcp-oauth-v1`). Long token sets are split into
+chunk items, so macOS's 4 KiB limit per `security` write does not apply to them; values go to the keychain tool on
+standard input. Every ATOMICS process on the host shares the items, including isolated ones with their own
+`ATOMICS_HOME`. Refresh, sign-in and sign-out of one server take a lock file next to the config,
+`mcp-oauth-<key>.lock` (`flock` on Unix, `LockFileEx` on Windows), so a rotating refresh token is spent once.
+The lock files hold no secrets.
+
 ATOMICS's ticket layer stays on the **host** in both modes. Its existing ticket configuration and
 credentials do not need to be copied into a VM. Scoped ticket tools and reports reach the host
 through the per-sandbox ATOMICS MCP server.

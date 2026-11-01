@@ -227,15 +227,26 @@ follows the standards:
    redirect `http://127.0.0.1:<port>/callback`. The `client_id` is kept per authorization server and reused while
    its loopback port is free.
 3. **Authorization.** The system browser (`open`, `xdg-open`, or Windows `start`) gets an S256 PKCE request with `state` and
-   `resource` set to the server URL (RFC 8707). A listener on 127.0.0.1 takes one callback within five minutes and
-   checks `state` and `iss`.
+   `resource` set to the server URL (RFC 8707). A listener on 127.0.0.1 waits up to five minutes for the callback
+   whose `state` is this sign-in's, then checks `iss`. Any other request, such as a stale tab's callback or one with
+   no `state`, gets a short error page and the wait goes on. Each connection has two seconds to send its request, so
+   a slow or silent client cannot hold the listener.
 4. **Tokens.** The code is exchanged, and the access token is sent as the bearer on every MCP call. It is refreshed
    before it expires and once after a `401`; the refresh token rotates when the server rotates it. A refusal
-   clears the saved sign-in and the call fails with `sign-in required: …`. It is never retried in a loop.
+   clears the saved sign-in and the call fails with `sign-in required: …`. It is never retried in a loop. A
+   refresh holds a per-server lock file next to the config (`mcp-oauth-<key>.lock`), so several ATOMICS processes
+   never spend one rotating refresh token twice. Once it has the lock, a process reads the keychain again and uses
+   the new access token if another process has already refreshed. Saving a sign-in and signing out take the same lock.
 5. **Storage.** Tokens and the `client_id` are OS-keychain items only (service `atomics-mcp-oauth-v1`, one item per
    server or authorization server), never in the config, a file, the log or an error. They are separate from the
    credential catalog because macOS's `security` takes 4 KiB per write: a few signed-in servers would crowd out the
-   catalog, and every refresh would rewrite it.
+   catalog, and every refresh would rewrite it. A value over 1 KiB of JSON (a JWT access token can pass 2 KiB) is
+   split into numbered chunk items `<slot>-a0…` or `<slot>-b0…`, up to 16 KiB of JSON per slot. The slot's own
+   item then names the chunks' generation and count and a SHA-256 of the value. A write puts the new chunks under the
+   generation the current item does not name, then switches the item to them, then deletes the old generation, so a
+   reader sees either the old value or the new one, never a mix; a mix fails the digest and is read again. Leftover
+   chunks are deleted on every write and on sign-out. Values reach `security` and `secret-tool` on standard
+   input, never on a command line.
 
 **The ticket worker never opens a browser:** a job against a server that is not signed in fails with
 `sign-in required: <url> needs a sign-in`, and the UI offers the sign-in. A server with `oauth` unset that answers
