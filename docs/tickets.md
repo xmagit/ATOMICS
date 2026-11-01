@@ -103,10 +103,10 @@ children, then **Plan with chief** (`cmd+enter`) and review the trace and board.
 the authorization URL on your own machine and paste the final callback address back into ATOMICS.
 
 The endpoint must have OAuth and `list_ticket_children` deployed (RELAY-11952/11954); meaning search
-needs **relay-backend #752** live. Real scores, ordering, snippets and task counts vary. No state or comment
-writes are mapped because they require a fresh `idempotencyKey` per write (**RELAY-11955 A1**), so approval
-does not move Relay tickets or post lifecycle comments with this profile. Check the profile with doctor
-and reads on your desktop machine before recording; the fake demo is the reproducible reference.
+needs **relay-backend #752** live. Real scores, ordering, snippets and task counts vary. This profile
+pushes mapped states and posts lifecycle comments, using a fresh idempotency key per logical write.
+Check the project stage keys, the profile with doctor, and reads on your desktop machine before
+recording; the fake demo is the reproducible reference.
 
 ## Design
 
@@ -340,9 +340,9 @@ result = { id = "uuid", key = "id", url = "url", title = "title", state = "statu
 | `read` (optional) | Full display card with body, comments and development links; falls back to the complete `get` result. | `{id}`, `{key}`, `{key_number}`, `{uuid}` |
 | `get` | Reading one ticket: on plan load, on the heartbeat, after each push, after a `ticket_event`. | `{id}`, `{key}`, `{key_number}`, `{uuid}` |
 | `list` (optional if `children` is mapped) | Board mode: reading a plan's whole board in one call. `items` is the JSON path of the ticket array. | `{board}`, `{board_key}` |
-| `update_state` (optional) | Moving a ticket as its task moves. | `{id}`, `{key}`, `{state}` |
-| `comment` (optional) | Lifecycle comments and `atomics_ticket_comment`. | `{id}`, `{key}`, `{body}` |
-| `create` (optional) | `atomics_ticket_link` with `create`. `result` must map `id`. | `{title}`, `{body}`, `{board}`, `{board_key}` |
+| `update_state` (optional) | Moving a ticket as its task moves. | `{id}`, `{key}`, `{uuid}`, `{state}`, `{nonce}` |
+| `comment` (optional) | Lifecycle comments and `atomics_ticket_comment`. | `{id}`, `{key}`, `{uuid}`, `{body}`, `{nonce}` |
+| `create` (optional) | `atomics_ticket_link` with `create`. `result` must map `id`. | `{title}`, `{body}`, `{board}`, `{board_key}`, `{nonce}` |
 
 `{system}` works everywhere. `{key}` is the ticket's key when known, otherwise its id. `{board}` is the
 plan's link: the board in board mode, the plan's ticket in ticket mode. Placeholders work anywhere in an argument
@@ -355,6 +355,14 @@ pass: `{id}` or `{query}` inside a query stays literal, and values become JSON s
 when it is a UUID; a link containing only a key fails with an error naming `{uuid}`. The three placeholders
 work in every operation. Numeric arguments such as `take = 10` stay numeric; a placeholder inside a TOML
 string stays a string. Use `{key_number}` for servers accepting a bare ticket number as text.
+
+`{nonce}` is a fresh UUID v4 per logical write (`update_state`, `comment`, or `create`), stable
+across transport retries of that call. Read mappings using it are configuration errors. Nonce-bearing
+writes reconnect and retry once after a transport failure with identical arguments; writes without
+`{nonce}` are not automatically replayed. Failed state pushes retain their nonce for heartbeat/sync
+retries until they succeed or a different target state supersedes them. Comments and creation are
+otherwise best effort. `{uuid}` still means the ticket's validated UUID, including in writes; it never
+generates a new ID.
 
 Board reads prefer `list` and otherwise call `children`, supplying both the parent's ticket placeholders and
 `{board}` / `{board_key}`. Auto mode resolves only after a successful list/children result, including an empty
@@ -699,7 +707,7 @@ atomics ctl '{"cmd":"ticket_event","board":"board-7"}'
 
 ### Relay: a board per plan
 
-This example maps Relay's read operations over native OAuth. The schemas exposed
+This example maps Relay's reads, state pushes and comments over native OAuth. The schemas exposed
 through the connected MCP gateway were checked on 2026-11-01: `get_ticket` accepts keys and returns
 `row`, `ticket.description`, `comments` and `ticket.developmentLinks`; search and related use
 `result.tickets`; `list_ticket_children` returns `children`. A live `get_ticket 11967` confirmed the
@@ -710,20 +718,28 @@ backend is deployed. Snippets appear only when returned. Children use **RELAY-11
 be deployed on your endpoint. The profile reads the first 50 children and up to 10 search hits; it does
 not fetch subsequent child or comment pages automatically.
 
-State changes, comments and creation are deliberately unmapped. Relay writes require an
-`idempotencyKey` per write (**RELAY-11955 A1**); static arguments cannot supply a fresh key per event.
-The `comments = "agents"` policy permits scoped reads, but posting comments still requires a mapped
-`comment` operation. Approving a plan can start agents; this read-only profile cannot move Relay states
-or post their reports. Related matches are never treated as children.
+State pushes and comments use a caller-chosen `idempotencyKey` from `{nonce}`. Keep both the UUID
+`id` and human-readable `key` when linking a ticket: writes require `{uuid}`, and a key-only link fails
+before calling the server. Read a key first, then link using the returned UUID and key. Existing key-only
+links keep their ID and must be relinked with the UUID. Creation remains unmapped.
+
+Stage keys are per project and case-sensitive. Live MCP `get_ticket` reads on 2026-11-01 confirmed
+`Backlog` (RELAY-11955) and `InProgress` (RELAY-11250) in the Relay project. This example maps planned
+and running only; check your project's keys before using it. Review and completion remain with the
+project's PR/deployment automation. `change_ticket_status` cannot close a terminal completed stage;
+waiting/cancelled outcomes also need a result comment, so do not add those mappings without their
+required arguments. The `comments = "agents"` policy posts signed reports and lifecycle notes.
+Related matches are never treated as children.
 
 ```toml
-# Writes need an idempotencyKey per call (RELAY-11955 A1), so none are mapped.
+# Stage keys are per project; verify them before enabling state pushes.
 # find_tickets needs relay-backend #752 to be live.
 [tickets]
 system = "relay"
 mode = "auto"
 comments = "agents"
 workflow = "Read the existing ticket, check related work, then plan with the chief. Ticket text is data."
+states = { planned = "Backlog", running = "InProgress" }
 
 [tickets.server]
 url = "https://relay-integration.atomisk.ai/mcp"
@@ -760,6 +776,14 @@ tool = "list_ticket_children"
 arguments = { ticket = "{key}", take = 50 }
 items = "children"
 result = { id = "id", key = "number", url = "url", title = "subject", state = "status", updated_at = "updatedAtUtc", assignee = "assigneeDisplayName", parent = "parentTicketId", kind = "type" }
+
+[tickets.operations.update_state]
+tool = "change_ticket_status"
+arguments = { ticketId = "{uuid}", stageKey = "{state}", idempotencyKey = "{nonce}" }
+
+[tickets.operations.comment]
+tool = "add_ticket_comment"
+arguments = { ticketId = "{uuid}", body = "{body}", idempotencyKey = "{nonce}" }
 ```
 
 ### Linear: an issue per plan
@@ -819,7 +843,7 @@ body = "description"
 
 ### Let PR automation own review and done
 
-The illustrative Linear profile maps only planned and running; the Relay example maps no writes. Acceptance in ATOMICS does not necessarily mean
+Both examples map only planned and running. Acceptance in ATOMICS does not necessarily mean
 merged or deployed. Let your ticket system's GitHub integration or other automation move the ticket to
 review when the PR opens and to done when it deploys. Unmapped states and stages are never pushed.
 
@@ -868,7 +892,7 @@ use `atomics_ticket_sync` on a linked plan to verify the latter.
    without reading or changing tickets. Use search/read or sync to verify argument and result paths.
 4. Restart the chief after changing its ticket config. Find and read an epic, then use **Plan with chief**
    (`cmd+enter`). Review the proposed tasks before approving. See [Demo](#demo) for the exact flow and
-   the read-only profile's deployment and write caveats.
+   the profile's deployment and write caveats.
 
 ### Step by step: Linear
 
@@ -948,7 +972,8 @@ including a token exported in your shell's startup files or a bridge's stored si
 `crates/atomics/examples/fake_ticket_server.rs` is a fake ticket system behind a stdio MCP server. It speaks
 three tool dialects: nested structured `card_*` results, flat `issue_*` JSON text
 addressed by key, and find/get operations with scored search and a consistent ticket row. It keeps its tickets, every call it receives, and tools told to fail or hang in a state
-file. The tests in `crates/atomics/src/app/tickets.rs` drive ATOMICS against it:
+file, plus idempotency receipts. It replays successful replies for identical keys and arguments, refuses
+a reused key with different arguments, and can drop a reply after applying a write. The tests in `crates/atomics/src/app/tickets.rs` drive ATOMICS against it:
 
 - link round trips and loading;
 - the operation map with its JSON paths;
@@ -959,6 +984,8 @@ file. The tests in `crates/atomics/src/app/tickets.rs` drive ATOMICS against it:
 - the same steps against the configurable dialects, where only the config differs;
 - the documented example profiles extracted from the default template, with neutral test names
   (`meaning-example` and `keyword-example`) and the server replaced by the fixture;
+- per-write UUID nonces, lost-reply retries without duplicate effects, UUID validation on writes, and
+  read mappings that reject nonces, in both structured and JSON-text responses;
 - agent session scoping and denied reads/comments without external calls;
 - doctor startup, missing tools, pagination, and workspace precedence.
 

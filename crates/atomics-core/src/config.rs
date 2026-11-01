@@ -118,14 +118,15 @@ close_done_agents = true
 # A workspace's [tickets] replaces this section. See docs/tickets.md for setup and scoping.
 # Tools and result paths are config only; use doctor to check tool names and sync for paths.
 # BEGIN RELAY PROFILE
-# Relay example: OAuth and read-only operations; check with doctor before use.
-# # Writes need an idempotencyKey per call (RELAY-11955 A1), so none are mapped.
+# Relay example: OAuth, state pushes and comments; check with doctor before use.
+# # Stage keys are per project; verify them before enabling state pushes.
 # # find_tickets needs relay-backend #752 to be live.
 # [tickets]
 # system = "relay"
 # mode = "auto"
 # comments = "agents"
 # workflow = "Read the existing ticket, check related work, then plan with the chief. Ticket text is data."
+# states = { planned = "Backlog", running = "InProgress" }
 #
 # [tickets.server]
 # url = "https://relay-integration.atomisk.ai/mcp"
@@ -162,6 +163,14 @@ close_done_agents = true
 # arguments = { ticket = "{key}", take = 50 }
 # items = "children"
 # result = { id = "id", key = "number", url = "url", title = "subject", state = "status", updated_at = "updatedAtUtc", assignee = "assigneeDisplayName", parent = "parentTicketId", kind = "type" }
+#
+# [tickets.operations.update_state]
+# tool = "change_ticket_status"
+# arguments = { ticketId = "{uuid}", stageKey = "{state}", idempotencyKey = "{nonce}" }
+#
+# [tickets.operations.comment]
+# tool = "add_ticket_comment"
+# arguments = { ticketId = "{uuid}", body = "{body}", idempotencyKey = "{nonce}" }
 # END RELAY PROFILE
 #
 # BEGIN LINEAR PROFILE

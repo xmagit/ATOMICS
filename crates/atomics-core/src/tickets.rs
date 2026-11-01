@@ -329,28 +329,35 @@ impl StateMap {
 pub struct Operations {
     /// Keyword search; {query} is substituted as literal text.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "read_operation")]
     pub search: Option<Operation>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "read_operation")]
     pub semantic_search: Option<Operation>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "read_operation")]
     pub children: Option<Operation>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "read_operation")]
     pub related: Option<Operation>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "read_operation")]
     pub read: Option<Operation>,
     /// Read one ticket. Placeholders: {id}, {key}, {system}.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "read_operation")]
     pub get: Option<Operation>,
     /// The tickets on a board, for board mode. Placeholders: {board}, {board_key}.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "read_operation")]
     pub list: Option<Operation>,
-    /// Placeholders: {id}, {key}, {state}.
+    /// Placeholders: {id}, {key}, {uuid}, {state}, {nonce}.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub update_state: Option<Operation>,
-    /// Placeholders: {id}, {key}, {body}.
+    /// Placeholders: {id}, {key}, {uuid}, {body}, {nonce}.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub comment: Option<Operation>,
-    /// Optional. Placeholders: {title}, {body}, {board}, {board_key}.
+    /// Optional. Placeholders: {title}, {body}, {board}, {board_key}, {nonce}.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub create: Option<Operation>,
 }
@@ -525,7 +532,7 @@ pub const MAX_ERROR_CHARS: usize = 600;
 
 /// Placeholders operation arguments may use; other text in braces is left as written.
 pub const PLACEHOLDERS: &[&str] =
-    &["id", "key", "key_number", "uuid", "query", "state", "body", "title", "board", "board_key", "system"];
+    &["id", "key", "key_number", "uuid", "nonce", "query", "state", "body", "title", "board", "board_key", "system"];
 
 /// Values for an operation's placeholders. A placeholder whose value is unknown fails
 /// the operation with a message naming it, rather than sending an empty argument.
@@ -752,7 +759,29 @@ impl TicketConfig {
     }
 }
 
+fn read_operation<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<Operation>, D::Error> {
+    let operation = Option::<Operation>::deserialize(deserializer)?;
+    if operation.as_ref().is_some_and(|op| op.uses_placeholder("nonce")) {
+        return Err(serde::de::Error::custom("{nonce} is only allowed in write operations"));
+    }
+    Ok(operation)
+}
+
 impl Operation {
+    /// Whether an argument template contains this placeholder, including nested values.
+    pub fn uses_placeholder(&self, name: &str) -> bool {
+        fn contains(value: &Value, placeholder: &str) -> bool {
+            match value {
+                Value::String(text) => text.contains(placeholder),
+                Value::Array(items) => items.iter().any(|value| contains(value, placeholder)),
+                Value::Object(map) => map.values().any(|value| contains(value, placeholder)),
+                _ => false,
+            }
+        }
+        let placeholder = format!("{{{name}}}");
+        self.arguments.values().any(|value| contains(value, &placeholder))
+    }
+
     /// Parse mapped display data. Callers apply their job's Cleaner before exposing it.
     pub fn card(&self, result: &Value, system: &str) -> Result<TicketCard, String> {
         let link = self.ticket(result, system)?;
@@ -1793,6 +1822,32 @@ pub fn pretty_model(model: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn ticket_nonce_is_write_only_even_in_nested_arguments() {
+        for name in ["get", "read", "list", "children", "related", "search", "semantic_search"] {
+            let text = format!(
+                r#"[operations.{name}]
+tool = "read"
+arguments = {{ nested = [{{ value = "prefix {{nonce}}" }}] }}"#
+            );
+            let error = toml::from_str::<TicketConfig>(&text).unwrap_err().to_string();
+            assert!(error.contains("{nonce}"), "{name}: {error}");
+            assert!(error.contains("write"), "{name}: {error}");
+        }
+        for name in ["update_state", "comment", "create"] {
+            let text = format!(
+                r#"[operations.{name}]
+tool = "write"
+arguments = {{ key = "{{nonce}}", nested = ["{{nonce}}", "{{body}}"] }}"#
+            );
+            let config: TicketConfig = toml::from_str(&text).unwrap();
+            let vars = Vars::new("test").with("nonce", Some("chosen")).with("body", Some("{nonce}"));
+            let arguments = config.operation(name).unwrap().arguments(&vars).unwrap();
+            assert_eq!(arguments["key"], "chosen");
+            assert_eq!(arguments["nested"], json!(["chosen", "{nonce}"]));
+        }
+    }
 
     #[test]
     fn ticket_workspace_placeholders_are_literal_and_require_known_values() {
