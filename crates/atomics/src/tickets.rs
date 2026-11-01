@@ -345,7 +345,12 @@ impl Worker {
                     if write.op == "conversation_post"
                         && let Some(body) = write.vars.get("body").and_then(Value::as_str)
                     {
-                        let body: String = self.trace_cleaner(config)?.redacted(body).chars().take(2000).collect();
+                        let cleaned = self.trace_cleaner(config)?.redacted(body);
+                        let body: String = if write.mirror {
+                            atomics_core::trace::cap_block(&cleaned)
+                        } else {
+                            cleaned.chars().take(2000).collect()
+                        };
                         write.vars = write.vars.with("body", Some(&body));
                     }
                     let mut state = RemoteState::load(&home, &plan).map_err(|e| e.to_string())?;
@@ -446,13 +451,47 @@ impl Worker {
         home: &std::path::Path,
         plan: &str,
     ) -> Result<TicketOutput, String> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
+        self.drain_outbox_at(config, home, plan, now_ms)
+    }
+
+    fn drain_outbox_at(
+        &mut self,
+        config: &TicketConfig,
+        home: &std::path::Path,
+        plan: &str,
+        now_ms: u64,
+    ) -> Result<TicketOutput, String> {
         let mut state = RemoteState::load(home, plan).map_err(|e| e.to_string())?;
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        let now = now_ms / 1000;
+        state.reset_post_day(now_ms);
         let mut messages = Vec::new();
         // Preserve post order: a delayed write holds later writes behind it.
         while let Some(write) = state.outbox.first().cloned() {
+            if write.mirror && state.posted_today >= atomics_core::remote::DAILY_POSTS {
+                state.outbox.remove(0);
+                if !state.pause_shown {
+                    messages.push("Conversation mirror paused: 1000 posts today".into());
+                    state.pause_shown = true;
+                }
+                state.save(home, plan).map_err(|e| e.to_string())?;
+                continue;
+            }
             if write.next_at > now {
                 break;
+            }
+            if write.op == "conversation_post" {
+                if state.last_post_ms.is_some_and(|at| now_ms.saturating_sub(at) < config.remote.min_interval_ms) {
+                    break;
+                }
+                // Persist before transport, also bounding refused posts and lost replies.
+                state.last_post_ms = Some(now_ms);
+                state.outbox[0].attempted = true;
+                state.save(home, plan).map_err(|e| e.to_string())?;
             }
             let vars = write.vars.clone().with("nonce", Some(&write.nonce));
             match self.call(config, &write.op, &vars) {
@@ -471,7 +510,10 @@ impl Worker {
                         replacement.nonce = uuid::Uuid::new_v4().to_string();
                         replacement.vars = replacement.vars.with("body", Some(WITHHELD_TEXT));
                         replacement.withheld = true;
+                        replacement.mirror = false;
+                        replacement.tool = false;
                         replacement.attempts = 0;
+                        replacement.attempted = false;
                         replacement.next_at = 0;
                         state.outbox.insert(0, replacement);
                     }
@@ -790,6 +832,7 @@ pub(crate) mod tests {
 
     pub(crate) fn remote_profile(prefix: &str, path: &std::path::Path) -> TicketConfig {
         let mut config = crate::mcp_client::tests::example_profile("meaning-example", path);
+        config.remote.min_interval_ms = 0;
         let whoami = match prefix {
             "card_" => {
                 json!({"id":"actor.ref", "kind":"actor.type", "name":"actor.name", "owner_id":"actor.owner.ref", "owner_name":"actor.owner.name"})
@@ -1174,7 +1217,119 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn ticket_remote_outbox_content_refusal_posts_one_placeholder() {
+    fn mirror_hundred_rapid_turns_are_capped_coalesced_and_rate_limited_with_status_preserved() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let path = crate::mcp_client::tests::fake_state(dir.path(), json!([]));
+        let mut config = conversation_profile("", &path);
+        config.remote.min_interval_ms = 2000;
+        let home = dir.path();
+        let mut state = RemoteState::default();
+        for turn in 0..100 {
+            for kind in ["user", "assistant", "tool"] {
+                let vars = Vars::new(&config.system)
+                    .with("activity", Some(""))
+                    .with("turn", Some(""))
+                    .with("kind", Some("assistant"))
+                    .with("conversation", Some("conversation-1"))
+                    .with("kind", Some(kind))
+                    .with("turn", Some(&format!("turn-{turn}")))
+                    .with("body", Some(&format!("{kind} {turn}")));
+                let mut write = PendingWrite::new("conversation_post", format!("{kind}-{turn}"), vars);
+                write.mirror = true;
+                write.tool = kind == "tool";
+                state.queue(home, "burst", write).unwrap();
+            }
+            if turn % 10 == 0 {
+                let vars = Vars::new(&config.system)
+                    .with("activity", Some(""))
+                    .with("turn", Some(""))
+                    .with("kind", Some("assistant"))
+                    .with("conversation", Some("conversation-1"))
+                    .with("kind", Some("status"))
+                    .with("body", Some("Needs input"));
+                state
+                    .queue(home, "burst", PendingWrite::new("conversation_post", format!("status-{turn}"), vars))
+                    .unwrap();
+            }
+            assert!(state.outbox.iter().filter(|w| w.mirror).count() <= 50);
+        }
+        assert_eq!(state.outbox.iter().filter(|w| !w.mirror).count(), 10);
+        assert!(
+            state
+                .outbox
+                .iter()
+                .any(|w| w.skipped_turns > 0
+                    && w.vars.get("body").unwrap().as_str().unwrap().ends_with("turns skipped)"))
+        );
+        assert!(state.outbox.iter().filter(|w| w.tool).count() <= 1, "tool blocks are dropped first");
+        let total = state.outbox.len();
+        let mut worker = Worker::default();
+        let now = 2 * 86_400_000;
+        worker.drain_outbox_at(&config, home, "burst", now).unwrap();
+        assert_eq!(server(&path)["posts"].as_array().unwrap().len(), 1);
+        worker.drain_outbox_at(&config, home, "burst", now + 1999).unwrap();
+        assert_eq!(server(&path)["posts"].as_array().unwrap().len(), 1);
+        // A new worker honours the persisted spacing as well.
+        worker = Worker::default();
+        for n in 1..total {
+            worker.drain_outbox_at(&config, home, "burst", now + n as u64 * 2000).unwrap();
+            assert_eq!(server(&path)["posts"].as_array().unwrap().len(), n + 1);
+        }
+        let posted = server(&path);
+        let posts = posted["posts"].as_array().unwrap();
+        assert_eq!(posts.iter().filter(|p| p["kind"] == "status").count(), 10);
+        assert!(RemoteState::load(home, "burst").unwrap().outbox.is_empty());
+        let seqs: Vec<_> = posts.iter().map(|p| p["sequence"].as_u64().unwrap()).collect();
+        assert!(seqs.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn mirror_daily_pause_keeps_status_approval_plan_and_resets_next_utc_day() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let path = crate::mcp_client::tests::fake_state(dir.path(), json!([]));
+        let config = conversation_profile("", &path);
+        let now = 2 * 86_400_000;
+        let mut state = RemoteState { post_day: 2, posted_today: 1000, ..Default::default() };
+        for kind in ["assistant", "status", "approval", "plan", "user"] {
+            let vars = Vars::new(&config.system)
+                .with("activity", Some(""))
+                .with("turn", Some(""))
+                .with("kind", Some("assistant"))
+                .with("conversation", Some("conversation-1"))
+                .with("kind", Some(kind))
+                .with("body", Some(kind))
+                .with("turn", Some(kind));
+            let mut write = PendingWrite::new("conversation_post", kind.into(), vars);
+            write.mirror = matches!(kind, "assistant" | "user");
+            state.queue(dir.path(), "daily", write).unwrap();
+        }
+        let mut worker = Worker::default();
+        let TicketOutput::Outbox(messages) = worker.drain_outbox_at(&config, dir.path(), "daily", now).unwrap() else {
+            panic!()
+        };
+        assert_eq!(messages, ["Conversation mirror paused: 1000 posts today"]);
+        let posted = server(&path);
+        let kinds: Vec<_> = posted["posts"].as_array().unwrap().iter().map(|p| p["kind"].as_str().unwrap()).collect();
+        assert_eq!(kinds, ["status", "approval", "plan"]);
+        let vars = Vars::new(&config.system)
+            .with("activity", Some(""))
+            .with("turn", Some(""))
+            .with("kind", Some("assistant"))
+            .with("conversation", Some("conversation-1"))
+            .with("body", Some("New day"));
+        let mut write = PendingWrite::new("conversation_post", "next-day".into(), vars);
+        write.mirror = true;
+        state = RemoteState::load(dir.path(), "daily").unwrap();
+        state.queue(dir.path(), "daily", write).unwrap();
+        worker.drain_outbox_at(&config, dir.path(), "daily", now + 86_400_000).unwrap();
+        state = RemoteState::load(dir.path(), "daily").unwrap();
+        assert_eq!(state.posted_today, 1);
+        assert!(!state.pause_shown);
+        assert_eq!(server(&path)["posts"].as_array().unwrap().last().unwrap()["text"], "New day");
+    }
+
+    #[test]
+    fn mirror_outbox_content_refusal_posts_one_placeholder() {
         let dir = crate::test_support::tempdir().unwrap();
         let path = crate::mcp_client::tests::fake_state(dir.path(), json!([]));
         let config = remote_profile("", &path);

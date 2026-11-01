@@ -29,6 +29,7 @@ pub(super) struct Remote {
     pub(super) plans: HashMap<String, RemotePlan>,
     /// The chief's latest turn, from its UserPromptSubmit and Stop hooks.
     pub(super) chief_turn: Option<Instant>,
+    pub(super) chief_plan: Option<String>,
     /// Plans whose interrupted deliveries this process has already handled.
     recovered: HashSet<String>,
     /// Bumped when remote restarts, so results of older jobs are recognised.
@@ -40,6 +41,7 @@ pub(super) struct Remote {
 impl Remote {
     pub(super) fn reset(&mut self) {
         self.plans.clear();
+        self.chief_plan = None;
         self.epoch += 1;
         self.shown = None;
     }
@@ -65,6 +67,10 @@ pub(super) struct RemotePlan {
     /// Items not sent to the chief, with the reason.
     pub(super) notices: Vec<String>,
     error: Option<String>,
+    turn: String,
+    entries: Vec<atomics_core::trace::TraceEntry>,
+    activity: Option<String>,
+    blocked: HashSet<String>,
 }
 
 impl RemotePlan {
@@ -144,6 +150,17 @@ impl State {
                 Some((plan.id.clone(), link, plan.goal.clone()))
             })
             .collect();
+        // Completion is the final event, before this plan leaves the polling set.
+        let completed: Vec<_> = self
+            .tickets
+            .remote
+            .plans
+            .keys()
+            .filter_map(|id| self.plans.iter().position(|p| p.id == *id && p.status == PlanStatus::Completed))
+            .collect();
+        for index in completed {
+            self.remote_activity(index, "done", "Plan finished");
+        }
         self.tickets.remote.plans.retain(|id, _| followed.iter().any(|(plan, ..)| plan == id));
         let home = paths::atomics_home();
         let epoch = self.tickets.remote.epoch;
@@ -195,11 +212,38 @@ impl State {
         }
         for index in 0..self.plans.len() {
             self.remote_request_approval(index, false);
+            let blocked: HashSet<_> = self.plans[index]
+                .tasks
+                .iter()
+                .filter(|t| t.status == TaskStatus::Blocked)
+                .map(|t| t.id.clone())
+                .collect();
+            if let Some(entry) = self.tickets.remote.plans.get_mut(&self.plans[index].id) {
+                let changed = !blocked.is_empty() && blocked != entry.blocked;
+                entry.blocked = blocked;
+                if changed {
+                    self.remote_activity(index, "blocked", "A task is blocked");
+                }
+            }
         }
     }
 
     /// Every post goes through the worker's durable outbox, including approval replies.
     fn remote_post(&mut self, index: usize, kind: &str, body: &str, activity: Option<&str>, turn: &str) {
+        self.remote_write(index, kind, body, activity, turn, false, false);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn remote_write(
+        &mut self,
+        index: usize,
+        kind: &str,
+        body: &str,
+        activity: Option<&str>,
+        turn: &str,
+        mirror: bool,
+        tool: bool,
+    ) {
         let Some(config) = self.ticket_config() else { return };
         if !matches!(config.remote_status(self.tickets.whoami.as_ref()), RemoteStatus::On(_)) {
             return;
@@ -214,13 +258,141 @@ impl State {
             .with("body", Some(body))
             .with("activity", Some(activity.unwrap_or("")))
             .with("turn", Some(turn));
-        let write =
+        let mut write =
             atomics_core::remote::PendingWrite::new("conversation_post", uuid::Uuid::new_v4().to_string(), vars);
+        write.mirror = mirror;
+        write.tool = tool;
         self.send_ticket(
             &config,
             TicketOp::Outbox { home: paths::atomics_home(), plan: plan.clone(), write: Some(Box::new(write)) },
             super::tickets::outbox_tag(&plan, &config),
         );
+    }
+
+    /// Fixed status copy: no terminal, permission command or worker text is sent.
+    pub(super) fn remote_activity(&mut self, index: usize, state: &str, body: &str) {
+        let Some(config) = self.ticket_config() else { return };
+        let Some(entry) = self.tickets.remote.plans.get_mut(&self.plans[index].id) else { return };
+        if entry.conversation.is_none() || entry.activity.as_deref() == Some(state) {
+            return;
+        }
+        entry.activity = Some(state.into());
+        if entry.turn.is_empty() {
+            entry.turn = uuid::Uuid::new_v4().to_string();
+        }
+        let turn = entry.turn.clone();
+        let activity = match state {
+            "input" => &config.remote.activity.input,
+            "blocked" => &config.remote.activity.blocked,
+            "done" => &config.remote.activity.done,
+            _ => &config.remote.activity.working,
+        };
+        self.remote_post(index, &config.remote.kinds.status, body, Some(activity), &turn);
+    }
+
+    pub(super) fn mirror_pending_permission(&mut self) {
+        if self.sessions.iter().any(|s| s.chief && (s.approval_hold || !s.approvals.is_empty())) {
+            let index = self
+                .tickets
+                .remote
+                .chief_plan
+                .as_ref()
+                .and_then(|id| self.plans.iter().position(|p| &p.id == id))
+                .unwrap_or(self.selected_plan);
+            if index < self.plans.len() {
+                self.remote_activity(index, "input", "Chief needs your input in ATOMICS");
+            }
+        }
+    }
+
+    /// Invoked only for an authorized chief hook, after TraceCleaner has resolved.
+    pub(super) fn mirror_hook(
+        &mut self,
+        event: &atomics_core::hook::HookEvent,
+        plan: Option<&str>,
+        cleaner: &ticket::Cleaner,
+        trace: Option<atomics_core::trace::TraceEntry>,
+    ) {
+        let Some(index) = plan.and_then(|id| self.plans.iter().position(|p| p.id == id && p.is_open())) else { return };
+        let Some(config) = self.ticket_config() else { return };
+        let Some(entry) = self.tickets.remote.plans.get_mut(&self.plans[index].id) else { return };
+        if entry.conversation.is_none() {
+            return;
+        }
+        if event.name == "UserPromptSubmit" || entry.turn.is_empty() {
+            entry.turn = uuid::Uuid::new_v4().to_string();
+            entry.entries.clear();
+        }
+        let turn = entry.turn.clone();
+        if let Some(mut trace) = trace {
+            if config.remote.tools == ticket::ToolMirror::Off {
+                return;
+            }
+            if config.remote.tools == ticket::ToolMirror::Names {
+                trace.cards.clear();
+            }
+            if let Some(old) = entry.entries.iter_mut().find(|old| old.seq == trace.seq) {
+                *old = trace;
+            } else if entry.entries.len() < 10 {
+                entry.entries.push(trace);
+            }
+            return;
+        }
+        match event.name.as_str() {
+            "UserPromptSubmit" => {
+                self.remote_activity(index, "working", "Chief is working");
+                if config.remote.user_turns
+                    && let Some(prompt) = &event.prompt
+                {
+                    // This source label is produced by deliver_steering; don't echo it back.
+                    if !(prompt.starts_with("[From ")
+                        && prompt.lines().next().is_some_and(|s| s.contains(", a verified steering human, via ")))
+                    {
+                        self.remote_write(
+                            index,
+                            &config.remote.kinds.user,
+                            &cleaner.redacted(prompt),
+                            None,
+                            &turn,
+                            true,
+                            false,
+                        );
+                    }
+                }
+            }
+            "Stop" => {
+                let entries = std::mem::take(
+                    &mut self.tickets.remote.plans.get_mut(&self.plans[index].id).expect("open").entries,
+                );
+                if let Some(answer) = &event.last_assistant_message {
+                    self.remote_write(
+                        index,
+                        &config.remote.kinds.assistant,
+                        &cleaner.redacted(answer),
+                        None,
+                        &turn,
+                        true,
+                        false,
+                    );
+                }
+                if !entries.is_empty() {
+                    let block = atomics_core::trace::render_block(&entries);
+                    self.remote_write(
+                        index,
+                        &config.remote.kinds.tool,
+                        &cleaner.redacted(&block),
+                        None,
+                        &turn,
+                        true,
+                        true,
+                    );
+                }
+            }
+            "PermissionRequest" | "Notification" => {
+                self.remote_activity(index, "input", "Chief needs your input in ATOMICS")
+            }
+            _ => {}
+        }
     }
 
     /// Called on plan_set, brief edits and opening/reopening remote. The digest also
@@ -240,6 +412,7 @@ impl State {
         }
         entry.requested_digest = Some(digest.clone());
         entry.approval_open = true;
+        entry.activity = Some("approval".into());
         entry.next_poll = None;
         let turn = format!("approval:{}:{digest}", plan.id);
         let bodies: Vec<_> = plan
@@ -277,6 +450,7 @@ impl State {
         if let Some(entry) = self.tickets.remote.plans.get_mut(&self.plans[index].id) {
             entry.approval_open = false;
             entry.requested_digest = None;
+            entry.activity = Some("working".into());
         }
         let Some(config) = self.ticket_config() else { return };
         let body = author
@@ -660,6 +834,249 @@ mod tests {
 
     fn approval_events(app: &Desktop<'_>) -> Vec<Value> {
         app.runtime.events.iter().filter(|event| event.change == Some("approved")).map(StatusEvent::to_json).collect()
+    }
+
+    fn mirror_event(app: &mut Desktop<'_>, payload: Value) {
+        let mut payload = payload;
+        payload["session_id"] = json!("chief");
+        let event = atomics_core::hook::HookEvent::from_payload(&payload).unwrap();
+        app.runtime.on_hook(HookMessage {
+            pane: Some("chief".into()),
+            ancestors: vec![],
+            delivered: 0,
+            approval_reply: None,
+            event,
+        });
+    }
+
+    #[test]
+    fn mirror_chief_turn_masks_prompt_answer_arguments_and_excludes_unmapped_output() {
+        with_app(
+            "app::remote::tests::mirror_chief_turn_masks_prompt_answer_arguments_and_excludes_unmapped_output",
+            |app, _| {
+                let dir = crate::test_support::tempdir().unwrap();
+                let path = remote_app(app, dir.path(), |_| {});
+                app.runtime.config.tickets.server.env.insert("API_KEY".into(), "known-secret".into());
+                app.runtime.apply_ticket_config();
+                settle(app, 3);
+                app.runtime.selected_plan = app.runtime.plans.iter().position(|p| p.id == "remote-plan").unwrap();
+                mirror_event(
+                    app,
+                    json!({"hook_event_name":"UserPromptSubmit", "prompt":"status known-secret https://user:prompt-secret@example.test"}),
+                );
+                mirror_event(
+                    app,
+                    json!({"hook_event_name":"PreToolUse", "tool_name":"mcp__unknown__lookup", "tool_use_id":"tool-1", "tool_input":{"access_token":"argument-secret", "query":"status known-secret"}}),
+                );
+                mirror_event(
+                    app,
+                    json!({"hook_event_name":"PostToolUse", "tool_name":"mcp__unknown__lookup", "tool_use_id":"tool-1", "tool_input":{"access_token":"argument-secret", "query":"status known-secret"}, "tool_response":{"text":"UNMAPPED PRIVATE OUTPUT"}}),
+                );
+                mirror_event(
+                    app,
+                    json!({"hook_event_name":"Stop", "last_assistant_message":format!("Answer known-secret https://example.test/?access_token=answer-secret {}", "é ".repeat(1500))}),
+                );
+                settle(app, 1);
+                let state = fake(&path);
+                let posts = state["posts"].as_array().unwrap();
+                assert_eq!(posts.iter().filter(|p| p["kind"] == "assistant").count(), 1);
+                let tools: Vec<_> = posts.iter().filter(|p| p["kind"] == "tool").collect();
+                assert_eq!(tools.len(), 1);
+                assert!(tools[0]["text"].as_str().unwrap().contains("lookup"));
+                assert!(tools[0]["text"].as_str().unwrap().contains("Ok"));
+                let serialized = serde_json::to_string(posts).unwrap();
+                for secret in
+                    ["known-secret", "prompt-secret", "answer-secret", "argument-secret", "UNMAPPED PRIVATE OUTPUT"]
+                {
+                    assert!(!serialized.contains(secret), "{secret}: {serialized}");
+                    assert!(
+                        !std::fs::read_to_string(RemoteState::path(&paths::atomics_home(), "remote-plan").unwrap())
+                            .unwrap()
+                            .contains(secret)
+                    );
+                }
+                for post in posts {
+                    assert!(post["text"].as_str().unwrap().chars().count() <= 2000);
+                }
+                assert!(
+                    posts.iter().find(|p| p["kind"] == "assistant").unwrap()["text"]
+                        .as_str()
+                        .unwrap()
+                        .ends_with("more characters in ATOMICS)")
+                );
+                let count = posts.len();
+                app.runtime.sessions[0].chief = false;
+                mirror_event(app, json!({"hook_event_name":"Stop", "last_assistant_message":"WORKER PRIVATE TEXT"}));
+                app.runtime.sessions[0].chief = true;
+                mirror_event(
+                    app,
+                    json!({"hook_event_name":"UserPromptSubmit", "prompt":"[From Max, a verified steering human, via example conversation on DEMO-1, message 2.]\nstatus?"}),
+                );
+                settle(app, 1);
+                assert_eq!(fake(&path)["posts"].as_array().unwrap().len(), count, "no worker mirror or steering echo");
+            },
+        );
+    }
+
+    #[test]
+    fn mirror_waits_for_refreshed_oauth_credentials_and_fails_closed() {
+        with_app("app::remote::tests::mirror_waits_for_refreshed_oauth_credentials_and_fails_closed", |app, _| {
+            use crate::mcp_client::{FakeOAuthServer, McpClient};
+            let dir = crate::test_support::tempdir().unwrap();
+            let path = remote_app(app, dir.path(), |_| {});
+            let client =
+                McpClient::connect(&app.runtime.config.tickets.server, Duration::from_secs(10), |_| None).unwrap();
+            let oauth_server = FakeOAuthServer::start_with_tickets(client);
+            oauth_server.state.lock().unwrap().expires_in = 30;
+            let (keychain, oauth) = crate::mcp_client::oauth_test_machine();
+            let server = oauth_server.server();
+            oauth
+                .sign_in_via(&server, Duration::from_secs(10), &|url| {
+                    let url = url.to_string();
+                    std::thread::spawn(move || crate::mcp_client::oauth_test_browse(&url));
+                    Ok(())
+                })
+                .unwrap();
+            let old = oauth_server.state.lock().unwrap().access.iter().next().unwrap().clone();
+            oauth_server.state.lock().unwrap().expires_in = 3600;
+            let refreshed = McpClient::connect_with(&server, Duration::from_secs(5), |_| None, Some(&oauth)).unwrap();
+            let token = refreshed.oauth_token().unwrap().to_string();
+            assert_ne!(token, old);
+            app.runtime.stop_tickets();
+            app.runtime.tickets.sign.override_oauth(oauth);
+            app.runtime.config.tickets.server = server;
+            app.runtime.apply_ticket_config();
+            settle(app, 3);
+            app.runtime.selected_plan = app.runtime.plans.iter().position(|p| p.id == "remote-plan").unwrap();
+            let before = posts(&path).len();
+            mirror_event(app, json!({"hook_event_name":"UserPromptSubmit", "prompt":format!("Prompt {token}")}));
+            mirror_event(app, json!({"hook_event_name":"Stop", "last_assistant_message":format!("Answer {token}")}));
+            assert_eq!(posts(&path).len(), before, "capture waits for TraceCleaner");
+            assert!(!app.runtime.tickets.trace_jobs.is_empty());
+            settle(app, 2);
+            let posted = fake(&path)["posts"].to_string();
+            assert!(!posted.contains(&token) && !posted.contains(&old));
+            assert!(posted.contains("Prompt ***") && posted.contains("Answer ***"));
+            let count = fake(&path)["posts"].as_array().unwrap().len();
+            std::fs::write(keychain.path().join("fail-keychain"), "").unwrap();
+            mirror_event(
+                app,
+                json!({"hook_event_name":"Stop", "last_assistant_message":format!("Must not be sent {token}")}),
+            );
+            settle(app, 1);
+            assert_eq!(fake(&path)["posts"].as_array().unwrap().len(), count);
+            assert!(
+                !std::fs::read_to_string(RemoteState::path(&paths::atomics_home(), "remote-plan").unwrap())
+                    .unwrap()
+                    .contains(&token)
+            );
+        });
+    }
+
+    #[test]
+    fn mirror_tool_modes_and_turns_stay_with_their_plan_across_tab_switches() {
+        with_app(
+            "app::remote::tests::mirror_tool_modes_and_turns_stay_with_their_plan_across_tab_switches",
+            |app, _| {
+                let dir = crate::test_support::tempdir().unwrap();
+                let path = remote_app(app, dir.path(), |_| {});
+                let index = app.runtime.plans.iter().position(|p| p.id == "remote-plan").unwrap();
+                app.runtime.plans.push(Plan { id: "other-plan".into(), approved: true, ..Default::default() });
+                let other = app.runtime.plans.len() - 1;
+                for mode in [ticket::ToolMirror::Cards, ticket::ToolMirror::Names, ticket::ToolMirror::Off] {
+                    app.runtime.config.tickets.remote.tools = mode;
+                    app.runtime.config.tickets.remote.user_turns = false;
+                    app.runtime.apply_ticket_config();
+                    settle(app, 3);
+                    let before = posts(&path).len();
+                    app.runtime.selected_plan = index;
+                    mirror_event(
+                        app,
+                        json!({"hook_event_name":"UserPromptSubmit", "prompt":"PRIVATE PROMPT DISABLED"}),
+                    );
+                    app.runtime.selected_plan = other;
+                    mirror_event(
+                        app,
+                        json!({"hook_event_name":"PostToolUse", "tool_name":"mcp__atomics__atomics_ticket_read", "tool_use_id":"cards", "tool_input":{"ticket":"DEMO-1"}, "tool_response":{"card":{"id":"1","key":"DEMO-1","title":"Visible title","body":"PRIVATE BODY"}}}),
+                    );
+                    mirror_event(
+                        app,
+                        json!({"hook_event_name":"Stop", "last_assistant_message":"Done with first plan"}),
+                    );
+                    settle(app, 1);
+                    let state = fake(&path);
+                    let new = &state["posts"].as_array().unwrap()[before..];
+                    assert_eq!(new.iter().filter(|p| p["kind"] == "assistant").count(), 1);
+                    let tool: Vec<_> = new.iter().filter(|p| p["kind"] == "tool").collect();
+                    assert_eq!(tool.len(), usize::from(mode != ticket::ToolMirror::Off));
+                    if mode != ticket::ToolMirror::Off {
+                        assert_eq!(
+                            tool[0]["text"].as_str().unwrap().contains("Visible title"),
+                            mode == ticket::ToolMirror::Cards
+                        );
+                    }
+                    let json = serde_json::to_string(new).unwrap();
+                    assert!(!json.contains("PRIVATE BODY") && !json.contains("PRIVATE PROMPT DISABLED"));
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn mirror_permission_input_is_once_then_working_blocked_and_done() {
+        with_app("app::remote::tests::mirror_permission_input_is_once_then_working_blocked_and_done", |app, _| {
+            let dir = crate::test_support::tempdir().unwrap();
+            let path = remote_app(app, dir.path(), |_| {});
+            let index = app.runtime.plans.iter().position(|p| p.id == "remote-plan").unwrap();
+            app.runtime.selected_plan = index;
+            for _ in 0..3 {
+                mirror_event(
+                    app,
+                    json!({"hook_event_name":"Notification", "notification_type":"permission_prompt", "message":"PRIVATE PERMISSION"}),
+                );
+                app.runtime.sessions[0].approval_hold = true;
+                app.runtime.mirror_pending_permission();
+            }
+            settle(app, 1);
+            assert_eq!(posts(&path), ["Chief needs your input in ATOMICS"]);
+            assert_eq!(fake(&path)["posts"][0]["activity"], "WaitingForInput");
+            app.runtime.sessions[0].approval_hold = false;
+            mirror_event(app, json!({"hook_event_name":"UserPromptSubmit", "prompt":"next"}));
+            app.runtime.plans[index].tasks.push(atomics_core::plan::Task {
+                id: "blocked-task".into(),
+                status: TaskStatus::Blocked,
+                ..Default::default()
+            });
+            settle(app, 2);
+            app.runtime.plans[index].status = PlanStatus::Completed;
+            // Queue final activity before the per-plan remote state leaves the poll set.
+            app.runtime.remote_tick();
+            // Explicit FIFO barrier, since completed plans are no longer in settle's set.
+            let config = app.runtime.ticket_config().unwrap();
+            app.runtime.send_ticket(
+                &config,
+                TicketOp::Whoami,
+                super::super::tickets::remote_tag(
+                    "remote-plan",
+                    &config,
+                    RemoteJob::Steerers,
+                    app.runtime.tickets.remote.epoch,
+                ),
+            );
+            settle(app, 1);
+            let state = fake(&path);
+            let activities: Vec<_> = state["posts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|p| p["activity"].as_str())
+                .filter(|s| !s.is_empty())
+                .collect();
+            assert_eq!(activities, ["WaitingForInput", "Working", "blocked", "done"]);
+            assert_eq!(state["posts"].as_array().unwrap().last().unwrap()["text"], "Plan finished");
+            assert!(!app.runtime.tickets.remote.plans.contains_key("remote-plan"));
+            assert!(!state["posts"].to_string().contains("PRIVATE PERMISSION"));
+        });
     }
 
     #[test]
