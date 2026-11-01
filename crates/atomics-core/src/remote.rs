@@ -20,6 +20,8 @@ pub struct RemoteState {
     pub seen: Vec<String>,
     pub outbox: Vec<PendingWrite>,
     pub posted_today: u64,
+    /// Polls on which the chief could not receive a steering item, by item id.
+    pub retries: BTreeMap<String, u32>,
 }
 
 impl Default for RemoteState {
@@ -32,6 +34,7 @@ impl Default for RemoteState {
             seen: Vec::new(),
             outbox: Vec::new(),
             posted_today: 0,
+            retries: BTreeMap::new(),
         }
     }
 }

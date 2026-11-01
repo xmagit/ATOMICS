@@ -232,7 +232,8 @@ fn report(workspace: Option<&str>, for_agent: bool, projects: &[PathBuf]) -> Rep
                     &crate::mcp_client::OAuth::new(credential_keychain.clone(), crate::connections::Browser::current()),
                     &tickets,
                 ));
-                lines.push(ticket_check(&tickets))
+                lines.push(ticket_check(&tickets));
+                lines.extend(remote_check(&tickets));
             }
             Ok(_) => {}
             Err(error) => {
@@ -366,6 +367,33 @@ fn ticket_check(config: &atomics_core::tickets::TicketConfig) -> String {
     )
 }
 
+/// `[tickets.remote]`, when enabled: reads whoami (a read without side effects) and applies
+/// the steering-list rules. A connection that could steer itself is an error.
+fn remote_check(config: &atomics_core::tickets::TicketConfig) -> Option<String> {
+    use atomics_core::tickets::{Vars, Whoami};
+    if !config.remote.enabled {
+        return None;
+    }
+    let whoami = config.operation("whoami").map(|operation| -> Result<Whoami, String> {
+        let mut client = crate::mcp_client::McpClient::connect(
+            &config.server,
+            std::time::Duration::from_secs(config.timeout_secs.max(1)),
+            crate::setup::env_var,
+        )
+        .map_err(|e| e.to_string())?;
+        let result = client
+            .call_tool(&operation.tool, operation.arguments(&Vars::new(&config.system))?)
+            .map_err(|e| e.to_string())?;
+        Whoami::read(operation, &atomics_core::tickets::tool_output(&result))
+    });
+    let cleaner = atomics_core::tickets::Cleaner::of(config, crate::setup::env_var);
+    let status = match whoami.transpose() {
+        Ok(whoami) => config.remote_status(whoami.map(|w| w.cleaned(&cleaner)).as_ref()),
+        Err(error) => return Some(crate::ticket_signin::remote_failed_line(&cleaner.error(&error))),
+    };
+    Some(crate::ticket_signin::remote_line(&status))
+}
+
 fn exit_code(git_ok: bool, config_ok: bool) -> i32 {
     i32::from(!git_ok || !config_ok)
 }
@@ -450,6 +478,44 @@ mod tests {
         }
         let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(state).unwrap()).unwrap();
         assert_eq!(value["calls"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn remote_doctor_errors_for_self_steering_and_human_connections_and_says_why_it_is_off() {
+        use serde_json::{Value, json};
+        let dir = crate::test_support::tempdir().unwrap();
+        let state = crate::mcp_client::tests::fake_state(dir.path(), json!([]));
+        let whoami = |identity: Value| {
+            let mut value: Value = serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+            value["whoami"] = identity;
+            std::fs::write(&state, value.to_string()).unwrap();
+        };
+        let config = crate::tickets::tests::conversation_profile("", &state);
+        let line = remote_check(&config).unwrap();
+        assert!(line.starts_with('✓') && line.contains("human-1"), "{line}");
+        let mut own = config.clone();
+        own.remote.owners = vec!["agent-1".into()];
+        let line = remote_check(&own).unwrap();
+        assert!(line.starts_with('✗') && line.contains("(error)") && line.contains("agent-1"), "{line}");
+        let mut unmapped = config.clone();
+        unmapped.operations.conversation_read.as_mut().unwrap().result.author_kind.clear();
+        let line = remote_check(&unmapped).unwrap();
+        assert!(line.starts_with('·') && line.contains("off") && line.contains("author_id and author_kind"), "{line}");
+        whoami(json!({"userId":"agent-2", "kind":"agent", "displayName":"Product agent"}));
+        let line = remote_check(&config).unwrap();
+        assert!(
+            line.starts_with('·') && line.contains("off") && line.contains("set [tickets.remote] owners"),
+            "{line}"
+        );
+        let mut listed = config.clone();
+        listed.remote.owners = vec!["human-9".into()];
+        assert!(remote_check(&listed).unwrap().starts_with('✓'));
+        whoami(json!({"userId":"human-1", "kind":"human", "displayName":"Example human"}));
+        let line = remote_check(&listed).unwrap();
+        assert!(line.starts_with('✗') && line.contains("(error)") && line.contains("connect as an agent"), "{line}");
+        let mut off = config.clone();
+        off.remote.enabled = false;
+        assert!(remote_check(&off).is_none());
     }
 
     #[test]

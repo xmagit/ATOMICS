@@ -139,6 +139,32 @@ close_done_agents = true
 # tool = "whoami"
 # result = { id = "userId", kind = "kind", name = "displayName", owner_id = "ownerUserId", owner_name = "ownerDisplayName" }
 #
+# # Remote control from the ticket's conversation, once Relay's item-conversation tools are live.
+# # Uncomment it with the conversation_* mappings below; see docs/tickets.md, "Remote control".
+# # [tickets.remote]
+# # enabled = true
+# # kinds = { user = "Steering", assistant = "AgentMessage", tool = "Tool", status = "Status", plan = "Plan", approval = "Approval" }
+# # activity = { working = "Working", input = "WaitingForInput", approval = "WaitingForApproval", blocked = "Failed", done = "Completed" }
+# # [tickets.operations.conversation_open]
+# # tool = "open_item_conversation"
+# # arguments = { itemType = "tickets.ticket", itemId = "{uuid}", title = "{title}", steeringUserIds = "{owners}" }
+# # result = { id = "conversationId", cursor = "latestRevision", steerers = "steeringUsers", steerer_id = "userId", steerer_name = "displayName" }
+# # [tickets.operations.conversation_post]
+# # tool = "post_item_conversation"
+# # arguments = { conversationId = "{conversation}", eventId = "{nonce}", sequence = "{seq}", kind = "{kind}", text = "{body}", activityState = "{activity}", activityTurnId = "{turn}" }
+# # [tickets.operations.conversation_read]
+# # tool = "read_item_conversation"
+# # arguments = { conversationId = "{conversation}", afterRevision = "{after}", take = 25 }
+# # items = "items"
+# # result = { id = "steeringId", seq = "revision", author_id = "authorUserId", author_kind = "authorKind", author = "authorDisplayName", text = "text", at = "createdAtUtc" }
+# # [tickets.operations.conversation_ack]
+# # tool = "acknowledge_item_conversation"
+# # arguments = { conversationId = "{conversation}", steeringIds = "{ids}" }
+# # [tickets.operations.conversation_steerers]
+# # tool = "list_item_conversation_steerers"
+# # arguments = { conversationId = "{conversation}" }
+# # result = { steerers = "steeringUsers", steerer_id = "userId", steerer_name = "displayName" }
+#
 # [tickets.operations.get]
 # tool = "get_ticket"
 # arguments = { ticket = "{key}" }

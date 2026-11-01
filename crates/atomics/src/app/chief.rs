@@ -134,21 +134,27 @@ impl State {
     /// Sends `text` to the chief, starting it with `text` as its first prompt when it is not
     /// running, and opens its window with the terminal focused.
     pub(super) fn send_to_chief(&mut self, text: &str) -> Result<(), String> {
+        self.chief_delivery(text)?;
+        self.chief_open = true;
+        self.focus_terminal = self.sessions.iter().find(|s| s.chief).map(|s| s.id.clone());
+        Ok(())
+    }
+
+    /// Delivers `text` to the chief, starting it with `text` as its first prompt when it is not
+    /// running, without opening its window. Unavailable is an error; the other outcomes are returned.
+    pub(super) fn chief_delivery(&mut self, text: &str) -> Result<Delivery, String> {
         match self.sessions.iter().position(|s| s.chief && s.can_receive()) {
-            Some(index) => {
-                if self.deliver(index, text) == Delivery::Unavailable {
-                    return Err("The chief cannot receive messages right now".into());
-                }
-            }
+            Some(index) => match self.deliver(index, text) {
+                Delivery::Unavailable => Err("The chief cannot receive messages right now".into()),
+                delivery => Ok(delivery),
+            },
             None => {
                 self.sessions.retain(|s| !s.chief);
                 let ctx = self.ctx.clone();
                 self.start_chief(&ctx, Some(text.to_string()))?;
+                Ok(Delivery::Sent)
             }
         }
-        self.chief_open = true;
-        self.focus_terminal = self.sessions.iter().find(|s| s.chief).map(|s| s.id.clone());
-        Ok(())
     }
 
     pub(super) fn toggle_chief(&mut self, ctx: &egui::Context) {

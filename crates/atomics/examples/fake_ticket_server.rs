@@ -197,28 +197,7 @@ fn call(path: &str, params: &Value) -> Result<Value, String> {
             text(identity)
         }
     } else if generic.starts_with("conversation_") {
-        let result = match generic {
-            "conversation_open" => {
-                json!({"id":"conversation-1", "cursor":state["cursor"].as_u64().unwrap_or(0), "steerers":args["owners"]})
-            }
-            "conversation_post" => {
-                if !state["posts"].is_array() {
-                    state["posts"] = json!([]);
-                }
-                state["posts"].as_array_mut().unwrap().push(args.clone());
-                json!({"posted":true})
-            }
-            "conversation_read" => json!({"items":state["steering"].as_array().cloned().unwrap_or_default()}),
-            "conversation_ack" => {
-                if !state["acks"].is_array() {
-                    state["acks"] = json!([]);
-                }
-                state["acks"].as_array_mut().unwrap().push(args.clone());
-                json!({"acknowledged":true})
-            }
-            "conversation_steerers" => json!({"steerers":state["steerers"].as_array().cloned().unwrap_or_default()}),
-            _ => return Err(format!("unknown tool {name}")),
-        };
+        let result = conversation(&mut state, name, generic, args)?;
         if name.starts_with("card_") { structured(result) } else { text(result) }
     } else {
         match name {
@@ -345,6 +324,121 @@ fn call(path: &str, params: &Value) -> Result<Value, String> {
         std::process::exit(0);
     }
     Ok(result)
+}
+
+/// One ticket-linked conversation per state file. `steering` holds what humans and others
+/// wrote, as `{id, revision, author_id, author_kind, author, text, at}`; `cursor` is the newest
+/// revision `conversation_open` reports (default: the newest in `steering`); ids in
+/// `refuse_steerers` are refused on open; `conversation_id` names the conversation.
+fn conversation(state: &mut Value, name: &str, generic: &str, args: &Value) -> Result<Value, String> {
+    let arg = |keys: &[&str]| keys.iter().map(|key| &args[*key]).find(|value| !value.is_null()).cloned();
+    let id = state["conversation_id"].as_str().unwrap_or("conversation-1").to_string();
+    if generic != "conversation_open" && arg(&["conversation", "conversationId"]) != Some(json!(id)) {
+        return Err(format!("no conversation {}", arg(&["conversation", "conversationId"]).unwrap_or_default()));
+    }
+    let push = |state: &mut Value, key: &str, value: Value| {
+        if !state[key].is_array() {
+            state[key] = json!([]);
+        }
+        state[key].as_array_mut().unwrap().push(value);
+    };
+    let card = name.starts_with("card_");
+    let issue = name.starts_with("issue_");
+    let people = |state: &Value| -> Vec<Value> {
+        state["accepted"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|person| {
+                if card {
+                    json!({"ref":person["id"], "name":person["name"]})
+                } else if issue {
+                    person.clone()
+                } else {
+                    json!({"userId":person["id"], "displayName":person["name"]})
+                }
+            })
+            .collect()
+    };
+    Ok(match generic {
+        "conversation_open" => {
+            let owners = arg(&["owners", "steeringUserIds"]).and_then(|v| v.as_array().cloned()).unwrap_or_default();
+            let refused: Vec<Value> = state["refuse_steerers"].as_array().cloned().unwrap_or_default();
+            let accepted: Vec<Value> = owners
+                .iter()
+                .filter(|owner| !refused.contains(owner))
+                .map(|owner| {
+                    let name = state["people"][owner.as_str().unwrap_or_default()]
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| owner.as_str().unwrap_or_default().replace("human-", "Example human "));
+                    json!({"id":owner, "name":name})
+                })
+                .collect();
+            if accepted.is_empty() {
+                return Err("no steering human was accepted".into());
+            }
+            state["accepted"] = json!(accepted);
+            push(state, "opens", args.clone());
+            let newest =
+                state["steering"].as_array().into_iter().flatten().filter_map(|item| item["revision"].as_u64()).max();
+            let cursor =
+                state.get("cursor").cloned().filter(|c| !c.is_null()).unwrap_or_else(|| json!(newest.unwrap_or(0)));
+            if card {
+                json!({"conversation":{"ref":id, "head":cursor, "people":people(state)}})
+            } else if issue {
+                json!({"id":id, "cursor":cursor, "steerers":people(state), "refused":refused})
+            } else {
+                json!({"conversationId":id, "state":"Running", "latestRevision":cursor, "steeringUsers":people(state), "refusedUserIds":refused})
+            }
+        }
+        "conversation_post" => {
+            push(state, "posts", args.clone());
+            json!({"posted":true, "recorded":true})
+        }
+        "conversation_read" => {
+            let after = arg(&["after", "afterRevision"]).unwrap_or(Value::Null);
+            let take = args["take"].as_u64().unwrap_or(25).min(25) as usize;
+            let items: Vec<Value> = state["steering"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|item| after.is_null() || item["revision"].as_u64() > after.as_u64().or_else(|| after.as_str()?.parse().ok()))
+                .take(take)
+                .map(|item| {
+                    if card {
+                        json!({"ref":item["id"], "rev":item["revision"], "by":{"ref":item["author_id"], "type":item["author_kind"], "name":item["author"]}, "body":item["text"], "when":item["at"]})
+                    } else if issue {
+                        json!({"id":item["id"], "seq":item["revision"], "author_id":item["author_id"], "author_kind":item["author_kind"], "author":item["author"], "text":item["text"], "at":item["at"]})
+                    } else {
+                        json!({"steeringId":item["id"], "revision":item["revision"], "authorUserId":item["author_id"], "authorKind":item["author_kind"], "authorDisplayName":item["author"], "text":item["text"], "createdAtUtc":item["at"]})
+                    }
+                })
+                .collect();
+            if card {
+                json!({"entries":items})
+            } else if issue {
+                json!({"messages":items})
+            } else {
+                json!({"items":items})
+            }
+        }
+        "conversation_ack" => {
+            push(state, "acks", args.clone());
+            json!({"acknowledged":true})
+        }
+        "conversation_steerers" => {
+            if card {
+                json!({"conversation":{"people":people(state)}})
+            } else if issue {
+                json!({"steerers":people(state)})
+            } else {
+                json!({"steeringUsers":people(state), "state":"Running"})
+            }
+        }
+        _ => return Err(format!("unknown tool {name}")),
+    })
 }
 
 fn find<'a>(state: &'a Value, reference: &Value) -> Result<&'a Value, String> {

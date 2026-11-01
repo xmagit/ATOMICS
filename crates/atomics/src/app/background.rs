@@ -202,6 +202,7 @@ impl State {
             self.finish_integration(integrated);
         }
         changed |= self.ticket_results();
+        self.remote_tick();
         changed |= self.poll_signin();
         self.expire_approvals(Instant::now());
         while let Ok(message) = self.control_rx.try_recv() {
@@ -709,6 +710,9 @@ impl State {
         let root = session.root();
         let (id, title) = (session.id.clone(), session.title.clone());
         self.capture_chief_trace(index, &event);
+        if self.sessions[index].chief && matches!(event.name.as_str(), "UserPromptSubmit" | "Stop") {
+            self.tickets.remote.chief_turn = Some(Instant::now());
+        }
         if matches!(event.name.as_str(), "PostToolUse" | "Stop" | "UserPromptSubmit" | "CwdChanged")
             && let Some(state) = self.diffs.get_mut(&root)
         {

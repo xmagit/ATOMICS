@@ -8,7 +8,9 @@ use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
 use atomics_core::remote::{PendingWrite, RemoteState, WITHHELD_TEXT};
-use atomics_core::tickets::{self, McpServer, TicketCard, TicketConfig, TicketLink, Vars};
+use atomics_core::tickets::{
+    self, Conversation, McpServer, Steerer, SteeringItem, TicketCard, TicketConfig, TicketLink, Vars,
+};
 use serde_json::Value;
 
 use crate::mcp_client::{McpClient, McpError, OAuth};
@@ -32,6 +34,31 @@ pub enum TicketOp {
         home: PathBuf,
         plan: String,
         write: Option<Box<PendingWrite>>,
+    },
+    /// Open a plan's conversation (idempotent) and reconcile its sidecar. `recover` handles
+    /// deliveries a previous process recorded and never finished.
+    RemoteOpen {
+        home: PathBuf,
+        plan: String,
+        link: TicketLink,
+        title: String,
+        owners: Vec<String>,
+        recover: bool,
+    },
+    RemoteSteerers(String),
+    /// Read steering after the sidecar's cursor and judge each item.
+    RemotePoll {
+        home: PathBuf,
+        plan: String,
+        whoami: Box<tickets::Whoami>,
+        owners: Vec<String>,
+    },
+    /// What delivering a polled item to the chief did; acknowledges and moves the cursor.
+    RemoteSettle {
+        home: PathBuf,
+        plan: String,
+        item: Box<SteeringItem>,
+        outcome: RemoteOutcome,
     },
     // Consumers are added by the chief-tools and Tickets-panel tasks.
     #[allow(dead_code)]
@@ -74,7 +101,54 @@ pub enum TicketOutput {
     Tickets(Vec<TicketLink>),
     /// A push went through; the ticket as read right after, when `get` is configured.
     Pushed(Option<Result<TicketLink, String>>),
+    Remote(RemoteOutput),
 }
+
+/// How a steering item handed to the app was dealt with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteOutcome {
+    /// Sent, pending or queued for the chief.
+    Delivered,
+    /// Held behind a permission prompt; pasted once it is answered.
+    Held,
+    /// The chief could not receive it; retried on a later poll.
+    Unavailable,
+    /// Not tried, because an earlier item of the same poll was unavailable.
+    Deferred,
+    /// An ATOMICS command, answered in the conversation and never delivered.
+    Command(String),
+}
+
+pub enum RemoteOutput {
+    Opened {
+        conversation: Conversation,
+        /// Toasts: deliveries a restart interrupted.
+        messages: Vec<String>,
+    },
+    Steerers(Vec<Steerer>),
+    Polled {
+        /// In order; each is recorded in the sidecar's `delivering` before it is returned.
+        deliver: Vec<SteeringItem>,
+        /// Items shown as "not sent to the chief", with the reason.
+        refused: Vec<(SteeringItem, String)>,
+    },
+    /// The read failed; `throttled` for a 429, 5xx or lost connection, which backs off.
+    PollFailed {
+        error: String,
+        throttled: bool,
+    },
+    Settled(Vec<String>),
+}
+
+/// Statuses ATOMICS posts about a steering item (§3.4).
+pub const DELIVERED_TEXT: &str = "delivered to the chief";
+pub const HELD_TEXT: &str = "held until the permission prompt in ATOMICS is answered";
+pub const UNDELIVERED_TEXT: &str = "not delivered: the chief cannot receive messages";
+pub const RESTARTED_TEXT: &str = "may not have reached the chief because ATOMICS restarted; send it again if needed";
+/// At most this many deliveries a minute per plan; the rest wait in order.
+pub const DELIVERIES_PER_MINUTE: usize = 10;
+/// Polls an unavailable chief gets before an item is given up.
+pub const DELIVERY_ATTEMPTS: u32 = 3;
 
 pub struct TicketJob<T> {
     pub config: Arc<TicketConfig>,
@@ -160,6 +234,10 @@ struct Worker {
     /// Where saved browser sign-ins are read from.
     oauth: Option<OAuth>,
     content_refused: bool,
+    /// The last failure was a lost connection, a timeout, a 429 or a 5xx.
+    throttled: bool,
+    /// When each plan's recent steering items were handed out, for the per-minute cap.
+    handed: std::collections::HashMap<(PathBuf, String), std::collections::VecDeque<Instant>>,
 }
 
 impl Worker {
@@ -213,6 +291,23 @@ impl Worker {
                 TicketOutput::Cards(cards.into_iter().map(|card| self.cleaner.card(card)).collect())
             }
             TicketOutput::Pushed(read) => TicketOutput::Pushed(read.map(|read| read.map(link).map_err(error))),
+            TicketOutput::Remote(output) => TicketOutput::Remote(match output {
+                RemoteOutput::Opened { conversation, messages } => RemoteOutput::Opened {
+                    conversation: self.cleaner.conversation(conversation),
+                    messages: messages.into_iter().map(error).collect(),
+                },
+                RemoteOutput::Steerers(steerers) => RemoteOutput::Steerers(
+                    self.cleaner.conversation(Conversation { steerers, ..Conversation::default() }).steerers,
+                ),
+                RemoteOutput::Polled { deliver, refused } => RemoteOutput::Polled {
+                    deliver: deliver.into_iter().map(|item| self.cleaner.steering(item)).collect(),
+                    refused: refused.into_iter().map(|(item, why)| (self.cleaner.steering(item), error(why))).collect(),
+                },
+                RemoteOutput::PollFailed { error: why, throttled } => {
+                    RemoteOutput::PollFailed { error: error(why), throttled }
+                }
+                RemoteOutput::Settled(messages) => RemoteOutput::Settled(messages.into_iter().map(error).collect()),
+            }),
         })
     }
 
@@ -220,6 +315,24 @@ impl Worker {
         let system = config.system.as_str();
         match op {
             TicketOp::ResetOutboxes => Ok(TicketOutput::Outbox(Vec::new())),
+            TicketOp::RemoteOpen { home, plan, link, title, owners, recover } => {
+                self.remote_open(config, &home, &plan, &link, &title, owners, recover)
+            }
+            TicketOp::RemoteSteerers(conversation) => {
+                let value = self.call(
+                    config,
+                    "conversation_steerers",
+                    &Vars::new(system).with("conversation", Some(&conversation)),
+                )?;
+                let steerers = config.operation("conversation_steerers").expect("called").steerers(&value);
+                Ok(TicketOutput::Remote(RemoteOutput::Steerers(steerers)))
+            }
+            TicketOp::RemotePoll { home, plan, whoami, owners } => {
+                self.remote_poll(config, &home, &plan, &whoami, &owners)
+            }
+            TicketOp::RemoteSettle { home, plan, item, outcome } => {
+                self.remote_settle(config, &home, &plan, &item, outcome)
+            }
             TicketOp::Whoami => {
                 let value = self.call(config, "whoami", &Vars::new(system))?;
                 tickets::Whoami::read(config.operation("whoami").expect("called"), &value).map(TicketOutput::Whoami)
@@ -367,6 +480,190 @@ impl Worker {
         Ok(TicketOutput::Outbox(messages))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn remote_open(
+        &mut self,
+        config: &TicketConfig,
+        home: &std::path::Path,
+        plan: &str,
+        link: &TicketLink,
+        title: &str,
+        owners: Vec<String>,
+        recover: bool,
+    ) -> Result<TicketOutput, String> {
+        let nonce = uuid::Uuid::new_v4().to_string();
+        let vars = Vars::new(&config.system)
+            .ticket(link)
+            .with("title", Some(title))
+            .with("nonce", Some(&nonce))
+            .typed("owners", Value::from(owners));
+        let value = self.call(config, "conversation_open", &vars)?;
+        let conversation = config.operation("conversation_open").expect("called").conversation(&value)?;
+        let mut state = RemoteState::load(home, plan).map_err(|e| e.to_string())?;
+        let mut messages = Vec::new();
+        if recover && !state.delivering.is_empty() {
+            // Recorded intent without a recorded outcome: the paste may or may not have
+            // happened, so it is never repeated. The writes go to the conversation it came from.
+            let from = state.conversation.clone().unwrap_or_else(|| conversation.id.clone());
+            for id in std::mem::take(&mut state.delivering).into_keys() {
+                self.queue_status(config, home, plan, &mut state, &from, &id, RESTARTED_TEXT, true)?;
+                state.remember(id);
+                messages.push(format!("A remote message {RESTARTED_TEXT}"));
+            }
+        }
+        if state.conversation.as_deref() != Some(conversation.id.as_str()) {
+            // A new conversation starts at the server's newest revision: nothing written
+            // before remote was on, or before a lost sidecar, is ever delivered.
+            state.conversation = Some(conversation.id.clone());
+            state.cursor = conversation.cursor.clone();
+            state.retries.clear();
+        } else if state.cursor.is_none() {
+            state.cursor = conversation.cursor.clone();
+        }
+        state.save(home, plan).map_err(|e| e.to_string())?;
+        if let TicketOutput::Outbox(mut drained) = self.drain_outbox(config, home, plan)? {
+            messages.append(&mut drained);
+        }
+        Ok(TicketOutput::Remote(RemoteOutput::Opened { conversation, messages }))
+    }
+
+    fn remote_poll(
+        &mut self,
+        config: &TicketConfig,
+        home: &std::path::Path,
+        plan: &str,
+        whoami: &tickets::Whoami,
+        owners: &[String],
+    ) -> Result<TicketOutput, String> {
+        let mut state = RemoteState::load(home, plan).map_err(|e| e.to_string())?;
+        let conversation = state.conversation.clone().ok_or("the plan's conversation is not open")?;
+        let vars = Vars::new(&config.system)
+            .with("conversation", Some(&conversation))
+            .typed("after", state.cursor.clone().unwrap_or(Value::Null));
+        let value = match self.call(config, "conversation_read", &vars) {
+            Ok(value) => value,
+            Err(error) => {
+                return Ok(TicketOutput::Remote(RemoteOutput::PollFailed { error, throttled: self.throttled }));
+            }
+        };
+        let items = config.operation("conversation_read").expect("called").steering(&value, &conversation)?;
+        let handed = self.handed.entry((home.to_path_buf(), plan.to_string())).or_default();
+        while handed.front().is_some_and(|at| at.elapsed() >= Duration::from_secs(60)) {
+            handed.pop_front();
+        }
+        let (mut deliver, mut refused) = (Vec::new(), Vec::new());
+        // The cursor only moves over a settled prefix, so an item waiting its turn is read again.
+        let mut waiting = false;
+        for item in items {
+            if state.delivering.contains_key(&item.id) {
+                waiting = true;
+                continue;
+            }
+            let verdict = tickets::steering_verdict(
+                &item,
+                whoami,
+                owners,
+                &config.remote.human_kind,
+                state.cursor.as_ref(),
+                &state.seen,
+                &conversation,
+            );
+            match verdict {
+                Err(refusal) => {
+                    if !refusal.quiet() {
+                        state.remember(item.id.clone());
+                        refused.push((item.clone(), refusal.reason()));
+                    }
+                    if !waiting
+                        && let Some(seq) = &item.seq
+                        && tickets::seq_after(Some(seq), state.cursor.as_ref())
+                    {
+                        state.cursor = Some(seq.clone());
+                    }
+                }
+                Ok(()) if handed.len() >= DELIVERIES_PER_MINUTE => waiting = true,
+                Ok(()) => {
+                    handed.push_back(Instant::now());
+                    state.delivering.insert(item.id.clone(), atomics_core::store::now());
+                    deliver.push(item);
+                    waiting = true;
+                }
+            }
+        }
+        // Intent is durable before anything is pasted.
+        state.save(home, plan).map_err(|e| e.to_string())?;
+        Ok(TicketOutput::Remote(RemoteOutput::Polled { deliver, refused }))
+    }
+
+    fn remote_settle(
+        &mut self,
+        config: &TicketConfig,
+        home: &std::path::Path,
+        plan: &str,
+        item: &SteeringItem,
+        outcome: RemoteOutcome,
+    ) -> Result<TicketOutput, String> {
+        let mut state = RemoteState::load(home, plan).map_err(|e| e.to_string())?;
+        let conversation = item.conversation.clone();
+        state.delivering.remove(&item.id);
+        let (ack, status) = match &outcome {
+            RemoteOutcome::Delivered => (true, Some(DELIVERED_TEXT.to_string())),
+            RemoteOutcome::Held => (true, Some(HELD_TEXT.to_string())),
+            RemoteOutcome::Command(reply) => (true, Some(reply.clone())),
+            RemoteOutcome::Deferred => (false, None),
+            RemoteOutcome::Unavailable => {
+                let tries = state.retries.entry(item.id.clone()).or_default();
+                *tries += 1;
+                if *tries >= DELIVERY_ATTEMPTS { (false, Some(UNDELIVERED_TEXT.to_string())) } else { (false, None) }
+            }
+        };
+        if let Some(status) = status {
+            self.queue_status(config, home, plan, &mut state, &conversation, &item.id, &status, ack)?;
+            state.retries.remove(&item.id);
+            state.remember(item.id.clone());
+            if let Some(seq) = &item.seq
+                && tickets::seq_after(Some(seq), state.cursor.as_ref())
+                && state.delivering.is_empty()
+            {
+                state.cursor = Some(seq.clone());
+            }
+        }
+        state.save(home, plan).map_err(|e| e.to_string())?;
+        let TicketOutput::Outbox(messages) = self.drain_outbox(config, home, plan)? else { unreachable!() };
+        Ok(TicketOutput::Remote(RemoteOutput::Settled(messages)))
+    }
+
+    /// Queue an optional acknowledgement and a status event about one steering item.
+    #[allow(clippy::too_many_arguments)]
+    fn queue_status(
+        &mut self,
+        config: &TicketConfig,
+        home: &std::path::Path,
+        plan: &str,
+        state: &mut RemoteState,
+        conversation: &str,
+        id: &str,
+        text: &str,
+        ack: bool,
+    ) -> Result<(), String> {
+        let remote = &config.remote;
+        let base = Vars::new(&config.system).with("conversation", Some(conversation));
+        if ack {
+            let vars = base.clone().typed("ids", Value::from(vec![id.to_string()]));
+            let write = PendingWrite::new("conversation_ack", uuid::Uuid::new_v4().to_string(), vars);
+            state.queue(home, plan, write).map_err(|e| e.to_string())?;
+        }
+        let activity = if text == HELD_TEXT { &remote.activity.input } else { &remote.activity.working };
+        let vars = base
+            .with("kind", Some(&remote.kinds.status))
+            .with("body", Some(text))
+            .with("activity", Some(activity))
+            .with("turn", Some(&format!("steering:{plan}:{id}")));
+        let write = PendingWrite::new("conversation_post", uuid::Uuid::new_v4().to_string(), vars);
+        state.queue(home, plan, write).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     fn cards(&mut self, config: &TicketConfig, name: &str, vars: &Vars) -> Result<TicketOutput, String> {
         let output = self.call(config, name, vars)?;
         let cards = config.operation(name).expect("called").cards(&output, &config.system)?;
@@ -386,6 +683,7 @@ impl Worker {
     /// Calls the tool behind a generic operation and returns what its result paths read from.
     fn call(&mut self, config: &TicketConfig, name: &str, vars: &Vars) -> Result<Value, String> {
         self.content_refused = false;
+        self.throttled = false;
         let operation = config.operation(name).ok_or_else(|| format!("operations.{name} is not configured"))?;
         let write = matches!(
             name,
@@ -450,6 +748,7 @@ impl Worker {
             let message = message.to_ascii_lowercase();
             message.contains("credential") || message.contains("text refused") || message.contains("content refused")
         });
+        self.throttled = matches!(err, McpError::Transport { retryable: true, .. });
         if matches!(err, McpError::SignInRequired(_)) {
             // No backoff: once the user signs in, the next job reconnects with the new tokens.
             self.client = None;
@@ -463,14 +762,14 @@ impl Worker {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::json;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
     use std::sync::mpsc::Receiver;
 
-    fn remote_profile(prefix: &str, path: &std::path::Path) -> TicketConfig {
+    pub(crate) fn remote_profile(prefix: &str, path: &std::path::Path) -> TicketConfig {
         let mut config = crate::mcp_client::tests::example_profile("meaning-example", path);
         let whoami = match prefix {
             "card_" => {
@@ -495,6 +794,239 @@ mod tests {
             .unwrap(),
         );
         config
+    }
+
+    /// The X1 profile with every conversation operation mapped in the dialect of `prefix`
+    /// ("", "card_" or "issue_"), and `[tickets.remote]` on.
+    pub(crate) fn conversation_profile(prefix: &str, path: &std::path::Path) -> TicketConfig {
+        let mut config = remote_profile(prefix, path);
+        let (open, read, steerers) = match prefix {
+            "card_" => (
+                json!({"id":"conversation.ref", "cursor":"conversation.head", "steerers":"conversation.people", "steerer_id":"ref", "steerer_name":"name"}),
+                (
+                    "entries",
+                    json!({"id":"ref", "seq":"rev", "author_id":"by.ref", "author_kind":"by.type", "author":"by.name", "text":"body", "at":"when"}),
+                ),
+                json!({"steerers":"conversation.people", "steerer_id":"ref", "steerer_name":"name"}),
+            ),
+            "issue_" => (
+                json!({"id":"id", "cursor":"cursor", "steerers":"steerers", "steerer_id":"id", "steerer_name":"name"}),
+                (
+                    "messages",
+                    json!({"id":"id", "seq":"seq", "author_id":"author_id", "author_kind":"author_kind", "author":"author", "text":"text", "at":"at"}),
+                ),
+                json!({"steerers":"steerers", "steerer_id":"id", "steerer_name":"name"}),
+            ),
+            _ => (
+                json!({"id":"conversationId", "cursor":"latestRevision", "steerers":"steeringUsers", "steerer_id":"userId", "steerer_name":"displayName"}),
+                (
+                    "items",
+                    json!({"id":"steeringId", "seq":"revision", "author_id":"authorUserId", "author_kind":"authorKind", "author":"authorDisplayName", "text":"text", "at":"createdAtUtc"}),
+                ),
+                json!({"steerers":"steeringUsers", "steerer_id":"userId", "steerer_name":"displayName"}),
+            ),
+        };
+        let op = |value: Value| serde_json::from_value(value).unwrap();
+        config.operations.conversation_open = Some(op(json!({
+            "tool":format!("{prefix}conversation_open"),
+            "arguments":{"itemType":"tickets.ticket", "itemId":"{uuid}", "title":"{title}", "owners":"{owners}"}, "result":open
+        })));
+        config.operations.conversation_post = Some(op(json!({
+            "tool":format!("{prefix}conversation_post"),
+            "arguments":{"conversation":"{conversation}", "eventId":"{nonce}", "sequence":"{seq}", "kind":"{kind}",
+                "text":"{body}", "activity":"{activity}", "turn":"{turn}"}
+        })));
+        config.operations.conversation_read = Some(op(json!({
+            "tool":format!("{prefix}conversation_read"),
+            "arguments":{"conversation":"{conversation}", "after":"{after}", "take":25}, "items":read.0, "result":read.1
+        })));
+        config.operations.conversation_steerers = Some(op(json!({
+            "tool":format!("{prefix}conversation_steerers"), "arguments":{"conversation":"{conversation}"}, "result":steerers
+        })));
+        config.remote.enabled = true;
+        config.remote.kinds.status = "Status".into();
+        config.remote.activity.working = "Working".into();
+        config.remote.activity.input = "WaitingForInput".into();
+        config
+    }
+
+    fn set(path: &std::path::Path, edit: impl FnOnce(&mut Value)) {
+        let mut state: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        edit(&mut state);
+        std::fs::write(path, state.to_string()).unwrap();
+    }
+
+    fn server(path: &std::path::Path) -> Value {
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn remote_conversation_opens_reads_after_a_revision_acks_and_lists_steerers_in_all_three_dialects() {
+        for prefix in ["", "card_", "issue_"] {
+            let dir = crate::test_support::tempdir().unwrap();
+            let home = dir.path();
+            let path = crate::mcp_client::tests::fake_state(home, json!([]));
+            let item = |id: &str, revision: u64, author: &str, kind: &str| json!({"id":id, "revision":revision, "author_id":author, "author_kind":kind, "author":"Example human", "text":"status?", "at":"now"});
+            set(&path, |state| {
+                state["steering"] = json!([item("old", 1, "human-1", "Human")]);
+                state["refuse_steerers"] = json!(["human-2"]);
+            });
+            let config = conversation_profile(prefix, &path);
+            let mut worker = Worker::default();
+            worker.prepare(&config);
+            let link = TicketLink {
+                id: "00000000-0000-4000-8000-000000000001".into(),
+                key: Some("DEMO-1".into()),
+                ..Default::default()
+            };
+            let open = TicketOp::RemoteOpen {
+                home: home.into(),
+                plan: "plan".into(),
+                link,
+                title: "Goal".into(),
+                owners: vec!["human-1".into(), "human-2".into()],
+                recover: true,
+            };
+            let TicketOutput::Remote(RemoteOutput::Opened { conversation, messages }) =
+                worker.run(&config, open).unwrap()
+            else {
+                panic!("{prefix}: open")
+            };
+            assert!(messages.is_empty());
+            assert_eq!(conversation.id, "conversation-1", "{prefix}");
+            assert_eq!(conversation.cursor, Some(json!(1)), "{prefix}");
+            assert_eq!(conversation.steerers, vec![Steerer { id: "human-1".into(), name: "Example human 1".into() }]);
+            let opened = server(&path)["opens"][0].clone();
+            assert_eq!(opened["owners"], json!(["human-1", "human-2"]), "typed owners");
+            assert_eq!(opened["itemId"], "00000000-0000-4000-8000-000000000001");
+            let state = RemoteState::load(home, "plan").unwrap();
+            assert_eq!(state.cursor, Some(json!(1)), "starts at the server's newest revision");
+            set(&path, |state| {
+                state["steering"].as_array_mut().unwrap().extend([
+                    item("s-2", 2, "human-1", "Human"),
+                    item("s-3", 3, "agent-9", "Agent"),
+                    item("s-4", 4, "human-1", "human"),
+                ]);
+            });
+            let whoami = tickets::Whoami { id: "agent-1".into(), kind: "personalAgent".into(), ..Default::default() };
+            let poll = || TicketOp::RemotePoll {
+                home: home.into(),
+                plan: "plan".into(),
+                whoami: Box::new(whoami.clone()),
+                owners: vec!["human-1".into()],
+            };
+            let TicketOutput::Remote(RemoteOutput::Polled { deliver, refused }) = worker.run(&config, poll()).unwrap()
+            else {
+                panic!("{prefix}: poll")
+            };
+            assert_eq!(deliver.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(), ["s-2", "s-4"], "{prefix}");
+            assert_eq!(deliver[0].author.as_deref(), Some("Example human"));
+            assert_eq!(refused.len(), 1);
+            assert!(refused[0].1.contains("not a human"), "{}", refused[0].1);
+            assert_eq!(server(&path)["calls"].as_array().unwrap().last().unwrap()["arguments"]["after"], json!(1));
+            let state = RemoteState::load(home, "plan").unwrap();
+            assert!(state.delivering.contains_key("s-2") && state.delivering.contains_key("s-4"), "intent first");
+            // Items in flight are never handed out twice.
+            let TicketOutput::Remote(RemoteOutput::Polled { deliver: again, .. }) =
+                worker.run(&config, poll()).unwrap()
+            else {
+                panic!("poll")
+            };
+            assert!(again.is_empty());
+            for item in deliver {
+                let settle = TicketOp::RemoteSettle {
+                    home: home.into(),
+                    plan: "plan".into(),
+                    item: Box::new(item),
+                    outcome: RemoteOutcome::Delivered,
+                };
+                worker.run(&config, settle).unwrap();
+            }
+            let fake = server(&path);
+            let acks: Vec<_> = fake["acks"].as_array().unwrap().iter().map(|ack| ack["ids"].clone()).collect();
+            assert_eq!(acks, [json!(["s-2"]), json!(["s-4"])], "{prefix}");
+            let posts = fake["posts"].as_array().unwrap();
+            assert_eq!(posts.len(), 2);
+            assert!(posts.iter().all(|post| post["text"] == DELIVERED_TEXT && post["kind"] == "Status"));
+            let state = RemoteState::load(home, "plan").unwrap();
+            assert!(state.delivering.is_empty());
+            assert_eq!(state.cursor, Some(json!(4)));
+            let TicketOutput::Remote(RemoteOutput::Polled { deliver, refused }) = worker.run(&config, poll()).unwrap()
+            else {
+                panic!("poll")
+            };
+            assert!(deliver.is_empty() && refused.is_empty());
+            assert_eq!(server(&path)["calls"].as_array().unwrap().last().unwrap()["arguments"]["after"], json!(4));
+            let TicketOutput::Remote(RemoteOutput::Steerers(steerers)) =
+                worker.run(&config, TicketOp::RemoteSteerers("conversation-1".into())).unwrap()
+            else {
+                panic!("steerers")
+            };
+            assert_eq!(steerers.len(), 1, "{prefix}");
+            assert_eq!(steerers[0].id, "human-1");
+        }
+    }
+
+    #[test]
+    fn remote_unavailable_chief_retries_three_polls_and_caps_deliveries_per_minute() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let home = dir.path();
+        let path = crate::mcp_client::tests::fake_state(home, json!([]));
+        set(&path, |state| state["cursor"] = json!(0));
+        let config = conversation_profile("", &path);
+        let mut worker = Worker::default();
+        worker.prepare(&config);
+        let link = TicketLink { id: "00000000-0000-4000-8000-000000000001".into(), ..Default::default() };
+        let open = TicketOp::RemoteOpen {
+            home: home.into(),
+            plan: "plan".into(),
+            link,
+            title: "Goal".into(),
+            owners: vec!["human-1".into()],
+            recover: false,
+        };
+        worker.run(&config, open).unwrap();
+        set(&path, |state| {
+            state["steering"] = json!((1..=12).map(|n| json!({"id":format!("s-{n}"), "revision":n, "author_id":"human-1", "author_kind":"Human", "text":"hi"})).collect::<Vec<_>>());
+        });
+        let whoami = tickets::Whoami { id: "agent-1".into(), kind: "personalAgent".into(), ..Default::default() };
+        let poll = |worker: &mut Worker| {
+            let op = TicketOp::RemotePoll {
+                home: home.into(),
+                plan: "plan".into(),
+                whoami: Box::new(whoami.clone()),
+                owners: vec!["human-1".into()],
+            };
+            let TicketOutput::Remote(RemoteOutput::Polled { deliver, .. }) = worker.run(&config, op).unwrap() else {
+                panic!("poll")
+            };
+            deliver
+        };
+        let first = poll(&mut worker);
+        assert_eq!(first.len(), DELIVERIES_PER_MINUTE, "the rest wait in order");
+        for (n, item) in first.into_iter().enumerate() {
+            let outcome = if n == 0 { RemoteOutcome::Unavailable } else { RemoteOutcome::Deferred };
+            let op = TicketOp::RemoteSettle { home: home.into(), plan: "plan".into(), item: Box::new(item), outcome };
+            worker.run(&config, op).unwrap();
+        }
+        assert!(poll(&mut worker).is_empty(), "the minute's budget is spent");
+        worker.handed.clear();
+        for attempt in 2..=DELIVERY_ATTEMPTS {
+            let items = poll(&mut worker);
+            assert_eq!(items[0].id, "s-1", "attempt {attempt}");
+            worker.handed.clear();
+            for (n, item) in items.into_iter().enumerate() {
+                let outcome = if n == 0 { RemoteOutcome::Unavailable } else { RemoteOutcome::Deferred };
+                let op =
+                    TicketOp::RemoteSettle { home: home.into(), plan: "plan".into(), item: Box::new(item), outcome };
+                worker.run(&config, op).unwrap();
+            }
+        }
+        let fake = server(&path);
+        assert!(fake["acks"].as_array().is_none_or(|acks| acks.is_empty()), "never acknowledged");
+        assert_eq!(fake["posts"].as_array().unwrap().len(), 1);
+        assert_eq!(fake["posts"][0]["text"], UNDELIVERED_TEXT);
+        assert_eq!(poll(&mut worker)[0].id, "s-2", "the given-up item is not offered again");
     }
 
     #[test]
