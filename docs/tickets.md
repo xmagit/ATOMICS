@@ -756,7 +756,7 @@ and a profile that maps no conversation operations behaves as before:
 ```toml
 [tickets.remote]
 enabled = false                    # needs whoami and every conversation_* operation
-owners = []                        # human user ids that may steer. Empty: whoami's owner_id, only when
+owners = []                        # human user ids that may steer and approve. Empty: whoami's owner_id, only when
                                    # whoami's kind is personal_agent_kind; otherwise remote stays off.
 human_kind = "human"               # the author kind meaning a human, compared ignoring ASCII case
 personal_agent_kind = "personalAgent"
@@ -823,6 +823,37 @@ its `seq` is above the cursor and its id was not seen before, and it came from t
 An id still in `delivering` when ATOMICS starts is never pasted again: ATOMICS acknowledges it, posts "may
 not have reached the chief because ATOMICS restarted; send it again if needed", and shows a toast.
 A message whose first line is `/approve …` is a command and never reaches the chief.
+
+**Approval contract.** When an unapproved plan is set or its approval scope changes, ATOMICS posts one
+`plan` event per task, followed by an `approval` event. Each task event starts with `t1 · Title`, then
+`agent codex · repo ATOMICS · args …`, then the opening of its brief, at most 2000 characters total.
+The Approval event says `Plan PLAN-ID needs approval: 6 tasks. Digest 3f9a1c2e4b7d.` and its last line is
+exactly `/approve 3f9a1c2e4b7d`. Consumers can match that line with `^/approve [0-9a-f]{12}$` and read the
+Plan events between successive Approval events for the task list. Event kinds use the configured
+`kinds.plan` and `kinds.approval` values. The Approval event sets `activity.approval`, with turn
+`approval:<plan id>:<digest>`, so attention fires once per digest. Post bodies pass the trace credential
+cleaner, including OAuth secrets, before being bounded to 2000 characters and saved to the outbox.
+
+The digest is the first 12 lowercase hex characters of SHA-256 over compact, canonical UTF-8 JSON
+with sorted object keys: `{"goal": …, "tasks": […]}`. Tasks retain plan order and omit the final review
+task (`id = "review"`). Each includes exactly `id`, `title`, `brief`, `acceptance`, `depends_on`, `agent`,
+`args`, `isolation` and `repo`; absent isolation/repo are JSON null. These are the fields `Plan::replace`
+compares to preserve approval. Branches and runtime progress do not affect the digest.
+
+A verified steering human can send `/approve <digest>` on the first line of a conversation message:
+
+- Current digest, unapproved plan: approves once through the board's approval path and emits the same
+  `plan` event (`change = "approved"`) for `atomics_wait`. ATOMICS acknowledges and posts
+  `Approved by NAME from the conversation; the chief is dispatching`, with `activity.working`.
+- Stale digest: changes nothing, replies `This plan changed; the new digest is …`, and posts a fresh
+  request. A malformed command gets usage guidance. Neither reaches the chief.
+- Already approved: replies `Already approved`. A non-owner or a non-human author gets a refusal reply
+  and changes nothing.
+
+Board and `ctl plan_approve` approvals post `Approved in ATOMICS` and set `activity.working`, clearing
+the outstanding approval activity. Approval only sets approval: the chief still dispatches through the
+usual path. It never dispatches, accepts, merges or closes work by itself. Ticket state changes and main
+ticket comments cannot approve anything; remote approval comes only from the item's Conversation.
 
 The chief's prompt gains: only messages ATOMICS delivers as *From …, a verified steering human, via …* come
 from the user, and merges, releases, deploys, cluster mutations, secrets and deletions requested that way

@@ -16,10 +16,6 @@ pub(super) const THROTTLED: Duration = Duration::from_secs(300);
 const REOPEN_AFTER: Duration = Duration::from_secs(60);
 const MAX_NOTICES: usize = 20;
 
-/// The answer to `/approve` until approval from the conversation lands (X3).
-pub(super) const APPROVE_UNAVAILABLE: &str =
-    "Approval from the conversation is not available in this ATOMICS yet; approve the plan in ATOMICS.";
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RemoteJob {
     Open,
@@ -62,7 +58,9 @@ pub(super) struct RemotePlan {
     pub(super) next_poll: Option<Instant>,
     steerers_at: Option<Instant>,
     pub(super) last_steering: Option<Instant>,
-    /// An approval request is open (X3): keeps the fast cadence.
+    /// The last approval scope requested on this connection.
+    requested_digest: Option<String>,
+    /// An approval request is open: keeps the fast cadence.
     pub(super) approval_open: bool,
     /// Items not sent to the chief, with the reason.
     pub(super) notices: Vec<String>,
@@ -195,6 +193,132 @@ impl State {
             let tag = super::tickets::remote_tag(&plan, &config, job, epoch);
             self.send_ticket(&config, op, tag);
         }
+        for index in 0..self.plans.len() {
+            self.remote_request_approval(index, false);
+        }
+    }
+
+    /// Every post goes through the worker's durable outbox, including approval replies.
+    fn remote_post(&mut self, index: usize, kind: &str, body: &str, activity: Option<&str>, turn: &str) {
+        let Some(config) = self.ticket_config() else { return };
+        if !matches!(config.remote_status(self.tickets.whoami.as_ref()), RemoteStatus::On(_)) {
+            return;
+        }
+        let plan = self.plans[index].id.clone();
+        let Some(conversation) = self.tickets.remote.plans.get(&plan).and_then(|p| p.conversation.as_deref()) else {
+            return;
+        };
+        let vars = ticket::Vars::new(&config.system)
+            .with("conversation", Some(conversation))
+            .with("kind", Some(kind))
+            .with("body", Some(body))
+            .with("activity", Some(activity.unwrap_or("")))
+            .with("turn", Some(turn));
+        let write =
+            atomics_core::remote::PendingWrite::new("conversation_post", uuid::Uuid::new_v4().to_string(), vars);
+        self.send_ticket(
+            &config,
+            TicketOp::Outbox { home: paths::atomics_home(), plan: plan.clone(), write: Some(Box::new(write)) },
+            super::tickets::outbox_tag(&plan, &config),
+        );
+    }
+
+    /// Called on plan_set, brief edits and opening/reopening remote. The digest also
+    /// catches approval resets made before the conversation finished opening.
+    pub(super) fn remote_request_approval(&mut self, index: usize, force: bool) {
+        let plan = &self.plans[index];
+        if !plan.is_open() || plan.approved {
+            return;
+        }
+        let Some(entry) = self.tickets.remote.plans.get_mut(&plan.id) else { return };
+        if entry.conversation.is_none() {
+            return;
+        }
+        let digest = plan.digest();
+        if !force && entry.requested_digest.as_ref() == Some(&digest) {
+            return;
+        }
+        entry.requested_digest = Some(digest.clone());
+        entry.approval_open = true;
+        entry.next_poll = None;
+        let turn = format!("approval:{}:{digest}", plan.id);
+        let bodies: Vec<_> = plan
+            .tasks
+            .iter()
+            .map(|task| {
+                // The worker redacts before bounding this to the server's 2000 characters.
+                format!(
+                    "{} · {}\nagent {} · repo {} · args {}\n{}",
+                    task.id,
+                    task.title,
+                    task.agent,
+                    task.repo.as_deref().unwrap_or(""),
+                    task.args.join(" "),
+                    task.brief
+                )
+            })
+            .collect();
+        let approval =
+            format!("Plan {} needs approval: {} tasks. Digest {digest}.\n/approve {digest}", plan.id, plan.tasks.len());
+        let Some(config) = self.ticket_config() else { return };
+        for body in bodies {
+            self.remote_post(index, &config.remote.kinds.plan, &body, None, &turn);
+        }
+        self.remote_post(
+            index,
+            &config.remote.kinds.approval,
+            &approval,
+            Some(&config.remote.activity.approval),
+            &turn,
+        );
+    }
+
+    pub(super) fn remote_approved(&mut self, index: usize, author: Option<&str>) {
+        if let Some(entry) = self.tickets.remote.plans.get_mut(&self.plans[index].id) {
+            entry.approval_open = false;
+            entry.requested_digest = None;
+        }
+        let Some(config) = self.ticket_config() else { return };
+        let body = author
+            .map(|name| format!("Approved by {name} from the conversation; the chief is dispatching"))
+            .unwrap_or_else(|| "Approved in ATOMICS".into());
+        // Working clears the outstanding approval activity, including for board and ctl approvals.
+        self.remote_post(
+            index,
+            &config.remote.kinds.status,
+            &body,
+            Some(&config.remote.activity.working),
+            &format!("approved:{}:{}", self.plans[index].id, self.plans[index].digest()),
+        );
+    }
+
+    fn remote_approve(&mut self, index: usize, item: &SteeringItem, config: &TicketConfig) {
+        let command = ticket::steering_command(&item.text).expect("approval command");
+        let digest = self.plans[index].digest();
+        let supplied = command.strip_prefix("/approve ").unwrap_or("").trim();
+        let turn = format!("steering:{}:{}", self.plans[index].id, item.id);
+        if supplied.len() != 12 || !supplied.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+            self.remote_post(
+                index,
+                &config.remote.kinds.status,
+                "Use /approve followed by the plan's 12 character digest.",
+                None,
+                &turn,
+            );
+        } else if supplied != digest {
+            self.remote_post(
+                index,
+                &config.remote.kinds.status,
+                &format!("This plan changed; the new digest is {digest}"),
+                None,
+                &turn,
+            );
+            self.remote_request_approval(index, true);
+        } else if self.plans[index].approved {
+            self.remote_post(index, &config.remote.kinds.status, "Already approved", None, &turn);
+        } else {
+            self.approve_plan_by(index, item.author.as_deref().or(item.author_id.as_deref()));
+        }
     }
 
     pub(super) fn finish_remote(
@@ -231,6 +355,9 @@ impl State {
                                 .cloned()
                                 .collect()
                         };
+                        if entry.conversation.as_ref() != Some(&conversation.id) {
+                            entry.requested_digest = None;
+                        }
                         entry.conversation = Some(conversation.id);
                         self.tickets.remote.recovered.insert(plan.clone());
                         let entry = self.tickets.remote.plans.get_mut(&plan).expect("current");
@@ -246,6 +373,9 @@ impl State {
                         }
                         for message in messages {
                             self.toast(message);
+                        }
+                        if let Some(index) = self.plans.iter().position(|p| p.id == plan) {
+                            self.remote_request_approval(index, false);
                         }
                         // Register the sidecar so its writes are retried.
                         let home = paths::atomics_home();
@@ -273,6 +403,21 @@ impl State {
                     Ok(RemoteOutput::Polled { deliver, refused }) => {
                         if current {
                             for (item, reason) in refused {
+                                // Rejected commands get a reply in this plan's conversation; they never
+                                // enter the approval handler or the chief's delivery path.
+                                if ticket::steering_command(&item.text).is_some()
+                                    && self.tickets.remote.plans[&plan].conversation.as_deref()
+                                        == Some(&item.conversation)
+                                    && let Some(index) = self.plans.iter().position(|p| p.id == plan)
+                                {
+                                    self.remote_post(
+                                        index,
+                                        &config.remote.kinds.status,
+                                        &format!("Approval refused: {reason}"),
+                                        None,
+                                        &format!("refused:{plan}:{}", item.id),
+                                    );
+                                }
                                 let author = item.author.or(item.author_id).unwrap_or_else(|| "someone".into());
                                 let notice = format!("Not sent to the chief: a message from {author}: {reason}");
                                 let entry = self.tickets.remote.plans.get_mut(&plan).expect("current");
@@ -336,14 +481,16 @@ impl State {
     /// as never tried, which clears its recorded intent without pasting it.
     fn remote_deliver(&mut self, plan: &str, config: &Arc<TicketConfig>, items: Vec<SteeringItem>, current: bool) {
         let label = self.plans.iter().find(|p| p.id == plan).and_then(|p| p.ticket.clone());
-        let mut unavailable = !current || label.is_none();
+        let mut unavailable = !current || label.is_none() || !self.plans.iter().any(|p| p.id == plan && p.is_open());
         let label = label.map(|link| link.label().to_string()).unwrap_or_default();
         for item in items {
             let outcome = if unavailable {
                 RemoteOutcome::Deferred
             } else if ticket::steering_command(&item.text).is_some() {
-                // Commands go to their handler, never to the chief.
-                RemoteOutcome::Command(APPROVE_UNAVAILABLE.into())
+                // Commands go to their handler, never to the chief (even if the chief is unavailable).
+                let index = self.plans.iter().position(|p| p.id == plan).expect("current plan");
+                self.remote_approve(index, &item, config);
+                RemoteOutcome::Command
             } else {
                 let text = ticket::steering_message(&item, &config.system, &label);
                 match self.chief_delivery(&text) {
@@ -414,6 +561,26 @@ mod tests {
             app.runtime.ticket_results();
             std::thread::sleep(Duration::from_millis(5));
         }
+        // Outbox posts are uncounted because the worker also reports background retries.
+        // A counted read after them is a FIFO barrier, so assertions observe their results.
+        if let Some(config) = app.runtime.ticket_config()
+            && let Some((plan, conversation)) =
+                app.runtime.tickets.remote.plans.iter().find_map(|(id, p)| Some((id.clone(), p.conversation.clone()?)))
+        {
+            let tag = super::super::tickets::remote_tag(
+                &plan,
+                &config,
+                RemoteJob::Steerers,
+                app.runtime.tickets.remote.epoch,
+            );
+            app.runtime.send_ticket(&config, TicketOp::RemoteSteerers(conversation), tag);
+            let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(30));
+            while app.runtime.tickets.pending > 0 {
+                app.runtime.ticket_results();
+                assert!(Instant::now() < deadline, "outbox barrier did not finish");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
     }
 
     /// A chief whose messages queue in the hub, a plan on the fake ticket, and remote on.
@@ -430,6 +597,7 @@ mod tests {
         app.runtime.plans.push(Plan {
             id: "remote-plan".into(),
             goal: "Remote goal".into(),
+            approved: true,
             ticket: Some(ticket::TicketLink {
                 system: config.system.clone(),
                 id: TICKET.into(),
@@ -442,10 +610,12 @@ mod tests {
         app.runtime.apply_ticket_config();
         settle(app, 3);
         assert_eq!(
-            app.runtime.tickets.remote.plans["remote-plan"].conversation.as_deref(),
+            app.runtime.tickets.remote.plans.get("remote-plan").and_then(|p| p.conversation.as_deref()),
             Some("conversation-1"),
-            "{:?}",
-            app.runtime.toast
+            "toast: {:?}; identity: {:?}; calls: {:?}",
+            app.runtime.toast,
+            app.runtime.tickets.whoami,
+            fake(&path)
         );
         path
     }
@@ -470,6 +640,205 @@ mod tests {
 
     fn acks(path: &Path) -> Vec<Value> {
         fake(path)["acks"].as_array().into_iter().flatten().map(|a| a["ids"].clone()).collect()
+    }
+
+    fn approval_app(app: &mut Desktop<'_>, dir: &Path) -> (PathBuf, usize) {
+        let path = remote_app(app, dir, |_| {});
+        let index = app.runtime.plans.iter().position(|p| p.id == "remote-plan").unwrap();
+        let response = super::super::tests::request(
+            app,
+            json!({
+                "cmd":"plan_set", "plan":"remote-plan", "goal":"Approval goal",
+                "tasks":[{"id":"t1", "title":"Implement", "brief":"Opening\nDetails", "agent":"codex",
+                    "repo":"ATOMICS", "args":["--fast"], "acceptance":["passes"]}]
+            }),
+        );
+        assert!(response.ok, "{:?}", response);
+        settle(app, 2);
+        (path, index)
+    }
+
+    fn approval_events(app: &Desktop<'_>) -> Vec<Value> {
+        app.runtime.events.iter().filter(|event| event.change == Some("approved")).map(StatusEvent::to_json).collect()
+    }
+
+    #[test]
+    fn approval_request_contract_and_scope_updates() {
+        with_app("app::remote::tests::approval_request_contract_and_scope_updates", |app, _| {
+            let dir = crate::test_support::tempdir().unwrap();
+            let (path, index) = approval_app(app, dir.path());
+            let check = |app: &Desktop<'_>, path: &Path| {
+                let state = fake(path);
+                let posts = state["posts"].as_array().unwrap();
+                let request = posts.last().unwrap();
+                let digest = app.runtime.plans[index].digest();
+                assert_eq!(request["kind"], "approval");
+                let text = request["text"].as_str().unwrap();
+                let last = text.lines().last().unwrap();
+                assert_eq!(last, format!("/approve {digest}"));
+                assert_eq!(last.len(), 21);
+                assert!(last[9..].bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+                assert_eq!(request["activity"], "approval");
+                assert_eq!(request["turn"], format!("approval:remote-plan:{digest}"));
+                let tasks = &app.runtime.plans[index].tasks;
+                let task_posts = &posts[posts.len() - tasks.len() - 1..posts.len() - 1];
+                for (post, task) in task_posts.iter().zip(tasks) {
+                    assert_eq!(post["kind"], "plan");
+                    let text = post["text"].as_str().unwrap();
+                    assert!(text.starts_with(&format!("{} · {}\nagent {} · repo ", task.id, task.title, task.agent)));
+                    assert!(text.chars().count() <= 2000);
+                }
+                assert!(app.runtime.tickets.remote.plans["remote-plan"].approval_open);
+            };
+            check(app, &path);
+            assert!(posts(&path)[0].starts_with("t1 · Implement\nagent codex · repo ATOMICS · args --fast\nOpening"));
+            let before = posts(&path).len();
+            settle(app, 3);
+            assert_eq!(posts(&path).len(), before, "one request for an unchanged scope");
+            let old = app.runtime.plans[index].digest();
+            app.runtime.edit_task_brief(index, "t1", "é".repeat(4000));
+            settle(app, 2);
+            assert_ne!(app.runtime.plans[index].digest(), old);
+            check(app, &path);
+            assert_eq!(posts(&path).len(), before * 2);
+            app.runtime.approve_plan(index);
+            settle(app, 1);
+            let response = super::super::tests::request(
+                app,
+                json!({
+                    "cmd":"plan_set", "plan":"remote-plan", "goal":"Changed after approval",
+                    "tasks":[{"id":"t1", "title":"Implement", "brief":"changed", "agent":"codex"}]
+                }),
+            );
+            assert!(response.ok);
+            assert!(!app.runtime.plans[index].approved);
+            settle(app, 2);
+            check(app, &path);
+        });
+    }
+
+    #[test]
+    fn approval_from_steering_human_is_once_and_matches_board_event() {
+        with_app("app::remote::tests::approval_from_steering_human_is_once_and_matches_board_event", |app, _| {
+            let dir = crate::test_support::tempdir().unwrap();
+            let (path, index) = approval_app(app, dir.path());
+            let text = format!("/approve {}\nThanks", app.runtime.plans[index].digest());
+            set(&path, |state| {
+                state["steering"].as_array_mut().unwrap().extend([
+                    steering("approve-2", 2, "human-1", "Human", &text),
+                    steering("approve-3", 3, "human-1", "human", &text),
+                ]);
+            });
+            // Approval commands work even when no chief can receive ordinary steering.
+            app.runtime.sessions.clear();
+            poll_now(app);
+            assert!(app.runtime.plans[index].approved);
+            let events = approval_events(app);
+            assert_eq!(events.len(), 1);
+            assert!(sent(app).is_empty());
+            assert!(app.runtime.sessions.is_empty(), "approval does not start or dispatch an agent");
+            assert!(
+                app.runtime.plans[index].tasks.iter().all(|t| t.status == TaskStatus::Planned && t.session.is_none())
+            );
+            assert_eq!(acks(&path), [json!(["approve-2"]), json!(["approve-3"])]);
+            assert!(
+                posts(&path)
+                    .iter()
+                    .any(|p| p == "Approved by human-1 name from the conversation; the chief is dispatching")
+            );
+            assert_eq!(posts(&path).last().unwrap(), "Already approved");
+            let state = fake(&path);
+            let confirmed = state["posts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["text"].as_str().unwrap().starts_with("Approved by "))
+                .unwrap();
+            assert_eq!(confirmed["activity"], "Working");
+            assert!(!app.runtime.tickets.remote.plans["remote-plan"].approval_open);
+            poll_now(app);
+            assert_eq!(approval_events(app).len(), 1);
+            assert_eq!(acks(&path).len(), 2);
+            // The exact same plan, approved through the board's method, emits the same event fields.
+            app.runtime.events.clear();
+            app.runtime.plans[index].approved = false;
+            app.runtime.approve_plan(index);
+            let board = approval_events(app);
+            for key in ["session", "title", "status", "plan", "task", "change", "approval"] {
+                assert_eq!(events[0][key], board[0][key], "{key}");
+            }
+        });
+    }
+
+    #[test]
+    fn approval_stale_non_owner_agent_and_malformed_commands_reply_without_changes() {
+        with_app(
+            "app::remote::tests::approval_stale_non_owner_agent_and_malformed_commands_reply_without_changes",
+            |app, _| {
+                let dir = crate::test_support::tempdir().unwrap();
+                let (path, index) = approval_app(app, dir.path());
+                let before = app.runtime.plans[index].clone();
+                let text = format!("/approve {}", before.digest());
+                let stale = if before.digest() == "000000000000" { "111111111111" } else { "000000000000" };
+                set(&path, |state| {
+                    state["steering"].as_array_mut().unwrap().extend([
+                        steering("reject-2", 2, "human-2", "Human", &text),
+                        steering("reject-3", 3, "human-1", "Agent", &text),
+                        steering("stale-4", 4, "human-1", "Human", &format!("/approve {stale}")),
+                        steering("bad-5", 5, "human-1", "Human", "/approve"),
+                    ]);
+                });
+                poll_now(app);
+                assert_eq!(app.runtime.plans[index], before);
+                assert!(approval_events(app).is_empty());
+                assert!(sent(app).is_empty());
+                let replies = posts(&path);
+                assert!(
+                    replies.iter().any(|p| p.contains("Approval refused:") && p.contains("not on the steering list"))
+                );
+                assert!(replies.iter().any(|p| p.contains("Approval refused:") && p.contains("not a human")));
+                let stale_reply = replies
+                    .iter()
+                    .position(|p| p == &format!("This plan changed; the new digest is {}", before.digest()))
+                    .unwrap();
+                assert!(replies[stale_reply + 1].starts_with("t1 · Implement"));
+                assert!(replies[stale_reply + before.tasks.len() + 1].ends_with(&text));
+                assert!(replies.last().unwrap().starts_with("Use /approve"));
+                assert_eq!(acks(&path), [json!(["stale-4"]), json!(["bad-5"])]);
+                assert!(app.runtime.tickets.remote.plans["remote-plan"].approval_open);
+                let count = replies.len();
+                poll_now(app);
+                assert_eq!(posts(&path).len(), count, "rejected and stale messages are settled once");
+            },
+        );
+    }
+
+    #[test]
+    fn approval_board_and_ctl_clear_conversation_activity() {
+        with_app("app::remote::tests::approval_board_and_ctl_clear_conversation_activity", |app, _| {
+            let dir = crate::test_support::tempdir().unwrap();
+            let (path, index) = approval_app(app, dir.path());
+            for ctl in [false, true] {
+                app.runtime.plans[index].approved = false;
+                app.runtime.remote_request_approval(index, true);
+                settle(app, 1);
+                if ctl {
+                    assert!(super::super::tests::request(app, json!({"cmd":"plan_approve", "plan":"remote-plan"})).ok);
+                } else {
+                    app.runtime.approve_plan(index);
+                }
+                settle(app, 1);
+                let state = fake(&path);
+                let last = state["posts"].as_array().unwrap().last().unwrap();
+                assert_eq!(last["text"], "Approved in ATOMICS");
+                assert_eq!(last["activity"], "Working");
+                assert!(!app.runtime.tickets.remote.plans["remote-plan"].approval_open);
+                let count = posts(&path).len();
+                app.runtime.approve_plan(index);
+                settle(app, 1);
+                assert_eq!(posts(&path).len(), count, "repeated local approval posts nothing");
+            }
+        });
     }
 
     #[test]

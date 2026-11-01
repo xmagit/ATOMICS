@@ -116,7 +116,7 @@ pub enum RemoteOutcome {
     /// Not tried, because an earlier item of the same poll was unavailable.
     Deferred,
     /// An ATOMICS command, answered in the conversation and never delivered.
-    Command(String),
+    Command,
 }
 
 pub enum RemoteOutput {
@@ -339,7 +339,15 @@ impl Worker {
             }
             TicketOp::Outbox { home, plan, write } => {
                 let mut messages = Vec::new();
-                if let Some(write) = write {
+                if let Some(mut write) = write {
+                    // Resolve the same credentials as the trace before approval text reaches
+                    // either the durable outbox or the conversation.
+                    if write.op == "conversation_post"
+                        && let Some(body) = write.vars.get("body").and_then(Value::as_str)
+                    {
+                        let body: String = self.trace_cleaner(config)?.redacted(body).chars().take(2000).collect();
+                        write.vars = write.vars.with("body", Some(&body));
+                    }
                     let mut state = RemoteState::load(&home, &plan).map_err(|e| e.to_string())?;
                     if state.queue(&home, &plan, *write).map_err(|e| e.to_string())?.is_some() {
                         messages.push("Remote outbox full: dropped a tool block".into());
@@ -351,13 +359,7 @@ impl Worker {
                 messages.append(&mut drained);
                 Ok(TicketOutput::Outbox(messages))
             }
-            TicketOp::TraceCleaner => {
-                let secrets = match &self.oauth {
-                    Some(oauth) => oauth.secrets(&config.server).map_err(|err| err.to_string())?,
-                    None => Vec::new(),
-                };
-                Ok(TicketOutput::TraceCleaner(self.cleaner.clone().with(secrets)))
-            }
+            TicketOp::TraceCleaner => Ok(TicketOutput::TraceCleaner(self.trace_cleaner(config)?)),
             TicketOp::Search { query, semantic } => {
                 let name = if semantic { "semantic_search" } else { "search" };
                 self.cards(config, name, &Vars::new(system).query(&query))
@@ -426,6 +428,14 @@ impl Worker {
                 Ok(TicketOutput::Ticket(config.link_url(created)?))
             }
         }
+    }
+
+    fn trace_cleaner(&self, config: &TicketConfig) -> Result<tickets::Cleaner, String> {
+        let secrets = match &self.oauth {
+            Some(oauth) => oauth.secrets(&config.server).map_err(|err| err.to_string())?,
+            None => Vec::new(),
+        };
+        Ok(self.cleaner.clone().with(secrets))
     }
 
     /// Runs only on the ticket worker. A failed reply leaves the original nonce and
@@ -609,7 +619,7 @@ impl Worker {
         let (ack, status) = match &outcome {
             RemoteOutcome::Delivered => (true, Some(DELIVERED_TEXT.to_string())),
             RemoteOutcome::Held => (true, Some(HELD_TEXT.to_string())),
-            RemoteOutcome::Command(reply) => (true, Some(reply.clone())),
+            RemoteOutcome::Command => (true, None),
             RemoteOutcome::Deferred => (false, None),
             RemoteOutcome::Unavailable => {
                 let tries = state.retries.entry(item.id.clone()).or_default();
@@ -617,8 +627,17 @@ impl Worker {
                 if *tries >= DELIVERY_ATTEMPTS { (false, Some(UNDELIVERED_TEXT.to_string())) } else { (false, None) }
             }
         };
-        if let Some(status) = status {
-            self.queue_status(config, home, plan, &mut state, &conversation, &item.id, &status, ack)?;
+        if outcome == RemoteOutcome::Command {
+            let vars = Vars::new(&config.system)
+                .with("conversation", Some(&conversation))
+                .typed("ids", Value::from(vec![item.id.clone()]));
+            let write = PendingWrite::new("conversation_ack", uuid::Uuid::new_v4().to_string(), vars);
+            state.queue(home, plan, write).map_err(|e| e.to_string())?;
+        }
+        if status.is_some() || outcome == RemoteOutcome::Command {
+            if let Some(status) = status {
+                self.queue_status(config, home, plan, &mut state, &conversation, &item.id, &status, ack)?;
+            }
             state.retries.remove(&item.id);
             state.remember(item.id.clone());
             if let Some(seq) = &item.seq
@@ -1088,6 +1107,34 @@ pub(crate) mod tests {
                 assert_eq!(identity.owner_name.as_deref(), owner.then_some("Example human"));
             }
         }
+    }
+
+    #[test]
+    fn approval_posts_are_cleaned_before_persistence_and_transport() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let path = crate::mcp_client::tests::fake_state(dir.path(), json!([]));
+        let config = remote_profile("", &path);
+        set(&path, |state| state["fail"] = json!(["conversation_post"]));
+        let mut worker = Worker { cleaner: tickets::Cleaner::new(vec!["known-secret".into()]), ..Default::default() };
+        let text = format!("known-secret https://example.test/?access_token=hidden-token {}", "é".repeat(3000));
+        let vars = Vars::new(&config.system).with("conversation", Some("conversation-1")).with("body", Some(&text));
+        worker
+            .run(
+                &config,
+                TicketOp::Outbox {
+                    home: dir.path().into(),
+                    plan: "approval".into(),
+                    write: Some(Box::new(PendingWrite::new("conversation_post", "approval-event".into(), vars))),
+                },
+            )
+            .unwrap();
+        let persisted = RemoteState::load(dir.path(), "approval").unwrap();
+        let body = persisted.outbox[0].vars.get("body").unwrap().as_str().unwrap();
+        assert!(!body.contains("known-secret") && !body.contains("hidden-token"));
+        assert_eq!(body.chars().count(), 2000);
+        let sent = server(&path);
+        assert_eq!(sent["calls"][0]["arguments"]["text"], body);
+        assert_eq!(persisted.outbox[0].nonce, "approval-event");
     }
 
     #[test]
