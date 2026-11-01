@@ -624,7 +624,7 @@ pub(crate) fn request_for_tool(name: &str, mut args: Value) -> Result<ControlReq
     }
     let cmd = match name {
         "atomics_list" => "list",
-        "atomics_trace_get" => "trace",
+        "atomics_trace_get" => "trace_get",
         "atomics_restart" => "restart",
         "atomics_start" => "start",
         "atomics_send" => "send",
@@ -706,7 +706,7 @@ mod tests {
             }
         }
         match super::request_for_tool("atomics_trace_get", serde_json::json!({"limit":20})).unwrap() {
-            atomics_core::control::ControlRequest::Trace { session, limit } => {
+            atomics_core::control::ControlRequest::TraceGet { session, limit } => {
                 assert_eq!(session, None);
                 assert_eq!(limit, Some(20));
             }
@@ -836,6 +836,12 @@ mod tests {
     use super::*;
 
     fn example(schema: &Value, required_only: bool) -> Value {
+        if let Some(choices) = schema.get("oneOf").and_then(Value::as_array) {
+            // Ticket references accept a compact key or a full link. Exercise the key with
+            // required arguments, and the full link (including optional fields) otherwise.
+            let choice = if required_only { choices.first() } else { choices.last() };
+            return example(choice.expect("oneOf must contain a schema"), required_only);
+        }
         if let Some(values) = schema.get("enum").and_then(Value::as_array) {
             return values[0].clone();
         }

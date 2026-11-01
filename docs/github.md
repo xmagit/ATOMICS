@@ -31,6 +31,9 @@ author, checks (✓ passing, ✗ failing, ● running), review state and merge s
   `viewerCanMergeAsAdmin`, or every ruleset on its base branch lets you bypass it
   (`current_user_can_bypass` is `always` or `pull_requests_only`). If GitHub refuses the ruleset
   lookup with 403 or 404, it is offered only for repository admins (`viewerPermission: ADMIN`).
+  A server error, rate limit or network failure disables admin merge from rulesets while the rest
+  of the poll continues. Results are cached per repository and base branch for five minutes;
+  retargeting a pull request uses the new base's rules.
   This does what `gh pr merge --admin` does.
 - The workflow actions configured for pull requests in that repository.
 

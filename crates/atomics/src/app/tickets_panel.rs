@@ -1955,7 +1955,7 @@ mod tests {
                                 (src[0] + d[0] as f32 * keep) as u8,
                                 (src[1] + d[1] as f32 * keep) as u8,
                                 (src[2] + d[2] as f32 * keep) as u8,
-                                255,
+                                background.a(),
                             );
                         }
                     }

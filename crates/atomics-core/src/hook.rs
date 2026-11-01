@@ -164,6 +164,14 @@ pub fn session_settings(atomics_exe: &Path, socket: &Path, pane: &str, codex: bo
 /// Only chief sessions pay for MCP start hooks; ordinary Claude sessions keep EVENTS.
 pub fn chief_session_settings(atomics_exe: &Path, socket: &Path, pane: &str) -> Value {
     let mut settings = session_settings(atomics_exe, socket, pane, false);
+    for groups in settings["hooks"].as_object_mut().expect("hooks").values_mut() {
+        for group in groups.as_array_mut().expect("groups") {
+            for hook in group["hooks"].as_array_mut().expect("handlers") {
+                let command = hook["command"].as_str().expect("command");
+                hook["command"] = json!(format!("ATOMICS_CHIEF=1 {command}"));
+            }
+        }
+    }
     let mut groups = settings["hooks"]["PostToolUse"].clone();
     groups[0]["matcher"] = json!("mcp__.*");
     settings["hooks"]["PreToolUse"] = groups;
@@ -279,6 +287,16 @@ mod tests {
     fn chief_mcp_pre_hooks_are_session_local_and_do_not_change_status() {
         let chief = chief_session_settings(Path::new("atomics"), Path::new("own.sock"), "chief");
         assert_eq!(chief["hooks"]["PreToolUse"][0]["matcher"], "mcp__.*");
+        assert!(
+            chief["hooks"]["PostToolUse"][0]["hooks"][0]["command"].as_str().unwrap().starts_with("ATOMICS_CHIEF=1 ")
+        );
+        assert!(
+            !session_settings(Path::new("atomics"), Path::new("own.sock"), "worker", false)["hooks"]["PostToolUse"][0]
+                ["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("ATOMICS_CHIEF")
+        );
         assert!(chief["hooks"]["PreToolUse"][0]["hooks"][0]["command"].as_str().unwrap().contains("--pane chief"));
         assert!(
             session_settings(Path::new("atomics"), Path::new("own.sock"), "worker", false)["hooks"]

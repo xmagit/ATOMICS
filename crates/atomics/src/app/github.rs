@@ -25,6 +25,7 @@ pub(super) struct Github {
     /// The last rate-limit wait, doubled while limits continue.
     backoff: Option<u64>,
     polling: bool,
+    ruleset_cache: Arc<Mutex<gh::RulesetCache>>,
     /// The modal is open: polls fetch details, and it shows.
     pub(super) modal: bool,
     jobs: Vec<Receiver<Done>>,
@@ -291,6 +292,7 @@ impl State {
                 .collect(),
             viewers: self.github.viewers.keys().cloned().collect(),
             details: self.github.modal,
+            ruleset_cache: self.github.ruleset_cache.clone(),
         };
         let (endpoints, store) = (self.github.endpoints.clone(), Github::store(&self.relay));
         self.github_job(move |tx| {

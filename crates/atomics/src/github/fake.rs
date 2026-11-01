@@ -116,6 +116,13 @@ impl FakeGithub {
         entry.1.push(pull);
     }
 
+    pub fn retarget(&self, repo: &RepoId, number: u64, base: &str) {
+        let mut data = self.data.lock().unwrap();
+        let (version, pulls) = data.repos.get_mut(&repo.full_name()).expect("repository");
+        pulls.iter_mut().find(|pull| pull.number == number).expect("pull request").base = base.into();
+        *version += 1;
+    }
+
     pub fn branch_rules(&self, repo: &RepoId, base: &str, status: u16, rules: Value) {
         self.data.lock().unwrap().branch_rules.insert((repo.full_name(), base.into()), (status, rules));
     }
@@ -228,6 +235,10 @@ fn serve(stream: TcpStream, data: &Mutex<Data>) {
         429 => "Too Many Requests",
         _ => "Status",
     };
+    // A zero status simulates a network failure after accepting the request.
+    if status == 0 {
+        return;
+    }
     let mut out = format!("HTTP/1.1 {status} {reason}\r\nconnection: close\r\ncontent-length: {}\r\n", body.len());
     for (name, value) in extra {
         out.push_str(&format!("{name}: {value}\r\n"));

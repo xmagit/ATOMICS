@@ -3,12 +3,14 @@ use super::*;
 use atomics_core::trace::{self, TraceLog};
 
 impl State {
-    fn trace_cleaner(&self) -> atomics_core::tickets::Cleaner {
+    pub(super) fn trace_cleaner(&mut self) -> atomics_core::tickets::Cleaner {
         let cleaner = self.cleaner();
-        match self.ticket_config() {
-            Some(config) => cleaner.with(crate::mcp_client::OAuth::current().secrets(&config.server)),
-            None => cleaner,
+        let Some(config) = self.ticket_config() else { return cleaner };
+        let sign = &mut self.tickets.sign;
+        if sign.trace_secrets.as_ref().is_none_or(|(server, _)| *server != config.server) {
+            sign.trace_secrets = Some((config.server.clone(), sign.oauth().secrets(&config.server)));
         }
+        cleaner.with(sign.trace_secrets.as_ref().unwrap().1.clone())
     }
 
     pub(super) fn load_chief_trace(&mut self, id: &str) {
@@ -130,15 +132,15 @@ mod tests {
             assert!(app.runtime.traces.is_empty());
             app.runtime.on_hook(hook("chief", "chief", "PreToolUse"));
             app.runtime.on_hook(hook("chief", "chief", "PostToolUse"));
-            let response = request(app, json!({"cmd":"trace", "limit":20}));
+            let response = request(app, json!({"cmd":"trace_get", "limit":20}));
             assert!(response.ok);
             assert_eq!(response.result["entries"].as_array().unwrap().len(), 1);
             assert_eq!(response.result["entries"][0]["cards"][0]["key"], "DEMO-1");
             assert_eq!(response.result["entries"][0]["state"], "ok");
-            assert!(!request(app, json!({"cmd":"trace", "session":"worker"})).ok);
+            assert!(!request(app, json!({"cmd":"trace_get", "session":"worker"})).ok);
             app.runtime.traces.clear();
-            assert_eq!(request(app, json!({"cmd":"trace", "limit":20})).result, response.result);
-            assert_eq!(request(app, json!({"cmd":"trace", "limit":0})).result["entries"], json!([]));
+            assert_eq!(request(app, json!({"cmd":"trace_get", "limit":20})).result, response.result);
+            assert_eq!(request(app, json!({"cmd":"trace_get", "limit":0})).result["entries"], json!([]));
             app.runtime.plans.push(Plan { id: "trace-plan".into(), ..Default::default() });
             app.runtime.selected_plan = app.runtime.plans.len() - 1;
             app.runtime.on_hook(hook("chief", "chief", "PostToolUse"));

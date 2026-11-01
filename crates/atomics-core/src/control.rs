@@ -11,7 +11,7 @@ use crate::diff::{FileStatus, LineKind, WorktreeDiff};
 pub enum ControlRequest {
     List,
     /// The chief's cleaned MCP calls, oldest first among the newest `limit` entries.
-    Trace {
+    TraceGet {
         #[serde(default)]
         session: Option<String>,
         #[serde(default)]

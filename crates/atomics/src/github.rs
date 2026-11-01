@@ -6,7 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use atomics_core::github::{
     Check, CheckState, Details, GithubConfig, MergeMethod, Pull, RepoId, SCOPES, api_urls, is_github_app, valid_host,
@@ -20,6 +21,22 @@ const MAX_DIFF: u64 = 16 * 1024 * 1024;
 const MAX_BODY: u64 = 8 * 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(30);
 
+const RULESET_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// Shared by successive polls, including when they construct a new API client.
+#[derive(Debug, Default)]
+pub struct RulesetCache {
+    entries: BTreeMap<(RepoId, String), CachedBypass>,
+}
+
+#[derive(Debug)]
+struct CachedBypass {
+    at: Instant,
+    admin: bool,
+    viewer: Option<[u8; 32]>,
+    endpoint: String,
+}
+
 /// A GitHub token. Never Debug, Display or Serialize its value.
 #[derive(Clone, PartialEq)]
 pub struct Token(String);
@@ -30,6 +47,10 @@ impl Token {
         let value = value.trim();
         let known = ["gho_", "ghp_", "ghu_", "github_pat_"].iter().any(|prefix| value.starts_with(prefix));
         (known && value.len() <= 8192 && value.bytes().all(|b| b.is_ascii_graphic())).then(|| Token(value.into()))
+    }
+
+    fn fingerprint(&self) -> [u8; 32] {
+        ring::digest::digest(&ring::digest::SHA256, self.0.as_bytes()).as_ref().try_into().unwrap()
     }
 
     pub fn secret(&self) -> &str {
@@ -119,6 +140,7 @@ pub struct Api {
     web: String,
     token: Option<Token>,
     agent: ureq::Agent,
+    ruleset_cache: Arc<Mutex<RulesetCache>>,
 }
 
 impl Api {
@@ -140,7 +162,7 @@ impl Api {
             .user_agent(concat!("atomics/", env!("CARGO_PKG_VERSION")));
         // A local fake is never reached through this machine's proxy.
         let config = if local { config.proxy(None) } else { config };
-        Api { rest, graphql, web, token, agent: config.build().into() }
+        Api { rest, graphql, web, token, agent: config.build().into(), ruleset_cache: Arc::default() }
     }
 
     fn send(
@@ -312,9 +334,21 @@ impl Api {
                 Some((pull["number"].as_u64()?, details))
             })
             .collect();
-        // A details request is one repository's part of a poll. PRs targeting the same base
-        // share this result, but the next poll must observe changes to rules or permissions.
-        let mut bypass = BTreeMap::new();
+        // Drop bases no longer observed (including retargeted PRs). A new base always gets
+        // its own lookup, and credentials/endpoints must never reuse another viewer's result.
+        let bases: BTreeSet<_> = repository["pullRequests"]["nodes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|pull| pull["baseRefName"].as_str())
+            .collect();
+        let mut cache = self.ruleset_cache.lock().unwrap();
+        cache.entries.retain(|(cached_repo, base), entry| {
+            cached_repo != repo
+                || (bases.contains(base.as_str())
+                    && entry.viewer == self.token.as_ref().map(Token::fingerprint)
+                    && entry.endpoint == self.rest)
+        });
         for pull in repository["pullRequests"]["nodes"].as_array().into_iter().flatten() {
             let Some(details) = pull["number"].as_u64().and_then(|number| pulls.get_mut(&number)) else {
                 continue;
@@ -325,15 +359,37 @@ impl Api {
             let Some(base) = pull["baseRefName"].as_str().filter(|base| !base.is_empty()) else {
                 continue;
             };
-            details.admin = match bypass.get(base) {
-                Some(&admin) => admin,
+            let key = (repo.clone(), base.to_string());
+            details.admin = match cache.entries.get(&key).filter(|entry| entry.at.elapsed() < RULESET_CACHE_TTL) {
+                Some(entry) => entry.admin,
                 None => {
                     let admin = match self.ruleset_bypass(repo, base) {
                         Ok(admin) => admin,
                         Err(ApiError::Status(403 | 404, _)) => repository["viewerPermission"] == "ADMIN",
+                        Err(
+                            ApiError::Status(429 | 500..=599, _)
+                            | ApiError::RateLimited { .. }
+                            | ApiError::Transport(_),
+                        ) => {
+                            // Cache this conservative result too, so a failing optional lookup
+                            // logs once per cache lifetime and leaves the rest of the poll usable.
+                            eprintln!(
+                                "ATOMICS: GitHub ruleset lookup unavailable for {} ({base}); admin merge disabled",
+                                repo.full_name()
+                            );
+                            false
+                        }
                         Err(error) => return Err(error),
                     };
-                    bypass.insert(base.to_string(), admin);
+                    cache.entries.insert(
+                        key,
+                        CachedBypass {
+                            at: Instant::now(),
+                            admin,
+                            viewer: self.token.as_ref().map(Token::fingerprint),
+                            endpoint: self.rest.clone(),
+                        },
+                    );
                     admin
                 }
             };
@@ -810,6 +866,7 @@ pub struct PollRequest {
     pub etags: BTreeMap<RepoId, String>,
     pub viewers: BTreeSet<String>,
     pub details: bool,
+    pub ruleset_cache: Arc<Mutex<RulesetCache>>,
 }
 
 #[derive(Debug, Default)]
@@ -849,6 +906,7 @@ pub fn poll(endpoints: &Endpoints, store: &Store, request: &PollRequest) -> Poll
                 continue;
             }
         };
+        signed.api.ruleset_cache = request.ruleset_cache.clone();
         if !request.viewers.contains(&host) {
             let viewer = signed.call(Api::viewer);
             let stop = matches!(viewer, Err(ApiError::Unauthorized | ApiError::RateLimited { .. }));
@@ -969,14 +1027,85 @@ mod tests {
                 }
             }
         }
-        // Authentication, rate limits and server failures must still reach the existing error path.
-        for status in [401, 429, 500] {
+        // Authentication failures still reach the existing sign-out path.
+        {
+            let status = 401;
             let fake = FakeGithub::start(TOKEN);
             fake.add_pull(&repo(), fake::pull(7, "alice", &[], "BLOCKED", false));
             fake.viewer_permission(&repo(), "ADMIN");
             fake.branch_rules(&repo(), "main", status, json!({ "message": "Unavailable" }));
             assert!(Api::at(&fake.url, Token::new(TOKEN)).details(&repo()).is_err(), "{status}");
         }
+    }
+
+    #[test]
+    fn github_ruleset_transient_errors_preserve_details_and_cache_no_admin_merge() {
+        // Zero tells the fake to disconnect without sending an HTTP response.
+        for status in [0, 429, 500, 503] {
+            for branch_endpoint in [false, true] {
+                let fake = FakeGithub::start(TOKEN);
+                fake.add_pull(&repo(), fake::pull(7, "alice", &[], "BLOCKED", false));
+                fake.viewer_permission(&repo(), "ADMIN");
+                fake.branch_rules(
+                    &repo(),
+                    "main",
+                    if branch_endpoint { status } else { 200 },
+                    json!([{"ruleset_id":42}]),
+                );
+                fake.ruleset(&repo(), 42, status, json!({"message":"Unavailable"}));
+                let api = Api::at(&fake.url, Token::new(TOKEN));
+                let details = api.details(&repo()).unwrap();
+                assert!(!details.pulls[&7].admin, "{status}, branch={branch_endpoint}");
+                assert!(!details.methods.is_empty());
+                let lookups = fake.seen().iter().filter(|seen| seen.path.contains("/rules")).count();
+                api.details(&repo()).unwrap();
+                assert_eq!(fake.seen().iter().filter(|seen| seen.path.contains("/rules")).count(), lookups);
+            }
+        }
+    }
+
+    #[test]
+    fn github_polls_share_the_ruleset_cache() {
+        let (_dir, _, store) = crate::credentials::tests::machine(cfg!(target_os = "macos"));
+        store.put_github_app("github.com", TOKEN).unwrap();
+        let fake = FakeGithub::start(TOKEN);
+        fake.add_pull(&repo(), fake::pull(7, "alice", &[], "BLOCKED", false));
+        fake.branch_rules(&repo(), "main", 200, json!([{"ruleset_id":42}]));
+        fake.ruleset(&repo(), 42, 200, json!({"current_user_can_bypass":"always"}));
+        let endpoints = Endpoints { base: Some(fake.url.clone()), gh: None };
+        let request = PollRequest {
+            config: GithubConfig { repos: vec![repo().full_name()], ..GithubConfig::default() },
+            details: true,
+            ..PollRequest::default()
+        };
+        for _ in 0..2 {
+            let polled = poll(&endpoints, &store, &request);
+            assert!(polled.details[0].1.as_ref().unwrap().pulls[&7].admin);
+        }
+        assert_eq!(fake.seen().iter().filter(|seen| seen.path.contains("/rules/branches/")).count(), 1);
+    }
+
+    #[test]
+    fn github_ruleset_cache_invalidates_when_the_base_or_viewer_changes() {
+        let fake = FakeGithub::start(TOKEN);
+        fake.add_pull(&repo(), fake::pull(7, "alice", &[], "BLOCKED", false));
+        fake.branch_rules(&repo(), "main", 200, json!([{"ruleset_id":42}]));
+        fake.ruleset(&repo(), 42, 200, json!({"current_user_can_bypass":"always"}));
+        let api = Api::at(&fake.url, Token::new(TOKEN));
+        assert!(api.details(&repo()).unwrap().pulls[&7].admin);
+        fake.retarget(&repo(), 7, "release");
+        assert!(!api.details(&repo()).unwrap().pulls[&7].admin);
+        assert!(!api.ruleset_cache.lock().unwrap().entries.contains_key(&(repo(), "main".into())));
+        fake.retarget(&repo(), 7, "main");
+        fake.ruleset(&repo(), 42, 200, json!({"current_user_can_bypass":"never"}));
+        assert!(!api.details(&repo()).unwrap().pulls[&7].admin);
+        // A different credential must not reuse even an unexpired positive result.
+        let entry = api.ruleset_cache.lock().unwrap().entries.remove(&(repo(), "main".into())).unwrap();
+        api.ruleset_cache.lock().unwrap().entries.insert(
+            (repo(), "main".into()),
+            CachedBypass { admin: true, viewer: Token::new("ghp_previous").as_ref().map(Token::fingerprint), ..entry },
+        );
+        assert!(!api.details(&repo()).unwrap().pulls[&7].admin);
     }
 
     #[test]
@@ -988,11 +1117,14 @@ mod tests {
         assert!(!api.details(&repo()).unwrap().pulls[&7].admin, "no rules is no bypass");
         fake.branch_rules(&repo(), "main", 200, json!([{ "ruleset_id": 42 }]));
         fake.ruleset(&repo(), 42, 200, json!({}));
-        assert!(!api.details(&repo()).unwrap().pulls[&7].admin, "missing bypass is no permission");
+        assert!(
+            !Api::at(&fake.url, Token::new(TOKEN)).details(&repo()).unwrap().pulls[&7].admin,
+            "missing bypass is no permission"
+        );
     }
 
     #[test]
-    fn github_ruleset_bypass_is_cached_per_base_for_one_poll() {
+    fn github_ruleset_bypass_is_cached_per_base_across_polls_and_expires() {
         let fake = FakeGithub::start(TOKEN);
         for number in 7..=9 {
             let mut pull = fake::pull(number, "alice", &[], "BLOCKED", false);
@@ -1011,10 +1143,15 @@ mod tests {
         assert_eq!(seen.iter().filter(|seen| seen.path.contains("/rules/branches/")).count(), 2);
         assert_eq!(seen.iter().filter(|seen| seen.path.ends_with("/rulesets/42")).count(), 2, "distinct IDs per base");
         fake.ruleset(&repo(), 42, 200, json!({ "current_user_can_bypass": "never" }));
-        assert!(
-            api.details(&repo()).unwrap().pulls.values().all(|details| !details.admin),
-            "the next poll refreshes permissions"
-        );
+        let mut next = Api::at(&fake.url, Token::new(TOKEN));
+        next.ruleset_cache = api.ruleset_cache.clone();
+        assert!(next.details(&repo()).unwrap().pulls.values().all(|details| details.admin));
+        assert_eq!(fake.seen().iter().filter(|seen| seen.path.contains("/rules/branches/")).count(), 2);
+        for entry in api.ruleset_cache.lock().unwrap().entries.values_mut() {
+            entry.at = Instant::now() - RULESET_CACHE_TTL;
+        }
+        assert!(next.details(&repo()).unwrap().pulls.values().all(|details| !details.admin));
+        assert_eq!(fake.seen().iter().filter(|seen| seen.path.contains("/rules/branches/")).count(), 4);
     }
 
     #[test]

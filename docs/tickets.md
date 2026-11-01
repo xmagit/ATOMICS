@@ -706,6 +706,8 @@ The `comments = "agents"` policy permits scoped reads, but posting comments stil
 or post their reports. Related matches are never treated as children.
 
 ```toml
+# Writes need an idempotencyKey per call (RELAY-11955 A1), so none are mapped.
+# find_tickets needs relay-backend #752 to be live.
 [tickets]
 system = "relay"
 mode = "auto"
@@ -1008,7 +1010,7 @@ of plan files. Windows uses the platform's file permissions.
 Read the newest entries without drawing the UI:
 
 ```sh
-atomics ctl '{"cmd":"trace","limit":20}'
+atomics ctl '{"cmd":"trace_get","limit":20}'
 ```
 
 `atomics_trace_get {limit?, session?}` exposes the same reader to the chief only

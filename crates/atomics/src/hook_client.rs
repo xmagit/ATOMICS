@@ -17,7 +17,7 @@ pub fn run(socket: Option<std::path::PathBuf>, pane: Option<String>) {
         return;
     }
     let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(&input) else { return };
-    cap_tool_response(&mut payload);
+    prepare_tool_response(&mut payload, std::env::var("ATOMICS_CHIEF").as_deref() == Ok("1"));
     let ancestors = if pane.is_none()
         && payload.get("hook_event_name").and_then(serde_json::Value::as_str) == Some("SessionStart")
     {
@@ -34,14 +34,27 @@ pub fn run(socket: Option<std::path::PathBuf>, pane: Option<String>) {
 
 const MAX_TOOL_RESPONSE_BYTES: usize = 256 * 1024;
 
+const MAX_TOOL_SUMMARY_BYTES: usize = 1024;
+
+/// Only the chief's MCP trace needs a full response. Other hooks keep a small summary.
+fn prepare_tool_response(payload: &mut serde_json::Value, chief: bool) {
+    if chief && payload["tool_name"].as_str().is_some_and(|name| name.starts_with("mcp__")) {
+        if let Some(response) = payload.get_mut("tool_response") {
+            cap_response(response, MAX_TOOL_RESPONSE_BYTES);
+        }
+    } else if let Some(mut response) = payload.as_object_mut().and_then(|object| object.remove("tool_response")) {
+        cap_response(&mut response, MAX_TOOL_SUMMARY_BYTES);
+        payload["tool_response_summary"] = response;
+    }
+}
+
 /// Keep a UTF-8 head and an explicit marker, including JSON escaping in the wire cap.
-fn cap_tool_response(payload: &mut serde_json::Value) {
-    let Some(response) = payload.get_mut("tool_response") else { return };
+fn cap_response(response: &mut serde_json::Value, max_bytes: usize) {
     let serialized = response.to_string();
-    if serialized.len() <= MAX_TOOL_RESPONSE_BYTES {
+    if serialized.len() <= max_bytes {
         return;
     }
-    let (mut low, mut high) = (0, serialized.len().min(MAX_TOOL_RESPONSE_BYTES));
+    let (mut low, mut high) = (0, serialized.len().min(max_bytes));
     while low < high {
         let mid = (low + high).div_ceil(2);
         let mut cut = mid;
@@ -50,7 +63,7 @@ fn cap_tool_response(payload: &mut serde_json::Value) {
         }
         let candidate =
             serde_json::json!({"head": &serialized[..cut], "truncated": true, "original_bytes": serialized.len()});
-        if candidate.to_string().len() <= MAX_TOOL_RESPONSE_BYTES {
+        if candidate.to_string().len() <= max_bytes {
             low = mid;
         } else {
             high = mid - 1;
@@ -113,7 +126,7 @@ mod tests {
         ] {
             let original = response.to_string();
             let mut payload = serde_json::json!({"tool_response": response, "tool_use_id":"unchanged"});
-            cap_tool_response(&mut payload);
+            cap_response(&mut payload["tool_response"], MAX_TOOL_RESPONSE_BYTES);
             assert!(payload["tool_response"].to_string().len() <= MAX_TOOL_RESPONSE_BYTES);
             assert_eq!(payload["tool_response"]["truncated"], true);
             assert!(original.starts_with(payload["tool_response"]["head"].as_str().unwrap()));
@@ -121,8 +134,30 @@ mod tests {
         }
         let mut small = serde_json::json!({"tool_response":{"structuredContent":{"id":"one"}}});
         let original = small.clone();
-        cap_tool_response(&mut small);
+        cap_response(&mut small["tool_response"], MAX_TOOL_RESPONSE_BYTES);
         assert_eq!(small, original);
+    }
+
+    #[test]
+    fn only_chief_mcp_hooks_send_full_tool_responses() {
+        for chief in [false, true] {
+            for tool in ["Bash", "mcp__example__read"] {
+                for response in [serde_json::json!({"id":"small"}), serde_json::json!("é\"\n".repeat(300_000))] {
+                    let mut payload = serde_json::json!({
+                        "tool_name":tool, "tool_response":response, "tool_use_id":"one"
+                    });
+                    prepare_tool_response(&mut payload, chief);
+                    if chief && tool.starts_with("mcp__") {
+                        assert!(payload.get("tool_response_summary").is_none());
+                        assert!(payload["tool_response"].to_string().len() <= MAX_TOOL_RESPONSE_BYTES);
+                    } else {
+                        assert!(payload.get("tool_response").is_none());
+                        assert!(payload["tool_response_summary"].to_string().len() <= MAX_TOOL_SUMMARY_BYTES);
+                    }
+                    assert_eq!(payload["tool_use_id"], "one");
+                }
+            }
+        }
     }
 
     #[test]

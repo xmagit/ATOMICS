@@ -565,7 +565,7 @@ exactly like card text on the board.
   Reloaded when the chief resumes after a restart (commit `db3358f` resumes the chief in its cwd), and removed
   with the plan by plan cleanup.
 - **Not in plan files:** traces are high-churn; plans keep only links, as now.
-- **Exposed:** `atomics ctl '{"cmd":"trace","limit":20}'` and an `atomics_trace_get` MCP tool give the chief
+- **Exposed:** `atomics ctl '{"cmd":"trace_get","limit":20}'` and an `atomics_trace_get` MCP tool give the chief
   and scripts the cleaned entries, so a test can assert the trace without drawing it.
 - The existing `state.mark_dirty` path for diffs is untouched.
 
