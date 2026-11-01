@@ -29,6 +29,9 @@ pub enum McpError {
         retryable: bool,
     },
     Server(String),
+    /// A tool error with `structuredContent`: users see `message`, while `details` (the
+    /// content as JSON, such as an error code) is only for telling refusals apart.
+    Tool { message: String, details: String },
     /// The server needs a person to sign in (again): never retried, never a browser by itself.
     SignInRequired(String),
 }
@@ -58,7 +61,9 @@ impl McpError {
 impl std::fmt::Display for McpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            McpError::Transport { message, .. } | McpError::Server(message) => f.write_str(message),
+            McpError::Transport { message, .. } | McpError::Server(message) | McpError::Tool { message, .. } => {
+                f.write_str(message)
+            }
             McpError::SignInRequired(message) => write!(f, "{SIGN_IN_REQUIRED}: {message}"),
         }
     }
@@ -152,7 +157,9 @@ impl McpClient {
             "clientInfo": { "name": "atomics", "title": "ATOMICS", "version": env!("CARGO_PKG_VERSION") },
         });
         client.request("initialize", params).map_err(|err| match err {
-            McpError::Server(message) => McpError::transport(format!("initialize failed: {message}")),
+            McpError::Server(message) | McpError::Tool { message, .. } => {
+                McpError::transport(format!("initialize failed: {message}"))
+            }
             transport => transport,
         })?;
         if let Transport::Http(http) = &mut client.transport {
@@ -191,12 +198,17 @@ impl McpClient {
                 .filter_map(|item| item.get("text").and_then(Value::as_str))
                 .collect::<Vec<_>>()
                 .join("\n");
-            let mut message =
-                format!("{name} failed: {}", if text.trim().is_empty() { "no details" } else { text.trim() });
-            if let Some(structured) = result.get("structuredContent").filter(|value| value.is_object()) {
-                message = format!("{message} {structured}");
-            }
-            return Err(McpError::Server(message));
+            let structured = result.get("structuredContent").filter(|value| value.is_object());
+            // The text says it once; the JSON's own message stands in when there is no text.
+            let shown = Some(text.trim())
+                .filter(|text| !text.is_empty())
+                .or_else(|| structured?.get("message")?.as_str().map(str::trim).filter(|m| !m.is_empty()))
+                .unwrap_or("no details");
+            let message = format!("{name} failed: {shown}");
+            return Err(match structured {
+                Some(structured) => McpError::Tool { message, details: structured.to_string() },
+                None => McpError::Server(message),
+            });
         }
         Ok(result)
     }
@@ -767,19 +779,20 @@ pub(crate) mod tests {
         std::fs::write(&state, fake.to_string()).unwrap();
         let server = stdio(vec![fake_server().display().to_string(), state.display().to_string()]);
         let mut client = McpClient::connect(&server, Duration::from_secs(10), |_| None).unwrap();
-        let Err(McpError::Server(message)) = client.call_tool("conversation_post", json!({})) else {
+        let Err(McpError::Tool { message, details }) = client.call_tool("conversation_post", json!({})) else {
             panic!("a tool error")
         };
+        assert_eq!(message, "conversation_post failed: The item conversation has ended; open a new one to continue.");
         assert_eq!(
-            message,
-            r#"conversation_post failed: The item conversation has ended; open a new one to continue. {"code":"conversation_ended","message":"The item conversation has ended; open a new one to continue."}"#
+            details,
+            r#"{"code":"conversation_ended","message":"The item conversation has ended; open a new one to continue."}"#
         );
         let errors = atomics_core::tickets::RemoteErrors {
             code: "code".into(),
             ended: vec!["conversation_ended".into()],
             ..Default::default()
         };
-        assert_eq!(errors.classify(&message), Some(atomics_core::tickets::RemoteError::Ended));
+        assert_eq!(errors.classify(&format!("{message} {details}")), Some(atomics_core::tickets::RemoteError::Ended));
     }
 
     /// Runs `call` on a thread of its own and fails the test when it has not returned within

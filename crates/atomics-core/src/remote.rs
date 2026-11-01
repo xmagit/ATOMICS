@@ -241,19 +241,23 @@ impl RemoteState {
         Ok(Self::others(home, plan, conversation)?.iter().map(|(_, other)| other.next_seq).fold(1, u64::max))
     }
 
-    /// The furthest cursor the sidecars of the open `peers` hold on `conversation`, and the
-    /// steering ids they saw: a plan taking the conversation (back) from an open plan neither
-    /// delivers again what that plan handled nor skips what was written since. A closed plan's
-    /// leftover sidecar hands nothing over: steering written while remote was off stays unread.
+    /// The furthest cursor the sidecars of `peers` hold on `conversation`, and the steering ids
+    /// they saw: a plan taking the conversation over from the plan that owned it neither
+    /// delivers again what that plan handled nor skips what was written since. With `every`,
+    /// which holds when the plan's own sidecar already names the conversation, every sidecar
+    /// on it counts, closed plans included; that only holds steering back, never delivers it
+    /// twice. Otherwise a leftover sidecar of a plan that is no peer hands nothing over:
+    /// steering written while remote was off stays unread.
     #[cfg(feature = "native")]
     pub fn used_cursor(
         home: &std::path::Path,
         plan: &str,
         conversation: &str,
         peers: &[String],
+        every: bool,
     ) -> anyhow::Result<(Option<Value>, Vec<String>)> {
         let (mut cursor, mut seen) = (None::<Value>, Vec::new());
-        for (_, other) in Self::others(home, plan, conversation)?.into_iter().filter(|(id, _)| peers.contains(id)) {
+        for (_, other) in Self::others(home, plan, conversation)?.into_iter().filter(|(id, _)| every || peers.contains(id)) {
             if let Some(theirs) = other.cursor.filter(|c| !c.is_null())
                 && crate::tickets::seq_after(Some(&theirs), cursor.as_ref())
             {
