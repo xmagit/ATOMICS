@@ -12,7 +12,7 @@
 //! what ATOMICS pushed. Optional idempotencyKey receipts deduplicate writes; structured_results
 //! selects structured output for text tools, and drop_reply loses a reply after committing the write.
 //! `find_tickets` without `about` lists by recency (`rev`, newest first) without scores. Its
-//! filters (`status`, where `active` means in progress, `assignee`, where `me` is the state's `me`
+//! filters (`status` as an array, where `active` means in progress, `assignee`, where `owner` is the state's `me`
 //! or Demo User, `type`, `parent`) and `cursor` paging work with or without `about`.
 
 use std::io::{BufRead, Write};
@@ -135,6 +135,12 @@ fn call(path: &str, params: &Value) -> Result<Value, String> {
         };
         let content: Vec<Value> = blocks.into_iter().map(|text| json!({ "type": "text", "text": text })).collect();
         return Ok(json!({ "isError": true, "content": content }));
+    }
+    if matches!(name, "find_tickets" | "find_keyword_tickets")
+        && args.get("status").is_some_and(|status| !status.is_array())
+    {
+        save(path, &state);
+        return Err("status must be an array".into());
     }
     // Persist successful replies so retries after a lost reply cannot duplicate a write.
     let key = args["idempotencyKey"].as_str();
@@ -418,11 +424,11 @@ fn find_tickets(state: &Value, args: &Value) -> Value {
         let status = match &args["status"] {
             Value::Null => true,
             Value::Array(states) => states.iter().any(|wanted| in_status(ticket, wanted)),
-            wanted => in_status(ticket, wanted),
+            _ => false,
         };
         let assignee = match args["assignee"].as_str() {
             None => true,
-            Some("me") => ticket["assignee"] == me,
+            Some("owner") => ticket["assignee"] == me,
             Some(name) => ticket["assignee"] == name,
         };
         let kind = args["type"].is_null() || ticket["kind"] == args["type"];

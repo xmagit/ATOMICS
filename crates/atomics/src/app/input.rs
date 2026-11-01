@@ -163,7 +163,8 @@ impl Desktop<'_> {
             self.runtime.tickets_to_list();
         }
         // Alt+1…9 switch the Tickets panel's filter chips, in the list or the query box.
-        if self.runtime.panel == PanelMode::Tickets
+        if self.runtime.tickets.config.as_ref().is_some_and(|config| config.has_views())
+            && self.runtime.panel == PanelMode::Tickets
             && self.runtime.diff_open
             && self.runtime.tickets.panel.view == tickets_panel::TicketsView::Find
             && ctx.memory(|m| m.has_focus(diff_view::focus_id()) || m.has_focus(tickets_panel::query_id()))
