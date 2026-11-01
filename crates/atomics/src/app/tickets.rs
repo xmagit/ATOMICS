@@ -445,7 +445,7 @@ impl State {
         }
     }
 
-    fn queue_read(&mut self, config: &Arc<TicketConfig>, key: LinkKey, op: TicketOp, batch: Option<u64>) {
+    pub(super) fn queue_read(&mut self, config: &Arc<TicketConfig>, key: LinkKey, op: TicketOp, batch: Option<u64>) {
         let (kind, ticket, operation) = match &op {
             TicketOp::List(link) => (Kind::List, link.id.clone(), config.list_operation().unwrap_or("list")),
             TicketOp::Get(link) => (Kind::Refresh, link.id.clone(), "get"),
@@ -764,11 +764,19 @@ impl State {
         let keep_error = self.tickets.failed.contains_key(&tag.key);
         // A webhook may echo ATOMICS's own push before the push itself has returned.
         let pushing = self.tickets.pushing.get(&tag.key).cloned();
+        let config = self.ticket_config();
         let Some(link) = self.live_link(tag, true) else {
             return;
         };
         let before = link.state.clone();
         link.update_from(fetched);
+        // A link made with the ticket's key takes the system's id once the profile needs one.
+        if let Some(config) = config
+            && config.id_unfit(link)
+            && !config.id_unfit(fetched)
+        {
+            link.adopt_id(fetched);
+        }
         link.synced_at = Some(atomics_core::store::now());
         if !keep_error {
             link.error = None;

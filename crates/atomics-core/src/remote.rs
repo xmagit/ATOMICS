@@ -30,6 +30,10 @@ pub struct RemoteState {
     /// The plan digest whose approval was last requested in this conversation, so a restart
     /// doesn't post the Plan and Approval events again.
     pub requested_digest: Option<String>,
+    /// Plans that owned this ticket's conversation until this one took it, recorded when the
+    /// takeover starts and cleared once the open succeeds: a restart before then, or a plan
+    /// deleted in the meantime, still hands the conversation's cursor over.
+    pub takeover: Vec<String>,
 }
 
 impl Default for RemoteState {
@@ -47,6 +51,7 @@ impl Default for RemoteState {
             pause_shown: false,
             retries: BTreeMap::new(),
             requested_digest: None,
+            takeover: Vec::new(),
         }
     }
 }
@@ -257,7 +262,9 @@ impl RemoteState {
         every: bool,
     ) -> anyhow::Result<(Option<Value>, Vec<String>)> {
         let (mut cursor, mut seen) = (None::<Value>, Vec::new());
-        for (_, other) in Self::others(home, plan, conversation)?.into_iter().filter(|(id, _)| every || peers.contains(id)) {
+        for (_, other) in
+            Self::others(home, plan, conversation)?.into_iter().filter(|(id, _)| every || peers.contains(id))
+        {
             if let Some(theirs) = other.cursor.filter(|c| !c.is_null())
                 && crate::tickets::seq_after(Some(&theirs), cursor.as_ref())
             {

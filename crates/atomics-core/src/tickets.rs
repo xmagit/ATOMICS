@@ -92,6 +92,18 @@ impl TicketLink {
         *self != before
     }
 
+    /// Takes the system's own id from a fetched ticket, for a link made with its key: the key
+    /// stays as the label.
+    pub fn adopt_id(&mut self, fetched: &TicketLink) {
+        if fetched.id.is_empty() || fetched.id == self.id {
+            return;
+        }
+        if self.key.as_deref().is_none_or(str::is_empty) {
+            self.key = Some(self.id.clone());
+        }
+        self.id = fetched.id.clone();
+    }
+
     /// A link set through `atomics_plan_set` or `atomics_ticket_link`. Linking the same
     /// ticket again keeps what ATOMICS knows about it; a different ticket starts fresh.
     pub fn relink(new: Option<TicketLink>, old: Option<&TicketLink>) -> Option<TicketLink> {
@@ -721,6 +733,7 @@ pub struct RemoteErrors {
     pub content_refused: Vec<String>,
     pub ended: Vec<String>,
     pub conflict: Vec<String>,
+    pub reused: Vec<String>,
     pub invalid: Vec<String>,
     pub unreadable: Vec<String>,
 }
@@ -734,6 +747,8 @@ pub enum RemoteError {
     Ended,
     /// The event id or sequence was already used with other content.
     Conflict,
+    /// The event id was already used for other content: the same id never succeeds.
+    Reused,
     /// The arguments failed the server's validation.
     Invalid,
     /// The connection can no longer read the conversation's item.
@@ -751,9 +766,9 @@ pub const ERROR_MESSAGES: &[(RemoteError, &str)] = &[
     (RemoteError::ContentRefused, "a safe observable summary is required"),
     (RemoteError::ContentRefused, "text refused"),
     (RemoteError::ContentRefused, "content refused"),
+    (RemoteError::Reused, "this event id was already used for other content"),
     (RemoteError::Conflict, "another event already holds this sequence"),
     (RemoteError::Conflict, "another event took this event's id or sequence at the same time"),
-    (RemoteError::Conflict, "this event id was already used for other content"),
     (RemoteError::Conflict, "conflict"),
     (RemoteError::Invalid, "an item conversation event needs an id"),
     (RemoteError::Invalid, "activity is invalid"),
@@ -777,6 +792,7 @@ impl RemoteErrors {
                 (RemoteError::ContentRefused, &self.content_refused),
                 (RemoteError::Ended, &self.ended),
                 (RemoteError::Conflict, &self.conflict),
+                (RemoteError::Reused, &self.reused),
                 (RemoteError::Invalid, &self.invalid),
                 (RemoteError::Unreadable, &self.unreadable),
             ];
@@ -1437,6 +1453,21 @@ impl TicketConfig {
     /// so their ids, briefs and reports never reach unrelated tickets.
     pub fn accepts(&self, link: &TicketLink) -> bool {
         link.system.is_empty() || link.system == self.system
+    }
+
+    /// Why an operation can't address a link: the link's id doesn't fit a placeholder the
+    /// operation uses (`{uuid}` needs a UUID, not a ticket key).
+    pub fn unfit_id(&self, operation: &str, link: &TicketLink) -> Option<String> {
+        let op = self.operation(operation)?;
+        (op.uses_placeholder("uuid") && uuid::Uuid::parse_str(&link.id).is_err())
+            .then(|| format!("{} needs the ticket's UUID, but {} is linked by {}", op.tool, link.label(), link.id))
+    }
+
+    /// Whether any operation that addresses a ticket can't use this link's id.
+    pub fn id_unfit(&self, link: &TicketLink) -> bool {
+        ["conversation_open", "get", "read", "children", "related", "update_state", "comment"]
+            .iter()
+            .any(|operation| self.unfit_id(operation, link).is_some())
     }
 
     /// Why a link is left alone, for the card and for replies.
@@ -2809,7 +2840,7 @@ mod tests {
                 RemoteError::Conflict,
             ),
             ("Another event took this event's id or sequence at the same time; retry it.", RemoteError::Conflict),
-            ("This event id was already used for other content.", RemoteError::Conflict),
+            ("This event id was already used for other content.", RemoteError::Reused),
             (
                 "An item conversation event needs an id, a kind, text and, when given, a sequence from 1.",
                 RemoteError::Invalid,
@@ -2844,7 +2875,7 @@ mod tests {
         assert_eq!(config.remote.errors.classify(r#"failed: {"code":"unreadable"}"#), Some(RemoteError::Unreadable));
         // The reference server's codes, as the MCP client appends structuredContent to a tool error's text.
         let config: TicketConfig = toml::from_str(
-            "system = \"example\"\n[remote]\nerrors = { code = \"code\", content_refused = [\"content_refused\"], ended = [\"conversation_ended\"], conflict = [\"sequence_conflict\"], invalid = [\"validation\"], unreadable = [\"item_unreadable\"] }",
+            "system = \"example\"\n[remote]\nerrors = { code = \"code\", content_refused = [\"content_refused\"], ended = [\"conversation_ended\"], conflict = [\"sequence_conflict\"], reused = [\"event_id_reused\"], invalid = [\"validation\"], unreadable = [\"item_unreadable\"] }",
         )
         .unwrap();
         for (code, class) in [
@@ -2853,6 +2884,7 @@ mod tests {
             ("sequence_conflict", RemoteError::Conflict),
             ("validation", RemoteError::Invalid),
             ("item_unreadable", RemoteError::Unreadable),
+            ("event_id_reused", RemoteError::Reused),
         ] {
             // A text with braces of its own, and a message the fallback would class differently.
             let error = format!(
@@ -2860,6 +2892,25 @@ mod tests {
             );
             assert_eq!(config.remote.errors.classify(&error), Some(class), "{code}");
         }
+    }
+
+    #[test]
+    fn a_link_made_with_a_key_needs_the_systems_id_only_where_a_placeholder_wants_a_uuid() {
+        let mut config: TicketConfig = toml::from_str(
+            "system = \"example\"\n[operations.conversation_open]\ntool = \"open\"\narguments = { itemId = \"{uuid}\" }\n[operations.get]\ntool = \"get\"\narguments = { id = \"{id}\" }",
+        )
+        .unwrap();
+        let id = "00000000-0000-4000-8000-000000000001";
+        let keyed = TicketLink { id: "EX-12".into(), ..Default::default() };
+        let fitting = TicketLink { id: id.into(), key: Some("EX-12".into()), ..Default::default() };
+        assert!(config.unfit_id("conversation_open", &keyed).unwrap().contains("EX-12"));
+        assert!(config.unfit_id("get", &keyed).is_none());
+        assert!(config.id_unfit(&keyed) && !config.id_unfit(&fitting));
+        let mut link = keyed.clone();
+        link.adopt_id(&fitting);
+        assert_eq!((link.id.as_str(), link.key.as_deref()), (id, Some("EX-12")));
+        config.operations.conversation_open = None;
+        assert!(!config.id_unfit(&keyed), "no operation needs a UUID");
     }
 
     #[test]
