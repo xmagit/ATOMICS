@@ -31,6 +31,7 @@ pub mod mcp_import;
 #[cfg(feature = "native")]
 pub mod paths;
 pub mod plan;
+pub mod remote;
 pub mod repo_workflow;
 pub mod selfconfig;
 pub mod session;

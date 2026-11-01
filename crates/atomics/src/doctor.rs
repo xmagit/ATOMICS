@@ -317,12 +317,24 @@ fn ticket_check(config: &atomics_core::tickets::TicketConfig) -> String {
         )
         .map_err(|e| e.to_string())?;
         let tools = client.tool_names().map_err(|e| e.to_string())?;
-        let missing: Vec<_> = ["get", "list", "update_state", "comment", "create"]
-            .into_iter()
-            .filter_map(|name| {
-                config.operation(name).filter(|op| !tools.contains(&op.tool)).map(|op| format!("{name} → {}", op.tool))
-            })
-            .collect();
+        let missing: Vec<_> = [
+            "get",
+            "list",
+            "update_state",
+            "comment",
+            "create",
+            "whoami",
+            "conversation_open",
+            "conversation_post",
+            "conversation_read",
+            "conversation_ack",
+            "conversation_steerers",
+        ]
+        .into_iter()
+        .filter_map(|name| {
+            config.operation(name).filter(|op| !tools.contains(&op.tool)).map(|op| format!("{name} → {}", op.tool))
+        })
+        .collect();
         if !missing.is_empty() {
             return Err(format!("missing mapped tools: {}", missing.join(", ")));
         }
@@ -466,6 +478,10 @@ mod tests {
             value["page_size"] = json!(2);
             std::fs::write(&state, value.to_string()).unwrap();
             assert!(ticket_check(&config).starts_with('✓'));
+            if name == "meaning-example" {
+                assert!(config.escape_mentions);
+                assert_eq!(config.operation("whoami").unwrap().tool, "whoami");
+            }
             config.operations.get.as_mut().unwrap().tool = "unknown_get".into();
             let failed = ticket_check(&config);
             assert!(failed.starts_with('✗') && failed.contains("get → unknown_get"), "{failed}");

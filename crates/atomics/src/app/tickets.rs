@@ -23,6 +23,8 @@ pub(super) struct Tag {
 #[derive(Clone, PartialEq)]
 enum Kind {
     Trace(u64),
+    Whoami(Arc<TicketConfig>, u64),
+    Outbox,
     Read,
     Refresh,
     List,
@@ -77,6 +79,8 @@ pub(super) struct Tickets {
     pub(super) sign: super::tickets_signin::SignUi,
     pub(super) trace_jobs: HashMap<u64, (Arc<TicketConfig>, super::trace::TraceAction)>,
     pub(super) next_trace_job: u64,
+    pub(super) whoami: Option<ticket::Whoami>,
+    pub(super) identity_epoch: u64,
 }
 
 /// A control request answered once all of its ticket jobs are done.
@@ -120,6 +124,8 @@ impl Tickets {
             sign: super::tickets_signin::SignUi::new(wake),
             trace_jobs: HashMap::new(),
             next_trace_job: 0,
+            whoami: None,
+            identity_epoch: 0,
         }
     }
 }
@@ -178,7 +184,27 @@ impl State {
         let effective = self.effective_tickets();
         let effective = effective.is_configured().then(|| Arc::new(effective));
         if effective != self.tickets.config {
+            let previous = self.tickets.config.clone();
             self.tickets.config = effective;
+            // Keep one serial worker: replacing it during an in-flight write could race
+            // another worker saving the same sidecar. Reset its registrations in order.
+            if self.tickets.jobs.is_some()
+                && let Some(config) = self.tickets.config.clone().or(previous)
+            {
+                self.send_ticket(
+                    &config,
+                    TicketOp::ResetOutboxes,
+                    Tag {
+                        key: (String::new(), None),
+                        ticket: String::new(),
+                        system: config.system.clone(),
+                        kind: Kind::Outbox,
+                        batch: None,
+                    },
+                );
+            }
+            self.refresh_ticket_identity();
+            self.resume_ticket_outboxes();
             self.tickets.failed.clear();
             self.tickets.state_nonces.clear();
             self.refresh_tickets(None, None);
@@ -296,7 +322,12 @@ impl State {
             | TicketOp::List(link)
             | TicketOp::UpdateState(link, _, _)
             | TicketOp::Comment(link, _) => Some(link),
-            TicketOp::TraceCleaner | TicketOp::Create { .. } | TicketOp::Search { .. } => None,
+            TicketOp::TraceCleaner
+            | TicketOp::Whoami
+            | TicketOp::ResetOutboxes
+            | TicketOp::Outbox { .. }
+            | TicketOp::Create { .. }
+            | TicketOp::Search { .. } => None,
         };
         // Callers already leave other systems' links alone; nothing may reach them anyway.
         if let Some(mismatch) = addressed.and_then(|link| config.mismatch(link)) {
@@ -309,11 +340,16 @@ impl State {
             Some(oauth) => crate::tickets::spawn_with(done, oauth),
             None => crate::tickets::spawn(done),
         });
-        self.tickets.pending += 1;
+        let counted = tag.kind != Kind::Outbox;
+        if counted {
+            self.tickets.pending += 1;
+        }
         if let Err(unsent) = jobs.send(TicketJob { config: config.clone(), op, tag }) {
             // A worker that stopped is started again for the next job; this one fails.
             self.tickets.jobs = None;
-            self.tickets.pending -= 1;
+            if counted {
+                self.tickets.pending -= 1;
+            }
             self.finish_ticket(unsent.0.tag, Err("the ticket worker stopped".into()));
         }
     }
@@ -380,7 +416,9 @@ impl State {
         let mut changed = false;
         while let Ok((tag, result)) = self.tickets.done_rx.try_recv() {
             changed = true;
-            self.tickets.pending = self.tickets.pending.saturating_sub(1);
+            if tag.kind != Kind::Outbox {
+                self.tickets.pending = self.tickets.pending.saturating_sub(1);
+            }
             self.finish_ticket(tag, result);
         }
         changed
@@ -411,7 +449,73 @@ impl State {
         );
     }
 
+    pub(super) fn refresh_ticket_identity(&mut self) {
+        self.tickets.whoami = None;
+        self.tickets.identity_epoch += 1;
+        let Some(config) = self.ticket_config().filter(|c| c.operation("whoami").is_some()) else { return };
+        self.send_ticket(
+            &config,
+            TicketOp::Whoami,
+            Tag {
+                key: (String::new(), None),
+                ticket: String::new(),
+                system: config.system.clone(),
+                kind: Kind::Whoami(config.clone(), self.tickets.identity_epoch),
+                batch: None,
+            },
+        );
+    }
+
+    /// Register persisted writes after startup or reload. No conversation is opened by X1.
+    pub(super) fn resume_ticket_outboxes(&mut self) {
+        let Some(config) = self.ticket_config() else { return };
+        if config.operation("conversation_post").is_none() && config.operation("conversation_ack").is_none() {
+            return;
+        }
+        let home = paths::atomics_home();
+        let plans: Vec<_> = self.plans.iter().map(|p| p.id.clone()).collect();
+        for plan in plans {
+            if atomics_core::remote::RemoteState::path(&home, &plan).is_ok_and(|p| p.exists()) {
+                self.send_ticket(
+                    &config,
+                    TicketOp::Outbox { home: home.clone(), plan: plan.clone(), write: None },
+                    Tag {
+                        key: (plan, None),
+                        ticket: String::new(),
+                        system: config.system.clone(),
+                        kind: Kind::Outbox,
+                        batch: None,
+                    },
+                );
+            }
+        }
+    }
+
     fn finish_ticket(&mut self, tag: Tag, result: Result<TicketOutput, String>) {
+        if let Kind::Whoami(config, epoch) = &tag.kind {
+            if self.tickets.config.as_ref() == Some(config) && self.tickets.identity_epoch == *epoch {
+                match result {
+                    Ok(TicketOutput::Whoami(identity)) => self.tickets.whoami = Some(identity),
+                    Err(error) if crate::mcp_client::is_sign_in_required(&error) => self.tickets.panel.signin = true,
+                    Err(error) => self.toast(format!("Ticket identity: {error}")),
+                    _ => {}
+                }
+            }
+            return;
+        }
+        if tag.kind == Kind::Outbox {
+            match result {
+                Ok(TicketOutput::Outbox(messages)) => {
+                    for message in messages {
+                        self.toast(message);
+                    }
+                }
+                Err(error) => self.toast(format!("Remote outbox: {error}")),
+                _ => {}
+            }
+            return;
+        }
+
         if let Kind::Trace(seq) = tag.kind {
             self.finish_trace(seq, result);
             return;
@@ -458,7 +562,14 @@ impl State {
             Kind::State(_) => {
                 self.tickets.pushing.remove(&tag.key);
             }
-            Kind::Trace(_) | Kind::Read | Kind::Comment | Kind::Create(_) | Kind::Panel(..) | Kind::Cards { .. } => {}
+            Kind::Whoami(..)
+            | Kind::Outbox
+            | Kind::Trace(_)
+            | Kind::Read
+            | Kind::Comment
+            | Kind::Create(_)
+            | Kind::Panel(..)
+            | Kind::Cards { .. } => {}
         }
         let error = match (tag.kind.clone(), result) {
             (Kind::Read, Ok(TicketOutput::Read(value))) => {
@@ -522,7 +633,9 @@ impl State {
             }
             (kind, Err(err)) => {
                 let what = match &kind {
-                    Kind::Trace(_) | Kind::Read | Kind::Refresh | Kind::List => "reading the ticket failed".to_string(),
+                    Kind::Whoami(..) | Kind::Outbox | Kind::Trace(_) | Kind::Read | Kind::Refresh | Kind::List => {
+                        "reading the ticket failed".to_string()
+                    }
                     Kind::State(state) => {
                         self.tickets.failed.insert(tag.key.clone(), state.clone());
                         format!("setting the state to {state} failed")
@@ -1341,6 +1454,62 @@ mod tests {
         arguments = { board = "{board}", name = "{title}", text = "{body}" }
         result = { id = "card.ref", key = "card.code", url = "card.href", title = "card.name", state = "card.column.title" }
     "#;
+
+    #[test]
+    fn ticket_identity_reloads_and_plan_json_excludes_the_sidecar() {
+        with_app("app::tickets::tests::ticket_identity_reloads_and_plan_json_excludes_the_sidecar", |app, _| {
+            let dir = crate::test_support::tempdir().unwrap();
+            let path = fake_state(dir.path(), json!([]));
+            let config = crate::mcp_client::tests::example_profile("meaning-example", &path);
+            app.runtime.config.tickets = config.clone();
+            app.runtime.apply_ticket_config();
+            settle(app);
+            let identity = app.runtime.tickets.whoami.as_ref().unwrap();
+            assert_eq!(identity.name, "Example agent");
+            assert_eq!(identity.owner_name.as_deref(), Some("Example human"));
+            let mut server: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            server["whoami"] = json!({"userId":"agent-b", "kind":"agent", "displayName":"Another agent"});
+            std::fs::write(&path, server.to_string()).unwrap();
+            app.runtime.config.tickets.workflow.push_str(" Reloaded.");
+            app.runtime.apply_ticket_config();
+            assert!(app.runtime.tickets.whoami.is_none(), "identity is cleared during reload");
+            settle(app);
+            let identity = app.runtime.tickets.whoami.as_ref().unwrap();
+            assert_eq!(identity.name, "Another agent");
+            assert!(identity.owner_id.is_none());
+            app.runtime.plans.push(Plan {
+                id: "private-remote-test".into(),
+                goal: "Public goal".into(),
+                ..Default::default()
+            });
+            let home = paths::atomics_home();
+            let remote = atomics_core::remote::RemoteState {
+                conversation: Some("private-conversation".into()),
+                ..Default::default()
+            };
+            remote.save(&home, "private-remote-test").unwrap();
+            let value = app.runtime.plan_json(app.runtime.plans.len() - 1);
+            for field in
+                ["remote", "conversation", "cursor", "next_seq", "delivering", "seen", "outbox", "posted_today"]
+            {
+                assert!(value.get(field).is_none(), "{field}");
+            }
+            assert!(!value.to_string().contains("private-conversation"));
+            // An in-flight result from an older mapping cannot replace the new identity.
+            let stale = Tag {
+                key: (String::new(), None),
+                ticket: String::new(),
+                system: config.system.clone(),
+                kind: Kind::Whoami(Arc::new(config), 0),
+                batch: None,
+            };
+            app.runtime.finish_ticket(
+                stale,
+                Ok(TicketOutput::Whoami(ticket::Whoami { name: "Stale".into(), ..Default::default() })),
+            );
+            assert_eq!(app.runtime.tickets.whoami.as_ref().unwrap().name, "Another agent");
+        });
+    }
 
     /// An issue system answering with flat JSON text, addressed by key.
     const ISSUES: &str = r#"

@@ -76,9 +76,9 @@ fn ticket_demo_sign_in_search_read_plan_trace_and_board() {
         let fake = FakeOAuthServer::start_with_tickets(client);
         let (_keychain, oauth) = crate::mcp_client::oauth_test_machine();
         config.server = fake.server();
+        app.runtime.tickets.sign.override_oauth(oauth.clone());
         app.runtime.config.tickets = config;
         app.runtime.apply_ticket_config();
-        app.runtime.tickets.sign.override_oauth(oauth.clone());
         app.runtime.tickets.sign.headless = true;
         quiet_chief(app);
         let before = app.runtime.plans.len();
@@ -122,8 +122,9 @@ fn ticket_demo_sign_in_search_read_plan_trace_and_board() {
         demo_wait(app, |r| r.tickets.sign.job.is_none());
         assert_eq!(app.runtime.tickets.sign.state(), Some(&SignState::SignedIn));
         assert!(!app.runtime.tickets.panel.signin);
+        settle(app);
         let signed = texts(&frame(app, ctx, vec![])).join("\n");
-        assert!(signed.contains("signed in"), "{signed}");
+        assert!(signed.contains("Example agent (personalAgent)") && signed.contains("Example human"), "{signed}");
         {
             let auth = fake.state.lock().unwrap();
             assert_eq!(auth.registrations.len(), 1);
