@@ -3,12 +3,15 @@
 //! related tickets and links). It sits in the diff's slot and uses the diff's keyboard
 //! model (`panel_nav`): Shift+↓/↑ step results or sections, PageUp/PageDown/Home/End
 //! scroll, Enter opens, Alt+← goes back. Reads run on the ticket worker as panel jobs.
+//! A profile with views lists tickets without a query: its view tabs sit beside the box
+//! (←/→ in the list), its filter chips below it (Alt+1…9), and "More" follows the cursor.
 use super::*;
 use crate::markdown::{self, Block, Inline};
 use crate::panel_nav;
 use crate::tickets::{TicketOp, TicketOutput};
 use atomics_core::tickets::{TicketCard, TicketConfig, TicketLink, TicketMode};
 use egui::text::{LayoutJob, TextWrapping};
+use serde_json::{Map, Value};
 
 const ROW_H: f32 = 58.0;
 const ECHO_H: f32 = 22.0;
@@ -20,6 +23,8 @@ const COMMENT_LINES: usize = 12;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Job {
     Find,
+    /// The next page of the results, for "More".
+    More,
     Read,
     Children,
     Related,
@@ -61,6 +66,14 @@ pub(super) struct Find {
     pub ran: Option<(String, bool)>,
     /// The chief ran the search; the user's own query box is untouched.
     pub from_chief: bool,
+    /// The view whose listing made the results, when no query did.
+    pub listed: Option<usize>,
+    /// Where "More" continues the results, when the operation maps paging.
+    pub next: Option<String>,
+    /// "More" is reading the next page.
+    pub more: bool,
+    /// The operation, query and extra arguments that made the results, for "More".
+    request: Option<(&'static str, Option<String>, Map<String, Value>)>,
     seq: u64,
     reveal: bool,
     /// Scroll position as of the last frame.
@@ -151,6 +164,12 @@ pub(super) struct TicketsPanel {
     pub dialog: Option<PlanDialog>,
     /// Plans whose Plan with chief message the chief has received.
     pub planning: HashSet<String>,
+    /// The view tab picked; `None` shows the profile's default view.
+    pub tab: Option<usize>,
+    /// The filter chips switched on, by their index in `[[tickets.filters]]`.
+    pub chips: std::collections::BTreeSet<usize>,
+    /// A ticket was opened: the panel takes the keys on the next frame.
+    focus: bool,
     seq: u64,
 }
 
@@ -206,6 +225,13 @@ pub(super) enum Act {
     Browser(String),
     FindView,
     Plan,
+    /// List the selected view: the query is empty.
+    List,
+    Tab(usize),
+    Chip(usize),
+    More,
+    /// The next or previous ticket of the list, read in place.
+    Step(i32),
 }
 
 impl TicketsPanel {
@@ -241,6 +267,9 @@ impl TicketsPanel {
         match self.view {
             TicketsView::Find => {
                 let len = self.find.results.len();
+                if key == Key::ArrowDown && len > 0 && self.find.selected == Some(len - 1) && self.find.next.is_some() {
+                    return Some(Act::More);
+                }
                 let selected = &mut self.find.selected;
                 match key {
                     Key::ArrowDown => *selected = panel_nav::step_index(*selected, len, 1),
@@ -278,6 +307,28 @@ impl TicketsPanel {
                 }
             }
         }
+    }
+
+    /// The view tab shown while the query is empty.
+    pub(super) fn tab(&self, config: &TicketConfig) -> usize {
+        self.tab.unwrap_or_else(|| config.default_view()).min(config.views.len().saturating_sub(1))
+    }
+
+    /// The arguments the switched-on chips add to an operation that takes them.
+    fn chip_arguments(&self, config: &TicketConfig, name: &str) -> Map<String, Value> {
+        let mut extra = Map::new();
+        for filter in self.chips.iter().filter_map(|&i| config.filters.get(i)) {
+            if config.filter_applies(filter, name) {
+                extra.extend(filter.arguments.clone());
+            }
+        }
+        extra
+    }
+
+    /// Whether the ticket Read shows is one of the results, so ↑/↓ step through them.
+    fn reading_from_list(&self) -> bool {
+        self.crumbs.is_empty()
+            && self.read.as_ref().is_some_and(|read| self.find.results.iter().any(|c| c.link.same_ticket(&read.link)))
     }
 
     /// Where the card of `link` is known from, so a read starts with what the lists showed.
@@ -362,17 +413,108 @@ impl State {
         }
         let has = |op: &str| config.operation(op).is_some();
         let semantic = has("semantic_search") && (!self.tickets.panel.keyword || !has("search"));
+        let name = if semantic { "semantic_search" } else { "search" };
         let panel = &mut self.tickets.panel;
+        let extra = panel.chip_arguments(&config, name);
         panel.signin = false;
         panel.seq += 1;
-        panel.find = Find { seq: panel.seq, busy: true, ran: Some((query.clone(), semantic)), ..Find::default() };
+        panel.find = Find {
+            seq: panel.seq,
+            busy: true,
+            ran: Some((query.clone(), semantic)),
+            request: Some((name, Some(query.clone()), extra.clone())),
+            ..Find::default()
+        };
         if !has("search") && !has("semantic_search") {
             panel.find.busy = false;
             panel.find.error = Some("No search operation is mapped in [tickets.operations]".into());
             return;
         }
         let tag = self.panel_tag(&config, Job::Find, self.tickets.panel.seq);
-        self.send_ticket(&config, TicketOp::Search { query, semantic }, tag);
+        self.send_ticket(&config, TicketOp::Page { name, query: Some(query), extra }, tag);
+    }
+
+    /// Lists the selected view with the chips' arguments: what Find shows while the query is empty.
+    pub(super) fn tickets_list(&mut self) {
+        let Some(config) = self.ticket_config() else { return };
+        if !config.has_views() {
+            return;
+        }
+        let panel = &mut self.tickets.panel;
+        let tab = panel.tab(&config);
+        let mut extra = config.views[tab].arguments.clone();
+        extra.extend(panel.chip_arguments(&config, "browse"));
+        panel.signin = false;
+        panel.seq += 1;
+        panel.find = Find {
+            seq: panel.seq,
+            busy: true,
+            listed: Some(tab),
+            request: Some(("browse", None, extra.clone())),
+            ..Find::default()
+        };
+        let tag = self.panel_tag(&config, Job::Find, self.tickets.panel.seq);
+        self.send_ticket(&config, TicketOp::Page { name: "browse", query: None, extra }, tag);
+    }
+
+    /// A view tab: the query is cleared and the view listed.
+    pub(super) fn tickets_tab(&mut self, tab: usize) {
+        let Some(config) = self.ticket_config() else { return };
+        if tab >= config.views.len() {
+            return;
+        }
+        let panel = &mut self.tickets.panel;
+        panel.tab = Some(tab);
+        panel.query.clear();
+        panel.view = TicketsView::Find;
+        self.tickets_list();
+    }
+
+    /// Switches filter chip `index` and runs the search, or the view, again.
+    pub(super) fn tickets_chip(&mut self, index: usize) {
+        let Some(config) = self.ticket_config() else { return };
+        if index >= config.filters.len() {
+            return;
+        }
+        let panel = &mut self.tickets.panel;
+        if !panel.chips.remove(&index) {
+            panel.chips.insert(index);
+        }
+        let searched = panel.find.ran.is_some() && !panel.find.from_chief && !panel.query.trim().is_empty();
+        if searched {
+            self.tickets_search();
+        } else {
+            self.tickets_list();
+        }
+    }
+
+    /// "More": the next page of the results, from the cursor the last page returned.
+    pub(super) fn tickets_more(&mut self) {
+        let Some(config) = self.ticket_config() else { return };
+        let find = &mut self.tickets.panel.find;
+        if find.busy || find.more {
+            return;
+        }
+        let (Some(cursor), Some((name, query, mut extra))) = (find.next.clone(), find.request.clone()) else { return };
+        let Some(argument) = config.operation(name).map(|op| op.paging.cursor.clone()) else { return };
+        extra.insert(argument, Value::String(cursor));
+        find.more = true;
+        let seq = find.seq;
+        let tag = self.panel_tag(&config, Job::More, seq);
+        self.send_ticket(&config, TicketOp::Page { name, query, extra }, tag);
+    }
+
+    /// Escape in Read: back to the list, with the ticket read selected there.
+    pub(super) fn tickets_to_list(&mut self) {
+        let panel = &mut self.tickets.panel;
+        panel.view = TicketsView::Find;
+        if let Some(read) = &panel.read
+            && let Some(at) = panel.find.results.iter().position(|card| card.link.same_ticket(&read.link))
+        {
+            panel.find.selected = Some(at);
+            panel.find.reveal = true;
+        }
+        self.ctx.request_repaint();
     }
 
     /// Reads a ticket in the panel: the card, its children and the tickets related to it.
@@ -402,6 +544,7 @@ impl State {
         panel.seq += 1;
         let seq = panel.seq;
         panel.view = TicketsView::Read;
+        panel.focus = true;
         let seed = panel.known(&link);
         panel.read = Some(Read::new(link.clone(), seed, seq, &config));
         let has = |op: &str| config.operation(op).is_some();
@@ -556,16 +699,29 @@ impl State {
             panel.signin = true;
         }
         match job {
-            Job::Find if panel.find.seq == seq => {
-                panel.find.busy = false;
+            Job::Find | Job::More if panel.find.seq == seq => {
+                let find = &mut panel.find;
+                find.busy = false;
+                find.more = false;
                 match result {
-                    Ok(TicketOutput::Cards(cards)) => {
-                        panel.find.selected = (!cards.is_empty()).then_some(0);
-                        panel.find.results = cards;
+                    Ok(TicketOutput::Page(cards, next)) if job == Job::More => {
+                        find.results.extend(cards);
+                        find.next = next;
                     }
-                    Ok(_) => panel.find.error = Some("unexpected ticket result".into()),
+                    Ok(TicketOutput::Page(cards, next)) => {
+                        find.selected = (!cards.is_empty()).then_some(0);
+                        find.results = cards;
+                        find.next = next;
+                    }
+                    Ok(TicketOutput::Cards(cards)) => {
+                        find.selected = (!cards.is_empty()).then_some(0);
+                        find.results = cards;
+                    }
+                    Ok(_) => find.error = Some("unexpected ticket result".into()),
+                    // The view lists again once the sign-in banner is gone.
+                    Err((true, _)) if job == Job::Find => find.listed = None,
                     Err((true, _)) => {}
-                    Err((false, error)) => panel.find.error = Some(error),
+                    Err((false, error)) => find.error = Some(error),
                 }
             }
             Job::Read | Job::Children | Job::Related => {
@@ -693,6 +849,13 @@ fn find_row(
 impl Desktop<'_> {
     pub(super) fn tickets_panel(&mut self, ui: &mut egui::Ui, rect: Rect) {
         panel_nav::focusable(ui, rect);
+        // An opened ticket keeps the keys in the panel, so ↑/↓ and Escape work at once. Asking
+        // again while it has them would reset the focus lock that keeps Escape for the panel.
+        if std::mem::take(&mut self.runtime.tickets.panel.focus) && !ui.memory(|m| m.has_focus(panel_nav::focus_id())) {
+            self.client.focus_terminal = None;
+            self.client.focus_editor = false;
+            ui.memory_mut(|m| m.request_focus(panel_nav::focus_id()));
+        }
         let p = self.runtime.palette.clone();
         ui.painter().rect_filled(rect, 0.0, p.background);
         // The chief's newest trace card, one line, opens the chief.
@@ -771,6 +934,11 @@ impl Desktop<'_> {
                 Act::Back => self.runtime.tickets_back(),
                 Act::FindView => self.runtime.show_find(),
                 Act::Plan => self.runtime.open_plan_dialog(),
+                Act::List => self.runtime.tickets_list(),
+                Act::Tab(tab) => self.runtime.tickets_tab(tab),
+                Act::Chip(index) => self.runtime.tickets_chip(index),
+                Act::More => self.runtime.tickets_more(),
+                Act::Step(delta) => self.runtime.tickets_step(delta),
                 Act::Browser(url) => {
                     let url = self.runtime.cleaner().url(&url);
                     if markdown::web_url(&url).is_some() {
@@ -858,7 +1026,13 @@ impl Desktop<'_> {
         use egui::Key;
         let query_id = query_id();
         let both = config.operation("semantic_search").is_some() && config.operation("search").is_some();
+        let views = config.has_views();
         let panel = &mut self.runtime.tickets.panel;
+        // An empty query shows the selected view: on opening, and when the query is cleared.
+        if views && panel.query.trim().is_empty() && panel.find.listed.is_none() && !panel.find.from_chief {
+            acts.push(Act::List);
+        }
+        let tab = panel.tab(config);
         let in_box = ui.memory(|m| m.has_focus(query_id));
         let plain = |key: Key| panel_nav::consume_bare(ui, key);
         if in_box {
@@ -883,12 +1057,32 @@ impl Desktop<'_> {
         }
         ui.horizontal(|ui| {
             let toggle = if both { 150.0 } else { 0.0 };
+            let font = egui::TextStyle::Button.resolve(ui.style());
+            let pad = 2.0 * ui.spacing().button_padding.x + ui.spacing().item_spacing.x;
+            let tabs: f32 = if views {
+                config
+                    .views
+                    .iter()
+                    .map(|view| ui.painter().layout_no_wrap(view.label.clone(), font.clone(), p.muted).size().x + pad)
+                    .sum()
+            } else {
+                0.0
+            };
             let response = ui.add(
                 egui::TextEdit::singleline(&mut panel.query)
                     .id(query_id)
                     .hint_text("Search tickets…")
-                    .desired_width((ui.available_width() - toggle).max(60.0)),
+                    .desired_width((ui.available_width() - toggle - tabs).max(60.0)),
             );
+            if views {
+                let showing = panel.query.trim().is_empty() && panel.find.listed.is_some();
+                for (i, view) in config.views.iter().enumerate() {
+                    let label = ui.selectable_label(showing && i == tab, &view.label);
+                    if label.on_hover_text("←/→ in the list").clicked() {
+                        acts.push(Act::Tab(i));
+                    }
+                }
+            }
             if std::mem::take(&mut panel.focus_query) {
                 response.request_focus();
             }
@@ -914,11 +1108,31 @@ impl Desktop<'_> {
                 }
             }
         });
+        if !config.filters.is_empty() {
+            let name = panel.find.request.as_ref().map_or("browse", |request| request.0);
+            ui.horizontal_wrapped(|ui| {
+                for (i, filter) in config.filters.iter().enumerate() {
+                    let on = panel.chips.contains(&i);
+                    let applies = config.filter_applies(filter, name);
+                    let chip = ui
+                        .add_enabled(applies, egui::Button::selectable(on, filter.label.as_str()).small())
+                        .on_hover_text(format!("Alt+{}", i + 1))
+                        .on_disabled_hover_text("This search does not take this filter");
+                    if chip.clicked() {
+                        acts.push(Act::Chip(i));
+                    }
+                }
+            });
+        }
         let find = &panel.find;
         let status = if find.busy {
-            "searching…".to_string()
+            if find.listed.is_some() { "listing…" } else { "searching…" }.to_string()
         } else if let Some(error) = &find.error {
             error.clone()
+        } else if let Some(listed) = find.listed {
+            let n = find.results.len();
+            let label = config.views.get(listed).map_or("", |view| view.label.as_str());
+            format!("{n} ticket{} · {label}", if n == 1 { "" } else { "s" })
         } else if let Some((query, semantic)) = &find.ran {
             let how = if *semantic { "by meaning" } else { "by keyword" };
             let n = find.results.len();
@@ -928,12 +1142,47 @@ impl Desktop<'_> {
             "Type a query and press Enter.".to_string()
         };
         let color = if find.error.is_some() { p.error } else { p.muted };
-        ui.add(egui::Label::new(RichText::new(status).size(11.5).color(color)).truncate());
+        ui.horizontal(|ui| {
+            if find.more {
+                ui.label(RichText::new("loading more…").size(11.5).color(p.muted));
+            } else if find.next.is_some()
+                && !find.busy
+                && ui.small_button("More").on_hover_text("↓ on the last").clicked()
+            {
+                acts.push(Act::More);
+            }
+            ui.add(egui::Label::new(RichText::new(status).size(11.5).color(color)).truncate());
+        });
         ui.separator();
         // Selection and Enter, then paging.
         for key in panel_nav::take_keys(ui, &[Key::ArrowUp, Key::ArrowDown, Key::Home, Key::End, Key::Enter]) {
             if let Some(act) = panel.key(key) {
                 acts.push(act);
+            }
+        }
+        // ←/→ in the list: the previous or next view.
+        if views {
+            if ui.memory(|m| m.has_focus(panel_nav::focus_id())) {
+                ui.memory_mut(|m| {
+                    m.set_focus_lock_filter(
+                        panel_nav::focus_id(),
+                        egui::EventFilter {
+                            vertical_arrows: true,
+                            horizontal_arrows: true,
+                            escape: true,
+                            ..Default::default()
+                        },
+                    );
+                });
+            }
+            for key in panel_nav::take_keys(ui, &[Key::ArrowLeft, Key::ArrowRight]) {
+                let delta = if key == Key::ArrowRight { 1 } else { -1 };
+                // From search results, the arrows first return to the selected view.
+                let next = match panel.find.listed {
+                    Some(_) => panel_nav::step_index(Some(tab), config.views.len(), delta).filter(|&next| next != tab),
+                    None => Some(tab),
+                };
+                acts.extend(next.map(Act::Tab));
             }
         }
         let range = score_range(&panel.find.results);
@@ -1052,6 +1301,12 @@ impl Desktop<'_> {
         }
         for key in panel_nav::take_keys(ui, &[Key::PageUp, Key::PageDown]) {
             panel.step_section(if key == Key::PageDown { 1 } else { -1 });
+        }
+        // A ticket read from the list: ↑/↓ read the previous or next one in place.
+        if panel.reading_from_list() {
+            for key in panel_nav::take_keys(ui, &[Key::ArrowUp, Key::ArrowDown]) {
+                acts.push(Act::Step(if key == Key::ArrowDown { 1 } else { -1 }));
+            }
         }
         let read = panel.read.as_mut().expect("checked above");
         let scroll_id = ui.make_persistent_id(egui::IdSalt::new("tickets-read"));
@@ -1491,6 +1746,11 @@ mod tests {
                 assert_eq!(panel.view, TicketsView::Read);
                 assert_eq!(panel.read.as_ref().unwrap().link.label(), "DEMO-2");
                 assert!(panel.crumbs.is_empty());
+                // Escape goes back to the list, again to the terminal.
+                frame(app, ctx, vec![key(Key::Escape, NONE)]);
+                assert_eq!(app.runtime.tickets.panel.view, TicketsView::Find);
+                assert_eq!(app.runtime.tickets.panel.find.selected, Some(1), "the ticket read stays selected");
+                assert!(focused(ctx));
                 frame(app, ctx, vec![key(Key::Escape, NONE)]);
                 assert!(!focused(ctx));
                 assert_eq!(app.client.focus_terminal.as_deref(), Some("agent"));
@@ -1671,6 +1931,48 @@ mod tests {
             assert_eq!(label(app), "DEMO-2");
             assert!(app.runtime.tickets.panel.crumbs.is_empty());
         });
+    }
+
+    #[test]
+    fn arrows_with_a_ticket_open_read_the_neighbours_and_escape_returns_to_the_list() {
+        with_app(
+            "app::tickets_panel::tests::arrows_with_a_ticket_open_read_the_neighbours_and_escape_returns_to_the_list",
+            |app, ctx| {
+                open_panel(app, ctx, TicketsView::Find);
+                results(app, 30);
+                // Opened by a click or the sidebar: the panel takes the keys.
+                app.runtime.open_ticket(card(1, None).link, Nav::Fresh);
+                frame(app, ctx, vec![]);
+                assert!(focused(ctx), "an opened ticket keeps the keys in the panel");
+                let label =
+                    |app: &Desktop<'_>| app.runtime.tickets.panel.read.as_ref().unwrap().link.label().to_string();
+                frame(app, ctx, vec![key(Key::ArrowDown, NONE)]);
+                assert_eq!(label(app), "DEMO-2", "↓ reads the next ticket in place");
+                assert_eq!(app.runtime.tickets.panel.view, TicketsView::Read);
+                for _ in 0..20 {
+                    frame(app, ctx, vec![key(Key::ArrowDown, NONE)]);
+                }
+                assert_eq!(label(app), "DEMO-22");
+                frame(app, ctx, vec![key(Key::ArrowUp, NONE)]);
+                assert_eq!(label(app), "DEMO-21", "↑ reads the previous one");
+                assert_eq!(app.runtime.tickets.panel.find.selected, Some(20), "the selection follows");
+                assert!(app.runtime.tickets.panel.crumbs.is_empty());
+                frame(app, ctx, vec![key(Key::Escape, NONE)]);
+                assert_eq!(app.runtime.tickets.panel.view, TicketsView::Find, "Escape returns to the list");
+                assert!(focused(ctx));
+                frame(app, ctx, vec![]);
+                let offset = app.runtime.tickets.panel.find.offset;
+                assert!(offset > 0.0 && offset <= 20.0 * ROW_H, "the selection is scrolled into view: {offset}");
+                // Back in the list, ↓ moves the selection again and Enter reads it.
+                frame(app, ctx, vec![key(Key::ArrowDown, NONE)]);
+                frame(app, ctx, vec![key(Key::Enter, NONE)]);
+                assert_eq!(label(app), "DEMO-22");
+                // On a trail of opened tickets, ↑/↓ scroll the ticket as before.
+                app.runtime.open_ticket(card(99, None).link, Nav::Push);
+                frame(app, ctx, vec![key(Key::ArrowDown, NONE)]);
+                assert_eq!(label(app), "DEMO-99");
+            },
+        );
     }
 
     #[test]
@@ -1875,6 +2177,170 @@ mod tests {
             let text = texts(&output).join("\n");
             assert!(text.contains("Children (4)") && text.contains("Comments (1)") && text.contains("Goal"), "{text}");
             assert_eq!(app.runtime.tickets.panel.recent[0].label(), "DEMO-1");
+        });
+    }
+
+    fn labels(app: &Desktop<'_>) -> Vec<String> {
+        app.runtime.tickets.panel.find.results.iter().map(|c| c.link.label().to_string()).collect()
+    }
+
+    /// Edits the fake server's state between calls; it rereads the file on each.
+    fn edit_state(path: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
+        let mut state: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        edit(&mut state);
+        std::fs::write(path, state.to_string()).unwrap();
+    }
+
+    /// The arguments of each `find_tickets` call the fake server received.
+    fn finds(path: &Path) -> Vec<serde_json::Value> {
+        let state: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        state["calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|call| call["tool"] == "find_tickets")
+            .map(|call| call["arguments"].clone())
+            .collect()
+    }
+
+    fn in_list(ctx: &egui::Context) {
+        ctx.memory_mut(|m| m.request_focus(diff_view::focus_id()));
+    }
+
+    #[test]
+    fn views_list_recent_switch_tabs_and_chips_narrow_against_the_fake_server() {
+        with_app(
+            "app::tickets_panel::tests::views_list_recent_switch_tabs_and_chips_narrow_against_the_fake_server",
+            |app, ctx| {
+                let dir = crate::test_support::tempdir().unwrap();
+                let state = dir.path().join("fake.json");
+                fake_profile(app, dir.path());
+                app.runtime.toggle_tickets();
+                frame(app, ctx, vec![]);
+                settle(app);
+                // The empty panel shows Recent: newest first, without a query or scores.
+                assert_eq!(labels(app), ["DEMO-5", "DEMO-4", "DEMO-3", "DEMO-2", "DEMO-1"]);
+                assert!(app.runtime.tickets.panel.find.results.iter().all(|c| c.score.is_none()));
+                let text = texts(&frame(app, ctx, vec![])).join("\n");
+                assert!(text.contains("5 tickets · Recent") && text.contains("Being worked on"), "{text}");
+                assert!(text.contains("Mine"), "{text}");
+                let first = &finds(&state)[0];
+                assert!(first.get("about").is_none() && first.get("status").is_none(), "{first}");
+
+                edit_state(&state, |state| {
+                    let tickets = state["tickets"].as_array_mut().unwrap();
+                    tickets[2]["state"] = "InProgress".into();
+                    tickets[2]["rev"] = 5.into();
+                    tickets[1]["assignee"] = "Someone Else".into();
+                });
+                // → in the list switches to Being worked on.
+                in_list(ctx);
+                frame(app, ctx, vec![key(Key::ArrowRight, NONE)]);
+                settle(app);
+                assert_eq!(app.runtime.tickets.panel.tab, Some(1));
+                assert_eq!(labels(app), ["DEMO-3", "DEMO-2"], "DEMO-2 is Deploying, DEMO-3 newly in progress");
+                assert_eq!(finds(&state).last().unwrap()["status"], "active");
+                assert!(texts(&frame(app, ctx, vec![])).join("\n").contains("2 tickets · Being worked on"));
+
+                // Alt+1 switches on Mine, which narrows the view.
+                frame(app, ctx, vec![key(Key::Num1, egui::Modifiers::ALT)]);
+                settle(app);
+                assert!(app.runtime.tickets.panel.chips.contains(&0));
+                assert_eq!(labels(app), ["DEMO-3"]);
+                let last = finds(&state).last().unwrap().clone();
+                assert_eq!((&last["status"], &last["assignee"]), (&"active".into(), &"me".into()));
+
+                // Typing searches, with the chip the search accepts.
+                ctx.memory_mut(|m| m.request_focus(query_id()));
+                frame(app, ctx, vec![]);
+                frame(app, ctx, vec![egui::Event::Text("ticket workspace".into())]);
+                assert_eq!(app.runtime.tickets.panel.query, "ticket workspace");
+                frame(app, ctx, vec![key(Key::Enter, NONE)]);
+                settle(app);
+                let find = &app.runtime.tickets.panel.find;
+                assert_eq!(find.ran.as_ref().map(|r| r.0.as_str()), Some("ticket workspace"));
+                assert_eq!(labels(app), ["DEMO-1", "DEMO-3", "DEMO-4", "DEMO-5"], "Mine leaves out DEMO-2");
+                let last = finds(&state).last().unwrap().clone();
+                assert_eq!((&last["about"], &last["assignee"]), (&"ticket workspace".into(), &"me".into()));
+                assert!(last.get("status").is_none(), "the view's arguments stay with the view");
+
+                // Clearing the query returns to the selected view.
+                app.runtime.tickets.panel.query.clear();
+                frame(app, ctx, vec![]);
+                settle(app);
+                assert_eq!(app.runtime.tickets.panel.find.listed, Some(1));
+                assert_eq!(labels(app), ["DEMO-3"]);
+                screenshot(app, ctx, "views");
+
+                // ← back to Recent, and Mine off again.
+                in_list(ctx);
+                frame(app, ctx, vec![key(Key::ArrowLeft, NONE)]);
+                settle(app);
+                assert_eq!(labels(app), ["DEMO-3", "DEMO-5", "DEMO-4", "DEMO-1"]);
+                app.runtime.tickets_chip(0);
+                settle(app);
+                assert_eq!(labels(app).len(), 5);
+            },
+        );
+    }
+
+    #[test]
+    fn more_follows_the_next_cursor_against_the_fake_server() {
+        with_app("app::tickets_panel::tests::more_follows_the_next_cursor_against_the_fake_server", |app, ctx| {
+            let dir = crate::test_support::tempdir().unwrap();
+            let state = dir.path().join("fake.json");
+            let mut config = example_profile("meaning-example", &state);
+            config.operations.browse.as_mut().unwrap().arguments.insert("take".into(), 2.into());
+            app.runtime.config.tickets = config;
+            app.runtime.apply_ticket_config();
+            app.runtime.toggle_tickets();
+            frame(app, ctx, vec![]);
+            settle(app);
+            assert_eq!(labels(app), ["DEMO-5", "DEMO-4"]);
+            assert_eq!(app.runtime.tickets.panel.find.next.as_deref(), Some("2"));
+            assert!(texts(&frame(app, ctx, vec![])).join("\n").contains("More"));
+            // ↓ on the last result reads the next page.
+            in_list(ctx);
+            frame(app, ctx, vec![key(Key::End, NONE)]);
+            frame(app, ctx, vec![key(Key::ArrowDown, NONE)]);
+            settle(app);
+            assert_eq!(labels(app), ["DEMO-5", "DEMO-4", "DEMO-3", "DEMO-2"]);
+            assert_eq!(app.runtime.tickets.panel.find.selected, Some(1), "the selection stays");
+            assert_eq!(finds(&state).last().unwrap()["cursor"], "2");
+            app.runtime.tickets_more();
+            settle(app);
+            assert_eq!(labels(app).len(), 5);
+            assert_eq!(app.runtime.tickets.panel.find.next, None, "the last page has no cursor");
+        });
+    }
+
+    #[test]
+    fn a_profile_without_views_keeps_the_empty_search_box() {
+        with_app("app::tickets_panel::tests::a_profile_without_views_keeps_the_empty_search_box", |app, ctx| {
+            let dir = crate::test_support::tempdir().unwrap();
+            let state = dir.path().join("fake.json");
+            let mut config = example_profile("meaning-example", &state);
+            config.views.clear();
+            config.filters.clear();
+            app.runtime.config.tickets = config;
+            app.runtime.apply_ticket_config();
+            app.runtime.toggle_tickets();
+            frame(app, ctx, vec![]);
+            settle(app);
+            assert!(app.runtime.tickets.panel.find.results.is_empty());
+            let text = texts(&frame(app, ctx, vec![])).join("\n");
+            assert!(text.contains("Type a query and press Enter.") && !text.contains("Recent"), "{text}");
+            assert!(!state.exists() || finds(&state).is_empty(), "nothing is listed without a query");
+            app.runtime.tickets.panel.query = "personal-agent ticket workspace".into();
+            app.runtime.tickets_search();
+            settle(app);
+            assert_eq!(labels(app).len(), 5);
+            assert!(texts(&frame(app, ctx, vec![])).join("\n").contains("5 tickets by meaning"));
+            app.runtime.tickets.panel.query.clear();
+            frame(app, ctx, vec![]);
+            settle(app);
+            assert_eq!(labels(app).len(), 5, "clearing leaves the results");
+            assert_eq!(finds(&state).len(), 1);
         });
     }
 

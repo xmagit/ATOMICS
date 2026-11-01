@@ -296,7 +296,7 @@ impl State {
             | TicketOp::List(link)
             | TicketOp::UpdateState(link, _, _)
             | TicketOp::Comment(link, _) => Some(link),
-            TicketOp::TraceCleaner | TicketOp::Create { .. } | TicketOp::Search { .. } => None,
+            TicketOp::TraceCleaner | TicketOp::Create { .. } | TicketOp::Search { .. } | TicketOp::Page { .. } => None,
         };
         // Callers already leave other systems' links alone; nothing may reach them anyway.
         if let Some(mismatch) = addressed.and_then(|link| config.mismatch(link)) {
