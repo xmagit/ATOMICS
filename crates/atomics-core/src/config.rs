@@ -120,7 +120,7 @@ close_done_agents = true
 # BEGIN RELAY PROFILE
 # Relay example: OAuth, state pushes and comments; check with doctor before use.
 # # Stage keys are per project; verify them before enabling state pushes.
-# # find_tickets needs relay-backend #752 to be live.
+# # find_tickets needs relay-backend #752 to be live; browse, accepts and paging need RELAY-11976.
 # [tickets]
 # system = "relay"
 # mode = "auto"
@@ -151,7 +151,16 @@ close_done_agents = true
 # tool = "find_tickets"
 # arguments = { about = "{query}", take = 10, includeClosed = false }
 # items = "result.tickets"
+# accepts = ["assignee", "status"]
+# paging = { cursor = "cursor", next = "result.nextCursor" }
 # result = { id = "id", key = "number", url = "url", title = "subject", state = "status", updated_at = "updatedAtUtc", score = "score", snippet = "snippet", assignee = "assigneeDisplayName", parent = "parentTicketId", kind = "type" }
+#
+# [tickets.operations.browse]
+# tool = "find_tickets"
+# arguments = { take = 25, includeClosed = false }
+# items = "result.tickets"
+# paging = { cursor = "cursor", next = "result.nextCursor" }
+# result = { id = "id", key = "number", url = "url", title = "subject", state = "status", updated_at = "updatedAtUtc", assignee = "assigneeDisplayName", parent = "parentTicketId", kind = "type" }
 #
 # [tickets.operations.related]
 # tool = "find_related_tickets"
@@ -172,6 +181,17 @@ close_done_agents = true
 # [tickets.operations.comment]
 # tool = "add_ticket_comment"
 # arguments = { ticketId = "{uuid}", body = "{body}", idempotencyKey = "{nonce}" }
+#
+# [[tickets.views]]
+# label = "Recent"
+#
+# [[tickets.views]]
+# label = "Being worked on"
+# arguments = { status = "active" }
+#
+# [[tickets.filters]]
+# label = "Mine"
+# arguments = { assignee = "me" }
 # END RELAY PROFILE
 #
 # BEGIN LINEAR PROFILE

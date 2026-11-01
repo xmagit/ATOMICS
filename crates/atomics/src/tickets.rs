@@ -7,7 +7,7 @@ use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
 use atomics_core::tickets::{self, McpServer, TicketCard, TicketConfig, TicketLink, Vars};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::mcp_client::{McpClient, McpError, OAuth};
 
@@ -27,6 +27,13 @@ pub enum TicketOp {
     Search {
         query: String,
         semantic: bool,
+    },
+    /// A Tickets panel list: `browse` (a view, no query) or a search, with the view's, the
+    /// chips' and the cursor's arguments in `extra`.
+    Page {
+        name: &'static str,
+        query: Option<String>,
+        extra: Map<String, Value>,
     },
     #[allow(dead_code)]
     Children(TicketLink),
@@ -55,6 +62,8 @@ pub enum TicketOutput {
     Cards(Vec<TicketCard>),
     #[allow(dead_code)]
     Card(Box<TicketCard>),
+    /// One page of a list, with the cursor of the next when the operation maps paging.
+    Page(Vec<TicketCard>, Option<String>),
     Ticket(TicketLink),
     Read(Value),
     Tickets(Vec<TicketLink>),
@@ -162,6 +171,9 @@ impl Worker {
             TicketOutput::Cards(cards) => {
                 TicketOutput::Cards(cards.into_iter().map(|card| self.cleaner.card(card)).collect())
             }
+            TicketOutput::Page(cards, next) => {
+                TicketOutput::Page(cards.into_iter().map(|card| self.cleaner.card(card)).collect(), next)
+            }
             TicketOutput::Pushed(read) => TicketOutput::Pushed(read.map(|read| read.map(link).map_err(error))),
         })
     }
@@ -179,6 +191,20 @@ impl Worker {
             TicketOp::Search { query, semantic } => {
                 let name = if semantic { "semantic_search" } else { "search" };
                 self.cards(config, name, &Vars::new(system).query(&query))
+            }
+            TicketOp::Page { name, query, extra } => {
+                let vars = Vars::new(system);
+                let vars = match &query {
+                    Some(query) => vars.query(query),
+                    None => vars,
+                };
+                let output = self.call_with(config, name, &vars, &extra)?;
+                let operation = config.operation(name).expect("called");
+                let cards = operation.cards(&output, system)?;
+                Ok(TicketOutput::Page(
+                    cards.into_iter().map(|card| config.card_url(card)).collect::<Result<_, _>>()?,
+                    operation.next_cursor(&output),
+                ))
             }
             TicketOp::Children(link) | TicketOp::Related(link) | TicketOp::ReadCard(link) if !config.accepts(&link) => {
                 Err(config.mismatch(&link).expect("mismatch"))
@@ -264,6 +290,17 @@ impl Worker {
 
     /// Calls the tool behind a generic operation and returns what its result paths read from.
     fn call(&mut self, config: &TicketConfig, name: &str, vars: &Vars) -> Result<Value, String> {
+        self.call_with(config, name, vars, &Map::new())
+    }
+
+    /// `call` with arguments added to the operation's own, such as a panel view's.
+    fn call_with(
+        &mut self,
+        config: &TicketConfig,
+        name: &str,
+        vars: &Vars,
+        extra: &Map<String, Value>,
+    ) -> Result<Value, String> {
         let operation = config.operation(name).ok_or_else(|| format!("operations.{name} is not configured"))?;
         let write = matches!(name, "update_state" | "comment" | "create");
         let idempotent = write && operation.uses_placeholder("nonce");
@@ -271,7 +308,7 @@ impl Worker {
             return Err(format!("operations.{name}: {{nonce}} is only allowed in write operations"));
         }
         // Expand once: transport retries must send exactly the original write arguments.
-        let arguments = operation.arguments(vars)?;
+        let arguments = operation.arguments_with(vars, extra)?;
         if let Some((server, since, error)) = &self.down
             && *server == config.server
             && since.elapsed() < BACKOFF
