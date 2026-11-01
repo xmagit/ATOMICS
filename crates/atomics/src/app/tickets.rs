@@ -25,6 +25,8 @@ enum Kind {
     Trace(u64),
     Whoami(Arc<TicketConfig>, u64),
     Outbox,
+    /// A remote-control job for the plan in the tag's key, at the remote epoch it was sent in.
+    Remote(super::remote::RemoteJob, u64, Arc<TicketConfig>),
     Read,
     Refresh,
     List,
@@ -81,6 +83,7 @@ pub(super) struct Tickets {
     pub(super) next_trace_job: u64,
     pub(super) whoami: Option<ticket::Whoami>,
     pub(super) identity_epoch: u64,
+    pub(super) remote: super::remote::Remote,
 }
 
 /// A control request answered once all of its ticket jobs are done.
@@ -126,7 +129,28 @@ impl Tickets {
             next_trace_job: 0,
             whoami: None,
             identity_epoch: 0,
+            remote: Default::default(),
         }
+    }
+}
+
+pub(super) fn remote_tag(plan: &str, config: &Arc<TicketConfig>, job: super::remote::RemoteJob, epoch: u64) -> Tag {
+    Tag {
+        key: (plan.to_string(), None),
+        ticket: String::new(),
+        system: config.system.clone(),
+        kind: Kind::Remote(job, epoch, config.clone()),
+        batch: None,
+    }
+}
+
+pub(super) fn outbox_tag(plan: &str, config: &Arc<TicketConfig>) -> Tag {
+    Tag {
+        key: (plan.to_string(), None),
+        ticket: String::new(),
+        system: config.system.clone(),
+        kind: Kind::Outbox,
+        batch: None,
     }
 }
 
@@ -203,6 +227,7 @@ impl State {
                     },
                 );
             }
+            self.tickets.remote.reset();
             self.refresh_ticket_identity();
             self.resume_ticket_outboxes();
             self.tickets.failed.clear();
@@ -321,7 +346,9 @@ impl State {
             | TicketOp::Related(link)
             | TicketOp::List(link)
             | TicketOp::UpdateState(link, _, _)
-            | TicketOp::Comment(link, _) => Some(link),
+            | TicketOp::Comment(link, _)
+            | TicketOp::RemoteOpen { link, .. } => Some(link),
+            TicketOp::RemoteSteerers(_) | TicketOp::RemotePoll { .. } | TicketOp::RemoteSettle { .. } => None,
             TicketOp::TraceCleaner
             | TicketOp::Whoami
             | TicketOp::ResetOutboxes
@@ -450,6 +477,7 @@ impl State {
     }
 
     pub(super) fn refresh_ticket_identity(&mut self) {
+        self.tickets.remote.reset();
         self.tickets.whoami = None;
         self.tickets.identity_epoch += 1;
         let Some(config) = self.ticket_config().filter(|c| c.operation("whoami").is_some()) else { return };
@@ -501,6 +529,11 @@ impl State {
                     _ => {}
                 }
             }
+            return;
+        }
+        if let Kind::Remote(job, epoch, config) = &tag.kind {
+            let (job, epoch, config) = (*job, *epoch, config.clone());
+            self.finish_remote(tag.key.0, job, epoch, config, result);
             return;
         }
         if tag.kind == Kind::Outbox {
@@ -564,6 +597,7 @@ impl State {
             }
             Kind::Whoami(..)
             | Kind::Outbox
+            | Kind::Remote(..)
             | Kind::Trace(_)
             | Kind::Read
             | Kind::Comment
@@ -633,9 +667,13 @@ impl State {
             }
             (kind, Err(err)) => {
                 let what = match &kind {
-                    Kind::Whoami(..) | Kind::Outbox | Kind::Trace(_) | Kind::Read | Kind::Refresh | Kind::List => {
-                        "reading the ticket failed".to_string()
-                    }
+                    Kind::Whoami(..)
+                    | Kind::Outbox
+                    | Kind::Remote(..)
+                    | Kind::Trace(_)
+                    | Kind::Read
+                    | Kind::Refresh
+                    | Kind::List => "reading the ticket failed".to_string(),
                     Kind::State(state) => {
                         self.tickets.failed.insert(tag.key.clone(), state.clone());
                         format!("setting the state to {state} failed")

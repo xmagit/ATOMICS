@@ -54,6 +54,7 @@ mod plan_view;
 mod plans;
 mod projects;
 mod ref_guard;
+mod remote;
 mod repo_workflow;
 mod restart;
 mod sandbox_settings;

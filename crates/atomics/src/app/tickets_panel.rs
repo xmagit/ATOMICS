@@ -737,10 +737,8 @@ impl Desktop<'_> {
                         (
                             p.success,
                             self.runtime
-                                .tickets
-                                .whoami
-                                .as_ref()
-                                .map(|id| format!("{system} · {}", id.label()))
+                                .ticket_identity_label()
+                                .map(|label| format!("{system} · {label}"))
                                 .unwrap_or_else(|| system.clone()),
                         )
                     };

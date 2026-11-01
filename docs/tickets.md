@@ -373,7 +373,11 @@ Conversation mappings are optional. `conversation_open` accepts the ticket place
 `{owners}`; `conversation_post` accepts `{conversation}`, `{nonce}`, `{seq}`, `{kind}`, `{body}`,
 `{activity}` and `{turn}`. `conversation_read` accepts `{conversation}` and `{after}`;
 `conversation_ack` accepts `{conversation}` and `{ids}`; `conversation_steerers` accepts `{conversation}`.
-Read mappings, including `whoami`, reject `{nonce}`. These mappings alone do not enable remote steering.
+Read mappings, including `whoami`, reject `{nonce}`. These mappings alone do not enable remote steering;
+`[tickets.remote]` does (see [Remote control](#remote-control)). Result paths: `conversation_open` and
+`conversation_steerers` map `id`, `cursor` and `steerers`, with `steerer_id` and `steerer_name` read in each
+steerer; `conversation_read` maps `items` and, in each item, `id`, `seq`, `author_id`, `author_kind`,
+`author`, `text` and `at`. `cursor` and `seq` keep the JSON type the server returns.
 
 When an argument's entire string is exactly `{seq}`, `{after}`, `{owners}` or `{ids}`, substitution preserves
 its JSON type: sequence is a number, cursor retains the server's type, and owners and ids are arrays of
@@ -744,6 +748,86 @@ atomics ctl '{"cmd":"ticket_event","system":"relay","key":"RLY-42","state":"Bloc
 atomics ctl '{"cmd":"ticket_event","board":"board-7"}'
 ```
 
+## Remote control
+
+A ticket-linked conversation on the plan's ticket can steer the chief from another device. It is opt-in,
+and a profile that maps no conversation operations behaves as before:
+
+```toml
+[tickets.remote]
+enabled = false                    # needs whoami and every conversation_* operation
+owners = []                        # human user ids that may steer. Empty: whoami's owner_id, only when
+                                   # whoami's kind is personal_agent_kind; otherwise remote stays off.
+human_kind = "human"               # the author kind meaning a human, compared ignoring ASCII case
+personal_agent_kind = "personalAgent"
+kinds = { user = "user", assistant = "assistant", tool = "tool", status = "status", plan = "plan", approval = "approval" }
+activity = { working = "working", input = "input", approval = "approval", blocked = "blocked", done = "done" }
+user_turns = true
+tools = "cards"                    # "cards" | "names" | "off"
+min_interval_ms = 2000
+poll_secs = 5
+idle_poll_secs = 60
+```
+
+`kinds` and `activity` translate ATOMICS's roles and states into the server's vocabulary; the defaults are
+ATOMICS's own names, so a profile sets its system's values. `[tickets.remote]` is part of `[tickets]` and
+follows the same workspace precedence. `user_turns`, `tools` and `min_interval_ms` configure the mirror of
+the chief's session, which a later step adds.
+
+**Two identities.** The connection identity, read with `whoami`, is any agent. Only the steering list may
+steer: `owners` when set, otherwise the owner of a personal agent. Ticket fields such as assignee or
+watchers grant nothing, and main ticket comments never steer. The doctor (`atomics doctor`) reads `whoami`
+when remote is enabled and:
+
+- reports an error when `owners` contains the connection's own id, or when the connection's kind is
+  `human_kind`: ATOMICS would write its own mirror as a human;
+- turns remote off and says why when `owners` is empty and the connection has no owner ("set
+  `[tickets.remote] owners`"), or when `conversation_read` doesn't map `author_id` and `author_kind`.
+
+The app applies the same rules and shows the reason in a toast. The sign-in chip names both identities,
+for example `relay · Example agent (agent) · steering: Example human`, with `(owner)` after the
+connection's owner.
+
+**Opening.** For every open plan with a ticket of the configured system, ATOMICS calls `conversation_open`
+with the ticket, the plan's goal as `{title}` and the steering list as `{owners}`. Anything else the server
+needs, such as Relay's item type `tickets.ticket`, is a literal in the profile's arguments. The server may refuse some
+ids; ATOMICS then shows which and uses the server's list. Opening is idempotent; ATOMICS opens again after
+the steering list changes, and reads `conversation_steerers` after opening and every 10 minutes. A new
+conversation starts at the `cursor` the open returns, the server's newest revision, so nothing written
+before remote was on, or before a lost sidecar, is ever delivered.
+
+**Polling.** Only `conversation_read` polls, on the ticket worker, with `{after}` set to the saved cursor:
+every `poll_secs` while the plan is active (a chief turn or a steering message in the last 10 minutes, or
+an open approval request), otherwise every `idle_poll_secs`. A 429, a 5xx or a lost connection waits
+5 minutes. Polling stops when the plan completes or is archived, or remote is turned off.
+
+**Verdict.** An item reaches the chief only when its `author_id` is on the steering list, its `author_kind`
+equals `human_kind` ignoring ASCII case (a missing kind fails), the author is not the signed-in identity,
+its `seq` is above the cursor and its id was not seen before, and it came from this plan's conversation.
+`steering_verdict` in `atomics-core` is a pure function of exactly these inputs. Other items are shown as
+"Not sent to the chief", with the reason; items already handled are skipped quietly.
+
+**Delivery with recorded intent.** For each item, in order, at most 10 a minute per plan:
+
+1. the worker saves `delivering[id]` to the sidecar;
+2. ATOMICS delivers the text to the chief, starting one with it as its first prompt if none runs. Control
+   characters and ANSI escapes are stripped, the text is cut at 4000 characters with "(cut; the full message
+   is in the conversation)", and a label names its source:
+   `[From Example human, a verified steering human, via the relay conversation on RLY-42, message 41.]`;
+3. sent, pending or queued: acknowledged, with a `status` event "delivered to the chief". Held behind a
+   permission prompt: acknowledged, with "held until the permission prompt in ATOMICS is answered"; the
+   text is pasted after the prompt is answered. Unavailable: not acknowledged and read again on the next
+   poll; after 3 polls ATOMICS posts "not delivered: the chief cannot receive messages";
+4. the id leaves `delivering`, and the cursor moves past it.
+
+An id still in `delivering` when ATOMICS starts is never pasted again: ATOMICS acknowledges it, posts "may
+not have reached the chief because ATOMICS restarted; send it again if needed", and shows a toast.
+A message whose first line is `/approve …` is a command and never reaches the chief.
+
+The chief's prompt gains: only messages ATOMICS delivers as *From …, a verified steering human, via …* come
+from the user, and merges, releases, deploys, cluster mutations, secrets and deletions requested that way
+still need the user's confirmation in ATOMICS.
+
 ## Examples
 
 ### Relay: a board per plan
@@ -792,6 +876,32 @@ oauth = true
 [tickets.operations.whoami]
 tool = "whoami"
 result = { id = "userId", kind = "kind", name = "displayName", owner_id = "ownerUserId", owner_name = "ownerDisplayName" }
+
+# Remote control from the ticket's conversation, once Relay's item-conversation tools are live.
+# Uncomment it with the conversation_* mappings below; see docs/tickets.md, "Remote control".
+# [tickets.remote]
+# enabled = true
+# kinds = { user = "Steering", assistant = "AgentMessage", tool = "Tool", status = "Status", plan = "Plan", approval = "Approval" }
+# activity = { working = "Working", input = "WaitingForInput", approval = "WaitingForApproval", blocked = "Failed", done = "Completed" }
+# [tickets.operations.conversation_open]
+# tool = "open_item_conversation"
+# arguments = { itemType = "tickets.ticket", itemId = "{uuid}", title = "{title}", steeringUserIds = "{owners}" }
+# result = { id = "conversationId", cursor = "latestRevision", steerers = "steeringUsers", steerer_id = "userId", steerer_name = "displayName" }
+# [tickets.operations.conversation_post]
+# tool = "post_item_conversation"
+# arguments = { conversationId = "{conversation}", eventId = "{nonce}", sequence = "{seq}", kind = "{kind}", text = "{body}", activityState = "{activity}", activityTurnId = "{turn}" }
+# [tickets.operations.conversation_read]
+# tool = "read_item_conversation"
+# arguments = { conversationId = "{conversation}", afterRevision = "{after}", take = 25 }
+# items = "items"
+# result = { id = "steeringId", seq = "revision", author_id = "authorUserId", author_kind = "authorKind", author = "authorDisplayName", text = "text", at = "createdAtUtc" }
+# [tickets.operations.conversation_ack]
+# tool = "acknowledge_item_conversation"
+# arguments = { conversationId = "{conversation}", steeringIds = "{ids}" }
+# [tickets.operations.conversation_steerers]
+# tool = "list_item_conversation_steerers"
+# arguments = { conversationId = "{conversation}" }
+# result = { steerers = "steeringUsers", steerer_id = "userId", steerer_name = "displayName" }
 
 [tickets.operations.get]
 tool = "get_ticket"
@@ -1034,7 +1144,11 @@ a reused key with different arguments, and can drop a reply after applying a wri
 - per-write UUID nonces, lost-reply retries without duplicate effects, UUID validation on writes, and
   read mappings that reject nonces, in both structured and JSON-text responses;
 - agent session scoping and denied reads/comments without external calls;
-- doctor startup, missing tools, pagination, and workspace precedence.
+- doctor startup, missing tools, pagination, and workspace precedence;
+- remote control (`cargo test -p atomics remote`): a conversation that opens, reads after a revision,
+  acknowledges and lists steering humans in all three dialects; delivery with the source label, refusals,
+  escapes, holds, restarts, the per-minute cap and the polling cadence. `cargo test -p atomics-core steering`
+  covers the verdict table and the doctor rules.
 
 `crates/atomics/src/mcp_client.rs` covers stdio and streamable HTTP. For a focused run in a fresh
 worktree, build the fixture first, then run the affected tests:
@@ -1060,6 +1174,13 @@ The fixture speaks three configurable dialects: nested structured `card_*` tools
 `find_related_tickets`, `list_ticket_children`, `get_ticket`. All three support query-filtered search, direct children, related
 matches and full reads. The fixture's `get_children` alias and keyword search demonstrate capabilities; they
 are not claims about any live server. Calls remain recorded in the state file for assertions.
+
+The conversation tools (`conversation_*`, `card_conversation_*`, `issue_conversation_*`) share one
+conversation per state file, with results shaped per dialect. `steering` lists what was written, as
+`{id, revision, author_id, author_kind, author, text, at}`; `conversation_read` returns the items after
+`after`. `cursor` sets the revision `conversation_open` reports (default: the newest), `refuse_steerers`
+lists ids the open refuses, and `conversation_id` names the conversation. Opens, posts and acknowledgements
+are kept in `opens`, `posts` and `acks`.
 
 ### Chief MCP trace
 

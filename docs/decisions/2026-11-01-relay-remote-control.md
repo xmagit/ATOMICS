@@ -191,7 +191,7 @@ result = { id = "userId", kind = "kind", name = "displayName", owner_id = "owner
 
 [tickets.operations.conversation_open]
 tool = "open_item_conversation"
-arguments = { itemType = "ticket", itemId = "{uuid}", title = "{title}", steeringUserIds = "{owners}" }
+arguments = { itemType = "tickets.ticket", itemId = "{uuid}", title = "{title}", steeringUserIds = "{owners}" }
 result = { id = "conversationId", cursor = "latestRevision", steerers = "steeringUsers", steerer_id = "userId", steerer_name = "displayName" }
 
 [tickets.operations.conversation_post]
@@ -540,7 +540,7 @@ never sees revision N+1 before N has committed. A test runs concurrent writers a
 #### 5.1.3 The human side (Flat)
 
 These are kernel endpoints in `KernelService.WebApi/AgentIdentitiesController*.cs`:
-- `GET /api/v1/agent-identities/conversations?itemType=ticket&itemId=<id>` returns the caller's
+- `GET /api/v1/agent-identities/conversations?itemType=tickets.ticket&itemId=<id>` returns the caller's
   conversations on that item, those where the caller is a steering human. It returns nothing otherwise.
 - `GET /api/v1/agent-identities/sessions/{id}` (events, steering, acknowledgements) and
   `POST …/sessions/{id}/steering` serve this kind only to steering humans who are Human, are not impersonating

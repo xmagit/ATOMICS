@@ -181,6 +181,22 @@ pub fn doctor_line(oauth: &OAuth, config: &TicketConfig) -> Option<String> {
     })
 }
 
+/// The doctor line for `[tickets.remote]`.
+pub fn remote_line(status: &atomics_core::tickets::RemoteStatus) -> String {
+    use atomics_core::tickets::RemoteStatus;
+    match status {
+        RemoteStatus::On(owners) => format!("✓ remote control: on; steering humans {}", owners.join(", ")),
+        RemoteStatus::Off(why) => format!("· remote control: off; {why}"),
+        RemoteStatus::Error(why) => {
+            format!("✗ remote control (error): {why} — fix [tickets.remote] owners or the connection's identity")
+        }
+    }
+}
+
+pub fn remote_failed_line(error: &str) -> String {
+    format!("✗ remote control check failed (warning): whoami: {error} — check operations.whoami")
+}
+
 /// `atomics tickets login|logout`. Returns the exit code.
 pub fn run_cli(login: bool, workspace: Option<&str>) -> i32 {
     let config = match crate::doctor::ticket_config_for(workspace) {
