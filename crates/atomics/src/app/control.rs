@@ -210,6 +210,7 @@ impl State {
                 self.plans[index].project = project.and_then(|p| self.project_of(&p));
                 self.reload_repo_workflows();
                 self.save_plan(index);
+                self.remote_request_approval(index, false);
                 let id = self.plans[index].id.clone();
                 self.refresh_tickets(Some(&id), None);
                 if new || (self.plan_view && self.selected_plan == index) {

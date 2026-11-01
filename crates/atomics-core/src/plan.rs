@@ -217,6 +217,16 @@ pub struct Report {
 }
 
 impl Task {
+    /// The complete approval scope, shared by `replace` and the remote digest.
+    fn approval_specification(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id, "title": self.title, "brief": self.brief,
+            "acceptance": self.acceptance, "depends_on": self.depends_on,
+            "agent": self.agent, "args": self.args, "isolation": self.isolation,
+            "repo": self.repo,
+        })
+    }
+
     pub fn completion_line(&self) -> Option<String> {
         let elapsed = self.finished_at?.saturating_sub(self.dispatched_at?);
         Some(format!("Agent completed in {}m {}s", elapsed / 60, elapsed % 60))
@@ -428,28 +438,29 @@ impl Plan {
         }
     }
 
+    /// SHA-256 of canonical JSON (sorted object keys, compact encoding), cut to 12 hex digits.
+    /// Runtime progress, branches and the automatically added review task grant no approval scope.
+    pub fn digest(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let scope = serde_json::json!({
+            "goal": self.goal,
+            "tasks": self.tasks.iter().filter(|t| t.id != REVIEW_TASK)
+                .map(Task::approval_specification).collect::<Vec<_>>(),
+        });
+        let hash = Sha256::digest(serde_json::to_vec(&scope).expect("plan scope is JSON"));
+        format!("{hash:x}")[..12].to_string()
+    }
+
     pub fn replace(&mut self, goal: String, mut tasks: Vec<Task>) {
         Plan::assign_task_ids(&mut tasks);
-        let specification = |task: &Task| Task {
-            id: task.id.clone(),
-            title: task.title.clone(),
-            brief: task.brief.clone(),
-            acceptance: task.acceptance.clone(),
-            depends_on: task.depends_on.clone(),
-            agent: task.agent.clone(),
-            args: task.args.clone(),
-            isolation: task.isolation,
-            repo: task.repo.clone(),
-            ..Default::default()
-        };
         let approved = self.approved
             && self.goal == goal
             && self
                 .tasks
                 .iter()
                 .filter(|t| t.id != REVIEW_TASK)
-                .map(specification)
-                .eq(tasks.iter().filter(|t| t.id != REVIEW_TASK).map(specification));
+                .map(Task::approval_specification)
+                .eq(tasks.iter().filter(|t| t.id != REVIEW_TASK).map(Task::approval_specification));
         for task in tasks.iter_mut() {
             let old = self.tasks.iter().find(|t| t.id == task.id);
             task.ticket = crate::tickets::TicketLink::relink(task.ticket.take(), old.and_then(|o| o.ticket.as_ref()));
@@ -656,6 +667,69 @@ pub fn short_slug(title: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn digest_tracks_exactly_the_replace_approval_scope() {
+        let mut plan = Plan::default();
+        plan.replace(
+            "Ship café".into(),
+            vec![Task {
+                id: "t1".into(),
+                title: "Implement".into(),
+                brief: "Opening\nDetails".into(),
+                acceptance: vec!["passes".into()],
+                agent: "codex".into(),
+                args: vec!["--fast".into()],
+                repo: Some("ATOMICS".into()),
+                ..Default::default()
+            }],
+        );
+        // Independently calculated SHA-256 of sorted, compact UTF-8 JSON.
+        assert_eq!(plan.digest(), "cedf306324d4");
+        plan.approved = true;
+        let digest = plan.digest();
+        for field in ["goal", "id", "title", "brief", "acceptance", "depends_on", "agent", "args", "isolation", "repo"]
+        {
+            let mut changed = plan.clone();
+            match field {
+                "goal" => changed.goal.push('!'),
+                "id" => changed.tasks[0].id.push('!'),
+                "title" => changed.tasks[0].title.push('!'),
+                "brief" => changed.tasks[0].brief.push('!'),
+                "acceptance" => changed.tasks[0].acceptance.push("another requirement".into()),
+                "depends_on" => changed.tasks[0].depends_on.push("dependency".into()),
+                "agent" => changed.tasks[0].agent = "claude".into(),
+                "args" => changed.tasks[0].args.push("--careful".into()),
+                "isolation" => changed.tasks[0].isolation = Some(crate::isolation::IsolationMode::Bare),
+                "repo" => changed.tasks[0].repo = Some("OTHER".into()),
+                _ => unreachable!(),
+            }
+            assert_ne!(changed.digest(), digest, "{field}");
+            let mut replaced = plan.clone();
+            replaced.replace(changed.goal, changed.tasks);
+            assert!(!replaced.approved, "{field}");
+            assert_ne!(replaced.digest(), digest, "{field}");
+        }
+        let mut runtime = plan.clone();
+        runtime.id = "another-plan".into();
+        runtime.approved = false;
+        runtime.integration = Some("integration-branch".into());
+        runtime.tasks[0].branch = Some("task-branch".into());
+        runtime.tasks[0].session = Some("session".into());
+        runtime.tasks[0].status = TaskStatus::Done;
+        runtime.tasks[0].notes.push("progress".into());
+        runtime.tasks[1].brief = "a revised final review".into();
+        assert_eq!(runtime.digest(), digest, "branches, progress and review do not grant approval scope");
+        let mut replaced = plan.clone();
+        replaced.replace(runtime.goal, runtime.tasks);
+        assert!(replaced.approved);
+        assert_eq!(replaced.digest(), digest);
+        let mut reordered = plan.clone();
+        reordered.tasks.insert(0, Task { id: "t2".into(), ..Default::default() });
+        let before = reordered.digest();
+        reordered.tasks.swap(0, 1);
+        assert_ne!(reordered.digest(), before, "task order is approval scope too");
+    }
 
     #[test]
     fn branch_only_plan_edits_preserve_approval_but_scope_edits_require_review() {

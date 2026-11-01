@@ -265,11 +265,17 @@ impl State {
 
     /// Approves the plan; one `plan` event the first time.
     pub(super) fn approve_plan(&mut self, index: usize) {
+        self.approve_plan_by(index, None);
+    }
+
+    /// The board, ctl and verified conversation commands share this approval path.
+    pub(super) fn approve_plan_by(&mut self, index: usize, author: Option<&str>) {
         let newly = !self.plans[index].approved;
         self.plans[index].approved = true;
         self.save_plan(index);
         if newly {
             self.plan_event(index, "approved");
+            self.remote_approved(index, author);
         }
     }
 
@@ -285,6 +291,7 @@ impl State {
         task.brief = brief;
         self.save_plan(index);
         self.plan_event(index, "edited");
+        self.remote_request_approval(index, false);
     }
 
     /// A plan milestone for `atomics_wait`: `change` is approved, edited, closed or reopened.
