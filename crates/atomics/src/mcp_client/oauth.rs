@@ -87,6 +87,14 @@ pub struct OAuth {
     store: Store,
     browser: Browser,
     callback_timeout: Duration,
+    trace_secrets: std::sync::Arc<std::sync::Mutex<Option<TraceSecrets>>>,
+}
+
+// Never Debug: cached redaction credentials stay in memory only.
+struct TraceSecrets {
+    key: String,
+    heads: (Option<String>, Option<String>),
+    secrets: Vec<String>,
 }
 
 // Never Debug: the store reaches real tokens.
@@ -132,7 +140,12 @@ impl OAuth {
     }
 
     pub fn new(keychain: crate::relay::Keychain, browser: Browser) -> Self {
-        Self { store: Store::new(keychain), browser, callback_timeout: CALLBACK_TIMEOUT }
+        Self {
+            store: Store::new(keychain),
+            browser,
+            callback_timeout: CALLBACK_TIMEOUT,
+            trace_secrets: Default::default(),
+        }
     }
 
     #[cfg(test)]
@@ -156,11 +169,28 @@ impl OAuth {
 
     /// Credentials used by the current sign-in, for the ticket/trace cleaner only.
     /// This never refreshes, opens a browser, or returns keychain errors containing data.
-    pub(crate) fn secrets(&self, server: &McpServer) -> Vec<String> {
-        server_key(server)
-            .and_then(|key| self.load(&key).ok().flatten())
+    /// Call only on a background worker: the fingerprint reads the two keychain heads.
+    pub(crate) fn secrets(&self, server: &McpServer) -> anyhow::Result<Vec<String>> {
+        let Some(key) = server_key(server) else { return Ok(Vec::new()) };
+        let _lock = self.store.oauth_lock(&key)?;
+        let heads = (
+            self.store.oauth_fingerprint(&slot("tokens", &key))?,
+            self.store.oauth_fingerprint(&slot("access", &key))?,
+        );
+        let mut cache = self.trace_secrets.lock().unwrap();
+        if let Some(cached) = cache.as_ref().filter(|cached| cached.key == key && cached.heads == heads) {
+            return Ok(cached.secrets.clone());
+        }
+        let secrets: Vec<String> = self
+            .load(&key)?
             .map(|(tokens, access)| tokens.refresh_token.into_iter().chain(access.map(|access| access.token)).collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        *cache = Some(TraceSecrets { key, heads, secrets: secrets.clone() });
+        Ok(secrets)
+    }
+
+    fn clear_trace_secrets(&self) {
+        *self.trace_secrets.lock().unwrap() = None;
     }
 
     /// Forgets the server's tokens, after telling the authorization server to revoke them (RFC 7009)
@@ -307,11 +337,13 @@ impl OAuth {
     }
 
     fn save(&self, key: &str, tokens: &Tokens, access: &Access) -> Result<(), McpError> {
+        self.clear_trace_secrets();
         self.write_json(&slot("access", key), access)?;
         self.write_json(&slot("tokens", key), tokens)
     }
 
     fn clear(&self, key: &str) -> Result<(), McpError> {
+        self.clear_trace_secrets();
         for kind in ["tokens", "access"] {
             self.store.remove_oauth_item(&slot(kind, key)).map_err(storage)?;
         }
@@ -378,6 +410,7 @@ impl Session {
     /// and starts from what the keychain holds then, so a refresh token is spent once. When another
     /// process refreshed while this one waited, its access token is used and nothing is sent.
     pub(crate) fn refresh(&mut self) -> Result<(), McpError> {
+        self.oauth.clear_trace_secrets();
         let need = |why: &str| McpError::SignInRequired(format!("{} {why}", self.url));
         let _lock = self.oauth.store.oauth_lock(&self.key).map_err(storage)?;
         let (tokens, access) = self.oauth.load(&self.key).map_err(storage)?.ok_or_else(|| need("needs a sign-in"))?;
@@ -652,7 +685,8 @@ fn register(agent: &ureq::Agent, auth: &AuthServer, redirect_uri: &str) -> Resul
 /// Waits on the loopback listener for this sign-in's callback: the code, after checking `state` and
 /// `iss`. A request for another address, or a callback whose `state` is not this sign-in's (a stale tab,
 /// another program), gets a short error page and the wait goes on until the timeout. A callback with
-/// the right `state` decides: its code, or its error.
+/// the right `state` decides: its code, or its error. An error without state decides only when
+/// it explicitly names the expected issuer.
 fn await_callback(
     listener: &TcpListener,
     state: &str,
@@ -696,7 +730,7 @@ fn await_callback(
             continue;
         }
         let param = |name: &str| url.query_pairs().find(|(k, _)| k == name).map(|(_, v)| v.into_owned());
-        if param("state").as_deref() != Some(state) {
+        if !answer_matches(&param, state, auth) {
             stray = true;
             let _ = page(
                 &mut stream,
@@ -718,10 +752,22 @@ fn await_callback(
     }
 }
 
+/// Error redirects may omit state, but then must explicitly name this issuer. A supplied
+/// state always has to match, including on errors.
+fn answer_matches(param: &impl Fn(&str) -> Option<String>, state: &str, auth: &AuthServer) -> bool {
+    match param("state") {
+        Some(answer) => answer == state,
+        None => {
+            param("error").is_some()
+                && param("iss").is_some_and(|iss| iss.trim_end_matches('/') == auth.issuer.trim_end_matches('/'))
+        }
+    }
+}
+
 /// The code of an authorization answer, after checking `state` and `iss`. The messages are free of
 /// anything the answer carried.
 fn answer_code(param: impl Fn(&str) -> Option<String>, state: &str, auth: &AuthServer) -> Result<String, String> {
-    if param("state").as_deref() != Some(state) {
+    if !answer_matches(&param, state, auth) {
         return Err("the sign-in answer did not match this request (state mismatch)".to_string());
     }
     match param("iss") {

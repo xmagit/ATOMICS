@@ -95,6 +95,8 @@ enum Command {
         socket: Option<PathBuf>,
         #[arg(long)]
         pane: Option<String>,
+        #[arg(long)]
+        chief: bool,
     },
     /// Forward Claude's status line data to ATOMICS, preserving the user's command
     Statusline {
@@ -298,8 +300,8 @@ fn main() -> eframe::Result {
             std::process::exit(ticket_signin::run_cli(matches!(command, TicketsCommand::Login), cli.workspace.as_deref()))
         }
         Some(Command::Doctor) => std::process::exit(doctor::run(cli.workspace.as_deref())),
-        Some(Command::Hook { socket, pane }) => {
-            hook_client::run(socket, pane);
+        Some(Command::Hook { socket, pane, chief }) => {
+            hook_client::run(socket, pane, chief);
             return Ok(());
         }
         Some(Command::Statusline { socket }) => {
@@ -446,6 +448,18 @@ mod cli_tests {
         assert!(cli.workspace.is_none());
         let Some(Command::Queue { command, .. }) = cli.command else { panic!("queue command") };
         assert_eq!(command, ["make", "-w", "x"]);
+    }
+
+    #[test]
+    fn hook_parses_the_chief_flag() {
+        for chief in [false, true] {
+            let mut args = vec!["atomics", "hook", "--pane", "chief"];
+            if chief {
+                args.push("--chief");
+            }
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(matches!(cli.command, Some(Command::Hook { chief: parsed, .. }) if parsed == chief));
+        }
     }
 
     #[test]

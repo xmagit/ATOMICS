@@ -168,7 +168,7 @@ pub fn chief_session_settings(atomics_exe: &Path, socket: &Path, pane: &str) -> 
         for group in groups.as_array_mut().expect("groups") {
             for hook in group["hooks"].as_array_mut().expect("handlers") {
                 let command = hook["command"].as_str().expect("command");
-                hook["command"] = json!(format!("ATOMICS_CHIEF=1 {command}"));
+                hook["command"] = json!(format!("{command} --chief"));
             }
         }
     }
@@ -287,15 +287,13 @@ mod tests {
     fn chief_mcp_pre_hooks_are_session_local_and_do_not_change_status() {
         let chief = chief_session_settings(Path::new("atomics"), Path::new("own.sock"), "chief");
         assert_eq!(chief["hooks"]["PreToolUse"][0]["matcher"], "mcp__.*");
-        assert!(
-            chief["hooks"]["PostToolUse"][0]["hooks"][0]["command"].as_str().unwrap().starts_with("ATOMICS_CHIEF=1 ")
-        );
+        assert!(chief["hooks"]["PostToolUse"][0]["hooks"][0]["command"].as_str().unwrap().ends_with(" --chief"));
         assert!(
             !session_settings(Path::new("atomics"), Path::new("own.sock"), "worker", false)["hooks"]["PostToolUse"][0]
                 ["hooks"][0]["command"]
                 .as_str()
                 .unwrap()
-                .contains("ATOMICS_CHIEF")
+                .contains("--chief")
         );
         assert!(chief["hooks"]["PreToolUse"][0]["hooks"][0]["command"].as_str().unwrap().contains("--pane chief"));
         assert!(
@@ -468,7 +466,14 @@ mod tests {
 
     #[test]
     fn legacy_detection_matches_the_executable_and_subcommand() {
-        for command in ["cox hook", "/tmp/cox hook", "'/path with spaces/cox' hook", "\"/tmp/cox\" hook"] {
+        for command in [
+            "cox hook",
+            "/tmp/cox hook",
+            "'/path with spaces/cox' hook",
+            "\"/tmp/cox\" hook",
+            "cox hook --chief",
+            "imacs hook --chief",
+        ] {
             assert!(is_cox_hook(&json!({"type": "command", "command": command})), "{command}");
         }
         for command in ["echo cox hook", "atomics hook", "my-cox hook", "cox doctor", "cox hook-status", "'cox hook'"] {

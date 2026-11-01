@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use atomics_core::hook::{HookReply, HookRequest};
 
-pub fn run(socket: Option<std::path::PathBuf>, pane: Option<String>) {
+pub fn run(socket: Option<std::path::PathBuf>, pane: Option<String>, chief: bool) {
     // A globally installed Claude hook must not attach this pane to the default instance.
     if socket.is_none() && std::env::var("TERM_PROGRAM").as_deref() == Ok("atomics") {
         return;
@@ -17,7 +17,7 @@ pub fn run(socket: Option<std::path::PathBuf>, pane: Option<String>) {
         return;
     }
     let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(&input) else { return };
-    prepare_tool_response(&mut payload, std::env::var("ATOMICS_CHIEF").as_deref() == Ok("1"));
+    prepare_tool_response(&mut payload, chief);
     let ancestors = if pane.is_none()
         && payload.get("hook_event_name").and_then(serde_json::Value::as_str) == Some("SessionStart")
     {
@@ -227,7 +227,7 @@ mod tests {
     #[test]
     fn ancestry_runs_only_at_session_start_and_uses_path() {
         if let Some(socket) = std::env::var_os("ATOMICS_HOOK_TEST_SOCKET") {
-            run(Some(socket.into()), None);
+            run(Some(socket.into()), None, false);
             return;
         }
         let dir = crate::test_support::tempdir().unwrap();

@@ -237,7 +237,8 @@ impl Fake {
                     _ => return invalid("unsupported_grant_type"),
                 }
                 st.counter += 1;
-                let (access, refresh) = (format!("at-{}", st.counter), format!("rt-{}", st.counter));
+                let (access, refresh) =
+                    (format!("access-token-{}", st.counter), format!("refresh-token-{}", st.counter));
                 st.access.insert(access.clone());
                 st.refresh.insert(refresh.clone());
                 json_resp(
@@ -648,12 +649,78 @@ fn trace_cleaner_reads_access_and_refresh_secrets_without_refreshing() {
             &Access { token: "access-trace-secret".into(), expires_at: 0 },
         )
         .unwrap();
-    let secrets = oauth.secrets(&server);
+    let secrets = oauth.secrets(&server).unwrap();
     assert_eq!(secrets.len(), 2);
     let cleaner = atomics_core::tickets::Cleaner::new(secrets);
     let clean = cleaner.redacted("access-trace-secret refresh-trace-secret");
     assert!(!clean.contains("access-trace-secret"));
     assert!(!clean.contains("refresh-trace-secret"));
     oauth.sign_out(&server).unwrap();
-    assert!(oauth.secrets(&server).is_empty());
+    assert!(oauth.secrets(&server).unwrap().is_empty());
+}
+
+#[test]
+fn an_error_without_state_finishes_only_for_the_expected_issuer() {
+    let (listener, base) = bind();
+    let issuer = "https://auth.example";
+    let auth = AuthServer {
+        issuer: issuer.into(),
+        authorization_endpoint: Url::parse(issuer).unwrap(),
+        token_endpoint: Url::parse(issuer).unwrap(),
+        registration_endpoint: None,
+        revocation_endpoint: None,
+        iss_in_response: true,
+    };
+    let sender = std::thread::spawn(move || {
+        let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+        for query in [
+            "error=access_denied&state=wrong&iss=https://auth.example",
+            "error=access_denied",
+            "error=access_denied&iss=https://other.example",
+            "code=stolen&iss=https://auth.example",
+            "error=access_denied&iss=https://auth.example",
+        ] {
+            let response = agent.get(format!("{base}/callback?{query}")).call().unwrap();
+            assert_eq!(response.status(), 400);
+        }
+    });
+    let cancel = AtomicBool::new(false);
+    let (_tx, paste) = std::sync::mpsc::channel();
+    let control =
+        SignInControl { cancel: &cancel, paste: &paste, notify: &|_| {}, open_browser: false, can_paste: false };
+    let error = await_callback(&listener, "expected-state", &auth, Duration::from_secs(10), &control).unwrap_err();
+    sender.join().unwrap();
+    assert!(
+        matches!(&error, McpError::Server(message) if message == "the authorization server answered access_denied"),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn trace_secret_fingerprints_detect_other_process_sign_in_and_access_only_rotation() {
+    let (dir, oauth) = machine();
+    let fake = Fake::start();
+    let server = fake.server();
+    assert!(oauth.secrets(&server).unwrap().is_empty(), "cache the initially absent sign-in");
+    // An independent handle models a process that cannot invalidate this handle's cache.
+    let other = OAuth { trace_secrets: Default::default(), ..oauth.clone() };
+    sign_in(&other, &server).unwrap();
+    let old = oauth.secrets(&server).unwrap();
+    assert_eq!(old.len(), 2);
+    let argv = dir.path().join("keychain-argv");
+    std::fs::write(&argv, "").unwrap();
+    assert_eq!(oauth.secrets(&server).unwrap(), old);
+    let calls = std::fs::read_to_string(&argv).unwrap();
+    assert_eq!(calls.lines().filter(|line| *line == "lookup").count(), 2, "cached reads inspect heads only");
+    let key = server_key(&server).unwrap();
+    other
+        .write_json(
+            &slot("access", &key),
+            &Access { token: "access-only-rotation".into(), expires_at: unix_now() + 3600 },
+        )
+        .unwrap();
+    let cleaner = atomics_core::tickets::Cleaner::new(oauth.secrets(&server).unwrap());
+    assert_eq!(cleaner.redacted("access-only-rotation"), "***");
+    other.sign_out(&server).unwrap();
+    assert!(oauth.secrets(&server).unwrap().is_empty());
 }

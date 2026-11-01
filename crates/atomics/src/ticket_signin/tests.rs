@@ -264,7 +264,7 @@ fn no_token_or_client_secret_reaches_doctor_output_plan_files_errors_or_messages
     outputs.push(format!("{:?}", SignState::of(&oauth, &server)));
 
     // Secrets as the server and the keychain hold them.
-    let mut secrets = oauth.secrets(&server);
+    let mut secrets = oauth.secrets(&server).unwrap();
     secrets.extend(fake.state.lock().unwrap().access.iter().cloned());
     secrets.extend(fake.state.lock().unwrap().refresh.iter().cloned());
     secrets.extend(fake.state.lock().unwrap().clients.keys().cloned());

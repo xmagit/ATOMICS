@@ -20,6 +20,8 @@ const BACKOFF: Duration = Duration::from_secs(15);
 const MISSING_ENV: Duration = Duration::from_secs(60);
 
 pub enum TicketOp {
+    /// Resolve trace credentials on this worker, including cross-process token changes.
+    TraceCleaner,
     // Consumers are added by the chief-tools and Tickets-panel tasks.
     #[allow(dead_code)]
     Search {
@@ -47,6 +49,7 @@ pub enum TicketOp {
 }
 
 pub enum TicketOutput {
+    TraceCleaner(tickets::Cleaner),
     #[allow(dead_code)]
     Cards(Vec<TicketCard>),
     #[allow(dead_code)]
@@ -150,6 +153,7 @@ impl Worker {
         let error = |error: String| self.cleaner.error(&error);
         let link = |link: TicketLink| self.cleaner.link(link);
         Ok(match result.map_err(error)? {
+            TicketOutput::TraceCleaner(cleaner) => TicketOutput::TraceCleaner(cleaner),
             TicketOutput::Ticket(ticket) => TicketOutput::Ticket(link(ticket)),
             TicketOutput::Tickets(tickets) => TicketOutput::Tickets(tickets.into_iter().map(link).collect()),
             TicketOutput::Read(value) => TicketOutput::Read(self.cleaner.value(value)),
@@ -164,6 +168,13 @@ impl Worker {
     fn run(&mut self, config: &TicketConfig, op: TicketOp) -> Result<TicketOutput, String> {
         let system = config.system.as_str();
         match op {
+            TicketOp::TraceCleaner => {
+                let secrets = match &self.oauth {
+                    Some(oauth) => oauth.secrets(&config.server).map_err(|err| err.to_string())?,
+                    None => Vec::new(),
+                };
+                Ok(TicketOutput::TraceCleaner(self.cleaner.clone().with(secrets)))
+            }
             TicketOp::Search { query, semantic } => {
                 let name = if semantic { "semantic_search" } else { "search" };
                 self.cards(config, name, &Vars::new(system).query(&query))

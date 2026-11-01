@@ -35,6 +35,7 @@ fn demo_call(app: &mut Desktop<'_>, tool: &str, input: serde_json::Value) -> ser
     use serde_json::{Value, json};
 
     app.runtime.on_hook(demo_hook("PreToolUse", tool, input.clone(), Value::Null));
+    demo_wait(app, |r| r.tickets.trace_jobs.is_empty());
     assert_eq!(app.runtime.lane_entries().last().unwrap().state, TraceState::Running);
     if tool == "atomics_plan_set" {
         assert_eq!(app.runtime.lane_entries().last().unwrap().plan.as_ref().unwrap().tasks.len(), 6);
@@ -54,6 +55,7 @@ fn demo_call(app: &mut Desktop<'_>, tool: &str, input: serde_json::Value) -> ser
     };
     assert!(reply.ok, "{reply:?}");
     app.runtime.on_hook(demo_hook("PostToolUse", tool, input, json!({"structuredContent": reply.result})));
+    demo_wait(app, |r| r.tickets.trace_jobs.is_empty());
     assert_eq!(app.runtime.lane_entries().last().unwrap().state, TraceState::Ok);
     reply.result
 }
@@ -252,7 +254,7 @@ fn ticket_demo_sign_in_search_read_plan_trace_and_board() {
         assert!(calls.iter().any(|c| c["tool"] == "list_ticket_children" && c["arguments"]["take"] == 50));
         let trace =
             std::fs::read_to_string(paths::atomics_home().join("trace").join(format!("{}.jsonl", plan.id))).unwrap();
-        for secret in oauth.secrets(&fake.server()) {
+        for secret in oauth.secrets(&fake.server()).unwrap() {
             assert!(!trace.contains(&secret));
         }
     });

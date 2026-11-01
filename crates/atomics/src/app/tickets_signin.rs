@@ -13,8 +13,6 @@ pub(super) struct SignUi {
     oauth: Option<OAuth>,
     /// The state of the configured server, and the server URL it was read for.
     state: Option<(String, SignState)>,
-    /// Trace redaction credentials, read once per server and refreshed after sign-in/out.
-    pub(super) trace_secrets: Option<(McpServer, Vec<String>)>,
     pub(super) job: Option<SignInJob>,
     out: Option<std::sync::mpsc::Receiver<Result<crate::mcp_client::Revocation, String>>>,
     /// The address being pasted, and whether the manual steps show on a machine with a browser.
@@ -32,7 +30,6 @@ impl SignUi {
             wake: wake.clone(),
             oauth: None,
             state: None,
-            trace_secrets: None,
             job: None,
             out: None,
             paste: String::new(),
@@ -49,7 +46,6 @@ impl SignUi {
     #[cfg(test)]
     pub(super) fn override_oauth(&mut self, oauth: OAuth) {
         self.oauth = Some(oauth);
-        self.trace_secrets = None;
         self.state = None;
     }
 
@@ -83,7 +79,6 @@ impl State {
         {
             changed = true;
             self.tickets.sign.job = None;
-            self.tickets.sign.trace_secrets = None;
             self.tickets.sign.paste.clear();
             match result {
                 Ok(()) => {
@@ -108,7 +103,6 @@ impl State {
         {
             changed = true;
             self.tickets.sign.out = None;
-            self.tickets.sign.trace_secrets = None;
             let message = ticket_signin::sign_out_message(&host, &result);
             let message = self.scrub(&message);
             self.tickets.sign.state = None;
@@ -335,7 +329,7 @@ mod tests {
             "app::tickets_signin::tests::ticket_signin_state_banner_and_sign_out_follow_the_fake_server",
             |app, _| {
                 let fake = FakeOAuthServer::start();
-                let (dir, oauth) = crate::mcp_client::oauth_test_machine();
+                let (_dir, oauth) = crate::mcp_client::oauth_test_machine();
                 app.runtime.config.tickets = toml::from_str("system = \"echo\"").unwrap();
                 app.runtime.config.tickets.server = fake.server();
                 app.runtime.apply_ticket_config();
@@ -348,9 +342,6 @@ mod tests {
                 assert!(app.runtime.tickets.panel.signin);
                 assert_eq!(app.runtime.tickets.sign.state(), Some(&SignState::SignedOut));
 
-                // Before sign-in the empty read is cached too.
-                app.runtime.trace_cleaner();
-                assert!(app.runtime.tickets.sign.trace_secrets.as_ref().unwrap().1.is_empty());
                 app.runtime.start_sign_in();
                 assert_eq!(app.runtime.tickets.sign.state(), Some(&SignState::SigningIn));
                 let url = loop {
@@ -368,26 +359,11 @@ mod tests {
                 pump(app, |r| r.tickets.sign.job.is_none());
                 assert_eq!(app.runtime.tickets.sign.state(), Some(&SignState::SignedIn));
                 assert!(!app.runtime.tickets.panel.signin);
-                assert!(app.runtime.tickets.sign.trace_secrets.is_none(), "sign-in invalidates the trace cache");
-                app.runtime.trace_cleaner();
-                assert!(!app.runtime.tickets.sign.trace_secrets.as_ref().unwrap().1.is_empty());
-                let reads = std::fs::read(dir.path().join("keychain-argv")).unwrap();
-                for _ in 0..5 {
-                    app.runtime.trace_cleaner();
-                }
-                assert_eq!(
-                    std::fs::read(dir.path().join("keychain-argv")).unwrap(),
-                    reads,
-                    "hooks reuse the cached secrets"
-                );
 
                 app.runtime.start_sign_out();
                 assert!(app.runtime.tickets.panel.signin);
                 pump(app, |r| r.tickets.sign.out.is_none() && r.tickets.sign.state() == Some(&SignState::SignedOut));
                 assert_eq!(fake.state.lock().unwrap().revoked.len(), 2);
-                assert!(app.runtime.tickets.sign.trace_secrets.is_none(), "sign-out invalidates the trace cache");
-                app.runtime.trace_cleaner();
-                assert!(app.runtime.tickets.sign.trace_secrets.as_ref().unwrap().1.is_empty());
             },
         );
     }

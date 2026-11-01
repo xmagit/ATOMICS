@@ -335,10 +335,16 @@ pub const USAGE_MARK: &str = "--- atomics usage ";
 /// `sbx exec` arguments that print the account usage a sandbox's agents last saw, each part bounded
 /// in the VM: the end of the newest Codex rollout, and Claude's last status line input.
 pub fn usage_args(name: &str) -> Vec<String> {
+    usage_args_with_statusline(name, STATUSLINE_FILE)
+}
+
+/// Like [`usage_args`], with an explicit statusline path for isolated callers and tests.
+pub fn usage_args_with_statusline(name: &str, statusline: &str) -> Vec<String> {
+    let statusline = format!("'{}'", statusline.replace('\'', "'\"'\"'"));
     let script = format!(
         r#"f=$(ls -t "$HOME"/.codex/sessions/*/*/*/rollout-*.jsonl 2>/dev/null | head -n 1)
 if [ -n "$f" ]; then echo '{USAGE_MARK}codex'; tail -c 16384 "$f"; echo; fi
-s={STATUSLINE_FILE}
+s={statusline}
 if [ -f "$s" ]; then echo "{USAGE_MARK}claude $(stat -c %Y "$s")"; head -c 65536 "$s"; echo; fi"#
     );
     ["exec", name, "timeout", "-k", "2", "10", "sh", "-c", &script].map(String::from).into()
@@ -857,7 +863,7 @@ command = ["codex"]
         assert_eq!(args[..8], ["exec", "atomics-s1", "timeout", "-k", "2", "10", "sh", "-c"]);
         assert_eq!(args.len(), 9);
         for part in
-            [format!("echo '{USAGE_MARK}codex'"), format!("{USAGE_MARK}claude "), format!("s={STATUSLINE_FILE}")]
+            [format!("echo '{USAGE_MARK}codex'"), format!("{USAGE_MARK}claude "), format!("s='{STATUSLINE_FILE}'")]
         {
             assert!(args[8].contains(&part), "{part} in {}", args[8]);
         }

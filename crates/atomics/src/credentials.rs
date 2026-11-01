@@ -357,6 +357,13 @@ impl Store {
         Err(invalid())
     }
 
+    /// A digest of only the stored head, cheap even for chunked tokens. Readers compare both
+    /// token and access heads so rotation without a new refresh token is detected too.
+    pub(crate) fn oauth_fingerprint(&self, slot: &str) -> Result<Option<String>> {
+        check_slot(slot)?;
+        Ok(self.keychain.read_item(MCP_OAUTH, slot)?.map(|head| digest_hex(&head)))
+    }
+
     /// The value `chunks` names, or `None` when a chunk is gone or the digest does not match: a writer
     /// replaced them meanwhile.
     fn read_chunks(&self, slot: &str, chunks: &Chunks) -> Result<Option<String>> {
@@ -396,13 +403,13 @@ impl Store {
                 self.keychain.write_item(MCP_OAUTH, &chunk_name(slot, generation, index), OAUTH_LABEL, piece)?;
             }
             // Longer leftovers of a write that stopped before its head.
-            self.remove_chunks(slot, generation, pieces.len())?;
+            self.remove_chunks(slot, generation, pieces.len(), None)?;
             let head = Chunks { generation, count: pieces.len(), digest: digest_hex(&encoded) };
             self.keychain.write_item(MCP_OAUTH, slot, OAUTH_LABEL, &head.to_string())?;
         }
         // The head no longer names the previous chunks; a chunked write always used the other generation.
         if let Some(previous) = previous {
-            self.remove_chunks(slot, previous.generation, 0)?;
+            self.remove_chunks(slot, previous.generation, 0, Some(previous.count))?;
         }
         Ok(())
     }
@@ -412,22 +419,31 @@ impl Store {
     pub fn remove_oauth_item(&self, slot: &str) -> Result<()> {
         check_slot(slot)?;
         let _lock = self.keychain.catalog_lock()?;
+        let previous = self.keychain.read_item(MCP_OAUTH, slot)?.as_deref().and_then(Chunks::parse);
         self.keychain.remove_item(MCP_OAUTH, slot)?;
         for generation in ['a', 'b'] {
-            self.remove_chunks(slot, generation, 0)?;
+            let count = previous.as_ref().filter(|head| head.generation == generation).map(|head| head.count);
+            self.remove_chunks(slot, generation, 0, count)?;
         }
         Ok(())
     }
 
-    /// Removes `generation`'s chunks from index `from` on. Chunks are written in order and removed
-    /// last first, so what exists is always a run from 0 even after an interrupted write or removal.
-    fn remove_chunks(&self, slot: &str, generation: char, from: usize) -> Result<()> {
-        let mut end = from;
-        while end < OAUTH_MAX_CHUNKS
-            && self.keychain.read_item(MCP_OAUTH, &chunk_name(slot, generation, end))?.is_some()
-        {
-            end += 1;
-        }
+    /// Uses the previous head's count without reading each chunk. Only a generation with no
+    /// readable head (an interrupted write) needs a bounded probe for its unknown tail.
+    /// Removal runs backwards, preserving a contiguous prefix if it is interrupted.
+    fn remove_chunks(&self, slot: &str, generation: char, from: usize, count: Option<usize>) -> Result<()> {
+        let end = match count {
+            Some(count) => count,
+            None => {
+                let mut end = from;
+                while end < OAUTH_MAX_CHUNKS
+                    && self.keychain.read_item(MCP_OAUTH, &chunk_name(slot, generation, end))?.is_some()
+                {
+                    end += 1;
+                }
+                end
+            }
+        };
         for index in (from..end).rev() {
             self.keychain.remove_item(MCP_OAUTH, &chunk_name(slot, generation, index))?;
         }
@@ -1055,6 +1071,29 @@ pub(crate) mod tests {
             store.remove_oauth_item(slot).unwrap();
             assert!(oauth_files(dir.path(), slot).is_empty(), "{:?}", oauth_files(dir.path(), slot));
             assert!(store.oauth_item(slot).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn credentials_oauth_cleanup_uses_the_previous_heads_count() {
+        for mac in [true, false] {
+            let (dir, _, store) = machine(mac);
+            let slot = "tokens-count";
+            store.put_oauth_item(slot, &token_set(8 * 1024, "eight")).unwrap();
+            let argv = dir.path().join("keychain-argv");
+            std::fs::write(&argv, "").unwrap();
+            store.put_oauth_item(slot, "{}").unwrap();
+            let calls = std::fs::read_to_string(&argv).unwrap();
+            let reads = calls.lines().filter(|line| matches!(*line, "lookup" | "find-generic-password")).count();
+            assert_eq!(reads, 2, "only the old head and verified new head are read, not the eight old chunks");
+
+            store.put_oauth_item(slot, &token_set(8 * 1024, "eight")).unwrap();
+            std::fs::write(&argv, "").unwrap();
+            store.remove_oauth_item(slot).unwrap();
+            let calls = std::fs::read_to_string(&argv).unwrap();
+            let reads = calls.lines().filter(|line| matches!(*line, "lookup" | "find-generic-password")).count();
+            assert_eq!(reads, 2, "the head and the unnamed generation's first slot, not each named chunk");
+            assert!(oauth_files(dir.path(), slot).is_empty());
         }
     }
 

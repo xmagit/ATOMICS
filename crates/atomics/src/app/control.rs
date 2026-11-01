@@ -87,7 +87,10 @@ impl State {
                 }
                 None => missing(&session),
             },
-            ControlRequest::TraceGet { session, limit } => done(self.trace_response(session.as_deref(), limit)),
+            ControlRequest::TraceGet { session, limit } => {
+                self.request_trace(session, limit, reply);
+                return;
+            }
             ControlRequest::List => {
                 let sessions: Vec<_> = (0..self.sessions.len()).map(|i| self.describe(i)).collect();
                 let (window, monitor) = ctx.input(|i| (i.content_rect().size(), i.viewport().monitor_size));

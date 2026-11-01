@@ -22,6 +22,7 @@ pub(super) struct Tag {
 
 #[derive(Clone, PartialEq)]
 enum Kind {
+    Trace(u64),
     Read,
     Refresh,
     List,
@@ -72,6 +73,8 @@ pub(super) struct Tickets {
     pub(super) panel: super::tickets_panel::TicketsPanel,
     /// Sign-in state and jobs of the ticket server.
     pub(super) sign: super::tickets_signin::SignUi,
+    pub(super) trace_jobs: HashMap<u64, (Arc<TicketConfig>, super::trace::TraceAction)>,
+    pub(super) next_trace_job: u64,
 }
 
 /// A control request answered once all of its ticket jobs are done.
@@ -112,6 +115,8 @@ impl Tickets {
             generations: HashMap::new(),
             panel: Default::default(),
             sign: super::tickets_signin::SignUi::new(wake),
+            trace_jobs: HashMap::new(),
+            next_trace_job: 0,
         }
     }
 }
@@ -287,7 +292,7 @@ impl State {
             | TicketOp::List(link)
             | TicketOp::UpdateState(link, _)
             | TicketOp::Comment(link, _) => Some(link),
-            TicketOp::Create { .. } | TicketOp::Search { .. } => None,
+            TicketOp::TraceCleaner | TicketOp::Create { .. } | TicketOp::Search { .. } => None,
         };
         // Callers already leave other systems' links alone; nothing may reach them anyway.
         if let Some(mismatch) = addressed.and_then(|link| config.mismatch(link)) {
@@ -388,7 +393,25 @@ impl State {
         }
     }
 
+    pub(super) fn send_trace_job(&mut self, config: &Arc<TicketConfig>, seq: u64) {
+        self.send_ticket(
+            config,
+            TicketOp::TraceCleaner,
+            Tag {
+                key: (String::new(), None),
+                ticket: String::new(),
+                system: config.system.clone(),
+                kind: Kind::Trace(seq),
+                batch: None,
+            },
+        );
+    }
+
     fn finish_ticket(&mut self, tag: Tag, result: Result<TicketOutput, String>) {
+        if let Kind::Trace(seq) = tag.kind {
+            self.finish_trace(seq, result);
+            return;
+        }
         if let Kind::Panel(job, seq) = tag.kind {
             self.panel_result(job, seq, result);
             return;
@@ -431,7 +454,7 @@ impl State {
             Kind::State(_) => {
                 self.tickets.pushing.remove(&tag.key);
             }
-            Kind::Read | Kind::Comment | Kind::Create(_) | Kind::Panel(..) | Kind::Cards { .. } => {}
+            Kind::Trace(_) | Kind::Read | Kind::Comment | Kind::Create(_) | Kind::Panel(..) | Kind::Cards { .. } => {}
         }
         let error = match (tag.kind.clone(), result) {
             (Kind::Read, Ok(TicketOutput::Read(value))) => {
@@ -494,7 +517,7 @@ impl State {
             }
             (kind, Err(err)) => {
                 let what = match &kind {
-                    Kind::Read | Kind::Refresh | Kind::List => "reading the ticket failed".to_string(),
+                    Kind::Trace(_) | Kind::Read | Kind::Refresh | Kind::List => "reading the ticket failed".to_string(),
                     Kind::State(state) => {
                         self.tickets.failed.insert(tag.key.clone(), state.clone());
                         format!("setting the state to {state} failed")

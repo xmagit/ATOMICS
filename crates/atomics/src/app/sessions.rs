@@ -1332,7 +1332,7 @@ mod tests {
                         100,
                     )
                     .unwrap();
-                    let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
+                    let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(60));
                     while !terminal.screen_text(60).contains(text) || exit && !terminal.exited() {
                         assert!(Instant::now() < deadline);
                         std::thread::sleep(Duration::from_millis(10));
@@ -1347,11 +1347,24 @@ mod tests {
                         status: TaskStatus::Running,
                         ..Default::default()
                     }];
-                    for _ in 0..2 {
+                    let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(60));
+                    loop {
                         app.runtime.busy_checked = Instant::now() - Duration::from_secs(1);
                         app.runtime.runtime_tick(ctx);
-                        assert_eq!(app.runtime.sessions[0].status, AgentStatus::NeedsInput);
+                        if app.runtime.sessions[0].status == AgentStatus::NeedsInput
+                            && app.runtime.plans[0].tasks[0].status == TaskStatus::Blocked
+                            && app.runtime.plans[0].tasks[0].report.as_ref().is_some_and(|r| r.summary.contains(text))
+                            && app.runtime.sessions[0].last_message.as_ref().is_some_and(|m| m.contains(text))
+                        {
+                            break;
+                        }
+                        assert!(Instant::now() < deadline, "credential failure did not block the task");
+                        std::thread::sleep(Duration::from_millis(20));
                     }
+                    // It stays blocked on the following tick, including after the terminal exits.
+                    app.runtime.busy_checked = Instant::now() - Duration::from_secs(1);
+                    app.runtime.runtime_tick(ctx);
+                    assert_eq!(app.runtime.sessions[0].status, AgentStatus::NeedsInput);
                     assert_eq!(app.runtime.plans[0].tasks[0].status, TaskStatus::Blocked);
                     assert!(app.runtime.plans[0].tasks[0].report.as_ref().unwrap().summary.contains(text));
                     assert!(app.runtime.sessions[0].last_message.as_ref().unwrap().contains(text));

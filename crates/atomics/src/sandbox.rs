@@ -660,11 +660,14 @@ pub fn installed(program: &str) -> bool {
 /// The account usage a running sandbox's agents last saw ([`isolation::usage_args`]). Its agent
 /// controls the VM, so only the first 128 KiB are read, and callers treat the rest as its claims.
 pub fn read_usage(program: &str, name: &str) -> Result<String> {
+    read_usage_with_args(program, &isolation::usage_args(name))
+}
+
+fn read_usage_with_args(program: &str, args: &[String]) -> Result<String> {
     const LIMIT: u64 = 128 * 1024;
     let (mut stdout, stderr) = (capture()?, capture()?);
-    let mut child = sbx_command(program, &isolation::usage_args(name), false, &stdout, &stderr)?
-        .spawn()
-        .with_context(|| format!("running {program}"))?;
+    let mut child =
+        sbx_command(program, args, false, &stdout, &stderr)?.spawn().with_context(|| format!("running {program}"))?;
     match wait(&mut child, Instant::now() + Duration::from_secs(20), None)? {
         Some(status) if status.success() => {}
         Some(status) => bail!("sbx exec failed ({status})"),
@@ -1404,7 +1407,9 @@ mod tests {
         File::options().write(true).open(&old).unwrap().set_modified(std::time::UNIX_EPOCH).unwrap();
         std::fs::write(day.join("rollout-new.jsonl"), format!("{}\n{}\n", "x".repeat(40_000), event(12))).unwrap();
 
-        let output = read_usage(&sbx, "atomics-u").unwrap();
+        let statusline = bin.path().join("statusline.json");
+        let args = isolation::usage_args_with_statusline("atomics-u", statusline.to_str().unwrap());
+        let output = read_usage_with_args(&sbx, &args).unwrap();
         assert!(output.len() < 20_000, "the VM keeps only the end of the rollout: {} bytes", output.len());
         let reports = crate::usage::sandbox_reports(&output, i64::MAX);
         let [crate::usage::Report::Codex(usage)] = reports.as_slice() else { panic!("one Codex report: {output}") };
