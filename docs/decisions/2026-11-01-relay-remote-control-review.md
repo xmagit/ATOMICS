@@ -3,6 +3,9 @@
 Reviewed: `docs/decisions/2026-11-01-relay-remote-control.md` at `1747bdc` (called **d1** below; `d1:N` is its
 line N). Reviewer: host session with every repository, read only, 2026-11-01. Nothing was built or run.
 
+Outcome: every finding below is **resolved in design d2** (same file, revised in place). The last section,
+[Resolved in d2](#resolved-in-d2), lists each change with its d2 section.
+
 Code read, after `git fetch`:
 - foundation-template `origin/main` `44128b5e` (kernel, called **FT**);
 - relay-backend `origin/main` `089e68c8d` (**RB**);
@@ -333,3 +336,72 @@ The design holds to that as long as:
 | X6 | both | Device acceptance; webhook repositories added (gitops, Max's go) |
 
 Wave A can still be X1 + R1, once Max approves d2.
+
+---
+
+## Resolved in d2
+
+d2 revised the design in place, with the chief's fixed decisions (identities, H1–H5, the mediums). It was
+checked against the same heads: FT `44128b5e`, RB `089e68c8d`, RS `279e8d8`. `§N` below means a section of d2.
+
+### High
+
+| Finding | Outcome | Change in d2 |
+| --- | --- | --- |
+| H1 conversation needs a ticket link and an MCP surface | **Resolved in d2** | R1 is now a kernel **item conversation** that any agent connection opens (§5.1). It is an `AgentWorkRequestRecord` with a new `ItemConversation` source kind, and reuses steering revisions, acknowledgements, events, activity and the attention dedupe ids. A new table holds the named steering humans. Each is checked as an active Human who can read the ticket, through the existing `TicketAgentSessionSourcePresentationProvider`. The conversation is visible and steerable only by them; ManageAgents grants nothing, agents can't steer, and claims and operational lists exclude it (§5.1.1, §5.1.3, §5.1.4). The MCP tools open, post, read steering after a revision, acknowledge, and list the steering humans (§5.1.2). ATOMICS maps them as generic `conversation_*` operations (§3.1). Kernel comment threads and `list_ticket_comments` are gone. Flat gets a Conversation tab (§5.3.4). Events are ≤ 2000 characters throughout (§3.6). §5.4 names the repo for each part. |
+| H2 Flat has no PWA | **Resolved in d2** | R3 is a build: a manifest (§5.3.1), and `/sw.js` as a push worker with `push` and `notificationclick` handlers and still no `fetch` handler (§5.3.2). The worker keeps the legacy shell's cache cleanup and stops unregistering itself; the old-worker retirement stays for the legacy shell only. Also a tap-gated subscription with antiforgery and sign-out (§5.3.3), phone layouts (§5.3.5), and deep links including the `/notifications` fallback (§5.3.6), all ported from RF's files. The offline shell is d2's only open question (§7), recommending none in v1. |
+| H3 attention comments can't notify; mention pushes leak text | **Resolved in d2** | **Chose the dedicated notification path** (§5.1.5), with the reasons: mention pushes put up to 300 characters on the lock screen; mentions live in main comments that every reader sees; explicit MCP mentions would let any agent push to any human; and the personal attention path already has generic copy, dedupe and deep links. Attention comments and `notify_mention` are deleted. Conversation activity (WaitingForApproval, WaitingForInput, Failed) and Completed push to the steering humans with a generic title and no body. CI failed and deployed arrive as item notices (§5.1.6, R2 in §5.2), also with no body. |
+| H4 the doc kept what Q3 and Q4 rejected; two Q1 details wrong | **Resolved in d2** | Gone: main-comment steering, `steer = "comments"`, `steer_prefix`, state approval (Option B), `target = "comments"` and `require_kind = ""`. The approval request and `/approve` live in the Conversation (§3.5). Only steering humans see the conversation (§4.2, §5.1.4). §4.1 states Max's Q1 rule in his words. G-R3 is deleted (shipped in #748). The chip names both identities (§3.2). The ATOMICS security model now covers only conversation items (§3.4). |
+| H5 Relay's linker misses ATOMICS branches | **Resolved in d2** | The ATOMICS side is config only: `[tickets] branch = "relay/{key_number}-{slug}"` in Max's profile, using the existing template support, which already covers the ticket-mode integration branch and the `-<task>` suffix (§3.8). No Relay names in code. The board-mode integration branch can be passed to `plan_set`. Operator step O1 lists installing the GitHub app and the gitops webhook-repositories change (§6). `record_stage` stays with RELAY-11955 A5. |
+
+### Medium
+
+| Finding | Outcome | Change in d2 |
+| --- | --- | --- |
+| M1 R1 aimed at the wrong repository | **Resolved in d2** | R1 is foundation-template, under an ATOM ticket on an `atom/` branch: the conversation, its MCP tools, notifications and the MCP rate limit. R2 is relay-backend: the ticket readability provider in the integration host, and the CI and deploy notices (§5.2). §5.4 names the repo per part. **Correction to this review:** `IntegrationWebApiModule.cs` (the MCP mapping and rate limits) is kernel-owned. RB's `kernel.lock` pins it, and it is byte-identical to FT's, so the rate limit belongs to R1, not relay-backend. The suggestion to show the conversation on `get_ticket` was dropped: `open_item_conversation` is idempotent, and Flat uses the kernel's per-item list. |
+| M2 author-kind casing and vocabulary | **Resolved in d2** | `human_kind` is compared ignoring ASCII case, and `personal_agent_kind` reads whoami's value (§3.2). An unmapped author kind turns remote off with a reason; no setting disables the check. X2 tests `Human` and `human`, and that a personal agent's message never steers, even with its owner on the list. The server also refuses steering written by any agent (§4.2). |
+| M3 the digest missed approval fields | **Resolved in d2** | The digest covers the goal plus exactly `Plan::replace`'s fields (id, title, brief, acceptance, depends_on, agent, args, isolation, repo), as 12 hex characters (§3.5). Plan events give the phone's sheet each task's agent, repo and brief opening. X3 tests that changing a brief, repo, args or agent changes the digest. |
+| M4 steering is broader than approval | **Resolved in d2** | §4.4 lists the actions that stay confirmed at the desk and adds the chief's prompt rule (§3.6). Person mode stays off (§4.1). The residual risks are in §4.5. X2 tests the source label. |
+| M5 X1 overlapped a1 | **Resolved in d2** | X1 depends on a1 merged to main, and keeps only what a1 didn't cover: whoami, comment identity fields, typed placeholders, the sidecar outbox and mention escaping (§6 X1). `create` stays unmapped. |
+| M6 restart replay and outbox placement | **Resolved in d2** | Delivery intent is saved before `deliver`, the acknowledgement follows the outcome, and a restart never pastes again (§3.4). Remote state lives in a sidecar file outside `plan_json` (§3.3). |
+| M7 `@alias` in agent-written comments is refused | **Resolved in d2** | The mirror never writes main comments. a1's lifecycle comments still do, so a generic `[tickets] escape_mentions` inserts U+2060 after `@`; the Relay profile sets it (§3.9). |
+| M8 a sequence cursor can skip rows | **Resolved in d2** | The cursor is the steering revision, assigned inside the serializable transaction that also updates the conversation's row, so it is commit-ordered (§5.1.2). R1 tests concurrent writers. ATOMICS deduplicates by id as well (§3.4). |
+| M9 unbounded polling cost | **Resolved in d2** | Only the cursor read polls, every 5 s while the plan is "active" (defined in §3.7) and every 60 s otherwise. Polling stops when the plan or the conversation ends, and backs off on 429. No `get_ticket` poll exists. The kernel adds a per-identity token bucket on MCP (§5.1.7). |
+
+### Low
+
+| Finding | Outcome | Change in d2 |
+| --- | --- | --- |
+| L1 citations | **Resolved in d2** | §1.1 is rewritten with file:line. `@agent` is placed in RB. The source caveat is removed. d2 no longer depends on `commentsTake` or on the runner protocol. |
+| L2 the Approve button's contract | **Resolved in d2** | A documented ATOMICS text contract: the Approval event's last line is `/approve <12 hex>`, and the Plan events since the latest Approval event list the tasks (§3.5). X3 documents and tests it; Flat reads it (§5.3.4). |
+| L3 test runs | **Resolved in d2** | Every task runs its full suite once through `atomics queue --class test` (§6). |
+| L4 CI budget | **Resolved in d2** | Phone-width browser and device checks run locally only. CI runs `check-fast.sh` (with the new PWA node tests) and the cargo checks (§6 R3). |
+
+### The chief's answers (§2 table)
+
+| Q | Outcome | Change in d2 |
+| --- | --- | --- |
+| Q1 owner identity | **Resolved in d2** | §4.1 states Max's rule. `owners` holds human user ids, and the empty default applies only to personal agents (§3.2). `require_kind` is gone and G-R3 is deleted. The chip is fixed, and the doctor says "set `[tickets.remote] owners`". The question is closed. |
+| Q2 thread storage | **Resolved in d2** | See H1. Closed. |
+| Q3 visibility | **Resolved in d2** | Steering humans only; `target = "comments"` is removed. Closed. |
+| Q4 steering word | **Resolved in d2** | The Conversation only. Closed. |
+| Q5 stages | **Resolved in d2** | See H5. Closed. |
+| Q6 phase 2 | **Resolved in d2** | Approving permissions and merges from the phone stays phase 2 (§4.4). Closed. |
+| Q7 session strength | **Resolved in d2** | No extra MFA in v1, plus the list of actions confirmed at the desk (§4.4). Closed. |
+| Q8 frontend | **Resolved in d2** | Flat, built as a PWA (H2). Closed. |
+| Q9 polling | **Resolved in d2** | See M9. Closed. |
+
+### Agnosticism and the task list
+
+- **Agnosticism: resolved in d2.** ATOMICS uses only generic MCP operations. Relay's vocabulary (tool names,
+  event kinds, activity states, `itemType = "ticket"`) appears only in the example profile (§3.1, §3.2). The
+  approval text is ATOMICS's own contract (§3.5).
+- **Task list (§4 above): resolved in d2, with three differences.**
+  - d1's X5 (attention comments and `record_stage`) is removed: branch linking is config (§3.8, O1),
+    `record_stage` stays with RELAY-11955 A5, and attention became conversation activity (X4). d2's X5 is d1's
+    X6.
+  - R2 doesn't show the conversation on `get_ticket` (M1).
+  - The work runs in five waves, to keep at most two build-heavy tasks at once: X1 + R1, X2 + R3, X3 + R2, X4,
+    then X5.
+
+Still open after d2: only the offline shell (d2 §7).
