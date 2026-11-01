@@ -197,7 +197,13 @@ fn call(path: &str, params: &Value) -> Result<Value, String> {
             text(identity)
         }
     } else if generic.starts_with("conversation_") {
-        let result = conversation(&mut state, name, generic, args)?;
+        let result = match conversation(&mut state, name, generic, args) {
+            Ok(result) => result,
+            Err(error) => {
+                save(path, &state);
+                return Err(error);
+            }
+        };
         if name.starts_with("card_") { structured(result) } else { text(result) }
     } else {
         match name {
@@ -330,11 +336,44 @@ fn call(path: &str, params: &Value) -> Result<Value, String> {
 /// wrote, as `{id, revision, author_id, author_kind, author, text, at}`; `cursor` is the newest
 /// revision `conversation_open` reports (default: the newest in `steering`); ids in
 /// `refuse_steerers` are refused on open; `conversation_id` names the conversation.
+///
+/// It enforces the reference conversation server's rules, with its messages: a title is 1–200 UTF-16 units without
+/// control characters; post text is non-blank and at most 2000 UTF-16 units after trimming;
+/// a sequence is used once per conversation; a post with activity `Completed` ends the
+/// conversation (`ended`), and the next open starts a new one. `unreadable` makes the item
+/// unreadable; `next_sequence = true` makes open return `nextSequence`.
 fn conversation(state: &mut Value, name: &str, generic: &str, args: &Value) -> Result<Value, String> {
     let arg = |keys: &[&str]| keys.iter().map(|key| &args[*key]).find(|value| !value.is_null()).cloned();
-    let id = state["conversation_id"].as_str().unwrap_or("conversation-1").to_string();
-    if generic != "conversation_open" && arg(&["conversation", "conversationId"]) != Some(json!(id)) {
-        return Err(format!("no conversation {}", arg(&["conversation", "conversationId"]).unwrap_or_default()));
+    if state["unreadable"] == true {
+        return Err(if generic == "conversation_open" {
+            "The item does not exist, or this agent can't read it.".into()
+        } else {
+            "This agent can no longer read the conversation's item.".into()
+        });
+    }
+    if generic == "conversation_open" && state["ended"] == true {
+        let generation = state["generation"].as_u64().unwrap_or(1) + 1;
+        state["generation"] = json!(generation);
+        state["conversation_id"] = json!(format!("conversation-{generation}"));
+        state["ended"] = json!(false);
+    }
+    let main = state["conversation_id"].as_str().unwrap_or("conversation-1").to_string();
+    // `conversations` maps further items to conversations of their own: {itemId: id}.
+    let item = arg(&["itemId", "uuid", "id", "ticket"]).and_then(|item| item.as_str().map(str::to_string));
+    let id = if generic == "conversation_open" {
+        item.and_then(|item| state["conversations"][&item].as_str().map(str::to_string)).unwrap_or(main.clone())
+    } else {
+        let named = arg(&["conversation", "conversationId"]).and_then(|id| id.as_str().map(str::to_string));
+        let known = |id: &String| {
+            *id == main || state["conversations"].as_object().is_some_and(|map| map.values().any(|v| v == id))
+        };
+        match named.filter(known) {
+            Some(id) => id,
+            None => return Err("The conversation does not exist, or belongs to another agent.".into()),
+        }
+    };
+    if generic == "conversation_post" && state["ended"] == true && id == main {
+        return Err("The item conversation has ended.".into());
     }
     let push = |state: &mut Value, key: &str, value: Value| {
         if !state[key].is_array() {
@@ -363,6 +402,13 @@ fn conversation(state: &mut Value, name: &str, generic: &str, args: &Value) -> R
     };
     Ok(match generic {
         "conversation_open" => {
+            if let Some(title) = arg(&["title"]) {
+                let title = title.as_str().unwrap_or_default();
+                if title.trim().is_empty() || title.encode_utf16().count() > 200 || title.chars().any(char::is_control)
+                {
+                    return Err("The conversation title must be 1-200 characters without control characters.".into());
+                }
+            }
             let owners = arg(&["owners", "steeringUserIds"]).and_then(|v| v.as_array().cloned()).unwrap_or_default();
             let refused: Vec<Value> = state["refuse_steerers"].as_array().cloned().unwrap_or_default();
             let accepted: Vec<Value> = owners
@@ -385,6 +431,13 @@ fn conversation(state: &mut Value, name: &str, generic: &str, args: &Value) -> R
                 state["steering"].as_array().into_iter().flatten().filter_map(|item| item["revision"].as_u64()).max();
             let cursor =
                 state.get("cursor").cloned().filter(|c| !c.is_null()).unwrap_or_else(|| json!(newest.unwrap_or(0)));
+            if state["next_sequence"] == true {
+                let used = state["sequences"][&id]
+                    .as_object()
+                    .map(|used| used.keys().filter_map(|seq| seq.parse::<u64>().ok()).max().unwrap_or(0));
+                return Ok(json!({"conversationId":id, "latestRevision":cursor, "steeringUsers":people(state),
+                    "nextSequence": used.unwrap_or(0) + 1}));
+            }
             if card {
                 json!({"conversation":{"ref":id, "head":cursor, "people":people(state)}})
             } else if issue {
@@ -394,6 +447,32 @@ fn conversation(state: &mut Value, name: &str, generic: &str, args: &Value) -> R
             }
         }
         "conversation_post" => {
+            let text = arg(&["text", "body"]).and_then(|text| text.as_str().map(str::to_string)).unwrap_or_default();
+            if text.trim().is_empty() {
+                return Err("A safe observable summary is required.".into());
+            }
+            if text.trim().encode_utf16().count() > 2000 {
+                return Err("The observable session text must be at most 2000 characters.".into());
+            }
+            if let Some(seq) = arg(&["seq", "sequence"]).filter(|seq| !seq.is_null()) {
+                let seq = seq.as_u64().map(|n| n.to_string()).unwrap_or_else(|| seq.to_string());
+                if !state["sequences"].is_object() {
+                    state["sequences"] = json!({});
+                }
+                if !state["sequences"][&id].is_object() {
+                    state["sequences"][&id] = json!({});
+                }
+                let event = arg(&["eventId", "nonce"]).unwrap_or(Value::Null);
+                match state["sequences"][&id].get(&seq) {
+                    Some(previous) if *previous != event => {
+                        return Err("An agent session event sequence was already used.".into());
+                    }
+                    _ => state["sequences"][&id][&seq] = event,
+                }
+            }
+            if id == main && arg(&["activity", "activityState"]).is_some_and(|activity| activity == "Completed") {
+                state["ended"] = json!(true);
+            }
             push(state, "posts", args.clone());
             json!({"posted":true, "recorded":true})
         }
@@ -405,6 +484,8 @@ fn conversation(state: &mut Value, name: &str, generic: &str, args: &Value) -> R
                 .into_iter()
                 .flatten()
                 .filter(|item| after.is_null() || item["revision"].as_u64() > after.as_u64().or_else(|| after.as_str()?.parse().ok()))
+                // Items naming a conversation belong to it alone.
+                .filter(|item| item["conversation"].as_str().is_none_or(|of| of == id))
                 .take(take)
                 .map(|item| {
                     if card {

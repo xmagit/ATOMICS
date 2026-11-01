@@ -5,6 +5,7 @@
 use super::*;
 use crate::tickets::{RemoteOutcome, RemoteOutput, TicketOp, TicketOutput};
 use atomics_core::tickets::{self as ticket, RemoteConfig, RemoteStatus, Steerer, SteeringItem, TicketConfig};
+use std::collections::{BTreeMap, VecDeque};
 
 /// A chief turn or a steering message this recent keeps a plan on the fast cadence.
 pub(super) const ACTIVE_WINDOW: Duration = Duration::from_secs(600);
@@ -15,6 +16,17 @@ pub(super) const THROTTLED: Duration = Duration::from_secs(300);
 /// The wait before opening again after a failed open.
 const REOPEN_AFTER: Duration = Duration::from_secs(60);
 const MAX_NOTICES: usize = 20;
+/// Source labels of recently pasted steering, kept to attribute the chief's next turns.
+const MAX_PASTED: usize = 50;
+
+/// Unix milliseconds.
+pub(super) fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RemoteJob {
@@ -29,7 +41,12 @@ pub(super) struct Remote {
     pub(super) plans: HashMap<String, RemotePlan>,
     /// The chief's latest turn, from its UserPromptSubmit and Stop hooks.
     pub(super) chief_turn: Option<Instant>,
+    /// The plan the chief's current turn is mirrored to; none mirrors nothing.
     pub(super) chief_plan: Option<String>,
+    /// (plan, source label) of steering pasted to the chief, oldest first.
+    pasted: VecDeque<(String, String)>,
+    /// Open plans on a ticket whose conversation a newer plan owns, with why.
+    pub(super) standby: BTreeMap<String, String>,
     /// Plans whose interrupted deliveries this process has already handled.
     recovered: HashSet<String>,
     /// Bumped when remote restarts, so results of older jobs are recognised.
@@ -42,6 +59,8 @@ impl Remote {
     pub(super) fn reset(&mut self) {
         self.plans.clear();
         self.chief_plan = None;
+        self.pasted.clear();
+        self.standby.clear();
         self.epoch += 1;
         self.shown = None;
     }
@@ -67,6 +86,9 @@ pub(super) struct RemotePlan {
     /// Items not sent to the chief, with the reason.
     pub(super) notices: Vec<String>,
     error: Option<String>,
+    /// The conversation ended or its item became unreadable: polling stopped, and the next
+    /// open, at the slow cadence, starts again from the server's cursor.
+    lost: Option<String>,
     turn: String,
     entries: Vec<atomics_core::trace::TraceEntry>,
     activity: Option<String>,
@@ -141,25 +163,62 @@ impl State {
         };
         let Some(whoami) = self.tickets.whoami.clone() else { return };
         // Polling stops when a plan completes or is archived: it simply leaves this list.
-        let followed: Vec<(String, ticket::TicketLink, String)> = self
+        let linked: Vec<(usize, ticket::TicketLink)> = self
             .plans
             .iter()
-            .filter(|plan| plan.is_open())
-            .filter_map(|plan| {
-                let link = plan.ticket.clone().filter(|link| !link.id.is_empty() && config.accepts(link))?;
-                Some((plan.id.clone(), link, plan.goal.clone()))
+            .enumerate()
+            .filter(|(_, plan)| plan.is_open())
+            .filter_map(|(index, plan)| {
+                Some((index, plan.ticket.clone().filter(|link| !link.id.is_empty() && config.accepts(link))?))
             })
             .collect();
-        // Completion is the final event, before this plan leaves the polling set.
-        let completed: Vec<_> = self
+        // The server keeps one conversation per ticket: the newest open plan on it owns it.
+        let mut followed: Vec<(String, ticket::TicketLink, String)> = Vec::new();
+        let mut standby = BTreeMap::new();
+        for (index, link) in &linked {
+            let owner = linked
+                .iter()
+                .filter(|(_, other)| other.same_ticket(link))
+                .map(|(other, _)| *other)
+                .max_by_key(|other| (self.plans[*other].created_at, *other))
+                .expect("the plan itself");
+            let plan = &self.plans[*index];
+            if owner == *index {
+                followed.push((plan.id.clone(), link.clone(), plan.goal.clone()));
+            } else {
+                standby.insert(
+                    plan.id.clone(),
+                    format!(
+                        "remote control is off for this plan: plan {} is newer on {} and owns its conversation",
+                        self.plans[owner].id,
+                        link.label()
+                    ),
+                );
+            }
+        }
+        for (plan, why) in &standby {
+            if self.tickets.remote.standby.get(plan) != Some(why) {
+                self.toast(format!("Plan {plan}: {why}"));
+            }
+        }
+        self.tickets.remote.standby = standby;
+        // Completion is the final event, before this plan leaves the polling set. It ends the
+        // conversation, unless another open plan on the ticket takes it over.
+        let ended: Vec<_> = self
             .tickets
             .remote
             .plans
             .keys()
-            .filter_map(|id| self.plans.iter().position(|p| p.id == *id && p.status == PlanStatus::Completed))
+            .filter_map(|id| {
+                let index = self.plans.iter().position(|p| p.id == *id && !p.is_open())?;
+                let link = self.plans[index].ticket.as_ref()?;
+                (!followed.iter().any(|(_, other, _)| other.same_ticket(link))).then_some(index)
+            })
             .collect();
-        for index in completed {
-            self.remote_activity(index, "done", "Plan finished");
+        for index in ended {
+            let body =
+                if self.plans[index].status == PlanStatus::Completed { "Plan finished" } else { "Plan archived" };
+            self.remote_activity(index, "done", body);
         }
         self.tickets.remote.plans.retain(|id, _| followed.iter().any(|(plan, ..)| plan == id));
         let home = paths::atomics_home();
@@ -179,13 +238,17 @@ impl State {
                 entry.owners = owners.clone();
                 // Marked once an open succeeds, so a failed first open still recovers later.
                 let recover = !remote.recovered.contains(&plan);
+                let title = Some(ticket::conversation_title(&goal))
+                    .filter(|title| !title.is_empty())
+                    .unwrap_or_else(|| ticket::conversation_title(link.label()));
                 let op = TicketOp::RemoteOpen {
                     home: home.clone(),
                     plan: plan.clone(),
                     link,
-                    title: goal,
+                    title,
                     owners: owners.clone(),
                     recover,
+                    reset: entry.lost.is_some(),
                 };
                 jobs.push((plan, op, RemoteJob::Open));
                 continue;
@@ -245,7 +308,9 @@ impl State {
         tool: bool,
     ) {
         let Some(config) = self.ticket_config() else { return };
-        if !matches!(config.remote_status(self.tickets.whoami.as_ref()), RemoteStatus::On(_)) {
+        // The server refuses blank text; such a post would only wait in the outbox.
+        if body.trim().is_empty() || !matches!(config.remote_status(self.tickets.whoami.as_ref()), RemoteStatus::On(_))
+        {
             return;
         }
         let plan = self.plans[index].id.clone();
@@ -292,14 +357,8 @@ impl State {
 
     pub(super) fn mirror_pending_permission(&mut self) {
         if self.sessions.iter().any(|s| s.chief && (s.approval_hold || !s.approvals.is_empty())) {
-            let index = self
-                .tickets
-                .remote
-                .chief_plan
-                .as_ref()
-                .and_then(|id| self.plans.iter().position(|p| &p.id == id))
-                .unwrap_or(self.selected_plan);
-            if index < self.plans.len() {
+            let plan = self.tickets.remote.chief_plan.clone().or_else(|| self.remote_desk_plan());
+            if let Some(index) = plan.and_then(|id| self.plans.iter().position(|p| p.id == id)) {
                 self.remote_activity(index, "input", "Chief needs your input in ATOMICS");
             }
         }
@@ -412,6 +471,10 @@ impl State {
         }
         entry.requested_digest = Some(digest.clone());
         entry.approval_open = true;
+        let id = plan.id.clone();
+        self.remote_requested(&id, Some(digest.clone()));
+        let plan = &self.plans[index];
+        let Some(entry) = self.tickets.remote.plans.get_mut(&plan.id) else { return };
         entry.activity = Some("approval".into());
         entry.next_poll = None;
         let turn = format!("approval:{}:{digest}", plan.id);
@@ -446,11 +509,56 @@ impl State {
         );
     }
 
+    /// Saves the requested digest in the sidecar, in order with the writes that follow.
+    fn remote_requested(&mut self, plan: &str, digest: Option<String>) {
+        let Some(config) = self.ticket_config() else { return };
+        self.send_ticket(
+            &config,
+            TicketOp::RemoteRequested { home: paths::atomics_home(), plan: plan.into(), digest },
+            super::tickets::outbox_tag(plan, &config),
+        );
+    }
+
+    /// The plan desk-typed chief turns mirror to: the only plan with an open conversation.
+    fn remote_desk_plan(&self) -> Option<String> {
+        let mut open = self.tickets.remote.plans.iter().filter(|(_, plan)| plan.conversation.is_some());
+        let (id, _) = open.next()?;
+        open.next().is_none().then(|| id.clone())
+    }
+
+    /// The plan a chief turn starting with `prompt` is mirrored to: the plan whose pasted
+    /// steering it carries; else, for a turn typed at the desk, the only plan with an open
+    /// conversation; else none.
+    pub(super) fn remote_turn_plan(&mut self, prompt: &str) -> Option<String> {
+        let mut found = None;
+        self.tickets.remote.pasted.retain(|(plan, label)| {
+            if prompt.contains(label.as_str()) {
+                found.get_or_insert_with(|| plan.clone());
+                false
+            } else {
+                true
+            }
+        });
+        found.or_else(|| self.remote_desk_plan())
+    }
+
+    /// Why a plan's remote control is not running, for plan_json.
+    pub(super) fn remote_note(&self, plan: &str) -> Option<String> {
+        self.tickets
+            .remote
+            .standby
+            .get(plan)
+            .cloned()
+            .or_else(|| self.tickets.remote.plans.get(plan).and_then(|entry| entry.lost.clone()))
+    }
+
     pub(super) fn remote_approved(&mut self, index: usize, author: Option<&str>) {
         if let Some(entry) = self.tickets.remote.plans.get_mut(&self.plans[index].id) {
             entry.approval_open = false;
             entry.requested_digest = None;
             entry.activity = Some("working".into());
+            let id = self.plans[index].id.clone();
+            self.remote_requested(&id, None);
         }
         let Some(config) = self.ticket_config() else { return };
         let body = author
@@ -518,7 +626,7 @@ impl State {
                 let entry = self.tickets.remote.plans.get_mut(&plan).expect("current");
                 entry.opening = false;
                 match result {
-                    Ok(RemoteOutput::Opened { conversation, messages }) => {
+                    Ok(RemoteOutput::Opened { conversation, messages, requested }) => {
                         let refused: Vec<String> = if conversation.steerers.is_empty() {
                             Vec::new()
                         } else {
@@ -529,9 +637,13 @@ impl State {
                                 .cloned()
                                 .collect()
                         };
-                        if entry.conversation.as_ref() != Some(&conversation.id) {
-                            entry.requested_digest = None;
+                        // The sidecar's digest, so a restart doesn't ask for the same approval again.
+                        entry.requested_digest = requested;
+                        entry.error = None;
+                        if entry.lost.take().is_some() {
+                            self.toast(format!("Remote conversation for {plan} is open again"));
                         }
+                        let entry = self.tickets.remote.plans.get_mut(&plan).expect("current");
                         entry.conversation = Some(conversation.id);
                         self.tickets.remote.recovered.insert(plan.clone());
                         let entry = self.tickets.remote.plans.get_mut(&plan).expect("current");
@@ -561,8 +673,13 @@ impl State {
                     }
                     Ok(_) => {}
                     Err(error) => {
-                        entry.open_after = Some(now + REOPEN_AFTER);
-                        self.toast(format!("Remote conversation for {plan}: {error}"));
+                        let slow = Duration::from_secs(config.remote.idle_poll_secs.max(1));
+                        entry.open_after =
+                            Some(now + if entry.lost.is_some() { slow.max(REOPEN_AFTER) } else { REOPEN_AFTER });
+                        if entry.error.as_ref() != Some(&error) {
+                            entry.error = Some(error.clone());
+                            self.toast(format!("Remote conversation for {plan}: {error}"));
+                        }
                     }
                 }
             }
@@ -603,8 +720,11 @@ impl State {
                         }
                         deliver
                     }
-                    Ok(RemoteOutput::PollFailed { error, throttled }) => {
+                    Ok(RemoteOutput::PollFailed { error, throttled, lost }) => {
                         self.remote_poll_failed(&plan, current, error, throttled);
+                        if lost {
+                            self.remote_lost(&plan, current, &config);
+                        }
                         Vec::new()
                     }
                     Ok(_) => Vec::new(),
@@ -634,6 +754,27 @@ impl State {
             }
             (RemoteJob::Settle, Err(error)) => self.toast(format!("Remote conversation for {plan}: {error}")),
             (RemoteJob::Settle, Ok(_)) => {}
+        }
+    }
+
+    /// Stops polling a conversation the server ended or whose item it can no longer read, and
+    /// opens it again at the slow cadence; the reopen starts again from the server's cursor.
+    fn remote_lost(&mut self, plan: &str, current: bool, config: &TicketConfig) {
+        if !current {
+            return;
+        }
+        let secs = config.remote.idle_poll_secs.max(REOPEN_AFTER.as_secs());
+        let entry = self.tickets.remote.plans.get_mut(plan).expect("current");
+        let why = entry.error.clone().unwrap_or_default();
+        let note = format!(
+            "remote control is paused: the ticket system ended the conversation or can no longer read its ticket ({why}); ATOMICS tries to open it again every {secs} s"
+        );
+        entry.conversation = None;
+        entry.next_poll = None;
+        entry.open_after = Some(Instant::now() + Duration::from_secs(secs));
+        if entry.lost.as_ref() != Some(&note) {
+            entry.lost = Some(note.clone());
+            self.toast(format!("Plan {plan}: {note}"));
         }
     }
 
@@ -667,7 +808,16 @@ impl State {
                 RemoteOutcome::Command
             } else {
                 let text = ticket::steering_message(&item, &config.system, &label);
-                match self.chief_delivery(&text) {
+                let delivery = self.chief_delivery(&text);
+                if delivery.is_ok() {
+                    // The chief turn this paste starts is this plan's, whatever the UI shows.
+                    let pasted = &mut self.tickets.remote.pasted;
+                    pasted.push_back((plan.to_string(), text.lines().next().unwrap_or_default().to_string()));
+                    while pasted.len() > MAX_PASTED {
+                        pasted.pop_front();
+                    }
+                }
+                match delivery {
                     Ok(Delivery::Held) => RemoteOutcome::Held,
                     Ok(_) => RemoteOutcome::Delivered,
                     Err(_) => {
@@ -759,6 +909,10 @@ mod tests {
 
     /// A chief whose messages queue in the hub, a plan on the fake ticket, and remote on.
     fn remote_app(app: &mut Desktop<'_>, dir: &Path, edit: impl FnOnce(&mut Value)) -> PathBuf {
+        remote_app_goal(app, dir, "Remote goal", edit)
+    }
+
+    fn remote_app_goal(app: &mut Desktop<'_>, dir: &Path, goal: &str, edit: impl FnOnce(&mut Value)) -> PathBuf {
         let path = crate::mcp_client::tests::fake_state(dir, json!([]));
         set(&path, |state| {
             state["steering"] = json!([steering("before", 1, "human-1", "Human", "written before remote")]);
@@ -770,7 +924,7 @@ mod tests {
         app.runtime.sessions = vec![chief];
         app.runtime.plans.push(Plan {
             id: "remote-plan".into(),
-            goal: "Remote goal".into(),
+            goal: goal.into(),
             approved: true,
             ticket: Some(ticket::TicketLink {
                 system: config.system.clone(),
@@ -1436,6 +1590,297 @@ mod tests {
                 }
                 settle(app, 2);
                 assert_eq!(calls(&path, "conversation_read"), reads, "polling stopped");
+            },
+        );
+    }
+
+    const TICKET_2: &str = "00000000-0000-4000-8000-000000000002";
+
+    fn poll_all(app: &mut Desktop<'_>) {
+        for plan in app.runtime.tickets.remote.plans.values_mut() {
+            plan.next_poll = None;
+        }
+        settle(app, 2);
+    }
+
+    /// FIFO barrier for writes of plans that already left the polling set.
+    fn barrier(app: &mut Desktop<'_>) {
+        let config = app.runtime.ticket_config().unwrap();
+        let tag = super::super::tickets::remote_tag(
+            "barrier",
+            &config,
+            RemoteJob::Steerers,
+            app.runtime.tickets.remote.epoch,
+        );
+        app.runtime.send_ticket(&config, TicketOp::Whoami, tag);
+        settle(app, 1);
+    }
+
+    fn link(config: &TicketConfig, id: &str, key: &str) -> Option<ticket::TicketLink> {
+        Some(ticket::TicketLink {
+            system: config.system.clone(),
+            id: id.into(),
+            key: Some(key.into()),
+            ..Default::default()
+        })
+    }
+
+    fn posted<'a>(state: &'a Value, text: &str) -> Vec<&'a Value> {
+        state["posts"].as_array().into_iter().flatten().filter(|post| post["text"] == text).collect()
+    }
+
+    #[test]
+    fn remote_open_sends_one_clean_title_line_the_fake_server_accepts() {
+        with_app("app::remote::tests::remote_open_sends_one_clean_title_line_the_fake_server_accepts", |app, _| {
+            let dir = crate::test_support::tempdir().unwrap();
+            let goal = "\n  Ship the\tremote \u{1b}[1mfixes\u{1b}[0m \u{7} \nSecond line\nThird";
+            let path = remote_app_goal(app, dir.path(), goal, |_| {});
+            assert_eq!(fake(&path)["opens"][0]["title"], "Ship the remote fixes");
+            // A first line over 200 UTF-16 units is cut without splitting an emoji.
+            let index = app.runtime.plans.iter().position(|p| p.id == "remote-plan").unwrap();
+            app.runtime.plans[index].goal = format!("{}\nmore", "\u{1f600}".repeat(150));
+            app.runtime.tickets.remote.plans.get_mut("remote-plan").unwrap().conversation = None;
+            settle(app, 2);
+            let title = fake(&path)["opens"][1]["title"].as_str().unwrap().to_string();
+            assert_eq!((title.encode_utf16().count(), title.chars().count()), (200, 100));
+            // A goal with no text falls back to the ticket key.
+            app.runtime.plans[index].goal = " \n\t\n".into();
+            app.runtime.tickets.remote.plans.get_mut("remote-plan").unwrap().conversation = None;
+            settle(app, 2);
+            assert_eq!(fake(&path)["opens"][2]["title"], "DEMO-1");
+            // The fake server enforces the server's title rules.
+            let config = app.runtime.ticket_config().unwrap();
+            let mut client =
+                crate::mcp_client::McpClient::connect(&config.server, Duration::from_secs(10), |_| None).unwrap();
+            for title in [goal.to_string(), "x".repeat(201), "\u{1f600}".repeat(101), " ".into()] {
+                let open = json!({"itemType":"tickets.ticket", "itemId":TICKET, "title":title, "owners":["human-1"]});
+                let error = client.call_tool("conversation_open", open).unwrap_err().to_string();
+                assert!(error.contains("title"), "{title:?}: {error}");
+            }
+            let open = json!({"itemType":"tickets.ticket", "itemId":TICKET, "title":"\u{1f600}".repeat(100), "owners":["human-1"]});
+            client.call_tool("conversation_open", open).unwrap();
+        });
+    }
+
+    #[test]
+    fn mirror_attributes_steered_turns_to_their_plan_and_desk_turns_only_to_a_single_remote_plan() {
+        with_app(
+            "app::remote::tests::mirror_attributes_steered_turns_to_their_plan_and_desk_turns_only_to_a_single_remote_plan",
+            |app, _| {
+                let dir = crate::test_support::tempdir().unwrap();
+                let path = remote_app(app, dir.path(), |state| {
+                    state["conversations"] = json!({ TICKET_2: "conversation-2" });
+                });
+                let config = app.runtime.ticket_config().unwrap();
+                app.runtime.plans.push(Plan {
+                    id: "second-plan".into(),
+                    goal: "Second goal".into(),
+                    approved: true,
+                    ticket: link(&config, TICKET_2, "DEMO-2"),
+                    ..Default::default()
+                });
+                settle(app, 3);
+                assert_eq!(
+                    app.runtime.tickets.remote.plans["second-plan"].conversation.as_deref(),
+                    Some("conversation-2")
+                );
+                let first = app.runtime.plans.iter().position(|p| p.id == "remote-plan").unwrap();
+                let second = app.runtime.plans.iter().position(|p| p.id == "second-plan").unwrap();
+                // The UI shows the first plan while steering for the second arrives.
+                app.runtime.selected_plan = first;
+                set(&path, |state| {
+                    let mut item = steering("for-second", 5, "human-1", "Human", "status of the second?");
+                    item["conversation"] = json!("conversation-2");
+                    state["steering"].as_array_mut().unwrap().push(item);
+                });
+                poll_all(app);
+                let pasted = sent(app).last().cloned().expect("steering pasted");
+                assert!(pasted.contains("on DEMO-2") && pasted.ends_with("status of the second?"), "{pasted}");
+                mirror_event(app, json!({"hook_event_name":"UserPromptSubmit", "prompt":pasted}));
+                mirror_event(app, json!({"hook_event_name":"Stop", "last_assistant_message":"Answer for the second"}));
+                settle(app, 1);
+                let state = fake(&path);
+                let answer = posted(&state, "Answer for the second");
+                assert_eq!(answer.len(), 1);
+                assert_eq!(answer[0]["conversation"], "conversation-2");
+                // Typed at the desk with two remote plans: mirrored nowhere, not to the selected plan.
+                mirror_event(app, json!({"hook_event_name":"UserPromptSubmit", "prompt":"desk prompt with two"}));
+                mirror_event(app, json!({"hook_event_name":"Stop", "last_assistant_message":"desk answer with two"}));
+                settle(app, 1);
+                let state = fake(&path);
+                assert!(
+                    posted(&state, "desk prompt with two").is_empty()
+                        && posted(&state, "desk answer with two").is_empty()
+                );
+                // With one remote plan left, desk turns are its turns.
+                app.runtime.plans[second].status = PlanStatus::Archived;
+                settle(app, 2);
+                assert!(!app.runtime.tickets.remote.plans.contains_key("second-plan"));
+                app.runtime.selected_plan = second;
+                mirror_event(app, json!({"hook_event_name":"UserPromptSubmit", "prompt":"desk prompt with one"}));
+                mirror_event(app, json!({"hook_event_name":"Stop", "last_assistant_message":"desk answer with one"}));
+                settle(app, 1);
+                let state = fake(&path);
+                for text in ["desk prompt with one", "desk answer with one"] {
+                    let post = posted(&state, text);
+                    assert_eq!(post.len(), 1, "{text}");
+                    assert_eq!(post[0]["conversation"], "conversation-1");
+                }
+                // A blank answer is never queued.
+                let count = fake(&path)["posts"].as_array().unwrap().len();
+                mirror_event(app, json!({"hook_event_name":"Stop", "last_assistant_message":" \n\t "}));
+                settle(app, 1);
+                assert_eq!(fake(&path)["posts"].as_array().unwrap().len(), count);
+                assert!(RemoteState::load(&paths::atomics_home(), "remote-plan").unwrap().outbox.is_empty());
+            },
+        );
+    }
+
+    #[test]
+    fn remote_newest_plan_on_a_ticket_owns_it_and_closing_the_last_posts_completed() {
+        with_app(
+            "app::remote::tests::remote_newest_plan_on_a_ticket_owns_it_and_closing_the_last_posts_completed",
+            |app, _| {
+                let dir = crate::test_support::tempdir().unwrap();
+                let path = remote_app(app, dir.path(), |_| {});
+                app.runtime.config.tickets.remote.activity.done = "Completed".into();
+                app.runtime.apply_ticket_config();
+                settle(app, 3);
+                let config = app.runtime.ticket_config().unwrap();
+                app.runtime.plans.push(Plan {
+                    id: "newer-plan".into(),
+                    goal: "Newer goal".into(),
+                    approved: true,
+                    ticket: link(&config, TICKET, "DEMO-1"),
+                    created_at: now_ms(),
+                    ..Default::default()
+                });
+                settle(app, 3);
+                let older = app.runtime.plans.iter().position(|p| p.id == "remote-plan").unwrap();
+                let newer = app.runtime.plans.iter().position(|p| p.id == "newer-plan").unwrap();
+                assert_eq!(app.runtime.tickets.remote.plans.keys().collect::<Vec<_>>(), ["newer-plan"]);
+                let why = app.runtime.plan_json(older)["remote"].as_str().unwrap().to_string();
+                assert!(why.contains("newer-plan") && why.contains("DEMO-1"), "{why}");
+                assert!(app.runtime.plan_json(newer).get("remote").is_none());
+                mirror_event(app, json!({"hook_event_name":"UserPromptSubmit", "prompt":"newer prompt"}));
+                mirror_event(app, json!({"hook_event_name":"Stop", "last_assistant_message":"newer answer"}));
+                settle(app, 1);
+                assert_eq!(posted(&fake(&path), "newer answer").len(), 1);
+                // The newer plan closes: the older one takes the conversation over and nothing ends.
+                app.runtime.plans[newer].status = PlanStatus::Archived;
+                settle(app, 3);
+                assert_eq!(app.runtime.tickets.remote.plans.keys().collect::<Vec<_>>(), ["remote-plan"]);
+                assert!(app.runtime.tickets.remote.standby.is_empty());
+                assert_ne!(fake(&path)["ended"], true);
+                // Its posts continue after the newer plan's sequences, which the server refuses to reuse.
+                mirror_event(app, json!({"hook_event_name":"UserPromptSubmit", "prompt":"older prompt"}));
+                mirror_event(app, json!({"hook_event_name":"Stop", "last_assistant_message":"older answer"}));
+                settle(app, 1);
+                let state = fake(&path);
+                assert_eq!(posted(&state, "older answer").len(), 1, "{:?}", app.runtime.toast);
+                let mut sequences: Vec<_> =
+                    state["posts"].as_array().unwrap().iter().map(|p| p["sequence"].as_u64().unwrap()).collect();
+                let count = sequences.len();
+                sequences.sort_unstable();
+                sequences.dedup();
+                assert_eq!(sequences.len(), count, "{sequences:?}");
+                // Archiving the last plan on the ticket ends the conversation.
+                app.runtime.plans[older].status = PlanStatus::Archived;
+                app.runtime.remote_tick();
+                barrier(app);
+                let state = fake(&path);
+                let last = state["posts"].as_array().unwrap().last().unwrap();
+                assert_eq!(
+                    (last["text"].as_str(), last["activity"].as_str()),
+                    (Some("Plan archived"), Some("Completed"))
+                );
+                assert_eq!(state["ended"], true);
+                assert!(app.runtime.tickets.remote.plans.is_empty());
+            },
+        );
+    }
+
+    #[test]
+    fn remote_unreadable_item_stops_polling_then_reopens_slowly_from_the_servers_cursor_and_sequence() {
+        with_app(
+            "app::remote::tests::remote_unreadable_item_stops_polling_then_reopens_slowly_from_the_servers_cursor_and_sequence",
+            |app, _| {
+                let dir = crate::test_support::tempdir().unwrap();
+                let path = remote_app(app, dir.path(), |state| state["next_sequence"] = json!(true));
+                app.runtime.config.tickets.operations.conversation_open.as_mut().unwrap().result.next_sequence =
+                    "nextSequence".into();
+                app.runtime.apply_ticket_config();
+                settle(app, 3);
+                set(&path, |state| state["unreadable"] = json!(true));
+                poll_now(app);
+                let entry = &app.runtime.tickets.remote.plans["remote-plan"];
+                assert!(entry.conversation.is_none());
+                let at = entry.open_after.unwrap();
+                assert!(at > Instant::now() + Duration::from_secs(50), "slow cadence");
+                let toast = app.runtime.toast.clone().unwrap().0;
+                assert!(toast.contains("can no longer read the conversation's item"), "{toast}");
+                let index = app.runtime.plans.iter().position(|p| p.id == "remote-plan").unwrap();
+                assert!(app.runtime.plan_json(index)["remote"].as_str().unwrap().contains("paused"));
+                let (reads, opens) = (calls(&path, "conversation_read"), calls(&path, "conversation_open"));
+                settle(app, 3);
+                assert_eq!(calls(&path, "conversation_read"), reads, "polling stopped");
+                assert_eq!(calls(&path, "conversation_open"), opens, "no reopen before the slow cadence");
+                // The item is readable again; the next open resets the cursor and the sequence.
+                set(&path, |state| {
+                    state["unreadable"] = json!(false);
+                    state["cursor"] = json!(7);
+                    state["sequences"] = json!({"conversation-1": {"1":"a", "2":"b", "3":"c", "4":"d"}});
+                });
+                app.runtime.tickets.remote.plans.get_mut("remote-plan").unwrap().open_after = Some(Instant::now());
+                settle(app, 3);
+                let entry = &app.runtime.tickets.remote.plans["remote-plan"];
+                assert_eq!(entry.conversation.as_deref(), Some("conversation-1"));
+                assert!(app.runtime.remote_note("remote-plan").is_none());
+                let state = RemoteState::load(&paths::atomics_home(), "remote-plan").unwrap();
+                assert_eq!((state.cursor, state.next_seq), (Some(json!(7)), 5));
+                assert!(calls(&path, "conversation_read") > reads, "polling resumed");
+            },
+        );
+    }
+
+    #[test]
+    fn approval_request_survives_a_restart_and_delivery_statuses_keep_it_open() {
+        with_app(
+            "app::remote::tests::approval_request_survives_a_restart_and_delivery_statuses_keep_it_open",
+            |app, _| {
+                let dir = crate::test_support::tempdir().unwrap();
+                let (path, index) = approval_app(app, dir.path());
+                let requests = |path: &Path| {
+                    fake(path)["posts"].as_array().unwrap().iter().filter(|p| p["kind"] == "approval").count()
+                };
+                assert_eq!(requests(&path), 1);
+                let digest = app.runtime.plans[index].digest();
+                assert_eq!(
+                    RemoteState::load(&paths::atomics_home(), "remote-plan").unwrap().requested_digest,
+                    Some(digest)
+                );
+                // A restart loses everything in memory; the sidecar keeps the request.
+                app.runtime.tickets.remote.reset();
+                settle(app, 3);
+                assert_eq!(requests(&path), 1, "no second Plan or Approval event");
+                assert!(app.runtime.tickets.remote.plans["remote-plan"].conversation.is_some());
+                // A delivered steering message's status carries no activity.
+                set(&path, |state| {
+                    state["steering"].as_array_mut().unwrap().push(steering("s-2", 2, "human-1", "Human", "status?"));
+                });
+                poll_now(app);
+                let state = fake(&path);
+                let delivered = posted(&state, DELIVERED_TEXT);
+                assert_eq!(delivered.len(), 1);
+                assert_eq!(delivered[0]["activity"], "");
+                let last_activity = state["posts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .rev()
+                    .filter_map(|p| p["activity"].as_str())
+                    .find(|activity| !activity.is_empty());
+                assert_eq!(last_activity, Some("approval"), "the approval request stays open");
             },
         );
     }

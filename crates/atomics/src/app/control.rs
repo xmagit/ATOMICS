@@ -171,7 +171,7 @@ impl State {
                     target
                 } else {
                     let id = plan::unique_id(&goal, &self.plans, &paths::atomics_home());
-                    self.plans.push(Plan { id, ..Plan::default() });
+                    self.plans.push(Plan { id, created_at: super::remote::now_ms(), ..Plan::default() });
                     self.plans.len() - 1
                 };
                 let plan_id = self.plans[index].id.clone();

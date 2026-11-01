@@ -60,6 +60,8 @@ pub(super) fn with_state(name: &str, test: impl FnOnce(State, &egui::Context)) {
                 .env("ATOMICS_CONFIG", dir.path().join("config.toml"))
                 .env("ATOMICS_SOCKET", dir.path().join("atomics.sock"))
                 .env("XDG_RUNTIME_DIR", runtime)
+                // A login shell such as zsh would run its first-run wizard in the fresh HOME.
+                .env("SHELL", "/bin/sh")
                 .env_remove("ATOMICS_PANE"),
         );
         assert!(

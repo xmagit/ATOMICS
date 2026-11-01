@@ -338,6 +338,7 @@ impl State {
             project,
             ticket: Some(link),
             ticket_mode: Some(mode),
+            created_at: super::remote::now_ms(),
             ..Plan::default()
         });
         let index = self.plans.len() - 1;
@@ -360,6 +361,9 @@ impl State {
         value["workflow"] = json!(self.plan_workflow(&self.plans[index]));
         value["ready"] = json!(self.plans[index].ready().iter().map(|t| &t.id).collect::<Vec<_>>());
         value["integration"] = json!(self.plans[index].integration_branch());
+        if let Some(note) = self.remote_note(&self.plans[index].id) {
+            value["remote"] = json!(note);
+        }
         if let Some(tasks) = value["tasks"].as_array_mut() {
             for (task, value) in self.plans[index].tasks.iter().zip(tasks) {
                 if task.integrated.is_some() {

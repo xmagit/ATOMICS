@@ -6,8 +6,19 @@ use atomics_core::trace::{self, TraceLog};
 /// persistence nor rendering can observe an event cleaned with stale credentials.
 pub(super) enum TraceAction {
     Load(String),
-    Capture { id: String, event: Box<atomics_core::hook::HookEvent>, plan: Option<String>, at: u64 },
-    Respond { reference: Option<String>, limit: Option<usize>, reply: Sender<ControlOutcome> },
+    /// `plan` keeps the trace entry; `mirror` is the plan whose conversation the turn goes to.
+    Capture {
+        id: String,
+        event: Box<atomics_core::hook::HookEvent>,
+        plan: Option<String>,
+        mirror: Option<String>,
+        at: u64,
+    },
+    Respond {
+        reference: Option<String>,
+        limit: Option<usize>,
+        reply: Sender<ControlOutcome>,
+    },
 }
 
 impl State {
@@ -34,8 +45,8 @@ impl State {
         };
         match action {
             TraceAction::Load(id) => self.load_chief_trace_with(&id, &cleaner),
-            TraceAction::Capture { id, event, plan, at } => {
-                self.ingest_chief_trace(&id, &event, Some(&config), &cleaner, at, plan.as_deref());
+            TraceAction::Capture { id, event, plan, mirror, at } => {
+                self.ingest_chief_trace(&id, &event, Some(&config), &cleaner, at, plan.as_deref(), mirror.as_deref());
             }
             TraceAction::Respond { reference, limit, reply } => {
                 let response = self.trace_response(reference.as_deref(), limit, &cleaner);
@@ -94,9 +105,10 @@ impl State {
         }
         let id = self.sessions[index].id.clone();
         if event.name == "UserPromptSubmit" {
-            self.tickets.remote.chief_plan =
-                self.plans.get(self.selected_plan).filter(|p| p.is_open() && !p.id.is_empty()).map(|p| p.id.clone());
+            // Steering pasted for a plan is that plan's turn; never the plan the UI shows.
+            self.tickets.remote.chief_plan = self.remote_turn_plan(event.prompt.as_deref().unwrap_or_default());
         }
+        let mirror = self.tickets.remote.chief_plan.clone();
         let plan = event
             .tool_input
             .get("plan")
@@ -117,12 +129,14 @@ impl State {
             .as_millis()
             .min(u64::MAX as u128) as u64;
         if let Some(config) = config.as_ref().filter(|config| config.server.uses_oauth()) {
-            self.queue_trace(config.clone(), TraceAction::Capture { id, event: Box::new(event.clone()), plan, at });
+            let event = Box::new(event.clone());
+            self.queue_trace(config.clone(), TraceAction::Capture { id, event, plan, mirror, at });
             return;
         }
-        self.ingest_chief_trace(&id, event, config.as_deref(), &self.cleaner(), at, plan.as_deref());
+        self.ingest_chief_trace(&id, event, config.as_deref(), &self.cleaner(), at, plan.as_deref(), mirror.as_deref());
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn ingest_chief_trace(
         &mut self,
         id: &str,
@@ -131,6 +145,7 @@ impl State {
         cleaner: &atomics_core::tickets::Cleaner,
         at: u64,
         plan: Option<&str>,
+        mirror: Option<&str>,
     ) {
         if !self.sessions.iter().any(|session| session.id == id && session.chief) {
             return;
@@ -147,7 +162,7 @@ impl State {
         }
         // A credential job from an old profile must not mirror into a new connection.
         if config == self.ticket_config().as_deref() {
-            self.mirror_hook(event, plan, cleaner, entry);
+            self.mirror_hook(event, mirror, cleaner, entry);
         }
     }
 

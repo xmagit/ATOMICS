@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use atomics_core::remote::{PendingWrite, RemoteState, WITHHELD_TEXT};
 use atomics_core::tickets::{
-    self, Conversation, McpServer, Steerer, SteeringItem, TicketCard, TicketConfig, TicketLink, Vars,
+    self, Conversation, McpServer, RemoteError, Steerer, SteeringItem, TicketCard, TicketConfig, TicketLink, Vars,
 };
 use serde_json::Value;
 
@@ -36,7 +36,8 @@ pub enum TicketOp {
         write: Option<Box<PendingWrite>>,
     },
     /// Open a plan's conversation (idempotent) and reconcile its sidecar. `recover` handles
-    /// deliveries a previous process recorded and never finished.
+    /// deliveries a previous process recorded and never finished; `reset` starts again at the
+    /// server's cursor after the conversation was lost.
     RemoteOpen {
         home: PathBuf,
         plan: String,
@@ -44,6 +45,13 @@ pub enum TicketOp {
         title: String,
         owners: Vec<String>,
         recover: bool,
+        reset: bool,
+    },
+    /// Record the digest whose approval was requested, or none, in the sidecar.
+    RemoteRequested {
+        home: PathBuf,
+        plan: String,
+        digest: Option<String>,
     },
     RemoteSteerers(String),
     /// Read steering after the sidecar's cursor and judge each item.
@@ -124,6 +132,8 @@ pub enum RemoteOutput {
         conversation: Conversation,
         /// Toasts: deliveries a restart interrupted.
         messages: Vec<String>,
+        /// The digest whose approval this conversation was already asked for.
+        requested: Option<String>,
     },
     Steerers(Vec<Steerer>),
     Polled {
@@ -133,9 +143,11 @@ pub enum RemoteOutput {
         refused: Vec<(SteeringItem, String)>,
     },
     /// The read failed; `throttled` for a 429, 5xx or lost connection, which backs off.
+    /// `lost` when the conversation ended or its item became unreadable: polling stops.
     PollFailed {
         error: String,
         throttled: bool,
+        lost: bool,
     },
     Settled(Vec<String>),
 }
@@ -233,7 +245,8 @@ struct Worker {
     missing: std::collections::HashMap<String, Instant>,
     /// Where saved browser sign-ins are read from.
     oauth: Option<OAuth>,
-    content_refused: bool,
+    /// How the server refused the last call, when `[tickets.remote] errors` recognises it.
+    refusal: Option<RemoteError>,
     /// The last failure was a lost connection, a timeout, a 429 or a 5xx.
     throttled: bool,
     /// When each plan's recent steering items were handed out, for the per-minute cap.
@@ -292,7 +305,8 @@ impl Worker {
             }
             TicketOutput::Pushed(read) => TicketOutput::Pushed(read.map(|read| read.map(link).map_err(error))),
             TicketOutput::Remote(output) => TicketOutput::Remote(match output {
-                RemoteOutput::Opened { conversation, messages } => RemoteOutput::Opened {
+                RemoteOutput::Opened { conversation, messages, requested } => RemoteOutput::Opened {
+                    requested,
                     conversation: self.cleaner.conversation(conversation),
                     messages: messages.into_iter().map(error).collect(),
                 },
@@ -303,8 +317,8 @@ impl Worker {
                     deliver: deliver.into_iter().map(|item| self.cleaner.steering(item)).collect(),
                     refused: refused.into_iter().map(|(item, why)| (self.cleaner.steering(item), error(why))).collect(),
                 },
-                RemoteOutput::PollFailed { error: why, throttled } => {
-                    RemoteOutput::PollFailed { error: error(why), throttled }
+                RemoteOutput::PollFailed { error: why, throttled, lost } => {
+                    RemoteOutput::PollFailed { error: error(why), throttled, lost }
                 }
                 RemoteOutput::Settled(messages) => RemoteOutput::Settled(messages.into_iter().map(error).collect()),
             }),
@@ -315,8 +329,16 @@ impl Worker {
         let system = config.system.as_str();
         match op {
             TicketOp::ResetOutboxes => Ok(TicketOutput::Outbox(Vec::new())),
-            TicketOp::RemoteOpen { home, plan, link, title, owners, recover } => {
-                self.remote_open(config, &home, &plan, &link, &title, owners, recover)
+            TicketOp::RemoteOpen { home, plan, link, title, owners, recover, reset } => {
+                self.remote_open(config, &home, &plan, &link, &title, owners, recover, reset)
+            }
+            TicketOp::RemoteRequested { home, plan, digest } => {
+                let mut state = RemoteState::load(&home, &plan).map_err(|e| e.to_string())?;
+                if state.requested_digest != digest {
+                    state.requested_digest = digest;
+                    state.save(&home, &plan).map_err(|e| e.to_string())?;
+                }
+                Ok(TicketOutput::Outbox(Vec::new()))
             }
             TicketOp::RemoteSteerers(conversation) => {
                 let value = self.call(
@@ -342,19 +364,21 @@ impl Worker {
                 if let Some(mut write) = write {
                     // Resolve the same credentials as the trace before approval text reaches
                     // either the durable outbox or the conversation.
-                    if write.op == "conversation_post"
-                        && let Some(body) = write.vars.get("body").and_then(Value::as_str)
-                    {
+                    let mut blank = false;
+                    if write.op == "conversation_post" {
+                        let body = write.vars.get("body").and_then(Value::as_str).unwrap_or_default();
                         let cleaned = self.trace_cleaner(config)?.redacted(body);
-                        let body: String = if write.mirror {
+                        // The server counts UTF-16 units after trimming, and refuses blank text.
+                        let body = if write.mirror {
                             atomics_core::trace::cap_block(&cleaned)
                         } else {
-                            cleaned.chars().take(2000).collect()
+                            tickets::utf16_prefix(cleaned.trim(), atomics_core::trace::MAX_EVENT_UNITS).to_string()
                         };
+                        blank = body.trim().is_empty();
                         write.vars = write.vars.with("body", Some(&body));
                     }
                     let mut state = RemoteState::load(&home, &plan).map_err(|e| e.to_string())?;
-                    if state.queue(&home, &plan, *write).map_err(|e| e.to_string())?.is_some() {
+                    if !blank && state.queue(&home, &plan, *write).map_err(|e| e.to_string())?.is_some() {
                         messages.push("Remote outbox full: dropped a tool block".into());
                     }
                 }
@@ -467,13 +491,37 @@ impl Worker {
         now_ms: u64,
     ) -> Result<TicketOutput, String> {
         let mut state = RemoteState::load(home, plan).map_err(|e| e.to_string())?;
-        let now = now_ms / 1000;
         state.reset_post_day(now_ms);
         let mut messages = Vec::new();
-        // Preserve post order: a delayed write holds later writes behind it.
-        while let Some(write) = state.outbox.first().cloned() {
+        // Each lane keeps its order: a delayed post holds later posts behind it, never acknowledgements.
+        for lane in ["conversation_ack", "conversation_post"] {
+            self.drain_lane(config, home, plan, &mut state, lane, now_ms, &mut messages)?;
+        }
+        Ok(TicketOutput::Outbox(messages))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn drain_lane(
+        &mut self,
+        config: &TicketConfig,
+        home: &std::path::Path,
+        plan: &str,
+        state: &mut RemoteState,
+        lane: &str,
+        now_ms: u64,
+        messages: &mut Vec<String>,
+    ) -> Result<(), String> {
+        let now = now_ms / 1000;
+        // A final refusal often repeats for every queued write; it is said once.
+        let say = |messages: &mut Vec<String>, message: String| {
+            if !messages.contains(&message) {
+                messages.push(message);
+            }
+        };
+        while let Some(index) = state.outbox.iter().position(|write| write.op == lane) {
+            let write = state.outbox[index].clone();
             if write.mirror && state.posted_today >= atomics_core::remote::DAILY_POSTS {
-                state.outbox.remove(0);
+                state.outbox.remove(index);
                 if !state.pause_shown {
                     messages.push("Conversation mirror paused: 1000 posts today".into());
                     state.pause_shown = true;
@@ -490,19 +538,19 @@ impl Worker {
                 }
                 // Persist before transport, also bounding refused posts and lost replies.
                 state.last_post_ms = Some(now_ms);
-                state.outbox[0].attempted = true;
+                state.outbox[index].attempted = true;
                 state.save(home, plan).map_err(|e| e.to_string())?;
             }
             let vars = write.vars.clone().with("nonce", Some(&write.nonce));
             match self.call(config, &write.op, &vars) {
                 Ok(_) => {
-                    state.outbox.remove(0);
+                    state.outbox.remove(index);
                     if write.op == "conversation_post" {
                         state.posted_today += 1;
                     }
                 }
-                Err(_) if self.content_refused => {
-                    state.outbox.remove(0);
+                Err(_) if self.refusal == Some(RemoteError::ContentRefused) => {
+                    state.outbox.remove(index);
                     messages.push("Remote text withheld: the ticket system refused it".into());
                     if write.op == "conversation_post" && !write.withheld {
                         // A different body needs a new event id; keep the reserved sequence.
@@ -515,12 +563,17 @@ impl Worker {
                         replacement.attempts = 0;
                         replacement.attempted = false;
                         replacement.next_at = 0;
-                        state.outbox.insert(0, replacement);
+                        state.outbox.insert(index, replacement);
                     }
                 }
+                // An ended conversation, a validation error or a used sequence fails the same way again.
+                Err(error) if self.refusal.is_some() => {
+                    state.outbox.remove(index);
+                    say(messages, format!("Remote write dropped: {error}"));
+                }
                 Err(error) => {
-                    if !state.outbox[0].retry(now) {
-                        state.outbox.remove(0);
+                    if !state.outbox[index].retry(now) {
+                        state.outbox.remove(index);
                         messages.push(format!("Remote write dropped after 10 attempts: {error}"));
                     }
                     state.save(home, plan).map_err(|e| e.to_string())?;
@@ -529,7 +582,7 @@ impl Worker {
             }
             state.save(home, plan).map_err(|e| e.to_string())?;
         }
-        Ok(TicketOutput::Outbox(messages))
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -542,11 +595,15 @@ impl Worker {
         title: &str,
         owners: Vec<String>,
         recover: bool,
+        reset: bool,
     ) -> Result<TicketOutput, String> {
         let nonce = uuid::Uuid::new_v4().to_string();
+        let title = Some(tickets::conversation_title(title))
+            .filter(|title| !title.is_empty())
+            .unwrap_or_else(|| tickets::conversation_title(link.label()));
         let vars = Vars::new(&config.system)
             .ticket(link)
-            .with("title", Some(title))
+            .with("title", Some(&title))
             .with("nonce", Some(&nonce))
             .typed("owners", Value::from(owners));
         let value = self.call(config, "conversation_open", &vars)?;
@@ -565,18 +622,33 @@ impl Worker {
         }
         if state.conversation.as_deref() != Some(conversation.id.as_str()) {
             // A new conversation starts at the server's newest revision: nothing written
-            // before remote was on, or before a lost sidecar, is ever delivered.
+            // before remote was on, or before a lost sidecar, is ever delivered. Its events start at 1.
             state.conversation = Some(conversation.id.clone());
             state.cursor = conversation.cursor.clone();
             state.retries.clear();
-        } else if state.cursor.is_none() {
+            state.requested_digest = None;
+            state.next_seq = 1;
+        } else if reset || state.cursor.is_none() {
             state.cursor = conversation.cursor.clone();
+            if reset {
+                state.retries.clear();
+                state.requested_digest = None;
+            }
         }
+        // Another plan on the same ticket may have posted here since: one conversation per ticket.
+        state.next_seq =
+            state.next_seq.max(RemoteState::used_seq(home, plan, &conversation.id).map_err(|e| e.to_string())?);
+        if let Some(next) = conversation.next_seq {
+            // The server knows the conversation's sequence; writes already queued keep theirs.
+            let reserved = state.outbox.iter().filter_map(|w| w.vars.get("seq")?.as_u64()).max().map_or(0, |s| s + 1);
+            state.next_seq = next.max(reserved);
+        }
+        let requested = state.requested_digest.clone();
         state.save(home, plan).map_err(|e| e.to_string())?;
         if let TicketOutput::Outbox(mut drained) = self.drain_outbox(config, home, plan)? {
             messages.append(&mut drained);
         }
-        Ok(TicketOutput::Remote(RemoteOutput::Opened { conversation, messages }))
+        Ok(TicketOutput::Remote(RemoteOutput::Opened { conversation, messages, requested }))
     }
 
     fn remote_poll(
@@ -595,7 +667,8 @@ impl Worker {
         let value = match self.call(config, "conversation_read", &vars) {
             Ok(value) => value,
             Err(error) => {
-                return Ok(TicketOutput::Remote(RemoteOutput::PollFailed { error, throttled: self.throttled }));
+                let lost = matches!(self.refusal, Some(RemoteError::Unreadable | RemoteError::Ended));
+                return Ok(TicketOutput::Remote(RemoteOutput::PollFailed { error, throttled: self.throttled, lost }));
             }
         };
         let items = config.operation("conversation_read").expect("called").steering(&value, &conversation)?;
@@ -714,11 +787,12 @@ impl Worker {
             let write = PendingWrite::new("conversation_ack", uuid::Uuid::new_v4().to_string(), vars);
             state.queue(home, plan, write).map_err(|e| e.to_string())?;
         }
-        let activity = if text == HELD_TEXT { &remote.activity.input } else { &remote.activity.working };
+        // No activity: a delivery status never changes what the conversation waits for, so an
+        // open approval request stays open.
         let vars = base
             .with("kind", Some(&remote.kinds.status))
             .with("body", Some(text))
-            .with("activity", Some(activity))
+            .with("activity", Some(""))
             .with("turn", Some(&format!("steering:{plan}:{id}")));
         let write = PendingWrite::new("conversation_post", uuid::Uuid::new_v4().to_string(), vars);
         state.queue(home, plan, write).map_err(|e| e.to_string())?;
@@ -743,7 +817,7 @@ impl Worker {
 
     /// Calls the tool behind a generic operation and returns what its result paths read from.
     fn call(&mut self, config: &TicketConfig, name: &str, vars: &Vars) -> Result<Value, String> {
-        self.content_refused = false;
+        self.refusal = None;
         self.throttled = false;
         let operation = config.operation(name).ok_or_else(|| format!("operations.{name} is not configured"))?;
         let write = matches!(
@@ -796,7 +870,12 @@ impl Worker {
                 Err(McpError::Transport { retryable: true, .. }) if idempotent && attempt == 0 => {
                     self.client = None;
                 }
-                Err(err) => return Err(self.broken(&config.server, err)),
+                Err(err) => {
+                    if let McpError::Server(message) = &err {
+                        self.refusal = config.remote.errors.classify(message);
+                    }
+                    return Err(self.broken(&config.server, err));
+                }
             }
         }
         unreachable!("the final attempt returns")
@@ -805,10 +884,6 @@ impl Worker {
     /// The backoff remembers the failure cleaned with this job's secrets: a later job may
     /// run with others.
     fn broken(&mut self, server: &McpServer, err: McpError) -> String {
-        self.content_refused = matches!(&err, McpError::Server(message) if {
-            let message = message.to_ascii_lowercase();
-            message.contains("credential") || message.contains("text refused") || message.contains("content refused")
-        });
         self.throttled = matches!(err, McpError::Transport { retryable: true, .. });
         if matches!(err, McpError::SignInRequired(_)) {
             // No backoff: once the user signs in, the next job reconnects with the new tokens.
@@ -948,8 +1023,9 @@ pub(crate) mod tests {
                 title: "Goal".into(),
                 owners: vec!["human-1".into(), "human-2".into()],
                 recover: true,
+                reset: false,
             };
-            let TicketOutput::Remote(RemoteOutput::Opened { conversation, messages }) =
+            let TicketOutput::Remote(RemoteOutput::Opened { conversation, messages, .. }) =
                 worker.run(&config, open).unwrap()
             else {
                 panic!("{prefix}: open")
@@ -1046,6 +1122,7 @@ pub(crate) mod tests {
             title: "Goal".into(),
             owners: vec!["human-1".into()],
             recover: false,
+            reset: false,
         };
         worker.run(&config, open).unwrap();
         set(&path, |state| {
@@ -1995,5 +2072,155 @@ pub(crate) mod tests {
             // The new connection's server echoes both tokens: the old one is cleaned too.
             assert_eq!(rotated, "note failed: credential *** rejected; last time ***", "{name:?}");
         }
+    }
+
+    fn outbox(
+        worker: &mut Worker,
+        config: &TicketConfig,
+        home: &std::path::Path,
+        write: Option<PendingWrite>,
+    ) -> Vec<String> {
+        let op = TicketOp::Outbox { home: home.into(), plan: "lanes".into(), write: write.map(Box::new) };
+        let TicketOutput::Outbox(messages) = worker.run(config, op).unwrap() else { panic!("outbox") };
+        messages
+    }
+
+    fn post(config: &TicketConfig, body: &str) -> PendingWrite {
+        let vars = Vars::new(&config.system)
+            .with("conversation", Some("conversation-1"))
+            .with("kind", Some("status"))
+            .with("activity", Some(""))
+            .with("turn", Some("turn"))
+            .with("body", Some(body));
+        PendingWrite::new("conversation_post", uuid::Uuid::new_v4().to_string(), vars)
+    }
+
+    #[test]
+    fn remote_outbox_skips_blank_posts_drops_final_refusals_and_acks_in_their_own_lane() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let home = dir.path();
+        let path = crate::mcp_client::tests::fake_state(home, json!([]));
+        let config = remote_profile("", &path);
+        let mut worker = Worker::default();
+        worker.prepare(&config);
+        let calls =
+            |tool: &str| server(&path)["calls"].as_array().unwrap().iter().filter(|c| c["tool"] == tool).count();
+        // Blank after cleaning: never queued, never sent.
+        assert!(outbox(&mut worker, &config, home, Some(post(&config, " \n\t "))).is_empty());
+        assert_eq!(calls("conversation_post"), 0);
+        assert!(RemoteState::load(home, "lanes").unwrap().outbox.is_empty());
+        // The reference server's final refusals are dropped after one call, never retried.
+        for message in [
+            "The item conversation has ended.",
+            "An agent session event sequence was already used.",
+            "An agent session event identifier was already used for different content.",
+            "A safe observable summary is required.",
+            "The conversation does not exist, or belongs to another agent.",
+        ] {
+            set(&path, |state| {
+                state["fail"] = json!(["conversation_post"]);
+                state["fail_message"] = json!(message);
+            });
+            let before = calls("conversation_post");
+            let messages = outbox(&mut worker, &config, home, Some(post(&config, "hello")));
+            assert_eq!(calls("conversation_post"), before + 1, "{message}");
+            assert!(RemoteState::load(home, "lanes").unwrap().outbox.is_empty(), "{message}");
+            assert!(messages.len() == 1 && messages[0].contains(message), "{messages:?}");
+        }
+        // A post waiting for its retry doesn't hold an acknowledgement back.
+        set(&path, |state| state["fail_message"] = json!("the server is busy"));
+        outbox(&mut worker, &config, home, Some(post(&config, "retried later")));
+        let vars = Vars::new(&config.system).with("conversation", Some("conversation-1")).typed("ids", json!(["s-1"]));
+        let ack = PendingWrite::new("conversation_ack", uuid::Uuid::new_v4().to_string(), vars);
+        assert!(outbox(&mut worker, &config, home, Some(ack)).is_empty());
+        assert_eq!(server(&path)["acks"][0]["ids"], json!(["s-1"]));
+        let state = RemoteState::load(home, "lanes").unwrap();
+        assert_eq!(state.outbox.len(), 1);
+        assert_eq!((state.outbox[0].op.as_str(), state.outbox[0].attempts), ("conversation_post", 1));
+        // A mapped error code decides before the messages do.
+        let mut coded = config.clone();
+        coded.remote.errors =
+            tickets::RemoteErrors { code: "code".into(), ended: vec!["ended".into()], ..Default::default() };
+        set(&path, |state| state["fail_message"] = json!(r#"{"code":"ended","message":"gone"}"#));
+        let mut pending = RemoteState::load(home, "lanes").unwrap();
+        pending.outbox[0].next_at = 0;
+        pending.save(home, "lanes").unwrap();
+        let messages = outbox(&mut worker, &coded, home, None);
+        assert!(RemoteState::load(home, "lanes").unwrap().outbox.is_empty(), "{messages:?}");
+    }
+
+    #[test]
+    fn remote_posts_are_capped_by_utf16_units_after_trimming_near_the_limit() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let home = dir.path();
+        let path = crate::mcp_client::tests::fake_state(home, json!([]));
+        let config = remote_profile("", &path);
+        let mut worker = Worker::default();
+        worker.prepare(&config);
+        let emoji = "\u{1f600}";
+        // Exactly 2000 units once trimmed, then just over: the fake server refuses anything longer.
+        for (count, mirror) in [(1000, false), (1001, false), (1000, true), (1001, true), (1500, true)] {
+            let mut write = post(&config, &format!("  \n{}  \n", emoji.repeat(count)));
+            write.mirror = mirror;
+            let messages = outbox(&mut worker, &config, home, Some(write));
+            assert!(messages.is_empty(), "{count} {mirror}: {messages:?}");
+            let state = server(&path);
+            let text = state["posts"].as_array().unwrap().last().unwrap()["text"].as_str().unwrap().to_string();
+            assert!(text.encode_utf16().count() <= 2000, "{count} {mirror}");
+            assert_eq!(text.trim(), text);
+            let kept = text.chars().take_while(|c| c.to_string() == emoji).count();
+            match (count, mirror) {
+                (1000, _) => assert_eq!(text, emoji.repeat(1000)),
+                (_, false) => assert_eq!(text, emoji.repeat(1000)),
+                _ => assert!(text.ends_with(&format!("(… {} more characters in ATOMICS)", count - kept)), "{text}"),
+            }
+        }
+    }
+
+    #[test]
+    fn remote_open_starts_at_the_servers_next_sequence_when_the_profile_maps_it() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let home = dir.path();
+        let path = crate::mcp_client::tests::fake_state(home, json!([]));
+        set(&path, |state| {
+            state["next_sequence"] = json!(true);
+            state["sequences"] = json!({"conversation-1": {"1":"a", "2":"b", "3":"c"}});
+        });
+        let open = |plan: &str| TicketOp::RemoteOpen {
+            home: home.into(),
+            plan: plan.into(),
+            link: TicketLink { id: "00000000-0000-4000-8000-000000000001".into(), ..Default::default() },
+            title: "Goal".into(),
+            owners: vec!["human-1".into()],
+            recover: false,
+            reset: false,
+        };
+        let mut config = conversation_profile("", &path);
+        let mut worker = Worker::default();
+        worker.prepare(&config);
+        // Unmapped: the path stays optional and the plan starts at 1.
+        worker.run(&config, open("unmapped")).unwrap();
+        assert_eq!(RemoteState::load(home, "unmapped").unwrap().next_seq, 1);
+        config.operations.conversation_open.as_mut().unwrap().result.next_sequence = "nextSequence".into();
+        let TicketOutput::Remote(RemoteOutput::Opened { conversation, .. }) =
+            worker.run(&config, open("mapped")).unwrap()
+        else {
+            panic!("opened")
+        };
+        assert_eq!(conversation.next_seq, Some(4));
+        assert_eq!(RemoteState::load(home, "mapped").unwrap().next_seq, 4);
+        let op =
+            TicketOp::Outbox { home: home.into(), plan: "mapped".into(), write: Some(Box::new(post(&config, "next"))) };
+        worker.run(&config, op).unwrap();
+        assert_eq!(server(&path)["posts"].as_array().unwrap().last().unwrap()["sequence"], 4);
+        // A sequence another plan already used is refused, and the refusal is final.
+        let op = TicketOp::Outbox {
+            home: home.into(),
+            plan: "unmapped".into(),
+            write: Some(Box::new(post(&config, "stale"))),
+        };
+        let TicketOutput::Outbox(messages) = worker.run(&config, op).unwrap() else { panic!("outbox") };
+        assert!(messages[0].contains("An agent session event sequence was already used."), "{messages:?}");
+        assert!(RemoteState::load(home, "unmapped").unwrap().outbox.is_empty());
     }
 }

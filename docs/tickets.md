@@ -377,7 +377,9 @@ Read mappings, including `whoami`, reject `{nonce}`. These mappings alone do not
 `[tickets.remote]` does (see [Remote control](#remote-control)). Result paths: `conversation_open` and
 `conversation_steerers` map `id`, `cursor` and `steerers`, with `steerer_id` and `steerer_name` read in each
 steerer; `conversation_read` maps `items` and, in each item, `id`, `seq`, `author_id`, `author_kind`,
-`author`, `text` and `at`. `cursor` and `seq` keep the JSON type the server returns.
+`author`, `text` and `at`. `cursor` and `seq` keep the JSON type the server returns. `conversation_open`
+may also map `next_sequence`, the event sequence the server expects next (a number, or digits as text);
+when the result has it, the plan's next post uses it, after any sequences already reserved by queued writes.
 
 When an argument's entire string is exactly `{seq}`, `{after}`, `{owners}` or `{ids}`, substitution preserves
 its JSON type: sequence is a number, cursor retains the server's type, and owners and ids are arrays of
@@ -389,15 +391,32 @@ the job's Cleaner along with the author's display name and text, and appear in c
 comments remain data and cannot steer or approve work.
 
 Conversation state lives beside each plan in `plans/<plan id>.remote.json` under ATOMICS's state directory.
-It stores the conversation, cursor, next sequence, delivery intents, the last 500 seen ids, pending writes
-and today's post count. Missing sidecars load with defaults. Sidecars are excluded from plan loading and
+It stores the conversation, cursor, next sequence, delivery intents, the last 500 seen ids, pending writes,
+today's post count and the digest whose approval was last requested, so a restart doesn't post the Plan and
+Approval events again. Missing sidecars load with defaults. Sidecars are excluded from plan loading and
 from `plan_json`, so private remote bookkeeping never enters the chief's plan prompt.
 
 Posts and acknowledgements use the ticket worker's durable outbox. The worker reserves and saves a post's
 sequence before queuing it, and retains its nonce and variables across transport retries and restarts.
 Successful replies (including idempotent replays) remove the write. Failed writes back off from 2 seconds
-to 5 minutes and are dropped with a toast after 10 attempts. Content refusals are not retried: one new event
-replaces refused text with `(withheld: the ticket system refused this text)`. A refused replacement stops.
+to 5 minutes and are dropped with a toast after 10 attempts. Posts keep their order, and acknowledgements
+drain in a lane of their own, so a post waiting to be retried never holds an acknowledgement back. A post
+whose text is blank after cleaning is never queued. Content refusals are not retried: one new event replaces
+refused text with `(withheld: the ticket system refused this text)`. A refused replacement stops. A write
+refused because the conversation ended, the arguments failed validation or the sequence or event id was
+already used is final: it is dropped with a toast and never retried.
+
+ATOMICS tells these refusals apart with `[tickets.remote] errors`:
+
+```toml
+[tickets.remote]
+errors = { code = "code", content_refused = ["…"], ended = ["…"], conflict = ["…"], invalid = ["…"], unreadable = ["…"] }
+```
+
+When `code` names a JSON path and the tool's error text holds a JSON object with a value there, that code
+is compared with the lists, and an unlisted code is an ordinary failure. Without `code`, or for an error
+without one, ATOMICS matches the messages in `atomics_core::tickets::ERROR_MESSAGES` (case-insensitive
+fragments, such as "can no longer read the conversation's item" and "event sequence was already used").
 Each plan holds at most 200 pending writes; tool blocks are evicted first. If no tool block can be removed,
 the new write is rejected with a visible error, preserving existing status, plan and approval events.
 
@@ -767,6 +786,7 @@ tools = "cards"                    # "cards" | "names" | "off"
 min_interval_ms = 2000
 poll_secs = 5
 idle_poll_secs = 60
+errors = { code = "" }             # optional error codes; see "Outbox" above
 ```
 
 `kinds` and `activity` translate ATOMICS's roles and states into the server's vocabulary; the defaults are
@@ -775,13 +795,16 @@ follows the same workspace precedence. `user_turns`, `tools` and `min_interval_m
 the chief's session.
 
 The mirror sends only the chief's submitted prompts, final answers and one tool block per turn. Text
-already delivered from this conversation is not echoed. Tool blocks contain reduced trace operation,
+already delivered from this conversation is not echoed. A chief turn that starts with steering ATOMICS
+pasted for a plan is mirrored to that plan's conversation, whichever plan the UI shows. A turn typed at the
+desk is mirrored only when exactly one plan has an open conversation; otherwise it is mirrored nowhere. Tool blocks contain reduced trace operation,
 argument summary, state and elapsed time; `cards` includes up to five ticket keys and titles per entry,
 `names` omits cards, and `off` omits tool blocks. Each block includes at most ten entries. Workers, raw tool
 responses, terminals, files and diffs are never mirrored. Text passes the trace Cleaner after current OAuth
 credentials resolve, including token and URL credential masks, before entering the per-plan outbox.
 
-Events contain at most 2000 Unicode characters; long turns end with “(… N more characters in ATOMICS)”. All
+Events contain at most 2000 UTF-16 code units after trimming, as the server counts them (an emoji counts
+two); long turns end with “(… N more characters in ATOMICS)”, and a surrogate pair is never split. All
 posts use the durable outbox and are spaced by `min_interval_ms`. At 50 pending mirror events, tool blocks
 give way first, then old turns become “(N turns skipped)”. After 1000 posts per plan per UTC day, mirroring
 pauses with a toast and resumes the next day. Status, plan and approval events survive these mirror limits.
@@ -789,8 +812,10 @@ A content refusal produces “(withheld: the ticket system refused this text)”
 produce another replacement.
 
 Permission notifications and pending chief permission prompts set `input` once, a blocked task sets
-`blocked`, approval sets `approval`, and the next chief turn sets `working`. A finished plan queues `done`
-and ends its conversation; polling stops. Status messages contain fixed copy, never permission commands or
+`blocked`, approval sets `approval`, and the next chief turn sets `working`. A finished or archived plan
+queues `done`, which ends its conversation, and polling stops; when another open plan on the same ticket
+takes the conversation over, nothing ends. Delivery statuses ("delivered to the chief", "held …") carry no
+activity, so an open approval request stays open. Status messages contain fixed copy, never permission commands or
 worker text. Remote steering still cannot answer permission menus or authorize sensitive operations.
 
 **Two identities.** The connection identity, read with `whoami`, is any agent. Only the steering list may
@@ -807,8 +832,13 @@ The app applies the same rules and shows the reason in a toast. The sign-in chip
 for example `relay · Example agent (agent) · steering: Example human`, with `(owner)` after the
 connection's owner.
 
-**Opening.** For every open plan with a ticket of the configured system, ATOMICS calls `conversation_open`
-with the ticket, the plan's goal as `{title}` and the steering list as `{owners}`. Anything else the server
+**Opening.** The server keeps one conversation per ticket and agent, so for each ticket of the configured
+system the newest open plan linked to it owns the remote; plans older than that say why in a toast and in
+`plan_json` (`remote`), and the next newest takes over when the owner closes. ATOMICS calls
+`conversation_open` with the ticket, the plan goal's first non-empty line as `{title}` (trimmed, without
+control characters, cut to 200 UTF-16 code units; the ticket key when the goal is empty) and the steering
+list as `{owners}`. A plan taking over a conversation another plan wrote to continues after that plan's
+sequences. Anything else the server
 needs, such as Relay's item type `tickets.ticket`, is a literal in the profile's arguments. The server may refuse some
 ids; ATOMICS then shows which and uses the server's list. Opening is idempotent; ATOMICS opens again after
 the steering list changes, and reads `conversation_steerers` after opening and every 10 minutes. A new
@@ -818,7 +848,10 @@ before remote was on, or before a lost sidecar, is ever delivered.
 **Polling.** Only `conversation_read` polls, on the ticket worker, with `{after}` set to the saved cursor:
 every `poll_secs` while the plan is active (a chief turn or a steering message in the last 10 minutes, or
 an open approval request), otherwise every `idle_poll_secs`. A 429, a 5xx or a lost connection waits
-5 minutes. Polling stops when the plan completes or is archived, or remote is turned off.
+5 minutes. Polling stops when the plan completes or is archived, or remote is turned off. When a read says
+the conversation ended or the connection can no longer read the conversation's item, polling stops with a
+toast and a `remote` note in `plan_json`; ATOMICS opens it again every `idle_poll_secs` (at least 60 s), and
+a successful open starts again at the server's cursor and sequence.
 
 **Verdict.** An item reaches the chief only when its `author_id` is on the steering list, its `author_kind`
 equals `human_kind` ignoring ASCII case (a missing kind fails), the author is not the signed-in identity,
@@ -1197,7 +1230,9 @@ a reused key with different arguments, and can drop a reply after applying a wri
 - doctor startup, missing tools, pagination, and workspace precedence;
 - remote control (`cargo test -p atomics remote`): a conversation that opens, reads after a revision,
   acknowledges and lists steering humans in all three dialects; delivery with the source label, refusals,
-  escapes, holds, restarts, the per-minute cap and the polling cadence. `cargo test -p atomics-core steering`
+  escapes, holds, restarts, the per-minute cap and the polling cadence; titles, UTF-16 caps, final refusals,
+  the acknowledgement lane, one plan per ticket, turn attribution and an unreadable item. The fake server
+  enforces the reference server's title, text, sequence and completion rules with its messages. `cargo test -p atomics-core steering`
   covers the verdict table and the doctor rules.
 
 `crates/atomics/src/mcp_client.rs` covers stdio and streamable HTTP. For a focused run in a fresh

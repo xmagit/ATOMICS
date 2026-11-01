@@ -27,6 +27,9 @@ pub struct RemoteState {
     pub pause_shown: bool,
     /// Polls on which the chief could not receive a steering item, by item id.
     pub retries: BTreeMap<String, u32>,
+    /// The plan digest whose approval was last requested in this conversation, so a restart
+    /// doesn't post the Plan and Approval events again.
+    pub requested_digest: Option<String>,
 }
 
 impl Default for RemoteState {
@@ -43,6 +46,7 @@ impl Default for RemoteState {
             last_post_ms: None,
             pause_shown: false,
             retries: BTreeMap::new(),
+            requested_digest: None,
         }
     }
 }
@@ -193,6 +197,33 @@ impl RemoteState {
         tmp.persist(&path)?;
         std::fs::File::open(dir)?.sync_all()?;
         Ok(())
+    }
+
+    /// The first sequence a plan may use in `conversation`: past every sequence another plan's
+    /// sidecar reserved there (the server keeps one conversation per item, ATOMICS one sidecar
+    /// per plan), else 1.
+    #[cfg(feature = "native")]
+    pub fn used_seq(home: &std::path::Path, plan: &str, conversation: &str) -> anyhow::Result<u64> {
+        let mut next = 1;
+        let own = Self::path(home, plan)?;
+        let Ok(entries) = std::fs::read_dir(home.join("plans")) else { return Ok(next) };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path == own || !path.file_name().is_some_and(|name| name.to_string_lossy().ends_with(".remote.json")) {
+                continue;
+            }
+            // Another plan's broken sidecar is reported when that plan is followed, not here.
+            let Ok(other) = std::fs::read(&path)
+                .map_err(anyhow::Error::from)
+                .and_then(|bytes| serde_json::from_slice::<RemoteState>(&bytes).map_err(anyhow::Error::from))
+            else {
+                continue;
+            };
+            if other.conversation.as_deref() == Some(conversation) {
+                next = next.max(other.next_seq);
+            }
+        }
+        Ok(next)
     }
 
     /// Reserve and persist a post sequence before its write is added to the outbox.

@@ -348,7 +348,10 @@ impl State {
             | TicketOp::UpdateState(link, _, _)
             | TicketOp::Comment(link, _)
             | TicketOp::RemoteOpen { link, .. } => Some(link),
-            TicketOp::RemoteSteerers(_) | TicketOp::RemotePoll { .. } | TicketOp::RemoteSettle { .. } => None,
+            TicketOp::RemoteSteerers(_)
+            | TicketOp::RemotePoll { .. }
+            | TicketOp::RemoteSettle { .. }
+            | TicketOp::RemoteRequested { .. } => None,
             TicketOp::TraceCleaner
             | TicketOp::Whoami
             | TicketOp::ResetOutboxes

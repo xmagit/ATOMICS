@@ -35,6 +35,14 @@ pub struct Plan {
     /// Latest lifecycle progress consumed by the completion sweep, including while closed.
     #[serde(default)]
     pub finished_stage_sequence: u64,
+    /// Unix milliseconds when ATOMICS created the plan; 0 in older plans. The newest open plan
+    /// on a ticket owns its remote conversation.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub created_at: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

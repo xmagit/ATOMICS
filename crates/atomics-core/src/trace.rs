@@ -16,20 +16,26 @@ pub const MAX_ENTRIES: usize = 200;
 pub const MAX_CARDS: usize = 25;
 pub const MAX_DISK_BYTES: usize = 1024 * 1024;
 
-/// The conversation server counts Unicode characters, including the omission note.
+/// The longest event text, in UTF-16 code units after trimming, as the conversation server counts.
+pub const MAX_EVENT_UNITS: usize = 2000;
+
+/// Trimmed, then cut to `MAX_EVENT_UNITS` including the omission note.
 pub fn cap_block(text: &str) -> String {
-    let count = text.chars().count();
-    if count <= 2000 {
+    let text = text.trim();
+    if tickets::utf16_len(text) <= MAX_EVENT_UNITS {
         return text.into();
     }
-    let mut keep = 2000;
+    let count = text.chars().count();
+    let mut units = MAX_EVENT_UNITS;
     loop {
-        let note = format!("(… {} more characters in ATOMICS)", count - keep);
-        let next = 2000 - note.chars().count();
-        if next == keep {
-            return format!("{}{note}", text.chars().take(keep).collect::<String>());
+        let kept = tickets::utf16_prefix(text, units);
+        let note = format!("(… {} more characters in ATOMICS)", count - kept.chars().count());
+        let next = MAX_EVENT_UNITS - tickets::utf16_len(&note);
+        // Fewer kept characters can only lengthen the note, so this settles.
+        if next >= units {
+            return format!("{kept}{note}");
         }
-        keep = next;
+        units = next;
     }
 }
 
@@ -736,6 +742,18 @@ mod tests {
                 assert!(capped.ends_with(&format!("(… {} more characters in ATOMICS)", length - kept)));
             }
         }
+        // Emoji are two UTF-16 units each; the limit counts units after trimming.
+        let emoji = "\u{1f600}";
+        let exact = format!("  {}\n", emoji.repeat(1000));
+        assert_eq!(cap_block(&exact), emoji.repeat(1000));
+        for count in [1001, 1500, 4000] {
+            let capped = cap_block(&emoji.repeat(count));
+            let units = capped.encode_utf16().count();
+            assert!((1999..=2000).contains(&units), "{count}: {units}");
+            let kept = capped.chars().take_while(|c| c.to_string() == emoji).count();
+            assert!(capped.ends_with(&format!("(… {} more characters in ATOMICS)", count - kept)), "{capped}");
+        }
+        assert_eq!(cap_block(&format!("{}\u{1f600}", "a".repeat(1999))).encode_utf16().count(), 2000);
     }
 
     #[test]

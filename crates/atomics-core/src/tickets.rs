@@ -634,6 +634,7 @@ pub struct RemoteConfig {
     pub min_interval_ms: u64,
     pub poll_secs: u64,
     pub idle_poll_secs: u64,
+    pub errors: RemoteErrors,
 }
 
 impl Default for RemoteConfig {
@@ -650,8 +651,107 @@ impl Default for RemoteConfig {
             min_interval_ms: 2000,
             poll_secs: 5,
             idle_poll_secs: 60,
+            errors: RemoteErrors::default(),
         }
     }
+}
+
+/// `[tickets.remote] errors`: how the conversation operations' refusals are told apart.
+/// With `code` set, the code at that JSON path of an error whose text holds a JSON object
+/// is compared with the lists. Otherwise, or when an error carries no code, the messages in
+/// `ERROR_MESSAGES` are matched.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RemoteErrors {
+    pub code: String,
+    pub content_refused: Vec<String>,
+    pub ended: Vec<String>,
+    pub conflict: Vec<String>,
+    pub invalid: Vec<String>,
+    pub unreadable: Vec<String>,
+}
+
+/// A refusal from the conversation server. A write refused this way is never retried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteError {
+    /// The text itself: replaced once by the withheld note.
+    ContentRefused,
+    /// The conversation ended, or no longer exists for this agent.
+    Ended,
+    /// The event id or sequence was already used with other content.
+    Conflict,
+    /// The arguments failed the server's validation.
+    Invalid,
+    /// The connection can no longer read the conversation's item.
+    Unreadable,
+}
+
+/// Lowercase message fragments, checked in order when no error code decides.
+pub const ERROR_MESSAGES: &[(RemoteError, &str)] = &[
+    (RemoteError::Unreadable, "can no longer read the conversation's item"),
+    (RemoteError::Unreadable, "the item does not exist, or this agent can't read it"),
+    (RemoteError::Ended, "conversation has ended"),
+    (RemoteError::Ended, "the conversation does not exist, or belongs to another agent"),
+    (RemoteError::ContentRefused, "credential"),
+    (RemoteError::ContentRefused, "text refused"),
+    (RemoteError::ContentRefused, "content refused"),
+    (RemoteError::Conflict, "event sequence was already used"),
+    (RemoteError::Conflict, "already used for different content"),
+    (RemoteError::Conflict, "conflict"),
+    (RemoteError::Invalid, "a safe observable summary is required"),
+    (RemoteError::Invalid, "validation"),
+    (RemoteError::Invalid, "invalid params"),
+];
+
+impl RemoteErrors {
+    pub fn classify(&self, message: &str) -> Option<RemoteError> {
+        if !self.code.trim().is_empty()
+            && let Some(code) = message
+                .find('{')
+                .and_then(|at| serde_json::Deserializer::from_str(&message[at..]).into_iter::<Value>().next())
+                .and_then(Result::ok)
+                .and_then(|value| json_path(&value, self.code.trim()).and_then(scalar))
+        {
+            let lists = [
+                (RemoteError::ContentRefused, &self.content_refused),
+                (RemoteError::Ended, &self.ended),
+                (RemoteError::Conflict, &self.conflict),
+                (RemoteError::Invalid, &self.invalid),
+                (RemoteError::Unreadable, &self.unreadable),
+            ];
+            return lists.into_iter().find(|(_, codes)| codes.iter().any(|c| c.trim() == code)).map(|(class, _)| class);
+        }
+        let message = message.to_lowercase().replace('\u{2019}', "'");
+        ERROR_MESSAGES.iter().find(|(_, fragment)| message.contains(fragment)).map(|(class, _)| *class)
+    }
+}
+
+/// UTF-16 code units, as the conversation server counts text.
+pub fn utf16_len(text: &str) -> usize {
+    text.encode_utf16().count()
+}
+
+/// The longest prefix of at most `max` UTF-16 code units; a surrogate pair is never split.
+pub fn utf16_prefix(text: &str, max: usize) -> &str {
+    let mut units = 0;
+    for (at, c) in text.char_indices() {
+        units += c.len_utf16();
+        if units > max {
+            return &text[..at];
+        }
+    }
+    text
+}
+
+/// The longest conversation title, in UTF-16 code units.
+pub const MAX_TITLE_UNITS: usize = 200;
+
+/// A conversation title from a plan goal: its first non-empty line, trimmed, without control
+/// characters, cut to `MAX_TITLE_UNITS`. Empty when the goal has no text.
+pub fn conversation_title(goal: &str) -> String {
+    let goal = strip_controls(goal).replace('\t', " ");
+    let line = goal.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or_default();
+    utf16_prefix(line, MAX_TITLE_UNITS).trim_end().to_string()
 }
 
 /// The operations remote control needs, all of them.
@@ -755,6 +855,8 @@ pub struct Conversation {
     /// The server's newest revision, in the JSON type it was returned in.
     pub cursor: Option<Value>,
     pub steerers: Vec<Steerer>,
+    /// The sequence the server expects next, read from the optional `next_sequence` path.
+    pub next_seq: Option<u64>,
 }
 
 /// One steering message from `conversation_read`.
@@ -802,7 +904,16 @@ impl Operation {
             .then(|| json_path(value, &self.result.cursor).cloned())
             .flatten()
             .filter(|cursor| !cursor.is_null());
-        Ok(Conversation { id, cursor, steerers: self.steerers(value) })
+        let next_seq = (!self.result.next_sequence.trim().is_empty())
+            .then(|| json_path(value, &self.result.next_sequence))
+            .flatten()
+            .and_then(|value| match value {
+                Value::Number(n) => n.as_u64(),
+                Value::String(text) => text.trim().parse().ok(),
+                _ => None,
+            })
+            .filter(|seq| *seq > 0);
+        Ok(Conversation { id, cursor, steerers: self.steerers(value), next_seq })
     }
 
     /// Steering items of a read; `conversation` is the id the read was called with.
@@ -1053,6 +1164,8 @@ pub struct FieldPaths {
     pub steerers: String,
     pub steerer_id: String,
     pub steerer_name: String,
+    /// `conversation_open`: the server's next event sequence, when it returns one.
+    pub next_sequence: String,
     pub seq: String,
     pub author_id: String,
     pub author: String,
@@ -1083,6 +1196,7 @@ impl Default for FieldPaths {
             steerers: String::new(),
             steerer_id: String::new(),
             steerer_name: String::new(),
+            next_sequence: String::new(),
             seq: String::new(),
             author_id: String::new(),
             author: String::new(),
@@ -2554,22 +2668,74 @@ mod tests {
     #[test]
     fn steering_message_names_its_source_strips_escapes_and_cuts() {
         let mut item = steering_item("human-1", Some("Human"), json!(41));
-        item.author = Some("Max \u{1b}[31mFalk".into());
+        item.author = Some("Example \u{1b}[31mHuman".into());
         item.text = "\u{1b}[2J\u{1b}]0;title\u{7}status?\u{1b}[0m\r\n\u{0}next\tline\u{9b}31m".into();
-        let message = steering_message(&item, "relay", "RELAY-11972");
+        let message = steering_message(&item, "example", "DEMO-1");
         assert_eq!(
             message,
-            "[From Max Falk, a verified steering human, via the relay conversation on RELAY-11972, message 41.]\nstatus?\nnext\tline"
+            "[From Example Human, a verified steering human, via the example conversation on DEMO-1, message 41.]\nstatus?\nnext\tline"
         );
         assert!(!message.contains('\u{1b}'));
         item.text = "é".repeat(5000);
-        let message = steering_message(&item, "relay", "RELAY-11972");
+        let message = steering_message(&item, "example", "DEMO-1");
         let body = message.split_once('\n').unwrap().1;
         assert_eq!(body.chars().count(), MAX_STEERING_CHARS);
         assert!(body.ends_with(STEERING_CUT));
         assert_eq!(steering_command("  /approve 3f9a1c2e4b7d\nthanks"), Some("/approve 3f9a1c2e4b7d"));
         assert_eq!(steering_command("please /approve 3f9a"), None);
         assert_eq!(steering_command("/approved"), None);
+    }
+
+    #[test]
+    fn remote_errors_pin_the_reference_server_messages_and_prefer_a_mapped_code() {
+        let errors = RemoteErrors::default();
+        let table = [
+            ("The observable session text is invalid or contains credential-shaped data.", RemoteError::ContentRefused),
+            ("A safe observable summary is required.", RemoteError::Invalid),
+            ("The item conversation has ended.", RemoteError::Ended),
+            ("An agent session event sequence was already used.", RemoteError::Conflict),
+            ("An agent session event sequence was already used in this attempt.", RemoteError::Conflict),
+            ("An agent session event identifier was already used for different content.", RemoteError::Conflict),
+            ("This agent can no longer read the conversation's item.", RemoteError::Unreadable),
+            ("The conversation does not exist, or belongs to another agent.", RemoteError::Ended),
+            ("The item does not exist, or this agent can't read it.", RemoteError::Unreadable),
+        ];
+        for (message, class) in table {
+            // As the MCP client reports a tool error.
+            assert_eq!(errors.classify(&format!("post_item_conversation failed: {message}")), Some(class), "{message}");
+        }
+        assert_eq!(errors.classify("conversation_read failed: the server is busy"), None);
+        let coded = RemoteErrors {
+            code: "error.code".into(),
+            ended: vec!["conversation_ended".into()],
+            conflict: vec!["sequence_used".into()],
+            ..Default::default()
+        };
+        let error = r#"post failed: {"error":{"code":"sequence_used","message":"The item conversation has ended."}}"#;
+        assert_eq!(coded.classify(error), Some(RemoteError::Conflict), "the code wins over the message");
+        assert_eq!(coded.classify(r#"post failed: {"error":{"code":"other"}}"#), None);
+        assert_eq!(coded.classify("post failed: The item conversation has ended."), Some(RemoteError::Ended));
+        let config: TicketConfig = toml::from_str(
+            "system = \"example\"\n[remote]\nerrors = { code = \"code\", content_refused = [\"refused\"], ended = [\"ended\"], conflict = [\"conflict\"], unreadable = [\"unreadable\"] }",
+        )
+        .unwrap();
+        assert_eq!(config.remote.errors.classify(r#"failed: {"code":"unreadable"}"#), Some(RemoteError::Unreadable));
+    }
+
+    #[test]
+    fn conversation_titles_are_one_clean_line_within_200_utf16_units() {
+        assert_eq!(conversation_title("\n  \t\n  Ship the remote fixes  \nDetails\nMore"), "Ship the remote fixes");
+        assert_eq!(conversation_title("Fix\tthe \u{1b}[31mred\u{1b}[0m bug\u{7}\r\nnext"), "Fix the red bug");
+        assert_eq!(conversation_title(" \n\t"), "");
+        let emoji = "\u{1f600}".repeat(150);
+        let title = conversation_title(&emoji);
+        assert_eq!(utf16_len(&title), 200);
+        assert_eq!(title.chars().count(), 100);
+        let title = conversation_title(&format!("a{emoji}"));
+        assert_eq!(utf16_len(&title), 199, "a surrogate pair is never split");
+        assert!(conversation_title(&"word ".repeat(100)).chars().all(|c| !c.is_control()));
+        assert_eq!(utf16_prefix("abc", 2), "ab");
+        assert_eq!(utf16_prefix("a\u{1f600}", 2), "a");
     }
 
     #[test]
