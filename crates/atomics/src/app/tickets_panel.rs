@@ -514,22 +514,15 @@ impl State {
         self.send_ticket(&config, TicketOp::Page { name, query, extra }, tag);
     }
 
-    /// A failed More discards the cursor and starts the same listing or search over.
+    /// A failed More discards the cursor and retries, keeping loaded rows until the first page arrives.
     fn tickets_restart(&mut self) {
         let Some(config) = self.ticket_config() else { return };
         let panel = &mut self.tickets.panel;
         let Some((name, query, extra)) = panel.find.request.clone() else { return };
         panel.seq += 1;
         let previous = std::mem::take(&mut panel.find);
-        panel.find = Find {
-            seq: panel.seq,
-            busy: true,
-            listed: previous.listed,
-            ran: previous.ran,
-            from_chief: previous.from_chief,
-            request: previous.request,
-            ..Find::default()
-        };
+        panel.find =
+            Find { seq: panel.seq, busy: true, next: None, more: false, read_next: None, error: None, ..previous };
         let tag = self.panel_tag(&config, Job::Find, self.tickets.panel.seq);
         self.send_ticket(&config, TicketOp::Page { name, query, extra }, tag);
     }
@@ -742,17 +735,23 @@ impl State {
                 }
                 match result {
                     Ok(TicketOutput::Page(cards, next)) if job == Job::More => {
+                        if panel.view == TicketsView::Find && !cards.is_empty() {
+                            find.selected = Some(find.results.len());
+                            find.reveal = true;
+                        }
                         find.results.extend(cards);
                         find.next = next;
                         advance = find.read_next.take();
                     }
                     Ok(TicketOutput::Page(cards, next)) => {
                         find.selected = (!cards.is_empty()).then_some(0);
+                        find.reveal = true;
                         find.results = cards;
                         find.next = next;
                     }
                     Ok(TicketOutput::Cards(cards)) => {
                         find.selected = (!cards.is_empty()).then_some(0);
+                        find.reveal = true;
                         find.results = cards;
                     }
                     Ok(_) => find.error = Some("unexpected ticket result".into()),
@@ -1351,13 +1350,15 @@ impl Desktop<'_> {
         // In a list ticket, scroll until the edge before stepping to its neighbour.
         let mut jump = None;
         if panel.reading_from_list() {
-            for key in panel_nav::take_keys(ui, &[Key::ArrowUp, Key::ArrowDown]) {
+            for (key, repeat) in
+                panel_nav::take_key_presses_for(ui, panel_nav::focus_id(), &[Key::ArrowUp, Key::ArrowDown])
+            {
                 let read = panel.read.as_ref().expect("checked above");
                 let offset = jump.unwrap_or(read.offset);
                 let down = key == Key::ArrowDown;
                 if (down && offset < read.max_offset) || (!down && offset > 0.0) {
                     jump = Some((offset + if down { LINE_H } else { -LINE_H }).clamp(0.0, read.max_offset));
-                } else {
+                } else if !repeat && !read.loading {
                     acts.push(Act::Step(if down { 1 } else { -1 }));
                 }
             }
@@ -2178,6 +2179,127 @@ mod tests {
     }
 
     #[test]
+    fn read_arrow_repeats_scroll_but_never_step_and_loading_has_no_edge() {
+        with_app(
+            "app::tickets_panel::tests::read_arrow_repeats_scroll_but_never_step_and_loading_has_no_edge",
+            |app, ctx| {
+                open_panel(app, ctx, TicketsView::Read);
+                results(app, 3);
+                long_read(app);
+                let read = app.runtime.tickets.panel.read.as_mut().unwrap();
+                read.link = card(2, None).link;
+                read.card.link = read.link.clone();
+                in_list(ctx);
+                frame(app, ctx, vec![]);
+                // egui derives repeats from keys held across frames. The usual frame helper releases them.
+                let hold = |app: &mut Desktop<'_>, code| {
+                    ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1020.0, 800.0))),
+                            events: vec![key(code, NONE)],
+                            ..Default::default()
+                        },
+                        |ui| {
+                            app.shortcuts(ui.ctx());
+                            app.diff_panel(ui, Rect::from_min_max(pos2(0.0, 0.0), pos2(1020.0, 760.0)));
+                        },
+                    )
+                    .drop_without_applying_deltas();
+                    app.runtime.drain_actions();
+                };
+                let release = |code| egui::Event::Key {
+                    key: code,
+                    physical_key: Some(code),
+                    pressed: false,
+                    repeat: false,
+                    modifiers: NONE,
+                };
+                hold(app, Key::ArrowDown);
+                let offset = app.runtime.tickets.panel.read.as_ref().unwrap().offset;
+                hold(app, Key::ArrowDown);
+                assert!(app.runtime.tickets.panel.read.as_ref().unwrap().offset > offset, "held arrows still scroll");
+                frame(app, ctx, vec![release(Key::ArrowDown)]);
+                for (edge, arrow) in [(Key::Home, Key::ArrowUp), (Key::End, Key::ArrowDown)] {
+                    frame(app, ctx, vec![key(edge, NONE)]);
+                    app.runtime.tickets.panel.read.as_mut().unwrap().loading = true;
+                    hold(app, arrow);
+                    app.runtime.tickets.panel.read.as_mut().unwrap().loading = false;
+                    for _ in 0..4 {
+                        hold(app, arrow);
+                    }
+                    assert_eq!(app.runtime.tickets.panel.read.as_ref().unwrap().link.label(), "DEMO-2");
+                    assert_eq!(app.runtime.tickets.pending, 0, "repeats queue no work");
+                    frame(app, ctx, vec![release(arrow)]);
+                    app.runtime.tickets.panel.read.as_mut().unwrap().loading = true;
+                    frame(app, ctx, vec![key(arrow, NONE)]);
+                    assert_eq!(
+                        app.runtime.tickets.panel.read.as_ref().unwrap().link.label(),
+                        "DEMO-2",
+                        "loading has no edge"
+                    );
+                    app.runtime.tickets.panel.read.as_mut().unwrap().loading = false;
+                }
+                frame(app, ctx, vec![]);
+                frame(app, ctx, vec![key(Key::End, NONE)]);
+                frame(app, ctx, vec![key(Key::ArrowDown, NONE)]);
+                assert_eq!(
+                    app.runtime.tickets.panel.read.as_ref().unwrap().link.label(),
+                    "DEMO-3",
+                    "a fresh press at the edge steps"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn newer_reads_supersede_all_queued_parts_without_cancelling_find() {
+        with_app(
+            "app::tickets_panel::tests::newer_reads_supersede_all_queued_parts_without_cancelling_find",
+            |app, _ctx| {
+                let dir = crate::test_support::tempdir().unwrap();
+                fake_profile(app, dir.path());
+                let (jobs, queued) = std::sync::mpsc::channel();
+                app.runtime.tickets.jobs = Some(jobs);
+                let link = |n| TicketLink { system: String::new(), ..card(n, None).link };
+                app.runtime.open_ticket(link(1), Nav::Fresh);
+                app.runtime.tickets_list();
+                app.runtime.open_ticket(link(2), Nav::Fresh);
+                let queued: Vec<_> = queued.try_iter().collect();
+                assert_eq!(queued.len(), 7);
+                for (i, job) in queued.into_iter().enumerate() {
+                    let (current, seq) = job.sequence.expect("each panel request has a sequence");
+                    assert_eq!(
+                        current.load(std::sync::atomic::Ordering::Relaxed) == seq,
+                        i >= 3,
+                        "old read, children and related jobs expire; Find and all new parts stay current"
+                    );
+                }
+                app.runtime.stop_tickets();
+            },
+        );
+    }
+
+    #[test]
+    fn alt_digits_beyond_the_chips_still_type_in_the_query() {
+        with_app("app::tickets_panel::tests::alt_digits_beyond_the_chips_still_type_in_the_query", |app, ctx| {
+            let dir = crate::test_support::tempdir().unwrap();
+            fake_profile(app, dir.path());
+            app.runtime.toggle_tickets();
+            settle(app);
+            assert_eq!(app.runtime.tickets.config.as_ref().unwrap().filters.len(), 1);
+            ctx.memory_mut(|m| m.request_focus(query_id()));
+            frame(app, ctx, vec![]);
+            frame(app, ctx, vec![key(Key::Num5, egui::Modifiers::ALT), egui::Event::Text("∞".into())]);
+            assert_eq!(app.runtime.tickets.panel.query, "∞");
+            assert!(app.runtime.tickets.panel.chips.is_empty());
+            frame(app, ctx, vec![key(Key::Num1, egui::Modifiers::ALT), egui::Event::Text("¡".into())]);
+            assert_eq!(app.runtime.tickets.panel.query, "∞", "a mapped chip consumes its Option text");
+            assert!(app.runtime.tickets.panel.chips.contains(&0));
+            settle(app);
+        });
+    }
+
+    #[test]
     fn chief_results_are_tagged_and_leave_the_users_query_alone() {
         with_app("app::tickets_panel::tests::chief_results_are_tagged_and_leave_the_users_query_alone", |app, ctx| {
             open_panel(app, ctx, TicketsView::Find);
@@ -2444,6 +2566,11 @@ mod tests {
                 }
                 settle(app);
                 let original = finds(&state).last().unwrap().clone();
+                app.runtime.tickets_more();
+                settle(app);
+                let loaded = labels(app);
+                let selected = app.runtime.tickets.panel.find.selected;
+                assert_eq!(loaded.len(), 4);
                 edit_state(&state, |state| state["fail"] = serde_json::json!(["find_tickets"]));
                 let before = finds(&state).len();
                 app.runtime.tickets_more();
@@ -2453,13 +2580,21 @@ mod tests {
                 assert!(calls[before]["cursor"].is_string());
                 assert_eq!(calls.last().unwrap(), &original);
                 assert_eq!(app.runtime.tickets.panel.find.next, None);
-                assert!(app.runtime.tickets.panel.find.results.is_empty());
+                assert_eq!(labels(app), loaded, "failed More and retry keep the loaded pages");
+                assert_eq!(app.runtime.tickets.panel.find.selected, selected);
                 assert!(app.runtime.tickets.panel.find.error.is_some());
                 edit_state(&state, |state| state["fail"] = serde_json::json!([]));
+                app.runtime.tickets.panel.find.offset = 66.0;
                 app.runtime.tickets_restart();
+                assert!(app.runtime.tickets.panel.find.busy);
+                assert_eq!(labels(app), loaded, "keep pages while the first page is loading");
+                assert_eq!(app.runtime.tickets.panel.find.selected, selected);
+                assert_eq!(app.runtime.tickets.panel.find.offset, 66.0);
                 settle(app);
                 assert_eq!(finds(&state).last().unwrap(), &original);
                 assert_eq!(labels(app).len(), 2, "replaces rather than appends");
+                assert_eq!(app.runtime.tickets.panel.find.selected, Some(0));
+                assert!(app.runtime.tickets.panel.find.reveal, "reveal the first replacement row when it arrives");
                 assert!(app.runtime.tickets.panel.find.error.is_none());
             }
         });
@@ -2529,11 +2664,17 @@ mod tests {
             frame(app, ctx, vec![key(Key::ArrowDown, NONE)]);
             settle(app);
             assert_eq!(labels(app), ["DEMO-5", "DEMO-4", "DEMO-3", "DEMO-2"]);
-            assert_eq!(app.runtime.tickets.panel.find.selected, Some(1), "the selection stays");
+            assert_eq!(app.runtime.tickets.panel.find.selected, Some(2), "More selects the first new row");
             assert_eq!(finds(&state).last().unwrap()["cursor"], "2");
             app.runtime.tickets_more();
             settle(app);
             assert_eq!(labels(app).len(), 5);
+            assert_eq!(
+                app.runtime.tickets.panel.find.selected,
+                Some(4),
+                "explicit More also selects the first new row"
+            );
+            assert!(app.runtime.tickets.panel.find.reveal);
             assert_eq!(app.runtime.tickets.panel.find.next, None, "the last page has no cursor");
         });
     }

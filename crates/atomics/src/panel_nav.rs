@@ -32,17 +32,22 @@ pub fn take_keys(ui: &egui::Ui, keys: &[Key]) -> Vec<Key> {
 
 /// `take_keys` for another keyboard target, such as the chief's trace lane.
 pub fn take_keys_for(ui: &egui::Ui, focus: egui::Id, keys: &[Key]) -> Vec<Key> {
+    take_key_presses_for(ui, focus, keys).into_iter().map(|(key, _)| key).collect()
+}
+
+/// Takes keys with their repeat flag, so scrolling can repeat without repeating ticket changes.
+pub fn take_key_presses_for(ui: &egui::Ui, focus: egui::Id, keys: &[Key]) -> Vec<(Key, bool)> {
     let mut taken = Vec::new();
     if !ui.memory(|m| m.has_focus(focus)) {
         return taken;
     }
     ui.input_mut(|i| {
         i.events.retain(|event| {
-            let egui::Event::Key { key, pressed: true, modifiers, .. } = event else { return true };
+            let egui::Event::Key { key, pressed: true, modifiers, repeat, .. } = event else { return true };
             if !modifiers.is_none() || !keys.contains(key) {
                 return true;
             }
-            taken.push(*key);
+            taken.push((*key, *repeat));
             false
         });
     });

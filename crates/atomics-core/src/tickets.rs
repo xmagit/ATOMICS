@@ -973,14 +973,24 @@ impl Operation {
         mapped_field(result, &self.paging.next).filter(|cursor| !cursor.is_empty())
     }
 
-    /// The tool arguments with `extra` added, replacing any of the same name, and placeholders filled in.
+    /// The tool arguments with `extra` replacing any of the same name and placeholders filled in.
+    /// Paging cursors are opaque server values, inserted after placeholder rendering.
     pub fn arguments_with(&self, vars: &Vars, extra: &Map<String, Value>) -> Result<Value, String> {
         if extra.is_empty() {
             return self.arguments(vars);
         }
         let mut operation = self.clone();
-        operation.arguments.extend(extra.clone());
-        operation.arguments(vars)
+        let mut extra = extra.clone();
+        let cursor = extra.remove(&self.paging.cursor);
+        if cursor.is_some() {
+            operation.arguments.remove(&self.paging.cursor);
+        }
+        operation.arguments.extend(extra);
+        let mut arguments = operation.arguments(vars)?;
+        if let Some(cursor) = cursor {
+            arguments.as_object_mut().expect("arguments are an object").insert(self.paging.cursor.clone(), cursor);
+        }
+        Ok(arguments)
     }
 
     /// The tool arguments with placeholders filled in.
@@ -2724,6 +2734,20 @@ arguments = {{ key = "{{nonce}}", nested = ["{{nonce}}", "{{body}}"] }}"#
             plan_id: "demo-1",
             extra: "",
         }
+    }
+
+    #[test]
+    fn tickets_panel_cursor_is_opaque_while_filter_placeholders_render() {
+        let mut operation = Operation::default();
+        operation.paging.cursor = "cursor".into();
+        operation.arguments.insert("query".into(), json!("{query}"));
+        operation.arguments.insert("cursor".into(), json!("{unavailable}"));
+        let extra = json!({"cursor": "opaque:{query}:{unavailable}", "assignee": "{query}"});
+        let vars = Vars::new("demo").with("query", Some("search terms"));
+        assert_eq!(
+            operation.arguments_with(&vars, extra.as_object().unwrap()).unwrap(),
+            json!({"query": "search terms", "assignee": "search terms", "cursor": "opaque:{query}:{unavailable}"})
+        );
     }
 
     #[test]

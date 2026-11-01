@@ -1135,7 +1135,8 @@ kind = "shell"
                 block.lines().skip(1).map(|line| line.strip_prefix("# ").unwrap_or("")).collect::<Vec<_>>().join("\n");
             let config: Config = toml::from_str(&text).unwrap();
             assert!(config.tickets.is_configured());
-            if config.tickets.has_views() {
+            if name == "RELAY PROFILE" {
+                assert!(config.tickets.has_views());
                 assert_eq!(config.tickets.views[1].arguments["status"], serde_json::json!(["active"]));
                 assert_eq!(config.tickets.filters[0].arguments["assignee"], "owner");
             }

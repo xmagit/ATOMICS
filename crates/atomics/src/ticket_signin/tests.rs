@@ -186,7 +186,8 @@ fn expiry_refreshes_then_invalid_grant_signs_out_and_the_worker_does_not_back_of
     let config = Arc::new(config(&server));
     let comment = |tag: u32| {
         let link = TicketLink { id: "1".into(), ..TicketLink::default() };
-        jobs.send(TicketJob { config: config.clone(), op: TicketOp::Comment(link, "Hi".into()), tag }).unwrap();
+        jobs.send(TicketJob { config: config.clone(), op: TicketOp::Comment(link, "Hi".into()), tag, sequence: None })
+            .unwrap();
         results.recv_timeout(Duration::from_secs(10)).unwrap().1
     };
     for tag in 0..2 {
@@ -292,7 +293,8 @@ fn no_token_or_client_secret_reaches_doctor_output_plan_files_errors_or_messages
     let jobs = spawn_with(done, oauth.clone());
     config.server = server.clone();
     let link = TicketLink { id: "1".into(), ..TicketLink::default() };
-    jobs.send(TicketJob { config: Arc::new(config), op: TicketOp::Comment(link, "Hi".into()), tag: 0 }).unwrap();
+    jobs.send(TicketJob { config: Arc::new(config), op: TicketOp::Comment(link, "Hi".into()), tag: 0, sequence: None })
+        .unwrap();
     outputs.push(results.recv_timeout(Duration::from_secs(10)).unwrap().1.err().unwrap());
     outputs.push(sign_out_message("h", &Err("boom".into())));
 

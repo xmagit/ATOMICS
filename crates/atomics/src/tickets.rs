@@ -1,8 +1,10 @@
 //! The ticket worker: runs the generic ticket operations against the configured MCP
 //! server on a thread of its own, so a slow or broken ticket system never holds up
-//! ATOMICS. Jobs run one at a time, in order, over one kept-open connection.
+//! ATOMICS. Jobs run one at a time, in order, over one kept-open connection; superseded
+//! panel requests are acknowledged without calling the server.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
@@ -75,6 +77,8 @@ pub struct TicketJob<T> {
     pub config: Arc<TicketConfig>,
     pub op: TicketOp,
     pub tag: T,
+    /// Panel reads/listings can be superseded while waiting behind a slow job. Other work has no sequence.
+    pub sequence: Option<(Arc<AtomicU64>, u64)>,
 }
 
 /// Starts the worker. Each finished job comes back on `done` with its tag.
@@ -95,9 +99,15 @@ pub fn spawn_with<T: Send + 'static>(
         .spawn(move || {
             let mut worker = Worker { oauth: Some(oauth), ..Worker::default() };
             while let Ok(job) = rx.recv() {
-                worker.prepare(&job.config);
-                let result = worker.run(&job.config, job.op);
-                let result = worker.clean(result);
+                let result =
+                    if job.sequence.as_ref().is_some_and(|(current, seq)| current.load(Ordering::Relaxed) != *seq) {
+                        // Still acknowledge the job so the app can retire its pending count.
+                        Err("superseded ticket request".into())
+                    } else {
+                        worker.prepare(&job.config);
+                        let result = worker.run(&job.config, job.op);
+                        worker.clean(result)
+                    };
                 if done.send((job.tag, result)).is_err() {
                     break;
                 }
@@ -838,6 +848,51 @@ mod tests {
     }
 
     #[test]
+    fn tickets_panel_worker_drops_stale_reads_and_pages_but_acknowledges_every_job() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let state = dir.path().join("fake.json");
+        let config = Arc::new(crate::mcp_client::tests::example_profile("meaning-example", &state));
+        let current = Arc::new(AtomicU64::new(2));
+        let link = TicketLink {
+            id: "00000000-0000-4000-8000-000000000001".into(),
+            key: Some("DEMO-1".into()),
+            ..Default::default()
+        };
+        let (done, results) = crate::host::Wake::default().channel();
+        let jobs = spawn(done);
+        let stale = [
+            TicketOp::ReadCard(link.clone()),
+            TicketOp::Children(link.clone()),
+            TicketOp::Related(link.clone()),
+            TicketOp::Page { name: "browse", query: None, extra: Map::new() },
+        ];
+        for (tag, op) in stale.into_iter().enumerate() {
+            jobs.send(TicketJob { config: config.clone(), op, tag, sequence: Some((current.clone(), 1)) }).unwrap();
+        }
+        for expected in 0..4 {
+            let (tag, result) = results.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert_eq!(tag, expected, "dropped jobs still retire pending counts");
+            assert_eq!(result.err().unwrap(), "superseded ticket request");
+        }
+        assert!(!state.exists(), "stale jobs never connect to the ticket server");
+        for (tag, op, sequence) in [
+            (4, TicketOp::ReadCard(link.clone()), Some((current, 2))),
+            (5, TicketOp::Comment(link, "Keep unsequenced writes".into()), None),
+        ] {
+            jobs.send(TicketJob { config: config.clone(), op, tag, sequence }).unwrap();
+            let (finished, result) = results.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert_eq!(finished, tag);
+            assert!(result.is_ok(), "{tag}: {:?}", result.err());
+        }
+        let state: Value = serde_json::from_str(&std::fs::read_to_string(state).unwrap()).unwrap();
+        assert_eq!(
+            state["calls"].as_array().unwrap().len(),
+            3,
+            "only the current read, the write and its follow-up get reached the server"
+        );
+    }
+
+    #[test]
     fn a_job_against_a_server_that_is_not_signed_in_fails_without_opening_a_browser() {
         use std::os::unix::fs::PermissionsExt;
         let (dir, keychain, _) = crate::credentials::tests::machine(false);
@@ -855,7 +910,7 @@ mod tests {
         let jobs = spawn_with(done, oauth);
         for tag in 0..2 {
             let op = TicketOp::Comment(TicketLink { id: "1".into(), ..TicketLink::default() }, "Hi".into());
-            jobs.send(TicketJob { config: Arc::new(config.clone()), op, tag }).unwrap();
+            jobs.send(TicketJob { config: Arc::new(config.clone()), op, tag, sequence: None }).unwrap();
             let (_, result) = results.recv_timeout(Duration::from_secs(10)).unwrap();
             let error = result.err().unwrap();
             assert!(crate::mcp_client::is_sign_in_required(&error), "{error}");
@@ -897,7 +952,7 @@ mod tests {
             let jobs = spawn(done);
             let comment = |n: u32| {
                 let op = TicketOp::Comment(TicketLink { id: "1".into(), ..TicketLink::default() }, "Hi".into());
-                jobs.send(TicketJob { config: config.clone(), op, tag: n }).unwrap();
+                jobs.send(TicketJob { config: config.clone(), op, tag: n, sequence: None }).unwrap();
                 let (tag, result) = results.recv_timeout(Duration::from_secs(10)).unwrap();
                 assert_eq!(tag, n);
                 result.err().unwrap()

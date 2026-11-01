@@ -172,6 +172,7 @@ impl Desktop<'_> {
             for (n, key) in
                 [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9]
                     .into_iter()
+                    .take(self.runtime.tickets.config.as_ref().map_or(0, |config| config.filters.len()))
                     .enumerate()
             {
                 if ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, key)) {
