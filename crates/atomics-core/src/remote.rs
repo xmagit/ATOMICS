@@ -203,18 +203,23 @@ impl RemoteState {
         Ok(())
     }
 
-    /// Other plans' sidecars on `conversation`. The server keeps one conversation per item,
-    /// ATOMICS one sidecar per plan.
+    /// Other plans' sidecars on `conversation`, by plan id. The server keeps one conversation
+    /// per item, ATOMICS one sidecar per plan.
     #[cfg(feature = "native")]
-    fn others(home: &std::path::Path, plan: &str, conversation: &str) -> anyhow::Result<Vec<RemoteState>> {
+    fn others(home: &std::path::Path, plan: &str, conversation: &str) -> anyhow::Result<Vec<(String, RemoteState)>> {
         let own = Self::path(home, plan)?;
         let Ok(entries) = std::fs::read_dir(home.join("plans")) else { return Ok(Vec::new()) };
         let mut others = Vec::new();
         for entry in entries.flatten() {
             let path = entry.path();
-            if path == own || !path.file_name().is_some_and(|name| name.to_string_lossy().ends_with(".remote.json")) {
+            let Some(id) = path
+                .file_name()
+                .and_then(|name| name.to_str()?.strip_suffix(".remote.json"))
+                .filter(|_| path != own)
+                .map(str::to_string)
+            else {
                 continue;
-            }
+            };
             // Another plan's broken sidecar is reported when that plan is followed, not here.
             let Ok(other) = std::fs::read(&path)
                 .map_err(anyhow::Error::from)
@@ -223,7 +228,7 @@ impl RemoteState {
                 continue;
             };
             if other.conversation.as_deref() == Some(conversation) {
-                others.push(other);
+                others.push((id, other));
             }
         }
         Ok(others)
@@ -233,20 +238,22 @@ impl RemoteState {
     /// sidecar reserved there, else 1.
     #[cfg(feature = "native")]
     pub fn used_seq(home: &std::path::Path, plan: &str, conversation: &str) -> anyhow::Result<u64> {
-        Ok(Self::others(home, plan, conversation)?.iter().map(|other| other.next_seq).fold(1, u64::max))
+        Ok(Self::others(home, plan, conversation)?.iter().map(|(_, other)| other.next_seq).fold(1, u64::max))
     }
 
-    /// The furthest cursor other plans' sidecars hold on `conversation`, and the steering ids
-    /// they saw: a plan taking the conversation (back) neither delivers again what another
-    /// plan handled nor skips what was written since.
+    /// The furthest cursor the sidecars of the open `peers` hold on `conversation`, and the
+    /// steering ids they saw: a plan taking the conversation (back) from an open plan neither
+    /// delivers again what that plan handled nor skips what was written since. A closed plan's
+    /// leftover sidecar hands nothing over: steering written while remote was off stays unread.
     #[cfg(feature = "native")]
     pub fn used_cursor(
         home: &std::path::Path,
         plan: &str,
         conversation: &str,
+        peers: &[String],
     ) -> anyhow::Result<(Option<Value>, Vec<String>)> {
         let (mut cursor, mut seen) = (None::<Value>, Vec::new());
-        for other in Self::others(home, plan, conversation)? {
+        for (_, other) in Self::others(home, plan, conversation)?.into_iter().filter(|(id, _)| peers.contains(id)) {
             if let Some(theirs) = other.cursor.filter(|c| !c.is_null())
                 && crate::tickets::seq_after(Some(&theirs), cursor.as_ref())
             {

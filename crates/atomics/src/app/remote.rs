@@ -223,6 +223,8 @@ impl State {
         self.tickets.remote.plans.retain(|id, _| followed.iter().any(|(plan, ..)| plan == id));
         let home = paths::atomics_home();
         let epoch = self.tickets.remote.epoch;
+        let open: Vec<(String, ticket::TicketLink)> =
+            linked.iter().map(|(index, link)| (self.plans[*index].id.clone(), link.clone())).collect();
         let mut jobs = Vec::new();
         for (plan, link, goal) in followed {
             let remote = &mut self.tickets.remote;
@@ -241,6 +243,12 @@ impl State {
                 let title = Some(ticket::conversation_title(&goal))
                     .filter(|title| !title.is_empty())
                     .unwrap_or_else(|| ticket::conversation_title(link.label()));
+                // A takeover continues from open plans only; a closed plan's sidecar is left over.
+                let peers = open
+                    .iter()
+                    .filter(|(id, other)| *id != plan && other.same_ticket(&link))
+                    .map(|(id, _)| id.clone())
+                    .collect();
                 let op = TicketOp::RemoteOpen {
                     home: home.clone(),
                     plan: plan.clone(),
@@ -249,6 +257,7 @@ impl State {
                     owners: owners.clone(),
                     recover,
                     reset: entry.lost.is_some(),
+                    peers,
                 };
                 jobs.push((plan, op, RemoteJob::Open));
                 continue;

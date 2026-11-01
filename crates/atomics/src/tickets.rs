@@ -37,7 +37,8 @@ pub enum TicketOp {
     },
     /// Open a plan's conversation (idempotent) and reconcile its sidecar. `recover` handles
     /// deliveries a previous process recorded and never finished; `reset` starts again at the
-    /// server's cursor after the conversation was lost.
+    /// server's cursor after the conversation was lost. `peers` are the other open plans on
+    /// the ticket: only their sidecars hand the conversation's cursor over.
     RemoteOpen {
         home: PathBuf,
         plan: String,
@@ -46,6 +47,7 @@ pub enum TicketOp {
         owners: Vec<String>,
         recover: bool,
         reset: bool,
+        peers: Vec<String>,
     },
     /// Record the digest whose approval was requested, or none, in the sidecar.
     RemoteRequested {
@@ -331,8 +333,8 @@ impl Worker {
         let system = config.system.as_str();
         match op {
             TicketOp::ResetOutboxes => Ok(TicketOutput::Outbox(Vec::new())),
-            TicketOp::RemoteOpen { home, plan, link, title, owners, recover, reset } => {
-                self.remote_open(config, &home, &plan, &link, &title, owners, recover, reset)
+            TicketOp::RemoteOpen { home, plan, link, title, owners, recover, reset, peers } => {
+                self.remote_open(config, &home, &plan, &link, &title, owners, recover, reset, &peers)
             }
             TicketOp::RemoteRequested { home, plan, digest } => {
                 let mut state = RemoteState::load(&home, &plan).map_err(|e| e.to_string())?;
@@ -619,6 +621,7 @@ impl Worker {
         owners: Vec<String>,
         recover: bool,
         reset: bool,
+        peers: &[String],
     ) -> Result<TicketOutput, String> {
         let nonce = uuid::Uuid::new_v4().to_string();
         let title = Some(tickets::conversation_title(title))
@@ -643,13 +646,13 @@ impl Worker {
                 messages.push(format!("A remote message {RESTARTED_TEXT}"));
             }
         }
-        // Another plan on the same ticket may have followed this conversation: one conversation per ticket.
+        // Another open plan on the same ticket may have followed this conversation: one conversation per ticket.
         let (their_cursor, their_seen) =
-            RemoteState::used_cursor(home, plan, &conversation.id).map_err(|e| e.to_string())?;
+            RemoteState::used_cursor(home, plan, &conversation.id, peers).map_err(|e| e.to_string())?;
         if state.conversation.as_deref() != Some(conversation.id.as_str()) {
             // A new conversation starts at the server's newest revision: nothing written
             // before remote was on, or before a lost sidecar, is ever delivered. Taken over from
-            // another plan, it starts where that plan stopped. Its events start at 1.
+            // another open plan, it starts where that plan stopped. Its events start at 1.
             state.conversation = Some(conversation.id.clone());
             state.cursor = their_cursor.clone().or_else(|| conversation.cursor.clone());
             state.retries.clear();
@@ -1057,6 +1060,7 @@ pub(crate) mod tests {
                 owners: vec!["human-1".into(), "human-2".into()],
                 recover: true,
                 reset: false,
+                peers: Vec::new(),
             };
             let TicketOutput::Remote(RemoteOutput::Opened { conversation, messages, .. }) =
                 worker.run(&config, open).unwrap()
@@ -1156,6 +1160,7 @@ pub(crate) mod tests {
             owners: vec!["human-1".into()],
             recover: false,
             reset: false,
+            peers: Vec::new(),
         };
         worker.run(&config, open).unwrap();
         set(&path, |state| {
@@ -2227,6 +2232,7 @@ pub(crate) mod tests {
             owners: vec!["human-1".into()],
             recover: false,
             reset: false,
+            peers: Vec::new(),
         };
         let mut config = conversation_profile("", &path);
         let mut worker = Worker::default();
@@ -2349,6 +2355,7 @@ pub(crate) mod tests {
             owners: vec!["human-1".into()],
             recover: false,
             reset: false,
+            peers: Vec::new(),
         };
         worker.run(&config, open).unwrap();
         // A write to a conversation the plan no longer follows is only dropped.
@@ -2398,6 +2405,7 @@ pub(crate) mod tests {
                 owners: vec!["human-1".into()],
                 recover: false,
                 reset: false,
+                peers: vec![if plan == "older" { "newer" } else { "older" }.to_string()],
             };
             worker.run(&config, op).unwrap();
         };
@@ -2448,5 +2456,60 @@ pub(crate) mod tests {
         let pasted: Vec<_> =
             server(&path)["acks"].as_array().unwrap().iter().map(|ack| ack["ids"][0].clone()).collect();
         assert_eq!(pasted, [json!("s-2"), json!("s-3"), json!("s-4"), json!("s-5")], "each acknowledged once");
+    }
+
+    #[test]
+    fn remote_a_closed_plans_leftover_sidecar_hands_no_old_steering_over() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let home = dir.path();
+        let path = crate::mcp_client::tests::fake_state(home, json!([]));
+        let item = |id: &str, revision: u64| json!({"id":id, "revision":revision, "author_id":"human-1", "author_kind":"Human", "author":"Example human", "text":id, "at":"now"});
+        set(&path, |state| state["steering"] = json!([item("old", 1)]));
+        let config = conversation_profile("", &path);
+        let mut worker = Worker::default();
+        worker.prepare(&config);
+        let open = |worker: &mut Worker, plan: &str| {
+            let op = TicketOp::RemoteOpen {
+                home: home.into(),
+                plan: plan.into(),
+                link: TicketLink { id: "00000000-0000-4000-8000-000000000001".into(), ..Default::default() },
+                title: "Goal".into(),
+                owners: vec!["human-1".into()],
+                recover: false,
+                reset: false,
+                // The closed plan is no peer: no open plan is on the ticket.
+                peers: Vec::new(),
+            };
+            worker.run(&config, op).unwrap();
+        };
+        let poll = |worker: &mut Worker, plan: &str| -> Vec<String> {
+            let op = TicketOp::RemotePoll {
+                home: home.into(),
+                plan: plan.into(),
+                whoami: Box::new(tickets::Whoami {
+                    id: "agent-1".into(),
+                    kind: "personalAgent".into(),
+                    ..Default::default()
+                }),
+                owners: vec!["human-1".into()],
+            };
+            let TicketOutput::Remote(RemoteOutput::Polled { deliver, .. }) = worker.run(&config, op).unwrap() else {
+                panic!("poll")
+            };
+            deliver.into_iter().map(|item| item.id).collect()
+        };
+        // The closed plan followed the conversation up to revision 1, then remote went off.
+        open(&mut worker, "closed");
+        assert_eq!(RemoteState::load(home, "closed").unwrap().cursor, Some(json!(1)));
+        let add = |id: &str, revision: u64| {
+            set(&path, |state| state["steering"].as_array_mut().unwrap().push(item(id, revision)))
+        };
+        add("while-off", 2);
+        // A new plan starts at the server's newest revision, not at the leftover cursor.
+        open(&mut worker, "fresh");
+        assert_eq!(RemoteState::load(home, "fresh").unwrap().cursor, Some(json!(2)));
+        assert!(poll(&mut worker, "fresh").is_empty(), "steering written while remote was off is not pasted");
+        add("after", 3);
+        assert_eq!(poll(&mut worker, "fresh"), ["after"]);
     }
 }
