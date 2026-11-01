@@ -57,6 +57,24 @@ fn main() {
 }
 
 const TOOLS: &[&str] = &[
+    "whoami",
+    "conversation_open",
+    "conversation_post",
+    "conversation_read",
+    "conversation_ack",
+    "conversation_steerers",
+    "card_whoami",
+    "card_conversation_open",
+    "card_conversation_post",
+    "card_conversation_read",
+    "card_conversation_ack",
+    "card_conversation_steerers",
+    "issue_whoami",
+    "issue_conversation_open",
+    "issue_conversation_post",
+    "issue_conversation_read",
+    "issue_conversation_ack",
+    "issue_conversation_steerers",
     "card_search",
     "card_semantic_search",
     "card_children",
@@ -121,7 +139,7 @@ fn call(path: &str, params: &Value) -> Result<Value, String> {
         save(path, &state);
         std::thread::sleep(std::time::Duration::from_secs(60));
     }
-    if listed("fail") {
+    if listed("fail") || state["refuse_text"].as_str().is_some_and(|text| args["text"] == text) {
         save(path, &state);
         // `fail_message` lets tests make a failing backend echo whatever they need, as one
         // text block or, given an array, as several.
@@ -134,7 +152,7 @@ fn call(path: &str, params: &Value) -> Result<Value, String> {
         return Ok(json!({ "isError": true, "content": content }));
     }
     // Persist successful replies so retries after a lost reply cannot duplicate a write.
-    let key = args["idempotencyKey"].as_str();
+    let key = args["idempotencyKey"].as_str().or_else(|| args["eventId"].as_str()).or_else(|| args["nonce"].as_str());
     if matches!(name, "change_ticket_status" | "add_ticket_comment")
         && args["ticketId"].as_str().is_none_or(|id| uuid::Uuid::parse_str(id).is_err())
     {
@@ -159,96 +177,149 @@ fn call(path: &str, params: &Value) -> Result<Value, String> {
     let text = |value: Value| json!({ "content": [{ "type": "text", "text": value.to_string() }] });
     let structured =
         |value: Value| json!({ "structuredContent": value, "content": [{ "type": "text", "text": "ok" }] });
-    let result = match name {
-        "card_search" | "card_semantic_search" => {
-            structured(json!({"cards": search(&state, &args["query"]).map(card).collect::<Vec<_>>()}))
+    let generic = name.strip_prefix("card_").or_else(|| name.strip_prefix("issue_")).unwrap_or(name);
+    let result = if generic == "whoami" {
+        let identity = state.get("whoami").cloned().unwrap_or_else(|| {
+            json!({
+                "userId":"agent-1", "kind":"personalAgent", "displayName":"Example agent",
+                "ownerUserId":"human-1", "ownerDisplayName":"Example human"
+            })
+        });
+        if name.starts_with("card_") {
+            structured(
+                json!({"actor": {"ref":identity["userId"], "type":identity["kind"], "name":identity["displayName"],
+                "owner":{"ref":identity["ownerUserId"], "name":identity["ownerDisplayName"]}}}),
+            )
+        } else if name.starts_with("issue_") {
+            text(json!({"uuid":identity["userId"], "kind":identity["kind"], "name":identity["displayName"],
+                "owner_id":identity["ownerUserId"], "owner_name":identity["ownerDisplayName"]}))
+        } else {
+            text(identity)
         }
-        "card_children" => structured(json!({"cards": children(&state, &args["card"]).map(card).collect::<Vec<_>>()})),
-        "card_related" => structured(json!({"cards": related(&state, &args["card"])? .map(card).collect::<Vec<_>>()})),
-        "issue_semantic_search" => {
-            text(json!({"issues": search(&state, &args["query"]).map(issue).collect::<Vec<_>>()}))
-        }
-        "issue_search" if args["query"].is_string() => {
-            text(json!({"issues": search(&state, &args["query"]).map(issue).collect::<Vec<_>>()}))
-        }
-        "issue_children" => text(json!({"issues": children(&state, &args["id"]).map(issue).collect::<Vec<_>>()})),
-        "issue_related" => text(json!({"issues": related(&state, &args["id"])? .map(issue).collect::<Vec<_>>()})),
-        "find_tickets" | "find_keyword_tickets" => {
-            text(json!({"result":{"tickets": search(&state, args.get("about").unwrap_or(&args["query"]))
+    } else if generic.starts_with("conversation_") {
+        let result = match generic {
+            "conversation_open" => {
+                json!({"id":"conversation-1", "cursor":state["cursor"].as_u64().unwrap_or(0), "steerers":args["owners"]})
+            }
+            "conversation_post" => {
+                if !state["posts"].is_array() {
+                    state["posts"] = json!([]);
+                }
+                state["posts"].as_array_mut().unwrap().push(args.clone());
+                json!({"posted":true})
+            }
+            "conversation_read" => json!({"items":state["steering"].as_array().cloned().unwrap_or_default()}),
+            "conversation_ack" => {
+                if !state["acks"].is_array() {
+                    state["acks"] = json!([]);
+                }
+                state["acks"].as_array_mut().unwrap().push(args.clone());
+                json!({"acknowledged":true})
+            }
+            "conversation_steerers" => json!({"steerers":state["steerers"].as_array().cloned().unwrap_or_default()}),
+            _ => return Err(format!("unknown tool {name}")),
+        };
+        if name.starts_with("card_") { structured(result) } else { text(result) }
+    } else {
+        match name {
+            "card_search" | "card_semantic_search" => {
+                structured(json!({"cards": search(&state, &args["query"]).map(card).collect::<Vec<_>>()}))
+            }
+            "card_children" => {
+                structured(json!({"cards": children(&state, &args["card"]).map(card).collect::<Vec<_>>()}))
+            }
+            "card_related" => {
+                structured(json!({"cards": related(&state, &args["card"])? .map(card).collect::<Vec<_>>()}))
+            }
+            "issue_semantic_search" => {
+                text(json!({"issues": search(&state, &args["query"]).map(issue).collect::<Vec<_>>()}))
+            }
+            "issue_search" if args["query"].is_string() => {
+                text(json!({"issues": search(&state, &args["query"]).map(issue).collect::<Vec<_>>()}))
+            }
+            "issue_children" => text(json!({"issues": children(&state, &args["id"]).map(issue).collect::<Vec<_>>()})),
+            "issue_related" => text(json!({"issues": related(&state, &args["id"])? .map(issue).collect::<Vec<_>>()})),
+            "find_tickets" | "find_keyword_tickets" => {
+                text(json!({"result":{"tickets": search(&state, args.get("about").unwrap_or(&args["query"]))
             .take(args["take"].as_u64().unwrap_or(25).min(25) as usize).map(found_ticket).collect::<Vec<_>>()}}))
-        }
-        "find_related_tickets" => text(
-            json!({"result":{"tickets": related(&state, &args["ticket"])? .map(found_ticket).collect::<Vec<_>>()}}),
-        ),
-        "get_children" => {
-            text(json!({"result":{"tickets": children(&state, &args["ticket"]).map(found_ticket).collect::<Vec<_>>()}}))
-        }
-        "list_ticket_children" => text(json!({"children": children(&state, &args["ticket"])
+            }
+            "find_related_tickets" => text(
+                json!({"result":{"tickets": related(&state, &args["ticket"])? .map(found_ticket).collect::<Vec<_>>()}}),
+            ),
+            "get_children" => text(
+                json!({"result":{"tickets": children(&state, &args["ticket"]).map(found_ticket).collect::<Vec<_>>()}}),
+            ),
+            "list_ticket_children" => text(json!({"children": children(&state, &args["ticket"])
             .take(args["take"].as_u64().unwrap_or(50).min(50) as usize).map(found_ticket).collect::<Vec<_>>()})),
-        "card_get" => structured(json!({ "card": card(find(&state, &args["card"])?) })),
-        "card_list" => structured(json!({ "cards": on_board(&state, &args["board"]).map(card).collect::<Vec<_>>() })),
-        "card_move" => {
-            change(&mut state, &args["card"], |t| t["state"] = args["column"].clone())?;
-            structured(json!({ "moved": true }))
-        }
-        "card_note" => {
-            change(&mut state, &args["card"], |t| comment(t, &args["text"]))?;
-            structured(json!({ "noted": true }))
-        }
-        "card_add" => structured(json!({ "card": card(&create(&mut state, &args["board"], &args["name"])) })),
-        "issue_read" => text(issue(find(&state, &args["id"])?)),
-        "issue_search" => text(json!({ "issues": on_board(&state, &args["project"]).map(issue).collect::<Vec<_>>() })),
-        "issue_save" => {
-            change(&mut state, &args["id"], |t| t["state"] = args["state"].clone())?;
-            text(json!({ "success": true }))
-        }
-        "issue_comment" => {
-            change(&mut state, &args["issueId"], |t| comment(t, &args["body"]))?;
-            text(json!({ "success": true }))
-        }
-        "issue_create" => text(issue(&create(&mut state, &args["project"], &args["title"]))),
-        "get_ticket" => {
-            let ticket = find(&state, args.get("ticketNumber").unwrap_or(&args["ticket"]))?;
-            text(json!({"row": found_ticket(ticket), "ticket": full_ticket(ticket), "url": ticket["url"],
+            "card_get" => structured(json!({ "card": card(find(&state, &args["card"])?) })),
+            "card_list" => {
+                structured(json!({ "cards": on_board(&state, &args["board"]).map(card).collect::<Vec<_>>() }))
+            }
+            "card_move" => {
+                change(&mut state, &args["card"], |t| t["state"] = args["column"].clone())?;
+                structured(json!({ "moved": true }))
+            }
+            "card_note" => {
+                change(&mut state, &args["card"], |t| comment(t, &args["text"]))?;
+                structured(json!({ "noted": true }))
+            }
+            "card_add" => structured(json!({ "card": card(&create(&mut state, &args["board"], &args["name"])) })),
+            "issue_read" => text(issue(find(&state, &args["id"])?)),
+            "issue_search" => {
+                text(json!({ "issues": on_board(&state, &args["project"]).map(issue).collect::<Vec<_>>() }))
+            }
+            "issue_save" => {
+                change(&mut state, &args["id"], |t| t["state"] = args["state"].clone())?;
+                text(json!({ "success": true }))
+            }
+            "issue_comment" => {
+                change(&mut state, &args["issueId"], |t| comment(t, &args["body"]))?;
+                text(json!({ "success": true }))
+            }
+            "issue_create" => text(issue(&create(&mut state, &args["project"], &args["title"]))),
+            "get_ticket" => {
+                let ticket = find(&state, args.get("ticketNumber").unwrap_or(&args["ticket"]))?;
+                text(json!({"row": found_ticket(ticket), "ticket": full_ticket(ticket), "url": ticket["url"],
                 "comments": ticket["comments"], "childCount": children(&state, &ticket["id"]).count()}))
+            }
+            "list_tickets" => {
+                structured(json!({"tickets": on_board(&state, &args["board"]).map(full_ticket).collect::<Vec<_>>() }))
+            }
+            "change_ticket_status" => {
+                change(&mut state, &args["ticketId"], |t| t["state"] = args["stageKey"].clone())?;
+                text(json!({"updated":true}))
+            }
+            "add_ticket_comment" => {
+                change(&mut state, &args["ticketId"], |t| comment(t, &args["body"]))?;
+                text(json!({"posted":true}))
+            }
+            "update_ticket" => {
+                change(&mut state, &args["ticket"], |t| t["state"] = args["status"].clone())?;
+                structured(json!({"updated":true}))
+            }
+            "add_comment" => {
+                change(&mut state, &args["ticket"], |t| comment(t, &args["body"]))?;
+                structured(json!({"posted":true}))
+            }
+            "create_ticket" => {
+                structured(json!({"ticket": full_ticket(&create(&mut state, &args["board"], &args["title"]))}))
+            }
+            "list_issues" if args["parentId"].is_string() => {
+                text(json!({"issues": children(&state, &args["parentId"]).map(issue).collect::<Vec<_>>()}))
+            }
+            "list_issues" => text(json!({"issues": search(&state, &args["query"]).map(issue).collect::<Vec<_>>()})),
+            "get_issue" => text(issue(find(&state, &args["id"])?)),
+            "save_issue" if args["id"].is_string() => {
+                change(&mut state, &args["id"], |t| t["state"] = args["state"].clone())?;
+                text(json!({"success":true}))
+            }
+            "save_issue" => text(issue(&create(&mut state, &args["team"], &args["title"]))),
+            "save_comment" => {
+                change(&mut state, &args["issueId"], |t| comment(t, &args["body"]))?;
+                text(json!({"success":true}))
+            }
+            _ => return Err(format!("unknown tool {name}")),
         }
-        "list_tickets" => {
-            structured(json!({"tickets": on_board(&state, &args["board"]).map(full_ticket).collect::<Vec<_>>() }))
-        }
-        "change_ticket_status" => {
-            change(&mut state, &args["ticketId"], |t| t["state"] = args["stageKey"].clone())?;
-            text(json!({"updated":true}))
-        }
-        "add_ticket_comment" => {
-            change(&mut state, &args["ticketId"], |t| comment(t, &args["body"]))?;
-            text(json!({"posted":true}))
-        }
-        "update_ticket" => {
-            change(&mut state, &args["ticket"], |t| t["state"] = args["status"].clone())?;
-            structured(json!({"updated":true}))
-        }
-        "add_comment" => {
-            change(&mut state, &args["ticket"], |t| comment(t, &args["body"]))?;
-            structured(json!({"posted":true}))
-        }
-        "create_ticket" => {
-            structured(json!({"ticket": full_ticket(&create(&mut state, &args["board"], &args["title"]))}))
-        }
-        "list_issues" if args["parentId"].is_string() => {
-            text(json!({"issues": children(&state, &args["parentId"]).map(issue).collect::<Vec<_>>()}))
-        }
-        "list_issues" => text(json!({"issues": search(&state, &args["query"]).map(issue).collect::<Vec<_>>()})),
-        "get_issue" => text(issue(find(&state, &args["id"])?)),
-        "save_issue" if args["id"].is_string() => {
-            change(&mut state, &args["id"], |t| t["state"] = args["state"].clone())?;
-            text(json!({"success":true}))
-        }
-        "save_issue" => text(issue(&create(&mut state, &args["team"], &args["title"]))),
-        "save_comment" => {
-            change(&mut state, &args["issueId"], |t| comment(t, &args["body"]))?;
-            text(json!({"success":true}))
-        }
-        _ => return Err(format!("unknown tool {name}")),
     };
     let result = if state["structured_results"] == true && result["structuredContent"].is_null() {
         structured(serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap())

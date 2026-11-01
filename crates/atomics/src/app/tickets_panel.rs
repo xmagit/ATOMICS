@@ -734,7 +734,15 @@ impl Desktop<'_> {
                     let (dot, text) = if self.runtime.tickets.panel.signin {
                         (p.warning, format!("{system} · not signed in"))
                     } else {
-                        (p.success, system.clone())
+                        (
+                            p.success,
+                            self.runtime
+                                .tickets
+                                .whoami
+                                .as_ref()
+                                .map(|id| format!("{system} · {}", id.label()))
+                                .unwrap_or_else(|| system.clone()),
+                        )
                     };
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(RichText::new(text).size(11.5).color(p.muted));
@@ -1131,8 +1139,8 @@ fn comment_view(
 ) {
     ui.horizontal(|ui| {
         ui.label(RichText::new(comment.author.as_deref().unwrap_or("someone")).strong().size(12.0));
-        if comment.kind.as_deref().is_some_and(|k| k.eq_ignore_ascii_case("agent")) {
-            ui.label(RichText::new("agent").size(10.5).color(p.info));
+        if let Some(kind) = comment.author_kind.as_deref().or(comment.kind.as_deref()) {
+            ui.label(RichText::new(kind).size(10.5).color(p.info));
         }
         if let Some(at) = &comment.at {
             ui.label(RichText::new(at).size(11.0).color(p.muted));

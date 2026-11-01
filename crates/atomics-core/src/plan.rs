@@ -79,7 +79,9 @@ pub fn load_plans(home: &Path) -> Result<(Vec<Plan>, Vec<String>)> {
                 continue;
             }
         };
-        if path.extension().is_none_or(|ext| ext != "json") {
+        if path.extension().is_none_or(|ext| ext != "json")
+            || path.file_name().is_some_and(|name| name.to_string_lossy().ends_with(".remote.json"))
+        {
             continue;
         }
         let Some(id) = path.file_stem().and_then(|s| s.to_str()).filter(|id| valid_id(id)) else {
@@ -119,7 +121,10 @@ pub fn unique_id(goal: &str, plans: &[Plan], home: &Path) -> String {
     let slug = if slug.is_empty() { "plan" } else { &slug };
     let mut id = slug.to_string();
     let mut suffix = 2;
-    while plans.iter().any(|p| p.id == id) || home.join("plans").join(format!("{id}.json")).exists() {
+    while plans.iter().any(|p| p.id == id)
+        || home.join("plans").join(format!("{id}.json")).exists()
+        || home.join("plans").join(format!("{id}.remote.json")).exists()
+    {
         id = format!("{slug}-{suffix}");
         suffix += 1;
     }

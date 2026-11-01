@@ -2,10 +2,12 @@
 //! server on a thread of its own, so a slow or broken ticket system never holds up
 //! ATOMICS. Jobs run one at a time, in order, over one kept-open connection.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
+use atomics_core::remote::{PendingWrite, RemoteState, WITHHELD_TEXT};
 use atomics_core::tickets::{self, McpServer, TicketCard, TicketConfig, TicketLink, Vars};
 use serde_json::Value;
 
@@ -22,6 +24,15 @@ const MISSING_ENV: Duration = Duration::from_secs(60);
 pub enum TicketOp {
     /// Resolve trace credentials on this worker, including cross-process token changes.
     TraceCleaner,
+    Whoami,
+    /// Stop retrying sidecars from a previous configuration.
+    ResetOutboxes,
+    /// Register a sidecar for retries, optionally durably adding a new write first.
+    Outbox {
+        home: PathBuf,
+        plan: String,
+        write: Option<Box<PendingWrite>>,
+    },
     // Consumers are added by the chief-tools and Tickets-panel tasks.
     #[allow(dead_code)]
     Search {
@@ -51,6 +62,9 @@ pub enum TicketOp {
 
 pub enum TicketOutput {
     TraceCleaner(tickets::Cleaner),
+    Whoami(tickets::Whoami),
+    /// Messages the UI must surface as toasts (drops, refusals and exhausted retries).
+    Outbox(Vec<String>),
     #[allow(dead_code)]
     Cards(Vec<TicketCard>),
     #[allow(dead_code)]
@@ -69,14 +83,16 @@ pub struct TicketJob<T> {
 }
 
 /// Starts the worker. Each finished job comes back on `done` with its tag.
-pub fn spawn<T: Send + 'static>(done: crate::host::Sender<(T, Result<TicketOutput, String>)>) -> Sender<TicketJob<T>> {
+pub fn spawn<T: Clone + Send + 'static>(
+    done: crate::host::Sender<(T, Result<TicketOutput, String>)>,
+) -> Sender<TicketJob<T>> {
     spawn_with(done, OAuth::current())
 }
 
 /// Like `spawn`, with the keychain and browser that sign-in uses. The worker only reads saved
 /// sign-ins: a job against a server that is not signed in fails with "sign-in required" and never
 /// opens the browser; signing in is the user's act (`OAuth::sign_in`).
-pub fn spawn_with<T: Send + 'static>(
+pub fn spawn_with<T: Clone + Send + 'static>(
     done: crate::host::Sender<(T, Result<TicketOutput, String>)>,
     oauth: OAuth,
 ) -> Sender<TicketJob<T>> {
@@ -85,11 +101,42 @@ pub fn spawn_with<T: Send + 'static>(
         .name("atomics-tickets".into())
         .spawn(move || {
             let mut worker = Worker { oauth: Some(oauth), ..Worker::default() };
-            while let Ok(job) = rx.recv() {
-                worker.prepare(&job.config);
-                let result = worker.run(&job.config, job.op);
-                let result = worker.clean(result);
-                if done.send((job.tag, result)).is_err() {
+            let mut outboxes: Vec<(Arc<TicketConfig>, PathBuf, String, T)> = Vec::new();
+            loop {
+                match rx.recv_timeout(Duration::from_secs(1)) {
+                    Ok(job) => {
+                        if matches!(job.op, TicketOp::ResetOutboxes) {
+                            outboxes.clear();
+                        }
+                        if let TicketOp::Outbox { home, plan, .. } = &job.op {
+                            outboxes.retain(|(_, h, p, _)| h != home || p != plan);
+                            outboxes.push((job.config.clone(), home.clone(), plan.clone(), job.tag.clone()));
+                        }
+                        worker.prepare(&job.config);
+                        let result = worker.run(&job.config, job.op);
+                        let result = worker.clean(result);
+                        if done.send((job.tag, result)).is_err() {
+                            break;
+                        }
+                        // Observe config changes and disconnection before another retry.
+                        continue;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                }
+                let mut disconnected = false;
+                outboxes.retain(|(config, home, plan, tag)| {
+                    worker.prepare(config);
+                    let result = worker.drain_outbox(config, home, plan);
+                    // A broken sidecar is reported once; a new registration may try again.
+                    let keep = result.is_ok();
+                    let quiet = matches!(&result, Ok(TicketOutput::Outbox(messages)) if messages.is_empty());
+                    if !quiet && done.send((tag.clone(), worker.clean(result))).is_err() {
+                        disconnected = true;
+                    }
+                    keep
+                });
+                if disconnected {
                     break;
                 }
             }
@@ -112,6 +159,7 @@ struct Worker {
     missing: std::collections::HashMap<String, Instant>,
     /// Where saved browser sign-ins are read from.
     oauth: Option<OAuth>,
+    content_refused: bool,
 }
 
 impl Worker {
@@ -155,6 +203,8 @@ impl Worker {
         let link = |link: TicketLink| self.cleaner.link(link);
         Ok(match result.map_err(error)? {
             TicketOutput::TraceCleaner(cleaner) => TicketOutput::TraceCleaner(cleaner),
+            TicketOutput::Whoami(identity) => TicketOutput::Whoami(identity.cleaned(&self.cleaner)),
+            TicketOutput::Outbox(messages) => TicketOutput::Outbox(messages.into_iter().map(error).collect()),
             TicketOutput::Ticket(ticket) => TicketOutput::Ticket(link(ticket)),
             TicketOutput::Tickets(tickets) => TicketOutput::Tickets(tickets.into_iter().map(link).collect()),
             TicketOutput::Read(value) => TicketOutput::Read(self.cleaner.value(value)),
@@ -169,6 +219,25 @@ impl Worker {
     fn run(&mut self, config: &TicketConfig, op: TicketOp) -> Result<TicketOutput, String> {
         let system = config.system.as_str();
         match op {
+            TicketOp::ResetOutboxes => Ok(TicketOutput::Outbox(Vec::new())),
+            TicketOp::Whoami => {
+                let value = self.call(config, "whoami", &Vars::new(system))?;
+                tickets::Whoami::read(config.operation("whoami").expect("called"), &value).map(TicketOutput::Whoami)
+            }
+            TicketOp::Outbox { home, plan, write } => {
+                let mut messages = Vec::new();
+                if let Some(write) = write {
+                    let mut state = RemoteState::load(&home, &plan).map_err(|e| e.to_string())?;
+                    if state.queue(&home, &plan, *write).map_err(|e| e.to_string())?.is_some() {
+                        messages.push("Remote outbox full: dropped a tool block".into());
+                    }
+                }
+                let TicketOutput::Outbox(mut drained) = self.drain_outbox(config, &home, &plan)? else {
+                    unreachable!()
+                };
+                messages.append(&mut drained);
+                Ok(TicketOutput::Outbox(messages))
+            }
             TicketOp::TraceCleaner => {
                 let secrets = match &self.oauth {
                     Some(oauth) => oauth.secrets(&config.server).map_err(|err| err.to_string())?,
@@ -246,6 +315,58 @@ impl Worker {
         }
     }
 
+    /// Runs only on the ticket worker. A failed reply leaves the original nonce and
+    /// variables on disk; a process restart registers the same sidecar and replays it.
+    fn drain_outbox(
+        &mut self,
+        config: &TicketConfig,
+        home: &std::path::Path,
+        plan: &str,
+    ) -> Result<TicketOutput, String> {
+        let mut state = RemoteState::load(home, plan).map_err(|e| e.to_string())?;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        let mut messages = Vec::new();
+        // Preserve post order: a delayed write holds later writes behind it.
+        while let Some(write) = state.outbox.first().cloned() {
+            if write.next_at > now {
+                break;
+            }
+            let vars = write.vars.clone().with("nonce", Some(&write.nonce));
+            match self.call(config, &write.op, &vars) {
+                Ok(_) => {
+                    state.outbox.remove(0);
+                    if write.op == "conversation_post" {
+                        state.posted_today += 1;
+                    }
+                }
+                Err(_) if self.content_refused => {
+                    state.outbox.remove(0);
+                    messages.push("Remote text withheld: the ticket system refused it".into());
+                    if write.op == "conversation_post" && !write.withheld {
+                        // A different body needs a new event id; keep the reserved sequence.
+                        let mut replacement = write;
+                        replacement.nonce = uuid::Uuid::new_v4().to_string();
+                        replacement.vars = replacement.vars.with("body", Some(WITHHELD_TEXT));
+                        replacement.withheld = true;
+                        replacement.attempts = 0;
+                        replacement.next_at = 0;
+                        state.outbox.insert(0, replacement);
+                    }
+                }
+                Err(error) => {
+                    if !state.outbox[0].retry(now) {
+                        state.outbox.remove(0);
+                        messages.push(format!("Remote write dropped after 10 attempts: {error}"));
+                    }
+                    state.save(home, plan).map_err(|e| e.to_string())?;
+                    break;
+                }
+            }
+            state.save(home, plan).map_err(|e| e.to_string())?;
+        }
+        Ok(TicketOutput::Outbox(messages))
+    }
+
     fn cards(&mut self, config: &TicketConfig, name: &str, vars: &Vars) -> Result<TicketOutput, String> {
         let output = self.call(config, name, vars)?;
         let cards = config.operation(name).expect("called").cards(&output, &config.system)?;
@@ -264,8 +385,12 @@ impl Worker {
 
     /// Calls the tool behind a generic operation and returns what its result paths read from.
     fn call(&mut self, config: &TicketConfig, name: &str, vars: &Vars) -> Result<Value, String> {
+        self.content_refused = false;
         let operation = config.operation(name).ok_or_else(|| format!("operations.{name} is not configured"))?;
-        let write = matches!(name, "update_state" | "comment" | "create");
+        let write = matches!(
+            name,
+            "update_state" | "comment" | "create" | "conversation_open" | "conversation_post" | "conversation_ack"
+        );
         let idempotent = write && operation.uses_placeholder("nonce");
         if !write && operation.uses_placeholder("nonce") {
             return Err(format!("operations.{name}: {{nonce}} is only allowed in write operations"));
@@ -321,6 +446,10 @@ impl Worker {
     /// The backoff remembers the failure cleaned with this job's secrets: a later job may
     /// run with others.
     fn broken(&mut self, server: &McpServer, err: McpError) -> String {
+        self.content_refused = matches!(&err, McpError::Server(message) if {
+            let message = message.to_ascii_lowercase();
+            message.contains("credential") || message.contains("text refused") || message.contains("content refused")
+        });
         if matches!(err, McpError::SignInRequired(_)) {
             // No backoff: once the user signs in, the next job reconnects with the new tokens.
             self.client = None;
@@ -340,6 +469,259 @@ mod tests {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
     use std::sync::mpsc::Receiver;
+
+    fn remote_profile(prefix: &str, path: &std::path::Path) -> TicketConfig {
+        let mut config = crate::mcp_client::tests::example_profile("meaning-example", path);
+        let whoami = match prefix {
+            "card_" => {
+                json!({"id":"actor.ref", "kind":"actor.type", "name":"actor.name", "owner_id":"actor.owner.ref", "owner_name":"actor.owner.name"})
+            }
+            "issue_" => {
+                json!({"id":"uuid", "kind":"kind", "name":"name", "owner_id":"owner_id", "owner_name":"owner_name"})
+            }
+            _ => {
+                json!({"id":"userId", "kind":"kind", "name":"displayName", "owner_id":"ownerUserId", "owner_name":"ownerDisplayName"})
+            }
+        };
+        config.operations.whoami =
+            Some(serde_json::from_value(json!({"tool":format!("{prefix}whoami"), "result":whoami})).unwrap());
+        config.operations.conversation_post = Some(serde_json::from_value(json!({
+            "tool":format!("{prefix}conversation_post"), "arguments":{"conversation":"{conversation}", "eventId":"{nonce}", "sequence":"{seq}", "text":"{body}"}
+        })).unwrap());
+        config.operations.conversation_ack = Some(
+            serde_json::from_value(json!({
+                "tool":format!("{prefix}conversation_ack"), "arguments":{"conversation":"{conversation}", "ids":"{ids}"}
+            }))
+            .unwrap(),
+        );
+        config
+    }
+
+    #[test]
+    fn ticket_remote_outbox_worker_retries_without_another_job() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let path = crate::mcp_client::tests::fake_state(dir.path(), json!([]));
+        let config = remote_profile("", &path);
+        let mut server: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        server["fail"] = json!(["conversation_post"]);
+        std::fs::write(&path, server.to_string()).unwrap();
+        let (done, results) = crate::host::Wake::default().channel();
+        let jobs = spawn(done);
+        let op = TicketOp::Outbox {
+            home: dir.path().into(),
+            plan: "test".into(),
+            write: Some(Box::new(PendingWrite::new(
+                "conversation_post",
+                uuid::Uuid::new_v4().to_string(),
+                Vars::new(&config.system).with("conversation", Some("conversation-1")).with("body", Some("Hello")),
+            ))),
+        };
+        jobs.send(TicketJob { config: Arc::new(config), op, tag: 1 }).unwrap();
+        let (_, result) = results.recv_timeout(Duration::from_secs(20)).unwrap();
+        assert!(result.is_ok());
+        let persisted = RemoteState::load(dir.path(), "test").unwrap();
+        assert_eq!(persisted.outbox[0].attempts, 1);
+        let mut server: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        server["fail"] = json!([]);
+        std::fs::write(&path, server.to_string()).unwrap();
+        let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
+        while !RemoteState::load(dir.path(), "test").unwrap().outbox.is_empty() {
+            assert!(Instant::now() < deadline, "outbox worker did not retry");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(jobs);
+    }
+
+    #[test]
+    fn ticket_whoami_with_and_without_owner_in_all_three_dialects() {
+        for prefix in ["", "card_", "issue_"] {
+            for owner in [false, true] {
+                let dir = crate::test_support::tempdir().unwrap();
+                let path = crate::mcp_client::tests::fake_state(dir.path(), json!([]));
+                let mut state: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                state["whoami"] = json!({"userId":"agent-1", "kind":if owner {"personalAgent"} else {"agent"}, "displayName":"Example agent"});
+                if owner {
+                    state["whoami"]["ownerUserId"] = json!("human-1");
+                    state["whoami"]["ownerDisplayName"] = json!("Example human");
+                }
+                std::fs::write(&path, state.to_string()).unwrap();
+                let config = remote_profile(prefix, &path);
+                let mut worker = Worker::default();
+                worker.prepare(&config);
+                let result = worker.run(&config, TicketOp::Whoami);
+                let TicketOutput::Whoami(identity) = worker.clean(result).unwrap() else { panic!("whoami") };
+                assert_eq!(identity.id, "agent-1");
+                assert_eq!(identity.name, "Example agent");
+                assert_eq!(identity.owner_id.as_deref(), owner.then_some("human-1"));
+                assert_eq!(identity.owner_name.as_deref(), owner.then_some("Example human"));
+            }
+        }
+    }
+
+    #[test]
+    fn ticket_remote_outbox_dropped_reply_reuses_nonce_and_server_stores_one_post() {
+        for prefix in ["", "card_", "issue_"] {
+            let dir = crate::test_support::tempdir().unwrap();
+            let path = crate::mcp_client::tests::fake_state(dir.path(), json!([]));
+            let mut state: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            state["drop_reply"] = json!([format!("{prefix}conversation_post")]);
+            std::fs::write(&path, state.to_string()).unwrap();
+            let config = remote_profile(prefix, &path);
+            let nonce = uuid::Uuid::new_v4().to_string();
+            let vars =
+                Vars::new(&config.system).with("conversation", Some("conversation-1")).with("body", Some("Hello"));
+            let mut worker = Worker::default();
+            worker.prepare(&config);
+            worker
+                .run(
+                    &config,
+                    TicketOp::Outbox {
+                        home: dir.path().into(),
+                        plan: "test".into(),
+                        write: Some(Box::new(PendingWrite::new("conversation_post", nonce.clone(), vars))),
+                    },
+                )
+                .unwrap();
+            let state: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            let calls = state["calls"].as_array().unwrap();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[0]["arguments"], calls[1]["arguments"]);
+            assert_eq!(calls[0]["arguments"]["eventId"], nonce);
+            assert_eq!(calls[0]["arguments"]["sequence"], 1);
+            assert_eq!(state["posts"].as_array().unwrap().len(), 1);
+            assert!(RemoteState::load(dir.path(), "test").unwrap().outbox.is_empty());
+            assert_eq!(RemoteState::load(dir.path(), "test").unwrap().posted_today, 1);
+        }
+    }
+
+    #[test]
+    fn ticket_remote_outbox_content_refusal_posts_one_placeholder() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let path = crate::mcp_client::tests::fake_state(dir.path(), json!([]));
+        let config = remote_profile("", &path);
+        let mut server: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        server["refuse_text"] = json!("sensitive text");
+        server["fail_message"] = json!("credential-shaped text refused");
+        std::fs::write(&path, server.to_string()).unwrap();
+        let mut worker = Worker::default();
+        let result = worker
+            .run(
+                &config,
+                TicketOp::Outbox {
+                    home: dir.path().into(),
+                    plan: "test".into(),
+                    write: Some(Box::new(PendingWrite::new(
+                        "conversation_post",
+                        uuid::Uuid::new_v4().to_string(),
+                        Vars::new(&config.system)
+                            .with("conversation", Some("conversation-1"))
+                            .with("body", Some("sensitive text")),
+                    ))),
+                },
+            )
+            .unwrap();
+        let TicketOutput::Outbox(messages) = result else { panic!("outbox") };
+        assert_eq!(messages.len(), 1);
+        let server: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(server["calls"].as_array().unwrap().len(), 2);
+        assert_ne!(server["calls"][0]["arguments"]["eventId"], server["calls"][1]["arguments"]["eventId"]);
+        assert_eq!(server["calls"][0]["arguments"]["sequence"], server["calls"][1]["arguments"]["sequence"]);
+        assert_eq!(server["posts"].as_array().unwrap().len(), 1);
+        assert_eq!(server["posts"][0]["text"], WITHHELD_TEXT);
+        assert!(RemoteState::load(dir.path(), "test").unwrap().outbox.is_empty());
+    }
+
+    #[test]
+    fn ticket_remote_outbox_restart_ack_refusal_and_exhaustion() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let home = dir.path();
+        let path = crate::mcp_client::tests::fake_state(home, json!([]));
+        let config = remote_profile("", &path);
+        let mut server: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        server["fail"] = json!(["conversation_post"]);
+        std::fs::write(&path, server.to_string()).unwrap();
+        let nonce = uuid::Uuid::new_v4().to_string();
+        let vars = Vars::new(&config.system).with("conversation", Some("conversation-1")).with("body", Some("hello"));
+        {
+            let mut worker = Worker::default();
+            worker
+                .run(
+                    &config,
+                    TicketOp::Outbox {
+                        home: home.into(),
+                        plan: "test".into(),
+                        write: Some(Box::new(PendingWrite::new("conversation_post", nonce.clone(), vars.clone()))),
+                    },
+                )
+                .unwrap();
+        }
+        let mut persisted = RemoteState::load(home, "test").unwrap();
+        assert_eq!(persisted.outbox[0].attempts, 1);
+        assert_eq!(persisted.outbox[0].nonce, nonce);
+        persisted.outbox[0].next_at = 0;
+        persisted.save(home, "test").unwrap();
+        let mut server: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        server["fail"] = json!([]);
+        std::fs::write(&path, server.to_string()).unwrap();
+        let mut worker = Worker::default();
+        worker.run(&config, TicketOp::Outbox { home: home.into(), plan: "test".into(), write: None }).unwrap();
+        worker
+            .run(
+                &config,
+                TicketOp::Outbox {
+                    home: home.into(),
+                    plan: "test".into(),
+                    write: Some(Box::new(PendingWrite::new(
+                        "conversation_ack",
+                        uuid::Uuid::new_v4().to_string(),
+                        vars.clone().typed("ids", json!(["message-1", "message-2"])),
+                    ))),
+                },
+            )
+            .unwrap();
+        let mut server: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(server["posts"][0]["eventId"], nonce);
+        assert_eq!(server["acks"][0]["ids"], json!(["message-1", "message-2"]));
+        server["fail"] = json!(["conversation_post"]);
+        server["fail_message"] = json!("credential-shaped text refused");
+        std::fs::write(&path, server.to_string()).unwrap();
+        let TicketOutput::Outbox(messages) = worker
+            .run(
+                &config,
+                TicketOp::Outbox {
+                    home: home.into(),
+                    plan: "test".into(),
+                    write: Some(Box::new(PendingWrite::new(
+                        "conversation_post",
+                        uuid::Uuid::new_v4().to_string(),
+                        vars.clone(),
+                    ))),
+                },
+            )
+            .unwrap()
+        else {
+            panic!("outbox")
+        };
+        assert_eq!(messages.len(), 2, "original and one refused replacement");
+        assert!(RemoteState::load(home, "test").unwrap().outbox.is_empty());
+        let mut server: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let calls = server["calls"].as_array().unwrap();
+        assert_eq!(calls.last().unwrap()["arguments"]["text"], WITHHELD_TEXT);
+        assert_ne!(calls[calls.len() - 1]["arguments"]["eventId"], calls[calls.len() - 2]["arguments"]["eventId"]);
+        server["fail_message"] = json!("temporarily unavailable");
+        std::fs::write(&path, server.to_string()).unwrap();
+        let mut persisted = RemoteState::load(home, "test").unwrap();
+        let mut write =
+            PendingWrite::new("conversation_post", uuid::Uuid::new_v4().to_string(), vars.typed("seq", json!(99)));
+        write.attempts = 9;
+        persisted.enqueue(write).unwrap();
+        persisted.save(home, "test").unwrap();
+        let TicketOutput::Outbox(messages) = worker.drain_outbox(&config, home, "test").unwrap() else {
+            panic!("outbox")
+        };
+        assert!(messages[0].contains("10 attempts"));
+        assert!(RemoteState::load(home, "test").unwrap().outbox.is_empty());
+    }
 
     #[test]
     fn nonce_writes_retry_only_connection_failures_and_retryable_http_statuses_once() {
@@ -444,7 +826,7 @@ mod tests {
         let path = fake_state(dir.path(), json!([{"id":id, "key":"DEMO-1", "comments":[]}]));
         let mut config = example_profile("meaning-example", &path);
         config.max_comment_chars = 240;
-        let original = format!("@all @équipe user@example.com {}", "🦀é界".repeat(200));
+        let original = format!("@max-agent @all @équipe user@example.com {}", "🦀é界".repeat(200));
         let task = Task { id: "a".into(), title: "@team".into(), brief: original.clone(), ..Default::default() };
         let author = Author::Agent("Test".into());
         let bodies = [
@@ -466,7 +848,10 @@ mod tests {
             let body = body.as_str().unwrap();
             assert_eq!(body.chars().count(), 240);
             assert!(body.ends_with(" … (truncated)"));
-            assert!(body.contains("@\u{200b}all @\u{200b}équipe user@example.com"), "{body}");
+            assert!(
+                body.contains("@\u{2060}max-agent @\u{2060}all @\u{2060}équipe user@\u{2060}example.com"),
+                "{body}"
+            );
             assert!(!body.contains("@team"));
         }
         assert_eq!(task.brief, original);

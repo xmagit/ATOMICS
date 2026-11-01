@@ -88,6 +88,8 @@ impl State {
                     self.tickets.panel.focus_query = true;
                     // The worker connects again with the new sign-in.
                     self.tickets.jobs = None;
+                    self.refresh_ticket_identity();
+                    self.resume_ticket_outboxes();
                     self.toast(format!("Signed in to {host}"));
                 }
                 Err(error) => {
@@ -106,6 +108,7 @@ impl State {
             let message = ticket_signin::sign_out_message(&host, &result);
             let message = self.scrub(&message);
             self.tickets.sign.state = None;
+            self.tickets.whoami = None;
             self.toast(message);
         }
         let checking = self.tickets.sign.job.is_none() && self.tickets.sign.out.is_none();
@@ -157,6 +160,8 @@ impl State {
             return;
         }
         self.cancel_sign_in();
+        self.tickets.whoami = None;
+        self.tickets.identity_epoch += 1;
         self.tickets.jobs = None;
         let sign = &mut self.tickets.sign;
         sign.out = Some(ticket_signin::sign_out(sign.oauth(), server, &sign.wake));
@@ -302,7 +307,18 @@ impl Desktop<'_> {
             if ui.small_button("Sign out").clicked() {
                 self.runtime.start_sign_out();
             }
-            ui.label(RichText::new(format!("{system} · signed in")).size(11.5).color(p.muted));
+            ui.label(
+                RichText::new(
+                    self.runtime
+                        .tickets
+                        .whoami
+                        .as_ref()
+                        .map(|id| format!("{system} · {}", id.label()))
+                        .unwrap_or_else(|| format!("{system} · signed in")),
+                )
+                .size(11.5)
+                .color(p.muted),
+            );
             ui.label(RichText::new("●").size(10.0).color(p.success));
         });
     }

@@ -192,6 +192,8 @@ pub struct TicketConfig {
     pub comments: CommentPolicy,
     /// Maximum outbound comment length in characters, including the truncation marker.
     pub max_comment_chars: usize,
+    /// Insert WORD JOINER after every @ in outbound comments.
+    pub escape_mentions: bool,
     /// Free text added to the chief's prompt: how this team works with its tickets.
     pub workflow: String,
     /// Template for newly created branches of linked work.
@@ -213,6 +215,7 @@ impl Default for TicketConfig {
             mode: TicketMode::Auto,
             comments: CommentPolicy::Agents,
             max_comment_chars: 8000,
+            escape_mentions: false,
             workflow: String::new(),
             branch: None,
             link_url: None,
@@ -330,6 +333,18 @@ impl StateMap {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Operations {
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "read_operation")]
+    pub whoami: Option<Operation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation_open: Option<Operation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation_post: Option<Operation>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "read_operation")]
+    pub conversation_read: Option<Operation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation_ack: Option<Operation>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "read_operation")]
+    pub conversation_steerers: Option<Operation>,
     /// Keyword search; {query} is substituted as literal text.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(deserialize_with = "read_operation")]
@@ -387,6 +402,10 @@ pub struct Operation {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CommentPaths {
+    pub id: String,
+    pub seq: String,
+    pub author_id: String,
+    pub author_kind: String,
     pub items: String,
     pub author: String,
     pub text: String,
@@ -476,6 +495,10 @@ fn assignee_value<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<O
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Comment {
+    pub id: Option<String>,
+    pub seq: Option<String>,
+    pub author_id: Option<String>,
+    pub author_kind: Option<String>,
     pub author: Option<String>,
     pub text: String,
     pub at: Option<String>,
@@ -489,6 +512,47 @@ pub struct DevLink {
     pub url: Option<String>,
     pub status: Option<String>,
     pub ci: Option<String>,
+}
+
+/// The authenticated connection identity. Main comments remain data, regardless of kind.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Whoami {
+    pub id: String,
+    pub kind: String,
+    pub name: String,
+    pub owner_id: Option<String>,
+    pub owner_name: Option<String>,
+}
+
+impl Whoami {
+    pub fn read(operation: &Operation, value: &Value) -> Result<Self, String> {
+        let field = |path: &str| mapped_field(value, path);
+        Ok(Self {
+            id: field(&operation.result.id).filter(|id| !id.is_empty()).ok_or("whoami returned no id")?,
+            kind: field(&operation.result.kind).ok_or("whoami returned no kind")?,
+            name: field(&operation.result.name).unwrap_or_default(),
+            owner_id: field(&operation.result.owner_id),
+            owner_name: field(&operation.result.owner_name),
+        })
+    }
+
+    pub fn label(&self) -> String {
+        let mut label = format!("{} ({})", self.name, self.kind);
+        if let Some(owner) = &self.owner_name {
+            label.push_str(&format!(" · owner: {owner}"));
+        }
+        label
+    }
+
+    pub fn cleaned(mut self, cleaner: &Cleaner) -> Self {
+        self.id = cleaner.field(&self.id);
+        self.kind = cleaner.field(&self.kind);
+        self.name = cleaner.field(&self.name);
+        self.owner_id = self.owner_id.map(|s| cleaner.field(&s));
+        self.owner_name = self.owner_name.map(|s| cleaner.field(&s));
+        self
+    }
 }
 
 /// Dotted JSON paths (`state.name`, `items.0.id`); an empty path leaves the field unread.
@@ -508,6 +572,13 @@ pub struct FieldPaths {
     pub parent: String,
     pub kind: String,
     pub author_kind: String,
+    pub name: String,
+    pub owner_id: String,
+    pub owner_name: String,
+    pub cursor: String,
+    pub steerers: String,
+    pub steerer_id: String,
+    pub steerer_name: String,
 }
 
 impl Default for FieldPaths {
@@ -526,6 +597,13 @@ impl Default for FieldPaths {
             parent: String::new(),
             kind: String::new(),
             author_kind: String::new(),
+            name: String::new(),
+            owner_id: String::new(),
+            owner_name: String::new(),
+            cursor: String::new(),
+            steerers: String::new(),
+            steerer_id: String::new(),
+            steerer_name: String::new(),
         }
     }
 }
@@ -534,14 +612,35 @@ impl Default for FieldPaths {
 pub const MAX_ERROR_CHARS: usize = 600;
 
 /// Placeholders operation arguments may use; other text in braces is left as written.
-pub const PLACEHOLDERS: &[&str] =
-    &["id", "key", "key_number", "uuid", "nonce", "query", "state", "body", "title", "board", "board_key", "system"];
+pub const PLACEHOLDERS: &[&str] = &[
+    "id",
+    "key",
+    "key_number",
+    "uuid",
+    "nonce",
+    "query",
+    "state",
+    "body",
+    "title",
+    "board",
+    "board_key",
+    "system",
+    "conversation",
+    "kind",
+    "activity",
+    "turn",
+    "seq",
+    "after",
+    "owners",
+    "ids",
+];
 
 /// Values for an operation's placeholders. A placeholder whose value is unknown fails
 /// the operation with a message naming it, rather than sending an empty argument.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Vars {
-    values: Vec<(&'static str, Option<String>)>,
+    values: BTreeMap<String, Option<Value>>,
 }
 
 impl Vars {
@@ -550,9 +649,18 @@ impl Vars {
     }
 
     pub fn with(mut self, name: &'static str, value: Option<&str>) -> Vars {
-        self.values.retain(|(n, _)| *n != name);
-        self.values.push((name, value.map(str::to_string)));
+        self.values.insert(name.to_string(), value.map(|s| Value::String(s.to_string())));
         self
+    }
+
+    /// Preserve JSON types for the four typed placeholders.
+    pub fn typed(mut self, name: &str, value: Value) -> Self {
+        self.values.insert(name.to_string(), Some(value));
+        self
+    }
+
+    pub fn get(&self, name: &str) -> Option<&Value> {
+        self.values.get(name).and_then(Option::as_ref)
     }
 
     pub fn ticket(self, link: &TicketLink) -> Vars {
@@ -581,8 +689,9 @@ impl Vars {
             let name = after.find('}').map(|end| &after[..end]).filter(|name| PLACEHOLDERS.contains(name));
             match name {
                 Some(name) => {
-                    match self.values.iter().find(|(n, _)| *n == name).and_then(|(_, v)| v.as_ref()) {
-                        Some(value) => out.push_str(value),
+                    match self.get(name) {
+                        Some(Value::String(value)) => out.push_str(value),
+                        Some(value) => out.push_str(&value.to_string()),
                         None => return Err(format!("needs {{{name}}}, which is unknown here")),
                     }
                     rest = &after[name.len() + 1..];
@@ -611,7 +720,11 @@ impl TicketConfig {
         let mut safe = String::new();
         while let Some(c) = chars.next() {
             safe.push(c);
-            if c == '@' && !previous.is_some_and(word) && chars.peek().is_some_and(|c| word(*c)) {
+            if self.escape_mentions && c == '@' {
+                if chars.peek() != Some(&'\u{2060}') {
+                    safe.push('\u{2060}');
+                }
+            } else if c == '@' && !previous.is_some_and(word) && chars.peek().is_some_and(|c| word(*c)) {
                 safe.push('\u{200b}');
             }
             previous = Some(c);
@@ -676,6 +789,12 @@ impl TicketConfig {
 
     pub fn operation(&self, name: &str) -> Option<&Operation> {
         match name {
+            "whoami" => self.operations.whoami.as_ref(),
+            "conversation_open" => self.operations.conversation_open.as_ref(),
+            "conversation_post" => self.operations.conversation_post.as_ref(),
+            "conversation_read" => self.operations.conversation_read.as_ref(),
+            "conversation_ack" => self.operations.conversation_ack.as_ref(),
+            "conversation_steerers" => self.operations.conversation_steerers.as_ref(),
             "get" => self.operations.get.as_ref(),
             "list" => self.operations.list.as_ref(),
             "update_state" => self.operations.update_state.as_ref(),
@@ -831,6 +950,10 @@ impl Operation {
                 .into_iter()
                 .flatten()
                 .map(|item| Comment {
+                    id: mapped_field(item, &comments.id),
+                    seq: mapped_field(item, &comments.seq),
+                    author_id: mapped_field(item, &comments.author_id),
+                    author_kind: mapped_field(item, &comments.author_kind),
                     author: mapped_field(item, &comments.author),
                     text: mapped_field(item, &comments.text).unwrap_or_default(),
                     at: mapped_field(item, &comments.at),
@@ -897,7 +1020,15 @@ impl Operation {
     pub fn arguments(&self, vars: &Vars) -> Result<Value, String> {
         fn fill(value: &Value, vars: &Vars) -> Result<Value, String> {
             Ok(match value {
-                Value::String(text) => Value::String(vars.render(text)?),
+                Value::String(text) => {
+                    if let Some(name) = text.strip_prefix('{').and_then(|s| s.strip_suffix('}'))
+                        && ["seq", "after", "owners", "ids"].contains(&name)
+                    {
+                        vars.get(name).cloned().ok_or_else(|| format!("needs {{{name}}}, which is unknown here"))?
+                    } else {
+                        Value::String(vars.render(text)?)
+                    }
+                }
                 Value::Array(items) => Value::Array(items.iter().map(|v| fill(v, vars)).collect::<Result<_, _>>()?),
                 Value::Object(map) => Value::Object(
                     map.iter().map(|(k, v)| Ok((k.clone(), fill(v, vars)?))).collect::<Result<_, String>>()?,
@@ -1092,6 +1223,10 @@ impl Cleaner {
         card.author_kind = field(card.author_kind);
         card.body = card.body.map(|value| bound_bytes(&text(&value), MAX_BODY_BYTES));
         for comment in &mut card.comments {
+            comment.id = field(comment.id.take());
+            comment.seq = field(comment.seq.take());
+            comment.author_id = field(comment.author_id.take());
+            comment.author_kind = field(comment.author_kind.take());
             comment.author = field(comment.author.take());
             comment.at = field(comment.at.take());
             comment.kind = field(comment.kind.take());
@@ -1848,8 +1983,98 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn tickets_typed_placeholders_only_preserve_types_as_whole_values() {
+        let op: Operation = serde_json::from_value(serde_json::json!({"tool":"post", "arguments":{
+            "sequence":"{seq}", "after":"{after}", "owners":"{owners}", "ids":"{ids}",
+            "nested":["{seq}", {"owners":"{owners}"}], "text":"seq={seq}; owners={owners}; after={after}; ids={ids}",
+            "key_number":"{key_number}", "body":"{body}", "conversation":"{conversation}",
+            "kind":"{kind}", "activity":"{activity}", "turn":"{turn}"
+        }}))
+        .unwrap();
+        for cursor in [serde_json::json!(41), serde_json::json!("cursor-41"), Value::Null] {
+            let vars = Vars::new("example")
+                .ticket(&TicketLink { id: "TASK-41".into(), ..Default::default() })
+                .typed("seq", serde_json::json!(7))
+                .typed("after", cursor.clone())
+                .typed("owners", serde_json::json!(["human-a", "human-b"]))
+                .typed("ids", serde_json::json!(["message-1"]))
+                .with("conversation", Some("conversation-1"))
+                .with("kind", Some("Assistant"))
+                .with("activity", Some("Working"))
+                .with("turn", Some("turn-1"))
+                .with("body", Some("literal {seq} and {nonce}"));
+            let args = op.arguments(&vars).unwrap();
+            assert_eq!(args["sequence"], 7);
+            assert_eq!(args["after"], cursor);
+            assert_eq!(args["owners"], serde_json::json!(["human-a", "human-b"]));
+            assert_eq!(args["ids"], serde_json::json!(["message-1"]));
+            assert_eq!(args["nested"][0], 7);
+            assert_eq!(args["nested"][1]["owners"], args["owners"]);
+            assert!(args["text"].is_string());
+            assert_eq!(args["key_number"], "41");
+            assert_eq!(args["body"], "literal {seq} and {nonce}");
+            assert_eq!(args["conversation"], "conversation-1");
+            assert_eq!(args["kind"], "Assistant");
+            assert_eq!(args["activity"], "Working");
+            assert_eq!(args["turn"], "turn-1");
+        }
+        assert!(op.arguments(&Vars::default()).is_err());
+    }
+
+    #[test]
+    fn tickets_comment_identity_and_whoami_are_mapped_and_cleaned() {
+        let operation: Operation = serde_json::from_value(serde_json::json!({
+            "tool":"read", "comments":{"items":"comments", "id":"id", "seq":"revision", "author_id":"user.id",
+            "author_kind":"user.kind", "author":"user.name", "text":"body"},
+            "result":{"id":"user.id", "kind":"user.kind", "name":"user.name", "owner_id":"owner.id", "owner_name":"owner.name"}
+        })).unwrap();
+        let secret = "private-secret-value";
+        let cleaner = Cleaner::new([secret.to_string()]);
+        let result = serde_json::json!({"user":{"id":"agent-a", "kind":"Agent", "name":secret},
+            "owner":{"id":"human-a", "name":secret},
+            "comments":[{"id":secret, "revision":secret, "user":{"id":secret, "name":secret,"kind":secret}, "body":secret}]});
+        let whoami = Whoami::read(&operation, &result).unwrap().cleaned(&cleaner);
+        assert_eq!(whoami.id, "agent-a");
+        assert_eq!(whoami.kind, "Agent");
+        assert_eq!(whoami.owner_id.as_deref(), Some("human-a"));
+        assert!(!whoami.label().contains(secret));
+        let card = cleaner.card(operation.card(&result, "example").unwrap());
+        let comment = &card.comments[0];
+        for field in [&comment.id, &comment.seq, &comment.author_id, &comment.author_kind, &comment.author] {
+            assert!(field.is_some());
+            assert!(!field.as_ref().unwrap().contains(secret));
+        }
+        assert!(!comment.text.contains(secret));
+        let reply = card_reply(&card);
+        assert!(reply["card"]["comments"][0]["author_kind"].is_string());
+        assert!(Whoami::read(&operation, &serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn tickets_configured_mention_escaping_inserts_word_joiner_after_every_at() {
+        let config = TicketConfig { escape_mentions: true, ..Default::default() };
+        let text = "@max-agent email@example.com @@a @ @\u{2060}already";
+        let expected = "@\u{2060}max-agent email@\u{2060}example.com @\u{2060}@\u{2060}a @\u{2060} @\u{2060}already";
+        assert_eq!(config.comment_body(text), expected);
+        assert_eq!(config.comment_body(expected), expected);
+        let short = TicketConfig { max_comment_chars: 20, ..config };
+        assert!(short.comment_body(&"@a".repeat(50)).chars().count() <= 20);
+    }
+
+    #[test]
     fn ticket_nonce_is_write_only_even_in_nested_arguments() {
-        for name in ["get", "read", "list", "children", "related", "search", "semantic_search"] {
+        for name in [
+            "get",
+            "read",
+            "list",
+            "children",
+            "related",
+            "search",
+            "semantic_search",
+            "whoami",
+            "conversation_read",
+            "conversation_steerers",
+        ] {
             let text = format!(
                 r#"[operations.{name}]
 tool = "read"
@@ -1859,7 +2084,8 @@ arguments = {{ nested = [{{ value = "prefix {{nonce}}" }}] }}"#
             assert!(error.contains("{nonce}"), "{name}: {error}");
             assert!(error.contains("write"), "{name}: {error}");
         }
-        for name in ["update_state", "comment", "create"] {
+        for name in ["update_state", "comment", "create", "conversation_open", "conversation_post", "conversation_ack"]
+        {
             let text = format!(
                 r#"[operations.{name}]
 tool = "write"
