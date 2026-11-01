@@ -9,7 +9,8 @@
 //! A missing state file is seeded with the demo epic and four direct children. The state file holds `tickets`, every call made
 //! (`calls`), tools that fail (`fail`, with an optional `fail_message`, one string or an array of blocks) and tools that never answer (`hang`). Each call
 //! rereads and rewrites it, so tests can change tickets behind ATOMICS's back and check
-//! what ATOMICS pushed.
+//! what ATOMICS pushed. Optional idempotencyKey receipts deduplicate writes; structured_results
+//! selects structured output for text tools, and drop_reply loses a reply after committing the write.
 
 use std::io::{BufRead, Write};
 
@@ -82,6 +83,8 @@ const TOOLS: &[&str] = &[
     "list_tickets",
     "update_ticket",
     "add_comment",
+    "change_ticket_status",
+    "add_ticket_comment",
     "create_ticket",
     "list_issues",
     "get_issue",
@@ -129,6 +132,23 @@ fn call(path: &str, params: &Value) -> Result<Value, String> {
         };
         let content: Vec<Value> = blocks.into_iter().map(|text| json!({ "type": "text", "text": text })).collect();
         return Ok(json!({ "isError": true, "content": content }));
+    }
+    // Persist successful replies so retries after a lost reply cannot duplicate a write.
+    let key = args["idempotencyKey"].as_str();
+    if matches!(name, "change_ticket_status" | "add_ticket_comment") && key.is_none() {
+        save(path, &state);
+        return Err("idempotencyKey is required".into());
+    }
+    if let Some(key) = key
+        && let Some(previous) = state["idempotency"].get(key)
+    {
+        let result = if previous["tool"] == name && previous["arguments"] == *args {
+            Ok(previous["result"].clone())
+        } else {
+            Err("idempotencyKey reused with different arguments".into())
+        };
+        save(path, &state);
+        return result;
     }
     let text = |value: Value| json!({ "content": [{ "type": "text", "text": value.to_string() }] });
     let structured =
@@ -189,6 +209,14 @@ fn call(path: &str, params: &Value) -> Result<Value, String> {
         "list_tickets" => {
             structured(json!({"tickets": on_board(&state, &args["board"]).map(full_ticket).collect::<Vec<_>>() }))
         }
+        "change_ticket_status" => {
+            change(&mut state, &args["ticketId"], |t| t["state"] = args["stageKey"].clone())?;
+            text(json!({"updated":true}))
+        }
+        "add_ticket_comment" => {
+            change(&mut state, &args["ticketId"], |t| comment(t, &args["body"]))?;
+            text(json!({"posted":true}))
+        }
         "update_ticket" => {
             change(&mut state, &args["ticket"], |t| t["state"] = args["status"].clone())?;
             structured(json!({"updated":true}))
@@ -216,7 +244,29 @@ fn call(path: &str, params: &Value) -> Result<Value, String> {
         }
         _ => return Err(format!("unknown tool {name}")),
     };
+    let result = if state["structured_results"] == true && result["structuredContent"].is_null() {
+        structured(serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap())
+    } else {
+        result
+    };
+    if let Some(key) = key {
+        if !state["idempotency"].is_object() {
+            state["idempotency"] = json!({});
+        }
+        state["idempotency"][key] = json!({"tool":name, "arguments":args, "result":result});
+    }
+    // Apply the write, save its receipt, then lose the reply exactly once.
+    let drop_reply = state["drop_reply"]
+        .as_array_mut()
+        .and_then(|tools| {
+            let index = tools.iter().position(|tool| tool == name)?;
+            Some(tools.remove(index))
+        })
+        .is_some();
     save(path, &state);
+    if drop_reply {
+        std::process::exit(0);
+    }
     Ok(result)
 }
 

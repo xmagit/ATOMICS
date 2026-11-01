@@ -62,6 +62,8 @@ pub(super) struct Tickets {
     pushing: HashMap<LinkKey, String>,
     /// State pushes that failed, retried on the next heartbeat or sync.
     failed: HashMap<LinkKey, String>,
+    /// Caller-chosen nonce retained until a state push succeeds or is superseded.
+    state_nonces: HashMap<LinkKey, (String, String, String)>,
     /// The tickets each board-mode plan's board lists.
     pub(super) boards: HashMap<String, Vec<TicketLink>>,
     batches: HashMap<u64, Batch>,
@@ -109,6 +111,7 @@ impl Tickets {
             refreshing: HashSet::new(),
             pushing: HashMap::new(),
             failed: HashMap::new(),
+            state_nonces: HashMap::new(),
             boards: HashMap::new(),
             batches: HashMap::new(),
             next_batch: 0,
@@ -177,6 +180,7 @@ impl State {
         if effective != self.tickets.config {
             self.tickets.config = effective;
             self.tickets.failed.clear();
+            self.tickets.state_nonces.clear();
             self.refresh_tickets(None, None);
         }
     }
@@ -290,7 +294,7 @@ impl State {
             | TicketOp::Children(link)
             | TicketOp::Related(link)
             | TicketOp::List(link)
-            | TicketOp::UpdateState(link, _)
+            | TicketOp::UpdateState(link, _, _)
             | TicketOp::Comment(link, _) => Some(link),
             TicketOp::TraceCleaner | TicketOp::Create { .. } | TicketOp::Search { .. } => None,
         };
@@ -474,6 +478,7 @@ impl State {
             (kind @ (Kind::State(_) | Kind::Comment), Ok(TicketOutput::Pushed(fresh))) => {
                 if let Kind::State(state) = &kind {
                     self.tickets.failed.remove(&tag.key);
+                    self.tickets.state_nonces.remove(&tag.key);
                     if let Some(link) = self.live_link(&tag, true) {
                         link.pushed_state = Some(state.clone());
                     }
@@ -739,6 +744,14 @@ impl State {
                 links.push(((plan.id.clone(), None), status, link, desired));
             }
             for (key, status, link, desired) in links.into_iter().filter(|(_, _, link, _)| config.accepts(link)) {
+                if self
+                    .tickets
+                    .state_nonces
+                    .get(&key)
+                    .is_some_and(|saved| saved.0 != link.id || Some(saved.1.as_str()) != desired)
+                {
+                    self.tickets.state_nonces.remove(&key);
+                }
                 let Some(desired) = desired else { continue };
                 if link.pushed_state.as_deref() == Some(desired)
                     || (link.pushed_state.is_none() && status == TaskStatus::Planned)
@@ -751,6 +764,15 @@ impl State {
             }
         }
         for (key, link, state) in pushes {
+            let saved = self
+                .tickets
+                .state_nonces
+                .entry(key.clone())
+                .or_insert_with(|| (link.id.clone(), state.clone(), uuid::Uuid::new_v4().to_string()));
+            if saved.0 != link.id || saved.1 != state {
+                *saved = (link.id.clone(), state.clone(), uuid::Uuid::new_v4().to_string());
+            }
+            let nonce = saved.2.clone();
             self.tickets.pushing.insert(key.clone(), state.clone());
             let tag = Tag {
                 key,
@@ -759,7 +781,7 @@ impl State {
                 batch,
                 system: config.system.clone(),
             };
-            self.send_ticket(&config, TicketOp::UpdateState(link, state), tag);
+            self.send_ticket(&config, TicketOp::UpdateState(link, state, nonce), tag);
         }
     }
 
@@ -1645,6 +1667,17 @@ mod tests {
                         "id":"b1", "key":"ENG-100", "title":"Example epic", "state":"Todo", "kind":"epic"
                     }));
                 });
+                if name == "meaning-example" {
+                    edit_fake(&state, |fake| {
+                        for ticket in fake["tickets"].as_array_mut().unwrap() {
+                            let suffix = if ticket["id"] == "b1" { "100" } else { ticket["id"].as_str().unwrap() };
+                            ticket["id"] = json!(format!("00000000-0000-4000-8000-{:0>12}", suffix));
+                            if ticket["board"] == "b1" {
+                                ticket["board"] = json!("00000000-0000-4000-8000-000000000100");
+                            }
+                        }
+                    });
+                }
                 let config = example_profile(name, &state);
                 let board = config.mode != TicketMode::Ticket;
                 app.runtime.plans.clear();
@@ -1653,8 +1686,8 @@ mod tests {
                 let plan = request(
                     app,
                     json!({"cmd":"plan_set", "goal":name,
-                    "ticket":{"id": if board {"b1"} else {"ENG-1"}},
-                    "tasks":[{"id":"a", "title":"Parser", "ticket": if board {json!({"id":"ENG-1"})} else {Value::Null}}]}),
+                    "ticket":{"id": if board {"00000000-0000-4000-8000-000000000100"} else {"ENG-1"}, "key": if board {"ENG-100"} else {"ENG-1"}},
+                    "tasks":[{"id":"a", "title":"Parser", "ticket": if board {json!({"id":"00000000-0000-4000-8000-000000000001", "key":"ENG-1"})} else {Value::Null}}]}),
                 )
                 .result["plan"]
                     .as_str()
@@ -1666,21 +1699,23 @@ mod tests {
                 assert_eq!(fetched.label(), "ENG-1");
                 assert_eq!(app.runtime.tickets.boards.contains_key(&plan), board);
                 if board {
-                    // This shipped example is read-only until per-write idempotency keys are supported.
-                    assert!(config.operations.update_state.is_none());
-                    assert!(config.operations.comment.is_none());
                     assert!(config.operations.create.is_none());
                     assert!(ticket_request(app, json!({"cmd":"ticket_children", "ticket":"ENG-100"})).ok);
-                    let denied = ticket_request(
-                        app,
-                        json!({"cmd":"ticket_comment", "plan":plan,
-                        "task":"a", "text":"Unmapped write"}),
+                    assert!(
+                        ticket_request(
+                            app,
+                            json!({"cmd":"ticket_comment", "plan":plan, "task":"a", "text":"Implementation details"})
+                        )
+                        .ok
                     );
-                    assert!(!denied.ok);
-                    assert!(comments(&state, "ENG-1").is_empty());
+                    let posted = comments(&state, "ENG-1");
+                    assert_eq!(posted.len(), 1);
+                    assert!(posted[0].ends_with("Implementation details"));
                     assert!(request(app, json!({"cmd":"plan_update", "plan":plan,"id":"a","status":"running"})).ok);
                     settle(app);
-                    assert_eq!(ticket(&state, "ENG-1")["state"], "Todo");
+                    assert_eq!(ticket(&state, "ENG-1")["state"], "InProgress");
+                    assert!(count(&state, "change_ticket_status") > 0);
+                    assert!(count(&state, "add_ticket_comment") > 0);
                     continue;
                 }
                 assert!(
@@ -1874,7 +1909,7 @@ mod tests {
                 fake["tickets"][0]["description"] = json!("Task implementation details");
             });
             app.runtime.config.tickets = example_profile("meaning-example", &state);
-            // Exercise the generic writable fixture separately from the read-only shipped example.
+            // Use a generic comment operation here so this scoping test also accepts opaque IDs.
             app.runtime.config.tickets.operations.comment = Some(
                 toml::from_str(
                     r#"
@@ -2359,7 +2394,15 @@ mod tests {
             let dir = crate::test_support::tempdir().unwrap();
             let state = tickets_fixture(dir.path(), "CARD");
             // Startup and ordinary error replies are fixture readiness, not the timeout behavior.
-            configure(app, CARDS, &state, |_| {});
+            configure(app, CARDS, &state, |config| {
+                config
+                    .operations
+                    .update_state
+                    .as_mut()
+                    .unwrap()
+                    .arguments
+                    .insert("idempotencyKey".into(), json!("{nonce}"));
+            });
             edit_fake(&state, |fake| fake["fail"] = json!(["card_move", "card_note"]));
             let plan = request(
                 app,
@@ -2384,6 +2427,17 @@ mod tests {
             app.runtime.ticket_heartbeat();
             settle(app);
             assert_eq!(count(&state, "card_move"), 2);
+            let moves = |state: &Path| {
+                fake(state)["calls"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|call| call["tool"] == "card_move")
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            let attempts = moves(&state);
+            assert_eq!(attempts[0]["arguments"], attempts[1]["arguments"], "heartbeat retains the logical write nonce");
             assert!(link(app, index, 0).error.is_some(), "a successful read does not hide a failed push");
 
             let (tx, rx) = channel();
@@ -2415,6 +2469,14 @@ mod tests {
             assert_eq!((replied["state"].as_str(), replied.get("error")), (Some("Doing"), None), "{replied}");
             let healed = link(app, index, 0);
             assert_eq!((healed.state.as_deref(), healed.error.as_deref()), (Some("Doing"), None));
+            assert_eq!(moves(&state)[2]["arguments"], attempts[0]["arguments"], "sync retains the nonce too");
+            assert!(app.runtime.tickets.state_nonces.is_empty(), "success finishes the logical write");
+            assert!(request(app, json!({"cmd":"plan_update", "plan":plan, "id":"a", "status":"review"})).ok);
+            settle(app);
+            assert_ne!(moves(&state)[3]["arguments"]["idempotencyKey"], attempts[0]["arguments"]["idempotencyKey"]);
+            assert!(request(app, json!({"cmd":"plan_update", "plan":plan, "id":"a", "status":"running"})).ok);
+            settle(app);
+            assert_ne!(moves(&state)[4]["arguments"]["idempotencyKey"], attempts[0]["arguments"]["idempotencyKey"]);
 
             // A server that stops answering times out, and the next jobs fail at once.
             app.runtime.config.tickets.timeout_secs = 1;

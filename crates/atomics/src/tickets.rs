@@ -39,7 +39,8 @@ pub enum TicketOp {
     Read(TicketLink),
     /// The tickets on a board.
     List(TicketLink),
-    UpdateState(TicketLink, String),
+    /// The caller retains the nonce across heartbeat/sync retries of a failed push.
+    UpdateState(TicketLink, String, String),
     Comment(TicketLink, String),
     Create {
         board: Option<TicketLink>,
@@ -210,17 +211,30 @@ impl Worker {
                     links.into_iter().map(|link| config.link_url(link)).collect::<Result<_, _>>()?,
                 ))
             }
-            TicketOp::UpdateState(link, state) => {
-                self.call(config, "update_state", &Vars::new(system).ticket(&link).with("state", Some(&state)))?;
+            TicketOp::UpdateState(link, state, nonce) => {
+                self.call(
+                    config,
+                    "update_state",
+                    &Vars::new(system).ticket(&link).with("state", Some(&state)).with("nonce", Some(&nonce)),
+                )?;
                 Ok(TicketOutput::Pushed(self.reread(config, link)))
             }
             TicketOp::Comment(link, body) => {
-                self.call(config, "comment", &Vars::new(system).ticket(&link).with("body", Some(&body)))?;
+                let nonce = uuid::Uuid::new_v4().to_string();
+                self.call(
+                    config,
+                    "comment",
+                    &Vars::new(system).ticket(&link).with("body", Some(&body)).with("nonce", Some(&nonce)),
+                )?;
                 Ok(TicketOutput::Pushed(self.reread(config, link)))
             }
             TicketOp::Create { board, title, body } => {
-                let vars =
-                    Vars::new(system).board(board.as_ref()).with("title", Some(&title)).with("body", Some(&body));
+                let nonce = uuid::Uuid::new_v4().to_string();
+                let vars = Vars::new(system)
+                    .board(board.as_ref())
+                    .with("title", Some(&title))
+                    .with("body", Some(&body))
+                    .with("nonce", Some(&nonce));
                 let output = self.call(config, "create", &vars)?;
                 let created = config.operation("create").expect("called").ticket(&output, system)?;
                 if created.id.is_empty() {
@@ -250,6 +264,12 @@ impl Worker {
     /// Calls the tool behind a generic operation and returns what its result paths read from.
     fn call(&mut self, config: &TicketConfig, name: &str, vars: &Vars) -> Result<Value, String> {
         let operation = config.operation(name).ok_or_else(|| format!("operations.{name} is not configured"))?;
+        let write = matches!(name, "update_state" | "comment" | "create");
+        let idempotent = write && operation.uses_placeholder("nonce");
+        if !write && operation.uses_placeholder("nonce") {
+            return Err(format!("operations.{name}: {{nonce}} is only allowed in write operations"));
+        }
+        // Expand once: transport retries must send exactly the original write arguments.
         let arguments = operation.arguments(vars)?;
         if let Some((server, since, error)) = &self.down
             && *server == config.server
@@ -257,38 +277,44 @@ impl Worker {
         {
             return Err(format!("{} is unavailable: {error}", config.system));
         }
-        if self.client.as_ref().is_none_or(|(server, used, _)| *server != config.server || *used != self.token) {
-            self.client = None;
-            let timeout = Duration::from_secs(config.timeout_secs.max(1));
-            // The connection authenticates with the token this job resolved, and the worker records
-            // the token the connection reports using, so the two can never quietly differ.
-            let token = self.token.clone();
-            let bearer = config.server.bearer_env().map(str::to_string);
-            let env = |name: &str| {
-                if bearer.as_deref() == Some(name) { token.clone() } else { crate::setup::env_var(name) }
-            };
-            let oauth = config.server.uses_oauth().then_some(()).and(self.oauth.as_ref());
-            match McpClient::connect_with(&config.server, timeout, env, oauth) {
-                Ok(client) => {
-                    let used = client.token().map(str::to_string);
-                    self.client = Some((config.server.clone(), used, client));
+        for attempt in 0..=1 {
+            if self.client.as_ref().is_none_or(|(server, used, _)| *server != config.server || *used != self.token) {
+                self.client = None;
+                let timeout = Duration::from_secs(config.timeout_secs.max(1));
+                // The connection authenticates with the token this job resolved, and the worker records
+                // the token the connection reports using, so the two can never quietly differ.
+                let token = self.token.clone();
+                let bearer = config.server.bearer_env().map(str::to_string);
+                let env = |name: &str| {
+                    if bearer.as_deref() == Some(name) { token.clone() } else { crate::setup::env_var(name) }
+                };
+                let oauth = config.server.uses_oauth().then_some(()).and(self.oauth.as_ref());
+                match McpClient::connect_with(&config.server, timeout, env, oauth) {
+                    Ok(client) => {
+                        let used = client.token().map(str::to_string);
+                        self.client = Some((config.server.clone(), used, client));
+                    }
+                    Err(err) => return Err(self.broken(&config.server, err)),
+                }
+            }
+            let (_, _, client) = self.client.as_mut().expect("connected");
+            let result = client.call_tool(&operation.tool, arguments.clone());
+            // A refresh during the call may have changed the access token: clean for the current one.
+            if let Some(token) = client.oauth_token() {
+                self.cleaner = std::mem::take(&mut self.cleaner).with([token.to_string()]);
+            }
+            match result {
+                Ok(result) => {
+                    self.down = None;
+                    return Ok(atomics_core::tickets::tool_output(&result));
+                }
+                Err(McpError::Transport(_)) if idempotent && attempt == 0 => {
+                    self.client = None;
                 }
                 Err(err) => return Err(self.broken(&config.server, err)),
             }
         }
-        let (_, _, client) = self.client.as_mut().expect("connected");
-        let result = client.call_tool(&operation.tool, arguments);
-        // A refresh during the call may have changed the access token: clean for the current one.
-        if let Some(token) = client.oauth_token() {
-            self.cleaner = std::mem::take(&mut self.cleaner).with([token.to_string()]);
-        }
-        match result {
-            Ok(result) => {
-                self.down = None;
-                Ok(atomics_core::tickets::tool_output(&result))
-            }
-            Err(err) => Err(self.broken(&config.server, err)),
-        }
+        unreachable!("the final attempt returns")
     }
 
     /// The backoff remembers the failure cleaned with this job's secrets: a later job may
@@ -313,6 +339,115 @@ mod tests {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
     use std::sync::mpsc::Receiver;
+
+    #[test]
+    fn ticket_example_writes_use_distinct_nonces_and_retry_without_duplicate_effects_in_both_dialects() {
+        use crate::mcp_client::tests::{example_profile, fake_state};
+        for structured in [false, true] {
+            let dir = crate::test_support::tempdir().unwrap();
+            let id = "00000000-0000-4000-8000-000000000001";
+            let path = fake_state(
+                dir.path(),
+                json!([{
+                    "id":id, "key":"DEMO-1", "title":"Write", "state":"Backlog", "comments":[]
+                }]),
+            );
+            let mut config = example_profile("meaning-example", &path);
+            // Creation is deliberately absent from the shipped profile. Exercise the
+            // generic nonce support using another fixture operation.
+            config.operations.create = Some(serde_json::from_value(json!({
+                "tool":"create_ticket", "arguments":{"title":"{title}", "body":"{body}", "idempotencyKey":"{nonce}"},
+                "result":{"id":"ticket.id", "key":"ticket.key"}
+            })).unwrap());
+            let link = TicketLink { id: id.into(), key: Some("DEMO-1".into()), ..Default::default() };
+            let mut worker = Worker::default();
+            worker.prepare(&config);
+            let running = config.states.running.clone().unwrap();
+            let mut nonces = std::collections::HashSet::new();
+            for name in ["update_state", "comment", "create"] {
+                let tool = config.operation(name).unwrap().tool.clone();
+                for _ in 0..2 {
+                    let mut state: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+                    state["structured_results"] = json!(structured);
+                    state["drop_reply"] = json!([tool]);
+                    std::fs::write(&path, state.to_string()).unwrap();
+                    let op = match name {
+                        "update_state" => {
+                            TicketOp::UpdateState(link.clone(), running.clone(), uuid::Uuid::new_v4().to_string())
+                        }
+                        "comment" => TicketOp::Comment(link.clone(), "Literal {nonce} in a report".into()),
+                        _ => TicketOp::Create { board: None, title: "Same title".into(), body: "Same body".into() },
+                    };
+                    let result = worker.run(&config, op).unwrap();
+                    if name != "create" {
+                        let TicketOutput::Pushed(Some(Ok(fetched))) = result else { panic!("reread after {name}") };
+                        assert_eq!(fetched.state.as_deref(), Some(running.as_str()));
+                    } else {
+                        let TicketOutput::Ticket(created) = result else { panic!("created ticket") };
+                        assert!(!created.id.is_empty());
+                    }
+                    let state: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+                    let calls: Vec<_> =
+                        state["calls"].as_array().unwrap().iter().filter(|call| call["tool"] == tool).collect();
+                    let attempts = &calls[calls.len() - 2..];
+                    assert_eq!(attempts[0]["arguments"], attempts[1]["arguments"]);
+                    let nonce = attempts[0]["arguments"]["idempotencyKey"].as_str().unwrap();
+                    assert_eq!(uuid::Uuid::parse_str(nonce).unwrap().get_version_num(), 4);
+                    assert!(nonces.insert(nonce.to_string()), "fresh nonce for each logical write");
+                    if name != "create" {
+                        assert_eq!(attempts[0]["arguments"]["ticketId"], id);
+                    }
+                }
+            }
+            let state: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(state["tickets"].as_array().unwrap().len(), 3, "each create applied once");
+            assert_eq!(
+                state["tickets"][0]["comments"],
+                json!(["Literal {nonce} in a report", "Literal {nonce} in a report"])
+            );
+            assert_eq!(state["idempotency"].as_object().unwrap().len(), 6);
+            // A repeated key with changed arguments is refused by the fixture.
+            let nonce = state["calls"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|call| call["tool"] == "add_ticket_comment")
+                .unwrap()["arguments"]["idempotencyKey"]
+                .as_str()
+                .unwrap();
+            let error = worker
+                .call(
+                    &config,
+                    "comment",
+                    &Vars::new(&config.system)
+                        .ticket(&link)
+                        .with("nonce", Some(nonce))
+                        .with("body", Some("Changed body")),
+                )
+                .unwrap_err();
+            assert!(error.contains("different arguments"), "{error}");
+            let state: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(state["tickets"][0]["comments"].as_array().unwrap().len(), 2);
+
+            let calls = state["calls"].as_array().unwrap().len();
+            for id in ["DEMO-1", "malformed-uuid"] {
+                let invalid = TicketLink { id: id.into(), ..Default::default() };
+                for op in [
+                    TicketOp::UpdateState(invalid.clone(), running.clone(), uuid::Uuid::new_v4().to_string()),
+                    TicketOp::Comment(invalid, "Must not be sent".into()),
+                ] {
+                    let Err(error) = worker.run(&config, op) else { panic!("UUID validation") };
+                    assert!(error.contains("{uuid}"), "{error}");
+                }
+            }
+            // Also guard programmatically assembled read configs, before connecting.
+            config.operations.get.as_mut().unwrap().arguments.insert("invalid".into(), json!("{nonce}"));
+            let Err(error) = worker.run(&config, TicketOp::Get(link)) else { panic!("read nonce rejected") };
+            assert!(error.contains("{nonce}") && error.contains("operations.get"), "{error}");
+            let state: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(state["calls"].as_array().unwrap().len(), calls);
+        }
+    }
 
     fn card_profile(dialect: &str, path: &std::path::Path) -> TicketConfig {
         let (get, search, semantic, children, related, args, items, row, one, body, comments, links) = match dialect {
