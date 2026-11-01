@@ -220,6 +220,7 @@ impl Worker {
                 Ok(TicketOutput::Pushed(self.reread(config, link)))
             }
             TicketOp::Comment(link, body) => {
+                let body = config.comment_body(&body);
                 let nonce = uuid::Uuid::new_v4().to_string();
                 self.call(
                     config,
@@ -308,7 +309,7 @@ impl Worker {
                     self.down = None;
                     return Ok(atomics_core::tickets::tool_output(&result));
                 }
-                Err(McpError::Transport(_)) if idempotent && attempt == 0 => {
+                Err(McpError::Transport { retryable: true, .. }) if idempotent && attempt == 0 => {
                     self.client = None;
                 }
                 Err(err) => return Err(self.broken(&config.server, err)),
@@ -324,7 +325,7 @@ impl Worker {
             // No backoff: once the user signs in, the next job reconnects with the new tokens.
             self.client = None;
         }
-        if let McpError::Transport(message) = &err {
+        if let McpError::Transport { message, .. } = &err {
             self.client = None;
             self.down = Some((server.clone(), Instant::now(), self.cleaner.error(message)));
         }
@@ -339,6 +340,138 @@ mod tests {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
     use std::sync::mpsc::Receiver;
+
+    #[test]
+    fn nonce_writes_retry_only_connection_failures_and_retryable_http_statuses_once() {
+        use crate::mcp_client::tests::{http_connections, respond};
+        use std::os::fd::AsRawFd;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Zero means reset the socket after reading the write, before replying.
+        for (status, nonce, persistent, expected) in [
+            (200, true, false, 1), // A malformed MCP reply is not a connection failure.
+            (400, true, false, 1),
+            (401, true, false, 1),
+            (403, true, false, 1),
+            (404, true, false, 1),
+            (408, true, false, 1),
+            (422, true, false, 1),
+            (429, true, false, 2),
+            (503, true, false, 2),
+            (0, true, false, 2),
+            (503, true, true, 2),
+            (0, true, true, 2),
+            (503, false, false, 1),
+            (0, false, false, 1),
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let seen = calls.clone();
+            let (url, requests) = http_connections(move |body, stream| {
+                let result = match body["method"].as_str().unwrap() {
+                    "initialize" => json!({"protocolVersion":"2025-06-18", "capabilities":{}}),
+                    "notifications/initialized" => {
+                        respond(stream, "202 Accepted", &[], "").unwrap();
+                        return;
+                    }
+                    "tools/call" => {
+                        let attempt = seen.fetch_add(1, Ordering::SeqCst);
+                        if attempt == 0 || persistent {
+                            if status == 0 {
+                                let linger = libc::linger { l_onoff: 1, l_linger: 0 };
+                                // SAFETY: a live socket fd and a correctly sized linger value.
+                                assert_eq!(
+                                    unsafe {
+                                        libc::setsockopt(
+                                            stream.as_raw_fd(),
+                                            libc::SOL_SOCKET,
+                                            libc::SO_LINGER,
+                                            &linger as *const _ as *const libc::c_void,
+                                            std::mem::size_of_val(&linger) as libc::socklen_t,
+                                        )
+                                    },
+                                    0
+                                );
+                            } else {
+                                respond(stream, &format!("{status} Failed"), &[], "rejected").unwrap();
+                            }
+                            return;
+                        }
+                        json!({"content":[]})
+                    }
+                    _ => panic!("unexpected request"),
+                };
+                respond(
+                    stream,
+                    "200 OK",
+                    &[("Content-Type", "application/json".into())],
+                    &json!({"jsonrpc":"2.0", "id":body["id"], "result":result}).to_string(),
+                )
+                .unwrap();
+            });
+            let config: TicketConfig = serde_json::from_value(json!({
+                "system":"test", "server":{"url":url},
+                "operations":{"comment":{"tool":"note", "arguments":if nonce {
+                    json!({"body":"{body}", "nonce":"{nonce}"})
+                } else { json!({"body":"{body}"}) }}}
+            }))
+            .unwrap();
+            let mut worker = Worker::default();
+            let result = worker.run(&config, TicketOp::Comment(TicketLink::default(), "Hello".into()));
+            assert_eq!(result.is_ok(), expected == 2 && !persistent, "status {status}, nonce {nonce}");
+            assert_eq!(calls.load(Ordering::SeqCst), expected, "status {status}, nonce {nonce}");
+            let attempts: Vec<Value> = requests
+                .try_iter()
+                .filter_map(|request| {
+                    let (_, body) = request.split_once("\n{")?;
+                    let body: Value = serde_json::from_str(&format!("{{{body}")).unwrap();
+                    (body["method"] == "tools/call").then(|| body["params"]["arguments"].clone())
+                })
+                .collect();
+            assert_eq!(attempts.len(), expected);
+            if expected == 2 {
+                assert_eq!(attempts[0], attempts[1]);
+                assert_eq!(uuid::Uuid::parse_str(attempts[0]["nonce"].as_str().unwrap()).unwrap().get_version_num(), 4);
+            }
+        }
+    }
+
+    #[test]
+    fn all_composed_comment_types_are_bounded_and_mentions_are_neutralised_on_the_wire() {
+        use crate::mcp_client::tests::{example_profile, fake_state};
+        use atomics_core::plan::Task;
+        use atomics_core::tickets::{Author, agent_comment, chief_comment, dispatch_comment, report_comment};
+        let dir = crate::test_support::tempdir().unwrap();
+        let id = "00000000-0000-4000-8000-000000000001";
+        let path = fake_state(dir.path(), json!([{"id":id, "key":"DEMO-1", "comments":[]}]));
+        let mut config = example_profile("meaning-example", &path);
+        config.max_comment_chars = 240;
+        let original = format!("@all @équipe user@example.com {}", "🦀é界".repeat(200));
+        let task = Task { id: "a".into(), title: "@team".into(), brief: original.clone(), ..Default::default() };
+        let author = Author::Agent("Test".into());
+        let bodies = [
+            dispatch_comment(&Author::Atomics, &task, "Test"),
+            report_comment(&author, &task, "done", &original),
+            chief_comment(&Author::Chief("Test".into()), &original),
+            agent_comment(&author, &task, &original),
+        ];
+        let mut worker = Worker::default();
+        for body in &bodies {
+            worker
+                .run(&config, TicketOp::Comment(TicketLink { id: id.into(), ..Default::default() }, body.clone()))
+                .unwrap();
+        }
+        let state: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let comments = state["tickets"][0]["comments"].as_array().unwrap();
+        assert_eq!(comments.len(), bodies.len());
+        for body in comments {
+            let body = body.as_str().unwrap();
+            assert_eq!(body.chars().count(), 240);
+            assert!(body.ends_with(" … (truncated)"));
+            assert!(body.contains("@\u{200b}all @\u{200b}équipe user@example.com"), "{body}");
+            assert!(!body.contains("@team"));
+        }
+        assert_eq!(task.brief, original);
+        assert_eq!(task.title, "@team");
+    }
 
     #[test]
     fn ticket_example_writes_use_distinct_nonces_and_retry_without_duplicate_effects_in_both_dialects() {

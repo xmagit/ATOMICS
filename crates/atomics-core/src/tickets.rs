@@ -190,6 +190,8 @@ pub struct TicketConfig {
     pub system: String,
     pub mode: TicketMode,
     pub comments: CommentPolicy,
+    /// Maximum outbound comment length in characters, including the truncation marker.
+    pub max_comment_chars: usize,
     /// Free text added to the chief's prompt: how this team works with its tickets.
     pub workflow: String,
     /// Template for newly created branches of linked work.
@@ -210,6 +212,7 @@ impl Default for TicketConfig {
             system: String::new(),
             mode: TicketMode::Auto,
             comments: CommentPolicy::Agents,
+            max_comment_chars: 8000,
             workflow: String::new(),
             branch: None,
             link_url: None,
@@ -600,6 +603,27 @@ fn key_number(key: &str) -> Option<&str> {
 }
 
 impl TicketConfig {
+    /// Prepare only the outbound copy. Some servers act on @mentions in composed or quoted text.
+    pub fn comment_body(&self, body: &str) -> String {
+        let word = |c: char| c.is_alphanumeric() || c == '_';
+        let mut chars = body.chars().peekable();
+        let mut previous = None;
+        let mut safe = String::new();
+        while let Some(c) = chars.next() {
+            safe.push(c);
+            if c == '@' && !previous.is_some_and(word) && chars.peek().is_some_and(|c| word(*c)) {
+                safe.push('\u{200b}');
+            }
+            previous = Some(c);
+        }
+        if safe.chars().count() > self.max_comment_chars {
+            const MARKER: &str = " … (truncated)";
+            let keep = self.max_comment_chars.saturating_sub(MARKER.chars().count());
+            safe = safe.chars().take(keep).chain(MARKER.chars().take(self.max_comment_chars)).collect();
+        }
+        safe
+    }
+
     /// Render only known placeholders in one pass. Missing values leave naming to ATOMICS.
     pub fn branch_name(&self, link: &TicketLink) -> Option<String> {
         if !self.accepts(link) {
@@ -2493,6 +2517,32 @@ arguments = {{ key = "{{nonce}}", nested = ["{{nonce}}", "{{body}}"] }}"#
         assert_eq!(model_label("codex", &[]), "Codex");
         assert_eq!(model_label("", &[]), "Claude");
         assert_eq!(pretty_model("gpt-6.1-terra"), "GPT-6.1 Terra");
+    }
+
+    #[test]
+    fn outbound_comments_count_characters_and_include_the_marker_in_the_cap() {
+        let mut config: TicketConfig = toml::from_str("").unwrap();
+        assert_eq!(config.max_comment_chars, 8000);
+        assert_eq!(config.comment_body(&"é".repeat(8000)), "é".repeat(8000));
+        assert_eq!(config.comment_body(&"é".repeat(8001)), format!("{} … (truncated)", "é".repeat(7986)));
+        config = toml::from_str("max_comment_chars = 20").unwrap();
+        assert_eq!(config.comment_body("é🦀界é🦀界é🦀界é🦀界é🦀界é🦀界é🦀界"), "é🦀界é🦀界 … (truncated)");
+        for cap in 0..=14 {
+            config.max_comment_chars = cap;
+            assert_eq!(config.comment_body(&"🦀".repeat(30)).chars().count(), cap);
+        }
+    }
+
+    #[test]
+    fn outbound_comments_neutralise_mentions_without_changing_other_text() {
+        let config = TicketConfig::default();
+        let text =
+            "@all, (@team)\n>@équipe @user_name @123 @@here email:user@example.com @ already @\u{200b}safe {body}";
+        let expected = "@\u{200b}all, (@\u{200b}team)\n>@\u{200b}équipe @\u{200b}user_name @\u{200b}123 @@\u{200b}here email:user@example.com @ already @\u{200b}safe {body}";
+        assert_eq!(config.comment_body(text), expected);
+        assert_eq!(config.comment_body(expected), expected);
+        let config = TicketConfig { max_comment_chars: 20, ..config };
+        assert_eq!(config.comment_body("@all é🦀界 repeated repeated"), "@\u{200b}all  … (truncated)");
     }
 
     #[test]

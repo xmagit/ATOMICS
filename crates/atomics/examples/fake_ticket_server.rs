@@ -135,6 +135,12 @@ fn call(path: &str, params: &Value) -> Result<Value, String> {
     }
     // Persist successful replies so retries after a lost reply cannot duplicate a write.
     let key = args["idempotencyKey"].as_str();
+    if matches!(name, "change_ticket_status" | "add_ticket_comment")
+        && args["ticketId"].as_str().is_none_or(|id| uuid::Uuid::parse_str(id).is_err())
+    {
+        save(path, &state);
+        return Err("ticketId must be a UUID".into());
+    }
     if matches!(name, "change_ticket_status" | "add_ticket_comment") && key.is_none() {
         save(path, &state);
         return Err("idempotencyKey is required".into());

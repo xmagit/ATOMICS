@@ -709,6 +709,17 @@ impl State {
     /// heartbeat or `atomics_ticket_sync` instead of repeating every tick. A sync passes
     /// its batch, so it answers only once the pushes and the reads after them are done.
     pub(super) fn push_ticket_states(&mut self, batch: Option<u64>) {
+        self.tickets.state_nonces.retain(|(plan_id, task_id), _| {
+            self.plans.iter().any(|plan| {
+                plan.id == *plan_id
+                    && !plan.id.is_empty()
+                    && plan.status != PlanStatus::Archived
+                    && match task_id {
+                        Some(id) => plan.tasks.iter().any(|task| task.id == *id && task.ticket.is_some()),
+                        None => plan.ticket.is_some(),
+                    }
+            })
+        });
         let Some(config) = self.ticket_config() else { return };
         if config.operation("update_state").is_none() {
             return;
@@ -2385,6 +2396,53 @@ mod tests {
                 assert_eq!(tools(&state), expected);
                 assert!(request(app, json!({"cmd":"plan_close", "plan":plan, "status":"archived"})).ok);
             }
+        });
+    }
+
+    #[test]
+    fn computing_pushes_prunes_nonces_for_removed_links_tasks_and_plans() {
+        with_app("app::tickets::tests::computing_pushes_prunes_nonces_for_removed_links_tasks_and_plans", |app, _| {
+            let mut config: TicketConfig = toml::from_str(CARDS).unwrap();
+            config.mode = TicketMode::Ticket;
+            app.runtime.tickets.config = Some(Arc::new(config));
+            let link = TicketLink { id: "1".into(), pushed_state: Some("Doing".into()), ..Default::default() };
+            app.runtime.plans = vec![Plan {
+                id: "p".into(),
+                ticket: Some(link.clone()),
+                tasks: vec![Task {
+                    id: "a".into(),
+                    status: TaskStatus::Running,
+                    ticket: Some(link),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }];
+            let plan_key = ("p".into(), None);
+            let task_key = ("p".into(), Some("a".into()));
+            let nonce = ("1".into(), "Doing".into(), uuid::Uuid::new_v4().to_string());
+            app.runtime.tickets.state_nonces.insert(plan_key.clone(), nonce.clone());
+            app.runtime.tickets.state_nonces.insert(task_key.clone(), nonce.clone());
+            app.runtime.tickets.state_nonces.insert(("gone".into(), None), nonce.clone());
+            app.runtime.tickets.state_nonces.insert(("p".into(), Some("gone".into())), nonce.clone());
+            app.runtime.push_ticket_states(None);
+            assert_eq!(app.runtime.tickets.state_nonces.len(), 2);
+            assert_eq!(app.runtime.tickets.state_nonces[&task_key], nonce);
+            app.runtime.plans[0].tasks[0].ticket = None;
+            app.runtime.push_ticket_states(None);
+            assert!(!app.runtime.tickets.state_nonces.contains_key(&task_key));
+            assert!(app.runtime.tickets.state_nonces.contains_key(&plan_key));
+            app.runtime.plans[0].ticket = None;
+            app.runtime.push_ticket_states(None);
+            assert!(app.runtime.tickets.state_nonces.is_empty());
+            app.runtime.plans[0].ticket = Some(TicketLink::default());
+            app.runtime.tickets.state_nonces.insert(plan_key.clone(), nonce.clone());
+            app.runtime.plans[0].status = PlanStatus::Archived;
+            app.runtime.push_ticket_states(None);
+            assert!(app.runtime.tickets.state_nonces.is_empty());
+            app.runtime.tickets.state_nonces.insert(plan_key, nonce);
+            app.runtime.plans.clear();
+            app.runtime.push_ticket_states(None);
+            assert!(app.runtime.tickets.state_nonces.is_empty());
         });
     }
 

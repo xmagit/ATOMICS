@@ -262,8 +262,8 @@ impl OAuth {
             (Some(listener), Some(client)) => (listener, client),
             _ => {
                 let listener = TcpListener::bind(("127.0.0.1", 0))
-                    .map_err(|err| McpError::Transport(format!("cannot listen for the sign-in callback: {err}")))?;
-                let port = listener.local_addr().map_err(|e| McpError::Transport(e.to_string()))?.port();
+                    .map_err(|err| McpError::transport(format!("cannot listen for the sign-in callback: {err}")))?;
+                let port = listener.local_addr().map_err(|e| McpError::transport(e.to_string()))?.port();
                 let redirect_uri = format!("http://127.0.0.1:{port}/callback");
                 let client_id = register(&agent, &auth, &redirect_uri)?;
                 let client = Client { client_id, redirect_uri };
@@ -368,7 +368,7 @@ impl OAuth {
         let key = server_key(server).ok_or_else(|| McpError::Server("no MCP server url".into()))?;
         let need = |why: &str| McpError::SignInRequired(format!("{url} {why}"));
         let (tokens, access) =
-            self.load(&key).map_err(|e| McpError::Transport(e.to_string()))?.ok_or_else(|| need("needs a sign-in"))?;
+            self.load(&key).map_err(|e| McpError::transport(e.to_string()))?.ok_or_else(|| need("needs a sign-in"))?;
         let mut session = Session {
             oauth: self.clone(),
             key,
@@ -456,7 +456,7 @@ fn due(access: &Access) -> bool {
 }
 
 fn storage(err: anyhow::Error) -> McpError {
-    McpError::Transport(err.to_string())
+    McpError::transport(err.to_string())
 }
 
 fn unix_now() -> u64 {
@@ -532,7 +532,7 @@ struct Reply {
 }
 
 fn reply(response: Result<ureq::http::Response<ureq::Body>, ureq::Error>, what: &str) -> Result<Reply, McpError> {
-    let mut response = response.map_err(|err| McpError::Transport(format!("{what} failed: {err}")))?;
+    let mut response = response.map_err(|err| McpError::transport(format!("{what} failed: {err}")))?;
     let authenticate = response
         .headers()
         .get_all("www-authenticate")
@@ -545,7 +545,7 @@ fn reply(response: Result<ureq::http::Response<ureq::Body>, ureq::Error>, what: 
         .with_config()
         .limit(1024 * 1024)
         .read_to_string()
-        .map_err(|err| McpError::Transport(format!("reading {what} failed: {err}")))?;
+        .map_err(|err| McpError::transport(format!("reading {what} failed: {err}")))?;
     Ok(Reply { status, authenticate, body })
 }
 
@@ -694,7 +694,7 @@ fn await_callback(
     timeout: Duration,
     control: &SignInControl,
 ) -> Result<String, McpError> {
-    listener.set_nonblocking(true).map_err(|e| McpError::Transport(e.to_string()))?;
+    listener.set_nonblocking(true).map_err(|e| McpError::transport(e.to_string()))?;
     let deadline = Instant::now() + timeout;
     let mut stray = false;
     loop {
@@ -718,7 +718,7 @@ fn await_callback(
                 std::thread::sleep(Duration::from_millis(20));
                 continue;
             }
-            Err(err) => return Err(McpError::Transport(format!("sign-in callback failed: {err}"))),
+            Err(err) => return Err(McpError::transport(format!("sign-in callback failed: {err}"))),
         };
         let _ = stream.set_nonblocking(false);
         // A client that does not read its answer cannot hold the listener either.
@@ -888,7 +888,7 @@ fn token_request(agent: &ureq::Agent, endpoint: &Url, form: &[(&str, &str)]) -> 
     .map_err(TokenError::Transport)?;
     let value: Value = serde_json::from_str(&r.body).unwrap_or(Value::Null);
     if r.status >= 500 {
-        return Err(TokenError::Transport(McpError::Transport(format!(
+        return Err(TokenError::Transport(McpError::transport(format!(
             "the token endpoint answered HTTP {}",
             r.status
         ))));
