@@ -120,7 +120,7 @@ close_done_agents = true
 # BEGIN RELAY PROFILE
 # Relay example: OAuth, state pushes and comments; check with doctor before use.
 # # Stage keys are per project; verify them before enabling state pushes.
-# # find_tickets needs relay-backend #752 to be live.
+# # find_tickets needs relay-backend #752 to be live; browse, accepts and paging need RELAY-11976.
 # [tickets]
 # system = "relay"
 # mode = "auto"
@@ -184,7 +184,16 @@ close_done_agents = true
 # tool = "find_tickets"
 # arguments = { about = "{query}", take = 10, includeClosed = false }
 # items = "result.tickets"
+# accepts = ["assignee", "status"]
+# paging = { cursor = "cursor", next = "result.nextCursor" }
 # result = { id = "id", key = "number", url = "url", title = "subject", state = "status", updated_at = "updatedAtUtc", score = "score", snippet = "snippet", assignee = "assigneeDisplayName", parent = "parentTicketId", kind = "type" }
+#
+# [tickets.operations.browse]
+# tool = "find_tickets"
+# arguments = { take = 25, includeClosed = false }
+# items = "result.tickets"
+# paging = { cursor = "cursor", next = "result.nextCursor" }
+# result = { id = "id", key = "number", url = "url", title = "subject", state = "status", updated_at = "updatedAtUtc", assignee = "assigneeDisplayName", parent = "parentTicketId", kind = "type" }
 #
 # [tickets.operations.related]
 # tool = "find_related_tickets"
@@ -205,6 +214,17 @@ close_done_agents = true
 # [tickets.operations.comment]
 # tool = "add_ticket_comment"
 # arguments = { ticketId = "{uuid}", body = "{body}", idempotencyKey = "{nonce}" }
+#
+# [[tickets.views]]
+# label = "Recent"
+#
+# [[tickets.views]]
+# label = "Being worked on"
+# arguments = { status = ["active"] }
+#
+# [[tickets.filters]]
+# label = "Mine"
+# arguments = { assignee = "owner" }
 # END RELAY PROFILE
 #
 # BEGIN LINEAR PROFILE
@@ -1138,7 +1158,7 @@ kind = "shell"
     }
 
     #[test]
-    fn ticket_profile_examples_match_the_documentation() {
+    fn tickets_profile_examples_match_the_documentation() {
         let docs = include_str!("../../../docs/tickets.md");
         let mut profiles = 0;
         for block in DEFAULT_CONFIG.split("# BEGIN ").skip(1) {
@@ -1148,6 +1168,11 @@ kind = "shell"
                 block.lines().skip(1).map(|line| line.strip_prefix("# ").unwrap_or("")).collect::<Vec<_>>().join("\n");
             let config: Config = toml::from_str(&text).unwrap();
             assert!(config.tickets.is_configured());
+            if name == "RELAY PROFILE" {
+                assert!(config.tickets.has_views());
+                assert_eq!(config.tickets.views[1].arguments["status"], serde_json::json!(["active"]));
+                assert_eq!(config.tickets.filters[0].arguments["assignee"], "owner");
+            }
             assert!(docs.contains(text.trim()), "{name} example drifted from docs/tickets.md");
             profiles += 1;
         }

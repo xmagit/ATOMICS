@@ -339,6 +339,7 @@ result = { id = "uuid", key = "id", url = "url", title = "title", state = "statu
 | `whoami` (optional) | Read the connection identity at startup, sign-in and config reload; shown in the sign-in chip. Result paths: `id`, `kind`, `name`, `owner_id`, `owner_name`. | None |
 | `search` (optional) | Keyword search; `items` selects the hit array. | `{query}` |
 | `semantic_search` (optional) | Meaning search with optional scores; `items` selects the hit array. | `{query}` |
+| `browse` (optional) | Tickets without a query, for the Tickets panel's [views](#views-and-filters); `items` selects the array. | none |
 | `children` (optional) | Direct children; also used when board mode has no `list` mapping. | `{id}`, `{key}`, `{key_number}`, `{uuid}` |
 | `related` (optional) | Related matches, with optional scores. These are never treated as children. | `{id}`, `{key}`, `{key_number}`, `{uuid}` |
 | `read` (optional) | Full display card with body, comments and development links; falls back to the complete `get` result. | `{id}`, `{key}`, `{key_number}`, `{uuid}` |
@@ -477,7 +478,7 @@ whose tools are absent produce doctor notes; they do not make an otherwise usabl
 ## The Tickets panel
 
 `cmd+k` (Ctrl+Shift+K elsewhere; `cmd+j` already jumps to the next agent that needs you) shows the Tickets
-panel in the diff's slot. It appears when `[tickets]` is configured and has two views. The key is
+panel in the diff's slot. It appears when `[tickets]` is configured and has two modes, Find and Read. The key is
 `[keys] toggle_tickets`.
 
 **Find** has a query box and, when both `search` and `semantic_search` are mapped, a *meaning / keyword*
@@ -487,6 +488,11 @@ lowest to the highest score of that result set (one result, or equal scores, fil
 is printed beside it; scores of different searches are not comparable. State chips use the system's own names
 and are coloured only for states in `[tickets.states]`. A system with only `search` shows the same list
 without bars or toggle.
+
+With [views](#views-and-filters), Find opens on the default view instead of an empty box: its tabs sit beside
+the query box, the profile's filter chips below it, and the status line names the view (`25 tickets ·
+Recent`). Typing and `Enter` search; clearing the box returns to the selected view. Picking a tab clears
+the query. When the operation maps `paging`, **More** (or `↓` on the last result) adds the next page.
 
 **Read** shows one ticket: the description as markdown (headings, lists, code, bold, inline code and links;
 images are links), then comments (long ones are cut to 12 lines; `Enter` expands), **Children** and
@@ -501,22 +507,71 @@ Opening a child or related ticket adds it to the breadcrumbs.
 | `cmd+k` | open / close the panel | same |
 | `Ctrl+1…9` (`Cmd+1…9`) | select agent N; Find stays in Find | select agent N and show its task's ticket (the chief and untasked agents show the plan's) |
 | `Shift+↓` / `Shift+↑` | next / previous result | next / previous ticket: the following result, or on a trail of opened tickets (`↑` only) the one before. Ignored in a text field and in the editor |
-| `↑` `↓` | move the selection (`↓` in the box enters the list) | scroll a line |
+| `↑` `↓` | move the selection (`↓` in the box enters the list; on the last result, **More**) | scroll a line; at the top / bottom, read the previous / next ticket of the list in place (loading More at the last loaded ticket); the list's selection follows. On a trail of opened tickets, or for a ticket not in the list, scroll a line |
+| `←` `→` (in the list) | previous / next view; from search results, back to the selected view | |
+| `Alt+1…9` | switch filter chip N (also in the box) | |
 | `PageUp` / `PageDown` | scroll a page | next / previous section: description parts, comments, each child, each related ticket |
 | `Home` / `End` | first / last result | top / bottom |
 | `Enter` | search (in the box), read (on a result) | open the selected child or related ticket; expand a comment |
 | `Alt+←` | | back along the breadcrumbs, then to the results |
 | `cmd+enter` (`[keys] plan_with_chief`) | | Plan with chief |
 | `Tab` (in the box) | toggle meaning / keyword | |
-| `Esc` | leave the box; again, return to the terminal | return to the terminal |
+| `Esc` | leave the box; again, return to the terminal | back to the list, with the ticket selected and scrolled into view |
 
 The sidebar gets a **TICKETS** section: in a plan's view its ticket tree (the plan's ticket, each task's
 ticket and, in board mode, the board's tickets without a task), elsewhere a *Find tickets…* row and the last
 five tickets read. A click opens the ticket in Read. A plan's tab shows its ticket's key and progress
 (`KEY · 2/6`, or `KEY · planning…` while it has no tasks) instead of its goal.
 
+Opening a ticket, from the list, the sidebar or the trace lane, gives the panel the keyboard, so `↑`/`↓`
+and `Esc` work at once.
+
 When the ticket system says it needs a sign-in, the panel shows a "not signed in" banner (and a dot on the
 top-bar entry) instead of an error. The Sign in button starts the native OAuth flow described above; in an SSH session, use the paste path.
+
+### Views and filters
+
+A profile can list tickets without a query. Map `browse`, declare views, and optionally filter chips:
+
+```toml
+[tickets.operations.browse]
+tool = "list_tickets"
+arguments = { take = 25 }
+items = "tickets"
+paging = { cursor = "cursor", next = "nextCursor" }
+result = { id = "id", key = "key", title = "title", state = "state", updated_at = "updated" }
+
+[[tickets.views]]
+label = "Recent"
+
+[[tickets.views]]
+label = "In progress"
+arguments = { state = "started" }
+
+[[tickets.filters]]
+label = "Mine"
+arguments = { assignee = "owner" }
+```
+
+- **Views** are tabs beside the query box, in this order. Each one calls `browse` with its `arguments`
+  added to the operation's own (a view's value replaces one of the same name). The view with
+  `default = true`, else the first, shows while the query is empty. The server decides the order; ask for
+  "most recently updated first" in the arguments if it does not list that way by default.
+- **Filters** are chips below the box when views and `browse` are mapped; several can be on at once.
+  Their `arguments` are added to every view, after the view's own, and to a search when that operation's
+  `accepts` names every argument: `accepts = ["assignee", "status"]` on `semantic_search` lets Mine
+  narrow a meaning search too.
+  A chip that a search does not take is dimmed while its results show.
+- **Paging.** `paging.cursor` is the argument that takes a cursor and `paging.next` the result path of
+  the next one. While the last result had a cursor, **More** asks for the next page with the same
+  arguments plus that cursor, and adds the tickets to the list. Without `paging`, there is no More. `paging`
+  works on `browse`, `search` and `semantic_search`. If More fails, the cursor is discarded and the
+  same listing or search starts again from its first page.
+- Argument values are passed as written; placeholders work as in other operations, but `browse` knows only
+  `{system}`. The chief's `atomics_ticket_search` is unaffected by views and chips.
+
+A profile without views, or with views but no `browse`, keeps the empty query box and lists nothing
+until you search. Doctor notes a mapped `browse` tool the server does not offer.
 
 ## Plan with chief
 
@@ -932,7 +987,11 @@ through the connected MCP gateway were checked on 2026-11-01: `get_ticket` accep
 read shape. The commented default template contains the same example.
 
 `find_tickets` needs **relay-backend #752** to be live; a declared schema alone does not prove the
-backend is deployed. Snippets appear only when returned. Children use **RELAY-11954**'s tool and must
+backend is deployed. The views use `find_tickets` without `about` (`browse`): **Recent** lists by
+`updatedAtUtc`, newest first; **Being worked on** passes `status = ["active"]`, the stage category of work
+in progress; the **Mine** chip passes `assignee = "owner"`, the human the connection acts for, and meaning
+search `accepts` it and `status`. More follows `result.nextCursor` through `cursor`. Listing without
+`about`, these filters and paging need **RELAY-11976** on your endpoint. Snippets appear only when returned. Children use **RELAY-11954**'s tool and must
 be deployed on your endpoint. The profile reads the first 50 children and up to 10 search hits; it does
 not fetch subsequent child or comment pages automatically.
 
@@ -951,7 +1010,7 @@ Related matches are never treated as children.
 
 ```toml
 # Stage keys are per project; verify them before enabling state pushes.
-# find_tickets needs relay-backend #752 to be live.
+# find_tickets needs relay-backend #752 to be live; browse, accepts and paging need RELAY-11976.
 [tickets]
 system = "relay"
 mode = "auto"
@@ -1015,7 +1074,16 @@ links = { items = "ticket.developmentLinks", label = "title", url = "pullRequest
 tool = "find_tickets"
 arguments = { about = "{query}", take = 10, includeClosed = false }
 items = "result.tickets"
+accepts = ["assignee", "status"]
+paging = { cursor = "cursor", next = "result.nextCursor" }
 result = { id = "id", key = "number", url = "url", title = "subject", state = "status", updated_at = "updatedAtUtc", score = "score", snippet = "snippet", assignee = "assigneeDisplayName", parent = "parentTicketId", kind = "type" }
+
+[tickets.operations.browse]
+tool = "find_tickets"
+arguments = { take = 25, includeClosed = false }
+items = "result.tickets"
+paging = { cursor = "cursor", next = "result.nextCursor" }
+result = { id = "id", key = "number", url = "url", title = "subject", state = "status", updated_at = "updatedAtUtc", assignee = "assigneeDisplayName", parent = "parentTicketId", kind = "type" }
 
 [tickets.operations.related]
 tool = "find_related_tickets"
@@ -1036,6 +1104,17 @@ arguments = { ticketId = "{uuid}", stageKey = "{state}", idempotencyKey = "{nonc
 [tickets.operations.comment]
 tool = "add_ticket_comment"
 arguments = { ticketId = "{uuid}", body = "{body}", idempotencyKey = "{nonce}" }
+
+[[tickets.views]]
+label = "Recent"
+
+[[tickets.views]]
+label = "Being worked on"
+arguments = { status = ["active"] }
+
+[[tickets.filters]]
+label = "Mine"
+arguments = { assignee = "owner" }
 ```
 
 ### Linear: an issue per plan
@@ -1233,6 +1312,11 @@ a reused key with different arguments, and can drop a reply after applying a wri
 - inbound `ticket_event`;
 - failures shown on the card, timeouts and the backoff;
 - the board's chips and header;
+- the Tickets panel's views and filters (`crates/atomics/src/app/tickets_panel.rs`): the empty panel
+  lists Recent, `→` switches to Being worked on, the Mine chip narrows, typing searches with the chip
+  and clearing returns to the view, More follows the cursor and restarts after an error, and chips need
+  views and browse; ↑/↓ scroll Read until an edge, then read its neighbours (loading More as needed),
+  while PageUp/PageDown still step sections and Escape returns to the list;
 - the same steps against the configurable dialects, where only the config differs;
 - the documented example profiles extracted from the default template, with neutral test names
   (`meaning-example` and `keyword-example`) and the server replaced by the fixture;
@@ -1269,7 +1353,10 @@ are preserved.
 The fixture speaks three configurable dialects: nested structured `card_*` tools, flat JSON-text
 `issue_*` tools, and JSON-text `find_tickets` / `find_keyword_tickets`, `get_children`,
 `find_related_tickets`, `list_ticket_children`, `get_ticket`. All three support query-filtered search, direct children, related
-matches and full reads. The fixture's `get_children` alias and keyword search demonstrate capabilities; they
+matches and full reads. `find_tickets` without `about` lists by recency (newest `rev` first) without
+scores; with or without it, it takes `status` (a stage, or `active` for InProgress, Deploying and
+Review) as an array, `assignee` (`owner` is the state's `me`, default Demo User), `type`, `parent` and `cursor`, and
+returns `result.nextCursor` while more remain. The fixture's `get_children` alias and keyword search demonstrate capabilities; they
 are not claims about any live server. Calls remain recorded in the state file for assertions.
 
 The conversation tools (`conversation_*`, `card_conversation_*`, `issue_conversation_*`) share one

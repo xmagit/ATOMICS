@@ -11,6 +11,9 @@
 //! rereads and rewrites it, so tests can change tickets behind ATOMICS's back and check
 //! what ATOMICS pushed. Optional idempotencyKey receipts deduplicate writes; structured_results
 //! selects structured output for text tools, and drop_reply loses a reply after committing the write.
+//! `find_tickets` without `about` lists by recency (`rev`, newest first) without scores. Its
+//! filters (`status` as an array, where `active` means in progress, `assignee`, where `owner` is the state's `me`
+//! or Demo User, `type`, `parent`) and `cursor` paging work with or without `about`.
 
 use std::io::{BufRead, Write};
 
@@ -156,6 +159,12 @@ fn call(path: &str, params: &Value) -> Result<Value, String> {
         }
         return Ok(result);
     }
+    if matches!(name, "find_tickets" | "find_keyword_tickets")
+        && args.get("status").is_some_and(|status| !status.is_array())
+    {
+        save(path, &state);
+        return Err("status must be an array".into());
+    }
     // Persist successful replies so retries after a lost reply cannot duplicate a write.
     let key = args["idempotencyKey"].as_str().or_else(|| args["eventId"].as_str()).or_else(|| args["nonce"].as_str());
     if matches!(name, "change_ticket_status" | "add_ticket_comment")
@@ -229,10 +238,7 @@ fn call(path: &str, params: &Value) -> Result<Value, String> {
             }
             "issue_children" => text(json!({"issues": children(&state, &args["id"]).map(issue).collect::<Vec<_>>()})),
             "issue_related" => text(json!({"issues": related(&state, &args["id"])? .map(issue).collect::<Vec<_>>()})),
-            "find_tickets" | "find_keyword_tickets" => {
-                text(json!({"result":{"tickets": search(&state, args.get("about").unwrap_or(&args["query"]))
-            .take(args["take"].as_u64().unwrap_or(25).min(25) as usize).map(found_ticket).collect::<Vec<_>>()}}))
-            }
+            "find_tickets" | "find_keyword_tickets" => text(json!({ "result": find_tickets(&state, args) })),
             "find_related_tickets" => text(
                 json!({"result":{"tickets": related(&state, &args["ticket"])? .map(found_ticket).collect::<Vec<_>>()}}),
             ),
@@ -672,6 +678,65 @@ fn related<'a>(state: &'a Value, reference: &Value) -> Result<impl Iterator<Item
         other["id"] != ticket["id"]
             && (other["parent"] == ticket["id"] || (!ticket["parent"].is_null() && other["parent"] == ticket["parent"]))
     }))
+}
+
+/// Search or list, filter, then cut one page at `cursor` with the next page's cursor.
+fn find_tickets(state: &Value, args: &Value) -> Value {
+    let query = args.get("about").or_else(|| args.get("query")).filter(|query| !query.is_null());
+    let mut hits: Vec<&Value> = match query {
+        Some(query) => search(state, query).collect(),
+        None => {
+            let mut all: Vec<(usize, &Value)> = state["tickets"].as_array().into_iter().flatten().enumerate().collect();
+            all.sort_by_key(|(index, ticket)| std::cmp::Reverse((ticket["rev"].as_u64().unwrap_or(0), *index)));
+            all.into_iter().map(|(_, ticket)| ticket).collect()
+        }
+    };
+    let me = state["me"].as_str().unwrap_or("Demo User");
+    hits.retain(|ticket| {
+        let status = match &args["status"] {
+            Value::Null => true,
+            Value::Array(states) => states.iter().any(|wanted| in_status(ticket, wanted)),
+            _ => false,
+        };
+        let assignee = match args["assignee"].as_str() {
+            None => true,
+            Some("owner") => ticket["assignee"] == me,
+            Some(name) => ticket["assignee"] == name,
+        };
+        let kind = args["type"].is_null() || ticket["kind"] == args["type"];
+        let parent = args["parent"].is_null()
+            || find(state, &args["parent"]).is_ok_and(|parent| ticket["parent"] == parent["id"]);
+        status && assignee && kind && parent
+    });
+    let start = args["cursor"].as_str().and_then(|cursor| cursor.parse::<usize>().ok()).unwrap_or(0);
+    let take = args["take"].as_u64().unwrap_or(25).min(25) as usize;
+    let tickets: Vec<Value> = hits
+        .iter()
+        .skip(start)
+        .take(take)
+        .map(|ticket| {
+            let mut row = found_ticket(ticket);
+            if query.is_none() {
+                row["score"] = Value::Null;
+            }
+            row
+        })
+        .collect();
+    let mut result = json!({ "tickets": tickets });
+    if start + take < hits.len() {
+        result["nextCursor"] = json!((start + take).to_string());
+    }
+    result
+}
+
+/// A stage name, or `active` for the stages of work in progress.
+fn in_status(ticket: &Value, wanted: &Value) -> bool {
+    let state = ticket["state"].as_str().unwrap_or_default();
+    match wanted.as_str() {
+        Some("active") => ["InProgress", "Deploying", "Review"].contains(&state),
+        Some(wanted) => state.eq_ignore_ascii_case(wanted),
+        None => false,
+    }
 }
 
 fn found_ticket(ticket: &Value) -> Value {

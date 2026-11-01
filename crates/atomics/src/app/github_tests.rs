@@ -653,6 +653,16 @@ fn github_shortcut_toggles_the_modal_before_the_terminal() {
 }
 
 #[test]
+fn tickets_panel_filter_shortcut_conflicts_are_reported_and_fall_back() {
+    for n in 1..=9 {
+        let keys = atomics_core::config::KeyConfig { github: format!("alt+{n}"), ..Default::default() };
+        let (chord, problem) = github_shortcut(&keys);
+        assert_eq!(chord, crate::theme::shortcut("primary+g"));
+        assert!(problem.unwrap().contains(&format!("the ticket filter chord for chip {n}")));
+    }
+}
+
+#[test]
 fn github_shortcut_conflicts_are_reported_and_fall_back() {
     let keys = atomics_core::config::KeyConfig::default();
     let (chord, problem) = github_shortcut(&keys);

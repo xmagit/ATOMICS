@@ -57,6 +57,9 @@ pub(super) struct Tickets {
     /// The workspace file's `[chief] cwd`, `resume` and `autostart`.
     pub(super) workspace_chief: Option<atomics_core::config::ChiefLaunch>,
     pub(super) jobs: Option<std::sync::mpsc::Sender<TicketJob<Tag>>>,
+    /// Find and Read are independent: opening a ticket must not cancel its in-flight list page.
+    panel_find_sequence: Arc<std::sync::atomic::AtomicU64>,
+    panel_read_sequence: Arc<std::sync::atomic::AtomicU64>,
     done_tx: crate::host::Sender<Done>,
     done_rx: Receiver<Done>,
     /// Jobs sent and not yet answered.
@@ -112,6 +115,8 @@ impl Tickets {
             workspace_isolation: None,
             workspace_chief: None,
             jobs: None,
+            panel_find_sequence: Default::default(),
+            panel_read_sequence: Default::default(),
             done_tx,
             done_rx,
             pending: 0,
@@ -357,7 +362,8 @@ impl State {
             | TicketOp::ResetOutboxes
             | TicketOp::Outbox { .. }
             | TicketOp::Create { .. }
-            | TicketOp::Search { .. } => None,
+            | TicketOp::Search { .. }
+            | TicketOp::Page { .. } => None,
         };
         // Callers already leave other systems' links alone; nothing may reach them anyway.
         if let Some(mismatch) = addressed.and_then(|link| config.mismatch(link)) {
@@ -370,11 +376,22 @@ impl State {
             Some(oauth) => crate::tickets::spawn_with(done, oauth),
             None => crate::tickets::spawn(done),
         });
+        let sequence = if let Kind::Panel(job, seq) = &tag.kind {
+            use super::tickets_panel::Job;
+            let current = match job {
+                Job::Find | Job::More => self.tickets.panel_find_sequence.clone(),
+                Job::Read | Job::Children | Job::Related => self.tickets.panel_read_sequence.clone(),
+            };
+            current.store(*seq, std::sync::atomic::Ordering::Relaxed);
+            Some((current, *seq))
+        } else {
+            None
+        };
         let counted = tag.kind != Kind::Outbox;
         if counted {
             self.tickets.pending += 1;
         }
-        if let Err(unsent) = jobs.send(TicketJob { config: config.clone(), op, tag }) {
+        if let Err(unsent) = jobs.send(TicketJob { config: config.clone(), op, tag, sequence }) {
             // A worker that stopped is started again for the next job; this one fails.
             self.tickets.jobs = None;
             if counted {

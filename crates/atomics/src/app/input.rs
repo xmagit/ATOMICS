@@ -153,6 +153,35 @@ impl Desktop<'_> {
         {
             self.runtime.tickets_back();
         }
+        // Escape in a ticket goes back to the list; the panel keeps the keys.
+        if self.runtime.panel == PanelMode::Tickets
+            && self.runtime.diff_open
+            && self.runtime.tickets.panel.view == tickets_panel::TicketsView::Read
+            && ctx.memory(|m| m.has_focus(diff_view::focus_id()))
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape))
+        {
+            self.runtime.tickets_to_list();
+        }
+        // Alt+1…9 switch the Tickets panel's filter chips, in the list or the query box.
+        if self.runtime.tickets.config.as_ref().is_some_and(|config| config.has_views())
+            && self.runtime.panel == PanelMode::Tickets
+            && self.runtime.diff_open
+            && self.runtime.tickets.panel.view == tickets_panel::TicketsView::Find
+            && ctx.memory(|m| m.has_focus(diff_view::focus_id()) || m.has_focus(tickets_panel::query_id()))
+        {
+            for (n, key) in
+                [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9]
+                    .into_iter()
+                    .take(self.runtime.tickets.config.as_ref().map_or(0, |config| config.filters.len()))
+                    .enumerate()
+            {
+                if ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, key)) {
+                    // Option+digit also types a character on macOS; here it is only the chip key.
+                    ctx.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Text(_))));
+                    self.runtime.tickets_chip(n);
+                }
+            }
+        }
         if pressed(&keys.toggle_chief) {
             self.toggle_chief(ctx);
         }

@@ -208,6 +208,34 @@ pub struct TicketConfig {
     pub operations: Operations,
     /// `[tickets.remote]`; follows the same workspace precedence as the rest of `[tickets]`.
     pub remote: RemoteConfig,
+    /// Tabs of the Tickets panel beside the query box, each a `browse` listing.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub views: Vec<TicketView>,
+    /// Filter chips of the Tickets panel.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub filters: Vec<TicketFilter>,
+}
+
+/// A tab of the Tickets panel: the `browse` operation with extra arguments.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TicketView {
+    pub label: String,
+    /// Shown while the query is empty; without one, the first view is.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub default: bool,
+    /// Added to the `browse` arguments, replacing any of the same name.
+    #[serde(skip_serializing_if = "Map::is_empty")]
+    pub arguments: Map<String, Value>,
+}
+
+/// A filter chip of the Tickets panel: arguments added to every view, and to a search whose
+/// operation `accepts` all of them.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TicketFilter {
+    pub label: String,
+    pub arguments: Map<String, Value>,
 }
 
 impl Default for TicketConfig {
@@ -226,6 +254,8 @@ impl Default for TicketConfig {
             states: StateMap::default(),
             operations: Operations::default(),
             remote: RemoteConfig::default(),
+            views: Vec::new(),
+            filters: Vec::new(),
         }
     }
 }
@@ -372,6 +402,10 @@ pub struct Operations {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(deserialize_with = "read_operation")]
     pub list: Option<Operation>,
+    /// Tickets without a query, for the Tickets panel's views; `items` selects the array.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "read_operation")]
+    pub browse: Option<Operation>,
     /// Placeholders: {id}, {key}, {uuid}, {state}, {nonce}.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub update_state: Option<Operation>,
@@ -400,6 +434,26 @@ pub struct Operation {
     pub body: String,
     pub comments: CommentPaths,
     pub links: DevLinkPaths,
+    /// For searches: the argument names the Tickets panel's filter chips may add.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub accepts: Vec<String>,
+    /// For lists: how the Tickets panel's "More" asks for the next page.
+    #[serde(skip_serializing_if = "Paging::is_empty")]
+    pub paging: Paging,
+}
+
+/// Cursor paging: the argument that takes a cursor, and the result path of the next one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Paging {
+    pub cursor: String,
+    pub next: String,
+}
+
+impl Paging {
+    pub fn is_empty(&self) -> bool {
+        self.cursor.is_empty() && self.next.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1402,6 +1456,7 @@ impl TicketConfig {
             "conversation_steerers" => self.operations.conversation_steerers.as_ref(),
             "get" => self.operations.get.as_ref(),
             "list" => self.operations.list.as_ref(),
+            "browse" => self.operations.browse.as_ref(),
             "update_state" => self.operations.update_state.as_ref(),
             "comment" => self.operations.comment.as_ref(),
             "create" => self.operations.create.as_ref(),
@@ -1413,6 +1468,23 @@ impl TicketConfig {
             _ => None,
         }
         .filter(|op| !op.tool.trim().is_empty())
+    }
+
+    /// Whether the Tickets panel lists tickets without a query: views and `browse` are mapped.
+    pub fn has_views(&self) -> bool {
+        !self.views.is_empty() && self.operation("browse").is_some()
+    }
+
+    /// The view shown while the query is empty: the one marked default, else the first.
+    pub fn default_view(&self) -> usize {
+        self.views.iter().position(|view| view.default).unwrap_or(0)
+    }
+
+    /// Whether a filter chip applies to an operation: `browse` takes every chip, a search
+    /// only those whose arguments its `accepts` names.
+    pub fn filter_applies(&self, filter: &TicketFilter, name: &str) -> bool {
+        name == "browse"
+            || self.operation(name).is_some_and(|op| filter.arguments.keys().all(|key| op.accepts.contains(key)))
     }
 
     /// Board reads retain the older list mapping when both are present.
@@ -1622,6 +1694,34 @@ impl Operation {
         let mut card = self.card(result, system)?;
         fields(result, "", &mut card);
         Ok(card)
+    }
+
+    /// The cursor of the next page, when `paging` is mapped and the result has one.
+    pub fn next_cursor(&self, result: &Value) -> Option<String> {
+        if self.paging.cursor.is_empty() {
+            return None;
+        }
+        mapped_field(result, &self.paging.next).filter(|cursor| !cursor.is_empty())
+    }
+
+    /// The tool arguments with `extra` replacing any of the same name and placeholders filled in.
+    /// Paging cursors are opaque server values, inserted after placeholder rendering.
+    pub fn arguments_with(&self, vars: &Vars, extra: &Map<String, Value>) -> Result<Value, String> {
+        if extra.is_empty() {
+            return self.arguments(vars);
+        }
+        let mut operation = self.clone();
+        let mut extra = extra.clone();
+        let cursor = extra.remove(&self.paging.cursor);
+        if cursor.is_some() {
+            operation.arguments.remove(&self.paging.cursor);
+        }
+        operation.arguments.extend(extra);
+        let mut arguments = operation.arguments(vars)?;
+        if let Some(cursor) = cursor {
+            arguments.as_object_mut().expect("arguments are an object").insert(self.paging.cursor.clone(), cursor);
+        }
+        Ok(arguments)
     }
 
     /// The tool arguments with placeholders filled in.
@@ -2947,6 +3047,7 @@ mod tests {
             "get",
             "read",
             "list",
+            "browse",
             "children",
             "related",
             "search",
@@ -3743,6 +3844,20 @@ arguments = {{ key = "{{nonce}}", nested = ["{{nonce}}", "{{body}}"] }}"#
     }
 
     #[test]
+    fn tickets_panel_cursor_is_opaque_while_filter_placeholders_render() {
+        let mut operation = Operation::default();
+        operation.paging.cursor = "cursor".into();
+        operation.arguments.insert("query".into(), json!("{query}"));
+        operation.arguments.insert("cursor".into(), json!("{unavailable}"));
+        let extra = json!({"cursor": "opaque:{query}:{unavailable}", "assignee": "{query}"});
+        let vars = Vars::new("demo").with("query", Some("search terms"));
+        assert_eq!(
+            operation.arguments_with(&vars, extra.as_object().unwrap()).unwrap(),
+            json!({"query": "search terms", "assignee": "search terms", "cursor": "opaque:{query}:{unavailable}"})
+        );
+    }
+
+    #[test]
     fn plan_message_is_the_design_text_byte_for_byte() {
         let mut request = plan_request();
         let board = "Plan and implement ticket DEMO-1 (system: example), plan id demo-1.\n\
@@ -3778,5 +3893,64 @@ ATOMICS.md and the user direct the work.";
         assert!(plan_message(&request).len() < 2 * PLAN_EXTRA_MAX);
         request.title = "";
         assert!(!plan_message(&request).contains("Title:"));
+    }
+
+    #[test]
+    fn ticket_views_and_filters_map_browse_chips_and_paging() {
+        let text = r#"
+system = "demo"
+[operations.browse]
+tool = "list_recent"
+arguments = { take = 25 }
+items = "tickets"
+paging = { cursor = "cursor", next = "nextCursor" }
+
+[operations.semantic_search]
+tool = "find"
+arguments = { about = "{query}" }
+accepts = ["assignee"]
+
+[[views]]
+label = "Recent"
+
+[[views]]
+label = "Being worked on"
+default = true
+arguments = { status = "active" }
+
+[[filters]]
+label = "Mine"
+arguments = { assignee = "me" }
+
+[[filters]]
+label = "Bugs"
+arguments = { type = "bug" }
+"#;
+        let config: TicketConfig = toml::from_str(text).unwrap();
+        assert!(config.has_views());
+        assert_eq!(config.default_view(), 1);
+        assert_eq!(config.views[1].arguments["status"], "active");
+        let (mine, bugs) = (&config.filters[0], &config.filters[1]);
+        assert!(config.filter_applies(mine, "browse") && config.filter_applies(bugs, "browse"));
+        assert!(config.filter_applies(mine, "semantic_search"));
+        assert!(!config.filter_applies(bugs, "semantic_search"), "the search does not accept type");
+        assert!(!config.filter_applies(mine, "search"), "unmapped");
+
+        let browse = config.operation("browse").unwrap();
+        let mut extra = config.views[1].arguments.clone();
+        extra.extend(mine.arguments.clone());
+        extra.insert("take".into(), json!(5));
+        let arguments = browse.arguments_with(&Vars::new("demo"), &extra).unwrap();
+        assert_eq!(arguments, json!({"take": 5, "status": "active", "assignee": "me"}));
+        assert_eq!(browse.next_cursor(&json!({"nextCursor": "p2"})).as_deref(), Some("p2"));
+        assert_eq!(browse.next_cursor(&json!({"nextCursor": null})), None);
+        let search = config.operation("semantic_search").unwrap();
+        assert_eq!(search.next_cursor(&json!({"nextCursor": "p2"})), None, "paging is not mapped");
+
+        let mut plain = config.clone();
+        plain.operations.browse = None;
+        assert!(!plain.has_views(), "views need a browse operation");
+        let saved = toml::to_string(&TicketConfig { system: "demo".into(), ..TicketConfig::default() }).unwrap();
+        assert!(!saved.contains("views") && !saved.contains("filters") && !saved.contains("paging"));
     }
 }
