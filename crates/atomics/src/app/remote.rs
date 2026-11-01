@@ -74,6 +74,9 @@ pub(super) struct RemotePlan {
     /// The steering humans the server accepted.
     pub(super) steerers: Vec<Steerer>,
     opening: bool,
+    /// Plans that owned this ticket's conversation until this one took it, open or closed, kept
+    /// until an open succeeds: the conversation continues from where they stopped.
+    takeover: Vec<String>,
     open_after: Option<Instant>,
     polling: bool,
     pub(super) next_poll: Option<Instant>,
@@ -220,6 +223,15 @@ impl State {
                 if self.plans[index].status == PlanStatus::Completed { "Plan finished" } else { "Plan archived" };
             self.remote_activity(index, "done", body);
         }
+        let mut takeovers: HashMap<String, Vec<String>> = HashMap::new();
+        for id in self.tickets.remote.plans.keys().filter(|id| !followed.iter().any(|(plan, ..)| plan == *id)) {
+            let Some(link) = self.plans.iter().find(|p| p.id == *id).and_then(|p| p.ticket.as_ref()) else { continue };
+            for (plan, other, _) in &followed {
+                if other.same_ticket(link) {
+                    takeovers.entry(plan.clone()).or_default().push(id.clone());
+                }
+            }
+        }
         self.tickets.remote.plans.retain(|id, _| followed.iter().any(|(plan, ..)| plan == id));
         let home = paths::atomics_home();
         let epoch = self.tickets.remote.epoch;
@@ -229,6 +241,11 @@ impl State {
         for (plan, link, goal) in followed {
             let remote = &mut self.tickets.remote;
             let entry = remote.plans.entry(plan.clone()).or_default();
+            for from in takeovers.remove(&plan).unwrap_or_default() {
+                if !entry.takeover.contains(&from) {
+                    entry.takeover.push(from);
+                }
+            }
             if entry.opening {
                 continue;
             }
@@ -243,12 +260,18 @@ impl State {
                 let title = Some(ticket::conversation_title(&goal))
                     .filter(|title| !title.is_empty())
                     .unwrap_or_else(|| ticket::conversation_title(link.label()));
-                // A takeover continues from open plans only; a closed plan's sidecar is left over.
-                let peers = open
+                // A takeover continues from the plan that owned the conversation until now, open
+                // or closed, and from the other open plans on the ticket.
+                let mut peers: Vec<String> = open
                     .iter()
                     .filter(|(id, other)| *id != plan && other.same_ticket(&link))
                     .map(|(id, _)| id.clone())
                     .collect();
+                for from in &entry.takeover {
+                    if *from != plan && !peers.contains(from) {
+                        peers.push(from.clone());
+                    }
+                }
                 let op = TicketOp::RemoteOpen {
                     home: home.clone(),
                     plan: plan.clone(),
@@ -653,6 +676,7 @@ impl State {
                         };
                         // The sidecar's digest, so a restart doesn't ask for the same approval again.
                         entry.requested_digest = requested;
+                        entry.takeover.clear();
                         entry.error = None;
                         if entry.lost.take().is_some() {
                             self.toast(format!("Remote conversation for {plan} is open again"));
@@ -1822,6 +1846,64 @@ mod tests {
                 assert!(app.runtime.tickets.remote.plans.is_empty());
             },
         );
+    }
+
+    /// The remote plan, then a newer plan on its ticket that takes the conversation and
+    /// delivers `s-2`; `s-3` is written, then the newer plan is archived and the first takes over.
+    fn takeover_after_delivery(app: &mut Desktop<'_>, dir: &Path, forget_older: bool) {
+        let path = remote_app(app, dir, |_| {});
+        let config = app.runtime.ticket_config().unwrap();
+        app.runtime.plans.push(Plan {
+            id: "newer-plan".into(),
+            goal: "Newer goal".into(),
+            approved: true,
+            ticket: link(&config, TICKET, "DEMO-1"),
+            created_at: now_ms(),
+            ..Default::default()
+        });
+        settle(app, 3);
+        assert_eq!(app.runtime.tickets.remote.plans.keys().collect::<Vec<_>>(), ["newer-plan"]);
+        set(&path, |state| {
+            state["steering"].as_array_mut().unwrap().push(steering("s-2", 2, "human-1", "Human", "status?"));
+        });
+        poll_all(app);
+        assert_eq!(sent(app).len(), 1, "the newer plan delivers s-2");
+        if forget_older {
+            std::fs::remove_file(RemoteState::path(&paths::atomics_home(), "remote-plan").unwrap()).unwrap();
+        }
+        // Written after the newer plan stopped, before the other plan reads anything.
+        set(&path, |state| {
+            state["steering"].as_array_mut().unwrap().push(steering("s-3", 3, "human-1", "Human", "next"));
+        });
+        let newer = app.runtime.plans.iter().position(|p| p.id == "newer-plan").unwrap();
+        app.runtime.plans[newer].status = PlanStatus::Archived;
+        settle(app, 3);
+        assert_eq!(app.runtime.tickets.remote.plans.keys().collect::<Vec<_>>(), ["remote-plan"]);
+        assert!(app.runtime.tickets.remote.plans["remote-plan"].conversation.is_some(), "{:?}", app.runtime.toast);
+    }
+
+    #[test]
+    fn remote_takeover_from_an_archived_plan_pastes_nothing_twice() {
+        with_app("app::remote::tests::remote_takeover_from_an_archived_plan_pastes_nothing_twice", |app, _| {
+            let dir = crate::test_support::tempdir().unwrap();
+            takeover_after_delivery(app, dir.path(), false);
+            poll_all(app);
+            let all = sent(app);
+            assert_eq!(all.len(), 2, "s-2 is not pasted again by the plan that took over: {all:?}");
+            assert!(all[1].ends_with("next"), "{all:?}");
+        });
+    }
+
+    #[test]
+    fn remote_takeover_by_a_plan_that_never_opened_skips_nothing() {
+        with_app("app::remote::tests::remote_takeover_by_a_plan_that_never_opened_skips_nothing", |app, _| {
+            let dir = crate::test_support::tempdir().unwrap();
+            takeover_after_delivery(app, dir.path(), true);
+            poll_all(app);
+            let all = sent(app);
+            assert_eq!(all.len(), 2, "s-3 is not skipped and s-2 is not repeated: {all:?}");
+            assert!(all[1].ends_with("next"), "{all:?}");
+        });
     }
 
     #[test]

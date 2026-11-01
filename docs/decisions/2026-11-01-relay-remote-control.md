@@ -231,8 +231,11 @@ tools = "cards"                    # "cards" | "names" | "off"
 min_interval_ms = 2000
 poll_secs = 5
 idle_poll_secs = 60
+errors = { code = "" }             # optional: how refusals are told apart, by the code at this JSON path
 ```
 
+`errors` names the JSON path of an error code in a tool error's `structuredContent` and lists the codes
+(`content_refused`, `ended`, `conflict`, `invalid`, `unreadable`); without it the known messages decide.
 `kinds` and `activity` map ATOMICS's roles and states to the server's vocabulary, so the Relay values live
 only in the profile. The section follows the same workspace precedence as the rest of `[tickets]`.
 

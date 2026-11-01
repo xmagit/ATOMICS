@@ -587,8 +587,12 @@ impl Worker {
             let vars = write.vars.clone().with("nonce", Some(&write.nonce));
             let result = self.call(config, &write.op, &vars);
             // A server assigning sequences itself can race over one: a conflict on a post sent
-            // without a sequence is transient.
+            // without a sequence is transient. An event id reused for other content never is.
+            let id_reused = result.as_ref().err().is_some_and(|error| {
+                error.to_lowercase().replace('\u{2019}', "'").contains("event id was already used for other content")
+            });
             if self.refusal == Some(RemoteError::Conflict)
+                && !id_reused
                 && write.op == "conversation_post"
                 && config.operation(&write.op).is_some_and(|op| !op.uses_placeholder("seq"))
             {
@@ -686,8 +690,10 @@ impl Worker {
             }
         }
         // Another open plan on the same ticket may have followed this conversation: one conversation per ticket.
+        // A plan whose sidecar already names the conversation counts every sidecar on it.
+        let every = state.conversation.as_deref() == Some(conversation.id.as_str());
         let (their_cursor, their_seen) =
-            RemoteState::used_cursor(home, plan, &conversation.id, peers).map_err(|e| e.to_string())?;
+            RemoteState::used_cursor(home, plan, &conversation.id, peers, every).map_err(|e| e.to_string())?;
         if state.conversation.as_deref() != Some(conversation.id.as_str()) {
             // A new conversation starts at the server's newest revision: nothing written
             // before remote was on, or before a lost sidecar, is ever delivered. Taken over from
@@ -957,8 +963,12 @@ impl Worker {
                     self.client = None;
                 }
                 Err(err) => {
-                    if let McpError::Server(message) = &err {
-                        self.refusal = config.remote.errors.classify(message);
+                    match &err {
+                        McpError::Server(message) => self.refusal = config.remote.errors.classify(message),
+                        McpError::Tool { message, details } => {
+                            self.refusal = config.remote.errors.classify(&format!("{message} {details}"))
+                        }
+                        _ => {}
                     }
                     return Err(self.broken(&config.server, err));
                 }
@@ -2407,6 +2417,8 @@ pub(crate) mod tests {
         });
         let messages = outbox(&mut worker, &config, home, Some(post(&config, "sequenced")));
         assert!(messages[0].starts_with("Remote write dropped"), "{messages:?}");
+        assert_eq!(messages[0].matches("Another event already holds").count(), 1, "said once: {messages:?}");
+        assert!(!messages[0].contains("sequence_conflict"), "no JSON in the toast: {messages:?}");
         assert!(RemoteState::load(home, "lanes").unwrap().outbox.is_empty());
         // Without a sequence the server assigns it, and its conflict is a race to retry.
         let mut unsequenced = config.clone();
@@ -2431,6 +2443,14 @@ pub(crate) mod tests {
         assert!(RemoteState::load(home, "lanes").unwrap().outbox.is_empty());
         let last = posts().pop().unwrap();
         assert_eq!((last["eventId"].as_str(), last.get("sequence")), (Some(nonce.as_str()), None), "the same event");
+        // An event id reused for other content is final, even without a sequence.
+        set(&path, |state| {
+            state["fail"] = json!(["conversation_post"]);
+            state["fail_message"] = json!("This event id was already used for other content.");
+        });
+        let messages = outbox(&mut worker, &unsequenced, home, Some(post(&config, "reused")));
+        assert!(messages[0].starts_with("Remote write dropped"), "{messages:?}");
+        assert!(RemoteState::load(home, "lanes").unwrap().outbox.is_empty());
     }
 
     #[test]
@@ -2500,6 +2520,8 @@ pub(crate) mod tests {
                 owners: vec!["human-1".into()],
                 recover: false,
                 reset: false,
+                // Each is the other's peer as the app passes them: the plan that owned the
+                // conversation until now, whether it is still open or already closed.
                 peers: vec![if plan == "older" { "newer" } else { "older" }.to_string()],
             };
             worker.run(&config, op).unwrap();

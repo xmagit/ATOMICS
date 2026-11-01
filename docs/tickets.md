@@ -420,8 +420,9 @@ errors = { code = "code", content_refused = ["…"], ended = ["…"], conflict =
 ```
 
 When `code` names a JSON path and the tool error holds a JSON object with a value there, that code is
-compared with the lists. ATOMICS appends a tool error's `structuredContent` to its text as JSON, so
-`code = "code"` reads Relay's `structuredContent.code`; it, and an unlisted code is an ordinary failure. Without `code`, or for an error
+compared with the lists. ATOMICS classifies a tool error's text together with its `structuredContent` as
+JSON, so `code = "code"` reads Relay's `structuredContent.code`; users see only the text (the JSON's `message`
+when the text is empty), never the JSON. An error without a code, and an unlisted code, is an ordinary failure. Without `code`, or for an error
 without one, ATOMICS matches the messages in `atomics_core::tickets::ERROR_MESSAGES` (case-insensitive
 fragments, such as "can no longer read the conversation's item" and "another event already holds this sequence").
 Each plan holds at most 200 pending writes; tool blocks are evicted first. If no tool block can be removed,
@@ -899,10 +900,13 @@ system the newest open plan linked to it owns the remote; plans older than that 
 `conversation_open` with the ticket, the plan goal's first non-empty line as `{title}` (trimmed, without
 control characters, cut to 200 UTF-16 code units; the ticket key when the goal is empty) and the steering
 list as `{owners}`. A plan taking over a conversation another plan wrote to continues after that plan's
-sequences. Taken over from another open plan, it continues after the furthest cursor the open plans'
-sidecars hold there, with the ids they saw: steering one plan already handled is never delivered again,
-and none written since is skipped. A closed plan's leftover sidecar hands nothing over, so a plan opening
-the conversation with no other open plan on the ticket starts at the server's newest revision. Anything else the server
+sequences. Taken over from the plan that owned the conversation until then, open or closed, or from
+another open plan, it continues after the furthest cursor their sidecars hold there, with the ids they saw:
+steering one plan already handled is never delivered again, and none written since is skipped. A plan whose
+own sidecar already names the conversation takes the furthest cursor and the union of seen ids across every
+sidecar on it, closed plans included; that only holds steering back. Any other closed plan's leftover sidecar
+hands nothing over, so a plan opening the conversation with no previous owner starts at the server's newest
+revision. Anything else the server
 needs, such as Relay's item type `tickets.ticket`, is a literal in the profile's arguments. The server may refuse some
 ids; ATOMICS then shows which and uses the server's list. Opening is idempotent; ATOMICS opens again after
 the steering list changes, and reads `conversation_steerers` after opening and every 10 minutes. A new
