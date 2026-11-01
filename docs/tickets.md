@@ -447,7 +447,7 @@ Opening a child or related ticket adds it to the breadcrumbs.
 | `cmd+k` | open / close the panel | same |
 | `Ctrl+1…9` (`Cmd+1…9`) | select agent N; Find stays in Find | select agent N and show its task's ticket (the chief and untasked agents show the plan's) |
 | `Shift+↓` / `Shift+↑` | next / previous result | next / previous ticket: the following result, or on a trail of opened tickets (`↑` only) the one before. Ignored in a text field and in the editor |
-| `↑` `↓` | move the selection (`↓` in the box enters the list; on the last result, **More**) | read the previous / next ticket of the list in place; the list's selection follows. On a trail of opened tickets, or for a ticket not in the list, scroll a line |
+| `↑` `↓` | move the selection (`↓` in the box enters the list; on the last result, **More**) | scroll a line; at the top / bottom, read the previous / next ticket of the list in place (loading More at the last loaded ticket); the list's selection follows. On a trail of opened tickets, or for a ticket not in the list, scroll a line |
 | `←` `→` (in the list) | previous / next view; from search results, back to the selected view | |
 | `Alt+1…9` | switch filter chip N (also in the box) | |
 | `PageUp` / `PageDown` | scroll a page | next / previous section: description parts, comments, each child, each related ticket |
@@ -490,21 +490,23 @@ arguments = { state = "started" }
 
 [[tickets.filters]]
 label = "Mine"
-arguments = { assignee = "me" }
+arguments = { assignee = "owner" }
 ```
 
 - **Views** are tabs beside the query box, in this order. Each one calls `browse` with its `arguments`
   added to the operation's own (a view's value replaces one of the same name). The view with
   `default = true`, else the first, shows while the query is empty. The server decides the order; ask for
   "most recently updated first" in the arguments if it does not list that way by default.
-- **Filters** are chips below the box; several can be on at once. Their `arguments` are added to every
-  view, after the view's own, and to a search when that operation's `accepts` names every one of their
-  arguments: `accepts = ["assignee", "status"]` on `semantic_search` lets Mine narrow a meaning search too.
+- **Filters** are chips below the box when views and `browse` are mapped; several can be on at once.
+  Their `arguments` are added to every view, after the view's own, and to a search when that operation's
+  `accepts` names every argument: `accepts = ["assignee", "status"]` on `semantic_search` lets Mine
+  narrow a meaning search too.
   A chip that a search does not take is dimmed while its results show.
 - **Paging.** `paging.cursor` is the argument that takes a cursor and `paging.next` the result path of
   the next one. While the last result had a cursor, **More** asks for the next page with the same
   arguments plus that cursor, and adds the tickets to the list. Without `paging`, there is no More. `paging`
-  works on `browse`, `search` and `semantic_search`.
+  works on `browse`, `search` and `semantic_search`. If More fails, the cursor is discarded and the
+  same listing or search starts again from its first page.
 - Argument values are passed as written; placeholders work as in other operations, but `browse` knows only
   `{system}`. The chief's `atomics_ticket_search` is unaffected by views and chips.
 
@@ -776,10 +778,10 @@ read shape. The commented default template contains the same example.
 
 `find_tickets` needs **relay-backend #752** to be live; a declared schema alone does not prove the
 backend is deployed. The views use `find_tickets` without `about` (`browse`): **Recent** lists by
-`updatedAtUtc`, newest first; **Being worked on** passes `status = "active"`, the stage category of work
-in progress; the **Mine** chip passes `assignee = "me"`, and meaning search `accepts` it and `status`. More
-follows `result.nextCursor` through `cursor`. Listing without `about`, these filters and paging need
-**RELAY-11976** on your endpoint. Snippets appear only when returned. Children use **RELAY-11954**'s tool and must
+`updatedAtUtc`, newest first; **Being worked on** passes `status = ["active"]`, the stage category of work
+in progress; the **Mine** chip passes `assignee = "owner"`, the human the connection acts for, and meaning
+search `accepts` it and `status`. More follows `result.nextCursor` through `cursor`. Listing without
+`about`, these filters and paging need **RELAY-11976** on your endpoint. Snippets appear only when returned. Children use **RELAY-11954**'s tool and must
 be deployed on your endpoint. The profile reads the first 50 children and up to 10 search hits; it does
 not fetch subsequent child or comment pages automatically.
 
@@ -865,11 +867,11 @@ label = "Recent"
 
 [[tickets.views]]
 label = "Being worked on"
-arguments = { status = "active" }
+arguments = { status = ["active"] }
 
 [[tickets.filters]]
 label = "Mine"
-arguments = { assignee = "me" }
+arguments = { assignee = "owner" }
 ```
 
 ### Linear: an issue per plan
@@ -1069,8 +1071,9 @@ a reused key with different arguments, and can drop a reply after applying a wri
 - the board's chips and header;
 - the Tickets panel's views and filters (`crates/atomics/src/app/tickets_panel.rs`): the empty panel
   lists Recent, `→` switches to Being worked on, the Mine chip narrows, typing searches with the chip
-  and clearing returns to the view, More follows the cursor, and a profile without views keeps the empty
-  box; ↑/↓ with a ticket open read its neighbours and Escape returns to the list;
+  and clearing returns to the view, More follows the cursor and restarts after an error, and chips need
+  views and browse; ↑/↓ scroll Read until an edge, then read its neighbours (loading More as needed),
+  while PageUp/PageDown still step sections and Escape returns to the list;
 - the same steps against the configurable dialects, where only the config differs;
 - the documented example profiles extracted from the default template, with neutral test names
   (`meaning-example` and `keyword-example`) and the server replaced by the fixture;
@@ -1103,7 +1106,7 @@ The fixture speaks three configurable dialects: nested structured `card_*` tools
 `find_related_tickets`, `list_ticket_children`, `get_ticket`. All three support query-filtered search, direct children, related
 matches and full reads. `find_tickets` without `about` lists by recency (newest `rev` first) without
 scores; with or without it, it takes `status` (a stage, or `active` for InProgress, Deploying and
-Review), `assignee` (`me` is the state's `me`, default Demo User), `type`, `parent` and `cursor`, and
+Review) as an array, `assignee` (`owner` is the state's `me`, default Demo User), `type`, `parent` and `cursor`, and
 returns `result.nextCursor` while more remain. The fixture's `get_children` alias and keyword search demonstrate capabilities; they
 are not claims about any live server. Calls remain recorded in the state file for assertions.
 

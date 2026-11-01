@@ -74,6 +74,8 @@ pub(super) struct Find {
     pub more: bool,
     /// The operation, query and extra arguments that made the results, for "More".
     request: Option<(&'static str, Option<String>, Map<String, Value>)>,
+    /// After More, advance from this ticket only if it is still open.
+    read_next: Option<TicketLink>,
     seq: u64,
     reveal: bool,
     /// Scroll position as of the last frame.
@@ -96,6 +98,7 @@ pub(super) struct Read {
     /// Scroll position and document height as of the last frame.
     pub offset: f32,
     content_h: f32,
+    max_offset: f32,
 }
 
 /// The places PageUp/PageDown stop at in a ticket, in reading order.
@@ -126,6 +129,7 @@ impl Read {
             jump: false,
             offset: 0.0,
             content_h: 0.0,
+            max_offset: 0.0,
         };
         read.parts = read.card.body.as_deref().map(markdown::sections).unwrap_or_default();
         read
@@ -394,6 +398,12 @@ impl State {
                 panel.find.reveal = true;
             }
             self.open_ticket(link, nav);
+        } else if delta > 0 && panel.reading_from_list() && panel.find.next.is_some() {
+            let link = panel.read.as_ref().map(|read| read.link.clone());
+            self.tickets_more();
+            if self.tickets.panel.find.more {
+                self.tickets.panel.find.read_next = link;
+            }
         }
     }
 
@@ -473,7 +483,7 @@ impl State {
     /// Switches filter chip `index` and runs the search, or the view, again.
     pub(super) fn tickets_chip(&mut self, index: usize) {
         let Some(config) = self.ticket_config() else { return };
-        if index >= config.filters.len() {
+        if !config.has_views() || index >= config.filters.len() {
             return;
         }
         let panel = &mut self.tickets.panel;
@@ -501,6 +511,26 @@ impl State {
         find.more = true;
         let seq = find.seq;
         let tag = self.panel_tag(&config, Job::More, seq);
+        self.send_ticket(&config, TicketOp::Page { name, query, extra }, tag);
+    }
+
+    /// A failed More discards the cursor and starts the same listing or search over.
+    fn tickets_restart(&mut self) {
+        let Some(config) = self.ticket_config() else { return };
+        let panel = &mut self.tickets.panel;
+        let Some((name, query, extra)) = panel.find.request.clone() else { return };
+        panel.seq += 1;
+        let previous = std::mem::take(&mut panel.find);
+        panel.find = Find {
+            seq: panel.seq,
+            busy: true,
+            listed: previous.listed,
+            ran: previous.ran,
+            from_chief: previous.from_chief,
+            request: previous.request,
+            ..Find::default()
+        };
+        let tag = self.panel_tag(&config, Job::Find, self.tickets.panel.seq);
         self.send_ticket(&config, TicketOp::Page { name, query, extra }, tag);
     }
 
@@ -694,6 +724,8 @@ impl State {
 
     pub(super) fn panel_result(&mut self, job: Job, seq: u64, result: Result<TicketOutput, String>) {
         let result = result.map_err(|error| (crate::mcp_client::is_sign_in_required(&error), self.scrub(&error)));
+        let mut restart = false;
+        let mut advance = None;
         let panel = &mut self.tickets.panel;
         if let Err((true, _)) = &result {
             panel.signin = true;
@@ -703,10 +735,16 @@ impl State {
                 let find = &mut panel.find;
                 find.busy = false;
                 find.more = false;
+                if job == Job::More && result.is_err() {
+                    find.next = None;
+                    find.read_next = None;
+                    restart = matches!(&result, Err((false, _)));
+                }
                 match result {
                     Ok(TicketOutput::Page(cards, next)) if job == Job::More => {
                         find.results.extend(cards);
                         find.next = next;
+                        advance = find.read_next.take();
                     }
                     Ok(TicketOutput::Page(cards, next)) => {
                         find.selected = (!cards.is_empty()).then_some(0);
@@ -719,8 +757,7 @@ impl State {
                     }
                     Ok(_) => find.error = Some("unexpected ticket result".into()),
                     // The view lists again once the sign-in banner is gone.
-                    Err((true, _)) if job == Job::Find => find.listed = None,
-                    Err((true, _)) => {}
+                    Err((true, _)) => find.listed = None,
                     Err((false, error)) => find.error = Some(error),
                 }
             }
@@ -752,6 +789,15 @@ impl State {
                 }
             }
             _ => {}
+        }
+        if restart {
+            self.tickets_restart();
+        } else if let Some(link) = advance
+            && self.tickets.panel.view == TicketsView::Read
+            && self.tickets.panel.read.as_ref().is_some_and(|read| read.link.same_ticket(&link))
+            && self.tickets.panel.neighbour(1).is_some()
+        {
+            self.tickets_step(1);
         }
     }
 }
@@ -1108,7 +1154,7 @@ impl Desktop<'_> {
                 }
             }
         });
-        if !config.filters.is_empty() {
+        if views && !config.filters.is_empty() {
             let name = panel.find.request.as_ref().map_or("browse", |request| request.0);
             ui.horizontal_wrapped(|ui| {
                 for (i, filter) in config.filters.iter().enumerate() {
@@ -1302,19 +1348,28 @@ impl Desktop<'_> {
         for key in panel_nav::take_keys(ui, &[Key::PageUp, Key::PageDown]) {
             panel.step_section(if key == Key::PageDown { 1 } else { -1 });
         }
-        // A ticket read from the list: ↑/↓ read the previous or next one in place.
+        // In a list ticket, scroll until the edge before stepping to its neighbour.
+        let mut jump = None;
         if panel.reading_from_list() {
             for key in panel_nav::take_keys(ui, &[Key::ArrowUp, Key::ArrowDown]) {
-                acts.push(Act::Step(if key == Key::ArrowDown { 1 } else { -1 }));
+                let read = panel.read.as_ref().expect("checked above");
+                let offset = jump.unwrap_or(read.offset);
+                let down = key == Key::ArrowDown;
+                if (down && offset < read.max_offset) || (!down && offset > 0.0) {
+                    jump = Some((offset + if down { LINE_H } else { -LINE_H }).clamp(0.0, read.max_offset));
+                } else {
+                    acts.push(Act::Step(if down { 1 } else { -1 }));
+                }
             }
         }
         let read = panel.read.as_mut().expect("checked above");
         let scroll_id = ui.make_persistent_id(egui::IdSalt::new("tickets-read"));
         let rows = (read.content_h / LINE_H).ceil() as usize;
-        let jump = panel_nav::keyboard_scroll(ui, scroll_id, LINE_H, 0..rows, &panel_nav::SCROLL_KEYS, None);
+        let jump = panel_nav::keyboard_scroll(ui, scroll_id, LINE_H, 0..rows, &panel_nav::SCROLL_KEYS, jump);
         let mut area = egui::ScrollArea::vertical().id_salt("tickets-read").auto_shrink([false, false]);
         if let Some(offset) = jump {
-            area = area.vertical_scroll_offset(offset);
+            // Row-rounded End offsets must not start the overscroll spring past the content edge.
+            area = area.vertical_scroll_offset(offset.clamp(0.0, read.max_offset));
         }
         let output = area.show(ui, |ui| {
             let mut stop_at = 0;
@@ -1367,6 +1422,7 @@ impl Desktop<'_> {
         read.jump = false;
         read.offset = output.state.clamped_offset().y;
         read.content_h = output.content_size.y;
+        read.max_offset = (output.content_size.y - output.inner_rect.height()).max(0.0);
     }
 }
 
@@ -1976,6 +2032,72 @@ mod tests {
     }
 
     #[test]
+    fn list_ticket_arrows_scroll_until_the_edges_and_page_keys_still_step_sections() {
+        with_app(
+            "app::tickets_panel::tests::list_ticket_arrows_scroll_until_the_edges_and_page_keys_still_step_sections",
+            |app, ctx| {
+                open_panel(app, ctx, TicketsView::Read);
+                results(app, 3);
+                long_read(app);
+                let read = app.runtime.tickets.panel.read.as_mut().unwrap();
+                read.link = card(2, None).link;
+                read.card.link = read.link.clone();
+                in_list(ctx);
+                frame(app, ctx, vec![]);
+                let label =
+                    |app: &Desktop<'_>| app.runtime.tickets.panel.read.as_ref().unwrap().link.label().to_string();
+                let offset = |app: &Desktop<'_>| app.runtime.tickets.panel.read.as_ref().unwrap().offset;
+                frame(app, ctx, vec![key(Key::ArrowDown, NONE)]);
+                assert!(offset(app) > 0.0);
+                assert_eq!(label(app), "DEMO-2");
+                frame(app, ctx, vec![key(Key::ArrowUp, NONE)]);
+                assert_eq!(offset(app), 0.0);
+                assert_eq!(label(app), "DEMO-2", "reaching the top still scrolls");
+                frame(app, ctx, vec![key(Key::ArrowUp, NONE)]);
+                assert_eq!(label(app), "DEMO-1", "only another up steps to the previous ticket");
+
+                long_read(app);
+                let read = app.runtime.tickets.panel.read.as_mut().unwrap();
+                read.link = card(2, None).link;
+                read.card.link = read.link.clone();
+                frame(app, ctx, vec![key(Key::Home, NONE)]);
+                frame(app, ctx, vec![key(Key::End, NONE)]);
+                frame(app, ctx, vec![]);
+                let bottom = offset(app);
+                frame(app, ctx, vec![key(Key::ArrowUp, NONE)]);
+                assert!(
+                    offset(app) < bottom,
+                    "up: {bottom} -> {}, max {}, ticket {}",
+                    offset(app),
+                    app.runtime.tickets.panel.read.as_ref().unwrap().max_offset,
+                    label(app)
+                );
+                frame(app, ctx, vec![key(Key::ArrowDown, NONE)]);
+                assert_eq!(label(app), "DEMO-2", "reaching the bottom still scrolls");
+                frame(app, ctx, vec![key(Key::ArrowDown, NONE)]);
+                assert_eq!(
+                    label(app),
+                    "DEMO-3",
+                    "at the bottom, down reads the next ticket; offset {} / max {}",
+                    offset(app),
+                    app.runtime.tickets.panel.read.as_ref().unwrap().max_offset
+                );
+                // Section jumps animate; check their selection separately from edge scrolling.
+                long_read(app);
+                let read = app.runtime.tickets.panel.read.as_mut().unwrap();
+                read.link = card(2, None).link;
+                read.card.link = read.link.clone();
+                frame(app, ctx, vec![key(Key::PageDown, NONE)]);
+                frame(app, ctx, vec![key(Key::PageDown, NONE)]);
+                assert_eq!(read_stop(app), Some(Stop::Description(1)));
+                assert_eq!(label(app), "DEMO-2");
+                frame(app, ctx, vec![key(Key::PageUp, NONE)]);
+                assert_eq!(read_stop(app), Some(Stop::Description(0)));
+            },
+        );
+    }
+
+    #[test]
     fn agent_chords_retarget_read_and_leave_find_alone() {
         with_app("app::tickets_panel::tests::agent_chords_retarget_read_and_leave_find_alone", |app, ctx| {
             let link = |key: &str| TicketLink {
@@ -2239,7 +2361,7 @@ mod tests {
                 settle(app);
                 assert_eq!(app.runtime.tickets.panel.tab, Some(1));
                 assert_eq!(labels(app), ["DEMO-3", "DEMO-2"], "DEMO-2 is Deploying, DEMO-3 newly in progress");
-                assert_eq!(finds(&state).last().unwrap()["status"], "active");
+                assert_eq!(finds(&state).last().unwrap()["status"], serde_json::json!(["active"]));
                 assert!(texts(&frame(app, ctx, vec![])).join("\n").contains("2 tickets · Being worked on"));
 
                 // Alt+1 switches on Mine, which narrows the view.
@@ -2248,7 +2370,7 @@ mod tests {
                 assert!(app.runtime.tickets.panel.chips.contains(&0));
                 assert_eq!(labels(app), ["DEMO-3"]);
                 let last = finds(&state).last().unwrap().clone();
-                assert_eq!((&last["status"], &last["assignee"]), (&"active".into(), &"me".into()));
+                assert_eq!((&last["status"], &last["assignee"]), (&serde_json::json!(["active"]), &"owner".into()));
 
                 // Typing searches, with the chip the search accepts.
                 ctx.memory_mut(|m| m.request_focus(query_id()));
@@ -2261,7 +2383,7 @@ mod tests {
                 assert_eq!(find.ran.as_ref().map(|r| r.0.as_str()), Some("ticket workspace"));
                 assert_eq!(labels(app), ["DEMO-1", "DEMO-3", "DEMO-4", "DEMO-5"], "Mine leaves out DEMO-2");
                 let last = finds(&state).last().unwrap().clone();
-                assert_eq!((&last["about"], &last["assignee"]), (&"ticket workspace".into(), &"me".into()));
+                assert_eq!((&last["about"], &last["assignee"]), (&"ticket workspace".into(), &"owner".into()));
                 assert!(last.get("status").is_none(), "the view's arguments stay with the view");
 
                 // Clearing the query returns to the selected view.
@@ -2279,6 +2401,108 @@ mod tests {
                 assert_eq!(labels(app), ["DEMO-3", "DEMO-5", "DEMO-4", "DEMO-1"]);
                 app.runtime.tickets_chip(0);
                 settle(app);
+                assert_eq!(labels(app).len(), 5);
+            },
+        );
+    }
+
+    #[test]
+    fn status_filter_rejects_a_scalar_against_the_fake_server() {
+        with_app("app::tickets_panel::tests::status_filter_rejects_a_scalar_against_the_fake_server", |app, _ctx| {
+            let dir = crate::test_support::tempdir().unwrap();
+            let state = dir.path().join("fake.json");
+            let mut config = example_profile("meaning-example", &state);
+            config.views[1].arguments.insert("status".into(), "active".into());
+            app.runtime.config.tickets = config;
+            app.runtime.apply_ticket_config();
+            app.runtime.tickets_tab(1);
+            settle(app);
+            let find = &app.runtime.tickets.panel.find;
+            assert!(find.error.as_deref().unwrap().contains("status must be an array"));
+            assert!(find.results.is_empty());
+        });
+    }
+
+    #[test]
+    fn more_error_restarts_the_same_request_without_a_cursor() {
+        with_app("app::tickets_panel::tests::more_error_restarts_the_same_request_without_a_cursor", |app, _ctx| {
+            let dir = crate::test_support::tempdir().unwrap();
+            let state = dir.path().join("fake.json");
+            let mut config = example_profile("meaning-example", &state);
+            config.operations.browse.as_mut().unwrap().arguments.insert("take".into(), 2.into());
+            config.operations.semantic_search.as_mut().unwrap().arguments.insert("take".into(), 2.into());
+            app.runtime.config.tickets = config;
+            app.runtime.apply_ticket_config();
+            // Retry both a view with a chip and a search, retaining their original arguments.
+            for search in [false, true] {
+                app.runtime.tickets.panel.chips.insert(0);
+                if search {
+                    app.runtime.tickets.panel.query = "ticket workspace".into();
+                    app.runtime.tickets_search();
+                } else {
+                    app.runtime.tickets_list();
+                }
+                settle(app);
+                let original = finds(&state).last().unwrap().clone();
+                edit_state(&state, |state| state["fail"] = serde_json::json!(["find_tickets"]));
+                let before = finds(&state).len();
+                app.runtime.tickets_more();
+                settle(app);
+                let calls = finds(&state);
+                assert_eq!(calls.len(), before + 2, "More fails, then the first page retries once");
+                assert!(calls[before]["cursor"].is_string());
+                assert_eq!(calls.last().unwrap(), &original);
+                assert_eq!(app.runtime.tickets.panel.find.next, None);
+                assert!(app.runtime.tickets.panel.find.results.is_empty());
+                assert!(app.runtime.tickets.panel.find.error.is_some());
+                edit_state(&state, |state| state["fail"] = serde_json::json!([]));
+                app.runtime.tickets_restart();
+                settle(app);
+                assert_eq!(finds(&state).last().unwrap(), &original);
+                assert_eq!(labels(app).len(), 2, "replaces rather than appends");
+                assert!(app.runtime.tickets.panel.find.error.is_none());
+            }
+        });
+    }
+
+    #[test]
+    fn down_at_the_last_read_ticket_loads_more_and_opens_the_next() {
+        with_app(
+            "app::tickets_panel::tests::down_at_the_last_read_ticket_loads_more_and_opens_the_next",
+            |app, ctx| {
+                let dir = crate::test_support::tempdir().unwrap();
+                let state = dir.path().join("fake.json");
+                let mut config = example_profile("meaning-example", &state);
+                config.operations.browse.as_mut().unwrap().arguments.insert("take".into(), 2.into());
+                app.runtime.config.tickets = config;
+                app.runtime.apply_ticket_config();
+                app.runtime.toggle_tickets();
+                frame(app, ctx, vec![]);
+                settle(app);
+                let link = app.runtime.tickets.panel.find.results[1].link.clone();
+                app.runtime.open_ticket(link, Nav::Fresh);
+                settle(app);
+                frame(app, ctx, vec![]);
+                frame(app, ctx, vec![key(Key::End, NONE)]);
+                frame(app, ctx, vec![key(Key::ArrowDown, NONE)]);
+                settle(app);
+                let panel = &app.runtime.tickets.panel;
+                assert_eq!(panel.read.as_ref().unwrap().link.label(), "DEMO-3");
+                assert_eq!(panel.find.selected, Some(2));
+                assert_eq!(labels(app), ["DEMO-5", "DEMO-4", "DEMO-3", "DEMO-2"]);
+                assert_eq!(finds(&state).last().unwrap()["cursor"], "2");
+                assert!(panel.crumbs.is_empty());
+                assert_eq!(panel.view, TicketsView::Read);
+                assert!(panel.read.as_ref().unwrap().card.body.is_some());
+                // Leaving Read while the next page is in flight must not reopen a ticket.
+                let link = app.runtime.tickets.panel.find.results[3].link.clone();
+                app.runtime.open_ticket(link, Nav::Fresh);
+                settle(app);
+                app.runtime.tickets_step(1);
+                app.runtime.tickets_to_list();
+                settle(app);
+                assert_eq!(app.runtime.tickets.panel.view, TicketsView::Find);
+                assert_eq!(app.runtime.tickets.panel.read.as_ref().unwrap().link.label(), "DEMO-2");
                 assert_eq!(labels(app).len(), 5);
             },
         );
@@ -2315,13 +2539,30 @@ mod tests {
     }
 
     #[test]
+    fn chips_are_hidden_without_browse_even_with_views() {
+        with_app("app::tickets_panel::tests::chips_are_hidden_without_browse_even_with_views", |app, ctx| {
+            let dir = crate::test_support::tempdir().unwrap();
+            let mut config = example_profile("meaning-example", &dir.path().join("fake.json"));
+            config.operations.browse = None;
+            app.runtime.config.tickets = config;
+            app.runtime.apply_ticket_config();
+            app.runtime.toggle_tickets();
+            let text = texts(&frame(app, ctx, vec![])).join("\n");
+            assert!(!text.contains("Mine") && !text.contains("Recent"), "{text}");
+            in_list(ctx);
+            frame(app, ctx, vec![key(Key::Num1, egui::Modifiers::ALT)]);
+            app.runtime.tickets_chip(0);
+            assert!(app.runtime.tickets.panel.chips.is_empty());
+        });
+    }
+
+    #[test]
     fn a_profile_without_views_keeps_the_empty_search_box() {
         with_app("app::tickets_panel::tests::a_profile_without_views_keeps_the_empty_search_box", |app, ctx| {
             let dir = crate::test_support::tempdir().unwrap();
             let state = dir.path().join("fake.json");
             let mut config = example_profile("meaning-example", &state);
             config.views.clear();
-            config.filters.clear();
             app.runtime.config.tickets = config;
             app.runtime.apply_ticket_config();
             app.runtime.toggle_tickets();
@@ -2330,6 +2571,10 @@ mod tests {
             assert!(app.runtime.tickets.panel.find.results.is_empty());
             let text = texts(&frame(app, ctx, vec![])).join("\n");
             assert!(text.contains("Type a query and press Enter.") && !text.contains("Recent"), "{text}");
+            assert!(!text.contains("Mine"), "filters without views are hidden: {text}");
+            in_list(ctx);
+            frame(app, ctx, vec![key(Key::Num1, egui::Modifiers::ALT)]);
+            assert!(app.runtime.tickets.panel.chips.is_empty());
             assert!(!state.exists() || finds(&state).is_empty(), "nothing is listed without a query");
             app.runtime.tickets.panel.query = "personal-agent ticket workspace".into();
             app.runtime.tickets_search();

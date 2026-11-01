@@ -812,7 +812,7 @@ pub(super) fn revoke_url(host: &str) -> String {
 }
 
 /// The GitHub shortcut ATOMICS takes, and what is wrong with the configured one. A binding that
-/// does not parse, or that another `[keys]` binding or Ctrl/Command+1…9 already uses, falls back to
+/// does not parse, or that another `[keys]` binding, Ctrl/Command+1…9 or Alt+1…9 already uses, falls back to
 /// `primary+g`, unless that is taken too; then there is no shortcut and the top-bar icon remains.
 pub(super) fn github_shortcut(
     keys: &atomics_core::config::KeyConfig,
@@ -840,6 +840,10 @@ pub(super) fn github_shortcut(
         .enumerate()
     {
         taken.push((format!("the agent chord for agent {}", n + 1), egui::KeyboardShortcut::new(agent, key)));
+        taken.push((
+            format!("the ticket filter chord for chip {}", n + 1),
+            egui::KeyboardShortcut::new(egui::Modifiers::ALT, key),
+        ));
     }
     let owner = |chord: &egui::KeyboardShortcut| {
         taken
