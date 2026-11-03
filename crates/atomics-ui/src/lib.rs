@@ -5,10 +5,12 @@
 //! the Tickets panel, the ticket markdown reader, chords, the top bar's layout helpers and the terminal
 //! painter, which draws the screens `atomics.v1` streams (the desktop paints through it too). So do the
 //! views that draw from a [`Backend`] into a [`Client`]: the plan board, the approval banner, a worktree's
-//! diff panel, the sidebar's sessions and explorer, and the top bar's navigation, brand, notices, buttons
-//! and Project menu. They record what the user asks for as [`Command`]s, which the platform carries out
-//! after the draw: a host's through [`Backend::send`], a view command on the UI itself. A platform drawing
-//! for a finger on a small screen sets [`Client::touch`], and the views fit a phone ([`touch`]).
+//! diff panel, the sidebar's sessions and explorer, the top bar's navigation, brand, notices, buttons and
+//! Project menu, and the fleet's tiles, whose terminals the platform draws through a
+//! [`terminal_surface::TerminalSurface`]. They record what the user asks for as [`Command`]s, which the
+//! platform carries out after the draw: a host's through [`Backend::send`], a view command on the UI
+//! itself. A platform drawing for a finger on a small screen sets [`Client::touch`], and the views fit a
+//! phone ([`touch`]).
 //!
 //! This crate must stay free of desktop-only dependencies; `tests/dependencies.rs` enforces it.
 
@@ -19,6 +21,7 @@ mod client;
 mod command;
 pub mod diff_panel;
 pub mod diff_view;
+pub mod fleet;
 pub mod keys;
 pub mod markdown;
 pub mod panel_nav;
@@ -26,14 +29,16 @@ pub mod sidebar;
 pub mod status;
 pub mod tabs;
 pub mod terminal;
+pub mod terminal_surface;
 pub mod text;
 pub mod theme;
 pub mod topbar;
 pub mod touch;
 
 pub use backend::{
-    ApprovalRow, Backend, BoardView, DiffHeading, DiffSnapshot, Notices, PanelMode, PlanRow, PlanState, ProjectMenu,
-    RecentSession, SandboxLoad, SessionRow, UiConfig, ViewHints, WorktreeRow,
+    ApprovalRow, Backend, BoardView, CompletedTile, ConnectButton, DiffHeading, DiffSnapshot, Notices, PanelMode,
+    PlanRow, PlanState, ProjectMenu, RecentSession, SandboxLoad, SessionRow, TileView, UiConfig, ViewHints,
+    WorktreeRow,
 };
 pub use client::Client;
 pub use command::{Command, Remote};

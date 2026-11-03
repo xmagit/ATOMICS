@@ -134,6 +134,9 @@ pub enum Command {
     CloseSession(String),
     /// Start a session again from its record.
     Resume(SessionRecord),
+    /// Start an exited session, by id, again in its place: its tile closes and its agent picks its
+    /// conversation up again.
+    ResumeSession(String),
     /// Give a session, by id, a new title.
     RenameSession {
         session: String,

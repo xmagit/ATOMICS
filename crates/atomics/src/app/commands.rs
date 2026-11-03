@@ -5,8 +5,10 @@
 //! execution is safe.
 use atomics_core::ops::{self, ApprovalDecide, Outcome};
 use atomics_ui::Command;
+use atomics_ui::terminal_surface::TerminalSurface;
 
 use super::backend::Local;
+use super::fleet::Terminals;
 use super::*;
 
 pub(super) type Action = Box<dyn FnOnce(&mut State) + Send>;
@@ -164,6 +166,7 @@ impl Local<'_> {
             Command::StartAgent { agent, folder } => state.post(move |state| state.pending_open.push((agent, folder))),
             Command::CloseSession(id) => state.post(move |state| state.close(&id)),
             Command::Resume(record) => state.post(move |state| state.resume.push(record)),
+            Command::ResumeSession(id) => state.post(move |state| state.resume_exited(&id)),
             Command::RenameSession { session, title } => state.post(move |state| {
                 if let Some(found) = state.sessions.iter_mut().find(|s| s.id == session) {
                     found.rename(&title);
@@ -253,8 +256,18 @@ impl Desktop<'_> {
     /// Draws with atomics-ui code: the client's palette is the host's theme, reads go through the
     /// in-process backend, and the commands the draw recorded run when it returns.
     pub(super) fn draw<R>(&mut self, draw: impl FnOnce(&dyn Backend, &mut atomics_ui::Client) -> R) -> R {
+        self.draw_terminals(|backend, client, _| draw(backend, client))
+    }
+
+    /// [`Desktop::draw`] for views that hold terminals: they draw each through the desktop's own terminal
+    /// views ([`Terminals`]).
+    pub(super) fn draw_terminals<R>(
+        &mut self,
+        draw: impl FnOnce(&dyn Backend, &mut atomics_ui::Client, &mut dyn TerminalSurface) -> R,
+    ) -> R {
         self.client.ui.palette = self.palette();
-        let result = draw(&self.runtime.backend(), &mut self.client.ui);
+        let mut terminals = Terminals { sessions: &self.runtime.sessions, views: &mut self.client.terminal_views };
+        let result = draw(&self.runtime.backend(), &mut self.client.ui, &mut terminals);
         for command in std::mem::take(&mut self.client.ui.commands) {
             self.send(command);
         }

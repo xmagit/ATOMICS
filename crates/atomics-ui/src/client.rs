@@ -1,5 +1,5 @@
 //! What one UI holds for itself, apart from the host: the palette it draws with, the cards it has open,
-//! what waits for the user's confirmation, and the commands its last draw recorded.
+//! what waits for the user's confirmation, the terminal to focus, and the commands its last draw recorded.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -37,6 +37,8 @@ pub struct Client {
     pub selected: HashSet<String>,
     /// A session waiting for the user to confirm closing it, by id.
     pub confirm_close: Option<String>,
+    /// The session whose terminal takes the keyboard on the next frame, by id.
+    pub focus_terminal: Option<String>,
     /// The ATOMICS icon, once the platform has loaded it.
     pub icon: Option<egui::TextureHandle>,
     /// The name typed for saving the open projects as a workspace.
@@ -60,6 +62,7 @@ impl Default for Client {
             explorers: HashMap::new(),
             selected: HashSet::new(),
             confirm_close: None,
+            focus_terminal: None,
             icon: None,
             workspace_input: String::new(),
             touch: None,

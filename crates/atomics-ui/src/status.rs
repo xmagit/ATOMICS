@@ -22,6 +22,17 @@ pub fn status_color(status: AgentStatus, p: &Palette) -> Color32 {
     }
 }
 
+/// The glyph before a session's title on its tab.
+pub fn status_glyph(status: AgentStatus) -> &'static str {
+    match status {
+        AgentStatus::NeedsInput => "◆",
+        AgentStatus::Done => "●",
+        AgentStatus::Working => "◐",
+        AgentStatus::Exited => "×",
+        _ => "○",
+    }
+}
+
 /// The status dot; working agents pulse like Claude Code's spinner.
 pub fn status_dot(status: AgentStatus, p: &Palette, time: f64) -> Color32 {
     let color = status_color(status, p);

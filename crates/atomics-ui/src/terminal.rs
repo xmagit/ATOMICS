@@ -23,6 +23,15 @@ pub struct Metrics {
     pub cell: Vec2,
 }
 
+impl Metrics {
+    /// `palette`'s monospace font at the theme's size, else at `size` (the config's), and its cell.
+    pub fn new(ui: &egui::Ui, palette: &crate::theme::Palette, size: f32) -> Self {
+        let font = palette.mono(palette.fonts.mono_size.unwrap_or(size));
+        let cell = ui.fonts_mut(|f| vec2(f.glyph_width(&font, 'M'), f.row_height(&font)));
+        Self { font, cell: vec2(cell.x, cell.y.ceil()) }
+    }
+}
+
 /// The theme colours drawn around and over the cells. Cells take their own colours from the
 /// screen's palette.
 #[derive(Debug, Clone, Copy, PartialEq)]

@@ -86,7 +86,6 @@ use editor::save_png;
 use fleet::queue_note;
 
 const TAB_HEIGHT: f32 = 30.0;
-const TILE_HEADER: f32 = 26.0;
 const WORKTREE_REFRESH: Duration = Duration::from_secs(30);
 const BACKGROUND_REFRESH: Duration = Duration::from_secs(5);
 const FALLBACK_REFRESH: Duration = Duration::from_secs(30);
@@ -654,7 +653,6 @@ struct Client {
     /// The host's theme in egui colors and fonts, with the theme it was made from.
     palette_cache: std::cell::RefCell<Option<(Arc<Theme>, Arc<Palette>)>>,
     project_picker: Option<PathBuf>,
-    focus_terminal: Option<String>,
     cleanup_open: bool,
     cleanup_selected: HashSet<PathBuf>,
     /// Orphaned sandboxes picked for removal in the clean-up dialog.
@@ -721,7 +719,6 @@ impl Client {
             ctx: ctx.clone(),
             palette_cache: Default::default(),
             project_picker: None,
-            focus_terminal: None,
             cleanup_open: false,
             cleanup_selected: HashSet::new(),
             cleanup_sandboxes: HashSet::new(),
@@ -1379,42 +1376,6 @@ fn state_refresh(state: &mut DiffData) {
     state.dirty_since = Some(Instant::now() - Duration::from_secs(1));
 }
 
-/// A task's result on a completed-task tile. The board draws the same through atomics-ui, from what the
-/// host read for it.
-fn task_result(
-    ui: &mut egui::Ui,
-    task: &Task,
-    status: Option<AgentStatus>,
-    expanded: bool,
-    read_only: bool,
-    config: &Config,
-    p: &Palette,
-) -> Option<&'static str> {
-    let available = task.finished_at.is_some() && task.worktree.as_ref().is_some_and(|path| path.is_dir());
-    let codex = config.agent(&task.agent).is_some_and(|agent| agent.is_codex());
-    atomics_ui::board::task_result(
-        ui,
-        task,
-        status,
-        expanded,
-        read_only,
-        available,
-        codex,
-        atomics_core::store::now(),
-        p,
-    )
-}
-
-fn status_glyph(status: AgentStatus) -> &'static str {
-    match status {
-        AgentStatus::NeedsInput => "◆",
-        AgentStatus::Done => "●",
-        AgentStatus::Working => "◐",
-        AgentStatus::Exited => "×",
-        _ => "○",
-    }
-}
-
 fn modified(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
@@ -1583,10 +1544,7 @@ impl Desktop<'_> {
     }
 
     fn metrics(&self, ui: &egui::Ui) -> Metrics {
-        let p = self.palette();
-        let font = p.mono(p.fonts.mono_size.unwrap_or(self.runtime.config.font.size));
-        let cell = ui.fonts_mut(|f| vec2(f.glyph_width(&font, 'M'), f.row_height(&font)));
-        Metrics { font, cell: vec2(cell.x, cell.y.ceil()) }
+        Metrics::new(ui, &self.palette(), self.runtime.config.font.size)
     }
 
     fn steer_bar(&mut self, ui: &mut egui::Ui) {

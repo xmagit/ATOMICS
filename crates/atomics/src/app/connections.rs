@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::*;
 use crate::connections::{self as mcp, Registered, Status};
 use atomics_core::mcp_import::{self, Definition};
+use atomics_ui::ConnectButton;
 
 #[derive(Default)]
 pub(super) struct Connections {
@@ -518,12 +519,14 @@ impl Desktop<'_> {
         );
         action
     }
+}
 
+impl State {
     /// The buttons a tile's banner offers for the servers it needs: each connects its server,
     /// storing its environment when it has one to store (the button says so).
     /// `asker` is the session's title: the banner says which agent asked.
     pub(super) fn connect_buttons(&self, needed: &[Needed], asker: &str) -> Vec<ConnectButton> {
-        let connections = &self.runtime.connections;
+        let connections = &self.connections;
         needed
             .iter()
             .map(|needed| {
@@ -562,16 +565,6 @@ impl Desktop<'_> {
             })
             .collect()
     }
-}
-
-pub(super) struct ConnectButton {
-    pub name: String,
-    pub label: String,
-    /// What connecting it would use, and who asked.
-    pub detail: String,
-    pub url: Option<String>,
-    pub store_env: bool,
-    pub enabled: bool,
 }
 
 #[cfg(test)]

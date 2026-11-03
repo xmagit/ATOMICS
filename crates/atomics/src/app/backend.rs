@@ -1,8 +1,8 @@
 //! The in-process [`Backend`]: reads the host model directly. The desktop's draw code reads through it,
 //! so a loopback or browser client can read the same things over the protocol.
 use atomics_ui::{
-    ApprovalRow, Backend, BoardView, DiffHeading, DiffSnapshot, Notices, PlanRow, ProjectMenu, RecentSession,
-    SandboxLoad, SessionRow, UiConfig, ViewHints, WorktreeRow,
+    ApprovalRow, Backend, BoardView, CompletedTile, DiffHeading, DiffSnapshot, Notices, PlanRow, ProjectMenu,
+    RecentSession, SandboxLoad, SessionRow, TileView, UiConfig, ViewHints, WorktreeRow,
 };
 
 use super::*;
@@ -15,6 +15,16 @@ impl State {
     pub(super) fn backend(&self) -> Local<'_> {
         Local(self)
     }
+}
+
+/// A finished task's worktree is still on disk: its `diff` and `resume` need it.
+pub(super) fn worktree_kept(task: &Task) -> bool {
+    task.finished_at.is_some() && task.worktree.as_ref().is_some_and(|path| path.is_dir())
+}
+
+/// The task runs a Codex agent (by its program, not its name), which resumes without a saved id.
+pub(super) fn resumes_as_codex(config: &Config, task: &Task) -> bool {
+    config.agent(&task.agent).is_some_and(|agent| agent.is_codex())
 }
 
 impl Local<'_> {
@@ -106,16 +116,11 @@ impl Backend for Local<'_> {
                 .collect(),
             ticket_config: state.ticket_config(),
             board_counts,
-            worktrees: plan
-                .tasks
-                .iter()
-                .filter(|task| task.finished_at.is_some() && task.worktree.as_ref().is_some_and(|path| path.is_dir()))
-                .map(|task| task.id.clone())
-                .collect(),
+            worktrees: plan.tasks.iter().filter(|task| worktree_kept(task)).map(|task| task.id.clone()).collect(),
             codex: plan
                 .tasks
                 .iter()
-                .filter(|task| state.config.agent(&task.agent).is_some_and(|agent| agent.is_codex()))
+                .filter(|task| resumes_as_codex(&state.config, task))
                 .map(|task| task.id.clone())
                 .collect(),
             now: atomics_core::store::now(),
@@ -139,6 +144,66 @@ impl Backend for Local<'_> {
         let session = self.0.sessions.get(index)?;
         let pending = session.approvals.first()?;
         Some(ApprovalRow { session: session.id.clone(), id: pending.id.clone(), request: pending.request.clone() })
+    }
+
+    fn tile(&self, index: usize) -> Option<TileView> {
+        let state = self.0;
+        let session = state.sessions.get(index)?;
+        let reported = if matches!(session.status, AgentStatus::Idle | AgentStatus::Done) {
+            state
+                .plans
+                .iter()
+                .flat_map(|p| &p.tasks)
+                .find(|t| t.session.as_deref() == Some(&session.id))
+                .and_then(|t| t.reported_line(atomics_core::store::now()))
+        } else {
+            None
+        };
+        let queue_note = session.terminal.as_ref().and_then(|terminal| {
+            let (running, waiting) = state.governor.snapshot();
+            super::fleet::queue_note(terminal.process_id(), &running, &waiting)
+        });
+        let sandboxes = &state.sandbox_usage;
+        Some(TileView {
+            reported,
+            sandbox_usage: session
+                .sandbox
+                .as_ref()
+                .and_then(|name| sandboxes.usage.get(name))
+                .map(|usage| usage.label()),
+            sandbox_error: sandboxes.error.clone(),
+            queue_note,
+            connect: match session.sandbox {
+                Some(_) => state.connect_buttons(&session.mcp_needed, &session.title),
+                None => Vec::new(),
+            },
+            exited: session.terminal.as_ref().is_some_and(|terminal| terminal.exited()),
+            resumable: session.kind == AgentKind::Claude && session.claude_id.is_some(),
+            folder: paths::display(&session.cwd),
+            last_prompt: session.last_prompt.clone(),
+            last_message: session.last_message.clone(),
+        })
+    }
+
+    fn completed_tasks(&self) -> Vec<CompletedTile> {
+        let state = self.0;
+        let now = atomics_core::store::now();
+        state
+            .completed_tasks()
+            .into_iter()
+            .map(|(plan, index)| {
+                let task = &state.plans[plan].tasks[index];
+                CompletedTile {
+                    plan,
+                    index,
+                    read_only: !state.plans[plan].is_open(),
+                    worktree: worktree_kept(task),
+                    codex: resumes_as_codex(&state.config, task),
+                    now,
+                    task: task.clone(),
+                }
+            })
+            .collect()
     }
 
     fn diff_roots(&self) -> Vec<PathBuf> {
