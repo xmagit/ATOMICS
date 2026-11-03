@@ -6,7 +6,8 @@
 //! painter, which draws the screens `atomics.v1` streams (the desktop paints through it too). So do the
 //! views that draw from a [`Backend`] into a [`Client`]: the plan board, the approval banner, a worktree's
 //! diff panel, the sidebar's sessions and explorer, the top bar's navigation, brand, notices, buttons and
-//! Project menu, and the fleet's tiles, whose terminals the platform draws through a
+//! Project menu, the fleet's tiles and the chief (its pill, its docked or floating window and the steer
+//! bar). The platform draws the terminals in the tiles and in the chief's window through a
 //! [`terminal_surface::TerminalSurface`]. They record what the user asks for as [`Command`]s, which the
 //! platform carries out after the draw: a host's through [`Backend::send`], a view command on the UI
 //! itself. A platform drawing for a finger on a small screen sets [`Client::touch`], and the views fit a
@@ -17,6 +18,7 @@
 pub mod approvals;
 mod backend;
 pub mod board;
+pub mod chief;
 mod client;
 mod command;
 pub mod diff_panel;
@@ -36,9 +38,9 @@ pub mod topbar;
 pub mod touch;
 
 pub use backend::{
-    ApprovalRow, Backend, BoardView, CompletedTile, ConnectButton, DiffHeading, DiffSnapshot, Notices, PanelMode,
-    PlanRow, PlanState, ProjectMenu, RecentSession, SandboxLoad, SessionRow, TileView, UiConfig, ViewHints,
-    WorktreeRow,
+    ApprovalRow, Backend, BoardView, ChiefView, CompletedTile, ConnectButton, DiffHeading, DiffSnapshot, Heartbeat,
+    Notices, PanelMode, PlanRow, PlanState, ProjectMenu, RecentSession, SandboxLoad, SessionRow, TileView, UiConfig,
+    ViewHints, WorktreeRow,
 };
 pub use client::Client;
 pub use command::{Command, Remote};

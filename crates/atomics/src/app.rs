@@ -34,7 +34,9 @@ use atomics_core::hook::HookReply;
 use atomics_core::plan::{self, Plan, PlanStatus, Report, Task, TaskStatus, short_slug};
 use atomics_core::wire::{Disposition, ErrorCode, WireError};
 use atomics_core::workspace::{self, Workspace};
-use atomics_ui::status::{PULSE_STEP, status_dot};
+#[cfg(test)]
+use atomics_ui::chief::SteerTarget;
+use atomics_ui::status::PULSE_STEP;
 use atomics_ui::text::truncate;
 use atomics_ui::{Backend, Command, PanelMode};
 use serde_json::json;
@@ -81,7 +83,7 @@ mod voice;
 mod workflow;
 mod worktrees;
 
-use chief::{CHIEF_ALLOWED_TOOLS, chief_divider};
+use chief::CHIEF_ALLOWED_TOOLS;
 use editor::save_png;
 use fleet::queue_note;
 
@@ -224,13 +226,6 @@ const CODEX_VERSION_TIMEOUT: Duration = Duration::from_secs(30);
 const QUIT_WAIT: Duration = Duration::from_secs(10);
 /// How long a quit waits for sandbox and worktree cleanup still running.
 const QUIT_JOBS_WAIT: Duration = Duration::from_secs(60);
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SteerTarget {
-    Active,
-    Agents,
-    Selected,
-}
 
 struct NewDialog {
     agent: String,
@@ -666,9 +661,6 @@ struct Client {
     focus_editor: bool,
     editor_id: Option<egui::Id>,
     terminal_views: HashMap<egui::Id, TerminalView>,
-    steer_text: String,
-    steer_target: SteerTarget,
-    focus_steer: bool,
     new_dialog: Option<NewDialog>,
     rename: Option<Rename>,
     quick_open: Option<QuickOpen>,
@@ -731,9 +723,6 @@ impl Client {
             focus_editor: false,
             editor_id: None,
             terminal_views: HashMap::new(),
-            steer_text: String::new(),
-            steer_target: SteerTarget::Active,
-            focus_steer: false,
             new_dialog: None,
             rename: None,
             quick_open: None,
@@ -1547,69 +1536,6 @@ impl Desktop<'_> {
         Metrics::new(ui, &self.palette(), self.runtime.config.font.size)
     }
 
-    fn steer_bar(&mut self, ui: &mut egui::Ui) {
-        let p = self.palette();
-        ui.horizontal(|ui| {
-            let active_title = self
-                .runtime
-                .active_index()
-                .map(|i| self.runtime.sessions[i].title.clone())
-                .unwrap_or_else(|| "none".into());
-            let agents = self.runtime.sessions.iter().filter(|s| s.is_agent() && s.can_receive()).count();
-            let selected = self.client.selected.len();
-            let label = match self.client.steer_target {
-                SteerTarget::Active => format!("→ {active_title}"),
-                SteerTarget::Agents => format!("→ all agents ({agents})"),
-                SteerTarget::Selected => format!("→ selected ({selected})"),
-            };
-            egui::ComboBox::from_id_salt("steer-target").selected_text(label).width(190.0).show_ui(ui, |ui| {
-                ui.selectable_value(
-                    &mut self.client.steer_target,
-                    SteerTarget::Active,
-                    format!("Active: {active_title}"),
-                );
-                ui.selectable_value(
-                    &mut self.client.steer_target,
-                    SteerTarget::Agents,
-                    format!("All agents ({agents})"),
-                );
-                ui.selectable_value(
-                    &mut self.client.steer_target,
-                    SteerTarget::Selected,
-                    format!("Selected ({selected})"),
-                );
-            });
-
-            let id = ui.scope_id().with("steer-input");
-            let focused = ui.memory(|m| m.has_focus(id));
-            let mut send = false;
-            if focused && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter)) {
-                send = true;
-            }
-            let width = ui.available_width() - 70.0;
-            let edit = egui::TextEdit::multiline(&mut self.client.steer_text)
-                .id(id)
-                .desired_rows(1)
-                .desired_width(width)
-                .hint_text(format!(
-                    "Steer · Enter sends · Shift+Enter newline · {} focuses",
-                    shortcut_label(ui.ctx(), &self.runtime.config.keys.focus_steer)
-                ))
-                .font(p.ui(13.5));
-            let response = ui.add(edit);
-            if std::mem::take(&mut self.client.focus_steer) {
-                response.request_focus();
-            }
-            let button = egui::Button::new(RichText::new("Send").color(p.on_accent)).fill(p.accent);
-            if ui.add(button).clicked() {
-                send = true;
-            }
-            if send {
-                self.send_steer();
-            }
-        });
-    }
-
     fn welcome(&mut self, ui: &mut egui::Ui, rect: Rect) {
         let p = self.palette();
         let mut child = ui.new_child(
@@ -1704,7 +1630,7 @@ impl Desktop<'_> {
             .show(ui, |ui| self.top_bar(ui));
         egui::Panel::bottom("steer")
             .frame(egui::Frame::new().fill(p.panel).inner_margin(egui::Margin::symmetric(10, 7)))
-            .show(ui, |ui| self.steer_bar(ui));
+            .show(ui, |ui| self.draw(|backend, client| atomics_ui::chief::steer_bar(ui, backend, client)));
 
         let area = ui.available_rect_before_wrap();
         let history_board = self.runtime.plan_view
@@ -1718,15 +1644,7 @@ impl Desktop<'_> {
             layout::LayoutConfig { diff_width: self.client.split, ..self.runtime.config.layout.clone() };
         let visible = if history_board { Vec::new() } else { self.runtime.visible_sessions() };
         let completed = if history_board { 0 } else { self.runtime.completed_tasks().len() };
-        let dock_width = if self.runtime.chief_open && self.runtime.chief_dock() == ChiefDock::Docked {
-            self.runtime.store.chief_width.filter(|w| w.is_finite()).unwrap_or_else(|| {
-                let sidebar =
-                    if area.width() >= layout_config.sidebar_min_window { layout_config.sidebar_width } else { 0.0 };
-                ((area.width() - sidebar) * 0.34).max(layout::MIN_DOCK_WIDTH)
-            })
-        } else {
-            0.0
-        };
+        let dock_width = atomics_ui::chief::dock_width(&self.runtime.backend().chief(), area.width(), &layout_config);
         let mut layout = layout::compute(
             area.width(),
             area.height(),
@@ -1758,19 +1676,8 @@ impl Desktop<'_> {
                 .show(ui, |ui| self.sidebar(ui));
         }
 
-        let chief_rect = if layout.dock_width > 0.0 {
-            Some(
-                egui::Panel::left("chief-dock")
-                    .exact_size(layout.dock_width)
-                    .resizable(false)
-                    .frame(egui::Frame::new().fill(p.terminal).inner_margin(egui::Margin::same(6)))
-                    .show(ui, |ui| self.chief_content(ui))
-                    .response
-                    .rect,
-            )
-        } else {
-            None
-        };
+        let chief_rect = (layout.dock_width > 0.0)
+            .then(|| atomics_ui::chief::dock(ui, layout.dock_width, &p, |ui| self.chief_content(ui)));
 
         egui::CentralPanel::default().frame(egui::Frame::new().fill(p.background)).show(ui, |ui| {
             let mut rect = ui.max_rect();
@@ -1835,10 +1742,8 @@ impl Desktop<'_> {
             }
         });
 
-        if let Some(rect) = chief_rect
-            && chief_divider(ui, rect, &mut self.runtime.store.chief_width, &p)
-        {
-            self.send(Command::SaveChiefPreferences);
+        if let Some(rect) = chief_rect {
+            self.draw(|_, client| atomics_ui::chief::divider(ui, rect, client));
         }
 
         self.chief_ui(&ctx);

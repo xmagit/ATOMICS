@@ -1,8 +1,8 @@
 //! The in-process [`Backend`]: reads the host model directly. The desktop's draw code reads through it,
 //! so a loopback or browser client can read the same things over the protocol.
 use atomics_ui::{
-    ApprovalRow, Backend, BoardView, CompletedTile, DiffHeading, DiffSnapshot, Notices, PlanRow, ProjectMenu,
-    RecentSession, SandboxLoad, SessionRow, TileView, UiConfig, ViewHints, WorktreeRow,
+    ApprovalRow, Backend, BoardView, ChiefView, CompletedTile, DiffHeading, DiffSnapshot, Heartbeat, Notices, PlanRow,
+    ProjectMenu, RecentSession, SandboxLoad, SessionRow, TileView, UiConfig, ViewHints, WorktreeRow,
 };
 
 use super::*;
@@ -58,6 +58,7 @@ impl Local<'_> {
             scratch: session.scratch.is_some(),
             sandbox: session.sandbox.clone(),
             outside: session.terminal.is_none(),
+            can_receive: session.can_receive(),
             pending_approvals: session.approvals.len(),
             held_messages: session.held.len(),
             changes: self
@@ -224,6 +225,21 @@ impl Backend for Local<'_> {
         })
     }
 
+    fn chief(&self) -> ChiefView {
+        let state = self.0;
+        ChiefView {
+            session: state.sessions.iter().position(|s| s.chief),
+            open: state.chief_open,
+            dock: state.chief_dock(),
+            width: state.store.chief_width,
+            heartbeat: state.heartbeat.last.as_ref().map(|(at, findings)| Heartbeat {
+                age: atomics_core::store::now().saturating_sub(*at),
+                time: local_time(*at),
+                findings: findings.len(),
+            }),
+        }
+    }
+
     fn diff_heading(&self, root: &Path) -> DiffHeading {
         let state = self.0;
         let session = state.active_index().map(|i| &state.sessions[i]);
@@ -354,6 +370,28 @@ impl Backend for Local<'_> {
             can_save: !state.open_projects.is_empty(),
         }
     }
+}
+
+/// `at`, in seconds since the epoch, as this machine's local date and time; "unavailable" if it cannot tell.
+fn local_time(at: u64) -> String {
+    let timestamp = at as libc::time_t;
+    let mut local = std::mem::MaybeUninit::<libc::tm>::uninit();
+    // SAFETY: both pointers are valid; a non-null result points to initialized local.
+    let local = unsafe { libc::localtime_r(&timestamp, local.as_mut_ptr()).as_ref() };
+    local.map_or_else(
+        || "unavailable".into(),
+        |local| {
+            format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                local.tm_year + 1900,
+                local.tm_mon + 1,
+                local.tm_mday,
+                local.tm_hour,
+                local.tm_min,
+                local.tm_sec
+            )
+        },
+    )
 }
 
 #[cfg(test)]
@@ -518,6 +556,34 @@ mod tests {
             );
             assert_eq!((loose.sandbox.as_deref(), loose.pending_approvals, loose.held_messages), (Some("vm"), 0, 1));
             assert!(rows.iter().all(|row| row.outside), "the test's sessions have no terminal in ATOMICS");
+        });
+    }
+
+    #[test]
+    fn the_chief_and_who_can_take_a_steer_follow_the_model() {
+        with_app("app::backend::tests::the_chief_and_who_can_take_a_steer_follow_the_model", |app, _| {
+            let dir = crate::test_support::tempdir().unwrap();
+            let mut chief = session("chief", AgentKind::Claude, AgentStatus::Idle, dir.path());
+            chief.chief = true;
+            chief.claude_id = Some("conversation".into());
+            let mut gone = session("gone", AgentKind::Claude, AgentStatus::Exited, dir.path());
+            gone.claude_id = Some("old".into());
+            app.runtime.sessions = vec![gone, chief];
+            app.runtime.chief_open = true;
+            app.runtime.store.chief_dock = Some(ChiefDock::Docked);
+            app.runtime.store.chief_width = Some(640.0);
+            app.runtime.heartbeat.last = Some((atomics_core::store::now() - 120, Vec::new()));
+
+            let backend = app.runtime.backend();
+            let chief = backend.chief();
+            assert_eq!(chief.session, Some(1));
+            assert_eq!((chief.open, chief.dock, chief.width), (true, ChiefDock::Docked, Some(640.0)));
+            let heartbeat = chief.heartbeat.expect("the heartbeat ran");
+            assert!((120..180).contains(&heartbeat.age), "{}", heartbeat.age);
+            assert_eq!(heartbeat.findings, 0);
+            assert_eq!(heartbeat.time.len(), "2026-11-03 12:00:00".len(), "{}", heartbeat.time);
+            let rows = backend.session_list();
+            assert_eq!(rows.iter().map(|row| row.can_receive).collect::<Vec<_>>(), [false, true]);
         });
     }
 

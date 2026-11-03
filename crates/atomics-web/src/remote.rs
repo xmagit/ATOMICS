@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use atomics_core::approvals::ApprovalRequest;
-use atomics_core::config::{AgentKind, FontConfig, KeyConfig};
+use atomics_core::config::{AgentKind, ChiefDock, FontConfig, KeyConfig};
 use atomics_core::diff::{FileDiff, WorktreeDiff};
 use atomics_core::diff_data::Prepared;
 use atomics_core::layout::LayoutConfig;
@@ -27,8 +27,9 @@ use atomics_core::screen::Screen;
 use atomics_core::session::AgentStatus;
 use atomics_core::wire::{self, Envelope, ErrorCode, Message, Role, Seq, VERSION};
 use atomics_ui::{
-    ApprovalRow, Backend, BoardView, Command, CompletedTile, DiffHeading, DiffSnapshot, Notices, PanelMode, PlanRow,
-    PlanState, ProjectMenu, RecentSession, Remote, SandboxLoad, SessionRow, TileView, UiConfig, ViewHints, WorktreeRow,
+    ApprovalRow, Backend, BoardView, ChiefView, Command, CompletedTile, DiffHeading, DiffSnapshot, Notices, PanelMode,
+    PlanRow, PlanState, ProjectMenu, RecentSession, Remote, SandboxLoad, SessionRow, TileView, UiConfig, ViewHints,
+    WorktreeRow,
 };
 
 use crate::screens::{Lease, Refused, Screens};
@@ -689,6 +690,7 @@ fn session_row(session: &SessionInfo, mirror: &Mirror) -> SessionRow {
         scratch: false,
         sandbox: None,
         outside: false,
+        can_receive: session.status != AgentStatus::Exited,
         pending_approvals: session.pending_approvals as usize,
         held_messages: 0,
         changes: mirror.diffs.get(root.to_string_lossy().as_ref()).map(|d| (d.additions(), d.deletions())),
@@ -828,6 +830,14 @@ impl Backend for RemoteBackend {
 
     fn diff(&self, root: &Path) -> Option<DiffSnapshot> {
         self.state.borrow_mut().snapshot(root.to_string_lossy().as_ref())
+    }
+
+    /// The chief's session as the mirror has it. Its window, dock and heartbeat are the host's, which
+    /// atomics.v1 does not send: hidden, floating, none.
+    fn chief(&self) -> ChiefView {
+        let s = self.state.borrow();
+        let session = s.mirror.sessions.values().position(|x| x.chief);
+        ChiefView { session, open: false, dock: ChiefDock::Floating, width: None, heartbeat: None }
     }
 
     fn diff_heading(&self, root: &Path) -> DiffHeading {
