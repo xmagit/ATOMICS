@@ -89,7 +89,9 @@ pub fn tab_strip(
 /// its header (status, title, agent, branch and status, its sandbox, close), its approval banner, the
 /// banner of MCP servers it needs, its plan task's last report and its terminal, which `surface` draws;
 /// for a session outside ATOMICS, its last exchange instead. A click on a title shows the session's diff,
-/// a double-click renames it; a click in a terminal makes its session the active one.
+/// a double-click renames it; a click in a terminal makes its session the active one. Under
+/// [`Client::touch`] a tile fills its cell to the screen's sides and its header and close are a finger's
+/// size.
 pub fn tiles(
     ui: &mut egui::Ui,
     rect: Rect,
@@ -121,20 +123,24 @@ pub fn tiles(
     let can_connect = backend.available(&Command::Connect { name: String::new(), store_env: false, url: None });
     let can_dismiss = backend.available(&Command::DismissMcp(String::new()));
     let focus_request = client.focus_terminal.take();
+    let (inset, header_height, close_size) = match client.touch {
+        Some(touch) => (0.0, touch.target, touch.target),
+        None => (3.0, TILE_HEADER, 18.0),
+    };
     let now = ui.input(|i| i.time);
     let sessions = backend.session_list();
     let active_id = backend.view_hints().active;
 
     for (slot, &index) in tiled.iter().enumerate() {
         let min = rect.min + vec2((slot % cols) as f32 * size.x, (slot / cols) as f32 * size.y);
-        let tile = Rect::from_min_size(min, size).shrink(3.0);
+        let tile = Rect::from_min_size(min, size).shrink(inset);
         let row = &sessions[index];
         let view = backend.tile(index).unwrap_or_default();
         let active = active_id.as_deref() == Some(row.id.as_str());
         // Closing a scratch session deletes its folder, so it asks even once the agent exited.
         let ask = row.scratch || (!row.outside && !view.exited);
 
-        let header = tile.with_max_y(tile.top() + TILE_HEADER);
+        let header = tile.with_max_y(tile.top() + header_height);
         let mut body = tile.with_min_y(header.bottom());
         ui.painter().rect_filled(header, 2.0, if active { lerp(p.raised, p.accent, 0.12) } else { p.raised });
         ui.painter().line_segment([header.left_bottom(), header.right_bottom()], Stroke::new(1.0, p.border));
@@ -149,8 +155,11 @@ pub fn tiles(
             let galley = ui.fonts_mut(|f| f.layout_no_wrap(text, p.ui(10.0), p.info));
             badge_width = galley.size().x + SANDBOX_ICON + 19.0;
             let badge = Rect::from_min_max(
-                pos2((header.right() - 28.0 - badge_width).max(header.left() + 22.0), header.center().y - 8.5),
-                pos2(header.right() - 31.0, header.center().y + 8.5),
+                pos2(
+                    (header.right() - close_size - 10.0 - badge_width).max(header.left() + 22.0),
+                    header.center().y - 8.5,
+                ),
+                pos2(header.right() - close_size - 13.0, header.center().y + 8.5),
             );
             ui.painter().rect_filled(badge, 4.0, lerp(p.raised, p.info, 0.15));
             let painter = ui.painter().with_clip_rect(badge);
@@ -172,7 +181,7 @@ pub fn tiles(
         }
         let title_rect = Rect::from_min_max(
             pos2(header.left() + 22.0, header.top()),
-            pos2(header.right() - 28.0 - badge_width, header.bottom()),
+            pos2(header.right() - close_size - 10.0 - badge_width, header.bottom()),
         );
         let title_response = ui.interact(title_rect, ui.scope_id().with(("tile-title", &row.id)), Sense::click());
         let title_color = if title_response.hovered() || active { p.accent } else { p.foreground };
@@ -210,7 +219,10 @@ pub fn tiles(
             activate = Some((row.id.clone(), true));
         }
         if can_close {
-            let close_rect = Rect::from_center_size(pos2(header.right() - 14.0, header.center().y), Vec2::splat(18.0));
+            let close_rect = Rect::from_center_size(
+                pos2(header.right() - close_size / 2.0 - 5.0, header.center().y),
+                Vec2::splat(close_size),
+            );
             let close_response = ui.interact(close_rect, ui.scope_id().with(("tile-close", &row.id)), Sense::click());
             ui.painter().text(
                 close_rect.center(),

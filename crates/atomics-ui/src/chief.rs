@@ -230,9 +230,17 @@ pub fn content(
     let session = backend.session_row(index)?;
     let p = client.palette.clone();
     let touch = client.touch;
+    // A phone keeps the header off the screen's sides; the terminal keeps to them itself.
+    let gutter = touch.map_or(0.0, |touch| touch.gutter);
     ui.horizontal(|ui| {
+        if gutter > 0.0 {
+            ui.add_space(gutter);
+        }
         ui.label(RichText::new("◆ CHIEF AGENT").color(p.accent).strong());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if gutter > 0.0 {
+                ui.add_space(gutter);
+            }
             if backend.available(&Command::HideChief)
                 && touch::small_button(ui, touch, "minimize")
                     .on_hover_text(shortcut_label(ui.ctx(), &backend.ui_config().keys.toggle_chief))

@@ -55,6 +55,8 @@ extern "C" {
     fn set_writable(on: bool);
     #[wasm_bindgen(js_name = blurInput)]
     fn blur_input();
+    #[wasm_bindgen(js_name = focusInput)]
+    fn focus_input();
     #[wasm_bindgen(js_name = setSticky)]
     fn set_sticky(ctrl: bool, alt: bool);
     #[wasm_bindgen(js_name = setCopy)]
@@ -234,7 +236,8 @@ impl App {
         install(&layout::keybar_json().to_string(), &page);
         set_theme(&theme_colors(&client.palette));
         let layout = LayoutMode::named(&load_layout());
-        let view = View { layout, ..View::default() };
+        let mut view = View::default();
+        view.layout = layout;
         Self {
             driver,
             client,
@@ -258,6 +261,7 @@ impl App {
         if std::mem::take(&mut overlay.blur) {
             blur_input();
         }
+        let focus = std::mem::take(&mut overlay.focus);
         let now = overlay.clone();
         let last = &self.applied;
         if now.writable != last.writable {
@@ -271,6 +275,10 @@ impl App {
         }
         if (now.ctrl, now.alt) != (last.ctrl, last.alt) {
             set_sticky(now.ctrl, now.alt);
+        }
+        // After placing it: a click picked this terminal, so typing goes there.
+        if focus {
+            focus_input();
         }
         if now.copy != last.copy {
             match &now.copy {
@@ -418,7 +426,7 @@ impl eframe::App for App {
         {
             views::apply_theme(&mut self.view, boot);
             set_theme(&theme_colors(&self.view.looks.desktop));
-            self.view.tab = boot.view.as_deref().map_or(Tab::Board, Tab::named);
+            self.view.open(boot.view.as_deref().map_or(Tab::Board, Tab::named));
             self.view.ticket_key.clone_from(&boot.ticket_key);
             self.themed = true;
         }

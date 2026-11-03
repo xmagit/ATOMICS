@@ -293,7 +293,8 @@ pub fn show(
             });
         });
     } else {
-        // A phone stacks the header: the title, the branch and counts, then every button in a row that wraps.
+        // A phone stacks the header: the title, the branch and counts, then every button in a row that wraps,
+        // with Close last.
         let title = egui::RichText::new(header.title).strong().size(15.0).color(palette.foreground);
         ui.add(egui::Label::new(title).wrap());
         let prepared = state.prepared.clone().filter(|_| state.viewing.is_none());
@@ -310,6 +311,7 @@ pub fn show(
             if let Some(prepared) = &prepared {
                 diff_buttons(ui, state, &prepared.diff, &mut split, touch, &mut action);
             }
+            close_button(ui, touch, &mut action);
         });
     }
 
@@ -357,8 +359,11 @@ pub fn show(
         highest.to_string().len().max(2)
     });
     let gutter = digits.map_or(char_w * 13.0, |digits| char_w * (digits as f32 + 3.0));
-    let wrap = (touch.is_some() && !state.unwrapped && !split)
-        .then(|| (((view.width() - gutter) / char_w).floor() as usize).max(8));
+    // The width a wrapped row has for code, in points; a row holds at least eight digits.
+    let wrap = (touch.is_some() && !state.unwrapped && !split).then(|| (view.width() - gutter).max(char_w * 8.0));
+    // How a line wraps there, measured with the glyphs it is drawn with.
+    let ctx = ui.ctx().clone();
+    let wrapped = |text: &str, width: f32| ctx.fonts_mut(|f| wrapping(text, width, |c| f.glyph_width(font, c)));
 
     // Comment anchors: (path, line, removed) → comment indices.
     let mut anchored: HashMap<(&str, u32, bool), Vec<usize>> = HashMap::new();
@@ -405,8 +410,8 @@ pub fn show(
             } else {
                 for li in 0..hunk.lines.len() {
                     rows.push(Row::Line(fi, hi, li));
-                    if let Some(chars) = wrap {
-                        let (_, more) = wrapping(&hunk.lines[li].text, chars);
+                    if let Some(width) = wrap {
+                        let more = wrapped(&hunk.lines[li].text, width).starts.len();
                         rows.extend((1..=more).map(|piece| Row::Wrap(fi, hi, li, piece)));
                     }
                     annotate(&mut rows, li);
@@ -531,7 +536,7 @@ pub fn show(
                     let code_x = rect.left() + gutter;
                     let hovered = response.hovered();
                     let piece = if let Row::Wrap(.., piece) = *row { piece } else { 0 };
-                    let segment = wrap.map(|chars| Piece::of(&line.text, chars, piece, char_w));
+                    let segment = wrap.map(|width| Piece::of(&wrapped(&line.text, width), piece, width));
                     let spans = spans(fi, hi, li);
                     let hovered = hovered && can_review;
                     paint_line(painter, rect, code_x, 0.0, char_w, line, spans, hovered, font, palette, segment);
@@ -687,8 +692,9 @@ fn header_buttons(
     action: &mut DiffAction,
 ) {
     let touch = header.touch;
-    if touch::small_button(ui, touch, "×").on_hover_text("Close diff").clicked() {
-        *action = DiffAction::Close;
+    // Right to left on a desktop, so Close is the header's last button; a phone draws it after the rest.
+    if touch.is_none() {
+        close_button(ui, touch, action);
     }
     if touch::small_button(ui, touch, "⟳").on_hover_text("Refresh").clicked() {
         *action = DiffAction::Refresh;
@@ -724,6 +730,12 @@ fn header_buttons(
     }
     if !state.comments.is_empty() && touch::small_button(ui, touch, "discard").clicked() {
         state.comments.clear();
+    }
+}
+
+fn close_button(ui: &mut egui::Ui, touch: Option<Touch>, action: &mut DiffAction) {
+    if touch::small_button(ui, touch, "×").on_hover_text("Close diff").clicked() {
+        *action = DiffAction::Close;
     }
 }
 
@@ -1148,13 +1160,37 @@ fn status_badge(status: FileStatus, palette: &Palette) -> (&'static str, Color32
     }
 }
 
-/// How a line of `text` wraps at `chars` a row: the columns its continuations hang in by, the line's own
-/// indent up to half a row, and how many continuations there are.
-fn wrapping(text: &str, chars: usize) -> (usize, usize) {
-    let width = |c: char| if c == '\t' { 4 } else { 1 };
-    let total: usize = text.chars().map(width).sum();
-    let indent = text.chars().take_while(|c| c.is_whitespace()).map(width).sum::<usize>().min(chars / 2);
-    (indent, total.saturating_sub(chars).div_ceil(chars - indent))
+/// How a line wraps in rows of a width, in points: what its continuations hang in by, and where each starts.
+#[derive(Debug, Clone, PartialEq)]
+struct Wrapped {
+    /// The line's own indent, up to half a row.
+    indent: f32,
+    /// Where each continuation starts, from the line's start: always at a character, never inside one.
+    starts: Vec<f32>,
+}
+
+/// How a line of `text` wraps in rows `width` points wide, `glyph` giving each character's advance (a tab
+/// is four spaces, as the line is drawn). Wide characters (CJK, emoji) take what their glyphs take, so a row
+/// never runs past the screen or cuts a character in two.
+fn wrapping(text: &str, width: f32, mut glyph: impl FnMut(char) -> f32) -> Wrapped {
+    let mut advance = |c: char| if c == '\t' { 4.0 * glyph(' ') } else { glyph(c) };
+    let mut indent = 0.0;
+    let mut starts = Vec::new();
+    let (mut x, mut row_start, mut row_width, mut leading) = (0.0, 0.0, width, true);
+    for c in text.chars() {
+        let w = advance(c);
+        leading &= c.is_whitespace();
+        if leading {
+            indent = (indent + w).min(width / 2.0);
+        }
+        if x > row_start && x + w - row_start > row_width + 0.01 {
+            starts.push(x);
+            row_start = x;
+            row_width = width - indent;
+        }
+        x += w;
+    }
+    Wrapped { indent, starts }
 }
 
 /// The part of a wrapped line one row shows, in points: the code from `start` on, drawn `indent` right of
@@ -1167,16 +1203,13 @@ struct Piece {
 }
 
 impl Piece {
-    /// The `piece`th part of a line of `text` wrapped at `chars` a row: the first a whole row, each
-    /// continuation under the line's indent ([`wrapping`]).
-    fn of(text: &str, chars: usize, piece: usize, char_w: f32) -> Piece {
-        let (indent, _) = wrapping(text, chars);
-        let rest = chars - indent;
-        let (start, indent, width) = match piece {
-            0 => (0, 0, chars),
-            _ => (chars + (piece - 1) * rest, indent, rest),
-        };
-        Piece { start: start as f32 * char_w, indent: indent as f32 * char_w, width: width as f32 * char_w }
+    /// The `piece`th part of a line wrapped in rows `width` points wide: the first from the line's start,
+    /// each continuation under the line's indent, each up to where the next starts.
+    fn of(wrapped: &Wrapped, piece: usize, width: f32) -> Piece {
+        let start = if piece == 0 { 0.0 } else { wrapped.starts.get(piece - 1).copied().unwrap_or(f32::INFINITY) };
+        let indent = if piece == 0 { 0.0 } else { wrapped.indent };
+        let end = wrapped.starts.get(piece).copied().unwrap_or(start + width - indent);
+        Piece { start, indent, width: end - start }
     }
 }
 
@@ -1387,19 +1420,39 @@ mod tests {
 
     #[test]
     fn a_phone_wraps_a_long_line_under_its_indent() {
-        assert_eq!(wrapping("short", 10), (0, 0));
-        assert_eq!(wrapping("0123456789", 10), (0, 0), "a line that just fits");
-        assert_eq!(wrapping("0123456789abcdefghij", 10), (0, 1));
-        // Four spaces in: the continuations hang under the code, six columns a row.
+        // Ten two-point glyphs a row.
+        let mono = |text: &str| wrapping(text, 20.0, |_| 2.0);
+        let rows = |text: &str| mono(text).starts.len();
+        assert_eq!(rows("short"), 0);
+        assert_eq!(rows("0123456789"), 0, "a line that just fits");
+        assert_eq!(rows("0123456789abcdefghij"), 1);
+        // Four spaces in: the continuations hang under the code, six glyphs a row.
         let line = "    step(1); // xxxxxxxx";
-        assert_eq!(wrapping(line, 10), (4, 3));
-        let piece = |n| Piece::of(line, 10, n, 2.0);
+        let wrapped = mono(line);
+        assert_eq!(wrapped, Wrapped { indent: 8.0, starts: vec![20.0, 32.0, 44.0] });
+        let piece = |n| Piece::of(&wrapped, n, 20.0);
         assert_eq!(piece(0), Piece { start: 0.0, indent: 0.0, width: 20.0 });
         assert_eq!(piece(1), Piece { start: 20.0, indent: 8.0, width: 12.0 });
         assert_eq!(piece(3), Piece { start: 44.0, indent: 8.0, width: 12.0 });
-        // A tab is four columns; an indent past half a row hangs at half.
-        assert_eq!(wrapping("\tx", 10).0, 4);
-        assert_eq!(wrapping(&format!("{}x{}", " ".repeat(9), "y".repeat(10)), 10), (5, 2));
+        // A tab is four spaces; an indent past half a row hangs at half.
+        assert_eq!(mono("\tx").indent, 8.0);
+        let deep = mono(&format!("{}x{}", " ".repeat(9), "y".repeat(10)));
+        assert_eq!((deep.indent, deep.starts.len()), (10.0, 2));
+    }
+
+    #[test]
+    fn a_phone_wraps_wide_glyphs_by_their_width() {
+        // CJK glyphs twice as wide as Latin ones: five fit a row, and none is cut in two.
+        let glyph = |c: char| if c.is_ascii() { 2.0 } else { 4.0 };
+        let wrapped = wrapping("日本語のテキストです", 20.0, glyph);
+        assert_eq!(wrapped.starts, [20.0]);
+        assert_eq!(Piece::of(&wrapped, 1, 20.0), Piece { start: 20.0, indent: 0.0, width: 20.0 });
+        // A glyph that would cross the row's edge starts the next row instead.
+        let wrapped = wrapping("abcdefghi日x", 20.0, glyph);
+        assert_eq!(wrapped.starts, [18.0]);
+        assert_eq!(Piece::of(&wrapped, 0, 20.0).width, 18.0, "the first row ends before the glyph");
+        let emoji = wrapping(&"🦀".repeat(7), 20.0, |c| if c == '🦀' { 6.0 } else { 2.0 });
+        assert_eq!(emoji.starts, [18.0, 36.0], "three to a row");
     }
 
     #[test]

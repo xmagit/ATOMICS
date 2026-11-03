@@ -185,15 +185,19 @@ pub const KEYBAR: [&[BarKey]; 2] = [
         BarKey { label: "Paste", name: "Paste", send: Send::Paste, wide: true },
     ],
 ];
-/// Slots per row, the bar's padding and the gap between keys, as the page lays them out.
+/// Slots per row, the bar's padding and the gap between keys, and a key's least size, as the page lays them
+/// out (`web/style.css`), in CSS pixels. A key is a finger's target both ways; a screen too narrow for eight
+/// of them a row scrolls the row.
 pub const KEYBAR_SLOTS: usize = 8;
-pub const KEYBAR_PAD: f32 = 4.0;
-pub const KEYBAR_GAP: f32 = 4.0;
-pub const KEYBAR_KEY_HEIGHT: f32 = 38.0;
+pub const KEYBAR_PAD: f32 = 2.0;
+pub const KEYBAR_GAP: f32 = 2.0;
+pub const KEYBAR_KEY: f32 = 44.0;
 
-/// One slot's width at a viewport `width`.
-pub fn keybar_slot(width: f32) -> f32 {
-    (width - 2.0 * KEYBAR_PAD - (KEYBAR_SLOTS - 1) as f32 * KEYBAR_GAP) / KEYBAR_SLOTS as f32
+/// One slot's width at a viewport `width`, with the safe area's side insets `inset` (each side's padding
+/// is the larger of the inset and the bar's own).
+pub fn keybar_slot(width: f32, (left, right): (f32, f32)) -> f32 {
+    let inner = width - left.max(KEYBAR_PAD) - right.max(KEYBAR_PAD);
+    ((inner - (KEYBAR_SLOTS - 1) as f32 * KEYBAR_GAP) / KEYBAR_SLOTS as f32).max(KEYBAR_KEY)
 }
 
 /// The key bar for the page: `[[{label, name, kind, value, wide}]]`.
@@ -263,8 +267,11 @@ mod tests {
             assert!(r.bar.is_none());
             assert_eq!((keys.bottom(), keys.height()), (height - 336.0, 88.0));
             assert_eq!((r.body.bottom(), r.body.width()), (keys.top(), width), "the terminal fills the width above it");
-            // Every key bar key is a usable target: wide enough, two rows of eight slots.
-            assert!(keybar_slot(width) >= 40.0, "{width}: {}", keybar_slot(width));
+            // Every key bar key is a finger's target, 44 CSS pixels each way, two rows of eight slots; they fit
+            // without scrolling from an iPhone mini's width up.
+            assert!(keybar_slot(width, (0.0, 0.0)) >= KEYBAR_KEY, "{width}");
+            let fits = |width: f32| width - 2.0 * KEYBAR_PAD - 7.0 * KEYBAR_GAP >= 8.0 * KEYBAR_KEY;
+            assert_eq!(fits(width), width >= 375.0, "{width}");
             for row in KEYBAR {
                 let slots: usize = row.iter().map(|k| if k.wide { 2 } else { 1 }).sum();
                 assert_eq!(slots, KEYBAR_SLOTS);
@@ -296,6 +303,9 @@ mod tests {
         assert!(zoomed.coarse);
         let css = |points: f32| (points * ZOOM * 100.0).round() / 100.0;
         assert_eq!((css(TOUCH), css(GUTTER)), (44.0, 16.0), "a finger's target, and the side gutter, in CSS pixels");
+        // Held sideways, the key bar keeps its keys out of the notch's side.
+        let sideways = keybar_slot(844.0, (47.0, 47.0));
+        assert!((sideways - (844.0 - 94.0 - 14.0) / 8.0).abs() < 1e-3 && sideways >= KEYBAR_KEY, "{sideways}");
     }
 
     #[test]

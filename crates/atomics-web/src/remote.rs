@@ -6,6 +6,12 @@
 //! The browser offers everything read-only, answers approvals and approves plans where `may` allows, and
 //! follows and types into terminals ([`crate::screens`]) where it grants `type`. [`Backend::available`] says
 //! so, and the views draw no action for any other command; one sent anyway says so on the notice line.
+//!
+//! What a host keeps of its own window and atomics.v1 does not send (the tab, the active session, the
+//! right panel, the chief's window) is the page's, set by the views from their [`crate::desk::Desk`]
+//! ([`RemoteBackend::set_view`], [`RemoteBackend::set_chief_window`]); what the host cannot send at all
+//! (its config, projects, worktrees, sandboxes, usage) reads as absent, so the frame's host-only items stay
+//! empty.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -32,6 +38,7 @@ use atomics_ui::{
     WorktreeRow,
 };
 
+use crate::desk::{self, ChiefWindow};
 use crate::screens::{Lease, Refused, Screens};
 
 /// What this client asks the host for.
@@ -79,6 +86,9 @@ struct State {
     notice: Option<String>,
     now_ms: u64,
     view: ViewHints,
+    /// The chief's window in this page, and whether the page draws the wide layout, where it has one.
+    chief: ChiefWindow,
+    wide: bool,
     screens: Screens,
 }
 
@@ -144,6 +154,8 @@ impl RemoteBackend {
             notice: None,
             now_ms: 0,
             view: default_hints(),
+            chief: ChiefWindow { open: false, dock: ChiefDock::Floating, width: None },
+            wide: false,
             screens: Screens::default(),
         };
         Self { state: RefCell::new(state), prefix: prefix.to_string(), ops: Cell::new(0) }
@@ -227,6 +239,23 @@ impl RemoteBackend {
     /// What is on screen, which the UI reads back through [`Backend::view_hints`].
     pub fn set_view(&self, hints: ViewHints) {
         self.state.borrow_mut().view = hints;
+    }
+
+    /// The chief's window in this page, which the UI reads back through [`Backend::chief`], and whether the
+    /// page draws the wide layout, the only one with a window to show, dock or resize.
+    pub fn set_chief_window(&self, chief: ChiefWindow, wide: bool) {
+        let mut s = self.state.borrow_mut();
+        (s.chief, s.wide) = (chief, wide);
+    }
+
+    /// Fetch the hunks of `worktree`'s files, the diff on screen, and of no other worktree.
+    pub fn set_wanted(&self, worktree: Option<&Path>) {
+        let mut s = self.state.borrow_mut();
+        let wanted: BTreeSet<String> = worktree.map(|w| w.to_string_lossy().into_owned()).into_iter().collect();
+        if s.wanted != wanted {
+            s.wanted = wanted;
+            s.fetch();
+        }
     }
 
     /// Fetch the hunks of `worktree`'s changed files: its diff is on screen.
@@ -749,8 +778,14 @@ impl Backend for RemoteBackend {
     /// The view commands the frame carries out, a diff's refresh, and the commands this release offers
     /// while the host's `welcome` grants what they would send. Offline nothing can be sent.
     fn available(&self, command: &Command) -> bool {
-        if command.is_view() {
-            return crate::views::carries_out(command);
+        if command.is_view() || desk::window_command(command) {
+            let s = self.state.borrow();
+            let chief = || s.mirror.sessions.values().any(|x| x.chief);
+            // The plan's board and button need a plan, which a host may not have, or not have sent yet.
+            let plan = matches!(command, Command::TogglePlan | Command::SetPanel(PanelMode::Plan));
+            return desk::carries_out(command, s.wide)
+                && (!desk::window_command(command) || chief())
+                && (!plan || !s.mirror.plans.is_empty());
         }
         if matches!(command, Command::RefreshDiff(_)) {
             return true;
@@ -851,12 +886,13 @@ impl Backend for RemoteBackend {
         self.state.borrow_mut().snapshot(root.to_string_lossy().as_ref())
     }
 
-    /// The chief's session as the mirror has it. Its window, dock and heartbeat are the host's, which
-    /// atomics.v1 does not send: hidden, floating, none.
+    /// The chief's session as the mirror has it, in this page's window ([`RemoteBackend::set_chief_window`]).
+    /// The host's heartbeat is not sent.
     fn chief(&self) -> ChiefView {
         let s = self.state.borrow();
         let session = s.mirror.sessions.values().position(|x| x.chief);
-        ChiefView { session, open: false, dock: ChiefDock::Floating, width: None, heartbeat: None }
+        let ChiefWindow { open, dock, width } = s.chief;
+        ChiefView { session, open: open && session.is_some(), dock, width, heartbeat: None }
     }
 
     fn diff_heading(&self, root: &Path) -> DiffHeading {
@@ -889,8 +925,21 @@ impl Backend for RemoteBackend {
         self.state.borrow().view.clone()
     }
 
+    /// The tab's sessions, as the desktop's rule picks them: a plan's tab its tasks' sessions, the Ungrouped
+    /// tab every session outside a plan, else all; never the chief.
     fn visible_sessions(&self) -> Vec<usize> {
-        (0..self.state.borrow().mirror.sessions.len()).collect()
+        let s = self.state.borrow();
+        let plan = s.view.plan_view.then(|| s.mirror.plans.values().nth(s.view.selected_plan)).flatten();
+        let in_plan = |x: &SessionInfo, plan: &PlanInfo| {
+            x.task.as_ref().is_some_and(|link| link.plan == plan.id)
+                || plan.tasks.iter().any(|t| t.session.as_deref() == Some(x.id.as_str()))
+        };
+        let shown = |x: &SessionInfo| match plan {
+            Some(plan) => in_plan(x, plan),
+            None if s.view.ungrouped => x.task.is_none(),
+            None => true,
+        };
+        s.mirror.sessions.values().enumerate().filter(|(_, x)| !x.chief && shown(x)).map(|(i, _)| i).collect()
     }
 
     fn checkouts(&self) -> Vec<String> {

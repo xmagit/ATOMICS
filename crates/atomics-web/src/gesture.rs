@@ -2,8 +2,9 @@
 //! §4.4) receives every touch and click there, so the canvas never sees them; the page forwards its
 //! pointer events here. Pure: events and a clock in, gestures out.
 //!
-//! A touch: a tap, a one-finger drag (history and panning), a long press that starts a selection and
-//! drags it out, or two fingers pinching (the font size). A mouse: a click, or a drag that selects, as
+//! A touch: a tap, a one-finger drag (history and panning), a long press that selects a word and drags
+//! the selection out, or two fingers pinching (the font size). The terminal pane drags a selection's
+//! handles itself. A mouse: a click, or a drag that selects, as
 //! on the desktop.
 //!
 //! A pointer whose lift never arrives would stay down and make every later touch a pinch. The page
@@ -52,8 +53,9 @@ pub enum Gesture {
     Drag(Vec2),
     /// Two fingers: the font size times `factor`, about `center`.
     Pinch { factor: f32, center: Pos2 },
-    /// A selection from `from` to `to`; `done` once the pointer lifted.
-    Select { from: Pos2, to: Pos2, done: bool },
+    /// A selection from `from` to `to`; `done` once the pointer lifted. `word`: a long press started it,
+    /// so it takes the word under `from` whole; a mouse's drag selects cell by cell.
+    Select { from: Pos2, to: Pos2, done: bool, word: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -73,6 +75,7 @@ enum Mode {
         id: i32,
         from: Pos2,
         to: Pos2,
+        word: bool,
     },
     Pinching {
         distance: f32,
@@ -120,8 +123,8 @@ impl Recognizer {
                 match self.mode {
                     Mode::Pressed { id, start, kind, .. } if id == e.id && e.pos.distance(start) > SLOP => {
                         if kind == Kind::Mouse {
-                            self.mode = Mode::Selecting { id, from: start, to: e.pos };
-                            out.push(Gesture::Select { from: start, to: e.pos, done: false });
+                            self.mode = Mode::Selecting { id, from: start, to: e.pos, word: false };
+                            out.push(Gesture::Select { from: start, to: e.pos, done: false, word: false });
                         } else {
                             self.mode = Mode::Dragging { id, last: e.pos };
                             out.push(Gesture::Drag(e.pos - start));
@@ -131,9 +134,9 @@ impl Recognizer {
                         self.mode = Mode::Dragging { id, last: e.pos };
                         out.push(Gesture::Drag(e.pos - last));
                     }
-                    Mode::Selecting { id, from, .. } if id == e.id => {
-                        self.mode = Mode::Selecting { id, from, to: e.pos };
-                        out.push(Gesture::Select { from, to: e.pos, done: false });
+                    Mode::Selecting { id, from, word, .. } if id == e.id => {
+                        self.mode = Mode::Selecting { id, from, to: e.pos, word };
+                        out.push(Gesture::Select { from, to: e.pos, done: false, word });
                     }
                     Mode::Pinching { distance } => {
                         if let Some((now, center)) = self.pair() {
@@ -156,9 +159,9 @@ impl Recognizer {
                         self.mode = Mode::Idle;
                     }
                     Mode::Dragging { id, .. } if id == e.id => self.mode = Mode::Idle,
-                    Mode::Selecting { id, from, to } if id == e.id => {
+                    Mode::Selecting { id, from, to, word } if id == e.id => {
                         let to = if lifted { e.pos } else { to };
-                        out.push(Gesture::Select { from, to, done: true });
+                        out.push(Gesture::Select { from, to, done: true, word });
                         self.mode = Mode::Idle;
                     }
                     Mode::Pinching { .. } | Mode::Done => {
@@ -174,12 +177,12 @@ impl Recognizer {
         out
     }
 
-    /// The clock moved: a touch held still long enough starts a selection where it is.
+    /// The clock moved: a touch held still long enough selects the word where it is.
     pub fn tick(&mut self, now_ms: f64) -> Vec<Gesture> {
         match self.mode {
             Mode::Pressed { id, start, since, kind } if kind != Kind::Mouse && now_ms - since >= LONG_PRESS_MS => {
-                self.mode = Mode::Selecting { id, from: start, to: start };
-                vec![Gesture::Select { from: start, to: start, done: false }]
+                self.mode = Mode::Selecting { id, from: start, to: start, word: true };
+                vec![Gesture::Select { from: start, to: start, done: false, word: true }]
             }
             _ => Vec::new(),
         }
@@ -234,16 +237,14 @@ mod tests {
         assert!(run(&mut r, &[at(3, Phase::Down, 50.0, 50.0, t, 1000.0)]).is_empty());
         assert_eq!(r.due_ms(), Some(1000.0 + LONG_PRESS_MS));
         assert!(r.tick(1200.0).is_empty(), "not yet");
-        assert_eq!(r.tick(1460.0), [Gesture::Select { from: pos2(50.0, 50.0), to: pos2(50.0, 50.0), done: false }]);
+        let word = |to: Pos2, done| Gesture::Select { from: pos2(50.0, 50.0), to, done, word: true };
+        assert_eq!(r.tick(1460.0), [word(pos2(50.0, 50.0), false)]);
         let selected =
             run(&mut r, &[at(3, Phase::Move, 90.0, 66.0, t, 1500.0), at(3, Phase::Up, 92.0, 66.0, t, 1600.0)]);
         assert_eq!(
             selected,
-            [
-                Gesture::Select { from: pos2(50.0, 50.0), to: pos2(90.0, 66.0), done: false },
-                Gesture::Select { from: pos2(50.0, 50.0), to: pos2(92.0, 66.0), done: true },
-            ],
-            "a long press drags out a selection, then lifts"
+            [word(pos2(90.0, 66.0), false), word(pos2(92.0, 66.0), true)],
+            "a long press selects a word and drags the selection out, then lifts"
         );
         assert_eq!(r.due_ms(), None);
     }
@@ -305,8 +306,8 @@ mod tests {
         assert_eq!(
             drag,
             [
-                Gesture::Select { from: pos2(10.0, 10.0), to: pos2(60.0, 10.0), done: false },
-                Gesture::Select { from: pos2(10.0, 10.0), to: pos2(60.0, 10.0), done: true },
+                Gesture::Select { from: pos2(10.0, 10.0), to: pos2(60.0, 10.0), done: false, word: false },
+                Gesture::Select { from: pos2(10.0, 10.0), to: pos2(60.0, 10.0), done: true, word: false },
             ],
             "a cancelled drag keeps where it got to"
         );

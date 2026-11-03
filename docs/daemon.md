@@ -818,7 +818,7 @@ clipboard could not be read, and pasting with the keyboard still works.
 | `theme` | no | The page's theme. A built-in ATOMICS theme of that name is used, else the first built-in of `scheme` |
 | `scheme` | no | `dark` (the default) or `light` |
 | `locale` | no | The page's locale |
-| `view` | no | Where to open: `board` (the default), `plans`, `approvals`, `diffs`, `terminal` (an agent's) or `chief`; an unknown name opens the board |
+| `view` | no | Where to open: `board` (the default), `agents`, `approvals`, `diffs`, `terminal` (an agent's) or `chief`; on a wide screen `diffs` opens the right panel on the diff and `chief` shows the chief; `plans`, or an unknown name, opens the board |
 | `ticket_key` | no | A ticket's key (`docs/tickets.md`; its id where it has no key): opens the plan that follows it, else one with a task for it (open plans first, keys compared without regard to ASCII case), or the board when none does. Wins over `view`. A text like the others; empty is ignored. (`ticket` is the connect ticket.) |
 | `mode` | no | Absent, or `pair` on a pairing page |
 | `pair` | with `mode: pair` | `{v: 1, host_noise_pubkey, psk, age_ms}`: the pairing link's fields, each key 43 characters of unpadded base64url, and optionally `age_ms`, how many milliseconds before this boot the page got the link (opened, scanned or pasted). The link's five minutes run from then; without it, or with anything but a number of at least 0, from the boot |
@@ -866,21 +866,35 @@ connected, sees no action it cannot take. A diff on screen
 is fetched file by file with `diff_get`, four files at a time, up to 16 pages each; the browser draws it without
 syntax colours.
 
-**Layouts (C4).** On a desktop, a top bar with the connection's state and a tab per view: Board, Plans,
-Approvals, Diffs, Terminal (an agent's, picked from a list) and Chief. On a phone (narrower than 600 CSS pixels, or
-900 with a coarse pointer; the ⋯ menu overrides it, remembered in the client origin's `localStorage`), one pane at a
-time (Board, Plans, Diffs, Terminal, Chief) from a bottom bar, the approvals behind the top bar's ◆ badge, all
-inside `visualViewport` and the safe-area insets (the sides too, for a phone held sideways). Everything is drawn in
-the boot's ATOMICS theme (`Palette`); the page's own controls take its colours as CSS custom properties.
+**Layouts (C4).** A wide window draws the desktop's own window, `atomics_ui::shell::frame`, in the boot's theme
+as the desktop draws it (monospace UI text where the theme says so; the default theme does): the top bar with the
+plan tabs and the chief's pill, the sidebar where the window has room for it, the tiled terminals with their
+headers and approval banners, the board or a worktree's diff in the right panel, and the chief docked (at first)
+or floating. The items only a host has (Settings, sandboxes, credentials, the ticket sign-in, GitHub, the load
+gauge, USAGE, `+ New`, Project, the steer bar) are hooks the browser leaves empty; the connection's state takes
+the place of the desktop's Remote item, and the ⋯ layout menu that of Settings. What the desktop keeps in its
+host's model about its window (the tab, the active session, the right panel, the chief's window) the browser keeps
+per page (`atomics-web/src/desk.rs`), following the desktop's rules for the view commands; the tabs are the plans'
+and Ungrouped, and a page opens on the first plan's with its board beside the agents. A click into a terminal sends
+what is typed there, as on the desktop: the page's one input moves over it, focused.
+
+On a phone (narrower than 600 CSS pixels, or 900 with a coarse pointer; the ⋯ menu overrides it, remembered in the
+client origin's `localStorage`), one pane at a time from a bottom bar, each a view of the desktop's: Agents (the
+sidebar's AGENTS list; a tap opens the agent's tile), Board, Diffs (the worktrees with changes, then the diff
+panel), Terminal (the active agent's fleet tile at the pane's size: its header, its approval banner, its terminal)
+and Chief (the chief's window). The approvals are behind the top bar's ◆ badge, selected while they show. All of it
+sits inside `visualViewport` and the safe-area insets (the sides too, for a phone held sideways). The page's own
+controls take the theme's colours as CSS custom properties.
 
 The phone draws the theme's colours zoomed by 1.25 (through the theme's UI size, so code and terminals keep their
 CSS size), with proportional UI text and monospace only for code, terminals and IDs; every control is at least
 44 CSS pixels square and the content keeps a 16 px gutter from the sides. The shared views fit it through
 `Client::touch` (`atomics_ui::touch`), which the desktop never sets: the board stacks the statuses that have tasks
-with full-width cards under its header and buttons; the diff header stacks the title, then the branch and counts,
-then its buttons in a row that wraps, and the diff shows one side, numbers each line once and wraps long lines
-under their indent (**wrap** turns that off); approval banners span the screen. Plans and Diffs are lists of
-full-width rows.
+with full-width cards under its header and buttons; a tile fills the pane to its sides with a finger-sized header;
+the diff header stacks the title, then the branch and counts, then its buttons in a row that wraps with Close last,
+and the diff shows one side, numbers each line once and wraps long lines under their indent, measured by the
+glyphs they are drawn with, so wide characters never run past the screen (**wrap** turns that off); approval
+banners span the screen.
 
 **Terminals (C4).** A terminal on screen is subscribed (focused); a terminal no frame shows is unsubscribed, and
 the history kept for it freed. Its cells are the desktop's grid, drawn by the shared painter: the font fits the
@@ -896,12 +910,15 @@ desktop, and lasts as long as the lease (**Computer's size** gives it back early
   spellcheck off. A touch on it is handled by the client: a tap focuses it from the touch's own handler (which
   opens the keyboard), and the browser's loupe, callout and page zoom never start.
 - **The key bar** (two rows: Esc, Tab, sticky Ctrl and Alt, the arrows, PgUp/PgDn, `|` `~` `/` `-`, Paste) shows
-  while the field has the focus on a coarse pointer, sits on `visualViewport`'s bottom edge, and takes the bottom
-  bar's place. Its keys never take the focus; Paste reads the clipboard on the touch's end.
+  while the field has the focus on a coarse pointer, sits on `visualViewport`'s bottom edge, clear of the
+  safe area's sides, and takes the bottom bar's place. Its keys are at least 44 CSS pixels each way (a screen
+  narrower than 375 scrolls a row) and never take the focus; Paste reads the clipboard on the touch's end.
 - **Touch and mouse.** A tap clicks the cell (press and release) where the program asked for mouse reports and this
   client types; a one-finger drag scrolls this client's own history (`history_get` as it reaches older lines; new
-  output does not move a view scrolled back) and pans; a long press (450 ms) selects, and a **Copy** chip copies
-  on its touch's end, leaving the focus where it was (see the iframe above); a pinch sets the font size (5-28
+  output does not move a view scrolled back) and pans; a long press (450 ms) selects the word under the finger
+  (letters, digits and `_-./~:@%+`; else the one cell), out to wherever the finger then moves, with a handle at
+  each end to drag; a **Copy** chip copies just that range on its touch's end, leaving the focus where it was (see
+  the iframe above). The page's own text selection is off. A pinch sets the font size (5-28
   points). A touch whose lift never reached the client is cancelled when the next touch starts. A mouse clicks
   and drag-selects, and its wheel scrolls; Ctrl+wheel zooms. In the alternate screen, or with SGR mouse reports, a
   scroll sends arrows or wheel reports instead, as the desktop does, only while this client types.
@@ -932,17 +949,26 @@ the views drawn headless; the manifest; and that the crate names no hosting prod
 `tests/browser.rs` runs the real bundle in headless Chrome against that host, behind a fake broker. On a desktop
 it pairs, reconnects and reloads, types into a terminal through DevTools, sees the echo, and loses and regains the
 lease. As an iPhone (390 × 844 points at 3×, a touch screen, Safari's user agent, framed full screen) it is used
-by touch alone: it pairs, shows the board, the plans and a two-file diff, approves the plan and a tool request
-with a tap on their buttons, focuses a terminal with a tap, types `ls`, Return, Backspace and the key bar's ↑
-(checking the bytes the host receives), and once the desktop takes the terminal back checks that the field lost
-the focus and typing sends nothing. It saves every screen as a PNG in `target/phone-shots/` for a person to
-review. Both need the bundle and Chrome, so they are ignored by default:
+by touch alone: it pairs, shows the board, the AGENTS list and a two-file diff, approves the plan and a tool request
+with a tap on their buttons (checking the `plan_command` approve and the `approval_decide` the host receives),
+focuses a terminal with a tap, types a line, Return, Backspace and the key bar's ↑ (checking the bytes, and that the
+key is 44 CSS pixels each way), and once the desktop takes the terminal back checks that the field lost the focus
+and typing sends nothing; then it long-presses a word, drags the selection's end handle over the next word and
+checks that Copy copies exactly those two words. It saves every screen as a PNG in `target/phone-shots/` for a
+person to review. In a 1600 × 1000 window it checks the desktop's frame: the board, the docked chief's terminal and
+the agent's tile, a click into either terminal typing there, and Approve plan; it saves `target/wide-shots/browser.png`
+and, beside the desktop's QA screenshot of the same board (`scripts/wide-desktop-shot.sh`, which writes
+`target/wide-shots/desktop.png`), `target/wide-shots/side-by-side.png`. All three need the bundle and Chrome, so
+they are ignored by default:
 
 ```sh
 scripts/build-web.sh
 cargo test -p atomics-web --test browser -- --ignored
 # the phone alone, printing where its screenshots are:
 cargo test -p atomics-web --test browser -- --ignored --nocapture the_bundle_works_on_a_phone_by_touch
+# the desktop's QA screenshot first, then the wide window beside it:
+atomics queue --class qa -- scripts/wide-desktop-shot.sh
+cargo test -p atomics-web --test browser -- --ignored --nocapture the_bundle_draws_the_desktops_frame_in_a_wide_window
 ```
 
 `ATOMICS_WEB_DIST` names another bundle folder and `CHROME` another browser.

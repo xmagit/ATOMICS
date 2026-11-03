@@ -7,14 +7,16 @@
 //! - [`remote`]: the UI's `Backend` over `atomics.v1`, on `atomics_core::mirror`.
 //! - [`screens`]: terminals: following screens, the lease and typing, history.
 //! - [`driver`]: the frame's life with its host, reconnecting included, as a state machine.
-//! - [`views`]: the screens, drawn with atomics-ui's draw functions, in the desktop or the phone
-//!   [`layout`]; terminals in a [`term_pane`], touched through [`gesture`]s.
+//! - [`views`]: the screens, drawn with atomics-ui's views: the desktop's own frame when the window is
+//!   wide, a shared widget a pane on a phone ([`layout`]); what the page shows of its host is its [`desk`];
+//!   terminals in a [`term_pane`], touched through [`gesture`]s.
 //! - `web` (wasm32 only): the browser glue that runs the driver's outputs.
 //!
 //! Everything but `web` builds natively, so the rules are tested without a browser.
 
 pub mod boot;
 pub mod connection;
+pub mod desk;
 pub mod device;
 pub mod driver;
 pub mod gesture;
