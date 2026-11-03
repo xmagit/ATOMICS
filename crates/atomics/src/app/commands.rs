@@ -315,6 +315,9 @@ impl Desktop<'_> {
             }
             Command::Rename(session) => self.begin_rename(&session),
             Command::PickProject => self.pick_project(),
+            Command::HideChief => self.runtime.chief_open = false,
+            Command::ResizeChief(width) => self.runtime.store.chief_width = width,
+            Command::Toast(text) => self.runtime.toast(text),
             command => {
                 debug_assert!(!command.is_view(), "the desktop does not show {command:?}");
                 self.runtime.backend().send(command);

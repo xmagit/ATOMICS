@@ -271,8 +271,8 @@ Commits, one per file group:
    frame the tabs after it still show the old selection, as the tabs before it always did, and the next
    frame shows the new one. `icon` and `workspace_input` move to the client, and `record_item` and the history's
    records to `atomics-ui`, behind `test-support`. The bar's layout (`top_bar`) stays in the desktop with the
-   items that have not moved: the chief pill, the Tickets button and sign-in (S4), the GitHub counter, the
-   load gauge and the Settings menu.
+   items that have not moved: the chief pill (moved with the chief, 7), the Tickets button and sign-in (S4),
+   the GitHub counter, the load gauge and the Settings menu.
 6. **Fleet** (`fleet.rs`). `atomics_ui::fleet::tiles` draws the session tiles (header with status, title,
    agent, branch and status, sandbox badge and close; the approval banner; the MCP banner; the plan task's
    last report; the terminal, or the last exchange of a session outside ATOMICS; the exited overlay) and
@@ -298,6 +298,38 @@ Commits, one per file group:
    the temporary folder's random name in the outside transcript, which differ between two runs of the
    same build too. The completed-task tiles and the exited overlay were not on screen: the tiles' tests
    ran unchanged, and the overlay, which no test draws, moved line for line.
+7. **Chief** (`chief.rs`, and the steer bar in `app.rs`). `atomics_ui::chief` draws the chief's pill, its
+   window and the steer bar. A new read, `Backend::chief()`, returns `ChiefView`: the chief's session and
+   status, whether its window shows, docked or floating, the width the user gave it, and the last heartbeat
+   with its age and local time. The host works those two out, because a browser has neither its clock nor
+   its time zone (`store::now` is native-only). `pill` reads it and the selected plan's row. The platform
+   passes what the microphone does as `VoiceState`; `None` (no microphone) leaves voice out of the tooltip.
+   The window is three frames and a body. `dock_width` is the width the docked chief asks for (the user's,
+   else a third of what the sidebar leaves). `dock` is the left panel, `window` the floating one, and
+   `content` the header (minimize, dock or float) with the chief's terminal. `divider`, drawn after the
+   central panel, resizes the dock.
+   `ChiefView::session` is the chief's position in `session_list`, and `content` draws its terminal
+   through the fleet's `TerminalSurface` (6) when the chief runs inside ATOMICS; the desktop passes its
+   `Terminals`. `content` returns the strip under the terminal that the platform asked for. The desktop
+   draws its trace lane (host-only: the chief's ticket calls) there after `content` returns, since the
+   lane writes the model, which the backend borrows while `content` runs.
+   `steer_bar` and `send_steer` read the targets from session rows, which gain `can_receive`. A message
+   with no target records `Command::Toast` and keeps the text. Three view commands are new: `HideChief`
+   (minimize, which wrote `chief_open`), `ResizeChief` (the divider, which wrote the store's
+   `chief_width`) and `Toast`. The desktop carries them out at once, as before. `steer_text`,
+   `steer_target` and `focus_steer` move to the client, and `SteerTarget` with them.
+   `Desktop::send_steer` stays, test-only, as the steer bar's Send for the tests that call it, and
+   `lane_height` moves to `State`. The divider's test moved with it and reads the commands it records.
+   Still in the desktop: the host's chief logic (`wake_chief`, `start_chief`, `toggle_chief`,
+   `set_chief_dock`, delivery) and the frames around the steer bar and the dock in `paint` (the window's
+   split, S7s).
+   Checked with Linux QA screenshots before and after (`scripts/linux-qa.sh screenshot`, 1600x1000) in four
+   scenes: no chief, docked, floating, and started then hidden. The image has no agent CLI, so a shell
+   session first installs a stand-in `claude` that runs `sh`. Against the commit before the fleet (6),
+   the build with both slices draws the chief's dock, its floating window, the top bar up to the load
+   gauge and the steer bar pixel for pixel the same. The only differences are those two runs of one build
+   have too: the load gauge, and the container's host name and random temporary folders in the shells'
+   text, including where that text shows through the floating window's anti-aliased left edge.
 
 ### 4.7 S8
 
@@ -328,7 +360,7 @@ Eight commits, one per domain, then the mapping. The tests ran unchanged but one
 | | `Resume`, `ResumeSession`, `RenameSession`, `CloseIdle`, `SeeSession`, `DismissMcp` | none yet |
 | Projects and worktrees | `OpenProject`, `CloseProject`, `OpenWorkspace`, `SaveWorkspace`, `OpenCleanup`, `CleanupFetch`, `CleanupPrune`, `CleanupReload`, `RemoveWorktrees` | none yet |
 | Chief and settings | `ToggleChief`, `SetChiefDock`, `SaveChiefPreferences`, `VoiceToChief`, `SelectTheme`, `CheckSandbox`, `RefreshConnections`, `ImportConnections`, `Connect`, `Disconnect`, `AddConnection`, `DecideProposal` | none yet |
-| View | `Activate`, `OpenTaskSession`, `ShowTaskDiff`, `ShowRoot`, `OpenDiff`, `CloseDiff`, `ToggleDiff`, `SetPanel`, `SetView`, `ShowUngrouped`, `ShowPlan`, `ViewPlanHistory`, `TogglePlan`, `EditingPlan`, `ClosePlanTab`; the dialogs `NewSession`, `NewWorktree`, `Rename`, `PickProject` | none: the client's own |
+| View | `Activate`, `OpenTaskSession`, `ShowTaskDiff`, `ShowRoot`, `OpenDiff`, `CloseDiff`, `ToggleDiff`, `SetPanel`, `SetView`, `ShowUngrouped`, `ShowPlan`, `ViewPlanHistory`, `TogglePlan`, `EditingPlan`, `ClosePlanTab`; the dialogs `NewSession`, `NewWorktree`, `Rename`, `PickProject`; since S7's chief, `HideChief`, `ResizeChief`, `Toast` | none: the client's own |
 
 - `Command::remote(backend, op)` is the mapping the remote `Backend` (C5) uses. It answers `Remote::Send` with the
   mutations in order (empty when what the command names is gone), `Remote::Client` or `Remote::Unsupported`. It

@@ -266,6 +266,12 @@ pub enum Command {
     Rename(String),
     /// Ask the platform for a folder to open as a project.
     PickProject,
+    /// Hide the chief's window; the chief keeps running.
+    HideChief,
+    /// Give the docked chief this width, or its default with `None`.
+    ResizeChief(Option<f32>),
+    /// Say something short on the notice line.
+    Toast(String),
 }
 
 impl Command {
@@ -294,6 +300,9 @@ impl Command {
                 | Command::NewWorktree(_)
                 | Command::Rename(_)
                 | Command::PickProject
+                | Command::HideChief
+                | Command::ResizeChief(_)
+                | Command::Toast(_)
         )
     }
 

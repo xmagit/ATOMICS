@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use atomics_core::approvals::ApprovalRequest;
-use atomics_core::config::{AgentKind, FontConfig, KeyConfig};
+use atomics_core::config::{AgentKind, ChiefDock, FontConfig, KeyConfig};
 use atomics_core::diff_data::{FileView, Prepared};
 use atomics_core::layout::LayoutConfig;
 use atomics_core::plan::{Plan, PlanStatus, Task};
@@ -102,6 +102,9 @@ pub struct SessionRow {
     pub sandbox: Option<String>,
     /// It runs in a terminal outside ATOMICS, which sees it through its hooks.
     pub outside: bool,
+    /// It can take a message now: its terminal runs, or, outside ATOMICS, its conversation is known and has
+    /// not exited.
+    pub can_receive: bool,
     /// Permission requests waiting for a decision.
     pub pending_approvals: usize,
     /// Messages held back until those requests are decided.
@@ -196,6 +199,32 @@ pub struct BoardView {
     /// The host's clock when it read the board, in seconds since the epoch: how old a report or a ticket
     /// read is.
     pub now: u64,
+}
+
+/// The chief as its pill in the top bar and its window show it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChiefView {
+    /// The chief's session, by position in [`Backend::session_list`], while there is a chief.
+    pub session: Option<usize>,
+    /// Its window shows.
+    pub open: bool,
+    /// Docked beside the agents, or floating over them.
+    pub dock: ChiefDock,
+    /// The width the user gave the docked chief; `None` for the default.
+    pub width: Option<f32>,
+    /// The host's last heartbeat check, once one ran.
+    pub heartbeat: Option<Heartbeat>,
+}
+
+/// The host's last heartbeat check, as the chief's pill shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Heartbeat {
+    /// Seconds since it ran, by the host's clock when it was read.
+    pub age: u64,
+    /// When it ran, as the host's local date and time.
+    pub time: String,
+    /// How many findings it reported.
+    pub findings: usize,
 }
 
 /// A permission request a session waits on, as its approval banner shows it.
@@ -374,6 +403,9 @@ pub trait Backend {
 
     /// The diff of one worktree.
     fn diff(&self, root: &Path) -> Option<DiffSnapshot>;
+
+    /// The chief: its session, its window and the last heartbeat.
+    fn chief(&self) -> ChiefView;
 
     /// What the diff panel's header shows of the worktree at `root`.
     fn diff_heading(&self, root: &Path) -> DiffHeading;

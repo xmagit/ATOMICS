@@ -9,6 +9,7 @@ use atomics_core::layout::DiffSplit;
 use atomics_core::plan::PlanStatus;
 
 use crate::Command;
+use crate::chief::SteerTarget;
 use crate::diff_view::{DiffState, ExplorerState};
 use crate::theme::{Fonts, Palette};
 use crate::touch::Touch;
@@ -43,6 +44,12 @@ pub struct Client {
     pub icon: Option<egui::TextureHandle>,
     /// The name typed for saving the open projects as a workspace.
     pub workspace_input: String,
+    /// The message typed in the steer bar.
+    pub steer_text: String,
+    /// Who the steer bar sends to.
+    pub steer_target: SteerTarget,
+    /// The steer bar takes the keyboard when it is next drawn.
+    pub focus_steer: bool,
     /// Set while the platform draws for a finger on a small screen; the desktop leaves it `None`.
     pub touch: Option<Touch>,
 }
@@ -65,6 +72,9 @@ impl Default for Client {
             focus_terminal: None,
             icon: None,
             workspace_input: String::new(),
+            steer_text: String::new(),
+            steer_target: SteerTarget::Active,
+            focus_steer: false,
             touch: None,
         }
     }

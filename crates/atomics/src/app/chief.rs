@@ -1,5 +1,7 @@
+use super::fleet::Terminals;
 use super::*;
 use atomics_core::heartbeat::{Finding, Kind};
+use atomics_ui::chief::VoiceState;
 
 struct WakeConditions {
     wake_secs: u64,
@@ -176,43 +178,6 @@ impl State {
     }
 }
 
-pub(super) fn chief_divider(ui: &mut egui::Ui, rect: Rect, width: &mut Option<f32>, p: &Palette) -> bool {
-    let handle = Rect::from_center_size(rect.right_center(), vec2(8.0, rect.height()));
-    let response = ui.interact(handle, egui::Id::NULL.with("chief-divider"), Sense::click_and_drag());
-    ui.painter().line_segment([rect.right_top(), rect.right_bottom()], Stroke::new(1.0, p.border));
-    if response.hovered() || response.dragged() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-        ui.painter().rect_filled(handle.shrink2(vec2(3.0, 0.0)), 0.0, p.accent.gamma_multiply(0.6));
-    }
-    if (response.dragged() || response.drag_stopped())
-        && let Some(pointer) = response.interact_pointer_pos()
-    {
-        *width = Some((pointer.x - rect.left()).max(layout::MIN_DOCK_WIDTH));
-    }
-    if response.double_clicked() {
-        *width = None;
-    }
-    response.drag_stopped() || response.double_clicked()
-}
-
-/// The chief's mark: a planet with a tilted orbit and a moon, after the atomisk.ai icon.
-fn orbit_icon(painter: &egui::Painter, rect: Rect, accent: Color32, light: Color32) {
-    let c = rect.center();
-    let r = rect.width() / 2.0;
-    painter.circle_filled(c, r * 0.32, light);
-    let tilt = -23f32.to_radians();
-    let points: Vec<Pos2> = (0..=48)
-        .map(|k| {
-            let t = k as f32 / 48.0 * std::f32::consts::TAU;
-            let (x, y) = (r * 0.95 * t.cos(), r * 0.38 * t.sin());
-            pos2(c.x + x * tilt.cos() - y * tilt.sin(), c.y + x * tilt.sin() + y * tilt.cos())
-        })
-        .collect();
-    painter.add(egui::Shape::line(points, Stroke::new(1.4, accent)));
-    let moon = pos2(c.x + r * 0.95 * tilt.cos(), c.y + r * 0.95 * tilt.sin());
-    painter.circle_filled(moon, r * 0.14, accent);
-}
-
 /// Tools the chief may use without asking: reading, planning, reviewing, and running the
 /// plan the user approved. Starting agents, typing into terminals and closing sessions ask
 /// first. Config tools only read or propose: a proposed change waits for the user to apply it.
@@ -252,205 +217,50 @@ pub(super) const CHIEF_ALLOWED_TOOLS: &[&str] = &[
 ];
 
 impl Desktop<'_> {
+    /// The chief's pill in the top bar (`atomics_ui::chief::pill`), with what the microphone does.
     pub(super) fn chief_pill(&mut self, ui: &mut egui::Ui, compact: bool) {
-        let p = self.palette();
-        let chief = self.runtime.sessions.iter().position(|s| s.chief);
-        let status = chief.map(|i| self.runtime.sessions[i].status);
-        let mut toggle = false;
-        let mut dock = self.runtime.chief_dock();
-        let stroke = if self.runtime.chief_open { p.accent } else { lerp(p.border, p.accent, 0.5) };
-        let response = egui::Frame::new()
-            .fill(lerp(p.raised, p.accent, 0.08))
-            .stroke(Stroke::new(1.0, stroke))
-            .corner_radius(13)
-            .inner_margin(egui::Margin::symmetric(14, 3))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let (icon, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
-                    orbit_icon(ui.painter(), icon, p.accent, p.foreground);
-                    ui.label(RichText::new("CHIEF").strong().color(p.accent).size(13.0));
-                    match status {
-                        Some(status) => {
-                            let (dot, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
-                            let time = ui.input(|i| i.time);
-                            ui.painter().circle_filled(dot.center(), 3.5, status_dot(status, &p, time));
-                            if !compact {
-                                ui.label(RichText::new(status.label()).color(p.muted).size(11.5));
-                            }
-                        }
-                        None if !compact => {
-                            ui.label(RichText::new("start").color(p.muted).size(11.5));
-                        }
-                        None => {}
-                    }
-                    if !compact && !self.runtime.plans[self.runtime.selected_plan].tasks.is_empty() {
-                        let done = self.runtime.plans[self.runtime.selected_plan].count(TaskStatus::Done);
-                        ui.label(
-                            RichText::new(format!(
-                                "plan {done}/{}",
-                                self.runtime.plans[self.runtime.selected_plan].tasks.len()
-                            ))
-                            .color(p.muted)
-                            .size(11.5),
-                        );
-                    }
-                    if !compact && let Some((at, findings)) = &self.runtime.heartbeat.last {
-                        if !findings.is_empty() {
-                            let (dot, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
-                            ui.painter().circle_filled(dot.center(), 3.0, p.error);
-                        }
-                        let age = atomics_core::store::now().saturating_sub(*at);
-                        let age_text = match age {
-                            0..60 => "now".into(),
-                            60..3600 => format!("{}m", age / 60),
-                            3600..86400 => format!("{}h", age / 3600),
-                            _ => format!("{}d", age / 86400),
-                        };
-                        ui.ctx().request_repaint_after(Duration::from_secs(60 - age % 60));
-                        ui.label(RichText::new(format!("♥ {age_text}")).color(p.muted).size(11.5));
-                    }
-                    match &self.client.voice {
-                        Voice::Recording(recorder) => {
-                            let secs = recorder.elapsed().as_secs();
-                            let text = format!("● REC {}:{:02}", secs / 60, secs % 60);
-                            ui.label(RichText::new(text).color(p.error).strong().size(11.5));
-                        }
-                        Voice::Opening(_) | Voice::Transcribing => {
-                            ui.add(egui::Spinner::new().size(12.0).color(p.accent));
-                        }
-                        Voice::Idle => {}
-                    }
-                });
-            })
-            .response
-            .interact(Sense::click());
-        super::topbar::record_item(ui, "chief", &response);
-        let keys = &self.runtime.config.keys;
-        let hover = match self.client.voice {
-            Voice::Opening(_) => "Opening microphone: Esc cancels".to_string(),
-            Voice::Recording(_) => format!("Recording: {} sends, Esc cancels", shortcut_label(ui.ctx(), &keys.voice)),
-            Voice::Transcribing => "Transcribing".to_string(),
-            Voice::Idle => format!(
-                "The chief agent ({}) · voice ({})",
-                shortcut_label(ui.ctx(), &keys.toggle_chief),
-                shortcut_label(ui.ctx(), &keys.voice)
-            ),
+        let voice = match &self.client.voice {
+            Voice::Idle => VoiceState::Idle,
+            Voice::Opening(_) => VoiceState::Opening,
+            Voice::Recording(recorder) => VoiceState::Recording(recorder.elapsed().as_secs()),
+            Voice::Transcribing => VoiceState::Transcribing,
         };
-        response.context_menu(|ui| {
-            if ui.selectable_value(&mut dock, ChiefDock::Floating, "Float chief").clicked()
-                || ui.selectable_value(&mut dock, ChiefDock::Docked, "Dock chief").clicked()
-            {
-                ui.close();
-            }
-        });
-        if response
-            .on_hover_ui(|ui| {
-                ui.label(hover);
-                if let Some(status) = status {
-                    ui.label(status.label());
-                }
-                if let Some((at, findings)) = &self.runtime.heartbeat.last {
-                    let timestamp = *at as libc::time_t;
-                    let mut local = std::mem::MaybeUninit::<libc::tm>::uninit();
-                    // SAFETY: both pointers are valid; a non-null result points to initialized local.
-                    let local = unsafe { libc::localtime_r(&timestamp, local.as_mut_ptr()).as_ref() };
-                    let time = local.map_or_else(
-                        || "unavailable".into(),
-                        |local| {
-                            format!(
-                                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                                local.tm_year + 1900,
-                                local.tm_mon + 1,
-                                local.tm_mday,
-                                local.tm_hour,
-                                local.tm_min,
-                                local.tm_sec
-                            )
-                        },
-                    );
-                    ui.label(format!("Last heartbeat: {time} (local)\n{} findings", findings.len()));
-                }
-            })
-            .clicked()
-        {
-            toggle = true;
-        }
-        if dock != self.runtime.chief_dock() {
-            self.send(Command::SetChiefDock(dock));
-        }
-        if toggle {
-            self.send(Command::ToggleChief);
-        }
+        self.draw(|backend, client| atomics_ui::chief::pill(ui, compact, Some(voice), backend, client));
     }
 
+    /// The floating chief, while it shows and the layout has not docked it.
     pub(super) fn chief_ui(&mut self, ctx: &egui::Context) {
-        let p = self.palette();
         if !self.runtime.chief_open || self.runtime.last_layout.is_some_and(|layout| layout.dock_width > 0.0) {
             return;
         }
-        let screen = ctx.content_rect();
-        egui::Window::new("CHIEF AGENT")
-            .id(egui::Id::NULL.with("chief-window"))
-            .title_bar(false)
-            .resizable(true)
-            .default_size(vec2(screen.width() * 0.5, screen.height() * 0.66))
-            .default_pos(screen.center())
-            .pivot(egui::Align2::CENTER_CENTER)
-            .frame(
-                egui::Frame::window(&ctx.global_style())
-                    .fill(p.terminal)
-                    .stroke(Stroke::new(1.5, p.accent.gamma_multiply(0.8))),
-            )
-            .show(ctx, |ui| self.chief_content(ui));
+        let p = self.palette();
+        atomics_ui::chief::window(ctx, &p, |ui| self.chief_content(ui));
     }
 
+    /// The chief's window, docked or floating (`atomics_ui::chief::content`), with the trace lane under the
+    /// terminal while the chief has ticket calls to show. It draws as [`Desktop::draw_terminals`] does, but
+    /// the lane's height reads the model while the window draws.
     pub(super) fn chief_content(&mut self, ui: &mut egui::Ui) {
-        let Some(index) = self.runtime.sessions.iter().position(|s| s.chief) else { return };
         let p = self.palette();
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("◆ CHIEF AGENT").color(p.accent).strong());
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .small_button("minimize")
-                    .on_hover_text(shortcut_label(ui.ctx(), &self.runtime.config.keys.toggle_chief))
-                    .clicked()
-                {
-                    self.runtime.chief_open = false;
-                }
-                let dock = self.runtime.chief_dock();
-                let label = if dock == ChiefDock::Floating { "dock" } else { "float" };
-                if ui.small_button(label).clicked() {
-                    self.send(Command::SetChiefDock(if dock == ChiefDock::Floating {
-                        ChiefDock::Docked
-                    } else {
-                        ChiefDock::Floating
-                    }));
-                }
-            });
+        self.client.ui.palette = p.clone();
+        let state: &State = self.runtime;
+        let mut terminals = Terminals { sessions: &state.sessions, views: &mut self.client.terminal_views };
+        let lane = atomics_ui::chief::content(ui, &state.backend(), &mut self.client.ui, &mut terminals, |height| {
+            state.lane_height(height)
         });
-        ui.separator();
-        let metrics = self.metrics(ui);
-        let rect = ui.available_rect_before_wrap();
-        ui.allocate_rect(rect, Sense::hover());
-        // The trace lane sits under the terminal while the chief has ticket calls to show.
-        let lane_height = self.lane_height(rect.height());
-        let lane = (lane_height > 0.0).then(|| rect.with_min_y(rect.bottom() - lane_height));
-        let rect = lane.map_or(rect, |lane| rect.with_max_y(lane.top()));
-        let session = &mut self.runtime.sessions[index];
-        let focus = self.client.focus_terminal.as_deref() == Some(session.id.as_str());
-        if let Some(terminal) = &mut session.terminal {
-            let id = egui::Id::NULL.with(("chief-term", &session.id));
-            if focus {
-                ui.memory_mut(|m| m.request_focus(id));
-                self.client.focus_terminal = None;
-            }
-            self.client.terminal_views.entry(id).or_default().show(terminal, ui, rect, id, &metrics, &p);
+        for command in std::mem::take(&mut self.client.ui.commands) {
+            self.send(command);
         }
         if let Some(lane) = lane {
             self.trace_lane(ui, lane, self.runtime.chief_dock() == ChiefDock::Docked);
             super::trace_lane::lane_divider(ui, lane, &mut self.runtime.lane.height, &p);
         }
     }
+}
+
+/// A set config value: trimmed, and unset when empty.
+fn setting(value: Option<String>) -> Option<String> {
+    value.map(|value| value.trim().to_string()).filter(|value| !value.is_empty())
 }
 
 #[cfg(test)]
@@ -592,69 +402,4 @@ mod tests {
         assert!(CHIEF_ALLOWED_TOOLS.contains(&"mcp__atomics__atomics_exec"));
         assert!(readme.contains("pre-approved `atomics_exec`"));
     }
-}
-
-#[cfg(test)]
-mod chief_tests {
-    use super::*;
-
-    #[test]
-    fn divider_drags_and_double_click_resets() {
-        let ctx = egui::Context::default();
-        let palette = crate::theme::Theme::from_config(&atomics_core::config::ThemeConfig::default()).palette();
-        let mut width = Some(720.0);
-        let mut time = 0.0;
-        let mut frame = |events| {
-            time += 0.05;
-            let mut save = false;
-            let input = egui::RawInput {
-                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(2000.0, 1000.0))),
-                time: Some(time),
-                events,
-                ..Default::default()
-            };
-            let output = ctx.run_ui(input, |ui| {
-                egui::Panel::top("top").exact_size(34.0).show(ui, |_| {});
-                egui::Panel::left("sidebar").exact_size(250.0).resizable(false).show(ui, |_| {});
-                let rect = egui::Panel::left("chief-dock")
-                    .exact_size(width.unwrap_or(595.0))
-                    .resizable(false)
-                    .frame(egui::Frame::new().inner_margin(egui::Margin::same(6)))
-                    .show(ui, |ui| {
-                        ui.interact(ui.max_rect(), egui::Id::NULL.with("chief-term"), Sense::click_and_drag());
-                        ui.take_available_space();
-                    })
-                    .response
-                    .rect;
-                egui::CentralPanel::default().show(ui, |ui| {
-                    ui.interact(ui.max_rect(), egui::Id::NULL.with("agent-term"), Sense::click_and_drag());
-                });
-                save = chief_divider(ui, rect, &mut width, &palette);
-            });
-            output.drop_without_applying_deltas();
-            (width, save)
-        };
-        let button = |pos, pressed| egui::Event::PointerButton {
-            pos,
-            button: egui::PointerButton::Primary,
-            pressed,
-            modifiers: egui::Modifiers::NONE,
-        };
-        let start = pos2(970.0, 400.0);
-        let end = pos2(1100.0, 400.0);
-        frame(vec![]);
-        frame(vec![egui::Event::PointerMoved(start), button(start, true)]);
-        assert_eq!(frame(vec![egui::Event::PointerMoved(end)]).0, Some(850.0));
-        assert!(frame(vec![button(end, false)]).1);
-        frame(vec![]);
-        frame(vec![button(end, true)]);
-        frame(vec![button(end, false)]);
-        frame(vec![button(end, true)]);
-        assert_eq!(frame(vec![button(end, false)]), (None, true));
-    }
-}
-
-/// A set config value: trimmed, and unset when empty.
-fn setting(value: Option<String>) -> Option<String> {
-    value.map(|value| value.trim().to_string()).filter(|value| !value.is_empty())
 }

@@ -330,18 +330,20 @@ fn ticket_row(
     }
 }
 
-impl Desktop<'_> {
+impl State {
     /// Height the lane takes in a column `available` tall, 0 when the chief has no trace in view.
     pub(super) fn lane_height(&self, available: f32) -> f32 {
-        if self.runtime.lane_entries().is_empty() {
+        if self.lane_entries().is_empty() {
             return 0.0;
         }
-        if self.runtime.lane.collapsed {
+        if self.lane.collapsed {
             return HEAD_H + 4.0;
         }
-        self.runtime.lane.height.unwrap_or(DEFAULT_H).clamp(MIN_H, (available * 0.7).max(MIN_H))
+        self.lane.height.unwrap_or(DEFAULT_H).clamp(MIN_H, (available * 0.7).max(MIN_H))
     }
+}
 
+impl Desktop<'_> {
     /// Draws the lane in `rect`. `docked` collapses cards to a line each.
     pub(super) fn trace_lane(&mut self, ui: &mut egui::Ui, rect: Rect, docked: bool) {
         let p = self.palette();
