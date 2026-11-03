@@ -371,6 +371,48 @@ fn fit_to_this_screen_resizes_until_the_desktop_takes_the_terminal_back() {
 }
 
 #[test]
+fn going_on_to_another_terminal_lets_go_of_its_lease_and_of_a_grant_on_its_way() {
+    let mut world = live();
+    show(&mut world, "s1");
+    acquire(&mut world, "s1", false);
+    assert!(world.driver.remote.lease("s1").yours);
+    world.driver.remote.release("s1");
+    world.driver.flush();
+    world.pump();
+    assert!(world.sent().iter().any(|m| matches!(m, Message::LeaseRelease { .. })), "the host hears it");
+    let terminal = &world.host.terminals["s1"];
+    assert!(terminal.lease.is_none() && terminal.followed, "it stays on screen, free");
+    let lease = world.driver.remote.lease("s1");
+    assert!(!lease.yours && lease.holder.is_none() && lease.lost.is_none(), "{lease:?}");
+    assert_eq!(type_text(&mut world, "s1", "x"), Err(Refused::NoLease), "typing there is a new tap");
+    acquire(&mut world, "s1", false);
+    assert!(world.driver.remote.lease("s1").yours, "and that tap takes it again");
+
+    // Left before the grant came: what waits for it is dropped, and the grant is let go when it comes.
+    let mut world = live();
+    show(&mut world, "s1");
+    world.driver.remote.acquire("s1", false);
+    world.driver.remote.type_text("s1", "ls").unwrap();
+    world.driver.remote.release("s1");
+    world.driver.flush();
+    world.pump();
+    assert!(world.host.terminals["s1"].lease.is_none(), "the grant went straight back");
+    assert!(world.host.terminals["s1"].typed.is_empty(), "nothing typed into the terminal the user left");
+    assert!(!world.driver.remote.lease("s1").yours && !world.driver.remote.lease("s1").acquiring);
+
+    // Coming back before it came: the same request stands, and the grant is kept.
+    let mut world = live();
+    show(&mut world, "s1");
+    world.driver.remote.acquire("s1", false);
+    world.driver.remote.release("s1");
+    world.driver.remote.acquire("s1", false);
+    world.driver.flush();
+    world.pump();
+    assert!(world.driver.remote.lease("s1").yours && world.host.terminals["s1"].lease.is_some());
+    assert!(!world.sent().iter().any(|m| matches!(m, Message::LeaseRelease { .. })));
+}
+
+#[test]
 fn a_terminal_no_frame_shows_is_let_go() {
     let mut world = live();
     show(&mut world, "s1");

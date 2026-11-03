@@ -16,12 +16,16 @@
 //!   only) and pans; a long press selects the word under the finger, with a handle at each end to drag
 //!   and Copy for just that range; a pinch sets the font size. A mouse clicks and drag-selects; its wheel
 //!   scrolls.
+//! - **The overlay yields to what lies over it.** It takes the pointer only where egui would give the
+//!   terminal the pointer: a floating window over the terminal is cut out of it ([`Overlay::covered`]), and an
+//!   open menu or popup takes all of it, so a click away closes the popup as it does anywhere else.
 //! - **Typing needs the lease**, asked for only when the overlay gains the focus (a tap) and only where
 //!   `welcome` grants `type`. Losing it to the desktop or another client, or being refused it, blurs the
 //!   overlay, so typing again is a new tap. Text, keys and pastes forwarded while the overlay does not
 //!   have the focus, or in the frame the lease was lost, are dropped: what was in flight then (keys of
 //!   that frame, a word the keyboard commits as the overlay loses the focus, a Paste whose clipboard read
-//!   finishes late) neither types nor asks for the lease again.
+//!   finishes late) neither types nor asks for the lease again. The input leaving a terminal lets go of
+//!   its lease.
 //! - **Offline** the screen shows as it was, marked disconnected, and nothing is typed.
 
 use std::collections::HashMap;
@@ -33,7 +37,7 @@ use atomics_ui::terminal::{self as painter, Metrics, Point, Selection, encode};
 use atomics_ui::terminal_surface::TerminalSurface;
 use atomics_ui::theme::Palette;
 use atomics_ui::touch::{self, Touch};
-use egui::{Align2, Key, Modifiers, Pos2, Rect, RichText, Sense, Stroke, Vec2, pos2, vec2};
+use egui::{Align2, Key, LayerId, Modifiers, Order, Pos2, Rect, RichText, Sense, Stroke, Vec2, pos2, vec2};
 
 use crate::gesture::{Gesture, Kind, Phase, Pointer, Recognizer};
 use crate::remote::RemoteBackend;
@@ -85,13 +89,16 @@ pub enum TermInput {
 pub struct Overlay {
     /// Over the terminal's cells, while one shows.
     pub rect: Option<Rect>,
+    /// The parts of `rect` that egui's layers above the terminal take the pointer over ([`clip_path`]).
+    pub covered: Vec<Rect>,
     /// May be typed into: a device that may type, connected, and nobody else typing.
     pub writable: bool,
     /// The key bar's sticky modifiers.
     pub ctrl: bool,
     pub alt: bool,
-    /// A selection to offer Copy for, and where.
-    pub copy: Option<(String, Pos2)>,
+    /// A selection to offer Copy for, and where: above the point, or below the height where there is no
+    /// room above it in the terminal.
+    pub copy: Option<(String, Pos2, f32)>,
     /// Take the focus away: the lease went elsewhere, or the input goes to another terminal now.
     pub blur: bool,
     /// Give it the focus where a pointer that is not a finger picked this terminal: a click into it types
@@ -106,12 +113,12 @@ struct Cell {
     col: u16,
 }
 
-/// A finger dragging one end of the selection: the pointer, which end (`end`: the later one) and how far
-/// that end's cell centre was from the finger when it took the handle.
+/// A finger dragging one end of the selection: the pointer, the other end, which stays where it is even when
+/// the finger crosses it, and how far the dragged end's cell centre was from the finger when it took the handle.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct HandleDrag {
     id: i32,
-    end: bool,
+    anchor: Cell,
     grab: Vec2,
 }
 
@@ -156,6 +163,8 @@ pub struct TermPane {
     pub focus_next: bool,
     /// Where the cells were last painted.
     painted: Option<Frame>,
+    /// The layer the terminal was last drawn in.
+    layer: LayerId,
 }
 
 impl Default for TermPane {
@@ -184,6 +193,7 @@ impl Default for TermPane {
             blur_next: false,
             focus_next: false,
             painted: None,
+            layer: LayerId::background(),
         }
     }
 }
@@ -304,11 +314,18 @@ impl TermPane {
         self.drawn = false;
     }
 
-    /// After a frame that drew no terminal: the overlay goes, the focus with it, and what it forwarded
-    /// is dropped, never typed later.
-    pub fn end_frame(&mut self) {
+    /// After a frame: what lies over the terminal takes its part of the overlay. A frame that drew no
+    /// terminal takes the overlay away, the focus and the lease with it, and what it forwarded is dropped,
+    /// never typed later.
+    pub fn end_frame(&mut self, ctx: &egui::Context, remote: &RemoteBackend) {
         if self.drawn {
+            if let Some(rect) = self.overlay.rect {
+                self.overlay.covered = covered(ctx, self.layer, rect);
+            }
             return;
+        }
+        if let Some(last) = &self.session {
+            remote.release(last);
         }
         self.drop_inputs();
         self.preedit.clear();
@@ -351,8 +368,14 @@ impl TermPane {
         p: &Palette,
         now_ms: f64,
     ) {
+        // The input leaves the terminal it was on, and so does the lease: another browser would see it held
+        // until it expires, by someone who has moved on.
+        if let Some(last) = self.session.as_deref().filter(|last| *last != session) {
+            remote.release(last);
+        }
         self.switch(session);
         self.drawn = true;
+        self.layer = ui.layer_id();
         remote.show_screen(session, true);
         let lease = remote.lease(session);
         let may_type = remote.may(Grant::Type);
@@ -433,14 +456,18 @@ impl TermPane {
         let writable = live && may_type && (lease.yours || lease.holder.is_none());
         let copy = self.selection.and_then(|(a, b)| {
             let text = self.selection_text(a, b);
-            let at = frame.origin + vec2(0.0, (a.line.min(b.line).saturating_sub(frame.top)) as f32 * frame.cell.y);
-            (!text.is_empty()).then(|| (text, pos2(frame.rect.center().x, at.y.max(frame.rect.top()))))
+            let line_y = |line: u64| frame.origin.y + line.saturating_sub(frame.top) as f32 * frame.cell.y;
+            let above = line_y(a.line.min(b.line)).max(frame.rect.top());
+            // Under the last line, and under its handles' knobs where it has them.
+            let below = line_y(a.line.max(b.line) + 1) + if self.handles { 2.0 * KNOB } else { 0.0 };
+            (!text.is_empty()).then(|| (text, pos2(frame.rect.center().x, above), below.min(frame.rect.bottom())))
         });
         // The overlay keeps the focus only while typing goes somewhere: this client holds the lease or is
         // asking for it. Otherwise (lost, refused, read only) it loses it, and typing again is a new tap.
         let typing = lease.yours || lease.acquiring;
         self.overlay = Overlay {
             rect: Some(frame.rect),
+            covered: Vec::new(),
             writable,
             ctrl: self.ctrl,
             alt: self.alt,
@@ -697,8 +724,7 @@ impl TermPane {
     fn handle_at(&self, pointer: &Pointer, frame: &Frame) -> Option<HandleDrag> {
         let [start, end] = self.knobs(frame)?;
         let reach = |knob: Pos2| knob.distance(pointer.pos);
-        let (cell, is_end) = if reach(end.1) <= reach(start.1) { (end.0, true) } else { (start.0, false) };
-        let knob = if is_end { end.1 } else { start.1 };
+        let ((cell, knob), anchor) = if reach(end.1) <= reach(start.1) { (end, start.0) } else { (start, end.0) };
         if reach(knob) > KNOB_REACH {
             return None;
         }
@@ -707,15 +733,14 @@ impl TermPane {
                 (f32::from(cell.col) + 0.5) * frame.cell.x,
                 (cell.line as f32 - frame.top as f32 + 0.5) * frame.cell.y,
             );
-        Some(HandleDrag { id: pointer.id, end: is_end, grab: centre - pointer.pos })
+        Some(HandleDrag { id: pointer.id, anchor, grab: centre - pointer.pos })
     }
 
     /// Move the dragged end of the selection to the cell under the finger, as far as it held the handle.
     fn drag_handle(&mut self, drag: HandleDrag, at: Pos2, frame: &Frame) {
-        let Some((a, b)) = self.selection else { return };
-        let (start, end) = if a <= b { (a, b) } else { (b, a) };
-        let cell = frame.cell_at(at + drag.grab);
-        self.selection = Some(if drag.end { (start, cell) } else { (cell, end) });
+        if self.selection.is_some() {
+            self.selection = Some((drag.anchor, frame.cell_at(at + drag.grab)));
+        }
     }
 
     /// The font size times `factor`, keeping the column under `at` where it is.
@@ -890,6 +915,76 @@ fn fit_size(frame: &Frame) -> GridSize {
     let rows = ((frame.rect.height() - 2.0 * frame.pad.y) / frame.cell.y).floor().max(1.0) as u16;
     let pixels = |v: f32| Some((v.round() as u16).clamp(1, MAX_CELL_PIXELS));
     GridSize { cols, rows, cell_width: pixels(frame.cell.x), cell_height: pixels(frame.cell.y) }
+}
+
+/// The parts of the overlay at `rect`, over a terminal in `layer`, that egui would not give the terminal the
+/// pointer over: a floating window drawn above it this frame, with the margin its resize handles take outside
+/// it, and all of it while a menu or popup is open, since a click anywhere then closes that first. A tooltip
+/// takes no pointer.
+fn covered(ctx: &egui::Context, layer: LayerId, rect: Rect) -> Vec<Rect> {
+    let layers: Vec<LayerId> = ctx.memory(|m| m.layer_ids().collect());
+    let own = layers.iter().position(|l| *l == layer);
+    let grab = ctx.global_style().interaction.resize_grab_radius_side;
+    let mut covered = Vec::new();
+    for (at, above) in layers.iter().enumerate() {
+        if above.order < layer.order || (above.order == layer.order && own.is_none_or(|own| at <= own)) {
+            continue;
+        }
+        // Drawn this frame: egui goes on finding a layer for one frame after it stops being shown.
+        let drawn = ctx.graphics(|graphics| graphics.get(*above).is_some_and(|shapes| !shapes.is_empty()));
+        let Some(area) = egui::AreaState::load(ctx, above.id).filter(|area| area.interactable && drawn) else {
+            continue;
+        };
+        match above.order {
+            Order::Middle => covered.push(area.rect().expand(grab).intersect(rect)),
+            Order::Foreground => return vec![rect],
+            _ => {}
+        }
+    }
+    covered.retain(|part| part.is_positive());
+    covered
+}
+
+/// `part` without `cover`: what is left of a rectangle, as up to four rectangles.
+fn without(part: Rect, cover: Rect) -> Vec<Rect> {
+    let cover = part.intersect(cover);
+    if !cover.is_positive() {
+        return vec![part];
+    }
+    let row = cover.y_range();
+    [
+        part.with_max_y(cover.top()),
+        part.with_min_y(cover.bottom()),
+        Rect::from_x_y_ranges(part.left()..=cover.left(), row),
+        Rect::from_x_y_ranges(cover.right()..=part.right(), row),
+    ]
+    .into_iter()
+    .filter(|left| left.is_positive())
+    .collect()
+}
+
+/// The overlay at `rect` without `covered`, as a CSS `clip-path` in pixels from its corner at egui's `zoom`:
+/// the browser sends a clipped part's pointer to the canvas under it. Empty when nothing covers it.
+pub fn clip_path(rect: Rect, covered: &[Rect], zoom: f32) -> String {
+    if covered.is_empty() {
+        return String::new();
+    }
+    let mut open = vec![rect];
+    for cover in covered {
+        open = open.into_iter().flat_map(|part| without(part, *cover)).collect();
+    }
+    if open.is_empty() {
+        return "inset(50%)".into();
+    }
+    let corner = rect.min.to_vec2();
+    let parts: String = open
+        .iter()
+        .map(|part| {
+            let (min, max) = ((part.min - corner) * zoom, (part.max - corner) * zoom);
+            format!("M{} {}H{}V{}H{}Z", min.x, min.y, max.x, max.y, min.x)
+        })
+        .collect();
+    format!("path(\"{parts}\")")
 }
 
 /// The browser's terminals, for the shared views (`TerminalSurface`). The one the page's input goes to

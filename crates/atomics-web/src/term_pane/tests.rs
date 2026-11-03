@@ -367,7 +367,7 @@ fn a_long_press_selects_and_offers_copy() {
             touch(1, Phase::Up, start + vec2(300.0, 0.0), now + 10.0),
         ],
     );
-    let (text, _) = view.term.overlay.copy.clone().expect("Copy offered");
+    let (text, ..) = view.term.overlay.copy.clone().expect("Copy offered");
     assert_eq!(text, "$ hello world");
     send(&ctx, &mut world, &mut client, &mut view, vec![TermInput::Copied]);
     assert_eq!(view.term.overlay.copy, None);
@@ -388,8 +388,12 @@ fn a_long_press_selects_the_word_and_its_handles_move_its_ends() {
     frame(&ctx, &mut world, &mut client, &mut view, PHONE);
     let now = view.now_ms;
     send(&ctx, &mut world, &mut client, &mut view, vec![touch(1, Phase::Up, on_hello, now)]);
-    let copy = |view: &View| view.term.overlay.copy.clone().map(|(text, _)| text);
+    let copy = |view: &View| view.term.overlay.copy.clone().map(|(text, ..)| text);
     assert_eq!(copy(&view).as_deref(), Some("hello"), "the word under the finger, nothing more");
+    // Copy goes above the selection, or below its handles' knobs where that would leave the terminal.
+    let (_, above, below) = view.term.overlay.copy.clone().unwrap();
+    let (line, _) = view.term.cell_centre(0, 9);
+    assert!(above.y < line.y && below > line.y + cell.y / 2.0 + 2.0 * KNOB - 0.5, "{above:?} {below} {line:?}");
 
     // The end handle's knob hangs under the word's last cell; dragging it over "world" takes that word in.
     let knob = |col: u16| view.term.cell_centre(0, col).0 + vec2(cell.x / 2.0, cell.y / 2.0 + KNOB);
@@ -458,4 +462,53 @@ fn the_phone_layout_at_phone_widths() {
         }
         assert!(world.host.terminals["chief"].followed && !world.host.terminals["s1"].followed);
     }
+}
+
+#[test]
+fn dragging_a_handle_past_the_other_end_keeps_that_end() {
+    let (ctx, mut world, mut client, mut view) = terminal(|_| {});
+    let output = world.host.output("s1", "echo hello world\r");
+    world.deliver(output);
+    frame(&ctx, &mut world, &mut client, &mut view, PHONE);
+    // "$ echo hello world": the finger rests on "world", columns 13 to 17.
+    let (on_world, cell) = view.term.cell_centre(0, 15);
+    let now = view.now_ms;
+    send(&ctx, &mut world, &mut client, &mut view, vec![touch(1, Phase::Down, on_world, now)]);
+    view.now_ms += 600.0;
+    frame(&ctx, &mut world, &mut client, &mut view, PHONE);
+    let now = view.now_ms;
+    send(&ctx, &mut world, &mut client, &mut view, vec![touch(1, Phase::Up, on_world, now)]);
+    let copy = |view: &View| view.term.overlay.copy.clone().map(|(text, ..)| text);
+    assert_eq!(copy(&view).as_deref(), Some("world"));
+    // The end handle, over two moves, to the left of the start handle: "world"'s first cell stays selected.
+    let knob = |col: u16| view.term.cell_centre(0, col).0 + vec2(cell.x / 2.0, cell.y / 2.0 + KNOB);
+    let (end, a, b) = (knob(17), knob(10), knob(8));
+    let now = view.now_ms;
+    send(
+        &ctx,
+        &mut world,
+        &mut client,
+        &mut view,
+        vec![
+            touch(2, Phase::Down, end, now),
+            touch(2, Phase::Move, a, now + 30.0),
+            touch(2, Phase::Move, b, now + 60.0),
+            touch(2, Phase::Up, b, now + 90.0),
+        ],
+    );
+    assert_eq!(copy(&view).as_deref(), Some("ello w"));
+}
+
+#[test]
+fn the_clip_leaves_out_what_covers_the_overlay() {
+    let rect = Rect::from_min_size(pos2(100.0, 200.0), vec2(300.0, 100.0));
+    assert_eq!(clip_path(rect, &[], 1.0), "", "nothing over it: no clip");
+    assert_eq!(clip_path(rect, &[rect], 1.0), "inset(50%)", "all of it covered");
+    // A window over its top right corner: what is left, in pixels from the overlay's corner, at the zoom.
+    let window = Rect::from_min_max(pos2(300.0, 100.0), pos2(500.0, 250.0));
+    assert_eq!(clip_path(rect, &[window], 2.0), "path(\"M0 100H600V200H0ZM0 0H400V100H0Z\")");
+    // Two that overlap leave out their union, which an even-odd hole in the overlay would not.
+    let left = Rect::from_min_size(pos2(100.0, 200.0), vec2(200.0, 100.0));
+    let right = Rect::from_min_size(pos2(200.0, 200.0), vec2(200.0, 100.0));
+    assert_eq!(clip_path(rect, &[left, right], 1.0), "inset(50%)");
 }

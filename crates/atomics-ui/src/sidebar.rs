@@ -81,6 +81,8 @@ pub fn sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     let active_id = backend.view_hints().active;
     let can_rename = backend.available(&Command::Rename(String::new()));
     let can_close = backend.available(&Command::CloseSession(String::new()));
+    // What "selected" is for: the steer bar sends to them.
+    let can_steer = backend.available(&Command::Steer { sessions: Vec::new(), text: String::new() });
     for (index, session) in sessions.iter().enumerate() {
         if !visible.contains(&index) {
             continue;
@@ -90,9 +92,12 @@ pub fn sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
         if row.clicked() {
             clicked = Some(session.id.clone());
         }
+        if !can_steer && !can_rename && !can_close {
+            continue;
+        }
         row.context_menu(|ui| {
             let mut selected = client.selected.contains(&session.id);
-            if ui.checkbox(&mut selected, "Include in “selected”").changed() {
+            if can_steer && ui.checkbox(&mut selected, "Include in “selected”").changed() {
                 if selected {
                     client.selected.insert(session.id.clone());
                 } else {

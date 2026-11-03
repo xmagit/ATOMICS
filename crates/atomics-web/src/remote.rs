@@ -354,6 +354,13 @@ impl RemoteBackend {
         s.screens.acquire(session, takeover, &mut s.outgoing);
     }
 
+    /// The input left `session`'s terminal: let go of its lease ([`Screens::release`]).
+    pub fn release(&self, session: &str) {
+        let mut s = self.state.borrow_mut();
+        let s = &mut *s;
+        s.screens.release(session, &mut s.outgoing);
+    }
+
     /// Type `data` into `session`, already encoded for its modes, while this client holds the lease or is
     /// asking for it ([`Screens::type_text`]). Nothing is sent without the `type` grant or a channel, and
     /// nothing refused is kept for later: typing never asks for the lease.
@@ -781,11 +788,11 @@ impl Backend for RemoteBackend {
         if command.is_view() || desk::window_command(command) {
             let s = self.state.borrow();
             let chief = || s.mirror.sessions.values().any(|x| x.chief);
-            // The plan's board and button need a plan, which a host may not have, or not have sent yet.
+            // The plan's board and button need a plan to show: a host may have none, or none open.
             let plan = matches!(command, Command::TogglePlan | Command::SetPanel(PanelMode::Plan));
             return desk::carries_out(command, s.wide)
                 && (!desk::window_command(command) || chief())
-                && (!plan || !s.mirror.plans.is_empty());
+                && (!plan || s.mirror.plans.values().nth(s.view.selected_plan).is_some());
         }
         if matches!(command, Command::RefreshDiff(_)) {
             return true;
@@ -797,6 +804,11 @@ impl Backend for RemoteBackend {
             Remote::Send(mutations) => mutations.iter().all(|mutation| self.may(mutation.grant())),
             Remote::Client | Remote::Unsupported => false,
         }
+    }
+
+    /// A page has no keyboard chords of its own: the keyboard goes to the terminal or to the browser.
+    fn has_shortcuts(&self) -> bool {
+        false
     }
 
     fn plan_list(&self) -> Vec<PlanRow> {

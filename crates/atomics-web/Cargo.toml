@@ -25,6 +25,8 @@ zeroize = "1.9.1"
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts"] }
 js-sys = "0.3.106"
+# The ATOMICS icon, which the top bar shows as the desktop's does.
+png = "0.18.1"
 wasm-bindgen = "0.2.129"
 wasm-bindgen-futures = "0.4.79"
 web-sys = { version = "0.3.106", features = [

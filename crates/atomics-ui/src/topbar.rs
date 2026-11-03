@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use atomics_core::config::AgentKind;
+use atomics_core::config::{AgentKind, KeyConfig};
 use egui::{Rect, RichText, Sense, vec2};
 
 use crate::keys::shortcut_label;
@@ -83,6 +83,20 @@ pub fn brand(ui: &mut egui::Ui, show_agents: bool, backend: &dyn Backend, client
     ui.separator();
 }
 
+/// `response` with a tooltip naming the chord `key` reads from the `[keys]`, on a platform that takes them.
+pub fn shortcut_tip(
+    response: egui::Response,
+    backend: &dyn Backend,
+    key: impl FnOnce(&KeyConfig) -> &String,
+) -> egui::Response {
+    if !backend.has_shortcuts() {
+        return response;
+    }
+    let keys = backend.ui_config().keys;
+    let label = shortcut_label(&response.ctx, key(&keys));
+    response.on_hover_text(label)
+}
+
 /// Shows or hides the diff panel.
 pub fn diff_button(ui: &mut egui::Ui, in_menu: bool, backend: &dyn Backend, client: &mut Client) {
     if !backend.available(&Command::ToggleDiff) {
@@ -90,7 +104,7 @@ pub fn diff_button(ui: &mut egui::Ui, in_menu: bool, backend: &dyn Backend, clie
     }
     let response = ui.button(if backend.view_hints().diff_open { "Hide diff" } else { "Show diff" });
     record_item(ui, "diff", &response);
-    if response.on_hover_text(shortcut_label(ui.ctx(), &backend.ui_config().keys.toggle_diff)).clicked() {
+    if shortcut_tip(response, backend, |keys| &keys.toggle_diff).clicked() {
         client.send(Command::ToggleDiff);
         if in_menu {
             ui.close();
@@ -105,7 +119,7 @@ pub fn new_button(ui: &mut egui::Ui, in_menu: bool, backend: &dyn Backend, clien
     }
     let response = ui.button("+ New");
     record_item(ui, "+ New", &response);
-    if response.on_hover_text(shortcut_label(ui.ctx(), &backend.ui_config().keys.new_session)).clicked() {
+    if shortcut_tip(response, backend, |keys| &keys.new_session).clicked() {
         client.send(Command::NewSession);
         if in_menu {
             ui.close();
@@ -126,7 +140,7 @@ pub fn plan_button(ui: &mut egui::Ui, in_menu: bool, backend: &dyn Backend, clie
         RichText::new(label).color(if attention > 0 { client.palette.warning } else { client.palette.foreground });
     let response = ui.selectable_label(hints.panel == PanelMode::Plan && hints.diff_open, text);
     record_item(ui, "Plan", &response);
-    if response.on_hover_text(shortcut_label(ui.ctx(), &backend.ui_config().keys.toggle_plan)).clicked() {
+    if shortcut_tip(response, backend, |keys| &keys.toggle_plan).clicked() {
         client.send(Command::TogglePlan);
         if in_menu {
             ui.close();

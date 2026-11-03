@@ -331,7 +331,6 @@ fn the_frame_leaves_out_the_host_items_and_what_the_browser_cannot_do() {
         "Hide diff",
         "Plan 0/2",
         "AGENTS",
-        "EXPLORER",
         "PLAN",
         "Approve plan",
     ] {
@@ -340,7 +339,7 @@ fn the_frame_leaves_out_the_host_items_and_what_the_browser_cannot_do() {
     for host_only in ["USAGE", "TICKETS", "Settings", "Tickets", "load ", "Remote", "Project"] {
         assert!(!has(host_only), "{host_only} is the host's: {text:?}");
     }
-    for unavailable in ["+ New", "All ·", "Repos", "Close plan…", "Steer", "Send"] {
+    for unavailable in ["+ New", "All ·", "Repos", "Close plan…", "Steer", "Send", "EXPLORER"] {
         assert!(!has(unavailable), "{unavailable} cannot be sent from the browser: {text:?}");
     }
 

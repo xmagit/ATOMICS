@@ -13,7 +13,7 @@ use crate::status::status_dot;
 use crate::terminal::Metrics;
 use crate::terminal_surface::TerminalSurface;
 use crate::theme::{Palette, lerp};
-use crate::topbar::record_item;
+use crate::topbar::{record_item, shortcut_tip};
 use crate::{Backend, ChiefView, Client, Command, touch};
 
 /// Who the steer bar's message goes to.
@@ -68,7 +68,7 @@ pub fn pill(ui: &mut egui::Ui, compact: bool, voice: Option<VoiceState>, backend
                             ui.label(RichText::new(status.label()).color(p.muted).size(11.5));
                         }
                     }
-                    None if !compact => {
+                    None if !compact && backend.available(&Command::ToggleChief) => {
                         ui.label(RichText::new("start").color(p.muted).size(11.5));
                     }
                     None => {}
@@ -118,7 +118,10 @@ pub fn pill(ui: &mut egui::Ui, compact: bool, voice: Option<VoiceState>, backend
             shortcut_label(ui.ctx(), &keys.toggle_chief),
             shortcut_label(ui.ctx(), &keys.voice)
         ),
-        None => format!("The chief agent ({})", shortcut_label(ui.ctx(), &keys.toggle_chief)),
+        None if backend.has_shortcuts() => {
+            format!("The chief agent ({})", shortcut_label(ui.ctx(), &keys.toggle_chief))
+        }
+        None => "The chief agent".to_string(),
     };
     if backend.available(&Command::SetChiefDock(chief.dock)) {
         response.context_menu(|ui| {
@@ -242,8 +245,7 @@ pub fn content(
                 ui.add_space(gutter);
             }
             if backend.available(&Command::HideChief)
-                && touch::small_button(ui, touch, "minimize")
-                    .on_hover_text(shortcut_label(ui.ctx(), &backend.ui_config().keys.toggle_chief))
+                && shortcut_tip(touch::small_button(ui, touch, "minimize"), backend, |keys| &keys.toggle_chief)
                     .clicked()
             {
                 client.send(Command::HideChief);

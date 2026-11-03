@@ -4,12 +4,12 @@
 //!   `Platform`: the top bar, the sidebar, the tiled terminals, the board or a diff in the right panel and the
 //!   chief, docked or floating, in the host's theme. The host's own items (settings, sandboxes, credentials,
 //!   ticket sign-in, GitHub) are hooks this page leaves empty; its connection's state and the layout menu
-//!   take the top bar's last slots.
+//!   take the top bar's last slots, and connection trouble a line under the frame.
 //! - **Phone**: one pane at a time, switched from a bottom bar, each a shared widget: the AGENTS list, the
-//!   board, the approval banners, a worktree's diff panel, an agent's fleet tile at full size and the chief's
-//!   window. It draws inside the part of the viewport the user sees, in the phone's look ([`Looks`]): the
-//!   theme's colours with proportional UI text, zoomed, spaced for a finger, the shared views fitted to a
-//!   phone ([`atomics_ui::touch`]).
+//!   current plan's board under a picker of the others, the approval banners, a worktree's diff panel, an
+//!   agent's fleet tile at full size and the chief's window. It draws inside the part of the viewport the user
+//!   sees, in the phone's look ([`Looks`]): the theme's colours with proportional UI text, zoomed, spaced for a
+//!   finger, the shared views fitted to a phone ([`atomics_ui::touch`]).
 //!
 //! Terminals are drawn by [`TermPane`]s through [`Terminals`]. After each piece of the frame, what the user
 //! asked for in it is carried out: a view command here, on the page's [`Desk`], any other through the
@@ -22,14 +22,16 @@ use std::sync::Arc;
 use atomics_core::layout::{DiffPlacement, Layout as Grid};
 use atomics_core::noise;
 use atomics_core::ops::Grant;
+use atomics_core::plan::PlanStatus;
 use atomics_core::theme::ThemeTokens;
 use atomics_core::wire::Role;
 use atomics_ui::shell::{self, Platform};
+use atomics_ui::terminal::Metrics;
 use atomics_ui::terminal_surface::TerminalSurface;
 use atomics_ui::theme::{FontHook, Fonts, Palette, UI_SIZE, definitions};
 use atomics_ui::touch::{self, Touch};
-use atomics_ui::{Backend, Client, Command, PanelMode, approvals, board, chief, diff_panel, fleet, sidebar};
-use egui::{Align, Layout, Rect, RichText, Sense, Stroke, TextStyle, pos2, vec2};
+use atomics_ui::{Backend, Client, Command, PanelMode, PlanRow, approvals, board, chief, diff_panel, fleet, sidebar};
+use egui::{Align, Color32, Layout, Rect, RichText, Sense, Stroke, TextStyle, pos2, vec2};
 
 use crate::boot::Boot;
 use crate::desk::{self, Desk};
@@ -219,14 +221,15 @@ pub fn draw(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &
     } else {
         wide(ui, driver, client, view);
     }
-    view.term.end_frame();
+    view.term.end_frame(ui.ctx(), &driver.remote);
     driver.remote.end_frame();
     carry_out(driver, client, view);
     want(&driver.remote, view);
     driver.flush();
 }
 
-/// The boot's ticket key, once the board is in: its plan on the board, or the board when none names it.
+/// The boot's ticket key, once the board is in: its plan on the board, or the board the page opens on when no
+/// plan names it.
 fn open_ticket(driver: &Driver, view: &mut View) {
     let remote = &driver.remote;
     if view.ticket_key.is_none() || !remote.live() || remote.with_mirror(|m| m.epoch.is_none()) {
@@ -234,7 +237,11 @@ fn open_ticket(driver: &Driver, view: &mut View) {
     }
     let key = view.ticket_key.take().expect("checked");
     view.tab = Tab::Board;
-    view.desk.apply(Command::ViewPlanHistory(remote.plan_for_ticket(&key).unwrap_or(0)), remote);
+    if let Some(index) = remote.plan_for_ticket(&key) {
+        let open = remote.plan_row(index).is_some_and(|row| row.status == PlanStatus::Open);
+        view.desk.apply(if open { Command::ShowPlan(index) } else { Command::ViewPlanHistory(index) }, remote);
+    }
+    view.desk.panel = PanelMode::Plan;
     view.desk.diff_open = true;
 }
 
@@ -283,8 +290,8 @@ fn want(remote: &RemoteBackend, view: &View) {
     let shown = if view.compact {
         view.diff.clone().filter(|_| view.tab == Tab::Diffs)
     } else {
-        let desk = &view.desk;
-        (desk.diff_open && desk.panel == PanelMode::Diff).then(|| desk.diff_target(remote)).flatten()
+        let hints = view.desk.hints(remote);
+        hints.diff_target.filter(|_| hints.diff_open && hints.panel == PanelMode::Diff)
     };
     remote.set_wanted(shown.as_deref());
 }
@@ -304,14 +311,20 @@ impl Platform for Web<'_> {
         result
     }
 
+    fn laid_out(&mut self, layout: &Grid) {
+        self.view.desk.dock_fits = layout.dock_width > 0.0;
+    }
+
     /// Where the desktop has its Tickets, GitHub and Remote items: how this page's connection is.
     fn top_bar_items(&mut self, ui: &mut egui::Ui, _in_menu: bool) {
         let (text, good) = status_line(self.driver);
         let p = &self.client.palette;
-        let label = ui.label(RichText::new(text).color(status_color(good, p)).size(11.5));
-        if let Status::Stopped(stop) = self.driver.status() {
-            label.on_hover_text(stop.message());
-        }
+        ui.label(RichText::new(text).color(status_color(good, p)).size(11.5));
+    }
+
+    /// The chief's window, with the permission request it waits on over its terminal.
+    fn chief_window(&mut self, ui: &mut egui::Ui) {
+        self.draw(|backend, client, terminals| chief_window(ui, backend, client, terminals));
     }
 
     /// Where the desktop has its Settings: the layout this page draws.
@@ -394,6 +407,8 @@ fn view_command(remote: &RemoteBackend, view: &mut View, command: Command) {
     if let Command::Toast(text) = &command {
         remote.say(text.clone());
     }
+    // Picking an agent types there, as on the desktop. A finger taps the terminal itself, which opens the keyboard.
+    view.term.focus_next |= !view.compact && matches!(command, Command::Activate { .. });
     view.desk.apply(command, remote);
 }
 
@@ -418,6 +433,16 @@ fn wide(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &mut 
                 status_screen(ui, driver, client);
             });
         return;
+    }
+    // Under the frame, where its coming and going moves nothing the user may be about to click.
+    if let Some((text, color)) = connection_note(driver, &client.palette) {
+        let fill = client.palette.panel;
+        egui::Panel::bottom("atomics-connection")
+            .resizable(false)
+            .frame(egui::Frame::new().fill(fill).inner_margin(egui::Margin::symmetric(10, 4)))
+            .show(ui, |ui| {
+                ui.label(RichText::new(text).color(color));
+            });
     }
     shell::frame(ui, &mut Web { driver, client, view });
 }
@@ -505,9 +530,12 @@ fn layout_menu(ui: &mut egui::Ui, view: &mut View) {
 fn pane_bar(ui: &mut egui::Ui, bar: Rect, screen: Rect, driver: &Driver, view: &mut View, p: &Palette) {
     ui.painter().rect_filled(Rect::from_x_y_ranges(screen.x_range(), bar.y_range()), 0.0, p.topbar);
     ui.painter().hline(screen.x_range(), bar.top(), Stroke::new(1.0, p.separator));
-    let waiting = driver
-        .remote
-        .with_mirror(|m| m.approvals.values().any(|a| m.sessions.get(&a.session).is_some_and(|s| !s.chief)));
+    let waits = |chief: bool| {
+        driver
+            .remote
+            .with_mirror(|m| m.approvals.values().any(|a| m.sessions.get(&a.session).is_some_and(|s| s.chief == chief)))
+    };
+    let (agent_waits, chief_waits) = (waits(false), waits(true));
     for ((tab, label), item) in BAR.iter().zip(layout::bar_items(bar, BAR.len())) {
         let response = ui.interact(item, ui.scope_id().with(("pane", label)), Sense::click());
         let active = view.tab == *tab;
@@ -527,8 +555,8 @@ fn pane_bar(ui: &mut egui::Ui, bar: Rect, screen: Rect, driver: &Driver, view: &
         let at = item.center() - galley.size() / 2.0;
         let end = at.x + galley.size().x;
         ui.painter().galley(at, galley, color);
-        // An agent waits on an approval: a dot by the Terminal pane's name.
-        if *tab == Tab::Terminal && waiting {
+        // A permission request waits: a dot by the name of the pane that answers it.
+        if (*tab == Tab::Terminal && agent_waits) || (*tab == Tab::Chief && chief_waits) {
             ui.painter().circle_filled(pos2(end + 5.0, at.y + 3.0), 3.0, p.warning);
         }
         if response.clicked() {
@@ -552,11 +580,24 @@ fn status_line(driver: &Driver) -> (String, Option<bool>) {
     }
 }
 
-fn status_color(good: Option<bool>, p: &Palette) -> egui::Color32 {
+fn status_color(good: Option<bool>, p: &Palette) -> Color32 {
     match good {
         Some(true) => p.success,
         Some(false) => p.warning,
         None => p.muted,
+    }
+}
+
+/// What the connection's state says of the board on screen, and in what colour: why this page stopped, or that
+/// the board may be out of date.
+fn connection_note(driver: &Driver, p: &Palette) -> Option<(&'static str, Color32)> {
+    match driver.status() {
+        Status::Stopped(stop) => Some((stop.message(), p.error)),
+        Status::Reconnecting { .. } => Some((
+            "Reconnecting. The board may be out of date, and nothing can be changed until the computer is back.",
+            p.warning,
+        )),
+        _ => None,
     }
 }
 
@@ -705,16 +746,8 @@ fn phone_body(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view:
     let p = client.palette.clone();
     // A phone keeps text off the screen's sides; the panes that reach them keep to the gutter themselves.
     let gutter = gutter(client);
-    match driver.status().clone() {
-        Status::Stopped(stop) => {
-            padded(ui, gutter, |ui| ui.label(RichText::new(stop.message()).color(p.error)));
-        }
-        Status::Reconnecting { .. } => {
-            let stale = "Reconnecting. The board may be out of date, and nothing can be changed until the computer \
-                         is back.";
-            padded(ui, gutter, |ui| ui.label(RichText::new(stale).color(p.warning)));
-        }
-        _ => {}
+    if let Some((text, color)) = connection_note(driver, &p) {
+        padded(ui, gutter, |ui| ui.label(RichText::new(text).color(color)));
     }
     padded(ui, gutter, |ui| notice(ui, driver, client.touch));
     match view.tab {
@@ -764,7 +797,7 @@ fn terminal_tab(ui: &mut egui::Ui, driver: &Driver, client: &mut Client, view: &
     });
 }
 
-/// The chief's window at the pane's size: its header and its terminal.
+/// The chief's window at the pane's size: its header, the permission request it waits on and its terminal.
 fn chief_tab(ui: &mut egui::Ui, driver: &Driver, client: &mut Client, view: &mut View) {
     let Some(chief) = driver.remote.session_list().into_iter().find(|s| s.chief) else {
         return empty(ui, client, "No chief is running on this computer.");
@@ -773,9 +806,41 @@ fn chief_tab(ui: &mut egui::Ui, driver: &Driver, client: &mut Client, view: &mut
     fill(ui, |ui, rect| {
         let mut child = ui.new_child(egui::UiBuilder::new().id_salt("chief").max_rect(rect));
         lend(driver, client, view, |backend, client, terminals| {
-            chief::content(&mut child, backend, client, terminals, |_| 0.0);
+            chief_window(&mut child, backend, client, terminals);
         });
     });
+}
+
+/// The terminal a view asks for, kept to draw once what goes over it is drawn.
+#[derive(Default)]
+struct Kept(Option<(usize, String, Rect, egui::Id, Metrics)>);
+
+impl TerminalSurface for Kept {
+    fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        index: usize,
+        session: &str,
+        rect: Rect,
+        id: egui::Id,
+        metrics: &Metrics,
+        _palette: &Palette,
+    ) -> egui::Response {
+        let metrics = Metrics { font: metrics.font.clone(), cell: metrics.cell };
+        self.0 = Some((index, session.to_string(), rect, id, metrics));
+        ui.interact(Rect::from_min_size(rect.min, vec2(0.0, 0.0)), id.with("kept"), Sense::hover())
+    }
+}
+
+/// The chief's window, with the permission request the chief waits on over its terminal, as an agent's tile has
+/// it: the browser's one place to answer it where it asks.
+fn chief_window(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, terminals: &mut dyn TerminalSurface) {
+    let mut kept = Kept::default();
+    chief::content(ui, backend, client, &mut kept, |_| 0.0);
+    let Some((index, session, rect, id, metrics)) = kept.0 else { return };
+    let p = client.palette.clone();
+    let rest = approvals::banner(ui, rect, index, backend, client);
+    terminals.show(ui, index, &session, rest, id, &metrics, &p);
 }
 
 fn empty(ui: &mut egui::Ui, client: &Client, text: &str) {
@@ -794,27 +859,79 @@ fn fill(ui: &mut egui::Ui, draw: impl FnOnce(&mut egui::Ui, Rect)) {
     ui.allocate_rect(rect, Sense::hover());
 }
 
-/// The selected plan's board, under the plans to pick from when there are several.
+/// The selected plan's board, under a picker when there are other plans to pick.
 fn board_tab(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, view: &View) {
     let plans = backend.plan_list();
     if plans.is_empty() {
         return empty(ui, client, "No plans on this computer yet.");
     }
-    let selected = view.desk.selected_plan.min(plans.len() - 1);
-    if plans.len() > 1 {
-        let p = client.palette.clone();
-        padded(ui, gutter(client), |ui| {
-            ui.horizontal_wrapped(|ui| {
-                for (index, row) in plans.iter().enumerate() {
-                    let label = RichText::new(row.state.label(&row.tab_name)).color(row.state.color(&p));
-                    if ui.selectable_label(index == selected, label).clicked() {
-                        client.send(Command::ShowPlan(index));
-                    }
-                }
-            })
+    let selected = view.desk.hints(backend).selected_plan;
+    padded(ui, gutter(client), |ui| plan_picker(ui, &plans, selected, client));
+    if selected < plans.len() {
+        fill(ui, |ui, rect| board::draw(ui, rect, selected, backend, client));
+    } else {
+        empty(ui, client, "No plan is open. Finished plans are under History.");
+    }
+}
+
+/// A plan's name on a phone: the state and goal the desktop's tab shows, as a command picks it.
+fn plan_pick(ui: &mut egui::Ui, row: &PlanRow, index: usize, selected: usize, client: &mut Client) -> bool {
+    let p = client.palette.clone();
+    let label = RichText::new(row.state.label(&row.tab_name)).color(row.state.color(&p));
+    let picked = ui.selectable_label(index == selected, label).clicked();
+    if picked {
+        client.send(if row.status == PlanStatus::Open {
+            Command::ShowPlan(index)
+        } else {
+            Command::ViewPlanHistory(index)
         });
     }
-    fill(ui, |ui, rect| board::draw(ui, rect, selected, backend, client));
+    picked
+}
+
+/// The plans a phone picks from, one row high so the board stays on screen: the open ones, and a finished one
+/// while it shows, in a strip that scrolls sideways, and the other finished ones in a scrolling History menu.
+/// Nothing to pick draws nothing.
+fn plan_picker(ui: &mut egui::Ui, plans: &[PlanRow], selected: usize, client: &mut Client) {
+    let named = || plans.iter().enumerate().filter(|(_, row)| !row.id.is_empty());
+    let mut strip: Vec<(usize, &PlanRow)> =
+        named().filter(|(index, row)| row.status == PlanStatus::Open || *index == selected).collect();
+    strip.sort_by_key(|(_, row)| row.status != PlanStatus::Open);
+    let history: Vec<(usize, &PlanRow)> = named().filter(|(_, row)| row.status != PlanStatus::Open).collect();
+    if strip.len() + history.len() < 2 {
+        return;
+    }
+    ui.add_space(4.0);
+    let width = ui.available_width();
+    ui.allocate_ui_with_layout(vec2(width, layout::TOUCH), Layout::right_to_left(Align::Center), |ui| {
+        if !history.is_empty() {
+            let button = egui::Button::new("History").min_size(vec2(layout::TOUCH, layout::TOUCH));
+            let height = (ui.ctx().content_rect().height() * 0.6).max(layout::TOUCH);
+            egui::containers::menu::MenuButton::from_button(button).ui(ui, |ui| {
+                ui.set_max_width(width - ui.spacing().menu_margin.sum().x);
+                egui::ScrollArea::vertical().id_salt("plan-history").max_height(height).show(ui, |ui| {
+                    for (index, row) in &history {
+                        if plan_pick(ui, row, *index, selected, client) {
+                            ui.close();
+                        }
+                    }
+                });
+            });
+        }
+        let rest = ui.available_rect_before_wrap();
+        let mut left = ui.new_child(egui::UiBuilder::new().max_rect(rest).layout(Layout::left_to_right(Align::Center)));
+        egui::ScrollArea::horizontal()
+            .id_salt("plan-strip")
+            .auto_shrink([false, true])
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+            .show(&mut left, |ui| {
+                ui.horizontal(|ui| {
+                    for (index, row) in &strip {
+                        plan_pick(ui, row, *index, selected, client);
+                    }
+                });
+            });
+    });
 }
 
 fn approvals_tab(ui: &mut egui::Ui, driver: &Driver, client: &mut Client) {

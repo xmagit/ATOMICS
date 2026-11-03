@@ -35,7 +35,15 @@
 //! and the plan's board. Its screenshot is saved as `target/wide-shots/browser.png`; where
 //! `target/wide-shots/desktop.png` is (`scripts/wide-desktop-shot.sh` takes the desktop's QA screenshot of the
 //! same board), the two go side by side into `target/wide-shots/side-by-side.png`. Then a click into the
-//! agent's terminal types there, a click into the chief's moves the input there, and Approve plan approves.
+//! agent's terminal types there, a click into the chief's moves the input there and lets go of the agent's
+//! lease, and Approve plan approves.
+//!
+//! `the_input_gives_way_to_a_floating_window` and `a_menu_over_a_terminal_acts_and_takes_no_lease`: the input
+//! lies over a terminal, and real clicks where something else lies over that terminal reach what the user sees.
+//!
+//! `a_page_of_many_plans_opens_on_the_open_plan` and `a_phone_of_many_plans_shows_the_open_plans_board`: a host
+//! of 26 plans, 25 of them archived, opens with the open plan's Approve plan on screen, in a wide window and on
+//! a phone, where History reaches the others. Their screenshots are saved in `target/many-plans-shots/`.
 
 #[allow(dead_code)] // shared with the unit tests, which use more of it
 #[path = "../src/fake_host.rs"]
@@ -322,6 +330,7 @@ fn broker(
                         Message::LeaseAcquire { session, takeover } => {
                             log.push(format!("acquire {session}{}", if *takeover { " takeover" } else { "" }));
                         }
+                        Message::LeaseRelease { session, .. } => log.push(format!("release {session}")),
                         Message::TerminalResize { session, .. } => log.push(format!("resize {session}")),
                         _ => {}
                     }
@@ -1205,6 +1214,7 @@ fn the_bundle_works_on_a_phone_by_touch() {
     frame.eval("window.copied = null; navigator.clipboard.writeText = (text) => { window.copied = text; return Promise.resolve(); }; true");
     let copy = frame.eval(&format!("(() => {{ const r = {chip}.getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2, r.height]; }})()"));
     assert!(number(&copy, 2) >= 44.0, "Copy is a finger's target: {copy}");
+    assert!(number(&copy, 1) - number(&copy, 2) / 2.0 >= cells.top(), "Copy leaves the strip's words alone: {copy}");
     page.tap(pos2(number(&copy, 0), number(&copy, 1)));
     frame.wait("the copy done", &format!("window.copied !== null && {chip}.hidden"));
     assert_eq!(frame.eval("window.copied"), json!("hello world"), "Copy copies the selected range and nothing else");
@@ -1327,6 +1337,7 @@ fn the_bundle_draws_the_desktops_frame_in_a_wide_window() {
         "the input over the chief's terminal, focused",
         &format!("{focused} && document.getElementById('atomics-input').getBoundingClientRect().right < 520"),
     );
+    log.wait("release s1", 1);
     page.call("Input.insertText", json!({ "text": "hi" }));
     wait_host(&host, "\"hi\" typed into the chief's terminal", |h| h.terminals["chief"].typed == "hi");
     assert_eq!(typed(&host, "s1"), "ls", "the agent's terminal got nothing more");
@@ -1341,4 +1352,250 @@ fn the_bundle_draws_the_desktops_frame_in_a_wide_window() {
     });
     assert!(!log.has("resize s1") && !log.has("resize chief"), "nothing was resized by looking at it");
     assert!(!log.lines.lock().unwrap().iter().any(|l| l.starts_with("host closed")), "no channel was refused");
+}
+
+/// The bundle opened and paired over `host`, on a screen of `size`: with a mouse, or as an iPhone by `touch`.
+struct Opened {
+    host: Arc<Mutex<FakeHost>>,
+    log: Arc<Log>,
+    _browser: Browser,
+    page: DevTools,
+    frame: DevTools,
+    /// What the client draws with.
+    palette: Palette,
+}
+
+fn open(mut host: FakeHost, size: (f32, f32), touch: bool) -> Opened {
+    let dist = dist();
+    let pairing = host.open_pairing();
+    let host = Arc::new(Mutex::new(host));
+    let log = Arc::new(Log::default());
+    let bind = || TcpListener::bind("127.0.0.1:0").unwrap();
+    let (client, parent, tunnel) = (bind(), bind(), bind());
+    let port = |l: &TcpListener| l.local_addr().unwrap().port();
+    let client_origin = format!("http://127.0.0.1:{}", port(&client));
+    let parent_origin = format!("http://localhost:{}", port(&parent));
+    let broker_url = format!("ws://127.0.0.1:{}/atomics/tunnel", port(&tunnel));
+    let fragment = pairing.fragment();
+    let keys: Vec<&str> = fragment.split('.').collect();
+    let pair = json!({
+        "type": "atomics.embed.boot", "v": 1, "host_id": HOST_ID, "ticket": "ticket-0", "broker": broker_url,
+        "display_name": "A Person", "theme": "dark", "scheme": "dark", "locale": "en", "view": "board",
+        "mode": "pair", "pair": { "v": 1, "host_noise_pubkey": keys[2], "psk": keys[3] },
+    });
+    serve_client(client, dist, &parent_origin, port(&tunnel));
+    let phase = Arc::new(Mutex::new(if touch { "wait" } else { "go" }.to_string()));
+    let page_html = include_str!("browser/phone.html")
+        .replace("CLIENT_ORIGIN", &client_origin)
+        .replace("PHONE_BOOT", &pair.to_string());
+    serve_parent(parent, HashMap::from([("/", page_html)]), log.clone(), phase.clone());
+    broker(tunnel, host.clone(), log.clone(), client_origin.clone(), Arc::default(), Arc::default());
+
+    let scale = if touch { PHONE_SCALE } else { 1.0 };
+    let mut flags = vec![
+        format!("--window-size={},{}", size.0, size.1),
+        format!("--force-device-scale-factor={scale}"),
+        "--hide-scrollbars".to_string(),
+    ];
+    if touch {
+        flags.push(format!("--user-agent={IOS_SAFARI}"));
+    }
+    let browser = launch(&flags, &format!("{parent_origin}/"), &log, PHONE_OVERALL);
+    let devtools = browser.devtools();
+    let mut page = DevTools::open(&devtools, "the hosting page", |t| t["type"] == "page");
+    let metrics =
+        json!({ "width": size.0 as u32, "height": size.1 as u32, "deviceScaleFactor": scale, "mobile": touch });
+    page.call("Emulation.setDeviceMetricsOverride", metrics);
+    if touch {
+        // The client's frame draws in a renderer of its own: its touch screen is set up on its own target, before
+        // its first script runs (see the_bundle_works_on_a_phone_by_touch).
+        let screen = json!({ "enabled": true, "maxTouchPoints": 5 });
+        page.call("Emulation.setTouchEmulationEnabled", screen.clone());
+        page.call(
+            "Target.setAutoAttach",
+            json!({ "autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true }),
+        );
+        *phase.lock().unwrap() = "go".into();
+        let attached = page.event("Target.attachedToTarget", |e| e["params"]["targetInfo"]["type"] == "iframe");
+        let session = attached["params"]["sessionId"].as_str().expect("the frame's session").to_string();
+        page.call_in(Some(&session), "Emulation.setTouchEmulationEnabled", screen);
+        page.call_in(Some(&session), "Runtime.runIfWaitingForDebugger", json!({}));
+    }
+    log.wait("parent atomics.paired", 1);
+    log.wait("hello new", 1);
+    let frame_url = format!("{client_origin}/");
+    let frame = DevTools::open(&devtools, "the client's frame", |t| {
+        t["type"] == "iframe" && t["url"].as_str().is_some_and(|u| u.starts_with(&frame_url))
+    });
+    let parent = ParentOrigin::parse(&parent_origin).expect("a loopback origin");
+    let Ok(FromParent::Boot(booted)) = boot::read(&parent, &parent_origin, true, &pair) else { panic!("the boot") };
+    let palette = Palette::new(&booted.theme_tokens(), Fonts::default());
+    Opened { host, log, _browser: browser, page, frame, palette }
+}
+
+/// The input is on the terminal, and has the focus.
+const FOCUSED: &str = "document.activeElement === document.getElementById('atomics-input')";
+/// What is cut out of the input.
+const CLIP: &str = "document.getElementById('atomics-input').style.clipPath";
+
+/// The screenshots of many plans, for a person to look at.
+fn many_plans_dir() -> PathBuf {
+    let dir = target().join("many-plans-shots");
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+#[ignore = "needs the built bundle (scripts/build-web.sh) and Chrome"]
+fn the_input_gives_way_to_a_floating_window() {
+    let Opened { host, log, _browser, mut page, mut frame, .. } = open(fake_host::host(), WIDE, false);
+    log.wait("subscribe s1", 1);
+    log.wait("subscribe chief", 1);
+    frame.wait("the input over a terminal", "!document.getElementById('atomics-input').hidden");
+
+    // The docked chief's "float": its window lies over the active agent's terminal, under the input.
+    page.click((409.0, 50.0));
+    frame.wait("the window cut out of the input", &format!("{CLIP}.startsWith('path(')"));
+    let input = frame.eval("(() => { const r = document.getElementById('atomics-input').getBoundingClientRect(); return [r.left, r.right, r.top, r.bottom]; })()");
+    let n = |i: usize| input[i].as_f64().expect("a number");
+    let (on_window, on_agent) = ((600.0, 500.0), (300.0, 500.0));
+    assert!(n(0) < on_agent.0 && on_window.0 < n(1) && n(2) < 500.0 && 500.0 < n(3), "both over the input: {input}");
+    // The browser's own hit test: the canvas under the window, the input beside it.
+    let hit = |at: (f64, f64)| format!("document.elementFromPoint({}, {}).id", at.0, at.1);
+    assert_eq!(frame.eval(&hit(on_window)), json!("atomics"), "the window's part of the input is the canvas's");
+    assert_eq!(frame.eval(&hit(on_agent)), json!("atomics-input"));
+
+    // A click on the chief's terminal, and typing: the chief gets the text, and the agent neither it nor a lease.
+    page.click(on_window);
+    log.wait("acquire chief", 1);
+    frame.wait("the focus on the input", FOCUSED);
+    page.call("Input.insertText", json!({ "text": "hi" }));
+    wait_host(&host, "\"hi\" typed into the chief's terminal", |h| h.terminals["chief"].typed == "hi");
+    assert_eq!(typed(&host, "s1"), "", "nothing reached the agent the user was not looking at");
+    assert!(!log.has("acquire s1"), "the agent's lease was not taken");
+
+    // Back on the agent's tile, beside the window: the input follows, and the chief's lease is let go.
+    page.click(on_agent);
+    log.wait("release chief", 1);
+    log.wait("acquire s1", 1);
+    frame
+        .wait("the input back over the agent's terminal, focused", &format!("{FOCUSED} && {CLIP}.startsWith('path(')"));
+    page.call("Input.insertText", json!({ "text": "ls" }));
+    wait_host(&host, "\"ls\" typed into the agent's terminal", |h| h.terminals["s1"].typed == "ls");
+    assert_eq!(typed(&host, "chief"), "hi", "the chief got nothing more");
+    assert!(host.lock().unwrap().terminals["chief"].lease.is_none(), "another browser sees the chief free");
+    assert!(!log.has("resize s1") && !log.has("resize chief"));
+}
+
+#[test]
+#[ignore = "needs the built bundle (scripts/build-web.sh) and Chrome"]
+fn a_menu_over_a_terminal_acts_and_takes_no_lease() {
+    use atomics_core::session::AgentStatus;
+
+    let mut board = fake_host::host();
+    board.board.approvals.clear();
+    for session in &mut board.board.sessions {
+        session.status = AgentStatus::Idle;
+        session.pending_approvals = 0;
+    }
+    let Opened { log, _browser, mut page, mut frame, .. } = open(board, WIDE, false);
+    log.wait("subscribe s1", 1);
+    frame.wait("the input over a terminal", "!document.getElementById('atomics-input').hidden");
+
+    // "Hide diff": the agent's terminal reaches the right edge, under where the ⋯ menu opens.
+    page.click((1400.0, 16.0));
+    frame.wait(
+        "the terminal under the menu's place",
+        "document.getElementById('atomics-input').getBoundingClientRect().right > 1560",
+    );
+    let (dots, desktop, terminal) = ((1585.0, 16.0), (1542.0, 105.0), (1000.0, 500.0));
+
+    // An entry over the terminal: the menu acts, and the terminal hears nothing of it.
+    page.click(dots);
+    frame.wait("the open menu taking the input's pointer", &format!("{CLIP} === 'inset(50%)'"));
+    assert_eq!(frame.eval(&format!("document.elementFromPoint({}, {}).id", desktop.0, desktop.1)), json!("atomics"));
+    page.click(desktop);
+    frame.wait("the menu's choice kept", "localStorage.getItem('atomics.layout') === 'desktop'");
+    frame.wait("the menu closed", &format!("{CLIP} === ''"));
+    assert!(!log.has("acquire s1"), "no lease was taken");
+    assert_eq!(frame.eval(FOCUSED), json!(false));
+
+    // A click away closes the menu, as anywhere else; the next click is the terminal's.
+    page.click(dots);
+    frame.wait("the menu open again", &format!("{CLIP} === 'inset(50%)'"));
+    page.click(terminal);
+    frame.wait("the menu closed by a click away", &format!("{CLIP} === ''"));
+    assert!(!log.has("acquire s1"), "that click was the menu's");
+    page.click(terminal);
+    log.wait("acquire s1", 1);
+    frame.wait("the focus on the input", FOCUSED);
+}
+
+#[test]
+#[ignore = "needs the built bundle (scripts/build-web.sh) and Chrome"]
+fn a_page_of_many_plans_opens_on_the_open_plan() {
+    let Opened { host, log, _browser, mut page, palette: p, .. } = open(fake_host::many_plans(), WIDE, false);
+    log.wait("subscribe s1", 1);
+    log.wait("subscribe chief", 1);
+    let dir = many_plans_dir();
+    let area = Rect::from_min_max(pos2(WIDE.0 * 0.6, 34.0), pos2(WIDE.0, 120.0));
+    let (approve, png) = until_on(&mut page, WIDE, &dir, "Approve plan", |page| {
+        boxes(page, p.accent, 6, area, 150.0).into_iter().find(|b| b.width() >= 60.0)
+    });
+    std::fs::write(dir.join("wide.png"), base64(&png)).unwrap();
+    eprintln!("many plans, wide: {}", dir.join("wide.png").display());
+    page.click((f64::from(approve.center().x), f64::from(approve.center().y)));
+    wait_host(&host, "plan_command approve for the open plan", |h| {
+        h.received.iter().any(|m| {
+            matches!(m, Message::PlanCommand(c) if c.action == PlanAction::Approve
+                && c.plan.as_deref() == Some("p1") && c.digest.as_deref() == Some("digest-1"))
+        })
+    });
+}
+
+#[test]
+#[ignore = "needs the built bundle (scripts/build-web.sh) and Chrome"]
+fn a_phone_of_many_plans_shows_the_open_plans_board() {
+    let Opened { host, _browser, mut page, palette: p, .. } = open(fake_host::many_plans(), PHONE, true);
+    let dir = many_plans_dir();
+    let pixels = (PHONE.0 * PHONE_SCALE, PHONE.1 * PHONE_SCALE);
+    let css = |r: Rect| {
+        Rect::from_min_max((r.min.to_vec2() * layout::ZOOM).to_pos2(), (r.max.to_vec2() * layout::ZOOM).to_pos2())
+    };
+    let points = Rect::from_min_size(Pos2::ZERO, vec2(PHONE.0, PHONE.1) / layout::ZOOM);
+    let regions =
+        layout::regions(points, &Viewport { visible: Some(points), coarse: true, ..Viewport::default() }, false);
+    let (screen, body) = (css(points), css(regions.body));
+    let header = Rect::from_min_max(body.left_top(), pos2(screen.right(), body.top() + 270.0));
+    let approve = |page: &mut DevTools| {
+        boxes(page, p.accent, 6, header, 150.0).into_iter().find(|b| b.width() >= 40.0 && b.height() >= 40.0)
+    };
+
+    // The open plan's board at once, its Approve a finger's size, under the one row the picker takes.
+    let (button, png) = until_on(&mut page, pixels, &dir, "the open plan's Approve", approve);
+    std::fs::write(dir.join("phone.png"), base64(&png)).unwrap();
+    eprintln!("many plans, phone: {}", dir.join("phone.png").display());
+    assert!(button.top() > body.top() + 44.0 && button.bottom() < body.bottom(), "on screen: {button:?}");
+
+    // History, at the row's right end, opens the finished plans; a tap on one shows its board, read-only.
+    let row = body.top() + layout::TOUCH * layout::ZOOM / 2.0;
+    page.tap(pos2(screen.right() - 40.0, row));
+    thread::sleep(Duration::from_millis(800));
+    let shot = page.call("Page.captureScreenshot", json!({ "format": "png" }));
+    std::fs::write(dir.join("phone-history.png"), base64(shot["data"].as_str().expect("a screenshot"))).unwrap();
+    page.tap(pos2(screen.center().x, row + 70.0));
+    let ((), png) =
+        until_on(&mut page, pixels, &dir, "the finished plan's board", |page| approve(page).is_none().then_some(()));
+    std::fs::write(dir.join("phone-history-plan.png"), base64(&png)).unwrap();
+
+    // The open plan, first in the strip, is one tap away, and a tap on its Approve approves it.
+    page.tap(pos2(body.left() + 60.0, row));
+    let (button, _) = until_on(&mut page, pixels, &dir, "the open plan's Approve again", approve);
+    page.tap(button.center());
+    wait_host(&host, "plan_command approve for the open plan", |h| {
+        h.received.iter().any(|m| {
+            matches!(m, Message::PlanCommand(c) if c.action == PlanAction::Approve
+                && c.plan.as_deref() == Some("p1") && c.digest.as_deref() == Some("digest-1"))
+        })
+    });
 }

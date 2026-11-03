@@ -274,12 +274,15 @@ pub fn right_panel(ui: &mut egui::Ui, rect: Rect, platform: &mut impl Platform) 
 }
 
 /// The sidebar: the host's USAGE, its TICKETS and the AGENTS over the EXPLORER, which takes the rest while a
-/// worktree's files show.
+/// worktree's files show. A backend with no projects and no way to open one has no EXPLORER.
 pub fn sidebar(ui: &mut egui::Ui, platform: &mut impl Platform) {
-    let files_root = read(platform, |backend, _| backend.view_hints().diff_target);
+    let (files_root, explorer) = read(platform, |backend, _| {
+        let explorer = !backend.repos().is_empty() || backend.available(&Command::PickProject);
+        (backend.view_hints().diff_target, explorer)
+    });
     platform.sidebar_usage(ui);
     let total = ui.available_height();
-    let sessions_height = if files_root.is_some() { (total * 0.46).max(150.0) } else { total };
+    let sessions_height = if explorer && files_root.is_some() { (total * 0.46).max(150.0) } else { total };
     ui.add_space(6.0);
     egui::ScrollArea::vertical().id_salt("sidebar").max_height(sessions_height).auto_shrink([false, true]).show(
         ui,
@@ -289,9 +292,11 @@ pub fn sidebar(ui: &mut egui::Ui, platform: &mut impl Platform) {
         },
     );
 
-    ui.add_space(4.0);
-    ui.separator();
-    platform.draw(|backend, client, _| sidebar::explorer(ui, backend, client));
+    if explorer {
+        ui.add_space(4.0);
+        ui.separator();
+        platform.draw(|backend, client, _| sidebar::explorer(ui, backend, client));
+    }
 }
 
 /// The top bar: the brand, the navigation with the notice line, the chief's pill (centered while there is
@@ -428,6 +433,12 @@ pub fn welcome(ui: &mut egui::Ui, rect: Rect, byline: Option<&str>, backend: &dy
             ui.label(RichText::new(place).color(p.muted).size(12.0));
         }
         ui.add_space(14.0);
-        ui.label(RichText::new("Click an agent's title to see its worktree's diff against main.\nComment on any line and send the review straight to the agent.").color(p.muted).size(12.0));
+        let reviews = backend.available(&Command::SendReview(PathBuf::new()));
+        let hint = if reviews {
+            "Click an agent's title to see its worktree's diff against main.\nComment on any line and send the review straight to the agent."
+        } else {
+            "Click an agent's title to see its worktree's diff against main."
+        };
+        ui.label(RichText::new(hint).color(p.muted).size(12.0));
     });
 }

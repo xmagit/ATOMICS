@@ -875,14 +875,19 @@ gauge, USAGE, `+ New`, Project, the steer bar) are hooks the browser leaves empt
 the place of the desktop's Remote item, and the ⋯ layout menu that of Settings. What the desktop keeps in its
 host's model about its window (the tab, the active session, the right panel, the chief's window) the browser keeps
 per page (`atomics-web/src/desk.rs`), following the desktop's rules for the view commands; the tabs are the plans'
-and Ungrouped, and a page opens on the first plan's with its board beside the agents. A click into a terminal sends
-what is typed there, as on the desktop: the page's one input moves over it, focused.
+and Ungrouped, and a page opens as the desktop does, on the first open plan's with its board beside the agents, and
+keeps its plan by id. Finished plans are reached through History; with no open plan, every agent shows and no board.
+A click into a terminal, or picking an agent, sends what is typed there, as on the desktop: the page's one input
+moves over it, focused, and the terminal it left gets its lease back. A chief's permission request is answered over
+the chief's terminal, and connection trouble (why the page stopped, or that the board may be out of date) stays in
+a line under the frame.
 
 On a phone (narrower than 600 CSS pixels, or 900 with a coarse pointer; the ⋯ menu overrides it, remembered in the
 client origin's `localStorage`), one pane at a time from a bottom bar, each a view of the desktop's: Agents (the
-sidebar's AGENTS list; a tap opens the agent's tile), Board, Diffs (the worktrees with changes, then the diff
-panel), Terminal (the active agent's fleet tile at the pane's size: its header, its approval banner, its terminal)
-and Chief (the chief's window). The approvals are behind the top bar's ◆ badge, selected while they show. All of it
+sidebar's AGENTS list; a tap opens the agent's tile), Board (the current plan's board under one row to pick plans
+from: the open ones in a strip that scrolls sideways, the finished ones behind a scrolling History), Diffs (the
+worktrees with changes, then the diff panel), Terminal (the active agent's fleet tile at the pane's size: its header,
+its approval banner, its terminal) and Chief (the chief's window, with the request it waits on). The approvals are behind the top bar's ◆ badge, selected while they show. All of it
 sits inside `visualViewport` and the safe-area insets (the sides too, for a phone held sideways). The page's own
 controls take the theme's colours as CSS custom properties.
 
@@ -908,7 +913,10 @@ desktop, and lasts as long as the lease (**Computer's size** gives it back early
   from `keydown` (Ctrl+V and Cmd stay the browser's), a soft keyboard's Return and Backspace from `beforeinput`
   where its `keydown` names no key, and pastes. The field has autocorrect, autocapitalisation, autocomplete and
   spellcheck off. A touch on it is handled by the client: a tap focuses it from the touch's own handler (which
-  opens the keyboard), and the browser's loupe, callout and page zoom never start.
+  opens the keyboard), and the browser's loupe, callout and page zoom never start. It takes the pointer only where
+  egui would give the terminal the pointer: a floating window over the terminal is cut out of it with a `clip-path`,
+  so the browser sends that part's pointer to the canvas, and all of it goes while a menu or popup is open, so a click
+  away closes the popup as it does anywhere else.
 - **The key bar** (two rows: Esc, Tab, sticky Ctrl and Alt, the arrows, PgUp/PgDn, `|` `~` `/` `-`, Paste) shows
   while the field has the focus on a coarse pointer, sits on `visualViewport`'s bottom edge, clear of the
   safe area's sides, and takes the bottom bar's place. Its keys are at least 44 CSS pixels each way (a screen
@@ -917,14 +925,15 @@ desktop, and lasts as long as the lease (**Computer's size** gives it back early
   client types; a one-finger drag scrolls this client's own history (`history_get` as it reaches older lines; new
   output does not move a view scrolled back) and pans; a long press (450 ms) selects the word under the finger
   (letters, digits and `_-./~:@%+`; else the one cell), out to wherever the finger then moves, with a handle at
-  each end to drag; a **Copy** chip copies just that range on its touch's end, leaving the focus where it was (see
-  the iframe above). The page's own text selection is off. A pinch sets the font size (5-28
+  each end to drag; a **Copy** chip, above the selection or below it where there is no room in the terminal, copies
+  just that range on its touch's end, leaving the focus where it was (see the iframe above). The page's own text selection is off. A pinch sets the font size (5-28
   points). A touch whose lift never reached the client is cancelled when the next touch starts. A mouse clicks
   and drag-selects, and its wheel scrolls; Ctrl+wheel zooms. In the alternate screen, or with SGR mouse reports, a
   scroll sends arrows or wheel reports instead, as the desktop does, only while this client types.
 - **Typing needs the lease.** Only the tap that focuses the field asks for a free lease; text typed meanwhile waits
   for the grant (16 KiB at most, this connection only), and a lease state sent before the host read the request
-  leaves it standing. Typing never asks for the lease: text, keys and pastes count only while the field has the
+  leaves it standing. The input moving to another terminal, or to none, releases the lease (a grant still on its way
+  goes back when it comes), so another browser never sees it held by someone who has moved on. Typing never asks for the lease: text, keys and pastes count only while the field has the
   focus and this client holds the lease or is asking for it, and anything else is dropped, never kept. Another
   client typing makes the field read-only, with **Take over**. The lease is renewed every 10 s while the field has
   the focus. Losing it (the desktop types or takes it back, another client takes over), or being refused it, takes
@@ -943,7 +952,8 @@ desktop, and lasts as long as the lease (**Computer's size** gives it back early
 board, commands and grants, reconnecting and every stop against an in-process host built from `atomics_core`
 (`src/fake_host.rs`, whose terminals echo under leases); the terminals' leases, typing, history, no replay and
 `slow_client`; that nothing typed after a take back types or asks for the lease; the gestures; the overlay's
-events; the phone layout at 360, 390 and 430 points; key encoding per terminal mode (`atomics_ui::terminal::encode`);
+events and what is cut out of it; the page's plan and tabs against the desktop's rules; the phone layout at 360, 390
+and 430 points; key encoding per terminal mode (`atomics_ui::terminal::encode`);
 the views drawn headless; the manifest; and that the crate names no hosting product.
 
 `tests/browser.rs` runs the real bundle in headless Chrome against that host, behind a fake broker. On a desktop
@@ -955,8 +965,11 @@ focuses a terminal with a tap, types a line, Return, Backspace and the key bar's
 key is 44 CSS pixels each way), and once the desktop takes the terminal back checks that the field lost the focus
 and typing sends nothing; then it long-presses a word, drags the selection's end handle over the next word and
 checks that Copy copies exactly those two words. It saves every screen as a PNG in `target/phone-shots/` for a
-person to review. In a 1600 × 1000 window it checks the desktop's frame: the board, the docked chief's terminal and
-the agent's tile, a click into either terminal typing there, and Approve plan; it saves `target/wide-shots/browser.png`
+person to review. A click on a floating chief types there, and a click on a ⋯ menu entry over a terminal acts and
+takes no lease; a host of 26 plans, 25 of them archived, opens with the open plan's Approve plan on screen in a wide
+window and on a phone, where History reaches the others (`target/many-plans-shots/`). In a 1600 × 1000 window it
+checks the desktop's frame: the board, the docked chief's terminal and the agent's tile, a click into either terminal
+typing there and releasing the other's lease, and Approve plan; it saves `target/wide-shots/browser.png`
 and, beside the desktop's QA screenshot of the same board (`scripts/wide-desktop-shot.sh`, which writes
 `target/wide-shots/desktop.png`), `target/wide-shots/side-by-side.png`. All three need the bundle and Chrome, so
 they are ignored by default:

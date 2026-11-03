@@ -38,6 +38,91 @@ fn a_page_opens_on_the_first_plans_tab_with_its_first_agent_active() {
 }
 
 #[test]
+fn a_page_opens_on_the_first_open_plan_with_a_name_whatever_sorts_before_it() {
+    use atomics_core::plan::PlanStatus::{Archived, Completed, Open};
+
+    let mut host = fake_host::host();
+    host.board.plans.push(fake_host::closed_plan("a-archived", Archived, "Archived"));
+    host.board.plans.push(fake_host::closed_plan("b-done", Completed, "Done"));
+    host.board.plans.push(fake_host::closed_plan("", Open, ""));
+    let mut world = World::paired(host);
+    let mut desk = Desk::default();
+    // Before the board is in: nothing to show, and the plan's tab still to open.
+    settle(&mut desk, &world);
+    assert!(!desk.hints(&world.driver.remote).plan_view && desk.plan_view);
+    world.boot(None);
+    settle(&mut desk, &world);
+    let hints = desk.hints(&world.driver.remote);
+    assert_eq!(desk.plan.as_deref(), Some("p1"));
+    assert_eq!((hints.plan_view, hints.selected_plan, hints.panel), (true, 3, PanelMode::Plan));
+    assert_eq!(desk.active.as_deref(), Some("s1"), "the plan's agent");
+}
+
+#[test]
+fn a_plan_stays_selected_by_its_id_until_it_goes() {
+    use atomics_core::wire::Message;
+
+    let mut world = live();
+    let mut desk = Desk::default();
+    settle(&mut desk, &world);
+    let earlier = fake_host::closed_plan("a-new", atomics_core::plan::PlanStatus::Open, "Sorts first");
+    let frames = world.host.event(|cursor| Message::PlanUpsert { cursor, plan: earlier });
+    world.deliver(frames);
+    settle(&mut desk, &world);
+    assert_eq!(desk.plan.as_deref(), Some("p1"), "an earlier open plan takes nothing over");
+    assert_eq!(desk.hints(&world.driver.remote).selected_plan, 1);
+    // A picked plan the host no longer has gives way to the first open one.
+    desk.plan = Some("gone".into());
+    settle(&mut desk, &world);
+    assert_eq!(desk.plan.as_deref(), Some("a-new"));
+    assert_eq!(desk.hints(&world.driver.remote).selected_plan, 0);
+}
+
+#[test]
+fn a_tab_opens_as_the_desktops_does() {
+    use atomics_core::plan::PlanStatus::Archived;
+
+    let mut host = fake_host::host();
+    host.board.plans.push(fake_host::closed_plan("z-old", Archived, "Old"));
+    let mut world = World::paired(host);
+    world.boot(None);
+    let remote = &world.driver.remote;
+    let mut desk = Desk::default();
+    settle(&mut desk, &world);
+
+    // A finished plan's board: the panel opens, and no session or worktree stays picked.
+    desk.apply(Command::CloseDiff, remote);
+    desk.apply(Command::ShowRoot("/w/other".into()), remote);
+    desk.apply(Command::CloseDiff, remote);
+    desk.apply(Command::ViewPlanHistory(1), remote);
+    settle(&mut desk, &world);
+    let hints = desk.hints(remote);
+    assert_eq!(desk.plan.as_deref(), Some("z-old"));
+    assert!(hints.diff_open && hints.plan_view && hints.panel == PanelMode::Plan, "{hints:?}");
+    assert_eq!((desk.active.as_deref(), desk.diff_root.as_deref()), (None, None));
+
+    // An open plan's tab: a floating chief steps aside for the fleet, and a worktree picked on its own goes
+    // with the session picked for the tab.
+    desk.apply(Command::SetChiefDock(ChiefDock::Floating), remote);
+    desk.apply(Command::ShowRoot("/w/other".into()), remote);
+    desk.apply(Command::ShowPlan(0), remote);
+    settle(&mut desk, &world);
+    assert!(!desk.chief.open);
+    assert_eq!((desk.active.as_deref(), desk.diff_root.as_deref()), (Some("s1"), None));
+    assert_eq!(desk.hints(remote).panel, PanelMode::Diff);
+    // So does a docked chief the window had no room for.
+    desk.apply(Command::SetChiefDock(ChiefDock::Docked), remote);
+    desk.apply(Command::ToggleChief, remote);
+    desk.dock_fits = false;
+    desk.apply(Command::ShowPlan(0), remote);
+    assert!(!desk.chief.open);
+    desk.dock_fits = true;
+    desk.apply(Command::ToggleChief, remote);
+    desk.apply(Command::ShowPlan(0), remote);
+    assert!(desk.chief.open, "one beside the fleet stays");
+}
+
+#[test]
 fn view_commands_move_the_page_as_they_move_the_desktop() {
     let world = live();
     let remote = &world.driver.remote;

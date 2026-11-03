@@ -302,6 +302,12 @@ export function place(x, y, width, height) {
   ta.hidden = false;
 }
 
+/** Leave out of the overlay what the app draws over it (a CSS clip-path, empty for nothing): the browser gives
+    the pointer over a clipped part to the canvas under it. */
+export function setClip(clip) {
+  ta.style.clipPath = clip;
+}
+
 /** No terminal shows. */
 export function hide() {
   if (document.activeElement === ta) ta.blur();
@@ -334,8 +340,9 @@ export function setSticky(ctrl, alt) {
   }
 }
 
-/** Offer Copy for `text` at (x, y), above the selection; `null` takes it away. */
-export function setCopy(text, x, y) {
+/** Offer Copy for `text` around x: above `y`, or below `below` where that would leave the terminal and cover
+    the strip over it. `null` takes it away. */
+export function setCopy(text, x, y, below) {
   copyText = text;
   chip.hidden = !text;
   if (!text) {
@@ -347,8 +354,9 @@ export function setCopy(text, x, y) {
   const width = chip.offsetWidth || 64;
   const height = chip.offsetHeight || 44;
   const left = Math.max(8, Math.min(innerWidth - width - 8, x - width / 2));
-  const top = Math.max(8, y - height - 8);
-  Object.assign(chip.style, { left: left + "px", top: top + "px" });
+  const above = y - height - 8;
+  const top = above >= px(ta.style.top) ? above : Math.min(innerHeight - height - 8, below + 8);
+  Object.assign(chip.style, { left: left + "px", top: Math.max(8, top) + "px" });
 }
 
 /** The app's theme for the page's own controls: `{name: "rgba(…)"}` as CSS custom properties. */

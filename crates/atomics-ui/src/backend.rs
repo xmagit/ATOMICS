@@ -373,6 +373,11 @@ pub trait Backend {
     /// names count, not its other fields.
     fn available(&self, command: &Command) -> bool;
 
+    /// Whether the platform takes the `[keys]` chords, so that a tooltip may name them.
+    fn has_shortcuts(&self) -> bool {
+        true
+    }
+
     /// Every plan, in the host's order. The UI addresses a plan by its position in this list.
     fn plan_list(&self) -> Vec<PlanRow>;
 

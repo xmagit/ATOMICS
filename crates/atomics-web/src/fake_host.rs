@@ -856,6 +856,33 @@ pub fn file_diff(path: &str, lines: u32) -> FileDiff {
     }
 }
 
+/// A finished plan with no tasks.
+pub fn closed_plan(id: &str, status: atomics_core::plan::PlanStatus, goal: &str) -> PlanInfo {
+    PlanInfo {
+        id: id.into(),
+        status,
+        goal: goal.into(),
+        project: Some("/w/repo".into()),
+        approved: true,
+        integration: None,
+        tasks: Vec::new(),
+        digest: String::new(),
+        ticket: None,
+    }
+}
+
+/// [`host`] with 26 plans, as a host that has run for a while has them: 25 archived, and in id order the open
+/// plan at position 23.
+pub fn many_plans() -> FakeHost {
+    use atomics_core::plan::PlanStatus;
+    let mut host = self::host();
+    for n in 0..25 {
+        let id = if n < 23 { format!("a-{n:02}") } else { format!("z-{n:02}") };
+        host.board.plans.push(closed_plan(&id, PlanStatus::Archived, &format!("Archived plan number {n}")));
+    }
+    host
+}
+
 /// The board's host with its two files' diffs, and a terminal for the agent and for the chief.
 pub fn host() -> FakeHost {
     let mut host = FakeHost::new(board());

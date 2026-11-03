@@ -7,8 +7,8 @@
 //! that framed this page, is dropped before its data is read.
 //!
 //! Terminal input is the page's `<textarea>` overlay and key bar (`web/terminal.js`): what it reports is
-//! read by [`crate::page`] and handed to the terminal pane, and after each frame the overlay is placed and
-//! set as the pane says ([`Overlay`]).
+//! read by [`crate::page`] and handed to the terminal pane, and after each frame the overlay is placed,
+//! clipped and set as the pane says ([`Overlay`]).
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -30,7 +30,7 @@ use crate::device::{self, Device};
 use crate::driver::{Driver, Output};
 use crate::layout::{self, LayoutMode};
 use crate::page::{self, PageEvent};
-use crate::term_pane::Overlay;
+use crate::term_pane::{self, Overlay};
 use crate::views::{self, BundledFonts, Tab, View};
 
 /// The largest message event read from the parent, as JSON text.
@@ -50,6 +50,8 @@ extern "C" {
 extern "C" {
     fn install(keys: &str, callback: &Closure<dyn FnMut(JsValue)>);
     fn place(x: f32, y: f32, width: f32, height: f32);
+    #[wasm_bindgen(js_name = setClip)]
+    fn set_clip(clip: &str);
     fn hide();
     #[wasm_bindgen(js_name = setWritable)]
     fn set_writable(on: bool);
@@ -60,7 +62,7 @@ extern "C" {
     #[wasm_bindgen(js_name = setSticky)]
     fn set_sticky(ctrl: bool, alt: bool);
     #[wasm_bindgen(js_name = setCopy)]
-    fn set_copy(text: Option<String>, x: f32, y: f32);
+    fn set_copy(text: Option<String>, x: f32, y: f32, below: f32);
     #[wasm_bindgen(js_name = setTheme)]
     fn set_theme(colors: &str);
     #[wasm_bindgen(js_name = loadLayout)]
@@ -174,6 +176,18 @@ pub fn start() {
     });
 }
 
+/// The ATOMICS icon, for the top bar's brand.
+fn load_icon(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let decoder = png::Decoder::new(std::io::Cursor::new(include_bytes!("../../../assets/icon.png")));
+    let mut reader = decoder.read_info().ok()?;
+    let mut rgba = vec![0; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut rgba).ok()?;
+    rgba.truncate(info.buffer_size());
+    let size = [info.width as usize, info.height as usize];
+    let image = egui::ColorImage::from_rgba_unmultiplied(size, &rgba);
+    Some(ctx.load_texture("atomics-icon", image, egui::TextureOptions::LINEAR))
+}
+
 /// A random prefix for this page's operation IDs.
 fn op_prefix() -> String {
     let mut bytes = [0u8; 8];
@@ -198,8 +212,9 @@ impl App {
         let agent = window.navigator().user_agent().unwrap_or_default();
         let driver =
             Driver::new(parent.as_ref().map(|(_, origin)| origin.clone()), &op_prefix(), &device::name(&agent));
-        let client = Client::default();
+        let mut client = Client::default();
         client.palette.apply(&ctx, &BundledFonts);
+        client.icon = load_icon(&ctx);
         let inbox: Inbox = Rc::default();
         let listener = {
             let (inbox, ctx, parent) = (inbox.clone(), ctx.clone(), parent.clone());
@@ -273,6 +288,9 @@ impl App {
                 None => hide(),
             }
         }
+        if let Some(rect) = now.rect.filter(|_| now.rect != last.rect || now.covered != last.covered) {
+            set_clip(&term_pane::clip_path(rect, &now.covered, zoom));
+        }
         if (now.ctrl, now.alt) != (last.ctrl, last.alt) {
             set_sticky(now.ctrl, now.alt);
         }
@@ -282,8 +300,8 @@ impl App {
         }
         if now.copy != last.copy {
             match &now.copy {
-                Some((text, at)) => set_copy(Some(text.clone()), at.x * zoom, at.y * zoom),
-                None => set_copy(None, 0.0, 0.0),
+                Some((text, at, below)) => set_copy(Some(text.clone()), at.x * zoom, at.y * zoom, below * zoom),
+                None => set_copy(None, 0.0, 0.0, 0.0),
             }
         }
         self.applied = now;
