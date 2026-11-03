@@ -9,7 +9,7 @@ use crate::{Backend, Client, Command};
 /// Draws the first permission request the session at `index` of [`Backend::session_list`] waits on at the
 /// top of its tile's `body`, and returns the part of `body` below it; with no request waiting, `body` as it
 /// is. Allow, Allow always (never for Azure REST) and Deny record a [`Command::Decide`] once per request;
-/// the buttons stay disabled until the host has decided.
+/// the buttons stay disabled until the host has decided, and are not drawn where the backend cannot decide.
 pub fn banner(ui: &mut egui::Ui, body: Rect, index: usize, backend: &dyn Backend, client: &mut Client) -> Rect {
     let Some(pending) = backend.session_approval(index) else { return body };
     let p = client.palette.clone();
@@ -25,7 +25,12 @@ pub fn banner(ui: &mut egui::Ui, body: Rect, index: usize, backend: &dyn Backend
     child.set_clip_rect(banner);
     child.label(RichText::new("Permission requested").color(p.warning).strong());
     let mut decided = None;
+    let can_decide =
+        backend.available(&Command::Decide { session: index, approval: pending.id.clone(), decision: Decision::Deny });
     child.horizontal_wrapped(|ui| {
+        if !can_decide {
+            return;
+        }
         for (label, decision) in
             [("Allow", Decision::Allow), ("Allow always", Decision::AllowAlways), ("Deny", Decision::Deny)]
         {

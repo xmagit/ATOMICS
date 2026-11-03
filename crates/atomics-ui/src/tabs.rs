@@ -1,6 +1,7 @@
 //! The top bar's navigation: the All, Ungrouped and Repos tabs, a tab per plan, the menu the tabs that do
 //! not fit move into, and the plan history. Tabs share a bounded slot: labels shorten first, then tabs move
-//! into the menu, while the selected tab and the plans that need the user stay in the row.
+//! into the menu, while the selected tab and the plans that need the user stay in the row. A tab, a close
+//! button or a menu entry whose command the backend cannot carry out is left out.
 
 use std::path::{Path, PathBuf};
 
@@ -125,7 +126,17 @@ impl Nav<'_> {
 
     fn view_tabs(&mut self, ui: &mut egui::Ui) {
         let rows = self.backend.plan_list();
-        let mut tabs = vec![ViewTab::All, ViewTab::Ungrouped, ViewTab::Repos];
+        let views = self.backend.available(&Command::SetView(None));
+        let mut tabs = Vec::new();
+        if views {
+            tabs.push(ViewTab::All);
+        }
+        if self.backend.available(&Command::ShowUngrouped) {
+            tabs.push(ViewTab::Ungrouped);
+        }
+        if views {
+            tabs.push(ViewTab::Repos);
+        }
         tabs.extend(
             rows.iter()
                 .enumerate()
@@ -133,6 +144,7 @@ impl Nav<'_> {
                     !row.id.is_empty()
                         && (row.status != PlanStatus::Archived
                             || self.hints.plan_view && self.hints.selected_plan == *index)
+                        && self.backend.available(&plan_command(row, *index))
                 })
                 .map(|(index, _)| ViewTab::Plan(index)),
         );
@@ -466,7 +478,9 @@ impl Nav<'_> {
         }
         let mut close_clicked = false;
         let mut over_close = false;
-        if let ViewTab::Plan(index) = tab {
+        if let ViewTab::Plan(index) = tab
+            && self.backend.available(&Command::ClosePlanTab(*index))
+        {
             let close =
                 Rect::from_center_size(pos2(response.rect.right() - 12.0, response.rect.center().y), vec2(18.0, 18.0));
             let _id = egui::Id::NULL.with(("plan-close", plan_row.as_ref().map_or("", |row| row.id.as_str())));
@@ -503,8 +517,8 @@ impl Nav<'_> {
                 ViewTab::Project(root) => self.client.send(Command::SetView(Some(root.clone()))),
                 ViewTab::Repos => unreachable!(),
                 ViewTab::Plan(index) => {
-                    if plan_row.as_ref().is_some_and(|row| row.status == PlanStatus::Open) {
-                        self.client.send(Command::ShowPlan(*index));
+                    if let Some(row) = &plan_row {
+                        self.client.send(plan_command(row, *index));
                     } else {
                         self.client.send(Command::ViewPlanHistory(*index));
                     }
@@ -515,7 +529,7 @@ impl Nav<'_> {
             }
         }
         match tab {
-            ViewTab::Project(root) => {
+            ViewTab::Project(root) if self.backend.available(&Command::CloseIdle(root.clone())) => {
                 response.context_menu(|ui| {
                     if ui
                         .button("Close idle sessions")
@@ -527,7 +541,10 @@ impl Nav<'_> {
                     }
                 });
             }
-            ViewTab::Plan(index) if plan_row.as_ref().is_some_and(|row| row.status == PlanStatus::Completed) => {
+            ViewTab::Plan(index)
+                if plan_row.as_ref().is_some_and(|row| row.status == PlanStatus::Completed)
+                    && self.backend.available(&Command::ClosePlanTab(*index)) =>
+            {
                 response.context_menu(|ui| {
                     if ui.button("Archive plan").clicked() {
                         self.client.send(Command::ClosePlanTab(*index));
@@ -542,6 +559,8 @@ impl Nav<'_> {
     fn history_menu(&mut self, ui: &mut egui::Ui) {
         let mut view = None;
         let mut reopen = None;
+        let can_view = self.backend.available(&Command::ViewPlanHistory(0));
+        let can_reopen = self.backend.available(&Command::ReopenPlan(0));
         let response = ui
             .menu_button("History", |ui| {
                 for (index, plan) in self
@@ -562,17 +581,21 @@ impl Nav<'_> {
                             .on_hover_text(
                                 "Date the plan was last saved, or its last task completion when no saved file exists",
                             );
-                            let response = ui.button("View");
-                            record_history_action(ui, &plan.id, "view", &response);
-                            if response.clicked() {
-                                view = Some(index);
-                                ui.close();
+                            if can_view {
+                                let response = ui.button("View");
+                                record_history_action(ui, &plan.id, "view", &response);
+                                if response.clicked() {
+                                    view = Some(index);
+                                    ui.close();
+                                }
                             }
-                            let response = ui.button("Reopen");
-                            record_history_action(ui, &plan.id, "reopen", &response);
-                            if response.clicked() {
-                                reopen = Some(index);
-                                ui.close();
+                            if can_reopen {
+                                let response = ui.button("Reopen");
+                                record_history_action(ui, &plan.id, "reopen", &response);
+                                if response.clicked() {
+                                    reopen = Some(index);
+                                    ui.close();
+                                }
                             }
                         });
                     });
@@ -587,6 +610,11 @@ impl Nav<'_> {
             self.client.send(Command::ReopenPlan(index));
         }
     }
+}
+
+/// What a plan's tab asks for: an open plan's sessions and board, else the finished plan's board, read-only.
+fn plan_command(row: &PlanRow, index: usize) -> Command {
+    if row.status == PlanStatus::Open { Command::ShowPlan(index) } else { Command::ViewPlanHistory(index) }
 }
 
 fn record_history_action(_ui: &egui::Ui, _plan: &str, _action: &str, _response: &egui::Response) {

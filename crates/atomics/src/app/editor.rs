@@ -85,47 +85,7 @@ pub(super) fn save_png(path: &Path, image: &egui::ColorImage) -> anyhow::Result<
 }
 
 impl Desktop<'_> {
-    pub(super) fn diff_panel(&mut self, ui: &mut egui::Ui, rect: Rect) {
-        self.sync_diffs();
-        if self.runtime.panel == PanelMode::Plan {
-            self.plan_panel(ui, rect);
-            return;
-        }
-        if self.runtime.panel == PanelMode::Tickets {
-            self.tickets_panel(ui, rect);
-            return;
-        }
-        if self.runtime.panel == PanelMode::Diff && self.github_pr_panel(ui, rect) {
-            return;
-        }
-        let Some(root) = self.runtime.diff_target() else { return };
-        // What changed sits right next to the diff/editor, in both modes.
-        let rect = if rect.width() >= 760.0 {
-            let column = rect.with_max_x(rect.left() + 250.0);
-            let current = match self.runtime.panel {
-                PanelMode::Editor => self.client.editor_file.get(&root).cloned(),
-                _ => self.client.diff_views.get(&root).and_then(|d| d.focused.clone()),
-            };
-            let p = self.palette();
-            let state = self.client.diff_views.entry(root.clone()).or_default();
-            if let Some((path, line)) = diff_view::changed_files(ui, column, state, current.as_deref(), &p) {
-                match self.runtime.panel {
-                    PanelMode::Editor => self.send(Command::Edit { root: root.clone(), path: Some(path), line }),
-                    _ => self.send(Command::OpenFile { root: root.clone(), path }),
-                }
-            }
-            rect.with_min_x(column.right())
-        } else {
-            rect
-        };
-        if self.runtime.panel == PanelMode::Editor {
-            self.editor_panel(ui, rect, &root);
-            return;
-        }
-        self.draw(|backend, client| atomics_ui::diff_panel::draw(ui, rect, &root, backend, client));
-    }
-
-    fn editor_panel(&mut self, ui: &mut egui::Ui, rect: Rect, root: &Path) {
+    pub(super) fn editor_panel(&mut self, ui: &mut egui::Ui, rect: Rect, root: &Path) {
         let p = self.palette();
         ui.painter().rect_filled(rect, 0.0, p.terminal);
         let header = rect.with_max_y(rect.top() + 30.0);

@@ -198,3 +198,132 @@ fn archive_finished_is_not_sent_as_unconditional_archive() {
     assert!(remote.take_outgoing().is_empty());
     assert!(remote.notice().unwrap().contains("not available"));
 }
+
+#[test]
+fn only_what_the_browser_can_send_is_available() {
+    let decide = Command::Decide { session: 1, approval: "a1".into(), decision: Decision::Allow };
+    let offline = RemoteBackend::new("op");
+    assert!(!offline.available(&Command::ApprovePlan(0)), "offline nothing can be sent");
+    assert!(offline.available(&Command::ShowPlan(0)), "the frame's own commands stay");
+
+    let controller = connected(Role::Controller);
+    for command in [decide.clone(), Command::ApprovePlan(0), Command::RefreshDiff(WORKTREE.into())] {
+        assert!(controller.available(&command), "{command:?}");
+    }
+    for command in
+        [Command::Activate { session: "s1".into(), open_diff: true }, Command::ToggleDiff, Command::Toast("hi".into())]
+    {
+        assert!(controller.available(&command), "the frame carries out {command:?}");
+    }
+    for command in [
+        Command::DispatchReady(0),
+        Command::IntegrateAccepted(0),
+        Command::ArchiveFinished(0),
+        Command::ClosePlan { plan: 0, status: PlanStatus::Completed },
+        Command::SendReview(WORKTREE.into()),
+        Command::Steer { sessions: vec!["s1".into()], text: "go on".into() },
+        Command::CloseSession("s1".into()),
+        Command::Start { agent: "claude".into(), folder: None },
+        Command::ToggleChief,
+        Command::NewSession,
+        Command::PickProject,
+        Command::SetView(None),
+        Command::ShowUngrouped,
+        Command::Rename("s1".into()),
+        Command::HideChief,
+    ] {
+        assert!(!controller.available(&command), "{command:?}");
+    }
+
+    let viewer = connected(Role::Viewer);
+    assert!(!viewer.available(&decide), "a viewer may not decide");
+    assert!(!viewer.available(&Command::ApprovePlan(0)));
+    assert!(viewer.available(&Command::ShowPlan(0)));
+}
+
+/// The window's frame over this backend, with no host items and no terminals.
+struct Frame<'a> {
+    remote: &'a RemoteBackend,
+    client: atomics_ui::Client,
+}
+
+struct NoTerminals;
+
+impl atomics_ui::terminal_surface::TerminalSurface for NoTerminals {
+    fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        _index: usize,
+        _session: &str,
+        rect: egui::Rect,
+        id: egui::Id,
+        _metrics: &atomics_ui::terminal::Metrics,
+        _palette: &atomics_ui::theme::Palette,
+    ) -> egui::Response {
+        ui.interact(rect, id, egui::Sense::click())
+    }
+}
+
+impl atomics_ui::shell::Platform for Frame<'_> {
+    fn draw<R>(
+        &mut self,
+        draw: impl FnOnce(
+            &dyn Backend,
+            &mut atomics_ui::Client,
+            &mut dyn atomics_ui::terminal_surface::TerminalSurface,
+        ) -> R,
+    ) -> R {
+        draw(self.remote, &mut self.client, &mut NoTerminals)
+    }
+}
+
+/// The text the frame draws over `remote` in a wide window, once it has settled.
+fn frame_text(remote: &RemoteBackend) -> Vec<String> {
+    let ctx = egui::Context::default();
+    let mut frame = Frame { remote, client: atomics_ui::Client::default() };
+    let mut text = Vec::new();
+    for time in [0.0, 0.1] {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0))),
+            time: Some(time),
+            ..Default::default()
+        };
+        let output = ctx.run_ui(input, |ui| atomics_ui::shell::frame(ui, &mut frame));
+        text = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.text().to_string()),
+                _ => None,
+            })
+            .collect();
+        output.drop_without_applying_deltas();
+        assert!(frame.client.commands.is_empty(), "drawing alone asks for nothing");
+    }
+    text
+}
+
+#[test]
+fn the_frame_leaves_out_the_host_items_and_what_the_browser_cannot_do() {
+    let remote = connected(Role::Controller);
+    remote.set_view(ViewHints { diff_open: true, ..default_hints() });
+    let text = frame_text(&remote);
+    let has = |label: &str| text.iter().any(|t| t.starts_with(label));
+    for shown in
+        ["ATOMICS", "CHIEF", "◆ Parse faster", "Hide diff", "Plan 0/2", "AGENTS", "EXPLORER", "PLAN", "Approve plan"]
+    {
+        assert!(has(shown), "{shown} is missing: {text:?}");
+    }
+    for host_only in ["USAGE", "TICKETS", "Settings", "Tickets", "load ", "Remote", "Project"] {
+        assert!(!has(host_only), "{host_only} is the host's: {text:?}");
+    }
+    for unavailable in ["+ New", "All ·", "Ungrouped", "Repos", "Close plan…", "Steer", "Send"] {
+        assert!(!has(unavailable), "{unavailable} cannot be sent from the browser: {text:?}");
+    }
+
+    let viewer = connected(Role::Viewer);
+    viewer.set_view(ViewHints { diff_open: true, ..default_hints() });
+    let text = frame_text(&viewer);
+    assert!(text.iter().any(|t| t == "PLAN"), "a viewer sees the board: {text:?}");
+    assert!(!text.iter().any(|t| t == "Approve plan" || t == "Allow"), "but cannot change it: {text:?}");
+}

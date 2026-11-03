@@ -56,7 +56,7 @@ pub(super) fn plan_tab_name(plan: &Plan) -> String {
 
 impl Desktop<'_> {
     /// The TICKETS section: a plan's ticket tree in its view, else Find and the last tickets read.
-    fn tickets_section(&mut self, ui: &mut egui::Ui, p: &Palette) {
+    pub(super) fn tickets_section(&mut self, ui: &mut egui::Ui, p: &Palette) {
         let Some(config) = self.runtime.ticket_config() else { return };
         let mut open: Option<atomics_core::tickets::TicketLink> = None;
         let mut find = false;
@@ -126,32 +126,6 @@ impl Desktop<'_> {
 }
 
 impl Desktop<'_> {
-    pub(super) fn sidebar(&mut self, ui: &mut egui::Ui) {
-        let p = self.palette();
-        let files_root = self.runtime.diff_target();
-        section(ui, &p, "USAGE");
-        self.runtime.usage.show(ui, &p);
-        ui.separator();
-        let total = ui.available_height();
-        let sessions_height = if files_root.is_some() { (total * 0.46).max(150.0) } else { total };
-        ui.add_space(6.0);
-        egui::ScrollArea::vertical().id_salt("sidebar").max_height(sessions_height).auto_shrink([false, true]).show(
-            ui,
-            |ui| {
-                self.tickets_section(ui, &p);
-                self.draw(|backend, client| atomics_ui::sidebar::sessions(ui, backend, client));
-            },
-        );
-
-        ui.add_space(4.0);
-        ui.separator();
-        self.draw(|backend, client| atomics_ui::sidebar::explorer(ui, backend, client));
-    }
-
-    pub(super) fn project_menu(&mut self, ui: &mut egui::Ui) {
-        self.draw(|backend, client| atomics_ui::topbar::project_menu(ui, backend, client));
-    }
-
     pub(super) fn settings_menu(&mut self, ui: &mut egui::Ui) {
         if ui.button("Edit config").clicked() {
             let _ = open_path(&self.runtime.config_path);

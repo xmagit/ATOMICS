@@ -860,7 +860,9 @@ not authenticate (the host's key is not the one this browser paired with).
 **What it offers.** The board, the plans, the approvals, the diffs and the terminals, with `board`, `plans`,
 `approvals`, `diffs`, `terminals`, `input` and `mutations` asked for in `hello`. It answers approvals
 (`approval_decide`), approves plans (`plan_command` `approve`, with the plan's digest) and types into terminals
-when `welcome`'s `may` grants it; any other command says it is not available in the browser yet. A diff on screen
+when `welcome`'s `may` grants it. The shared views ask the backend which commands it can carry out
+(`Backend::available`) and draw no button, menu entry or tab for the others, so a viewer, or a browser that is not
+connected, sees no action it cannot take. A diff on screen
 is fetched file by file with `diff_get`, four files at a time, up to 16 pages each; the browser draws it without
 syntax colours.
 

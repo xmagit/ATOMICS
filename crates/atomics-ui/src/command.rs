@@ -130,6 +130,12 @@ pub enum Command {
         agent: String,
         folder: PathBuf,
     },
+    /// Start a configured agent as `atomics ctl start` does: in `folder`, or with none in a scratch folder
+    /// of its own outside any project. The welcome's buttons start agents this way.
+    Start {
+        agent: String,
+        folder: Option<PathBuf>,
+    },
     /// End a session, by id, and close its tab.
     CloseSession(String),
     /// Start a session again from its record.
@@ -397,6 +403,12 @@ impl Command {
                 .collect(),
             Command::StartAgent { agent, folder } => {
                 let folder = Some(folder.to_string_lossy().into_owned());
+                let action =
+                    SessionAction::Start { agent: agent.clone(), folder, repo: None, branch: None, prompt: None };
+                vec![session(action, op)]
+            }
+            Command::Start { agent, folder } => {
+                let folder = folder.as_ref().map(|folder| folder.to_string_lossy().into_owned());
                 let action =
                     SessionAction::Start { agent: agent.clone(), folder, repo: None, branch: None, prompt: None };
                 vec![session(action, op)]

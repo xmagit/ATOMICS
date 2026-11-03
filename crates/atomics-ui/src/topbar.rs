@@ -1,9 +1,10 @@
 //! The top bar's pieces: laying out a row of widgets (measuring it before drawing it, drawing into a
 //! bounded slot), the brand, the notice line, the diff, new-session and plan buttons and the Project menu.
-//! The bar's layout and its other items (the chief, GitHub, Tickets, load and Settings) are the platform's
-//! for now; the navigation tabs are in [`crate::tabs`].
+//! The bar's layout is [`crate::shell::top_bar`], the navigation tabs are in [`crate::tabs`], and the
+//! chief's pill in [`crate::chief`]. A button whose command the backend cannot carry out is not drawn.
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 
 use atomics_core::config::AgentKind;
 use egui::{Rect, RichText, Sense, vec2};
@@ -84,6 +85,9 @@ pub fn brand(ui: &mut egui::Ui, show_agents: bool, backend: &dyn Backend, client
 
 /// Shows or hides the diff panel.
 pub fn diff_button(ui: &mut egui::Ui, in_menu: bool, backend: &dyn Backend, client: &mut Client) {
+    if !backend.available(&Command::ToggleDiff) {
+        return;
+    }
     let response = ui.button(if backend.view_hints().diff_open { "Hide diff" } else { "Show diff" });
     record_item(ui, "diff", &response);
     if response.on_hover_text(shortcut_label(ui.ctx(), &backend.ui_config().keys.toggle_diff)).clicked() {
@@ -96,6 +100,9 @@ pub fn diff_button(ui: &mut egui::Ui, in_menu: bool, backend: &dyn Backend, clie
 
 /// Opens the new-session dialog.
 pub fn new_button(ui: &mut egui::Ui, in_menu: bool, backend: &dyn Backend, client: &mut Client) {
+    if !backend.available(&Command::NewSession) {
+        return;
+    }
     let response = ui.button("+ New");
     record_item(ui, "+ New", &response);
     if response.on_hover_text(shortcut_label(ui.ctx(), &backend.ui_config().keys.new_session)).clicked() {
@@ -108,6 +115,9 @@ pub fn new_button(ui: &mut egui::Ui, in_menu: bool, backend: &dyn Backend, clien
 
 /// The selected plan's progress; it shows or hides the plan board.
 pub fn plan_button(ui: &mut egui::Ui, in_menu: bool, backend: &dyn Backend, client: &mut Client) {
+    if !backend.available(&Command::TogglePlan) {
+        return;
+    }
     let hints = backend.view_hints();
     let plan = backend.plan_row(hints.selected_plan).expect("a plan is selected");
     let (done, total, attention) = (plan.done, plan.total, plan.attention);
@@ -126,12 +136,12 @@ pub fn plan_button(ui: &mut egui::Ui, in_menu: bool, backend: &dyn Backend, clie
 
 /// The Project menu: open a project, a recent project or a workspace, or save the open projects as one.
 pub fn project_menu(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
-    if ui.button("Open project…").clicked() {
+    if backend.available(&Command::PickProject) && ui.button("Open project…").clicked() {
         ui.close();
         client.send(Command::PickProject);
     }
     let menu = backend.project_menu();
-    if !menu.recent.is_empty() {
+    if !menu.recent.is_empty() && backend.available(&Command::OpenProject(PathBuf::new())) {
         ui.separator();
         ui.label(RichText::new("Recent projects").size(11.0).color(client.palette.muted));
         for (root, display) in menu.recent {
@@ -141,6 +151,9 @@ pub fn project_menu(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Clien
             }
         }
     }
+    if !backend.available(&Command::OpenWorkspace(String::new())) {
+        return;
+    }
     ui.separator();
     ui.label(RichText::new("Workspaces").size(11.0).color(client.palette.muted));
     for name in menu.workspaces {
@@ -149,6 +162,9 @@ pub fn project_menu(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Clien
             client.send(Command::OpenWorkspace(name));
             ui.close();
         }
+    }
+    if !backend.available(&Command::SaveWorkspace(String::new())) {
+        return;
     }
     ui.horizontal(|ui| {
         ui.add(egui::TextEdit::singleline(&mut client.workspace_input).hint_text("name").desired_width(120.0));
@@ -204,6 +220,7 @@ pub fn notice(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     );
     record_item(ui, "notice", &response);
     if response.on_hover_text(text).clicked()
+        && backend.available(&Command::Activate { session: String::new(), open_diff: true })
         && let Some(session) = sessions.iter().find(|s| s.status.needs_attention())
     {
         client.send(Command::Activate { session: session.id.clone(), open_diff: true });

@@ -1,7 +1,6 @@
 use super::fleet::Terminals;
 use super::*;
 use atomics_core::heartbeat::{Finding, Kind};
-use atomics_ui::chief::VoiceState;
 
 struct WakeConditions {
     wake_secs: u64,
@@ -217,26 +216,6 @@ pub(super) const CHIEF_ALLOWED_TOOLS: &[&str] = &[
 ];
 
 impl Desktop<'_> {
-    /// The chief's pill in the top bar (`atomics_ui::chief::pill`), with what the microphone does.
-    pub(super) fn chief_pill(&mut self, ui: &mut egui::Ui, compact: bool) {
-        let voice = match &self.client.voice {
-            Voice::Idle => VoiceState::Idle,
-            Voice::Opening(_) => VoiceState::Opening,
-            Voice::Recording(recorder) => VoiceState::Recording(recorder.elapsed().as_secs()),
-            Voice::Transcribing => VoiceState::Transcribing,
-        };
-        self.draw(|backend, client| atomics_ui::chief::pill(ui, compact, Some(voice), backend, client));
-    }
-
-    /// The floating chief, while it shows and the layout has not docked it.
-    pub(super) fn chief_ui(&mut self, ctx: &egui::Context) {
-        if !self.runtime.chief_open || self.runtime.last_layout.is_some_and(|layout| layout.dock_width > 0.0) {
-            return;
-        }
-        let p = self.palette();
-        atomics_ui::chief::window(ctx, &p, |ui| self.chief_content(ui));
-    }
-
     /// The chief's window, docked or floating (`atomics_ui::chief::content`), with the trace lane under the
     /// terminal while the chief has ticket calls to show. It draws as [`Desktop::draw_terminals`] does, but
     /// the lane's height reads the model while the window draws.

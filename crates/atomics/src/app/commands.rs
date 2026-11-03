@@ -164,6 +164,9 @@ impl Local<'_> {
             Command::Edit { root, path, line } => state.post(move |state| state.edit(&root, path.as_deref(), line)),
             Command::Steer { sessions, text } => state.post(move |state| state.steer_sessions(sessions, text)),
             Command::StartAgent { agent, folder } => state.post(move |state| state.pending_open.push((agent, folder))),
+            Command::Start { agent, folder } => {
+                state.post(move |state| state.client_commands.push(start_request(agent, folder)))
+            }
             Command::CloseSession(id) => state.post(move |state| state.close(&id)),
             Command::Resume(record) => state.post(move |state| state.resume.push(record)),
             Command::ResumeSession(id) => state.post(move |state| state.resume_exited(&id)),
@@ -252,6 +255,19 @@ impl Local<'_> {
     }
 }
 
+/// `atomics ctl start` for an agent in `folder`, or with none in a scratch folder of its own.
+fn start_request(agent: String, folder: Option<PathBuf>) -> ControlRequest {
+    ControlRequest::Start {
+        agent,
+        folder: folder.map(|folder| folder.to_string_lossy().into_owned()),
+        repo: None,
+        branch: None,
+        prompt: None,
+        args: Vec::new(),
+        isolation: None,
+    }
+}
+
 impl Desktop<'_> {
     /// Draws with atomics-ui code: the client's palette is the host's theme, reads go through the
     /// in-process backend, and the commands the draw recorded run when it returns.
@@ -277,7 +293,8 @@ impl Desktop<'_> {
     /// Carries out a command now: a view command ([`Command::is_view`]) on this window, any other through
     /// the in-process backend. Selection is immediate client state, projected into the native model
     /// (`active`, `diff_root`, `diff_open`, `panel`, the tab) for ctl and the host's subscription and
-    /// scheduling decisions; dialogs open on this window's client.
+    /// scheduling decisions; dialogs open on this window's client. The welcome's [`Command::Start`] joins
+    /// the window's control requests, which go to the host when the frame is drawn.
     pub(super) fn send(&mut self, command: Command) {
         match command {
             Command::Activate { session, open_diff } => self.activate(&session, open_diff),
@@ -318,6 +335,9 @@ impl Desktop<'_> {
             Command::HideChief => self.runtime.chief_open = false,
             Command::ResizeChief(width) => self.runtime.store.chief_width = width,
             Command::Toast(text) => self.runtime.toast(text),
+            // The window's own control requests, which it sends to the host after the draw, as the new-session
+            // dialog's.
+            Command::Start { agent, folder } => self.runtime.client_commands.push(start_request(agent, folder)),
             command => {
                 debug_assert!(!command.is_view(), "the desktop does not show {command:?}");
                 self.runtime.backend().send(command);

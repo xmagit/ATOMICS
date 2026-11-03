@@ -1,5 +1,6 @@
 //! The sidebar's views: the AGENTS list with the RECENT sessions to resume, and the EXPLORER of the open
-//! projects, their worktrees and files. The sidebar around them (USAGE, TICKETS) is the platform's.
+//! projects, their worktrees and files. The sidebar around them is [`crate::shell::sidebar`], with the
+//! host's USAGE and TICKETS. A menu entry or button whose command the backend cannot carry out is left out.
 
 use std::path::PathBuf;
 
@@ -78,6 +79,8 @@ pub fn sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     let sessions = backend.session_list();
     let visible = backend.visible_sessions();
     let active_id = backend.view_hints().active;
+    let can_rename = backend.available(&Command::Rename(String::new()));
+    let can_close = backend.available(&Command::CloseSession(String::new()));
     for (index, session) in sessions.iter().enumerate() {
         if !visible.contains(&index) {
             continue;
@@ -96,11 +99,11 @@ pub fn sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
                     client.selected.remove(&session.id);
                 }
             }
-            if !session.chief && ui.button("Rename…").clicked() {
+            if !session.chief && can_rename && ui.button("Rename…").clicked() {
                 rename = Some(session.id.clone());
                 ui.close();
             }
-            if ui.button("Close").clicked() {
+            if can_close && ui.button("Close").clicked() {
                 close = Some(session.id.clone());
                 ui.close();
             }
@@ -133,7 +136,9 @@ pub fn sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     }
 
     let recent = backend.recent_sessions();
-    if !recent.is_empty() {
+    if let Some(first) = recent.first()
+        && backend.available(&Command::Resume(first.record.clone()))
+    {
         ui.add_space(10.0);
         section(ui, &p, "RECENT · click to resume");
         for RecentSession { record, folder } in recent {
@@ -156,14 +161,21 @@ pub fn explorer(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     let repos = backend.repos();
     let agent_names = backend.ui_config().agents;
     let focus = target.as_deref().and_then(|t| backend.project_of(t)).or_else(|| repos.first().cloned());
+    let can_pick = backend.available(&Command::PickProject);
     ui.horizontal(|ui| {
         section(ui, p, "EXPLORER");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.small_button("+").on_hover_text("Open project…").clicked() {
+            if can_pick && ui.small_button("+").on_hover_text("Open project…").clicked() {
                 client.send(Command::PickProject);
             }
         });
     });
+    let can_start = backend.available(&Command::StartAgent { agent: String::new(), folder: PathBuf::new() });
+    let can_add_worktree = backend.available(&Command::NewWorktree(PathBuf::new()));
+    let can_close = backend.available(&Command::CloseProject(PathBuf::new()));
+    let can_clean_up = backend.available(&Command::OpenCleanup { repo: PathBuf::new(), preselect: None });
+    let can_open = backend.available(&Command::OpenFile { root: PathBuf::new(), path: String::new() });
+    let agent_names = if can_start { agent_names } else { Vec::new() };
     let sessions = backend.session_list();
     let mut switch_to: Option<PathBuf> = None;
     let mut close: Option<PathBuf> = None;
@@ -178,22 +190,25 @@ pub fn explorer(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
             if response.clicked() && !selected {
                 switch_to = Some(root.clone());
             }
-            response.on_hover_text(backend.display(&root)).context_menu(|ui| {
-                for agent in &agent_names {
-                    if ui.button(format!("Start {agent} in the main checkout")).clicked() {
-                        client.send(Command::StartAgent { agent: agent.clone(), folder: root.clone() });
+            let response = response.on_hover_text(backend.display(&root));
+            if !agent_names.is_empty() || can_add_worktree || can_close {
+                response.context_menu(|ui| {
+                    for agent in &agent_names {
+                        if ui.button(format!("Start {agent} in the main checkout")).clicked() {
+                            client.send(Command::StartAgent { agent: agent.clone(), folder: root.clone() });
+                            ui.close();
+                        }
+                    }
+                    if can_add_worktree && ui.button("New worktree…").clicked() {
+                        client.send(Command::NewWorktree(root.clone()));
                         ui.close();
                     }
-                }
-                if ui.button("New worktree…").clicked() {
-                    client.send(Command::NewWorktree(root.clone()));
-                    ui.close();
-                }
-                if ui.button("Close project").clicked() {
-                    close = Some(root.clone());
-                    ui.close();
-                }
-            });
+                    if can_close && ui.button("Close project").clicked() {
+                        close = Some(root.clone());
+                        ui.close();
+                    }
+                });
+            }
         }
     });
     if let Some(root) = switch_to {
@@ -204,8 +219,10 @@ pub fn explorer(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
         return;
     }
     let Some(project) = focus else {
-        ui.add_space(8.0);
-        ui.label(RichText::new("Open a project with + or Project › Open project…").color(p.muted).size(12.0));
+        if can_pick {
+            ui.add_space(8.0);
+            ui.label(RichText::new("Open a project with + or Project › Open project…").color(p.muted).size(12.0));
+        }
         return;
     };
 
@@ -241,7 +258,11 @@ pub fn explorer(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
         if header.clicked() {
             explorer.show_worktrees = !explorer.show_worktrees;
         }
-        if ui.small_button("clean up…").on_hover_text("Find merged or abandoned worktrees and remove them").clicked()
+        if can_clean_up
+            && ui
+                .small_button("clean up…")
+                .on_hover_text("Find merged or abandoned worktrees and remove them")
+                .clicked()
         {
             open_cleanup = true;
         }
@@ -278,18 +299,20 @@ pub fn explorer(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
                 if response.clicked() {
                     pick = Some(wt.path.clone());
                 }
-                response.context_menu(|ui| {
-                    for agent in &agent_names {
-                        if ui.button(format!("Start {agent} here")).clicked() {
-                            client.send(Command::StartAgent { agent: agent.clone(), folder: wt.path.clone() });
+                if !agent_names.is_empty() || can_clean_up {
+                    response.context_menu(|ui| {
+                        for agent in &agent_names {
+                            if ui.button(format!("Start {agent} here")).clicked() {
+                                client.send(Command::StartAgent { agent: agent.clone(), folder: wt.path.clone() });
+                                ui.close();
+                            }
+                        }
+                        if can_clean_up && ui.button("Remove worktree…").clicked() {
+                            remove_one = Some(wt.path.clone());
                             ui.close();
                         }
-                    }
-                    if ui.button("Remove worktree…").clicked() {
-                        remove_one = Some(wt.path.clone());
-                        ui.close();
-                    }
-                });
+                    });
+                }
             }
         });
         if let Some(path) = remove_one {
@@ -322,7 +345,9 @@ pub fn explorer(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
         }
     };
     let explorer = client.explorers.entry(project).or_default();
-    if let Some(path) = diff_view::files_panel(ui, explorer, &main, &changes, viewing.as_deref(), p) {
+    if let Some(path) = diff_view::files_panel(ui, explorer, &main, &changes, viewing.as_deref(), p)
+        && can_open
+    {
         client.send(Command::OpenFile { root: review, path });
     }
 }

@@ -4,8 +4,8 @@
 //! frames come in through [`RemoteBackend::receive`] and go out through [`RemoteBackend::take_outgoing`].
 //!
 //! The browser offers everything read-only, answers approvals and approves plans where `may` allows, and
-//! follows and types into terminals ([`crate::screens`]) where it grants `type`. Any other command says so
-//! on the notice line.
+//! follows and types into terminals ([`crate::screens`]) where it grants `type`. [`Backend::available`] says
+//! so, and the views draw no action for any other command; one sent anyway says so on the notice line.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -708,8 +708,9 @@ impl Backend for RemoteBackend {
         if let Command::RefreshDiff(root) = &command {
             return self.refetch(root);
         }
+        // The views do not draw these; this is for a command sent some other way.
         if !offered(&command) {
-            return self.say("That is not available in the browser yet; use ATOMICS on the computer.");
+            return self.say("That is not available in the browser; use ATOMICS on the computer.");
         }
         if self.welcome().is_none() {
             self.refuse(&command);
@@ -742,6 +743,24 @@ impl Backend for RemoteBackend {
             let now = s.now_ms;
             let message = s.pending.send(mutation, now);
             s.outgoing.push(Envelope::new(message));
+        }
+    }
+
+    /// The view commands the frame carries out, a diff's refresh, and the commands this release offers
+    /// while the host's `welcome` grants what they would send. Offline nothing can be sent.
+    fn available(&self, command: &Command) -> bool {
+        if command.is_view() {
+            return crate::views::carries_out(command);
+        }
+        if matches!(command, Command::RefreshDiff(_)) {
+            return true;
+        }
+        if !offered(command) || self.state.borrow().welcome.is_none() {
+            return false;
+        }
+        match command.remote(self, &mut String::new) {
+            Remote::Send(mutations) => mutations.iter().all(|mutation| self.may(mutation.grant())),
+            Remote::Client | Remote::Unsupported => false,
         }
     }
 
@@ -916,6 +935,11 @@ impl Backend for RemoteBackend {
 
     fn project_menu(&self) -> ProjectMenu {
         ProjectMenu::default()
+    }
+
+    /// The host's folders are its own.
+    fn launch_dir(&self) -> Option<PathBuf> {
+        None
     }
 }
 

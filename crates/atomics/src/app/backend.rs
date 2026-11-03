@@ -77,6 +77,15 @@ impl Backend for Local<'_> {
         self.run(command);
     }
 
+    /// The desktop carries out every command.
+    fn available(&self, _command: &atomics_ui::Command) -> bool {
+        true
+    }
+
+    fn launch_dir(&self) -> Option<PathBuf> {
+        Some(self.0.launch_dir.clone())
+    }
+
     fn plan_list(&self) -> Vec<PlanRow> {
         self.0.plans.iter().enumerate().map(|(index, plan)| self.row(index, plan)).collect()
     }
