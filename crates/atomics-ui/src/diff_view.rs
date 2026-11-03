@@ -252,6 +252,10 @@ pub struct Header<'a> {
     pub editor_shortcut: &'a str,
     /// A phone: the header stacks, a side shows at a time and long lines wrap ([`crate::touch`]).
     pub touch: Option<Touch>,
+    /// A click on a line starts a review comment, and Send review shows.
+    pub review: bool,
+    /// A double click on a line, and the editor button, open the file in the editor.
+    pub edit: bool,
 }
 
 pub use crate::panel_nav::focus_id;
@@ -310,7 +314,7 @@ pub fn show(
     }
 
     if let Some(path) = state.viewing.clone() {
-        if let Some(line) = show_file(ui, state, &path, palette, font) {
+        if let Some(line) = show_file(ui, state, &path, palette, font, header.review, header.edit) {
             action = DiffAction::Edit { path: Some(path), line: Some(line) };
         }
         return action;
@@ -447,6 +451,7 @@ pub fn show(
     }
     let mut clicked_line: Option<(usize, usize, usize)> = None;
     let mut edit_line: Option<(String, Option<u32>)> = None;
+    let (can_review, can_edit) = (header.review, header.edit);
     let mut toggle: Option<String> = None;
     let mut delete: Option<usize> = None;
     let mut commit_editor = false;
@@ -528,6 +533,7 @@ pub fn show(
                     let piece = if let Row::Wrap(.., piece) = *row { piece } else { 0 };
                     let segment = wrap.map(|chars| Piece::of(&line.text, chars, piece, char_w));
                     let spans = spans(fi, hi, li);
+                    let hovered = hovered && can_review;
                     paint_line(painter, rect, code_x, 0.0, char_w, line, spans, hovered, font, palette, segment);
                     if let Some(digits) = digits.filter(|_| piece == 0) {
                         let n = if line.kind == LineKind::Removed { line.old_no } else { line.new_no };
@@ -550,9 +556,9 @@ pub fn show(
                         );
                     }
                     if line.kind != LineKind::Note {
-                        if response.double_clicked() {
+                        if can_edit && response.double_clicked() {
                             edit_line = Some((diff.files[fi].path().to_string(), edit_target(line)));
-                        } else if response.clicked() {
+                        } else if can_review && response.clicked() {
                             clicked_line = Some((fi, hi, li));
                         }
                     }
@@ -569,7 +575,7 @@ pub fn show(
                         };
                         let line = &lines[li];
                         let code_x = cell.left() + side_gutter;
-                        let over = hovered == Some(right);
+                        let over = hovered == Some(right) && can_review;
                         let spans = spans(fi, hi, li);
                         paint_line(painter, cell, code_x, shift, char_w, line, spans, over, font, palette, None);
                         let n = if right { line.new_no } else { line.old_no };
@@ -581,9 +587,9 @@ pub fn show(
                         .and_then(|right| if right { pair.new } else { pair.old })
                         .filter(|&li| lines[li].kind != LineKind::Note);
                     if let Some(li) = target {
-                        if response.double_clicked() {
+                        if can_edit && response.double_clicked() {
                             edit_line = Some((diff.files[fi].path().to_string(), edit_target(&lines[li])));
-                        } else if response.clicked() {
+                        } else if can_review && response.clicked() {
                             clicked_line = Some((fi, hi, li));
                         }
                     }
@@ -691,15 +697,19 @@ fn header_buttons(
     {
         state.viewing = None;
     }
-    if touch::small_button(ui, touch, "editor")
-        .on_hover_text(format!(
-            "Edit in the editor ({}) · double-click a line to edit there",
-            shortcut_label(ui.ctx(), header.editor_shortcut)
-        ))
-        .clicked()
+    if header.edit
+        && touch::small_button(ui, touch, "editor")
+            .on_hover_text(format!(
+                "Edit in the editor ({}) · double-click a line to edit there",
+                shortcut_label(ui.ctx(), header.editor_shortcut)
+            ))
+            .clicked()
     {
         let first = state.prepared.as_ref().and_then(|p| p.diff.files.first().map(|f| f.path().to_string()));
         *action = DiffAction::Edit { path: state.viewing.clone().or(first), line: None };
+    }
+    if !header.review {
+        return;
     }
     let n = state.comments.len();
     let (text, fill) = if n > 0 { (palette.on_accent, palette.accent) } else { (palette.muted, Color32::TRANSPARENT) };
@@ -776,9 +786,17 @@ fn diff_buttons(
     }
 }
 
-/// A whole file, read-only, where clicking a line starts a comment just like in the
-/// diff. Returns a line that was double-clicked, to edit there.
-fn show_file(ui: &mut egui::Ui, state: &mut DiffState, path: &str, palette: &Palette, font: &FontId) -> Option<u32> {
+/// A whole file, read-only, where clicking a line starts a comment just like in the diff, with `review`.
+/// Returns a line that was double-clicked, to edit there, with `edit`.
+fn show_file(
+    ui: &mut egui::Ui,
+    state: &mut DiffState,
+    path: &str,
+    palette: &Palette,
+    font: &FontId,
+    review: bool,
+    edit: bool,
+) -> Option<u32> {
     ui.horizontal(|ui| {
         ui.label(RichText::new(path).monospace().color(palette.foreground));
         ui.label(RichText::new("unchanged · click a line to comment").color(palette.muted).size(12.0));
@@ -839,7 +857,7 @@ fn show_file(ui: &mut egui::Ui, state: &mut DiffState, path: &str, palette: &Pal
             let text_pos = |x: f32| pos2(rect.left() + x, rect.top() + 1.5);
             match *row {
                 Row::FileLine(i) => {
-                    if response.hovered() {
+                    if response.hovered() && review {
                         painter.rect_filled(rect, 0.0, palette.hover());
                         painter.text(
                             text_pos(char_w * 7.0),
@@ -855,9 +873,9 @@ fn show_file(ui: &mut egui::Ui, state: &mut DiffState, path: &str, palette: &Pal
                     let job = line_job(&file.lines[i], spans, &[], palette.background, font, palette);
                     let galley = ui.fonts_mut(|f| f.layout_job(job));
                     ui.painter().galley(text_pos(gutter), galley, palette.foreground);
-                    if response.double_clicked() {
+                    if edit && response.double_clicked() {
                         double_clicked = Some(i);
-                    } else if response.clicked() {
+                    } else if review && response.clicked() {
                         clicked = Some(i);
                     }
                 }

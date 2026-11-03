@@ -114,6 +114,12 @@ pub fn tiles(
     // A banner's Connect button: the server, whether to store its environment, the agent's URL.
     let mut connect: Option<(String, bool, Option<String>)> = None;
     let mut dismiss: Option<String> = None;
+    // The actions the backend can carry out; the others are not drawn.
+    let can_rename = backend.available(&Command::Rename(String::new()));
+    let can_close = backend.available(&Command::CloseSession(String::new()));
+    let can_resume = backend.available(&Command::ResumeSession(String::new()));
+    let can_connect = backend.available(&Command::Connect { name: String::new(), store_env: false, url: None });
+    let can_dismiss = backend.available(&Command::DismissMcp(String::new()));
     let focus_request = client.focus_terminal.take();
     let now = ui.input(|i| i.time);
     let sessions = backend.session_list();
@@ -198,28 +204,30 @@ pub fn tiles(
             "Show this worktree's diff against main · double-click to rename"
         };
         let title_response = title_response.on_hover_text(hover);
-        if title_response.double_clicked() {
+        if title_response.double_clicked() && can_rename {
             rename = Some(row.id.clone());
         } else if title_response.clicked() {
             activate = Some((row.id.clone(), true));
         }
-        let close_rect = Rect::from_center_size(pos2(header.right() - 14.0, header.center().y), Vec2::splat(18.0));
-        let close_response = ui.interact(close_rect, ui.scope_id().with(("tile-close", &row.id)), Sense::click());
-        ui.painter().text(
-            close_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            "×",
-            p.ui(15.0),
-            if close_response.hovered() { p.error } else { p.muted },
-        );
-        if close_response.clicked() {
-            close = Some((row.id.clone(), ask));
+        if can_close {
+            let close_rect = Rect::from_center_size(pos2(header.right() - 14.0, header.center().y), Vec2::splat(18.0));
+            let close_response = ui.interact(close_rect, ui.scope_id().with(("tile-close", &row.id)), Sense::click());
+            ui.painter().text(
+                close_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "×",
+                p.ui(15.0),
+                if close_response.hovered() { p.error } else { p.muted },
+            );
+            if close_response.clicked() {
+                close = Some((row.id.clone(), ask));
+            }
         }
         let edge = if active { p.accent.gamma_multiply(0.7) } else { p.border };
         ui.painter().rect_stroke(tile, 2.0, Stroke::new(1.0, edge), egui::StrokeKind::Outside);
 
         body = approvals::banner(ui, body, index, backend, client);
-        if !view.connect.is_empty() {
+        if !view.connect.is_empty() && can_connect {
             let shown = view.connect.len().min(3);
             let banner = body.with_max_y((body.top() + 8.0 + 28.0 * shown as f32).min(body.bottom()));
             ui.painter().rect_filled(banner, 0.0, p.panel);
@@ -236,7 +244,7 @@ pub fn tiles(
                         "This agent needs an MCP server that is not connected. Connecting it opens its sign-in \
                          page in your browser, and every sandboxed session then gets it.",
                     );
-                    if line == 0 && ui.small_button("×").on_hover_text("Dismiss").clicked() {
+                    if line == 0 && can_dismiss && ui.small_button("×").on_hover_text("Dismiss").clicked() {
                         dismiss = Some(row.id.clone());
                     }
                 });
@@ -273,10 +281,10 @@ pub fn tiles(
                 child.vertical_centered(|ui| {
                     ui.label(RichText::new("Process exited").color(p.foreground));
                     ui.horizontal(|ui| {
-                        if view.resumable && ui.button("Resume").clicked() {
+                        if view.resumable && can_resume && ui.button("Resume").clicked() {
                             resume = Some(row.id.clone());
                         }
-                        if ui.button("Close").clicked() {
+                        if can_close && ui.button("Close").clicked() {
                             close = Some((row.id.clone(), ask));
                         }
                     });
@@ -322,7 +330,7 @@ pub fn tiles(
             egui::UiBuilder::new().id_salt(("completed", done.plan, done.index)).max_rect(tile.shrink(14.0)),
         );
         child.label(RichText::new(&done.task.title).color(p.foreground).strong().size(13.0));
-        if let Some(action) = board::task_result(
+        if let Some(action) = board::task_result_for(
             &mut child,
             &done.task,
             None,
@@ -332,6 +340,8 @@ pub fn tiles(
             done.codex,
             done.now,
             &p,
+            None,
+            board::TaskButtons::of(backend, done.plan),
         ) {
             task_action = Some((done.plan, done.index, action));
         }

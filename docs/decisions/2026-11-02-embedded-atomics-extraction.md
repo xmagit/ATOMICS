@@ -92,7 +92,7 @@ are agent-days of focused work, review wait excluded. "C1"/"C2" are the design's
 | S4 | Ticket panels: `tickets_panel.rs` (3,093 lines) onto `TicketsView`. Split by panel (tree, find, sign-in) | 3 PRs | 2.5 | C2 |
 | **S5** | **Done** (4.3). `Palette` (egui colors and fonts) out of `State`: the web crate owns `Palette`; `fontique` lookup stays a desktop hook that supplies the fonts (`theme::FontSource` already names a font in the config). `config.keys` and `layout` are already core | 1–2 PRs | 1.5 | C1 |
 | **S6** | **Done** (4.5). Move the files that read nothing from `runtime`: `diff_view.rs`, `panel_nav.rs`, `markdown.rs`, `topbar` helpers into `atomics-ui` (adds `egui` with default features off). Needs S5 for `Palette` | 1 PR | 1.5 | C1 |
-| S7 | Move `Client` and the draw functions: `fn draw_*(ui, &dyn Backend, &mut Client)` per file, `Desktop` becomes a shim holding `&mut State` for the writes not yet converted. Order: `topbar`, `sidebar`, `board`, `fleet`, `chief`, `editor` (diff panel), `github`, `tickets_panel`, settings menus. Moved so far (4.6): `board`, the approval banner, the worktree diff view, `sidebar`, `topbar` and `fleet` | 8–10 PRs | 5 | C1 |
+| **S7** | **Done** (4.6). Move `Client` and the draw functions: `fn draw_*(ui, &dyn Backend, &mut Client)` per file, `Desktop` becomes a shim holding `&mut State` for the writes not yet converted. Order: `topbar`, `sidebar`, `board`, `fleet`, `chief`, `editor` (diff panel), `github`, `tickets_panel`, settings menus. Moved: `board`, the approval banner, the worktree diff view, `sidebar`, `topbar`, `fleet`, the chief and the window's frame (`shell`). The GitHub panels, the Tickets panel (S4) and the settings menus stay the desktop's, drawn through the frame's hooks | 8–10 PRs | 5 | C1 |
 | **S8** | **Done** (4.7). Writes: `Command` enum and `Backend::send`, domain by domain, replacing `post` closures (50 sites) and the direct `runtime.*` view-hint writes | 5 PRs | 3 | H4 / C1 |
 | **S9** | **Done** (4.8). `atomics-ui` builds for `wasm32-unknown-unknown` in CI (`cargo check --target`), eframe web entry point `atomics-web` | 1 PR | 1.5 | C5 |
 
@@ -258,7 +258,7 @@ Commits, one per file group:
    and `display(path)`; `UiConfig` gains the agents' names. Clicks become intents: activate, rename,
    resume, pick a project, start an agent in a folder, new worktree, close a project, show a folder's
    diff, clean up worktrees, open a file. `selected`, `confirm_close` and `explorers` move to the client.
-   The sidebar frame (USAGE, the TICKETS section of S4) stays in the desktop and calls both.
+   The sidebar frame (USAGE, the TICKETS section of S4) stayed in the desktop until the frame moved (8).
 5. **Top bar** (`topbar.rs`, the tabs in `sidebar.rs`, the history in `plan_view.rs`). `atomics_ui::tabs` is
    the navigation: the tabs, their overflow menu and the plan history (`view_tabs`, `urgent_tabs_label`,
    `urgent_navigation_width`). `atomics_ui::topbar` gains the brand, the notice line, the diff, `+ New` and
@@ -270,9 +270,9 @@ Commits, one per file group:
    frame, as before. The tabs are one: a click on a tab takes effect once the strip is drawn, so in that
    frame the tabs after it still show the old selection, as the tabs before it always did, and the next
    frame shows the new one. `icon` and `workspace_input` move to the client, and `record_item` and the history's
-   records to `atomics-ui`, behind `test-support`. The bar's layout (`top_bar`) stays in the desktop with the
-   items that have not moved: the chief pill (moved with the chief, 7), the Tickets button and sign-in (S4),
-   the GitHub counter, the load gauge and the Settings menu.
+   records to `atomics-ui`, behind `test-support`. The bar's layout (`top_bar`) stayed in the desktop with
+   the items that had not moved (the chief pill, the Tickets button and sign-in, the GitHub counter, the load
+   gauge and the Settings menu) until the frame moved (8).
 6. **Fleet** (`fleet.rs`). `atomics_ui::fleet::tiles` draws the session tiles (header with status, title,
    agent, branch and status, sandbox badge and close; the approval banner; the MCP banner; the plan task's
    last report; the terminal, or the last exchange of a session outside ATOMICS; the exited overlay) and
@@ -321,8 +321,7 @@ Commits, one per file group:
    `Desktop::send_steer` stays, test-only, as the steer bar's Send for the tests that call it, and
    `lane_height` moves to `State`. The divider's test moved with it and reads the commands it records.
    Still in the desktop: the host's chief logic (`wake_chief`, `start_chief`, `toggle_chief`,
-   `set_chief_dock`, delivery) and the frames around the steer bar and the dock in `paint` (the window's
-   split, S7s).
+   `set_chief_dock`, delivery). The frames around the steer bar and the dock moved with the frame (8).
    Checked with Linux QA screenshots before and after (`scripts/linux-qa.sh screenshot`, 1600x1000) in four
    scenes: no chief, docked, floating, and started then hidden. The image has no agent CLI, so a shell
    session first installs a stand-in `claude` that runs `sh`. Against the commit before the fleet (6),
@@ -330,6 +329,54 @@ Commits, one per file group:
    gauge and the steer bar pixel for pixel the same. The only differences are those two runs of one build
    have too: the load gauge, and the container's host name and random temporary folders in the shells'
    text, including where that text shows through the floating window's anti-aliased left edge.
+8. **The frame** (`paint` in `app.rs`, `top_bar`, the sidebar frame, `diff_panel` in `editor.rs`, the
+   welcome). `atomics_ui::shell::frame` draws the whole window: the top bar, the steer bar, the sidebar,
+   the chief's dock, the central panel (a finished plan's board, the session tabs, the welcome, the tiles,
+   and the right panel with the divider beside it) and the floating chief. `shell::top_bar`, `sidebar` and
+   `right_panel` are its parts; `TAB_HEIGHT` moved with them, and the diff panel's width (`split`) joined
+   `atomics_ui::Client`.
+   - The frame draws through a `shell::Platform`. Its `draw` lends one piece the backend, the client and
+     the platform's terminals, and carries out what that piece recorded before the next one draws, as the
+     desktop's draw calls did: a click still reaches what is drawn after it in the same frame. Every other
+     method is a hook for an item only a host has, empty by default: the top bar's items after Plan (on the
+     desktop the Tickets button, the GitHub counter, Remote and, in the Actions menu, the ticket sign-in),
+     its load gauge and Settings; USAGE and TICKETS in the sidebar; the chief's window body, where the
+     desktop adds its trace lane; the Tickets panel, a pull request's diff and the editor (with the file open
+     in it); the welcome's byline; what the microphone does; and `laid_out`, where the desktop keeps the
+     layout for ctl and its shortcuts. `Desktop::paint` keeps what comes before and after the frame (the
+     shortcuts, the dialogs, the GitHub modal) and calls `shell::frame(ui, self)`. `app/frame.rs` is the
+     desktop's `Platform`, with the draw wrappers the tests call (`top_bar`, `diff_panel`, `plan_panel`,
+     `tiles`, `view_tabs`), now test-only.
+   - `Backend::available(&Command)` says whether this UI can carry out a command, a host's or a view
+     command. The views draw no button, menu entry, tab or line action for a command it cannot. The desktop's
+     `Local` carries out every command. `RemoteBackend` answers with the view commands the browser's frame
+     carries out (`views::carries_out`, which now include `Toast`), a diff's refresh, and `Decide` and
+     `ApprovePlan` while it is connected and `welcome`'s `may` grants the mutations they map to. A viewer,
+     or a browser that is offline, sees the board without its buttons. This replaces the browser's "not
+     available in the browser yet" notice for such clicks; `send` keeps the refusal for a command sent some
+     other way. The frame also leaves out the steer bar without `Steer`, the Project menu without
+     `PickProject`, the changed-files column without `OpenFile` (`Edit` in the editor), and the diff view's
+     comments and editing (`Header::review`, `Header::edit`) without `EditComments` and `SendReview`, or
+     `Edit`.
+   - The welcome's Start buttons pushed a control request (as `atomics ctl start`), not `StartAgent`. They
+     now record `Command::Start { agent, folder }` (no folder: a scratch folder), which the desktop pushes
+     onto the same control requests and `Command::remote` maps onto `session_command` `start`.
+     `Backend::launch_dir()` is the folder they start in. The byline under the name is a hook, since the UI
+     crate names no hosting product (`names::no_hosting_product_is_named`).
+   - `diff_panel::sync` copies the backend's diffs into the client's views; the desktop's `sync_diffs`
+     calls it.
+
+   Checked with Linux QA screenshots (`scripts/linux-qa.sh screenshot`, 1600x1000) in three scenes, two runs
+   before and one after: empty (the project's shell closed, so the welcome shows), a new plan's board, and a
+   bare shell's scratch repository with a commit and changes, its diff open beside the project's exited
+   shell. Before and after are identical pixel for pixel except the load gauge, the container's random
+   temporary folder in the exited shell's tile, the scratch commit's hash and, in one run, a tooltip under
+   the pointer; the two runs before differ in the same places. The desktop's tests ran unchanged. New in
+   the browser crate: `only_what_the_browser_can_send_is_available`, and
+   `the_frame_leaves_out_the_host_items_and_what_the_browser_cannot_do`, which draws the frame over
+   `RemoteBackend` and finds no USAGE, TICKETS, Settings, Tickets, load, Remote or Project, no All,
+   Ungrouped or Repos tab, no `+ New`, Close plan or steer bar, and the board's Approve plan for a
+   controller but not for a viewer.
 
 ### 4.7 S8
 
@@ -393,10 +440,10 @@ Eight commits, one per domain, then the mapping. The tests ran unchanged but one
 - `crates/atomics-web` (C5) runs the moved draw functions in a browser: `board::draw`, `approvals::banner` and
   `diff_panel::draw` over `RemoteBackend`, a `Backend` on `atomics_core::mirror` fed by `atomics.v1`. Its writes are
   `Command::remote`'s mutations, sent only where `welcome`'s `may` grants them; the browser offers `Decide` and
-  `ApprovePlan` in this release and says so for the rest. A view command stays in the frame (`views.rs`), as
+  `ApprovePlan` in this release, and since the frame moved (4.6, 8) the views draw no action for the rest. A view command stays in the frame (`views.rs`), as
   `Desktop::send` keeps it in the desktop.
 - What `RemoteBackend` cannot know reads as empty or default: the host's config (`ui_config` is the defaults),
-  projects, worktrees, recent sessions, the sandbox and the ticket config. Positions are the mirror's order (by
+  projects, worktrees, recent sessions, the sandbox, the ticket config and the folder the host started in. Positions are the mirror's order (by
   id). A board's `Plan` is built from `PlanInfo`, so briefs and acceptance are not on the cards; `plan_digest` is
   the host's `PlanInfo.digest`, never recomputed in the browser.
 - The diff panel reads each worktree's `DiffSummary` and fills in hunks as `diff_get` brings them; no spans travel,

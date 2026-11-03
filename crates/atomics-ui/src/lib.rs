@@ -7,11 +7,12 @@
 //! views that draw from a [`Backend`] into a [`Client`]: the plan board, the approval banner, a worktree's
 //! diff panel, the sidebar's sessions and explorer, the top bar's navigation, brand, notices, buttons and
 //! Project menu, the fleet's tiles and the chief (its pill, its docked or floating window and the steer
-//! bar). The platform draws the terminals in the tiles and in the chief's window through a
+//! bar), and the window's frame that lays them out ([`shell`]), with hooks for the items only a host has.
+//! The platform draws the terminals in the tiles and in the chief's window through a
 //! [`terminal_surface::TerminalSurface`]. They record what the user asks for as [`Command`]s, which the
 //! platform carries out after the draw: a host's through [`Backend::send`], a view command on the UI
-//! itself. A platform drawing for a finger on a small screen sets [`Client::touch`], and the views fit a
-//! phone ([`touch`]).
+//! itself; they draw no action [`Backend::available`] says the platform cannot carry out. A platform
+//! drawing for a finger on a small screen sets [`Client::touch`], and the views fit a phone ([`touch`]).
 //!
 //! This crate must stay free of desktop-only dependencies; `tests/dependencies.rs` enforces it.
 
@@ -27,6 +28,7 @@ pub mod fleet;
 pub mod keys;
 pub mod markdown;
 pub mod panel_nav;
+pub mod shell;
 pub mod sidebar;
 pub mod status;
 pub mod tabs;

@@ -9,9 +9,27 @@ use egui::Rect;
 use crate::diff_view::{self, DiffAction, Header};
 use crate::{Backend, Client, Command};
 
+/// Copies every worktree's diff the host has into its view, and the file it shows whole while the view still
+/// asks for that file.
+pub fn sync(backend: &dyn Backend, client: &mut Client) {
+    for root in backend.diff_roots() {
+        let Some(data) = backend.diff(&root) else { continue };
+        let view = client.diff_views.entry(root).or_default();
+        view.prepared = data.prepared;
+        view.error = data.error;
+        view.loading = data.loading;
+        view.comments = data.comments;
+        if view.viewing == data.viewing {
+            view.file = data.file;
+            view.file_error = data.file_error;
+        }
+    }
+}
+
 /// The diff of the worktree at `root` under its header: its session's title and branch, whether an agent
 /// there can take a review, and the diff view. Review comments, Send review, Refresh, Close and Edit record
-/// commands; the side-by-side toggle stays with the client.
+/// commands, and commenting and editing show only where the backend can carry them out; the side-by-side
+/// toggle stays with the client.
 pub fn draw(ui: &mut egui::Ui, rect: Rect, root: &Path, backend: &dyn Backend, client: &mut Client) {
     let heading = backend.diff_heading(root);
     let config = backend.ui_config();
@@ -26,6 +44,9 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, root: &Path, backend: &dyn Backend, c
         split,
         editor_shortcut: &config.keys.toggle_editor,
         touch: client.touch,
+        review: backend.available(&Command::EditComments { root: root.to_path_buf(), before: vec![], after: vec![] })
+            && backend.available(&Command::SendReview(root.to_path_buf())),
+        edit: backend.available(&Command::Edit { root: root.to_path_buf(), path: None, line: None }),
     };
     let before = state.comments.clone();
     let action = diff_view::show(ui, rect, state, header, &palette, &font);

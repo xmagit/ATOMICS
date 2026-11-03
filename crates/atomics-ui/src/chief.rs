@@ -39,7 +39,8 @@ pub enum VoiceState {
 
 /// The chief's pill: its mark, its status, the selected plan's progress and the last heartbeat; `compact`
 /// leaves out the words. `voice` is what the microphone does, `None` on a platform without one. A click
-/// shows or hides the chief ([`Command::ToggleChief`]); its menu floats or docks it.
+/// shows or hides the chief ([`Command::ToggleChief`]); its menu floats or docks it. Where the backend can
+/// do neither, the pill only shows.
 pub fn pill(ui: &mut egui::Ui, compact: bool, voice: Option<VoiceState>, backend: &dyn Backend, client: &mut Client) {
     let p = client.palette.clone();
     let chief = backend.chief();
@@ -119,13 +120,15 @@ pub fn pill(ui: &mut egui::Ui, compact: bool, voice: Option<VoiceState>, backend
         ),
         None => format!("The chief agent ({})", shortcut_label(ui.ctx(), &keys.toggle_chief)),
     };
-    response.context_menu(|ui| {
-        if ui.selectable_value(&mut dock, ChiefDock::Floating, "Float chief").clicked()
-            || ui.selectable_value(&mut dock, ChiefDock::Docked, "Dock chief").clicked()
-        {
-            ui.close();
-        }
-    });
+    if backend.available(&Command::SetChiefDock(chief.dock)) {
+        response.context_menu(|ui| {
+            if ui.selectable_value(&mut dock, ChiefDock::Floating, "Float chief").clicked()
+                || ui.selectable_value(&mut dock, ChiefDock::Docked, "Dock chief").clicked()
+            {
+                ui.close();
+            }
+        });
+    }
     if response
         .on_hover_ui(|ui| {
             ui.label(hover);
@@ -143,7 +146,7 @@ pub fn pill(ui: &mut egui::Ui, compact: bool, voice: Option<VoiceState>, backend
     if dock != chief.dock {
         client.send(Command::SetChiefDock(dock));
     }
-    if toggle {
+    if toggle && backend.available(&Command::ToggleChief) {
         client.send(Command::ToggleChief);
     }
 }
@@ -230,14 +233,16 @@ pub fn content(
     ui.horizontal(|ui| {
         ui.label(RichText::new("◆ CHIEF AGENT").color(p.accent).strong());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if touch::small_button(ui, touch, "minimize")
-                .on_hover_text(shortcut_label(ui.ctx(), &backend.ui_config().keys.toggle_chief))
-                .clicked()
+            if backend.available(&Command::HideChief)
+                && touch::small_button(ui, touch, "minimize")
+                    .on_hover_text(shortcut_label(ui.ctx(), &backend.ui_config().keys.toggle_chief))
+                    .clicked()
             {
                 client.send(Command::HideChief);
             }
             let label = if chief.dock == ChiefDock::Floating { "dock" } else { "float" };
-            if touch::small_button(ui, touch, label).clicked() {
+            if backend.available(&Command::SetChiefDock(chief.dock)) && touch::small_button(ui, touch, label).clicked()
+            {
                 client.send(Command::SetChiefDock(if chief.dock == ChiefDock::Floating {
                     ChiefDock::Docked
                 } else {

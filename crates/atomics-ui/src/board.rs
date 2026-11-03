@@ -130,12 +130,31 @@ pub fn task_result(
     now: u64,
     p: &Palette,
 ) -> Option<&'static str> {
-    task_result_for(ui, task, status, expanded, read_only, available, codex, now, p, None)
+    task_result_for(ui, task, status, expanded, read_only, available, codex, now, p, None, TaskButtons::ALL)
 }
 
-/// [`task_result`] with its buttons sized for `touch`.
+/// Which of a task card's `diff` and `resume` buttons the backend can carry out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TaskButtons {
+    pub diff: bool,
+    pub resume: bool,
+}
+
+impl TaskButtons {
+    const ALL: TaskButtons = TaskButtons { diff: true, resume: true };
+
+    /// The buttons of the tasks of the plan at `plan` that `backend` offers.
+    pub fn of(backend: &dyn Backend, plan: usize) -> TaskButtons {
+        TaskButtons {
+            diff: backend.available(&Command::ShowTaskDiff { plan, task: 0 }),
+            resume: backend.available(&Command::ResumeTask { plan, task: 0 }),
+        }
+    }
+}
+
+/// [`task_result`] with its buttons sized for `touch`, and only those in `buttons`.
 #[allow(clippy::too_many_arguments)]
-fn task_result_for(
+pub(crate) fn task_result_for(
     ui: &mut egui::Ui,
     task: &Task,
     status: Option<AgentStatus>,
@@ -146,6 +165,7 @@ fn task_result_for(
     now: u64,
     p: &Palette,
     touch: Option<Touch>,
+    buttons: TaskButtons,
 ) -> Option<&'static str> {
     let result = |ui: &mut egui::Ui| {
         let mut action = None;
@@ -181,10 +201,13 @@ fn task_result_for(
         if task.finished_at.is_some() {
             ui.label(RichText::new(format!("+{} −{}", task.additions, task.deletions)).color(p.muted).size(12.0));
             ui.horizontal(|ui| {
-                if ui.add_enabled(available, touch::sized(egui::Button::new("diff").small(), touch)).clicked() {
+                if buttons.diff
+                    && ui.add_enabled(available, touch::sized(egui::Button::new("diff").small(), touch)).clicked()
+                {
                     action = Some("diff");
                 }
                 if !read_only
+                    && buttons.resume
                     && ui
                         .add_enabled(
                             status.is_none() && available && (task.resume_id.is_some() || codex),
@@ -243,6 +266,23 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
     let mut clean_plan = false;
     let ready = board.ready.len();
     let total = plan.tasks.len();
+    // The actions the backend can carry out; the others are not drawn.
+    let can = |command: Command| backend.available(&command);
+    let can_archive = can(Command::ArchivePlan(index));
+    let can_clean_up = can(Command::CleanUpPlan(index));
+    let can_reopen = can(Command::ReopenPlan(index));
+    let can_close = can(Command::ClosePlan { plan: index, status: PlanStatus::Completed });
+    let can_approve = can(Command::ApprovePlan(index));
+    let can_dispatch = can(Command::DispatchReady(index));
+    let can_integrate_accepted = can(Command::IntegrateAccepted(index));
+    let can_sync = can(Command::SyncTickets(index));
+    let can_edit = can(Command::EditBrief { plan: index, task: String::new(), brief: String::new() });
+    let can_start = can(Command::StartTask { plan: index, task: String::new() });
+    let can_move = can(Command::SetTaskStatus { plan: index, task: String::new(), status: TaskStatus::Done });
+    let can_integrate = can(Command::IntegrateTask { plan: index, task: String::new() });
+    let can_open = can(Command::OpenTaskSession(String::new()));
+    let can_acknowledge = can(Command::AcknowledgeRefs { plan: index, task: 0 });
+    let buttons = TaskButtons::of(backend, index);
     if board.checking {
         ui.label(RichText::new("Checking integration freshness…").color(p.muted));
     }
@@ -251,11 +291,11 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
     let mut end_buttons = |ui: &mut egui::Ui| {
         if read_only {
             if plan.status == PlanStatus::Completed {
-                archive = touch::small_button(ui, touch, "Archive").clicked();
-                clean_plan = touch::small_button(ui, touch, "Clean up plan…").clicked();
+                archive = can_archive && touch::small_button(ui, touch, "Archive").clicked();
+                clean_plan = can_clean_up && touch::small_button(ui, touch, "Clean up plan…").clicked();
             }
-            reopen = touch::small_button(ui, touch, "Reopen plan").clicked();
-        } else if touch::small_button(ui, touch, "Close plan…").clicked() {
+            reopen = can_reopen && touch::small_button(ui, touch, "Reopen plan").clicked();
+        } else if can_close && touch::small_button(ui, touch, "Close plan…").clicked() {
             close_status = Some(PlanStatus::Completed);
         }
     };
@@ -264,16 +304,20 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
             return;
         }
         if !plan.approved {
+            if !can_approve {
+                return;
+            }
             let button = egui::Button::new(RichText::new("Approve plan").color(p.on_accent)).fill(p.accent);
             approve = ui
                 .add(touch::sized(button, touch))
                 .on_hover_text("Let the orchestrator dispatch these tasks")
                 .clicked();
         } else {
-            dispatch_all = ui
-                .add_enabled(ready > 0, touch::sized(egui::Button::new(format!("Dispatch ready ({ready})")), touch))
-                .on_hover_text("Start every task whose dependencies are done")
-                .clicked();
+            dispatch_all = can_dispatch
+                && ui
+                    .add_enabled(ready > 0, touch::sized(egui::Button::new(format!("Dispatch ready ({ready})")), touch))
+                    .on_hover_text("Start every task whose dependencies are done")
+                    .clicked();
             ui.label(RichText::new("approved ✓").color(p.success).size(12.0));
         }
     };
@@ -316,7 +360,8 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
     if !read_only && pending > 0 {
         ui.horizontal(|ui| {
             ui.label(RichText::new(format!("{pending} accepted tasks not integrated yet")).color(p.warning));
-            integrate_accepted = ui.add(touch::sized(egui::Button::new("Integrate"), touch)).clicked();
+            integrate_accepted =
+                can_integrate_accepted && ui.add(touch::sized(egui::Button::new("Integrate"), touch)).clicked();
         });
     }
     let ticket_config = &board.ticket_config;
@@ -349,7 +394,7 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
                         .size(11.5),
                 );
             }
-            if ticket_config.is_some() {
+            if ticket_config.is_some() && can_sync {
                 sync_tickets =
                     touch::small_button(ui, touch, "sync").on_hover_text("Read the tickets again now").clicked();
             }
@@ -380,7 +425,7 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
     let mut actions: Vec<(String, &str)> = Vec::new();
     let mut editing = false;
     let mut open_session: Option<String> = None;
-    let editable = !read_only && !plan.approved;
+    let editable = !read_only && !plan.approved && can_edit;
     let ready_ids = &board.ready;
     let approved = plan.approved;
     let sessions = &board.sessions;
@@ -478,6 +523,7 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
                         now,
                         &p,
                         touch,
+                        buttons,
                     ) {
                         actions.push((task.id.clone(), action));
                     }
@@ -488,7 +534,8 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
                             .inner_margin(6)
                             .show(ui, |ui| {
                                 ui.label(RichText::new(alert).color(p.error).strong().size(12.0));
-                                if touch::small_button(ui, touch, "Acknowledge ref alert").clicked() {
+                                if can_acknowledge && touch::small_button(ui, touch, "Acknowledge ref alert").clicked()
+                                {
                                     actions.push((task.id.clone(), "acknowledge_refs"));
                                 }
                             });
@@ -513,7 +560,8 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
                         }
                     }
                     let buttons = |ui: &mut egui::Ui| {
-                        if task.session.as_ref().is_some_and(|s| sessions.contains_key(s))
+                        if can_open
+                            && task.session.as_ref().is_some_and(|s| sessions.contains_key(s))
                             && touch::small_button(ui, touch, "open").clicked()
                         {
                             open_session = task.session.clone();
@@ -522,12 +570,12 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
                             return;
                         }
                         match task.status {
-                            TaskStatus::Planned if approved && ready_ids.contains(&task.id) => {
+                            TaskStatus::Planned if approved && ready_ids.contains(&task.id) && can_start => {
                                 if touch::small_button(ui, touch, "start").clicked() {
                                     actions.push((task.id.clone(), "start"));
                                 }
                             }
-                            TaskStatus::Review => {
+                            TaskStatus::Review if can_move => {
                                 if touch::small_button(ui, touch, "accept").clicked() {
                                     actions.push((task.id.clone(), "done"));
                                 }
@@ -538,20 +586,22 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
                                     actions.push((task.id.clone(), "running"));
                                 }
                             }
-                            TaskStatus::Blocked => {
+                            TaskStatus::Blocked if can_move => {
                                 if touch::small_button(ui, touch, "unblock").clicked() {
                                     actions.push((task.id.clone(), "running"));
                                 }
                             }
                             TaskStatus::Done
-                                if task.session.as_ref().is_some_and(|s| sessions.contains_key(s))
+                                if can_move
+                                    && task.session.as_ref().is_some_and(|s| sessions.contains_key(s))
                                     && touch::small_button(ui, touch, "reopen").clicked() =>
                             {
                                 actions.push((task.id.clone(), "review"));
                             }
                             _ => {}
                         }
-                        if task.id != plan::REVIEW_TASK
+                        if can_integrate
+                            && task.id != plan::REVIEW_TASK
                             && task.branch.is_some()
                             && matches!(task.status, TaskStatus::Review | TaskStatus::Done)
                         {

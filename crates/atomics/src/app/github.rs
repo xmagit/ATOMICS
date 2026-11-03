@@ -1710,6 +1710,8 @@ impl Desktop<'_> {
             split,
             editor_shortcut: &editor_shortcut,
             touch: None,
+            review: true,
+            edit: true,
         };
         let action = diff_view::show(ui, rect, state, header, &palette, &font);
         // Read-only: nothing receives review comments on a pull request diff.

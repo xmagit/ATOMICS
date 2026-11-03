@@ -367,6 +367,12 @@ pub trait Backend {
     /// becomes of it shows in later reads. A view command is the UI's own and never comes here.
     fn send(&self, command: Command);
 
+    /// Whether this UI can carry out `command` now: a host's command, through [`send`](Backend::send), or a
+    /// view command, on the platform. The views draw no button, menu entry or tab for a command it cannot,
+    /// so what a client cannot do is absent rather than refused. Only the command's kind and the host it
+    /// names count, not its other fields.
+    fn available(&self, command: &Command) -> bool;
+
     /// Every plan, in the host's order. The UI addresses a plan by its position in this list.
     fn plan_list(&self) -> Vec<PlanRow>;
 
@@ -452,4 +458,8 @@ pub trait Backend {
 
     /// The Project menu's recent projects and workspaces.
     fn project_menu(&self) -> ProjectMenu;
+
+    /// The folder the host was started in, where the welcome starts agents outside the Ungrouped tab;
+    /// `None` when the host does not say.
+    fn launch_dir(&self) -> Option<PathBuf>;
 }

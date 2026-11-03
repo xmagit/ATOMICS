@@ -210,6 +210,7 @@ fn what_the_browser_does_not_offer_yet_says_so() {
         Command::SendReview(WORKTREE.into()),
         Command::CloseSession("s1".into()),
     ] {
+        assert!(!world.driver.remote.available(&command), "the views do not draw {command:?}");
         world.driver.remote.dismiss_notice();
         world.send(command);
         assert!(world.driver.remote.notice().unwrap().contains("not available in the browser"));

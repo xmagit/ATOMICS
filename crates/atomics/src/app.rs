@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime};
 use atomics_core::config::{AgentKind, ChiefDock, Config, VoiceTarget};
 use atomics_core::git::{self, Integration, Merge, Worktree, WorktreeEntry};
 use atomics_core::layout::{self, DiffPlacement, DiffSplit, Layout};
-use atomics_core::session::{AgentStatus, UNTITLED, pick_tiled, prompt_title, title_for};
+use atomics_core::session::{AgentStatus, UNTITLED, prompt_title, title_for};
 use atomics_core::store::{SessionRecord, Store};
 use atomics_core::{paths, steer, theme};
 use egui::{Color32, FontId, Key, Pos2, Rect, RichText, Sense, Stroke, Vec2, pos2, vec2};
@@ -52,6 +52,7 @@ mod control;
 mod credentials;
 mod editor;
 mod fleet;
+mod frame;
 mod github;
 mod heartbeat;
 mod input;
@@ -87,7 +88,6 @@ use chief::CHIEF_ALLOWED_TOOLS;
 use editor::save_png;
 use fleet::queue_note;
 
-const TAB_HEIGHT: f32 = 30.0;
 const WORKTREE_REFRESH: Duration = Duration::from_secs(30);
 const BACKGROUND_REFRESH: Duration = Duration::from_secs(5);
 const FALLBACK_REFRESH: Duration = Duration::from_secs(30);
@@ -656,7 +656,6 @@ struct Client {
     plan_cleanup_open: bool,
     plan_cleanup_selected: HashSet<(PathBuf, String)>,
     load: (Instant, Option<f64>),
-    split: Option<f32>,
     editor_file: HashMap<PathBuf, String>,
     focus_editor: bool,
     editor_id: Option<egui::Id>,
@@ -718,7 +717,6 @@ impl Client {
             plan_cleanup_open: false,
             plan_cleanup_selected: HashSet::new(),
             load: (Instant::now() - Duration::from_secs(10), None),
-            split: None,
             editor_file: HashMap::new(),
             focus_editor: false,
             editor_id: None,
@@ -1483,19 +1481,7 @@ impl Desktop<'_> {
     }
 
     fn sync_diffs(&mut self) {
-        let backend = self.runtime.backend();
-        for root in backend.diff_roots() {
-            let Some(data) = backend.diff(&root) else { continue };
-            let view = self.client.diff_views.entry(root).or_default();
-            view.prepared = data.prepared;
-            view.error = data.error;
-            view.loading = data.loading;
-            view.comments = data.comments;
-            if view.viewing == data.viewing {
-                view.file = data.file;
-                view.file_error = data.file_error;
-            }
-        }
+        self.draw(atomics_ui::diff_panel::sync);
     }
 
     /// Load per core, with the pool and queue on hover.
@@ -1534,41 +1520,6 @@ impl Desktop<'_> {
 
     fn metrics(&self, ui: &egui::Ui) -> Metrics {
         Metrics::new(ui, &self.palette(), self.runtime.config.font.size)
-    }
-
-    fn welcome(&mut self, ui: &mut egui::Ui, rect: Rect) {
-        let p = self.palette();
-        let mut child = ui.new_child(
-            egui::UiBuilder::new()
-                .id_salt("welcome")
-                .max_rect(Rect::from_center_size(rect.center(), vec2(rect.width().min(460.0), 260.0))),
-        );
-        child.vertical_centered(|ui| {
-            ui.label(RichText::new("ATOMICS").size(28.0).strong().color(p.accent));
-            ui.label(RichText::new("Emacs, but for agents").color(p.muted));
-            ui.label(RichText::new("an atomisk.ai project").color(p.muted).size(12.0));
-            ui.add_space(14.0);
-            // The Ungrouped tab starts sessions in scratch folders of their own.
-            let folder = (!self.runtime.ungrouped).then(|| self.runtime.launch_dir.to_string_lossy().into_owned());
-            ui.horizontal(|ui| {
-                for agent in self.runtime.config.agents.clone() {
-                    if ui.button(format!("Start {}", agent.name)).clicked() {
-                        self.runtime.client_commands.push(ControlRequest::Start {
-                            agent: agent.name.clone(), folder: folder.clone(),
-                            repo: None, branch: None, prompt: None, args: Vec::new(), isolation: None,
-                        });
-                    }
-                }
-            });
-            ui.add_space(6.0);
-            let place = match folder {
-                Some(_) => format!("in {}", paths::display(&self.runtime.launch_dir)),
-                None => "each in a scratch folder of its own, outside any project".into(),
-            };
-            ui.label(RichText::new(place).color(p.muted).size(12.0));
-            ui.add_space(14.0);
-            ui.label(RichText::new("Click an agent's title to see its worktree's diff against main.\nComment on any line and send the review straight to the agent.").color(p.muted).size(12.0));
-        });
     }
 
     fn client_logic(&mut self, ctx: &egui::Context) {
@@ -1622,131 +1573,7 @@ impl Desktop<'_> {
         }
         let ctx = ui.ctx().clone();
         self.shortcuts(&ctx);
-        let p = self.palette();
-
-        egui::Panel::top("top")
-            .exact_size(34.0)
-            .frame(egui::Frame::new().fill(p.topbar).inner_margin(egui::Margin::symmetric(10, 4)))
-            .show(ui, |ui| self.top_bar(ui));
-        egui::Panel::bottom("steer")
-            .frame(egui::Frame::new().fill(p.panel).inner_margin(egui::Margin::symmetric(10, 7)))
-            .show(ui, |ui| self.draw(|backend, client| atomics_ui::chief::steer_bar(ui, backend, client)));
-
-        let area = ui.available_rect_before_wrap();
-        let history_board = self.runtime.plan_view
-            && self.runtime.panel == PanelMode::Plan
-            && self.runtime.plans[self.runtime.selected_plan].status != PlanStatus::Open;
-        let diff_open = !history_board
-            && self.runtime.diff_open
-            && (self.runtime.diff_target().is_some()
-                || matches!(self.runtime.panel, PanelMode::Plan | PanelMode::Tickets));
-        let layout_config =
-            layout::LayoutConfig { diff_width: self.client.split, ..self.runtime.config.layout.clone() };
-        let visible = if history_board { Vec::new() } else { self.runtime.visible_sessions() };
-        let completed = if history_board { 0 } else { self.runtime.completed_tasks().len() };
-        let dock_width = atomics_ui::chief::dock_width(&self.runtime.backend().chief(), area.width(), &layout_config);
-        let mut layout = layout::compute(
-            area.width(),
-            area.height(),
-            visible.len(),
-            completed,
-            diff_open,
-            dock_width,
-            &layout_config,
-        );
-        if layout.tabs {
-            layout = layout::compute(
-                area.width(),
-                area.height() - TAB_HEIGHT,
-                visible.len(),
-                completed,
-                diff_open,
-                dock_width,
-                &layout_config,
-            );
-            layout.tabs = visible.len() > layout.tiled || layout.tiled == 0;
-        }
-
-        self.runtime.last_layout = Some(layout);
-        if layout.sidebar {
-            egui::Panel::left("sidebar")
-                .exact_size(self.runtime.config.layout.sidebar_width)
-                .resizable(false)
-                .frame(egui::Frame::new().fill(p.sidebar).inner_margin(egui::Margin::symmetric(10, 4)))
-                .show(ui, |ui| self.sidebar(ui));
-        }
-
-        let chief_rect = (layout.dock_width > 0.0)
-            .then(|| atomics_ui::chief::dock(ui, layout.dock_width, &p, |ui| self.chief_content(ui)));
-
-        egui::CentralPanel::default().frame(egui::Frame::new().fill(p.background)).show(ui, |ui| {
-            let mut rect = ui.max_rect();
-            if history_board {
-                self.plan_panel(ui, rect);
-                return;
-            }
-            let statuses: Vec<AgentStatus> = visible.iter().map(|&i| self.runtime.sessions[i].status).collect();
-            let active = self.runtime.active_index().and_then(|a| visible.iter().position(|&i| i == a));
-            let tiled: Vec<usize> =
-                pick_tiled(&statuses, active, layout.tiled).into_iter().map(|k| visible[k]).collect();
-            if layout.tabs {
-                self.tab_strip(ui, rect.with_max_y(rect.top() + TAB_HEIGHT), &tiled, &visible);
-                rect.min.y += TAB_HEIGHT;
-            }
-            if visible.is_empty() && completed == 0 && !diff_open {
-                self.welcome(ui, rect);
-                return;
-            }
-            let (diff_rect, term_rect) = match layout.diff {
-                DiffPlacement::Right { width } => {
-                    (Some(rect.with_min_x(rect.right() - width)), Some(rect.with_max_x(rect.right() - width)))
-                }
-                DiffPlacement::Top { height } => {
-                    (Some(rect.with_max_y(rect.top() + height)), Some(rect.with_min_y(rect.top() + height)))
-                }
-                DiffPlacement::Full => (Some(rect), None),
-                DiffPlacement::Hidden => (None, Some(rect)),
-            };
-            if let Some(term_rect) = term_rect {
-                if visible.is_empty() && layout.completed == 0 {
-                    self.welcome(ui, term_rect);
-                } else {
-                    self.tiles(ui, term_rect, &layout, &tiled);
-                }
-            }
-            if let Some(diff_rect) = diff_rect {
-                self.diff_panel(ui, diff_rect);
-                if let DiffPlacement::Right { width } = layout.diff {
-                    // Drag the divider to give the diff/editor more or less room; double-click resets.
-                    let handle = Rect::from_center_size(diff_rect.left_center(), vec2(8.0, diff_rect.height()));
-                    let response = ui.interact(handle, ui.scope_id().with("divider"), Sense::click_and_drag());
-                    if response.hovered() || response.dragged() {
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-                        ui.painter().rect_filled(handle.shrink2(vec2(3.0, 0.0)), 0.0, p.accent.gamma_multiply(0.6));
-                    }
-                    if response.dragged() {
-                        self.client.split = Some(width - response.drag_delta().x);
-                    }
-                    if response.double_clicked() {
-                        self.client.split = None;
-                    }
-                }
-                let edge = match layout.diff {
-                    DiffPlacement::Right { .. } => Some([diff_rect.left_top(), diff_rect.left_bottom()]),
-                    DiffPlacement::Top { .. } => Some([diff_rect.left_bottom(), diff_rect.right_bottom()]),
-                    _ => None,
-                };
-                if let Some(edge) = edge {
-                    ui.painter().line_segment(edge, Stroke::new(1.0, p.separator));
-                }
-            }
-        });
-
-        if let Some(rect) = chief_rect {
-            self.draw(|_, client| atomics_ui::chief::divider(ui, rect, client));
-        }
-
-        self.chief_ui(&ctx);
+        atomics_ui::shell::frame(ui, self);
         self.runtime.desktop_split = self.client.split;
         self.runtime.desktop_diff_split = self.client.diff_split;
         self.dialogs(&ctx);

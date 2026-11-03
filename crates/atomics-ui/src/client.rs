@@ -32,6 +32,8 @@ pub struct Client {
     pub diff_views: HashMap<PathBuf, DiffState>,
     /// Side by side or unified, picked in the diff header; wins over the config until the UI closes.
     pub diff_split: Option<DiffSplit>,
+    /// The diff panel's width, where the user dragged its divider; `None` for the layout's own.
+    pub split: Option<f32>,
     /// Each project's explorer: its filter, open folders and whether its worktrees show, by project.
     pub explorers: HashMap<PathBuf, ExplorerState>,
     /// The sessions picked to steer together, by id.
@@ -66,6 +68,7 @@ impl Default for Client {
             approval_decisions: HashSet::new(),
             diff_views: HashMap::new(),
             diff_split: None,
+            split: None,
             explorers: HashMap::new(),
             selected: HashSet::new(),
             confirm_close: None,

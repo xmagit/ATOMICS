@@ -763,6 +763,26 @@ fn carry_out(driver: &mut Driver, client: &mut Client, view: &mut View) {
     driver.flush();
 }
 
+/// The view commands this frame carries out ([`view_command`]); the views draw no action for the others.
+pub(crate) fn carries_out(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Activate { open_diff: true, .. }
+            | Command::OpenTaskSession(_)
+            | Command::ShowTaskDiff { .. }
+            | Command::ShowRoot(_)
+            | Command::OpenDiff
+            | Command::ToggleDiff
+            | Command::CloseDiff
+            | Command::SetPanel(PanelMode::Diff | PanelMode::Plan)
+            | Command::TogglePlan
+            | Command::ShowPlan(_)
+            | Command::ViewPlanHistory(_)
+            | Command::EditingPlan
+            | Command::Toast(_)
+    )
+}
+
 fn view_command(driver: &mut Driver, view: &mut View, command: Command) {
     let remote = &driver.remote;
     let session_root = |id: &str| remote.session_list().into_iter().find(|s| s.id == id).map(|s| s.root);
@@ -790,6 +810,10 @@ fn view_command(driver: &mut Driver, view: &mut View, command: Command) {
         Command::ShowPlan(index) | Command::ViewPlanHistory(index) => {
             view.plan = index;
             view.tab = Tab::Board;
+            None
+        }
+        Command::Toast(text) => {
+            remote.say(text);
             None
         }
         _ => None,

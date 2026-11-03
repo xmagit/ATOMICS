@@ -139,18 +139,6 @@ impl TerminalSurface for Terminals<'_> {
     }
 }
 
-impl Desktop<'_> {
-    pub(super) fn tab_strip(&mut self, ui: &mut egui::Ui, rect: Rect, tiled: &[usize], visible: &[usize]) {
-        self.draw(|backend, client| atomics_ui::fleet::tab_strip(ui, rect, tiled, visible, backend, client));
-    }
-
-    pub(super) fn tiles(&mut self, ui: &mut egui::Ui, rect: Rect, layout: &Layout, tiled: &[usize]) {
-        self.draw_terminals(|backend, client, terminals| {
-            atomics_ui::fleet::tiles(ui, rect, layout, tiled, backend, client, terminals)
-        });
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::backend::{resumes_as_codex, worktree_kept};
