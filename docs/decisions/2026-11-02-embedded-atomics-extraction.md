@@ -92,7 +92,7 @@ are agent-days of focused work, review wait excluded. "C1"/"C2" are the design's
 | S4 | Ticket panels: `tickets_panel.rs` (3,093 lines) onto `TicketsView`. Split by panel (tree, find, sign-in) | 3 PRs | 2.5 | C2 |
 | **S5** | **Done** (4.3). `Palette` (egui colors and fonts) out of `State`: the web crate owns `Palette`; `fontique` lookup stays a desktop hook that supplies the fonts (`theme::FontSource` already names a font in the config). `config.keys` and `layout` are already core | 1–2 PRs | 1.5 | C1 |
 | **S6** | **Done** (4.5). Move the files that read nothing from `runtime`: `diff_view.rs`, `panel_nav.rs`, `markdown.rs`, `topbar` helpers into `atomics-ui` (adds `egui` with default features off). Needs S5 for `Palette` | 1 PR | 1.5 | C1 |
-| S7 | Move `Client` and the draw functions: `fn draw_*(ui, &dyn Backend, &mut Client)` per file, `Desktop` becomes a shim holding `&mut State` for the writes not yet converted. Order: `topbar`, `sidebar`, `board`, `fleet`, `chief`, `editor` (diff panel), `github`, `tickets_panel`, settings menus | 8–10 PRs | 5 | C1 |
+| S7 | Move `Client` and the draw functions: `fn draw_*(ui, &dyn Backend, &mut Client)` per file, `Desktop` becomes a shim holding `&mut State` for the writes not yet converted. Order: `topbar`, `sidebar`, `board`, `fleet`, `chief`, `editor` (diff panel), `github`, `tickets_panel`, settings menus. Moved so far (4.6): `board`, the approval banner, the worktree diff view, `sidebar`, `topbar` and `fleet` | 8–10 PRs | 5 | C1 |
 | **S8** | **Done** (4.7). Writes: `Command` enum and `Backend::send`, domain by domain, replacing `post` closures (50 sites) and the direct `runtime.*` view-hint writes | 5 PRs | 3 | H4 / C1 |
 | **S9** | **Done** (4.8). `atomics-ui` builds for `wasm32-unknown-unknown` in CI (`cargo check --target`), eframe web entry point `atomics-web` | 1 PR | 1.5 | C5 |
 
@@ -273,6 +273,31 @@ Commits, one per file group:
    records to `atomics-ui`, behind `test-support`. The bar's layout (`top_bar`) stays in the desktop with the
    items that have not moved: the chief pill, the Tickets button and sign-in (S4), the GitHub counter, the
    load gauge and the Settings menu.
+6. **Fleet** (`fleet.rs`). `atomics_ui::fleet::tiles` draws the session tiles (header with status, title,
+   agent, branch and status, sandbox badge and close; the approval banner; the MCP banner; the plan task's
+   last report; the terminal, or the last exchange of a session outside ATOMICS; the exited overlay) and
+   the completed-task tiles, and `fleet::tab_strip` the session tabs over them. The terminal is drawn
+   through a hook, `atomics_ui::terminal_surface::TerminalSurface` (`show(ui, index, session, rect, id,
+   metrics, palette)`): the desktop's `Terminals` draws it with its `TerminalView`s, a browser will draw the
+   screen the host streams. `terminal::Metrics::new` makes the cell metrics from the palette and the
+   config's font size. Two reads join the `Backend`: `tile(index)` (`TileView`: the task's last report,
+   the sandbox's usage and the sampling error, the slot-queue note, the MCP banner's `ConnectButton`s, which
+   moved to `atomics-ui`, whether the process exited and can be resumed, and an outside session's folder,
+   last prompt and message) and `completed_tasks()` (`CompletedTile`: plan and task positions, the task,
+   and the `read_only`, `worktree`, `codex` and `now` that `task_result` needs, worked out as the board
+   works them out). Clicks become commands as before, plus `ResumeSession(id)` for the exited overlay's
+   Resume, which runs `State::resume_exited` on the runtime thread: the record, the scratch folder kept and
+   the close and resume, which the tile did at the click before. `focus_terminal` and `status_glyph` move
+   to `atomics-ui`; `connect_buttons` is `State`'s. Host rules stay in the desktop: `visible_sessions`,
+   `completed_tasks`, `close_idle` and `queue_note`. `RemoteBackend` reads a tile from the mirror (exited,
+   folder) and has no completed tiles yet.
+
+   Checked with `scripts/linux-qa.sh` screenshots at 1600×1000, two before and two after: the project's
+   shell, which shows as outside ATOMICS there (no sandbox in the container), two live shells and an
+   exited one on the tab strip. Before and after are identical pixel for pixel except the load gauge and
+   the temporary folder's random name in the outside transcript, which differ between two runs of the
+   same build too. The completed-task tiles and the exited overlay were not on screen: the tiles' tests
+   ran unchanged, and the overlay, which no test draws, moved line for line.
 
 ### 4.7 S8
 
@@ -300,7 +325,7 @@ Eight commits, one per domain, then the mapping. The tests ran unchanged but one
 | Review | `EditComments` (a `remove` for each comment gone, then an `add` for each new one, at the diff's revision), `SendReview` | `review_command` |
 | | `RefreshDiff`, `OpenFile`, `LeaveFile`, `Edit` | none (a remote client reads files with `diff_get` and `file_get`) |
 | Sessions | `Steer` (one per session), `VoiceToSession` (a steer), `StartAgent` (`start` in the folder), `CloseSession` | `session_command` |
-| | `Resume`, `RenameSession`, `CloseIdle`, `SeeSession`, `DismissMcp` | none yet |
+| | `Resume`, `ResumeSession`, `RenameSession`, `CloseIdle`, `SeeSession`, `DismissMcp` | none yet |
 | Projects and worktrees | `OpenProject`, `CloseProject`, `OpenWorkspace`, `SaveWorkspace`, `OpenCleanup`, `CleanupFetch`, `CleanupPrune`, `CleanupReload`, `RemoveWorktrees` | none yet |
 | Chief and settings | `ToggleChief`, `SetChiefDock`, `SaveChiefPreferences`, `VoiceToChief`, `SelectTheme`, `CheckSandbox`, `RefreshConnections`, `ImportConnections`, `Connect`, `Disconnect`, `AddConnection`, `DecideProposal` | none yet |
 | View | `Activate`, `OpenTaskSession`, `ShowTaskDiff`, `ShowRoot`, `OpenDiff`, `CloseDiff`, `ToggleDiff`, `SetPanel`, `SetView`, `ShowUngrouped`, `ShowPlan`, `ViewPlanHistory`, `TogglePlan`, `EditingPlan`, `ClosePlanTab`; the dialogs `NewSession`, `NewWorktree`, `Rename`, `PickProject` | none: the client's own |

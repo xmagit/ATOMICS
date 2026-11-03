@@ -1,3 +1,8 @@
+//! The fleet's host side: which sessions and finished tasks the current tab shows, closing idle sessions,
+//! resuming an exited one, the slot-queue note, and the desktop's terminal surface. atomics-ui draws the
+//! tiles and the tab strip (`atomics_ui::fleet`).
+use atomics_ui::terminal_surface::TerminalSurface;
+
 use super::*;
 
 impl State {
@@ -71,6 +76,31 @@ impl State {
         }
         idle.len()
     }
+
+    /// Starts the exited session `id` again in its place, from a record of it: its tile closes and its
+    /// agent picks its conversation up again. A resumed scratch session keeps its folder, and finds its
+    /// sandbox by its record.
+    pub(super) fn resume_exited(&mut self, id: &str) {
+        let Some(index) = self.sessions.iter().position(|s| s.id == id) else { return };
+        let s = &self.sessions[index];
+        let record = SessionRecord {
+            chief: s.chief,
+            pane: Some(s.id.clone()),
+            claude_session_id: s.claude_id.clone().unwrap_or_default(),
+            agent: s.agent.clone(),
+            cwd: s.cwd.clone(),
+            title: s.title.clone(),
+            last_prompt: None,
+            updated: 0,
+            sandbox: s.sandbox.clone(),
+            named: s.naming == Naming::Named,
+        };
+        if self.sessions[index].scratch.take().is_some() && record.sandbox.is_some() {
+            self.store.upsert(record.clone());
+        }
+        self.close(id);
+        self.resume.push(record);
+    }
 }
 
 /// What the slot queue holds for the process tree under `pid`.
@@ -83,390 +113,64 @@ pub(super) fn queue_note(pid: u32, running: &[Ticket], waiting: &[Ticket]) -> Op
     Some(format!("queued for a {} slot ({place} in line)", ticket.class.name()))
 }
 
-/// Side of the sandbox mark in a tile's header badge.
-const SANDBOX_ICON: f32 = 10.0;
+/// The desktop's [`TerminalSurface`]: each session's terminal drawn by the desktop's own terminal view,
+/// one per egui id.
+pub(super) struct Terminals<'a> {
+    pub(super) sessions: &'a [Session],
+    pub(super) views: &'a mut HashMap<egui::Id, TerminalView>,
+}
 
-/// The sandbox mark: a closed box, drawn as an isometric cube.
-fn sandbox_icon(painter: &egui::Painter, rect: Rect, color: Color32) {
-    let (c, r) = (rect.center(), rect.width() / 2.0);
-    let (dx, dy) = (r * 0.87, r * 0.5);
-    let corner = |x: f32, y: f32| pos2(c.x + x, c.y + y);
-    let outline =
-        vec![corner(0.0, -r), corner(dx, -dy), corner(dx, dy), corner(0.0, r), corner(-dx, dy), corner(-dx, -dy)];
-    let stroke = Stroke::new(1.2, color);
-    painter.add(egui::Shape::closed_line(outline, stroke));
-    painter.line_segment([corner(-dx, -dy), c], stroke);
-    painter.line_segment([corner(dx, -dy), c], stroke);
-    painter.line_segment([c, corner(0.0, r)], stroke);
+impl TerminalSurface for Terminals<'_> {
+    fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        index: usize,
+        session: &str,
+        rect: Rect,
+        id: egui::Id,
+        metrics: &Metrics,
+        palette: &Palette,
+    ) -> egui::Response {
+        match self.sessions.get(index).filter(|s| s.id == session).and_then(|s| s.terminal.as_ref()) {
+            Some(terminal) => self.views.entry(id).or_default().show(terminal, ui, rect, id, metrics, palette),
+            // Not reached: views ask only for sessions with a terminal, from the same model.
+            None => ui.interact(rect, id, Sense::click()),
+        }
+    }
 }
 
 impl Desktop<'_> {
     pub(super) fn tab_strip(&mut self, ui: &mut egui::Ui, rect: Rect, tiled: &[usize], visible: &[usize]) {
-        let p = self.palette();
-        ui.painter().rect_filled(rect, 0.0, p.panel);
-        let mut child = ui.new_child(
-            egui::UiBuilder::new()
-                .id_salt("tab-strip")
-                .max_rect(rect.shrink2(vec2(6.0, 3.0)))
-                .layout(egui::Layout::left_to_right(egui::Align::Center)),
-        );
-        let mut clicked = None;
-        let sessions = self.runtime.backend().session_list();
-        egui::ScrollArea::horizontal().id_salt("tab-strip-scroll").show(&mut child, |ui| {
-            ui.horizontal(|ui| {
-                for &i in visible {
-                    let s = &sessions[i];
-                    let active = self.runtime.active.as_deref() == Some(s.id.as_str());
-                    let shown = tiled.contains(&i);
-                    let color = if active {
-                        p.foreground
-                    } else if shown {
-                        lerp(p.muted, p.foreground, 0.5)
-                    } else {
-                        p.muted
-                    };
-                    let text =
-                        RichText::new(format!("{}  {}", status_glyph(s.status), s.title)).color(color).size(12.5);
-                    let response = ui.add(
-                        egui::Button::new(text)
-                            .fill(if active { lerp(p.panel, p.accent, 0.25) } else { Color32::TRANSPARENT })
-                            .stroke(Stroke::NONE),
-                    );
-                    if response.clicked() {
-                        clicked = Some(s.id.clone());
-                    }
-                }
-            });
-        });
-        if let Some(session) = clicked {
-            self.send(Command::Activate { session, open_diff: false });
-        }
+        self.draw(|backend, client| atomics_ui::fleet::tab_strip(ui, rect, tiled, visible, backend, client));
     }
 
     pub(super) fn tiles(&mut self, ui: &mut egui::Ui, rect: Rect, layout: &Layout, tiled: &[usize]) {
-        if layout.tiled + layout.completed == 0 {
-            return;
-        }
-        let metrics = self.metrics(ui);
-        let p = self.palette();
-        let (cols, rows) = (layout.columns.max(1), layout.rows.max(1));
-        let size = vec2(rect.width() / cols as f32, rect.height() / rows as f32);
-        let mut activate: Option<(String, bool)> = None;
-        let mut close: Option<String> = None;
-        let mut rename: Option<String> = None;
-        let mut resume: Option<usize> = None;
-        // A banner's Connect button: the server, whether to store its environment, the agent's URL.
-        let mut connect: Option<(String, bool, Option<String>)> = None;
-        let mut dismiss: Option<String> = None;
-        let focus_request = self.client.focus_terminal.take();
-        let now = ui.input(|i| i.time);
-        let (slots_running, slots_waiting) = self.runtime.governor.snapshot();
-        let sessions = self.runtime.backend().session_list();
-
-        for (slot, &index) in tiled.iter().enumerate() {
-            let min = rect.min + vec2((slot % cols) as f32 * size.x, (slot / cols) as f32 * size.y);
-            let tile = Rect::from_min_size(min, size).shrink(3.0);
-            // The header reads the session's row, and atomics-ui's approval banner its first request. The rest
-            // of the body (the MCP banner, the terminal) still reads the model, until the terminal slice moves it.
-            let row = &sessions[index];
-            let active = self.runtime.active.as_deref() == Some(row.id.as_str());
-            let reported = if matches!(row.status, AgentStatus::Idle | AgentStatus::Done) {
-                self.runtime
-                    .plans
-                    .iter()
-                    .flat_map(|p| &p.tasks)
-                    .find(|t| t.session.as_deref() == Some(&row.id))
-                    .and_then(|t| t.reported_line(atomics_core::store::now()))
-            } else {
-                None
-            };
-            let needed = match row.sandbox {
-                Some(_) => self.connect_buttons(&self.runtime.sessions[index].mcp_needed, &row.title),
-                None => Vec::new(),
-            };
-            let session = &mut self.runtime.sessions[index];
-
-            let header = tile.with_max_y(tile.top() + TILE_HEADER);
-            let mut body = tile.with_min_y(header.bottom());
-            ui.painter().rect_filled(header, 2.0, if active { lerp(p.raised, p.accent, 0.12) } else { p.raised });
-            ui.painter().line_segment([header.left_bottom(), header.right_bottom()], Stroke::new(1.0, p.border));
-            if active {
-                ui.painter().rect_filled(header.with_max_x(header.left() + 2.0), 0.0, p.accent);
-            }
-            ui.painter().circle_filled(
-                pos2(header.left() + 12.0, header.center().y),
-                3.5,
-                status_dot(row.status, &p, now),
-            );
-            let mut badge_width = 0.0;
-            if let Some(name) = &row.sandbox {
-                let usage = self.runtime.sandbox_usage.usage.get(name);
-                let text = usage.map_or_else(|| "Sandbox".into(), |usage| format!("Sandbox · {}", usage.label()));
-                let galley = ui.fonts_mut(|f| f.layout_no_wrap(text, p.ui(10.0), p.info));
-                badge_width = galley.size().x + SANDBOX_ICON + 19.0;
-                let badge = Rect::from_min_max(
-                    pos2((header.right() - 28.0 - badge_width).max(header.left() + 22.0), header.center().y - 8.5),
-                    pos2(header.right() - 31.0, header.center().y + 8.5),
-                );
-                ui.painter().rect_filled(badge, 4.0, lerp(p.raised, p.info, 0.15));
-                let painter = ui.painter().with_clip_rect(badge);
-                let icon = Rect::from_center_size(
-                    badge.left_center() + vec2(5.0 + SANDBOX_ICON / 2.0, 0.0),
-                    vec2(SANDBOX_ICON, SANDBOX_ICON),
-                );
-                sandbox_icon(&painter, icon, p.info);
-                painter.galley(badge.left_center() + vec2(9.0 + SANDBOX_ICON, -galley.size().y / 2.0), galley, p.info);
-                let resources = match (usage, &self.runtime.sandbox_usage.error) {
-                    (Some(_), _) => "Host VM process tree: resident memory and ps CPU (100% = one core).",
-                    (None, Some(error)) => error.as_str(),
-                    (None, None) => "Its memory and CPU show here once ATOMICS finds the VM's host process.",
-                };
-                ui.interact(badge, ui.scope_id().with(("sandbox-usage", name)), Sense::hover()).on_hover_text(format!(
-                    "Runs sandboxed in Docker Sandboxes VM {name}: it sees its worktree and git's write folders, \
-                         not the rest of this machine.\n{resources}"
-                ));
-            }
-            let title_rect = Rect::from_min_max(
-                pos2(header.left() + 22.0, header.top()),
-                pos2(header.right() - 28.0 - badge_width, header.bottom()),
-            );
-            let title_response = ui.interact(title_rect, ui.scope_id().with(("tile-title", &row.id)), Sense::click());
-            let title_color = if title_response.hovered() || active { p.accent } else { p.foreground };
-            let mut subtitle = match (row.scratch, row.branch.as_deref()) {
-                (true, _) => format!("{} · scratch · {}", row.agent, row.status.label()),
-                (false, Some(branch)) => format!("{} · {} · {}", row.agent, branch, row.status.label()),
-                (false, None) => format!("{} · {}", row.agent, row.status.label()),
-            };
-            if let Some(note) =
-                session.terminal.as_ref().and_then(|t| queue_note(t.process_id(), &slots_running, &slots_waiting))
-            {
-                subtitle.push_str(&format!(" · {note}"));
-            }
-            let galley = ui.fonts_mut(|f| f.layout_no_wrap(row.title.clone(), p.ui(13.0), title_color));
-            let title_width = galley.size().x;
-            ui.painter().with_clip_rect(title_rect).galley(
-                pos2(title_rect.left(), header.center().y - galley.size().y / 2.0),
-                galley,
-                title_color,
-            );
-            ui.painter().with_clip_rect(title_rect).text(
-                pos2(title_rect.left() + title_width + 10.0, header.center().y),
-                egui::Align2::LEFT_CENTER,
-                subtitle,
-                p.ui(11.5),
-                p.muted,
-            );
-            let hover = if row.chief {
-                "Show this worktree's diff against main"
-            } else {
-                "Show this worktree's diff against main · double-click to rename"
-            };
-            let title_response = title_response.on_hover_text(hover);
-            if title_response.double_clicked() {
-                rename = Some(row.id.clone());
-            } else if title_response.clicked() {
-                activate = Some((row.id.clone(), true));
-            }
-            let close_rect = Rect::from_center_size(pos2(header.right() - 14.0, header.center().y), Vec2::splat(18.0));
-            let close_response = ui.interact(close_rect, ui.scope_id().with(("tile-close", &row.id)), Sense::click());
-            ui.painter().text(
-                close_rect.center(),
-                egui::Align2::CENTER_CENTER,
-                "×",
-                p.ui(15.0),
-                if close_response.hovered() { p.error } else { p.muted },
-            );
-            if close_response.clicked() {
-                close = Some(row.id.clone());
-            }
-            let edge = if active { p.accent.gamma_multiply(0.7) } else { p.border };
-            ui.painter().rect_stroke(tile, 2.0, Stroke::new(1.0, edge), egui::StrokeKind::Outside);
-
-            body = self.draw(|backend, client| atomics_ui::approvals::banner(ui, body, index, backend, client));
-            let session = &mut self.runtime.sessions[index];
-            if !needed.is_empty() {
-                let shown = needed.len().min(3);
-                let banner = body.with_max_y((body.top() + 8.0 + 28.0 * shown as f32).min(body.bottom()));
-                ui.painter().rect_filled(banner, 0.0, p.panel);
-                let mut child = ui.new_child(
-                    egui::UiBuilder::new()
-                        .id_salt(("mcp-needed", &session.id))
-                        .max_rect(banner.shrink2(vec2(8.0, 4.0))),
-                );
-                child.set_clip_rect(banner);
-                for (row, button) in needed.iter().take(shown).enumerate() {
-                    child.horizontal(|ui| {
-                        if ui.add_enabled(button.enabled, egui::Button::new(&button.label)).clicked() {
-                            connect = Some((button.name.clone(), button.store_env, button.url.clone()));
-                        }
-                        ui.label(RichText::new(&button.detail).size(11.5).color(p.muted)).on_hover_text(
-                            "This agent needs an MCP server that is not connected. Connecting it opens its sign-in \
-                             page in your browser, and every sandboxed session then gets it.",
-                        );
-                        if row == 0 && ui.small_button("×").on_hover_text("Dismiss").clicked() {
-                            dismiss = Some(session.id.clone());
-                        }
-                    });
-                }
-                body.min.y = banner.bottom();
-            }
-            let term_id = ui.scope_id().with(("term", &session.id));
-            if let Some(reported) = reported {
-                let banner = body.with_max_y(body.top() + 24.0);
-                ui.painter().rect_filled(banner, 0.0, p.panel);
-                ui.painter().text(
-                    banner.left_center() + vec2(8.0, 0.0),
-                    egui::Align2::LEFT_CENTER,
-                    reported,
-                    p.ui(12.0),
-                    p.muted,
-                );
-                body.min.y = banner.bottom();
-            }
-            match &mut session.terminal {
-                Some(terminal) => {
-                    // Focus before reading this frame's events, including the key that left the diff.
-                    if focus_request.as_deref() == Some(session.id.as_str()) {
-                        ui.memory_mut(|m| m.request_focus(term_id));
-                    }
-                    let response = self
-                        .client
-                        .terminal_views
-                        .entry(term_id)
-                        .or_default()
-                        .show(terminal, ui, body, term_id, &metrics, &p);
-                    if (response.clicked() || response.gained_focus()) && !active {
-                        activate = Some((session.id.clone(), false));
-                    }
-                    if terminal.exited() {
-                        let overlay = Rect::from_center_size(body.center(), vec2(body.width().min(320.0), 80.0));
-                        ui.painter().rect_filled(overlay, 8.0, p.panel);
-                        let mut child = ui.new_child(
-                            egui::UiBuilder::new().id_salt(("exited", &session.id)).max_rect(overlay.shrink(12.0)),
-                        );
-                        child.vertical_centered(|ui| {
-                            ui.label(RichText::new("Process exited").color(p.foreground));
-                            ui.horizontal(|ui| {
-                                if session.kind == AgentKind::Claude
-                                    && session.claude_id.is_some()
-                                    && ui.button("Resume").clicked()
-                                {
-                                    resume = Some(index);
-                                }
-                                if ui.button("Close").clicked() {
-                                    close = Some(session.id.clone());
-                                }
-                            });
-                        });
-                    }
-                }
-                None => {
-                    ui.painter().rect_filled(body, 0.0, p.background);
-                    let mut child = ui.new_child(
-                        egui::UiBuilder::new().id_salt(("outside", &session.id)).max_rect(body.shrink(14.0)),
-                    );
-                    child.label(
-                        RichText::new(format!("Running outside ATOMICS in {}", paths::display(&session.cwd)))
-                            .color(p.muted)
-                            .size(12.0),
-                    );
-                    child.label(
-                        RichText::new("Messages reach it at its next tool call or turn end.").color(p.muted).size(12.0),
-                    );
-                    child.add_space(8.0);
-                    if let Some(prompt) = &session.last_prompt {
-                        child.label(RichText::new("You").color(p.accent).size(12.0));
-                        child.label(RichText::new(truncate(prompt, 600)).color(p.foreground));
-                        child.add_space(6.0);
-                    }
-                    if let Some(message) = &session.last_message {
-                        child.label(RichText::new("Claude").color(p.success).size(12.0));
-                        child.label(RichText::new(truncate(message, 1500)).color(p.foreground));
-                    }
-                    if ui.interact(body, term_id, Sense::click()).clicked() && !active {
-                        activate = Some((session.id.clone(), false));
-                    }
-                }
-            }
-        }
-
-        if let Some((name, store_env, url)) = connect {
-            self.send(Command::Connect { name, store_env, url });
-        }
-        if let Some(id) = dismiss {
-            self.send(Command::DismissMcp(id));
-        }
-        let mut task_action = None;
-        for (offset, (plan, task)) in self.runtime.completed_tasks().into_iter().take(layout.completed).enumerate() {
-            let slot = tiled.len() + offset;
-            let min = rect.min + vec2((slot % cols) as f32 * size.x, (slot / cols) as f32 * size.y);
-            let tile = Rect::from_min_size(min, size).shrink(3.0);
-            ui.painter().rect_filled(tile, 2.0, p.raised);
-            ui.painter().rect_stroke(tile, 2.0, Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
-            let mut child =
-                ui.new_child(egui::UiBuilder::new().id_salt(("completed", plan, task)).max_rect(tile.shrink(14.0)));
-            let task_data = &self.runtime.plans[plan].tasks[task];
-            child.label(RichText::new(&task_data.title).color(p.foreground).strong().size(13.0));
-            if let Some(action) = task_result(
-                &mut child,
-                task_data,
-                None,
-                false,
-                !self.runtime.plans[plan].is_open(),
-                &self.runtime.config,
-                &p,
-            ) {
-                task_action = Some((plan, task, action));
-            }
-        }
-        if let Some(command) = task_action.and_then(|(plan, task, action)| Command::task(plan, task, action)) {
-            self.send(command);
-        }
-
-        if let Some((session, open_diff)) = activate {
-            self.send(Command::Activate { session, open_diff });
-        }
-        if let Some(id) = rename {
-            self.send(Command::Rename(id));
-        }
-        if let Some(id) = close {
-            // Closing a scratch session deletes its folder, so it asks even once the agent exited.
-            let ask = self
-                .sessions
-                .iter()
-                .find(|s| s.id == id)
-                .is_some_and(|s| s.scratch.is_some() || s.terminal.as_ref().is_some_and(|t| !t.exited()));
-            if ask { self.client.confirm_close = Some(id) } else { self.send(Command::CloseSession(id)) }
-        }
-        if let Some(index) = resume {
-            let s = &self.runtime.sessions[index];
-            let record = SessionRecord {
-                chief: s.chief,
-                pane: Some(s.id.clone()),
-                claude_session_id: s.claude_id.clone().unwrap_or_default(),
-                agent: s.agent.clone(),
-                cwd: s.cwd.clone(),
-                title: s.title.clone(),
-                last_prompt: None,
-                updated: 0,
-                sandbox: s.sandbox.clone(),
-                named: s.naming == Naming::Named,
-            };
-            let id = s.id.clone();
-            // A resumed scratch session keeps its folder, and finds its sandbox by its record.
-            if self.runtime.sessions[index].scratch.take().is_some() && record.sandbox.is_some() {
-                self.runtime.store.upsert(record.clone());
-            }
-            self.send(Command::CloseSession(id));
-            self.send(Command::Resume(record));
-        }
+        self.draw_terminals(|backend, client, terminals| {
+            atomics_ui::fleet::tiles(ui, rect, layout, tiled, backend, client, terminals)
+        });
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::backend::{resumes_as_codex, worktree_kept};
     use super::super::tests::{repository, session, with_app};
     use super::*;
+
+    /// A task's result on a completed-task tile, from what the in-process backend reads for it.
+    fn task_result(
+        ui: &mut egui::Ui,
+        task: &Task,
+        status: Option<AgentStatus>,
+        expanded: bool,
+        read_only: bool,
+        config: &Config,
+        p: &Palette,
+    ) -> Option<&'static str> {
+        let (available, codex) = (worktree_kept(task), resumes_as_codex(config, task));
+        let now = atomics_core::store::now();
+        atomics_ui::board::task_result(ui, task, status, expanded, read_only, available, codex, now, p)
+    }
 
     #[test]
     fn queue_notes_name_the_slot_or_the_place_in_line() {

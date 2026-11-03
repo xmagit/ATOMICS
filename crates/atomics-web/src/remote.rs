@@ -27,8 +27,8 @@ use atomics_core::screen::Screen;
 use atomics_core::session::AgentStatus;
 use atomics_core::wire::{self, Envelope, ErrorCode, Message, Role, Seq, VERSION};
 use atomics_ui::{
-    ApprovalRow, Backend, BoardView, Command, DiffHeading, DiffSnapshot, Notices, PanelMode, PlanRow, PlanState,
-    ProjectMenu, RecentSession, Remote, SandboxLoad, SessionRow, UiConfig, ViewHints, WorktreeRow,
+    ApprovalRow, Backend, BoardView, Command, CompletedTile, DiffHeading, DiffSnapshot, Notices, PanelMode, PlanRow,
+    PlanState, ProjectMenu, RecentSession, Remote, SandboxLoad, SessionRow, TileView, UiConfig, ViewHints, WorktreeRow,
 };
 
 use crate::screens::{Lease, Refused, Screens};
@@ -803,6 +803,23 @@ impl Backend for RemoteBackend {
                 input: serde_json::Value::Null,
             },
         })
+    }
+
+    /// The mirror says only whether the session exited and where it runs; reports, the sandbox, the slot
+    /// queue and MCP servers are the host's.
+    fn tile(&self, index: usize) -> Option<TileView> {
+        let s = self.state.borrow();
+        let session = s.mirror.sessions.values().nth(index)?;
+        Some(TileView {
+            exited: session.status == AgentStatus::Exited,
+            folder: session.cwd.clone(),
+            ..TileView::default()
+        })
+    }
+
+    /// None: whether a finished task's worktree is still there is the host's to know.
+    fn completed_tasks(&self) -> Vec<CompletedTile> {
+        Vec::new()
     }
 
     fn diff_roots(&self) -> Vec<PathBuf> {
