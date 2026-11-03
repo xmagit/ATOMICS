@@ -19,13 +19,23 @@
 //!
 //! `the_bundle_works_on_a_phone_by_touch`: the same bundle on an iPhone (390 × 844 points at 3 pixels a
 //! point, a touch screen, Safari's user agent), framed full screen by a hosting page, and used by touch alone
-//! (`Input.dispatchTouchEvent`). It pairs, shows the board, the plans and a two-file diff, approves the plan
-//! and a tool request with a tap on their buttons, and opens an agent's terminal, where a tap focuses the input
-//! overlay; `ls`, Return, Backspace on an empty line and the key bar's ↑ reach the host as their bytes, and once
-//! the desktop takes the terminal back the field has lost the focus and typing sends nothing. Every screen
-//! is saved as a PNG in `target/phone-shots/` (emptied first) for a person to look at. The client draws on a
-//! canvas, so the test finds what to tap by colour in the screenshots, using the palette the client draws
-//! with, and the pane bar from the client's own layout code, whose points are `layout::ZOOM` CSS pixels.
+//! (`Input.dispatchTouchEvent`). It pairs, shows the board, the AGENTS list and a two-file diff, approves the
+//! plan (`plan_command` approve) and a tool request with a tap on their buttons, and opens an agent's tile,
+//! where a tap focuses the input overlay; text, Return, Backspace on an empty line and the key bar's ↑ (a key
+//! 44 CSS pixels each way) reach the host as their bytes, and once the desktop takes the terminal back the
+//! field has lost the focus and typing sends nothing. Then a long press on a word selects that word alone,
+//! its end handle dragged over the next word takes it in, and Copy copies exactly those two words. Every
+//! screen is saved as a PNG in `target/phone-shots/` (emptied first) for a person to look at. The client
+//! draws on a canvas, so the test finds what to tap by colour in the screenshots, using the palette the
+//! client draws with, and the pane bar from the client's own layout code, whose points are `layout::ZOOM`
+//! CSS pixels.
+//!
+//! `the_bundle_draws_the_desktops_frame_in_a_wide_window`: the bundle in a 1600 × 1000 window draws the
+//! desktop's own frame over the fake host: the top bar, the chief docked with its terminal, the agent's tile
+//! and the plan's board. Its screenshot is saved as `target/wide-shots/browser.png`; where
+//! `target/wide-shots/desktop.png` is (`scripts/wide-desktop-shot.sh` takes the desktop's QA screenshot of the
+//! same board), the two go side by side into `target/wide-shots/side-by-side.png`. Then a click into the
+//! agent's terminal types there, a click into the chief's moves the input there, and Approve plan approves.
 
 #[allow(dead_code)] // shared with the unit tests, which use more of it
 #[path = "../src/fake_host.rs"]
@@ -363,6 +373,19 @@ fn base64(text: &str) -> Vec<u8> {
     out
 }
 
+/// Standard base64 with padding, to hand the page a PNG.
+fn encode64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk.iter().enumerate().fold(0u32, |n, (i, b)| n | u32::from(*b) << (16 - 8 * i));
+        for i in 0..4 {
+            out.push(if i <= chunk.len() { char::from(ALPHABET[(n >> (18 - 6 * i) & 63) as usize]) } else { '=' });
+        }
+    }
+    out
+}
+
 /// A DevTools connection to one target of the browser (the page, or the client's frame), through the port
 /// Chrome wrote into its profile. Every step is bounded by [`WAIT`], and every read by [`READ`].
 struct DevTools {
@@ -530,6 +553,24 @@ impl DevTools {
     fn tap(&mut self, at: Pos2) {
         self.touch("touchStart", &[at]);
         thread::sleep(Duration::from_millis(80));
+        self.touch("touchEnd", &[]);
+    }
+
+    /// A finger rests on `at` long enough for a long press, and lifts.
+    fn long_press(&mut self, at: Pos2) {
+        self.touch("touchStart", &[at]);
+        thread::sleep(Duration::from_millis(900));
+        self.touch("touchEnd", &[]);
+    }
+
+    /// A finger goes down at `from`, moves to `to` in a few steps, and lifts.
+    fn drag(&mut self, from: Pos2, to: Pos2) {
+        self.touch("touchStart", &[from]);
+        for step in 1..=6 {
+            thread::sleep(Duration::from_millis(40));
+            self.touch("touchMove", &[from + (to - from) * (step as f32 / 6.0)]);
+        }
+        thread::sleep(Duration::from_millis(40));
         self.touch("touchEnd", &[]);
     }
 
@@ -795,24 +836,35 @@ fn the_bundle_pairs_reconnects_and_reloads_in_a_browser() {
     assert!(!log.lines.lock().unwrap().iter().any(|l| l.starts_with("host closed")), "no channel was refused");
 }
 
-/// Screenshot the page and keep it in the page for [`boxes`]: until `find` finds something on one, which is
+/// Screenshot the phone and keep it in the page for [`boxes`]: until `find` finds something on one, which is
 /// returned with that screenshot (a base64 PNG).
 fn until<T>(page: &mut DevTools, what: &str, find: impl Fn(&mut DevTools) -> Option<T>) -> (T, String) {
+    until_on(page, (PHONE.0 * PHONE_SCALE, PHONE.1 * PHONE_SCALE), &shots(), what, find)
+}
+
+/// [`until`] on a screen of `pixels`, saving the last screenshot in `dir` if it times out.
+fn until_on<T>(
+    page: &mut DevTools,
+    pixels: (f32, f32),
+    dir: &Path,
+    what: &str,
+    find: impl Fn(&mut DevTools) -> Option<T>,
+) -> (T, String) {
     let deadline = Instant::now() + WAIT;
     loop {
         let shot = page.call("Page.captureScreenshot", json!({ "format": "png" }));
         let png = shot["data"].as_str().unwrap_or_else(|| panic!("screenshot: DevTools said {shot}")).to_string();
         let size = page.eval(&format!("look('{png}')"));
-        let pixels = (size[0].as_f64(), size[1].as_f64());
-        let phone = (f64::from(PHONE.0 * PHONE_SCALE), f64::from(PHONE.1 * PHONE_SCALE));
-        assert_eq!(pixels, (Some(phone.0), Some(phone.1)), "a screenshot of the phone's pixels");
+        let size = (size[0].as_f64(), size[1].as_f64());
+        let expected = (f64::from(pixels.0), f64::from(pixels.1));
+        assert_eq!(size, (Some(expected.0), Some(expected.1)), "a screenshot of the screen's pixels");
         if let Some(found) = find(page) {
             return (found, png);
         }
         if Instant::now() >= deadline {
-            let out = shots().join("timed-out.png");
+            let out = dir.join("timed-out.png");
             std::fs::write(&out, base64(&png)).unwrap();
-            panic!("timed out waiting for {what} on the phone's screen; it showed {}", out.display());
+            panic!("timed out waiting for {what} on the screen; it showed {}", out.display());
         }
         thread::sleep(Duration::from_millis(150));
     }
@@ -855,9 +907,13 @@ struct Screens {
 
 /// `target/phone-shots`.
 fn shots() -> PathBuf {
-    // The test runs as `target/<profile>/deps/browser-<hash>`.
+    target().join("phone-shots")
+}
+
+/// The target folder: the test runs as `target/<profile>/deps/browser-<hash>`.
+fn target() -> PathBuf {
     let exe = std::env::current_exe().unwrap();
-    exe.ancestors().nth(3).expect("the target folder").join("phone-shots")
+    exe.ancestors().nth(3).expect("the target folder").to_path_buf()
 }
 
 impl Screens {
@@ -871,8 +927,13 @@ impl Screens {
     /// Wait for the screen `ready` sees, and save it.
     fn save(&mut self, page: &mut DevTools, name: &str, ready: impl Fn(&mut DevTools) -> bool) {
         let ((), png) = until(page, &format!("the {name} screen"), |page| ready(page).then_some(()));
+        self.keep(&png, name);
+    }
+
+    /// Save a screenshot already taken (a base64 PNG).
+    fn keep(&mut self, png: &str, name: &str) {
         let path = self.dir.join(format!("{:02}-{name}.png", self.saved.len() + 1));
-        std::fs::write(&path, base64(&png)).unwrap();
+        std::fs::write(&path, base64(png)).unwrap();
         self.saved.push(path);
     }
 }
@@ -1001,8 +1062,8 @@ fn the_bundle_works_on_a_phone_by_touch() {
 
     // 2. The board with its plan, the plans, and the task's diff of two files, each pane tapped in the bar.
     screens.save(&mut page, "board", |page| active(page) == Some(Tab::Board) && approve(page).is_some());
-    page.tap(pane(Tab::Plans));
-    screens.save(&mut page, "plans", |page| active(page) == Some(Tab::Plans));
+    page.tap(pane(Tab::Agents));
+    screens.save(&mut page, "agents", |page| active(page) == Some(Tab::Agents));
     page.tap(pane(Tab::Diffs));
     screens.save(&mut page, "diffs", |page| active(page) == Some(Tab::Diffs));
     // The worktree's row, first in the list, opens its diff.
@@ -1072,16 +1133,19 @@ fn the_bundle_works_on_a_phone_by_touch() {
     screens.save(&mut page, "terminal-focused", |page| active(page).is_none());
 
     // 5. What the phone types reaches the host as its bytes: text, Return, Backspace on the empty line the
-    // echo left (the field is empty too), and the key bar's ↑, which leaves the focus where it was.
-    page.call("Input.insertText", json!({ "text": "ls" }));
-    wait_host(&host, "\"ls\" typed", |h| h.terminals["s1"].typed == "ls");
+    // echo left (the field is empty too), and the key bar's ↑, a finger's size, which leaves the focus where
+    // it was.
+    let words = "echo hello world";
+    page.call("Input.insertText", json!({ "text": words }));
+    wait_host(&host, "the words typed", |h| h.terminals["s1"].typed == words);
     page.key("Enter", 13, Some("\r"));
-    wait_host(&host, "Return as CR", |h| h.terminals["s1"].typed == "ls\r");
+    wait_host(&host, "Return as CR", |h| h.terminals["s1"].typed == format!("{words}\r"));
     page.key("Backspace", 8, None);
-    wait_host(&host, "Backspace as DEL", |h| h.terminals["s1"].typed == "ls\r\x7f");
-    let up = frame.eval("(() => { const r = document.querySelector('#atomics-keybar button[data-value=\"ArrowUp\"]').getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2]; })()");
+    wait_host(&host, "Backspace as DEL", |h| h.terminals["s1"].typed == format!("{words}\r\x7f"));
+    let up = frame.eval("(() => { const r = document.querySelector('#atomics-keybar button[data-value=\"ArrowUp\"]').getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2, r.width, r.height]; })()");
+    assert!(number(&up, 2) >= 44.0 && number(&up, 3) >= 44.0, "a key bar key is a finger's target: {up}");
     page.tap(pos2(number(&up, 0), number(&up, 1)));
-    wait_host(&host, "↑ as CSI A", |h| h.terminals["s1"].typed == "ls\r\x7f\x1b[A");
+    wait_host(&host, "↑ as CSI A", |h| h.terminals["s1"].typed == format!("{words}\r\x7f\x1b[A"));
     assert_eq!(frame.eval(focused), json!(true), "a key bar key leaves the focus on the field");
     assert_eq!(inputs(&host), 4, "one terminal_input each");
     screens.save(&mut page, "typed", |page| active(page).is_none());
@@ -1099,9 +1163,52 @@ fn the_bundle_works_on_a_phone_by_touch() {
     screens.save(&mut page, "taken-back", |page| active(page) == Some(Tab::Terminal));
     thread::sleep(Duration::from_millis(1000));
     assert_eq!(frame.eval(focused), json!(false), "typing did not focus the field again");
-    assert_eq!(typed(&host, "s1"), "ls\r\x7f\x1b[A!", "after the take back nothing typed reaches the host");
+    let all = format!("{words}\r\x7f\x1b[A!");
+    assert_eq!(typed(&host, "s1"), all, "after the take back nothing typed reaches the host");
     assert_eq!(inputs(&host), 4, "no terminal_input after the take back");
     assert!(host.lock().unwrap().terminals["s1"].lease.is_none(), "the desktop holds the terminal");
+
+    // 7. Selecting by touch: a long press on a word selects that word alone, with a handle at each end; the end
+    // handle dragged over the next word takes it in, and Copy copies exactly that. The first line reads
+    // "$ echo hello world", in the terminal's foreground; its ink gives the cells' width.
+    let cells = Rect::from_min_size(
+        pos2(number(&overlay, 0), number(&overlay, 1)),
+        vec2(number(&overlay, 2), number(&overlay, 3)),
+    );
+    let ink = Color32::from_rgb(220, 216, 208);
+    let first_line = Rect::from_min_max(cells.min, pos2(cells.right(), cells.top() + 60.0));
+    let (text, _) = until(&mut page, "the first line's text", |page| {
+        let glyphs = boxes(page, ink, 40, first_line, 2.0);
+        let top = glyphs.iter().map(|g| g.top()).fold(f32::INFINITY, f32::min);
+        glyphs.into_iter().filter(|g| g.top() < top + 6.0).reduce(|a, b| a.union(b))
+    });
+    let cell = text.width() / ("$ echo hello world".len() as f32 - 0.2);
+    let column = |col: f32| text.left() + (col - 0.1) * cell;
+    page.long_press(pos2(column(9.5), text.center().y));
+    let chip = "document.getElementById('atomics-copy')";
+    frame.wait("Copy for the word alone", &format!("!{chip}.hidden && {chip}.title === 'Copy “hello”'"));
+    // A handle: a stem along the line and a knob under it, in the accent colour, taller than the line.
+    let under = Rect::from_min_max(pos2(cells.left(), text.top() - 6.0), pos2(cells.right(), text.bottom() + 30.0));
+    let handles = |page: &mut DevTools| {
+        let found = boxes(page, p.accent, 16, under, 30.0);
+        let mut found: Vec<Rect> = found.into_iter().filter(|b| b.height() > text.height() + 8.0).collect();
+        found.sort_by(|a, b| a.left().total_cmp(&b.left()));
+        (found.len() == 2).then_some(found)
+    };
+    let (found, png) = until(&mut page, "the selection's two handles", handles);
+    screens.keep(&png, "word-selected");
+    // The end handle's knob is the round end below the line.
+    let knob = pos2(found[1].center().x, found[1].bottom() - 7.0);
+    page.drag(knob, pos2(column(18.0), knob.y));
+    frame.wait("Copy for both words", &format!("{chip}.title === 'Copy “hello world”'"));
+    screens.save(&mut page, "words-selected", |_| true);
+    frame.eval("window.copied = null; navigator.clipboard.writeText = (text) => { window.copied = text; return Promise.resolve(); }; true");
+    let copy = frame.eval(&format!("(() => {{ const r = {chip}.getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2, r.height]; }})()"));
+    assert!(number(&copy, 2) >= 44.0, "Copy is a finger's target: {copy}");
+    page.tap(pos2(number(&copy, 0), number(&copy, 1)));
+    frame.wait("the copy done", &format!("window.copied !== null && {chip}.hidden"));
+    assert_eq!(frame.eval("window.copied"), json!("hello world"), "Copy copies the selected range and nothing else");
+    assert_eq!(typed(&host, "s1"), all, "selecting typed nothing");
     assert_eq!(log.lines.lock().unwrap().iter().filter(|l| l.starts_with("acquire s1")).count(), 1);
     assert!(!log.has("resize s1"), "the phone never resized the terminal");
     assert!(!log.has("upgrade refused"), "every upgrade carried the client's exact origin and the subprotocol");
@@ -1110,4 +1217,128 @@ fn the_bundle_works_on_a_phone_by_touch() {
     for path in &screens.saved {
         eprintln!("  {}", path.display());
     }
+}
+
+/// A wide window, the size the desktop's QA screenshots are taken at.
+const WIDE: (f32, f32) = (1600.0, 1000.0);
+
+#[test]
+#[ignore = "needs the built bundle (scripts/build-web.sh) and Chrome"]
+fn the_bundle_draws_the_desktops_frame_in_a_wide_window() {
+    let dist = dist();
+    let mut host = fake_host::host();
+    let pairing = host.open_pairing();
+    let host = Arc::new(Mutex::new(host));
+    let log = Arc::new(Log::default());
+    let bind = || TcpListener::bind("127.0.0.1:0").unwrap();
+    let (client, parent, tunnel) = (bind(), bind(), bind());
+    let port = |l: &TcpListener| l.local_addr().unwrap().port();
+    let client_origin = format!("http://127.0.0.1:{}", port(&client));
+    let parent_origin = format!("http://localhost:{}", port(&parent));
+    let broker_url = format!("ws://127.0.0.1:{}/atomics/tunnel", port(&tunnel));
+    let fragment = pairing.fragment();
+    let keys: Vec<&str> = fragment.split('.').collect();
+    let pair = json!({
+        "type": "atomics.embed.boot", "v": 1, "host_id": HOST_ID, "ticket": "ticket-0", "broker": broker_url,
+        "display_name": "A Person", "theme": "dark", "scheme": "dark", "locale": "en", "view": "board",
+        "mode": "pair", "pair": { "v": 1, "host_noise_pubkey": keys[2], "psk": keys[3] },
+    });
+    serve_client(client, dist, &parent_origin, port(&tunnel));
+    let page_html = include_str!("browser/phone.html")
+        .replace("CLIENT_ORIGIN", &client_origin)
+        .replace("PHONE_BOOT", &pair.to_string());
+    serve_parent(parent, HashMap::from([("/", page_html)]), log.clone(), Arc::new(Mutex::new("go".into())));
+    broker(tunnel, host.clone(), log.clone(), client_origin.clone(), Arc::default(), Arc::default());
+
+    let flags = [
+        format!("--window-size={},{}", WIDE.0, WIDE.1),
+        "--force-device-scale-factor=1".into(),
+        "--hide-scrollbars".into(),
+    ];
+    let browser = launch(&flags, &format!("{parent_origin}/"), &log, OVERALL);
+    let devtools = browser.devtools();
+    let mut page = DevTools::open(&devtools, "the hosting page", |t| t["type"] == "page");
+    let metrics = json!({ "width": WIDE.0 as u32, "height": WIDE.1 as u32, "deviceScaleFactor": 1, "mobile": false });
+    page.call("Emulation.setDeviceMetricsOverride", metrics);
+
+    // Paired, and both terminals followed: the agent's tile and the docked chief's.
+    log.wait("parent atomics.paired", 1);
+    log.wait("hello new", 1);
+    log.wait("subscribe s1", 1);
+    log.wait("subscribe chief", 1);
+    let frame_url = format!("{client_origin}/");
+    let mut frame = DevTools::open(&devtools, "the client's frame", |t| {
+        t["type"] == "iframe" && t["url"].as_str().is_some_and(|u| u.starts_with(&frame_url))
+    });
+    frame.wait("the input overlay over a terminal", "!document.getElementById('atomics-input').hidden");
+
+    // The desktop's frame in the boot's theme: the board's Approve plan in the right panel, the chief's prompt in
+    // the dock on the left, and the agent's prompt in its tile between them.
+    let parent = ParentOrigin::parse(&parent_origin).expect("a loopback origin");
+    let Ok(FromParent::Boot(booted)) = boot::read(&parent, &parent_origin, true, &pair) else { panic!("the boot") };
+    let p = Palette::new(&booted.theme_tokens(), Fonts::default());
+    let dir = target().join("wide-shots");
+    std::fs::create_dir_all(&dir).unwrap();
+    let ink = Color32::from_rgb(220, 216, 208);
+    let approve_area = Rect::from_min_max(pos2(WIDE.0 * 0.6, 34.0), pos2(WIDE.0, 120.0));
+    let dock = Rect::from_min_max(pos2(0.0, 60.0), pos2(500.0, 200.0));
+    let middle = Rect::from_min_max(pos2(520.0, 60.0), pos2(1030.0, 400.0));
+    let (approve, png) = until_on(&mut page, WIDE, &dir, "the frame with the board and both terminals", |page| {
+        let terminals = amount(page, ink, 40, dock) > 20.0 && amount(page, ink, 40, middle) > 5.0;
+        let button = boxes(page, p.accent, 6, approve_area, 150.0).into_iter().find(|b| b.width() >= 60.0);
+        button.filter(|_| terminals)
+    });
+    std::fs::write(dir.join("browser.png"), base64(&png)).unwrap();
+    let desktop = dir.join("desktop.png");
+    match std::fs::read(&desktop) {
+        Ok(desktop) => {
+            let both = page.eval(&format!("sideBySide('{png}', '{}')", encode64(&desktop)));
+            let both = both.as_str().expect("the page put the two side by side");
+            std::fs::write(dir.join("side-by-side.png"), base64(both)).unwrap();
+            eprintln!("wide: {} (this browser, then the desktop)", dir.join("side-by-side.png").display());
+        }
+        Err(_) => eprintln!(
+            "wide: {}; no {} to put beside it (scripts/wide-desktop-shot.sh takes one)",
+            dir.join("browser.png").display(),
+            desktop.display()
+        ),
+    }
+
+    // The input lies over the active agent's terminal, between the dock and the board. A click into it types
+    // there; a click into the chief's terminal moves the input there, focused, and types there.
+    let rect = |frame: &mut DevTools| {
+        let r = frame.eval("(() => { const r = document.getElementById('atomics-input').getBoundingClientRect(); return [r.left, r.top, r.width, r.height]; })()");
+        let n = |i: usize| r[i].as_f64().expect("a number") as f32;
+        Rect::from_min_size(pos2(n(0), n(1)), vec2(n(2), n(3)))
+    };
+    let agent = rect(&mut frame);
+    assert!(agent.left() > 500.0 && agent.right() < 1100.0, "over the agent's tile: {agent:?}");
+    let focused = "document.activeElement === document.getElementById('atomics-input')";
+    let at = |r: Rect| (f64::from(r.left() + 40.0), f64::from(r.top() + 20.0));
+    page.click(at(agent));
+    log.wait("acquire s1", 1);
+    frame.wait("the focus on the input", focused);
+    page.call("Input.insertText", json!({ "text": "ls" }));
+    wait_host(&host, "\"ls\" typed into the agent's terminal", |h| h.terminals["s1"].typed == "ls");
+
+    page.click((200.0, 400.0));
+    log.wait("acquire chief", 1);
+    frame.wait(
+        "the input over the chief's terminal, focused",
+        &format!("{focused} && document.getElementById('atomics-input').getBoundingClientRect().right < 520"),
+    );
+    page.call("Input.insertText", json!({ "text": "hi" }));
+    wait_host(&host, "\"hi\" typed into the chief's terminal", |h| h.terminals["chief"].typed == "hi");
+    assert_eq!(typed(&host, "s1"), "ls", "the agent's terminal got nothing more");
+
+    // The board's Approve plan, clicked, approves the plan at its digest.
+    page.click((f64::from(approve.center().x), f64::from(approve.center().y)));
+    wait_host(&host, "plan_command approve for p1 at its digest", |h| {
+        h.received.iter().any(|m| {
+            matches!(m, Message::PlanCommand(c) if c.action == PlanAction::Approve
+                && c.plan.as_deref() == Some("p1") && c.digest.as_deref() == Some("digest-1"))
+        })
+    });
+    assert!(!log.has("resize s1") && !log.has("resize chief"), "nothing was resized by looking at it");
+    assert!(!log.lines.lock().unwrap().iter().any(|l| l.starts_with("host closed")), "no channel was refused");
 }

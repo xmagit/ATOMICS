@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>Hosting page on a phone</title>
+  <title>Hosting page</title>
   <style>
     html, body { margin: 0; height: 100%; overflow: hidden; background: #1f1e1d; }
     iframe { display: block; border: 0; width: 100vw; height: 100vh; height: 100dvh; }
@@ -11,7 +11,7 @@
 </head>
 <body>
   <script>
-    // A hosting page on a phone: the client's frame fills the screen. The frame is mounted once the test has
+    // A hosting page, on a phone or a wide screen: the client's frame fills it. The frame is mounted once the test has
     // set the device up (`/phase` says `go`); the page boots it when it says it is ready, answers a request for
     // a fresh ticket, and reports what the frame said to the test's server.
     const client = 'CLIENT_ORIGIN';
@@ -85,6 +85,22 @@
         if (area >= minArea) found.push([x0 + left, y0 + top, right - left + 1, bottom - top + 1, area]);
       }
       return found.sort((a, b) => b[4] - a[4]);
+    };
+    // Two screenshots (base64 PNGs) side by side, the first on the left, as a base64 PNG.
+    window.sideBySide = async (left, right) => {
+      const images = await Promise.all([left, right].map(async png => {
+        const image = new Image();
+        image.src = `data:image/png;base64,${png}`;
+        await image.decode();
+        return image;
+      }));
+      const canvas = document.createElement('canvas');
+      canvas.width = images[0].width + images[1].width;
+      canvas.height = Math.max(images[0].height, images[1].height);
+      const g = canvas.getContext('2d');
+      g.drawImage(images[0], 0, 0);
+      g.drawImage(images[1], images[0].width, 0);
+      return canvas.toDataURL('image/png').split(',')[1];
     };
   </script>
 </body>

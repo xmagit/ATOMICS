@@ -1,8 +1,10 @@
 //! A terminal in the browser: the host's grid, never resized by looking at it, with the input the
-//! `<textarea>` overlay forwards (design §4.4). The page puts the overlay over the rect this pane says
-//! ([`Overlay::rect`]); everything typed, every key-bar key and every touch there arrives here as a
-//! [`TermInput`], is encoded with the screen's latest modes (`atomics_ui::terminal::encode`) and typed
-//! under the lease.
+//! `<textarea>` overlay forwards (design §4.4). The views draw terminals where the shared views put them,
+//! through [`Terminals`], the browser's `TerminalSurface`: the one the page's input goes to with this pane's
+//! overlay, every other as it is ([`TermPane::show`]), where a click picks it. The page puts the overlay over
+//! the rect this pane says ([`Overlay::rect`]); everything typed, every key-bar key and every touch there
+//! arrives here as a [`TermInput`], is encoded with the screen's latest modes
+//! (`atomics_ui::terminal::encode`) and typed under the lease.
 //!
 //! - **The grid is the desktop's.** The pane pans and zooms it: the font fits the width until the user
 //!   pinches, but on a phone never below a readable size, so a wider grid pans sideways; a grid taller than
@@ -11,8 +13,9 @@
 //!   the lease.
 //! - **Touch.** A tap focuses the overlay (the browser opens the keyboard) and, where the program takes
 //!   mouse reports and this client types, clicks the cell; a drag scrolls history (this client's view
-//!   only) and pans; a long press selects, with Copy; a pinch sets the font size. A mouse clicks and
-//!   drag-selects; its wheel scrolls.
+//!   only) and pans; a long press selects the word under the finger, with a handle at each end to drag
+//!   and Copy for just that range; a pinch sets the font size. A mouse clicks and drag-selects; its wheel
+//!   scrolls.
 //! - **Typing needs the lease**, asked for only when the overlay gains the focus (a tap) and only where
 //!   `welcome` grants `type`. Losing it to the desktop or another client, or being refused it, blurs the
 //!   overlay, so typing again is a new tap. Text, keys and pastes forwarded while the overlay does not
@@ -21,15 +24,18 @@
 //!   finishes late) neither types nor asks for the lease again.
 //! - **Offline** the screen shows as it was, marked disconnected, and nothing is typed.
 
+use std::collections::HashMap;
+
 use atomics_core::lease::{GridSize, MAX_CELL_PIXELS};
 use atomics_core::ops::Grant;
 use atomics_core::screen::{self as grid, Modes, Screen};
 use atomics_ui::terminal::{self as painter, Metrics, Point, Selection, encode};
+use atomics_ui::terminal_surface::TerminalSurface;
+use atomics_ui::theme::Palette;
 use atomics_ui::touch::{self, Touch};
-use atomics_ui::{Backend, Client, approvals};
-use egui::{Align2, Key, Modifiers, Pos2, Rect, RichText, Sense, Vec2, pos2, vec2};
+use egui::{Align2, Key, Modifiers, Pos2, Rect, RichText, Sense, Stroke, Vec2, pos2, vec2};
 
-use crate::gesture::{Gesture, Pointer, Recognizer};
+use crate::gesture::{Gesture, Kind, Phase, Pointer, Recognizer};
 use crate::remote::RemoteBackend;
 use crate::screens::{Lease, Lost, MAX_WAITING_BYTES, Refused};
 
@@ -44,6 +50,9 @@ const PHONE_FIT_MIN: f32 = 13.0;
 const PAD: f32 = 4.0;
 /// How often the lease is renewed while the user stays at the terminal without typing.
 const RENEW_MS: f64 = 10_000.0;
+/// A selection handle's knob, and how far from its centre a finger still takes it.
+const KNOB: f32 = 6.0;
+const KNOB_REACH: f32 = 24.0;
 
 /// What the overlay forwards.
 #[derive(Debug, Clone, PartialEq)]
@@ -83,8 +92,11 @@ pub struct Overlay {
     pub alt: bool,
     /// A selection to offer Copy for, and where.
     pub copy: Option<(String, Pos2)>,
-    /// Take the focus away: the lease went elsewhere.
+    /// Take the focus away: the lease went elsewhere, or the input goes to another terminal now.
     pub blur: bool,
+    /// Give it the focus where a pointer that is not a finger picked this terminal: a click into it types
+    /// there, as on the desktop. A finger taps the overlay itself, which opens the keyboard.
+    pub focus: bool,
 }
 
 /// One line and column of the terminal: `line` is a line ID (history below the screen's first).
@@ -92,6 +104,20 @@ pub struct Overlay {
 struct Cell {
     line: u64,
     col: u16,
+}
+
+/// A finger dragging one end of the selection: the pointer, which end (`end`: the later one) and how far
+/// that end's cell centre was from the finger when it took the handle.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct HandleDrag {
+    id: i32,
+    end: bool,
+    grab: Vec2,
+}
+
+/// A character a word holds, for a long press: letters, digits and what paths and names are made of.
+fn word_char(c: char) -> bool {
+    c.is_alphanumeric() || "_-./~:@%+".contains(c)
 }
 
 /// A terminal pane's own state: the view (font, panning, history), the selection, the composition, the
@@ -105,6 +131,9 @@ pub struct TermPane {
     top: Option<u64>,
     scroll_rest: f32,
     selection: Option<(Cell, Cell)>,
+    /// The selection was made by touch: it shows its handles.
+    handles: bool,
+    dragging: Option<HandleDrag>,
     preedit: String,
     ctrl: bool,
     alt: bool,
@@ -121,6 +150,12 @@ pub struct TermPane {
     drawn: bool,
     /// The phone layout's measures while it draws, set by the views each frame.
     pub touch: Option<Touch>,
+    /// The overlay is to lose the focus at the next draw: the input went to another terminal.
+    blur_next: bool,
+    /// The overlay is to take the focus at the next draw ([`Overlay::focus`]).
+    pub focus_next: bool,
+    /// Where the cells were last painted.
+    painted: Option<Frame>,
 }
 
 impl Default for TermPane {
@@ -132,6 +167,8 @@ impl Default for TermPane {
             top: None,
             scroll_rest: 0.0,
             selection: None,
+            handles: false,
+            dragging: None,
             preedit: String::new(),
             ctrl: false,
             alt: false,
@@ -144,6 +181,9 @@ impl Default for TermPane {
             overlay: Overlay::default(),
             drawn: false,
             touch: None,
+            blur_next: false,
+            focus_next: false,
+            painted: None,
         }
     }
 }
@@ -225,7 +265,8 @@ pub fn key_text(name: &str, mods: Modifiers, (ctrl, alt): (bool, bool), modes: &
 }
 
 impl TermPane {
-    /// Start over for another terminal: the view follows it; the font stays.
+    /// Start over for another terminal: the view follows it; the font stays. Typing in the last one ends:
+    /// the overlay loses the focus, and what it forwarded since is dropped.
     fn switch(&mut self, session: &str) {
         if self.session.as_deref() != Some(session) {
             self.session = Some(session.to_string());
@@ -233,10 +274,25 @@ impl TermPane {
             self.pan_x = 0.0;
             self.scroll_rest = 0.0;
             self.selection = None;
+            self.dragging = None;
             self.preedit.clear();
             self.held = false;
             self.gestures = Recognizer::default();
+            self.inputs.clear();
+            self.blur_next |= std::mem::take(&mut self.focused);
         }
+    }
+
+    /// The terminal this pane follows, by session id.
+    pub fn session(&self) -> Option<&str> {
+        self.session.as_deref()
+    }
+
+    /// The centre of the cell `row` lines under the top of what was last painted, at `col`, and a cell's size.
+    #[cfg(test)]
+    fn cell_centre(&self, row: u16, col: u16) -> (Pos2, Vec2) {
+        let frame = self.painted.expect("painted");
+        (frame.origin + vec2((f32::from(col) + 0.5) * frame.cell.x, (f32::from(row) + 0.5) * frame.cell.y), frame.cell)
     }
 
     /// Whether the overlay has the focus: the user is at the keyboard.
@@ -273,21 +329,31 @@ impl TermPane {
         self.gestures.due_ms().into_iter().chain(renew).reduce(f64::min)
     }
 
-    /// Draw `session`'s terminal into `rect`, with its header and any approval it waits on, after
-    /// carrying out what the overlay forwarded.
+    /// Draw `session`'s terminal as it is into `rect`, for a view that shows it while the page's input goes
+    /// to another: no header, no overlay, the live screen at the fitted size.
+    pub fn show(&mut self, ui: &mut egui::Ui, rect: Rect, session: &str, remote: &RemoteBackend, p: &Palette) {
+        self.switch(session);
+        remote.show_screen(session, false);
+        match self.frame(ui, rect, session, remote, p) {
+            Some(frame) => self.paint(ui, &frame, session, remote, p, false),
+            None => waiting(ui, rect, remote.live(), p),
+        }
+    }
+
+    /// Draw `session`'s terminal into `rect`, under a strip saying who types, after carrying out what the
+    /// overlay forwarded. The tile around it draws the session's header and the approval it waits on.
     pub fn draw(
         &mut self,
         ui: &mut egui::Ui,
         rect: Rect,
         session: &str,
         remote: &RemoteBackend,
-        client: &mut Client,
+        p: &Palette,
         now_ms: f64,
     ) {
         self.switch(session);
         self.drawn = true;
         remote.show_screen(session, true);
-        let p = client.palette.clone();
         let lease = remote.lease(session);
         let may_type = remote.may(Grant::Type);
         let live = remote.live();
@@ -295,27 +361,21 @@ impl TermPane {
         // Header: who types, and what this client may do about it.
         let (height, margin) = match self.touch {
             Some(touch) => (touch.target + 8.0, vec2(touch.gutter, 4.0)),
-            None => (30.0, vec2(8.0, 3.0)),
+            None => (24.0, vec2(8.0, 2.0)),
         };
         let header = Rect::from_min_size(rect.min, vec2(rect.width(), height));
+        ui.painter().rect_filled(header, 0.0, p.panel);
         let mut actions = Actions::default();
         let mut child =
             ui.new_child(egui::UiBuilder::new().id_salt(("term-header", session)).max_rect(header.shrink2(margin)));
-        child.horizontal(|ui| self.header(ui, &lease, may_type, live, &p, &mut actions));
-        let mut body = rect.with_min_y(header.bottom());
+        child.horizontal_centered(|ui| self.header(ui, &lease, may_type, live, p, &mut actions));
+        let body = rect.with_min_y(header.bottom());
 
-        // The approval this session waits on, as the desktop shows it over its terminal.
-        let backend: &dyn Backend = remote;
-        if let Some(index) = backend.session_list().iter().position(|s| s.id == session) {
-            body = approvals::banner(ui, body, index, backend, client);
-        }
-
-        let Some(frame) = self.frame(ui, body, session, remote, &p) else {
-            ui.painter().rect_filled(body, 0.0, p.terminal);
-            let text = if live { "Waiting for the terminal…" } else { "Not connected" };
-            ui.painter().text(body.center(), Align2::CENTER_CENTER, text, p.ui(13.0), p.muted);
+        let Some(frame) = self.frame(ui, body, session, remote, p) else {
+            waiting(ui, body, live, p);
             self.drop_inputs();
-            self.overlay = Overlay { blur: std::mem::take(&mut self.focused), ..Overlay::default() };
+            let blur = std::mem::take(&mut self.focused) || std::mem::take(&mut self.blur_next);
+            self.overlay = Overlay { blur, ..Overlay::default() };
             return;
         };
 
@@ -367,8 +427,8 @@ impl TermPane {
             self.active_ms = now_ms;
         }
 
-        let frame = self.frame(ui, body, session, remote, &p).unwrap_or(frame);
-        self.paint(ui, &frame, session, remote, &p, lease.yours);
+        let frame = self.frame(ui, body, session, remote, p).unwrap_or(frame);
+        self.paint(ui, &frame, session, remote, p, lease.yours);
 
         let writable = live && may_type && (lease.yours || lease.holder.is_none());
         let copy = self.selection.and_then(|(a, b)| {
@@ -385,22 +445,15 @@ impl TermPane {
             ctrl: self.ctrl,
             alt: self.alt,
             copy,
-            blur: lost || (self.focused && !(writable && typing)),
+            blur: lost || std::mem::take(&mut self.blur_next) || (self.focused && !(writable && typing)),
+            focus: std::mem::take(&mut self.focus_next) && writable,
         };
         if self.overlay.blur {
             self.focused = false;
         }
     }
 
-    fn header(
-        &self,
-        ui: &mut egui::Ui,
-        lease: &Lease,
-        may_type: bool,
-        live: bool,
-        p: &atomics_ui::theme::Palette,
-        actions: &mut Actions,
-    ) {
+    fn header(&self, ui: &mut egui::Ui, lease: &Lease, may_type: bool, live: bool, p: &Palette, actions: &mut Actions) {
         let (text, color) = if !live {
             ("Disconnected: typing is off".to_string(), p.warning)
         } else if !may_type {
@@ -410,11 +463,12 @@ impl TermPane {
         } else if let Some(holder) = &lease.holder {
             (format!("Typing from {holder}"), p.warning)
         } else {
+            // A finger taps, a mouse clicks.
+            let act = if self.touch.is_some() { "Tap" } else { "Click" };
             match lease.lost {
-                Some(Lost::Desktop) => ("The computer took this terminal back. Tap to type.".to_string(), p.muted),
-                Some(Lost::Expired) => ("Tap the terminal to type".to_string(), p.muted),
+                Some(Lost::Desktop) => (format!("The computer took this terminal back. {act} to type."), p.muted),
                 _ if lease.acquiring => ("Asking to type…".to_string(), p.muted),
-                _ => ("Tap the terminal to type".to_string(), p.muted),
+                _ => (format!("{act} the terminal to type"), p.muted),
             }
         };
         ui.label(RichText::new(text).color(color).size(12.5));
@@ -451,7 +505,7 @@ impl TermPane {
         body: Rect,
         session: &str,
         remote: &RemoteBackend,
-        p: &atomics_ui::theme::Palette,
+        p: &Palette,
     ) -> Option<Frame> {
         let (cols, rows, first, cursor_row, oldest) = remote
             .with_screen(session, |s| s.map(|(s, _)| (s.cols, s.rows, s.first_line, s.cursor.row, s.oldest_line())))?;
@@ -527,6 +581,24 @@ impl TermPane {
                 self.preedit.clear();
             }
             TermInput::Pointer(pointer) => {
+                // A finger on a selection's handle drags that end; nothing else sees that pointer.
+                if let Some(drag) = self.dragging.filter(|d| d.id == pointer.id) {
+                    match pointer.phase {
+                        Phase::Move | Phase::Up => self.drag_handle(drag, pointer.pos, frame),
+                        Phase::Down | Phase::Cancel => {}
+                    }
+                    if matches!(pointer.phase, Phase::Up | Phase::Cancel) {
+                        self.dragging = None;
+                    }
+                    return;
+                }
+                if pointer.phase == Phase::Down
+                    && pointer.kind != Kind::Mouse
+                    && let Some(drag) = self.handle_at(&pointer, frame)
+                {
+                    self.dragging = Some(drag);
+                    return;
+                }
                 for gesture in self.gestures.event(&pointer) {
                     self.gesture(gesture, frame, modes, lease, typed);
                 }
@@ -566,10 +638,84 @@ impl TermPane {
                 self.scroll(delta.y, frame.rect.center(), frame, modes, lease, typed);
             }
             Gesture::Pinch { factor, center } => self.zoom(factor, center, frame),
-            Gesture::Select { from, to, .. } => {
+            Gesture::Select { from, to, word: false, .. } => {
                 self.selection = Some((frame.cell_at(from), frame.cell_at(to)));
+                self.handles = false;
+            }
+            // A long press: the word under the finger, then out to wherever the finger moves before it lifts.
+            Gesture::Select { from, to, word: true, .. } => {
+                let (start, end) = self.word_at(frame.cell_at(from));
+                let to = frame.cell_at(to);
+                self.selection = Some(if to < start {
+                    (end, to)
+                } else if to > end {
+                    (start, to)
+                } else {
+                    (start, end)
+                });
+                self.handles = true;
             }
         }
+    }
+
+    /// The word around `cell` on the screen as last drawn, or the cell alone where there is none.
+    fn word_at(&self, cell: Cell) -> (Cell, Cell) {
+        let Some(line) = cell.line.checked_sub(self.view.first_line).and_then(|row| self.view.lines.get(row as usize))
+        else {
+            return (cell, cell);
+        };
+        let word = |col: usize| line.cells.get(col).is_some_and(|c| word_char(c.c));
+        let mut start = usize::from(cell.col);
+        if !word(start) {
+            return (cell, cell);
+        }
+        let mut end = start;
+        while start > 0 && word(start - 1) {
+            start -= 1;
+        }
+        while word(end + 1) {
+            end += 1;
+        }
+        let at = |col: usize| Cell { line: cell.line, col: col as u16 };
+        (at(start), at(end))
+    }
+
+    /// The selection's ends in order, and where their handles' knobs are: under the first cell's left edge
+    /// and the last cell's right edge.
+    fn knobs(&self, frame: &Frame) -> Option<[(Cell, Pos2); 2]> {
+        let (a, b) = self.selection.filter(|_| self.handles)?;
+        let (start, end) = if a <= b { (a, b) } else { (b, a) };
+        let bottom = |cell: Cell| frame.origin.y + (cell.line as f32 - frame.top as f32 + 1.0) * frame.cell.y;
+        let x = |col: u16| frame.origin.x + f32::from(col) * frame.cell.x;
+        Some([
+            (start, pos2(x(start.col), bottom(start) + KNOB)),
+            (end, pos2(x(end.col.saturating_add(1)), bottom(end) + KNOB)),
+        ])
+    }
+
+    /// The handle a finger going down at `pointer` takes, if it is on one.
+    fn handle_at(&self, pointer: &Pointer, frame: &Frame) -> Option<HandleDrag> {
+        let [start, end] = self.knobs(frame)?;
+        let reach = |knob: Pos2| knob.distance(pointer.pos);
+        let (cell, is_end) = if reach(end.1) <= reach(start.1) { (end.0, true) } else { (start.0, false) };
+        let knob = if is_end { end.1 } else { start.1 };
+        if reach(knob) > KNOB_REACH {
+            return None;
+        }
+        let centre = frame.origin
+            + vec2(
+                (f32::from(cell.col) + 0.5) * frame.cell.x,
+                (cell.line as f32 - frame.top as f32 + 0.5) * frame.cell.y,
+            );
+        Some(HandleDrag { id: pointer.id, end: is_end, grab: centre - pointer.pos })
+    }
+
+    /// Move the dragged end of the selection to the cell under the finger, as far as it held the handle.
+    fn drag_handle(&mut self, drag: HandleDrag, at: Pos2, frame: &Frame) {
+        let Some((a, b)) = self.selection else { return };
+        let (start, end) = if a <= b { (a, b) } else { (b, a) };
+        let cell = frame.cell_at(at + drag.grab);
+        self.selection = Some(if drag.end { (start, cell) } else { (cell, end) });
     }
 
     /// The font size times `factor`, keeping the column under `at` where it is.
@@ -617,9 +763,10 @@ impl TermPane {
         frame: &Frame,
         session: &str,
         remote: &RemoteBackend,
-        p: &atomics_ui::theme::Palette,
+        p: &Palette,
         yours: bool,
     ) {
+        self.painted = Some(*frame);
         remote.fill_screen(session, frame.top, frame.rows, &mut self.view);
         let metrics = Metrics { font: p.mono(frame.size), cell: frame.cell };
         let inner = Rect::from_min_size(
@@ -672,6 +819,15 @@ impl TermPane {
             ui.painter().galley(at, galley, p.foreground);
             ui.painter().line_segment([back.left_bottom(), back.right_bottom()], egui::Stroke::new(1.5, p.accent));
         }
+        // A touch selection's handles: a stem along each end's line and a knob under it to drag.
+        if let Some(knobs) = self.knobs(frame) {
+            let painter = ui.painter().with_clip_rect(frame.rect);
+            for (_, knob) in knobs {
+                let stem = [knob - vec2(0.0, KNOB + frame.cell.y), knob - vec2(0.0, KNOB)];
+                painter.line_segment(stem, Stroke::new(2.0, p.accent));
+                painter.circle_filled(knob, KNOB, p.accent);
+            }
+        }
         ui.allocate_rect(frame.rect, Sense::hover());
     }
 
@@ -705,6 +861,13 @@ impl TermPane {
     }
 }
 
+/// A terminal not received yet, or not while offline.
+fn waiting(ui: &egui::Ui, rect: Rect, live: bool, p: &Palette) {
+    ui.painter().rect_filled(rect, 0.0, p.terminal);
+    let text = if live { "Waiting for the terminal…" } else { "Not connected" };
+    ui.painter().text(rect.center(), Align2::CENTER_CENTER, text, p.ui(13.0), p.muted);
+}
+
 /// The note for typing refused as too much ([`Refused::TooMuch`]), naming the limit that refused it.
 fn too_much(limit: usize) -> String {
     let size = if limit >= 1 << 20 { format!("{} MiB", limit >> 20) } else { format!("{} KiB", limit >> 10) };
@@ -727,6 +890,46 @@ fn fit_size(frame: &Frame) -> GridSize {
     let rows = ((frame.rect.height() - 2.0 * frame.pad.y) / frame.cell.y).floor().max(1.0) as u16;
     let pixels = |v: f32| Some((v.round() as u16).clamp(1, MAX_CELL_PIXELS));
     GridSize { cols, rows, cell_width: pixels(frame.cell.x), cell_height: pixels(frame.cell.y) }
+}
+
+/// The browser's terminals, for the shared views (`TerminalSurface`). The one the page's input goes to
+/// (`target`) is drawn by `pane`, with the overlay; any other as it is, by a pane of its own, and a click
+/// on it picks it ([`Terminals::picked`]).
+pub struct Terminals<'a> {
+    pub pane: &'a mut TermPane,
+    pub others: &'a mut HashMap<String, TermPane>,
+    pub remote: &'a RemoteBackend,
+    pub target: Option<String>,
+    pub now_ms: f64,
+    /// The terminal a click picked while this drew, by session id.
+    pub picked: Option<String>,
+}
+
+impl TerminalSurface for Terminals<'_> {
+    fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        _index: usize,
+        session: &str,
+        rect: Rect,
+        id: egui::Id,
+        _metrics: &Metrics,
+        palette: &Palette,
+    ) -> egui::Response {
+        if self.target.as_deref() == Some(session) {
+            self.pane.draw(ui, rect, session, self.remote, palette, self.now_ms);
+            // The overlay lies over it and takes its pointer.
+            return ui.interact(rect, id, Sense::hover());
+        }
+        let pane = self.others.entry(session.to_string()).or_default();
+        pane.touch = self.pane.touch;
+        pane.show(ui, rect, session, self.remote, palette);
+        let response = ui.interact(rect, id, Sense::click());
+        if response.clicked() {
+            self.picked = Some(session.to_string());
+        }
+        response
+    }
 }
 
 #[derive(Default)]

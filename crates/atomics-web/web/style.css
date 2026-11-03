@@ -5,6 +5,10 @@ body {
   overflow: hidden;
   background: #1f1e1d;
   color: #d8d4cc;
+  /* The app selects terminal text itself (a long press, its handles, Copy); the browser's own selection
+     would take the whole page. */
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 @media (prefers-color-scheme: light) {
@@ -59,7 +63,8 @@ body {
 }
 
 /* The key bar sits on the keyboard: left and top stay 0, the transform places it (web/terminal.js). The
-   app lays out its two rows of eight slots (src/layout.rs, KEYBAR). */
+   app lays out its two rows of eight slots (src/layout.rs, KEYBAR): keys a finger's size both ways, clear of
+   a notch on a phone held sideways. A screen narrower than eight such keys scrolls the row. */
 #atomics-keybar {
   position: fixed;
   left: 0;
@@ -68,8 +73,8 @@ body {
   box-sizing: border-box;
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  padding: 4px;
+  gap: 2px;
+  padding: 2px max(2px, env(safe-area-inset-right)) 2px max(2px, env(safe-area-inset-left));
   transform-origin: 0 0;
   background: var(--atomics-bar, #2a2826);
   border-top: 1px solid var(--atomics-border, #3d3a36);
@@ -77,7 +82,13 @@ body {
 
 .atomics-keyrow {
   display: flex;
-  gap: 4px;
+  gap: 2px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.atomics-keyrow::-webkit-scrollbar {
+  display: none;
 }
 
 #atomics-keybar button,
@@ -93,14 +104,14 @@ body {
 }
 
 #atomics-keybar button {
-  flex: 1 1 0;
-  min-width: 0;
-  height: 38px;
+  flex: 1 0 44px;
+  min-width: 44px;
+  height: 44px;
   padding: 0;
 }
 
 #atomics-keybar button.wide {
-  flex-grow: 2;
+  flex: 2 0 90px;
 }
 
 #atomics-keybar button.on {
@@ -112,8 +123,9 @@ body {
 #atomics-copy {
   position: fixed;
   z-index: 3;
-  height: 36px;
-  padding: 0 14px;
+  height: 44px;
+  min-width: 64px;
+  padding: 0 16px;
   box-shadow: 0 2px 8px var(--atomics-shadow, rgba(0, 0, 0, 0.35));
 }
 

@@ -377,6 +377,30 @@ Commits, one per file group:
    `RemoteBackend` and finds no USAGE, TICKETS, Settings, Tickets, load, Remote or Project, no All,
    Ungrouped or Repos tab, no `+ New`, Close plan or steer bar, and the board's Approve plan for a
    controller but not for a viewer.
+9. **The browser draws the frame** (W1, `atomics-web`). A wide window calls `shell::frame` over
+   `RemoteBackend` through `views::Web`, the browser's `Platform`: the connection's state is its
+   `top_bar_items`, the layout menu its `top_bar_settings`, and every other hook stays empty. The terminals
+   are `term_pane::Terminals`, the browser's `TerminalSurface`: the one the page's input goes to (the active
+   session's, or the chief's once clicked into) is the `TermPane` under the `<textarea>` overlay, with a strip
+   saying who types; every other is painted as it is, and a click on it moves the input there. The tile draws
+   the approval banner, so the pane no longer does. What the desktop keeps in its model about its window and
+   atomics.v1 does not carry (the tab, the active session, the right panel, the chief's window) is the page's
+   `desk::Desk`, which carries out the view commands by the desktop's rules (`activate`, `toggle_plan`,
+   `show_plan_fleet`, `show_ungrouped`, the task's diff) and gives `RemoteBackend` its view hints and the chief's
+   window (`ToggleChief`, `SetChiefDock`, `HideChief`, `ResizeChief`, offered in the wide layout only).
+   `RemoteBackend::visible_sessions` follows the desktop's rule (the plan's sessions, the ungrouped ones, never
+   the chief), so the Ungrouped tab is offered; All and Repos stay out, as the browser knows no projects. A
+   phone draws one shared widget a pane: the AGENTS list, the board, the approval banners, the diff panel, an
+   agent's fleet tile at the pane's size and the chief's window. Under `Client::touch` (the desktop never sets
+   it) a tile fills its cell to the screen's sides with a finger-sized header and close, the chief's header keeps
+   the gutter, the diff header puts Close last, and wrapped diff lines are measured by their glyphs.
+
+   Checked with the browser crate's tests (the frame over the fake host at 1600 × 1000, a click into the chief's
+   terminal, a diff fetched only while it shows; the phone's panes at 360, 390 and 430 points; a long press's
+   word and its handles), the browser tests in headless Chrome (`target/wide-shots/side-by-side.png` puts the
+   wide window beside `scripts/wide-desktop-shot.sh`'s desktop QA screenshot of the same board), and Linux QA
+   screenshots of that scene (1600 × 1000) before and after, identical pixel for pixel but the load gauge's
+   digit: every change to a shared view is under `Client::touch`, which the desktop never sets.
 
 ### 4.7 S8
 

@@ -75,7 +75,12 @@ fn the_board_reads_as_the_desktop_draws_it() {
         ("Fix the parser", Some("atomics/t1"), false)
     );
     assert_eq!(remote.diff_heading(Path::new("/w/other")).title, "other");
-    assert_eq!(remote.visible_sessions(), [0, 1]);
+    // The tab's sessions, never the chief: the plan's tab its task's agent, the Ungrouped tab none here.
+    assert_eq!(remote.visible_sessions(), [1]);
+    remote.set_view(ViewHints { plan_view: false, ungrouped: true, ..default_hints() });
+    assert!(remote.visible_sessions().is_empty());
+    remote.set_view(ViewHints { plan_view: false, ..default_hints() });
+    assert_eq!(remote.visible_sessions(), [1]);
 }
 
 #[test]
@@ -210,9 +215,12 @@ fn only_what_the_browser_can_send_is_available() {
     for command in [decide.clone(), Command::ApprovePlan(0), Command::RefreshDiff(WORKTREE.into())] {
         assert!(controller.available(&command), "{command:?}");
     }
-    for command in
-        [Command::Activate { session: "s1".into(), open_diff: true }, Command::ToggleDiff, Command::Toast("hi".into())]
-    {
+    for command in [
+        Command::Activate { session: "s1".into(), open_diff: false },
+        Command::ToggleDiff,
+        Command::ShowUngrouped,
+        Command::Toast("hi".into()),
+    ] {
         assert!(controller.available(&command), "the frame carries out {command:?}");
     }
     for command in [
@@ -224,15 +232,21 @@ fn only_what_the_browser_can_send_is_available() {
         Command::Steer { sessions: vec!["s1".into()], text: "go on".into() },
         Command::CloseSession("s1".into()),
         Command::Start { agent: "claude".into(), folder: None },
-        Command::ToggleChief,
         Command::NewSession,
         Command::PickProject,
         Command::SetView(None),
-        Command::ShowUngrouped,
         Command::Rename("s1".into()),
-        Command::HideChief,
     ] {
         assert!(!controller.available(&command), "{command:?}");
+    }
+    // The chief's window is the page's, in the wide layout only.
+    for command in [Command::ToggleChief, Command::HideChief] {
+        assert!(!controller.available(&command), "{command:?} on a phone");
+        let window =
+            crate::desk::ChiefWindow { open: true, dock: atomics_core::config::ChiefDock::Docked, width: None };
+        controller.set_chief_window(window, true);
+        assert!(controller.available(&command), "{command:?} in the wide layout");
+        controller.set_chief_window(window, false);
     }
 
     let viewer = connected(Role::Viewer);
@@ -309,15 +323,24 @@ fn the_frame_leaves_out_the_host_items_and_what_the_browser_cannot_do() {
     remote.set_view(ViewHints { diff_open: true, ..default_hints() });
     let text = frame_text(&remote);
     let has = |label: &str| text.iter().any(|t| t.starts_with(label));
-    for shown in
-        ["ATOMICS", "CHIEF", "◆ Parse faster", "Hide diff", "Plan 0/2", "AGENTS", "EXPLORER", "PLAN", "Approve plan"]
-    {
+    for shown in [
+        "ATOMICS",
+        "CHIEF",
+        "Ungrouped · 0",
+        "◆ Parse faster",
+        "Hide diff",
+        "Plan 0/2",
+        "AGENTS",
+        "EXPLORER",
+        "PLAN",
+        "Approve plan",
+    ] {
         assert!(has(shown), "{shown} is missing: {text:?}");
     }
     for host_only in ["USAGE", "TICKETS", "Settings", "Tickets", "load ", "Remote", "Project"] {
         assert!(!has(host_only), "{host_only} is the host's: {text:?}");
     }
-    for unavailable in ["+ New", "All ·", "Ungrouped", "Repos", "Close plan…", "Steer", "Send"] {
+    for unavailable in ["+ New", "All ·", "Repos", "Close plan…", "Steer", "Send"] {
         assert!(!has(unavailable), "{unavailable} cannot be sent from the browser: {text:?}");
     }
 

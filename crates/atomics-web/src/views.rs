@@ -1,47 +1,64 @@
-//! The frame's screens: Board, Plans, Approvals, Diffs, an agent's Terminal and the Chief, drawn by
-//! atomics-ui's draw functions over the remote backend, and terminals by [`TermPane`]. Two layouts
-//! ([`crate::layout`]): on a desktop a top bar with the connection's state and a tab per view; on a phone
-//! one pane at a time, switched from a bottom bar, inside the part of the viewport the user sees, in the
-//! phone's look ([`Looks`]): the theme's colours, zoomed, spaced for a finger, with the shared views fitted
-//! to a phone ([`atomics_ui::touch`]). After each draw the commands the user gave are carried out: a view
-//! command here, any other through the backend.
+//! The frame's screens, drawn by atomics-ui over the remote backend in one of two layouts ([`crate::layout`]):
+//!
+//! - **Wide**: the desktop's own window, `atomics_ui::shell::frame`, through [`Web`], this page's
+//!   `Platform`: the top bar, the sidebar, the tiled terminals, the board or a diff in the right panel and the
+//!   chief, docked or floating, in the host's theme. The host's own items (settings, sandboxes, credentials,
+//!   ticket sign-in, GitHub) are hooks this page leaves empty; its connection's state and the layout menu
+//!   take the top bar's last slots.
+//! - **Phone**: one pane at a time, switched from a bottom bar, each a shared widget: the AGENTS list, the
+//!   board, the approval banners, a worktree's diff panel, an agent's fleet tile at full size and the chief's
+//!   window. It draws inside the part of the viewport the user sees, in the phone's look ([`Looks`]): the
+//!   theme's colours with proportional UI text, zoomed, spaced for a finger, the shared views fitted to a
+//!   phone ([`atomics_ui::touch`]).
+//!
+//! Terminals are drawn by [`TermPane`]s through [`Terminals`]. After each piece of the frame, what the user
+//! asked for in it is carried out: a view command here, on the page's [`Desk`], any other through the
+//! backend.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use atomics_core::layout::{DiffPlacement, Layout as Grid};
 use atomics_core::noise;
 use atomics_core::ops::Grant;
 use atomics_core::theme::ThemeTokens;
 use atomics_core::wire::Role;
+use atomics_ui::shell::{self, Platform};
+use atomics_ui::terminal_surface::TerminalSurface;
 use atomics_ui::theme::{FontHook, Fonts, Palette, UI_SIZE, definitions};
 use atomics_ui::touch::{self, Touch};
-use atomics_ui::{Backend, Client, Command, PanelMode, PlanRow, ViewHints, approvals, board, diff_panel};
+use atomics_ui::{Backend, Client, Command, PanelMode, approvals, board, chief, diff_panel, fleet, sidebar};
 use egui::{Align, Layout, Rect, RichText, Sense, Stroke, TextStyle, pos2, vec2};
 
 use crate::boot::Boot;
+use crate::desk::{self, Desk};
 use crate::driver::{Driver, Status};
 use crate::layout::{self, LayoutMode, Viewport};
-use crate::term_pane::TermPane;
+use crate::remote::RemoteBackend;
+use crate::term_pane::{TermPane, Terminals};
 
+/// The phone layout's panes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Tab {
+    /// The AGENTS list.
+    Agents,
     #[default]
     Board,
-    Plans,
+    /// Every permission request waiting, from the top bar's badge.
     Approvals,
     Diffs,
-    /// An agent's terminal.
+    /// The active agent's tile.
     Terminal,
-    /// The chief's terminal.
+    /// The chief's window.
     Chief,
 }
 
 impl Tab {
-    /// The tab a boot's `view` names; anything else opens on the board.
+    /// The pane a boot's `view` names; anything else opens on the board, plans too.
     pub fn named(view: &str) -> Tab {
         match view {
-            "plans" => Tab::Plans,
+            "agents" => Tab::Agents,
             "approvals" => Tab::Approvals,
             "diffs" => Tab::Diffs,
             "terminal" => Tab::Terminal,
@@ -57,26 +74,32 @@ impl Tab {
 
 /// The phone layout's pane switcher, in order.
 pub const BAR: [(Tab, &str); 5] = [
+    (Tab::Agents, "Agents"),
     (Tab::Board, "Board"),
-    (Tab::Plans, "Plans"),
     (Tab::Diffs, "Diffs"),
     (Tab::Terminal, "Terminal"),
     (Tab::Chief, "Chief"),
 ];
 
+/// How long the wide layout's notice line keeps a note of this page's.
+const NOTICE_MS: f64 = 12_000.0;
+
 /// What this frame shows.
 #[derive(Default)]
 pub struct View {
+    /// The phone's pane.
     pub tab: Tab,
-    /// The board's plan, by position in the plan list.
-    pub plan: usize,
-    /// The worktree whose diff is open.
+    /// What this page shows of its host in either layout: the active session, the plan, the tab, the right
+    /// panel and the chief's window.
+    pub desk: Desk,
+    /// The worktree whose diff the phone's Diffs pane shows; the list of worktrees while none.
     pub diff: Option<PathBuf>,
-    /// The agent the Terminal tab shows; the first agent while none was picked.
-    pub session: Option<String>,
     pub layout: LayoutMode,
     pub viewport: Viewport,
+    /// The terminal the page's input goes to, with the overlay.
     pub term: TermPane,
+    /// Every other terminal on screen, by session id.
+    pub tiles: HashMap<String, TermPane>,
     /// A ticket key from the boot, opened once the board is in.
     pub ticket_key: Option<String>,
     /// The clock, in milliseconds.
@@ -84,6 +107,23 @@ pub struct View {
     /// The last frame drew the phone layout.
     pub compact: bool,
     pub looks: Looks,
+    /// The terminal the page's input goes to, by session id, as the pane on screen says.
+    target: Option<String>,
+    /// The note on the notice line and when it first showed there.
+    noted: Option<(String, f64)>,
+}
+
+impl View {
+    /// Open on what a boot's `view` names: the phone's pane, and in the wide layout the right panel or the
+    /// chief.
+    pub fn open(&mut self, tab: Tab) {
+        self.tab = tab;
+        match tab {
+            Tab::Diffs => self.desk.panel = PanelMode::Diff,
+            Tab::Chief => self.desk.chief.open = true,
+            _ => {}
+        }
+    }
 }
 
 /// egui's bundled fonts: a browser has no font lookup, and a theme's named fonts are the desktop's.
@@ -95,9 +135,9 @@ impl FontHook for BundledFonts {
     }
 }
 
-/// The theme in each layout's look: as the desktop draws it, and on a phone with proportional UI text
-/// (monospace stays for code, terminals and IDs), zoomed by [`layout::ZOOM`] through the theme's UI size,
-/// with controls a finger's size and room between them.
+/// The theme in each layout's look: as the desktop draws it (monospace UI text where the theme says so), and
+/// on a phone with proportional UI text (monospace stays for code, terminals and IDs), zoomed by
+/// [`layout::ZOOM`] through the theme's UI size, with controls a finger's size and room between them.
 pub struct Looks {
     pub desktop: Arc<Palette>,
     pub phone: Arc<Palette>,
@@ -166,7 +206,6 @@ pub fn apply_theme(view: &mut View, boot: &Boot) {
 
 /// One frame, and then what the user asked for in it.
 pub fn draw(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &mut View) {
-    sync(driver, client, view);
     open_ticket(driver, view);
     view.term.begin_frame();
     let screen = ui.max_rect();
@@ -174,20 +213,17 @@ pub fn draw(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &
     view.compact = layout::compact(screen.width() * ui.ctx().zoom_factor(), view.viewport.coarse, view.layout);
     view.looks.apply(ui.ctx(), client, view.compact);
     view.term.touch = client.touch;
-    let p = client.palette.clone();
+    sync(driver, client, view);
     if view.compact {
         phone(ui, screen, driver, client, view);
     } else {
-        egui::Panel::top("atomics-top")
-            .frame(egui::Frame::new().fill(p.topbar).inner_margin(egui::Margin::symmetric(12, 6)))
-            .show(ui, |ui| top(ui, driver, view, &p));
-        egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(p.background).inner_margin(egui::Margin::same(8)))
-            .show(ui, |ui| body(ui, driver, client, view));
+        wide(ui, driver, client, view);
     }
     view.term.end_frame();
     driver.remote.end_frame();
     carry_out(driver, client, view);
+    want(&driver.remote, view);
+    driver.flush();
 }
 
 /// The boot's ticket key, once the board is in: its plan on the board, or the board when none names it.
@@ -198,7 +234,204 @@ fn open_ticket(driver: &Driver, view: &mut View) {
     }
     let key = view.ticket_key.take().expect("checked");
     view.tab = Tab::Board;
-    view.plan = remote.plan_for_ticket(&key).unwrap_or(0);
+    view.desk.apply(Command::ViewPlanHistory(remote.plan_for_ticket(&key).unwrap_or(0)), remote);
+    view.desk.diff_open = true;
+}
+
+/// Bring the client's own state and the page's view in line with the backend before drawing.
+fn sync(driver: &mut Driver, client: &mut Client, view: &mut View) {
+    let remote = &driver.remote;
+    for refused in remote.take_refused() {
+        client.approval_decisions.remove(&refused);
+    }
+    let pending: HashSet<(String, String)> =
+        remote.with_mirror(|m| m.approvals.values().map(|a| (a.session.clone(), a.id.clone())).collect());
+    client.approval_decisions.retain(|decision| pending.contains(decision));
+    view.desk.settle(remote, |hints| {
+        remote.set_view(hints.clone());
+        remote.visible_sessions()
+    });
+    hint(remote, view);
+    let sessions = remote.session_list();
+    view.tiles.retain(|id, _| sessions.iter().any(|s| &s.id == id));
+    view.target = if view.compact { None } else { view.desk.typing_target() };
+    // The wide layout's notice line has no close button: a note of this page's goes after a while.
+    match (remote.notice(), &view.noted) {
+        (None, _) => view.noted = None,
+        (Some(note), Some((seen, since))) if note == *seen => {
+            if !view.compact && view.now_ms - since > NOTICE_MS {
+                remote.dismiss_notice();
+                view.noted = None;
+            }
+        }
+        (Some(note), _) => view.noted = Some((note, view.now_ms)),
+    }
+}
+
+/// Tell the backend what the page shows: the phone's Agents pane lists every agent, the wide layout the tab's.
+fn hint(remote: &RemoteBackend, view: &View) {
+    let mut hints = view.desk.hints(remote);
+    if view.compact {
+        (hints.plan_view, hints.ungrouped) = (false, false);
+    }
+    remote.set_view(hints);
+    remote.set_chief_window(view.desk.chief, !view.compact);
+}
+
+/// Fetch the hunks of the diff on screen, and of no other.
+fn want(remote: &RemoteBackend, view: &View) {
+    let shown = if view.compact {
+        view.diff.clone().filter(|_| view.tab == Tab::Diffs)
+    } else {
+        let desk = &view.desk;
+        (desk.diff_open && desk.panel == PanelMode::Diff).then(|| desk.diff_target(remote)).flatten()
+    };
+    remote.set_wanted(shown.as_deref());
+}
+
+/// The wide layout's platform for the shared frame: it lends each piece the remote backend, this page's
+/// client and its terminals, and carries out what the piece recorded before the next draws.
+struct Web<'a> {
+    driver: &'a mut Driver,
+    client: &'a mut Client,
+    view: &'a mut View,
+}
+
+impl Platform for Web<'_> {
+    fn draw<R>(&mut self, draw: impl FnOnce(&dyn Backend, &mut Client, &mut dyn TerminalSurface) -> R) -> R {
+        let result = lend(self.driver, self.client, self.view, draw);
+        carry_out(self.driver, self.client, self.view);
+        result
+    }
+
+    /// Where the desktop has its Tickets, GitHub and Remote items: how this page's connection is.
+    fn top_bar_items(&mut self, ui: &mut egui::Ui, _in_menu: bool) {
+        let (text, good) = status_line(self.driver);
+        let p = &self.client.palette;
+        let label = ui.label(RichText::new(text).color(status_color(good, p)).size(11.5));
+        if let Status::Stopped(stop) = self.driver.status() {
+            label.on_hover_text(stop.message());
+        }
+    }
+
+    /// Where the desktop has its Settings: the layout this page draws.
+    fn top_bar_settings(&mut self, ui: &mut egui::Ui) {
+        layout_menu(ui, self.view);
+    }
+}
+
+/// Lends `draw` the backend, the client and the page's terminals; a terminal a click picks takes the
+/// page's input next.
+fn lend<R>(
+    driver: &Driver,
+    client: &mut Client,
+    view: &mut View,
+    draw: impl FnOnce(&dyn Backend, &mut Client, &mut dyn TerminalSurface) -> R,
+) -> R {
+    if !view.compact {
+        view.target = view.desk.typing_target();
+    }
+    let mut terminals = Terminals {
+        pane: &mut view.term,
+        others: &mut view.tiles,
+        remote: &driver.remote,
+        target: view.target.clone(),
+        now_ms: view.now_ms,
+        picked: None,
+    };
+    let result = draw(&driver.remote, client, &mut terminals);
+    if let Some(session) = terminals.picked.take() {
+        // A click into a terminal types there, as on the desktop: the chief's, or an agent's, which the tile
+        // makes the active one.
+        view.desk.typing_in = (view.desk.active.as_deref() != Some(session.as_str())).then_some(session);
+        view.term.focus_next = true;
+    }
+    result
+}
+
+/// Carry out what the draw recorded, in order: a view command on the page, any other through the backend.
+fn carry_out(driver: &mut Driver, client: &mut Client, view: &mut View) {
+    for command in std::mem::take(&mut client.commands) {
+        if command.is_view() || desk::window_command(&command) {
+            view_command(&driver.remote, view, command);
+        } else {
+            driver.remote.send(command);
+        }
+    }
+    hint(&driver.remote, view);
+}
+
+/// A view command: the page's desk as the desktop's model, and the phone's pane follows what was asked for.
+fn view_command(remote: &RemoteBackend, view: &mut View, command: Command) {
+    let root = |id: &str| remote.session_list().into_iter().find(|s| s.id == id).map(|s| s.root);
+    if view.compact {
+        match &command {
+            Command::Activate { .. } if view.tab == Tab::Agents => view.tab = Tab::Terminal,
+            Command::Activate { session, open_diff: true } | Command::OpenTaskSession(session) => {
+                if let Some(worktree) = root(session) {
+                    view.diff = Some(worktree);
+                    view.tab = Tab::Diffs;
+                }
+            }
+            Command::ShowTaskDiff { plan, task } => {
+                let session = remote.board(*plan).and_then(|b| b.plan.tasks.get(*task).and_then(|t| t.session.clone()));
+                if let Some(worktree) = session.as_deref().and_then(root) {
+                    view.diff = Some(worktree);
+                    view.tab = Tab::Diffs;
+                }
+            }
+            Command::ShowRoot(worktree) => {
+                view.diff = Some(worktree.clone());
+                view.tab = Tab::Diffs;
+            }
+            Command::OpenDiff | Command::ToggleDiff | Command::SetPanel(PanelMode::Diff) => view.tab = Tab::Diffs,
+            Command::CloseDiff => view.diff = None,
+            Command::SetPanel(PanelMode::Plan) | Command::TogglePlan | Command::ShowPlan(_) => view.tab = Tab::Board,
+            Command::ViewPlanHistory(_) => view.tab = Tab::Board,
+            _ => {}
+        }
+    }
+    if let Command::Toast(text) = &command {
+        remote.say(text.clone());
+    }
+    view.desk.apply(command, remote);
+}
+
+/// The wide layout: the desktop's window, or before there is a board the connection's state.
+fn wide(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &mut View) {
+    if waiting_room(driver) {
+        let p = client.palette.clone();
+        egui::Panel::top("atomics-top")
+            .exact_size(34.0)
+            .frame(egui::Frame::new().fill(p.topbar).inner_margin(egui::Margin::symmetric(10, 4)))
+            .show(ui, |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.label(RichText::new("ATOMICS").strong().size(14.0).color(p.accent).monospace());
+                    let (text, good) = status_line(driver);
+                    ui.label(RichText::new(text).color(status_color(good, &p)).size(11.5));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| layout_menu(ui, view));
+                });
+            });
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(p.background).inner_margin(egui::Margin::same(8)))
+            .show(ui, |ui| {
+                status_screen(ui, driver, client);
+            });
+        return;
+    }
+    shell::frame(ui, &mut Web { driver, client, view });
+}
+
+/// The board is not in: pairing, confirming a new pairing, connected before the host's first snapshot, or no
+/// board yet while connecting or stopped.
+fn waiting_room(driver: &Driver) -> bool {
+    let (has_board, snapshot) =
+        driver.remote.with_mirror(|m| (!m.plans.is_empty() || !m.sessions.is_empty(), m.epoch.is_some()));
+    match driver.status() {
+        Status::Pairing { .. } | Status::ConfirmRepair => true,
+        Status::Waiting | Status::Connecting | Status::Reconnecting { .. } | Status::Stopped(_) => !has_board,
+        Status::Live => !snapshot,
+    }
 }
 
 /// A child drawing into `rect` alone.
@@ -220,7 +453,7 @@ fn phone(ui: &mut egui::Ui, screen: Rect, driver: &mut Driver, client: &mut Clie
     let top = Rect::from_x_y_ranges(screen.x_range(), screen.top()..=regions.top.bottom());
     ui.painter().rect_filled(top, 0.0, p.topbar);
     region(ui, regions.top.shrink2(vec2(layout::GUTTER, 0.0)), "phone-top", |ui| phone_top(ui, driver, view, &p));
-    region(ui, regions.body, "phone-body", |ui| body(ui, driver, client, view));
+    region(ui, regions.body, "phone-body", |ui| phone_body(ui, driver, client, view));
     ui.painter().hline(screen.x_range(), top.bottom() - 0.5, Stroke::new(1.0, p.separator));
     if let Some(bar) = regions.bar {
         pane_bar(ui, bar, screen, driver, view, &p);
@@ -239,8 +472,10 @@ fn phone_top(ui: &mut egui::Ui, driver: &Driver, view: &mut View, p: &Palette) {
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             layout_menu(ui, view);
             if approvals > 0 {
+                // Selected while the approvals show, as a pane is in the bar.
                 let badge = RichText::new(format!("◆ {approvals}")).color(p.warning).strong();
-                let button = egui::Button::new(badge).min_size(vec2(layout::TOUCH, layout::TOUCH));
+                let open = view.tab == Tab::Approvals;
+                let button = egui::Button::new(badge).selected(open).min_size(vec2(layout::TOUCH, layout::TOUCH));
                 if ui.add(button).on_hover_text("Approvals").clicked() {
                     view.tab = Tab::Approvals;
                 }
@@ -275,7 +510,7 @@ fn pane_bar(ui: &mut egui::Ui, bar: Rect, screen: Rect, driver: &Driver, view: &
         .with_mirror(|m| m.approvals.values().any(|a| m.sessions.get(&a.session).is_some_and(|s| !s.chief)));
     for ((tab, label), item) in BAR.iter().zip(layout::bar_items(bar, BAR.len())) {
         let response = ui.interact(item, ui.scope_id().with(("pane", label)), Sense::click());
-        let active = view.tab == *tab || (*tab == Tab::Board && view.tab == Tab::Approvals);
+        let active = view.tab == *tab;
         let color = if active {
             p.accent
         } else if response.hovered() {
@@ -302,36 +537,6 @@ fn pane_bar(ui: &mut egui::Ui, bar: Rect, screen: Rect, driver: &Driver, view: &
     }
 }
 
-/// Bring the client's own state in line with the backend before drawing.
-fn sync(driver: &mut Driver, client: &mut Client, view: &View) {
-    let remote = &driver.remote;
-    for refused in remote.take_refused() {
-        client.approval_decisions.remove(&refused);
-    }
-    let pending: HashSet<(String, String)> =
-        remote.with_mirror(|m| m.approvals.values().map(|a| (a.session.clone(), a.id.clone())).collect());
-    client.approval_decisions.retain(|decision| pending.contains(decision));
-    if let Some(root) = &view.diff
-        && let Some(data) = remote.diff(root)
-    {
-        let state = client.diff_views.entry(root.clone()).or_default();
-        state.prepared = data.prepared;
-        state.error = data.error;
-        state.loading = data.loading;
-        state.comments = data.comments;
-    }
-    remote.set_view(ViewHints {
-        active: None,
-        diff_target: view.diff.clone(),
-        plan_view: view.tab == Tab::Board,
-        ungrouped: false,
-        project: None,
-        selected_plan: view.plan,
-        diff_open: view.diff.is_some(),
-        panel: if view.tab == Tab::Diffs { PanelMode::Diff } else { PanelMode::Plan },
-    });
-}
-
 fn status_line(driver: &Driver) -> (String, Option<bool>) {
     match driver.status() {
         Status::Waiting => ("Waiting for the page".into(), None),
@@ -355,29 +560,6 @@ fn status_color(good: Option<bool>, p: &Palette) -> egui::Color32 {
     }
 }
 
-fn top(ui: &mut egui::Ui, driver: &mut Driver, view: &mut View, p: &Palette) {
-    let remote = &driver.remote;
-    let (plans, approvals, diffs) = remote.with_mirror(|m| (m.plans.len(), m.approvals.len(), m.diffs.len()));
-    ui.horizontal_wrapped(|ui| {
-        ui.label(RichText::new("ATOMICS").color(p.accent).strong());
-        let (text, good) = status_line(driver);
-        ui.label(RichText::new(text).color(status_color(good, p)).small());
-        ui.separator();
-        let mut tab = |ui: &mut egui::Ui, which: Tab, label: String| {
-            if ui.selectable_label(view.tab == which, label).clicked() {
-                view.tab = which;
-            }
-        };
-        tab(ui, Tab::Board, "Board".into());
-        tab(ui, Tab::Plans, format!("Plans {plans}"));
-        tab(ui, Tab::Approvals, if approvals > 0 { format!("Approvals ◆ {approvals}") } else { "Approvals".into() });
-        tab(ui, Tab::Diffs, format!("Diffs {diffs}"));
-        tab(ui, Tab::Terminal, "Terminal".into());
-        tab(ui, Tab::Chief, "Chief".into());
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| layout_menu(ui, view));
-    });
-}
-
 fn notice(ui: &mut egui::Ui, driver: &Driver, touch: Option<Touch>) {
     let remote = &driver.remote;
     if let Some(notice) = remote.notice() {
@@ -395,7 +577,7 @@ fn gutter(client: &Client) -> f32 {
     client.touch.map_or(0.0, |touch| touch.gutter)
 }
 
-/// `add`, `gutter` away from both sides, below what the ui holds already.
+/// `add`, `gutter` away from both sides, below what the ui holds already. What draws nothing takes no room.
 fn padded<R>(ui: &mut egui::Ui, gutter: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     if gutter <= 0.0 {
         return add(ui);
@@ -403,7 +585,10 @@ fn padded<R>(ui: &mut egui::Ui, gutter: f32, add: impl FnOnce(&mut egui::Ui) -> 
     let rect = ui.available_rect_before_wrap().shrink2(vec2(gutter, 0.0));
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(*ui.layout()));
     let inner = add(&mut child);
-    ui.advance_cursor_after_rect(child.min_rect());
+    let drawn = child.min_rect();
+    if drawn.width() > 0.0 || drawn.height() > 0.0 {
+        ui.advance_cursor_after_rect(drawn);
+    }
     inner
 }
 
@@ -448,85 +633,93 @@ fn centred(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     });
 }
 
-fn body(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &mut View) {
+/// The connection's state while there is no board to show, filling the body; false when there is a board.
+fn status_screen(ui: &mut egui::Ui, driver: &mut Driver, client: &Client) -> bool {
+    let p = client.palette.clone();
+    let gutter = gutter(client);
+    if !waiting_room(driver) {
+        return false;
+    }
+    match driver.status().clone() {
+        Status::Pairing { code } => padded(ui, gutter, |ui| {
+            centred(ui, |ui| {
+                ui.label(RichText::new("Pairing this browser with your computer").size(18.0));
+                ui.add_space(16.0);
+                match code {
+                    Some(code) => {
+                        ui.label(RichText::new(noise::show_code(&code)).monospace().size(40.0).color(p.accent));
+                        ui.add_space(16.0);
+                        ui.label("Check that ATOMICS on the computer shows the same code, then accept it there.");
+                    }
+                    None if driver.pairing_busy() => {
+                        let busy = "Another device is pairing with the computer right now. Trying again…";
+                        ui.label(RichText::new(busy).color(p.muted));
+                    }
+                    None => {
+                        ui.label(RichText::new("Connecting…").color(p.muted));
+                    }
+                }
+            })
+        }),
+        Status::ConfirmRepair => padded(ui, gutter, |ui| {
+            centred(ui, |ui| {
+                ui.label(RichText::new("Pair this browser again?").size(18.0));
+                ui.add_space(16.0);
+                ui.label(
+                    "This browser is already paired with this computer, under another key. Pairing again \
+                     replaces it. Go on only if you started this pairing yourself, just now, from Remote devices \
+                     in ATOMICS on the computer.",
+                );
+                ui.add_space(16.0);
+                // The two buttons wrap on a narrow screen rather than run off it.
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Pair again").clicked() {
+                        driver.repair(true);
+                    }
+                    if ui.button("Keep the current pairing").clicked() {
+                        driver.repair(false);
+                    }
+                });
+            })
+        }),
+        Status::Stopped(stop) => padded(ui, gutter, |ui| {
+            centred(ui, |ui| {
+                ui.label(stop.message());
+            })
+        }),
+        _ => padded(ui, gutter, |ui| {
+            centred(ui, |ui| {
+                ui.label(RichText::new("Connecting to your computer…").color(p.muted));
+            })
+        }),
+    }
+    true
+}
+
+/// The phone's body: the connection's state while there is no board, else the pane, under what the
+/// connection and the host have to say.
+fn phone_body(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &mut View) {
+    if status_screen(ui, driver, client) {
+        return;
+    }
     let p = client.palette.clone();
     // A phone keeps text off the screen's sides; the panes that reach them keep to the gutter themselves.
     let gutter = gutter(client);
-    let has_board = driver.remote.with_mirror(|m| !m.plans.is_empty() || !m.sessions.is_empty());
     match driver.status().clone() {
-        Status::Pairing { code } => {
-            return padded(ui, gutter, |ui| {
-                centred(ui, |ui| {
-                    ui.label(RichText::new("Pairing this browser with your computer").size(18.0));
-                    ui.add_space(16.0);
-                    match code {
-                        Some(code) => {
-                            ui.label(RichText::new(noise::show_code(&code)).monospace().size(40.0).color(p.accent));
-                            ui.add_space(16.0);
-                            ui.label("Check that ATOMICS on the computer shows the same code, then accept it there.");
-                        }
-                        None if driver.pairing_busy() => {
-                            let busy = "Another device is pairing with the computer right now. Trying again…";
-                            ui.label(RichText::new(busy).color(p.muted));
-                        }
-                        None => {
-                            ui.label(RichText::new("Connecting…").color(p.muted));
-                        }
-                    }
-                })
-            });
-        }
-        Status::ConfirmRepair => {
-            return padded(ui, gutter, |ui| {
-                centred(ui, |ui| {
-                    ui.label(RichText::new("Pair this browser again?").size(18.0));
-                    ui.add_space(16.0);
-                    ui.label(
-                        "This browser is already paired with this computer, under another key. Pairing again \
-                         replaces it. Go on only if you started this pairing yourself, just now, from Remote devices \
-                         in ATOMICS on the computer.",
-                    );
-                    ui.add_space(16.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Pair again").clicked() {
-                            driver.repair(true);
-                        }
-                        if ui.button("Keep the current pairing").clicked() {
-                            driver.repair(false);
-                        }
-                    });
-                })
-            });
-        }
-        Status::Stopped(stop) if !has_board => {
-            return padded(ui, gutter, |ui| {
-                centred(ui, |ui| {
-                    ui.label(stop.message());
-                })
-            });
-        }
         Status::Stopped(stop) => {
             padded(ui, gutter, |ui| ui.label(RichText::new(stop.message()).color(p.error)));
         }
-        Status::Reconnecting { .. } if has_board => {
+        Status::Reconnecting { .. } => {
             let stale = "Reconnecting. The board may be out of date, and nothing can be changed until the computer \
                          is back.";
             padded(ui, gutter, |ui| ui.label(RichText::new(stale).color(p.warning)));
         }
-        Status::Waiting | Status::Connecting | Status::Reconnecting { .. } if !has_board => {
-            return padded(ui, gutter, |ui| {
-                centred(ui, |ui| {
-                    ui.label(RichText::new("Connecting to your computer…").color(p.muted));
-                })
-            });
-        }
         _ => {}
     }
     padded(ui, gutter, |ui| notice(ui, driver, client.touch));
-    let backend: &dyn Backend = &driver.remote;
     match view.tab {
-        Tab::Board => board_tab(ui, backend, client, view),
-        Tab::Plans => plans_tab(ui, backend, client),
+        Tab::Agents => agents_tab(ui, driver, client),
+        Tab::Board => board_tab(ui, &driver.remote, client, view),
         Tab::Approvals => approvals_tab(ui, driver, client),
         Tab::Diffs => diffs_tab(ui, driver, client, view),
         Tab::Terminal => terminal_tab(ui, driver, client, view),
@@ -534,53 +727,55 @@ fn body(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &mut 
     }
 }
 
-/// An agent's terminal, picked from the agents on the computer.
-fn terminal_tab(ui: &mut egui::Ui, driver: &Driver, client: &mut Client, view: &mut View) {
+/// The AGENTS list, as the desktop's sidebar has it: a tap opens the agent's terminal.
+fn agents_tab(ui: &mut egui::Ui, driver: &Driver, client: &mut Client) {
     let backend: &dyn Backend = &driver.remote;
-    let agents: Vec<_> = backend.session_list().into_iter().filter(|s| !s.chief).collect();
-    if agents.is_empty() {
+    if backend.visible_sessions().is_empty() {
         return empty(ui, client, "No agents are running on this computer.");
     }
-    let session =
-        view.session.clone().filter(|id| agents.iter().any(|s| &s.id == id)).unwrap_or_else(|| agents[0].id.clone());
-    let p = client.palette.clone();
-    let gutter = gutter(client);
-    if gutter > 0.0 {
-        ui.add_space(6.0);
-    }
-    padded(ui, gutter, |ui| {
-        ui.horizontal(|ui| {
-            let title = |s: &atomics_ui::SessionRow| {
-                if s.pending_approvals > 0 { format!("◆ {}", s.title) } else { s.title.clone() }
-            };
-            let current = agents.iter().find(|s| s.id == session).map(title).unwrap_or_default();
-            let width = if gutter > 0.0 { ui.available_width() } else { ui.available_width().min(320.0) };
-            egui::ComboBox::from_id_salt("terminal-session")
-                .selected_text(RichText::new(current).color(p.foreground))
-                .width(width)
-                .show_ui(ui, |ui| {
-                    for agent in &agents {
-                        if ui.selectable_label(agent.id == session, title(agent)).clicked() {
-                            view.session = Some(agent.id.clone());
-                        }
-                    }
-                });
-        });
-    });
-    let session = view.session.clone().filter(|id| agents.iter().any(|s| &s.id == id)).unwrap_or(session);
-    let now = view.now_ms;
-    let term = &mut view.term;
-    fill(ui, |ui, rect| term.draw(ui, rect, &session, &driver.remote, client, now));
+    padded(ui, gutter(client), |ui| list(ui, |ui| sidebar::sessions(ui, backend, client)));
 }
 
+/// The active agent's tile at the pane's size (the first agent's while none is active): its header, the
+/// approval it waits on and its terminal.
+fn terminal_tab(ui: &mut egui::Ui, driver: &Driver, client: &mut Client, view: &mut View) {
+    let sessions = driver.remote.session_list();
+    let agents: Vec<usize> = (0..sessions.len()).filter(|&i| !sessions[i].chief).collect();
+    let Some(&first) = agents.first() else {
+        return empty(ui, client, "No agents are running on this computer.");
+    };
+    let active = view.desk.active.as_deref();
+    let index = agents.iter().copied().find(|&i| Some(sessions[i].id.as_str()) == active).unwrap_or(first);
+    view.target = Some(sessions[index].id.clone());
+    let grid = Grid {
+        sidebar: false,
+        dock_width: 0.0,
+        diff: DiffPlacement::Hidden,
+        columns: 1,
+        rows: 1,
+        tiled: 1,
+        tabs: false,
+        completed: 0,
+    };
+    fill(ui, |ui, rect| {
+        lend(driver, client, view, |backend, client, terminals| {
+            fleet::tiles(ui, rect, &grid, &[index], backend, client, terminals)
+        })
+    });
+}
+
+/// The chief's window at the pane's size: its header and its terminal.
 fn chief_tab(ui: &mut egui::Ui, driver: &Driver, client: &mut Client, view: &mut View) {
-    let backend: &dyn Backend = &driver.remote;
-    let Some(chief) = backend.session_list().into_iter().find(|s| s.chief) else {
+    let Some(chief) = driver.remote.session_list().into_iter().find(|s| s.chief) else {
         return empty(ui, client, "No chief is running on this computer.");
     };
-    let now = view.now_ms;
-    let term = &mut view.term;
-    fill(ui, |ui, rect| term.draw(ui, rect, &chief.id, &driver.remote, client, now));
+    view.target = Some(chief.id);
+    fill(ui, |ui, rect| {
+        let mut child = ui.new_child(egui::UiBuilder::new().id_salt("chief").max_rect(rect));
+        lend(driver, client, view, |backend, client, terminals| {
+            chief::content(&mut child, backend, client, terminals, |_| 0.0);
+        });
+    });
 }
 
 fn empty(ui: &mut egui::Ui, client: &Client, text: &str) {
@@ -599,71 +794,27 @@ fn fill(ui: &mut egui::Ui, draw: impl FnOnce(&mut egui::Ui, Rect)) {
     ui.allocate_rect(rect, Sense::hover());
 }
 
-fn board_tab(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, view: &mut View) {
+/// The selected plan's board, under the plans to pick from when there are several.
+fn board_tab(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, view: &View) {
     let plans = backend.plan_list();
     if plans.is_empty() {
         return empty(ui, client, "No plans on this computer yet.");
     }
-    view.plan = view.plan.min(plans.len() - 1);
+    let selected = view.desk.selected_plan.min(plans.len() - 1);
     if plans.len() > 1 {
         let p = client.palette.clone();
-        let gutter = gutter(client);
-        padded(ui, gutter, |ui| {
+        padded(ui, gutter(client), |ui| {
             ui.horizontal_wrapped(|ui| {
                 for (index, row) in plans.iter().enumerate() {
                     let label = RichText::new(row.state.label(&row.tab_name)).color(row.state.color(&p));
-                    if ui.selectable_label(index == view.plan, label).clicked() {
+                    if ui.selectable_label(index == selected, label).clicked() {
                         client.send(Command::ShowPlan(index));
                     }
                 }
             })
         });
     }
-    fill(ui, |ui, rect| board::draw(ui, rect, view.plan, backend, client));
-}
-
-fn plans_tab(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
-    let plans = backend.plan_list();
-    if plans.is_empty() {
-        return empty(ui, client, "No plans on this computer yet.");
-    }
-    let p = client.palette.clone();
-    if client.touch.is_some() {
-        return padded(ui, gutter(client), |ui| {
-            list(ui, |ui| {
-                for (index, row) in plans.iter().enumerate() {
-                    let tapped = list_row(ui, &p, ("plan", index), |ui| {
-                        ui.label(RichText::new(row.state.label(&row.goal)).color(row.state.color(&p)).size(13.5));
-                        ui.label(RichText::new(plan_facts(row)).color(p.muted).small());
-                    });
-                    if tapped {
-                        client.send(Command::ShowPlan(index));
-                    }
-                }
-            })
-        });
-    }
-    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-        for (index, row) in plans.iter().enumerate() {
-            ui.horizontal_wrapped(|ui| {
-                let label = RichText::new(row.state.label(&row.goal)).color(row.state.color(&p)).size(14.0);
-                if ui.add(egui::Button::new(label).frame(false)).clicked() {
-                    client.send(Command::ShowPlan(index));
-                }
-                ui.label(RichText::new(plan_facts(row)).color(p.muted).small());
-            });
-            ui.separator();
-        }
-    });
-}
-
-/// A plan's progress: its tasks done, and those waiting for a review.
-fn plan_facts(row: &PlanRow) -> String {
-    let mut facts = format!("{}/{} done", row.done, row.total);
-    if row.attention > 0 {
-        facts.push_str(&format!(" · {} need review", row.attention));
-    }
-    facts
+    fill(ui, |ui, rect| board::draw(ui, rect, selected, backend, client));
 }
 
 fn approvals_tab(ui: &mut egui::Ui, driver: &Driver, client: &mut Client) {
@@ -700,10 +851,12 @@ fn approvals_tab(ui: &mut egui::Ui, driver: &Driver, client: &mut Client) {
     });
 }
 
-fn diffs_tab(ui: &mut egui::Ui, driver: &Driver, client: &mut Client, view: &mut View) {
+/// The worktrees with changes; one picked shows in the diff panel.
+fn diffs_tab(ui: &mut egui::Ui, driver: &Driver, client: &mut Client, view: &View) {
     let backend: &dyn Backend = &driver.remote;
     let roots = backend.diff_roots();
     if let Some(root) = view.diff.clone().filter(|root| roots.contains(root)) {
+        diff_panel::sync(backend, client);
         return fill(ui, |ui, rect| diff_panel::draw(ui, rect, &root, backend, client));
     }
     if roots.is_empty() {
@@ -715,118 +868,24 @@ fn diffs_tab(ui: &mut egui::Ui, driver: &Driver, client: &mut Client, view: &mut
     });
     let name =
         |worktree: &str| Path::new(worktree).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    if client.touch.is_some() {
-        return padded(ui, gutter(client), |ui| {
-            list(ui, |ui| {
-                for (worktree, files, added, removed) in rows {
-                    let tapped = list_row(ui, &p, ("diff", &worktree), |ui| {
-                        ui.label(RichText::new(name(&worktree)).color(p.foreground).strong().size(13.5));
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(RichText::new(format!("+{added}")).color(p.success));
-                            ui.label(RichText::new(format!("−{removed}")).color(p.error));
-                            ui.label(RichText::new(format!("{files} files")).color(p.muted));
-                        });
-                        ui.add(egui::Label::new(RichText::new(&worktree).color(p.muted).monospace()).truncate());
+    padded(ui, gutter(client), |ui| {
+        list(ui, |ui| {
+            for (worktree, files, added, removed) in rows {
+                let tapped = list_row(ui, &p, ("diff", &worktree), |ui| {
+                    ui.label(RichText::new(name(&worktree)).color(p.foreground).strong().size(13.5));
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(format!("+{added}")).color(p.success));
+                        ui.label(RichText::new(format!("−{removed}")).color(p.error));
+                        ui.label(RichText::new(format!("{files} files")).color(p.muted));
                     });
-                    if tapped {
-                        client.send(Command::ShowRoot(PathBuf::from(&worktree)));
-                    }
-                }
-            })
-        });
-    }
-    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-        for (worktree, files, added, removed) in rows {
-            ui.horizontal_wrapped(|ui| {
-                let name = name(&worktree);
-                if ui.add(egui::Button::new(RichText::new(name).size(14.0)).frame(false)).clicked() {
+                    ui.add(egui::Label::new(RichText::new(&worktree).color(p.muted).monospace()).truncate());
+                });
+                if tapped {
                     client.send(Command::ShowRoot(PathBuf::from(&worktree)));
                 }
-                ui.label(RichText::new(format!("+{added}")).color(p.added).small());
-                ui.label(RichText::new(format!("−{removed}")).color(p.removed).small());
-                ui.label(RichText::new(format!("{files} files · {worktree}")).color(p.muted).small());
-            });
-            ui.separator();
-        }
-    });
-}
-
-/// Carry out what the draw recorded, in order: a view command here, any other through the backend.
-fn carry_out(driver: &mut Driver, client: &mut Client, view: &mut View) {
-    for command in std::mem::take(&mut client.commands) {
-        if command.is_view() {
-            view_command(driver, view, command);
-        } else {
-            driver.remote.send(command);
-        }
-    }
-    driver.flush();
-}
-
-/// The view commands this frame carries out ([`view_command`]); the views draw no action for the others.
-pub(crate) fn carries_out(command: &Command) -> bool {
-    matches!(
-        command,
-        Command::Activate { open_diff: true, .. }
-            | Command::OpenTaskSession(_)
-            | Command::ShowTaskDiff { .. }
-            | Command::ShowRoot(_)
-            | Command::OpenDiff
-            | Command::ToggleDiff
-            | Command::CloseDiff
-            | Command::SetPanel(PanelMode::Diff | PanelMode::Plan)
-            | Command::TogglePlan
-            | Command::ShowPlan(_)
-            | Command::ViewPlanHistory(_)
-            | Command::EditingPlan
-            | Command::Toast(_)
-    )
-}
-
-fn view_command(driver: &mut Driver, view: &mut View, command: Command) {
-    let remote = &driver.remote;
-    let session_root = |id: &str| remote.session_list().into_iter().find(|s| s.id == id).map(|s| s.root);
-    let open = match command {
-        Command::Activate { session, open_diff: true } | Command::OpenTaskSession(session) => session_root(&session),
-        Command::ShowTaskDiff { plan, task } => remote
-            .board(plan)
-            .and_then(|b| b.plan.tasks.get(task).and_then(|t| t.session.clone()))
-            .and_then(|session| session_root(&session)),
-        Command::ShowRoot(root) => Some(root),
-        Command::OpenDiff | Command::ToggleDiff | Command::SetPanel(PanelMode::Diff) => {
-            view.tab = Tab::Diffs;
-            None
-        }
-        Command::CloseDiff => {
-            if let Some(old) = view.diff.take() {
-                remote.unwant_diff(&old);
             }
-            None
-        }
-        Command::SetPanel(PanelMode::Plan) | Command::TogglePlan => {
-            view.tab = Tab::Board;
-            None
-        }
-        Command::ShowPlan(index) | Command::ViewPlanHistory(index) => {
-            view.plan = index;
-            view.tab = Tab::Board;
-            None
-        }
-        Command::Toast(text) => {
-            remote.say(text);
-            None
-        }
-        _ => None,
-    };
-    if let Some(root) = open {
-        if let Some(old) = view.diff.replace(root.clone())
-            && old != root
-        {
-            remote.unwant_diff(&old);
-        }
-        remote.want_diff(&root);
-        view.tab = Tab::Diffs;
-    }
+        })
+    });
 }
 
 #[cfg(test)]
