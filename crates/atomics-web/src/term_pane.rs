@@ -18,7 +18,9 @@
 //!   scrolls.
 //! - **The overlay yields to what lies over it.** It takes the pointer only where egui would give the
 //!   terminal the pointer: a floating window over the terminal is cut out of it ([`Overlay::covered`]), and an
-//!   open menu or popup takes all of it, so a click away closes the popup as it does anywhere else.
+//!   open menu or popup takes all of it, so a click away closes the popup as it does anywhere else. A click
+//!   outside it, on a text box the page draws, takes the browser's focus with it, so what is typed there goes
+//!   there and nothing reaches the terminal.
 //! - **Typing needs the lease**, asked for only when the overlay gains the focus (a tap) and only where
 //!   `welcome` grants `type`. Losing it to the desktop or another client, or being refused it, blurs the
 //!   overlay, so typing again is a new tap. Text, keys and pastes forwarded while the overlay does not
@@ -414,8 +416,13 @@ impl TermPane {
         }
         let modes = remote.with_screen(session, |s| s.map(|(screen, _)| screen.modes)).unwrap_or_default();
         let mut typed = String::new();
+        let was_focused = self.focused;
         for input in std::mem::take(&mut self.inputs) {
             self.input(input, &frame, &modes, &lease, lost, remote, session, &mut typed, now_ms);
+        }
+        // The overlay takes the pointer before egui sees it: a text box that had the keyboard learns here.
+        if self.focused && !was_focused {
+            ui.memory_mut(|m| m.focused().into_iter().for_each(|id| m.surrender_focus(id)));
         }
         for gesture in self.gestures.tick(now_ms) {
             self.gesture(gesture, &frame, &modes, &lease, &mut typed);

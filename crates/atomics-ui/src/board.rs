@@ -271,7 +271,9 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
     let can_archive = can(Command::ArchivePlan(index));
     let can_clean_up = can(Command::CleanUpPlan(index));
     let can_reopen = can(Command::ReopenPlan(index));
-    let can_close = can(Command::ClosePlan { plan: index, status: PlanStatus::Completed });
+    // The confirmation offers the ways the backend has.
+    let can_close = can(Command::ClosePlan { plan: index, status: PlanStatus::Completed })
+        || can(Command::ClosePlan { plan: index, status: PlanStatus::Archived });
     let can_approve = can(Command::ApprovePlan(index));
     let can_dispatch = can(Command::DispatchReady(index));
     let can_integrate_accepted = can(Command::IntegrateAccepted(index));
@@ -358,11 +360,16 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
     }
     let pending = plan.pending_integrations().len();
     if !read_only && pending > 0 {
-        ui.horizontal(|ui| {
+        let row = |ui: &mut egui::Ui| {
             ui.label(RichText::new(format!("{pending} accepted tasks not integrated yet")).color(p.warning));
             integrate_accepted =
                 can_integrate_accepted && ui.add(touch::sized(egui::Button::new("Integrate"), touch)).clicked();
-        });
+        };
+        // On a phone the button goes under the words rather than off the screen.
+        match touch {
+            Some(_) => ui.horizontal_wrapped(row),
+            None => ui.horizontal(row),
+        };
     }
     let ticket_config = &board.ticket_config;
     stage_chip(ui, plan.stages.last());

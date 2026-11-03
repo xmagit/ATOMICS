@@ -857,22 +857,44 @@ time is up, on the host's sealed refusal (and forgets the key), a bare `not_pair
 `revoked`, a refused or failed pairing, a drop while the codes are being compared, or a handshake answer that does
 not authenticate (the host's key is not the one this browser paired with).
 
-**What it offers.** The board, the plans, the approvals, the diffs and the terminals, with `board`, `plans`,
-`approvals`, `diffs`, `terminals`, `input` and `mutations` asked for in `hello`. It answers approvals
-(`approval_decide`), approves plans (`plan_command` `approve`, with the plan's digest) and types into terminals
-when `welcome`'s `may` grants it. The shared views ask the backend which commands it can carry out
-(`Backend::available`) and draw no button, menu entry or tab for the others, so a viewer, or a browser that is not
-connected, sees no action it cannot take. A diff on screen
-is fetched file by file with `diff_get`, four files at a time, up to 16 pages each; the browser draws it without
-syntax colours.
+**What it offers.** What the desktop offers wherever `atomics.v1` can carry it, asked for in `hello` with `board`,
+`plans`, `approvals`, `diffs`, `terminals`, `input` and `mutations`. A command is offered when
+`Command::remote` has mutations for it and `welcome`'s `may` grants them all, so a viewer, or a browser that is not
+connected, sees no action it cannot take. The shared views ask `Backend::available` and draw no button, menu entry
+or tab for the others:
+
+- **Offered:** answering approvals; approving a plan, Dispatch, a card's start, accept, send back, unblock and reopen,
+  integrate and Integrate; a tile's close and the sidebar's Close, asking where the desktop asks; review comments and
+  Send review; the steer bar and "Include in selected" (wide only: a phone's terminal is right there); typing
+  into terminals.
+- **Close plan…** offers Archive alone: `atomics.v1` has no way to complete a plan. An open plan's tab closes the same
+  way; a finished plan's tab has no close, since archiving one needs a check the protocol lacks, and its board's
+  Archive stays. A closed plan's board stays read-only. A plan that closes while it shows gives way to the first open
+  plan, as on the desktop.
+- **`+ New`** (wide only) opens a small picker of what the host's board names: the agents its sessions and open plans use,
+  and a scratch folder or a folder its sessions and open plans use. The host's configured agents and its
+  worktrees are not sent, so a host with no session and no open plan offers none, and starting in a new worktree
+  stays on the computer.
+- **The changed-files column** scrolls to a file's hunks, which the page has already.
+- **Hidden, for lack of an action or of what it reads:** reopening a plan, cleaning one up, completing one, editing a
+  brief, syncing tickets, renaming and resuming a session, the editor, the whole file of a file with no changes, the
+  explorer; and the voice, since a browser has no microphone here. The mirror does not say whether a session is
+  sandboxed, outside ATOMICS or in a scratch folder, so closing an exited session outside a worktree and a plan asks, in
+  case it deletes its folder. It has no agent kinds either: a steer to all agents leaves out those named `shell`, where
+  it would run as a command.
+
+A command that fails says why: refused, unconfirmed or too large, on the phone's notice line and in a note under the
+wide layout's top bar. A steer goes back into the bar, an approval back to its banner, and a task's `integrating…` ends with
+the outcome; a comment shows once the host has it. A diff on screen is fetched file by file with `diff_get`, four
+files at a time, up to 16 pages each; the browser draws it without syntax colours.
 
 **Layouts (C4).** A wide window draws the desktop's own window, `atomics_ui::shell::frame`, in the boot's theme
 as the desktop draws it (monospace UI text where the theme says so; the default theme does): the top bar with the
 plan tabs and the chief's pill, the sidebar where the window has room for it, the tiled terminals with their
-headers and approval banners, the board or a worktree's diff in the right panel, and the chief docked (at first)
-or floating. The items only a host has (Settings, sandboxes, credentials, the ticket sign-in, GitHub, the load
-gauge, USAGE, `+ New`, Project, the steer bar) are hooks the browser leaves empty; the connection's state takes
-the place of the desktop's Remote item, and the ⋯ layout menu that of Settings. What the desktop keeps in its
+headers and approval banners, the steer bar, the board or a worktree's diff in the right panel, and the chief docked
+(at first) or floating. The items only a host has (Settings, sandboxes, credentials, the ticket sign-in, GitHub, the
+load gauge, USAGE, Project) are hooks the browser leaves empty; the connection's state takes the place of the
+desktop's Remote item, and the ⋯ layout menu that of Settings. What the desktop keeps in its
 host's model about its window (the tab, the active session, the right panel, the chief's window) the browser keeps
 per page (`atomics-web/src/desk.rs`), following the desktop's rules for the view commands; the tabs are the plans'
 and Ungrouped, and a page opens as the desktop does, on the first open plan's with its board beside the agents, and
@@ -916,7 +938,8 @@ desktop, and lasts as long as the lease (**Computer's size** gives it back early
   opens the keyboard), and the browser's loupe, callout and page zoom never start. It takes the pointer only where
   egui would give the terminal the pointer: a floating window over the terminal is cut out of it with a `clip-path`,
   so the browser sends that part's pointer to the canvas, and all of it goes while a menu or popup is open, so a click
-  away closes the popup as it does anywhere else.
+  away closes the popup as it does anywhere else. A click on a text box the page draws, the steer bar or a comment
+  box, takes the browser's focus with it: what is typed goes there, and nothing reaches the terminal.
 - **The key bar** (two rows: Esc, Tab, sticky Ctrl and Alt, the arrows, PgUp/PgDn, `|` `~` `/` `-`, Paste) shows
   while the field has the focus on a coarse pointer, sits on `visualViewport`'s bottom edge, clear of the
   safe area's sides, and takes the bottom bar's place. Its keys are at least 44 CSS pixels each way (a screen
@@ -954,7 +977,8 @@ board, commands and grants, reconnecting and every stop against an in-process ho
 `slow_client`; that nothing typed after a take back types or asks for the lease; the gestures; the overlay's
 events and what is cut out of it; the page's plan and tabs against the desktop's rules; the phone layout at 360, 390
 and 430 points; key encoding per terminal mode (`atomics_ui::terminal::encode`);
-the views drawn headless; the manifest; and that the crate names no hosting product.
+the views drawn headless, each command as a controller, a viewer and offline, what it sends and what the host does with
+it, its refusal and what it leaves on screen; the manifest; and that the crate names no hosting product.
 
 `tests/browser.rs` runs the real bundle in headless Chrome against that host, behind a fake broker. On a desktop
 it pairs, reconnects and reloads, types into a terminal through DevTools, sees the echo, and loses and regains the
@@ -971,8 +995,14 @@ window and on a phone, where History reaches the others (`target/many-plans-shot
 checks the desktop's frame: the board, the docked chief's terminal and the agent's tile, a click into either terminal
 typing there and releasing the other's lease, and Approve plan; it saves `target/wide-shots/browser.png`
 and, beside the desktop's QA screenshot of the same board (`scripts/wide-desktop-shot.sh`, which writes
-`target/wide-shots/desktop.png`), `target/wide-shots/side-by-side.png`. All three need the bundle and Chrome, so
-they are ignored by default:
+`target/wide-shots/desktop.png`), `target/wide-shots/side-by-side.png`. The actions are clicked and tapped where the
+fake board puts them, saving `target/actions-shots/`: while a terminal has the focus, a click on the steer bar or a
+comment box moves the keyboard there, what is typed reaches the host as a steer or a comment, Send review sends it,
+and nothing reaches the terminal; a refused steer says why and comes back; start and Dispatch; a tile's close with its
+confirmation; the picker of `+ New`; Close plan… with Archive alone; "Include in selected" and a steer to the
+selected; unblock, integrate, accept and Integrate; the changed-files column; and on a phone 360 CSS pixels wide, by
+touch, integrate, accept, Integrate, Close plan…, a comment and Send review, a tile's close and the archived plan
+from History. All of them need the bundle and Chrome, so they are ignored by default:
 
 ```sh
 scripts/build-web.sh

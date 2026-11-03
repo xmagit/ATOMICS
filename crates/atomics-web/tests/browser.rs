@@ -44,6 +44,18 @@
 //! `a_page_of_many_plans_opens_on_the_open_plan` and `a_phone_of_many_plans_shows_the_open_plans_board`: a host
 //! of 26 plans, 25 of them archived, opens with the open plan's Approve plan on screen, in a wide window and on
 //! a phone, where History reaches the others. Their screenshots are saved in `target/many-plans-shots/`.
+//!
+//! The actions a browser offers, against the fake host, with real clicks and touches where the fake board puts
+//! them. `text_boxes_take_the_keyboard_from_a_terminal`: while a terminal has the focus, a click on the steer bar
+//! or a comment box moves the keyboard there; what is typed reaches the host as a steer or a comment, Send
+//! review sends it, and nothing reaches the terminal, until a click back types there again. A refused steer says
+//! why and comes back to the bar. `a_board_and_a_tile_act_in_a_wide_window`: start, Dispatch, and a tile's close
+//! with its confirmation, which takes its part of the input. `a_plan_closes_and_a_new_session_starts`: the
+//! picker of `+ New`, and Close plan… offering Archive alone. `a_row_steers_and_a_review_column_acts`:
+//! "Include in selected" and a steer to the selected, then unblock, integrate, accept and Integrate in the
+//! board's further columns. `a_phone_acts_by_touch`, at 360 CSS pixels: integrate, accept and Integrate on the
+//! board, Close plan… with its confirmation, a comment and Send review after a terminal had the focus, a tile's
+//! close, and the archived plan from History. Their screenshots are saved in `target/actions-shots/`.
 
 #[allow(dead_code)] // shared with the unit tests, which use more of it
 #[path = "../src/fake_host.rs"]
@@ -62,7 +74,7 @@ use std::time::{Duration, Instant};
 
 use atomics_core::approvals::Decision;
 use atomics_core::ops::PlanAction;
-use atomics_core::wire::{Message, Topic};
+use atomics_core::wire::{ErrorCode, Message, Topic, WireError};
 use atomics_ui::theme::{Fonts, Palette};
 use atomics_web::boot::{self, FromParent, ParentOrigin};
 use atomics_web::layout::{self, Viewport};
@@ -547,6 +559,27 @@ impl DevTools {
     fn click(&mut self, at: (f64, f64)) {
         self.mouse("mousePressed", at);
         self.mouse("mouseReleased", at);
+    }
+
+    /// A click of the right button, which opens a row's menu.
+    fn right_click(&mut self, (x, y): (f64, f64)) {
+        for (kind, buttons) in [("mousePressed", 2), ("mouseReleased", 0)] {
+            let event = json!({ "type": kind, "x": x, "y": y, "button": "right", "buttons": buttons, "clickCount": 1 });
+            self.call("Input.dispatchMouseEvent", event);
+        }
+    }
+
+    /// A press at `from`, a move to `to`, and a release.
+    fn mouse_drag(&mut self, from: (f64, f64), to: (f64, f64)) {
+        self.mouse("mouseMoved", from);
+        self.mouse("mousePressed", from);
+        thread::sleep(Duration::from_millis(100));
+        for step in 1..=5 {
+            let t = f64::from(step) / 5.0;
+            self.mouse("mouseMoved", (from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t));
+            thread::sleep(Duration::from_millis(60));
+        }
+        self.mouse("mouseReleased", to);
     }
 
     /// A finger touches, moves or lifts: `points` are the fingers still on the screen.
@@ -1503,7 +1536,7 @@ fn a_menu_over_a_terminal_acts_and_takes_no_lease() {
     frame.wait("the input over a terminal", "!document.getElementById('atomics-input').hidden");
 
     // "Hide diff": the agent's terminal reaches the right edge, under where the ⋯ menu opens.
-    page.click((1400.0, 16.0));
+    page.click((1316.0, 16.0));
     frame.wait(
         "the terminal under the menu's place",
         "document.getElementById('atomics-input').getBoundingClientRect().right > 1560",
@@ -1598,4 +1631,381 @@ fn a_phone_of_many_plans_shows_the_open_plans_board() {
                 && c.plan.as_deref() == Some("p1") && c.digest.as_deref() == Some("digest-1"))
         })
     });
+}
+
+/// An egui text box has the keyboard: the page's focus is on eframe's own text field.
+const TEXT_BOX: &str = "document.activeElement && document.activeElement.tagName === 'INPUT'";
+/// The fake host's first agent is still there.
+fn has_agent(host: &FakeHost) -> bool {
+    host.board.sessions.iter().any(|s| s.id == "s1")
+}
+
+/// The screenshots of the browser's actions, for a person to look at.
+fn actions_dir() -> PathBuf {
+    let dir = target().join("actions-shots");
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// What the page shows now, once it drew what was just asked for.
+fn keep(page: &mut DevTools, name: &str) {
+    thread::sleep(Duration::from_millis(400));
+    let shot = page.call("Page.captureScreenshot", json!({ "format": "png" }));
+    let out = actions_dir().join(format!("{name}.png"));
+    std::fs::write(&out, base64(shot["data"].as_str().expect("a screenshot"))).unwrap();
+    eprintln!("actions: {}", out.display());
+}
+
+/// The fake host's task `id`.
+fn task(host: &FakeHost, id: &str) -> atomics_core::projection::TaskInfo {
+    host.board.plans[0].tasks.iter().find(|t| t.id == id).expect("a task").clone()
+}
+
+/// The input is on a terminal.
+fn terminal_input(frame: &mut DevTools) {
+    frame.wait("the input over a terminal", "!document.getElementById('atomics-input').hidden");
+}
+
+#[test]
+#[ignore = "needs the built bundle (scripts/build-web.sh) and Chrome"]
+fn text_boxes_take_the_keyboard_from_a_terminal() {
+    let Opened { host, log, _browser, mut page, mut frame, .. } = open(fake_host::working(), WIDE, false);
+    log.wait("subscribe s1", 1);
+    terminal_input(&mut frame);
+    let (terminal, bar) = ((700.0, 500.0), (362.0, 981.0));
+    let steered = |host: &Mutex<FakeHost>| host.lock().unwrap().steered.clone();
+
+    // The terminal has the keyboard: what is typed goes there.
+    page.click(terminal);
+    log.wait("acquire s1", 1);
+    frame.wait("the focus on the input", FOCUSED);
+    page.call("Input.insertText", json!({ "text": "ls" }));
+    wait_host(&host, "\"ls\" typed into the agent's terminal", |h| h.terminals["s1"].typed == "ls");
+
+    // A click on the steer bar takes it, and Return sends what is typed there to the active agent.
+    page.click(bar);
+    frame.wait("the keyboard on the steer bar", TEXT_BOX);
+    assert_eq!(frame.eval(FOCUSED), json!(false));
+    page.call("Input.insertText", json!({ "text": "go on" }));
+    keep(&mut page, "wide-steer-typed");
+    page.key("Enter", 13, Some("\r"));
+    wait_host(&host, "the steer", |h| h.steered == [("s1".to_string(), "go on".to_string())]);
+    assert_eq!(typed(&host, "s1"), "ls", "nothing reached the terminal");
+
+    // A click back on the terminal types there again, and the bar gets nothing.
+    page.click(terminal);
+    frame.wait("the focus back on the input", FOCUSED);
+    page.call("Input.insertText", json!({ "text": "pwd" }));
+    wait_host(&host, "\"pwd\" typed into the agent's terminal", |h| h.terminals["s1"].typed == "lspwd");
+    assert_eq!(steered(&host).len(), 1);
+
+    // Send, by a click on it.
+    page.click(bar);
+    frame.wait("the keyboard on the steer bar again", TEXT_BOX);
+    page.call("Input.insertText", json!({ "text": "and again" }));
+    thread::sleep(Duration::from_millis(300));
+    page.click((1548.0, 982.0));
+    wait_host(&host, "the second steer", |h| h.steered.len() == 2 && h.steered[1].1 == "and again");
+
+    // Refused: nothing arrives, the notice says why, and the text is back in the bar to send again.
+    host.lock().unwrap().refuse_next =
+        Some(WireError::new(ErrorCode::Rejected, "message not delivered: session exited"));
+    page.click(bar);
+    frame.wait("the keyboard on the steer bar once more", TEXT_BOX);
+    page.call("Input.insertText", json!({ "text": "third" }));
+    thread::sleep(Duration::from_millis(300));
+    page.key("Enter", 13, Some("\r"));
+    wait_host(&host, "the refusal used", |h| h.refuse_next.is_none());
+    keep(&mut page, "wide-steer-refused");
+    assert_eq!(steered(&host).len(), 2);
+    page.key("Enter", 13, Some("\r"));
+    wait_host(&host, "the text sent again", |h| h.steered.len() == 3 && h.steered[2].1 == "third");
+    assert_eq!(typed(&host, "s1"), "lspwd", "none of it reached the terminal");
+
+    // The diff in the right panel, and the terminal with the keyboard again.
+    page.click((1456.0, 16.0));
+    wait_host(&host, "both files of the diff asked for", |h| {
+        let asked = |file: &str| h.received.iter().any(|m| matches!(m, Message::DiffGet { path, .. } if path == file));
+        asked("src/a.rs") && asked("src/b.rs")
+    });
+    keep(&mut page, "wide-diff");
+    page.click(terminal);
+    frame.wait("the focus back on the input", FOCUSED);
+
+    // A click on a line opens its comment box, which takes the keyboard; Return adds the comment on the host.
+    page.click((1374.0, 172.0));
+    frame.wait("the keyboard on the comment box", TEXT_BOX);
+    page.call("Input.insertText", json!({ "text": "Why this step?" }));
+    keep(&mut page, "wide-comment-typed");
+    page.key("Enter", 13, Some("\r"));
+    wait_host(&host, "the comment", |h| h.board.diffs[0].comments.iter().any(|c| c.body == "Why this step?"));
+    assert_eq!(typed(&host, "s1"), "lspwd", "none of it reached the terminal");
+    keep(&mut page, "wide-comment");
+
+    // Send review sends it to the agent, as one review, and it leaves the diff.
+    page.click((1471.7, 49.5));
+    wait_host(&host, "the review", |h| h.reviews.len() == 1 && h.reviews[0].1[0].body == "Why this step?");
+    wait_host(&host, "the comment gone from the diff", |h| h.board.diffs[0].comments.is_empty());
+    keep(&mut page, "wide-review-sent");
+    assert_eq!(typed(&host, "s1"), "lspwd");
+    assert!(!log.has("resize s1"));
+}
+
+#[test]
+#[ignore = "needs the built bundle (scripts/build-web.sh) and Chrome"]
+fn a_board_and_a_tile_act_in_a_wide_window() {
+    use atomics_core::plan::TaskStatus;
+
+    let mut board = fake_host::working();
+    let mut another = board.board.plans[0].tasks[2].clone();
+    (another.id, another.title) = ("t7".into(), "Task t7".into());
+    board.board.plans[0].tasks.push(another);
+    let Opened { host, log, _browser, mut page, mut frame, .. } = open(board, WIDE, false);
+    log.wait("subscribe s1", 1);
+    terminal_input(&mut frame);
+    keep(&mut page, "wide-board");
+
+    // A card's start starts that task; Dispatch ready, then, the other one that is ready.
+    page.click((1086.5, 304.0));
+    wait_host(&host, "t3 started", |h| task(h, "t3").status == TaskStatus::Running);
+    assert_eq!(task(&host.lock().unwrap(), "t7").status, TaskStatus::Planned);
+    thread::sleep(Duration::from_millis(300));
+    page.click((1415.0, 52.5));
+    wait_host(&host, "t7 dispatched", |h| task(h, "t7").status == TaskStatus::Running);
+    keep(&mut page, "wide-board-dispatched");
+
+    // A running agent's × asks, over the terminal, whose input gives way to the dialog; Cancel closes nothing.
+    let (close, confirm, cancel) = ((1023.3, 50.5), (690.5, 532.0), (780.4, 532.0));
+    page.click(close);
+    frame.wait("the dialog cut out of the input", &format!("{CLIP}.startsWith('path(')"));
+    keep(&mut page, "wide-close-session");
+    assert!(has_agent(&host.lock().unwrap()), "not yet");
+    page.click(cancel);
+    frame.wait("the dialog gone", &format!("{CLIP} === ''"));
+    assert!(has_agent(&host.lock().unwrap()));
+
+    // The dialog's Close session closes it, and the input goes with its terminal.
+    page.click(close);
+    frame.wait("the dialog again", &format!("{CLIP}.startsWith('path(')"));
+    page.click(confirm);
+    wait_host(&host, "the agent closed", |h| !has_agent(h));
+    frame.wait("the input gone with its terminal", "document.getElementById('atomics-input').hidden");
+    keep(&mut page, "wide-session-closed");
+    assert!(!log.lines.lock().unwrap().iter().any(|l| l.starts_with("host closed")), "no channel was refused");
+}
+
+#[test]
+#[ignore = "needs the built bundle (scripts/build-web.sh) and Chrome"]
+fn a_plan_closes_and_a_new_session_starts() {
+    use atomics_core::plan::PlanStatus;
+
+    let Opened { host, log, _browser, mut page, mut frame, .. } = open(fake_host::working(), WIDE, false);
+    log.wait("subscribe s1", 1);
+    terminal_input(&mut frame);
+
+    // + New's picker: what the mirror names, started in a scratch folder, on the Ungrouped tab.
+    page.click((1388.5, 16.0));
+    keep(&mut page, "wide-new-session");
+    page.click((700.6, 545.0));
+    keep(&mut page, "wide-new-session-cancelled");
+    assert_eq!(host.lock().unwrap().board.sessions.len(), 2, "Cancel starts nothing");
+    page.click((1388.5, 16.0));
+    thread::sleep(Duration::from_millis(400));
+    page.click((640.0, 545.0));
+    wait_host(&host, "a new session", |h| h.board.sessions.iter().any(|s| s.id.starts_with("new-")));
+    keep(&mut page, "wide-new-session-started");
+    assert_eq!(
+        host.lock().unwrap().board.sessions.iter().find(|s| s.id.starts_with("new-")).unwrap().cwd,
+        "/scratch/new"
+    );
+    log.wait("subscribe new-0", 1);
+
+    // Back on the plan, its board: Close plan… offers Archive alone, and Cancel keeps it open.
+    page.click((372.5, 16.5));
+    thread::sleep(Duration::from_millis(300));
+    page.click((1456.0, 16.0));
+    thread::sleep(Duration::from_millis(300));
+    let (close, archive, cancel) = ((1541.0, 52.5), (687.0, 533.5), (773.2, 532.0));
+    page.click(close);
+    keep(&mut page, "wide-close-plan");
+    page.click(cancel);
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(host.lock().unwrap().board.plans[0].status, PlanStatus::Open);
+    page.click(close);
+    thread::sleep(Duration::from_millis(400));
+    page.click(archive);
+    wait_host(&host, "the plan archived", |h| h.board.plans[0].status == PlanStatus::Archived);
+    keep(&mut page, "wide-plan-archived");
+    assert!(!log.lines.lock().unwrap().iter().any(|l| l.starts_with("host closed")), "no channel was refused");
+}
+
+#[test]
+#[ignore = "needs the built bundle (scripts/build-web.sh) and Chrome"]
+fn a_row_steers_and_a_review_column_acts() {
+    use atomics_core::plan::TaskStatus;
+
+    // A window with room for the sidebar beside the docked chief.
+    const SIZE: (f32, f32) = (2800.0, 1000.0);
+    let Opened { host, log, _browser, mut page, mut frame, .. } = open(fake_host::working(), SIZE, false);
+    log.wait("subscribe s1", 1);
+    terminal_input(&mut frame);
+
+    // A row's menu puts it in "selected", and the bar's target sends to the selected.
+    page.right_click((80.5, 81.5));
+    frame.wait("the menu taking the input's pointer", &format!("{CLIP} === 'inset(50%)'"));
+    keep(&mut page, "wide-row-menu");
+    page.click((182.0, 98.0));
+    thread::sleep(Duration::from_millis(300));
+    page.click((1500.0, 700.0));
+    frame.wait("the menu closed", &format!("{CLIP} === ''"));
+    page.click((74.5, 983.5));
+    frame.wait("the target's list open", &format!("{CLIP} === 'inset(50%)'"));
+    keep(&mut page, "wide-steer-targets");
+    page.click((66.5, 955.5));
+    frame.wait("the target's list closed", &format!("{CLIP} === ''"));
+    page.click((362.0, 981.0));
+    frame.wait("the keyboard on the steer bar", TEXT_BOX);
+    page.call("Input.insertText", json!({ "text": "both of you" }));
+    keep(&mut page, "wide-steer-selected");
+    page.key("Enter", 13, Some("\r"));
+    wait_host(&host, "the steer to the selected", |h| h.steered == [("s1".to_string(), "both of you".to_string())]);
+
+    // The divider dragged left, as far as the agent's tile lets it, brings the board's fourth column on screen.
+    page.mouse_drag((1877.0, 600.0), (1000.0, 600.0));
+    keep(&mut page, "wide-board-wider");
+    page.click((2265.0, 227.0));
+    wait_host(&host, "t6 unblocked", |h| task(h, "t6").status == TaskStatus::Running);
+    thread::sleep(Duration::from_millis(300));
+    page.click((2709.4, 228.5));
+    wait_host(&host, "t4 integrated", |h| task(h, "t4").integrated.is_some());
+    thread::sleep(Duration::from_millis(300));
+    page.click((2547.5, 228.5));
+    wait_host(&host, "t4 accepted", |h| task(h, "t4").status == TaskStatus::Done);
+    thread::sleep(Duration::from_millis(300));
+    page.click((1948.9, 112.5));
+    wait_host(&host, "t5 integrated", |h| task(h, "t5").integrated.is_some());
+    keep(&mut page, "wide-board-integrated");
+
+    // A panel this wide has the changed-files column beside the diff; a click there scrolls to the file, and
+    // asks nothing of the host.
+    page.click((2656.2, 16.0));
+    wait_host(&host, "both files of the diff asked for", |h| {
+        let asked = |file: &str| h.received.iter().any(|m| matches!(m, Message::DiffGet { path, .. } if path == file));
+        asked("src/a.rs") && asked("src/b.rs")
+    });
+    keep(&mut page, "wide-changed-files");
+    let before = host.lock().unwrap().received.len();
+    page.click((1720.0, 124.0));
+    keep(&mut page, "wide-changed-files-picked");
+    assert_eq!(host.lock().unwrap().received.len(), before, "nothing went to the host");
+}
+
+#[test]
+#[ignore = "needs the built bundle (scripts/build-web.sh) and Chrome"]
+fn a_phone_acts_by_touch() {
+    use atomics_core::plan::{PlanStatus, TaskStatus};
+
+    // A review and an accepted task, on the narrowest screen; the board's other columns are the wide layout's test's.
+    const SIZE: (f32, f32) = (360.0, 740.0);
+    let at = |x: f32, y: f32| pos2(x * layout::ZOOM, y * layout::ZOOM);
+    let mut board = fake_host::working();
+    board.board.plans[0].tasks.retain(|t| t.id == "t4" || t.id == "t5");
+    let Opened { host, log, _browser, mut page, mut frame, .. } = open(board, SIZE, true);
+    log.wait("hello new", 1);
+    frame.wait("an iPhone's screen in the frame", "matchMedia('(pointer: coarse)').matches");
+    thread::sleep(Duration::from_millis(600));
+    keep(&mut page, "phone-board");
+
+    // The board's buttons, each a tap.
+    page.tap(at(210.6, 413.4));
+    wait_host(&host, "t4 integrated", |h| task(h, "t4").integrated.is_some());
+    thread::sleep(Duration::from_millis(300));
+    page.tap(at(51.0, 413.8));
+    wait_host(&host, "t4 accepted", |h| task(h, "t4").status == TaskStatus::Done);
+    keep(&mut page, "phone-accepted");
+    page.tap(at(50.0, 273.9));
+    wait_host(&host, "t5 integrated", |h| task(h, "t5").integrated.is_some());
+    keep(&mut page, "phone-integrated");
+
+    // Close plan… offers Archive alone, at a finger's size, and Cancel keeps it open.
+    page.tap(at(58.4, 191.1));
+    keep(&mut page, "phone-close-plan");
+    page.tap(at(151.1, 329.6));
+    thread::sleep(Duration::from_millis(400));
+    assert_eq!(host.lock().unwrap().board.plans[0].status, PlanStatus::Open);
+
+    // A terminal takes the keyboard by a tap; going on to the diff takes it from the terminal.
+    let (terminal_pane, diffs_pane) = (at(201.6, 569.2), at(144.5, 569.2));
+    page.tap(terminal_pane);
+    log.wait("subscribe s1", 1);
+    terminal_input(&mut frame);
+    keep(&mut page, "phone-terminal");
+    page.tap(at(100.0, 300.0));
+    log.wait("acquire s1", 1);
+    frame.wait("the focus on the input after a tap", FOCUSED);
+    page.call("Input.insertText", json!({ "text": "ls" }));
+    wait_host(&host, "\"ls\" typed into the agent's terminal", |h| h.terminals["s1"].typed == "ls");
+    // The key bar takes the pane bar's place; a tap on the terminal's own header moves on.
+    frame.eval("document.getElementById('atomics-input').blur()");
+    frame.wait("the key bar gone", "document.getElementById('atomics-keybar').hidden");
+    thread::sleep(Duration::from_millis(300));
+    page.tap(diffs_pane);
+    frame.wait("no terminal on the diffs pane", "document.getElementById('atomics-input').hidden");
+    thread::sleep(Duration::from_millis(300));
+    page.tap(at(45.4, 67.8));
+    wait_host(&host, "both files of the diff asked for", |h| {
+        let asked = |file: &str| h.received.iter().any(|m| matches!(m, Message::DiffGet { path, .. } if path == file));
+        asked("src/a.rs") && asked("src/b.rs")
+    });
+    keep(&mut page, "phone-diff");
+
+    // A tap on a line opens its comment box, which takes the keyboard; Return adds the comment on the host.
+    page.tap(at(100.0, 292.6));
+    frame.wait("the keyboard on the comment box", TEXT_BOX);
+    page.call("Input.insertText", json!({ "text": "Why this step?" }));
+    keep(&mut page, "phone-comment-typed");
+    page.key("Enter", 13, Some("\r"));
+    wait_host(&host, "the comment", |h| h.board.diffs[0].comments.iter().any(|c| c.body == "Why this step?"));
+    assert_eq!(typed(&host, "s1"), "ls", "none of it reached the terminal");
+    keep(&mut page, "phone-comment");
+    page.tap(at(110.0, 143.2));
+    wait_host(&host, "the review", |h| h.reviews.len() == 1 && h.reviews[0].1[0].body == "Why this step?");
+    keep(&mut page, "phone-review-sent");
+
+    // A tile's ×, a finger's size, asks; Cancel closes nothing, and the dialog's Close session closes it.
+    page.tap(terminal_pane);
+    terminal_input(&mut frame);
+    thread::sleep(Duration::from_millis(400));
+    let close = at(SIZE.0 / layout::ZOOM - 22.8, 60.4);
+    page.tap(close);
+    frame.wait("the dialog cut out of the input", &format!("{CLIP}.startsWith('path(')"));
+    keep(&mut page, "phone-close-session");
+    assert!(has_agent(&host.lock().unwrap()), "not yet");
+    page.tap(at(156.5, 329.6));
+    frame.wait("the dialog gone", &format!("{CLIP} === ''"));
+    assert!(has_agent(&host.lock().unwrap()));
+    page.tap(close);
+    frame.wait("the dialog again", &format!("{CLIP}.startsWith('path(')"));
+    page.tap(at(71.0, 329.6));
+    wait_host(&host, "the agent closed", |h| !has_agent(h));
+    keep(&mut page, "phone-session-closed");
+
+    // Archive, from the board.
+    page.tap(at(86.3, 569.2));
+    thread::sleep(Duration::from_millis(400));
+    page.tap(at(58.4, 191.1));
+    keep(&mut page, "phone-close-plan-again");
+    page.tap(at(68.2, 330.8));
+    wait_host(&host, "the plan archived", |h| h.board.plans[0].status == PlanStatus::Archived);
+    keep(&mut page, "phone-plan-archived");
+
+    // It was the only plan: History reaches it, read-only, and looking changes nothing on the host.
+    let before = host.lock().unwrap().received.len();
+    let row = layout::px(52.0) + layout::TOUCH / 2.0;
+    page.tap(at(SIZE.0 / layout::ZOOM - 32.0, row));
+    keep(&mut page, "phone-history");
+    page.tap(at(SIZE.0 / layout::ZOOM / 2.0, row + 56.0));
+    keep(&mut page, "phone-history-plan");
+    assert_eq!(host.lock().unwrap().received.len(), before, "nothing went to the host");
+    assert!(!log.lines.lock().unwrap().iter().any(|l| l.starts_with("host closed")), "no channel was refused");
 }

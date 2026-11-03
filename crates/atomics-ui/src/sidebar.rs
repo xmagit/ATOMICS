@@ -122,13 +122,12 @@ pub fn sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
         });
     }
     if sessions.is_empty() && checkouts.is_empty() {
-        ui.label(
-            RichText::new(
-                "No agents yet. Start one with + New,\nor install hooks to see agents\nrunning in other terminals.",
-            )
-            .color(p.muted)
-            .size(12.0),
-        );
+        let text = if backend.available(&Command::NewSession) {
+            "No agents yet. Start one with + New,\nor install hooks to see agents\nrunning in other terminals."
+        } else {
+            "No agents yet."
+        };
+        ui.label(RichText::new(text).color(p.muted).size(12.0));
     }
     if let Some(id) = clicked {
         client.send(Command::Activate { session: id, open_diff: true });

@@ -200,15 +200,15 @@ fn a_view_only_device_sends_no_mutation() {
 }
 
 #[test]
-fn what_the_browser_does_not_offer_yet_says_so() {
+fn what_atomics_v1_has_no_action_for_says_so() {
     let mut world = World::paired(fake_host::host());
     world.boot(None);
     let before = world.host.received.len();
     for command in [
-        Command::DispatchReady(0),
-        Command::Steer { sessions: vec!["s1".into()], text: "go on".into() },
-        Command::SendReview(WORKTREE.into()),
-        Command::CloseSession("s1".into()),
+        Command::ReopenPlan(0),
+        Command::ClosePlan { plan: 0, status: atomics_core::plan::PlanStatus::Completed },
+        Command::ResumeSession("s1".into()),
+        Command::VoiceToSession { session: 1, text: "go on".into() },
     ] {
         assert!(!world.driver.remote.available(&command), "the views do not draw {command:?}");
         world.driver.remote.dismiss_notice();
@@ -216,6 +216,144 @@ fn what_the_browser_does_not_offer_yet_says_so() {
         assert!(world.driver.remote.notice().unwrap().contains("not available in the browser"));
     }
     assert_eq!(world.host.received.len(), before);
+}
+
+/// The fake host's plan task `id`.
+fn task<'a>(world: &'a World, id: &str) -> &'a atomics_core::projection::TaskInfo {
+    world.host.board.plans[0].tasks.iter().find(|t| t.id == id).expect("a task")
+}
+
+#[test]
+fn each_command_changes_the_hosts_board_and_the_board_on_screen_follows() {
+    use atomics_core::plan::{PlanStatus, TaskStatus};
+
+    let mut world = World::paired(fake_host::working());
+    world.boot(None);
+    assert_eq!(world.driver.remote.board(0).unwrap().ready, ["t3"]);
+    let quiet = |world: &World| assert_eq!(world.driver.remote.notice(), None);
+
+    world.send(Command::StartTask { plan: 0, task: "t3".into() });
+    assert_eq!(task(&world, "t3").status, TaskStatus::Running);
+    assert!(world.driver.remote.board(0).unwrap().ready.is_empty(), "the mirror followed");
+    quiet(&world);
+
+    world.send(Command::SetTaskStatus { plan: 0, task: "t4".into(), status: TaskStatus::Done });
+    assert_eq!(task(&world, "t4").status, TaskStatus::Done, "accepted");
+    world.send(Command::SetTaskStatus { plan: 0, task: "t6".into(), status: TaskStatus::Running });
+    assert_eq!(task(&world, "t6").status, TaskStatus::Running, "unblocked");
+
+    world.send(Command::IntegrateTask { plan: 0, task: "t4".into() });
+    assert_eq!(task(&world, "t4").integrated.as_deref(), Some("atomics/plan-p1"));
+    let pending = |world: &World| {
+        let plan = world.driver.remote.board(0).unwrap().plan;
+        plan.pending_integrations().iter().map(|t| t.id.clone()).collect::<Vec<_>>()
+    };
+    assert_eq!(pending(&world), ["t5"], "t4 is in; t5 waits");
+    world.send(Command::IntegrateAccepted(0));
+    assert!(pending(&world).is_empty(), "every accepted task went in");
+
+    let another = atomics_core::projection::TaskInfo {
+        id: "t7".into(),
+        status: TaskStatus::Planned,
+        ..task(&world, "t5").clone()
+    };
+    world.host.board.plans[0].tasks.push(another);
+    let plan = world.host.board.plans[0].clone();
+    let frames = world.host.event(|cursor| Message::PlanUpsert { cursor, plan });
+    world.deliver(frames);
+    world.send(Command::DispatchReady(0));
+    assert_eq!(task(&world, "t7").status, TaskStatus::Running);
+    quiet(&world);
+
+    world.send(Command::Steer { sessions: vec!["s1".into()], text: "go on".into() });
+    assert_eq!(world.host.steered, [("s1".to_string(), "go on".to_string())]);
+    assert!(world.host.terminals["s1"].typed.is_empty(), "a steer is no one's typing");
+
+    world.send(Command::Start { agent: "claude".into(), folder: None });
+    let started = world.host.board.sessions.iter().find(|s| s.id.starts_with("new-")).expect("a new session");
+    assert_eq!((started.agent.as_str(), started.cwd.as_str()), ("claude", "/scratch/new"));
+    let id = started.id.clone();
+    assert!(world.driver.remote.session_list().iter().any(|s| s.id == id), "the mirror followed");
+
+    world.send(Command::CloseSession(id.clone()));
+    assert!(!world.host.board.sessions.iter().any(|s| s.id == id));
+    assert!(!world.driver.remote.session_list().iter().any(|s| s.id == id), "the mirror followed");
+    quiet(&world);
+
+    world.send(Command::ClosePlan { plan: 0, status: PlanStatus::Archived });
+    assert_eq!(world.host.board.plans[0].status, PlanStatus::Archived);
+    assert_eq!(world.driver.remote.plan_row(0).unwrap().status, PlanStatus::Archived);
+    quiet(&world);
+}
+
+#[test]
+fn comments_and_a_review_go_through_the_host_and_their_refusals_say_why() {
+    use atomics_core::steer::ReviewComment;
+
+    let mut world = World::paired(fake_host::working());
+    world.boot(None);
+    let root = std::path::PathBuf::from(WORKTREE);
+    let comment = ReviewComment {
+        path: "src/a.rs".into(),
+        line: Some(2),
+        removed: false,
+        excerpt: "x".into(),
+        body: "why?".into(),
+    };
+    let comments = |world: &World| world.driver.remote.diff(&root).unwrap().comments.len();
+    world.send(Command::EditComments { root: root.clone(), before: Vec::new(), after: vec![comment.clone()] });
+    assert_eq!(comments(&world), 1, "on the board the page reads");
+    assert_eq!(world.host.board.diffs[0].comments[0].body, "why?");
+
+    world.send(Command::SendReview(root.clone()));
+    assert_eq!(world.host.reviews.len(), 1);
+    assert_eq!(world.host.reviews[0].1[0].body, "why?");
+    assert_eq!(comments(&world), 0, "sent ones leave the diff");
+    assert_eq!(world.driver.remote.notice(), None);
+
+    // Nothing left to send: the host says so, and the page does.
+    world.send(Command::SendReview(root.clone()));
+    assert!(world.driver.remote.notice().unwrap().contains("no pending comments"));
+    world.driver.remote.dismiss_notice();
+
+    // The diff moved on under the comment: it is not added, and the page says why.
+    world.host.board.diffs[0].revision = 5;
+    world.send(Command::EditComments { root: root.clone(), before: Vec::new(), after: vec![comment] });
+    assert_eq!(comments(&world), 0);
+    assert!(world.driver.remote.notice().unwrap().contains("anchor the comment again"));
+}
+
+#[test]
+fn a_refusal_changes_nothing_on_the_host_and_says_why() {
+    use atomics_core::plan::{PlanStatus, TaskStatus};
+    use atomics_core::wire::{ErrorCode, WireError};
+
+    let refusal = || Some(WireError::new(ErrorCode::Rejected, "the merge has conflicts"));
+    let mut world = World::paired(fake_host::working());
+    world.boot(None);
+    for (command, unchanged) in [
+        (
+            Command::SetTaskStatus { plan: 0, task: "t4".into(), status: TaskStatus::Done },
+            (&|w: &World| task(w, "t4").status == TaskStatus::Review) as &dyn Fn(&World) -> bool,
+        ),
+        (Command::StartTask { plan: 0, task: "t3".into() }, &|w: &World| task(w, "t3").status == TaskStatus::Planned),
+        (Command::IntegrateTask { plan: 0, task: "t5".into() }, &|w: &World| task(w, "t5").integrated.is_none()),
+        (Command::ArchivePlan(0), &|w: &World| w.host.board.plans[0].status == PlanStatus::Open),
+        (Command::CloseSession("s1".into()), &|w: &World| w.host.board.sessions.iter().any(|s| s.id == "s1")),
+        (Command::Steer { sessions: vec!["s1".into()], text: "go".into() }, &|w: &World| w.host.steered.is_empty()),
+        (Command::SendReview(WORKTREE.into()), &|w: &World| w.host.reviews.is_empty()),
+    ] {
+        world.driver.remote.dismiss_notice();
+        world.host.refuse_next = refusal();
+        world.send(command.clone());
+        assert!(unchanged(&world), "{command:?}");
+        assert_eq!(
+            world.driver.remote.notice().as_deref(),
+            Some("The host refused: the merge has conflicts"),
+            "{command:?}"
+        );
+        assert!(world.driver.remote.board(0).unwrap().integrating.is_empty(), "{command:?}");
+    }
 }
 
 #[test]

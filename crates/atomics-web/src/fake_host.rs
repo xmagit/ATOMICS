@@ -11,9 +11,12 @@ use std::collections::{BTreeMap, HashMap};
 use atomics_core::diff::FileDiff;
 use atomics_core::lease::{GridSize, LeaseReason, LeaseState};
 use atomics_core::noise::{Access, Channel, Kind, PairAnswer, PairRequest, Pairing, PublicKey, Responder, Secret};
-use atomics_core::ops::{CommandResult, Outcome, PlanAction};
-use atomics_core::projection::{ApprovalInfo, DiffFileBody, DiffSummary, PlanInfo, SessionInfo};
+use atomics_core::ops::{
+    CommandResult, Outcome, PlanAction, PlanCommand, ReviewAction, ReviewCommand, SessionAction, SessionCommand,
+};
+use atomics_core::projection::{ApprovalInfo, DiffFileBody, DiffSummary, PlanInfo, SessionInfo, TaskInfo};
 use atomics_core::screen::{HistoryChunk, Line, RowsEncoder, Screen};
+use atomics_core::steer::ReviewComment;
 use atomics_core::tunnel::close;
 use atomics_core::wire::{
     self, CAPABILITIES, Disposition, Envelope, ErrorCode, Limits, Message, Resume, Revisions, Seq, Topic, VERSION,
@@ -76,6 +79,14 @@ pub struct FakeHost {
     /// The name the browser's leases are shown under: the name it paired with.
     pub device: String,
     tokens: u64,
+    /// The next plan, review or session command is refused with this, as a host that cannot do it says.
+    pub refuse_next: Option<WireError>,
+    /// What was steered, by session: delivered to the agent, not typed under a lease.
+    pub steered: Vec<(String, String)>,
+    /// The reviews sent to agents, by worktree.
+    pub reviews: Vec<(String, Vec<ReviewComment>)>,
+    /// Plan, review and session commands wait unanswered, as work that takes a while does.
+    pub hold_results: bool,
 }
 
 /// A terminal that echoes what it is typed, with its lease.
@@ -273,6 +284,10 @@ impl FakeHost {
             terminals: BTreeMap::new(),
             device: "Safari on iPhone".into(),
             tokens: 0,
+            refuse_next: None,
+            steered: Vec::new(),
+            reviews: Vec::new(),
+            hold_results: false,
         }
     }
 
@@ -370,6 +385,7 @@ impl FakeHost {
                 self.board.sessions.retain(|s| s.id != session.id);
                 self.board.sessions.push(session.clone());
             }
+            Message::SessionRemoved { id, .. } => self.board.sessions.retain(|s| s.id != *id),
             Message::PlanUpsert { plan, .. } => {
                 self.board.plans.retain(|p| p.id != plan.id);
                 self.board.plans.push(plan.clone());
@@ -591,28 +607,158 @@ impl FakeHost {
                 out
             }
             Message::PlanCommand(command) => {
-                let plan = self.board.plans.iter().find(|p| Some(&p.id) == command.plan.as_ref()).cloned();
-                let outcome = match (plan, command.action) {
-                    (Some(mut plan), PlanAction::Approve)
-                        if command.digest.as_deref() == Some(plan.digest.as_str()) =>
-                    {
-                        plan.approved = true;
-                        let _ = self.event(|cursor| Message::PlanUpsert { cursor, plan });
-                        Outcome::done(serde_json::Value::Null)
-                    }
-                    (Some(_), PlanAction::Approve) => {
-                        Outcome::refused(WireError::new(ErrorCode::StaleRevision, "the plan changed"))
-                    }
-                    _ => Outcome::refused(WireError::new(ErrorCode::Rejected, "not in this fake")),
-                };
-                let mut out = Vec::new();
-                if matches!(outcome, Outcome::Done { .. }) {
-                    out.push(self.events.last().cloned().unwrap());
-                }
-                out.push(host(Message::CommandResult(CommandResult { op: command.op, outcome })));
-                out
+                let op = command.op.clone();
+                self.mutate(op, |host| host.plan_command(command))
+            }
+            Message::ReviewCommand(command) => {
+                let op = command.op.clone();
+                self.mutate(op, |host| host.review_command(command))
+            }
+            Message::SessionCommand(command) => {
+                let op = command.op.clone();
+                self.mutate(op, |host| host.session_command(command))
             }
             _ => Vec::new(),
+        }
+    }
+
+    /// Carry out a mutation, unless [`FakeHost::refuse_next`] says otherwise: the events it made, then its result.
+    fn mutate(&mut self, op: String, carry_out: impl FnOnce(&mut Self) -> Outcome) -> Vec<Envelope> {
+        if self.hold_results {
+            return Vec::new();
+        }
+        let before = self.events.len();
+        let outcome = match self.refuse_next.take() {
+            Some(error) => Outcome::refused(error),
+            None => carry_out(self),
+        };
+        let mut out = self.events[before..].to_vec();
+        out.push(Envelope::host(&self.epoch, Message::CommandResult(CommandResult { op, outcome })));
+        out
+    }
+
+    fn plan_command(&mut self, command: PlanCommand) -> Outcome {
+        use atomics_core::plan::{Plan, PlanStatus, TaskStatus};
+        let refused = |code, text: &str| Outcome::refused(WireError::new(code, text));
+        let Some(mut plan) = self.board.plans.iter().find(|p| Some(&p.id) == command.plan.as_ref()).cloned() else {
+            return refused(ErrorCode::NotFound, "no such plan");
+        };
+        let branch = Plan { id: plan.id.clone(), integration: plan.integration.clone(), ..Plan::default() };
+        let done = |plan: &atomics_core::projection::PlanInfo, id: &String| {
+            plan.tasks.iter().any(|t| t.id == *id && t.status == TaskStatus::Done)
+        };
+        match command.action {
+            PlanAction::Approve if command.digest.as_deref() == Some(plan.digest.as_str()) => plan.approved = true,
+            PlanAction::Approve => return refused(ErrorCode::StaleRevision, "the plan changed"),
+            PlanAction::Dispatch { .. } if !plan.approved => return refused(ErrorCode::Rejected, "not approved yet"),
+            PlanAction::Dispatch { task } => {
+                let snapshot = plan.clone();
+                let ready = plan.tasks.iter_mut().filter(|t| {
+                    t.status == TaskStatus::Planned
+                        && t.depends_on.iter().all(|dep| done(&snapshot, dep))
+                        && task.as_ref().is_none_or(|id| *id == t.id)
+                });
+                let mut started = 0;
+                for t in ready {
+                    t.status = TaskStatus::Running;
+                    started += 1;
+                }
+                if started == 0 {
+                    return refused(ErrorCode::Rejected, "no task is ready");
+                }
+            }
+            PlanAction::Update { task, status, .. } => {
+                let Some(found) = plan.tasks.iter_mut().find(|t| t.id == task) else {
+                    return refused(ErrorCode::NotFound, "no such task");
+                };
+                if let Some(status) = status {
+                    found.status = status;
+                }
+            }
+            PlanAction::Integrate { task } => {
+                let Some(found) = plan.tasks.iter_mut().find(|t| t.id == task) else {
+                    return refused(ErrorCode::NotFound, "no such task");
+                };
+                found.integrated = Some(branch.integration_branch());
+            }
+            PlanAction::Archive => plan.status = PlanStatus::Archived,
+            PlanAction::Set { .. } => return refused(ErrorCode::Rejected, "not in this fake"),
+        }
+        let _ = self.event(|cursor| Message::PlanUpsert { cursor, plan });
+        Outcome::done(serde_json::Value::Null)
+    }
+
+    fn review_command(&mut self, command: ReviewCommand) -> Outcome {
+        let refused = |code, text: String| Outcome::refused(WireError::new(code, text));
+        let Some(mut summary) = self.board.diffs.iter().find(|d| d.worktree == command.worktree).cloned() else {
+            return refused(ErrorCode::NotFound, "no diff for that worktree".into());
+        };
+        let mut result = serde_json::Value::Null;
+        match command.action {
+            ReviewAction::Add { revision, .. } if revision.0 != summary.revision => {
+                let text = format!("the diff is at revision {}; anchor the comment again", summary.revision);
+                return refused(ErrorCode::StaleRevision, text);
+            }
+            ReviewAction::Add { path, line, removed, text, .. } => {
+                summary.comments.push(ReviewComment { path, line, removed, excerpt: String::new(), body: text });
+            }
+            ReviewAction::Remove { path, line, removed, text } => {
+                let at = summary
+                    .comments
+                    .iter()
+                    .position(|c| c.path == path && c.line == line && c.removed == removed && c.body == text);
+                let Some(at) = at else { return refused(ErrorCode::NotFound, "no such comment".into()) };
+                summary.comments.remove(at);
+            }
+            ReviewAction::Send => {
+                if summary.comments.is_empty() {
+                    return refused(ErrorCode::Rejected, "no pending comments".into());
+                }
+                result = serde_json::json!({ "sent_comments": summary.comments.len() });
+                self.reviews.push((summary.worktree.clone(), std::mem::take(&mut summary.comments)));
+            }
+        }
+        let _ = self.event(|cursor| Message::DiffSummary { cursor, summary });
+        Outcome::done(result)
+    }
+
+    fn session_command(&mut self, command: SessionCommand) -> Outcome {
+        use atomics_core::session::AgentStatus;
+        let not_found = |id: &str| Outcome::refused(WireError::new(ErrorCode::NotFound, format!("no session {id}")));
+        match command.action {
+            SessionAction::Steer { session, .. } if !self.board.sessions.iter().any(|s| s.id == session) => {
+                not_found(&session)
+            }
+            SessionAction::Steer { session, text } => {
+                self.steered.push((session, text));
+                Outcome::done(serde_json::json!({ "sent": true, "queued_until_next_hook": false }))
+            }
+            SessionAction::Start { agent, folder, .. } => {
+                let id = format!("new-{}", self.head());
+                let session = SessionInfo {
+                    id: id.clone(),
+                    title: "new session".into(),
+                    agent,
+                    cwd: folder.unwrap_or_else(|| "/scratch/new".into()),
+                    worktree: None,
+                    branch: None,
+                    status: AgentStatus::Idle,
+                    chief: false,
+                    task: None,
+                    pending_approvals: 0,
+                };
+                self.terminals.insert(id.clone(), FakeTerminal::new(80, 12, "$ "));
+                let _ = self.event(|cursor| Message::SessionUpsert { cursor, session });
+                Outcome::done(serde_json::json!({ "id": id }))
+            }
+            SessionAction::Close { session } if !self.board.sessions.iter().any(|s| s.id == session) => {
+                not_found(&session)
+            }
+            SessionAction::Close { session } => {
+                self.terminals.remove(&session);
+                let _ = self.event(|cursor| Message::SessionRemoved { cursor, id: session });
+                Outcome::done(serde_json::Value::Null)
+            }
         }
     }
 
@@ -768,7 +914,7 @@ pub const WORKTREE: &str = "/w/repo-t1";
 pub fn board() -> Board {
     use atomics_core::diff::FileStatus;
     use atomics_core::plan::{PlanStatus, TaskStatus};
-    use atomics_core::projection::{DiffFileSummary, TaskInfo, TaskLink};
+    use atomics_core::projection::{DiffFileSummary, TaskLink};
     use atomics_core::session::AgentStatus;
     let session = |id: &str, title: &str, chief: bool| SessionInfo {
         id: id.into(),
@@ -869,6 +1015,42 @@ pub fn closed_plan(id: &str, status: atomics_core::plan::PlanStatus, goal: &str)
         digest: String::new(),
         ticket: None,
     }
+}
+
+/// [`host`] with its plan approved, its agent waiting on nothing, and a task in every state a board's buttons are
+/// for: `t3` ready to start, `t4` to review on a branch, `t5` accepted and not integrated and `t6` blocked.
+pub fn working() -> FakeHost {
+    use atomics_core::plan::TaskStatus;
+    use atomics_core::session::AgentStatus;
+    let mut host = self::host();
+    let branched = |id: &str, status| TaskInfo {
+        id: id.into(),
+        title: format!("Task {id}"),
+        status,
+        agent: "claude".into(),
+        depends_on: Vec::new(),
+        session: None,
+        branch: Some(format!("atomics/{id}")),
+        integrated: None,
+        additions: 0,
+        deletions: 0,
+        report: None,
+        ticket: None,
+    };
+    let plan = &mut host.board.plans[0];
+    plan.approved = true;
+    plan.tasks.extend([
+        TaskInfo { branch: None, ..branched("t3", TaskStatus::Planned) },
+        branched("t4", TaskStatus::Review),
+        branched("t5", TaskStatus::Done),
+        branched("t6", TaskStatus::Blocked),
+    ]);
+    host.board.approvals.clear();
+    for session in &mut host.board.sessions {
+        session.status = AgentStatus::Idle;
+        session.pending_approvals = 0;
+    }
+    host
 }
 
 /// [`host`] with 26 plans, as a host that has run for a while has them: 25 archived, and in id order the open

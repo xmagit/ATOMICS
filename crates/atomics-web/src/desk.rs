@@ -6,7 +6,8 @@
 //!
 //! A page opens as the desktop does, on the first open plan's tab with its board beside the agents, whatever
 //! else the host streams. It keeps its plan by id, since a plan that sorts in earlier moves the positions. A
-//! closed plan is reached through the history alone; with no open plan none is selected, and every agent shows.
+//! closed plan is reached through the history alone, and a plan that closes while it shows gives way to the first
+//! open one; with no open plan none is selected, and every agent shows.
 
 use std::path::PathBuf;
 
@@ -38,6 +39,8 @@ pub struct Desk {
     pub ungrouped: bool,
     /// The plan of the plan tab and the board, by id; `None` while no plan is open and none was picked.
     pub plan: Option<String>,
+    /// Its status when it was last seen: one that closes since then gives way.
+    status: Option<PlanStatus>,
     /// Its place in the plan list since the last [`Desk::settle`] or view command; past the list's end while
     /// no plan is selected, so that it names none.
     selected: usize,
@@ -63,6 +66,7 @@ impl Default for Desk {
             plan_view: true,
             ungrouped: false,
             plan: None,
+            status: None,
             selected: 0,
             chief: ChiefWindow { open: true, dock: ChiefDock::Docked, width: None },
             dock_fits: true,
@@ -133,18 +137,28 @@ impl Desk {
         self.typing_in.clone().or_else(|| self.active.clone())
     }
 
-    /// Keeps what this page shows to what the host has: its plan where that still exists, else the first open
-    /// plan, whose tab opens, and an active session that runs, else the first the tab shows (as the desktop
-    /// picks one when a tab opens). `visible` reads the tab's sessions, as positions in the session list, for
-    /// these hints.
+    /// Keeps what this page shows to what the host has: its plan where that still exists and did not just close,
+    /// else the first open plan, whose tab opens (one that closed under the page's eyes leaves the agents and
+    /// the diff, as on the desktop), and an active session that runs, else the first the tab shows (as the
+    /// desktop picks one when a tab opens). `visible` reads the tab's sessions, as positions in the session
+    /// list, for these hints.
     pub fn settle(&mut self, backend: &dyn Backend, visible: impl Fn(&ViewHints) -> Vec<usize>) {
         let plans = backend.plan_list();
-        self.selected = match self.plan.as_deref().and_then(|id| plans.iter().position(|p| p.id == id)) {
-            Some(at) => at,
+        let at = self.plan.as_deref().and_then(|id| plans.iter().position(|p| p.id == id));
+        let closed = at.is_some_and(|at| plans[at].status != PlanStatus::Open && self.status != Some(plans[at].status));
+        self.selected = match at.filter(|_| !closed) {
+            Some(at) => {
+                self.status = Some(plans[at].status);
+                at
+            }
             None => {
                 let first = plans.iter().position(|p| !p.id.is_empty() && p.status == PlanStatus::Open);
                 self.plan = first.map(|at| plans[at].id.clone());
+                self.status = first.map(|at| plans[at].status);
                 self.pick |= first.is_some();
+                if closed && self.plan_view {
+                    self.panel = PanelMode::Diff;
+                }
                 first.unwrap_or(plans.len())
             }
         };
@@ -239,6 +253,7 @@ impl Desk {
     fn select(&mut self, index: usize, backend: &dyn Backend) {
         if let Some(row) = backend.plan_row(index) {
             self.plan = Some(row.id);
+            self.status = Some(row.status);
             self.selected = index;
             self.plan_view = true;
             self.ungrouped = false;

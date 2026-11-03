@@ -4,7 +4,8 @@
 //!   `Platform`: the top bar, the sidebar, the tiled terminals, the board or a diff in the right panel and the
 //!   chief, docked or floating, in the host's theme. The host's own items (settings, sandboxes, credentials,
 //!   ticket sign-in, GitHub) are hooks this page leaves empty; its connection's state and the layout menu
-//!   take the top bar's last slots, and connection trouble a line under the frame.
+//!   take the top bar's last slots, connection trouble a line under the frame, and what the page has to say,
+//!   why a command failed above all, a note under the top bar.
 //! - **Phone**: one pane at a time, switched from a bottom bar, each a shared widget: the AGENTS list, the
 //!   current plan's board under a picker of the others, the approval banners, a worktree's diff panel, an
 //!   agent's fleet tile at full size and the chief's window. It draws inside the part of the viewport the user
@@ -35,6 +36,7 @@ use egui::{Align, Color32, Layout, Rect, RichText, Sense, Stroke, TextStyle, pos
 
 use crate::boot::Boot;
 use crate::desk::{self, Desk};
+use crate::dialogs::{self, Picker};
 use crate::driver::{Driver, Status};
 use crate::layout::{self, LayoutMode, Viewport};
 use crate::remote::RemoteBackend;
@@ -83,8 +85,10 @@ pub const BAR: [(Tab, &str); 5] = [
     (Tab::Chief, "Chief"),
 ];
 
-/// How long the wide layout's notice line keeps a note of this page's.
+/// How long the wide layout keeps a note of this page's.
 const NOTICE_MS: f64 = 12_000.0;
+/// How far under the window's top the wide layout's note hangs: clear of the top bar.
+const NOTE_TOP: f32 = 40.0;
 
 /// What this frame shows.
 #[derive(Default)]
@@ -102,6 +106,8 @@ pub struct View {
     pub term: TermPane,
     /// Every other terminal on screen, by session id.
     pub tiles: HashMap<String, TermPane>,
+    /// The new-session picker, while it is open.
+    pub picker: Option<Picker>,
     /// A ticket key from the boot, opened once the board is in.
     pub ticket_key: Option<String>,
     /// The clock, in milliseconds.
@@ -221,6 +227,7 @@ pub fn draw(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &
     } else {
         wide(ui, driver, client, view);
     }
+    dialogs::draw(ui.ctx(), &driver.remote, client, &mut view.picker);
     view.term.end_frame(ui.ctx(), &driver.remote);
     driver.remote.end_frame();
     carry_out(driver, client, view);
@@ -254,6 +261,10 @@ fn sync(driver: &mut Driver, client: &mut Client, view: &mut View) {
     let pending: HashSet<(String, String)> =
         remote.with_mirror(|m| m.approvals.values().map(|a| (a.session.clone(), a.id.clone())).collect());
     client.approval_decisions.retain(|decision| pending.contains(decision));
+    // A steer that did not go through is the user's still, unless they started another.
+    if let Some(text) = remote.take_unsent().filter(|_| client.steer_text.is_empty()) {
+        client.steer_text = text;
+    }
     view.desk.settle(remote, |hints| {
         remote.set_view(hints.clone());
         remote.visible_sessions()
@@ -261,8 +272,9 @@ fn sync(driver: &mut Driver, client: &mut Client, view: &mut View) {
     hint(remote, view);
     let sessions = remote.session_list();
     view.tiles.retain(|id, _| sessions.iter().any(|s| &s.id == id));
+    client.selected.retain(|id| sessions.iter().any(|s| &s.id == id));
     view.target = if view.compact { None } else { view.desk.typing_target() };
-    // The wide layout's notice line has no close button: a note of this page's goes after a while.
+    // The wide layout's note has no close button: it goes after a while.
     match (remote.notice(), &view.noted) {
         (None, _) => view.noted = None,
         (Some(note), Some((seen, since))) if note == *seen => {
@@ -362,16 +374,25 @@ fn lend<R>(
     result
 }
 
-/// Carry out what the draw recorded, in order: a view command on the page, any other through the backend.
+/// Carry out what the draw recorded, in order: what asks first by its dialog, a view command on the page, any
+/// other through the backend.
 fn carry_out(driver: &mut Driver, client: &mut Client, view: &mut View) {
+    let remote = &driver.remote;
     for command in std::mem::take(&mut client.commands) {
-        if command.is_view() || desk::window_command(&command) {
-            view_command(&driver.remote, view, command);
-        } else {
-            driver.remote.send(command);
+        match command {
+            Command::CloseSession(id) if dialogs::may_be_scratch(remote, &id) => client.confirm_close = Some(id),
+            Command::ClosePlanTab(plan) => client.confirm_plan_close = dialogs::plan_to_close(remote, plan),
+            Command::NewSession => view.picker = Some(Picker::default()),
+            // The changed files' column names files the page has the hunks of: the diff scrolls to them.
+            Command::OpenFile { root, path } => {
+                view.desk.diff_open = true;
+                client.diff_views.entry(root).or_default().open_resolved(&path, false);
+            }
+            command if command.is_view() || desk::window_command(&command) => view_command(remote, view, command),
+            command => remote.send(command),
         }
     }
-    hint(&driver.remote, view);
+    hint(remote, view);
 }
 
 /// A view command: the page's desk as the desktop's model, and the phone's pane follows what was asked for.
@@ -445,6 +466,29 @@ fn wide(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &mut 
             });
     }
     shell::frame(ui, &mut Web { driver, client, view });
+    note(ui.ctx(), driver, client);
+}
+
+/// What the page has to say, why a command failed above all, whole: the top bar's slot would cut it to a few
+/// words. It lies over the frame and takes no pointer, so it moves nothing and is in the way of nothing.
+fn note(ctx: &egui::Context, driver: &Driver, client: &Client) {
+    let Some(text) = driver.remote.notice() else { return };
+    let p = &client.palette;
+    egui::Area::new(egui::Id::NULL.with("atomics-note"))
+        .order(egui::Order::Foreground)
+        .interactable(false)
+        .anchor(egui::Align2::CENTER_TOP, vec2(0.0, NOTE_TOP))
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(p.raised)
+                .stroke(Stroke::new(1.0, p.warning))
+                .corner_radius(4)
+                .inner_margin(egui::Margin::symmetric(10, 6))
+                .show(ui, |ui| {
+                    ui.set_max_width(ctx.content_rect().width() * 0.6);
+                    ui.label(RichText::new(text).color(p.foreground));
+                });
+        });
 }
 
 /// The board is not in: pairing, confirming a new pairing, connected before the host's first snapshot, or no
@@ -891,16 +935,16 @@ fn plan_pick(ui: &mut egui::Ui, row: &PlanRow, index: usize, selected: usize, cl
 
 /// The plans a phone picks from, one row high so the board stays on screen: the open ones, and a finished one
 /// while it shows, in a strip that scrolls sideways, and the other finished ones in a scrolling History menu.
-/// Nothing to pick draws nothing.
+/// No plan but the one showing draws nothing.
 fn plan_picker(ui: &mut egui::Ui, plans: &[PlanRow], selected: usize, client: &mut Client) {
     let named = || plans.iter().enumerate().filter(|(_, row)| !row.id.is_empty());
+    if named().all(|(index, _)| index == selected) {
+        return;
+    }
     let mut strip: Vec<(usize, &PlanRow)> =
         named().filter(|(index, row)| row.status == PlanStatus::Open || *index == selected).collect();
     strip.sort_by_key(|(_, row)| row.status != PlanStatus::Open);
     let history: Vec<(usize, &PlanRow)> = named().filter(|(_, row)| row.status != PlanStatus::Open).collect();
-    if strip.len() + history.len() < 2 {
-        return;
-    }
     ui.add_space(4.0);
     let width = ui.available_width();
     ui.allocate_ui_with_layout(vec2(width, layout::TOUCH), Layout::right_to_left(Align::Center), |ui| {

@@ -191,3 +191,55 @@ fn the_wide_layout_alone_carries_out_the_chiefs_window() {
     remote.set_chief_window(ChiefWindow { open: true, dock: ChiefDock::Docked, width: None }, false);
     assert!(!remote.available(&Command::HideChief), "a phone has no window to hide");
 }
+
+#[test]
+fn a_plan_that_closes_while_it_shows_gives_way_as_on_the_desktop() {
+    use atomics_core::plan::PlanStatus::{Archived, Completed, Open};
+    use atomics_core::wire::Message;
+
+    let mut host = fake_host::host();
+    let mut other = host.board.plans[0].clone();
+    other.id = "p2".into();
+    host.board.plans.push(other);
+    host.board.plans.push(fake_host::closed_plan("old", Completed, "Done long ago"));
+    let mut world = World::paired(host);
+    world.boot(None);
+    let mut desk = Desk::default();
+    settle(&mut desk, &world);
+    assert_eq!(desk.plan.as_deref(), Some("p1"));
+    assert_eq!(desk.hints(&world.driver.remote).panel, PanelMode::Plan);
+
+    let close = |world: &mut World, id: &str, status| {
+        let mut plan = world.host.board.plans.iter().find(|p| p.id == id).unwrap().clone();
+        plan.status = status;
+        let frames = world.host.event(|cursor| Message::PlanUpsert { cursor, plan });
+        world.deliver(frames);
+    };
+    // Closed on another client or the desktop, the same: the next open plan's agents and diff.
+    close(&mut world, "p1", Archived);
+    settle(&mut desk, &world);
+    assert_eq!(desk.plan.as_deref(), Some("p2"));
+    assert_eq!(desk.hints(&world.driver.remote).panel, PanelMode::Diff, "the fleet takes the window");
+
+    // A finished plan picked from the history stays, until it closes further.
+    let old = world.driver.remote.plan_list().iter().position(|p| p.id == "old").unwrap();
+    desk.apply(Command::ViewPlanHistory(old), &world.driver.remote);
+    settle(&mut desk, &world);
+    assert_eq!(desk.plan.as_deref(), Some("old"));
+    close(&mut world, "old", Archived);
+    settle(&mut desk, &world);
+    assert_eq!(desk.plan.as_deref(), Some("p2"), "archived from its board");
+
+    // Reopened while the history shows it, it stays; with no open plan left every agent shows.
+    let old = world.driver.remote.plan_list().iter().position(|p| p.id == "old").unwrap();
+    desk.apply(Command::ViewPlanHistory(old), &world.driver.remote);
+    settle(&mut desk, &world);
+    close(&mut world, "old", Open);
+    settle(&mut desk, &world);
+    assert_eq!(desk.plan.as_deref(), Some("old"));
+    close(&mut world, "p2", Archived);
+    close(&mut world, "old", Archived);
+    settle(&mut desk, &world);
+    assert_eq!(desk.plan, None);
+    assert!(!desk.hints(&world.driver.remote).plan_view, "no plan's tab");
+}

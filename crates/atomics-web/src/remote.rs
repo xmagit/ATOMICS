@@ -3,9 +3,10 @@
 //! become mutations through [`Command::remote`], each only when the host's `welcome` grants it. I/O free:
 //! frames come in through [`RemoteBackend::receive`] and go out through [`RemoteBackend::take_outgoing`].
 //!
-//! The browser offers everything read-only, answers approvals and approves plans where `may` allows, and
-//! follows and types into terminals ([`crate::screens`]) where it grants `type`. [`Backend::available`] says
-//! so, and the views draw no action for any other command; one sent anyway says so on the notice line.
+//! The browser offers what atomics.v1 can carry: a command is available when [`Command::remote`] has mutations
+//! for it and `welcome` grants them all, and it follows and types into terminals ([`crate::screens`]) where
+//! it grants `type`. The views draw no action for any other command; one sent anyway says so on the notice
+//! line, and so does a mutation the host refuses or cannot confirm, whose optimistic effects are undone.
 //!
 //! What a host keeps of its own window and atomics.v1 does not send (the tab, the active session, the
 //! right panel, the chief's window) is the page's, set by the views from their [`crate::desk::Desk`]
@@ -25,7 +26,7 @@ use atomics_core::diff_data::Prepared;
 use atomics_core::layout::LayoutConfig;
 use atomics_core::lease::GridSize;
 use atomics_core::mirror::Mirror;
-use atomics_core::ops::{self, Grant, Outcome, Pending};
+use atomics_core::ops::{self, Grant, Outcome, Pending, PlanAction, PlanCommand};
 use atomics_core::plan::{Plan, PlanStatus, Report, Task, TaskStatus};
 use atomics_core::projection::{DiffFileBody, DiffFileSummary, PlanInfo, SessionInfo, TaskInfo};
 use atomics_core::repo_workflow::RepoWorkflow;
@@ -48,6 +49,9 @@ pub const CAPABILITIES: &[&str] =
 const MAX_IN_FLIGHT: usize = 4;
 /// Pages of one file's diff read before the rest is left out.
 const MAX_PAGES: u32 = 16;
+/// The agent name a host gives a plain shell. The mirror has no agent kinds, and a steer to all agents leaves
+/// shells out: there it would run as a command.
+const SHELL: &str = "shell";
 
 /// What the host's `welcome` said about this client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,10 +75,12 @@ struct State {
     /// A `resync` is on its way: gaps until its snapshot lands are not reported again.
     resyncing: bool,
     pending: Pending,
-    /// Decisions in flight, by operation: the session and the request each answers.
-    decisions: HashMap<String, (String, String)>,
+    /// What a mutation in flight changed on screen, by operation.
+    flights: HashMap<String, Flight>,
     /// Decisions the host refused or could not confirm, which the approval banner may offer again.
     refused: Vec<(String, String)>,
+    /// A steer that did not go through: its text, for the steer bar to hold again.
+    unsent: Option<String>,
     /// Diffs as fetched, by worktree.
     diffs: BTreeMap<String, Fetched>,
     /// The worktrees whose files' hunks to fetch: those on screen.
@@ -90,6 +96,28 @@ struct State {
     chief: ChiefWindow,
     wide: bool,
     screens: Screens,
+}
+
+/// What a mutation in flight changed on screen: gone with its outcome, and undone if that is not `done`.
+enum Flight {
+    /// An approval decided here, by session and request: the banner hides it meanwhile.
+    Decision(String, String),
+    /// A steer's text, which the steer bar has let go of.
+    Steer(String),
+    /// A task being merged, by plan and task: its card says so meanwhile.
+    Integrate(String, String),
+}
+
+/// What a mutation that went through did not do yet, where the screen does not show it. The rest shows.
+fn delivery_note(result: &serde_json::Value) -> Option<String> {
+    let yes = |field: &str| result.get(field).and_then(serde_json::Value::as_bool).unwrap_or(false);
+    if yes("held") {
+        Some("Held until the session is ready.".into())
+    } else if yes("queued_until_next_hook") {
+        Some("Queued for an agent outside ATOMICS: it reads it at its next tool call or turn end.".into())
+    } else {
+        None
+    }
 }
 
 /// One worktree's diff at one revision.
@@ -144,8 +172,9 @@ impl RemoteBackend {
             ttl_secs: ops::OP_TTL_SECS,
             resyncing: false,
             pending: Pending::default(),
-            decisions: HashMap::new(),
+            flights: HashMap::new(),
             refused: Vec::new(),
+            unsent: None,
             diffs: BTreeMap::new(),
             wanted: BTreeSet::new(),
             requests: HashMap::new(),
@@ -221,6 +250,11 @@ impl RemoteBackend {
     /// The approvals decided here that the host refused or could not confirm, by session and request.
     pub fn take_refused(&self) -> Vec<(String, String)> {
         std::mem::take(&mut self.state.borrow_mut().refused)
+    }
+
+    /// The text of a steer that did not go through, for the steer bar to hold again.
+    pub fn take_unsent(&self) -> Option<String> {
+        self.state.borrow_mut().unsent.take()
     }
 
     pub fn notice(&self) -> Option<String> {
@@ -306,6 +340,17 @@ impl RemoteBackend {
         let rules: [&dyn Fn(&PlanInfo) -> bool; 3] =
             [&|p| open(p) && own(p), &|p| open(p) && task(p), &|p| own(p) || task(p)];
         rules.iter().find_map(|rule| s.mirror.plans.values().position(rule))
+    }
+
+    /// The folders this page can name for a new session, sorted: the open plans' projects and where the host's
+    /// sessions run. The host's own list of projects and worktrees stays on the host.
+    pub fn folders(&self) -> Vec<PathBuf> {
+        let s = self.state.borrow();
+        let projects =
+            s.mirror.plans.values().filter(|p| p.status == PlanStatus::Open).filter_map(|p| p.project.as_ref());
+        let known: BTreeSet<PathBuf> =
+            projects.map(PathBuf::from).chain(s.mirror.sessions.values().map(root)).collect();
+        known.into_iter().collect()
     }
 
     /// Connected and greeted: frames sent now are read.
@@ -394,6 +439,15 @@ impl RemoteBackend {
 }
 
 impl State {
+    /// An operation ended: what it changed on screen goes, undone unless it is `done`.
+    fn land(&mut self, op: &str, done: bool) {
+        match self.flights.remove(op) {
+            Some(Flight::Decision(session, approval)) if !done => self.refused.push((session, approval)),
+            Some(Flight::Steer(text)) if !done => self.unsent = Some(text),
+            _ => {}
+        }
+    }
+
     fn resync(&mut self) {
         if !self.resyncing {
             self.resyncing = true;
@@ -416,9 +470,7 @@ impl State {
                 let (again, expired) = self.pending.resend(self.now_ms, self.ttl_secs);
                 self.outgoing.extend(again.into_iter().map(Envelope::new));
                 for command in &expired {
-                    if let Some(decision) = self.decisions.remove(command.op()) {
-                        self.refused.push(decision);
-                    }
+                    self.land(command.op(), false);
                 }
                 if !expired.is_empty() {
                     self.notice = Some(
@@ -430,7 +482,7 @@ impl State {
             Message::DiffFile { body, truncated, next_offset } => self.diff_page(body, *truncated, *next_offset),
             Message::CommandResult(result) => {
                 let Some(outcome) = self.pending.apply(result) else { return };
-                let decision = self.decisions.remove(&result.op);
+                self.land(&result.op, matches!(outcome, Outcome::Done { .. }));
                 let notice = match outcome {
                     Outcome::Refused { code: ErrorCode::AlreadyResolved, message } => {
                         format!("That request was already answered: {message}")
@@ -442,10 +494,14 @@ impl State {
                     Outcome::Uncertain { message } => {
                         format!("The host could not confirm it ({message}). Check the board before trying again.")
                     }
-                    Outcome::Done { .. } | Outcome::Accepted | Outcome::Unknown => return,
+                    // It never takes the place of what went wrong with another.
+                    Outcome::Done { result } => {
+                        self.notice = self.notice.take().or_else(|| delivery_note(&result));
+                        return;
+                    }
+                    Outcome::Accepted | Outcome::Unknown => return,
                 };
                 self.notice = Some(notice);
-                self.refused.extend(decision);
             }
             Message::Ping { nonce } => {
                 let pong = Envelope::new(Message::Pong { nonce: nonce.clone() }).reply_to(envelope.request_id.clone());
@@ -684,6 +740,8 @@ fn task(info: &TaskInfo) -> Task {
         branch: info.branch.clone(),
         status: info.status,
         integrated: info.integrated.clone(),
+        // The host checks whether its branch still holds the task; the mirror says what it last found.
+        integration_verified: info.integrated.is_some(),
         session: info.session.clone(),
         additions: info.additions,
         deletions: info.deletions,
@@ -716,7 +774,7 @@ fn session_row(session: &SessionInfo, mirror: &Mirror) -> SessionRow {
         id: session.id.clone(),
         title: session.title.clone(),
         agent: session.agent.clone(),
-        kind: AgentKind::Generic,
+        kind: if session.agent == SHELL { AgentKind::Shell } else { AgentKind::Generic },
         status: session.status,
         chief: session.chief,
         worktree: session.worktree.as_ref().map(PathBuf::from),
@@ -734,9 +792,13 @@ fn session_row(session: &SessionInfo, mirror: &Mirror) -> SessionRow {
     }
 }
 
-/// The commands the browser offers in this release: answering approvals and approving plans.
-fn offered(command: &Command) -> bool {
-    matches!(command, Command::Decide { .. } | Command::ApprovePlan(_))
+/// The agents this page can name for a new session, sorted: those the host runs and those its open plans use.
+/// The host's configured list stays on the host, which refuses an agent it no longer has.
+fn known_agents(mirror: &Mirror) -> Vec<String> {
+    let tasks = mirror.plans.values().filter(|p| p.status == PlanStatus::Open).flat_map(|p| &p.tasks);
+    let names = mirror.sessions.values().map(|s| &s.agent).chain(tasks.map(|t| &t.agent));
+    let known: BTreeSet<&String> = names.filter(|name| !name.is_empty()).collect();
+    known.into_iter().cloned().collect()
 }
 
 impl Backend for RemoteBackend {
@@ -744,23 +806,34 @@ impl Backend for RemoteBackend {
         if let Command::RefreshDiff(root) = &command {
             return self.refetch(root);
         }
-        // The views do not draw these; this is for a command sent some other way.
-        if !offered(&command) {
-            return self.say("That is not available in the browser; use ATOMICS on the computer.");
-        }
         if self.welcome().is_none() {
             self.refuse(&command);
             return self.say("Not connected to the host. Try again once it is back.");
         }
         let mut op = || self.next_op();
-        let mutations = match command.remote(self, &mut op) {
+        let mutations = match self.remote_of(&command, &mut op) {
             Remote::Send(mutations) => mutations,
-            Remote::Client | Remote::Unsupported => return,
+            Remote::Client => return,
+            // The views do not draw these; this is for a command sent some other way.
+            Remote::Unsupported => {
+                self.refuse(&command);
+                return self.say("That is not available in the browser; use ATOMICS on the computer.");
+            }
         };
+        if mutations.is_empty() {
+            self.refuse(&command);
+            return self.say("That is no longer on the host. Check the board.");
+        }
         for mutation in mutations {
             if !self.may(mutation.grant()) {
                 self.refuse(&command);
                 self.say("This device may only view this host. Its owner decides what it may change.");
+                continue;
+            }
+            // What the host would refuse for its size says so here, and the operation waits for nothing.
+            if let Err(error) = mutation.validate() {
+                self.refuse(&command);
+                self.say(format!("That was not sent: {}.", error.message));
                 continue;
             }
             let mut s = self.state.borrow_mut();
@@ -771,10 +844,8 @@ impl Backend for RemoteBackend {
                 self.say("Too many changes are still waiting for the host. Try again once they are answered.");
                 continue;
             }
-            if let (ops::Command::ApprovalDecide(decide), Command::Decide { session, .. }) = (&mutation, &command)
-                && let Some(row) = self.session_row_in(&s.mirror, *session)
-            {
-                s.decisions.insert(decide.op.clone(), (row.id, decide.approval.clone()));
+            if let Some(flight) = self.flight(&s.mirror, &mutation, &command) {
+                s.flights.insert(mutation.op().to_string(), flight);
             }
             let now = s.now_ms;
             let message = s.pending.send(mutation, now);
@@ -782,9 +853,26 @@ impl Backend for RemoteBackend {
         }
     }
 
-    /// The view commands the frame carries out, a diff's refresh, and the commands this release offers
-    /// while the host's `welcome` grants what they would send. Offline nothing can be sent.
+    /// The view commands the frame carries out, a diff's refresh, and what can go to the host now
+    /// ([`RemoteBackend::sends`]). Offline nothing can be sent.
     fn available(&self, command: &Command) -> bool {
+        let wide = self.state.borrow().wide;
+        let start = || Command::Start { agent: String::new(), folder: None };
+        match command {
+            Command::RefreshDiff(_) => return true,
+            // The changed-files column, beside the wide layout's diff: a click scrolls to the file there.
+            Command::OpenFile { .. } => return wide,
+            // Only the wide layout has a steer bar; a phone's terminal is right there.
+            Command::Steer { .. } if !wide => return false,
+            // The wide layout's picker, of what the mirror names.
+            Command::NewSession => return wide && self.sends(&start()),
+            // An open plan's tab asks, and archives. Closing a finished one's needs a guard the protocol lacks.
+            Command::ClosePlanTab(plan) => {
+                let open = self.plan_row(*plan).is_some_and(|row| row.status == PlanStatus::Open);
+                return open && self.sends(&Command::ClosePlan { plan: *plan, status: PlanStatus::Archived });
+            }
+            _ => {}
+        }
         if command.is_view() || desk::window_command(command) {
             let s = self.state.borrow();
             let chief = || s.mirror.sessions.values().any(|x| x.chief);
@@ -794,16 +882,7 @@ impl Backend for RemoteBackend {
                 && (!desk::window_command(command) || chief())
                 && (!plan || s.mirror.plans.values().nth(s.view.selected_plan).is_some());
         }
-        if matches!(command, Command::RefreshDiff(_)) {
-            return true;
-        }
-        if !offered(command) || self.state.borrow().welcome.is_none() {
-            return false;
-        }
-        match command.remote(self, &mut String::new) {
-            Remote::Send(mutations) => mutations.iter().all(|mutation| self.may(mutation.grant())),
-            Remote::Client | Remote::Unsupported => false,
-        }
+        self.sends(command)
     }
 
     /// A page has no keyboard chords of its own: the keyboard goes to the terminal or to the browser.
@@ -825,13 +904,17 @@ impl Backend for RemoteBackend {
         let s = self.state.borrow();
         let info = s.mirror.plans.values().nth(index)?;
         let plan = plan(info);
+        let integrating = s.flights.values().filter_map(|flight| match flight {
+            Flight::Integrate(plan, task) if *plan == info.id => Some(task.clone()),
+            _ => None,
+        });
         Some(BoardView {
+            integrating: integrating.collect(),
             state: plan_state(info, &s.mirror),
             ready: plan.ready().iter().map(|t| t.id.clone()).collect(),
             sessions: s.mirror.sessions.values().map(|x| (x.id.clone(), (x.title.clone(), x.status))).collect(),
             integration_notes: HashMap::new(),
             checking: false,
-            integrating: HashSet::new(),
             ticket_config: None,
             board_counts: None,
             worktrees: HashSet::new(),
@@ -921,7 +1004,9 @@ impl Backend for RemoteBackend {
             .map(|x| x.title.clone())
             .unwrap_or_else(|| root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
         let branch = session.and_then(|x| x.branch.clone()).filter(|b| *b != title);
-        DiffHeading { title, branch, can_send: false }
+        let can_send =
+            s.mirror.sessions.values().filter(here).any(|x| x.agent != SHELL && x.status != AgentStatus::Exited);
+        DiffHeading { title, branch, can_send }
     }
 
     fn ui_config(&self) -> UiConfig {
@@ -929,7 +1014,7 @@ impl Backend for RemoteBackend {
             keys: KeyConfig::default(),
             font: FontConfig::default(),
             layout: LayoutConfig::default(),
-            agents: Vec::new(),
+            agents: known_agents(&self.state.borrow().mirror),
         }
     }
 
@@ -986,8 +1071,9 @@ impl Backend for RemoteBackend {
         String::new()
     }
 
+    /// None: the top bar's narrow slot would cut them. The page shows them whole ([`RemoteBackend::notice`]).
     fn notices(&self) -> Notices {
-        Notices { toast: self.notice(), ..Notices::default() }
+        Notices::default()
     }
 
     fn sandbox_load(&self) -> SandboxLoad {
@@ -1009,13 +1095,77 @@ impl RemoteBackend {
         mirror.sessions.values().nth(index).map(|x| session_row(x, mirror))
     }
 
-    /// A decision that will not be sent: the banner may offer it again.
-    fn refuse(&self, command: &Command) {
-        if let Command::Decide { session, approval, .. } = command {
-            let mut s = self.state.borrow_mut();
-            if let Some(id) = s.mirror.sessions.values().nth(*session).map(|x| x.id.clone()) {
-                s.refused.push((id, approval.clone()));
+    /// What the browser does with `command`: [`Command::remote`], but it has no microphone for a voice's.
+    fn remote_of(&self, command: &Command, op: &mut dyn FnMut() -> String) -> Remote {
+        match command {
+            Command::VoiceToSession { .. } => Remote::Unsupported,
+            _ => command.remote(self, op),
+        }
+    }
+
+    /// Whether `command` can go to the host now: connected, with mutations for it, each of them granted. The
+    /// views ask with what they have in hand, a steer with no target yet or a review with no comment yet, so
+    /// these ask as what they will send. A command that names what is gone cannot go.
+    fn sends(&self, command: &Command) -> bool {
+        if !self.live() {
+            return false;
+        }
+        let asked;
+        let command = match command {
+            Command::Steer { .. } => {
+                asked = Command::Steer { sessions: vec![String::new()], text: String::new() };
+                &asked
             }
+            Command::EditComments { root, .. } => {
+                asked = Command::SendReview(root.clone());
+                &asked
+            }
+            Command::IntegrateAccepted(plan) => {
+                asked = Command::IntegrateTask { plan: *plan, task: String::new() };
+                &asked
+            }
+            Command::Start { .. } | Command::StartAgent { .. }
+                if known_agents(&self.state.borrow().mirror).is_empty() =>
+            {
+                return false;
+            }
+            command => command,
+        };
+        match self.remote_of(command, &mut String::new) {
+            Remote::Send(mutations) => !mutations.is_empty() && mutations.iter().all(|m| self.may(m.grant())),
+            Remote::Client | Remote::Unsupported => false,
+        }
+    }
+
+    /// What `mutation` of `command` changes on screen while it is in flight.
+    fn flight(&self, mirror: &Mirror, mutation: &ops::Command, command: &Command) -> Option<Flight> {
+        match (mutation, command) {
+            (ops::Command::ApprovalDecide(decide), Command::Decide { session, .. }) => {
+                let row = self.session_row_in(mirror, *session)?;
+                Some(Flight::Decision(row.id, decide.approval.clone()))
+            }
+            (_, Command::Steer { text, .. }) => Some(Flight::Steer(text.clone())),
+            (
+                ops::Command::PlanCommand(PlanCommand {
+                    plan: Some(plan), action: PlanAction::Integrate { task }, ..
+                }),
+                _,
+            ) => Some(Flight::Integrate(plan.clone(), task.clone())),
+            _ => None,
+        }
+    }
+
+    /// A command that will not be sent: an approval the banner may offer again, and a steer the bar holds again.
+    fn refuse(&self, command: &Command) {
+        let mut s = self.state.borrow_mut();
+        match command {
+            Command::Decide { session, approval, .. } => {
+                if let Some(id) = s.mirror.sessions.values().nth(*session).map(|x| x.id.clone()) {
+                    s.refused.push((id, approval.clone()));
+                }
+            }
+            Command::Steer { text, .. } => s.unsent = Some(text.clone()),
+            _ => {}
         }
     }
 }

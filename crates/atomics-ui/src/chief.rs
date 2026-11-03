@@ -337,14 +337,17 @@ pub fn steer_bar(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) 
             send = true;
         }
         let width = ui.available_width() - 70.0;
+        let hint = "Steer · Enter sends · Shift+Enter newline";
+        let hint = if backend.has_shortcuts() {
+            format!("{hint} · {} focuses", shortcut_label(ui.ctx(), &backend.ui_config().keys.focus_steer))
+        } else {
+            hint.to_string()
+        };
         let edit = egui::TextEdit::multiline(&mut client.steer_text)
             .id(id)
             .desired_rows(1)
             .desired_width(width)
-            .hint_text(format!(
-                "Steer · Enter sends · Shift+Enter newline · {} focuses",
-                shortcut_label(ui.ctx(), &backend.ui_config().keys.focus_steer)
-            ))
+            .hint_text(hint)
             .font(p.ui(13.5));
         let response = ui.add(edit);
         if std::mem::take(&mut client.focus_steer) {
