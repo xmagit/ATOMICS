@@ -137,6 +137,8 @@ fn call(path: &str, params: &Value) -> Result<Value, String> {
     let mut state: Value =
         serde_json::from_str(&std::fs::read_to_string(path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
     state["calls"].as_array_mut().unwrap().push(json!({ "tool": name, "arguments": args }));
+    // Saved now, so a call the tool refuses below, such as an unknown ticket, is recorded too.
+    save(path, &state);
     let listed = |key: &str| state[key].as_array().is_some_and(|tools| tools.iter().any(|t| t == name));
     if listed("hang") {
         save(path, &state);

@@ -420,27 +420,34 @@ impl Worker {
             TicketOp::TraceCleaner => Ok(TicketOutput::TraceCleaner(self.trace_cleaner(config)?)),
             TicketOp::Search { query, semantic } => {
                 let name = if semantic { "semantic_search" } else { "search" };
-                self.cards(config, name, &Vars::new(system).query(&query))
+                let hit = self.key_hit(config, &query);
+                let found = self.cards(config, name, &Vars::new(system).query(&query));
+                hit_first(hit, found).map(TicketOutput::Cards)
             }
             TicketOp::Page { name, query, extra } => {
+                // A page without a cursor is a list's first; only there can a key's ticket go first.
+                let first = config.operation(name).is_some_and(|op| !extra.contains_key(&op.paging.cursor));
+                let hit = query.as_deref().filter(|_| first).and_then(|query| self.key_hit(config, query));
                 let vars = Vars::new(system);
                 let vars = match &query {
                     Some(query) => vars.query(query),
                     None => vars,
                 };
-                let output = self.call_with(config, name, &vars, &extra)?;
-                let operation = config.operation(name).expect("called");
-                let cards = operation.cards(&output, system)?;
-                Ok(TicketOutput::Page(
-                    cards.into_iter().map(|card| config.card_url(card)).collect::<Result<_, _>>()?,
-                    operation.next_cursor(&output),
-                ))
+                let (found, next) = match self.page(config, name, &vars, &extra) {
+                    Ok((cards, next)) => (Ok(cards), next),
+                    Err(error) => (Err(error), None),
+                };
+                Ok(TicketOutput::Page(hit_first(hit, found)?, next))
             }
             TicketOp::Children(link) | TicketOp::Related(link) | TicketOp::ReadCard(link) if !config.accepts(&link) => {
                 Err(config.mismatch(&link).expect("mismatch"))
             }
-            TicketOp::Children(link) => self.cards(config, "children", &Vars::new(system).ticket(&link)),
-            TicketOp::Related(link) => self.cards(config, "related", &Vars::new(system).ticket(&link)),
+            TicketOp::Children(link) => {
+                self.cards(config, "children", &Vars::new(system).ticket(&link)).map(TicketOutput::Cards)
+            }
+            TicketOp::Related(link) => {
+                self.cards(config, "related", &Vars::new(system).ticket(&link)).map(TicketOutput::Cards)
+            }
             TicketOp::ReadCard(link) => {
                 let name = if config.operation("read").is_some() { "read" } else { "get" };
                 let output = self.call(config, name, &Vars::new(system).ticket(&link))?;
@@ -903,10 +910,55 @@ impl Worker {
         Ok(())
     }
 
-    fn cards(&mut self, config: &TicketConfig, name: &str, vars: &Vars) -> Result<TicketOutput, String> {
+    fn cards(&mut self, config: &TicketConfig, name: &str, vars: &Vars) -> Result<Vec<TicketCard>, String> {
         let output = self.call(config, name, vars)?;
         let cards = config.operation(name).expect("called").cards(&output, &config.system)?;
-        Ok(TicketOutput::Cards(cards.into_iter().map(|card| config.card_url(card)).collect::<Result<_, _>>()?))
+        cards.into_iter().map(|card| config.card_url(card)).collect()
+    }
+
+    /// One page of a list and the cursor of the next.
+    fn page(
+        &mut self,
+        config: &TicketConfig,
+        name: &str,
+        vars: &Vars,
+        extra: &Map<String, Value>,
+    ) -> Result<(Vec<TicketCard>, Option<String>), String> {
+        let output = self.call_with(config, name, vars, extra)?;
+        let operation = config.operation(name).expect("called");
+        let cards = operation.cards(&output, &config.system)?;
+        Ok((
+            cards.into_iter().map(|card| config.card_url(card)).collect::<Result<_, _>>()?,
+            operation.next_cursor(&output),
+        ))
+    }
+
+    /// The ticket a key-shaped query names, as a result row: read with `get`, or with `read` when
+    /// `get` is unmapped or only takes a UUID, as typed and then with its letters upper-cased. A
+    /// miss or a failure is no hit and says nothing: the search that follows reports a server
+    /// that really is down or signed out.
+    fn key_hit(&mut self, config: &TicketConfig, query: &str) -> Option<TicketCard> {
+        let typed = query.trim();
+        if !tickets::looks_like_key(typed) {
+            return None;
+        }
+        let name = ["get", "read"]
+            .into_iter()
+            .find(|name| config.operation(name).is_some_and(|operation| !operation.uses_placeholder("uuid")))?;
+        let upper = typed.to_ascii_uppercase();
+        let spellings = if upper == typed { vec![typed] } else { vec![typed, upper.as_str()] };
+        spellings.into_iter().find_map(|key| {
+            let link = TicketLink {
+                system: config.system.clone(),
+                id: key.to_string(),
+                key: Some(key.to_string()),
+                ..TicketLink::default()
+            };
+            let output = self.call(config, name, &Vars::new(&config.system).ticket(&link)).ok()?;
+            let card = config.operation(name)?.card(&output, &config.system).ok()?;
+            let row = TicketCard { body: None, comments: Vec::new(), links: Vec::new(), ..card };
+            row.link.named_by_key(typed).then(|| config.card_url(row).ok()).flatten()
+        })
     }
 
     /// The ticket right after a push, so the card shows what the system now says.
@@ -1014,6 +1066,19 @@ impl Worker {
         }
         err.to_string()
     }
+}
+
+/// A key's ticket first, then what the search found, without the same ticket twice: the search's
+/// own row moves up when it has one, since that row carries the score and snippet. With the ticket
+/// in hand, a failed search still answers.
+fn hit_first(hit: Option<TicketCard>, found: Result<Vec<TicketCard>, String>) -> Result<Vec<TicketCard>, String> {
+    let Some(hit) = hit else { return found };
+    let mut cards = found.unwrap_or_default();
+    match cards.iter().position(|card| card.link.same_ticket(&hit.link)) {
+        Some(at) => cards[..=at].rotate_right(1),
+        None => cards.insert(0, hit),
+    }
+    Ok(cards)
 }
 
 #[cfg(test)]

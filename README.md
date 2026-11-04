@@ -626,7 +626,8 @@ the reporting model. Changes made in the ticket system reach the chief as `ticke
 Include `plan` in `atomics_wait` statuses to learn when the user approves a plan (board button or `atomics ctl plan_approve`), edits a task brief on the board, or closes or reopens a plan: one event with `plan` and `change` (`approved`, `edited`, `closed`, `reopened`).
 Failures show on the card and never block a plan. Only mapped writes push states or comments; the Relay
 example is read-only until per-write idempotency keys are supported. The Tickets panel (`cmd+k`) finds tickets by meaning or
-keyword and reads one in full, from the same operations; see [Tickets panel](docs/tickets.md#the-tickets-panel).
+keyword and reads one in full, from the same operations; a ticket key or bare number finds that ticket first.
+See [Tickets panel](docs/tickets.md#the-tickets-panel).
 The chief can search, read, list children and check related tickets through the chief-only
 `atomics_ticket_search`, `atomics_ticket_read`, `atomics_ticket_children` and `atomics_ticket_related` tools.
 They return cleaned cards using ATOMICS's credentials; worker agents retain their scoped read/comment tools.

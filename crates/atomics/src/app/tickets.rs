@@ -1318,6 +1318,9 @@ impl State {
                     reject("query must not be empty and take must be at least 1".into());
                     return;
                 }
+                // A profile may only search by meaning; that is then what a plain search does.
+                *semantic = *semantic
+                    || (config.operation("search").is_none() && config.operation("semantic_search").is_some());
                 (if *semantic { "semantic_search" } else { "search" }, Some((self.cleaner().field(query), *semantic)))
             }
             TicketOp::ReadCard(link) | TicketOp::Children(link) | TicketOp::Related(link) => {
@@ -1756,6 +1759,74 @@ mod tests {
                 assert!(!response.error.as_ref().unwrap().contains(secret));
                 assert!(response.error.unwrap().contains("***"));
             }
+        });
+    }
+
+    #[test]
+    fn ticket_search_finds_a_key_first_and_needs_only_semantic_search() {
+        with_app("app::tickets::tests::ticket_search_finds_a_key_first_and_needs_only_semantic_search", |app, _| {
+            let dir = crate::test_support::tempdir().unwrap();
+            let path = dir.path().join("demo.json");
+            configure_chief_tools(app, &path);
+            assert!(chief_tool(app, "atomics_ticket_search", json!({"query":"workspace"})).ok);
+            // Another ticket mentions the key and comes ahead of it in any search.
+            edit_fake(&path, |fake| {
+                let tickets = fake["tickets"].as_array_mut().unwrap();
+                let mut mention = tickets[0].clone();
+                mention["id"] = json!("id-40");
+                mention["key"] = json!("DEMO-40");
+                mention["title"] = json!("Follow-up to DEMO-3, ticket 3");
+                tickets.insert(0, mention);
+            });
+            let keys = |response: &ControlResponse| -> Vec<String> {
+                let cards = response.result["cards"].as_array().unwrap();
+                cards.iter().map(|card| card["key"].as_str().unwrap().to_string()).collect()
+            };
+            for semantic in [false, true] {
+                for query in ["DEMO-3", "demo-3", "3", "  DEMO-3  "] {
+                    let args = json!({"query":query, "semantic":semantic});
+                    let response = chief_tool(app, "atomics_ticket_search", args);
+                    assert!(response.ok, "{query}: {response:?}");
+                    assert_eq!(
+                        keys(&response),
+                        ["DEMO-3", "DEMO-40"],
+                        "{query}: the search follows, without DEMO-3 twice"
+                    );
+                }
+            }
+
+            // With only semantic_search mapped, a plain search no longer fails.
+            app.runtime.config.tickets.operations.search = None;
+            app.runtime.apply_ticket_config();
+            for query in ["DEMO-3", "demo-3", "3"] {
+                let response = chief_tool(app, "atomics_ticket_search", json!({"query":query, "take":1}));
+                assert!(response.ok, "{query}: {response:?}");
+                assert_eq!(keys(&response), ["DEMO-3"], "{query}: take keeps the ticket the key names");
+                assert_eq!(app.runtime.tickets.panel.find.ran, Some((query.to_string(), true)), "{query}");
+            }
+            let words = chief_tool(app, "atomics_ticket_search", json!({"query":"browser OAuth"}));
+            assert!(words.ok, "{words:?}");
+            assert_eq!(keys(&words), ["DEMO-2"]);
+            assert!(words.result["cards"][0]["score"].as_f64().is_some());
+            assert_eq!(fake(&path)["calls"].as_array().unwrap().last().unwrap()["tool"], "card_semantic_search");
+            let calls = fake(&path)["calls"].as_array().unwrap().len();
+            let missing = chief_tool(app, "atomics_ticket_search", json!({"query":"DEMO-999"}));
+            assert!(missing.ok, "{missing:?}");
+            assert!(keys(&missing).is_empty());
+            let called = fake(&path)["calls"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .skip(calls)
+                .map(|c| c["tool"].clone())
+                .collect::<Vec<_>>();
+            assert_eq!(called, [json!("card_get"), json!("card_semantic_search")]);
+
+            // Asking for a search the profile does not have still says so.
+            app.runtime.config.tickets.operations.semantic_search = None;
+            app.runtime.apply_ticket_config();
+            let none = chief_tool(app, "atomics_ticket_search", json!({"query":"DEMO-3"}));
+            assert!(!none.ok && none.error.unwrap().contains("tickets.operations.search"));
         });
     }
 

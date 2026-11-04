@@ -738,7 +738,9 @@ impl State {
                     restart = matches!(&result, Err((false, _)));
                 }
                 match result {
-                    Ok(TicketOutput::Page(cards, next)) if job == Job::More => {
+                    Ok(TicketOutput::Page(mut cards, next)) if job == Job::More => {
+                        // A key's ticket, already first, can come up again on a later page.
+                        cards.retain(|card| !find.results.iter().any(|row| row.link.same_ticket(&card.link)));
                         if panel.view == TicketsView::Find && !cards.is_empty() {
                             find.selected = Some(find.results.len());
                             find.reveal = true;
@@ -2440,6 +2442,253 @@ mod tests {
 
     fn labels(app: &Desktop<'_>) -> Vec<String> {
         app.runtime.tickets.panel.find.results.iter().map(|c| c.link.label().to_string()).collect()
+    }
+
+    fn search_for(app: &mut Desktop<'_>, query: &str) {
+        app.runtime.tickets.panel.query = query.into();
+        app.runtime.tickets_search();
+        settle(app);
+    }
+
+    /// A workspace that only searches by meaning, where DEMO-40 mentions DEMO-3 and ABC-7 and
+    /// comes ahead of DEMO-3 in the search, as other tickets rank above the one a key names.
+    fn only_meaning(app: &mut Desktop<'_>, state: &Path, edit: impl FnOnce(&mut TicketConfig)) {
+        let mut config = example_profile("meaning-example", state);
+        assert!(config.operation("search").is_none());
+        edit(&mut config);
+        app.runtime.config.tickets = config;
+        app.runtime.apply_ticket_config();
+        // The fake server writes its state when it starts.
+        search_for(app, "workspace");
+        edit_state(state, |state| {
+            let tickets = state["tickets"].as_array_mut().unwrap();
+            let mut mention = tickets[0].clone();
+            mention["id"] = "00000000-0000-4000-8000-000000000040".into();
+            mention["key"] = "DEMO-40".into();
+            mention["title"] = "Follow-up to DEMO-3 and ABC-7, ticket 3".into();
+            tickets.insert(0, mention);
+        });
+    }
+
+    /// What each key lookup asked the fake server for.
+    fn lookups(state: &Path) -> Vec<String> {
+        let state: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(state).unwrap()).unwrap();
+        state["calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|call| call["tool"] == "get_ticket")
+            .map(|call| call["arguments"]["ticket"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_key_shows_its_ticket_first_in_any_case_and_as_a_bare_number() {
+        with_app(
+            "app::tickets_panel::tests::a_key_shows_its_ticket_first_in_any_case_and_as_a_bare_number",
+            |app, ctx| {
+                let dir = crate::test_support::tempdir().unwrap();
+                let state = dir.path().join("fake.json");
+                only_meaning(app, &state, |_| {});
+                for (query, asked) in [
+                    ("DEMO-3", vec!["DEMO-3"]),
+                    ("demo-3", vec!["demo-3", "DEMO-3"]),
+                    ("Demo-3", vec!["Demo-3", "DEMO-3"]),
+                    ("3", vec!["3"]),
+                ] {
+                    let before = lookups(&state).len();
+                    search_for(app, query);
+                    let find = &app.runtime.tickets.panel.find;
+                    assert!(find.error.is_none(), "{query}: {:?}", find.error);
+                    assert_eq!(labels(app), ["DEMO-3", "DEMO-40"], "{query}: the search follows, without DEMO-3 twice");
+                    assert_eq!(find.selected, Some(0), "{query}");
+                    assert!(find.results[0].score.is_some(), "{query}: the search's own row moved up");
+                    assert_eq!(lookups(&state)[before..], asked, "{query}");
+                }
+                app.runtime.panel = PanelMode::Tickets;
+                app.runtime.diff_open = true;
+                let text = texts(&frame(app, ctx, vec![])).join("\n");
+                assert!(text.contains("DEMO-3") && text.contains("2 tickets by meaning"), "{text}");
+            },
+        );
+    }
+
+    #[test]
+    fn a_key_the_search_does_not_return_is_still_found() {
+        with_app("app::tickets_panel::tests::a_key_the_search_does_not_return_is_still_found", |app, _ctx| {
+            let dir = crate::test_support::tempdir().unwrap();
+            let state = dir.path().join("fake.json");
+            only_meaning(app, &state, |config| {
+                let search = config.operations.semantic_search.as_mut().unwrap();
+                search.arguments.insert("about".into(), "no ticket holds these words".into());
+            });
+            search_for(app, "demo-3");
+            assert!(app.runtime.tickets.panel.find.error.is_none());
+            assert_eq!(labels(app), ["DEMO-3"]);
+            let row = &app.runtime.tickets.panel.find.results[0];
+            assert!(row.link.title.as_deref().is_some_and(|title| title.contains("development stages")));
+            assert_eq!(row.link.url.as_deref(), Some("https://tickets.example/3"));
+            assert_eq!(finds(&state).last().unwrap()["about"], "no ticket holds these words", "the search still ran");
+        });
+    }
+
+    #[test]
+    fn a_query_that_names_no_ticket_is_the_normal_search_without_an_error() {
+        with_app(
+            "app::tickets_panel::tests::a_query_that_names_no_ticket_is_the_normal_search_without_an_error",
+            |app, _ctx| {
+                let dir = crate::test_support::tempdir().unwrap();
+                let state = dir.path().join("fake.json");
+                only_meaning(app, &state, |_| {});
+                // A key that does not exist: nothing, or what the search finds, and no error.
+                search_for(app, "DEMO-999");
+                assert!(app.runtime.tickets.panel.find.error.is_none());
+                assert!(labels(app).is_empty());
+                assert_eq!(app.runtime.tickets.panel.find.selected, None);
+                search_for(app, "abc-7");
+                assert!(app.runtime.tickets.panel.find.error.is_none());
+                assert_eq!(labels(app), ["DEMO-40"]);
+                assert_eq!(lookups(&state), ["DEMO-999", "abc-7", "ABC-7"]);
+                // A query that is not key-shaped never looks anything up.
+                for query in ["browser OAuth", "foo-bar-12", "2026-11-04", "DEMO-3 and more"] {
+                    search_for(app, query);
+                    assert!(app.runtime.tickets.panel.find.error.is_none(), "{query}");
+                    assert_eq!(finds(&state).last().unwrap()["about"], query);
+                }
+                assert_eq!(lookups(&state).len(), 3, "not key-shaped: no lookup");
+                search_for(app, "browser OAuth");
+                assert_eq!(labels(app), ["DEMO-2"]);
+                assert!(app.runtime.tickets.panel.find.results[0].score.is_some());
+                // A lookup that fails says nothing: the search answers.
+                edit_state(&state, |state| state["fail"] = serde_json::json!(["get_ticket"]));
+                search_for(app, "DEMO-3");
+                assert!(app.runtime.tickets.panel.find.error.is_none());
+                assert_eq!(labels(app), ["DEMO-40", "DEMO-3"]);
+            },
+        );
+    }
+
+    #[test]
+    fn a_failed_search_still_shows_the_keys_ticket_and_reports_when_it_has_none() {
+        with_app(
+            "app::tickets_panel::tests::a_failed_search_still_shows_the_keys_ticket_and_reports_when_it_has_none",
+            |app, _ctx| {
+                let dir = crate::test_support::tempdir().unwrap();
+                let state = dir.path().join("fake.json");
+                only_meaning(app, &state, |_| {});
+                edit_state(&state, |state| state["fail"] = serde_json::json!(["find_tickets"]));
+                search_for(app, "DEMO-3");
+                assert!(app.runtime.tickets.panel.find.error.is_none());
+                assert_eq!(labels(app), ["DEMO-3"]);
+                search_for(app, "DEMO-999");
+                assert!(app.runtime.tickets.panel.find.error.is_some(), "no ticket: the search's failure shows");
+                assert!(labels(app).is_empty());
+            },
+        );
+    }
+
+    #[test]
+    fn a_key_lookup_uses_get_else_read_and_only_trusts_the_ticket_it_names() {
+        with_app(
+            "app::tickets_panel::tests::a_key_lookup_uses_get_else_read_and_only_trusts_the_ticket_it_names",
+            |app, _ctx| {
+                let hidden = |config: &mut TicketConfig| {
+                    let search = config.operations.semantic_search.as_mut().unwrap();
+                    search.arguments.insert("about".into(), "no ticket holds these words".into());
+                };
+                // Only `read`: its row leaves the reading fields to the reading view.
+                let dir = crate::test_support::tempdir().unwrap();
+                let state = dir.path().join("fake.json");
+                only_meaning(app, &state, |config| {
+                    hidden(config);
+                    config.operations.get = None;
+                });
+                search_for(app, "DEMO-3");
+                assert_eq!(labels(app), ["DEMO-3"]);
+                let row = &app.runtime.tickets.panel.find.results[0];
+                assert!(row.body.is_none() && row.comments.is_empty() && row.links.is_empty(), "{row:?}");
+                // A `get` that only takes a UUID can't address a key: `read` does.
+                let dir = crate::test_support::tempdir().unwrap();
+                let state = dir.path().join("fake.json");
+                only_meaning(app, &state, |config| {
+                    hidden(config);
+                    config.operations.get.as_mut().unwrap().arguments.insert("ticket".into(), "{uuid}".into());
+                });
+                search_for(app, "DEMO-3");
+                assert!(app.runtime.tickets.panel.find.error.is_none());
+                assert_eq!(labels(app), ["DEMO-3"]);
+                // Neither: the normal search, as it answers.
+                let dir = crate::test_support::tempdir().unwrap();
+                let state = dir.path().join("fake.json");
+                only_meaning(app, &state, |config| {
+                    config.operations.get = None;
+                    config.operations.read = None;
+                });
+                search_for(app, "DEMO-3");
+                assert!(app.runtime.tickets.panel.find.error.is_none());
+                assert_eq!(labels(app), ["DEMO-40", "DEMO-3"]);
+                assert!(lookups(&state).is_empty());
+                // A system that addresses by number answers XYZ-3 with DEMO-3: not what was asked.
+                let dir = crate::test_support::tempdir().unwrap();
+                let state = dir.path().join("fake.json");
+                only_meaning(app, &state, |config| {
+                    hidden(config);
+                    config.operations.get.as_mut().unwrap().arguments.insert("ticket".into(), "{key_number}".into());
+                });
+                search_for(app, "XYZ-3");
+                assert_eq!(lookups(&state), ["3"], "the server was asked and answered");
+                assert!(labels(app).is_empty(), "{:?}", labels(app));
+                assert!(app.runtime.tickets.panel.find.error.is_none());
+            },
+        );
+    }
+
+    #[test]
+    fn more_does_not_repeat_a_keys_ticket_and_restarting_keeps_it_first() {
+        with_app(
+            "app::tickets_panel::tests::more_does_not_repeat_a_keys_ticket_and_restarting_keeps_it_first",
+            |app, _ctx| {
+                let dir = crate::test_support::tempdir().unwrap();
+                let state = dir.path().join("fake.json");
+                only_meaning(app, &state, |config| {
+                    config.operations.semantic_search.as_mut().unwrap().arguments.insert("take".into(), 1.into());
+                });
+                search_for(app, "3");
+                assert_eq!(labels(app), ["DEMO-3", "DEMO-40"]);
+                assert_eq!(app.runtime.tickets.panel.find.next.as_deref(), Some("1"));
+                let asked = lookups(&state).len();
+                app.runtime.tickets_more();
+                settle(app);
+                assert_eq!(finds(&state).last().unwrap()["cursor"], "1");
+                assert_eq!(labels(app), ["DEMO-3", "DEMO-40"], "the next page held DEMO-3 again");
+                assert_eq!(app.runtime.tickets.panel.find.selected, Some(0));
+                assert_eq!(app.runtime.tickets.panel.find.next, None);
+                assert_eq!(lookups(&state).len(), asked, "a later page looks nothing up");
+                app.runtime.tickets_restart();
+                settle(app);
+                assert_eq!(labels(app), ["DEMO-3", "DEMO-40"]);
+                assert_eq!(lookups(&state).len(), asked + 1, "starting again from the first page does");
+            },
+        );
+    }
+
+    #[test]
+    fn a_late_answer_for_a_key_cannot_overwrite_a_newer_query() {
+        with_app("app::tickets_panel::tests::a_late_answer_for_a_key_cannot_overwrite_a_newer_query", |app, _ctx| {
+            let dir = crate::test_support::tempdir().unwrap();
+            let state = dir.path().join("fake.json");
+            only_meaning(app, &state, |_| {});
+            app.runtime.tickets.panel.query = "DEMO-3".into();
+            app.runtime.tickets_search();
+            let late = app.runtime.tickets.panel.find.seq;
+            search_for(app, "DEMO-2");
+            assert_eq!(labels(app)[0], "DEMO-2");
+            assert_ne!(app.runtime.tickets.panel.find.seq, late);
+            let answer = vec![card(3, None)];
+            app.runtime.panel_result(Job::Find, late, Ok(TicketOutput::Page(answer, None)));
+            assert_eq!(labels(app)[0], "DEMO-2");
+            assert_eq!(app.runtime.tickets.panel.find.ran.as_ref().map(|r| r.0.as_str()), Some("DEMO-2"));
+        });
     }
 
     /// Edits the fake server's state between calls; it rereads the file on each.

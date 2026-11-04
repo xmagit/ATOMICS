@@ -70,6 +70,21 @@ impl TicketLink {
         self.matches(Some(&other.system), Some(&other.id), other.key.as_deref())
     }
 
+    /// Whether this is the ticket a key-shaped query names: in any letter case, or by number
+    /// when one side is only a number. A system may address tickets by number alone, so `UTF-8`
+    /// can bring back ticket 8 under another prefix, which is not what was asked for. A ticket
+    /// that shows no key has nothing to contradict the query.
+    pub fn named_by_key(&self, query: &str) -> bool {
+        let number = |text: &str| text.bytes().all(|b| b.is_ascii_digit());
+        let names = |name: &str| {
+            name.eq_ignore_ascii_case(query)
+                || ((number(query) || number(name))
+                    && key_number(name).is_some()
+                    && key_number(name) == key_number(query))
+        };
+        names(&self.id) || self.key.as_deref().filter(|key| !key.is_empty()).is_none_or(names)
+    }
+
     /// Takes the fields a ticket operation returned. The id stays what the link was
     /// made with, since that is what the operations address. Returns whether anything changed.
     pub fn update_from(&mut self, fetched: &TicketLink) -> bool {
@@ -1520,6 +1535,22 @@ pub fn is_plain_key(text: &str) -> bool {
     !text.is_empty() && text.len() <= 128 && !text.chars().any(|c| c.is_whitespace() || "/\\?&#".contains(c))
 }
 
+/// Whether a search query reads as a ticket key rather than as words: a prefix, a dash and digits
+/// in any letter case (`ABC-123`, `abc-123`), or only digits. The prefix starts with a letter and
+/// holds letters, digits and underscores, so a date or a hyphenated phrase is not a key.
+pub fn looks_like_key(text: &str) -> bool {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    is_plain_key(text)
+        && match text.rsplit_once('-') {
+            None => digits(text),
+            Some((prefix, number)) => {
+                digits(number)
+                    && prefix.starts_with(|c: char| c.is_ascii_alphabetic())
+                    && prefix.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            }
+        }
+}
+
 fn key_number(key: &str) -> Option<&str> {
     key.rsplit('-').next().filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
 }
@@ -1745,7 +1776,8 @@ impl TicketConfig {
         let mut text =
             format!("Tickets: this workspace tracks its work in {system}, which ATOMICS reaches over MCP.\n");
         text.push_str(
-            "Use ATOMICS's chief ticket tools: atomics_ticket_search (query, optional semantic and take), \
+            "Use ATOMICS's chief ticket tools: atomics_ticket_search (query, optional semantic and take; \
+             a ticket key or its bare number finds that ticket first), \
              atomics_ticket_read (ticket key or link, including description and comments), \
              atomics_ticket_children (direct children) and atomics_ticket_related (related tickets). \
              Use these tools for tickets so ATOMICS keeps credentials and maps results through the profile. \
@@ -2982,6 +3014,56 @@ mod tests {
         assert!(config("https://tickets.example/{key_number}").link_from_url("https://tickets.example/12").is_none());
         assert!(config("https://tickets.example/{id}{key}").link_from_url("https://tickets.example/12").is_none());
         assert!(TicketConfig::default().link_from_url("https://tickets.example/browse/ABC-12").is_none());
+    }
+
+    #[test]
+    fn a_query_looks_like_a_key_only_as_a_prefix_dash_digits_or_only_digits() {
+        for key in ["ABC-123", "abc-123", "Abc-1", "A1-42", "MY_TEAM-7", "123", "0"] {
+            assert!(looks_like_key(key), "{key}");
+        }
+        for query in [
+            "",
+            "-",
+            "-12",
+            "12-",
+            "abc",
+            "abc-",
+            "abc-12a",
+            "foo-bar-12",
+            "1a-12",
+            "2026-11-04",
+            "12.5",
+            "abc 123",
+            "abc-123 def",
+            "ключ-12",
+            "١٢٣",
+            "#123",
+            "https://tickets.example/ABC-123",
+        ] {
+            assert!(!looks_like_key(query), "{query}");
+        }
+        assert!(!looks_like_key(&"1".repeat(129)), "too long to be a key");
+    }
+
+    #[test]
+    fn a_found_ticket_is_named_by_its_key_in_any_case_or_by_number() {
+        let link = |id: &str, key: Option<&str>| TicketLink {
+            id: id.into(),
+            key: key.map(str::to_string),
+            ..TicketLink::default()
+        };
+        let ticket = link("00000000-0000-4000-8000-000000000012", Some("ABC-12"));
+        for query in ["ABC-12", "abc-12", "12"] {
+            assert!(ticket.named_by_key(query), "{query}");
+        }
+        for query in ["XYZ-12", "ABC-1", "1", "2", "012"] {
+            assert!(!ticket.named_by_key(query), "{query}");
+        }
+        assert!(link("ABC-12", None).named_by_key("abc-12"), "the id can hold the key");
+        assert!(link("id", Some("12")).named_by_key("ABC-12"), "a system may show only the number");
+        assert!(!link("id", Some("13")).named_by_key("ABC-12"));
+        assert!(link("id", None).named_by_key("ABC-12"), "no key to contradict the query");
+        assert!(link("id", Some("")).named_by_key("ABC-12"), "an empty key is no key");
     }
 
     #[test]

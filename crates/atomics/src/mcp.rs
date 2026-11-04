@@ -183,7 +183,7 @@ fn ticket_tools(plan: &Value) -> Value {
             }, "additionalProperties": false}
         }, {
             "name": "atomics_ticket_search",
-            "description": "Chief only: find tickets through the configured search operation, or semantic_search when semantic=true. Returns cleaned cards (at most 25); no plan or ticket link is needed. Missing mappings and sign-in required are tool errors.",
+            "description": "Chief only: find tickets through the configured search operation, or semantic_search when semantic=true or search is not mapped. A query shaped like a ticket key or a bare number first looks that ticket up, and a hit comes first. Returns cleaned cards (at most 25); no plan or ticket link is needed. Missing mappings and sign-in required are tool errors.",
             "annotations": { "readOnlyHint": true },
             "inputSchema": { "type": "object", "properties": {
                 "query": { "type": "string", "minLength": 1 },

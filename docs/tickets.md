@@ -342,9 +342,9 @@ result = { id = "id", key = "id", url = "url", title = "title", state = "status.
 | `browse` (optional) | Tickets without a query, for the Tickets panel's [views](#views-and-filters); `items` selects the array. | none |
 | `children` (optional) | Direct children; also used when board mode has no `list` mapping. | `{id}`, `{key}`, `{key_number}`, `{uuid}` |
 | `related` (optional) | Related matches, with optional scores. These are never treated as children. | `{id}`, `{key}`, `{key_number}`, `{uuid}` |
-| `read` (optional) | Full display card with body, comments and development links; falls back to the complete `get` result. | `{id}`, `{key}`, `{key_number}`, `{uuid}` |
+| `read` (optional) | Full display card with body, comments and development links; falls back to the complete `get` result. Without a `get` that takes a key, it also finds a ticket by its key in a search. | `{id}`, `{key}`, `{key_number}`, `{uuid}` |
 | `read_comments` (optional) | The comments of a read, for systems that list them with their own tool. Only its `comments` paths are read, and `comments.items` is relative to the whole result. When it fails, the card shows without comments and says why. | `{id}`, `{key}`, `{key_number}`, `{uuid}` |
-| `get` | Reading one ticket: on plan load, on the heartbeat, after each push, after a `ticket_event`. | `{id}`, `{key}`, `{key_number}`, `{uuid}` |
+| `get` | Reading one ticket: on plan load, on the heartbeat, after each push, after a `ticket_event`; also [finding a ticket by its key](#the-tickets-panel) in a search. | `{id}`, `{key}`, `{key_number}`, `{uuid}` |
 | `list` (optional if `children` is mapped) | Board mode: reading a plan's whole board in one call. `items` is the JSON path of the ticket array. | `{board}`, `{board_key}` |
 | `update_state` (optional) | Moving a ticket as its task moves. | `{id}`, `{key}`, `{uuid}`, `{state}`, `{nonce}` |
 | `comment` (optional) | Lifecycle comments and `atomics_ticket_comment`. | `{id}`, `{key}`, `{uuid}`, `{body}`, `{nonce}` |
@@ -520,6 +520,16 @@ lowest to the highest score of that result set (one result, or equal scores, fil
 is printed beside it; scores of different searches are not comparable. State chips use the system's own names
 and are coloured only for states in `[tickets.states]`. A system with only `search` shows the same list
 without bars or toggle.
+
+A query shaped like a ticket key finds that ticket whichever search runs: a prefix, a dash and digits
+(`ABC-123`, in any letter case), or only digits. It is first looked up with `get`, or with `read` when `get`
+is unmapped or only takes a `{uuid}`, as typed and then with its letters upper-cased. The ticket goes first
+and the normal search still runs, with its results below and without the same ticket twice; the filter
+chips narrow the search but not the ticket a key names. A ticket that comes back under another key is not
+a hit (a system that addresses by `{key_number}` answers `XYZ-3` with its ticket 3). A key that does not
+exist, a lookup that fails, or a profile without `get` and `read` gives the normal search, with no error. If
+the search fails after a hit, the ticket still shows. `{key_number}` or a `get` that accepts bare numbers
+is what makes a bare number find its ticket.
 
 With [views](#views-and-filters), Find opens on the default view instead of an empty box: its tabs sit beside
 the query box, the profile's filter chips below it, and the status line names the view (`25 tickets ·
@@ -862,7 +872,7 @@ The following discovery tools are available only through `atomics mcp --chief`, 
 
 | Tool | Operation | Reply |
 | --- | --- | --- |
-| `atomics_ticket_search {query, semantic?, take?}` | `search`, or `semantic_search` with `semantic: true` | `{cards: [...]}`; keyword by default; `take` defaults to 25 and is capped at 25. Query text, including spaces, quotes and braces, is substituted literally. |
+| `atomics_ticket_search {query, semantic?, take?}` | `search`, or `semantic_search` with `semantic: true` or when `search` is not mapped; a key-shaped query first looks that ticket up with `get` or `read` | `{cards: [...]}`; keyword by default; `take` defaults to 25 and is capped at 25. A ticket key or bare number [finds that ticket first](#the-tickets-panel), as in Find. Query text, including spaces, quotes and braces, is substituted literally. |
 | `atomics_ticket_read {ticket}` | `read`, falling back to `get` | `{card: ...}` with the description, mapped comments and development links. Without `read`, body-like fields and a key/value table come from `get`. |
 | `atomics_ticket_children {ticket}` | `children` | `{cards: [...]}` of direct children, up to 25. |
 | `atomics_ticket_related {ticket}` | `related` | `{cards: [...]}` of related tickets, up to 25, including scores when mapped. |
@@ -879,8 +889,9 @@ related lists are read separately with their tools. Chief search results also ap
 Failures are normal MCP tool errors (`isError: true`):
 
 - Missing `[tickets]` names `tickets.system` and `tickets.server`.
-- An unmapped operation names `tickets.operations.search`, `.semantic_search`, `.children` or `.related`.
-  Reading requires `tickets.operations.read` or the `tickets.operations.get` fallback.
+- An unmapped operation names `tickets.operations.search` (when neither search is mapped),
+  `.semantic_search` (when `semantic: true` asks for it), `.children` or `.related`. Reading requires
+  `tickets.operations.read` or the `tickets.operations.get` fallback.
 - An expired or missing sign-in says `sign-in required; press Sign in in the Tickets panel (tickets.server)`.
   The call never opens a browser and marks the panel as needing sign-in.
 - Empty queries/references and a zero `take` are rejected; a link naming another system is refused.
