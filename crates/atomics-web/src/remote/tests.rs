@@ -551,6 +551,47 @@ fn a_steer_some_targets_missed_names_them_and_only_one_all_missed_comes_back() {
 }
 
 #[test]
+fn a_steer_missed_by_a_session_gone_from_the_mirror_says_closed_and_not_its_id() {
+    let steer = |sessions: &[&str]| Command::Steer {
+        sessions: sessions.iter().map(|s| s.to_string()).collect(),
+        text: "go on".into(),
+    };
+    let no = || Outcome::refused(WireError::new(ErrorCode::Rejected, "session exited"));
+    let yes = || Outcome::done(serde_json::Value::Null);
+    let closed = "Missed by a closed session. The host refused: session exited";
+    let remote = connected(Role::Controller);
+
+    // The board comes back without s1 while the steer is on its way, as after a reset.
+    remote.send(steer(&["chief", "s1"]));
+    let mut board = fake_host::board();
+    board.sessions.retain(|s| s.chief);
+    remote.receive(Envelope::host(
+        EPOCH,
+        Message::StateSnapshot {
+            cursor: Seq(3),
+            revisions: Revisions { sessions: Seq(1), plans: Seq(1), approvals: Seq(1), diffs: Seq(1) },
+            sessions: board.sessions,
+            plans: board.plans,
+            approvals: board.approvals,
+            diffs: board.diffs,
+            part: None,
+        },
+    ));
+    assert_eq!(remote.session_list().len(), 1, "s1 has left the mirror");
+    result(&remote, "op-1", yes());
+    result(&remote, "op-2", no());
+    assert_eq!(remote.notice().as_deref(), Some(closed));
+
+    // Two of them read as one.
+    remote.dismiss_notice();
+    remote.send(steer(&["chief", "s1", "s2"]));
+    result(&remote, "op-3", yes());
+    result(&remote, "op-4", no());
+    result(&remote, "op-5", no());
+    assert_eq!(remote.notice().as_deref(), Some(closed));
+}
+
+#[test]
 fn a_comment_that_does_not_go_through_is_the_users_again() {
     let comment = ReviewComment {
         path: "src/a.rs".into(),

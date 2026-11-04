@@ -57,6 +57,8 @@ const MAX_PAGES: u32 = 16;
 const SHELL: &str = "shell";
 /// What a command says when the channel is down, until it is back.
 const NOT_CONNECTED: &str = "Not connected to the host. Try again once it is back.";
+/// What the notice calls a steer's target that has left the mirror, as after a reset: its id means nothing to a reader.
+const CLOSED_SESSION: &str = "a closed session";
 
 /// What the host's `welcome` said about this client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,7 +131,7 @@ struct Steering {
     text: String,
     waiting: usize,
     reached_any: bool,
-    /// The targets it missed, by title, and why the last of them did.
+    /// The targets it missed, each title once, and why the last of them did.
     missed: Vec<String>,
     why: Option<String>,
 }
@@ -483,7 +485,7 @@ impl State {
     fn land(&mut self, op: &str, done: bool) {
         match self.flights.remove(op) {
             Some(Flight::Decision(session, approval)) if !done => self.refused.push((session, approval)),
-            Some(Flight::Steer(steer, session)) => self.steer_answered(steer, session, done),
+            Some(Flight::Steer(steer, session)) => self.steer_answered(steer, &session, done),
             Some(Flight::Comment(root, comment)) if !done => self.unsent_comments.push((root, comment)),
             Some(Flight::Start) if done => self.started = true,
             _ => {}
@@ -493,14 +495,17 @@ impl State {
     /// One target of a steer answered, with the reason on the notice line if it was missed. Once all have: reached
     /// by none, the text goes back to the bar. Reached by some, the bar stays empty, since Enter would reach those
     /// again, and the note names the others.
-    fn steer_answered(&mut self, steer: u64, session: String, done: bool) {
+    fn steer_answered(&mut self, steer: u64, session: &str, done: bool) {
         let Some(steering) = self.steers.get_mut(&steer) else { return };
         steering.waiting -= 1;
         if done {
             steering.reached_any = true;
         } else {
             steering.why = self.notice.clone();
-            steering.missed.push(self.mirror.sessions.get(&session).map_or(session, |s| s.title.clone()));
+            let title = self.mirror.sessions.get(session).map_or(CLOSED_SESSION, |s| s.title.as_str());
+            if !steering.missed.iter().any(|missed| missed == title) {
+                steering.missed.push(title.to_string());
+            }
         }
         if steering.waiting > 0 {
             return;

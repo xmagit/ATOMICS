@@ -357,14 +357,7 @@ impl State {
     /// `review_command` share it.
     pub(super) fn deliver_review(&mut self, root: &Path) -> Result<serde_json::Value, String> {
         let count = self.diffs.get(root).map_or(0, |d| d.comments.len());
-        if count == 0 {
-            return Err("no pending comments".into());
-        }
-        let delivery = self.send_review(root);
-        if self.diffs.get(root).is_some_and(|d| !d.comments.is_empty()) {
-            return Err("could not deliver the review".into());
-        }
-        Ok(match delivery {
+        Ok(match self.send_review(root)? {
             Delivery::Held => json!({ "held_comments": count, "held": true }),
             Delivery::Pending => json!({ "pending_comments": count, "sent": false }),
             _ => json!({ "sent_comments": count }),

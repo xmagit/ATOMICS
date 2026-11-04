@@ -239,17 +239,24 @@ fn a_review_goes_to_an_agent_and_never_into_a_shell() {
             assert_eq!(delivered, ["agent"]);
             assert_eq!(kept, 0);
         };
-        let refused = |(answer, delivered, kept): (Result<serde_json::Value, String>, Vec<String>, usize)| {
-            assert_eq!(answer.unwrap_err(), "could not deliver the review", "what the browser is told");
+        let refused = |(answer, delivered, kept): (Result<serde_json::Value, String>, Vec<String>, usize),
+                       why: &str| {
+            assert_eq!(answer.unwrap_err(), why, "what the browser is told");
             assert!(delivered.is_empty(), "{delivered:?}");
             assert_eq!(kept, 1, "the comments stay");
         };
+        let no_agent = "No agent is working in this worktree";
 
         to_the_agent(review(vec![agent(), shell()], "shell"));
-        refused(review(vec![shell()], "shell"));
-        refused(review(vec![shell(), other()], "other"));
+        refused(review(vec![shell()], "shell"), no_agent);
+        refused(review(vec![shell(), other()], "other"), no_agent);
         to_the_agent(review(vec![agent(), shell(), other()], "other"));
         to_the_agent(review(vec![agent(), shell()], "agent"));
+
+        // There is an agent, but the message has no way to it: the general words.
+        let mut unreachable = agent();
+        unreachable.claude_id = None;
+        refused(review(vec![unreachable], "agent"), "could not deliver the review");
 
         // Through the mutation a client sends: the same refusal, with its reason, and the comments stay.
         state.sessions = vec![shell()];
@@ -280,7 +287,7 @@ fn a_review_goes_to_an_agent_and_never_into_a_shell() {
         });
         assert!(
             matches!(&outcome, atomics_core::ops::Outcome::Refused { message, .. }
-                if message == "could not deliver the review"),
+                if message == no_agent),
             "{outcome:?}"
         );
         assert_eq!(state.diffs[&root].comments.len(), 1);

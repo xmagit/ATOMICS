@@ -151,7 +151,7 @@ impl Local<'_> {
                 state.diffs.entry(root).or_default().edit_comments(before, after);
             }),
             Command::SendReview(root) => state.post(move |state| {
-                state.send_review(&root);
+                let _ = state.send_review(&root);
             }),
             Command::RefreshDiff(root) => state.post(move |state| state_refresh(state.diffs.entry(root).or_default())),
             Command::OpenFile { root, path } => state.post(move |state| state.open_file(&root, &path)),

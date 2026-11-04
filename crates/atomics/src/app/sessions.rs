@@ -1038,10 +1038,11 @@ impl State {
         Delivery::Queued
     }
 
-    pub(super) fn send_review(&mut self, root: &Path) -> Delivery {
+    /// Send `root`'s comments to its agent as one message. When they cannot go they stay, and the error says why.
+    pub(super) fn send_review(&mut self, root: &Path) -> Result<Delivery, &'static str> {
         let comments = self.diffs.get(root).map(|s| s.comments.clone()).unwrap_or_default();
         if comments.is_empty() {
-            return Delivery::Unavailable;
+            return Err("no pending comments");
         }
         let header = self.config.fill(&self.config.steer.review_header);
         let message = steer::compose_review(&header, &comments);
@@ -1050,24 +1051,26 @@ impl State {
             .filter(|&i| self.sessions[i].root() == root && self.sessions[i].is_agent())
             .or_else(|| self.sessions.iter().position(|s| s.root() == root && s.is_agent() && s.can_receive()));
         let Some(index) = target else {
-            self.toast("No agent is working in this worktree");
-            return Delivery::Unavailable;
+            let reason = "No agent is working in this worktree";
+            self.toast(reason);
+            return Err(reason);
         };
         let count = comments.len();
         let delivery = self.deliver(index, &message);
-        if delivery != Delivery::Unavailable {
-            if let Some(state) = self.diffs.get_mut(root) {
-                state.comments.clear();
-            }
-            let title = self.sessions[index].title.clone();
-            let action = match delivery {
-                Delivery::Held => "Held",
-                Delivery::Pending => "Sending",
-                _ => "Sent",
-            };
-            self.toast(format!("{action} {count} comment{} to {title}", if count == 1 { "" } else { "s" }));
+        if delivery == Delivery::Unavailable {
+            return Err("could not deliver the review");
         }
-        delivery
+        if let Some(state) = self.diffs.get_mut(root) {
+            state.comments.clear();
+        }
+        let title = self.sessions[index].title.clone();
+        let action = match delivery {
+            Delivery::Held => "Held",
+            Delivery::Pending => "Sending",
+            _ => "Sent",
+        };
+        self.toast(format!("{action} {count} comment{} to {title}", if count == 1 { "" } else { "s" }));
+        Ok(delivery)
     }
 }
 
