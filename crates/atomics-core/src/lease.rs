@@ -133,8 +133,11 @@ pub struct Typist {
     sent: VecDeque<(u64, String)>,
     /// Bytes sent since the last renew.
     unrenewed: usize,
-    /// The last lease state the host sent for this terminal.
+    /// The last lease state the host sent for this terminal, until this client lets go of the lease: from then
+    /// on nobody holds it, as far as this client can tell, whatever the host has yet to read.
     pub state: Option<LeaseState>,
+    /// The lease this client let go of last.
+    released: Option<Seq>,
 }
 
 impl Typist {
@@ -151,7 +154,7 @@ impl Typist {
     /// losing the lease drops the token, so nothing more is sent under it. The same token keeps
     /// the local numbering, which input in flight may have taken past the host's `next`.
     pub fn apply(&mut self, state: &LeaseState) {
-        if state.session != self.session {
+        if state.session != self.session || self.out_of_date(state) {
             return;
         }
         match (state.yours, state.lease) {
@@ -246,7 +249,15 @@ impl Typist {
     pub fn release(&mut self) -> Option<Message> {
         let lease = self.lease.take()?;
         self.sent.clear();
+        self.state = None;
+        self.released = Some(lease);
         Some(Message::LeaseRelease { session: self.session.clone(), lease })
+    }
+
+    /// Whether `state` gives this client the lease it has let go of: sent before the host read the release, with
+    /// the answer to that still to come. Tokens never come back, so it cannot be a new grant.
+    pub fn out_of_date(&self, state: &LeaseState) -> bool {
+        state.session == self.session && state.yours && state.lease.is_some() && state.lease == self.released
     }
 
     /// The connection ended. The host ended the lease with it; forget it here too.
@@ -254,6 +265,7 @@ impl Typist {
         self.lease = None;
         self.sent.clear();
         self.state = None;
+        self.released = None;
     }
 }
 
@@ -316,6 +328,43 @@ mod tests {
         // Another terminal's state does not touch this one.
         typist.apply(&LeaseState { session: "other".into(), ..lost });
         assert!(typist.may_type());
+    }
+
+    #[test]
+    fn letting_go_shows_nobody_holding_it_until_the_host_says_otherwise() {
+        let mut typist = Typist::new("s");
+        typist.apply(&LeaseState { holder: Some("phone".into()), ..granted(7, 1) });
+        assert_eq!(typist.state.as_ref().and_then(|s| s.holder.as_deref()), Some("phone"));
+
+        // The frame the host reads is what it always was.
+        let release = typist.release().unwrap();
+        assert!(matches!(&release, Message::LeaseRelease { session, lease } if session == "s" && lease.0 == 7));
+        assert!(!typist.may_type() && typist.state.is_none());
+        assert!(typist.release().is_none(), "there is nothing more to let go of");
+
+        // What the host said under that lease before it read the release changes nothing.
+        let earlier = LeaseState { holder: Some("phone".into()), ..granted(7, 2) };
+        assert!(typist.out_of_date(&earlier));
+        typist.apply(&earlier);
+        assert!(!typist.may_type() && typist.state.is_none() && typist.input("x").is_empty());
+        assert!(!typist.out_of_date(&LeaseState { session: "other".into(), ..earlier }));
+
+        // Its answer, someone else's lease and a new grant all count.
+        let released = LeaseState {
+            yours: false,
+            lease: None,
+            next: None,
+            ttl_ms: None,
+            holder: None,
+            reason: Some(LeaseReason::Released),
+            ..granted(7, 1)
+        };
+        typist.apply(&released);
+        assert_eq!(typist.state.as_ref().map(|s| s.holder.clone()), Some(None));
+        typist.apply(&LeaseState { holder: Some("desk".into()), ..released });
+        assert_eq!(typist.state.as_ref().and_then(|s| s.holder.as_deref()), Some("desk"));
+        typist.apply(&granted(8, 1));
+        assert_eq!(sent(&typist.input("z")), vec![(8, 1, "z".into())]);
     }
 
     #[test]

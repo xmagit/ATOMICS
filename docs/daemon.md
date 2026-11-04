@@ -871,8 +871,7 @@ or tab for the others:
   way; a finished plan's tab has no close, and its board's Archive does that. A closed plan's board stays read-only.
   A plan that closes while it shows gives way to the first open plan, as on the desktop.
 - **`+ New`** (wide only) opens a small picker of what the host's board names: the agents its sessions and open plans
-  use,
-  and a scratch folder or a folder its sessions and open plans use. The host's configured agents and its
+  use, and a scratch folder or a folder its sessions and open plans use. The host's configured agents and its
   worktrees are not sent, so a host with no session and no open plan offers none, and starting in a new worktree
   stays on the computer.
 - **The changed-files column** scrolls to a file's hunks, which the page has already.
@@ -882,18 +881,19 @@ or tab for the others:
   sandboxed, outside ATOMICS or in a scratch folder, so closing an exited session outside a worktree and a plan asks, in
   case it deletes its folder. It has no agent kinds either, and a shell can run under any name, so there is no "All
   agents" target: typed into a shell, a steer would run as a command. A shell not named `shell` still counts as an
-  agent in the top bar, and its worktree still offers Send review, which the host delivers to its active session if
-  that is the shell and otherwise refuses. An integration the host is still checking, or could not verify, shows as
-  integrated: the mirror does not carry that state.
+  agent in the top bar, and a worktree with only that shell still offers Send review; the host sends a review only to
+  an agent, so it refuses, and the comments stay. An integration the host is still checking, or could not verify,
+  shows as integrated: the mirror does not carry that state.
 
 A command that fails says why: refused, unconfirmed or too large, on the phone's notice line and in a note under the
 wide layout's top bar, which like a window takes the pointer and its part of the input, and goes after 12 s or a click.
 A note about the connection goes when the connection is back. A steer that reached none of its targets goes back into
 the bar; one that reached some does not, since Enter would reach those again, and the note names those it missed. An
 approval goes back to its banner, a refused comment back into its box with its text, and a task's `integrating…` ends
-with the outcome. A comment box open when the connection drops keeps its draft, and Enter waits until the connection
-is back. A diff on screen is fetched file by file with `diff_get`, four files at a time, up to 16 pages each; the
-browser draws it without syntax colours.
+with the outcome. A comment box open when the connection drops keeps its draft and the keyboard: Enter does nothing
+until the connection is back, then sends. If the host sends the whole board again, as after a restart, the box goes
+for a moment, so the draft stays and the keyboard takes a click. A diff on screen is fetched file by file with
+`diff_get`, four files at a time, up to 16 pages each; the browser draws it without syntax colours.
 
 **Layouts (C4).** A wide window draws the desktop's own window, `atomics_ui::shell::frame`, in the boot's theme
 as the desktop draws it (monospace UI text where the theme says so; the default theme does): the top bar with the
@@ -937,7 +937,8 @@ the history kept for it freed. Its cells are the desktop's grid, drawn by the sh
 width until the user pinches, on a phone never below 13 px, a wider grid pans, a grid taller than the pane keeps
 the cursor in view, and the screen's own background fills the pane below a shorter one. Looking never resizes the
 PTY. **Fit to this screen** sends `terminal_resize` for the pane at the current font, shown on the
-desktop, and lasts as long as the lease (**Computer's size** gives it back early).
+desktop, and lasts as long as the lease (**Computer's size** gives it back early), so the keyboard moving to a text
+box ends it too.
 
 - **Input** goes through a transparent `<textarea>` over the terminal (`web/terminal.js`; design §4.4): committed
   text, composition as preedit (drawn over the cursor), named keys (Return and Backspace too) and Ctrl+character
@@ -967,20 +968,20 @@ desktop, and lasts as long as the lease (**Computer's size** gives it back early
   or the chief's notice that moves it there; text typed meanwhile waits for the grant (16 KiB at most, this
   connection only), and a lease state sent before the host read the request leaves it standing. The input moving to
   another terminal or to none, or the keyboard moving to a text box the page draws, releases the lease (a grant still
-  on its way goes back when it comes), and a click back asks again. A field that only loses the focus, to another
-  window or to a button, keeps the lease until it runs out, since nothing renews it. Typing never asks for the lease:
-  text, keys and pastes count only while the field has the focus and this client holds the lease or is asking for
-  it, and anything else is dropped, never kept. Another client typing makes the field read-only, with **Take over**.
-  The lease is renewed every 10 s while the field has the focus. Losing it (the desktop types or takes it back, another client takes over), or being refused it, takes
-  the focus away, and what was in flight then is dropped: keys of that frame, a word the keyboard commits as the
-  field is blurred, a Paste whose clipboard read finishes late. The caret goes with the focus, so text a
-  keyboard commits later cannot focus the field again. Typing again is a new tap. A word being composed when the
-  user clicks away commits first, so it is typed, with no Return. A paste over
-  1 MiB, or more than may wait, is not typed, with a note naming the limit that refused it (16 KiB while waiting
-  for the grant, else 1 MiB). Input refused as `slow_client` is typed
-  again from the screen's next change on, at most 1 MiB per change. Lease requests, input and resizes carry
-  request IDs, so a refusal names what it refuses; the client keeps at most 1024, forgetting input once a lease
-  state shows it applied. A view-only device's field is always read-only.
+  on its way goes back when it comes), and a click back asks again at once, even before the host has answered. A field
+  that only loses the focus, to another window or to a button, keeps the lease until it runs out, since nothing renews
+  it. Typing never asks for the lease: text, keys and pastes count only while the field has the focus and this client
+  holds the lease or is asking for it, and anything else is dropped, never kept. Another client typing makes the field
+  read-only, with **Take over**. The lease is renewed every 10 s while the field has the focus. Losing it (the desktop
+  types or takes it back, another client takes over), or being refused it, takes the focus away, and what was in
+  flight then is dropped: keys of that frame, a word the keyboard commits as the field is blurred, a Paste whose
+  clipboard read finishes late. The caret goes with the focus, so text a keyboard commits later cannot focus the field
+  again. Typing again is a new tap. A word being composed when the user clicks away commits first, so it is typed,
+  with no Return. A paste over 1 MiB, or more than may wait, is not typed, with a note naming the limit that refused
+  it (16 KiB while waiting for the grant, else 1 MiB). Input refused as `slow_client` is typed again from the screen's
+  next change on, at most 1 MiB per change. Lease requests, input and resizes carry request IDs, so a refusal names
+  what it refuses; the client keeps at most 1024, forgetting input once a lease state shows it applied. A view-only
+  device's field is always read-only.
 - **Offline.** The screen stays on view, marked "Disconnected"; the field is read-only and nothing typed is kept:
   the lease and anything waiting end with the channel, and the screen is subscribed again after `welcome`.
 

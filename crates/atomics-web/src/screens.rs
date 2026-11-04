@@ -509,6 +509,10 @@ impl Screens {
     /// What the host says of a lease; `acquired` when it answers this client's request for it.
     fn lease_state(&mut self, state: &LeaseState, acquired: bool, out: &mut Vec<Envelope>) {
         let Some(term) = self.terms.get_mut(&state.session) else { return };
+        // From before the host read this client's release: its answer, and any new request's, are still to come.
+        if term.typist.out_of_date(state) {
+            return;
+        }
         let held = term.typist.may_type();
         term.typist.apply(state);
         // Input the host applied, or sent under a lease that ended, can no longer be refused as

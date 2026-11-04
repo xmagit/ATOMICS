@@ -1179,6 +1179,63 @@ fn a_box_open_when_the_connection_drops_keeps_its_draft_until_it_can_go() {
 }
 
 #[test]
+fn a_draft_outlasts_the_host_sending_the_whole_board_again() {
+    use atomics_core::wire::{Envelope, Limits, ResetReason, Resume, Revisions, Role, Seq, VERSION};
+
+    let (ctx, mut world, mut client, mut view, shown) = on_the_diff(WIDE);
+    let line = shown.iter().find(|(text, _)| text.contains("step(1)")).expect("the diff's lines").1.center();
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(line));
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, vec![egui::Event::Text("draft".into())]);
+
+    // The channel comes back on a new board: nothing shows of it until its snapshot lands, a frame or more on.
+    world.driver.remote.disconnected();
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    let capabilities: Vec<String> = crate::remote::CAPABILITIES.iter().map(|c| c.to_string()).collect();
+    let may = Role::Controller.may(&capabilities);
+    let resume = Resume::Reset { cursor: Seq(9), reason: ResetReason::CursorTooOld };
+    let welcome = Message::Welcome {
+        version: VERSION,
+        capabilities,
+        limits: Limits::default(),
+        role: Role::Controller,
+        resume,
+        may,
+    };
+    world.driver.remote.receive(Envelope::host("epoch-1", welcome));
+    let gap = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(!has(&gap, "draft"), "{gap:?}");
+
+    let board = world.host.board.clone();
+    let snapshot = Message::StateSnapshot {
+        cursor: Seq(9),
+        revisions: Revisions { sessions: Seq(1), plans: Seq(1), approvals: Seq(1), diffs: Seq(1) },
+        sessions: board.sessions,
+        plans: board.plans,
+        approvals: board.approvals,
+        diffs: board.diffs,
+        part: None,
+    };
+    world.driver.remote.receive(Envelope::host("epoch-1", snapshot));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(has(&shown, "draft"), "the box is back with its text: {shown:?}");
+
+    // It went for those frames, so the keyboard takes a click; then Enter sends it.
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(on(&shown, "draft")));
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    let enter = egui::Event::Key {
+        key: egui::Key::Enter,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    };
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, vec![enter]);
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(world.host.board.diffs[0].comments.iter().any(|c| c.body == "draft"));
+}
+
+#[test]
 fn the_steer_bar_names_no_all_agents_and_shift_enter_makes_a_new_line() {
     let (ctx, mut world, mut client, mut view) = live_with(fake_host::working());
     let list = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "→ Fix the parser");

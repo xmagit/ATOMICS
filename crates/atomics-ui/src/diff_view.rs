@@ -989,8 +989,8 @@ fn comment_row(
     }
 }
 
-/// The inline comment input. Returns (commit, cancel). Without `review` Enter commits nothing, and the box keeps
-/// its draft and the keyboard.
+/// The inline comment input. Returns (commit, cancel). Without `review` Enter does nothing: the box keeps its draft
+/// and the keyboard. Its id is its own, so that it keeps the keyboard when what is drawn before it changes.
 fn editor_row(
     ui: &mut egui::Ui,
     rect: Rect,
@@ -1003,9 +1003,11 @@ fn editor_row(
     let field = rect.with_min_x(rect.left() + gutter - char_w);
     let mut child = ui.new_child(egui::UiBuilder::new().id_salt("comment-editor").max_rect(field));
     let edit = egui::TextEdit::singleline(&mut editor.text)
+        .id(child.scope_id().with("comment-box"))
         .hint_text("Comment for the agent · Enter adds · Esc cancels")
         .font(font.clone())
         .desired_width(field.width().min(900.0));
+    let edit = if review { edit } else { edit.return_key(None::<egui::KeyboardShortcut>) };
     let response = child.add(edit);
     if editor.focus {
         response.request_focus();
@@ -1015,9 +1017,6 @@ fn editor_row(
         return (false, false);
     }
     if child.input(|i| i.key_pressed(Key::Enter)) {
-        if !review {
-            response.request_focus();
-        }
         (review, false)
     } else {
         (false, child.input(|i| i.key_pressed(Key::Escape)) || editor.text.trim().is_empty())
@@ -1444,6 +1443,68 @@ mod tests {
             all_files: Arc::default(),
         };
         DiffState { prepared: Some(Arc::new(prepared)), ..DiffState::default() }
+    }
+
+    #[test]
+    fn a_comment_box_keeps_the_keyboard_and_its_draft_until_the_comment_can_go() {
+        let ctx = egui::Context::default();
+        let mut state = state_with(&["a.rs"]);
+        state.editor = Some(Editor { anchor: Anchor::Diff(0, 0, 0), text: "draft".into(), focus: true });
+        let palette = crate::Client::default().palette;
+        let font = palette.mono(13.0);
+        let enter = egui::Event::Key {
+            key: Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut time = 0.0;
+        let mut frame = |state: &mut DiffState, ahead: usize, review: bool, events: Vec<egui::Event>| {
+            time += 0.05;
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0))),
+                time: Some(time),
+                events,
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                for _ in 0..ahead {
+                    ui.label("drawn ahead of the diff");
+                }
+                let header = Header {
+                    title: "title",
+                    branch: None,
+                    can_send: true,
+                    split: DiffSplit::Never,
+                    editor_shortcut: "",
+                    touch: None,
+                    review,
+                    edit: false,
+                };
+                let rect = ui.available_rect_before_wrap();
+                show(ui, rect, state, header, &palette, &font);
+            });
+            output.textures_delta.clear();
+            ctx.memory(|m| m.focused().is_some())
+        };
+        frame(&mut state, 0, true, Vec::new());
+        assert!(frame(&mut state, 0, true, Vec::new()), "the box has the keyboard");
+
+        // What comes before it changes, as a line under the frame does when it goes.
+        frame(&mut state, 1, true, Vec::new());
+        assert!(frame(&mut state, 1, true, Vec::new()), "and it keeps it");
+
+        // Nowhere to send it: Enter does nothing, not even for a frame.
+        assert!(frame(&mut state, 0, false, vec![enter.clone()]));
+        assert!(frame(&mut state, 0, false, Vec::new()));
+        assert_eq!(state.editor.as_ref().map(|editor| editor.text.as_str()), Some("draft"));
+        assert!(state.comments.is_empty());
+
+        // Back, one Enter adds it.
+        frame(&mut state, 0, true, vec![enter]);
+        assert_eq!(state.comments.iter().map(|c| c.body.as_str()).collect::<Vec<_>>(), ["draft"]);
+        assert!(state.editor.is_none());
     }
 
     #[test]

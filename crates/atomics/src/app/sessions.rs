@@ -1047,7 +1047,7 @@ impl State {
         let message = steer::compose_review(&header, &comments);
         let target = self
             .active_index()
-            .filter(|&i| self.sessions[i].root() == root)
+            .filter(|&i| self.sessions[i].root() == root && self.sessions[i].is_agent())
             .or_else(|| self.sessions.iter().position(|s| s.root() == root && s.is_agent() && s.can_receive()));
         let Some(index) = target else {
             self.toast("No agent is working in this worktree");

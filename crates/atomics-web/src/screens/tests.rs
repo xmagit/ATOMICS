@@ -87,6 +87,85 @@ fn a_shown_terminal_is_followed_and_text_typed_after_the_tap_waits_for_the_grant
     assert_eq!(inputs(&world), ["ls\r", "pwd"]);
 }
 
+/// What the host says of `session`'s lease as it stands, as it might in the moment before it reads a release.
+fn state_of_the_lease(world: &World, session: &str) -> atomics_core::lease::LeaseState {
+    use atomics_core::wire::Seq;
+
+    atomics_core::lease::LeaseState {
+        session: session.into(),
+        holder: world.driver.remote.lease(session).holder,
+        yours: true,
+        lease: world.host.terminals[session].lease.as_ref().map(|l| Seq(l.token)),
+        next: Some(Seq(1)),
+        ttl_ms: Some(30_000),
+        resized: false,
+        reason: Some(atomics_core::lease::LeaseReason::Granted),
+    }
+}
+
+/// The host's word on a lease, reaching this client now.
+fn tell(world: &World, state: &atomics_core::lease::LeaseState) {
+    let envelope = atomics_core::wire::Envelope::host(&world.host.epoch, Message::LeaseState(state.clone()));
+    world.driver.remote.receive(envelope);
+}
+
+#[test]
+fn asking_again_before_the_host_has_answered_a_release_settles_on_a_new_lease() {
+    let mut world = live();
+    show(&mut world, "s1");
+    acquire(&mut world, "s1", false);
+    assert_eq!(type_text(&mut world, "s1", "a"), Ok(()));
+    let earlier = state_of_the_lease(&world, "s1");
+    let (old, holder) = (earlier.lease, earlier.holder.clone());
+    assert!(old.is_some() && holder.is_some());
+
+    // Let go, and nothing has reached the host: nobody holds it here, so nothing offers to take it over.
+    world.driver.remote.release("s1");
+    let lease = world.driver.remote.lease("s1");
+    assert!(!lease.yours && lease.holder.is_none() && !lease.acquiring, "{lease:?}");
+
+    // A click back asks at once, and what is typed waits for the answer.
+    world.driver.remote.acquire("s1", false);
+    assert_eq!(world.driver.remote.type_text("s1", "b"), Ok(()));
+    tell(&world, &earlier);
+    let lease = world.driver.remote.lease("s1");
+    assert!(lease.acquiring && !lease.yours && lease.lost.is_none(), "the request stands: {lease:?}");
+
+    // The host reads both, in order, and it settles on a new lease with the text under it.
+    world.driver.flush();
+    world.pump();
+    let kinds: Vec<&Message> = world
+        .sent()
+        .into_iter()
+        .filter(|m| matches!(m, Message::LeaseRelease { .. } | Message::LeaseAcquire { .. }))
+        .collect();
+    assert!(matches!(kinds[..], [_, Message::LeaseRelease { .. }, Message::LeaseAcquire { .. }]), "{kinds:?}");
+    assert_eq!(world.host.terminals["s1"].typed, "ab");
+    let lease = world.driver.remote.lease("s1");
+    assert!(lease.yours && !lease.acquiring && lease.holder == holder, "{lease:?}");
+    let new = world.host.terminals["s1"].lease.as_ref().map(|l| l.token);
+    assert_ne!(new, old.map(|l| l.0), "under a new token");
+}
+
+#[test]
+fn a_state_from_before_a_release_changes_nothing_and_the_hosts_answer_settles_it() {
+    let mut world = live();
+    show(&mut world, "s1");
+    acquire(&mut world, "s1", false);
+    let earlier = state_of_the_lease(&world, "s1");
+    world.driver.remote.release("s1");
+    tell(&world, &earlier);
+    let lease = world.driver.remote.lease("s1");
+    assert!(!lease.yours && lease.holder.is_none() && !lease.acquiring && lease.lost.is_none(), "{lease:?}");
+    assert_eq!(world.driver.remote.type_text("s1", "x"), Err(Refused::NoLease), "nothing goes under the old lease");
+
+    world.driver.flush();
+    world.pump();
+    let lease = world.driver.remote.lease("s1");
+    assert!(!lease.yours && lease.holder.is_none() && !lease.acquiring, "{lease:?}");
+    assert!(world.host.terminals["s1"].lease.is_none());
+}
+
 #[test]
 fn the_first_keys_survive_the_lease_state_a_subscription_starts_with() {
     let mut world = live();

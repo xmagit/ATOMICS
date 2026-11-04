@@ -61,8 +61,9 @@
 //! comment box taking the keyboard releases the lease, and a click back asks again; Shift+Enter makes a new line.
 //! `a_steer_one_target_missed_names_it_and_stays_out_of_the_bar` and
 //! `a_note_takes_the_pointer_and_a_refused_comment_comes_back`: what a refusal leaves.
-//! `a_comment_box_keeps_its_draft_while_the_connection_is_down`, `a_viewer_has_no_comment_actions_in_a_diff` and
-//! `a_finished_plan_picked_on_a_phone_shows_in_the_strip` say what they do. Their screenshots are saved in
+//! `a_comment_box_keeps_its_draft_while_the_connection_is_down`, `a_viewer_has_no_comment_actions_in_a_diff`,
+//! `a_click_back_within_a_round_trip_types_at_once` and `a_finished_plan_picked_on_a_phone_shows_in_the_strip` say
+//! what they do. Their screenshots are saved in
 //! `target/actions-shots/`.
 
 #[allow(dead_code)] // shared with the unit tests, which use more of it
@@ -75,7 +76,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -261,14 +262,24 @@ fn content_type(path: &str) -> &'static str {
 /// Frames the host sends on its own (the desktop typing, say), which the broker passes on.
 type Pending = Arc<Mutex<Vec<Vec<u8>>>>;
 
+/// The broker's line to the browser, which a test can spoil.
+#[derive(Default)]
+struct Line {
+    /// Set, the broker drops the channel.
+    cut: AtomicBool,
+    /// Set, the broker turns the browser away, as while the computer is off.
+    down: AtomicBool,
+    /// How long the host's replies take, as for a host some way off.
+    round_trip_ms: AtomicU64,
+}
+
 /// The broker and the host behind it: one browser channel at a time, each socket one channel.
 fn broker(
     listener: TcpListener,
     host: Arc<Mutex<FakeHost>>,
     log: Arc<Log>,
     origin: String,
-    cut: Arc<AtomicBool>,
-    down: Arc<AtomicBool>,
+    line: Arc<Line>,
     pending: Pending,
 ) {
     thread::spawn(move || {
@@ -290,7 +301,7 @@ fn broker(
                     *refusal.status_mut() = tungstenite::http::StatusCode::FORBIDDEN;
                     refusal
                 };
-                if down.load(Ordering::SeqCst) {
+                if line.down.load(Ordering::SeqCst) {
                     return Err(refuse());
                 }
                 if header("Origin") != [origin.clone()] || !offered.iter().any(|p| p == "atomics.rendezvous.v1") {
@@ -311,7 +322,7 @@ fn broker(
             host.lock().unwrap().join();
             let mut first = true;
             loop {
-                if cut.swap(false, Ordering::SeqCst) {
+                if line.cut.swap(false, Ordering::SeqCst) {
                     let _ = socket.close(Some(CloseFrame { code: CloseCode::Away, reason: "".into() }));
                     let _ = socket.flush();
                     log.push("cut");
@@ -362,6 +373,10 @@ fn broker(
                 drop(host);
                 match result {
                     Ok(replies) => {
+                        let round_trip = line.round_trip_ms.load(Ordering::SeqCst);
+                        if round_trip > 0 && !replies.is_empty() {
+                            thread::sleep(Duration::from_millis(round_trip));
+                        }
                         for reply in replies {
                             let _ = socket.send(tungstenite::Message::binary(reply));
                         }
@@ -792,9 +807,9 @@ fn the_bundle_pairs_reconnects_and_reloads_in_a_browser() {
         .replace("SESSION_BOOT", &session.to_string());
     let attacker = include_str!("browser/other.html").replace("EVIL_BOOT", &evil.to_string());
     serve_parent(parent, HashMap::from([("/", page), ("/other", attacker)]), log.clone(), phase.clone());
-    let cut = Arc::new(AtomicBool::new(false));
+    let line = Arc::new(Line::default());
     let pending: Pending = Arc::default();
-    broker(tunnel, host.clone(), log.clone(), client_origin.clone(), cut.clone(), Arc::default(), pending.clone());
+    broker(tunnel, host.clone(), log.clone(), client_origin.clone(), line.clone(), pending.clone());
 
     let browser = launch(&["--window-size=420,900".into()], &format!("{parent_origin}/"), &log, OVERALL);
     let devtools = browser.devtools();
@@ -809,7 +824,7 @@ fn the_bundle_pairs_reconnects_and_reloads_in_a_browser() {
     assert_eq!(host.lock().unwrap().allowed.len(), 1, "the host holds the browser's key");
 
     // The broker cuts the channel: a fresh ticket from the parent, the stored key, and a resume.
-    cut.store(true, Ordering::SeqCst);
+    line.cut.store(true, Ordering::SeqCst);
     log.wait("cut", 1);
     log.wait("parent atomics.ticket", 1);
     log.wait("dial ticket-1", 1);
@@ -1033,7 +1048,7 @@ fn the_bundle_works_on_a_phone_by_touch() {
         .replace("PHONE_BOOT", &pair.to_string());
     serve_parent(parent, HashMap::from([("/", page_html)]), log.clone(), phase.clone());
     let pending: Pending = Arc::default();
-    broker(tunnel, host.clone(), log.clone(), client_origin.clone(), Arc::default(), Arc::default(), pending.clone());
+    broker(tunnel, host.clone(), log.clone(), client_origin.clone(), Arc::default(), pending.clone());
 
     // The phone. The client's frame is cross-origin, so it draws in a renderer of its own, which the page's
     // emulation does not reach: its pixel ratio comes from the browser's flag, its user agent too, and its touch
@@ -1303,7 +1318,7 @@ fn the_bundle_draws_the_desktops_frame_in_a_wide_window() {
         .replace("CLIENT_ORIGIN", &client_origin)
         .replace("PHONE_BOOT", &pair.to_string());
     serve_parent(parent, HashMap::from([("/", page_html)]), log.clone(), Arc::new(Mutex::new("go".into())));
-    broker(tunnel, host.clone(), log.clone(), client_origin.clone(), Arc::default(), Arc::default(), Arc::default());
+    broker(tunnel, host.clone(), log.clone(), client_origin.clone(), Arc::default(), Arc::default());
 
     let flags = [
         format!("--window-size={},{}", WIDE.0, WIDE.1),
@@ -1408,10 +1423,7 @@ struct Opened {
     frame: DevTools,
     /// What the client draws with.
     palette: Palette,
-    /// Set, the broker drops the channel.
-    cut: Arc<AtomicBool>,
-    /// Set, the broker turns the browser away, as while the computer is off.
-    down: Arc<AtomicBool>,
+    line: Arc<Line>,
 }
 
 fn open(mut host: FakeHost, size: (f32, f32), touch: bool) -> Opened {
@@ -1438,8 +1450,8 @@ fn open(mut host: FakeHost, size: (f32, f32), touch: bool) -> Opened {
         .replace("CLIENT_ORIGIN", &client_origin)
         .replace("PHONE_BOOT", &pair.to_string());
     serve_parent(parent, HashMap::from([("/", page_html)]), log.clone(), phase.clone());
-    let (cut, down) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
-    broker(tunnel, host.clone(), log.clone(), client_origin.clone(), cut.clone(), down.clone(), Arc::default());
+    let line = Arc::new(Line::default());
+    broker(tunnel, host.clone(), log.clone(), client_origin.clone(), line.clone(), Arc::default());
 
     let scale = if touch { PHONE_SCALE } else { 1.0 };
     let mut flags = vec![
@@ -1480,7 +1492,7 @@ fn open(mut host: FakeHost, size: (f32, f32), touch: bool) -> Opened {
     let parent = ParentOrigin::parse(&parent_origin).expect("a loopback origin");
     let Ok(FromParent::Boot(booted)) = boot::read(&parent, &parent_origin, true, &pair) else { panic!("the boot") };
     let palette = Palette::new(&booted.theme_tokens(), Fonts::default());
-    Opened { host, log, _browser: browser, page, frame, palette, cut, down }
+    Opened { host, log, _browser: browser, page, frame, palette, line }
 }
 
 /// The input is on the terminal, and has the focus.
@@ -2001,7 +2013,7 @@ fn review_commands(host: &Mutex<FakeHost>) -> usize {
 fn a_comment_box_keeps_its_draft_while_the_connection_is_down() {
     let mut board = fake_host::working();
     comment_on_the_host(&mut board);
-    let Opened { host, log, _browser, mut page, mut frame, cut, down, .. } = open(board, WIDE, false);
+    let Opened { host, log, _browser, mut page, mut frame, line, .. } = open(board, WIDE, false);
     log.wait("subscribe s1", 1);
     terminal_input(&mut frame);
     page.click((1456.0, 16.0));
@@ -2015,38 +2027,83 @@ fn a_comment_box_keeps_its_draft_while_the_connection_is_down() {
     page.call("Input.insertText", json!({ "text": "draft" }));
     thread::sleep(Duration::from_millis(300));
 
-    down.store(true, Ordering::SeqCst);
-    cut.store(true, Ordering::SeqCst);
+    line.down.store(true, Ordering::SeqCst);
+    line.cut.store(true, Ordering::SeqCst);
     log.wait("cut", 1);
     thread::sleep(Duration::from_millis(1000));
     keep(&mut page, "wide-comment-offline");
 
     // Enter closes nothing and loses nothing, and what is typed next goes on in the box.
     let before = review_commands(&host);
-    page.key("Enter", 13, Some("\r"));
-    thread::sleep(Duration::from_millis(400));
+    for _ in 0..3 {
+        page.key("Enter", 13, Some("\r"));
+        thread::sleep(Duration::from_millis(150));
+    }
+    thread::sleep(Duration::from_millis(250));
     assert_eq!(frame.eval(TEXT_BOX), json!(true), "the box keeps the keyboard");
     page.call("Input.insertText", json!({ "text": " more" }));
     keep(&mut page, "wide-comment-offline-enter");
 
-    // A comment on the diff has no × meanwhile, and a click on it changes nothing.
+    // A comment on the diff has no × meanwhile.
     page.mouse("mouseMoved", (1196.8, 170.6));
     keep(&mut page, "wide-comment-row-offline");
-    page.click((1196.8, 170.6));
-    keep(&mut page, "wide-comment-row-clicked-offline");
 
-    // Back: the box still has its text, and Enter there sends it.
-    down.store(false, Ordering::SeqCst);
+    // Back: the box still has its text and the keyboard, so Enter sends it without a click.
+    line.down.store(false, Ordering::SeqCst);
     log.wait("hello epoch-1", 1);
     thread::sleep(Duration::from_millis(1500));
     assert_eq!(review_commands(&host), before, "nothing was sent while it was down");
     keep(&mut page, "wide-comment-back");
-    page.click((1374.3, 207.2));
-    frame.wait("the keyboard on the comment box again", TEXT_BOX);
+    assert_eq!(frame.eval(TEXT_BOX), json!(true), "the box kept the keyboard");
     page.key("Enter", 13, Some("\r"));
     wait_host(&host, "the comment", |h| h.board.diffs[0].comments.iter().any(|c| c.body == "draft more"));
     assert_eq!(host.lock().unwrap().board.diffs[0].comments.len(), 2, "the other is still there");
     keep(&mut page, "wide-comment-sent-once-back");
+
+    // Down again, a click on a comment changes nothing.
+    line.down.store(true, Ordering::SeqCst);
+    line.cut.store(true, Ordering::SeqCst);
+    log.wait("cut", 2);
+    thread::sleep(Duration::from_millis(1000));
+    let before = review_commands(&host);
+    page.click((1196.8, 170.6));
+    keep(&mut page, "wide-comment-row-clicked-offline");
+    line.down.store(false, Ordering::SeqCst);
+    log.wait("hello epoch-1", 2);
+    thread::sleep(Duration::from_millis(1000));
+    assert_eq!(review_commands(&host), before);
+    assert_eq!(host.lock().unwrap().board.diffs[0].comments.len(), 2);
+}
+
+#[test]
+#[ignore = "needs the built bundle (scripts/build-web.sh) and Chrome"]
+fn a_click_back_within_a_round_trip_types_at_once() {
+    let Opened { host, log, _browser, mut page, mut frame, line, .. } = open(fake_host::working(), WIDE, false);
+    log.wait("subscribe s1", 1);
+    terminal_input(&mut frame);
+    let (terminal, bar) = ((700.0, 500.0), (362.0, 981.0));
+    const ROUND_TRIP_MS: u64 = 300;
+    line.round_trip_ms.store(ROUND_TRIP_MS, Ordering::SeqCst);
+
+    // Back on the terminal before the host has answered the release, and typing at once.
+    for gap in [0, 100, 200] {
+        page.click(terminal);
+        frame.wait("the focus on the input", FOCUSED);
+        wait_host(&host, "the lease", |h| h.terminals["s1"].lease.is_some());
+        thread::sleep(Duration::from_millis(ROUND_TRIP_MS + 300));
+        page.click(bar);
+        frame.wait("the keyboard on the steer bar", TEXT_BOX);
+        thread::sleep(Duration::from_millis(gap));
+        if gap == 100 {
+            keep(&mut page, "wide-release-on-its-way");
+        }
+        page.click(terminal);
+        thread::sleep(Duration::from_millis(40));
+        let word = format!("[{gap}]");
+        page.call("Input.insertText", json!({ "text": word }));
+        wait_host(&host, "what was typed", |h| h.terminals["s1"].typed.contains(&word));
+        assert_eq!(frame.eval(FOCUSED), json!(true), "one click was enough, {gap} ms after the release");
+    }
 }
 
 #[test]
