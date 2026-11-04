@@ -486,13 +486,11 @@ fn graphql(seen: &Seen, data: &Data) -> Response {
 /// A `gh` that records its arguments in `gh-argv` beside it and prints `token`, or fails like a
 /// signed-out gh when there is none.
 pub fn gh(dir: &Path, token: Option<&str>) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let program = dir.join(if token.is_some() { "gh" } else { "gh-signed-out" });
     let script = match token {
         Some(token) => format!("#!/bin/sh\nprintf '%s\\n' \"$*\" > \"${{0%/*}}/gh-argv\"\nprintf '%s\\n' '{token}'\n"),
         None => "#!/bin/sh\necho 'You are not logged into any GitHub hosts.' >&2\nexit 1\n".to_string(),
     };
-    std::fs::write(&program, script).unwrap();
-    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::test_support::write_program(&program, script);
     program
 }

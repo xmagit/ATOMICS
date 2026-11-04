@@ -197,7 +197,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn replaced_linux_executable_still_resolves_the_installation() {
         use crate::test_support::{CHILD_TIMEOUT, TestChild};
-        use std::os::unix::fs::PermissionsExt;
         use std::time::{Duration, Instant};
 
         const CHILD: &str = "ATOMICS_REPLACED_EXE_TEST";
@@ -219,7 +218,7 @@ mod tests {
         }
         let dir = crate::test_support::tempdir().unwrap();
         let executable = dir.path().join("atomics with spaces");
-        std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        crate::test_support::copy_program(std::env::current_exe().unwrap(), &executable);
         let mut child = TestChild::spawn(
             std::process::Command::new(&executable)
                 .args([
@@ -236,8 +235,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         let replacement = dir.path().join("replacement");
-        std::fs::write(&replacement, "#!/bin/sh\ntest \"$1\" = --version\n").unwrap();
-        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::write_program(&replacement, "#!/bin/sh\ntest \"$1\" = --version\n");
         std::fs::rename(replacement, &executable).unwrap();
         std::fs::write(executable.with_extension("updated"), "updated").unwrap();
         let output = child.wait_output().unwrap();
@@ -251,17 +249,15 @@ mod tests {
 
     #[test]
     fn version_probe_times_out_even_after_printing_a_valid_version() {
-        use std::os::unix::fs::PermissionsExt;
         use std::time::{Duration, Instant};
         let dir = crate::test_support::tempdir().unwrap();
         let program = dir.path().join("codex");
-        std::fs::write(&program, "#!/bin/sh\nprintf 'codex-cli 0.165.0\\n'\nexec sleep 30\n").unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::write_program(&program, "#!/bin/sh\nprintf 'codex-cli 0.165.0\\n'\nexec sleep 30\n");
         let started = Instant::now();
         assert_eq!(codex_supports_hooks(program.to_str().unwrap(), Duration::from_millis(100)), None);
         assert!(started.elapsed() < Duration::from_secs(5));
         for script in ["#!/bin/sh\nexit 1\n", "#!/bin/sh\nprintf 'not a version\\n'\n"] {
-            std::fs::write(&program, script).unwrap();
+            crate::test_support::write_program(&program, script);
             assert_eq!(codex_supports_hooks(program.to_str().unwrap(), Duration::from_secs(10)), None);
         }
         assert_eq!(codex_supports_hooks("/no/such/codex", Duration::from_secs(1)), None);
@@ -269,12 +265,13 @@ mod tests {
 
     #[test]
     fn version_probe_runs_in_the_root_folder() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = crate::test_support::tempdir().unwrap();
         let program = dir.path().join("codex");
         // Like the VM wrapper, it answers only from a folder the other side is sure to have.
-        std::fs::write(&program, "#!/bin/sh\n[ \"$(pwd)\" = / ] || exit 66\nprintf 'codex-cli 0.166.0\\n'\n").unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::write_program(
+            &program,
+            "#!/bin/sh\n[ \"$(pwd)\" = / ] || exit 66\nprintf 'codex-cli 0.166.0\\n'\n",
+        );
         assert_eq!(codex_supports_hooks(program.to_str().unwrap(), std::time::Duration::from_secs(10)), Some(true));
     }
 
@@ -282,8 +279,7 @@ mod tests {
     fn successful_version_probe_tolerates_slow_startup() {
         let dir = crate::test_support::tempdir().unwrap();
         let program = dir.path().join("codex");
-        std::fs::write(&program, "#!/bin/sh\nsleep 1.1\nprintf 'codex-cli 0.165.0\\n'\n").unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::write_program(&program, "#!/bin/sh\nsleep 1.1\nprintf 'codex-cli 0.165.0\\n'\n");
         assert_eq!(codex_supports_hooks(program.to_str().unwrap(), std::time::Duration::from_secs(10)), Some(true));
     }
 

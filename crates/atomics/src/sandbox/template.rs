@@ -522,7 +522,6 @@ mod tests {
 
     #[test]
     fn preparation_stages_tracked_edits_and_removes_source_even_when_the_build_fails() {
-        use std::os::unix::fs::PermissionsExt;
         for (succeeds, package) in [(true, ""), (true, "app-core"), (false, "")] {
             let dir = crate::test_support::tempdir().unwrap();
             let repo = dir.path().join("repo");
@@ -550,8 +549,7 @@ mod tests {
                 ),
             ] {
                 let path = bin.join(name);
-                std::fs::write(&path, script).unwrap();
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+                crate::test_support::write_program(&path, script);
             }
             let output = Command::new("bash")
                 .args(["-c", include_str!("template.sh"), "atomics-template"])
@@ -576,7 +574,6 @@ mod tests {
 
     #[test]
     fn dotnet_preparation_runs_the_installer_in_bash_with_the_sdk_pin_or_fallback() {
-        use std::os::unix::fs::PermissionsExt;
         for pinned in [true, false] {
             let dir = crate::test_support::tempdir().unwrap();
             let repo = dir.path().join("repo");
@@ -619,8 +616,7 @@ printf '%s\n' "$@" > "$HOME/build-args"
                 ),
             ] {
                 let path = bin.join(name);
-                std::fs::write(&path, script).unwrap();
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+                crate::test_support::write_program(&path, script);
             }
             let output = Command::new("bash")
                 .args(["-c", include_str!("template.sh"), "atomics-template"])

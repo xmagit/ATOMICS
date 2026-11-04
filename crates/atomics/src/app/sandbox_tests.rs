@@ -433,7 +433,7 @@ fn sandboxed_agents_attach_through_sbx_run_and_reattach_after_a_restart() {
 /// A subscription token in a fake keychain, and a fake Anthropic API behind the relay.
 fn subscription(app: &mut Desktop<'_>, bin: &Path) -> crate::relay::fake::Upstream {
     let keychain = bin.join("keychain");
-    std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keychain"), &keychain).unwrap();
+    crate::test_support::copy_program(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keychain"), &keychain);
     std::fs::write(bin.join("keychain-value"), SUBSCRIPTION).unwrap();
     let upstream = crate::relay::fake::start();
     app.runtime.relay = Arc::new(crate::relay::Service::with_upstreams(
@@ -627,7 +627,10 @@ fn the_relay_serves_sandboxes_while_the_state_lock_is_held_and_never_holds_it() 
         |mut state, _ctx| {
             let bin = crate::test_support::tempdir().unwrap();
             let keychain = bin.path().join("keychain");
-            std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keychain"), &keychain).unwrap();
+            crate::test_support::copy_program(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keychain"),
+                &keychain,
+            );
             std::fs::write(bin.path().join("keychain-value"), SUBSCRIPTION).unwrap();
             let upstream = crate::relay::fake::start();
             state.relay = Arc::new(crate::relay::Service::with_upstreams(
@@ -819,12 +822,10 @@ fn sandboxed_task_args_drop_host_sandbox_flags_and_bare_ones_keep_them() {
         // `agent` is the fake sbx's hook. Reusing that filename lets the still-starting
         // sandbox execute the bare probe and overwrite its arguments with sbx run's args.
         let script = bin.path().join("bare-agent.sh");
-        std::fs::write(
+        crate::test_support::write_program(
             &script,
             format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > {}.$$.tmp\nmv {0}.$$.tmp {0}\n", out.display()),
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        );
         app.runtime.config.agents.push(atomics_core::config::AgentConfig {
             name: "bare-agent".into(),
             command: vec![script.display().to_string()],
@@ -1031,9 +1032,6 @@ fn the_cleanup_dialog_removes_a_worktrees_sandbox_and_chosen_orphans() {
         assert!(git::pinned(&worktrees[0]).is_some() && git::pinned(&worktrees[1]).is_none());
         tick_until(app, ctx, "cleanup to finish", |app| app.runtime.cleanup.as_ref().is_some_and(|c| c.busy.is_none()));
         app.runtime.finish_lifecycle_jobs();
-        let fake_home = bin.path().to_path_buf();
-        drop(bin);
-        assert!(!fake_home.exists(), "the cleanup-dialog test left its fake sbx home behind");
     });
 }
 

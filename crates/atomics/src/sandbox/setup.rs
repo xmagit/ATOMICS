@@ -554,7 +554,7 @@ mod tests {
         let dir = crate::test_support::tempdir().unwrap();
         let sbx = fake::install(dir.path()).to_string_lossy().into_owned();
         let keychain = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keychain");
-        std::fs::copy(keychain, dir.path().join("keychain")).unwrap();
+        crate::test_support::copy_program(keychain, dir.path().join("keychain"));
         (dir, sbx)
     }
 

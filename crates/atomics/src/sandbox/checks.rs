@@ -564,7 +564,10 @@ mod tests {
         let dir = fixture();
         let dir = dir.path();
         let program = dir.join("keychain");
-        std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keychain"), &program).unwrap();
+        crate::test_support::copy_program(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keychain"),
+            &program,
+        );
         let keychain = crate::relay::Keychain::at(&program, cfg!(target_os = "macos"));
         let mut config = atomics_core::config::Config::default();
         assert!(claude_sandboxed(&config, None), "the default claude agent follows the sandbox mode");

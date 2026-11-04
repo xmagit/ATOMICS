@@ -159,8 +159,7 @@ impl Typer {
                     self.apply(&envelope);
                 }
                 Ok(_) => {}
-                Err(tungstenite::Error::Io(e))
-                    if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+                Err(tungstenite::Error::Io(e)) if crate::test_support::nothing_yet(&e) => {}
                 Err(e) => panic!("the connection ended: {e}"),
             }
         }

@@ -585,8 +585,6 @@ mod tests {
 
     #[test]
     fn doctor_reports_new_checks_without_changing_warning_exit_codes() {
-        use std::os::unix::fs::PermissionsExt;
-
         const CHILD: &str = "ATOMICS_DOCTOR_TEST_CHILD";
         if std::env::var_os(CHILD).is_some() {
             assert_eq!(run(None), 0);
@@ -608,9 +606,10 @@ mod tests {
         .unwrap();
         let merged = repo.with_file_name("merged");
         let shell = bin.join("shell");
-        std::fs::write(&shell, format!("#!/bin/sh\nprintf '__ATOMICS__{}:/usr/bin:/bin__ATOMICS__'\n", bin.display()))
-            .unwrap();
-        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::write_program(
+            &shell,
+            format!("#!/bin/sh\nprintf '__ATOMICS__{}:/usr/bin:/bin__ATOMICS__'\n", bin.display()),
+        );
         let codex = bin.join("codex");
         for (probe, allow, bad_plan) in [
             ("printf 'codex-cli 0.165.0\\n'", "rg", false),
@@ -621,8 +620,7 @@ mod tests {
             if probe == "missing" {
                 std::fs::remove_file(&codex).unwrap();
             } else {
-                std::fs::write(&codex, format!("#!/bin/sh\n{probe}\n")).unwrap();
-                std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+                crate::test_support::write_program(&codex, format!("#!/bin/sh\n{probe}\n"));
             }
             std::fs::write(&config, format!("base_ref = \"main\"\n[approvals]\nallow = [\"{allow}\"]\n")).unwrap();
             if bad_plan {
@@ -677,8 +675,6 @@ mod tests {
 
     #[test]
     fn json_lists_checks_with_hints_and_never_quotes_config_lines_or_secrets() {
-        use std::os::unix::fs::PermissionsExt;
-
         const CHILD: &str = "ATOMICS_DOCTOR_JSON_CHILD";
         if std::env::var_os(CHILD).is_some() {
             let config = paths::config_file();
@@ -738,9 +734,10 @@ mod tests {
         let bin = dir.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
         let shell = bin.join("shell");
-        std::fs::write(&shell, format!("#!/bin/sh\nprintf '__ATOMICS__{}:/usr/bin:/bin__ATOMICS__'\n", bin.display()))
-            .unwrap();
-        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::write_program(
+            &shell,
+            format!("#!/bin/sh\nprintf '__ATOMICS__{}:/usr/bin:/bin__ATOMICS__'\n", bin.display()),
+        );
         let output = crate::test_support::output(
             Command::new(std::env::current_exe().unwrap())
                 .args([

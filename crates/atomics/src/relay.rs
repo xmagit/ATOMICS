@@ -1659,8 +1659,10 @@ mod tests {
         let dir = crate::test_support::tempdir().unwrap();
         let upstream = fake::start();
         let keychain = dir.path().join("keychain");
-        std::fs::copy(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keychain"), &keychain)
-            .unwrap();
+        crate::test_support::copy_program(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keychain"),
+            &keychain,
+        );
         let home = dir.path().join("home");
         let upstreams = HashMap::from([(ANTHROPIC.to_string(), upstream.url.clone())]);
         for mac in [true, false] {
@@ -1712,8 +1714,10 @@ mod tests {
     fn the_keychain_stores_and_reads_a_token_on_both_systems_without_it_in_argv() {
         let dir = crate::test_support::tempdir().unwrap();
         let program = dir.path().join("keychain");
-        std::fs::copy(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keychain"), &program)
-            .unwrap();
+        crate::test_support::copy_program(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keychain"),
+            &program,
+        );
         for mac in [true, false] {
             let keychain = Keychain::at(&program, mac);
             crate::credentials::Store::new(keychain.clone()).put("claude", TOKEN, None).unwrap();

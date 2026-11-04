@@ -1594,7 +1594,6 @@ mod tests {
     #[test]
     fn codex_version_is_cached_per_program_without_blocking_launch() {
         with_app("app::sessions::tests::codex_version_is_cached_per_program_without_blocking_launch", |app, _ctx| {
-            use std::os::unix::fs::PermissionsExt;
             let dir = crate::test_support::tempdir().unwrap();
             let script = r#"#!/bin/sh
 dir=${0%/*}
@@ -1615,12 +1614,10 @@ fi
                 let folder = dir.path().join(name);
                 std::fs::create_dir(&folder).unwrap();
                 let program = folder.join("codex");
-                std::fs::write(
+                crate::test_support::write_program(
                     &program,
                     if name == "two" { script.replace("0.165.0", "0.164.0") } else { script.to_string() },
-                )
-                .unwrap();
-                std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+                );
                 app.runtime.config.agents.push(atomics_core::config::AgentConfig {
                     name: name.into(),
                     command: vec![program.to_string_lossy().into_owned()],
@@ -1708,7 +1705,6 @@ fi
         with_app(
             "app::sessions::tests::failed_codex_probes_are_retried_and_recovered_launches_get_hooks",
             |app, _ctx| {
-                use std::os::unix::fs::PermissionsExt;
                 let dir = crate::test_support::tempdir().unwrap();
                 let program = dir.path().join("codex");
                 let name = program.to_string_lossy().into_owned();
@@ -1720,13 +1716,12 @@ fi
                     isolation: None,
                 });
                 for script in ["#!/bin/sh\nexec sleep 30\n", "#!/bin/sh\nexit 1\n"] {
-                    std::fs::write(&program, script).unwrap();
-                    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+                    crate::test_support::write_program(&program, script);
                     let failed = Arc::new(OnceLock::new());
                     failed.set(crate::setup::codex_supports_hooks(&name, Duration::from_millis(100))).unwrap();
                     assert_eq!(failed.get(), Some(&None));
                     app.runtime.codex_versions.insert(name.clone(), failed.clone());
-                    std::fs::write(
+                    crate::test_support::write_program(
                         &program,
                         r#"#!/bin/sh
 if [ "$1" = --version ]; then
@@ -1735,8 +1730,7 @@ else
   printf '%s\n' "$@" > launch-args
 fi
 "#,
-                    )
-                    .unwrap();
+                    );
                     let id = app.runtime.start("flaky", dir.path().into(), None, vec![], None).unwrap();
                     let retried = app.runtime.codex_versions[&name].clone();
                     assert!(!Arc::ptr_eq(&failed, &retried), "failed probes must not be reused as old versions");
@@ -2027,10 +2021,9 @@ fi
             assert_eq!(worktree.root, dir);
             return;
         }
-        use std::os::unix::fs::PermissionsExt;
         let dir = crate::test_support::tempdir().unwrap();
         let git = dir.path().join("git");
-        std::fs::write(
+        crate::test_support::write_program(
             &git,
             r#"#!/bin/sh
 attempts=0
@@ -2047,9 +2040,7 @@ case "$5" in
   symbolic-ref) printf 'feature\n' ;;
 esac
 "#,
-        )
-        .unwrap();
-        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let output = crate::test_support::output(
             std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "app::sessions::tests::session_start_does_not_wait_for_git", "--nocapture"])

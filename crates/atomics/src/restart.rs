@@ -183,14 +183,14 @@ mod tests {
         let exe = dir.path().join("atomics");
         let timeout = crate::test_support::scaled_timeout(Duration::from_secs(60));
         assert!(check_version(&exe, timeout).unwrap_err().to_string().contains("missing"));
-        std::fs::write(&exe, "#!/bin/sh\nexit 0\n").unwrap();
+        crate::test_support::write_program(&exe, "#!/bin/sh\nexit 0\n");
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(check_version(&exe, timeout).is_err());
-        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
-        std::fs::write(&exe, "#!/bin/sh\ntest \"$1\" = --version\n").unwrap();
+        crate::test_support::write_program(&exe, "#!/bin/sh\ntest \"$1\" = --version\n");
         check_version(&exe, timeout).unwrap();
-        std::fs::write(&exe, "#!/bin/sh\nexit 42\n").unwrap();
+        crate::test_support::write_program(&exe, "#!/bin/sh\nexit 42\n");
         assert!(check_version(&exe, timeout).unwrap_err().to_string().contains("failed"));
-        std::fs::write(&exe, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        crate::test_support::write_program(&exe, "#!/bin/sh\nexec sleep 30\n");
         assert!(check_version(&exe, Duration::from_millis(30)).unwrap_err().to_string().contains("timed out"));
     }
 }

@@ -813,14 +813,12 @@ fn capture() -> Result<File> {
 /// The fake `sbx` in `tests/fixtures/sbx`, for tests here and in the app.
 #[cfg(test)]
 pub(crate) mod fake {
-    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
 
     /// Copies the fake into `dir`, where it keeps its state and call log, and returns its path.
     pub fn install(dir: &Path) -> PathBuf {
         let program = dir.join("sbx");
-        std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sbx"), &program).unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::copy_program(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sbx"), &program);
         program
     }
 
@@ -1057,7 +1055,10 @@ mod tests {
         let bin = crate::test_support::tempdir().unwrap();
         let sbx = fake::install(bin.path());
         let keychain = bin.path().join("keychain");
-        std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keychain"), &keychain).unwrap();
+        crate::test_support::copy_program(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keychain"),
+            &keychain,
+        );
         std::fs::write(bin.path().join("keychain-value"), "sk-ant-oat01-PRIVATE-token").unwrap();
         let mut job = job(&sbx, "atomics-c1", &repo, SandboxConfig::default());
         job.config.azure.enabled = false;

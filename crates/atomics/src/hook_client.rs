@@ -115,7 +115,6 @@ fn forward_with_wait_duration(
 mod tests {
     use super::*;
     use crate::test_support::{CHILD_TIMEOUT, TestChild};
-    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
     use std::process::{Command, Stdio};
 
@@ -236,12 +235,10 @@ mod tests {
         let listener = UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let ps = dir.path().join("ps");
-        std::fs::write(
+        crate::test_support::write_program(
             &ps,
             "#!/bin/sh\nprintf 'called\\n' >> \"$ATOMICS_PS_LOG\"\nprintf '%s 4242\\n4242 1\\n' \"$PPID\"\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&ps, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         for event in ["SessionStart", "PermissionRequest", "PostToolUse", "Interrupt"] {
             let mut child = TestChild::spawn(
                 Command::new(std::env::current_exe().unwrap())
@@ -299,8 +296,7 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         // A ps that fails proves ancestry is never consulted.
         let ps = dir.path().join("ps");
-        std::fs::write(&ps, "#!/bin/sh\nexit 1\n").unwrap();
-        std::fs::set_permissions(&ps, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::write_program(&ps, "#!/bin/sh\nexit 1\n");
         let mut child = TestChild::spawn(
             Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "hook_client::tests::a_pane_from_the_session_environment_replaces_ancestry"])

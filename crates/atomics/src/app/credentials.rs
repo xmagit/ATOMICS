@@ -379,22 +379,19 @@ mod tests {
         super::super::tests::with_app(
             "app::credentials::tests::credentials_bare_claude_launch_uses_a_placeholder_and_revokes_it_on_exit",
             |app, _ctx| {
-                use std::os::unix::fs::PermissionsExt;
                 let (dir, keychain, store) = crate::credentials::tests::machine(cfg!(target_os = "macos"));
                 let token = "sk-ant-oat01-PRIVATE-BARE";
                 store.put("claude", token, None).unwrap();
                 let script = dir.path().join("claude-probe");
                 let output = dir.path().join("env-and-args");
-                std::fs::write(
+                crate::test_support::write_program(
                     &script,
                     format!(
                         "#!/bin/sh\nenv > '{}'\nprintf '%s\\n' \"$@\" >> '{}'\n",
                         output.display(),
                         output.display()
                     ),
-                )
-                .unwrap();
-                std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+                );
                 let relay = Arc::new(crate::relay::Service::transient(dir.path().join("state"), keychain));
                 app.runtime.relay = relay.clone();
                 app.runtime.config.isolation.mode = atomics_core::isolation::IsolationMode::Bare;

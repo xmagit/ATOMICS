@@ -670,8 +670,7 @@ pub(crate) mod tests {
     /// A browser that records each URL it is asked to open in `opened` beside it.
     pub fn browser(dir: &Path) -> Browser {
         let program = dir.join("browser");
-        std::fs::write(&program, "#!/bin/sh\nprintf '%s\\n' \"$1\" >> \"${0%/*}/opened\"\n").unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::write_program(&program, "#!/bin/sh\nprintf '%s\\n' \"$1\" >> \"${0%/*}/opened\"\n");
         Browser::at(program.display().to_string())
     }
 

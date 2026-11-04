@@ -719,7 +719,10 @@ pub(crate) mod tests {
     pub fn machine(mac: bool) -> (crate::test_support::TempDir, Keychain, Store) {
         let dir = crate::test_support::tempdir().unwrap();
         let program = dir.path().join("keychain");
-        std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keychain"), &program).unwrap();
+        crate::test_support::copy_program(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keychain"),
+            &program,
+        );
         let keychain = Keychain::at(&program, mac);
         let store = Store::new(keychain.clone());
         (dir, keychain, store)

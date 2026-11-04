@@ -579,7 +579,7 @@ mod tests {
     #[test]
     #[cfg(feature = "native")]
     fn policy_checks_real_cargo_paths() {
-        use std::os::unix::fs::{PermissionsExt, symlink};
+        use std::os::unix::fs::symlink;
         use std::process::Command;
 
         // Isolate PATH in a child, without mutating the environment of parallel tests.
@@ -590,8 +590,7 @@ mod tests {
             }
             for folder in ["first", "second", "configured"] {
                 let path = dir.path().join(folder).join("cargo");
-                std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+                crate::test_support::write_program(&path, "#!/bin/sh\nexit 0\n");
             }
             symlink(dir.path().join("first/cargo"), dir.path().join("linked/cargo")).unwrap();
             symlink(dir.path().join("first/cargo"), dir.path().join("linked/rustc")).unwrap();
@@ -636,7 +635,6 @@ mod tests {
     #[test]
     #[cfg(feature = "native")]
     fn relative_path_entries_never_make_an_agent_cargo_trusted() {
-        use std::os::unix::fs::PermissionsExt;
         use std::process::Command;
 
         // Isolate PATH in a child, without mutating the environment of parallel tests.
@@ -645,10 +643,9 @@ mod tests {
             for folder in ["host", "worktree/bin"] {
                 std::fs::create_dir_all(dir.path().join(folder)).unwrap();
                 let path = dir.path().join(folder).join("cargo");
-                std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+                crate::test_support::write_program(&path, "#!/bin/sh\nexit 0\n");
             }
-            std::fs::copy(dir.path().join("host/cargo"), dir.path().join("worktree/cargo")).unwrap();
+            crate::test_support::copy_program(dir.path().join("host/cargo"), dir.path().join("worktree/cargo"));
             let path = std::env::join_paths([PathBuf::new(), PathBuf::from("bin"), dir.path().join("host")]).unwrap();
             let output = crate::test_support::output(
                 Command::new(std::env::current_exe().unwrap())

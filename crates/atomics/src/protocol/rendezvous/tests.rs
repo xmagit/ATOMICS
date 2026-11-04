@@ -130,7 +130,7 @@ impl Admitted {
                 }
                 Ok(tungstenite::Message::Close(_)) => return None,
                 Ok(_) => {}
-                Err(tungstenite::Error::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(tungstenite::Error::Io(e)) if crate::test_support::nothing_yet(&e) => {}
                 Err(_) => return None,
             }
         }
@@ -334,6 +334,15 @@ struct Fixture {
     devices: Arc<Devices>,
     _server: Server,
     _dir: crate::test_support::TempDir,
+}
+
+impl Drop for Fixture {
+    /// `stop` gives the channels' threads 2 s, as a quit should, and a loaded machine can take
+    /// longer. Each writes `devices.json` as its session ends, and `_dir` goes next.
+    fn drop(&mut self) {
+        self.rendezvous.stop();
+        self.rendezvous.crew.wait(Instant::now() + wait(Duration::from_secs(60)));
+    }
 }
 
 const PAIR_URL: &str = "https://service.example/atomics/pair#{pairing}";
@@ -1062,7 +1071,7 @@ fn stopping_closes_the_tunnel_normally_and_ends_every_channel() {
         match socket.ws.read() {
             Ok(tungstenite::Message::Close(frame)) => break frame.map(|f| u16::from(f.code)),
             Ok(_) => {}
-            Err(tungstenite::Error::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(tungstenite::Error::Io(e)) if crate::test_support::nothing_yet(&e) => {}
             Err(e) => panic!("no close frame: {e}"),
         }
     };

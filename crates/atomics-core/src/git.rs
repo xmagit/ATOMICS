@@ -1335,14 +1335,13 @@ pub(crate) mod tests {
     /// What a sandbox can plant in a git folder it writes: a git folder of its own that sees the
     /// repository's objects and refs, with a config whose fsmonitor and hooks leave `marker`.
     fn plant_hostile_git_dir(evil: &Path, real: &Path, head: &str, marker: &Path) {
-        use std::os::unix::fs::{PermissionsExt, symlink};
+        use std::os::unix::fs::symlink;
         std::fs::create_dir_all(evil.join("hooks")).unwrap();
         symlink(real.join("objects"), evil.join("objects")).unwrap();
         symlink(real.join("refs"), evil.join("refs")).unwrap();
         std::fs::write(evil.join("HEAD"), format!("ref: {head}\n")).unwrap();
         let hook = evil.join("hooks/reference-transaction");
-        std::fs::write(&hook, format!("#!/bin/sh\n: > '{}'\n", marker.display())).unwrap();
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::write_program(&hook, format!("#!/bin/sh\n: > '{}'\n", marker.display()));
         let config = format!(
             "[core]\n\trepositoryformatversion = 0\n\tfsmonitor = {}\n\thooksPath = {}\n",
             hook.display(),
@@ -1680,7 +1679,6 @@ pub(crate) mod tests {
 
     #[test]
     fn hooks_and_fsmonitor_never_run_in_a_repository_with_a_sandbox() {
-        use std::os::unix::fs::PermissionsExt;
         let (dir, repo) = project();
         let marker = dir.path().join("hook-ran");
         let worktree = repo.with_file_name("app-task");
@@ -1692,8 +1690,7 @@ pub(crate) mod tests {
             std::fs::create_dir_all(checkout.join(".hooks")).unwrap();
             for hook in ["pre-commit", "post-commit", "reference-transaction", "fsmonitor"] {
                 let path = checkout.join(".hooks").join(hook);
-                std::fs::write(&path, format!("#!/bin/sh\n: > '{}'\n", marker.display())).unwrap();
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+                crate::test_support::write_program(&path, format!("#!/bin/sh\n: > '{}'\n", marker.display()));
             }
         }
         commit_all(&repo, "unsandboxed").unwrap();
@@ -2008,7 +2005,6 @@ pub(crate) mod tests {
 
     #[test]
     fn worktree_creation_is_serialized_across_checkouts_of_one_repository() {
-        use std::os::unix::fs::PermissionsExt;
         use std::sync::mpsc::channel;
         use std::time::{Duration, Instant};
 
@@ -2020,11 +2016,14 @@ pub(crate) mod tests {
         let started = repo.join(".git/creation-started");
         let release = repo.join(".git/creation-release");
         let hook = repo.join(".git/hooks/reference-transaction");
-        std::fs::write(&hook, format!(
-            "#!/bin/sh\n[ \"$1\" = prepared ] || exit 0\n: > '{}'\nattempts=0\nwhile [ ! -f '{}' ]; do\n  attempts=$((attempts + 1))\n  [ \"$attempts\" -lt 1000 ] || exit 1\n  sleep 0.01\ndone\n",
-            started.display(), release.display(),
-        )).unwrap();
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::write_program(
+            &hook,
+            format!(
+                "#!/bin/sh\n[ \"$1\" = prepared ] || exit 0\n: > '{}'\nattempts=0\nwhile [ ! -f '{}' ]; do\n  attempts=$((attempts + 1))\n  [ \"$attempts\" -lt 1000 ] || exit 1\n  sleep 0.01\ndone\n",
+                started.display(),
+                release.display(),
+            ),
+        );
         let (tx, rx) = channel();
         std::thread::scope(|scope| {
             let tx_first = tx.clone();

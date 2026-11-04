@@ -949,12 +949,11 @@ mod tests {
     fn integration_checks_run_in_background_and_ignore_invalidated_results() {
         let name = "app::integrations::tests::integration_checks_run_in_background_and_ignore_invalidated_results";
         if std::env::var_os("ATOMICS_APP_TEST_CHILD").is_none() {
-            use std::os::unix::fs::PermissionsExt;
             let dir = crate::test_support::tempdir().unwrap();
             let real_git = crate::setup::resolve_program("git");
             let real_git = format!("'{}'", real_git.replace('\'', "'\\''"));
             let wrapper = dir.path().join("git");
-            std::fs::write(
+            crate::test_support::write_program(
                 &wrapper,
                 format!(
                     r#"#!/bin/sh
@@ -971,9 +970,7 @@ exec {} "$@"
 "#,
                     real_git
                 ),
-            )
-            .unwrap();
-            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+            );
             let path = format!("{}:{}", dir.path().display(), std::env::var("PATH").unwrap());
             let output = crate::test_support::output(
                 std::process::Command::new(std::env::current_exe().unwrap())
@@ -1187,7 +1184,6 @@ exec {} "$@"
 
     #[test]
     fn integrations_in_different_repositories_can_finish_independently() {
-        use std::os::unix::fs::PermissionsExt;
         with_app(
             "app::integrations::tests::integrations_in_different_repositories_can_finish_independently",
             |app, _| {
@@ -1200,7 +1196,7 @@ exec {} "$@"
                 // the test: a failed test drops its folder (often before the hook sees `release`), so
                 // the hook also stops when the folder is gone, and after a few minutes at most.
                 // Otherwise every failure would leave a loop starting processes and loading the machine.
-                std::fs::write(
+                crate::test_support::write_program(
                     &hook,
                     format!(
                         "#!/bin/sh\ntouch '{}'\nattempts=0\nwhile [ ! -f '{}' ]; do\n  [ -d '{}' ] || exit 1\n  \
@@ -1209,9 +1205,7 @@ exec {} "$@"
                         release.display(),
                         dir1.path().display()
                     ),
-                )
-                .unwrap();
-                std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+                );
                 app.runtime.config.worktree_path = "{repo_parent}/{slug}".into();
                 let mut indices = Vec::new();
                 for (goal, repo) in [("One", &repo1), ("Two", &repo2)] {

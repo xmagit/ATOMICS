@@ -161,7 +161,10 @@ pub(crate) mod tests {
 
     pub fn fake(dir: &std::path::Path) -> PathBuf {
         let program = dir.join("az");
-        std::fs::copy(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/az"), &program).unwrap();
+        crate::test_support::copy_program(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/az"),
+            &program,
+        );
         expiry(dir, SystemTime::now() + Duration::from_secs(3600));
         program
     }
@@ -208,7 +211,6 @@ pub(crate) mod tests {
 
     #[test]
     fn azure_is_found_on_the_login_shell_path_on_both_hosts() {
-        use std::os::unix::fs::PermissionsExt;
         const CHILD: &str = "ATOMICS_AZURE_DISCOVERY_CHILD";
         if std::env::var_os(CHILD).is_some() {
             let azure =
@@ -224,8 +226,7 @@ pub(crate) mod tests {
             "#!/bin/sh\nprintf '%s\\n' \"$*\" > '{0}/shell-argv'\nprintf '__ATOMICS__{0}:/usr/bin:/bin__ATOMICS__'\n",
             dir.path().display()
         );
-        std::fs::write(&shell, script).unwrap();
-        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::test_support::write_program(&shell, script);
         let output = crate::test_support::output(
             Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "relay::azure::tests::azure_is_found_on_the_login_shell_path_on_both_hosts"])
@@ -239,12 +240,13 @@ pub(crate) mod tests {
 
     #[test]
     fn a_hung_azure_cli_and_its_helpers_are_killed_without_capturing_output() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = crate::test_support::tempdir().unwrap();
         let program = dir.path().join("az");
         let marker = dir.path().join("helper-leaked");
-        std::fs::write(&program, format!("#!/bin/sh\n(sleep 0.4; touch '{}') & wait\n", marker.display())).unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::test_support::write_program(
+            &program,
+            format!("#!/bin/sh\n(sleep 0.4; touch '{}') & wait\n", marker.display()),
+        );
         let azure = Azure::new(program, AzureConfig::default());
         assert_eq!(
             azure.output("https://api.applicationinsights.io", Duration::from_millis(100)).unwrap_err(),

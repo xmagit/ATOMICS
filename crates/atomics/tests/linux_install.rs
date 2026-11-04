@@ -4,13 +4,12 @@
 mod test_support;
 
 use std::io::Write;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
 fn script(path: &Path, text: &str) {
-    std::fs::write(path, text).unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    test_support::write_program(path, text);
 }
 
 #[test]

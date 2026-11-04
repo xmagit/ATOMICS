@@ -266,7 +266,6 @@ mod tests {
 
     #[test]
     fn branch_config_cleanup_is_independent_of_git_language() {
-        use std::os::unix::fs::PermissionsExt;
         use std::process::Command;
 
         const CHILD: &str = "ATOMICS_CLEANUP_TEST_CHILD";
@@ -277,7 +276,7 @@ mod tests {
                 .find(|path| path.is_file())
                 .unwrap();
             let wrapper = dir.path().join("git");
-            std::fs::write(
+            crate::test_support::write_program(
                 &wrapper,
                 r#"#!/bin/sh
 if [ "$7" = --remove-section ]; then
@@ -290,9 +289,7 @@ if [ "$7" = --remove-section ]; then
 fi
 exec "$ATOMICS_TEST_REAL_GIT" "$@"
 "#,
-            )
-            .unwrap();
-            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+            );
             let output = crate::test_support::output(
                 Command::new(std::env::current_exe().unwrap())
                     .args([

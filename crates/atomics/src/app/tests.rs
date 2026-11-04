@@ -48,11 +48,14 @@ pub(super) fn with_state(name: &str, test: impl FnOnce(State, &egui::Context)) {
         use std::os::unix::fs::DirBuilderExt;
         let runtime = dir.path().join("runtime");
         std::fs::DirBuilder::new().mode(0o700).create(&runtime).unwrap();
+        let folders = dir.path().join("tmp");
+        std::fs::create_dir(&folders).unwrap();
         let output = crate::test_support::output(
             std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", name, "--nocapture"])
                 .current_dir(dir.path())
                 .env("ATOMICS_APP_TEST_CHILD", "1")
+                .env(crate::test_support::CHILD_FOLDERS, folders)
                 .env("CODEX_HOME", dir.path().join("codex"))
                 .env("CLAUDE_CONFIG_DIR", dir.path().join("claude"))
                 .env("HOME", dir.path())

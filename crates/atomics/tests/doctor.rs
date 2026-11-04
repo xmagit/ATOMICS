@@ -1,7 +1,6 @@
 #[path = "../../../tests/support.rs"]
 mod test_support;
 
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::process::Command;
 
@@ -11,8 +10,7 @@ fn setup_from_an_empty_machine_creates_config_and_gives_install_commands_without
     let bin = dir.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
     let shell = dir.path().join("shell");
-    std::fs::write(&shell, "#!/bin/sh\nprintf '__ATOMICS__%s__ATOMICS__' \"$PATH\"\n").unwrap();
-    std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+    test_support::write_program(&shell, "#!/bin/sh\nprintf '__ATOMICS__%s__ATOMICS__' \"$PATH\"\n");
     let config = dir.path().join("config.toml");
     let output = test_support::output(
         Command::new(env!("CARGO_BIN_EXE_atomics"))
@@ -52,8 +50,7 @@ fn doctor_checks_real_inputs_and_only_requires_git_and_valid_config() {
     let bin = dir.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
     let shell = dir.path().join("shell");
-    std::fs::write(&shell, "#!/bin/sh\nprintf '__ATOMICS__%s__ATOMICS__' \"$PATH\"\n").unwrap();
-    std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+    test_support::write_program(&shell, "#!/bin/sh\nprintf '__ATOMICS__%s__ATOMICS__' \"$PATH\"\n");
     let git = bin.join("git");
     let config = dir.path().join("config.toml");
     let socket = dir.path().join("atomics.sock");
@@ -73,8 +70,7 @@ fn doctor_checks_real_inputs_and_only_requires_git_and_valid_config() {
     };
     std::fs::write(&config, "").unwrap();
     for (probe, expected) in [("echo 'git version fixture'", 0), ("exit 1", 1), ("exit 0", 1)] {
-        std::fs::write(&git, format!("#!/bin/sh\n{probe}\n")).unwrap();
-        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+        test_support::write_program(&git, format!("#!/bin/sh\n{probe}\n"));
         let output = run();
         assert_eq!(output.status.code(), Some(expected));
         let text = String::from_utf8(output.stdout).unwrap();
@@ -98,8 +94,7 @@ fn doctor_checks_real_inputs_and_only_requires_git_and_valid_config() {
     }
     std::fs::remove_file(&git).unwrap();
     assert_eq!(run().status.code(), Some(1), "a missing git executable fails doctor");
-    std::fs::write(&git, "#!/bin/sh\necho 'git version fixture'\n").unwrap();
-    std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+    test_support::write_program(&git, "#!/bin/sh\necho 'git version fixture'\n");
     let host_config = dir.path().join("config.d/fixture.toml");
     std::fs::create_dir_all(host_config.parent().unwrap()).unwrap();
     std::fs::write(&host_config, "[font]\nsize = 17.0").unwrap();
@@ -120,8 +115,10 @@ fn doctor_checks_real_inputs_and_only_requires_git_and_valid_config() {
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8(output.stdout).unwrap().contains("✗ config failed:"));
     std::fs::write(&config, "").unwrap();
-    std::fs::write(&git, "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'git version fixture'; else exit 1; fi\n")
-        .unwrap();
+    test_support::write_program(
+        &git,
+        "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'git version fixture'; else exit 1; fi\n",
+    );
     let repo_config = dir.path().join(".atomics/config.toml");
     std::fs::create_dir(repo_config.parent().unwrap()).unwrap();
     std::fs::write(

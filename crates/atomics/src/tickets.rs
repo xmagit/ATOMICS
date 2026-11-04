@@ -2250,12 +2250,10 @@ pub(crate) mod tests {
 
     #[test]
     fn a_job_against_a_server_that_is_not_signed_in_fails_without_opening_a_browser() {
-        use std::os::unix::fs::PermissionsExt;
         let (dir, keychain, _) = crate::credentials::tests::machine(false);
         let marker = dir.path().join("browser-opened");
         let browser = dir.path().join("browser");
-        std::fs::write(&browser, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
-        std::fs::set_permissions(&browser, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::write_program(&browser, format!("#!/bin/sh\ntouch '{}'\n", marker.display()));
         let oauth = OAuth::new(keychain, crate::connections::Browser::at(browser.display().to_string()));
         let config: TicketConfig = toml::from_str(
             "system = \"echo\"\nserver = { url = \"http://127.0.0.1:9/mcp\", oauth = true }\n\

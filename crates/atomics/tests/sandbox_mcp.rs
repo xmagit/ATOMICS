@@ -4,7 +4,7 @@
 mod test_support;
 
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -35,8 +35,7 @@ fn registered_host_mcp_reports_and_scoped_ticket_requests_cross_the_stand_in_gat
     let listener = UnixListener::bind(&socket).unwrap();
     listener.set_nonblocking(true).unwrap();
     let sbx = dir.path().join("sbx");
-    std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sbx"), &sbx).unwrap();
-    std::fs::set_permissions(&sbx, std::fs::Permissions::from_mode(0o755)).unwrap();
+    test_support::copy_program(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sbx"), &sbx);
     let args = isolation::mcp_add_args("atomics-session-a", Path::new(env!("CARGO_BIN_EXE_atomics")), &socket);
     assert!(test_support::output(Command::new(&sbx).args(&args)).status.success());
     assert!(

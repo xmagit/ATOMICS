@@ -263,7 +263,6 @@ impl State {
 mod tests {
     use super::super::tests::{request, session, with_app};
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     fn refused(app: &mut Desktop<'_>, expected: &str) {
         let response = request(app, json!({"cmd":"restart"}));
@@ -410,8 +409,7 @@ mod tests {
                 assert!(forced.error.unwrap().contains("target is missing"));
                 assert!(!app.runtime.restarting);
                 let exe = paths::atomics_home().join("version-probe");
-                std::fs::write(&exe, "#!/bin/sh\ntest \"$1\" = --version\n").unwrap();
-                std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+                crate::test_support::write_program(&exe, "#!/bin/sh\ntest \"$1\" = --version\n");
                 let target =
                     || Ok(crate::restart::Target { executable: exe.clone(), command: vec!["/usr/bin/true".into()] });
                 let store_path = paths::store_file();
