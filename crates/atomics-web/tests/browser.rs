@@ -55,7 +55,15 @@
 //! "Include in selected" and a steer to the selected, then unblock, integrate, accept and Integrate in the
 //! board's further columns. `a_phone_acts_by_touch`, at 360 CSS pixels: integrate, accept and Integrate on the
 //! board, Close plan… with its confirmation, a comment and Send review after a terminal had the focus, a tile's
-//! close, and the archived plan from History. Their screenshots are saved in `target/actions-shots/`.
+//! close, and the archived plan from History. `a_shell_under_another_name_gets_no_steer_for_want_of_all_agents`:
+//! the target's list has no row that reaches a `zsh` session.
+//! `the_keyboard_in_a_text_box_lets_go_of_the_terminals_lease`: a card's open types in its agent, the steer bar or a
+//! comment box taking the keyboard releases the lease, and a click back asks again; Shift+Enter makes a new line.
+//! `a_steer_one_target_missed_names_it_and_stays_out_of_the_bar` and
+//! `a_note_takes_the_pointer_and_a_refused_comment_comes_back`: what a refusal leaves.
+//! `a_comment_box_keeps_its_draft_while_the_connection_is_down`, `a_viewer_has_no_comment_actions_in_a_diff` and
+//! `a_finished_plan_picked_on_a_phone_shows_in_the_strip` say what they do. Their screenshots are saved in
+//! `target/actions-shots/`.
 
 #[allow(dead_code)] // shared with the unit tests, which use more of it
 #[path = "../src/fake_host.rs"]
@@ -260,6 +268,7 @@ fn broker(
     log: Arc<Log>,
     origin: String,
     cut: Arc<AtomicBool>,
+    down: Arc<AtomicBool>,
     pending: Pending,
 ) {
     thread::spawn(move || {
@@ -281,6 +290,9 @@ fn broker(
                     *refusal.status_mut() = tungstenite::http::StatusCode::FORBIDDEN;
                     refusal
                 };
+                if down.load(Ordering::SeqCst) {
+                    return Err(refuse());
+                }
                 if header("Origin") != [origin.clone()] || !offered.iter().any(|p| p == "atomics.rendezvous.v1") {
                     return Err(refuse());
                 }
@@ -782,7 +794,7 @@ fn the_bundle_pairs_reconnects_and_reloads_in_a_browser() {
     serve_parent(parent, HashMap::from([("/", page), ("/other", attacker)]), log.clone(), phase.clone());
     let cut = Arc::new(AtomicBool::new(false));
     let pending: Pending = Arc::default();
-    broker(tunnel, host.clone(), log.clone(), client_origin.clone(), cut.clone(), pending.clone());
+    broker(tunnel, host.clone(), log.clone(), client_origin.clone(), cut.clone(), Arc::default(), pending.clone());
 
     let browser = launch(&["--window-size=420,900".into()], &format!("{parent_origin}/"), &log, OVERALL);
     let devtools = browser.devtools();
@@ -1021,7 +1033,7 @@ fn the_bundle_works_on_a_phone_by_touch() {
         .replace("PHONE_BOOT", &pair.to_string());
     serve_parent(parent, HashMap::from([("/", page_html)]), log.clone(), phase.clone());
     let pending: Pending = Arc::default();
-    broker(tunnel, host.clone(), log.clone(), client_origin.clone(), Arc::default(), pending.clone());
+    broker(tunnel, host.clone(), log.clone(), client_origin.clone(), Arc::default(), Arc::default(), pending.clone());
 
     // The phone. The client's frame is cross-origin, so it draws in a renderer of its own, which the page's
     // emulation does not reach: its pixel ratio comes from the browser's flag, its user agent too, and its touch
@@ -1291,7 +1303,7 @@ fn the_bundle_draws_the_desktops_frame_in_a_wide_window() {
         .replace("CLIENT_ORIGIN", &client_origin)
         .replace("PHONE_BOOT", &pair.to_string());
     serve_parent(parent, HashMap::from([("/", page_html)]), log.clone(), Arc::new(Mutex::new("go".into())));
-    broker(tunnel, host.clone(), log.clone(), client_origin.clone(), Arc::default(), Arc::default());
+    broker(tunnel, host.clone(), log.clone(), client_origin.clone(), Arc::default(), Arc::default(), Arc::default());
 
     let flags = [
         format!("--window-size={},{}", WIDE.0, WIDE.1),
@@ -1396,6 +1408,10 @@ struct Opened {
     frame: DevTools,
     /// What the client draws with.
     palette: Palette,
+    /// Set, the broker drops the channel.
+    cut: Arc<AtomicBool>,
+    /// Set, the broker turns the browser away, as while the computer is off.
+    down: Arc<AtomicBool>,
 }
 
 fn open(mut host: FakeHost, size: (f32, f32), touch: bool) -> Opened {
@@ -1422,7 +1438,8 @@ fn open(mut host: FakeHost, size: (f32, f32), touch: bool) -> Opened {
         .replace("CLIENT_ORIGIN", &client_origin)
         .replace("PHONE_BOOT", &pair.to_string());
     serve_parent(parent, HashMap::from([("/", page_html)]), log.clone(), phase.clone());
-    broker(tunnel, host.clone(), log.clone(), client_origin.clone(), Arc::default(), Arc::default());
+    let (cut, down) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+    broker(tunnel, host.clone(), log.clone(), client_origin.clone(), cut.clone(), down.clone(), Arc::default());
 
     let scale = if touch { PHONE_SCALE } else { 1.0 };
     let mut flags = vec![
@@ -1463,7 +1480,7 @@ fn open(mut host: FakeHost, size: (f32, f32), touch: bool) -> Opened {
     let parent = ParentOrigin::parse(&parent_origin).expect("a loopback origin");
     let Ok(FromParent::Boot(booted)) = boot::read(&parent, &parent_origin, true, &pair) else { panic!("the boot") };
     let palette = Palette::new(&booted.theme_tokens(), Fonts::default());
-    Opened { host, log, _browser: browser, page, frame, palette }
+    Opened { host, log, _browser: browser, page, frame, palette, cut, down }
 }
 
 /// The input is on the terminal, and has the focus.
@@ -1751,6 +1768,349 @@ fn text_boxes_take_the_keyboard_from_a_terminal() {
     assert!(!log.has("resize s1"));
 }
 
+/// Another session of the fake host's, outside its plan.
+fn another(board: &mut FakeHost, id: &str, agent: &str, title: &str) {
+    let base = board.board.sessions.iter().find(|s| s.id == "s1").expect("the agent").clone();
+    board.board.sessions.push(atomics_core::projection::SessionInfo {
+        id: id.into(),
+        agent: agent.into(),
+        title: title.into(),
+        task: None,
+        worktree: None,
+        branch: None,
+        cwd: format!("/w/{id}"),
+        ..base
+    });
+    board.terminals.insert(id.into(), fake_host::FakeTerminal::new(80, 12, "$ "));
+}
+
+#[test]
+#[ignore = "needs the built bundle (scripts/build-web.sh) and Chrome"]
+fn a_shell_under_another_name_gets_no_steer_for_want_of_all_agents() {
+    let mut board = fake_host::working();
+    another(&mut board, "z1", "zsh", "My zsh");
+    another(&mut board, "c2", "codex", "Second agent");
+    let Opened { host, log, _browser, mut page, mut frame, .. } = open(board, WIDE, false);
+    log.wait("subscribe s1", 1);
+    terminal_input(&mut frame);
+    let (combo, bar) = ((100.0, 983.0), (362.0, 981.0));
+
+    // The row just above Selected: "All agents" where the desktop has it, and the active agent here.
+    page.click(combo);
+    frame.wait("the list over the input", &format!("{CLIP} === 'inset(50%)'"));
+    keep(&mut page, "wide-steer-targets");
+    page.click((66.0, 935.0));
+    thread::sleep(Duration::from_millis(300));
+    page.click(bar);
+    frame.wait("the keyboard on the steer bar", TEXT_BOX);
+    page.call("Input.insertText", json!({ "text": "rm -rf build" }));
+    thread::sleep(Duration::from_millis(300));
+    page.key("Enter", 13, Some("\r"));
+    wait_host(&host, "the steer", |h| !h.steered.is_empty());
+    thread::sleep(Duration::from_millis(400));
+    let steered = host.lock().unwrap().steered.clone();
+    assert_eq!(steered, [("s1".to_string(), "rm -rf build".to_string())], "the active agent alone");
+    assert!(typed(&host, "z1").is_empty(), "nothing reached the shell");
+}
+
+#[test]
+#[ignore = "needs the built bundle (scripts/build-web.sh) and Chrome"]
+fn the_keyboard_in_a_text_box_lets_go_of_the_terminals_lease() {
+    let Opened { host, log, _browser, mut page, mut frame, .. } = open(fake_host::working(), WIDE, false);
+    log.wait("subscribe s1", 1);
+    terminal_input(&mut frame);
+    let (terminal, bar) = ((700.0, 500.0), (362.0, 981.0));
+    let held = |host: &Mutex<FakeHost>| host.lock().unwrap().terminals["s1"].lease.is_some();
+
+    // A card's open types in its agent, as picking it from the sidebar does.
+    page.click((1369.0, 247.0));
+    log.wait("acquire s1", 1);
+    frame.wait("the focus on the input", FOCUSED);
+    page.call("Input.insertText", json!({ "text": "a" }));
+    wait_host(&host, "\"a\" typed", |h| h.terminals["s1"].typed == "a");
+    assert!(held(&host));
+
+    // Another browser sees the terminal free as soon as the keyboard is in the steer bar.
+    page.click(bar);
+    frame.wait("the keyboard on the steer bar", TEXT_BOX);
+    log.wait("release s1", 1);
+    wait_host(&host, "the lease given back", |h| h.terminals["s1"].lease.is_none());
+    keep(&mut page, "wide-lease-released");
+
+    // Shift+Enter makes a new line there, as its hint says, and Enter sends.
+    page.call("Input.insertText", json!({ "text": "one" }));
+    thread::sleep(Duration::from_millis(200));
+    for kind in ["keyDown", "keyUp"] {
+        let mut key = json!({
+            "type": kind, "key": "Enter", "code": "Enter", "windowsVirtualKeyCode": 13, "modifiers": 8,
+        });
+        if kind == "keyDown" {
+            key["text"] = json!("\r");
+        }
+        page.call("Input.dispatchKeyEvent", key);
+    }
+    thread::sleep(Duration::from_millis(200));
+    assert!(host.lock().unwrap().steered.is_empty(), "Shift+Enter sends nothing");
+    page.call("Input.insertText", json!({ "text": "two" }));
+    keep(&mut page, "wide-steer-two-lines");
+    page.key("Enter", 13, Some("\r"));
+    wait_host(&host, "the steer of two lines", |h| h.steered == [("s1".to_string(), "one\ntwo".to_string())]);
+
+    // A click back asks again, and types there.
+    page.click(terminal);
+    log.wait("acquire s1", 2);
+    frame.wait("the focus back on the input", FOCUSED);
+    page.call("Input.insertText", json!({ "text": "b" }));
+    wait_host(&host, "\"b\" typed", |h| h.terminals["s1"].typed == "ab");
+    assert!(held(&host));
+    keep(&mut page, "wide-lease-asked-again");
+
+    // A comment box is a text box too. The card's open showed the diff.
+    wait_host(&host, "both files of the diff asked for", |h| {
+        let asked = |file: &str| h.received.iter().any(|m| matches!(m, Message::DiffGet { path, .. } if path == file));
+        asked("src/a.rs") && asked("src/b.rs")
+    });
+    thread::sleep(Duration::from_millis(400));
+    page.click(terminal);
+    frame.wait("the focus back on the input", FOCUSED);
+    wait_host(&host, "the lease again", |h| h.terminals["s1"].lease.is_some());
+    page.click((1374.0, 172.0));
+    frame.wait("the keyboard on the comment box", TEXT_BOX);
+    log.wait("release s1", 2);
+    wait_host(&host, "the lease given back again", |h| h.terminals["s1"].lease.is_none());
+    assert_eq!(typed(&host, "s1"), "ab");
+}
+
+/// The fake host's second task running in a session of its own, beside the first in the plan's tab.
+fn a_second_task(board: &mut FakeHost) {
+    use atomics_core::plan::TaskStatus;
+
+    another(board, "s2", "claude", "Second task");
+    let second = board.board.sessions.iter_mut().find(|s| s.id == "s2").expect("the session");
+    second.task = Some(atomics_core::projection::TaskLink { plan: "p1".into(), task: "t2".into() });
+    second.worktree = Some("/w/repo-t2".into());
+    board.board.plans[0].tasks[1].session = Some("s2".into());
+    board.board.plans[0].tasks[1].status = TaskStatus::Running;
+}
+
+#[test]
+#[ignore = "needs the built bundle (scripts/build-web.sh) and Chrome"]
+fn a_steer_one_target_missed_names_it_and_stays_out_of_the_bar() {
+    const SIZE: (f32, f32) = (2800.0, 1000.0);
+    let mut board = fake_host::working();
+    a_second_task(&mut board);
+    let Opened { host, log, _browser, mut page, mut frame, .. } = open(board, SIZE, false);
+    log.wait("subscribe s1", 1);
+    terminal_input(&mut frame);
+    let (away, bar) = ((800.0, 16.0), (362.0, 981.0));
+
+    // Both rows in "selected", and the bar's target on them.
+    for (row, include) in [((80.5, 81.5), (182.0, 98.0)), ((69.5, 122.0), (171.0, 138.0))] {
+        page.right_click(row);
+        frame.wait("the menu taking the input's pointer", &format!("{CLIP} === 'inset(50%)'"));
+        page.click(include);
+        thread::sleep(Duration::from_millis(300));
+        page.click(away);
+        frame.wait("the menu closed", &format!("{CLIP} === ''"));
+    }
+    page.click((74.5, 983.5));
+    frame.wait("the target's list open", &format!("{CLIP} === 'inset(50%)'"));
+    page.click((66.5, 955.5));
+    frame.wait("the target's list closed", &format!("{CLIP} === ''"));
+
+    // The first is refused: the other has it, the bar stays empty, and Enter sends nothing twice.
+    host.lock().unwrap().refuse_next =
+        Some(WireError::new(ErrorCode::Rejected, "message not delivered: session exited"));
+    page.click(bar);
+    frame.wait("the keyboard on the steer bar", TEXT_BOX);
+    page.call("Input.insertText", json!({ "text": "both of you" }));
+    thread::sleep(Duration::from_millis(300));
+    page.key("Enter", 13, Some("\r"));
+    wait_host(&host, "the steer that got through", |h| h.steered == [("s2".to_string(), "both of you".to_string())]);
+    keep(&mut page, "wide-steer-one-missed");
+    page.key("Enter", 13, Some("\r"));
+    thread::sleep(Duration::from_millis(400));
+    assert_eq!(host.lock().unwrap().steered.len(), 1, "nothing is left to send twice");
+}
+
+#[test]
+#[ignore = "needs the built bundle (scripts/build-web.sh) and Chrome"]
+fn a_note_takes_the_pointer_and_a_refused_comment_comes_back() {
+    let Opened { host, log, _browser, mut page, mut frame, .. } = open(fake_host::working(), WIDE, false);
+    log.wait("subscribe s1", 1);
+    terminal_input(&mut frame);
+
+    // A long note over the tile's close: the input gives way, and a click on it only dismisses it.
+    let long = "message not delivered: the session is not ready for it, and this sentence goes on long enough \
+                to take the width the note has and then some, over the terminal, as a real host's message can \
+                when it has a good deal to say about what went wrong and what to do about it";
+    host.lock().unwrap().refuse_next = Some(WireError::new(ErrorCode::Rejected, long));
+    page.click((362.0, 981.0));
+    frame.wait("the keyboard on the steer bar", TEXT_BOX);
+    page.call("Input.insertText", json!({ "text": "go on" }));
+    thread::sleep(Duration::from_millis(300));
+    page.key("Enter", 13, Some("\r"));
+    wait_host(&host, "the refusal used", |h| h.refuse_next.is_none());
+    frame.wait("the note cut out of the input", &format!("{CLIP}.startsWith('path(')"));
+    keep(&mut page, "wide-note-long");
+    page.click((1023.3, 50.5));
+    frame.wait("the note gone, and no dialog", &format!("{CLIP} === ''"));
+    keep(&mut page, "wide-note-dismissed");
+
+    // A refused comment comes back in its box, with the keyboard, and Enter tries again.
+    page.click((1456.0, 16.0));
+    wait_host(&host, "both files of the diff asked for", |h| {
+        let asked = |file: &str| h.received.iter().any(|m| matches!(m, Message::DiffGet { path, .. } if path == file));
+        asked("src/a.rs") && asked("src/b.rs")
+    });
+    thread::sleep(Duration::from_millis(400));
+    page.click((1374.0, 172.0));
+    frame.wait("the keyboard on the comment box", TEXT_BOX);
+    page.call("Input.insertText", json!({ "text": "Why this step?" }));
+    thread::sleep(Duration::from_millis(300));
+    host.lock().unwrap().refuse_next =
+        Some(WireError::new(ErrorCode::StaleRevision, "the diff is at revision 5; anchor the comment again"));
+    page.key("Enter", 13, Some("\r"));
+    wait_host(&host, "the refusal used", |h| h.refuse_next.is_none());
+    keep(&mut page, "wide-comment-refused");
+    assert!(host.lock().unwrap().board.diffs[0].comments.is_empty());
+    frame.wait("the keyboard back on the comment box", TEXT_BOX);
+    page.key("Enter", 13, Some("\r"));
+    wait_host(&host, "the comment", |h| h.board.diffs[0].comments.iter().any(|c| c.body == "Why this step?"));
+    keep(&mut page, "wide-comment-second-try");
+}
+
+/// A comment on the fake host's diff, on the line after the first the diff changes.
+fn comment_on_the_host(board: &mut FakeHost) {
+    board.board.diffs[0].comments.push(atomics_core::steer::ReviewComment {
+        path: "src/a.rs".into(),
+        line: Some(2),
+        removed: false,
+        excerpt: "step(1)".into(),
+        body: "On the host".into(),
+    });
+}
+
+/// What this page has sent the host about comments.
+fn review_commands(host: &Mutex<FakeHost>) -> usize {
+    host.lock().unwrap().received.iter().filter(|m| matches!(m, Message::ReviewCommand(_))).count()
+}
+
+#[test]
+#[ignore = "needs the built bundle (scripts/build-web.sh) and Chrome"]
+fn a_comment_box_keeps_its_draft_while_the_connection_is_down() {
+    let mut board = fake_host::working();
+    comment_on_the_host(&mut board);
+    let Opened { host, log, _browser, mut page, mut frame, cut, down, .. } = open(board, WIDE, false);
+    log.wait("subscribe s1", 1);
+    terminal_input(&mut frame);
+    page.click((1456.0, 16.0));
+    wait_host(&host, "both files of the diff asked for", |h| {
+        let asked = |file: &str| h.received.iter().any(|m| matches!(m, Message::DiffGet { path, .. } if path == file));
+        asked("src/a.rs") && asked("src/b.rs")
+    });
+    thread::sleep(Duration::from_millis(400));
+    page.click((1374.3, 189.7));
+    frame.wait("the keyboard on the comment box", TEXT_BOX);
+    page.call("Input.insertText", json!({ "text": "draft" }));
+    thread::sleep(Duration::from_millis(300));
+
+    down.store(true, Ordering::SeqCst);
+    cut.store(true, Ordering::SeqCst);
+    log.wait("cut", 1);
+    thread::sleep(Duration::from_millis(1000));
+    keep(&mut page, "wide-comment-offline");
+
+    // Enter closes nothing and loses nothing, and what is typed next goes on in the box.
+    let before = review_commands(&host);
+    page.key("Enter", 13, Some("\r"));
+    thread::sleep(Duration::from_millis(400));
+    assert_eq!(frame.eval(TEXT_BOX), json!(true), "the box keeps the keyboard");
+    page.call("Input.insertText", json!({ "text": " more" }));
+    keep(&mut page, "wide-comment-offline-enter");
+
+    // A comment on the diff has no × meanwhile, and a click on it changes nothing.
+    page.mouse("mouseMoved", (1196.8, 170.6));
+    keep(&mut page, "wide-comment-row-offline");
+    page.click((1196.8, 170.6));
+    keep(&mut page, "wide-comment-row-clicked-offline");
+
+    // Back: the box still has its text, and Enter there sends it.
+    down.store(false, Ordering::SeqCst);
+    log.wait("hello epoch-1", 1);
+    thread::sleep(Duration::from_millis(1500));
+    assert_eq!(review_commands(&host), before, "nothing was sent while it was down");
+    keep(&mut page, "wide-comment-back");
+    page.click((1374.3, 207.2));
+    frame.wait("the keyboard on the comment box again", TEXT_BOX);
+    page.key("Enter", 13, Some("\r"));
+    wait_host(&host, "the comment", |h| h.board.diffs[0].comments.iter().any(|c| c.body == "draft more"));
+    assert_eq!(host.lock().unwrap().board.diffs[0].comments.len(), 2, "the other is still there");
+    keep(&mut page, "wide-comment-sent-once-back");
+}
+
+#[test]
+#[ignore = "needs the built bundle (scripts/build-web.sh) and Chrome"]
+fn a_viewer_has_no_comment_actions_in_a_diff() {
+    let mut board = fake_host::working();
+    board.answer = Some(atomics_core::noise::Access::View);
+    comment_on_the_host(&mut board);
+    let Opened { host, log, _browser, mut page, mut frame, .. } = open(board, WIDE, false);
+    log.wait("subscribe s1", 1);
+    terminal_input(&mut frame);
+    page.click((1372.0, 16.0));
+    wait_host(&host, "both files of the diff asked for", |h| {
+        let asked = |file: &str| h.received.iter().any(|m| matches!(m, Message::DiffGet { path, .. } if path == file));
+        asked("src/a.rs") && asked("src/b.rs")
+    });
+    thread::sleep(Duration::from_millis(400));
+    keep(&mut page, "viewer-diff");
+
+    page.mouse("mouseMoved", (1196.8, 170.6));
+    keep(&mut page, "viewer-comment-hover");
+    page.click((1196.8, 170.6));
+    keep(&mut page, "viewer-comment-clicked");
+    page.click((1374.3, 189.7));
+    thread::sleep(Duration::from_millis(400));
+    assert_eq!(frame.eval(TEXT_BOX), json!(false), "a viewer never gets a box");
+    keep(&mut page, "viewer-line-clicked");
+    assert_eq!(review_commands(&host), 0);
+    assert_eq!(host.lock().unwrap().board.diffs[0].comments.len(), 1);
+}
+
+#[test]
+#[ignore = "needs the built bundle (scripts/build-web.sh) and Chrome"]
+fn a_finished_plan_picked_on_a_phone_shows_in_the_strip() {
+    use atomics_core::plan::PlanStatus;
+
+    let mut board = fake_host::many_plans();
+    for plan in board.board.plans.iter_mut().filter(|plan| ("a-01".."a-08").contains(&plan.id.as_str())) {
+        plan.status = PlanStatus::Open;
+    }
+    let Opened { _browser, mut page, .. } = open(board, PHONE, true);
+    let css = |r: Rect| {
+        Rect::from_min_max((r.min.to_vec2() * layout::ZOOM).to_pos2(), (r.max.to_vec2() * layout::ZOOM).to_pos2())
+    };
+    let points = Rect::from_min_size(Pos2::ZERO, vec2(PHONE.0, PHONE.1) / layout::ZOOM);
+    let regions =
+        layout::regions(points, &Viewport { visible: Some(points), coarse: true, ..Viewport::default() }, false);
+    let (screen, body) = (css(points), css(regions.body));
+    let row = body.top() + layout::TOUCH * layout::ZOOM / 2.0;
+    thread::sleep(Duration::from_millis(800));
+    keep(&mut page, "phone-strip");
+    page.tap(pos2(screen.right() - 40.0, row));
+    thread::sleep(Duration::from_millis(800));
+    keep(&mut page, "phone-strip-history");
+    page.tap(pos2(screen.center().x, row + 70.0));
+    thread::sleep(Duration::from_millis(800));
+    keep(&mut page, "phone-strip-history-picked");
+
+    // The plan before it is still a tap away, at the strip's left end.
+    page.tap(pos2(body.left() + 40.0, row));
+    thread::sleep(Duration::from_millis(800));
+    keep(&mut page, "phone-strip-tap-before");
+}
+
 #[test]
 #[ignore = "needs the built bundle (scripts/build-web.sh) and Chrome"]
 fn a_board_and_a_tile_act_in_a_wide_window() {
@@ -1809,6 +2169,14 @@ fn a_plan_closes_and_a_new_session_starts() {
     page.click((700.6, 545.0));
     keep(&mut page, "wide-new-session-cancelled");
     assert_eq!(host.lock().unwrap().board.sessions.len(), 2, "Cancel starts nothing");
+    // Refused: it says why, and the page stays on the plan.
+    page.click((1388.5, 16.0));
+    thread::sleep(Duration::from_millis(400));
+    host.lock().unwrap().refuse_next = Some(WireError::new(ErrorCode::NotFound, "no agent claude is configured"));
+    page.click((640.0, 545.0));
+    wait_host(&host, "the refusal used", |h| h.refuse_next.is_none());
+    keep(&mut page, "wide-new-session-refused");
+    assert_eq!(host.lock().unwrap().board.sessions.len(), 2);
     page.click((1388.5, 16.0));
     thread::sleep(Duration::from_millis(400));
     page.click((640.0, 545.0));

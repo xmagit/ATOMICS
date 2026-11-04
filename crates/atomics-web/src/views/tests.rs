@@ -739,8 +739,7 @@ fn a_steer_from_the_bar_reaches_the_host_and_one_refused_comes_back() {
     assert_eq!(client.steer_text, "again");
     assert!(has(&shown, "The host refused: message not delivered: session exited"), "whole: {shown:?}");
 
-    // The note lies over the frame, moves nothing, takes no pointer, and goes after a while.
-    assert!(view.term.overlay.covered.is_empty(), "{:?}", view.term.overlay);
+    // The note lies over the frame, moves nothing, and goes after a while.
     let bar = on(&shown, "→ Fix the parser");
     assert_eq!(on(&settled(&ctx, &mut world, &mut client, &mut view, WIDE), "→ Fix the parser"), bar);
     view.now_ms += NOTICE_MS + 1.0;
@@ -944,7 +943,14 @@ fn a_boards_buttons_change_the_plan_and_a_merge_shows_while_it_runs() {
 
 /// The fake host's working board with its diff in the right panel.
 fn on_the_diff(size: (f32, f32)) -> (egui::Context, World, Client, View, Vec<(String, Rect)>) {
-    let (ctx, mut world, mut client, mut view) = live_with(fake_host::working());
+    diff_of(live_with(fake_host::working()), size)
+}
+
+/// That page, on the diff.
+fn diff_of(
+    (ctx, mut world, mut client, mut view): (egui::Context, World, Client, View),
+    size: (f32, f32),
+) -> (egui::Context, World, Client, View, Vec<(String, Rect)>) {
     settled(&ctx, &mut world, &mut client, &mut view, size);
     client.send(Command::SetPanel(PanelMode::Diff));
     let mut shown = settled(&ctx, &mut world, &mut client, &mut view, size);
@@ -1002,7 +1008,7 @@ fn a_comment_and_a_review_reach_the_host_from_the_diff() {
 }
 
 #[test]
-fn a_refused_comment_says_why_and_leaves_no_comment_on_screen() {
+fn a_refused_comment_says_why_and_comes_back_in_its_box() {
     let (ctx, mut world, mut client, mut view, shown) = on_the_diff(WIDE);
     let line = shown.iter().find(|(text, _)| text.contains("step(1)")).expect("the diff's lines").1.center();
     drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(line));
@@ -1019,10 +1025,337 @@ fn a_refused_comment_says_why_and_leaves_no_comment_on_screen() {
         repeat: false,
         modifiers: egui::Modifiers::NONE,
     };
-    sized(&ctx, &mut world, &mut client, &mut view, WIDE, vec![enter]);
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, vec![enter.clone()]);
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
     assert!(has(&shown, "The host refused: the diff is at revision 5"), "{shown:?}");
-    assert!(has(&shown, "Send review (0)") && !has(&shown, "Why?"), "{shown:?}");
+    assert!(has(&shown, "Send review (0)") && has(&shown, "Why?"), "not added, and not lost: {shown:?}");
+    assert!(world.host.board.diffs[0].comments.is_empty());
+
+    // Nothing else had the keyboard, so the box has it, and Enter tries again.
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, vec![enter]);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert_eq!(world.host.board.diffs[0].comments[0].body, "Why?");
+    assert_eq!(world.host.board.diffs[0].comments[0].path, "src/a.rs");
+    assert!(has(&shown, "Send review (1)") && !has(&shown, "Comment for the agent"), "{shown:?}");
+}
+
+#[test]
+fn a_refused_comment_takes_the_keyboard_from_nobody_and_stays_in_the_note_without_a_box() {
+    use atomics_core::ops::{CommandResult, Outcome};
+    use atomics_core::wire::{Envelope, ErrorCode, WireError};
+
+    let comment = |body: &str, line| atomics_core::steer::ReviewComment {
+        path: "src/a.rs".into(),
+        line: Some(line),
+        removed: false,
+        excerpt: String::new(),
+        body: body.into(),
+    };
+    let refused = |world: &World, op: &str| {
+        let error = WireError::new(ErrorCode::Rejected, "not now");
+        let result = CommandResult { op: op.into(), outcome: Outcome::refused(error) };
+        world.driver.remote.receive(Envelope::host("epoch-1", Message::CommandResult(result)));
+    };
+    let op = |world: &World| {
+        let found = world.host.received.iter().rev().find_map(|m| match m {
+            Message::ReviewCommand(command) => Some(command.op.clone()),
+            _ => None,
+        });
+        found.expect("a comment sent")
+    };
+
+    // The user went on to a terminal while it was on its way.
+    let (ctx, mut world, mut client, mut view, _) = on_the_diff(WIDE);
+    world.host.hold_results = true;
+    client.send(Command::EditComments { root: WORKTREE.into(), before: Vec::new(), after: vec![comment("Why?", 2)] });
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, Vec::new());
+    view.term.inputs.push(term_pane::TermInput::Focus(true));
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, Vec::new());
+    refused(&world, &op(&world));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(has(&shown, "Why?"), "in its box: {shown:?}");
+    assert!(ctx.memory(|m| m.focused().is_none()) && view.term.typing(), "the terminal keeps the keyboard");
+
+    // A line no longer in the diff has no box: the note has the text.
+    client.send(Command::EditComments {
+        root: WORKTREE.into(),
+        before: Vec::new(),
+        after: vec![comment("Gone?", 999)],
+    });
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, Vec::new());
+    refused(&world, &op(&world));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(has(&shown, "The host refused: not now Your comment was: Gone?"), "{shown:?}");
+}
+
+/// The fake host's working board, with a comment on the host.
+fn with_a_comment() -> fake_host::FakeHost {
+    let mut host = fake_host::working();
+    host.board.diffs[0].comments.push(atomics_core::steer::ReviewComment {
+        path: "src/a.rs".into(),
+        line: Some(2),
+        removed: false,
+        excerpt: "step(1)".into(),
+        body: "On the host".into(),
+    });
+    host
+}
+
+/// A comment's ×: a × left of `row`, on its line.
+fn comment_cross(shown: &[(String, Rect)], row: egui::Pos2) -> bool {
+    shown.iter().any(|(text, rect)| text == "×" && (rect.center().y - row.y).abs() < 8.0 && rect.center().x < row.x)
+}
+
+#[test]
+fn a_viewer_has_no_comment_actions_and_never_a_box() {
+    // A controller has them.
+    let (ctx, mut world, mut client, mut view, shown) = diff_of(live_with(with_a_comment()), WIDE);
+    let row = on(&shown, "» On the host");
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, vec![egui::Event::PointerMoved(row)]);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(comment_cross(&shown, row), "{shown:?}");
+
+    let (ctx, mut world, mut client, mut view, shown) = diff_of(viewing(with_a_comment()), WIDE);
+    let row = on(&shown, "» On the host");
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, vec![egui::Event::PointerMoved(row)]);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(!comment_cross(&shown, row), "{shown:?}");
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(row));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(has(&shown, "» On the host"), "{shown:?}");
+    assert_eq!(world.driver.remote.notice(), None, "it did not try");
+
+    let line = shown.iter().find(|(text, _)| text.contains("step(1)")).expect("the diff's lines").1.center();
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(line));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(!has(&shown, "Comment for the agent"), "{shown:?}");
+    assert!(!world.sent().iter().any(|m| matches!(m, Message::ReviewCommand(_))));
+}
+
+#[test]
+fn a_box_open_when_the_connection_drops_keeps_its_draft_until_it_can_go() {
+    use atomics_core::tunnel::close;
+
+    let (ctx, mut world, mut client, mut view, shown) = diff_of(live_with(with_a_comment()), WIDE);
+    let line = shown.iter().find(|(text, _)| text.contains("step(1)")).expect("the diff's lines").1.center();
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(line));
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, vec![egui::Event::Text("draft".into())]);
+
+    world.drop_socket(close::ABNORMAL);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(has(&shown, "Reconnecting") && has(&shown, "draft"), "{shown:?}");
+
+    // Enter neither closes it nor loses it, and the keyboard stays there.
+    let enter = egui::Event::Key {
+        key: egui::Key::Enter,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    };
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, vec![enter.clone()]);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(has(&shown, "draft"), "{shown:?}");
+    assert!(ctx.memory(|m| m.focused().is_some()), "the box keeps the keyboard");
+    assert_eq!(world.driver.remote.notice(), None, "nothing was tried");
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, vec![egui::Event::Text(" more".into())]);
+
+    // The comments already there have no × meanwhile, and a line starts no other box.
+    let row = on(&shown, "» On the host");
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, vec![egui::Event::PointerMoved(row)]);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(!comment_cross(&shown, row) && has(&shown, "draft more"), "{shown:?}");
+
+    // Back: Enter sends it.
+    world.advance(world.driver.wake_in().expect("a retry is due"));
+    world.ticket("ticket-2");
+    assert_eq!(world.driver.status(), &Status::Live);
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, vec![enter]);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(world.host.board.diffs[0].comments.iter().any(|c| c.body == "draft more"));
+    assert!(!has(&shown, "Comment for the agent"), "the box closed: {shown:?}");
+}
+
+#[test]
+fn the_steer_bar_names_no_all_agents_and_shift_enter_makes_a_new_line() {
+    let (ctx, mut world, mut client, mut view) = live_with(fake_host::working());
+    let list = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "→ Fix the parser");
+    assert!(has(&list, "Active: Fix the parser") && has(&list, "Selected (0)"), "{list:?}");
+    assert!(!has(&list, "All agents"), "a shell can run under any name: {list:?}");
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(on(&list, "Active: Fix the parser")));
+
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(on(&shown, "Steer · Enter sends")));
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, Vec::new());
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, vec![egui::Event::Text("one".into())]);
+    let enter = |modifiers| egui::Event::Key {
+        key: egui::Key::Enter,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers,
+    };
+    let shift = egui::Modifiers::SHIFT;
+    let held = vec![egui::Event::ModifiersChanged(shift), enter(shift)];
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, held);
+    assert_eq!(client.steer_text, "one\n");
+    assert!(world.host.steered.is_empty(), "as its hint says");
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE)]);
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, vec![egui::Event::Text("two".into())]);
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, vec![enter(egui::Modifiers::NONE)]);
+    assert_eq!(world.host.steered, [("s1".to_string(), "one\ntwo".to_string())]);
+    assert_eq!(client.steer_text, "");
+}
+
+#[test]
+fn a_steer_one_target_missed_names_it_and_stays_out_of_the_bar() {
+    let mut host = fake_host::working();
+    let mut other = host.board.sessions.iter().find(|s| s.id == "s1").expect("the agent").clone();
+    (other.id, other.title, other.task, other.worktree) = ("c2".into(), "Second agent".into(), None, None);
+    host.board.sessions.push(other);
+    host.terminals.insert("c2".into(), fake_host::FakeTerminal::new(80, 12, "$ "));
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    client.selected.extend(["c2".to_string(), "s1".to_string()]);
+    client.steer_target = atomics_ui::chief::SteerTarget::Selected;
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(on(&shown, "Steer · Enter sends")));
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, Vec::new());
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, vec![egui::Event::Text("go on".into())]);
+    let enter = egui::Event::Key {
+        key: egui::Key::Enter,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    };
+    world.host.refuse_next = Some(atomics_core::wire::WireError::new(
+        atomics_core::wire::ErrorCode::Rejected,
+        "message not delivered: session exited",
+    ));
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, vec![enter.clone()]);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert_eq!(world.host.steered, [("s1".to_string(), "go on".to_string())]);
+    assert_eq!(client.steer_text, "", "Enter would reach the agent that has it again");
+    assert!(has(&shown, "Missed by Second agent. The host refused: message not delivered"), "{shown:?}");
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, vec![enter]);
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert_eq!(world.host.steered.len(), 1);
+}
+
+#[test]
+fn a_note_takes_the_pointer_and_a_click_on_it_dismisses_it() {
+    let (ctx, mut world, mut client, mut view) = live_with(fake_host::working());
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    world.driver.remote.say("A note that goes on. ".repeat(70));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    let note = shown.iter().find(|(text, _)| text.starts_with("A note")).expect("the note").1;
+
+    // As for any window, the input over a terminal gives way to it.
+    let covered = &view.term.overlay.covered;
+    assert!(covered.iter().any(|part| part.intersects(note)), "{covered:?} under {note:?}");
+
+    // A click on what lies under it reaches only the note.
+    let close = shown.iter().find(|(text, rect)| text == "×" && note.contains(rect.center()));
+    let close = close.expect("a tile's close under the note").1.center();
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(close));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(client.confirm_close.is_none(), "{shown:?}");
+    assert!(!has(&shown, "A note"), "{shown:?}");
+    assert_eq!(world.driver.remote.notice(), None);
+    assert!(view.term.overlay.covered.is_empty(), "{:?}", view.term.overlay);
+
+    // With the note gone it does.
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(close));
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert_eq!(client.confirm_close.as_deref(), Some("s1"));
+}
+
+#[test]
+fn the_keyboard_in_a_text_box_lets_go_of_the_lease_and_a_click_back_asks_again() {
+    let (ctx, mut world, mut client, mut view) = live_with(fake_host::working());
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    let bar = on(&shown, "Steer · Enter sends");
+    view.term.inputs.push(term_pane::TermInput::Focus(true));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(has(&shown, "You are typing") && world.host.terminals["s1"].lease.is_some(), "{shown:?}");
+
+    // The keyboard left for the window behind, say: nothing else has it, so the lease stays until it runs out.
+    view.term.inputs.push(term_pane::TermInput::Focus(false));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(has(&shown, "You are typing") && world.host.terminals["s1"].lease.is_some(), "{shown:?}");
+
+    view.term.inputs.push(term_pane::TermInput::Focus(true));
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    view.term.inputs.push(term_pane::TermInput::Focus(false));
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(bar));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(world.host.terminals["s1"].lease.is_none(), "another browser sees it free");
+    assert!(world.host.terminals["s1"].followed);
+    assert!(has(&shown, "Click the terminal to type"), "{shown:?}");
+    let released = world.sent().iter().filter(|m| matches!(m, Message::LeaseRelease { .. })).count();
+    assert_eq!(released, 1);
+
+    // Typing on in the bar lets nothing go twice, and a click back asks again.
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, vec![egui::Event::Text("x".into())]);
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert_eq!(world.sent().iter().filter(|m| matches!(m, Message::LeaseRelease { .. })).count(), 1);
+    view.term.inputs.push(term_pane::TermInput::Focus(true));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(has(&shown, "You are typing") && world.host.terminals["s1"].lease.is_some(), "{shown:?}");
+    view.term.inputs.push(term_pane::TermInput::Text("ls".into()));
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert_eq!(world.host.terminals["s1"].typed, "ls");
+}
+
+#[test]
+fn a_cards_open_types_in_its_agent_in_a_wide_window() {
+    let (ctx, mut world, mut client, mut view) = live_with(fake_host::working());
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    client.send(Command::OpenTaskSession("s1".into()));
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, Vec::new());
+    assert!(view.term.overlay.focus, "as picking it from the sidebar does");
+
+    // A finger taps the terminal itself, which opens the keyboard.
+    let (ctx, mut world, mut client, mut view) = live_with(fake_host::working());
+    settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    client.send(Command::OpenTaskSession("s1".into()));
+    sized(&ctx, &mut world, &mut client, &mut view, PHONE, Vec::new());
+    assert!(!view.term.focus_next && !view.term.overlay.focus);
+    assert_eq!(view.tab, Tab::Diffs);
+}
+
+#[test]
+fn a_finished_plan_picked_from_history_shows_in_the_phones_strip() {
+    use atomics_core::plan::PlanStatus;
+
+    let mut host = fake_host::many_plans();
+    for plan in host.board.plans.iter_mut().filter(|plan| ("a-01".."a-08").contains(&plan.id.as_str())) {
+        plan.status = PlanStatus::Open;
+    }
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    let opened = drawn(&ctx, &mut world, &mut client, &mut view, PHONE, click(on(&shown, "History")));
+    let opened =
+        if has(&opened, "✓ Archived") { opened } else { settled(&ctx, &mut world, &mut client, &mut view, PHONE) };
+    drawn(&ctx, &mut world, &mut client, &mut view, PHONE, click(on(&opened, "✓ Archived plan number 0")));
+    let mut shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    for _ in 0..60 {
+        shown = drawn(&ctx, &mut world, &mut client, &mut view, PHONE, Vec::new());
+    }
+    assert_eq!(view.desk.plan.as_deref(), Some("a-00"));
+    let name = shown.iter().find(|(text, _)| text.starts_with("✓ Archived plan number 0")).expect("its name").1;
+    let history = on(&shown, "History");
+    assert!(name.left() >= layout::TOUCH && name.left() < history.x, "{name:?} left of {history:?}");
+
+    // The plan before it is still a tap away, at the strip's left end.
+    let before = egui::pos2(layout::GUTTER + 10.0, name.center().y);
+    drawn(&ctx, &mut world, &mut client, &mut view, PHONE, click(before));
+    settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    assert_ne!(view.desk.plan.as_deref(), Some("a-00"), "it picked the plan before");
+    let open = world.driver.remote.plan_list().into_iter().find(|row| Some(&row.id) == view.desk.plan.as_ref());
+    assert_eq!(open.map(|row| row.status), Some(atomics_core::plan::PlanStatus::Open));
 }
 
 #[test]
@@ -1070,6 +1403,7 @@ fn the_picker_starts_an_agent_on_the_ungrouped_tab() {
     let shown = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Start");
     assert!(has(&shown, "The host refused: no agent claude is configured"), "{shown:?}");
     assert_eq!(world.host.board.sessions.len(), 2);
+    assert!(view.desk.plan_view && !view.desk.ungrouped, "the page stays where it was");
 }
 
 #[test]

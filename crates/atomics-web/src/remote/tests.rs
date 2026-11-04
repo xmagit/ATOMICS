@@ -504,6 +504,116 @@ fn a_steer_that_does_not_go_through_is_the_users_again() {
 }
 
 #[test]
+fn a_steer_some_targets_missed_names_them_and_only_one_all_missed_comes_back() {
+    let steer = || Command::Steer { sessions: vec!["chief".into(), "s1".into()], text: "go on".into() };
+    let no = || Outcome::refused(WireError::new(ErrorCode::Rejected, "session exited"));
+    let yes = || Outcome::done(serde_json::Value::Null);
+    let remote = connected(Role::Controller);
+    let agent = remote.session_list().into_iter().find(|s| s.id == "s1").unwrap().title;
+
+    // Whichever answers first, the text stays out of the bar and the note names who missed it.
+    remote.send(steer());
+    result(&remote, "op-1", yes());
+    assert_eq!(remote.notice(), None, "while the other is on its way");
+    result(&remote, "op-2", no());
+    assert_eq!(remote.take_unsent(), None);
+    assert_eq!(remote.notice(), Some(format!("Missed by {agent}. The host refused: session exited")));
+
+    remote.dismiss_notice();
+    remote.send(steer());
+    result(&remote, "op-3", no());
+    assert_eq!(remote.take_unsent(), None, "the other may still get it");
+    assert_eq!(remote.notice().as_deref(), Some("The host refused: session exited"));
+    result(&remote, "op-4", yes());
+    assert_eq!(remote.take_unsent(), None);
+    assert!(remote.notice().unwrap().starts_with("Missed by "), "{:?}", remote.notice());
+
+    // Missed by all: it comes back, as a steer to one does.
+    remote.dismiss_notice();
+    remote.send(steer());
+    result(&remote, "op-5", no());
+    result(&remote, "op-6", no());
+    assert_eq!(remote.take_unsent().as_deref(), Some("go on"));
+    assert_eq!(remote.notice().as_deref(), Some("The host refused: session exited"));
+
+    // Too many waiting: the one that went has it, and the other is named.
+    remote.dismiss_notice();
+    for _ in 0..wire::MAX_PENDING_OPS - 1 {
+        remote.send(Command::ApprovePlan(0));
+    }
+    remote.send(steer());
+    assert_eq!(remote.take_unsent(), None, "the first went");
+    let last = format!("op-{}", 6 + wire::MAX_PENDING_OPS);
+    result(&remote, &last, yes());
+    assert_eq!(remote.take_unsent(), None);
+    assert!(remote.notice().unwrap().starts_with("Missed by "), "{:?}", remote.notice());
+    assert!(remote.notice().unwrap().contains("Too many changes"), "{:?}", remote.notice());
+}
+
+#[test]
+fn a_comment_that_does_not_go_through_is_the_users_again() {
+    let comment = ReviewComment {
+        path: "src/a.rs".into(),
+        line: Some(2),
+        removed: false,
+        excerpt: String::new(),
+        body: "Why?".into(),
+    };
+    let add = || Command::EditComments { root: WORKTREE.into(), before: Vec::new(), after: vec![comment.clone()] };
+    let back = [(PathBuf::from(WORKTREE), comment.clone())];
+
+    let remote = connected(Role::Controller);
+    remote.send(add());
+    assert!(remote.take_unsent_comments().is_empty(), "while it is in flight");
+    result(&remote, "op-1", Outcome::refused(WireError::new(ErrorCode::StaleRevision, "the diff moved on")));
+    assert_eq!(remote.take_unsent_comments(), back);
+    assert_eq!(remote.notice().as_deref(), Some("The host refused: the diff moved on"));
+
+    remote.send(add());
+    result(&remote, "op-2", Outcome::done(serde_json::Value::Null));
+    assert!(remote.take_unsent_comments().is_empty(), "it went through");
+
+    // A comment that could not be removed stays on the host and on screen.
+    remote.send(Command::EditComments { root: WORKTREE.into(), before: vec![comment.clone()], after: Vec::new() });
+    result(&remote, "op-3", Outcome::refused(WireError::new(ErrorCode::Rejected, "no")));
+    assert!(remote.take_unsent_comments().is_empty());
+
+    // Offline nothing is sent, and it comes back all the same.
+    remote.disconnected();
+    remote.send(add());
+    assert_eq!(remote.take_unsent_comments(), back);
+}
+
+#[test]
+fn a_note_about_the_connection_goes_when_it_is_back_and_no_other_does() {
+    let remote = connected(Role::Controller);
+    remote.disconnected();
+    remote.send(Command::ApprovePlan(0));
+    assert_eq!(remote.notice().as_deref(), Some(NOT_CONNECTED));
+    remote.receive(welcome(Role::Controller));
+    assert_eq!(remote.notice(), None);
+
+    remote.disconnected();
+    remote.say("That was refused.");
+    remote.receive(welcome(Role::Controller));
+    assert_eq!(remote.notice().as_deref(), Some("That was refused."));
+}
+
+#[test]
+fn a_session_counts_as_started_once_the_host_has_started_it() {
+    let start = || Command::Start { agent: "claude".into(), folder: None };
+    let remote = connected(Role::Controller);
+    remote.send(start());
+    assert!(!remote.take_started(), "while it is on its way");
+    result(&remote, "op-1", Outcome::refused(WireError::new(ErrorCode::NotFound, "no agent claude is configured")));
+    assert!(!remote.take_started());
+    remote.send(start());
+    result(&remote, "op-2", Outcome::done(serde_json::Value::Null));
+    assert!(remote.take_started());
+    assert!(!remote.take_started(), "once");
+}
+
+#[test]
 fn a_delivery_that_did_not_happen_yet_says_so_without_hiding_a_refusal() {
     let remote = connected(Role::Controller);
     remote.take_outgoing();
@@ -544,7 +654,7 @@ fn a_task_shows_as_integrating_until_its_outcome() {
 }
 
 #[test]
-fn an_integrated_task_is_not_offered_again_and_a_shell_is_no_agent_to_steer() {
+fn an_integrated_task_is_not_offered_again_and_no_steer_goes_to_every_agent() {
     let remote = RemoteBackend::new("op");
     remote.receive(welcome(Role::Controller));
     let mut board = fake_host::board();
@@ -575,14 +685,13 @@ fn an_integrated_task_is_not_offered_again_and_a_shell_is_no_agent_to_steer() {
     assert_eq!(pending, ["t2"], "t1 is in the integration branch");
 
     remote.set_view(ViewHints { active: Some("s1".into()), ..default_hints() });
+    // The mirror has no agent kinds: typed into a shell under another name, it would run as a command.
+    assert!(!remote.tells_agents_from_shells());
     let mut client = atomics_ui::Client { steer_target: atomics_ui::chief::SteerTarget::Agents, ..Default::default() };
     client.steer_text = "go on".into();
     atomics_ui::chief::send_steer(&remote, &mut client);
-    assert_eq!(
-        client.commands,
-        [Command::Steer { sessions: vec!["s1".into()], text: "go on".into() }],
-        "typed into a shell, it would run as a command"
-    );
+    assert_eq!(client.commands, [Command::Toast("No session to send to".into())]);
+    assert_eq!(client.steer_text, "go on");
     assert!(!remote.diff_heading(Path::new("/w/shell")).can_send, "a shell takes no review");
 }
 

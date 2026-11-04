@@ -120,6 +120,28 @@ pub enum DiffAction {
 }
 
 impl DiffState {
+    /// Opens the comment box on `comment`'s line again, with its text, for a comment that did not go through; it
+    /// takes the keyboard with `focus`. False, and nothing changes, when another comment is being written or the
+    /// diff no longer has that line.
+    pub fn reopen_comment(&mut self, comment: &ReviewComment, focus: bool) -> bool {
+        if self.editor.as_ref().is_some_and(|editor| !editor.text.trim().is_empty()) {
+            return false;
+        }
+        let Some(prepared) = &self.prepared else { return false };
+        let on_it = |line: &DiffLine| {
+            let number = if comment.removed { line.old_no } else { line.new_no };
+            number.is_some() && number == comment.line && (line.kind == LineKind::Removed) == comment.removed
+        };
+        let files = prepared.diff.files.iter().enumerate().filter(|(_, file)| file.path() == comment.path);
+        let mut anchors = files.flat_map(|(fi, file)| {
+            let hunks = file.hunks.iter().enumerate();
+            hunks.filter_map(move |(hi, hunk)| hunk.lines.iter().position(on_it).map(|li| Anchor::Diff(fi, hi, li)))
+        });
+        let Some(anchor) = anchors.next() else { return false };
+        self.editor = Some(Editor { anchor, text: comment.body.clone(), focus });
+        true
+    }
+
     /// Opens `path`: its hunks when the diff touches it, the whole file otherwise.
     /// Returns true when the file content has to be loaded.
     pub fn open(&mut self, path: &str) -> bool {
@@ -252,7 +274,8 @@ pub struct Header<'a> {
     pub editor_shortcut: &'a str,
     /// A phone: the header stacks, a side shows at a time and long lines wrap ([`crate::touch`]).
     pub touch: Option<Touch>,
-    /// A click on a line starts a review comment, and Send review shows.
+    /// A click on a line starts a review comment, a click on one deletes it, and Send review shows. Without it a
+    /// comment box already open keeps its draft: Enter waits until it can go.
     pub review: bool,
     /// A double click on a line, and the editor button, open the file in the editor.
     pub edit: bool,
@@ -603,9 +626,9 @@ pub fn show(
                     let comment = &state.comments[i];
                     let (cell, gutter) = if split { (side(!comment.removed), side_gutter) } else { (rect, gutter) };
                     let over = |pos: Option<Pos2>| pos.is_some_and(|p| cell.x_range().contains(p.x));
-                    let hovered = over(response.hover_pos());
+                    let hovered = can_review && over(response.hover_pos());
                     comment_row(&painter.with_clip_rect(cell), cell, hovered, gutter, char_w, comment, font, palette);
-                    if response.clicked() && over(response.interact_pointer_pos()) {
+                    if can_review && response.clicked() && over(response.interact_pointer_pos()) {
                         delete = Some(i);
                     }
                 }
@@ -618,7 +641,7 @@ pub fn show(
                             }
                             _ => (rect, gutter),
                         };
-                        let (commit, cancel) = editor_row(ui, cell, gutter, char_w, editor, font);
+                        let (commit, cancel) = editor_row(ui, cell, gutter, char_w, editor, font, can_review);
                         commit_editor |= commit;
                         cancel_editor |= cancel;
                     }
@@ -893,14 +916,14 @@ fn show_file(
                 }
                 Row::Comment(i) => {
                     let comment = &state.comments[i];
-                    comment_row(painter, rect, response.hovered(), gutter, char_w, comment, font, palette);
-                    if response.clicked() {
+                    comment_row(painter, rect, review && response.hovered(), gutter, char_w, comment, font, palette);
+                    if review && response.clicked() {
                         delete = Some(i);
                     }
                 }
                 Row::Editor => {
                     if let Some(editor) = state.editor.as_mut() {
-                        let (c, x) = editor_row(ui, rect, gutter, char_w, editor, font);
+                        let (c, x) = editor_row(ui, rect, gutter, char_w, editor, font, review);
                         commit |= c;
                         cancel |= x;
                     }
@@ -966,7 +989,8 @@ fn comment_row(
     }
 }
 
-/// The inline comment input. Returns (commit, cancel).
+/// The inline comment input. Returns (commit, cancel). Without `review` Enter commits nothing, and the box keeps
+/// its draft and the keyboard.
 fn editor_row(
     ui: &mut egui::Ui,
     rect: Rect,
@@ -974,6 +998,7 @@ fn editor_row(
     char_w: f32,
     editor: &mut Editor,
     font: &FontId,
+    review: bool,
 ) -> (bool, bool) {
     let field = rect.with_min_x(rect.left() + gutter - char_w);
     let mut child = ui.new_child(egui::UiBuilder::new().id_salt("comment-editor").max_rect(field));
@@ -990,7 +1015,10 @@ fn editor_row(
         return (false, false);
     }
     if child.input(|i| i.key_pressed(Key::Enter)) {
-        (true, false)
+        if !review {
+            response.request_focus();
+        }
+        (review, false)
     } else {
         (false, child.input(|i| i.key_pressed(Key::Escape)) || editor.text.trim().is_empty())
     }

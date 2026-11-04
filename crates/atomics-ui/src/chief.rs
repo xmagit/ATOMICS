@@ -326,14 +326,17 @@ pub fn steer_bar(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) 
         };
         egui::ComboBox::from_id_salt("steer-target").selected_text(label).width(190.0).show_ui(ui, |ui| {
             ui.selectable_value(&mut client.steer_target, SteerTarget::Active, format!("Active: {active_title}"));
-            ui.selectable_value(&mut client.steer_target, SteerTarget::Agents, format!("All agents ({agents})"));
+            if backend.tells_agents_from_shells() {
+                ui.selectable_value(&mut client.steer_target, SteerTarget::Agents, format!("All agents ({agents})"));
+            }
             ui.selectable_value(&mut client.steer_target, SteerTarget::Selected, format!("Selected ({selected})"));
         });
 
         let id = ui.scope_id().with("steer-input");
         let focused = ui.memory(|m| m.has_focus(id));
         let mut send = false;
-        if focused && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter)) {
+        // Its match ignores Shift, which is the text box's: a new line.
+        if focused && ui.input_mut(|i| !i.modifiers.shift && i.consume_key(egui::Modifiers::NONE, Key::Enter)) {
             send = true;
         }
         let width = ui.available_width() - 70.0;
@@ -376,7 +379,7 @@ pub fn send_steer(backend: &dyn Backend, client: &mut Client) {
         .into_iter()
         .filter(|row| match client.steer_target {
             SteerTarget::Active => active.as_deref() == Some(row.id.as_str()),
-            SteerTarget::Agents => row.kind != AgentKind::Shell && !row.chief,
+            SteerTarget::Agents => backend.tells_agents_from_shells() && row.kind != AgentKind::Shell && !row.chief,
             SteerTarget::Selected => client.selected.contains(&row.id),
         })
         .filter(|row| row.can_receive)

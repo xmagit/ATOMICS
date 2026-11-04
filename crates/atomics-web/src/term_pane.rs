@@ -21,13 +21,14 @@
 //!   open menu or popup takes all of it, so a click away closes the popup as it does anywhere else. A click
 //!   outside it, on a text box the page draws, takes the browser's focus with it, so what is typed there goes
 //!   there and nothing reaches the terminal.
-//! - **Typing needs the lease**, asked for only when the overlay gains the focus (a tap) and only where
-//!   `welcome` grants `type`. Losing it to the desktop or another client, or being refused it, blurs the
-//!   overlay, so typing again is a new tap. Text, keys and pastes forwarded while the overlay does not
-//!   have the focus, or in the frame the lease was lost, are dropped: what was in flight then (keys of
-//!   that frame, a word the keyboard commits as the overlay loses the focus, a Paste whose clipboard read
-//!   finishes late) neither types nor asks for the lease again. The input leaving a terminal lets go of
-//!   its lease.
+//! - **Typing needs the lease**, asked for only when the overlay gains the focus (a tap or click, or a pick that
+//!   moves it there) and only where `welcome` grants `type`. Losing it to the desktop or another client, or
+//!   being refused it, blurs the overlay, so typing again is a new tap. Text, keys and pastes forwarded while the
+//!   overlay does not have the focus, or in the frame the lease was lost, are dropped: what was in flight
+//!   then (keys of that frame, a word the keyboard commits as the overlay is blurred, a Paste whose clipboard read
+//!   finishes late) neither types nor asks for the lease again. A word being composed when the user clicks away
+//!   commits first, so it is typed, with no Return. The input leaving a terminal lets go of its lease, and so
+//!   does the keyboard going to a text box.
 //! - **Offline** the screen shows as it was, marked disconnected, and nothing is typed.
 
 use std::collections::HashMap;
@@ -324,6 +325,14 @@ impl TermPane {
             if let Some(rect) = self.overlay.rect {
                 self.overlay.covered = covered(ctx, self.layer, rect);
             }
+            // The keyboard is in a text box the page draws: another browser would see the lease held until it
+            // expires, by someone who has moved on. A click back asks again.
+            if self.held && !self.focused && ctx.output(|output| output.ime.is_some()) {
+                if let Some(session) = &self.session {
+                    remote.release(session);
+                }
+                self.held = false;
+            }
             return;
         }
         if let Some(last) = &self.session {
@@ -605,7 +614,7 @@ impl TermPane {
             TermInput::Focus(true) => {
                 self.focused = true;
                 self.active_ms = now_ms;
-                // The tap that focuses the overlay is the only thing that asks for the lease.
+                // The overlay gaining the focus is the only thing that asks for the lease.
                 if !lease.yours && lease.holder.is_none() {
                     remote.acquire(session, false);
                 }

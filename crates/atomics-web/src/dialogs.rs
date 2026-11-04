@@ -122,7 +122,7 @@ pub struct Picker {
 }
 
 /// The picker of `+ New`: the agents and folders the mirror names, which is what atomics.v1 lets a client know.
-/// A new session is outside any plan, so it lands on the Ungrouped tab, as on the desktop.
+/// A new session is outside any plan, so the page goes to the Ungrouped tab once the host has started it.
 fn new_session(ctx: &egui::Context, remote: &RemoteBackend, client: &mut Client, picker: &mut Option<Picker>) {
     if picker.is_none() {
         return;
@@ -170,7 +170,6 @@ fn new_session(ctx: &egui::Context, remote: &RemoteBackend, client: &mut Client,
     let folder = picked.folder.clone();
     picked.agent = Some(agent.clone());
     if start {
-        client.send(Command::ShowUngrouped);
         client.send(Command::Start { agent, folder });
     }
     if start || cancel || !open {

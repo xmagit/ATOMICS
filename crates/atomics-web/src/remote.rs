@@ -26,12 +26,15 @@ use atomics_core::diff_data::Prepared;
 use atomics_core::layout::LayoutConfig;
 use atomics_core::lease::GridSize;
 use atomics_core::mirror::Mirror;
-use atomics_core::ops::{self, Grant, Outcome, Pending, PlanAction, PlanCommand};
+use atomics_core::ops::{
+    self, Grant, Outcome, Pending, PlanAction, PlanCommand, ReviewAction, ReviewCommand, SessionAction, SessionCommand,
+};
 use atomics_core::plan::{Plan, PlanStatus, Report, Task, TaskStatus};
 use atomics_core::projection::{DiffFileBody, DiffFileSummary, PlanInfo, SessionInfo, TaskInfo};
 use atomics_core::repo_workflow::RepoWorkflow;
 use atomics_core::screen::Screen;
 use atomics_core::session::AgentStatus;
+use atomics_core::steer::ReviewComment;
 use atomics_core::wire::{self, Envelope, ErrorCode, Message, Role, Seq, VERSION};
 use atomics_ui::{
     ApprovalRow, Backend, BoardView, ChiefView, Command, CompletedTile, DiffHeading, DiffSnapshot, Notices, PanelMode,
@@ -49,9 +52,11 @@ pub const CAPABILITIES: &[&str] =
 const MAX_IN_FLIGHT: usize = 4;
 /// Pages of one file's diff read before the rest is left out.
 const MAX_PAGES: u32 = 16;
-/// The agent name a host gives a plain shell. The mirror has no agent kinds, and a steer to all agents leaves
-/// shells out: there it would run as a command.
+/// The agent name a host gives a plain shell. The mirror has no agent kinds, so this is only the usual shell, for
+/// counting agents and for whether a worktree has one to review; nothing that types can rely on it.
 const SHELL: &str = "shell";
+/// What a command says when the channel is down, until it is back.
+const NOT_CONNECTED: &str = "Not connected to the host. Try again once it is back.";
 
 /// What the host's `welcome` said about this client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,8 +84,15 @@ struct State {
     flights: HashMap<String, Flight>,
     /// Decisions the host refused or could not confirm, which the approval banner may offer again.
     refused: Vec<(String, String)>,
-    /// A steer that did not go through: its text, for the steer bar to hold again.
+    /// The steers on their way, by number, and the last number given.
+    steers: HashMap<u64, Steering>,
+    last_steer: u64,
+    /// A steer that reached none of its targets: its text, for the steer bar to hold again.
     unsent: Option<String>,
+    /// Comments that did not go through, by worktree, for their boxes to hold again.
+    unsent_comments: Vec<(PathBuf, ReviewComment)>,
+    /// The host started a session this page asked for.
+    started: bool,
     /// Diffs as fetched, by worktree.
     diffs: BTreeMap<String, Fetched>,
     /// The worktrees whose files' hunks to fetch: those on screen.
@@ -102,10 +114,24 @@ struct State {
 enum Flight {
     /// An approval decided here, by session and request: the banner hides it meanwhile.
     Decision(String, String),
-    /// A steer's text, which the steer bar has let go of.
-    Steer(String),
+    /// One target of a steer ([`Steering`]), by the steer's number and the session.
+    Steer(u64, String),
+    /// A comment that left its box, by worktree.
+    Comment(PathBuf, ReviewComment),
+    /// A session being started.
+    Start,
     /// A task being merged, by plan and task: its card says so meanwhile.
     Integrate(String, String),
+}
+
+/// A steer on its way, until each of its targets has answered.
+struct Steering {
+    text: String,
+    waiting: usize,
+    reached_any: bool,
+    /// The targets it missed, by title, and why the last of them did.
+    missed: Vec<String>,
+    why: Option<String>,
 }
 
 /// What a mutation that went through did not do yet, where the screen does not show it. The rest shows.
@@ -174,7 +200,11 @@ impl RemoteBackend {
             pending: Pending::default(),
             flights: HashMap::new(),
             refused: Vec::new(),
+            steers: HashMap::new(),
+            last_steer: 0,
             unsent: None,
+            unsent_comments: Vec::new(),
+            started: false,
             diffs: BTreeMap::new(),
             wanted: BTreeSet::new(),
             requests: HashMap::new(),
@@ -252,9 +282,19 @@ impl RemoteBackend {
         std::mem::take(&mut self.state.borrow_mut().refused)
     }
 
-    /// The text of a steer that did not go through, for the steer bar to hold again.
+    /// The text of a steer that reached none of its targets, for the steer bar to hold again.
     pub fn take_unsent(&self) -> Option<String> {
         self.state.borrow_mut().unsent.take()
+    }
+
+    /// The comments that did not go through, by worktree, for their boxes to hold again.
+    pub fn take_unsent_comments(&self) -> Vec<(PathBuf, ReviewComment)> {
+        std::mem::take(&mut self.state.borrow_mut().unsent_comments)
+    }
+
+    /// Whether the host started a session this page asked for since the last time this was asked.
+    pub fn take_started(&self) -> bool {
+        std::mem::take(&mut self.state.borrow_mut().started)
     }
 
     pub fn notice(&self) -> Option<String> {
@@ -443,8 +483,34 @@ impl State {
     fn land(&mut self, op: &str, done: bool) {
         match self.flights.remove(op) {
             Some(Flight::Decision(session, approval)) if !done => self.refused.push((session, approval)),
-            Some(Flight::Steer(text)) if !done => self.unsent = Some(text),
+            Some(Flight::Steer(steer, session)) => self.steer_answered(steer, session, done),
+            Some(Flight::Comment(root, comment)) if !done => self.unsent_comments.push((root, comment)),
+            Some(Flight::Start) if done => self.started = true,
             _ => {}
+        }
+    }
+
+    /// One target of a steer answered, with the reason on the notice line if it was missed. Once all have: reached
+    /// by none, the text goes back to the bar. Reached by some, the bar stays empty, since Enter would reach those
+    /// again, and the note names the others.
+    fn steer_answered(&mut self, steer: u64, session: String, done: bool) {
+        let Some(steering) = self.steers.get_mut(&steer) else { return };
+        steering.waiting -= 1;
+        if done {
+            steering.reached_any = true;
+        } else {
+            steering.why = self.notice.clone();
+            steering.missed.push(self.mirror.sessions.get(&session).map_or(session, |s| s.title.clone()));
+        }
+        if steering.waiting > 0 {
+            return;
+        }
+        let Some(steering) = self.steers.remove(&steer) else { return };
+        if !steering.reached_any {
+            self.unsent = Some(steering.text);
+        } else if !steering.missed.is_empty() {
+            let why = steering.why.unwrap_or_default();
+            self.notice = Some(format!("Missed by {}. {why}", steering.missed.join(", ")));
         }
     }
 
@@ -467,41 +533,45 @@ impl State {
                     // A replay that does not follow the board held: start again from a snapshot.
                     self.resync();
                 }
+                // The connection is back, so what said it was not goes.
+                if self.notice.as_deref() == Some(NOT_CONNECTED) {
+                    self.notice = None;
+                }
                 let (again, expired) = self.pending.resend(self.now_ms, self.ttl_secs);
                 self.outgoing.extend(again.into_iter().map(Envelope::new));
-                for command in &expired {
-                    self.land(command.op(), false);
-                }
                 if !expired.is_empty() {
                     self.notice = Some(
                         "Some earlier actions may not have reached the host. Check the board before trying again."
                             .into(),
                     );
                 }
+                for command in &expired {
+                    self.land(command.op(), false);
+                }
             }
             Message::DiffFile { body, truncated, next_offset } => self.diff_page(body, *truncated, *next_offset),
             Message::CommandResult(result) => {
                 let Some(outcome) = self.pending.apply(result) else { return };
-                self.land(&result.op, matches!(outcome, Outcome::Done { .. }));
-                let notice = match outcome {
+                match &outcome {
                     Outcome::Refused { code: ErrorCode::AlreadyResolved, message } => {
-                        format!("That request was already answered: {message}")
+                        self.notice = Some(format!("That request was already answered: {message}"));
                     }
                     Outcome::Refused { code: ErrorCode::Unauthorised, .. } => {
-                        "The host does not let this device do that.".to_string()
+                        self.notice = Some("The host does not let this device do that.".into());
                     }
-                    Outcome::Refused { message, .. } => format!("The host refused: {message}"),
+                    Outcome::Refused { message, .. } => self.notice = Some(format!("The host refused: {message}")),
                     Outcome::Uncertain { message } => {
-                        format!("The host could not confirm it ({message}). Check the board before trying again.")
+                        self.notice = Some(format!(
+                            "The host could not confirm it ({message}). Check the board before trying again."
+                        ));
                     }
-                    // It never takes the place of what went wrong with another.
-                    Outcome::Done { result } => {
-                        self.notice = self.notice.take().or_else(|| delivery_note(&result));
-                        return;
-                    }
-                    Outcome::Accepted | Outcome::Unknown => return,
-                };
-                self.notice = Some(notice);
+                    Outcome::Done { .. } | Outcome::Accepted | Outcome::Unknown => {}
+                }
+                self.land(&result.op, matches!(outcome, Outcome::Done { .. }));
+                // It never takes the place of what went wrong with another.
+                if let Outcome::Done { result } = &outcome {
+                    self.notice = self.notice.take().or_else(|| delivery_note(result));
+                }
             }
             Message::Ping { nonce } => {
                 let pong = Envelope::new(Message::Pong { nonce: nonce.clone() }).reply_to(envelope.request_id.clone());
@@ -808,7 +878,7 @@ impl Backend for RemoteBackend {
         }
         if self.welcome().is_none() {
             self.refuse(&command);
-            return self.say("Not connected to the host. Try again once it is back.");
+            return self.say(NOT_CONNECTED);
         }
         let mut op = || self.next_op();
         let mutations = match self.remote_of(&command, &mut op) {
@@ -824,28 +894,27 @@ impl Backend for RemoteBackend {
             self.refuse(&command);
             return self.say("That is no longer on the host. Check the board.");
         }
+        let steer = self.steering(&command, mutations.len());
         for mutation in mutations {
-            if !self.may(mutation.grant()) {
-                self.refuse(&command);
-                self.say("This device may only view this host. Its owner decides what it may change.");
-                continue;
-            }
-            // What the host would refuse for its size says so here, and the operation waits for nothing.
-            if let Err(error) = mutation.validate() {
-                self.refuse(&command);
-                self.say(format!("That was not sent: {}.", error.message));
-                continue;
-            }
+            let refusal = if !self.may(mutation.grant()) {
+                Some("This device may only view this host. Its owner decides what it may change.".to_string())
+            } else if let Err(error) = mutation.validate() {
+                // What the host would refuse for its size says so here, and the operation waits for nothing.
+                Some(format!("That was not sent: {}.", error.message))
+            } else if self.state.borrow().pending.len() >= wire::MAX_PENDING_OPS {
+                // As many as the host takes at once (more are `too_many`): what waits stays bounded, offline too.
+                Some("Too many changes are still waiting for the host. Try again once they are answered.".to_string())
+            } else {
+                None
+            };
             let mut s = self.state.borrow_mut();
-            // As many as the host takes at once (more are `too_many`): what waits stays bounded, offline too.
-            if s.pending.len() >= wire::MAX_PENDING_OPS {
-                drop(s);
-                self.refuse(&command);
-                self.say("Too many changes are still waiting for the host. Try again once they are answered.");
-                continue;
-            }
-            if let Some(flight) = self.flight(&s.mirror, &mutation, &command) {
+            if let Some(flight) = self.flight(&s.mirror, &mutation, &command, steer) {
                 s.flights.insert(mutation.op().to_string(), flight);
+            }
+            if let Some(refusal) = refusal {
+                s.notice = Some(refusal);
+                s.land(mutation.op(), false);
+                continue;
             }
             let now = s.now_ms;
             let message = s.pending.send(mutation, now);
@@ -866,7 +935,7 @@ impl Backend for RemoteBackend {
             Command::Steer { .. } if !wide => return false,
             // The wide layout's picker, of what the mirror names.
             Command::NewSession => return wide && self.sends(&start()),
-            // An open plan's tab asks, and archives. Closing a finished one's needs a guard the protocol lacks.
+            // An open plan's tab asks, and archives. A finished one's has no close; its board's Archive does that.
             Command::ClosePlanTab(plan) => {
                 let open = self.plan_row(*plan).is_some_and(|row| row.status == PlanStatus::Open);
                 return open && self.sends(&Command::ClosePlan { plan: *plan, status: PlanStatus::Archived });
@@ -883,6 +952,11 @@ impl Backend for RemoteBackend {
                 && (!plan || s.mirror.plans.values().nth(s.view.selected_plan).is_some());
         }
         self.sends(command)
+    }
+
+    /// The mirror has no agent kinds: a shell can run under any name.
+    fn tells_agents_from_shells(&self) -> bool {
+        false
     }
 
     /// A page has no keyboard chords of its own: the keyboard goes to the terminal or to the browser.
@@ -1137,14 +1211,50 @@ impl RemoteBackend {
         }
     }
 
-    /// What `mutation` of `command` changes on screen while it is in flight.
-    fn flight(&self, mirror: &Mirror, mutation: &ops::Command, command: &Command) -> Option<Flight> {
+    /// The number of `command` if it is a steer, to `targets` targets; none is 0.
+    fn steering(&self, command: &Command, targets: usize) -> u64 {
+        let Command::Steer { text, .. } = command else { return 0 };
+        let mut s = self.state.borrow_mut();
+        s.last_steer += 1;
+        let steer = s.last_steer;
+        let steering =
+            Steering { text: text.clone(), waiting: targets, reached_any: false, missed: Vec::new(), why: None };
+        s.steers.insert(steer, steering);
+        steer
+    }
+
+    /// What `mutation` of `command` changes on screen while it is in flight; `steer` is the number of a steer.
+    fn flight(&self, mirror: &Mirror, mutation: &ops::Command, command: &Command, steer: u64) -> Option<Flight> {
         match (mutation, command) {
             (ops::Command::ApprovalDecide(decide), Command::Decide { session, .. }) => {
                 let row = self.session_row_in(mirror, *session)?;
                 Some(Flight::Decision(row.id, decide.approval.clone()))
             }
-            (_, Command::Steer { text, .. }) => Some(Flight::Steer(text.clone())),
+            (
+                ops::Command::SessionCommand(SessionCommand { action: SessionAction::Steer { session, .. }, .. }),
+                Command::Steer { .. },
+            ) => Some(Flight::Steer(steer, session.clone())),
+            (
+                ops::Command::SessionCommand(SessionCommand { action: SessionAction::Start { .. }, .. }),
+                Command::Start { .. },
+            ) => Some(Flight::Start),
+            (
+                ops::Command::ReviewCommand(ReviewCommand {
+                    worktree,
+                    action: ReviewAction::Add { path, line, removed, text, .. },
+                    ..
+                }),
+                _,
+            ) => {
+                let comment = ReviewComment {
+                    path: path.clone(),
+                    line: *line,
+                    removed: *removed,
+                    excerpt: String::new(),
+                    body: text.clone(),
+                };
+                Some(Flight::Comment(PathBuf::from(worktree), comment))
+            }
             (
                 ops::Command::PlanCommand(PlanCommand {
                     plan: Some(plan), action: PlanAction::Integrate { task }, ..
@@ -1155,7 +1265,8 @@ impl RemoteBackend {
         }
     }
 
-    /// A command that will not be sent: an approval the banner may offer again, and a steer the bar holds again.
+    /// A command that will not be sent: an approval the banner may offer again, a steer the bar holds again, and
+    /// comments their boxes hold again.
     fn refuse(&self, command: &Command) {
         let mut s = self.state.borrow_mut();
         match command {
@@ -1165,6 +1276,11 @@ impl RemoteBackend {
                 }
             }
             Command::Steer { text, .. } => s.unsent = Some(text.clone()),
+            Command::EditComments { root, before, after } => {
+                let unsent = after.iter().filter(|comment| !before.contains(comment));
+                let unsent: Vec<_> = unsent.map(|comment| (root.clone(), comment.clone())).collect();
+                s.unsent_comments.extend(unsent);
+            }
             _ => {}
         }
     }

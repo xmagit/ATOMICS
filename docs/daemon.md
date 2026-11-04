@@ -865,13 +865,13 @@ or tab for the others:
 
 - **Offered:** answering approvals; approving a plan, Dispatch, a card's start, accept, send back, unblock and reopen,
   integrate and Integrate; a tile's close and the sidebar's Close, asking where the desktop asks; review comments and
-  Send review; the steer bar and "Include in selected" (wide only: a phone's terminal is right there); typing
-  into terminals.
+  Send review; the steer bar, to the active session or the selected, and "Include in selected" (wide only: a phone's
+  terminal is right there); typing into terminals.
 - **Close plan…** offers Archive alone: `atomics.v1` has no way to complete a plan. An open plan's tab closes the same
-  way; a finished plan's tab has no close, since archiving one needs a check the protocol lacks, and its board's
-  Archive stays. A closed plan's board stays read-only. A plan that closes while it shows gives way to the first open
-  plan, as on the desktop.
-- **`+ New`** (wide only) opens a small picker of what the host's board names: the agents its sessions and open plans use,
+  way; a finished plan's tab has no close, and its board's Archive does that. A closed plan's board stays read-only.
+  A plan that closes while it shows gives way to the first open plan, as on the desktop.
+- **`+ New`** (wide only) opens a small picker of what the host's board names: the agents its sessions and open plans
+  use,
   and a scratch folder or a folder its sessions and open plans use. The host's configured agents and its
   worktrees are not sent, so a host with no session and no open plan offers none, and starting in a new worktree
   stays on the computer.
@@ -880,13 +880,20 @@ or tab for the others:
   brief, syncing tickets, renaming and resuming a session, the editor, the whole file of a file with no changes, the
   explorer; and the voice, since a browser has no microphone here. The mirror does not say whether a session is
   sandboxed, outside ATOMICS or in a scratch folder, so closing an exited session outside a worktree and a plan asks, in
-  case it deletes its folder. It has no agent kinds either: a steer to all agents leaves out those named `shell`, where
-  it would run as a command.
+  case it deletes its folder. It has no agent kinds either, and a shell can run under any name, so there is no "All
+  agents" target: typed into a shell, a steer would run as a command. A shell not named `shell` still counts as an
+  agent in the top bar, and its worktree still offers Send review, which the host delivers to its active session if
+  that is the shell and otherwise refuses. An integration the host is still checking, or could not verify, shows as
+  integrated: the mirror does not carry that state.
 
 A command that fails says why: refused, unconfirmed or too large, on the phone's notice line and in a note under the
-wide layout's top bar. A steer goes back into the bar, an approval back to its banner, and a task's `integrating…` ends with
-the outcome; a comment shows once the host has it. A diff on screen is fetched file by file with `diff_get`, four
-files at a time, up to 16 pages each; the browser draws it without syntax colours.
+wide layout's top bar, which like a window takes the pointer and its part of the input, and goes after 12 s or a click.
+A note about the connection goes when the connection is back. A steer that reached none of its targets goes back into
+the bar; one that reached some does not, since Enter would reach those again, and the note names those it missed. An
+approval goes back to its banner, a refused comment back into its box with its text, and a task's `integrating…` ends
+with the outcome. A comment box open when the connection drops keeps its draft, and Enter waits until the connection
+is back. A diff on screen is fetched file by file with `diff_get`, four files at a time, up to 16 pages each; the
+browser draws it without syntax colours.
 
 **Layouts (C4).** A wide window draws the desktop's own window, `atomics_ui::shell::frame`, in the boot's theme
 as the desktop draws it (monospace UI text where the theme says so; the default theme does): the top bar with the
@@ -900,17 +907,19 @@ per page (`atomics-web/src/desk.rs`), following the desktop's rules for the view
 and Ungrouped, and a page opens as the desktop does, on the first open plan's with its board beside the agents, and
 keeps its plan by id. Finished plans are reached through History; with no open plan, every agent shows and no board.
 A click into a terminal, or picking an agent, sends what is typed there, as on the desktop: the page's one input
-moves over it, focused, and the terminal it left gets its lease back. A chief's permission request is answered over
+moves over it, focused, and lets go of the lease of the terminal it left. A chief's permission request is answered over
 the chief's terminal, and connection trouble (why the page stopped, or that the board may be out of date) stays in
 a line under the frame.
 
 On a phone (narrower than 600 CSS pixels, or 900 with a coarse pointer; the ⋯ menu overrides it, remembered in the
 client origin's `localStorage`), one pane at a time from a bottom bar, each a view of the desktop's: Agents (the
 sidebar's AGENTS list; a tap opens the agent's tile), Board (the current plan's board under one row to pick plans
-from: the open ones in a strip that scrolls sideways, the finished ones behind a scrolling History), Diffs (the
+from: the open ones in a strip that scrolls sideways, the finished ones behind a scrolling History, the one picked
+there joining the strip, which scrolls to it and keeps a tap's width of the plan before it), Diffs (the
 worktrees with changes, then the diff panel), Terminal (the active agent's fleet tile at the pane's size: its header,
-its approval banner, its terminal) and Chief (the chief's window, with the request it waits on). The approvals are behind the top bar's ◆ badge, selected while they show. All of it
-sits inside `visualViewport` and the safe-area insets (the sides too, for a phone held sideways). The page's own
+its approval banner, its terminal) and Chief (the chief's window, with the request it waits on). The approvals are
+behind the top bar's ◆ badge, selected while they show. All of it sits inside `visualViewport` and the safe-area
+insets (the sides too, for a phone held sideways). The page's own
 controls take the theme's colours as CSS custom properties.
 
 The phone draws the theme's colours zoomed by 1.25 (through the theme's UI size, so code and terminals keep their
@@ -949,20 +958,24 @@ desktop, and lasts as long as the lease (**Computer's size** gives it back early
   output does not move a view scrolled back) and pans; a long press (450 ms) selects the word under the finger
   (letters, digits and `_-./~:@%+`; else the one cell), out to wherever the finger then moves, with a handle at
   each end to drag; a **Copy** chip, above the selection or below it where there is no room in the terminal, copies
-  just that range on its touch's end, leaving the focus where it was (see the iframe above). The page's own text selection is off. A pinch sets the font size (5-28
-  points). A touch whose lift never reached the client is cancelled when the next touch starts. A mouse clicks
-  and drag-selects, and its wheel scrolls; Ctrl+wheel zooms. In the alternate screen, or with SGR mouse reports, a
-  scroll sends arrows or wheel reports instead, as the desktop does, only while this client types.
-- **Typing needs the lease.** Only the tap that focuses the field asks for a free lease; text typed meanwhile waits
-  for the grant (16 KiB at most, this connection only), and a lease state sent before the host read the request
-  leaves it standing. The input moving to another terminal, or to none, releases the lease (a grant still on its way
-  goes back when it comes), so another browser never sees it held by someone who has moved on. Typing never asks for the lease: text, keys and pastes count only while the field has the
-  focus and this client holds the lease or is asking for it, and anything else is dropped, never kept. Another
-  client typing makes the field read-only, with **Take over**. The lease is renewed every 10 s while the field has
-  the focus. Losing it (the desktop types or takes it back, another client takes over), or being refused it, takes
+  just that range on its touch's end, leaving the focus where it was (see the iframe above). The page's own text
+  selection is off. A pinch sets the font size (5-28 points). A touch whose lift never reached the client is cancelled
+  when the next touch starts. A mouse clicks and drag-selects, and its wheel scrolls; Ctrl+wheel zooms. In the
+  alternate screen, or with SGR mouse reports, a scroll sends arrows or wheel reports instead, as the desktop does,
+  only while this client types.
+- **Typing needs the lease.** Only the field gaining the focus asks for a free lease, by a tap, a click, or a pick
+  or the chief's notice that moves it there; text typed meanwhile waits for the grant (16 KiB at most, this
+  connection only), and a lease state sent before the host read the request leaves it standing. The input moving to
+  another terminal or to none, or the keyboard moving to a text box the page draws, releases the lease (a grant still
+  on its way goes back when it comes), and a click back asks again. A field that only loses the focus, to another
+  window or to a button, keeps the lease until it runs out, since nothing renews it. Typing never asks for the lease:
+  text, keys and pastes count only while the field has the focus and this client holds the lease or is asking for
+  it, and anything else is dropped, never kept. Another client typing makes the field read-only, with **Take over**.
+  The lease is renewed every 10 s while the field has the focus. Losing it (the desktop types or takes it back, another client takes over), or being refused it, takes
   the focus away, and what was in flight then is dropped: keys of that frame, a word the keyboard commits as the
-  field loses the focus, a Paste whose clipboard read finishes late. The caret goes with the focus, so text a
-  keyboard commits later cannot focus the field again. Typing again is a new tap. A paste over
+  field is blurred, a Paste whose clipboard read finishes late. The caret goes with the focus, so text a
+  keyboard commits later cannot focus the field again. Typing again is a new tap. A word being composed when the
+  user clicks away commits first, so it is typed, with no Return. A paste over
   1 MiB, or more than may wait, is not typed, with a note naming the limit that refused it (16 KiB while waiting
   for the grant, else 1 MiB). Input refused as `slow_client` is typed
   again from the screen's next change on, at most 1 MiB per change. Lease requests, input and resizes carry
@@ -971,38 +984,15 @@ desktop, and lasts as long as the lease (**Computer's size** gives it back early
 - **Offline.** The screen stays on view, marked "Disconnected"; the field is read-only and nothing typed is kept:
   the lease and anything waiting end with the channel, and the screen is subscribed again after `welcome`.
 
-**Tests.** `cargo test -p atomics-web`: the boot's origin, window and field rules; the channel, pairing, the
-board, commands and grants, reconnecting and every stop against an in-process host built from `atomics_core`
-(`src/fake_host.rs`, whose terminals echo under leases); the terminals' leases, typing, history, no replay and
-`slow_client`; that nothing typed after a take back types or asks for the lease; the gestures; the overlay's
-events and what is cut out of it; the page's plan and tabs against the desktop's rules; the phone layout at 360, 390
-and 430 points; key encoding per terminal mode (`atomics_ui::terminal::encode`);
-the views drawn headless, each command as a controller, a viewer and offline, what it sends and what the host does with
-it, its refusal and what it leaves on screen; the manifest; and that the crate names no hosting product.
+**Tests.** `cargo test -p atomics-web` runs against an in-process host built from `atomics_core`
+(`src/fake_host.rs`, whose terminals echo under leases): pairing, the channel and reconnecting; each command as a
+controller, a viewer and offline, with what it sends and what comes of it; leases, typing and gestures; and the views
+drawn headless in both layouts.
 
-`tests/browser.rs` runs the real bundle in headless Chrome against that host, behind a fake broker. On a desktop
-it pairs, reconnects and reloads, types into a terminal through DevTools, sees the echo, and loses and regains the
-lease. As an iPhone (390 × 844 points at 3×, a touch screen, Safari's user agent, framed full screen) it is used
-by touch alone: it pairs, shows the board, the AGENTS list and a two-file diff, approves the plan and a tool request
-with a tap on their buttons (checking the `plan_command` approve and the `approval_decide` the host receives),
-focuses a terminal with a tap, types a line, Return, Backspace and the key bar's ↑ (checking the bytes, and that the
-key is 44 CSS pixels each way), and once the desktop takes the terminal back checks that the field lost the focus
-and typing sends nothing; then it long-presses a word, drags the selection's end handle over the next word and
-checks that Copy copies exactly those two words. It saves every screen as a PNG in `target/phone-shots/` for a
-person to review. A click on a floating chief types there, and a click on a ⋯ menu entry over a terminal acts and
-takes no lease; a host of 26 plans, 25 of them archived, opens with the open plan's Approve plan on screen in a wide
-window and on a phone, where History reaches the others (`target/many-plans-shots/`). In a 1600 × 1000 window it
-checks the desktop's frame: the board, the docked chief's terminal and the agent's tile, a click into either terminal
-typing there and releasing the other's lease, and Approve plan; it saves `target/wide-shots/browser.png`
-and, beside the desktop's QA screenshot of the same board (`scripts/wide-desktop-shot.sh`, which writes
-`target/wide-shots/desktop.png`), `target/wide-shots/side-by-side.png`. The actions are clicked and tapped where the
-fake board puts them, saving `target/actions-shots/`: while a terminal has the focus, a click on the steer bar or a
-comment box moves the keyboard there, what is typed reaches the host as a steer or a comment, Send review sends it,
-and nothing reaches the terminal; a refused steer says why and comes back; start and Dispatch; a tile's close with its
-confirmation; the picker of `+ New`; Close plan… with Archive alone; "Include in selected" and a steer to the
-selected; unblock, integrate, accept and Integrate; the changed-files column; and on a phone 360 CSS pixels wide, by
-touch, integrate, accept, Integrate, Close plan…, a comment and Send review, a tile's close and the archived plan
-from History. All of them need the bundle and Chrome, so they are ignored by default:
+`tests/browser.rs` runs the real bundle in headless Chrome against that host, behind a fake broker, in a desktop
+window and as an iPhone used by touch alone. Its header says what each test drives. The tests click and tap where the
+fake board puts things, and save screens for a person to review under `target/` (`phone-shots/`, `many-plans-shots/`,
+`wide-shots/`, `actions-shots/`). They need the bundle and Chrome, so they are ignored by default:
 
 ```sh
 scripts/build-web.sh

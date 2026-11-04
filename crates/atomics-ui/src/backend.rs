@@ -373,6 +373,12 @@ pub trait Backend {
     /// names count, not its other fields.
     fn available(&self, command: &Command) -> bool;
 
+    /// Whether this backend can tell agents from shells. Only then can a message go to every agent: typed into a
+    /// shell, it would run as a command.
+    fn tells_agents_from_shells(&self) -> bool {
+        true
+    }
+
     /// Whether the platform takes the `[keys]` chords, so that a tooltip may name them.
     fn has_shortcuts(&self) -> bool {
         true

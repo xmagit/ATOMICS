@@ -208,6 +208,54 @@ fn review_followups() {
     });
 }
 
+#[test]
+fn the_steer_bar_offers_all_agents_and_leaves_shells_out() {
+    with_app("app::tests::the_steer_bar_offers_all_agents_and_leaves_shells_out", |app, ctx| {
+        let dir = app.runtime.launch_dir.clone();
+        app.runtime.sessions = vec![
+            session("agent", AgentKind::Generic, AgentStatus::Idle, &dir),
+            session("shell", AgentKind::Shell, AgentStatus::Idle, &dir),
+        ];
+        let frame = |app: &mut Desktop<'_>, events| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0))),
+                events,
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                ui.add_space(200.0);
+                app.draw(|backend, client| atomics_ui::chief::steer_bar(ui, backend, client));
+            });
+            output.textures_delta.clear();
+            let text = output.shapes.iter().filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some((text.galley.text().to_string(), text.visual_bounding_rect())),
+                _ => None,
+            });
+            text.collect::<Vec<_>>()
+        };
+        frame(app, Vec::new());
+        let shown = frame(app, Vec::new());
+        let target = shown.iter().find(|(text, _)| text.starts_with("→ ")).expect("the target").1.center();
+        let button = |pressed| egui::Event::PointerButton {
+            pos: target,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(app, vec![egui::Event::PointerMoved(target), button(true), button(false)]);
+        let list = frame(app, Vec::new());
+        assert!(list.iter().any(|(text, _)| text == "All agents (1)"), "{list:?}");
+
+        app.client.steer_target = SteerTarget::Agents;
+        app.client.steer_text = "go on".into();
+        let commands = app.draw(|backend, client| {
+            atomics_ui::chief::send_steer(backend, client);
+            std::mem::take(&mut client.commands)
+        });
+        assert_eq!(commands, [Command::Steer { sessions: vec!["agent".into()], text: "go on".into() }]);
+    });
+}
+
 pub(super) fn request(app: &mut Desktop<'_>, value: serde_json::Value) -> ControlResponse {
     let (tx, rx) = channel();
     app.runtime.control(serde_json::from_value(value).unwrap(), tx);

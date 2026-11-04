@@ -5,7 +5,7 @@
 //!   chief, docked or floating, in the host's theme. The host's own items (settings, sandboxes, credentials,
 //!   ticket sign-in, GitHub) are hooks this page leaves empty; its connection's state and the layout menu
 //!   take the top bar's last slots, connection trouble a line under the frame, and what the page has to say,
-//!   why a command failed above all, a note under the top bar.
+//!   why a command failed above all, a note under the top bar that a click dismisses.
 //! - **Phone**: one pane at a time, switched from a bottom bar, each a shared widget: the AGENTS list, the
 //!   current plan's board under a picker of the others, the approval banners, a worktree's diff panel, an
 //!   agent's fleet tile at full size and the chief's window. It draws inside the part of the viewport the user
@@ -221,7 +221,7 @@ pub fn draw(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &
     view.compact = layout::compact(screen.width() * ui.ctx().zoom_factor(), view.viewport.coarse, view.layout);
     view.looks.apply(ui.ctx(), client, view.compact);
     view.term.touch = client.touch;
-    sync(driver, client, view);
+    sync(ui.ctx(), driver, client, view);
     if view.compact {
         phone(ui, screen, driver, client, view);
     } else {
@@ -253,7 +253,7 @@ fn open_ticket(driver: &Driver, view: &mut View) {
 }
 
 /// Bring the client's own state and the page's view in line with the backend before drawing.
-fn sync(driver: &mut Driver, client: &mut Client, view: &mut View) {
+fn sync(ctx: &egui::Context, driver: &mut Driver, client: &mut Client, view: &mut View) {
     let remote = &driver.remote;
     for refused in remote.take_refused() {
         client.approval_decisions.remove(&refused);
@@ -264,6 +264,18 @@ fn sync(driver: &mut Driver, client: &mut Client, view: &mut View) {
     // A steer that did not go through is the user's still, unless they started another.
     if let Some(text) = remote.take_unsent().filter(|_| client.steer_text.is_empty()) {
         client.steer_text = text;
+    }
+    // So is a comment, in its box, or in the note where there is no box for it. It takes the keyboard from nobody.
+    for (root, comment) in remote.take_unsent_comments() {
+        let free = !view.term.typing() && ctx.memory(|m| m.focused().is_none());
+        if !client.diff_views.entry(root).or_default().reopen_comment(&comment, free) {
+            let said = remote.notice().map_or(String::new(), |notice| format!("{notice} "));
+            remote.say(format!("{said}Your comment was: {}", comment.body));
+        }
+    }
+    // A new session is outside any plan, and shows on the Ungrouped tab.
+    if remote.take_started() {
+        view.desk.apply(Command::ShowUngrouped, remote);
     }
     view.desk.settle(remote, |hints| {
         remote.set_view(hints.clone());
@@ -429,7 +441,7 @@ fn view_command(remote: &RemoteBackend, view: &mut View, command: Command) {
         remote.say(text.clone());
     }
     // Picking an agent types there, as on the desktop. A finger taps the terminal itself, which opens the keyboard.
-    view.term.focus_next |= !view.compact && matches!(command, Command::Activate { .. });
+    view.term.focus_next |= !view.compact && matches!(command, Command::Activate { .. } | Command::OpenTaskSession(_));
     view.desk.apply(command, remote);
 }
 
@@ -470,13 +482,12 @@ fn wide(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &mut 
 }
 
 /// What the page has to say, why a command failed above all, whole: the top bar's slot would cut it to a few
-/// words. It lies over the frame and takes no pointer, so it moves nothing and is in the way of nothing.
+/// words. It lies over the frame and moves nothing. Like any window it takes the pointer, and its part of a
+/// terminal's input, so a click on it reaches nothing under it: it dismisses the note.
 fn note(ctx: &egui::Context, driver: &Driver, client: &Client) {
     let Some(text) = driver.remote.notice() else { return };
     let p = &client.palette;
-    egui::Area::new(egui::Id::NULL.with("atomics-note"))
-        .order(egui::Order::Foreground)
-        .interactable(false)
+    let shown = egui::Area::new(egui::Id::NULL.with("atomics-note"))
         .anchor(egui::Align2::CENTER_TOP, vec2(0.0, NOTE_TOP))
         .show(ctx, |ui| {
             egui::Frame::new()
@@ -486,9 +497,14 @@ fn note(ctx: &egui::Context, driver: &Driver, client: &Client) {
                 .inner_margin(egui::Margin::symmetric(10, 6))
                 .show(ui, |ui| {
                     ui.set_max_width(ctx.content_rect().width() * 0.6);
-                    ui.label(RichText::new(text).color(p.foreground));
+                    ui.add(egui::Label::new(RichText::new(text).color(p.foreground)).selectable(false));
                 });
         });
+    // Over a floating window a click may have raised.
+    ctx.move_to_top(shown.response.layer_id);
+    if shown.response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+        driver.remote.dismiss_notice();
+    }
 }
 
 /// The board is not in: pairing, confirming a new pairing, connected before the host's first snapshot, or no
@@ -919,18 +935,18 @@ fn board_tab(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, view
 }
 
 /// A plan's name on a phone: the state and goal the desktop's tab shows, as a command picks it.
-fn plan_pick(ui: &mut egui::Ui, row: &PlanRow, index: usize, selected: usize, client: &mut Client) -> bool {
+fn plan_pick(ui: &mut egui::Ui, row: &PlanRow, index: usize, selected: usize, client: &mut Client) -> egui::Response {
     let p = client.palette.clone();
     let label = RichText::new(row.state.label(&row.tab_name)).color(row.state.color(&p));
-    let picked = ui.selectable_label(index == selected, label).clicked();
-    if picked {
+    let name = ui.selectable_label(index == selected, label);
+    if name.clicked() {
         client.send(if row.status == PlanStatus::Open {
             Command::ShowPlan(index)
         } else {
             Command::ViewPlanHistory(index)
         });
     }
-    picked
+    name
 }
 
 /// The plans a phone picks from, one row high so the board stays on screen: the open ones, and a finished one
@@ -955,13 +971,17 @@ fn plan_picker(ui: &mut egui::Ui, plans: &[PlanRow], selected: usize, client: &m
                 ui.set_max_width(width - ui.spacing().menu_margin.sum().x);
                 egui::ScrollArea::vertical().id_salt("plan-history").max_height(height).show(ui, |ui| {
                     for (index, row) in &history {
-                        if plan_pick(ui, row, *index, selected, client) {
+                        if plan_pick(ui, row, *index, selected, client).clicked() {
                             ui.close();
                         }
                     }
                 });
             });
         }
+        // The plan just picked, from History too, scrolls into sight, with a tap's width of the one before it.
+        let shown = egui::Id::NULL.with("plan-strip-shows");
+        let moved = ui.data(|d| d.get_temp::<usize>(shown)) != Some(selected);
+        ui.data_mut(|d| d.insert_temp(shown, selected));
         let rest = ui.available_rect_before_wrap();
         let mut left = ui.new_child(egui::UiBuilder::new().max_rect(rest).layout(Layout::left_to_right(Align::Center)));
         egui::ScrollArea::horizontal()
@@ -971,7 +991,10 @@ fn plan_picker(ui: &mut egui::Ui, plans: &[PlanRow], selected: usize, client: &m
             .show(&mut left, |ui| {
                 ui.horizontal(|ui| {
                     for (index, row) in &strip {
-                        plan_pick(ui, row, *index, selected, client);
+                        let name = plan_pick(ui, row, *index, selected, client);
+                        if moved && *index == selected {
+                            ui.scroll_to_rect(name.rect.with_min_x(name.rect.left() - layout::TOUCH), None);
+                        }
                     }
                 });
             });
