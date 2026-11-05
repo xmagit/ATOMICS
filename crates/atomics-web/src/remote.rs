@@ -67,6 +67,7 @@ pub const CAPABILITIES: &[&str] = &[
     wire::PLAN_COMPLETE,
     wire::TRACE,
     wire::FIT,
+    wire::MACHINE,
 ];
 /// Files of one worktree whose hunks are asked for at once.
 const MAX_IN_FLIGHT: usize = 4;
@@ -96,6 +97,9 @@ pub struct RemoteBackend {
 }
 
 struct State {
+    machine: Option<atomics_core::machine::Machine>,
+    machine_open: bool,
+    machine_subscribed: bool,
     preview_actions: Vec<Command>,
     tunnel_messages: Vec<Message>,
     active_previews: Vec<u16>,
@@ -284,6 +288,9 @@ impl RemoteBackend {
     /// page a random one, so two pages never reuse an ID.
     pub fn new(prefix: &str) -> Self {
         let state = State {
+            machine: None,
+            machine_open: false,
+            machine_subscribed: false,
             preview_actions: Vec::new(),
             tunnel_messages: Vec::new(),
             active_previews: Vec::new(),
@@ -326,6 +333,11 @@ impl RemoteBackend {
             prefix: prefix.to_string(),
             ops: Cell::new(0),
         }
+    }
+
+    /// Whether a dashboard forward is still present in the latest host sample.
+    pub fn machine_previewable(&self, port: u16) -> bool {
+        self.machine_available() && self.state.borrow().machine.as_ref().is_some_and(|m| m.previewable(port))
     }
 
     /// Set only by a native platform that implements local TCP listeners.
@@ -390,6 +402,8 @@ impl RemoteBackend {
         s.preview_actions.clear();
         s.tunnel_messages.clear();
         s.active_previews.clear();
+        s.machine = None;
+        s.machine_subscribed = false;
         s.resyncing = false;
         s.outgoing.clear();
         s.requests.clear();
@@ -776,8 +790,21 @@ impl State {
                     preview.error = None;
                 }
             }
+            Message::Machine { snapshot } => {
+                if self.machine_subscribed
+                    && self.welcome.as_ref().is_some_and(|w| w.capabilities.iter().any(|c| c == wire::MACHINE))
+                {
+                    self.machine = Some(snapshot.clone());
+                }
+            }
             Message::Welcome { capabilities, limits, role, may, .. } => {
                 self.welcome = Some(Welcome { role: *role, may: may.clone(), capabilities: capabilities.clone() });
+                self.machine = None;
+                self.machine_subscribed =
+                    self.machine_open && may.contains(&Grant::Host) && capabilities.iter().any(|c| c == wire::MACHINE);
+                if self.machine_subscribed {
+                    self.outgoing.push(Envelope::new(Message::Subscribe { topics: vec![wire::Topic::Machine] }));
+                }
                 self.trace_revision = None;
                 self.trace_wanted = None;
                 self.trace_request = None;
@@ -1277,6 +1304,31 @@ fn known_agents(mirror: &Mirror) -> Vec<String> {
 }
 
 impl Backend for RemoteBackend {
+    fn machine_available(&self) -> bool {
+        self.state
+            .borrow()
+            .welcome
+            .as_ref()
+            .is_some_and(|w| w.capabilities.iter().any(|c| c == wire::MACHINE) && w.may.contains(&Grant::Host))
+    }
+    fn machine(&self) -> Option<atomics_core::machine::Machine> {
+        self.state.borrow().machine.clone()
+    }
+    fn watch_machine(&self, open: bool) {
+        let available = self.machine_available();
+        let mut s = self.state.borrow_mut();
+        s.machine_open = open;
+        let subscribe = open && available;
+        if s.machine_subscribed != subscribe {
+            s.machine_subscribed = subscribe;
+            let topics = vec![wire::Topic::Machine];
+            s.outgoing.push(Envelope::new(if subscribe {
+                Message::Subscribe { topics }
+            } else {
+                Message::Unsubscribe { topics }
+            }));
+        }
+    }
     fn can_preview(&self) -> bool {
         self.tunnels()
     }

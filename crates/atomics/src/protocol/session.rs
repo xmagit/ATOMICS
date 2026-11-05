@@ -310,6 +310,9 @@ fn run(out: &mut Out<'_>, peer: &Peer, shared: &Shared) -> Ended {
     }
     let may = role.may(&capabilities);
     out.manages_host = may.contains(&atomics_core::ops::Grant::Host);
+    if !out.manages_host {
+        capabilities.retain(|c| c != wire::MACHINE);
+    }
     let (results_tx, results) = mpsc::channel();
     let mut follows = Follows {
         board: Narrowed::default(),
@@ -322,6 +325,9 @@ fn run(out: &mut Out<'_>, peer: &Peer, shared: &Shared) -> Ended {
         mutations: capabilities.iter().any(|c| c == MUTATIONS),
         host: capabilities.iter().any(|c| c == wire::HOST),
         panels: capabilities.iter().any(|c| c == wire::PANELS),
+        machine: capabilities.iter().any(|c| c == wire::MACHINE),
+        follows_machine: false,
+        machine_revision: None,
         explorer: capabilities.iter().any(|c| c == wire::EXPLORER),
         complete: capabilities.iter().any(|c| c == wire::PLAN_COMPLETE),
         folders: HashMap::new(),
@@ -363,6 +369,9 @@ fn run(out: &mut Out<'_>, peer: &Peer, shared: &Shared) -> Ended {
     for (worktree, _) in follows.folders.keys() {
         shared.diffs.watch_folder(worktree, false);
     }
+    if follows.follows_machine {
+        shared.projections.machine_watchers.fetch_sub(1, Ordering::AcqRel);
+    }
     // Whatever lease this connection held ends with it: input sent on it can no longer land, and
     // a later connection starts without one.
     for session in &follows.screens {
@@ -401,7 +410,7 @@ impl Narrowed {
         match topic {
             Topic::Diff { worktree } => Some((&mut self.diffs, worktree.as_str())),
             Topic::Plan { id } => Some((&mut self.plans, id.as_str())),
-            Topic::Screen { .. } | Topic::Folder { .. } | Topic::Trace => None,
+            Topic::Screen { .. } | Topic::Folder { .. } | Topic::Trace | Topic::Machine => None,
         }
     }
 
@@ -442,6 +451,9 @@ struct Follows {
     /// It negotiated `host`: it is sent `host_upsert`.
     host: bool,
     panels: bool,
+    machine: bool,
+    follows_machine: bool,
+    machine_revision: Option<u64>,
     explorer: bool,
     complete: bool,
     folders: HashMap<(String, String), Option<u64>>,
@@ -477,12 +489,14 @@ impl Follows {
             + self.screens.len()
             + self.folders.len()
             + usize::from(self.follows_trace)
+            + usize::from(self.follows_machine)
     }
 
     fn has(&self, topic: &Topic) -> bool {
         match topic {
             Topic::Folder { worktree, path } => self.folders.contains_key(&(worktree.clone(), path.clone())),
             Topic::Trace => self.follows_trace,
+            Topic::Machine => self.follows_machine,
             Topic::Diff { worktree } => self.board.diffs.contains(worktree),
             Topic::Plan { id } => self.board.plans.contains(id),
             Topic::Screen { session, .. } => self.screens.contains(session),
@@ -536,7 +550,12 @@ fn conversation(
             return Err(Ended::Stopped);
         }
         let sessions = shared.projections.sessions.load();
-        for message in subscriptions.tunnels.poll(|port| previewable(&sessions.data, port)) {
+        let machine = shared.projections.machine.load();
+        let machine_capability = subscriptions.machine;
+        for message in subscriptions
+            .tunnels
+            .poll(|port| previewable(&sessions.data, machine_capability.then_some(&machine.data), port))
+        {
             out.envelope(&Envelope::host(&out.epoch, message)).map_err(link_ended)?;
         }
         match outbox.take() {
@@ -564,6 +583,16 @@ fn conversation(
             };
             let reply = Envelope::host(&out.epoch, Message::CommandResult(result)).reply_to(request_id);
             out.envelope(&reply).map_err(link_ended)?;
+        }
+        if subscriptions.follows_machine
+            && machine.revision > 0
+            && subscriptions.machine_revision != Some(machine.revision)
+        {
+            match wire::machine_frame(&out.epoch, &machine.data, shared.frame_budget) {
+                Ok(frame) => out.raw(&frame).map_err(link_ended)?,
+                Err(error) => out.error(error, None).map_err(link_ended)?,
+            }
+            subscriptions.machine_revision = Some(machine.revision);
         }
         if subscriptions.follows_trace {
             let revision = shared.projections.trace.load().revision;
@@ -809,7 +838,12 @@ fn handle(
             if !subscriptions.tunnel {
                 return Err(refuse(ErrorCode::Unauthorised, "the tunnel capability was not negotiated"));
             }
-            let permitted = previewable(&shared.projections.sessions.load().data, port);
+            let machine = shared.projections.machine.load();
+            let permitted = previewable(
+                &shared.projections.sessions.load().data,
+                subscriptions.machine.then_some(&machine.data),
+                port,
+            );
             let result = if permitted {
                 subscriptions.tunnels.open(tunnel.clone(), port)
             } else {
@@ -847,6 +881,9 @@ fn handle(
                     if !lock(&shared.hub).has_worktree(worktree) {
                         return Err(gone(WireError::new(ErrorCode::NotFound, "that worktree is no longer open")));
                     }
+                }
+                if matches!(topic, Topic::Machine) && !subscriptions.machine {
+                    return Err(refuse(ErrorCode::Unauthorised, "the machine capability was not negotiated"));
                 }
                 if matches!(topic, Topic::Trace) && !subscriptions.trace {
                     return Err(refuse(ErrorCode::Unauthorised, "the trace capability was not negotiated"));
@@ -888,6 +925,11 @@ fn handle(
                     }
                 }
             }
+            if topics.contains(&Topic::Machine) && !subscriptions.follows_machine {
+                subscriptions.follows_machine = true;
+                subscriptions.machine_revision = None;
+                shared.projections.machine_watchers.fetch_add(1, Ordering::AcqRel);
+            }
             if topics.contains(&Topic::Trace) {
                 subscriptions.follows_trace = true;
                 subscriptions.trace_revision = None;
@@ -916,6 +958,11 @@ fn handle(
                     && subscriptions.folders.remove(&(worktree.clone(), path.clone())).is_some()
                 {
                     shared.diffs.watch_folder(worktree, false);
+                }
+                if topic == Topic::Machine && subscriptions.follows_machine {
+                    subscriptions.follows_machine = false;
+                    subscriptions.machine_revision = None;
+                    shared.projections.machine_watchers.fetch_sub(1, Ordering::AcqRel);
                 }
                 if topic == Topic::Trace {
                     subscriptions.follows_trace = false;
@@ -1132,8 +1179,13 @@ fn outbox_resync(shared: &Shared, outbox: &Outbox) -> Result<(), WireError> {
 }
 
 /// All sessions in this projection are visible to this authenticated connection.
-fn previewable(sessions: &[atomics_core::projection::SessionInfo], port: u16) -> bool {
-    sessions
-        .iter()
-        .any(|s| s.status != atomics_core::session::AgentStatus::Exited && s.previews.iter().any(|p| p.port == port))
+fn previewable(
+    sessions: &[atomics_core::projection::SessionInfo],
+    machine: Option<&atomics_core::machine::Machine>,
+    port: u16,
+) -> bool {
+    machine.is_some_and(|snapshot| snapshot.previewable(port))
+        || sessions.iter().any(|s| {
+            s.status != atomics_core::session::AgentStatus::Exited && s.previews.iter().any(|p| p.port == port)
+        })
 }

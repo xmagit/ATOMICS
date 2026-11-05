@@ -6,7 +6,7 @@ use crate::wire::{ErrorCode, TUNNEL_CHUNK, WireError};
 
 pub const MAX_PREVIEWS: usize = 16;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Preview {
     pub port: u16,
     #[serde(default)]

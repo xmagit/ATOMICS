@@ -926,6 +926,11 @@ system wants a sign-in, else how many tickets on the plan's board no task follow
 picking it again hides the panel. Each window remembers its choice: the desktop in its state folder, a browser in
 its `localStorage`; picking another plan's tab keeps it. The CHIEF pill stays in the middle of the bar. The location
 line over the agents says where the window is, plan › task › session ([Navigation](docs/navigation.md)).
+Click the load gauge or **Machine** in Actions to see the host's CPU, memory, disk space, test/QA queues,
+containers, listening ports and agent previews. The shared panel works in the desktop and connected clients;
+remote access requires the host-management grant. Native controllers can Preview listed loopback services,
+including Docker published ports; browser clients show the data with Preview disabled. Collection runs only
+while a Machine panel is open. See [Machine dashboard](docs/daemon.md#machine-dashboard).
 
 
 `cmd` is Command on macOS and Ctrl+Shift on Linux, so it never collides with the terminal's plain Ctrl keys.

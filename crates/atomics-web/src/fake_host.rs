@@ -606,7 +606,10 @@ impl FakeHost {
                             && *c != wire::TUNNEL
                     })
                     .collect();
-                let capabilities = wire::common_capabilities(&capabilities, &offered);
+                let mut capabilities = wire::common_capabilities(&capabilities, &offered);
+                if !self.access.role().may(&capabilities).contains(&atomics_core::ops::Grant::Host) {
+                    capabilities.retain(|c| c != wire::MACHINE);
+                }
                 self.host_negotiated = capabilities.iter().any(|c| c == wire::HOST);
                 self.follows_trace = false;
                 let role = self.access.role();

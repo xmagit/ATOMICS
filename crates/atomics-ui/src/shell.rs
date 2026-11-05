@@ -187,6 +187,7 @@ pub fn frame(ui: &mut egui::Ui, platform: &mut impl Platform) {
         }
     });
 
+    platform.draw(|backend, client, _| crate::machine::window(ui.ctx(), backend, client));
     if let Some(rect) = chief_rect {
         platform.draw(|_, client, _| chief::divider(ui, rect, client));
     }
@@ -520,7 +521,17 @@ fn top_bar_controls(ui: &mut egui::Ui, platform: &mut impl Platform, show_load: 
         record_item(ui, "Project", &response);
     }
     if show_load || in_menu {
-        platform.draw(|backend, client, _| crate::resources::load(ui, backend, &client.palette, in_menu));
+        platform.draw(|backend, client, _| {
+            if crate::resources::load(ui, backend, &client.palette, in_menu) {
+                client.machine_open = !client.machine_open;
+                if in_menu {
+                    ui.close();
+                }
+            }
+        });
+    }
+    if in_menu {
+        platform.draw(|backend, client, _| crate::machine::button(ui, backend, client));
     }
     platform.draw(|backend, client, _| crate::management::buttons(ui, backend, client));
     platform.top_bar_settings(ui);

@@ -528,6 +528,9 @@ pub struct DiffFileBody {
 /// and the protocol thread (a reader).
 #[derive(Debug, Default)]
 pub struct Projections {
+    /// Machine samples have their own demand and do not advance the board cursor.
+    pub machine: Published<crate::machine::Machine>,
+    pub machine_watchers: Arc<std::sync::atomic::AtomicUsize>,
     pub sessions: Published<Vec<SessionInfo>>,
     pub plans: Published<Vec<PlanInfo>>,
     pub approvals: Published<Vec<ApprovalInfo>>,

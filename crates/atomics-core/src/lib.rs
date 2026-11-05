@@ -32,6 +32,7 @@ pub mod hook;
 pub mod isolation;
 pub mod layout;
 pub mod lease;
+pub mod machine;
 pub mod mcp_import;
 pub mod mirror;
 pub mod noise;

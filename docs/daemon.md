@@ -79,7 +79,7 @@ so browser number precision cannot corrupt cursors. Paths are host paths, never 
 | --- | --- | --- |
 | Client → host | `hello` | Supported versions, capabilities, client ID, prior epoch and last applied event cursor. |
 | Host → client | `welcome` | Chosen version, capabilities, limits, epoch, client role, what it may change (`may`) and resume/reset decision. |
-| Client → host | `subscribe`, `unsubscribe` | Session screens, worktree diffs/files and plans of interest; visible/focused hints. |
+| Client → host | `subscribe`, `unsubscribe` | Session screens, worktree diffs/files, plans, trace and the opt-in `machine` topic; visible/focused hints. |
 | Host → client | `state_snapshot` | Sessions, projects, plan summaries and pending approvals at a single event cursor, and the host's own state (`host`, in every part). |
 | Host → client | `skipped` | An event cursor the client's `diff`/`plan` topics left out, so cursors stay consecutive. |
 | Host → client | `session_upsert`, `session_removed` | Stable session ID, agent, title, cwd, worktree, status, chief flag and task link. |
@@ -87,6 +87,7 @@ so browser number precision cannot corrupt cursors. Paths are host paths, never 
 | Client → host | `lease_acquire`, `lease_renew`, `lease_release` | Session ID, takeover or the lease's fencing token. |
 | Host → client | `lease_state` | Session ID, holder, and for the holder only its token, next input sequence and time-to-live. |
 | Client → host | `terminal_input`, `terminal_resize` | Session ID, control lease, input sequence or rows/columns/cell pixels. |
+| Host → client | `machine` | Latest host resources, filesystems, containers and TCP listeners, only while subscribed to `machine` with the `machine` capability and the `host` grant. |
 | Client → host | `tunnel_open` | Native `tunnel` connection ID and previewable host loopback port. |
 | Host → client | `tunnel_opened`, `tunnel_refused` | Connection ready, or refusal with a reason. |
 | Both | `tunnel_data`, `tunnel_ack`, `tunnel_close` | Bounded base64 bytes, consumed-byte credit, directional EOF (or `abort: true` for immediate cancellation). |
@@ -676,7 +677,9 @@ open tunnels. Browser builds do not request it. Existing grants and capabilities
 
 A native Preview action binds `127.0.0.1` on the same port when available, otherwise an ephemeral
 port, then opens the default browser. Every accepted TCP connection sends `tunnel_open {id, port}`.
-The host rechecks that a visible, live session declares or owns that port and connects only to
+The host rechecks that a visible, live session declares or owns that port. A client that also
+negotiated `machine` may instead use a previewable TCP listener in the latest machine snapshot,
+including a Docker published TCP port bound on the host. The relay connects only to
 `127.0.0.1:<port>`, falling back to `[::1]:<port>`. There is no caller-selected target host, DNS,
 HTTP proxy or redirect following. Local browser traffic is relayed unchanged, including WebSocket
 upgrades. Hostname-based virtual hosting, HTTPS, and absolute URLs using a different port are not
@@ -698,6 +701,60 @@ and the other direction can finish. `abort: true` drops both directions immediat
 a session exit/removal, loss of preview permission, or link loss closes local listeners and active
 connections; they are never replayed on reconnect. Preview lists and the `OpenPreview` command take
 an optional session plus a port/path description, so other views can use the same action.
+
+## Machine dashboard
+
+Click the top bar's load gauge, or **Machine** in Actions (the overflow menu on a phone), to open
+one shared dashboard in the desktop, native client or browser. It shows resource bars, test/QA slot
+use and queues from `host.resources`, a Containers table, a Ports table and agents' previews. Tables
+scroll horizontally when narrow, and the panel scrolls vertically. The in-process desktop samples its
+own host and opens Preview directly at `http://127.0.0.1:<port>/`. Browsers can read Machine but
+cannot create local TCP forwards; their Preview buttons are disabled.
+
+`machine` is an additive capability. It is offered only when the authenticated peer is a controller
+with the `host` grant (`host` and `mutations` negotiated). The host checks this independently of the
+client's requested capabilities. Viewers, controllers without that grant, and older peers get no
+Machine data. Subscribing with `{"kind":"subscribe","topics":[{"topic":"machine"}]}` starts
+interest; `unsubscribe` releases it. Duplicate subscriptions count once and disconnect releases
+interest too. The host sends a `machine` frame with a `snapshot` object when a new sample is ready,
+then only when it changes. It has no board cursor, journal entry or replay history. Reconnecting
+clients with the panel open subscribe again and get the newest sample.
+
+The snapshot contains:
+
+| Field | Meaning |
+| --- | --- |
+| `sampled_at`, `cores` | Host Unix seconds and available CPU cores. |
+| `load`, `cpu_busy` | Optional 1/5/15 minute averages and CPU busy percent from consecutive CPU tick samples; the first CPU reading is absent. |
+| `memory` | Optional `{total, available}` in bytes. Linux uses MemAvailable; macOS uses free plus reclaimable inactive pages. |
+| `disks` | `{path, total, free}` in bytes for the filesystem of the ATOMICS home and each open project; free means space available to this user. Unreadable paths are omitted. |
+| `containers` | Container name, image, state, status, published ports, optional CPU percent and memory usage. `null` means **Docker not available**; an empty list means no running containers. |
+| `ports` | TCP bind address and port, optional owner process/PID and agent session ID, and `previewable`. Missing ownership permissions leave the owner blank. |
+| `truncated` | Optional `true` when rows were omitted to fit the connection's frame limit. |
+
+Collection runs on a native worker every two seconds only while at least one subscribed client or
+the desktop has Machine open. No filesystem or subprocess I/O runs on the UI/protocol threads or
+under the State lock. Linux reads CPU and memory from `/proc`, and shares Preview's listener and
+process-tree scanner. macOS uses host CPU/VM statistics and `lsof`, joining readable process parents
+to agent sessions. Disk sizes use `statvfs`. Docker is optional: `docker ps --format '{{json .}}'`
+has an 800 ms timeout; `docker stats --no-stream --format '{{json .}}'` has a 1.5 s timeout and runs
+at most every ten seconds. Output is bounded, timed-out commands are killed and reaped, and failure
+does not log an error for each sample. A stats failure leaves metrics unavailable until the next
+stats attempt. Published TCP bindings are included even when Docker uses NAT without a userspace
+listening socket. Snapshots retain at most 512 ports, 256 containers and 128 filesystems; a smaller
+frame budget can omit further rows.
+
+Dashboard Preview widens access only for peers that negotiated **both `tunnel` and `machine`**.
+The requested port must occur as previewable in the latest host sample, with a loopback or wildcard
+bind that the fixed loopback relay can reach. An unlisted or interface-only listener grants no
+access. The client supplies only a port, never an address. Ordinary agent Preview retains its
+existing visible/live-session rule and does not require `machine`. Removing a listener in a newer
+sample aborts its dashboard tunnels unless a live agent preview still authorizes that port. Closing the panel stops collection when nobody else follows
+it, retaining the last sample; reopening refreshes it. As with agent Preview, sampling and port reuse
+are not isolation from other host processes. The `host` grant is the trust boundary: it exposes
+machine resources, filesystem paths and process/container names, and permits previewing the whole
+listed local service, not just an HTTP path. No target beyond loopback, Docker exec, shell command,
+container management operation or additional grant is introduced.
 
 ## The desktop as a client
 

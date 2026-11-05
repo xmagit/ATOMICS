@@ -508,6 +508,7 @@ dependencies = [
  "egui",
  "fontique",
  "libc",
+ "mach2",
  "notify",
  "objc2 0.6.5",
  "png",

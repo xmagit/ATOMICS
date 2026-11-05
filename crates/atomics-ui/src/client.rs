@@ -18,6 +18,7 @@ use crate::touch::Touch;
 /// One UI's own state: the desktop keeps one per window, a browser one per page. Fields arrive here from
 /// the desktop's client as the draw code that uses them moves into this crate.
 pub struct Client {
+    pub machine_open: bool,
     pub tickets: crate::tickets::Tickets,
     pub pr_target: Option<(Option<String>, Option<PathBuf>)>,
     pub pr_view: Option<(String, DiffState)>,
@@ -78,6 +79,7 @@ impl Default for Client {
     fn default() -> Self {
         let tokens = atomics_core::theme::builtin(atomics_core::theme::DEFAULT).expect("the default theme is built in");
         Self {
+            machine_open: false,
             pr_target: None,
             pr_view: None,
             editor_id: None,

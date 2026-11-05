@@ -66,13 +66,14 @@ impl Client {
             }
         }
         self.listeners.retain(|port, l| {
-            remote.with_mirror(|m| {
-                m.sessions.values().any(|s| {
-                    l.session.as_ref().is_none_or(|id| s.id == *id)
-                        && s.status != atomics_core::session::AgentStatus::Exited
-                        && s.previews.iter().any(|p| p.port == *port)
+            (l.session.is_none() && remote.machine_previewable(*port))
+                || remote.with_mirror(|m| {
+                    m.sessions.values().any(|s| {
+                        l.session.as_ref().is_none_or(|id| s.id == *id)
+                            && s.status != atomics_core::session::AgentStatus::Exited
+                            && s.previews.iter().any(|p| p.port == *port)
+                    })
                 })
-            })
         });
         for message in remote.take_tunnel_messages() {
             if let Message::TunnelRefused { reason, .. } = &message {

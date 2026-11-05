@@ -167,11 +167,13 @@ fn screen_delta() -> crate::screen::ScreenDelta {
 
 fn every_message() -> Vec<Message> {
     let topics = vec![
+        Topic::Machine,
         Topic::Diff { worktree: "/w/a".into() },
         Topic::Plan { id: "p".into() },
         Topic::Screen { session: "s1".into(), focused: true },
     ];
     vec![
+        Message::Machine { snapshot: crate::machine::Machine { sampled_at: 1, cores: 4, ..Default::default() } },
         Message::TunnelOpen { id: "t1".into(), port: 5173 },
         Message::TunnelOpened { id: "t1".into() },
         Message::TunnelRefused { id: "t1".into(), reason: "not previewable".into() },
@@ -939,4 +941,36 @@ fn tunnel_frames_keep_their_bounds() {
         assert!(invalid.validate().is_err(), "{invalid:?}");
         assert!(decode(&serde_json::to_string(&Envelope::new(invalid)).unwrap()).is_err());
     }
+}
+
+#[test]
+fn machine_snapshot_rows_fit_a_small_frame_budget_without_losing_resource_readings() {
+    use crate::machine::{Container, Disk, Machine, Port};
+    let snapshot = Machine {
+        sampled_at: 1,
+        cores: 8,
+        load: Some([1.0, 2.0, 3.0]),
+        ports: (6000..6200)
+            .map(|port| Port { address: "127.0.0.1".into(), port, previewable: true, ..Default::default() })
+            .collect(),
+        containers: Some(
+            (0..100)
+                .map(|i| Container {
+                    name: format!("web-{i}"),
+                    image: "app.example/web:1".into(),
+                    ..Default::default()
+                })
+                .collect(),
+        ),
+        disks: vec![Disk { path: "/srv/work".into(), total: 100, free: 50 }],
+        ..Default::default()
+    };
+    let frame = machine_frame("epoch", &snapshot, 4096).unwrap();
+    assert!(frame.len() <= 4096);
+    let Message::Machine { snapshot: bounded } = decode(&frame).unwrap().message else { unreachable!() };
+    assert_eq!(bounded.cores, snapshot.cores);
+    assert_eq!(bounded.load, snapshot.load);
+    assert!(bounded.truncated);
+    assert!(bounded.ports.len() < snapshot.ports.len());
+    assert!(machine_frame("epoch", &snapshot, 1).is_err());
 }

@@ -23,6 +23,7 @@ mod host;
 mod instance;
 mod ipc;
 mod lifecycle;
+mod machine;
 mod mcp;
 mod mcp_client;
 mod open_link;

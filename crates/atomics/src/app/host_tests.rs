@@ -1695,3 +1695,32 @@ fn preview_declarations_publish_update_remove_and_end_without_frames() {
         eventually(&host, |state| state.previews.list("worker").is_empty());
     });
 }
+
+#[test]
+fn machine_collects_for_the_desktop_and_subscribed_clients_without_frames() {
+    with_state(
+        "app::host_tests::machine_collects_for_the_desktop_and_subscribed_clients_without_frames",
+        |mut state, _| {
+            let project = state.launch_dir.clone();
+            state.open_projects = vec![project.clone()];
+            let host = state.into_host();
+            assert!(host.state().machine.snapshot.is_none());
+            host.state().backend().watch_machine(true);
+            eventually(&host, |state| state.machine.snapshot.is_some());
+            let first = host.state().machine.snapshot.clone().unwrap();
+            assert!(first.cores > 0 && first.memory.is_some());
+            for path in [paths::atomics_home(), project] {
+                assert!(first.disks.iter().any(|disk| disk.path == path.to_string_lossy()));
+            }
+            host.state().backend().watch_machine(false);
+            assert!(!host.state().machine.desktop_open.load(std::sync::atomic::Ordering::Acquire));
+            let projections = host.projections();
+            assert!(Arc::ptr_eq(&host.state().machine.clients, &projections.machine_watchers));
+            projections.machine_watchers.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            host.wake();
+            eventually(&host, |state| state.machine.snapshot.as_ref().is_some_and(|m| m.sampled_at > first.sampled_at));
+            assert!(host.state().machine.snapshot.as_ref().unwrap().cpu_busy.is_some());
+            projections.machine_watchers.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        },
+    );
+}

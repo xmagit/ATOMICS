@@ -56,6 +56,7 @@ pub(crate) struct RemoteView {
 impl Host {
     pub(crate) fn start(mut state: State, wake: Wake, commands: Sender<ControlMessage>) -> Self {
         let projections = Arc::new(Projections::default());
+        state.machine.clients = projections.machine_watchers.clone();
         let bodies = Arc::new(DiffBodies::with_wake(wake.clone()));
         let remote = state.remote_access();
         let ownership =

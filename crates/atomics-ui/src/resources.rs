@@ -66,8 +66,8 @@ fn remaining_color(window: &Window, p: &Palette) -> Color32 {
 
 /// Load per core, with compiler jobs and the slot queue on hover. Menus show the details directly,
 /// where a phone has no hover.
-pub fn load(ui: &mut egui::Ui, backend: &dyn Backend, p: &Palette, in_menu: bool) {
-    let Some(state) = backend.resources() else { return };
+pub fn load(ui: &mut egui::Ui, backend: &dyn Backend, p: &Palette, in_menu: bool) -> bool {
+    let Some(state) = backend.resources() else { return false };
     let color = match state.load.map(|load| load / state.cores.max(1) as f64) {
         Some(load) if load >= 1.0 => p.error,
         Some(load) if load >= 0.7 => p.warning,
@@ -75,11 +75,15 @@ pub fn load(ui: &mut egui::Ui, backend: &dyn Backend, p: &Palette, in_menu: bool
     };
     let label = state.load.map_or_else(|| "load —".into(), |load| format!("load {load:.1}"));
     let details = load_details(&state);
-    let response = ui.label(RichText::new(label).color(color).size(12.0)).on_hover_text(&details);
+    let sense = if backend.machine_available() { Sense::click() } else { Sense::hover() };
+    let response = ui.add(egui::Label::new(RichText::new(label).color(color).size(12.0)).sense(sense)).on_hover_text(
+        if backend.machine_available() { format!("{details}\nClick to open Machine") } else { details.clone() },
+    );
     crate::topbar::record_item(ui, "load", &response);
     if in_menu {
         ui.label(RichText::new(details).font(p.ui(10.5)).color(p.muted));
     }
+    backend.machine_available() && response.clicked()
 }
 
 fn load_details(state: &ResourceInfo) -> String {

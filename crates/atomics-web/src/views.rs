@@ -267,6 +267,9 @@ pub fn draw(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &
     } else {
         wide(ui, driver, client, view);
     }
+    if view.compact {
+        atomics_ui::machine::window(ui.ctx(), &driver.remote, client);
+    }
     atomics_ui::management::dialogs(ui.ctx(), &driver.remote, client);
     dialogs::draw(ui.ctx(), &driver.remote, client, &mut view.picker);
     view.term.end_frame(ui.ctx(), &driver.remote);
@@ -857,7 +860,11 @@ fn phone_top(ui: &mut egui::Ui, driver: &Driver, client: &mut Client, view: &mut
                 }
                 clicked = place(ui, shown.as_ref(), &p);
                 ui.separator();
-                atomics_ui::resources::load(ui, backend, &p, true);
+                atomics_ui::machine::button(ui, backend, client);
+                if atomics_ui::resources::load(ui, backend, &p, true) {
+                    client.machine_open = !client.machine_open;
+                    ui.close();
+                }
                 atomics_ui::resources::section(ui, backend, &p);
             });
             view.place_clicked |= clicked;

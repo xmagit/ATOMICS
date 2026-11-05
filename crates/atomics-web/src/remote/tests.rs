@@ -1288,3 +1288,45 @@ fn preview_actions_need_native_negotiation_and_never_replay() {
     assert!(remote.take_preview_actions().is_empty());
     assert!(remote.take_tunnel_messages().is_empty());
 }
+
+#[test]
+fn machine_follows_the_open_panel_and_resubscribes_after_reconnect() {
+    let remote = connected(Role::Controller);
+    assert!(remote.machine_available());
+    assert!(remote.machine().is_none());
+    let snapshot = atomics_core::machine::Machine { sampled_at: 1, cores: 4, ..Default::default() };
+    remote.receive(Envelope::host(EPOCH, Message::Machine { snapshot: snapshot.clone() }));
+    assert!(remote.machine().is_none(), "ignore unsolicited data");
+    remote.watch_machine(true);
+    remote.watch_machine(true);
+    assert_eq!(
+        remote
+            .take_outgoing()
+            .iter()
+            .filter(|e| matches!(&e.message, Message::Subscribe { topics } if topics == &[wire::Topic::Machine]))
+            .count(),
+        1
+    );
+    remote.receive(Envelope::host(EPOCH, Message::Machine { snapshot: snapshot.clone() }));
+    assert_eq!(remote.machine(), Some(snapshot));
+    remote.disconnected();
+    assert!(remote.machine().is_none());
+    remote.receive(welcome(Role::Controller));
+    assert!(
+        remote
+            .take_outgoing()
+            .iter()
+            .any(|e| matches!(&e.message, Message::Subscribe { topics } if topics == &[wire::Topic::Machine]))
+    );
+    remote.watch_machine(false);
+    assert!(
+        remote
+            .take_outgoing()
+            .iter()
+            .any(|e| matches!(&e.message, Message::Unsubscribe { topics } if topics == &[wire::Topic::Machine]))
+    );
+    let viewer = connected(Role::Viewer);
+    viewer.watch_machine(true);
+    assert!(!viewer.machine_available());
+    assert!(viewer.take_outgoing().is_empty());
+}

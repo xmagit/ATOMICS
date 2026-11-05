@@ -1,6 +1,6 @@
 //! Native preview discovery and forwarding, independent of a particular view.
 pub mod client;
-mod detect;
+pub(crate) mod detect;
 pub mod relay;
 
 use atomics_core::preview::{MAX_PREVIEWS, Preview};

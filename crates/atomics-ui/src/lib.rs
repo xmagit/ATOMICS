@@ -26,6 +26,7 @@ pub mod diff_panel;
 pub mod diff_view;
 pub mod fleet;
 pub mod keys;
+pub mod machine;
 pub mod management;
 pub mod markdown;
 pub mod nav;

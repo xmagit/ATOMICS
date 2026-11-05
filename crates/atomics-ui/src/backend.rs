@@ -428,6 +428,15 @@ pub trait Backend {
     /// Every session, in the host's order. The UI addresses a session by its position in this list.
     fn session_list(&self) -> Vec<SessionRow>;
 
+    fn machine_available(&self) -> bool {
+        false
+    }
+    fn machine(&self) -> Option<atomics_core::machine::Machine> {
+        None
+    }
+    /// Declare this UI's interest, without filesystem or subprocess work on the draw thread.
+    fn watch_machine(&self, _open: bool) {}
+
     /// Preview descriptions are shared by tiles, details and machine views.
     fn previews(&self, _session: Option<&str>) -> Vec<atomics_core::preview::Preview> {
         Vec::new()

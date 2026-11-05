@@ -1350,3 +1350,6 @@ fn trace_is_paged_live_and_only_sent_under_its_capability() {
 
 #[path = "preview_tests.rs"]
 mod preview;
+
+#[path = "machine_tests.rs"]
+mod machine;
