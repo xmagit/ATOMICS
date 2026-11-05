@@ -158,7 +158,7 @@ start a new generation with a snapshot. A mismatch requests a snapshot instead o
 Preserve wrapped-line metadata and stable retained line IDs for selection/copy and independent history views.
 Scrolling one client's history never changes another client's viewport or the host's live-screen position.
 
-Coalesce focused output at roughly the existing 100 ms cadence, visible output at 200 ms, and stop screen
+Coalesce focused and visible output at about 60 frames a second (16 ms), and stop screen
 traffic for unsubscribed panes. Input echo can flush immediately; idle terminals send no cell traffic.
 Copy state under a short emulator lock and encode/send after unlocking; never block the PTY on a socket.
 Share snapshots between subscribers at the same revision and deduplicate repeated style runs.
@@ -316,7 +316,7 @@ screen's terminal, the subscription limit of 256 topics of every kind together),
 - **Who copies.** The runtime thread only publishes which terminals exist (`Terminals`), and only while the server runs;
   it does so before the board, so a client that sees a session can subscribe to its screen at once. A server thread of
   its own (`atomics-protocol-screens`) copies a screen only while a client subscribes to it, only when the emulator
-  reports a change, and at most every 100 ms (focused) or 200 ms (visible). The copy is taken under
+  reports a change, and at most every 16 ms, about 60 frames a second (focused or visible). The copy is taken under
   the emulator's fair lock from the live screen, never the desktop's scrolled view; comparing and encoding happen after
   the lock is released. The board keeps flowing while an emulator is locked, and nothing takes the `State` lock.
 - **Cells.** A frame lists the styles it uses once; each line is runs of cells sharing a style. A run is plain text (one

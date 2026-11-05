@@ -2,8 +2,8 @@
 //!
 //! The runtime thread publishes which terminals exist ([`Terminals`]); it does nothing else for
 //! streaming. This module runs on the protocol thread: it copies a screen only while some client
-//! subscribes to it, only when the emulator reports a change, and at most every 100 ms (a focused
-//! pane) or 200 ms (a visible one). The copy happens under the emulator's short lock; comparing,
+//! subscribes to it, only when the emulator reports a change, and at most every 16 ms (about 60
+//! frames a second, for a focused or a visible pane). The copy happens under the emulator's short lock; comparing,
 //! encoding and queueing happen after it is released, and nothing here takes the `State` lock.
 //!
 //! Each change is one revision: the first copy of a generation is a snapshot, later ones are
@@ -116,8 +116,10 @@ pub struct ScreenConfig {
 impl Default for ScreenConfig {
     fn default() -> Self {
         Self {
-            focused: Duration::from_millis(100),
-            visible: Duration::from_millis(200),
+            // About 60 frames a second. Only a screen that changed is copied, and a client that falls
+            // behind gets a snapshot in place of its backlog (slot_frames, slot_bytes).
+            focused: Duration::from_millis(16),
+            visible: Duration::from_millis(16),
             slot_frames: 32,
             slot_bytes: 2 << 20,
             echo_window: Duration::from_millis(200),
