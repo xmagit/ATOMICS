@@ -119,7 +119,10 @@ in
 
     boot.loader.systemd-boot.enable = true;
     boot.loader.efi.canTouchEfiVariables = false;
-    boot.kernelParams = [ "console=hvc0" ];
+    # Apple M4 and later report SME to guests of Apple Virtualization, and using it there crashes
+    # programs with SIGILL (the .NET JIT in parallel restores and builds, for one:
+    # https://github.com/dotnet/runtime/issues/122608). arm64.nosme hides it from the guest.
+    boot.kernelParams = [ "console=hvc0" "arm64.nosme" ];
     boot.initrd.availableKernelModules = [ "virtio_pci" "virtio_blk" "virtio_scsi" "virtiofs" ];
     boot.supportedFilesystems = [ "btrfs" ];
     fileSystems."/" = {

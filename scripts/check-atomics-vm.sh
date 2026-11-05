@@ -90,6 +90,14 @@ printf 'changed\n' > "$scratch/source"
 test "$(wc -c < "$scratch/clone")" -eq 1048576
 printf 'btrfs reflink: passed\n'
 
+# SME, which Apple M4 and later report to guests, crashes programs here with SIGILL; the kernel hides it
+# (arm64.nosme in nix/atomics-vm.nix).
+if grep -qw sme /proc/cpuinfo; then
+  printf 'SME is visible to the guest: boot it with arm64.nosme\n' >&2
+  exit 1
+fi
+printf 'no SME in the guest: passed\n'
+
 # An amd64 container runs under Rosetta (binfmt's fix-binary flag reaches into containers). Without
 # a translator its shell fails with "exec format error".
 test "$(docker run --rm --platform linux/amd64 docker.io/library/alpine:3.22 sh -c 'echo ran')" = ran
