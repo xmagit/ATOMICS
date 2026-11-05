@@ -154,6 +154,30 @@ fn the_phone_shows_the_desktops_grid_and_resizes_only_when_asked() {
 }
 
 #[test]
+fn a_fitted_terminal_stays_fitted_while_it_shows_though_the_click_on_fit_took_the_keyboard() {
+    let (ctx, mut world, mut client, mut view) = terminal(|_| {});
+    send(&ctx, &mut world, &mut client, &mut view, vec![TermInput::Focus(true), TermInput::Text("x".into())]);
+    // "Fit to this screen" lies outside the overlay, so the click on it takes the keyboard off the terminal.
+    world.driver.remote.resize("s1", Some(GridSize::new(30, 20)));
+    send(&ctx, &mut world, &mut client, &mut view, vec![TermInput::Focus(false)]);
+    assert!(!view.term.typing());
+    assert!(world.driver.remote.lease("s1").resized);
+    assert_eq!(world.host.terminals["s1"].screen.cols, 30);
+    // The host ends a lease 30 s after its last input, resize or renew, and the terminal's own size comes back with
+    // that. While the pane shows the terminal, it keeps the lease, and the size with it.
+    let renews = |world: &World| world.sent().iter().filter(|m| matches!(m, Message::LeaseRenew { .. })).count();
+    let start = view.now_ms;
+    while view.now_ms - start < 31_000.0 {
+        view.now_ms += 1_000.0;
+        frame(&ctx, &mut world, &mut client, &mut view, PHONE);
+    }
+    assert!(renews(&world) >= 3, "renewed {} times in 31 s: the host would have ended the fit", renews(&world));
+    assert!(view.term.due_ms().is_some(), "the next renew wakes the page");
+    assert!(world.driver.remote.lease("s1").yours && world.driver.remote.lease("s1").resized);
+    assert_eq!(world.host.terminals["s1"].screen.cols, 30);
+}
+
+#[test]
 fn losing_the_lease_blurs_the_overlay_and_another_typist_makes_it_read_only() {
     let (ctx, mut world, mut client, mut view) = terminal(|_| {});
     send(&ctx, &mut world, &mut client, &mut view, vec![TermInput::Focus(true), TermInput::Text("a".into())]);

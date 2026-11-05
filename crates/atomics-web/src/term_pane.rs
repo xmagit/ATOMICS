@@ -10,7 +10,7 @@
 //!   pinches, but on a phone never below a readable size, so a wider grid pans sideways; a grid taller than
 //!   the pane keeps the cursor in view, and the terminal's background fills the rest of the pane. "Fit to
 //!   this screen" is an explicit resize to the pane at that font, shown on the desktop, that lasts as long as
-//!   the lease.
+//!   the lease, which the pane keeps while it shows the terminal.
 //! - **Touch.** A tap focuses the overlay (the browser opens the keyboard) and, where the program takes
 //!   mouse reports and this client types, clicks the cell; a drag scrolls history (this client's view
 //!   only) and pans; a long press selects the word under the finger, with a handle at each end to drag
@@ -57,7 +57,7 @@ const FIT_MAX: f32 = 14.0;
 const PHONE_FIT_MIN: f32 = 13.0;
 /// Space between the pane's edge and the cells; on a phone the cells keep to the screen's gutter.
 const PAD: f32 = 4.0;
-/// How often the lease is renewed while the user stays at the terminal without typing.
+/// How often the lease is renewed while the user stays at the terminal without typing, or while its size is in force.
 const RENEW_MS: f64 = 10_000.0;
 /// A selection handle's knob, and how far from its centre a finger still takes it.
 const KNOB: f32 = 6.0;
@@ -164,6 +164,8 @@ pub struct TermPane {
     drawn: bool,
     /// The phone layout's measures while it draws, set by the views each frame.
     pub touch: Option<Touch>,
+    /// This client holds the lease with its own size in force.
+    sized: bool,
     /// The overlay is to lose the focus at the next draw: the input went to another terminal.
     blur_next: bool,
     /// The overlay is to take the focus at the next draw ([`Overlay::focus`]).
@@ -199,6 +201,7 @@ impl Default for TermPane {
             overlay: Overlay::default(),
             drawn: false,
             touch: None,
+            sized: false,
             blur_next: false,
             focus_next: false,
             handed: Vec::new(),
@@ -400,7 +403,7 @@ impl TermPane {
 
     /// When the pane wants a frame without input: a long press coming due, or a lease to renew.
     pub fn due_ms(&self) -> Option<f64> {
-        let renew = (self.held && self.focused).then_some(self.active_ms + RENEW_MS);
+        let renew = (self.held && (self.focused || self.sized)).then_some(self.active_ms + RENEW_MS);
         self.gestures.due_ms().into_iter().chain(renew).reduce(f64::min)
     }
 
@@ -518,10 +521,13 @@ impl TermPane {
             remote.resize(session, size.then(|| fit_size(&frame)));
         }
 
-        // The lease as it is now (a tap may have asked for it), renewed while the user is at the terminal.
+        // The lease as it is now (a tap may have asked for it), renewed while the user is at the terminal, and while
+        // the size it asked for is in force: the click on "Fit to this screen" takes the keyboard off the terminal,
+        // and the host gives its own size back when the lease ends.
         let lease = remote.lease(session);
         self.held = lease.yours;
-        if lease.yours && self.focused && now_ms - self.active_ms >= RENEW_MS {
+        self.sized = lease.yours && lease.resized;
+        if lease.yours && (self.focused || self.sized) && now_ms - self.active_ms >= RENEW_MS {
             remote.renew(session);
             self.active_ms = now_ms;
         }

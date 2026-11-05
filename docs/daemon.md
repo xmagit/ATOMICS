@@ -1078,7 +1078,8 @@ width until the user pinches, on a phone never below 13 px, a wider grid pans, a
 the cursor in view, and the screen's own background fills the pane below a shorter one. Looking never resizes the
 PTY. **Fit to this screen** sends `terminal_resize` for the pane at the current font, shown on the
 desktop, and lasts as long as the lease (**Computer's size** gives it back early), so the keyboard moving to a text
-box ends it too.
+box ends it too. The pane renews a lease whose size is in force while it shows the terminal: the click on the
+button takes the keyboard off it, and without the renew the host ended the lease, and the size, 30 s later.
 
 - **Input** goes through a transparent `<textarea>` over the terminal (`web/terminal.js`; design §4.4): committed
   text, composition as preedit (drawn over the cursor), named keys (Return and Backspace too) and Ctrl+character
