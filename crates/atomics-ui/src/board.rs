@@ -752,12 +752,9 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
                 .size(11.0),
         );
     };
-    // The columns want this much room; a narrower panel stacks the statuses as a phone does, so that no card
-    // is cut at the panel's edge.
-    let columns_fit = {
-        let columns = TaskStatus::ALL.len() as f32;
-        ui.available_width() >= MIN_COLUMN * columns + ui.spacing().item_spacing.x * (columns - 1.0)
-    };
+    // A panel narrower than all the columns scrolls them sideways; only a panel too narrow for one whole
+    // column stacks the statuses as a phone does, so that no card is cut at the panel's edge.
+    let columns_fit = ui.available_width() >= MIN_COLUMN;
     if !tasks.is_empty() && touch.is_none() && columns_fit {
         egui::ScrollArea::horizontal().id_salt(("plan-board", &plan_id)).auto_shrink([false, false]).show(ui, |ui| {
             let columns = TaskStatus::ALL.len();
@@ -781,7 +778,7 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
             });
         });
     } else if !tasks.is_empty() {
-        // A phone, or a panel too narrow for the columns, stacks the statuses that have tasks, one under the
+        // A phone, or a panel too narrow for one column, stacks the statuses that have tasks, one under the
         // other, each card the panel's width.
         egui::ScrollArea::vertical().id_salt(("plan-board", &plan_id)).auto_shrink([false, false]).show(ui, |ui| {
             for status in TaskStatus::ALL {
