@@ -11,6 +11,10 @@
 //!   the pane keeps the cursor in view, and the terminal's background fills the rest of the pane. "Fit to
 //!   this screen" is an explicit resize to the pane at that font, shown on the desktop, that lasts as long as
 //!   the lease, which the pane keeps while it shows the terminal.
+//! - **Where there is no desktop** (`RemoteBackend::fits`), a native client gives each terminal its pane's size
+//!   at the desktop's font, as the desktop does with its own panes ([`TermPane::fit`]), and follows the pane as it
+//!   changes. The pane the input goes to and every other keep the same room for the strip saying who types, so
+//!   picking a terminal never resizes it.
 //! - **Touch.** A tap focuses the overlay (the browser opens the keyboard) and, where the program takes
 //!   mouse reports and this client types, clicks the cell; a drag scrolls history (this client's view
 //!   only) and pans; a long press selects the word under the finger, with a handle at each end to drag
@@ -164,6 +168,9 @@ pub struct TermPane {
     drawn: bool,
     /// The phone layout's measures while it draws, set by the views each frame.
     pub touch: Option<Touch>,
+    /// The desktop's terminal font size where this client gives the terminal its pane's size, set by the views
+    /// each frame; `None` shows the host's grid as it is.
+    pub fit: Option<f32>,
     /// This client holds the lease with its own size in force.
     sized: bool,
     /// The overlay is to lose the focus at the next draw: the input went to another terminal.
@@ -201,6 +208,7 @@ impl Default for TermPane {
             overlay: Overlay::default(),
             drawn: false,
             touch: None,
+            fit: None,
             sized: false,
             blur_next: false,
             focus_next: false,
@@ -412,9 +420,34 @@ impl TermPane {
     pub fn show(&mut self, ui: &mut egui::Ui, rect: Rect, session: &str, remote: &RemoteBackend, p: &Palette) {
         self.switch(session);
         remote.show_screen(session, false);
+        // Fitted, it keeps the room the strip takes where the input goes, so picking it never resizes it.
+        let rect = match self.fit {
+            Some(_) => {
+                let strip = rect.with_max_y(rect.top() + self.header_height());
+                ui.painter().rect_filled(strip, 0.0, p.panel);
+                rect.with_min_y(strip.bottom())
+            }
+            None => rect,
+        };
         match self.frame(ui, rect, session, remote, p) {
-            Some(frame) => self.paint(ui, &frame, session, remote, p, false),
+            Some(frame) => {
+                self.refit(&frame, session, remote);
+                self.paint(ui, &frame, session, remote, p, false)
+            }
             None => waiting(ui, rect, remote.live(), p),
+        }
+    }
+
+    /// The strip over the terminal the input goes to, which says who types.
+    fn header_height(&self) -> f32 {
+        self.touch.map_or(24.0, |touch| touch.target + 8.0)
+    }
+
+    /// Where this client gives the terminal its size ([`TermPane::fit`]): the grid the pane holds, whenever that
+    /// changes.
+    fn refit(&self, frame: &Frame, session: &str, remote: &RemoteBackend) {
+        if self.fit.is_some() {
+            remote.fit(session, fit_size(frame));
         }
     }
 
@@ -443,10 +476,8 @@ impl TermPane {
         let live = remote.live();
 
         // Header: who types, and what this client may do about it.
-        let (height, margin) = match self.touch {
-            Some(touch) => (touch.target + 8.0, vec2(touch.gutter, 4.0)),
-            None => (24.0, vec2(8.0, 2.0)),
-        };
+        let height = self.header_height();
+        let margin = self.touch.map_or(vec2(8.0, 2.0), |touch| vec2(touch.gutter, 4.0));
         let header = Rect::from_min_size(rect.min, vec2(rect.width(), height));
         ui.painter().rect_filled(header, 0.0, p.panel);
         let mut actions = Actions::default();
@@ -533,6 +564,7 @@ impl TermPane {
         }
 
         let frame = self.frame(ui, body, session, remote, p).unwrap_or(frame);
+        self.refit(&frame, session, remote);
         self.paint(ui, &frame, session, remote, p, lease.yours);
 
         let writable = live && may_type && (lease.yours || lease.holder.is_none());
@@ -596,7 +628,8 @@ impl TermPane {
                     if button(ui, "Computer's size").clicked() {
                         actions.fit = Some(false);
                     }
-                } else if button(ui, "Fit to this screen")
+                } else if self.fit.is_none()
+                    && button(ui, "Fit to this screen")
                     .on_hover_text("Resize the terminal to this screen; the computer shows it, and gets its size back when it types")
                     .clicked()
                 {
@@ -624,8 +657,8 @@ impl TermPane {
             None => (vec2(PAD, PAD), FIT_MIN),
         };
         let ratio = ui.fonts_mut(|f| f.glyph_width(&p.mono(100.0), 'M')) / 100.0;
-        let fit = (body.width() - 2.0 * pad.x) / (f32::from(cols) * ratio.max(0.01));
-        let size = self.font.unwrap_or(fit.clamp(fit_min, FIT_MAX)).clamp(MIN_FONT, MAX_FONT);
+        let width_fit = (body.width() - 2.0 * pad.x) / (f32::from(cols) * ratio.max(0.01));
+        let size = self.font.or(self.fit).unwrap_or(width_fit.clamp(fit_min, FIT_MAX)).clamp(MIN_FONT, MAX_FONT);
         let font = p.mono(size);
         let cell = ui.fonts_mut(|f| vec2(f.glyph_width(&font, 'M'), f.row_height(&font).ceil()));
         let fit_rows = (((body.height() - 2.0 * pad.y) / cell.y).floor().max(1.0)) as u16;
@@ -1079,6 +1112,9 @@ pub struct Terminals<'a> {
     pub remote: &'a RemoteBackend,
     pub target: Option<String>,
     pub now_ms: f64,
+    /// A native client: it gives the terminals their panes' sizes where the host has no desktop of its own
+    /// ([`RemoteBackend::fits`]).
+    pub fit: bool,
     /// The terminal a click picked while this drew, by session id.
     pub picked: Option<String>,
 }
@@ -1091,16 +1127,19 @@ impl TerminalSurface for Terminals<'_> {
         session: &str,
         rect: Rect,
         id: egui::Id,
-        _metrics: &Metrics,
+        metrics: &Metrics,
         palette: &Palette,
     ) -> egui::Response {
+        let fit = (self.fit && self.remote.fits()).then_some(metrics.font.size);
         if self.target.as_deref() == Some(session) {
+            self.pane.fit = fit;
             self.pane.draw(ui, rect, session, self.remote, palette, self.now_ms);
             // The overlay lies over it and takes its pointer.
             return ui.interact(rect, id, Sense::hover());
         }
         let pane = self.others.entry(session.to_string()).or_default();
         pane.touch = self.pane.touch;
+        pane.fit = fit;
         pane.show(ui, rect, session, self.remote, palette);
         let response = ui.interact(rect, id, Sense::click());
         if response.clicked() {

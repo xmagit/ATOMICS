@@ -450,6 +450,60 @@ fn fit_to_this_screen_resizes_until_the_desktop_takes_the_terminal_back() {
 }
 
 #[test]
+fn a_pane_gives_a_terminal_its_size_when_it_changes_and_again_when_the_host_may_not_have_it() {
+    let mut host = fake_host::host();
+    host.headless = true;
+    let mut world = World::paired(host);
+    world.boot(None);
+    let fit = |world: &mut World, cols| {
+        world.driver.remote.fit("s1", GridSize::new(cols, 30));
+        world.driver.flush();
+        world.pump();
+    };
+    let fits = |world: &World| world.sent().iter().filter(|m| matches!(m, Message::TerminalFit { .. })).count();
+    fit(&mut world, 100);
+    assert_eq!(fits(&world), 0, "a screen not followed has no size to give");
+    show(&mut world, "s1");
+    for _ in 0..3 {
+        fit(&mut world, 100);
+    }
+    assert_eq!(fits(&world), 1, "once, not at every frame");
+    assert_eq!(world.host.terminals["s1"].screen.cols, 100);
+    fit(&mut world, 120);
+    assert_eq!((fits(&world), world.host.terminals["s1"].screen.cols), (2, 120));
+
+    // A new terminal under the session starts with a size of its own: its lease never changed hands.
+    let fresh = atomics_core::lease::LeaseState {
+        session: "s1".into(),
+        holder: None,
+        yours: false,
+        lease: None,
+        next: None,
+        ttl_ms: None,
+        resized: false,
+        reason: None,
+    };
+    tell(&world, &fresh);
+    fit(&mut world, 120);
+    assert_eq!(fits(&world), 3);
+
+    // Across a reconnect, the host may be a new one.
+    world.drop_socket(1006);
+    world.advance(world.driver.wake_in().expect("a retry is due"));
+    world.ticket("ticket-2");
+    show(&mut world, "s1");
+    fit(&mut world, 120);
+    assert_eq!(fits(&world), 4);
+
+    // A host with a desktop is never sent one.
+    let mut world = live();
+    show(&mut world, "s1");
+    assert!(!world.driver.remote.fits());
+    fit(&mut world, 100);
+    assert_eq!((fits(&world), world.host.terminals["s1"].screen.cols), (0, 80));
+}
+
+#[test]
 fn going_on_to_another_terminal_lets_go_of_its_lease_and_of_a_grant_on_its_way() {
     let mut world = live();
     show(&mut world, "s1");

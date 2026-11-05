@@ -285,6 +285,10 @@ fn every_message() -> Vec<Message> {
             size: Some(crate::lease::GridSize { cols: 40, rows: 20, cell_width: Some(9), cell_height: None }),
         },
         Message::TerminalResize { session: "s1".into(), lease: Seq(3), size: None },
+        Message::TerminalFit {
+            session: "s1".into(),
+            size: crate::lease::GridSize { cols: 120, rows: 40, cell_width: Some(8), cell_height: Some(17) },
+        },
         Message::ApprovalDecide(crate::ops::ApprovalDecide {
             op: "o1".into(),
             approval: "a1".into(),
@@ -760,6 +764,9 @@ fn input_frames_keep_their_bounds() {
     let resize = |size| Message::TerminalResize { session: "s".into(), lease: Seq(1), size: Some(size) };
     assert_eq!(ok(resize(GridSize::new(80, 24))), Ok(()));
     assert_eq!(refused(resize(GridSize::new(0, 24))), ErrorCode::Malformed);
+    let fit = |size| Message::TerminalFit { session: "s".into(), size };
+    assert_eq!(ok(fit(GridSize::new(120, 40))), Ok(()));
+    assert_eq!(refused(fit(GridSize::new(80, 0))), ErrorCode::Malformed);
     let long = "s".repeat(MAX_ID_BYTES + 1);
     assert_eq!(refused(Message::LeaseAcquire { session: long.clone(), takeover: false }), ErrorCode::Oversize);
     assert_eq!(refused(Message::LeaseRelease { session: long, lease: Seq(1) }), ErrorCode::Oversize);

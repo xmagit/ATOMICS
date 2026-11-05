@@ -108,6 +108,9 @@ pub struct FakeHost {
     /// state, and that state's events reach the browser as `skipped`, as a newer host sends them to a client
     /// that did not ask for `host`.
     pub offers_host: bool,
+    /// This host has no desktop of its own, as `atomics host`: it offers `fit`, and `terminal_fit` gives a terminal
+    /// its own size.
+    pub headless: bool,
     /// The channel open now negotiated `host`.
     host_negotiated: bool,
 }
@@ -117,7 +120,8 @@ pub struct FakeTerminal {
     pub screen: Screen,
     pub generation: u64,
     pub revision: u64,
-    /// The desktop's own size, which the terminal returns to when a holder's size ends.
+    /// The terminal's own size, the desktop's (or with no desktop, the client's pane's), which it returns to when a
+    /// holder's size ends.
     pub size: (u16, u16),
     pub lease: Option<FakeLease>,
     pub reason: Option<LeaseReason>,
@@ -318,6 +322,7 @@ impl FakeHost {
             hold_results: false,
             host_commands: Vec::new(),
             offers_host: true,
+            headless: false,
             host_negotiated: false,
         }
     }
@@ -592,8 +597,11 @@ impl FakeHost {
         let host = move |m| Envelope::host(&epoch, m);
         match envelope.message {
             Message::Hello { capabilities, prior_epoch, prior_cursor, .. } => {
-                let offered: Vec<&str> =
-                    CAPABILITIES.iter().copied().filter(|c| self.offers_host || *c != wire::HOST).collect();
+                let offered: Vec<&str> = CAPABILITIES
+                    .iter()
+                    .copied()
+                    .filter(|c| (self.offers_host || *c != wire::HOST) && (self.headless || *c != wire::FIT))
+                    .collect();
                 let capabilities = wire::common_capabilities(&capabilities, &offered);
                 self.host_negotiated = capabilities.iter().any(|c| c == wire::HOST);
                 self.follows_trace = false;
@@ -632,6 +640,7 @@ impl FakeHost {
             | Message::LeaseRelease { .. }
             | Message::TerminalInput { .. }
             | Message::TerminalResize { .. }
+            | Message::TerminalFit { .. }
             | Message::HistoryGet(_)) => self.terminal_frame(message, id),
             Message::Ping { nonce } => vec![host(Message::Pong { nonce }).reply_to(id)],
             Message::FolderGet { worktree, path, revision, offset } => {
@@ -1152,6 +1161,19 @@ impl FakeHost {
                 let mut out = terminal.set_size(&session, to);
                 out.push(Message::LeaseState(terminal.view(&session)));
                 out.into_iter().map(host).collect()
+            }
+            Message::TerminalFit { session, size } => {
+                if !self.headless {
+                    return refuse(ErrorCode::Unauthorised, "the fit capability was not negotiated");
+                }
+                let Some(terminal) = self.terminals.get_mut(&session).filter(|t| t.followed) else {
+                    return refuse(ErrorCode::NotFound, "subscribe to the screen first");
+                };
+                terminal.size = (size.cols, size.rows);
+                if terminal.lease.as_ref().is_some_and(|l| l.sized) {
+                    return Vec::new();
+                }
+                terminal.set_size(&session, terminal.size).into_iter().map(host).collect()
             }
             Message::HistoryGet(get) => {
                 let Some(terminal) = self.terminals.get(&get.session) else {

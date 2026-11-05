@@ -510,6 +510,46 @@ fn a_click_into_the_chiefs_terminal_types_there() {
 }
 
 #[test]
+fn a_native_window_fits_the_docked_chief_and_every_tile_where_the_host_has_no_desktop() {
+    let mut host = fake_host::host();
+    host.headless = true;
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    view.fit_terminals = true;
+    let size = |world: &World, session: &str| {
+        let screen = &world.host.terminals[session].screen;
+        (screen.cols, screen.rows)
+    };
+    let fits = |world: &World, session: &str| {
+        world.sent().iter().filter(|m| matches!(m, Message::TerminalFit { session: s, .. } if s == session)).count()
+    };
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    // The docked chief and the agent's tile have their panes' sizes, and nobody pressed anything or took a lease.
+    let (chief, agent) = (size(&world, "chief"), size(&world, "s1"));
+    assert!(chief != (80, 12) && agent != (80, 12), "{chief:?} {agent:?}");
+    assert!(world.host.terminals.values().all(|t| t.lease.is_none()));
+    assert!(!has(&shown, "Fit to this screen"), "{shown:?}");
+
+    // Picking the chief's terminal moves the input there; the room for the strip saying who types was kept for it.
+    let sent = fits(&world, "chief");
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, click(egui::pos2(200.0, 400.0)));
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert_eq!(view.term.session(), Some("chief"));
+    assert_eq!((size(&world, "chief"), fits(&world, "chief")), (chief, sent), "picking it never resizes it");
+
+    // The window gets shorter: the dock and the tile follow it.
+    settled(&ctx, &mut world, &mut client, &mut view, (WIDE.0, WIDE.1 - 300.0));
+    assert!(size(&world, "chief").1 < chief.1 && size(&world, "s1").1 < agent.1);
+
+    // Where the host has a desktop, its panes size the terminals: the window shows them as they are.
+    let (ctx, mut world, mut client, mut view) = live();
+    view.fit_terminals = true;
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(!world.driver.remote.fits());
+    assert_eq!((size(&world, "chief"), size(&world, "s1")), ((80, 12), (80, 12)));
+    assert!(world.sent().iter().all(|m| !matches!(m, Message::TerminalFit { .. })));
+}
+
+#[test]
 fn a_wide_window_over_a_host_without_plans_shows_every_agent_and_no_plan_button() {
     let mut host = fake_host::host();
     host.board.plans.clear();

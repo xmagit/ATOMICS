@@ -53,6 +53,7 @@ pub const CAPABILITIES: &[&str] = &[
     EXPLORER,
     PLAN_COMPLETE,
     TRACE,
+    FIT,
 ];
 /// Projects, worktrees, folder subscriptions/pages and bounded whole-file reads. Needs `host`.
 pub const EXPLORER: &str = "explorer";
@@ -74,6 +75,9 @@ pub const HOST: &str = "host";
 pub const PANELS: &str = "panels";
 /// Paged chief trace and live revision notifications (`trace` subscription).
 pub const TRACE: &str = "trace";
+/// `terminal_fit`: the host has no desktop of its own (`atomics host`), so a client's pane gives a terminal its own
+/// size. Only such a host offers it, and only with `input`.
+pub const FIT: &str = "fit";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Version {
@@ -557,6 +561,12 @@ pub enum Message {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         size: Option<GridSize>,
     },
+    /// Give the terminal its own size, as a desktop's pane does: the size it has whenever no lease holder's size is
+    /// in force. Only with `fit`.
+    TerminalFit {
+        session: String,
+        size: GridSize,
+    },
     ApprovalDecide(ApprovalDecide),
     PlanCommand(PlanCommand),
     ReviewCommand(ReviewCommand),
@@ -625,6 +635,7 @@ const KINDS: &[&str] = &[
     "lease_state",
     "terminal_input",
     "terminal_resize",
+    "terminal_fit",
     "approval_decide",
     "plan_command",
     "review_command",
@@ -781,6 +792,9 @@ impl Message {
             }),
             Message::TerminalResize { session, size, .. } => long("session", session)
                 .or_else(|| size.and_then(|s| s.invalid()).map(|why| WireError::new(ErrorCode::Malformed, why))),
+            Message::TerminalFit { session, size } => {
+                long("session", session).or_else(|| size.invalid().map(|why| WireError::new(ErrorCode::Malformed, why)))
+            }
             Message::ApprovalDecide(c) => c.validate().err(),
             Message::PlanCommand(c) => c.validate().err(),
             Message::ReviewCommand(c) => c.validate().err(),

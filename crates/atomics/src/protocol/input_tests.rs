@@ -430,6 +430,63 @@ fn the_phone_does_not_resize_unless_asked_and_its_size_ends_with_its_lease() {
     desk.until(|t| t.lease("s1").is_some_and(|l| l.holder.is_none() && !l.resized));
 }
 
+impl Typer {
+    fn offers(&self, capability: &str) -> bool {
+        matches!(&self.client.welcome.as_ref().unwrap().message,
+            Message::Welcome { capabilities, .. } if capabilities.iter().any(|c| c == capability))
+    }
+}
+
+#[test]
+fn a_host_without_a_desktop_takes_each_terminals_own_size_from_a_clients_pane() {
+    let terminal = Detached::new(80, 24, 100);
+    let config =
+        ServerConfig { headless: true, lease: Policy { ttl: Duration::from_secs(1), ..Policy::default() }, ..config() };
+    let f = start_with(config, &[("s1", &terminal)]);
+    let mut mac = Typer::connect(&f, "mac");
+    assert!(mac.offers(wire::FIT), "a host with no desktop of its own offers fit");
+    mac.subscribe("s1");
+    // The pane's size, with no lease and nothing typed: the terminal's own size from now on.
+    mac.send(Message::TerminalFit { session: "s1".into(), size: GridSize::new(120, 40) });
+    mac.until(|t| t.screen_size("s1") == Some((120, 40)));
+    assert_eq!(terminal.size(), (120, 40));
+
+    // A phone fits it to its screen for as long as its lease lasts; the pane's next size waits meanwhile.
+    let mut phone = Typer::connect(&f, "phone");
+    phone.subscribe("s1");
+    phone.acquire("s1", false).unwrap();
+    let fit = phone.typist("s1").resize(Some(GridSize::new(40, 12))).unwrap();
+    phone.send(fit);
+    mac.until(|t| t.screen_size("s1") == Some((40, 12)));
+    mac.send(Message::TerminalFit { session: "s1".into(), size: GridSize::new(130, 40) });
+    mac.idle(Duration::from_millis(50));
+    assert_eq!(terminal.size(), (40, 12));
+    // The phone's lease expires: the terminal returns to the pane's size, never to the size it started with.
+    mac.until(|t| t.lease("s1").is_some_and(|l| l.reason == Some(LeaseReason::Expired)));
+    mac.until(|t| t.screen_size("s1") == Some((130, 40)));
+    assert_eq!(terminal.size(), (130, 40));
+    assert!(mac.errors.is_empty(), "{:?}", mac.errors);
+}
+
+#[test]
+fn a_host_with_a_desktop_keeps_sizing_its_terminals() {
+    let terminal = Detached::new(80, 24, 100);
+    let f = start_with(config(), &[("s1", &terminal)]);
+    let mut client = Typer::connect(&f, "mac");
+    assert!(!client.offers(wire::FIT), "the desktop's panes size its terminals");
+    client.subscribe("s1");
+    let id = client.send(Message::TerminalFit { session: "s1".into(), size: GridSize::new(120, 40) });
+    assert_eq!(client.refusal(&id), ErrorCode::Unauthorised);
+    client.idle(Duration::from_millis(50));
+    assert_eq!(terminal.size(), (80, 24));
+
+    // Without `input` there is no fit either, even with no desktop.
+    let g = start_with(ServerConfig { headless: true, ..config() }, &[("s1", &terminal)]);
+    let screens_only = vec!["board".to_string(), wire::TERMINALS.to_string(), wire::FIT.to_string()];
+    let viewer = Typer::with_capabilities(&g, "viewer", screens_only);
+    assert!(!viewer.offers(wire::FIT));
+}
+
 #[test]
 fn resizes_from_a_burst_land_once_and_the_last_one_wins() {
     let terminal = Detached::new(80, 24, 100);

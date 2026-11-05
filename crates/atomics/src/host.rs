@@ -233,6 +233,8 @@ fn start_protocol(
         allowed_origins: config.allowed_origins.clone(),
         advertise: Some(home.join("protocol.json")),
         paired: Some(clients.clone()),
+        // `atomics host` has no window whose panes would size its terminals.
+        headless: !state.window().is_attached(),
         ..protocol::ServerConfig::default()
     };
     let commands = Arc::new(state.op_sender());

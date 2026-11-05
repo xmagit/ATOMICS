@@ -148,6 +148,26 @@ fn connect(home: &Path) -> Socket {
     socket
 }
 
+/// The capabilities the host's `welcome` offers a client that asks for all of them.
+fn welcome(home: &Path) -> Vec<String> {
+    let mut socket = connect(home);
+    let deadline = Instant::now() + scaled_timeout(Duration::from_secs(20));
+    loop {
+        assert!(Instant::now() < deadline, "no welcome");
+        match socket.read() {
+            Ok(tungstenite::Message::Text(text)) => {
+                if let Message::Welcome { capabilities, .. } = wire::decode(text.as_str()).unwrap().message {
+                    return capabilities;
+                }
+            }
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(e))
+                if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+            Err(e) => panic!("protocol connection failed: {e}"),
+        }
+    }
+}
+
 fn send(socket: &mut Socket, envelope: Envelope) {
     socket.send(tungstenite::Message::text(serde_json::to_string(&envelope).unwrap())).unwrap();
 }
@@ -417,6 +437,8 @@ fn headless_host_serves_ctl_hooks_plans_and_the_protocol_then_stops_on_sigterm()
     assert!(String::from_utf8_lossy(&screenshot.stdout).contains("no window"), "{screenshot:?}");
     let list = instance.ctl(json!({"cmd":"list"}));
     assert!(list["window"].is_null(), "{list}");
+    // With no window whose panes would size its terminals, a client's panes may.
+    assert!(welcome(&instance.home()).iter().any(|c| c == wire::FIT));
 
     // A shell session starts through ctl and runs in a PTY with no client attached.
     let marker = instance.dir.path().join("shell.pid");

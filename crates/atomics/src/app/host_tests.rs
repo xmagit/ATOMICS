@@ -953,6 +953,9 @@ fn the_protocol_serves_the_board_while_the_state_lock_is_held() {
         let mut first = TestClient::connect(addr, &token);
         first.hello();
         first.sync_until(|m| m.sessions.contains_key("worker"));
+        // The desktop's panes size its terminals, so no client is offered to.
+        assert!(matches!(&first.welcome.as_ref().unwrap().message,
+            atomics_core::wire::Message::Welcome { capabilities, .. } if !capabilities.iter().any(|c| c == "fit")));
 
         // With the model locked, as it is for a whole frame of drawing, the protocol thread still
         // connects a new client and sends the board: it never asks for this lock.
@@ -965,6 +968,65 @@ fn the_protocol_serves_the_board_while_the_state_lock_is_held() {
         // And the host still answers its own clients with a client attached.
         assert_eq!(host.state().sessions.len(), 1);
     });
+}
+
+#[test]
+fn a_host_without_a_window_takes_its_terminals_sizes_from_a_clients_pane() {
+    with_state(
+        "app::host_tests::a_host_without_a_window_takes_its_terminals_sizes_from_a_clients_pane",
+        |mut state, _| {
+            use crate::protocol::tests::TestClient;
+            use atomics_core::lease::GridSize;
+            use atomics_core::screen::ScreenMirror;
+            use atomics_core::wire::{self, Envelope, Message, Topic};
+            state.config.remote.enabled = true;
+            // As `atomics host` builds it: no window, so nothing on the host gives a terminal its size.
+            state.window = crate::host::Window::default();
+            let script = "read -r go; stty size; exec sleep 30";
+            let terminal = Terminal::spawn(
+                state.wake.clone(),
+                state.theme.terminal_colors(),
+                "/bin/sh".into(),
+                vec!["-c".into(), script.into()],
+                &state.launch_dir,
+                HashMap::new(),
+                100,
+            )
+            .unwrap();
+            state.sessions = vec![session("chief", AgentKind::Generic, AgentStatus::Working, &state.launch_dir)];
+            state.sessions[0].terminal = Some(terminal);
+            let host = state.into_host();
+            let mut client = remote_client(&host);
+            client.sync_until(|m| m.sessions.contains_key("chief"));
+            assert!(matches!(&client.welcome.as_ref().unwrap().message,
+                Message::Welcome { capabilities, .. } if capabilities.iter().any(|c| c == wire::FIT)));
+            client.send(&Envelope::new(Message::Subscribe {
+                topics: vec![Topic::Screen { session: "chief".into(), focused: true }],
+            }));
+            client.send(&Envelope::new(Message::TerminalFit { session: "chief".into(), size: GridSize::new(100, 30) }));
+            let mut mirror = ScreenMirror::default();
+            let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
+            let mut follow = |client: &mut TestClient, done: &dyn Fn(&atomics_core::screen::Screen) -> bool| {
+                while !mirror.screen.as_ref().is_some_and(done) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the screen never got there: {:?}",
+                        mirror.screen.as_ref().map(|s| s.text())
+                    );
+                    match client.next().expect("connection open").message {
+                        Message::ScreenSnapshot(s) => drop(mirror.apply_snapshot(&s)),
+                        Message::ScreenDelta(d) => drop(mirror.apply_delta(&d)),
+                        Message::Error { code, message } => panic!("{code:?}: {message}"),
+                        _ => {}
+                    }
+                }
+            };
+            follow(&mut client, &|s| (s.cols, s.rows) == (100, 30));
+            // The program reads the pane's size from its PTY.
+            host.state().sessions[0].terminal.as_ref().unwrap().write(b"go\r".to_vec());
+            follow(&mut client, &|s| s.text().contains("30 100"));
+        },
+    );
 }
 
 #[test]

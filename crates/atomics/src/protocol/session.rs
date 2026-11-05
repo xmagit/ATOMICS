@@ -14,7 +14,8 @@
 //! A client that negotiated `input` may hold the lease of a screen it follows (`lease.rs`). Its
 //! input is written to the PTY from this thread as soon as the frame is read, and the screens
 //! thread is woken to copy the echo. The loop also tells the client whenever a followed screen's
-//! lease changes hands, and when the connection ends, so does any lease it held.
+//! lease changes hands, and when the connection ends, so does any lease it held. On a host with
+//! no desktop, a client that negotiated `fit` gives a terminal it follows its own size.
 //!
 //! A mutation passes two gates here, the `mutations` capability and the client's grants (its
 //! `welcome`'s `may`), and goes to the runtime thread (`ops.rs`), which journals and carries it
@@ -130,6 +131,8 @@ pub struct Shared {
     pub stop: Arc<AtomicBool>,
     pub config: SessionConfig,
     pub lease: Policy,
+    /// No desktop gives the terminals their size: a client may (`fit`).
+    pub headless: bool,
     pub queue_frames: usize,
     /// The most bytes a frame this session builds (a diff page) may hold.
     pub frame_budget: usize,
@@ -296,6 +299,10 @@ fn run(out: &mut Out<'_>, peer: &Peer, shared: &Shared) -> Ended {
     if !capabilities.iter().any(|c| c == wire::HOST) {
         capabilities.retain(|c| c != wire::EXPLORER);
     }
+    // Where a desktop gives the terminals their size, it stays theirs.
+    if !shared.headless || !capabilities.iter().any(|c| c == INPUT) {
+        capabilities.retain(|c| c != wire::FIT);
+    }
     let may = role.may(&capabilities);
     out.manages_host = may.contains(&atomics_core::ops::Grant::Host);
     let (results_tx, results) = mpsc::channel();
@@ -304,6 +311,7 @@ fn run(out: &mut Out<'_>, peer: &Peer, shared: &Shared) -> Ended {
         screens: HashSet::new(),
         terminals,
         input: terminals && capabilities.iter().any(|c| c == INPUT),
+        fit: capabilities.iter().any(|c| c == wire::FIT),
         mutations: capabilities.iter().any(|c| c == MUTATIONS),
         host: capabilities.iter().any(|c| c == wire::HOST),
         panels: capabilities.iter().any(|c| c == wire::PANELS),
@@ -418,6 +426,8 @@ struct Follows {
     terminals: bool,
     /// It negotiated `input`: it is told who holds leases, and may hold one if it may `type`.
     input: bool,
+    /// It negotiated `fit`: its panes give the terminals their own size.
+    fit: bool,
     /// It negotiated `mutations`.
     mutations: bool,
     /// It negotiated `host`: it is sent `host_upsert`.
@@ -1022,6 +1032,14 @@ fn handle(
         Message::TerminalResize { session, lease, size } => {
             let (_, control) = controllable(shared, subscriptions, &session).map_err(refusal)?;
             control.resize_for(&subscriptions.me, lease.0, size, Instant::now(), &shared.lease).map_err(refused)
+        }
+        Message::TerminalFit { session, size } => {
+            if !subscriptions.fit {
+                return Err(refuse(ErrorCode::Unauthorised, "the fit capability was not negotiated"));
+            }
+            let (_, control) = controllable(shared, subscriptions, &session).map_err(refusal)?;
+            control.fit(size);
+            Ok(())
         }
         Message::Ack { cursor } => {
             let head = lock(&shared.hub).head();

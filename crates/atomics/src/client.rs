@@ -101,6 +101,8 @@ impl ClientApp {
         client.palette = view.looks.desktop.clone();
         client.palette.apply(ctx, &views::BundledFonts);
         client.icon = icon;
+        // A host with no window of its own (`atomics host`, the VM's) takes its terminals' sizes from these panes.
+        view.fit_terminals = true;
         let vm = (target == Target::Vm).then(vm::Gate::new);
         view.place = Some(match &vm {
             Some(gate) => Place {

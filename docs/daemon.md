@@ -87,6 +87,7 @@ so browser number precision cannot corrupt cursors. Paths are host paths, never 
 | Client → host | `lease_acquire`, `lease_renew`, `lease_release` | Session ID, takeover or the lease's fencing token. |
 | Host → client | `lease_state` | Session ID, holder, and for the holder only its token, next input sequence and time-to-live. |
 | Client → host | `terminal_input`, `terminal_resize` | Session ID, control lease, input sequence or rows/columns/cell pixels. |
+| Client → host | `terminal_fit` | Session ID and rows/columns/cell pixels: the terminal's own size from a client's pane, on a host with no desktop (`fit`). |
 | Host → client | `screen_snapshot`, `screen_delta` | Session ID, screen generation, base/new revision, cells, cursor and modes. |
 | Client → host | `history_get` | Session ID and bounded scrollback range by stable line ID. |
 | Host → client | `history_chunk` | Retained lines or an explicit indication that the requested history was evicted. |
@@ -418,9 +419,13 @@ side is `protocol/lease.rs` (one `Lease` per terminal, kept with the terminal's 
   same lease says so, and `Typist` sends a `lease_renew` after every MiB of input to get one.
 - **Resizing only when asked.** Taking the lease or typing never resizes. `terminal_resize` with a `size` ("fit to
   this screen") resizes for the holder; without one it returns to the host's own size. The holder's size lasts as
-  long as its lease: however the lease ends, the terminal returns to the desktop's size (the pane's last size, or
-  the size it started with on the headless host). A desktop resize made in the meantime waits until then. Resizes
-  are debounced: at most one per 100 ms, and the latest one waiting is applied when that time has passed.
+  long as its lease: however the lease ends, the terminal returns to its own size (the desktop pane's last size, on
+  the headless host the last size a client's pane gave it, else the size it started with). A resize of that made in
+  the meantime waits until then. Resizes are debounced: at most one per 100 ms, and the latest one waiting is
+  applied when that time has passed.
+- **A host with no desktop** (`atomics host`) offers the `fit` capability, with `input`, and takes a terminal's own
+  size from `terminal_fit`: no lease, the `type` grant and a followed screen, as the desktop's pane would give it. A
+  host with a desktop never offers it and refuses the message (`unauthorised`): its panes size its terminals.
 - **The desktop** is not a lease holder and types as it always has. Typing into a terminal pane (`TerminalView`)
   takes a remote client's lease back (`reason: desktop`), and with it any size the client set. Steering, ctl and MCP
   writes leave the lease alone.
@@ -642,8 +647,9 @@ another with `host_command`.
 - **A headless credential store.** `ATOMICS_CREDENTIALS_DIR` (Linux only) keeps what ATOMICS would put in the
   OS credential store (the ticket sign-in, MCP sign-ins, rendezvous keys) as private files instead: a 0700
   folder of 0600 files, an item each. For a machine without a keyring that is one trust domain, as the VM is.
-- **Not yet.** Terminals keep the size they started with unless a lease holder asks for its own (H3), and are
-  seen and typed into through ctl, MCP and `atomics.v1` (H2, H3). The container profile stays in Phase F.
+- **Not yet.** Terminals keep the size they started with until a native client's pane gives them theirs (`fit`) or
+  a lease holder asks for its own (H3), and are seen and typed into through ctl, MCP and `atomics.v1` (H2, H3).
+  The container profile stays in Phase F.
 
 ## The desktop as a client
 
@@ -683,6 +689,12 @@ a launcher).
   window (Ctrl+1 to 9, Shift+↑/↓; docs/navigation.md), which do here what they do on every client. Plain Ctrl with a
   letter still goes to the terminal. Reserved chords remain in egui's input; the client has no general `[keys]`
   handlers, so an unhandled chord does nothing and sends nothing to the terminal.
+- **Terminal sizes.** A host with no desktop (`fit` in its `welcome`) takes its terminals' sizes from this window,
+  as the desktop's own panes give them: every terminal it draws, the docked chief's included, is fitted to its pane
+  at the desktop's font with `terminal_fit`, again whenever the pane changes, and again after a reconnect or for a
+  new terminal under a session. A terminal the input is not on keeps the room of the strip that says who types, so
+  picking it never resizes it. "Fit to this screen" does not show. A host with a desktop keeps sizing its
+  terminals; a browser or a phone shows the host's grid with its button, as before.
 - **Closing the window** ends only the connection: the host's agents, terminals, plans and approvals go on, and
   a window opened again finds them as they are. The client takes no lock on the home and starts no runtime.
 - **Bounded.** The link reads at most 512 frames ahead of the window; a window that stops drawing makes it stop

@@ -140,6 +140,9 @@ pub struct View {
     pub place_clicked: bool,
     /// A native client's word on why its last dial did not reach the host, shown while it waits for it.
     pub unreachable: Option<String>,
+    /// A native client gives the terminals it draws their panes' sizes where the host has no desktop of its own
+    /// ([`RemoteBackend::fits`]), as the desktop does; a browser shows the host's grid as it is.
+    pub fit_terminals: bool,
     /// The terminal the page's input goes to, by session id, as the pane on screen says.
     target: Option<String>,
     /// The note on the notice line and when it first showed there.
@@ -522,6 +525,7 @@ fn lend<R>(
         remote: &driver.remote,
         target: view.target.clone(),
         now_ms: view.now_ms,
+        fit: view.fit_terminals,
         picked: None,
     };
     let result = draw(&driver.remote, client, &mut terminals);

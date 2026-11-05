@@ -178,6 +178,37 @@ fn a_fitted_terminal_stays_fitted_while_it_shows_though_the_click_on_fit_took_th
 }
 
 #[test]
+fn where_the_host_has_no_desktop_a_native_pane_fits_its_terminal_without_being_asked() {
+    let (ctx, mut world, mut client, mut view) = terminal(|host| host.headless = true);
+    assert!(world.driver.remote.fits());
+    let fits = |world: &World| world.sent().iter().filter(|m| matches!(m, Message::TerminalFit { .. })).count();
+    // A browser shows the host's grid as it is, even where it could fit it.
+    frame(&ctx, &mut world, &mut client, &mut view, PHONE);
+    assert_eq!((fits(&world), world.host.terminals["s1"].screen.cols), (0, 80));
+
+    view.fit_terminals = true;
+    for _ in 0..3 {
+        frame(&ctx, &mut world, &mut client, &mut view, PHONE);
+    }
+    // The grid is the pane's, at the desktop's font: every row and column shows, and nothing is left over.
+    let painted = view.term.painted.expect("painted");
+    let screen = &world.host.terminals["s1"].screen;
+    assert_eq!(fit_size(&painted), GridSize { cols: screen.cols, rows: screen.rows, ..fit_size(&painted) });
+    assert_eq!((painted.cols, painted.rows), (screen.cols, screen.rows));
+    assert_eq!(Some(painted.size), view.term.fit, "the desktop's font, not one that fits the host's grid");
+    assert_eq!(fits(&world), 1, "once: it is what the host has now");
+    assert!(world.host.terminals["s1"].lease.is_none(), "fitting takes no lease");
+
+    // A taller screen: the grid follows the pane.
+    let rows = screen.rows;
+    for _ in 0..2 {
+        frame(&ctx, &mut world, &mut client, &mut view, (PHONE.0, PHONE.1 + 200.0));
+    }
+    assert!(world.host.terminals["s1"].screen.rows > rows);
+    assert_eq!(fits(&world), 2);
+}
+
+#[test]
 fn losing_the_lease_blurs_the_overlay_and_another_typist_makes_it_read_only() {
     let (ctx, mut world, mut client, mut view) = terminal(|_| {});
     send(&ctx, &mut world, &mut client, &mut view, vec![TermInput::Focus(true), TermInput::Text("a".into())]);

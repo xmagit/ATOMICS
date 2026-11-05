@@ -66,6 +66,7 @@ pub const CAPABILITIES: &[&str] = &[
     wire::EXPLORER,
     wire::PLAN_COMPLETE,
     wire::TRACE,
+    wire::FIT,
 ];
 /// Files of one worktree whose hunks are asked for at once.
 const MAX_IN_FLIGHT: usize = 4;
@@ -368,6 +369,13 @@ impl RemoteBackend {
         self.state.borrow().welcome.as_ref().is_some_and(|w| w.may.contains(&grant))
     }
 
+    /// Whether this client may give the host's terminals their own size: the host has no desktop of its own
+    /// (`fit`), and this client may type.
+    pub fn fits(&self) -> bool {
+        self.may(Grant::Type)
+            && self.state.borrow().welcome.as_ref().is_some_and(|w| w.capabilities.iter().any(|c| c == wire::FIT))
+    }
+
     /// A read of the board as the mirror holds it.
     pub fn with_mirror<R>(&self, read: impl FnOnce(&Mirror) -> R) -> R {
         read(&self.state.borrow().mirror)
@@ -599,6 +607,16 @@ impl RemoteBackend {
         let mut s = self.state.borrow_mut();
         let s = &mut *s;
         s.screens.resize(session, size, &mut s.outgoing);
+    }
+
+    /// Give `session`'s terminal the pane's `size` as its own, where this client [`fits`](Self::fits) them.
+    pub fn fit(&self, session: &str, size: GridSize) {
+        if !self.fits() {
+            return;
+        }
+        let mut s = self.state.borrow_mut();
+        let s = &mut *s;
+        s.screens.fit(session, size, &mut s.outgoing);
     }
 }
 

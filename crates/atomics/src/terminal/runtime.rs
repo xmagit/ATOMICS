@@ -62,8 +62,9 @@ pub struct Shared {
     /// Which remote client may type into and resize this terminal. Nobody holds it unless the
     /// protocol server runs and a client asked; until then the desktop never takes its lock to type.
     lease: Lease,
-    /// The desktop's own size (its pane, or the size the terminal started with). `size` is what is
-    /// in force, which is a lease holder's size while it has one.
+    /// The terminal's own size: the desktop's pane, on a host with no desktop a client's pane, or
+    /// the size the terminal started with. `size` is what is in force, which is a lease holder's
+    /// size while it has one.
     local: Mutex<WindowSize>,
     /// Bytes lease holders sent that the PTY has not taken yet ([`CountedPty`]). A program that
     /// stops reading its input leaves them queued; the lease refuses more above a bound.
@@ -688,6 +689,16 @@ impl TerminalControl for ScreenHandle {
             cell_height: s.cell_height.unwrap_or(local.cell_height),
         });
         apply_size(&self.term, &self.shared, &self.input, size);
+    }
+
+    fn set_own_size(&self, size: GridSize) {
+        let mut local = self.shared.local.lock().unwrap();
+        *local = WindowSize {
+            num_cols: size.cols,
+            num_lines: size.rows,
+            cell_width: size.cell_width.unwrap_or(local.cell_width),
+            cell_height: size.cell_height.unwrap_or(local.cell_height),
+        };
     }
 }
 

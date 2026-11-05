@@ -11,8 +11,9 @@
 //!
 //! The desktop is not a lease holder. It types and resizes as it always has; its typing takes the
 //! lease back. A holder resizes only when it asks, its size lasts only as long as its lease, and
-//! its resizes are debounced. When its lease ends the terminal returns to the desktop's own size,
-//! and a desktop resize made in the meantime waits until then.
+//! its resizes are debounced. When its lease ends the terminal returns to its own size, and a
+//! resize of that made in the meantime waits until then. The desktop's pane gives a terminal its
+//! own size; on a host with no desktop, a client's pane does ([`fit`](dyn TerminalControl::fit)).
 //!
 //! Every change happens under the lease's own lock, and input is written to the PTY under it, so
 //! a takeover can never be overtaken by input admitted under the old lease. Nothing here takes
@@ -70,6 +71,9 @@ pub trait TerminalControl: Send + Sync {
     /// Resize to the holder's `size`, or with `None` to the desktop's own size. Called with the
     /// lease locked.
     fn resize(&self, size: Option<GridSize>);
+    /// Make `size` the terminal's own size, the one `resize(None)` returns to, as a desktop's pane
+    /// does. Called with the lease locked.
+    fn set_own_size(&self, size: GridSize);
 }
 
 struct Holder {
@@ -380,6 +384,12 @@ impl dyn TerminalControl + '_ {
         }
     }
 
+    /// A client's pane gives the terminal its own size, on a host with no desktop to: applied as
+    /// the desktop's own resize is ([`local_resize`](Self::local_resize)).
+    pub fn fit(&self, size: GridSize) {
+        self.local_resize(|| self.set_own_size(size));
+    }
+
     /// The lease as `who` should see it, and the version that state belongs to.
     pub fn view(&self, session: &str, who: &Client, policy: &Policy) -> (u64, LeaseState) {
         let locked = self.lease().lock();
@@ -409,6 +419,8 @@ mod tests {
         lease: Lease,
         written: Mutex<Vec<u8>>,
         sizes: Mutex<Vec<Option<GridSize>>>,
+        /// The own size a client's pane gave it, which `resize(None)` stands for.
+        own: Mutex<Option<GridSize>>,
         stalled: AtomicBool,
         unwritten: std::sync::atomic::AtomicUsize,
     }
@@ -428,6 +440,9 @@ mod tests {
         }
         fn resize(&self, size: Option<GridSize>) {
             self.sizes.lock().unwrap().push(size);
+        }
+        fn set_own_size(&self, size: GridSize) {
+            *self.own.lock().unwrap() = Some(size);
         }
     }
 
@@ -631,6 +646,27 @@ mod tests {
             end(t, token);
             assert_eq!(probe.sizes(), vec![Some(GridSize::new(30, 10)), None], "{name}");
         }
+    }
+
+    #[test]
+    fn a_clients_own_size_waits_for_a_holders_size_and_is_what_the_terminal_returns_to() {
+        let policy = Policy { ttl: Duration::from_secs(5), ..Policy::default() };
+        let (probe, now) = (Probe::default(), Instant::now());
+        let phone = client(1, "phone");
+        let t = probe.control();
+        t.fit(GridSize::new(120, 40));
+        assert_eq!(probe.sizes(), vec![None], "with no holder's size in force, at once");
+        assert_eq!(*probe.own.lock().unwrap(), Some(GridSize::new(120, 40)));
+        t.acquire(&phone, false, now, &policy).unwrap();
+        let token = probe.token(&phone);
+        t.resize_for(&phone, token, Some(GridSize::new(40, 12)), now, &policy).unwrap();
+        // The pane changes size while the phone's size is in force: it waits for the lease to end.
+        t.fit(GridSize::new(130, 40));
+        assert_eq!(probe.sizes(), vec![None, Some(GridSize::new(40, 12))]);
+        t.tick(now + Duration::from_secs(6), &policy);
+        assert_eq!(probe.sizes(), vec![None, Some(GridSize::new(40, 12)), None], "the expiry returns to it");
+        assert_eq!(*probe.own.lock().unwrap(), Some(GridSize::new(130, 40)));
+        assert!(!probe.lease.held());
     }
 
     #[test]

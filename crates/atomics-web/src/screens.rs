@@ -12,6 +12,9 @@
 //!   grant still on its way once it comes.
 //!   Input refused as `slow_client` is typed again, before anything newer, from the screen's next change
 //!   on, [`MAX_TYPED_BYTES`] per change: the program read something.
+//! - **Fitting.** On a host with no desktop of its own, a pane gives its terminal its own size
+//!   ([`Screens::fit`]), sent when it changes and again for a terminal that has not had it: after
+//!   (re)subscribing, or a new terminal under the session.
 //! - **No replay.** A disconnect forgets the lease, the waiting text and whatever was not known to be
 //!   applied (`Typist::disconnected`). The screen stays on view as it was, marked stale, until the next
 //!   snapshot.
@@ -89,8 +92,8 @@ enum Request {
     },
     /// Asking for the lease.
     Acquire(String),
-    /// A renew, a release or a resize. Refused, it changes nothing here: the lease or its terminal had
-    /// ended, and the lease state the host sends says so.
+    /// A renew, a release, a resize or a fit. Refused, it changes nothing here: the lease or its terminal
+    /// had ended, and the lease state the host sends says so.
     Lease,
     History(String),
     /// Following a screen.
@@ -103,6 +106,8 @@ struct Term {
     typist: Typist,
     /// Subscribed on this connection, and whether as focused.
     subscribed: Option<bool>,
+    /// The own size this client last gave the terminal, on this subscription.
+    fitted: Option<GridSize>,
     /// The host had no terminal for it yet (a session that is still starting): it is asked again once
     /// the session changes on the board ([`Screens::session_changed`]), not on every frame.
     refused: bool,
@@ -211,6 +216,7 @@ impl Screens {
         let mut frames = Vec::new();
         for (session, term) in &mut self.terms {
             if !std::mem::take(&mut term.shown) && term.subscribed.take().is_some() {
+                term.fitted = None;
                 if let Some(release) = term.typist.release() {
                     frames.push(release);
                 }
@@ -332,6 +338,18 @@ impl Screens {
         }
     }
 
+    /// Give `session`'s terminal the pane's `size` as its own (`terminal_fit`), when that is not what this
+    /// client gave it last. Only for a followed screen.
+    pub fn fit(&mut self, session: &str, size: GridSize, out: &mut Vec<Envelope>) {
+        let Some(term) = self.terms.get_mut(session).filter(|t| t.subscribed.is_some()) else { return };
+        if term.fitted == Some(size) {
+            return;
+        }
+        term.fitted = Some(size);
+        let id = self.request(Request::Lease);
+        out.push(Envelope::new(Message::TerminalFit { session: session.to_string(), size }).reply_to(Some(id)));
+    }
+
     /// Type up to [`MAX_TYPED_BYTES`] of what waits behind input refused as `slow_client`: the screen
     /// changed (a delta, or a snapshot after a gap), so the program may have read something. The rest
     /// waits for the next change.
@@ -415,6 +433,7 @@ impl Screens {
         for term in self.terms.values_mut() {
             term.typist.disconnected();
             term.subscribed = None;
+            term.fitted = None;
             term.acquiring = false;
             term.unwanted = false;
             term.waiting.clear();
@@ -525,6 +544,11 @@ impl Screens {
     /// What the host says of a lease; `acquired` when it answers this client's request for it.
     fn lease_state(&mut self, state: &LeaseState, acquired: bool, out: &mut Vec<Envelope>) {
         let Some(term) = self.terms.get_mut(&state.session) else { return };
+        // A lease that never changed hands: a terminal just followed, or a new one under the session, which has the
+        // size it started with.
+        if state.reason.is_none() {
+            term.fitted = None;
+        }
         // From before the host read this client's release: its answer, and any new request's, are still to come.
         if term.typist.out_of_date(state) {
             return;
@@ -593,6 +617,7 @@ impl Screens {
                     && code == ErrorCode::NotFound
                 {
                     term.subscribed = None;
+                    term.fitted = None;
                     term.refused = true;
                 }
             }

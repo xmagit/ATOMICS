@@ -88,6 +88,9 @@ pub struct ServerConfig {
     pub session: SessionConfig,
     pub screens: ScreenConfig,
     pub lease: lease::Policy,
+    /// This host has no desktop of its own (`atomics host`): it offers `fit`, so a client's panes
+    /// give its terminals their own size.
+    pub headless: bool,
 }
 
 impl Default for ServerConfig {
@@ -110,6 +113,7 @@ impl Default for ServerConfig {
             session: SessionConfig::default(),
             screens: ScreenConfig::default(),
             lease: lease::Policy::default(),
+            headless: false,
         }
     }
 }
@@ -172,6 +176,7 @@ impl Server {
             stop: stop.clone(),
             config: config.session.clone(),
             lease: config.lease.clone(),
+            headless: config.headless,
             queue_frames: config.queue_frames,
             frame_budget: config.frame_budget,
         });
