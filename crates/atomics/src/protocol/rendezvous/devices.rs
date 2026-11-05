@@ -55,7 +55,11 @@ pub struct Device {
 impl Device {
     /// Its sessions' peer: the role its access gives, its name and its key's digest.
     pub fn peer(&self) -> Peer {
-        Peer { role: self.access.role(), device: Some(PeerDevice { name: self.name.clone(), id: digest(&self.key) }) }
+        Peer {
+            native: false,
+            role: self.access.role(),
+            device: Some(PeerDevice { name: self.name.clone(), id: digest(&self.key) }),
+        }
     }
 }
 

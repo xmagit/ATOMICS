@@ -22,6 +22,7 @@ pub(crate) fn wait(base: Duration) -> Duration {
 
 pub(crate) fn session(id: &str, title: &str, status: AgentStatus) -> SessionInfo {
     SessionInfo {
+        previews: Vec::new(),
         id: id.into(),
         agent: "claude".into(),
         title: title.into(),
@@ -1346,3 +1347,6 @@ fn trace_is_paged_live_and_only_sent_under_its_capability() {
     old.send(&Envelope::new(Message::Ping { nonce: None }));
     assert!(matches!(old.next().unwrap().message, Message::Pong { .. }), "old clients receive no new message kinds");
 }
+
+#[path = "preview_tests.rs"]
+mod preview;

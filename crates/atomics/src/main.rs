@@ -26,6 +26,7 @@ mod lifecycle;
 mod mcp;
 mod mcp_client;
 mod open_link;
+mod preview;
 mod protocol;
 mod ref_guard;
 mod relay;

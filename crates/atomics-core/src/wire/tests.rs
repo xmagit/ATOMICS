@@ -6,6 +6,7 @@ use crate::session::AgentStatus;
 
 fn session() -> SessionInfo {
     SessionInfo {
+        previews: Vec::new(),
         id: "s1".into(),
         agent: "claude".into(),
         title: "fix".into(),
@@ -171,6 +172,12 @@ fn every_message() -> Vec<Message> {
         Topic::Screen { session: "s1".into(), focused: true },
     ];
     vec![
+        Message::TunnelOpen { id: "t1".into(), port: 5173 },
+        Message::TunnelOpened { id: "t1".into() },
+        Message::TunnelRefused { id: "t1".into(), reason: "not previewable".into() },
+        Message::TunnelData { id: "t1".into(), bytes: crate::preview::encode(&[0, 128, 255]) },
+        Message::TunnelAck { id: "t1".into(), bytes: 3 },
+        Message::TunnelClose { id: "t1".into(), abort: false },
         Message::Hello {
             client_id: "c".into(),
             versions: vec![VERSION],
@@ -913,5 +920,23 @@ fn a_snapshot_part_out_of_range_is_malformed() {
         *slot = Some(part);
         let frame = serde_json::to_string(&envelope).unwrap();
         assert_eq!(decode(&frame).unwrap_err().code, ErrorCode::Malformed, "{part:?}");
+    }
+}
+
+#[test]
+fn tunnel_frames_keep_their_bounds() {
+    let valid = Message::TunnelData { id: "t".into(), bytes: crate::preview::encode(&vec![255; TUNNEL_CHUNK]) };
+    assert!(decode(&encode(&Envelope::new(valid)).unwrap()).is_ok());
+    for invalid in [
+        Message::TunnelOpen { id: "t".into(), port: 0 },
+        Message::TunnelData { id: "t".into(), bytes: "!".into() },
+        Message::TunnelData { id: "t".into(), bytes: crate::preview::encode(&vec![0; TUNNEL_CHUNK + 1]) },
+        Message::TunnelData { id: "t".into(), bytes: String::new() },
+        Message::TunnelAck { id: "t".into(), bytes: 0 },
+        Message::TunnelAck { id: "t".into(), bytes: TUNNEL_WINDOW + 1 },
+        Message::TunnelClose { id: "x".repeat(MAX_ID_BYTES + 1), abort: true },
+    ] {
+        assert!(invalid.validate().is_err(), "{invalid:?}");
+        assert!(decode(&serde_json::to_string(&Envelope::new(invalid)).unwrap()).is_err());
     }
 }

@@ -641,6 +641,12 @@ task of the plan or of an open plan has it, and suggests a free name such as `<b
 exists outside any open plan is accepted with a warning: a task may name it to bring that work into the plan, but
 dispatching an agent on it would fail. Dropping a dependency that closed a cycle in an approved plan keeps the approval.
 
+Agents can offer a local web server with `atomics_preview {port: 5173, path: "/", label: "Web"}`;
+`atomics_preview {port: 5173, remove: true}` removes the declaration. The tile's **Preview** button opens it
+in your browser. A native client connected to a remote host forwards the TCP connection over `atomics.v1`;
+the in-process desktop opens loopback directly. Linux also detects listeners owned by the agent's process
+tree; macOS requires declarations. Browser clients cannot create local forwards. See [Preview](docs/daemon.md#preview).
+
 `atomics_plan_dispatch` (or **Dispatch ready** on the board) gives each ready task its own worktree and an agent whose
 first message is the brief. Every agent ATOMICS starts gets a `atomics_report` tool, pre-approved, to say when it is done,
 blocked or has a question. Reports land on the task card, move done tasks to review, and wake the orchestrator's
@@ -903,7 +909,7 @@ codex mcp add ATOMICS -- atomics mcp
 Tools: `atomics_wait` (block until an agent finishes a turn or needs input; returns a cursor for the next call),
 `atomics_approve` (allow, allow_always or deny a pending permission request),
 `atomics_result` (an agent's last prompt, final message and screen), `atomics_list`, `atomics_start` (in a folder, a new worktree from `repo` + `branch`, or with neither in a scratch folder; `isolation` overrides the settings for that session), `atomics_send` (a message, or raw
-keys for menus), `atomics_read` (screen text), `atomics_diff`, `atomics_comment` + `atomics_send_review`, `atomics_open` (show a file to the user), `atomics_focus`, `atomics_close`.
+keys for menus), `atomics_read` (screen text), `atomics_preview` (offer or remove a session's loopback web server), `atomics_diff`, `atomics_comment` + `atomics_send_review`, `atomics_open` (show a file to the user), `atomics_focus`, `atomics_close`.
 Comments an agent leaves show inline in the diff panel before they are sent, so you can see what it asks for.
 
 `atomics ctl '<json>'` sends the same requests from a shell, e.g. `atomics ctl '{"cmd":"list"}'`. A few extras exist for

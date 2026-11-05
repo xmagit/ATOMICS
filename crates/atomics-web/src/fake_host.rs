@@ -600,7 +600,11 @@ impl FakeHost {
                 let offered: Vec<&str> = CAPABILITIES
                     .iter()
                     .copied()
-                    .filter(|c| (self.offers_host || *c != wire::HOST) && (self.headless || *c != wire::FIT))
+                    .filter(|c| {
+                        (self.offers_host || *c != wire::HOST)
+                            && (self.headless || *c != wire::FIT)
+                            && *c != wire::TUNNEL
+                    })
                     .collect();
                 let capabilities = wire::common_capabilities(&capabilities, &offered);
                 self.host_negotiated = capabilities.iter().any(|c| c == wire::HOST);
@@ -849,6 +853,7 @@ impl FakeHost {
             SessionAction::Start { agent, folder, .. } => {
                 let id = format!("new-{}", self.head());
                 let session = SessionInfo {
+                    previews: Vec::new(),
                     id: id.clone(),
                     title: "new session".into(),
                     agent,
@@ -1234,6 +1239,7 @@ pub fn board() -> Board {
     use atomics_core::projection::{DiffFileSummary, TaskLink};
     use atomics_core::session::AgentStatus;
     let session = |id: &str, title: &str, chief: bool| SessionInfo {
+        previews: Vec::new(),
         id: id.into(),
         agent: "claude".into(),
         title: title.into(),

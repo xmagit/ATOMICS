@@ -39,6 +39,7 @@ pub mod ops;
 #[cfg(feature = "native")]
 pub mod paths;
 pub mod plan;
+pub mod preview;
 pub mod projection;
 pub mod remote;
 pub mod repo_workflow;

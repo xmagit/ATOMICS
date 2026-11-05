@@ -432,6 +432,7 @@ pub fn mcp_add_args(name: &str, exe: &Path, socket: &Path) -> Vec<String> {
     let command = [
         format!("ATOMICS_PANE={name}"),
         format!("ATOMICS_SOCKET={}", socket.display()),
+        "ATOMICS_SANDBOXED=1".into(),
         exe.display().to_string(),
         "mcp".into(),
         "--agent".into(),
@@ -909,6 +910,7 @@ command = ["codex"]
                 "/usr/bin/env",
                 "--args=ATOMICS_PANE=atomics-s1",
                 "--args=ATOMICS_SOCKET=/run/atomics.sock",
+                "--args=ATOMICS_SANDBOXED=1",
                 "--args=\"/Apps/ATOMICS, beta.app/atomics\"",
                 "--args=mcp",
                 "--args=--agent",

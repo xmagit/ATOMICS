@@ -54,6 +54,7 @@ pub const CAPABILITIES: &[&str] = &[
     PLAN_COMPLETE,
     TRACE,
     FIT,
+    TUNNEL,
 ];
 /// Projects, worktrees, folder subscriptions/pages and bounded whole-file reads. Needs `host`.
 pub const EXPLORER: &str = "explorer";
@@ -78,6 +79,11 @@ pub const TRACE: &str = "trace";
 /// `terminal_fit`: the host has no desktop of its own (`atomics host`), so a client's pane gives a terminal its own
 /// size. Only such a host offers it, and only with `input`.
 pub const FIT: &str = "fit";
+/// Bounded TCP previews, offered only on native remote connections.
+pub const TUNNEL: &str = "tunnel";
+pub const MAX_TUNNELS: usize = 16;
+pub const TUNNEL_WINDOW: u32 = 64 * 1024;
+pub const TUNNEL_CHUNK: usize = 16 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Version {
@@ -387,6 +393,33 @@ pub struct Revisions {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Message {
+    TunnelOpen {
+        id: String,
+        port: u16,
+    },
+    TunnelOpened {
+        id: String,
+    },
+    TunnelRefused {
+        id: String,
+        reason: String,
+    },
+    /// Standard base64; decoded payload is at most TUNNEL_CHUNK bytes.
+    TunnelData {
+        id: String,
+        bytes: String,
+    },
+    /// Credit returned only after bytes reach the TCP socket.
+    TunnelAck {
+        id: String,
+        bytes: u32,
+    },
+    /// EOF in the sender's direction; the other direction may finish independently.
+    TunnelClose {
+        id: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        abort: bool,
+    },
     FolderGet {
         worktree: String,
         path: String,
@@ -601,6 +634,12 @@ pub enum Message {
 }
 
 const KINDS: &[&str] = &[
+    "tunnel_open",
+    "tunnel_opened",
+    "tunnel_refused",
+    "tunnel_data",
+    "tunnel_ack",
+    "tunnel_close",
     "folder_get",
     "folder_page",
     "hello",
@@ -709,7 +748,24 @@ impl Message {
         let long = |what: &str, s: &str| {
             (s.len() > MAX_ID_BYTES).then(|| WireError::new(ErrorCode::Oversize, format!("{what} is too long")))
         };
+        let preview_bounds = |session: &SessionInfo| {
+            too_many("previews", session.previews.len(), crate::preview::MAX_PREVIEWS).or_else(|| {
+                session
+                    .previews
+                    .iter()
+                    .find_map(|p| p.validate().err().map(|e| WireError::new(ErrorCode::Malformed, e)))
+            })
+        };
         let failure = match self {
+            Message::TunnelOpen { id, port } => long("id", id)
+                .or_else(|| (*port == 0).then(|| WireError::new(ErrorCode::Malformed, "port must be nonzero"))),
+            Message::TunnelOpened { id } | Message::TunnelClose { id, .. } => long("id", id),
+            Message::TunnelRefused { id, reason } => long("id", id).or_else(|| long("reason", reason)),
+            Message::TunnelAck { id, bytes } => long("id", id).or_else(|| {
+                (*bytes == 0 || *bytes > TUNNEL_WINDOW)
+                    .then(|| WireError::new(ErrorCode::Malformed, "invalid tunnel credit"))
+            }),
+            Message::TunnelData { id, bytes } => long("id", id).or_else(|| crate::preview::decode(bytes).err()),
             Message::Hello { client_id, versions, capabilities, prior_epoch, .. } => {
                 too_many("versions", versions.len(), MAX_VERSIONS)
                     .or_else(|| too_many("capabilities", capabilities.len(), MAX_CAPABILITIES))
@@ -765,8 +821,13 @@ impl Message {
                 .or_else(|| long("worktree", &page.worktree))
                 .or_else(|| long("path", &page.path))
                 .or_else(|| page.entries.iter().find_map(|entry| long("entry path", &entry.path))),
-            Message::StateSnapshot { part: Some(part), .. } => (part.count == 0 || part.index >= part.count)
-                .then(|| WireError::new(ErrorCode::Malformed, "a snapshot part is out of range")),
+            Message::SessionUpsert { session, .. } => preview_bounds(session),
+            Message::StateSnapshot { part, sessions, .. } => part
+                .and_then(|part| {
+                    (part.count == 0 || part.index >= part.count)
+                        .then(|| WireError::new(ErrorCode::Malformed, "a snapshot part is out of range"))
+                })
+                .or_else(|| sessions.iter().find_map(preview_bounds)),
             Message::Resync { reason, screens } => too_many("screens", screens.len(), MAX_SUBSCRIPTIONS)
                 .or_else(|| reason.as_deref().and_then(|r| long("reason", r)))
                 .or_else(|| screens.iter().find_map(|s| long("session", s))),

@@ -381,10 +381,12 @@ fn serve_stream(stream: TcpStream, shared: &session::Shared, up: &Upgrade, pre_a
         let (response, who) = authorise(request, response, &up.token, up.paired.as_deref(), &up.origins)?;
         // Authenticated: only now does the connection take one of the client places.
         claimed.set(Some(Slot::take(&up.active, up.max_clients).ok_or_else(|| refuse(503, "too many clients"))?));
-        peer.set(Some(match who {
-            Some(device) => Peer { role: Role::Controller, device: Some(device) },
+        let mut identity = match who {
+            Some(device) => Peer { role: Role::Controller, device: Some(device), native: true },
             None => Peer::local(up.role),
-        }));
+        };
+        identity.native = !request.headers().contains_key(http::header::ORIGIN);
+        peer.set(Some(identity));
         Ok(response)
     };
     let stream = link::Stream::new(stream)?.with_deadline(up.deadline);

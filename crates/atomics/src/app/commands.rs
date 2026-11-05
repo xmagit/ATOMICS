@@ -66,6 +66,16 @@ impl Local<'_> {
     pub(super) fn run(&self, command: Command) {
         let state = self.0;
         match command {
+            Command::OpenPreview { preview, .. } => {
+                if preview.validate().is_ok() {
+                    let url = preview.url(preview.port);
+                    // Browser launch runs outside the runtime and its lock.
+                    std::thread::spawn(move || {
+                        let _ = crate::preview::client::open_browser(&url);
+                    });
+                }
+            }
+            Command::StopPreview { .. } => {}
             Command::EditorHints(root) => state.post(move |state| {
                 if let Some(editor) = state.editors.get(&root) {
                     editor.type_steps(state.config.editor.inlay_hints_keys.clone(), Duration::ZERO);

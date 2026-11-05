@@ -87,6 +87,9 @@ so browser number precision cannot corrupt cursors. Paths are host paths, never 
 | Client → host | `lease_acquire`, `lease_renew`, `lease_release` | Session ID, takeover or the lease's fencing token. |
 | Host → client | `lease_state` | Session ID, holder, and for the holder only its token, next input sequence and time-to-live. |
 | Client → host | `terminal_input`, `terminal_resize` | Session ID, control lease, input sequence or rows/columns/cell pixels. |
+| Client → host | `tunnel_open` | Native `tunnel` connection ID and previewable host loopback port. |
+| Host → client | `tunnel_opened`, `tunnel_refused` | Connection ready, or refusal with a reason. |
+| Both | `tunnel_data`, `tunnel_ack`, `tunnel_close` | Bounded base64 bytes, consumed-byte credit, directional EOF (or `abort: true` for immediate cancellation). |
 | Client → host | `terminal_fit` | Session ID and rows/columns/cell pixels: the terminal's own size from a client's pane, on a host with no desktop (`fit`). |
 | Host → client | `screen_snapshot`, `screen_delta` | Session ID, screen generation, base/new revision, cells, cursor and modes. |
 | Client → host | `history_get` | Session ID and bounded scrollback range by stable line ID. |
@@ -650,6 +653,51 @@ another with `host_command`.
 - **Not yet.** Terminals keep the size they started with until a native client's pane gives them theirs (`fit`) or
   a lease holder asks for its own (H3), and are seen and typed into through ctl, MCP and `atomics.v1` (H2, H3).
   The container profile stays in Phase F.
+
+## Preview
+
+An agent declares its web server with the session-scoped MCP tool
+`atomics_preview {port: 5173, path: "/demo", label: "Web"}`. Calling it again replaces that port's
+path and label; `remove: true` removes the declaration. A session has at most 16 declarations.
+Linux additionally discovers TCP listeners from `/proc/net/tcp` and `/proc/net/tcp6`, maps socket
+inodes through `/proc/<pid>/fd`, and follows parent PIDs from the agent's terminal process. Only
+loopback or wildcard listeners belonging to that process tree qualify. Discovery runs on a worker,
+never under `State` or on the protocol thread. macOS supports declared ports only.
+
+Session projections carry a `previews` list (port, path, label). Older clients ignore this additive
+field. The shared tile header offers **Preview**, with a label/port menu for multiple servers and
+**Stop** for an active forward; its details hover lists paths too. The in-process desktop opens
+`http://127.0.0.1:<port>/<path>` directly. Its terminal and runtime behavior stays unchanged.
+
+Native remote clients negotiate `tunnel`. Hosts offer it only to authenticated native controllers
+on their remote protocol server: direct WebSocket upgrades with an Origin are browsers, and the
+rendezvous browser channel never qualifies. Viewers and clients that did not request it cannot
+open tunnels. Browser builds do not request it. Existing grants and capabilities remain unchanged.
+
+A native Preview action binds `127.0.0.1` on the same port when available, otherwise an ephemeral
+port, then opens the default browser. Every accepted TCP connection sends `tunnel_open {id, port}`.
+The host rechecks that a visible, live session declares or owns that port and connects only to
+`127.0.0.1:<port>`, falling back to `[::1]:<port>`. There is no caller-selected target host, DNS,
+HTTP proxy or redirect following. Local browser traffic is relayed unchanged, including WebSocket
+upgrades. Hostname-based virtual hosting, HTTPS, and absolute URLs using a different port are not
+rewritten; when the original port is occupied, absolute URLs may still need the original server's
+configuration adjusted. Declaring a port intentionally grants access to that entire local service,
+not just the displayed path. A detected listener can change owners after discovery, so this is a
+trusted-host preview facility, not isolation from untrusted processes on that host.
+
+`tunnel_opened` starts each direction with 65,536 bytes of credit. `tunnel_data` carries standard
+base64, at most 16,384 decoded bytes per frame. Only a successful nonblocking TCP write returns
+`tunnel_ack {id, bytes}`; credit above the outstanding amount or data above the receive window
+aborts the connection. There are at most 16 connections per client, including connects in progress,
+and at most 16 connect workers (each with a bounded timeout). Each connection buffers at most one
+window in either direction. Socket reads and writes poll without blocking the protocol/UI thread;
+only connects use workers. No TCP I/O takes `State` or a shared projection lock.
+
+`tunnel_close` means EOF in the sender's direction: pending bytes drain before TCP write shutdown,
+and the other direction can finish. `abort: true` drops both directions immediately. Explicit stop,
+a session exit/removal, loss of preview permission, or link loss closes local listeners and active
+connections; they are never replayed on reconnect. Preview lists and the `OpenPreview` command take
+an optional session plus a port/path description, so other views can use the same action.
 
 ## The desktop as a client
 

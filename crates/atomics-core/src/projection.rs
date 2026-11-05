@@ -61,6 +61,8 @@ pub struct TaskLink {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionInfo {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub previews: Vec<crate::preview::Preview>,
     pub id: String,
     pub agent: String,
     pub title: String,
@@ -625,6 +627,7 @@ mod tests {
 
     fn session(id: &str, status: AgentStatus) -> SessionInfo {
         SessionInfo {
+            previews: Vec::new(),
             id: id.into(),
             agent: "claude".into(),
             title: id.into(),

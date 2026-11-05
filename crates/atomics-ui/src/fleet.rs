@@ -181,6 +181,52 @@ pub fn tiles(
                      not the rest of this machine.\n{resources}"
             ));
         }
+        let previews = backend.previews(Some(&row.id));
+        if !previews.is_empty() {
+            let width = 76.0;
+            let rect = Rect::from_min_max(
+                pos2(header.right() - close_size - 10.0 - badge_width - width, header.top()),
+                pos2(header.right() - close_size - 10.0 - badge_width, header.bottom()),
+            );
+            badge_width += width;
+            let mut child = ui.new_child(
+                egui::UiBuilder::new()
+                    .id_salt(("preview", &row.id))
+                    .max_rect(rect)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            );
+            child
+                .add_enabled_ui(backend.can_preview(), |ui| {
+                    if previews.len() == 1 && !backend.preview_active(previews[0].port) {
+                        if ui.button("Preview").on_hover_text(previews[0].title()).clicked() {
+                            client.send(Command::OpenPreview {
+                                session: Some(row.id.clone()),
+                                preview: previews[0].clone(),
+                            });
+                        }
+                    } else {
+                        ui.menu_button("Preview", |ui| {
+                            for preview in &previews {
+                                if ui.button(preview.title()).clicked() {
+                                    client.send(Command::OpenPreview {
+                                        session: Some(row.id.clone()),
+                                        preview: preview.clone(),
+                                    });
+                                    ui.close();
+                                }
+                                if backend.preview_active(preview.port)
+                                    && ui.small_button(format!("Stop port {}", preview.port)).clicked()
+                                {
+                                    client.send(Command::StopPreview { port: preview.port });
+                                    ui.close();
+                                }
+                            }
+                        });
+                    }
+                })
+                .response
+                .on_disabled_hover_text("Preview needs a native client connected to a host that supports tunnels");
+        }
         let title_rect = Rect::from_min_max(
             pos2(header.left() + 22.0, header.top()),
             pos2(header.right() - close_size - 10.0 - badge_width, header.bottom()),
@@ -219,7 +265,20 @@ pub fn tiles(
         } else {
             "Click to show this worktree's diff against its base; double-click to rename."
         };
-        let title_response = title_response.on_hover_text(format!("{}\n{subtitle}\n{action}", row.title));
+        let preview_details = if previews.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n{}",
+                previews
+                    .iter()
+                    .map(|p| format!("{} /{}", p.title(), p.path.trim_start_matches('/')))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        };
+        let title_response =
+            title_response.on_hover_text(format!("{}\n{subtitle}{preview_details}\n{action}", row.title));
         if title_response.double_clicked() && can_rename {
             rename = Some(row.id.clone());
         } else if title_response.clicked() {

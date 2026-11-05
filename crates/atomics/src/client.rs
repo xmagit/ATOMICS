@@ -45,6 +45,7 @@ pub type Resolve = Box<dyn FnOnce() -> anyhow::Result<Endpoint> + Send>;
 
 /// The window as a client of the host `target` names.
 pub struct ClientApp {
+    previews: crate::preview::client::Client,
     driver: Driver,
     client: Client,
     view: View,
@@ -130,6 +131,7 @@ impl ClientApp {
             },
         });
         Self {
+            previews: Default::default(),
             open: launch.open,
             screenshot: launch.screenshot.map(|(path, delay)| (path, f64::from(delay), Arc::default())),
             shot_requested: false,
@@ -206,6 +208,8 @@ impl ClientApp {
         self.driver.tick(now);
         self.take_events();
         self.start_agents();
+        self.previews.pump(&self.driver.remote);
+        self.driver.flush();
         self.run_outputs();
         self.view.now_ms = now as f64;
     }
@@ -249,6 +253,11 @@ impl ClientApp {
     pub(crate) fn draw(&mut self, ui: &mut egui::Ui) {
         if !self.vm_screen(ui) {
             views::draw(ui, &mut self.driver, &mut self.client, &mut self.view);
+        }
+        self.previews.pump(&self.driver.remote);
+        self.driver.flush();
+        if self.previews.active() {
+            ui.ctx().request_repaint_after(Duration::from_millis(10));
         }
         self.run_outputs();
         self.keyboard.follow(&mut self.view.term.overlay, &mut self.view.term.inputs);
@@ -443,6 +452,7 @@ impl ClientApp {
                     Output::Close { socket, .. } => {
                         if let Some((_, link)) = self.link.take_if(|(id, _)| *id == socket) {
                             link.close();
+                            self.previews = Default::default();
                         }
                     }
                     // A direct client has no hosting page and no stored device.
@@ -465,6 +475,7 @@ impl ClientApp {
                 Event::Closed { socket, code, unreachable } => {
                     if self.link.as_ref().is_some_and(|(id, _)| *id == socket) {
                         self.link = None;
+                        self.previews = Default::default();
                     }
                     // Why the host could not be reached: on screen while the window waits for it, and in
                     // the log each time it changes.

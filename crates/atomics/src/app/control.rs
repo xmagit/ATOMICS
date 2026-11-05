@@ -512,6 +512,38 @@ impl State {
                     Err(error) => ControlResponse::error(error),
                 })
             }
+            ControlRequest::Preview { pane, port, path, label, remove } => {
+                let result: Result<serde_json::Value, String> = (|| {
+                    let pane = pane.ok_or_else(|| "preview needs an agent session".to_string())?;
+                    let index = self.find(&pane).ok_or_else(|| "agent session not found".to_string())?;
+                    if self.sessions[index].status == AgentStatus::Exited {
+                        return Err("agent session ended".into());
+                    }
+                    // A sandboxed agent's servers listen inside its sandbox, and it may never name a port
+                    // of this host for clients to open.
+                    if self.sessions[index].sandbox.is_some() {
+                        return Err("a sandboxed session cannot offer a preview of this host's ports".into());
+                    }
+                    let preview = atomics_core::preview::Preview { port, path, label };
+                    preview.validate()?;
+                    let ports = self.previews.declared.entry(self.sessions[index].id.clone()).or_default();
+                    if !remove
+                        && !ports.iter().any(|p| p.port == port)
+                        && ports.len() >= atomics_core::preview::MAX_PREVIEWS
+                    {
+                        return Err("too many previews".into());
+                    }
+                    ports.retain(|p| p.port != port);
+                    if !remove {
+                        ports.push(preview);
+                    }
+                    Ok(json!({"port": port, "removed": remove}))
+                })();
+                match result {
+                    Ok(result) => done(ControlResponse::ok(result)),
+                    Err(error) => done(ControlResponse::error(error)),
+                }
+            }
             ControlRequest::Report { pane, status, summary } => {
                 let pane = self.pane_session(pane);
                 let task = self.report(pane.as_deref(), &status, &summary);

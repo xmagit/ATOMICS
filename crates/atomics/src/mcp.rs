@@ -63,7 +63,33 @@ const INSTRUCTIONS: &str = "ATOMICS runs coding agents (Claude Code, Codex, shel
 
 const AGENT_INSTRUCTIONS: &str = "You run inside ATOMICS, where an orchestrator and the user follow your work. Call atomics_report when you finish your task (status done), when you are blocked or need a decision (blocked or question), and optionally to report progress. ATOMICS posts your report to the linked ticket when configured; do not post a second copy. With tickets.comments = agents, atomics_agent_ticket_get reads your task's ticket (plan=true reads its board or plan ticket), and atomics_agent_ticket_comment adds a signed comment to your own task's ticket for questions or implementation details. These tools cannot choose another task or change ticket state. If you need an MCP server whose tools you lack, or whose tools fail with an authorization error, call atomics_mcp_connect with its name instead of asking for credentials.";
 
+fn preview_tool() -> Value {
+    json!({
+        "name": "atomics_preview",
+        "description": "Offer your local web server as a Preview on your session. Only loopback TCP ports can be opened. Set remove=true to stop offering it. Linux also detects listeners in your process tree; other hosts require this declaration.",
+        "inputSchema": { "type": "object", "properties": {
+            "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+            "path": { "type": "string", "maxLength": 1024 },
+            "label": { "type": "string", "maxLength": 128 },
+            "remove": { "type": "boolean" }
+        }, "required": ["port"], "additionalProperties": false }
+    })
+}
+
 fn agent_tools() -> Value {
+    agent_tools_for(std::env::var_os("ATOMICS_SANDBOXED").is_some())
+}
+
+/// A sandboxed agent's servers are in its sandbox, out of reach of this host's previews.
+fn agent_tools_for(sandboxed: bool) -> Value {
+    let mut tools = sandboxable_agent_tools();
+    if !sandboxed {
+        tools.as_array_mut().unwrap().insert(0, preview_tool());
+    }
+    tools
+}
+
+fn sandboxable_agent_tools() -> Value {
     json!([{
         "name": "atomics_report",
         "description": "Report on your task to the orchestrator and the user: done when finished (say what changed and how you checked it), blocked or question when you need a decision, progress for a milestone.",
@@ -116,6 +142,7 @@ fn available_tools(agent: bool, chief: bool) -> Value {
         return agent_tools();
     }
     let mut tools = tools();
+    tools.as_array_mut().unwrap().push(preview_tool());
     if !chief {
         tools.as_array_mut().unwrap().retain(|tool| !CHIEF_ONLY.iter().any(|name| tool["name"] == *name));
     }
@@ -642,6 +669,9 @@ fn exec_text(result: &Value) -> String {
 }
 
 pub(crate) fn request_for_tool(name: &str, mut args: Value) -> Result<ControlRequest, String> {
+    if name == "atomics_preview" {
+        return preview_request(args, std::env::var("ATOMICS_PANE").ok());
+    }
     if name == "atomics_agent_ticket_get" || name == "atomics_agent_ticket_comment" || name == "atomics_mcp_connect" {
         return agent_ticket_request(name, args, std::env::var("ATOMICS_PANE").ok());
     }
@@ -694,6 +724,20 @@ pub(crate) fn request_for_tool(name: &str, mut args: Value) -> Result<ControlReq
     serde_json::from_value(args).map_err(|err| format!("invalid arguments: {err}"))
 }
 
+fn preview_request(mut args: Value, pane: Option<String>) -> Result<ControlRequest, String> {
+    let map = args.as_object_mut().ok_or("preview arguments must be an object")?;
+    if map.keys().any(|key| !["port", "path", "label", "remove"].contains(&key.as_str())) {
+        return Err("preview only accepts port, path, label and remove".into());
+    }
+    map.insert("cmd".into(), json!("preview"));
+    map.insert("pane".into(), json!(pane.ok_or("preview needs an agent session")?));
+    let request: ControlRequest = serde_json::from_value(args).map_err(|e| format!("invalid arguments: {e}"))?;
+    if let ControlRequest::Preview { port, path, label, .. } = &request {
+        atomics_core::preview::Preview { port: *port, path: path.clone(), label: label.clone() }.validate()?;
+    }
+    Ok(request)
+}
+
 fn agent_ticket_request(name: &str, args: Value, pane: Option<String>) -> Result<ControlRequest, String> {
     let allowed: &[&str] = match name {
         "atomics_agent_ticket_get" => &["plan"],
@@ -716,6 +760,29 @@ fn tool_error(message: String) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn preview_is_scoped_validated_and_available_to_agents() {
+        let request = preview_request(json!({"port":5173,"path":"/demo","label":"Web"}), Some("own".into())).unwrap();
+        assert!(
+            matches!(request, ControlRequest::Preview { pane: Some(id), port: 5173, remove: false, .. } if id == "own")
+        );
+        assert!(matches!(
+            preview_request(json!({"port":5173,"remove":true}), Some("own".into())).unwrap(),
+            ControlRequest::Preview { remove: true, .. }
+        ));
+        for args in [
+            json!({"port":0}),
+            json!({"port":65536}),
+            json!({"port":5173,"pane":"other"}),
+            json!({"port":5173,"path":"bad\\path"}),
+        ] {
+            assert!(preview_request(args, Some("own".into())).is_err());
+        }
+        assert!(preview_request(json!({"port":5173}), None).is_err());
+        assert!(available_tools(true, false).as_array().unwrap().iter().any(|tool| tool["name"] == "atomics_preview"));
+        assert!(!agent_tools_for(true).as_array().unwrap().iter().any(|tool| tool["name"] == "atomics_preview"));
+    }
+
     #[test]
     fn trace_tool_is_chief_only_and_maps_to_the_control_reader() {
         for (agent, chief, visible) in [(true, false, false), (false, false, false), (false, true, true)] {
@@ -802,7 +869,13 @@ mod tests {
             agent_tools().as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
         assert_eq!(
             names,
-            ["atomics_report", "atomics_agent_ticket_get", "atomics_agent_ticket_comment", "atomics_mcp_connect"]
+            [
+                "atomics_preview",
+                "atomics_report",
+                "atomics_agent_ticket_get",
+                "atomics_agent_ticket_comment",
+                "atomics_mcp_connect"
+            ]
         );
         for key in ["pane", "session", "command", "args"] {
             let mut args = json!({"server":"linear"});
@@ -996,7 +1069,12 @@ mod tests {
             let name = tool["name"].as_str().unwrap();
             for required_only in [false, true] {
                 let args = example(&tool["inputSchema"], required_only);
-                let request = request_for_tool(name, args.clone()).unwrap_or_else(|err| panic!("{name}: {err}"));
+                let request = if name == "atomics_preview" {
+                    preview_request(args.clone(), Some("own-session".into()))
+                } else {
+                    request_for_tool(name, args.clone())
+                }
+                .unwrap_or_else(|err| panic!("{name}: {err}"));
                 let serialized = serde_json::to_value(request).unwrap();
                 let cmd = if name == "atomics_focus" { "activate" } else { name.strip_prefix("atomics_").unwrap() };
                 assert_eq!(serialized["cmd"], cmd, "{name}");

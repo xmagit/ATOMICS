@@ -9,12 +9,12 @@ description.workspace = true
 
 [features]
 default = ["native"]
-native = ["dep:base64", "dep:dirs", "dep:glob", "dep:ureq", "time/std", "dep:tempfile", "dep:libc"]
+native = ["dep:dirs", "dep:glob", "dep:ureq", "time/std", "dep:tempfile", "dep:libc"]
 test-support = []
 
 [dependencies]
 anyhow = "1.0.104"
-base64 = { version = "0.22.1", optional = true }
+base64 = "0.22.1"
 dirs = { version = "7.0.0", optional = true }
 # Warm-folder patterns ([worktrees] warm) are matched on the host only.
 glob = { version = "0.3.4", optional = true }

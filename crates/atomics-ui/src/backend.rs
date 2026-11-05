@@ -428,6 +428,17 @@ pub trait Backend {
     /// Every session, in the host's order. The UI addresses a session by its position in this list.
     fn session_list(&self) -> Vec<SessionRow>;
 
+    /// Preview descriptions are shared by tiles, details and machine views.
+    fn previews(&self, _session: Option<&str>) -> Vec<atomics_core::preview::Preview> {
+        Vec::new()
+    }
+    fn preview_active(&self, _port: u16) -> bool {
+        false
+    }
+    fn can_preview(&self) -> bool {
+        true
+    }
+
     /// The ticket a session works on, for the reader to follow: its task's or that task's plan's, among the open
     /// plans, else the selected plan's. It names the ticket system.
     fn session_ticket(&self, session: &str) -> Option<TicketLink> {

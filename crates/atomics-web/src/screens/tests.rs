@@ -581,6 +581,7 @@ fn a_screen_whose_terminal_has_not_started_is_asked_for_again_when_its_session_c
     use atomics_core::session::AgentStatus;
     let mut world = live();
     let mut starting = SessionInfo {
+        previews: Vec::new(),
         id: "new".into(),
         agent: "shell".into(),
         title: "new".into(),

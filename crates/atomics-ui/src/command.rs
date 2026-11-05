@@ -27,6 +27,14 @@ use crate::{Backend, PanelMode};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
+    /// Open a local server, forwarding it when the host is remote. Also usable by machine views.
+    OpenPreview {
+        session: Option<String>,
+        preview: atomics_core::preview::Preview,
+    },
+    StopPreview {
+        port: u16,
+    },
     EditorHints(PathBuf),
     LoadPullRequest(String),
     // ── Approvals ──────────────────────────────────────────────────────────────────────────────────

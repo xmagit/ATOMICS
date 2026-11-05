@@ -493,6 +493,7 @@ pub(crate) struct State {
     theme: Arc<Theme>,
     highlighter: Arc<Highlighter>,
     sessions: Vec<Session>,
+    previews: crate::preview::Catalog,
     codex_versions: HashMap<String, CodexVersion>,
     pending_codex: Vec<(AgentLaunch, CodexVersion)>,
     /// The `sbx` program sandboxed agents run with.
@@ -1028,6 +1029,7 @@ impl State {
             host_theme: false,
             themes: Default::default(),
             sessions: Vec::new(),
+            previews: Default::default(),
             codex_versions: HashMap::new(),
             pending_codex: Vec::new(),
             // Tests never reach the sbx installed on the machine running them.

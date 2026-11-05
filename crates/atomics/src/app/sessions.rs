@@ -529,7 +529,7 @@ impl State {
                     "--mcp-config".to_string(),
                     config.to_string(),
                     "--allowedTools".to_string(),
-                    "mcp__atomics__atomics_report,mcp__atomics__atomics_agent_ticket_get,mcp__atomics__atomics_agent_ticket_comment".to_string(),
+                    "mcp__atomics__atomics_preview,mcp__atomics__atomics_report,mcp__atomics__atomics_agent_ticket_get,mcp__atomics__atomics_agent_ticket_comment".to_string(),
                 ]);
             }
             AgentKind::Generic if codex.is_some() => {

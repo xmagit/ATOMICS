@@ -1256,3 +1256,35 @@ fn tickets_use_the_host_grant_and_a_refusal_ends_the_clients_request() {
     assert!(!old.available(&Command::OpenTicket(Default::default())));
     assert!(!old.available(&Command::SetPanel(PanelMode::Tickets)));
 }
+
+#[test]
+fn preview_actions_need_native_negotiation_and_never_replay() {
+    let remote = connected(Role::Controller);
+    assert!(
+        matches!(remote.hello("browser").message, Message::Hello { capabilities, .. } if !capabilities.iter().any(|c| c == wire::TUNNEL))
+    );
+    let preview = atomics_core::preview::Preview { port: 5173, path: "/demo".into(), label: "Web".into() };
+    let open = Command::OpenPreview { session: Some("s1".into()), preview };
+    remote.send(open.clone());
+    assert!(remote.take_preview_actions().is_empty());
+    remote.enable_native_previews();
+    assert!(
+        matches!(remote.hello("native").message, Message::Hello { capabilities, .. } if capabilities.iter().any(|c| c == wire::TUNNEL))
+    );
+    assert!(!remote.can_preview(), "older host did not negotiate it");
+    let mut hello = welcome(Role::Controller);
+    if let Message::Welcome { capabilities, .. } = &mut hello.message {
+        capabilities.push(wire::TUNNEL.into());
+    }
+    remote.receive(hello);
+    assert!(remote.can_preview());
+    remote.send(open.clone());
+    assert_eq!(remote.take_preview_actions(), vec![open.clone()]);
+    remote.send(open);
+    remote.set_active_previews(vec![5173]);
+    assert!(remote.preview_active(5173));
+    remote.disconnected();
+    assert!(!remote.preview_active(5173));
+    assert!(remote.take_preview_actions().is_empty());
+    assert!(remote.take_tunnel_messages().is_empty());
+}

@@ -204,6 +204,7 @@ mod tests {
 
     fn session(id: &str, status: AgentStatus) -> SessionInfo {
         SessionInfo {
+            previews: Vec::new(),
             id: id.into(),
             agent: "claude".into(),
             title: id.into(),

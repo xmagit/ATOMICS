@@ -389,6 +389,11 @@ impl State {
         self.sessions
             .iter()
             .map(|s| SessionInfo {
+                previews: if s.status == atomics_core::session::AgentStatus::Exited {
+                    Vec::new()
+                } else {
+                    self.previews.list(&s.id)
+                },
                 id: s.id.clone(),
                 agent: s.agent.clone(),
                 title: s.title.clone(),

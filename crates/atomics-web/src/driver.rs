@@ -258,6 +258,8 @@ impl Driver {
     pub fn direct(op_prefix: &str) -> Self {
         let mut driver = Self::new(None, op_prefix, "");
         driver.direct = true;
+        #[cfg(not(target_arch = "wasm32"))]
+        driver.remote.enable_native_previews();
         driver.status = Status::Connecting;
         driver.dial();
         driver

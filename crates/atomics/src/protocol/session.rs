@@ -142,6 +142,8 @@ pub struct Shared {
 /// is known only by its `hello`.
 #[derive(Debug, Clone)]
 pub struct Peer {
+    /// Native transports can create a local TCP listener; browser transports cannot.
+    pub native: bool,
     pub role: Role,
     pub device: Option<PeerDevice>,
 }
@@ -158,7 +160,7 @@ pub struct PeerDevice {
 
 impl Peer {
     pub fn local(role: Role) -> Self {
-        Self { role, device: None }
+        Self { role, device: None, native: true }
     }
 }
 
@@ -303,6 +305,9 @@ fn run(out: &mut Out<'_>, peer: &Peer, shared: &Shared) -> Ended {
     if !shared.headless || !capabilities.iter().any(|c| c == INPUT) {
         capabilities.retain(|c| c != wire::FIT);
     }
+    if !peer.native || role != Role::Controller {
+        capabilities.retain(|c| c != wire::TUNNEL);
+    }
     let may = role.may(&capabilities);
     out.manages_host = may.contains(&atomics_core::ops::Grant::Host);
     let (results_tx, results) = mpsc::channel();
@@ -312,6 +317,8 @@ fn run(out: &mut Out<'_>, peer: &Peer, shared: &Shared) -> Ended {
         terminals,
         input: terminals && capabilities.iter().any(|c| c == INPUT),
         fit: capabilities.iter().any(|c| c == wire::FIT),
+        tunnel: capabilities.iter().any(|c| c == wire::TUNNEL),
+        tunnels: Default::default(),
         mutations: capabilities.iter().any(|c| c == MUTATIONS),
         host: capabilities.iter().any(|c| c == wire::HOST),
         panels: capabilities.iter().any(|c| c == wire::PANELS),
@@ -428,6 +435,8 @@ struct Follows {
     input: bool,
     /// It negotiated `fit`: its panes give the terminals their own size.
     fit: bool,
+    tunnel: bool,
+    tunnels: crate::preview::relay::Relay,
     /// It negotiated `mutations`.
     mutations: bool,
     /// It negotiated `host`: it is sent `host_upsert`.
@@ -525,6 +534,10 @@ fn conversation(
     loop {
         if shared.stop.load(Ordering::Acquire) {
             return Err(Ended::Stopped);
+        }
+        let sessions = shared.projections.sessions.load();
+        for message in subscriptions.tunnels.poll(|port| previewable(&sessions.data, port)) {
+            out.envelope(&Envelope::host(&out.epoch, message)).map_err(link_ended)?;
         }
         match outbox.take() {
             Taken::Frames { board, screens } => {
@@ -792,6 +805,37 @@ fn handle(
     let gone = |error: WireError| Handled::Refused(Refusal::gone(error), id.clone());
     let no_terminals = || refuse(ErrorCode::Unauthorised, "the terminals capability was not negotiated");
     match envelope.message {
+        Message::TunnelOpen { id: tunnel, port } => {
+            if !subscriptions.tunnel {
+                return Err(refuse(ErrorCode::Unauthorised, "the tunnel capability was not negotiated"));
+            }
+            let permitted = previewable(&shared.projections.sessions.load().data, port);
+            let result = if permitted {
+                subscriptions.tunnels.open(tunnel.clone(), port)
+            } else {
+                Err("port is not previewable by this client".into())
+            };
+            if let Err(reason) = result {
+                out.envelope(&Envelope::host(&out.epoch, Message::TunnelRefused { id: tunnel, reason }))?;
+            }
+            Ok(())
+        }
+        message @ (Message::TunnelData { .. } | Message::TunnelAck { .. } | Message::TunnelClose { .. }) => {
+            if !subscriptions.tunnel {
+                return Err(refuse(ErrorCode::Unauthorised, "the tunnel capability was not negotiated"));
+            }
+            let tunnel = match &message {
+                Message::TunnelData { id, .. } | Message::TunnelAck { id, .. } | Message::TunnelClose { id, .. } => {
+                    id.clone()
+                }
+                _ => unreachable!(),
+            };
+            if let Err(reason) = subscriptions.tunnels.receive(message) {
+                subscriptions.tunnels.remove(&tunnel);
+                out.envelope(&Envelope::host(&out.epoch, Message::TunnelRefused { id: tunnel, reason }))?;
+            }
+            Ok(())
+        }
         Message::Subscribe { topics } => {
             // The whole list is checked first, so a refused request subscribes to nothing.
             let mut fresh = HashSet::new();
@@ -1085,4 +1129,11 @@ fn handle(
 
 fn outbox_resync(shared: &Shared, outbox: &Outbox) -> Result<(), WireError> {
     lock(&shared.hub).resync(outbox)
+}
+
+/// All sessions in this projection are visible to this authenticated connection.
+fn previewable(sessions: &[atomics_core::projection::SessionInfo], port: u16) -> bool {
+    sessions
+        .iter()
+        .any(|s| s.status != atomics_core::session::AgentStatus::Exited && s.previews.iter().any(|p| p.port == port))
 }
