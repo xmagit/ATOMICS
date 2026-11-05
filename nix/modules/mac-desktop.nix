@@ -183,6 +183,18 @@ let
       -L "$listen:127.0.0.1:${toString cfg.hostPort}" ${host}
   '';
 
+  # Codex's browser sign-in, for ChatGPT accounts that refuse device codes: `codex login` in the
+  # guest waits on its loopback port 1455 for the browser's return, which this forwards from the Mac
+  # while it runs (docs/nixos-vm.md, Sign in inside the VM).
+  codexLoginScript = preamble + ''
+    # Signs Codex in inside the VM ${cfg.lima.instance} through this Mac's browser: open the address
+    # it prints. Port 1455 of this Mac's loopback reaches the VM until the sign-in ends.
+    if [ -t 0 ]; then tty=-tt; else tty=-T; fi
+    exec ssh "$tty" ${sshOptions} -o ExitOnForwardFailure=yes \
+      -L 127.0.0.1:1455:127.0.0.1:1455 ${host} \
+      "exec /run/current-system/sw/bin/bash --login -c 'umask 077; exec codex login'"
+  '';
+
   tomlValue = value:
     if builtins.isList value then "[${lib.concatMapStringsSep ", " tomlValue value}]" else builtins.toJSON value;
   # Fields in the order a person reads them; null leaves one out.
@@ -330,6 +342,9 @@ let
     install -m 0755 ${textFile "atomics-vm-forward" forwardScript true} $out/bin/atomics-vm-forward
     ${lib.optionalString (cfg.hostPort != null) ''
       install -m 0755 ${textFile "atomics-vm-host-forward" hostForwardScript true} $out/bin/atomics-vm-host-forward
+    ''}
+    ${lib.optionalString (lib.elem "codex" cfg.agents) ''
+      install -m 0755 ${textFile "atomics-vm-codex-login" codexLoginScript true} $out/bin/atomics-vm-codex-login
     ''}
     install -m 0755 ${textFile "atomics-vm-install" installScript true} $out/install.sh
     install -m 0644 ${textFile "atomics-vm-config" configSnippet false} $out/config.d.toml

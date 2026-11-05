@@ -81,7 +81,8 @@ case "${1:-} ${2:-}" in
     ;;
   "auth setup-git")
     git config --global --replace-all credential.https://github.com.helper ''
-    git config --global --add credential.https://github.com.helper "!$0 auth git-credential"
+    # nixpkgs' gh writes the path of the program behind its wrapper, in the Nix store.
+    git config --global --add credential.https://github.com.helper "!${STUB_GH_HELPER:-$0} auth git-credential"
     ;;
   *) exit 3 ;;
 esac
@@ -184,6 +185,17 @@ expect "gh without Git's helper is missing" test "$(state_of check-no-helper gh)
 run fix-helper
 expect "a signed-in gh is only made Git's helper again" test "$(logins fix-helper)" -eq 0
 expect "a signed-in gh becomes Git's helper" test "$(helpers)" = ",!gh auth git-credential,"
+
+run check-store-helper --check
+expect "a helper on PATH is ok" test "$(state_of check-store-helper gh)" = ok
+git config --global --replace-all credential.https://github.com.helper \
+  '!/nix/store/00000000000000000000000000000000-gh/bin/.gh-wrapped auth git-credential' '^!'
+run check-store-helper --check
+expect "a helper in the Nix store is missing" test "$(state_of check-store-helper gh)" = missing
+STUB_GH_HELPER=/nix/store/00000000000000000000000000000000-gh/bin/.gh-wrapped run fix-store-helper
+expect "a store helper signs in to nothing" test "$(logins fix-store-helper)" -eq 0
+expect "a store helper becomes gh on PATH" test "$(helpers)" = ",!gh auth git-credential,"
+expect "no helper names the Nix store" test "$(git config --global --get-all credential.https://github.com.helper | grep -c /nix/store)" -eq 0
 
 # A credential file or folder others can open: --check names the first, a run fixes the modes.
 chmod 644 "$HOME/.codex/auth.json"

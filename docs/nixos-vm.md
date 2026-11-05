@@ -382,14 +382,20 @@ Mac's browser, and the code goes back into the terminal. Nothing needs a browser
    `~/.claude/.credentials.json`. Check: `claude auth status` exits 0 with a subscription sign-in,
    not an API key.
 2. **Codex** (`codex`). `codex login --device-auth`. Device code sign-in must be allowed in ChatGPT's
-   security settings. Otherwise run `codex login` over a session that forwards its callback port:
-   `ssh -F ~/.lima/atomics/ssh.config -L 1455:127.0.0.1:1455 lima-atomics codex login`. Codex keeps
-   it in `~/.codex/auth.json`. Check: `codex login status`.
+   security settings; on a business workspace that is the admin's choice. Otherwise sign in through
+   the Mac's browser: on the Mac, run the bundle's `bin/atomics-vm-codex-login`
+   (`~/.local/share/atomics-vm/bin/atomics-vm-codex-login`). It runs `codex login` in the VM and
+   forwards its callback port, 1455 on the Mac's loopback, while it runs; open the address it prints.
+   Then run `atomics-onboard` again. Codex keeps the sign-in in `~/.codex/auth.json`. Check:
+   `codex login status`.
 3. **GitHub** (`gh`). `gh auth login --hostname github.com --git-protocol https --web` shows a one-time
    code and the address to enter it at, then `gh auth setup-git --hostname github.com` makes gh Git's
-   credential helper for `https://github.com`, so agents can push. Without a keyring, gh keeps its token
+   credential helper for `https://github.com`, so agents can push. nixpkgs' gh writes the Nix store
+   path of the program behind its wrapper there, which a garbage collection after an update removes,
+   so `atomics-onboard` names gh where `PATH` finds it instead. Without a keyring, gh keeps its token
    in `~/.config/gh/hosts.yml`. Check: `gh auth status --hostname github.com` succeeds and Git's helper
-   for github.com is gh. A signed-in gh that is not Git's helper only gets `setup-git` again.
+   for github.com is gh, not a Nix store path. A signed-in gh that is not Git's helper only gets
+   `setup-git` again.
 4. **Private credential files** (`private`, after every sign-in). The sign-ins above keep plain-text
    tokens in the home folder ([Trust and secrets](#trust-and-secrets)). Each one that exists, and its
    folder, must give group and others no access (`0600` and `0700`, or stricter):

@@ -121,14 +121,19 @@ check_codex() {
 }
 login_codex() {
   codex login --device-auth && return 0
-  warn "device code sign-in failed: turn it on in ChatGPT's security settings, or run 'codex login' with port 1455 forwarded (docs/nixos-vm.md)"
+  warn "device code sign-in failed: ChatGPT allows it only when its security settings (a workspace admin's, for a business account) turn it on"
+  warn "sign in through the browser instead: on the Mac, run bin/atomics-vm-codex-login from the VM's bundle (~/.local/share/atomics-vm by default), then run atomics-onboard again"
   return 1
 }
 
-# gh signs in to github.com and becomes Git's credential helper there.
-readonly github_url=https://github.com
+# gh signs in to github.com and becomes Git's credential helper there. nixpkgs' gh is a wrapper,
+# and `gh auth setup-git` writes the path of the program behind it, in the Nix store, which a
+# garbage collection after an update removes. The helper names gh where PATH finds it instead.
+readonly github_hosts=(https://github.com https://gist.github.com)
+git_helpers() { git config --global --get-all "credential.$1.helper" 2>/dev/null; }
 gh_is_git_helper() {
-  git config --global --get-all "credential.$github_url.helper" 2>/dev/null | grep -q 'gh auth git-credential$'
+  git_helpers "${github_hosts[0]}" | grep -Eq '^!(/[^ ]*/)?gh auth git-credential$' &&
+    ! git_helpers "${github_hosts[0]}" | grep -q '^!/nix/store/'
 }
 check_gh() {
   installed gh || { reason="gh is not installed"; return 1; }
@@ -140,6 +145,14 @@ login_gh() {
     gh auth login --hostname github.com --git-protocol https --web || return 1
   fi
   gh auth setup-git --hostname github.com
+  local host gh_path
+  gh_path=$(command -v gh)
+  for host in "${github_hosts[@]}"; do
+    git_helpers "$host" | grep -q '^!/nix/store/' || continue
+    git config --global --unset-all "credential.$host.helper"
+    git config --global --add "credential.$host.helper" ''
+    git config --global --add "credential.$host.helper" "!$gh_path auth git-credential"
+  done
 }
 
 # The ATOMICS host on the Mac, through a socket forwarded into the VM. No socket: nothing to check.
