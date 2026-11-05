@@ -12,6 +12,7 @@
 //! paired one's ([`target`]). Instead of the page's input overlay, [`input`] routes the window's keys and
 //! pointer to the terminal that has the keyboard.
 
+mod frame_stats;
 pub mod input;
 pub mod link;
 pub mod target;
@@ -69,6 +70,8 @@ pub struct ClientApp {
     /// `--screenshot`: where, when (seconds after the start), and whether it was taken.
     screenshot: Option<(std::path::PathBuf, f64, Arc<AtomicBool>)>,
     shot_requested: bool,
+    /// `ATOMICS_FRAME_STATS`: frame rate and frame times written to a file, when set.
+    frame_stats: Option<frame_stats::FrameStats>,
     /// Tests reach a host of their own making.
     #[cfg(test)]
     fixed: Option<Arc<dyn Fn() -> anyhow::Result<Endpoint> + Send + Sync>>,
@@ -130,6 +133,7 @@ impl ClientApp {
             open: launch.open,
             screenshot: launch.screenshot.map(|(path, delay)| (path, f64::from(delay), Arc::default())),
             shot_requested: false,
+            frame_stats: frame_stats::FrameStats::from_env(),
             vm,
             vm_started: Arc::default(),
             confirm_local: false,
@@ -487,6 +491,9 @@ impl eframe::App for ClientApp {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(stats) = &mut self.frame_stats {
+            stats.begin(Instant::now());
+        }
         self.pump();
         self.screenshot(ctx);
         if let Some(wait) = self.driver.wake_in() {
@@ -499,6 +506,9 @@ impl eframe::App for ClientApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.draw(ui);
+        if let Some(stats) = &mut self.frame_stats {
+            stats.end(Instant::now());
+        }
     }
 }
 
