@@ -588,15 +588,16 @@ order (`atomics.vm.checks`); each one fails the run by exiting non-zero.
 off by default. Turn it on with `atomics.examples.dotnetAzure.enable = true;` in the flake above, or
 copy it as the start of your own module. It adds:
 
-- .NET SDK 9 with the .NET 8 and ASP.NET Core 8 runtimes, PowerShell, Azure CLI (with a Fabric
-  patch backported for Invoke 3), Git Credential Manager and the Azure Artifacts credential provider,
-  which NuGet discovers through `NUGET_PLUGIN_PATHS`;
+- .NET SDK 9 with the .NET 8 and ASP.NET Core 8 runtimes, PowerShell, Azure CLI with its `azure-devops`
+  extension built in (and a Fabric patch backported for Invoke 3), a Git helper using Azure CLI and
+  the Azure Artifacts credential provider, which NuGet discovers through `NUGET_PLUGIN_PATHS`;
 - four `atomics-onboard` steps ([`dotnet-azure/onboard.sh`](../nix/examples/dotnet-azure/onboard.sh)),
   and its plain-text token caches (`~/.azure`, `~/.local/.IdentityService`,
   `~/.local/share/MicrosoftCredentialProvider`) in the `private` check;
-- a check ([`dotnet-azure/check.sh`](../nix/examples/dotnet-azure/check.sh)) for those tools, the .NET
-  9 SDK and both 8.0 runtimes, that starts a fresh `linux/amd64` SQL Server 2022 container and waits
-  for `SQL Server is now ready for client connections`. Its random SA password exists only at runtime;
+- a check ([`dotnet-azure/check.sh`](../nix/examples/dotnet-azure/check.sh)) for those tools, the
+  built-in `az repos` command, the .NET 9 SDK and both 8.0 runtimes, that starts a fresh
+  `linux/amd64` SQL Server 2022 container and waits for `SQL Server is now ready for client connections`.
+  Its random SA password exists only at runtime;
   it publishes no port, uses no volume and removes its container on exit.
 
 Its first `atomics-onboard` run asks for the Azure DevOps organization and the Azure Artifacts feeds,
@@ -608,29 +609,27 @@ with a user part is never taken.
 1. **Azure CLI** (`az`). `az login --use-device-code --allow-no-subscriptions`. For one tenant, run
    `az login --use-device-code --tenant <tenant>` yourself; the step then counts as done. az keeps
    it in `~/.azure`. Check: `az account get-access-token` for Azure DevOps's resource
-   (`499b84ac-1321-427f-aa17-267ca6975798`) succeeds, with `--output none`.
-2. **Git push to Azure DevOps** (`ado-git`). Git Credential Manager is set up for
-   `https://dev.azure.com` alone, in `~/.gitconfig`:
+   (`499b84ac-1321-427f-aa17-267ca6975798`) succeeds, with `--output none`. The packaged
+   `azure-devops` extension makes `az repos` available without downloading an extension or using pip.
+2. **Git push to Azure DevOps** (`ado-git`). The packaged `git-credential-azure-cli` helper is set
+   up for `https://dev.azure.com` alone, in `~/.gitconfig`:
 
    ```ini
    [credential "https://dev.azure.com"]
-   	helper =
-   	helper = manager
-   	useHttpPath = true
-   	msauthFlow = devicecode
-   [credential]
-   	credentialStore = cache
+       helper =
+       helper = azure-cli
+       useHttpPath = true
    ```
 
-   The empty `helper` drops helpers configured before it, so no other helper stores an Azure DevOps
-   token. `credentialStore = cache` (Git's memory-only cache) is set only when no store is chosen;
-   Linux has no default. Then `git credential fill` asks for the organization's credential and GCM
-   shows a device code. The credential goes from `git credential fill` to `git credential approve`
-   through a pipe, as after a push, and never through the script. GCM uses Microsoft Entra OAuth
-   tokens, not PATs. The guest has no Secret Service, so GCM keeps Microsoft's token cache in a
-   plain file in the home folder, like az; it warns `using plain-text fallback token cache`. Check:
-   the same `git credential fill` with prompts off (`GCM_INTERACTIVE=never`, `GIT_TERMINAL_PROMPT=0`),
-   its credential discarded.
+   The empty `helper` drops helpers configured before it, including Git Credential Manager. This
+   step only configures Git; Azure CLI (step 1) does the sign-in. On `get` for this HTTPS host, the
+   helper runs `az account get-access-token --resource 499b84ac-1321-427f-aa17-267ca6975798 --query accessToken -o tsv`
+   and answers `username=AzureDevOps` and `password=<token>`. It answers nothing on `store` or `erase`
+   and keeps no tokens of its own. Azure CLI's on-disk refresh tokens survive VM restarts, so every
+   agent running as the guest user can get a fresh access token without another device-code prompt.
+   Check: the helper configuration matches and `git credential fill` returns a nonempty password
+   with prompts disabled (`GIT_TERMINAL_PROMPT=0`, `GIT_ASKPASS=false`, `SSH_ASKPASS=false`); its
+   credential is discarded. If the Azure CLI sign-in expires or is revoked, repeat step 1.
 3. **NuGet feeds** (`nuget`). For each feed, `CredentialProvider.Microsoft -U <feed> -R -F Json`
    with `ARTIFACTS_CREDENTIALPROVIDER_FORCE_CANSHOWDIALOG_TO=false`: device flow, its log and device
    code on stderr, the credential on stdout discarded. `dotnet restore` then finds the session token
@@ -649,10 +648,12 @@ bind-mount it read/write at the agent's `~/.nuget/packages`.
 
 The flake check `checks.<system>.atomics-onboard-dotnet-azure` runs
 [`dotnet-azure/onboard-test.sh`](../nix/examples/dotnet-azure/onboard-test.sh), the same canary test
-for these steps. In the guest:
+for these steps, using the real Git helper script with a stub Azure CLI. It checks noninteractive
+credential fills, a restart with only on-disk state, and an unchanged second onboarding run. In the guest:
 
 ```sh
 limactl shell --workdir="$PWD" atomics bash --login -c \
   'bash nix/examples/dotnet-azure/onboard-test.sh "$(command -v atomics-onboard)" \
-     /etc/atomics/onboard.d/50-azure-devops.sh --journal /nix/store "$HOME"'
+     /etc/atomics/onboard.d/50-azure-devops.sh \
+     nix/examples/dotnet-azure/git-credential-azure-cli.sh --journal /nix/store "$HOME"'
 ```

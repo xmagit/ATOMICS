@@ -4,11 +4,13 @@
 # starts under Rosetta.
 set -euo pipefail
 
-for tool in dotnet pwsh git-credential-manager az CredentialProvider.Microsoft; do
+for tool in dotnet pwsh git-credential-azure-cli az CredentialProvider.Microsoft; do
   command -v "$tool"
 done
 test -f "${NUGET_PLUGIN_PATHS:?NUGET_PLUGIN_PATHS is unset}"
 az version
+# This must work from the immutable package, without a dynamic extension install or pip.
+AZURE_EXTENSION_USE_DYNAMIC_INSTALL=no az repos --help >/dev/null
 
 dotnet --list-sdks
 dotnet --list-runtimes

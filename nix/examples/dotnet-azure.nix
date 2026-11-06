@@ -3,8 +3,9 @@
 # is with `atomics.examples.dotnetAzure.enable = true;` (docs/nixos-vm.md), or copy and adapt it.
 #
 # When enabled it adds:
-# - .NET SDK 9 with the .NET 8 and ASP.NET Core 8 runtimes, PowerShell, Azure CLI, Git Credential
-#   Manager and the Azure Artifacts credential provider, which NuGet finds through NUGET_PLUGIN_PATHS;
+# - .NET SDK 9 with the .NET 8 and ASP.NET Core 8 runtimes, PowerShell, Azure CLI with its Azure
+#   DevOps extension, a Git helper using az and the Azure Artifacts credential provider, which
+#   NuGet finds through NUGET_PLUGIN_PATHS;
 # - atomics-onboard steps for az, Git push to Azure DevOps, the Azure Artifacts NuGet feeds and the
 #   Azure DevOps MCP server for the chief, pinned to one release (dotnet-azure/onboard.sh);
 # - a VM check for those tools and an amd64 SQL Server container under Rosetta (dotnet-azure/check.sh).
@@ -39,6 +40,13 @@ let
       })
     ];
   });
+  azureCli = azurePkgs.azure-cli.withExtensions [ azurePkgs.azure-cli-extensions.azure-devops ];
+  adoGitHelper = pkgs.writeShellApplication {
+    name = "git-credential-azure-cli";
+    runtimeInputs = [ azureCli pkgs.coreutils ];
+    text = lib.removePrefix "#!/usr/bin/env bash\n"
+      (builtins.readFile ./dotnet-azure/git-credential-azure-cli.sh);
+  };
 in
 {
   options.atomics.examples.dotnetAzure.enable = lib.mkEnableOption ''
@@ -54,8 +62,8 @@ in
         aspnetcore_8_0
       ]))
       powershell
-      git-credential-manager
-      azurePkgs.azure-cli
+      azureCli
+      adoGitHelper
       azure-artifacts-credprovider
     ];
     environment.variables.NUGET_PLUGIN_PATHS =

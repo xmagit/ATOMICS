@@ -44,7 +44,10 @@
           atomics-onboard-dotnet-azure = onboardTest {
             name = "atomics-onboard-dotnet-azure-test";
             script = ./nix/examples/dotnet-azure/onboard-test.sh;
-            args = [ "${./nix/examples/dotnet-azure/onboard.sh}" ];
+            args = [
+              "${./nix/examples/dotnet-azure/onboard.sh}"
+              "${./nix/examples/dotnet-azure/git-credential-azure-cli.sh}"
+            ];
           };
         } // nixpkgs.lib.optionalAttrs (system == "aarch64-linux") {
           atomics-vm = vm.config.system.build.toplevel;

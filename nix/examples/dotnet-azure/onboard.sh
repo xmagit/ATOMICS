@@ -163,42 +163,29 @@ check_az() {
 }
 login_az() { az login --use-device-code --allow-no-subscriptions --output none; }
 
-# Git asks Git Credential Manager for dev.azure.com only, and asks nothing else there: the empty
-# helper resets helpers configured before it, so no other helper stores the token.
+# Git asks Azure CLI for dev.azure.com only. The empty helper resets earlier helpers, so no other
+# helper handles the token. Each request uses az's persistent sign-in, including after a VM restart.
 ado_git_helpers() { git config --global --get-all "credential.$ado_url.helper" 2>/dev/null || true; }
 ado_git_configured() {
-  [[ $(ado_git_helpers) == $'\nmanager' ]] \
-    && [[ $(git config --global --get "credential.$ado_url.useHttpPath" 2>/dev/null) == true ]] \
-    && [[ $(git config --global --get "credential.$ado_url.msauthFlow" 2>/dev/null) == devicecode ]] \
-    && [[ -n ${GCM_CREDENTIAL_STORE:-} || -n $(git config --get credential.credentialStore 2>/dev/null) ]]
+  [[ $(ado_git_helpers) == $'\nazure-cli' ]] \
+    && [[ $(git config --global --get "credential.$ado_url.useHttpPath" 2>/dev/null) == true ]]
 }
 ado_configure_git() {
   git config --global --replace-all "credential.$ado_url.helper" ''
-  git config --global --add "credential.$ado_url.helper" manager
+  git config --global --add "credential.$ado_url.helper" azure-cli
   git config --global "credential.$ado_url.useHttpPath" true
-  git config --global "credential.$ado_url.msauthFlow" devicecode
-  # Linux has no default store. GCM's Azure Repos sign-in keeps Microsoft's token cache itself;
-  # Git's in-memory cache holds anything else, and never on disk. A store already chosen stays.
-  if [[ -z ${GCM_CREDENTIAL_STORE:-} && -z $(git config --get credential.credentialStore 2>/dev/null) ]]; then
-    git config --global credential.credentialStore cache
-  fi
 }
 ado_credential_request() { printf 'protocol=https\nhost=dev.azure.com\npath=%s\n\n' "$ado_org"; }
 check_ado_git() {
-  installed git-credential-manager || { reason="git-credential-manager is not installed"; return 1; }
-  ado_git_configured || { reason="Git Credential Manager is not set up for dev.azure.com"; return 1; }
+  installed git-credential-azure-cli || { reason="git-credential-azure-cli is not installed"; return 1; }
+  ado_git_configured || { reason="Azure CLI Git helper is not set up for dev.azure.com"; return 1; }
   [[ -n $ado_org ]] || { reason="no Azure DevOps organization set (atomics-onboard --org NAME)"; return 1; }
-  # The credential goes to /dev/null; interaction is off, so a missing sign-in fails.
-  ado_credential_request | GIT_TERMINAL_PROMPT=0 GCM_INTERACTIVE=never timeout "$check_seconds" \
-    git credential fill >/dev/null 2>&1 || { reason="not signed in"; return 1; }
+  # Prompts are off; only the presence of a nonempty password leaves the pipe, never its value.
+  ado_credential_request | GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=false SSH_ASKPASS=false timeout "$check_seconds" \
+    git credential fill 2>/dev/null | grep '^password=.' >/dev/null \
+    || { reason="no Azure DevOps token from Azure CLI"; return 1; }
 }
-login_ado_git() {
-  ado_configure_git
-  [[ -n $ado_org ]] || return 1
-  # Sign in once, then hand the credential straight to the helper, as Git does after a push.
-  # It travels from one Git process to the other through the pipe, never through this script.
-  ado_credential_request | git credential fill | git credential approve
-}
+login_ado_git() { ado_configure_git; }
 
 # The credential provider prints a credential on stdout, as JSON with -F Json (redacted with -R,
 # and discarded all the same); its log, with any device code, goes to stderr. No dialog: device flow.
@@ -243,10 +230,9 @@ onboard_option org "Azure DevOps organization (dev.azure.com/NAME); remembered" 
 onboard_option feed "Azure Artifacts feed, .../nuget/v3/index.json (repeatable); replaces the remembered ones" ado_take_feed
 onboard_prepare ado_resolve_settings
 onboard_step az "Azure CLI (az login, Azure DevOps token)"
-onboard_step ado-git "Git push to Azure DevOps (Git Credential Manager)"
+onboard_step ado-git "Git push to Azure DevOps (Azure CLI token)"
 onboard_step nuget "Azure Artifacts NuGet feeds (credential provider)"
 onboard_step ado-mcp "Azure DevOps MCP server for the chief (az auth)"
-# The plain-text token caches: az's, Git Credential Manager's (Microsoft's MSAL cache) and the
-# credential provider's session tokens.
+# Keep token caches private, including any shared MSAL cache and the provider's session tokens.
 onboard_private .azure .azure/msal_token_cache.json .local/.IdentityService .local/share/MicrosoftCredentialProvider
 ado_load_settings
