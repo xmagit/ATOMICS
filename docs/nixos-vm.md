@@ -364,7 +364,10 @@ and bootloader. The update uses `switch-to-configuration boot`, leaving the runn
 until the restart. It never deletes or recreates the instance, its disk or its sign-ins.
 
 The command prints whether the system changed, the bundle was reinstalled and the VM restarted. It
-quits and reopens `ATOMICS.app` if installed, restarting the VM **only** when the system changed. With
+quits and reopens `ATOMICS.app` if installed, restarting the VM **only** when the system changed. The
+window reopens as the Dock would open it, without the command's own `ATOMICS_*` variables: an update run
+from a shell that points `ATOMICS_CONFIG` or `ATOMICS_HOME` at a scratch setup still reopens the VM's
+client, on the app's own config. With
 `--no-restart` it leaves both the window and VM running; a changed system takes effect on the next
 boot. If restarting fails after installation, the command says the next boot is already installed and
 how to start the VM again.

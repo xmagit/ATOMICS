@@ -474,9 +474,9 @@ pub enum BrandSize {
 /// middle, at one of its fixed widths ([`chief::pill_width`]), so that it never moves while the window keeps
 /// its size, whatever the chief, the plans or the notices do. The brand and the navigation share the half on
 /// its left, the actions the half on its right. The pill's size follows the bar's width alone: its words go
-/// under [`FULL_PILL_BAR`], its name under [`NAMED_PILL_BAR`]. Around it the load gauge goes first, the
-/// brand's agent count gives way to the Boards dropdown, the actions fold into a menu and the brand keeps only
-/// its mark. Every item keeps its natural width; the navigation folds the tabs it has no room for into the
+/// under [`FULL_PILL_BAR`], its name under [`NAMED_PILL_BAR`]. Around it the load gauge leaves the row of
+/// actions first, the brand's agent count gives way to the Boards dropdown, the actions fold into a menu, beside
+/// which the gauge comes back wherever it fits, and the brand keeps only its mark. Every item keeps its natural width; the navigation folds the tabs it has no room for into the
 /// dropdown's menu.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TopBarPlan {
@@ -485,6 +485,7 @@ pub struct TopBarPlan {
     /// The view switcher without its names.
     pub compact_switcher: bool,
     pub actions_menu: bool,
+    /// The load gauge, which opens Machine, in the bar: among the actions, or beside their folded menu.
     pub show_load: bool,
     /// An update under way stays in the row, beside the folded Actions menu.
     pub update_beside: bool,
@@ -512,6 +513,8 @@ pub struct TopBarWidths {
     pub controls: f32,
     pub controls_with_load: f32,
     pub actions_menu: f32,
+    /// The load gauge alone, nothing while the host reports no load.
+    pub load: f32,
     /// An update under way, which stays beside the folded menu where it fits. Nothing while none is.
     pub update: f32,
 }
@@ -544,10 +547,16 @@ impl TopBarPlan {
         } else {
             BrandSize::Mark
         };
-        let show_load = chief == PillSize::Full && right(w.controls_with_load, w.switcher[0]) <= side(chief);
         let switcher = w.switcher[usize::from(compact_switcher)];
-        let update_beside =
-            actions_menu && w.update > 0.0 && right(w.actions_menu + w.gap + w.update, switcher) <= side(chief);
+        // The gauge is a few characters wide and the way to Machine: once the actions fold it stays beside their
+        // menu wherever it fits, before an update under way does.
+        let show_load = if actions_menu {
+            w.load > 0.0 && right(w.actions_menu + w.gap + w.load, switcher) <= side(chief)
+        } else {
+            right(w.controls_with_load, w.switcher[0]) <= side(chief)
+        };
+        let beside = w.actions_menu + if actions_menu && show_load { w.gap + w.load } else { 0.0 };
+        let update_beside = actions_menu && w.update > 0.0 && right(beside + w.gap + w.update, switcher) <= side(chief);
         TopBarPlan { brand, chief, compact_switcher, actions_menu, show_load, update_beside }
     }
 }
@@ -577,6 +586,11 @@ pub fn top_bar(ui: &mut egui::Ui, platform: &mut impl Platform) {
         actions_menu: measure(ui, |ui| {
             ui.menu_button("Actions", |_| {});
         }),
+        load: measure(ui, |ui| {
+            platform.draw(|backend, client, _| {
+                crate::resources::load(ui, backend, &client.palette, false);
+            })
+        }),
         update: measure(ui, |ui| platform.draw(|backend, client, _| crate::update::status(ui, backend, client))),
     };
     let plan = TopBarPlan::choose(&widths);
@@ -593,10 +607,10 @@ pub fn top_bar(ui: &mut egui::Ui, platform: &mut impl Platform) {
     let switcher = widths.switcher[usize::from(plan.compact_switcher)];
     let used = switcher
         + if switcher > 0.0 { gap } else { 0.0 }
-        + if plan.update_beside {
-            widths.update + gap + widths.actions_menu
-        } else if plan.actions_menu {
+        + if plan.actions_menu {
             widths.actions_menu
+                + if plan.update_beside { widths.update + gap } else { 0.0 }
+                + if plan.show_load { widths.load + gap } else { 0.0 }
         } else if plan.show_load {
             widths.controls_with_load
         } else {
@@ -607,6 +621,13 @@ pub fn top_bar(ui: &mut egui::Ui, platform: &mut impl Platform) {
         if plan.actions_menu {
             if plan.update_beside {
                 platform.draw(|backend, client, _| crate::update::status(ui, backend, client));
+            }
+            if plan.show_load {
+                platform.draw(|backend, client, _| {
+                    if crate::resources::load(ui, backend, &client.palette, false) {
+                        client.machine_open = !client.machine_open;
+                    }
+                });
             }
             let update_inside = !plan.update_beside;
             let response =
@@ -749,13 +770,56 @@ mod tests {
             controls: 226.0,
             controls_with_load: 445.0,
             actions_menu: 65.0,
+            load: 52.0,
             update: 0.0,
         }
     }
 
+    /// A busy bar at a laptop's width, as a user with four agents and a board open had it: the actions fold
+    /// into their menu, and the gauge that opens Machine stays beside it, before an update under way.
+    #[test]
+    fn the_load_gauge_stays_beside_the_folded_actions_in_a_busy_bar() {
+        let busy = TopBarWidths {
+            width: 1500.0,
+            gap: 7.0,
+            chief: [214.0, 98.0, 56.0],
+            // ATOMICS with four agents, and the Boards button at its 360-point cap.
+            brand: [190.0, 99.0, 33.0],
+            boards: 360.0,
+            navigation: 138.0,
+            switcher: [190.0, 110.0],
+            // + New, the explorer, the host's items, pull requests, Project and settings.
+            controls: 520.0,
+            controls_with_load: 579.0,
+            actions_menu: 65.0,
+            load: 52.0,
+            update: 0.0,
+        };
+        let plan = TopBarPlan::choose(&busy);
+        assert_eq!(plan.chief, PillSize::Full);
+        assert!(plan.actions_menu && plan.show_load, "{plan:?}");
+        // At any pill size, wherever the gauge fits beside the menu it is there.
+        for width in (460..1500).step_by(5).map(|w| w as f32) {
+            let plan = TopBarPlan::choose(&TopBarWidths { width, ..busy });
+            let side = (width - busy.chief[plan.chief as usize]) / 2.0 - 7.0;
+            let switcher = if plan.compact_switcher { 110.0 } else { 190.0 };
+            if plan.actions_menu {
+                assert_eq!(plan.show_load, switcher + 7.0 + 65.0 + 7.0 + 52.0 <= side, "{width}: {plan:?}");
+            }
+        }
+        // Short of room for both, the gauge outranks an update under way, which the menu's mark then shows.
+        let short = TopBarPlan::choose(&TopBarWidths { width: 1000.0, update: 130.0, ..busy });
+        assert!(short.actions_menu && short.show_load && !short.update_beside, "{short:?}");
+        let roomy = TopBarPlan::choose(&TopBarWidths { update: 130.0, ..busy });
+        assert!(roomy.show_load && roomy.update_beside, "{roomy:?}");
+        // A host that reports no load has no gauge to keep.
+        assert!(!TopBarPlan::choose(&TopBarWidths { load: 0.0, ..busy }).show_load);
+    }
+
     #[test]
     fn an_update_under_way_stays_beside_the_folded_actions_only_where_it_fits() {
-        let with = |width, update| TopBarPlan::choose(&TopBarWidths { update, ..widths(width) });
+        // No gauge to keep: it would come before the update (`the_load_gauge_stays_beside_the_folded_actions…`).
+        let with = |width, update| TopBarPlan::choose(&TopBarWidths { update, load: 0.0, ..widths(width) });
         // Nothing under way, and nothing to keep.
         assert!(with(1000.0, 0.0).actions_menu && !with(1000.0, 0.0).update_beside);
         // Folded with room for it.
@@ -799,7 +863,14 @@ mod tests {
             // What is drawn beside the pill fits its half.
             let side = (width - widths(width).chief[plan.chief as usize]) / 2.0 - 7.0;
             let switcher = if plan.compact_switcher { 110.0 } else { 190.0 };
-            let actions = switcher + 7.0 + if plan.actions_menu { 65.0 } else { 226.0 };
+            let actions = switcher
+                + 7.0
+                + match (plan.actions_menu, plan.show_load) {
+                    (true, true) => 65.0 + 7.0 + 52.0,
+                    (true, false) => 65.0,
+                    (false, true) => 445.0,
+                    (false, false) => 226.0,
+                };
             assert!(actions <= side, "{width}: actions {actions} in {side}");
             assert!(widths(width).brand[plan.brand as usize] + 7.0 + 138.0 <= side, "{width}: {plan:?}");
             last = plan;

@@ -53,6 +53,7 @@ impl State {
         self.serve_dispatches();
         changed |= self.poll_cleanup();
         changed |= self.poll_plan_cleanup();
+        self.recheck_deferred_cleanup();
         changed |= self.usage.drain();
         changed |= self.poll_resources();
         changed |= self.poll_update();
@@ -197,7 +198,12 @@ impl State {
                     .as_ref()
                     .is_some_and(|(plan, _)| !self.plan_view || self.plans[self.selected_plan].id != *plan);
             let selection = (self.active.clone(), self.diff_root.clone(), self.focus_terminal.clone());
-            let outcome = result.and_then(|PreparedWorktree { path, warmed }| {
+            let start = result.as_ref().ok().and_then(|prepared| prepared.start.clone());
+            let warning = result.as_ref().ok().and_then(|prepared| prepared.warning.clone());
+            if let Some(warning) = &warning {
+                self.toast(format!("{branch}: {warning}"));
+            }
+            let outcome = result.and_then(|PreparedWorktree { path, warmed, .. }| {
                 let role = Role::Agent(launch.isolation);
                 self.interactive_start = launch.interactive;
                 let outcome = self.start_as(&launch.agent, path, None, launch.args, launch.prompt, role);
@@ -219,6 +225,12 @@ impl State {
                     Ok(id) => {
                         task.session = Some(id.clone());
                         task.worktree = self.sessions.iter().find(|s| &s.id == id).map(Session::root);
+                        if start.is_some() {
+                            task.start_commit = start;
+                        }
+                        if let Some(warning) = &warning {
+                            task.notes.push(warning.clone());
+                        }
                     }
                     Err(err) => {
                         task.set_status(TaskStatus::Blocked);
@@ -233,7 +245,13 @@ impl State {
                 }
             }
             let response = match outcome {
-                Ok(id) => ControlResponse::ok(self.describe(self.find(&id).expect("just started"))),
+                Ok(id) => {
+                    let mut started = self.describe(self.find(&id).expect("just started"));
+                    if let Some(warning) = warning {
+                        started["warning"] = json!(warning);
+                    }
+                    ControlResponse::ok(started)
+                }
                 Err(err) => {
                     self.toast(err.clone());
                     ControlResponse::error(err)
@@ -855,7 +873,7 @@ impl State {
                 status: AgentStatus::NeedsInput,
                 at: atomics_core::store::now(),
                 report: None,
-                approval: self.sessions[index].approvals.last().map(|pending| pending.request.clone()),
+                approval: self.sessions[index].approvals.last().map(PendingApproval::json),
                 findings: None,
                 config: None,
                 ticket: None,
@@ -943,7 +961,7 @@ fn leave_to_agent(reply: Option<Arc<ipc::ApprovalReply>>) {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{repository, request, session, with_app};
+    use super::super::tests::{answer_pending, repository, request, session, with_app};
     use super::*;
     use atomics_core::projection::{HostInfo, Projections, ResourceInfo};
 
@@ -1207,7 +1225,7 @@ mod tests {
                 assert_eq!(app.runtime.sessions[0].status, AgentStatus::NeedsInput);
                 // A real run: the memory agent ended while the main thread's hook waited for its answer.
                 background_thread_runs(app, &elsewhere);
-                let answered = request(app, json!({"cmd":"approve", "session":"worker", "decision":"allow"}));
+                let answered = answer_pending(app, json!({"cmd":"approve", "session":"worker", "decision":"allow"}));
                 assert!(answered.ok, "{answered:?}");
                 assert!(reply.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
                 assert!(app.runtime.sessions[0].approvals.is_empty());
@@ -1278,7 +1296,7 @@ mod tests {
                 app.runtime.on_hook(spawned("UserPromptSubmit", None));
                 assert_eq!(followed(&app.runtime.sessions[0]), waiting);
                 assert_eq!(app.runtime.sessions[0].approvals.len(), 1, "its start must not retire the main request");
-                assert!(request(app, json!({"cmd":"approve", "session":"worker", "decision":"allow"})).ok);
+                assert!(answer_pending(app, json!({"cmd":"approve", "session":"worker", "decision":"allow"})).ok);
                 assert!(main_reply.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
                 app.runtime.on_hook(thread_hook("PostToolUse", "main-thread", &repo, MAIN, None));
                 let before = followed(&app.runtime.sessions[0]);
@@ -1289,7 +1307,7 @@ mod tests {
                 app.runtime.on_hook(spawned("PermissionRequest", Some(reply.clone())));
                 assert_eq!(app.runtime.sessions[0].status, AgentStatus::NeedsInput);
                 assert_eq!(app.runtime.sessions[0].cwd, repo);
-                assert!(request(app, json!({"cmd":"approve", "session":"worker", "decision":"allow"})).ok);
+                assert!(answer_pending(app, json!({"cmd":"approve", "session":"worker", "decision":"allow"})).ok);
                 assert!(reply.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
                 app.runtime.on_hook(spawned("PostToolUse", None));
                 assert_eq!(followed(&app.runtime.sessions[0]), before, "back to where its request found the session");

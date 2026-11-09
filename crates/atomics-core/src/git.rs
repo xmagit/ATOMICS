@@ -7,7 +7,7 @@ use std::process::{Command, Output, Stdio};
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use glob::Pattern;
@@ -797,6 +797,87 @@ pub fn check_branch_name(repo: &Path, branch: &str, base_ref: &str) -> Result<()
     Ok(())
 }
 
+/// Where new work in a repository starts, from [`fresh_base`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FreshBase {
+    /// The ref to branch from: fetched just now when it could be.
+    pub base: String,
+    /// Why it may be behind the remote: the fetch failed, so it is as this machine last fetched it.
+    pub warning: Option<String>,
+}
+
+/// How long a fetch of a repository's remote serves the next new worktree there: tasks dispatched
+/// together fetch once.
+const FETCHED_FOR: Duration = Duration::from_secs(15);
+
+/// Where new work in `repo` starts, with its remote fetched first, so agents never build on what this
+/// machine happened to fetch last:
+/// - `base_ref` naming a remote-tracking branch (`origin/main`, `origin/develop`): that branch, as the
+///   remote has it now;
+/// - `base_ref` naming the local default branch (`main` or `master`): the remote's default branch
+///   (`<remote>/HEAD`, else `<remote>/main`, else `<remote>/master`), never the local one, which may be
+///   stale; the local branch is never moved;
+/// - anything else (another local branch, a tag, a commit), or a repository without a remote: `base_ref`
+///   as it is.
+///
+/// A fetch that fails (offline, missing credentials) does not stop the work: `base_ref` is used as this
+/// machine has it, with a warning saying so.
+pub fn fresh_base(repo: &Path, base_ref: &str) -> FreshBase {
+    let unchanged = |warning: Option<String>| FreshBase { base: base_ref.to_string(), warning };
+    let Ok(remotes) = git(repo, &["remote"]) else { return unchanged(None) };
+    let remotes: Vec<&str> = remotes.lines().map(str::trim).filter(|r| !r.is_empty()).collect();
+    let named = base_ref.split_once('/').filter(|(remote, _)| remotes.contains(remote)).map(|(remote, _)| remote);
+    let (remote, explicit) = match named {
+        Some(remote) => (remote, Some(base_ref)),
+        None if ["main", "master"].contains(&base_ref) => {
+            match remotes.iter().find(|r| **r == "origin").or(remotes.first()) {
+                Some(remote) => (*remote, None),
+                None => return unchanged(None),
+            }
+        }
+        None => return unchanged(None),
+    };
+    if let Err(error) = fetch_remote(repo, remote) {
+        let first = format!("{error:#}").lines().next().unwrap_or_default().to_string();
+        return unchanged(Some(format!(
+            "could not fetch {remote} ({first}); started from {base_ref} as this machine last fetched it, which may be \
+             behind {remote}"
+        )));
+    }
+    let exists = |name: &str| commit_of(repo, &format!("refs/remotes/{name}")).is_ok_and(|c| c.is_some());
+    if let Some(explicit) = explicit.filter(|name| exists(name)) {
+        return FreshBase { base: explicit.to_string(), warning: None };
+    }
+    let head = git(repo, &["symbolic-ref", "--quiet", &format!("refs/remotes/{remote}/HEAD")])
+        .ok()
+        .and_then(|target| target.trim().strip_prefix("refs/remotes/").map(str::to_string));
+    let fallback = [format!("{remote}/main"), format!("{remote}/master")];
+    match head.into_iter().chain(fallback).find(|name| exists(name)) {
+        Some(base) => FreshBase { base, warning: None },
+        None => unchanged(Some(format!(
+            "{remote} has no default branch here ({remote}/HEAD, {remote}/main or {remote}/master); started from \
+             {base_ref}"
+        ))),
+    }
+}
+
+/// `git fetch <remote>`, once per repository at a time; a fetch that succeeded within [`FETCHED_FOR`]
+/// serves again.
+fn fetch_remote(repo: &Path, remote: &str) -> Result<()> {
+    /// When a repository's remote was last fetched, held while it is fetched again.
+    type LastFetch = Arc<Mutex<Option<Instant>>>;
+    static FETCHED: LazyLock<Mutex<HashMap<(PathBuf, String), LastFetch>>> = LazyLock::new(Mutex::default);
+    let key = (common_dir(repo)?, remote.to_string());
+    let entry = FETCHED.lock().unwrap_or_else(|e| e.into_inner()).entry(key).or_default().clone();
+    let mut last = entry.lock().unwrap_or_else(|e| e.into_inner());
+    if last.is_some_and(|at| at.elapsed() < FETCHED_FOR) {
+        return Ok(());
+    }
+    git(repo, &["fetch", "--quiet", remote])?;
+    *last = Some(Instant::now());
+    Ok(())
+}
+
 /// Creates `branch` from `base_ref` (or its fallback) in a new worktree at `path`.
 pub fn add_worktree(repo: &Path, path: &Path, branch: &str, base_ref: &str) -> Result<()> {
     let lock = worktree_lock(repo)?;
@@ -1174,7 +1255,7 @@ pub fn probe_cache_clone(source_folder: &Path, destination_folder: &Path) -> Res
     Ok(clone_directory(source.path(), &destination.path().join("cache")))
 }
 
-fn branch_exists(repo: &Path, branch: &str) -> bool {
+pub fn branch_exists(repo: &Path, branch: &str) -> bool {
     git(repo, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_ok()
 }
 
@@ -2111,6 +2192,57 @@ pub(crate) mod tests {
         std::os::unix::fs::symlink(&outside, destination.join("build")).unwrap();
         assert!(!warm_worktree(&repo, &destination, &["build/cache".into()]));
         assert!(!outside.join("cache").exists());
+    }
+
+    /// Agents in a VM built on stale code: their worktrees came from what this machine last fetched.
+    /// New work starts from the remote as it is now, with a local bare repository as the remote here.
+    #[test]
+    fn new_work_starts_from_the_remote_as_it_is_now() {
+        let (dir, origin_work) = project();
+        let remote = dir.path().join("remote.git");
+        run(dir.path(), &["clone", "-q", "--bare", &origin_work.to_string_lossy(), &remote.to_string_lossy()]);
+        let repo = dir.path().join("clone");
+        run(dir.path(), &["clone", "-q", &remote.to_string_lossy(), &repo.to_string_lossy()]);
+        let stale = git(&repo, &["rev-parse", "main"]).unwrap().trim().to_string();
+        // The remote moves on, on main and on a develop branch, after this clone last fetched.
+        run(&origin_work, &["remote", "add", "origin", &remote.to_string_lossy()]);
+        run(&origin_work, &["commit", "-q", "--allow-empty", "-m", "landed on main"]);
+        run(&origin_work, &["push", "-q", "origin", "main", "main:develop"]);
+        let now = git(&origin_work, &["rev-parse", "main"]).unwrap().trim().to_string();
+        assert_ne!(stale, now);
+
+        let tip = |name: &str| git(&repo, &["rev-parse", name]).unwrap().trim().to_string();
+        // The default base, a remote-tracking branch: fetched, then used.
+        let fresh = fresh_base(&repo, "origin/main");
+        assert_eq!(fresh, FreshBase { base: "origin/main".into(), warning: None });
+        add_worktree_from(&repo, &dir.path().join("task"), "task", None, &fresh.base).unwrap();
+        assert_eq!(git(&dir.path().join("task"), &["rev-parse", "HEAD"]).unwrap().trim(), now);
+        assert_eq!(tip("main"), stale, "the user's local main is never moved");
+        // A local main is not where new work starts: the remote's default branch is.
+        assert_eq!(fresh_base(&repo, "main").base, "origin/main");
+        // An explicit remote branch stays the base, fetched.
+        assert_eq!(fresh_base(&repo, "origin/develop").base, "origin/develop");
+        assert_eq!(tip("origin/develop"), now);
+        // A dependent task's integration branch, made now, starts there too.
+        add_worktree_from(&repo, &dir.path().join("dependent"), "dependent", Some("integration"), &fresh.base).unwrap();
+        assert_eq!(tip("integration"), now);
+        // Another local branch, a tag or a commit is used as it is, with nothing fetched.
+        assert_eq!(fresh_base(&repo, "feature"), FreshBase { base: "feature".into(), warning: None });
+
+        // Offline: the fetch fails, the work starts from what this machine has, and says so.
+        let offline = dir.path().join("offline");
+        run(dir.path(), &["clone", "-q", &remote.to_string_lossy(), &offline.to_string_lossy()]);
+        run(&offline, &["remote", "set-url", "origin", &dir.path().join("gone.git").to_string_lossy()]);
+        let fallback = fresh_base(&offline, "origin/main");
+        assert_eq!(fallback.base, "origin/main");
+        let warning = fallback.warning.expect("a warning that the base may be stale");
+        assert!(warning.contains("could not fetch origin") && warning.contains("may be behind"), "{warning}");
+        add_worktree_from(&offline, &dir.path().join("offline-task"), "offline-task", None, &fallback.base).unwrap();
+
+        // A repository without a remote has nothing to fetch.
+        let (_local_dir, local) = project();
+        assert_eq!(fresh_base(&local, "origin/main"), FreshBase { base: "origin/main".into(), warning: None });
+        assert_eq!(fresh_base(&local, "main"), FreshBase { base: "main".into(), warning: None });
     }
 
     #[test]

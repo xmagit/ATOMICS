@@ -23,7 +23,9 @@ bar. The keys are the last section.
 
 - **The CHIEF pill** has a fixed width for each of three sizes, picked by the window's width alone, and always sits
   in the middle of the top bar. The brand and the navigation share the half on its left, the actions the half on its
-  right; what does not fit folds into the **Boards** and **Actions** menus. On the phone the pill sits in the middle of
+  right; what does not fit folds into the **Boards** and **Actions** menus. The load gauge, which opens Machine, stays
+  in the bar wherever it fits: among the actions, or beside their folded menu, before an update under way; **Machine**
+  stays in the menu too. On the phone the pill sits in the middle of
   the top bar too; a tap opens the chief's pane, a second tap goes back to the pane before it.
 - **One Boards dropdown** replaces a tab per plan. Its button names the board on screen and counts the boards that need
   the user, plans waiting for approval among them. They come first in its menu, then the other open boards with

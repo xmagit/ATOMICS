@@ -304,20 +304,21 @@ fn tools() -> Value {
         },
         {
             "name": "atomics_list",
-            "description": "List the sessions in ATOMICS with status (working, needs you, turn done, idle, exited), folder, branch and diff size. Each last prompt and pending request is cut to 300 characters; atomics_result shows one session's in more detail.",
+            "description": "List the sessions in ATOMICS with status (working, needs you, turn done, idle, exited), folder, branch, diff size and previews (web servers offered with atomics_preview or detected). Each last prompt and pending request is cut to 300 characters; atomics_result shows one session's in more detail.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
             "name": "atomics_approve",
-            "description": "Answer the oldest pending permission request for the specified session, regardless of the selected plan tab. allow_always remembers this exact command and directory until the session closes. If the hook has returned, or the agent runs without hooks, answers only a visible matching Codex or Claude command menu with that agent's keys; retry if it is not visible yet. The result echoes the command answered. Other menus (edits, questions) are not approvals: answer them with atomics_send raw.",
+            "description": "Answer a pending permission request of the specified session, regardless of the selected plan tab. Name the request you decided about with request: its id, as atomics_wait, atomics_list and atomics_result show it under approval.id. Only the session's current request can be answered; a missing id, or one no longer pending (answered, withdrawn, or replaced by a newer request), is refused with an error that shows the current request and its id: read that request before deciding again. allow_always remembers this exact command and directory until the session closes. If the hook has returned, or the agent runs without hooks, answers only a visible matching Codex or Claude command menu with that agent's keys; retry if it is not visible yet. The result echoes the command answered. Other menus (edits, questions) are not approvals: answer them with atomics_send raw.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "session": session,
+                    "request": { "type": "string", "description": "The id of the request this decision answers (approval.id)." },
                     "decision": { "type": "string", "enum": ["allow", "allow_always", "deny"] },
                     "message": { "type": "string" }
                 },
-                "required": ["session", "decision"]
+                "required": ["session", "request", "decision"]
             }
         },
         {
@@ -426,7 +427,7 @@ fn tools() -> Value {
         },
         {
             "name": "atomics_result",
-            "description": "What an agent produced: status, its last prompt, its final message (Claude), the tail of its screen, and its diff size. Read this when atomics_wait reports a turn done. Long texts are cut and say how much was left out.",
+            "description": "What an agent produced: status, its last prompt, its final message (Claude), the tail of its screen, its diff size, and its previews (port, path, label, url; declared or detected). Read this when atomics_wait reports a turn done. Long texts are cut and say how much was left out.",
             "inputSchema": { "type": "object", "properties": { "session": session }, "required": ["session"] }
         },
         {

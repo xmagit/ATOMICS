@@ -2,12 +2,13 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
+use std::os::fd::{AsRawFd, RawFd};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use atomics_core::preview;
 use atomics_core::wire::{MAX_TUNNELS, Message, TUNNEL_CHUNK, TUNNEL_WINDOW};
@@ -128,13 +129,46 @@ impl Drop for Connection {
     }
 }
 
+/// How long a relay counts as busy after it last moved data: a peer polling it waits briefly meanwhile.
+const BUSY_FOR: Duration = Duration::from_secs(1);
+
 #[derive(Default)]
 pub struct Relay {
     connections: HashMap<String, Connection>,
     connecting: Arc<AtomicUsize>,
+    /// When data last went either way, or a connection opened.
+    moved: Option<Instant>,
 }
 
 impl Relay {
+    /// Whether the relay moved data lately or a connect is under way, so a loop that cannot wait on its
+    /// sockets should poll it again soon rather than at its idle pace.
+    pub fn busy(&self) -> bool {
+        !self.connections.is_empty()
+            && (self.connections.values().any(|c| c.connecting.is_some())
+                || self.moved.is_some_and(|at| at.elapsed() < BUSY_FOR))
+    }
+
+    /// The sockets worth waiting on, and for what (`POLLIN`, `POLLOUT`): an open connection that may read
+    /// (it has credit and its socket has not ended) or has bytes waiting to be written. A socket that may
+    /// do neither is left out, so a wait on these never wakes for something the next poll cannot use.
+    pub fn interest(&self) -> Vec<(RawFd, i16)> {
+        self.connections
+            .values()
+            .filter_map(|c| {
+                let stream = c.stream.as_ref().filter(|_| c.opened)?;
+                let mut events = 0;
+                if !c.eof && c.credit > 0 {
+                    events |= libc::POLLIN;
+                }
+                if !c.pending.is_empty() {
+                    events |= libc::POLLOUT;
+                }
+                (events != 0).then(|| (stream.as_raw_fd(), events))
+            })
+            .collect()
+    }
+
     pub fn contains(&self, id: &str) -> bool {
         self.connections.contains_key(id)
     }
@@ -191,6 +225,9 @@ impl Relay {
             | Message::TunnelClose { id, .. } => id.clone(),
             _ => return Err("invalid tunnel message".into()),
         };
+        if matches!(message, Message::TunnelData { .. } | Message::TunnelAck { .. } | Message::TunnelOpened { .. }) {
+            self.moved = Some(Instant::now());
+        }
         let Some(c) = self.connections.get_mut(&id) else {
             return if matches!(message, Message::TunnelClose { .. } | Message::TunnelAck { .. }) {
                 Ok(())
@@ -240,6 +277,9 @@ impl Relay {
                 }
             }
         });
+        if !out.is_empty() {
+            self.moved = Some(Instant::now());
+        }
         out
     }
 }

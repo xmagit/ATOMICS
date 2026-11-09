@@ -33,7 +33,7 @@ impl State {
             "scratch": s.scratch,
             "last_prompt": s.last_prompt.as_deref().map(|prompt| clip(prompt, MAX_PROMPT_CHARS)),
             "approval": s.approvals.first().map(|p| {
-                let mut request = json!(p.request);
+                let mut request = p.json();
                 clip_json(&mut request, MAX_PROMPT_CHARS, 50);
                 request
             }),
@@ -44,7 +44,58 @@ impl State {
                 queue_note(t.process_id(), &running, &waiting)
             }),
             "diff": stats,
+            "previews": self.previews_json(index),
         })
+    }
+
+    /// The session's previews, as clients are offered them: what it declared with atomics_preview, then
+    /// listeners found in its process tree (Linux). None once it exited. Whether a server speaks TLS is
+    /// only found out when a client opens it, so `url` is the plain-HTTP address on this host.
+    fn previews_json(&self, index: usize) -> serde_json::Value {
+        let s = &self.sessions[index];
+        if s.status == AgentStatus::Exited {
+            return json!([]);
+        }
+        let declared = self.previews.declared.get(&s.id);
+        let previews: Vec<_> = self
+            .previews
+            .list(&s.id)
+            .into_iter()
+            .map(|p| {
+                let source =
+                    if declared.is_some_and(|d| d.iter().any(|d| d.port == p.port)) { "declared" } else { "detected" };
+                json!({
+                    "port": p.port,
+                    "path": p.path,
+                    "label": p.label,
+                    "title": p.title(),
+                    "url": p.url(p.port),
+                    "source": source,
+                })
+            })
+            .collect();
+        json!(previews)
+    }
+
+    /// The refusal of a decision that names no request, or one that is not the pending one: it says which
+    /// request is pending, in the error and as `result.pending`, to be read and answered by its id.
+    fn unseen_request(&self, index: usize, named: Option<&str>) -> ControlResponse {
+        let pending = self.sessions[index].approvals.first().map(|p| {
+            let mut request = p.json();
+            clip_json(&mut request, MAX_PROMPT_CHARS, 50);
+            request
+        });
+        let shown = pending.as_ref().map(|p| p.to_string()).unwrap_or_default();
+        let id = pending.as_ref().and_then(|p| p["id"].as_str()).unwrap_or_default().to_string();
+        let error = match named {
+            None => {
+                format!("name the request you answer: pass request with its id. The pending request is {id}: {shown}")
+            }
+            Some(named) => format!(
+                "request {named} is no longer pending, so this decision answers nothing. The pending request is now                  {id}: {shown}. Read it, then answer with request {id} if you mean to."
+            ),
+        };
+        ControlResponse { ok: false, result: json!({ "pending": pending }), error: Some(error) }
     }
 
     pub(super) fn control(&mut self, request: ControlRequest, reply: Sender<ControlOutcome>) {
@@ -128,7 +179,7 @@ impl State {
             ControlRequest::Remote => done(ControlResponse::ok(self.remote_json())),
             ControlRequest::PairClient { name } => done(self.pair_client(&name)),
             ControlRequest::UnpairClient { name } => done(self.unpair_client(&name)),
-            ControlRequest::Approve { session, decision, message } => match self.find(&session) {
+            ControlRequest::Approve { session, request, decision, message } => match self.find(&session) {
                 Some(index) => {
                     // What the screen shows now decides, not what the last poll saw.
                     self.approvable(index);
@@ -142,9 +193,20 @@ impl State {
                         None if menu => ControlResponse::error(
                             "the menu on screen is not a command approval; read it and answer with atomics_send raw keys",
                         ),
-                        None => ControlResponse::error("no pending permission request"),
+                        None => ControlResponse::error(match request {
+                            Some(request) => format!("request {request} is no longer pending, and nothing else is"),
+                            None => "no pending permission request".into(),
+                        }),
+                        // A decision answers only the request it names: one made about an earlier request
+                        // must never answer a newer one its maker has not seen.
+                        Some(approval) if request.as_deref() != Some(approval.as_str()) => {
+                            self.unseen_request(index, request.as_deref())
+                        }
                         Some(approval) => match self.approve(index, &approval, decision, message.as_deref()) {
                             Ok(answered) => ControlResponse::ok(answered.json()),
+                            Err(error) if error.code == atomics_core::wire::ErrorCode::StaleRevision => {
+                                self.unseen_request(index, request.as_deref())
+                            }
                             Err(error) => ControlResponse::error(error.message),
                         },
                     })
@@ -161,7 +223,7 @@ impl State {
                     .map(|i| {
                         let mut session = self.describe(i);
                         session["last_prompt"] = json!(self.sessions[i].last_prompt.as_deref().map(|p| clip(p, 300)));
-                        session["approval"] = json!(self.sessions[i].approvals.first().map(|p| &p.request));
+                        session["approval"] = json!(self.sessions[i].approvals.first().map(PendingApproval::json));
                         clip_json(&mut session["approval"], 300, 20);
                         session
                     })
@@ -233,6 +295,8 @@ impl State {
             ControlRequest::Result { session } => match self.find(&session) {
                 None => missing(&session),
                 Some(index) => {
+                    // The pending request, and its id, as the screen shows it now: what approve will answer.
+                    self.approvable(index);
                     let s = &self.sessions[index];
                     let screen = s.terminal.as_ref().map(|t| clip_start(&t.screen_text(40), MAX_SCREEN_CHARS));
                     let mut result = self.describe(index);
@@ -838,7 +902,7 @@ impl State {
                     status: session.status,
                     at: atomics_core::store::now(),
                     report: None,
-                    approval: session.approvals.first().map(|pending| pending.request.clone()),
+                    approval: session.approvals.first().map(PendingApproval::json),
                     findings: None,
                     config: None,
                     ticket: None,

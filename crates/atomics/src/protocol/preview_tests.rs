@@ -127,7 +127,7 @@ fn http_crosses_the_protocol_and_native_listener_in_both_directions_past_one_win
     let mut closes = (false, false);
     let mut got = None;
     while Instant::now() < deadline {
-        native.pump(&remote);
+        native.pump(&remote, None);
         for envelope in remote.take_outgoing() {
             match &envelope.message {
                 Message::TunnelData { bytes, .. } => sent += atomics_core::preview::decode(bytes).unwrap().len(),
@@ -171,7 +171,7 @@ fn http_crosses_the_protocol_and_native_listener_in_both_directions_past_one_win
     assert_eq!(got.expect("browser completed"), service.join().unwrap());
     browser.join().unwrap();
     atomics_ui::Backend::send(&remote, atomics_ui::Command::StopPreview { port });
-    native.pump(&remote);
+    native.pump(&remote, None);
     assert!(!native.active());
     assert!(TcpStream::connect((Ipv4Addr::LOCALHOST, local)).is_err());
     let url = native.open(None, info.previews[0].clone()).unwrap();
@@ -188,7 +188,7 @@ fn http_crosses_the_protocol_and_native_listener_in_both_directions_past_one_win
             break;
         }
     }
-    native.pump(&remote);
+    native.pump(&remote, None);
     assert!(!native.active(), "session exit closes the listener");
     f.projections.publish_sessions(vec![info.clone()]);
     loop {
@@ -201,7 +201,7 @@ fn http_crosses_the_protocol_and_native_listener_in_both_directions_past_one_win
     }
     native.open(Some("web".into()), info.previews[0].clone()).unwrap();
     remote.disconnected();
-    native.pump(&remote);
+    native.pump(&remote, None);
     assert!(!native.active());
     assert!(TcpStream::connect((Ipv4Addr::LOCALHOST, local)).is_err(), "disconnect closed listener");
 }
@@ -238,4 +238,84 @@ fn relay_credit_and_connection_count_are_bounded() {
     }
     assert!(relay.open("overflow".into(), 5173).is_err());
     assert!(relay.open("t".into(), 5173).is_err());
+}
+
+/// The window may not draw at all while a page loads (another app in front, the window hidden): once
+/// the preview is open, requests cross the tunnel on the relay's own thread and the host's, a round trip
+/// taking milliseconds, with no turn of the window's.
+#[test]
+fn a_preview_answers_at_once_while_the_window_draws_nothing() {
+    use crate::client::link::{Address, Endpoint, Event, Link};
+    const REQUESTS: usize = 40;
+    let http = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = http.local_addr().unwrap().port();
+    // A keep-alive server: one connection, a short answer to each request on it.
+    std::thread::spawn(move || {
+        let (mut socket, _) = http.accept().unwrap();
+        let mut request = Vec::new();
+        let mut buf = [0u8; 1024];
+        loop {
+            match socket.read(&mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => request.extend_from_slice(&buf[..n]),
+            }
+            while let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                request.drain(..end + 4);
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").unwrap();
+            }
+        }
+    });
+    let f = start();
+    let mut info = session("web", "web", AgentStatus::Working);
+    info.previews.push(Preview { port, path: String::new(), label: "Web".into() });
+    f.projections.publish_sessions(vec![info.clone()]);
+
+    let remote = atomics_web::remote::RemoteBackend::new("preview-test");
+    remote.enable_native_previews();
+    let mut native = crate::preview::client::Client::default();
+    let (events_tx, events) = std::sync::mpsc::sync_channel(512);
+    let endpoint = Endpoint {
+        addr: Address::Tcp(f.server.addr()),
+        host: f.server.addr().to_string(),
+        token: zeroize::Zeroizing::new(f.server.token().to_string()),
+    };
+    let link = Link::open(7, Box::new(move || Ok(endpoint)), events_tx, Arc::new(|| {}), native.tap());
+    // The window's turns until the board is in, as the driver takes them.
+    let deadline = Instant::now() + wait(Duration::from_secs(10));
+    while !(remote.tunnels() && remote.with_mirror(|m| m.sessions.contains_key("web"))) {
+        match events.recv_timeout(deadline.saturating_duration_since(Instant::now())).expect("the board") {
+            Event::Open { .. } => link.send(wire::encode(&remote.hello("native")).unwrap()),
+            Event::Data { bytes, .. } => remote.receive(wire::decode(std::str::from_utf8(&bytes).unwrap()).unwrap()),
+            Event::Closed { code, unreachable, .. } => panic!("the link closed: {code} {unreachable:?}"),
+        }
+    }
+    let url = native.open(Some("web".into()), info.previews[0].clone()).unwrap();
+    native.pump(&remote, Some((7, link.frames())));
+    let local: u16 = url.strip_prefix("http://127.0.0.1:").unwrap().split('/').next().unwrap().parse().unwrap();
+
+    // From here on the window takes no turn and reads none of the link's events.
+    let browser = std::thread::spawn(move || {
+        let mut socket = TcpStream::connect((Ipv4Addr::LOCALHOST, local)).unwrap();
+        socket.set_read_timeout(Some(wait(Duration::from_secs(10)))).unwrap();
+        let mut times = Vec::new();
+        for _ in 0..REQUESTS {
+            let started = Instant::now();
+            socket.write_all(b"GET /module.js HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+            let mut response = Vec::new();
+            let mut buf = [0u8; 256];
+            while !response.ends_with(b"ok") {
+                let n = socket.read(&mut buf).expect("an answer without a window turn");
+                assert!(n > 0, "the tunnel closed");
+                response.extend_from_slice(&buf[..n]);
+            }
+            times.push(started.elapsed());
+        }
+        times
+    });
+    let mut times = browser.join().unwrap();
+    times.sort();
+    let median = times[times.len() / 2];
+    // A window turn every 100 ms took about that long per request; the relay takes a millisecond or two.
+    assert!(median < wait(Duration::from_millis(20)), "median round trip {median:?}: {times:?}");
+    drop(events);
 }

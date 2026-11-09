@@ -21,6 +21,9 @@ pub(super) fn cycle_problems(plan: &Plan) -> Vec<String> {
     problems
 }
 
+/// How often worktrees a closed plan's cleanup left for their processes are checked again.
+pub(super) const DEFERRED_CHECK: Duration = Duration::from_secs(30);
+
 impl State {
     pub(super) fn show_plan_fleet(&mut self) {
         self.changed_plans.remove(&self.plans[self.selected_plan].id);
@@ -189,14 +192,73 @@ impl State {
         Ok(())
     }
 
-    pub(super) fn cleanup_closed_plan(&mut self, index: usize) {
-        let plan = self.plans[index].clone();
-        let enabled = match plan.status {
+    /// Whether closing `plan` as it is cleans up its task worktrees (`[cleanup]`).
+    fn cleans_up(&self, plan: &Plan) -> bool {
+        match plan.status {
             PlanStatus::Completed => self.config.cleanup.completed_plans,
             PlanStatus::Archived => self.config.cleanup.archived_plans,
             PlanStatus::Open => false,
+        }
+    }
+
+    /// A session closed in `root`: if that is a closed plan's task worktree, which the plan's cleanup kept
+    /// while the session used it, it is cleaned up now as that cleanup would have: kept when it has
+    /// uncommitted work or another session uses it, and left until nothing runs in it.
+    pub(super) fn clean_after_session(&mut self, id: &str, root: &Path) {
+        let real = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let Some(index) = self.plans.iter().position(|plan| {
+            self.cleans_up(plan)
+                && self.cleaning_plan.as_deref() != Some(plan.id.as_str())
+                && plan.tasks.iter().any(|task| {
+                    task.session.as_deref() == Some(id)
+                        || task.worktree.as_deref().is_some_and(|w| real(w) == real(root))
+                })
+        }) else {
+            return;
         };
-        if !enabled {
+        let plan = self.plans[index].clone();
+        let protected = self.protected_worktrees();
+        let (sbx, actions, closing) = (resolve_program(&self.sbx), self.action_tx.clone(), self.running_lifecycle());
+        let worktrees = vec![root.to_path_buf()];
+        let scope = Scope { sandboxes: Vec::new(), worktrees: Some(worktrees.clone()) };
+        self.lifecycle(scope, move || {
+            // The session's own stop and final ref check come first, as for a plan's cleanup.
+            for job in closing {
+                job.wait();
+            }
+            let home = paths::atomics_home();
+            let cleaned = crate::lifecycle::clean_worktrees(&home, &plan, &sbx, &protected, &worktrees);
+            let failures: Vec<_> =
+                cleaned.notes.iter().filter(|note| !note.starts_with("Kept worktree ")).cloned().collect();
+            crate::lifecycle::record_leftovers(&home, &failures);
+            let _ = actions.send(Box::new(move |state| {
+                state.worktrees_at = None;
+                if !cleaned.notes.is_empty() {
+                    state.toast(cleaned.notes.join("\n"));
+                }
+                state.defer_cleanup(cleaned.deferred);
+            }));
+        });
+    }
+
+    /// What a cleanup never removes: the folders sessions work in, and open plans' task worktrees.
+    fn protected_worktrees(&self) -> Vec<PathBuf> {
+        self.sessions
+            .iter()
+            .map(Session::root)
+            .chain(
+                self.plans
+                    .iter()
+                    .filter(|p| p.is_open())
+                    .flat_map(|p| p.tasks.iter())
+                    .filter_map(|t| t.worktree.clone()),
+            )
+            .collect()
+    }
+
+    pub(super) fn cleanup_closed_plan(&mut self, index: usize) {
+        let plan = self.plans[index].clone();
+        if !self.cleans_up(&plan) {
             return;
         }
         self.remove_plan_trace(&plan.id);
@@ -215,7 +277,10 @@ impl State {
                 continue;
             }
             self.remember(id);
+            // This cleanup covers the worktrees of the sessions it closes.
+            self.cleaning_plan = Some(plan.id.clone());
             self.close(id);
+            self.cleaning_plan = None;
         }
         let protected: Vec<_> = self
             .sessions
@@ -270,15 +335,140 @@ impl State {
                     );
                 }
             }
-            let notes = crate::lifecycle::clean_plan(&paths::atomics_home(), &plan, &sbx, &protected);
-            crate::lifecycle::record_leftovers(&paths::atomics_home(), &notes);
+            let cleaned = crate::lifecycle::clean_plan(&paths::atomics_home(), &plan, &sbx, &protected);
+            // A worktree left for its processes is not a failure: it goes once they end.
+            let failures: Vec<_> =
+                cleaned.notes.iter().filter(|note| !note.starts_with("Kept worktree ")).cloned().collect();
+            crate::lifecycle::record_leftovers(&paths::atomics_home(), &failures);
             let _ = actions.send(Box::new(move |state| {
                 state.worktrees_at = None;
-                if !notes.is_empty() {
-                    state.toast(notes.join("\n"));
+                if !cleaned.notes.is_empty() {
+                    state.toast(cleaned.notes.join("\n"));
                 }
+                state.defer_cleanup(cleaned.deferred);
             }));
         });
+    }
+
+    /// Worktrees a plan's cleanup left because processes still use them: noted on their tasks, and
+    /// kept on disk until they are removed.
+    pub(super) fn defer_cleanup(&mut self, deferred: Vec<crate::lifecycle::Deferred>) {
+        if deferred.is_empty() {
+            return;
+        }
+        for entry in deferred {
+            let note = format!(
+                "Worktree {} kept after the plan closed: {} still use it ({}). It is removed once nothing does.",
+                paths::display(&entry.worktree),
+                if entry.users.len() == 1 {
+                    "1 process".to_string()
+                } else {
+                    format!("{} processes", entry.users.len())
+                },
+                crate::lifecycle::shown_users(&entry.users)
+            );
+            self.note_cleanup(&entry, note, "worktree_kept");
+            self.deferred_cleanup.retain(|kept| kept.worktree != entry.worktree);
+            self.deferred_cleanup.push(entry);
+        }
+        self.save_deferred_cleanup();
+    }
+
+    fn save_deferred_cleanup(&self) {
+        if let Err(err) = crate::lifecycle::save_deferred(&paths::atomics_home(), &self.deferred_cleanup) {
+            eprintln!("ATOMICS: recording cleanups that wait for their processes: {err:#}");
+        }
+    }
+
+    /// A note on the task whose branch `entry` is, and a plan event for `atomics_wait`.
+    fn note_cleanup(&mut self, entry: &crate::lifecycle::Deferred, note: String, change: &'static str) {
+        let Some(index) = self.plans.iter().position(|p| p.id == entry.plan) else { return };
+        if let Some(task) = self.plans[index].tasks.iter_mut().find(|t| t.branch.as_deref() == Some(&entry.branch)) {
+            task.notes.push(note);
+            self.save_plan(index);
+        }
+        self.plan_event(index, change);
+    }
+
+    /// Checks again, off this thread, whether what kept closed plans' worktrees still runs in them, and
+    /// removes those nothing uses any more, as their plan's cleanup would have. Every
+    /// [`DEFERRED_CHECK`], on the host's background turns, and soon after a start.
+    pub(super) fn recheck_deferred_cleanup(&mut self) {
+        if self.deferred_cleanup.is_empty()
+            || self.deferred_checking.load(Ordering::Acquire)
+            || self.deferred_checked.is_some_and(|at| at.elapsed() < DEFERRED_CHECK)
+        {
+            return;
+        }
+        self.deferred_checked = Some(Instant::now());
+        // A plan reopened, or forgotten, has no cleanup to finish.
+        let before = self.deferred_cleanup.len();
+        let plans = &self.plans;
+        self.deferred_cleanup.retain(|entry| plans.iter().any(|p| p.id == entry.plan && !p.is_open()));
+        if self.deferred_cleanup.len() != before {
+            self.save_deferred_cleanup();
+        }
+        let mut work: Vec<(Plan, Vec<PathBuf>)> = Vec::new();
+        for entry in &self.deferred_cleanup {
+            match work.iter_mut().find(|(plan, _)| plan.id == entry.plan) {
+                Some((_, worktrees)) => worktrees.push(entry.worktree.clone()),
+                None => {
+                    let plan = self.plans.iter().find(|p| p.id == entry.plan).expect("kept above").clone();
+                    work.push((plan, vec![entry.worktree.clone()]));
+                }
+            }
+        }
+        if work.is_empty() {
+            return;
+        }
+        let protected = self.protected_worktrees();
+        let mut scope = Scope::none();
+        scope.worktrees = Some(work.iter().flat_map(|(_, worktrees)| worktrees.iter().cloned()).collect());
+        let (sbx, actions, checking) =
+            (resolve_program(&self.sbx), self.action_tx.clone(), self.deferred_checking.clone());
+        checking.store(true, Ordering::Release);
+        self.lifecycle(scope, move || {
+            let home = paths::atomics_home();
+            let mut results = Vec::new();
+            for (plan, worktrees) in work {
+                let cleaned = crate::lifecycle::clean_worktrees(&home, &plan, &sbx, &protected, &worktrees);
+                results.push((worktrees, cleaned));
+            }
+            let _ = actions.send(Box::new(move |state| {
+                state.deferred_checking.store(false, Ordering::Release);
+                state.finish_deferred_cleanup(results);
+            }));
+        });
+    }
+
+    fn finish_deferred_cleanup(&mut self, results: Vec<(Vec<PathBuf>, crate::lifecycle::Cleaned)>) {
+        for (checked, cleaned) in results {
+            for path in checked {
+                let Some(at) = self.deferred_cleanup.iter().position(|entry| entry.worktree == path) else { continue };
+                if let Some(still) = cleaned.deferred.iter().find(|entry| entry.worktree == path) {
+                    self.deferred_cleanup[at].users = still.users.clone();
+                    continue;
+                }
+                let entry = self.deferred_cleanup.remove(at);
+                if cleaned.removed.contains(&path) {
+                    let note = format!(
+                        "Worktree {} removed: nothing runs in it any more (kept since the plan closed).",
+                        paths::display(&path)
+                    );
+                    self.toast(note.clone());
+                    self.note_cleanup(&entry, note, "worktree_removed");
+                }
+            }
+            // What the check found instead, such as uncommitted changes since: kept, as a plan's cleanup keeps it.
+            let failures: Vec<_> =
+                cleaned.notes.iter().filter(|note| !note.starts_with("Kept worktree ")).cloned().collect();
+            if !failures.is_empty() {
+                crate::lifecycle::record_leftovers(&paths::atomics_home(), &failures);
+                self.toast(failures.join("\n"));
+            }
+        }
+        self.worktrees_at = None;
+        self.save_deferred_cleanup();
     }
 
     /// Never waits for the plan's cleanup: a task started again waits for it in its own worktree
@@ -743,8 +933,15 @@ impl State {
         }
         self.pin_ticket_integration(index)?;
         self.refresh_integrations();
+        let skipped = self.skip_empty_review(index);
+        if skipped {
+            self.finish_plan_agents();
+        }
         let ready: Vec<Task> =
             self.plans[index].ready().into_iter().filter(|t| only.is_none_or(|id| t.id == id)).cloned().collect();
+        if ready.is_empty() && skipped {
+            return Err(super::integrations::NOTHING_TO_REVIEW.into());
+        }
         if ready.is_empty() {
             let plan = &self.plans[index];
             if let Some(task) = plan.tasks.iter().find(|task| {
@@ -1304,6 +1501,145 @@ mod tests {
             assert_eq!(app.runtime.plans[0].status, PlanStatus::Open);
             assert!(request(app, json!({"cmd":"stage_event", "plan":"reopen", "stage":"merged"})).ok);
             assert_eq!(app.runtime.plans[0].status, PlanStatus::Completed);
+        });
+    }
+
+    /// As in a smoke test: tasks left their web stacks running for the user, and closing the plan removed
+    /// their worktrees under the running processes. A worktree something still runs in is kept, saying so,
+    /// across a restart, and removed with its merged branch on the first check after nothing does. And the
+    /// sessions the chief closed after the plan kept their worktrees for good: those go when their session
+    /// closes, unless they hold uncommitted work.
+    #[test]
+    fn a_closed_plans_worktree_stays_while_a_process_runs_in_it_then_goes() {
+        with_app("app::plans::tests::a_closed_plans_worktree_stays_while_a_process_runs_in_it_then_goes", |app, _| {
+            let (dir, repo) = repository();
+            git::git(&repo, &["branch", "integration"]).unwrap();
+            let worktree = dir.path().join("stack");
+            git::add_worktree(&repo, &worktree, "task-stack", "main").unwrap();
+            let (open, dirty) = (dir.path().join("open"), dir.path().join("dirty"));
+            git::add_worktree(&repo, &open, "task-open", "main").unwrap();
+            git::add_worktree(&repo, &dirty, "task-dirty", "main").unwrap();
+            std::fs::write(dirty.join("draft.txt"), "unfinished").unwrap();
+            let task = |id: &str, branch: &str, worktree: &Path, session: Option<&str>| Task {
+                id: id.into(),
+                branch: Some(branch.into()),
+                status: TaskStatus::Done,
+                worktree: Some(worktree.to_path_buf()),
+                session: session.map(str::to_string),
+                ..Default::default()
+            };
+            app.runtime.plans = vec![Plan {
+                id: "stack".into(),
+                project: Some(repo.clone()),
+                integration: Some("integration".into()),
+                approved: true,
+                tasks: vec![
+                    task("s1", "task-stack", &worktree, None),
+                    task("s2", "task-open", &open, Some("agent-two")),
+                    task("s3", "task-dirty", &dirty, Some("agent-three")),
+                ],
+                ..Default::default()
+            }];
+            app.runtime.sessions = vec![
+                session("agent-two", AgentKind::Generic, AgentStatus::Idle, &open),
+                session("agent-three", AgentKind::Generic, AgentStatus::Idle, &dirty),
+            ];
+            app.runtime.selected_plan = 0;
+            let mut server = std::process::Command::new("sleep").arg("60").current_dir(&worktree).spawn().unwrap();
+            let events = app.runtime.events.len();
+            let changes =
+                |app: &Desktop<'_>| app.runtime.events[events..].iter().filter_map(|e| e.change).collect::<Vec<_>>();
+            let settle = |app: &mut Desktop<'_>| {
+                app.runtime.finish_lifecycle_jobs();
+                app.runtime.drain_actions();
+            };
+
+            app.runtime.close_plan(0, PlanStatus::Completed).unwrap();
+            settle(app);
+            assert!(open.exists() && dirty.exists(), "their sessions still work there");
+            // Closed by the chief afterwards: a clean worktree goes with its session, one with work in it stays.
+            for id in ["agent-two", "agent-three"] {
+                assert!(request(app, json!({"cmd":"close", "session":id})).ok);
+                settle(app);
+            }
+            assert!(!open.exists(), "its session closed, and nothing else keeps it");
+            assert!(!git::branch_exists(&repo, "task-open"), "nor its merged branch");
+            assert!(dirty.join("draft.txt").exists(), "uncommitted work is never removed");
+            assert!(worktree.exists(), "a process still runs in it");
+            assert_eq!(app.runtime.deferred_cleanup.len(), 1);
+            assert_eq!(app.runtime.deferred_cleanup[0].users, [format!("{} sleep", server.id())]);
+            assert_eq!(app.runtime.deferred_cleanup[0].worktree.file_name(), worktree.file_name());
+            let note = app.runtime.plans[0].tasks[0].notes.last().cloned().unwrap_or_default();
+            assert!(note.contains("kept after the plan closed") && note.contains("sleep"), "{note}");
+            assert_eq!(changes(app), ["closed", "worktree_kept"]);
+            // It is still running at the next check.
+            app.runtime.deferred_checked = None;
+            app.runtime.recheck_deferred_cleanup();
+            settle(app);
+            assert!(worktree.exists() && app.runtime.deferred_cleanup.len() == 1);
+
+            // A restarted host finds it on disk.
+            app.runtime.deferred_cleanup = crate::lifecycle::deferred(&paths::atomics_home());
+            assert_eq!(app.runtime.deferred_cleanup.len(), 1);
+            server.kill().unwrap();
+            server.wait().unwrap();
+            app.runtime.deferred_checked = None;
+            app.runtime.recheck_deferred_cleanup();
+            settle(app);
+            assert!(!worktree.exists(), "removed once nothing runs in it");
+            assert!(!git::branch_exists(&repo, "task-stack"), "its merged branch goes too, as cleanup does");
+            assert!(app.runtime.deferred_cleanup.is_empty());
+            assert!(crate::lifecycle::deferred(&paths::atomics_home()).is_empty());
+            let note = app.runtime.plans[0].tasks[0].notes.last().cloned().unwrap_or_default();
+            assert!(note.contains("removed: nothing runs in it any more"), "{note}");
+            assert_eq!(changes(app), ["closed", "worktree_kept", "worktree_removed"]);
+        });
+    }
+
+    /// A task starts from its remote fetched just now; offline, it starts anyway from what this machine
+    /// has, and says so.
+    #[test]
+    fn a_task_starts_from_the_fetched_remote_or_says_why_not() {
+        with_app("app::plans::tests::a_task_starts_from_the_fetched_remote_or_says_why_not", |app, _| {
+            let (dir, upstream) = repository();
+            let remote = dir.path().join("remote.git");
+            git::git(dir.path(), &["clone", "-q", "--bare", &upstream.to_string_lossy(), &remote.to_string_lossy()])
+                .unwrap();
+            let repo = dir.path().join("clone");
+            git::git(dir.path(), &["clone", "-q", &remote.to_string_lossy(), &repo.to_string_lossy()]).unwrap();
+            // A second clone, that cannot reach its remote any more.
+            let offline = dir.path().join("offline");
+            git::git(dir.path(), &["clone", "-q", &remote.to_string_lossy(), &offline.to_string_lossy()]).unwrap();
+            git::git(&offline, &["remote", "set-url", "origin", &dir.path().join("gone.git").to_string_lossy()])
+                .unwrap();
+            git::git(&upstream, &["commit", "--allow-empty", "-qm", "landed later"]).unwrap();
+            git::git(&upstream, &["push", "-q", &remote.to_string_lossy(), "main"]).unwrap();
+            let landed = git::git(&upstream, &["rev-parse", "main"]).unwrap().trim().to_string();
+            app.runtime.config.base_ref = "origin/main".into();
+            app.runtime.config.worktree_path = "{repo_parent}/{repo}-{slug}".into();
+            let plan = |id: &str, project: &Path| Plan {
+                id: id.into(),
+                project: Some(project.to_path_buf()),
+                approved: true,
+                tasks: vec![Task { id: "a".into(), branch: Some(format!("{id}-a")), ..Default::default() }],
+                ..Default::default()
+            };
+            app.runtime.plans = vec![plan("fresh", &repo), plan("offline", &offline)];
+            let prepared = |app: &mut Desktop<'_>| {
+                let wait = crate::test_support::scaled_timeout(Duration::from_secs(10));
+                app.runtime.worktree_rx.recv_timeout(wait).unwrap().1.unwrap()
+            };
+            app.runtime.dispatch(0, Some("a")).unwrap();
+            let a = prepared(app);
+            assert_eq!(a.warning, None);
+            assert_eq!(a.start.as_deref(), Some(landed.as_str()), "a starts where the remote is now");
+            assert_eq!(git::git(&a.path, &["rev-parse", "HEAD"]).unwrap().trim(), landed);
+
+            app.runtime.dispatch(1, Some("a")).unwrap();
+            let stale = prepared(app);
+            let warning = stale.warning.expect("the fetch failed");
+            assert!(warning.contains("could not fetch origin"), "{warning}");
+            assert_ne!(git::git(&stale.path, &["rev-parse", "HEAD"]).unwrap().trim(), landed, "as fetched before");
         });
     }
 

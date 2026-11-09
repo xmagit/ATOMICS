@@ -38,13 +38,29 @@ impl State {
             let result = if conflict {
                 Err(format!("Branch {branch} is already owned by another task or plan in {}", repo.display()))
             } else if existing {
-                Ok(PreparedWorktree { path, warmed: false })
+                Ok(PreparedWorktree { path, warmed: false, start: None, warning: None })
             } else {
+                // New work starts from the remote as it is now, not as this machine last fetched it. Only
+                // where it starts from base_ref: an integration branch that exists is its own start.
+                let fresh = if start.as_deref().is_none_or(|start| !git::branch_exists(&repo, start)) {
+                    let _fetch =
+                        crate::ref_guard::host_write_refs(&repo, ["refs/remotes/".into(), "refs/tags/".into()]);
+                    git::fresh_base(&repo, &base_ref)
+                } else {
+                    git::FreshBase { base: base_ref.clone(), warning: None }
+                };
+                if let Some(warning) = &fresh.warning {
+                    eprintln!("ATOMICS: {branch} in {}: {warning}", repo.display());
+                }
                 let _write = crate::ref_guard::host_write(&repo, [&branch]);
-                git::add_worktree_from(&repo, &path, &branch, start.as_deref(), &base_ref)
+                let branch_ref = format!("refs/heads/{branch}");
+                // A branch that exists already may hold commits of an earlier attempt: only a new one's start counts.
+                let new = git::commit_of(&repo, &branch_ref).is_ok_and(|tip| tip.is_none());
+                git::add_worktree_from(&repo, &path, &branch, start.as_deref(), &fresh.base)
                     .map(|()| {
                         let warmed = git::warm_worktree(&repo, &path, &warm);
-                        PreparedWorktree { path, warmed }
+                        let start = new.then(|| git::commit_of(&repo, &branch_ref).ok().flatten()).flatten();
+                        PreparedWorktree { path, warmed, start, warning: fresh.warning }
                     })
                     .map_err(|e| format!("{e:#}"))
             };

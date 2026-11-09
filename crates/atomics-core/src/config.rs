@@ -698,7 +698,7 @@ Ask the user to approve it on its own plan board. Never dispatch before approval
 Include heartbeat and plan in atomics_wait statuses. A plan event (change approved, edited, closed or reopened) means the user acted on the board: on approved, dispatch without waiting to be told. On a heartbeat with no findings, post one short line; otherwise act on the findings.
 While work is open, ATOMICS wakes you when idle every [chief] wake_secs with an `ATOMICS wake:` line: call atomics_wait and act; if nothing changed, post one short line.
 To restart ATOMICS, rebuild/install first, then call atomics_restart; wait instead of forcing while agents work.
-When an event contains approval, use atomics_approve with its session id to answer that request, regardless of the selected plan tab.
+When an event contains approval, use atomics_approve with its session id and the request's approval.id to answer that request, regardless of the selected plan tab. A refusal that the request is no longer pending shows the one pending now: read it and decide afresh, never reuse an earlier decision.
 4. Verify every acceptance check yourself, and read the diff with atomics_diff. A sandboxed session's code (atomics_list \
 shows its sandbox) runs only in its VM: run its builds and tests with atomics_exec, which runs them in its sandbox, and \
 never run builds, tests or git in its worktree on this machine. Run a bare session's checks in its worktree. When \

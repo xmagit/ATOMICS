@@ -939,6 +939,8 @@ impl State {
             let guard = self.sessions[i].ref_guard.take();
             self.check_all_refs(&exempt);
             let mut session = self.sessions.remove(i);
+            // A closed plan's task worktree, kept while this session used it, may go now.
+            let worktree = (!session.chief && session.scratch.is_none()).then(|| session.root());
             self.traces.remove(&session.id);
             if session.chief {
                 self.hub.lock().unwrap().chief_running = false;
@@ -1003,6 +1005,9 @@ impl State {
                 && let Some(cid) = session.claude_id
             {
                 self.dismissed.insert(cid);
+            }
+            if let Some(worktree) = worktree {
+                self.clean_after_session(id, &worktree);
             }
         }
         if self.active.as_deref() == Some(id) {

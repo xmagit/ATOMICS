@@ -559,7 +559,7 @@ fn disposition(decision: Decision) -> Disposition {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{request, session, with_app};
+    use super::super::tests::{answer_pending, request, session, with_app};
     use super::*;
 
     /// A hookless agent drawing the recorded screens in `screens`, in order, whose terminal then
@@ -951,7 +951,8 @@ mod tests {
                             assert_eq!(app.runtime.decide("live", Decision::Allow, None).unwrap(), Disposition::Allowed)
                         }
                         "control" => {
-                            let answer = request(app, json!({"cmd":"approve", "session":"worker", "decision":"allow"}));
+                            let answer =
+                                answer_pending(app, json!({"cmd":"approve", "session":"worker", "decision":"allow"}));
                             assert!(answer.ok, "{answer:?}");
                             assert_eq!(answer.result["command"], "touch live");
                         }
@@ -967,7 +968,7 @@ mod tests {
                             .iter()
                             .find(|event| event.seq > cursor)
                             .expect("the chief hears the new head");
-                        assert_eq!(event.approval.as_ref().unwrap().command.as_deref(), Some("touch live"));
+                        assert_eq!(event.approval.as_ref().unwrap()["command"], "touch live");
                         app.runtime.approve(0, "live", Decision::Allow, None).unwrap();
                     }
                     assert!(live.wait(Duration::ZERO).stdout.unwrap().contains("allow"), "{reader}");
@@ -1001,7 +1002,9 @@ mod tests {
                     app.runtime.sessions[0].menu_absent_since = Some(now - APPROVAL_MENU_GRACE);
                     app.runtime.approvals_checked = now - APPROVAL_CHECK_INTERVAL;
                     let error = if control {
-                        request(app, json!({"cmd":"approve", "session":"worker", "decision":"allow"})).error.unwrap()
+                        answer_pending(app, json!({"cmd":"approve", "session":"worker", "decision":"allow"}))
+                            .error
+                            .unwrap()
                     } else {
                         app.runtime.approve(0, "dead-one", Decision::Allow, None).unwrap_err().message
                     };
@@ -1132,7 +1135,8 @@ mod tests {
                     let raw = request(app, json!({"cmd":"send", "session":"worker", "raw":true, "text":"y"}));
                     assert!(raw.error.unwrap().contains("atomics_approve"), "{kind}");
 
-                    let answered = request(app, json!({"cmd":"approve", "session":"worker", "decision":decision}));
+                    let answered =
+                        answer_pending(app, json!({"cmd":"approve", "session":"worker", "decision":decision}));
                     assert!(answered.ok, "{kind} {decision:?}: {answered:?}");
                     assert_eq!(answered.result["command"], command);
                     assert_eq!(answered.result["menu"], kind);
@@ -1149,7 +1153,7 @@ mod tests {
                     let raw = request(app, json!({"cmd":"send", "session":"worker", "raw":true, "text":"z"}));
                     assert!(raw.ok, "{raw:?}");
                     shows(app.runtime.sessions[0].terminal.as_ref().unwrap(), &format!("Keys: {keys} 7a"));
-                    let again = request(app, json!({"cmd":"approve", "session":"worker", "decision":"allow"}));
+                    let again = answer_pending(app, json!({"cmd":"approve", "session":"worker", "decision":"allow"}));
                     assert_eq!(again.error.as_deref(), Some("no pending permission request"));
                     app.runtime.sessions.clear();
                 }
@@ -1176,7 +1180,7 @@ mod tests {
             assert_eq!(app.runtime.sessions[0].status, AgentStatus::NeedsInput);
             // Before any poll holds input for it, atomics_approve already reads the menu on screen.
             app.runtime.needs_input_checked = Instant::now();
-            let approve = request(app, json!({"cmd":"approve", "session":"worker", "decision":"allow"}));
+            let approve = answer_pending(app, json!({"cmd":"approve", "session":"worker", "decision":"allow"}));
             assert!(approve.error.unwrap().contains("atomics_send raw"));
             app.runtime.needs_input_checked = Instant::now() - NEEDS_INPUT_CHECK_INTERVAL;
             poll_after_quiet(app);
@@ -1186,7 +1190,7 @@ mod tests {
             assert!(app.runtime.sessions[0].approvals.is_empty());
             assert_eq!(app.runtime.deliver(0, "steer later"), Delivery::Held);
             // ...but atomics_approve cannot answer it, so the keys that do are not refused.
-            let approve = request(app, json!({"cmd":"approve", "session":"worker", "decision":"allow"}));
+            let approve = answer_pending(app, json!({"cmd":"approve", "session":"worker", "decision":"allow"}));
             assert!(approve.error.unwrap().contains("atomics_send raw"));
             let raw = request(app, json!({"cmd":"send", "session":"worker", "raw":true, "text":"1"}));
             assert!(raw.ok, "{raw:?}");
@@ -1215,7 +1219,7 @@ mod tests {
                     app.runtime.sessions[0].approvals[0].request.reason.as_deref(),
                     Some("A long explanation of why access is needed")
                 );
-                let expanded = request(app, json!({"cmd":"approve", "session":"worker", "decision":"allow"}));
+                let expanded = answer_pending(app, json!({"cmd":"approve", "session":"worker", "decision":"allow"}));
                 assert!(expanded.error.unwrap().contains("expanded"));
                 shows(app.runtime.sessions[0].terminal.as_ref().unwrap(), "$ atomics queue");
                 // The command now shows: a new request under a new ID, and the one decided unseen is gone.
@@ -1246,7 +1250,7 @@ mod tests {
                 assert_eq!(app.runtime.sessions[0].approvals.len(), 1);
                 assert!(app.runtime.sessions[0].approvals[0].native.is_none());
                 assert_eq!(app.runtime.decide(&second, Decision::Allow, None).unwrap_err().code, ErrorCode::NotFound);
-                let answered = request(app, json!({"cmd":"approve", "session":"worker", "decision":"allow"}));
+                let answered = answer_pending(app, json!({"cmd":"approve", "session":"worker", "decision":"allow"}));
                 assert_eq!(answered.result["menu"], serde_json::Value::Null);
                 assert!(reply.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
                 app.runtime.sessions.clear();
@@ -1950,7 +1954,7 @@ mod tests {
                     assert!(app.runtime.sessions[index].pending.is_none());
                 }
                 assert_eq!(app.runtime.selected_plan, two);
-                assert!(request(app, json!({"cmd":"approve", "session":"worker-one", "decision":"allow_always", "message":"First plan approved"})).ok);
+                assert!(answer_pending(app, json!({"cmd":"approve", "session":"worker-one", "decision":"allow_always", "message":"First plan approved"})).ok);
                 let output: serde_json::Value =
                     serde_json::from_str(&first_reply.wait(Duration::ZERO).stdout.unwrap()).unwrap();
                 assert_eq!(output["hookSpecificOutput"]["decision"]["behavior"], "allow");
@@ -1978,7 +1982,7 @@ mod tests {
                 app.runtime.selected_plan = one;
                 app.runtime.show_plan_fleet();
                 assert!(
-                request(
+                answer_pending(
                     app,
                     json!({"cmd":"approve", "session":"worker-two", "decision":"deny", "message":"Second plan denied"})
                 )
@@ -2000,7 +2004,7 @@ mod tests {
                     1,
                     "allow_always must not leak to another plan's session"
                 );
-                assert!(request(app, json!({"cmd":"approve", "session":"worker-two", "decision":"allow"})).ok);
+                assert!(answer_pending(app, json!({"cmd":"approve", "session":"worker-two", "decision":"allow"})).ok);
                 assert!(reply.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
                 let (event, reply) = permission("worker-one");
                 app.runtime.on_hook(event);
@@ -2183,7 +2187,7 @@ mod tests {
                 assert!(warning.ends_with(TASK_TWOS), "{warning}");
                 // The chief's event and every client see it too.
                 let event = app.runtime.events.iter().rev().find(|event| event.session == "worker-one").unwrap();
-                assert_eq!(event.approval.as_ref().unwrap().warning.as_ref(), Some(&warning));
+                assert_eq!(event.approval.as_ref().unwrap()["warning"], json!(warning));
                 assert_eq!(app.runtime.approval_infos()[0].warning.as_ref(), Some(&warning));
 
                 // "Allow always" answers it once, and is not remembered.
@@ -2272,8 +2276,8 @@ mod tests {
                 app.runtime.record_events();
                 let event = app.runtime.events[events..].iter().rev().find(|event| event.session == "worker-one");
                 assert_eq!(
-                    event.and_then(|event| event.approval.as_ref()).and_then(|a| a.warning.as_ref()),
-                    Some(&warning)
+                    event.and_then(|event| event.approval.as_ref()).and_then(|a| a["warning"].as_str()),
+                    Some(warning.as_str())
                 );
                 assert!(app.runtime.decide(&id, Decision::Allow, None).is_err());
 

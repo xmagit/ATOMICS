@@ -99,6 +99,9 @@ impl Departed {
     }
 }
 
+/// How long a session waits for the client while a preview's tunnels move data.
+const TUNNEL_TICK: Duration = Duration::from_millis(1);
+
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
     pub handshake_timeout: Duration,
@@ -622,7 +625,10 @@ fn conversation(
                 }
             }
         }
-        match out.link.recv(config.tick) {
+        // A preview's sockets do not end the wait the way a client's frame does: while its tunnels move
+        // data, poll them again within a millisecond, so a response is not held for a whole tick.
+        let wait = if subscriptions.tunnels.busy() { config.tick.min(TUNNEL_TICK) } else { config.tick };
+        match out.link.recv(wait) {
             Ok(Some(frame)) => {
                 last_heard = Instant::now();
                 let envelope = match wire::decode(&frame) {

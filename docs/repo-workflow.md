@@ -79,7 +79,7 @@ stages = ["accepted", "integrated", "pr_opened", "ci_passed", "security_approved
 
 | Key | Type | Meaning |
 | --- | --- | --- |
-| `base_ref` | string | Base ref for project diffs, worktrees, branch guards, integration and cleanup. |
+| `base_ref` | string | Base ref for project diffs, worktrees, branch guards, integration and cleanup. New worktrees fetch its remote first; a local `main` or `master` starts them from the remote's default branch instead. |
 | `worktrees.warm` | array of strings | Relative cache folders or glob patterns to expand in the main checkout and clone into new worktrees. `*` matches one path component; `**` matches directory levels. Patterns look at most 8 levels deep and match at most 256 folders in all (later ones start cold, with a warning). A matched folder is cloned whole, and the pattern that matched it looks no further inside; a later pattern still can. Folders are cloned in pattern order, and one whose destination already exists is skipped: list `target` before `target/debug`, or `target/debug`'s clone creates `target` and the rest of `target` starts cold. Existing path and CoW safeguards apply. |
 | `tickets.branch` | string | Branch template; overrides the workspace's `[tickets] branch` for this project. |
 | `pr_title` | string | PR title template hint for agents, conventionally `{key}` and `{title}`. ATOMICS does not create PRs or expand this hint. |

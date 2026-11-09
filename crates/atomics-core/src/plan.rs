@@ -186,6 +186,9 @@ pub struct Task {
     /// Verified task tip, retained when cleanup deletes the source branch.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub integrated_commit: Option<String>,
+    /// The commit ATOMICS created the task's branch at. A branch still there has no commits of its own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_commit: Option<String>,
     /// Latest background ancestry check; rechecked after loading.
     #[serde(skip)]
     pub integration_verified: bool,
@@ -600,6 +603,15 @@ impl Plan {
             .collect()
     }
 
+    /// Whether the final review is still to start but has nothing to look at: every other task finished
+    /// without changes.
+    pub fn review_has_nothing(&self) -> bool {
+        let others: Vec<_> = self.tasks.iter().filter(|t| t.id != REVIEW_TASK).collect();
+        !others.is_empty()
+            && others.iter().all(|t| t.unchanged())
+            && self.tasks.iter().any(|t| t.id == REVIEW_TASK && t.status == TaskStatus::Planned)
+    }
+
     /// Planned tasks whose dependencies are all done and integrated, in plan order.
     pub fn ready(&self) -> Vec<&Task> {
         self.tasks
@@ -670,6 +682,17 @@ impl Plan {
 }
 
 impl Task {
+    /// A finished task that changed nothing: one never given a branch, or one whose branch was verified
+    /// still at the commit it started from, with nothing uncommitted in its worktree. It has nothing to
+    /// integrate, and nothing to review.
+    pub fn unchanged(&self) -> bool {
+        self.status == TaskStatus::Done
+            && (self.branch.is_none()
+                || self.integration_verified
+                    && self.start_commit.is_some()
+                    && self.integrated_commit == self.start_commit)
+    }
+
     pub fn set_status(&mut self, status: TaskStatus) {
         if !matches!(status, TaskStatus::Review | TaskStatus::Done) {
             self.integrated = None;

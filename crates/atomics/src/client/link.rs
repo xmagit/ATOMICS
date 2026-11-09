@@ -1,9 +1,11 @@
 //! One WebSocket to a host's protocol server, on a thread of its own: the native client's transport. It
 //! connects with the host's bearer token, then carries `atomics.v1` text frames both ways until either
-//! side closes. What happens is reported as [`Event`]s, each followed by a wake, so the window draws it.
+//! side closes. What happens is reported as [`Event`]s, each followed by a wake, so the window draws it;
+//! tunnel frames go to the preview relay instead, which needs no frame of the window's.
 
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -69,28 +71,64 @@ pub enum Event {
     },
 }
 
-/// How long a read waits before the thread looks for frames to send; a keystroke waits at most this.
+/// Without a pipe to wake it: how long a read waits before the thread looks for frames to send.
 const POLL: Duration = Duration::from_millis(4);
+/// How long the thread waits for the host or a frame to send before it looks at `stop` again; a frame to
+/// send, or a stop, ends the wait at once.
+const IDLE: Duration = Duration::from_millis(250);
 const CONNECT: Duration = Duration::from_secs(5);
 
 pub struct Link {
-    outgoing: Sender<String>,
+    outgoing: Frames,
     stop: Arc<AtomicBool>,
+}
+
+/// Frames for the host, from any thread: each ends the link thread's wait.
+#[derive(Clone)]
+pub struct Frames {
+    tx: Sender<String>,
+    wake: Option<Arc<UnixStream>>,
+}
+
+impl Frames {
+    pub fn send(&self, frame: String) {
+        if self.tx.send(frame).is_ok() {
+            self.wake();
+        }
+    }
+
+    fn wake(&self) {
+        // A full pipe already holds a wake.
+        if let Some(wake) = &self.wake {
+            let _ = (&**wake).write(&[1]);
+        }
+    }
 }
 
 impl Link {
     /// Find the host with `resolve` and connect, on a thread of its own; `wake` is called after every
     /// event. A host that cannot be found is a drop (1006), so the driver tries again later; why is in
-    /// the closing event.
+    /// the closing event. `previews` takes the host's tunnel frames as they arrive.
     pub fn open(
         socket: u64,
         resolve: super::Resolve,
         events: SyncSender<Event>,
         wake: Arc<dyn Fn() + Send + Sync>,
+        previews: crate::preview::client::Tap,
     ) -> Link {
-        let (outgoing, frames) = mpsc::channel();
+        let (tx, frames) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let running = stop.clone();
+        // Without the pipe the thread looks for frames to send every `POLL` instead.
+        let (to_link, woken) = match UnixStream::pair().and_then(|(a, b)| {
+            a.set_nonblocking(true)?;
+            b.set_nonblocking(true)?;
+            Ok((a, b))
+        }) {
+            Ok((to_link, woken)) => (Some(Arc::new(to_link)), Some(woken)),
+            Err(_) => (None, None),
+        };
+        let outgoing = Frames { tx, wake: to_link };
         let spawned = std::thread::Builder::new().name("atomics-client-link".into()).spawn(move || {
             let send = |event| {
                 let _ = events.send(event);
@@ -100,7 +138,12 @@ impl Link {
             let (code, unreachable) = match found.and_then(|endpoint| connect(&endpoint)) {
                 Ok((mut ws, protocol)) => {
                     send(Event::Open { socket, protocol });
-                    (pump(&mut ws, &frames, &running, &mut |bytes| send(Event::Data { socket, bytes })), None)
+                    let mut received = |bytes: Vec<u8>| {
+                        if !previews.take(&bytes) {
+                            send(Event::Data { socket, bytes })
+                        }
+                    };
+                    (pump(&mut ws, &frames, woken.as_ref(), &running, &mut received), None)
                 }
                 Err(Refused { code, why }) => (code, Some(why)),
             };
@@ -113,12 +156,18 @@ impl Link {
     }
 
     pub fn send(&self, frame: String) {
-        let _ = self.outgoing.send(frame);
+        self.outgoing.send(frame);
+    }
+
+    /// Where frames to send go, for a thread other than the window's (the preview relay).
+    pub fn frames(&self) -> &Frames {
+        &self.outgoing
     }
 
     /// Close it normally; no event follows that matters (the socket is no longer the driver's).
     pub fn close(&self) {
         self.stop.store(true, Ordering::Release);
+        self.outgoing.wake();
     }
 }
 
@@ -157,6 +206,20 @@ impl Stream {
                 Ok(Stream::Tcp(stream))
             }
             Address::Unix(path) => UnixStream::connect(path).map(Stream::Unix),
+        }
+    }
+
+    fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        match self {
+            Stream::Tcp(stream) => stream.set_nonblocking(nonblocking),
+            Stream::Unix(stream) => stream.set_nonblocking(nonblocking),
+        }
+    }
+
+    fn fd(&self) -> std::os::fd::RawFd {
+        match self {
+            Stream::Tcp(stream) => stream.as_raw_fd(),
+            Stream::Unix(stream) => stream.as_raw_fd(),
         }
     }
 
@@ -236,12 +299,17 @@ fn socket_config() -> tungstenite::protocol::WebSocketConfig {
 }
 
 /// Frames both ways until the host closes, the link drops, or `stop`. The close code it ended with.
+/// Between frames the thread waits for the host or a byte on `woken`, which comes with each frame to
+/// send; without `woken`, it looks for frames to send after every read times out.
 fn pump(
     ws: &mut WebSocket<Stream>,
     frames: &Receiver<String>,
+    woken: Option<&UnixStream>,
     stop: &AtomicBool,
     received: &mut dyn FnMut(Vec<u8>),
 ) -> u16 {
+    // Nothing was waiting the last time the thread read: wait for the host or a wake before reading.
+    let mut idle = false;
     loop {
         if stop.load(Ordering::Acquire) {
             let _ = ws.close(None);
@@ -268,18 +336,55 @@ fn pump(
             Err(tungstenite::Error::Io(e)) if would_block(&e) => {}
             Err(_) => return close::ABNORMAL,
         }
-        match ws.read() {
+        let read = match woken {
+            Some(woken) => {
+                // Woken for a frame to send, or nothing came: send, then wait again.
+                if idle && !wait(ws.get_ref(), woken) {
+                    continue;
+                }
+                read_now(ws)
+            }
+            None => ws.read(),
+        };
+        idle = false;
+        match read {
             Ok(Message::Text(text)) => {
                 trace("<", text.as_str());
                 received(text.as_bytes().to_vec())
             }
             Ok(Message::Close(frame)) => return frame.map_or(close::ABNORMAL, |f| u16::from(f.code)),
             Ok(_) => {}
-            Err(tungstenite::Error::Io(e)) if would_block(&e) => {}
+            Err(tungstenite::Error::Io(e)) if would_block(&e) => idle = true,
             Err(tungstenite::Error::ConnectionClosed) => return close::NORMAL,
             Err(_) => return close::ABNORMAL,
         }
     }
+}
+
+/// The next frame the host has sent, without waiting for one: a frame already in hand, or what the
+/// socket holds. Writes, between reads, wait as before.
+fn read_now(ws: &mut WebSocket<Stream>) -> tungstenite::Result<Message> {
+    if ws.get_ref().set_nonblocking(true).is_err() {
+        return ws.read();
+    }
+    let read = ws.read();
+    let _ = ws.get_ref().set_nonblocking(false);
+    read
+}
+
+/// Wait up to [`IDLE`] for the host to send or for a wake, then empty the wake pipe: a wake after
+/// that is a byte that ends the next wait. Whether the host's side has something to read.
+fn wait(stream: &Stream, woken: &UnixStream) -> bool {
+    let mut fds = [
+        libc::pollfd { fd: stream.fd(), events: libc::POLLIN, revents: 0 },
+        libc::pollfd { fd: woken.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+    ];
+    // SAFETY: `fds` is a valid array of two pollfd for the duration of the call.
+    let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, IDLE.as_millis() as libc::c_int) };
+    let mut sink = [0u8; 64];
+    while matches!((&*woken).read(&mut sink), Ok(n) if n > 0) {}
+    // A failed wait reads, as the thread did before it waited.
+    ready < 0 || fds[0].revents != 0
 }
 
 /// `ATOMICS_CLIENT_TRACE=1`: each frame's kind and size on stderr, for diagnosing a connection. Never

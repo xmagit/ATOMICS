@@ -57,9 +57,13 @@ Several plans can be open at once, each with a row in the top bar's Boards dropd
 Accepted tasks come together on the plan's integration branch, `atomics/plan-<plan id>` unless the plan names
 another. Integrating a task commits what it left uncommitted and merges its branch, in a worktree of its
 own, so your main checkout is never touched. A conflict aborts the merge and keeps the task in review.
-Tasks with dependencies branch from the integration branch, the others from `base_ref`. Every plan ends
+Tasks with dependencies branch from the integration branch, the others from `base_ref`, fetched from its remote
+just before (a local `main` or `master` base means the remote's default branch; a failed fetch falls back to what
+this machine has, with a warning). Every plan ends
 with a final review task that starts from the integration branch in a fresh worktree (in its own sandbox
-in sandbox mode) and runs the plan's builds and tests. The plan completes when every task is accepted and
+in sandbox mode) and runs the plan's builds and tests. A task that finished without changing anything (its
+branch still where it started, nothing uncommitted) has nothing to integrate and counts as integrated; when no
+task changed anything, the final review is marked done with a note instead of started. The plan completes when every task is accepted and
 the `[workflow] done` milestone is reached. See [Orchestration](../README.md#orchestration-several-plans-you-approve-agents-that-report-back)
 and [Lifecycle and completion](tickets.md#lifecycle-and-completion).
 
@@ -135,7 +139,11 @@ branches (`[cleanup]`). Removing a worktree also removes its sandboxes, their MC
 rules. ATOMICS records each sandbox in `sandbox-ownership.json` before making it, so a crash leaves nothing
 the next start's sweep cannot find; that sweep also removes stale briefs, unused warm worktrees and
 scratch folders. Dirty worktrees and the main checkout are always kept, and resources of another ATOMICS
-home are never touched. See [Lifecycle](isolation.md#lifecycle).
+home are never touched. A task worktree that a process still uses when its plan closes (its working
+directory is there, or it holds a file open there, such as a dev server an agent left running for you) is
+kept until nothing does, then removed as the plan's cleanup would have, branch included. One kept because
+its session was still open goes when that session closes. See
+[Lifecycle](isolation.md#lifecycle).
 
 ## Updates
 

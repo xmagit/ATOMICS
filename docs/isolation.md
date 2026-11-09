@@ -702,7 +702,28 @@ archived_plans = true
 ```
 
 Dirty worktrees, main checkouts, and worktrees used by another session are kept. If
-`[plan] close_done_agents = false`, running task sessions also prevent automatic worktree removal.
+`[plan] close_done_agents = false`, running task sessions also prevent automatic worktree removal. A
+worktree kept because its session was still open goes when that session closes (`atomics_close`, or
+closing it on the desktop), with the same checks: uncommitted work keeps it, and so does a running process
+(below).
+
+A clean task worktree that processes still use when its plan closes is not removed under them: an agent
+may leave a web stack running for you, by design. A process uses a worktree when its working directory
+is in it or it holds a file open under it, as `/proc/<pid>/cwd` and `/proc/<pid>/fd` show on Linux and
+`lsof` on macOS; only your own processes are seen, and processes inside containers are not. The removal
+is deferred, not skipped:
+
+1. On close, the cleanup keeps such a worktree. The toast, a note on its task (`atomics_plan_get`) and a
+   `worktree_kept` plan event in `atomics_wait` name the processes. The pending removal is written to
+   `cleanup-deferred.json` in `ATOMICS_HOME`, so a restarted host still makes it.
+2. Every 30 seconds, and at the first background turn after a start, the host checks those worktrees
+   again off its main thread.
+3. Once nothing uses one, it is removed exactly as the plan's cleanup would have removed it: the clean
+   worktree, its sandboxes, and for a completed plan its branch if merged into the integration branch.
+   A toast, a task note and a `worktree_removed` plan event say so.
+
+A worktree that gained uncommitted changes meanwhile is kept, with the usual note; one whose plan is
+reopened is no longer removed.
 Startup runs cleanup in the background. It removes orphaned sandboxes and MCP registrations without
 session records only when this `ATOMICS_HOME` recorded their creation in its ownership ledger. Other
 homes' resources and unknown `atomics-*` names are left alone, including resources from before the ledger

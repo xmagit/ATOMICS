@@ -1,11 +1,23 @@
 //! Native local listeners. One open action accepts a session or no session for future machine views.
+//!
+//! The listeners and the relay behind them run on a thread of their own, never on the window's frames:
+//! the window may stop drawing (another app in front, the window hidden), and a dev server's page loads
+//! hundreds of modules, each a round trip. The thread wakes when a socket is ready or a tunnel frame
+//! arrives from the host, which the connection's thread hands it directly ([`Tap`]) and which it answers
+//! straight onto that connection. The window's turns only open and close listeners, as the board says.
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, Read, Write};
 use std::net::TcpListener;
+use std::os::fd::AsRawFd;
+use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::thread::JoinHandle;
 
 use super::relay::Relay;
+use crate::client::link::Frames;
 use atomics_core::preview::Preview;
-use atomics_core::wire::{MAX_TUNNELS, Message};
+use atomics_core::wire::{self, Envelope, MAX_QUEUED_FRAMES, MAX_TUNNELS, Message};
 use atomics_ui::Command;
 use atomics_web::remote::RemoteBackend;
 
@@ -15,77 +27,49 @@ struct Listening {
     preview: Preview,
 }
 
+/// What the window and the relay thread share.
 #[derive(Default)]
-pub struct Client {
+struct Tunnels {
     listeners: HashMap<u16, Listening>,
     relay: Relay,
     next: u64,
+    /// Whether the host agreed to tunnels on the current connection: until then, and after it ends, the
+    /// connection's thread leaves tunnel frames to the window, which drops them.
+    enabled: bool,
+    /// Tunnel frames from the host, for the relay thread.
+    inbox: Vec<Message>,
+    /// The host sent more than [`MAX_QUEUED_FRAMES`] before the relay thread took them.
+    overflow: bool,
+    /// The connection's outgoing frames, by socket: where the relay thread sends. Without one, frames
+    /// wait in `outbox` for the window's next turn.
+    sink: Option<(u64, Frames)>,
+    outbox: Vec<Message>,
+    /// Errors for the window to show.
+    errors: Vec<String>,
 }
 
-impl Client {
-    /// Return the plain-HTTP browser URL after the loopback listener is ready.
-    #[cfg(test)]
-    pub fn open(&mut self, session: Option<String>, preview: Preview) -> io::Result<String> {
-        let local = self.listen(session, preview.clone())?;
-        Ok(preview.url(local))
-    }
-
-    /// The local port forwarding `preview`, listening once this returns.
-    fn listen(&mut self, session: Option<String>, preview: Preview) -> io::Result<u16> {
-        preview.validate().map_err(io::Error::other)?;
-        if !self.listeners.contains_key(&preview.port) {
-            if self.listeners.len() >= MAX_TUNNELS {
-                return Err(io::Error::other("too many previews"));
-            }
-            let socket = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, preview.port))
-                .or_else(|_| TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)))?;
-            socket.set_nonblocking(true)?;
-            self.listeners.insert(preview.port, Listening { socket, session, preview: preview.clone() });
-        }
-        Ok(self.listeners[&preview.port].socket.local_addr()?.port())
-    }
-
-    pub fn active(&self) -> bool {
-        !self.listeners.is_empty()
-    }
-
-    pub fn pump(&mut self, remote: &RemoteBackend) {
-        if !remote.tunnels() {
-            self.listeners.clear();
-            self.relay = Relay::default();
-            remote.set_active_previews(Vec::new());
-            return;
-        }
-        for action in remote.take_preview_actions() {
-            match action {
-                Command::OpenPreview { session, preview } => match self.listen(session, preview.clone()) {
-                    // The probe goes through this listener, so it waits for later pumps: off this thread.
-                    Ok(local) => {
-                        std::thread::spawn(move || {
-                            let _ = open_browser(&preview.url_with(local, speaks_tls(local)));
-                        });
-                    }
-                    Err(error) => remote.preview_error(format!("Could not open Preview: {error}")),
-                },
-                Command::StopPreview { port } => {
-                    self.listeners.remove(&port);
+impl Tunnels {
+    fn send(&mut self, message: Message) {
+        match &self.sink {
+            Some((_, frames)) => {
+                if let Ok(frame) = wire::encode(&Envelope::new(message)) {
+                    frames.send(frame);
                 }
-                _ => {}
             }
+            None => self.outbox.push(message),
         }
-        self.listeners.retain(|port, l| {
-            (l.session.is_none() && remote.machine_previewable(*port))
-                || remote.with_mirror(|m| {
-                    m.sessions.values().any(|s| {
-                        l.session.as_ref().is_none_or(|id| s.id == *id)
-                            && s.status != atomics_core::session::AgentStatus::Exited
-                            && s.previews.iter().any(|p| p.port == *port)
-                    })
-                })
-        });
-        for message in remote.take_tunnel_messages() {
+    }
+
+    /// One turn of the relay: the host's frames, new connections, and both ways across every socket.
+    fn turn(&mut self) {
+        if std::mem::take(&mut self.overflow) {
+            self.relay = Relay::default();
+            self.inbox.clear();
+            self.errors.push("Preview peer exceeded the receive queue".into());
+        }
+        for message in std::mem::take(&mut self.inbox) {
             if let Message::TunnelRefused { reason, .. } = &message {
-                remote.preview_error(format!("Preview: {reason}"));
+                self.errors.push(format!("Preview: {reason}"));
             }
             let id = match &message {
                 Message::TunnelOpened { id }
@@ -97,9 +81,10 @@ impl Client {
             };
             if self.relay.receive(message).is_err() {
                 self.relay.remove(&id);
-                remote.send_tunnel(Message::TunnelClose { id, abort: true });
+                self.send(Message::TunnelClose { id, abort: true });
             }
         }
+        let mut opened = Vec::new();
         for l in self.listeners.values() {
             while self.relay.len() < MAX_TUNNELS {
                 match l.socket.accept() {
@@ -107,17 +92,261 @@ impl Client {
                         self.next += 1;
                         let id = format!("preview-{}", self.next);
                         if self.relay.accept(id.clone(), l.preview.port, stream).is_ok() {
-                            remote.send_tunnel(Message::TunnelOpen { id, port: l.preview.port });
+                            opened.push(Message::TunnelOpen { id, port: l.preview.port });
                         }
                     }
                     Err(_) => break,
                 }
             }
         }
-        for message in self.relay.poll(|port| self.listeners.contains_key(&port)) {
+        let listeners = &self.listeners;
+        opened.extend(self.relay.poll(|port| listeners.contains_key(&port)));
+        for message in opened {
+            self.send(message);
+        }
+    }
+
+    /// What the relay thread waits on until its next turn: listeners while it can take another
+    /// connection, and the relay's sockets that can move data.
+    fn interest(&self) -> Vec<libc::pollfd> {
+        let accepting = self.relay.len() < MAX_TUNNELS;
+        let listeners = self.listeners.values().filter(|_| accepting).map(|l| (l.socket.as_raw_fd(), libc::POLLIN));
+        listeners.chain(self.relay.interest()).map(|(fd, events)| libc::pollfd { fd, events, revents: 0 }).collect()
+    }
+}
+
+struct Shared {
+    tunnels: Mutex<Tunnels>,
+    /// Ends the relay thread's wait: a byte on this pipe, made when the thread starts.
+    wake_tx: OnceLock<UnixStream>,
+    stop: AtomicBool,
+    /// Draws the window again, for an error to show or a frame to send without a connection's sink.
+    window: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl Shared {
+    fn lock(&self) -> MutexGuard<'_, Tunnels> {
+        self.tunnels.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn wake(&self) {
+        // A full pipe already holds a wake.
+        if let Some(tx) = self.wake_tx.get() {
+            let _ = (&*tx).write(&[1]);
+        }
+    }
+}
+
+/// The connection thread's way to the relay: tunnel frames go to the relay thread, not the window.
+#[derive(Clone)]
+pub struct Tap(Arc<Shared>);
+
+impl Tap {
+    /// Take `frame` if it is a tunnel frame on a connection with tunnels; `false` leaves it to the window.
+    pub fn take(&self, frame: &[u8]) -> bool {
+        let Ok(text) = std::str::from_utf8(frame) else { return false };
+        // Most frames are not tunnel frames: only these are decoded here, and again by the window.
+        if !text.contains("tunnel_") {
+            return false;
+        }
+        let Ok(envelope) = wire::decode(text) else { return false };
+        if !matches!(
+            envelope.message,
+            Message::TunnelOpened { .. }
+                | Message::TunnelRefused { .. }
+                | Message::TunnelData { .. }
+                | Message::TunnelAck { .. }
+                | Message::TunnelClose { .. }
+        ) {
+            return false;
+        }
+        let mut tunnels = self.0.lock();
+        if !tunnels.enabled {
+            return false;
+        }
+        if tunnels.inbox.len() < MAX_QUEUED_FRAMES {
+            tunnels.inbox.push(envelope.message);
+        } else {
+            tunnels.overflow = true;
+        }
+        drop(tunnels);
+        self.0.wake();
+        true
+    }
+}
+
+pub struct Client {
+    shared: Arc<Shared>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Default for Client {
+    fn default() -> Self {
+        Self::new(Arc::new(|| {}))
+    }
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        self.shared.stop.store(true, Ordering::Release);
+        self.shared.wake();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Client {
+    /// Previews for a window that `window` draws again.
+    pub fn new(window: Arc<dyn Fn() + Send + Sync>) -> Self {
+        let shared = Arc::new(Shared {
+            tunnels: Mutex::default(),
+            wake_tx: OnceLock::new(),
+            stop: AtomicBool::new(false),
+            window,
+        });
+        Self { shared, thread: None }
+    }
+
+    /// For the connection's thread: hands tunnel frames to the relay as they arrive.
+    pub fn tap(&self) -> Tap {
+        Tap(self.shared.clone())
+    }
+
+    /// The connection ended: every listener and tunnel with it.
+    pub fn reset(&self) {
+        *self.shared.lock() = Tunnels::default();
+    }
+
+    /// Return the plain-HTTP browser URL after the loopback listener is ready.
+    #[cfg(test)]
+    pub fn open(&mut self, session: Option<String>, preview: Preview) -> io::Result<String> {
+        let local = self.listen(session, preview.clone())?;
+        Ok(preview.url(local))
+    }
+
+    /// The local port forwarding `preview`, listening once this returns.
+    fn listen(&mut self, session: Option<String>, preview: Preview) -> io::Result<u16> {
+        preview.validate().map_err(io::Error::other)?;
+        self.start()?;
+        let mut tunnels = self.shared.lock();
+        if !tunnels.listeners.contains_key(&preview.port) {
+            if tunnels.listeners.len() >= MAX_TUNNELS {
+                return Err(io::Error::other("too many previews"));
+            }
+            let socket = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, preview.port))
+                .or_else(|_| TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)))?;
+            socket.set_nonblocking(true)?;
+            tunnels.listeners.insert(preview.port, Listening { socket, session, preview: preview.clone() });
+        }
+        let local = tunnels.listeners[&preview.port].socket.local_addr()?.port();
+        drop(tunnels);
+        self.shared.wake();
+        Ok(local)
+    }
+
+    /// The relay thread, started with the first listener.
+    fn start(&mut self) -> io::Result<()> {
+        if self.thread.is_some() {
+            return Ok(());
+        }
+        let (wake_tx, wake_rx) = UnixStream::pair()?;
+        wake_tx.set_nonblocking(true)?;
+        wake_rx.set_nonblocking(true)?;
+        let shared = self.shared.clone();
+        let thread =
+            std::thread::Builder::new().name("atomics-preview-relay".into()).spawn(move || run(&shared, &wake_rx))?;
+        // The thread takes a turn first, so nothing waits on a wake sent before this.
+        let _ = self.shared.wake_tx.set(wake_tx);
+        self.thread = Some(thread);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn active(&self) -> bool {
+        !self.shared.lock().listeners.is_empty()
+    }
+
+    /// The window's turn: open and close listeners as the board says, hand the relay `link` (the
+    /// connection's socket and its outgoing frames), and show what went wrong. The relay itself moves
+    /// data between turns.
+    pub fn pump(&mut self, remote: &RemoteBackend, link: Option<(u64, &Frames)>) {
+        if !remote.tunnels() {
+            self.reset();
+            remote.set_active_previews(Vec::new());
+            return;
+        }
+        for action in remote.take_preview_actions() {
+            match action {
+                Command::OpenPreview { session, preview } => match self.listen(session, preview.clone()) {
+                    // The probe goes through this listener and the relay: off this thread.
+                    Ok(local) => {
+                        std::thread::spawn(move || {
+                            let _ = open_browser(&preview.url_with(local, speaks_tls(local)));
+                        });
+                    }
+                    Err(error) => remote.preview_error(format!("Could not open Preview: {error}")),
+                },
+                Command::StopPreview { port } => {
+                    self.shared.lock().listeners.remove(&port);
+                }
+                _ => {}
+            }
+        }
+        let mut tunnels = self.shared.lock();
+        tunnels.enabled = true;
+        if tunnels.sink.as_ref().map(|(socket, _)| *socket) != link.map(|(socket, _)| socket) {
+            tunnels.sink = link.map(|(socket, frames)| (socket, frames.clone()));
+        }
+        tunnels.listeners.retain(|port, l| {
+            (l.session.is_none() && remote.machine_previewable(*port))
+                || remote.with_mirror(|m| {
+                    m.sessions.values().any(|s| {
+                        l.session.as_ref().is_none_or(|id| s.id == *id)
+                            && s.status != atomics_core::session::AgentStatus::Exited
+                            && s.previews.iter().any(|p| p.port == *port)
+                    })
+                })
+        });
+        // Frames that came the window's way: from a backend fed by hand rather than a tapped connection.
+        let mut came = remote.take_tunnel_messages();
+        let room = MAX_QUEUED_FRAMES.saturating_sub(tunnels.inbox.len());
+        if came.len() > room {
+            came.truncate(room);
+            tunnels.overflow = true;
+        }
+        tunnels.inbox.extend(came);
+        for error in std::mem::take(&mut tunnels.errors) {
+            remote.preview_error(error);
+        }
+        for message in std::mem::take(&mut tunnels.outbox) {
             remote.send_tunnel(message);
         }
-        remote.set_active_previews(self.listeners.keys().copied().collect());
+        remote.set_active_previews(tunnels.listeners.keys().copied().collect());
+        drop(tunnels);
+        self.shared.wake();
+    }
+}
+
+/// The relay thread: a turn, then a wait until a socket is ready or something wakes it.
+fn run(shared: &Shared, wake_rx: &UnixStream) {
+    while !shared.stop.load(Ordering::Acquire) {
+        let mut fds = {
+            let mut tunnels = shared.lock();
+            if tunnels.enabled {
+                tunnels.turn();
+            }
+            if !tunnels.errors.is_empty() || (tunnels.sink.is_none() && !tunnels.outbox.is_empty()) {
+                (shared.window)();
+            }
+            tunnels.interest()
+        };
+        fds.push(libc::pollfd { fd: wake_rx.as_raw_fd(), events: libc::POLLIN, revents: 0 });
+        // Every socket the next turn can use is in `fds`; the timeout is only a backstop.
+        // SAFETY: `fds` is a valid array of pollfd for the duration of the call.
+        unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 250) };
+        let mut sink = [0u8; 64];
+        while matches!((&*wake_rx).read(&mut sink), Ok(n) if n > 0) {}
     }
 }
 

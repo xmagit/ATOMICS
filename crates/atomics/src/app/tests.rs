@@ -390,6 +390,15 @@ pub(super) fn request(app: &mut Desktop<'_>, value: serde_json::Value) -> Contro
     }
 }
 
+/// `approve` as the chief sends it: naming the request `result` shows pending in its session, if any.
+pub(super) fn answer_pending(app: &mut Desktop<'_>, mut value: serde_json::Value) -> ControlResponse {
+    if value.get("request").is_none() {
+        let session = value["session"].clone();
+        value["request"] = request(app, json!({"cmd":"result", "session":session})).result["approval"]["id"].clone();
+    }
+    request(app, value)
+}
+
 pub(super) fn repository() -> (crate::test_support::TempDir, PathBuf) {
     let dir = crate::test_support::tempdir().unwrap();
     let repo = dir.path().join("repo");
@@ -442,9 +451,20 @@ fn permission_hooks_wake_waiters_and_accept_decisions(app: &mut Desktop<'_>, _ct
         assert_eq!(response.result["events"][0]["approval"]["command"], "touch approval-file");
         assert_eq!(response.result["events"][0]["approval"]["reason"], "Create a file");
         assert_eq!(response.result["events"][0]["approval"]["cwd"], json!(dir.path()));
+        let id = app.runtime.sessions[0].approvals[0].id.clone();
+        assert_eq!(
+            response.result["events"][0]["approval"]["id"],
+            json!(id),
+            "the chief sees which request it answers"
+        );
         let (tx, rx) = channel();
         app.runtime.control(
-            ControlRequest::Approve { session: "codex".into(), decision, message: Some("Reviewed".into()) },
+            ControlRequest::Approve {
+                session: "codex".into(),
+                request: Some(id),
+                decision,
+                message: Some("Reviewed".into()),
+            },
             tx,
         );
         assert!(matches!(rx.recv().unwrap(), ControlOutcome::Done(response) if response.ok));
@@ -495,6 +515,64 @@ fn permission_hooks_wake_waiters_and_accept_decisions(app: &mut Desktop<'_>, _ct
             .is_err()
     );
     assert!(CHIEF_ALLOWED_TOOLS.contains(&"mcp__atomics__atomics_approve"));
+}
+
+/// As in a smoke test: the chief decided about a request after it had been answered, and its decision,
+/// which named only the session, answered the newer request it had never seen (a reset that wiped
+/// databases). A decision now names its request and answers nothing else.
+#[test]
+fn a_late_decision_never_answers_a_newer_request() {
+    with_app("app::tests::a_late_decision_never_answers_a_newer_request", |app, _| {
+        let dir = crate::test_support::tempdir().unwrap();
+        app.runtime.sessions = vec![session("codex", AgentKind::Generic, AgentStatus::Working, dir.path())];
+        app.runtime.sessions[0].claude_id = Some("s1".into());
+        let permission = |command: &str| {
+            let reply = Arc::new(ipc::ApprovalReply::default());
+            let event = atomics_core::hook::HookEvent::from_payload(&json!({
+                "hook_event_name":"PermissionRequest", "session_id":"s1", "cwd":dir.path(),
+                "tool_name":"Bash", "tool_input":{"command":command}
+            }))
+            .unwrap();
+            let hook = HookMessage {
+                pane: Some("codex".into()),
+                ancestors: Vec::new(),
+                event,
+                delivered: 0,
+                approval_reply: Some(reply.clone()),
+            };
+            (hook, reply)
+        };
+        let (hook, first) = permission("touch first-file");
+        app.runtime.on_hook(hook);
+        let seen = request(app, json!({"cmd":"list"})).result["sessions"][0]["approval"]["id"].clone();
+        assert!(seen.is_string(), "list shows the request's id");
+        // The user answers it on the desktop meanwhile, and the agent asks again.
+        app.runtime.decide(seen.as_str().unwrap(), Decision::Allow, None).unwrap();
+        assert!(first.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
+        let (hook, second) = permission("git reset --hard");
+        app.runtime.on_hook(hook);
+        let current = app.runtime.sessions[0].approvals[0].id.clone();
+
+        let late = request(
+            app,
+            json!({"cmd":"approve", "session":"codex", "request":seen, "decision":"allow", "message":"Max approved reset"}),
+        );
+        assert!(!late.ok);
+        let error = late.error.unwrap();
+        assert!(error.contains("no longer pending") && error.contains(&current), "{error}");
+        assert!(error.contains("git reset --hard"), "the error shows the request now pending: {error}");
+        assert_eq!(late.result["pending"]["id"], json!(current));
+        let waiting =
+            |app: &Desktop<'_>| app.runtime.sessions[0].approvals.iter().map(|p| p.id.clone()).collect::<Vec<_>>();
+        assert_eq!(waiting(app), std::slice::from_ref(&current), "the newer request still waits");
+        let unnamed = request(app, json!({"cmd":"approve", "session":"codex", "decision":"allow"}));
+        assert!(!unnamed.ok && unnamed.error.unwrap().contains(&current));
+        assert_eq!(waiting(app), std::slice::from_ref(&current), "a decision naming no request answers nothing");
+
+        let answered = request(app, json!({"cmd":"approve", "session":"codex", "request":current, "decision":"deny"}));
+        assert!(answered.ok, "{answered:?}");
+        assert!(second.wait(Duration::ZERO).stdout.unwrap().contains("deny"));
+    });
 }
 
 fn busy_text_is_only_a_fallback(app: &mut Desktop<'_>, _ctx: &egui::Context) {

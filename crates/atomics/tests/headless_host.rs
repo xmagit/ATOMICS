@@ -110,6 +110,13 @@ impl Instance {
     }
 }
 
+/// The id of the permission request pending in `session`, which `approve` names.
+fn pending_id(instance: &Instance, session: &str) -> Value {
+    let result = instance.ctl(json!({"cmd":"result","session":session}));
+    assert!(result["approval"]["id"].is_string(), "no request is pending in {session}: {result}");
+    result["approval"]["id"].clone()
+}
+
 fn eventually(what: &str, mut check: impl FnMut() -> bool) {
     let deadline = Instant::now() + scaled_timeout(Duration::from_secs(20));
     while !check() {
@@ -471,7 +478,8 @@ fn headless_host_serves_ctl_hooks_plans_and_the_protocol_then_stops_on_sigterm()
         let list = instance.ctl(json!({"cmd":"list"}));
         list["sessions"].as_array().unwrap().iter().any(|s| s["id"] == session && !s["approval"].is_null())
     });
-    instance.ctl(json!({"cmd":"approve","session":session,"decision":"allow"}));
+    let id = pending_id(&instance, &session);
+    instance.ctl(json!({"cmd":"approve","session":session,"request":id,"decision":"allow"}));
     let reply = hook.wait_output().unwrap();
     assert!(reply.status.success());
     let reply: Value = serde_json::from_slice(&reply.stdout).unwrap();
@@ -519,7 +527,8 @@ fn headless_host_serves_ctl_hooks_plans_and_the_protocol_then_stops_on_sigterm()
         mirror.approvals.values().any(|approval| approval.warning.as_deref().is_some_and(|w| w.contains(entry)))
     });
     assert!(mirror.approvals.values().all(|approval| approval.session == session), "{:?}", mirror.approvals);
-    instance.ctl(json!({"cmd":"approve","session":session,"decision":"deny"}));
+    let id = pending_id(&instance, &session);
+    instance.ctl(json!({"cmd":"approve","session":session,"request":id,"decision":"deny"}));
     let reply: Value = serde_json::from_slice(&hook.wait_output().unwrap().stdout).unwrap();
     assert_eq!(reply["hookSpecificOutput"]["decision"]["behavior"], "deny", "{reply}");
 
@@ -643,18 +652,23 @@ fn an_agent_without_hooks_has_its_own_approval_menu_answered_through_the_host() 
     assert_eq!(approval.command.as_deref(), Some(command));
     assert_eq!(mirror.sessions[&session].pending_approvals, 1);
 
-    // The chief's tools agree: raw keys wait for atomics_approve, which answers the menu and echoes it.
+    // The chief's tools agree: raw keys wait for atomics_approve, which answers the menu it names and echoes
+    // it. A decision that names no request answers nothing, and says which one is pending.
+    let id = pending_id(&instance, &session);
     let results = mcp_calls(
         &instance,
         &[
             ("atomics_send", json!({"session":session, "text":"y", "raw":true})),
             ("atomics_approve", json!({"session":session, "decision":"allow"})),
+            ("atomics_approve", json!({"session":session, "request":id, "decision":"allow"})),
         ],
     );
     assert_eq!(results[0]["isError"], true, "{}", results[0]);
     assert!(results[0]["content"][0]["text"].as_str().unwrap().contains("use atomics_approve"), "{}", results[0]);
-    assert_eq!(results[1]["isError"], false, "{}", results[1]);
-    let answered = results[1]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(results[1]["isError"], true, "{}", results[1]);
+    assert!(results[1]["content"][0]["text"].as_str().unwrap().contains(id.as_str().unwrap()), "{}", results[1]);
+    assert_eq!(results[2]["isError"], false, "{}", results[2]);
+    let answered = results[2]["content"][0]["text"].as_str().unwrap();
     assert!(answered.contains(command) && answered.contains("codex"), "{answered}");
     eventually("the menu's keys", || {
         instance.ctl(json!({"cmd":"read", "session":session, "lines":40}))["screen"]

@@ -1,5 +1,9 @@
 use super::*;
 
+/// The final review's note when no task changed anything.
+pub(super) const NOTHING_TO_REVIEW: &str =
+    "Nothing to review: every task in this plan finished without changes, so no reviewer was started.";
+
 /// How long a readiness check that could not tell waits before it runs again.
 const INTEGRATION_RETRY: Duration = Duration::from_secs(30);
 /// How long a readiness check may run before it counts as failed and runs again later. Git stops each
@@ -39,6 +43,7 @@ impl State {
                 task.integration_verified = false;
             }
         }
+        let mut reviewed = Vec::new();
         while let Ok(checked) = self.integration_check_rx.try_recv() {
             let key = (checked.plan.clone(), checked.task.id.clone());
             // A check past its time limit already counts as failed, and may be running again.
@@ -78,8 +83,18 @@ impl State {
                 }
                 if checked.valid.is_some() {
                     self.save_plan(index);
+                    reviewed.push(index);
                 }
             }
+        }
+        // A task found to have changed nothing may leave the final review nothing to look at.
+        reviewed.dedup();
+        let mut skipped = false;
+        for index in reviewed {
+            skipped |= self.skip_empty_review(index);
+        }
+        if skipped {
+            self.finish_plan_agents();
         }
         let (mut jobs, now) = (Vec::new(), Instant::now());
         let late: Vec<_> =
@@ -137,7 +152,7 @@ impl State {
                                 branch,
                                 &into,
                                 base.as_deref(),
-                                task.integrated_commit.as_deref(),
+                                (task.integrated_commit.as_deref(), task.start_commit.as_deref()),
                                 &mut commit,
                             )
                         }
@@ -153,6 +168,29 @@ impl State {
                 let _ = tx.send(CheckedIntegration { id, commit, revision, plan, task, into, valid, problem });
             });
         }
+    }
+
+    /// Marks the plan's final review done instead of starting it when every other task finished without
+    /// changes: there is nothing to review. Whether it did.
+    pub(super) fn skip_empty_review(&mut self, index: usize) -> bool {
+        if self.plans[index].status != PlanStatus::Open || !self.plans[index].review_has_nothing() {
+            return false;
+        }
+        let Some(review) = self.plans[index].task_mut(plan::REVIEW_TASK) else { return false };
+        review.set_status(TaskStatus::Done);
+        review.notes.push(NOTHING_TO_REVIEW.into());
+        self.save_plan(index);
+        let author = atomics_core::tickets::Author::Atomics;
+        self.ticket_status_changed(
+            index,
+            plan::REVIEW_TASK,
+            TaskStatus::Planned,
+            TaskStatus::Done,
+            Some(NOTHING_TO_REVIEW),
+            author,
+        );
+        self.toast(format!("Plan {}: {NOTHING_TO_REVIEW}", self.plans[index].id));
+        true
     }
 
     /// Why a task's integration is not verified, while a check says so: it is running, or it could not
@@ -392,14 +430,16 @@ fn checked_task(task: &Task, into: &str) -> bool {
 
 /// Whether a task's work is in `into`, or in `base` while `into` does not exist yet: the commit
 /// `branch` is at, or the `saved` one once the branch is deleted, with nothing uncommitted in the
-/// branch's worktree. An error says why git could not tell, or that it did not run or finish.
-/// `commit` gets the commit it checked.
+/// branch's worktree. A branch still at its `start`, the commit it was created at, has no work of its
+/// own, wherever `into` and `base` have moved since: it counts as in once its worktree holds nothing
+/// uncommitted. An error says why git could not tell, or that it did not run or finish. `commit` gets
+/// the commit it checked.
 fn work_in(
     repo: &Path,
     branch: &str,
     into: &str,
     base: Option<&str>,
-    saved: Option<&str>,
+    (saved, start): (Option<&str>, Option<&str>),
     commit: &mut Option<String>,
 ) -> anyhow::Result<bool> {
     let branch_ref = format!("refs/heads/{branch}");
@@ -416,6 +456,9 @@ fn work_in(
         }
     };
     *commit = Some(source.clone());
+    if start == Some(source.as_str()) {
+        return nothing_uncommitted(repo, branch);
+    }
     let target = format!("refs/heads/{into}");
     let target_exists = git::commit_of(repo, &target)?.is_some();
     let target = match (target_exists, base) {
@@ -424,22 +467,25 @@ fn work_in(
         (false, None) => anyhow::bail!("{into} does not exist yet"),
     };
     match git::is_ancestor(repo, &source, target)? {
-        Some(true) => {
-            // A branch with no new commits can still have uncommitted work. Host git never runs in a
-            // worktree a sandbox may have moved, so its work cannot count as checked.
-            let trees = git::list_worktrees(repo)?;
-            match trees.iter().find(|tree| tree.branch.as_deref() == Some(branch)) {
-                Some(tree) if !tree.trusted => anyhow::bail!(
-                    "its worktree {} is not as git made it, so git does not look there for uncommitted work",
-                    tree.path.display()
-                ),
-                Some(tree) => Ok(git::git(&tree.path, &["status", "--porcelain", "--untracked-files=all"])?.is_empty()),
-                None => Ok(true),
-            }
-        }
+        Some(true) => nothing_uncommitted(repo, branch),
         Some(false) if target_exists => Ok(false),
         Some(false) => anyhow::bail!("{into} does not exist yet, and {target} does not contain {branch}"),
         None => anyhow::bail!("git could not compare {branch} with {target}"),
+    }
+}
+
+/// Whether `branch`'s worktree, if it still has one, holds nothing uncommitted: a branch with no new
+/// commits can still have uncommitted work. Host git never runs in a worktree a sandbox may have moved,
+/// so its work cannot count as checked.
+fn nothing_uncommitted(repo: &Path, branch: &str) -> anyhow::Result<bool> {
+    let trees = git::list_worktrees(repo)?;
+    match trees.iter().find(|tree| tree.branch.as_deref() == Some(branch)) {
+        Some(tree) if !tree.trusted => anyhow::bail!(
+            "its worktree {} is not as git made it, so git does not look there for uncommitted work",
+            tree.path.display()
+        ),
+        Some(tree) => Ok(git::git(&tree.path, &["status", "--porcelain", "--untracked-files=all"])?.is_empty()),
+        None => Ok(true),
     }
 }
 
@@ -454,6 +500,7 @@ fn same_work(a: &Task, b: &Task) -> bool {
         branch: task.branch.clone(),
         integrated: task.integrated.clone(),
         integrated_commit: task.integrated_commit.clone(),
+        start_commit: task.start_commit.clone(),
         integration_verified: task.integration_verified,
         ..Default::default()
     };
@@ -1253,6 +1300,82 @@ exec {} "$@"
                 app.runtime.finish_integration(first);
                 assert!(app.runtime.plans[indices[0]].tasks[0].integrated.is_some());
                 assert!(app.runtime.plans[indices[1]].tasks[0].integrated.is_some());
+            },
+        );
+    }
+
+    /// As seen in a smoke test: task s1 finished with no commits, its branch cut after main had moved past
+    /// the integration branch's start, and the task depending on it could not dispatch ("needs integrated
+    /// dependencies"). A branch still at the commit it started from has nothing to integrate; and when no
+    /// task changed anything, the final review has nothing to look at and is not started.
+    #[test]
+    fn a_task_that_changed_nothing_needs_no_integration_and_leaves_nothing_to_review() {
+        with_app(
+            "app::integrations::tests::a_task_that_changed_nothing_needs_no_integration_and_leaves_nothing_to_review",
+            |app, _| {
+                let (_dir, repo) = repository();
+                git::git(&repo, &["branch", "integration"]).unwrap();
+                git::git(&repo, &["commit", "--allow-empty", "-qm", "main moved on"]).unwrap();
+                git::git(&repo, &["branch", "task-a"]).unwrap();
+                git::git(&repo, &["branch", "task-b", "integration"]).unwrap();
+                request(
+                    app,
+                    json!({"cmd":"plan_set", "goal":"Nothing to change", "integration":"integration", "tasks":[
+                        {"id":"a", "repo":repo, "branch":"task-a"},
+                        {"id":"b", "repo":repo, "branch":"task-b", "depends_on":["a"]}]}),
+                );
+                let index = app.runtime.selected_plan;
+                let plan = app.runtime.plans[index].id.clone();
+                app.runtime.plans[index].approved = true;
+                let tip = |branch: &str| git::commit_of(&repo, &format!("refs/heads/{branch}")).unwrap();
+                let checked = |app: &mut Desktop<'_>, task: &str| {
+                    let key = (plan.clone(), task.to_string());
+                    app.runtime.refresh_integrations();
+                    let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
+                    while app.runtime.integration_checks.contains_key(&key) {
+                        assert!(Instant::now() < deadline, "the check of {task} did not finish");
+                        std::thread::sleep(Duration::from_millis(10));
+                        app.runtime.refresh_integrations();
+                    }
+                };
+                app.runtime.plans[index].tasks[0].status = TaskStatus::Done;
+                // Without the commit it started from, nothing says the branch has no work of its own.
+                checked(app, "a");
+                assert!(!app.runtime.plans[index].tasks[0].integration_verified);
+                assert!(app.runtime.dispatch(index, Some("b")).unwrap_err().contains("integrated dependencies"));
+
+                app.runtime.plans[index].tasks[0].start_commit = tip("task-a");
+                checked(app, "a");
+                let a = &app.runtime.plans[index].tasks[0];
+                assert!(a.integration_verified && a.unchanged(), "{a:?}");
+                assert_eq!(app.runtime.plans[index].ready().iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["b"]);
+                assert_eq!(app.runtime.plans[index].tasks[2].status, TaskStatus::Planned, "b is still to come");
+
+                // A commit of its own after its start is work to integrate again.
+                let worktree = repo.parent().unwrap().join("task-b");
+                git::git(&repo, &["worktree", "add", "-q", &worktree.to_string_lossy(), "task-b"]).unwrap();
+                app.runtime.plans[index].tasks[1].start_commit = tip("task-b");
+                app.runtime.plans[index].tasks[1].status = TaskStatus::Done;
+                git::git(&worktree, &["commit", "--allow-empty", "-qm", "b's own work"]).unwrap();
+                checked(app, "b");
+                assert!(!app.runtime.plans[index].tasks[1].integration_verified);
+                // Something uncommitted is work too.
+                git::git(&worktree, &["reset", "-q", "--hard", "HEAD~1"]).unwrap();
+                std::fs::write(worktree.join("notes.txt"), "draft").unwrap();
+                app.runtime.integration_dirty.store(true, Ordering::Relaxed);
+                checked(app, "b");
+                assert!(!app.runtime.plans[index].tasks[1].integration_verified);
+                assert_eq!(app.runtime.plans[index].tasks[2].status, TaskStatus::Planned);
+
+                // Back where it started and clean: neither task changed anything, so nobody is asked to review.
+                std::fs::remove_file(worktree.join("notes.txt")).unwrap();
+                app.runtime.integration_dirty.store(true, Ordering::Relaxed);
+                checked(app, "b");
+                let review = &app.runtime.plans[index].tasks[2];
+                assert_eq!(review.id, atomics_core::plan::REVIEW_TASK);
+                assert_eq!(review.status, TaskStatus::Done);
+                assert_eq!(review.notes, [NOTHING_TO_REVIEW]);
+                assert!(review.session.is_none() && review.branch.is_none(), "no reviewer was started");
             },
         );
     }

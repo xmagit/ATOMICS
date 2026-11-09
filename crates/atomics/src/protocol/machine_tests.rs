@@ -207,12 +207,12 @@ fn native_dashboard_forwards_survive_without_an_agent_and_stop_when_the_listener
     }
     let mut native = crate::preview::client::Client::default();
     native.open(None, atomics_core::preview::Preview { port, ..Default::default() }).unwrap();
-    native.pump(&remote);
+    native.pump(&remote, None);
     assert!(native.active(), "a machine forward needs no owning agent");
     f.projections.machine.publish(Machine::default());
     while remote.machine().is_some_and(|m| m.previewable(port)) {
         remote.receive(protocol.next().unwrap());
     }
-    native.pump(&remote);
+    native.pump(&remote, None);
     assert!(!native.active());
 }

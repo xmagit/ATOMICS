@@ -500,10 +500,24 @@ end if"#;
     let restart =
         if changed { super::stop(&info.instance).and_then(|()| super::start(&info.instance)) } else { Ok(()) };
     // Reopen even if Lima could not restart, so the window can show the VM's state.
-    if app.is_dir() && !Command::new("open").arg("-a").arg(app).status()?.success() {
+    if app.is_dir() && !reopen(&app, std::env::vars_os()).status()?.success() {
         bail!("the update is installed, but the ATOMICS window could not reopen");
     }
     restart.context("the next boot is installed, but Lima could not restart; run atomics vm start")
+}
+
+/// `open -a app` as the Dock would open it: with this command's environment, but none of its `ATOMICS_*`
+/// variables. `open` hands its environment to the app it starts, and a shell that pointed this command at a
+/// scratch config or home (`ATOMICS_CONFIG`, `ATOMICS_HOME`, `ATOMICS_SOCKET`, …) would otherwise bring the
+/// window up on those, as a host of its own, instead of as the VM's client. The app reads its own config.
+fn reopen(app: &Path, env: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>) -> Command {
+    let mut command = Command::new("open");
+    command
+        .arg("-a")
+        .arg(app)
+        .env_clear()
+        .envs(env.into_iter().filter(|(key, _)| !key.to_string_lossy().starts_with("ATOMICS_")));
+    command
 }
 
 #[cfg(test)]

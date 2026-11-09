@@ -246,3 +246,25 @@ case "$0" in */new/*) test -z "${FAIL_BOOT-}" ;; *) exit 0 ;; esac
     assert_eq!(String::from_utf8(restored.stdout).unwrap().trim(), "unchanged");
     assert_eq!(std::fs::read_link(profile).unwrap(), current);
 }
+
+#[test]
+fn the_window_reopens_without_the_updaters_atomics_variables() {
+    let env = [
+        ("ATOMICS_CONFIG", "/tmp/scratch/config.toml"),
+        ("ATOMICS_HOME", "/tmp/scratch"),
+        ("ATOMICS_SOCKET", "/tmp/scratch/atomics.sock"),
+        ("ATOMICS_HOST_SOCKET", "/tmp/scratch/host.sock"),
+        ("ATOMICS_TEST_RELEASE_FEED", "http://127.0.0.1:1/feed"),
+        ("HOME", "/Users/alice"),
+        ("PATH", "/usr/bin:/bin"),
+        ("LANG", "en_US.UTF-8"),
+    ]
+    .map(|(key, value)| (key.into(), value.into()));
+    let command = reopen(Path::new("/Applications/ATOMICS.app"), env);
+    assert_eq!(command.get_program(), "open");
+    assert_eq!(command.get_args().collect::<Vec<_>>(), ["-a", "/Applications/ATOMICS.app"]);
+    let mut passed: Vec<_> =
+        command.get_envs().filter_map(|(key, value)| Some((key.to_str()?, value?.to_str()?))).collect();
+    passed.sort();
+    assert_eq!(passed, [("HOME", "/Users/alice"), ("LANG", "en_US.UTF-8"), ("PATH", "/usr/bin:/bin")]);
+}

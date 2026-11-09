@@ -100,6 +100,10 @@ pub enum ControlRequest {
     },
     Approve {
         session: String,
+        /// The id of the pending request this decision answers, as `list`, `result` and `wait` show it.
+        /// Without it, or with one no longer pending, nothing is answered.
+        #[serde(default)]
+        request: Option<String>,
         decision: crate::approvals::Decision,
         #[serde(default)]
         message: Option<String>,

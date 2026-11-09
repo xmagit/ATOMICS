@@ -131,7 +131,7 @@ impl ClientApp {
             },
         });
         Self {
-            previews: Default::default(),
+            previews: crate::preview::client::Client::new(wake.clone()),
             open: launch.open,
             screenshot: launch.screenshot.map(|(path, delay)| (path, f64::from(delay), Arc::default())),
             shot_requested: false,
@@ -208,10 +208,17 @@ impl ClientApp {
         self.driver.tick(now);
         self.take_events();
         self.start_agents();
-        self.previews.pump(&self.driver.remote);
+        self.pump_previews();
         self.driver.flush();
         self.run_outputs();
         self.view.now_ms = now as f64;
+    }
+
+    /// Previews opened and closed as the board says. Their data moves on the relay's own thread, straight
+    /// to and from the link, whether or not the window draws.
+    fn pump_previews(&mut self) {
+        let link = self.link.as_ref().map(|(socket, link)| (*socket, link.frames()));
+        self.previews.pump(&self.driver.remote, link);
     }
 
     /// `--open`: once the host's board is in, each agent is started there, as the + New picker does.
@@ -254,11 +261,8 @@ impl ClientApp {
         if !self.vm_screen(ui) {
             views::draw(ui, &mut self.driver, &mut self.client, &mut self.view);
         }
-        self.previews.pump(&self.driver.remote);
+        self.pump_previews();
         self.driver.flush();
-        if self.previews.active() {
-            ui.ctx().request_repaint_after(Duration::from_millis(10));
-        }
         self.run_outputs();
         self.keyboard.follow(&mut self.view.term.overlay, &mut self.view.term.inputs);
         self.confirm_local |= std::mem::take(&mut self.view.place_clicked);
@@ -442,7 +446,13 @@ impl ClientApp {
             for output in outputs {
                 match output {
                     Output::DialDirect { socket } => {
-                        let link = Link::open(socket, self.resolver(), self.events_tx.clone(), self.wake.clone());
+                        let link = Link::open(
+                            socket,
+                            self.resolver(),
+                            self.events_tx.clone(),
+                            self.wake.clone(),
+                            self.previews.tap(),
+                        );
                         self.link = Some((socket, link));
                     }
                     Output::Send { socket, message } => {
@@ -453,7 +463,7 @@ impl ClientApp {
                     Output::Close { socket, .. } => {
                         if let Some((_, link)) = self.link.take_if(|(id, _)| *id == socket) {
                             link.close();
-                            self.previews = Default::default();
+                            self.previews.reset();
                         }
                     }
                     // A direct client has no hosting page, no stored device and no passkey, so the driver never
@@ -484,7 +494,7 @@ impl ClientApp {
                 Event::Closed { socket, code, unreachable } => {
                     if self.link.as_ref().is_some_and(|(id, _)| *id == socket) {
                         self.link = None;
-                        self.previews = Default::default();
+                        self.previews.reset();
                     }
                     // Why the host could not be reached: on screen while the window waits for it, and in
                     // the log each time it changes.

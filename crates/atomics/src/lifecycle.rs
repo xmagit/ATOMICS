@@ -115,17 +115,137 @@ pub fn wait_for(jobs: &[Job], name: Option<&str>, path: Option<&Path>) {
 /// to skip the plan.
 const PLAN_SKIPPED: &str = "Plan cleanup skipped: ";
 
-pub fn clean_plan(home: &Path, plan: &Plan, sbx: &str, protected: &[PathBuf]) -> Vec<String> {
-    let mut notes = Vec::new();
+/// What a plan's cleanup did: notes of what it kept and why, the worktrees it left for now because
+/// processes still use them, and the worktrees it removed.
+#[derive(Debug, Default)]
+pub struct Cleaned {
+    pub notes: Vec<String>,
+    pub deferred: Vec<Deferred>,
+    pub removed: Vec<PathBuf>,
+}
+
+/// A closed plan's task worktree whose removal waits: processes still run in it, or hold files open
+/// under it, such as a dev server an agent left running for the user. It is removed, as the plan's
+/// cleanup would have, once nothing uses it ([`clean_worktrees`]).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Deferred {
+    pub plan: String,
+    pub branch: String,
+    pub worktree: PathBuf,
+    /// What used it when last checked, as `<pid> <name>`.
+    pub users: Vec<String>,
+    /// When the cleanup first left it, in seconds since the epoch.
+    pub since: u64,
+}
+
+/// Where the removals waiting for their processes are kept, so a restarted host still makes them.
+const DEFERRED: &str = "cleanup-deferred.json";
+
+pub fn deferred(home: &Path) -> Vec<Deferred> {
+    std::fs::read(home.join(DEFERRED)).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default()
+}
+
+pub fn save_deferred(home: &Path, deferred: &[Deferred]) -> Result<()> {
+    let path = home.join(DEFERRED);
+    if deferred.is_empty() {
+        return match std::fs::remove_file(&path) {
+            Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err.into()),
+            _ => Ok(()),
+        };
+    }
+    std::fs::create_dir_all(home)?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(deferred)?)?;
+    std::fs::rename(tmp, path)?;
+    Ok(())
+}
+
+/// The processes of this user that use `dir`: their working directory is in it, or they hold a file
+/// open under it. Each as `<pid> <name>`; never this process. Empty when none do, or when this
+/// machine cannot tell (no `/proc`, no `lsof`).
+pub fn processes_in(dir: &Path) -> Vec<String> {
+    let dir = real(dir);
+    let inside = |path: &Path| path.starts_with(&dir);
+    let me = std::process::id();
+    let mut found = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let Some(pid) = entry.file_name().to_str().and_then(|name| name.parse::<u32>().ok()) else { continue };
+            if pid == me {
+                continue;
+            }
+            let base = entry.path();
+            let uses = std::fs::read_link(base.join("cwd")).is_ok_and(|cwd| inside(&cwd))
+                || std::fs::read_dir(base.join("fd"))
+                    .is_ok_and(|fds| fds.flatten().any(|fd| std::fs::read_link(fd.path()).is_ok_and(|f| inside(&f))));
+            if uses {
+                let name = std::fs::read_to_string(base.join("comm")).unwrap_or_default();
+                found.push(format!("{pid} {}", name.trim()));
+            }
+        }
+        return found;
+    }
+    // macOS: lsof lists every process's working directory and open files, as `p<pid>`, `c<name>` and
+    // `n<path>` lines.
+    let Ok(output) = std::process::Command::new("/usr/sbin/lsof")
+        .args(["-n", "-P", "-w", "-F", "pcn"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return found;
+    };
+    let (mut pid, mut name, mut counted) = (0u32, String::new(), false);
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        match line.split_at_checked(1) {
+            Some(("p", value)) => (pid, counted) = (value.parse().unwrap_or(0), false),
+            Some(("c", value)) => name = value.to_string(),
+            Some(("n", value)) if !counted && pid != 0 && pid != me && inside(Path::new(value)) => {
+                counted = true;
+                found.push(format!("{pid} {name}"));
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
+pub fn clean_plan(home: &Path, plan: &Plan, sbx: &str, protected: &[PathBuf]) -> Cleaned {
+    clean_plan_in(home, plan, sbx, protected, None)
+}
+
+/// [`clean_plan`] for those of the plan's worktrees in `worktrees` only: the ones it left for their
+/// processes, checked again, or one whose session has just closed.
+pub fn clean_worktrees(home: &Path, plan: &Plan, sbx: &str, protected: &[PathBuf], worktrees: &[PathBuf]) -> Cleaned {
+    clean_plan_in(home, plan, sbx, protected, Some(worktrees))
+}
+
+/// What became of one of a plan's task branches.
+enum Step {
+    Removed { branch: bool },
+    InUse(Vec<String>),
+}
+
+fn clean_plan_in(home: &Path, plan: &Plan, sbx: &str, protected: &[PathBuf], only: Option<&[PathBuf]>) -> Cleaned {
+    let mut cleaned = Cleaned::default();
     if let Err(error) = sandbox::load_owned_pins(home) {
-        return vec![format!("{PLAN_SKIPPED}{error:#}")];
+        cleaned.notes.push(format!("{PLAN_SKIPPED}{error:#}"));
+        return cleaned;
     }
     let entries = match cleanup::closed_tasks(plan) {
         Ok(entries) => entries,
-        Err(err) => return vec![format!("Plan cleanup: {err:#}")],
+        Err(err) => {
+            cleaned.notes.push(format!("Plan cleanup: {err:#}"));
+            return cleaned;
+        }
     };
     for entry in entries {
-        let result = (|| -> Result<bool> {
+        if let Some(only) = only
+            && !entry.worktree.as_ref().is_some_and(|path| only.iter().any(|o| real(o) == real(path)))
+        {
+            continue;
+        }
+        let result = (|| -> Result<Step> {
             let mut names = Vec::new();
             // Kept worktrees are never entered: not to check them, nor to stop their sandboxes.
             if let Some(keep) = &entry.keep {
@@ -143,6 +263,11 @@ pub fn clean_plan(home: &Path, plan: &Plan, sbx: &str, protected: &[PathBuf]) ->
                     "uncommitted changes in {}",
                     path.display()
                 );
+                // A server an agent left running for the user keeps its folder until it stops.
+                let users = processes_in(path);
+                if !users.is_empty() {
+                    return Ok(Step::InUse(users));
+                }
                 if sandbox::installed(sbx) {
                     names = sandbox::in_worktree(home, sbx, path)?;
                     for name in &names {
@@ -160,17 +285,50 @@ pub fn clean_plan(home: &Path, plan: &Plan, sbx: &str, protected: &[PathBuf]) ->
                     sandbox::remove(home, sbx, &name)?;
                 }
             }
-            removed_branch
+            removed_branch.map(|branch| Step::Removed { branch })
         })();
+        let worktree = entry.worktree.clone();
         match result {
-            Ok(false) if plan.status == atomics_core::plan::PlanStatus::Completed => {
-                notes.push(format!("Kept branch {}: not merged into {}", entry.branch, plan.integration_branch()))
+            Ok(Step::InUse(users)) => {
+                let path = worktree.expect("only a worktree is in use");
+                cleaned.notes.push(format!(
+                    "Kept worktree {} for now: {} still {} in it ({}); it is removed once nothing does",
+                    path.display(),
+                    if users.len() == 1 { "1 process".to_string() } else { format!("{} processes", users.len()) },
+                    if users.len() == 1 { "runs" } else { "run" },
+                    shown_users(&users)
+                ));
+                cleaned.deferred.push(Deferred {
+                    plan: plan.id.clone(),
+                    branch: entry.branch.clone(),
+                    worktree: path,
+                    users,
+                    since: atomics_core::store::now(),
+                });
             }
-            Ok(_) => {}
-            Err(err) => notes.push(format!("Cleanup {}: {err:#}", entry.branch)),
+            Ok(Step::Removed { branch }) => {
+                cleaned.removed.extend(worktree.filter(|path| !path.exists()));
+                if !branch && plan.status == atomics_core::plan::PlanStatus::Completed {
+                    cleaned.notes.push(format!(
+                        "Kept branch {}: not merged into {}",
+                        entry.branch,
+                        plan.integration_branch()
+                    ));
+                }
+            }
+            Err(err) => cleaned.notes.push(format!("Cleanup {}: {err:#}", entry.branch)),
         }
     }
-    notes
+    cleaned
+}
+
+/// Processes as a note names them: the first few, and how many more.
+pub fn shown_users(users: &[String]) -> String {
+    let mut shown = users.iter().take(4).cloned().collect::<Vec<_>>().join(", ");
+    if users.len() > 4 {
+        shown.push_str(&format!(" and {} more", users.len() - 4));
+    }
+    shown
 }
 
 /// Failures kept until someone looks: a session's or plan's cleanup, a ref guard's alert.
@@ -831,7 +989,7 @@ mod tests {
             ownership::created(&home, &format!("atomics-{branch}"), Resource::Mcp).unwrap();
         }
         std::fs::write(dir.path().join("dirty/keep"), "dirty").unwrap();
-        let notes = clean_plan(&home, &plan, &sbx, &[dir.path().join("busy")]);
+        let notes = clean_plan(&home, &plan, &sbx, &[dir.path().join("busy")]).notes;
         assert!(notes.iter().any(|n| n.contains("uncommitted")) && notes.iter().any(|n| n.contains("another session")));
         assert!(!dir.path().join("clean").exists());
         assert!(dir.path().join("dirty/keep").exists() && dir.path().join("busy").exists());
@@ -879,7 +1037,7 @@ mod tests {
                     tasks: vec![Task { branch: Some("task".into()), ..Task::default() }],
                     ..Plan::default()
                 };
-                let notes = clean_plan(&home, &plan, &sbx, &[]);
+                let notes = clean_plan(&home, &plan, &sbx, &[]).notes;
                 assert!(!marker.exists(), "cleanup followed the sandbox's git config");
                 assert_eq!(tree.exists(), dirty, "{notes:?}");
                 if dirty {

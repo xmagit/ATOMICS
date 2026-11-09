@@ -312,6 +312,10 @@ struct Launch {
 struct PreparedWorktree {
     path: PathBuf,
     warmed: bool,
+    /// The commit the branch was created at, when this made it.
+    start: Option<String>,
+    /// Why it may start behind the remote: the fetch before it failed.
+    warning: Option<String>,
 }
 
 /// A finished plan integration, to note on its task and answer.
@@ -379,7 +383,8 @@ struct StatusEvent {
     task: Option<String>,
     /// Set for a `atomics_report` from the agent: (status, summary, task).
     report: Option<(String, String, Option<String>)>,
-    approval: Option<ApprovalRequest>,
+    /// The pending request the event is about, with its id (`approval_json`).
+    approval: Option<serde_json::Value>,
     findings: Option<Vec<atomics_core::heartbeat::Finding>>,
     /// Set when someone changed a linked ticket in its system.
     ticket: Option<serde_json::Value>,
@@ -387,6 +392,15 @@ struct StatusEvent {
     config: Option<serde_json::Value>,
     /// Set when a plan was approved, edited, closed or reopened.
     change: Option<&'static str>,
+}
+
+impl PendingApproval {
+    /// The request as the chief sees it: its `id`, which `approve` must name, and what it asks.
+    fn json(&self) -> serde_json::Value {
+        let mut value = json!(self.request);
+        value["id"] = json!(self.id);
+        value
+    }
 }
 
 impl StatusEvent {
@@ -427,7 +441,7 @@ impl StatusEvent {
             value["change"] = json!(change);
         }
         if let Some(request) = &self.approval {
-            value["approval"] = json!(request);
+            value["approval"] = request.clone();
         }
         value
     }
@@ -528,6 +542,13 @@ pub(crate) struct State {
     /// The GitHub counter and controls: what the API last said, sign-in and actions under way.
     github: github::Github,
     lifecycle_jobs: Vec<crate::lifecycle::Job>,
+    /// Closed plans' worktrees whose removal waits for the processes still using them; kept on disk.
+    deferred_cleanup: Vec<crate::lifecycle::Deferred>,
+    /// When they were last checked, and whether a check is under way.
+    deferred_checked: Option<Instant>,
+    deferred_checking: Arc<AtomicBool>,
+    /// The plan whose cleanup is closing its sessions, and covers their worktrees itself.
+    cleaning_plan: Option<String>,
     startup_cleanup: Option<std::thread::JoinHandle<()>>,
     shutting_down: bool,
     sandbox_check: Option<Receiver<(Vec<String>, Vec<atomics_core::projection::SetupStep>)>>,
@@ -1094,6 +1115,10 @@ impl State {
             interactive_start: false,
             pending_sandbox: Vec::new(),
             lifecycle_jobs: Vec::new(),
+            deferred_cleanup: crate::lifecycle::deferred(&paths::atomics_home()),
+            deferred_checked: None,
+            deferred_checking: Arc::default(),
+            cleaning_plan: None,
             startup_cleanup: None,
             shutting_down: false,
             ref_checks: crate::ref_guard::Checks::new(),
