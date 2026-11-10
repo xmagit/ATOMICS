@@ -367,7 +367,8 @@ selected. Keep a worktree's Git metadata in the shares too, so the guest can rea
 Before building and again before installing, it asks the host's socket in the guest for `list` and
 refuses busy work: working or starting agents, agents waiting for you, and pending approvals or queue
 work. New hosts also publish the in-app updater's full blocker list, including background work, shells
-running commands and open editors. `--yes` explicitly continues despite reported busy work. An
+running commands and open editors. `--yes` explicitly continues despite reported busy work, announcing
+the override once while still rechecking at every stage. An
 unreachable host is an error; it is never taken to mean idle. In the older agents-over-ssh layout this
 needs the socket forward to the Mac's host.
 
@@ -387,7 +388,9 @@ never makes that update count as unchanged.
 The command prints whether the system changed, the bundle was reinstalled and the VM restarted. It
 asks every running instance of `ATOMICS.app` to quit gracefully and reopens the app after installation,
 restarting the VM when the running system differs. If a window refuses to quit, the error identifies
-its process and leaves the restart pending; close it and rerun `atomics vm update`. The
+its process, reopens the app after the partial quit, and leaves the restart pending; close the blocking
+window and rerun `atomics vm update`. If stopping succeeds but starting fails, run `atomics vm start`
+to boot the already installed system without rebuilding. The
 window reopens as the Dock would open it, without the command's own `ATOMICS_*` variables: an update run
 from a shell that points `ATOMICS_CONFIG` or `ATOMICS_HOME` at a scratch setup still reopens the VM's
 client, on the app's own config. With
@@ -398,10 +401,14 @@ how to start the VM again.
 In the VM client, **Machine** has a VM section with its state, Start, Stop, Check and Update. Stop asks
 for confirmation because agents stop with the VM. Check and Update show their command output there;
 the latest output is also saved in `~/.atomics/vm/<instance>-controls.log`, including across the app's
-update restart. If the host disconnects, a previously mirrored board gives way to the VM's state and
-Start button when it is stopped, or “starting” while the instance runs but its host is not connected.
-Status polling stops when the window is no longer drawing. A successful Lima list also removes setup
-records for deleted instances; failed or malformed lists leave them alone.
+update restart. The Machine window displays cached output refreshed in the background. While the host
+connects or reconnects, the mirrored board stays visible unless Lima confirms that the VM is stopped
+or not set up. A running VM with no host connection says “VM running, host not connected”; starting,
+stopping and a refused token each have their own text. A stopped VM shows its state and Start.
+Status polling stops when the window is no longer drawing and wakes immediately when a paused view
+returns. Explicit commands such as `vm status`, `vm setup` and `vm update` remove obsolete setup records
+after a successful Lima list; background polls never remove them. Cleanup failures warn without
+changing the reported VM state. A client also bypasses a stale local QA queue socket when starting.
 
 Keep the fresh-image route for a broken VM or disk-size changes: build a new image with
 `scripts/macos-vm-build.sh`, delete the old instance with `limactl delete <instance>`, and run

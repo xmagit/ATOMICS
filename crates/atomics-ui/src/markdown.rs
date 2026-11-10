@@ -165,13 +165,26 @@ pub fn sections(source: &str) -> Vec<(String, String)> {
 
 /// The shared check for every URL opened in a browser, including URLs supplied by a host or agent.
 /// Keep the authority explicit and refuse characters browsers might silently normalize.
+/// International hosts must be spelled as ASCII punycode so hints cannot show look-alikes.
 pub fn web_url(url: &str) -> Option<&str> {
     let (scheme, rest) = url.split_once("://")?;
     let authority = rest.split(['/', '?', '#']).next()?;
     ((scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
         && !authority.is_empty()
-        && !url.chars().any(|c| c.is_whitespace() || c.is_control() || c == '\\'))
+        && authority.is_ascii()
+        && !authority.contains('%')
+        && !url.chars().any(|c| c.is_whitespace() || hidden_url_char(c) || c == '\\'))
     .then_some(url)
+}
+
+fn hidden_url_char(c: char) -> bool {
+    use unicode_general_category::{GeneralCategory, get_general_category};
+    matches!(get_general_category(c), GeneralCategory::Control | GeneralCategory::Format)
+        // Other invisible characters, including fillers and variation selectors.
+        || matches!(c,
+            '\u{34f}' | '\u{115f}'..='\u{1160}' | '\u{17b4}'..='\u{17b5}' | '\u{180b}'..='\u{180f}'
+            | '\u{2060}'..='\u{206f}' | '\u{3164}' | '\u{fe00}'..='\u{fe0f}' | '\u{ffa0}'
+            | '\u{e0000}'..='\u{e0fff}')
 }
 
 #[cfg(test)]
@@ -242,6 +255,25 @@ mod tests {
             "https://example.com\\file",
         ] {
             assert_eq!(web_url(url), None, "{url:?}");
+        }
+    }
+
+    #[test]
+    fn browser_urls_refuse_hidden_characters_and_unicode_look_alike_hosts() {
+        for hidden in ['\u{202e}', '\u{200b}', '\u{200d}', '\u{feff}', '\u{ad}', '\u{34f}', '\u{fff9}', '\u{fe0f}'] {
+            for url in [
+                format!("https://example.com/{hidden}path"),
+                format!("https://example.com/?q={hidden}"),
+                format!("https://example.com/#{hidden}"),
+            ] {
+                assert_eq!(web_url(&url), None, "{url:?}");
+            }
+        }
+        for url in ["https://g\u{456}thub.com/repo", "https://\u{ff47}ithub.com/repo", "https://g%D1%96thub.com/repo"] {
+            assert_eq!(web_url(url), None, "{url:?}");
+        }
+        for url in ["https://xn--gthub-n2e.com/repo", "https://example.com/文档", "https://example.com/a%20b"] {
+            assert_eq!(web_url(url), Some(url));
         }
     }
 

@@ -380,8 +380,11 @@ scripts/check.sh
 
 It enters `nix develop .#default`, checks formatting, runs Clippy with warnings denied, then runs
 `cargo test --workspace --no-fail-fast --locked`. The shell supplies rustc, Clippy and rustfmt from
-the same pinned toolchain, plus the tests' helper programs. In an ATOMICS session the command goes
-through `atomics queue --class test` before starting the gate; allow a long wait for a shared slot.
+the same pinned toolchain, plus the tests' helper programs. Whenever `atomics` is on PATH, the command
+uses `atomics queue --class test` before starting the gate; without a reachable host, that CLI runs
+the command without a slot. Allow a long wait when a shared slot is in use.
+This is the native workspace gate. CI also checks the `wasm32-unknown-unknown` browser target,
+including Clippy, and runs `python3 tests/test_release_signing.py`; those checks are separate.
 During development use `nix develop .#default --command cargo check --workspace --all-targets` and
 run only the tests you change. Reserve the full gate for the end.
 Targeted ticket tests also need `cargo build -p atomics --example fake_ticket_server` in that shell;

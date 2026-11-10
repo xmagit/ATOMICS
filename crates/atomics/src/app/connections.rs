@@ -581,6 +581,7 @@ impl State {
                     })
                     .or(needed.url.as_deref());
                 let identity = endpoint.and_then(|url| mcp::server_identity(name, url));
+                let unparseable = endpoint.is_some() && identity.is_none();
                 if let Some((domain, _)) = &identity {
                     label.push_str(&format!(" · {domain}"));
                 }
@@ -589,7 +590,12 @@ impl State {
                     label.insert_str(0, "⚠ ");
                     detail = format!("{warning}. {detail}");
                 }
+                if unparseable {
+                    label = format!("⚠ {label} · unparseable URL");
+                    detail = format!("Warning: unparseable URL. {detail}");
+                }
                 let enabled = !busy
+                    && !unparseable
                     && checked
                     && (connections.status(name).is_some()
                         || connections.definition(name).is_some()
