@@ -636,7 +636,9 @@ The host receives metadata and issues random session placeholders. The broker ho
 rejects unknown or revoked placeholders, checks the stored host, method, path and authentication rule,
 adds the value and makes the HTTPS request itself. The host's existing loopback relay forwards to
 `/run/atomics-secret-broker/use.sock`; no connected window is needed. That socket has mode `0660`
-and group `atomics-secret-use`, granted to the VM and admin accounts. Unfinished JSON requests
+and group `atomics-secret-use`, granted to the VM and admin accounts.
+Existing SSH or shell logins of the VM user keep their old groups after an upgrade, so
+`atomics secret list` is refused there until they log in again. Unfinished JSON requests
 and relay headers share a two-second authentication deadline
 and a separate pool of 32 pending connections; they cannot occupy the 256 authenticated slots.
 The broker streams responses and redacts reflected credentials just as the desktop relay does.

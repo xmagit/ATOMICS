@@ -2,7 +2,8 @@
 use anyhow::{Context, Result};
 use atomics_core::secrets::{Auth, Scope, Secret};
 use clap::Subcommand;
-use std::io::{BufRead, IsTerminal, Read, Write};
+use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 
 #[derive(Subcommand)]
 pub enum Command {
@@ -73,7 +74,18 @@ pub fn run(command: Command) -> Result<()> {
             std::io::stderr().flush()?;
             let terminal = stdin.is_terminal();
             let echo = crate::sandbox::setup::Echo::hide(terminal)?;
-            let value = read_value(stdin.lock(), terminal)?;
+            let value = if terminal {
+                // A one-byte buffer leaves all input after Enter in the terminal queue, including
+                // when the terminal was already in noncanonical mode.
+                let value = (|| {
+                    let file = std::fs::File::from(stdin.as_fd().try_clone_to_owned()?);
+                    read_value(BufReader::with_capacity(1, file), true)
+                })();
+                clear_terminal_tail(stdin.as_fd())?;
+                value?
+            } else {
+                read_value(stdin.lock(), false)?
+            };
             drop(echo);
             eprintln!();
             if vm_client {
@@ -141,6 +153,36 @@ fn read_value(reader: impl BufRead, terminal: bool) -> Result<zeroize::Zeroizing
     }
     anyhow::ensure!(value.len() <= MAX_VALUE as usize, "Secret value exceeds 8192 bytes (contents hidden)");
     Ok(value)
+}
+
+/// Clear queued paste data while Echo still owns the hidden terminal settings.
+fn clear_terminal_tail(terminal: BorrowedFd<'_>) -> Result<()> {
+    const ADVICE: &str = "Pipe multi-line values from a file instead of pasting them into the terminal";
+    // SAFETY: terminal borrows a live fd; tcgetattr initializes the termios before it is used,
+    // and ioctl receives a valid pointer to an integer. Every changed mode is restored below.
+    unsafe {
+        let fd = terminal.as_raw_fd();
+        let mut previous = std::mem::zeroed::<libc::termios>();
+        if libc::tcgetattr(fd, &mut previous) != 0 {
+            libc::tcflush(fd, libc::TCIFLUSH);
+            anyhow::bail!("Could not inspect terminal input. {ADVICE}");
+        }
+        let mut immediate = previous;
+        // Expose an unterminated pasted line to FIONREAD as well as complete lines.
+        immediate.c_lflag &= !libc::ICANON;
+        let changed = libc::tcsetattr(fd, libc::TCSANOW, &immediate);
+        let mut pending: libc::c_int = 0;
+        let inspected = if changed == 0 { libc::ioctl(fd, libc::FIONREAD, &mut pending) } else { -1 };
+        // Flush even on an inspection error, and before echo can be restored on any return path.
+        let flushed = libc::tcflush(fd, libc::TCIFLUSH);
+        let restored = libc::tcsetattr(fd, libc::TCSANOW, &previous);
+        anyhow::ensure!(
+            changed == 0 && inspected == 0 && flushed == 0 && restored == 0,
+            "Could not clear terminal input. {ADVICE}"
+        );
+        anyhow::ensure!(pending == 0, "Multi-line terminal input refused. {ADVICE}");
+    }
+    Ok(())
 }
 
 #[cfg(test)]

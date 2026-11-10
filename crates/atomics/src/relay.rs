@@ -1649,10 +1649,30 @@ impl Service {
 
     /// Serialize Settings changes with grant preparation; failed edits keep existing grants.
     pub fn edit(&self, label: &str, update: impl FnOnce(&crate::credentials::Store) -> Result<()>) -> Result<()> {
+        self.edit_with_revocation(label, false, update)
+    }
+
+    /// A removal may reach the keychain before its acknowledgement fails; revoke on either result.
+    pub fn edit_removal(
+        &self,
+        label: &str,
+        remove: impl FnOnce(&crate::credentials::Store) -> Result<()>,
+    ) -> Result<()> {
+        self.edit_with_revocation(label, true, remove)
+    }
+
+    fn edit_with_revocation(
+        &self,
+        label: &str,
+        revoke_on_error: bool,
+        update: impl FnOnce(&crate::credentials::Store) -> Result<()>,
+    ) -> Result<()> {
         let _edit = self.edits.lock().unwrap();
-        update(&crate::credentials::Store::new(self.keychain.clone()))?;
-        self.revoke_credential(label);
-        Ok(())
+        let result = update(&crate::credentials::Store::new(self.keychain.clone()));
+        if revoke_on_error || result.is_ok() {
+            self.revoke_credential(label);
+        }
+        result
     }
 
     /// Only status crosses into Settings; keychain I/O happens on its worker.
@@ -2485,5 +2505,38 @@ mod tests {
         assert_eq!(store.secret_values().unwrap()[0].1.as_str(), "original-canary");
         service.edit("secret:KEY", |store| store.remove_secret("KEY")).unwrap();
         assert_eq!(service.live_grants(), 0);
+    }
+    #[test]
+    fn failed_secret_removal_revokes_grants_even_after_the_keychain_changed() {
+        use atomics_core::secrets::Secret;
+        for removed in [false, true] {
+            let dir = crate::test_support::tempdir().unwrap();
+            let keychain = Keychain::in_folder(&dir.path().join("keychain"));
+            let store = crate::credentials::Store::local(keychain.clone());
+            for name in ["KEY", "OTHER_KEY"] {
+                store
+                    .add_secret(
+                        Secret { name: name.into(), host: Some("api.example.com".into()), ..Default::default() },
+                        "canary",
+                    )
+                    .unwrap();
+            }
+            let mut service = Service::transient(dir.path().join("relay"), keychain);
+            service.broker = None;
+            let grant = service.grant_secrets("session", None, None, false, None).unwrap().unwrap();
+            let result = service.edit_removal("secret:KEY", |store| {
+                if removed {
+                    store.remove_secret("KEY")?;
+                }
+                anyhow::bail!("keychain removal acknowledgement failed")
+            });
+            assert!(result.is_err());
+            assert_eq!(service.live_grants(), 1);
+            let relay = service.relay.lock().unwrap();
+            let grants = relay.as_ref().unwrap().inner.grants.lock().unwrap();
+            assert!(!grants.contains_key(&grant.secrets["KEY"]));
+            assert!(grants.contains_key(&grant.secrets["OTHER_KEY"]));
+            assert_eq!(store.secrets().unwrap().iter().any(|s| s.name == "KEY"), !removed);
+        }
     }
 }

@@ -352,7 +352,15 @@ fn credential_tool(
     tool: atomics_core::ops::SettingsTool,
 ) -> Result<serde_json::Value, String> {
     let label = credential_label(&tool)?;
-    relay.edit(&label, |store| credential_action(store, tool)).map_err(|error| error.to_string())?;
+    let result = if matches!(
+        &tool,
+        atomics_core::ops::SettingsTool::RemoveSecret { .. } | atomics_core::ops::SettingsTool::RemoveCredential { .. }
+    ) {
+        relay.edit_removal(&label, |store| credential_action(store, tool))
+    } else {
+        relay.edit(&label, |store| credential_action(store, tool))
+    };
+    result.map_err(|error| error.to_string())?;
     credential_status(relay, &crate::credentials::Store::new(relay.keychain().clone()))
 }
 
@@ -692,5 +700,25 @@ mod tests {
                 );
             },
         );
+    }
+    #[test]
+    fn secret_removal_error_in_settings_still_revokes_the_live_grant() {
+        let (dir, keychain, store) = crate::credentials::tests::machine(false);
+        store
+            .add_secret(
+                atomics_core::secrets::Secret {
+                    name: "KEY".into(),
+                    host: Some("api.example.com".into()),
+                    ..Default::default()
+                },
+                "canary",
+            )
+            .unwrap();
+        let relay = crate::relay::Service::transient(dir.path().join("relay"), keychain);
+        let _grant = relay.grant_secrets("session", None, None, false, None).unwrap().unwrap();
+        // The previous removal reached storage, but its acknowledgement was lost.
+        store.remove_secret("KEY").unwrap();
+        assert!(credential_tool(&relay, atomics_core::ops::SettingsTool::RemoveSecret { name: "KEY".into() }).is_err());
+        assert_eq!(relay.live_grants(), 0);
     }
 }

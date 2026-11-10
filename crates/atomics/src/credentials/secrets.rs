@@ -180,7 +180,7 @@ mod tests {
                 }
             }
             let grant_for_removal = grant.secrets["EXAMPLE_KEY"].clone();
-            relay.edit("secret:EXAMPLE_KEY", |store| store.remove_secret("EXAMPLE_KEY")).unwrap();
+            relay.edit_removal("secret:EXAMPLE_KEY", |store| store.remove_secret("EXAMPLE_KEY")).unwrap();
             assert_eq!(relay.live_grants(), 0);
             assert!(!grant_for_removal.is_empty());
             relay.revoke(&grant);
