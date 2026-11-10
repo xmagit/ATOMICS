@@ -24,6 +24,9 @@ fn valid_value(spec: &Secret, value: &str) -> bool {
 
 impl Store {
     pub fn secrets(&self) -> Result<Vec<Secret>> {
+        if let Some(client) = &self.broker {
+            return client.list();
+        }
         let catalog = self.load()?;
         if catalog.secrets.iter().any(|(name, entry)| !entry.valid(name)) {
             bail!("Secret metadata is malformed (contents hidden); repair it privately in the credential store");
@@ -38,9 +41,18 @@ impl Store {
                 .to_string_lossy()
                 .into_owned();
         }
+        self.add_secret_rule(spec, value)
+    }
+
+    /// The broker accepts already canonicalized metadata from its administrator without opening
+    /// agent-owned project directories. Secret::validate still checks every rule field.
+    pub(crate) fn add_secret_rule(&self, spec: Secret, value: &str) -> Result<()> {
         spec.validate().map_err(anyhow::Error::msg)?;
         if !valid_value(&spec, value) {
             bail!("Secret value is empty, too large or contains unsupported characters (value hidden)");
+        }
+        if let Some(client) = &self.broker {
+            return client.set(spec, value);
         }
         let _lock = self.keychain.catalog_lock()?;
         let mut catalog = self.load()?;
@@ -52,6 +64,9 @@ impl Store {
     }
 
     pub fn remove_secret(&self, name: &str) -> Result<()> {
+        if let Some(client) = &self.broker {
+            return client.remove(name);
+        }
         if !atomics_core::secrets::valid_name(name) {
             bail!("Invalid secret name");
         }
@@ -65,6 +80,9 @@ impl Store {
 
     /// Only session preparation and the authenticated native clipboard worker read values.
     pub(crate) fn secret_values(&self) -> Result<Vec<(Secret, Zeroizing<String>)>> {
+        if self.broker.is_some() {
+            bail!("Broker secrets cannot be read or copied; only exposed session values may leave it");
+        }
         let catalog = self.load()?;
         if catalog.secrets.iter().any(|(name, entry)| !entry.valid(name)) {
             bail!("Secret catalog is malformed (contents hidden)");

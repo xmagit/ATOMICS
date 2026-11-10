@@ -21,6 +21,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 
 pub mod azure;
+pub mod broker;
 
 fn log_path(log: &std::path::Path) -> PathBuf {
     log.with_file_name("credential-usage.json")
@@ -66,6 +67,7 @@ pub struct Credential {
 enum Source {
     Static(String),
     Azure(Arc<azure::Azure>),
+    Broker(broker::Client),
 }
 
 impl std::fmt::Debug for Credential {
@@ -115,6 +117,27 @@ impl Credential {
         authorization: Authorization,
     ) -> Self {
         Self { label, source: Source::Static(token), authorization, prefix: "atomics-", hosts, rules }
+    }
+    fn secret(spec: &atomics_core::secrets::Secret, value: String) -> Self {
+        let host = spec.host.as_deref().expect("relayed secret");
+        let methods = if spec.methods.is_empty() { vec!["*".into()] } else { spec.methods.clone() };
+        let prefix = spec.path_prefix.as_deref().unwrap_or("/");
+        let rules = methods
+            .iter()
+            .flat_map(|method| {
+                [
+                    Rule::new(host, method, prefix),
+                    Rule::new(host, method, &format!("{}/*", prefix.trim_end_matches('/'))),
+                ]
+            })
+            .collect();
+        let auth = match &spec.auth {
+            atomics_core::secrets::Auth::Bearer => Authorization::Bearer,
+            atomics_core::secrets::Auth::Header(name) => Authorization::Header(name.clone()),
+            atomics_core::secrets::Auth::Basic(user) => Authorization::Basic(user.clone()),
+            atomics_core::secrets::Auth::Query(name) => Authorization::Query(name.clone()),
+        };
+        Self::stored(format!("secret:{}", spec.name), value, vec![host.into()], rules, auth)
     }
 }
 
@@ -192,33 +215,7 @@ impl Relay {
     pub fn start(port: u16, log: PathBuf, upstreams: HashMap<String, String>) -> io::Result<Self> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
         let port = listener.local_addr()?.port();
-        let config = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .max_redirects(0)
-            // The client's own headers go upstream as they are, and ureq adds none of its own.
-            .user_agent(ureq::config::AutoHeaderValue::None)
-            .accept(ureq::config::AutoHeaderValue::None)
-            .accept_encoding(ureq::config::AutoHeaderValue::None)
-            .timeout_connect(Some(Duration::from_secs(30)))
-            // A long non-streaming answer can take minutes before its first byte; a stream has no end in sight.
-            .timeout_recv_response(Some(Duration::from_secs(15 * 60)));
-        // Local fakes are never reached through this machine's proxy.
-        let config = if upstreams.is_empty() { config } else { config.proxy(None) };
-        let inner = Arc::new(Inner {
-            grants: Mutex::default(),
-            approvals: Mutex::default(),
-            log: Log { path: log.clone(), write: Mutex::new(()) },
-            agent: config.build().into(),
-            upstreams,
-            stopped: AtomicBool::new(false),
-            connections: AtomicUsize::new(0),
-            usage: Mutex::new(
-                std::fs::read(log_path(&log))
-                    .ok()
-                    .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-                    .unwrap_or_default(),
-            ),
-        });
+        let inner = Inner::new(log, upstreams, false);
         let accepting = inner.clone();
         let accept =
             std::thread::Builder::new().name("atomics-relay".into()).spawn(move || accepting.accept(listener))?;
@@ -241,6 +238,9 @@ impl Relay {
     /// Stops accepting `placeholder`. A request already under way finishes.
     pub fn revoke(&self, placeholder: &str) {
         if let Some(grant) = self.inner.grants.lock().unwrap().remove(placeholder) {
+            if let Source::Broker(client) = &grant.credential.source {
+                let _ = client.revoke(placeholder);
+            }
             grant.cancel_writes();
             self.inner.approvals.lock().unwrap().retain(|approval| {
                 if approval.session != grant.session {
@@ -256,7 +256,10 @@ impl Relay {
 impl Drop for Relay {
     fn drop(&mut self) {
         self.inner.stopped.store(true, Ordering::Release);
-        for (_, grant) in self.inner.grants.lock().unwrap().drain() {
+        for (placeholder, grant) in self.inner.grants.lock().unwrap().drain() {
+            if let Source::Broker(client) = &grant.credential.source {
+                let _ = client.revoke(&placeholder);
+            }
             grant.cancel_writes();
         }
         // Wakes the accept loop, which then sees it has stopped.
@@ -277,6 +280,36 @@ impl Drop for Slot {
 }
 
 impl Inner {
+    fn new(log: PathBuf, upstreams: HashMap<String, String>, direct: bool) -> Arc<Self> {
+        let config = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .max_redirects(0)
+            // The client's own headers go upstream as they are, and ureq adds none of its own.
+            .user_agent(ureq::config::AutoHeaderValue::None)
+            .accept(ureq::config::AutoHeaderValue::None)
+            .accept_encoding(ureq::config::AutoHeaderValue::None)
+            .timeout_connect(Some(Duration::from_secs(30)))
+            // A long non-streaming answer can take minutes before its first byte; a stream has no end in sight.
+            .timeout_recv_response(Some(Duration::from_secs(15 * 60)));
+        // Local fakes are never reached through this machine's proxy.
+        let config = if direct || !upstreams.is_empty() { config.proxy(None) } else { config };
+        Arc::new(Self {
+            grants: Mutex::default(),
+            approvals: Mutex::default(),
+            log: Log { path: log.clone(), write: Mutex::new(()) },
+            agent: config.build().into(),
+            upstreams,
+            stopped: AtomicBool::new(false),
+            connections: AtomicUsize::new(0),
+            usage: Mutex::new(
+                std::fs::read(log_path(&log))
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                    .unwrap_or_default(),
+            ),
+        })
+    }
+
     fn accept(self: Arc<Self>, listener: TcpListener) {
         for stream in listener.incoming() {
             if self.stopped.load(Ordering::Acquire) {
@@ -349,7 +382,7 @@ impl Inner {
                 if !credential.hosts.iter().any(|allowed| allowed.eq_ignore_ascii_case(&route.host)) {
                     Some((403, "this credential may not reach that host"))
                 } else if !match &credential.source {
-                    Source::Static(_) => {
+                    Source::Static(_) | Source::Broker(_) => {
                         credential.rules.iter().any(|rule| rule.allows(&route.host, &head.method, &route.path))
                     }
                     Source::Azure(_) => matches!(head.method.as_str(), "GET" | "POST" | "PUT" | "PATCH" | "DELETE"),
@@ -486,7 +519,14 @@ impl Inner {
         body: Vec<u8>,
         writer: &mut impl Write,
     ) -> (u16, bool) {
+        if let Source::Broker(client) = &credential.source {
+            return client.forward(head, body, writer).unwrap_or_else(|_| {
+                let _ = refuse(writer, 502, "secret broker unavailable");
+                (502, false)
+            });
+        }
         let secret = match &credential.source {
+            Source::Broker(_) => unreachable!(),
             Source::Static(secret) => secret.clone(),
             Source::Azure(azure) => match azure.token(&route.host) {
                 Ok(secret) => secret,
@@ -1017,8 +1057,7 @@ impl Keychain {
     /// A folder of private files instead of an OS credential store: each item a file of mode 0600 in
     /// a folder of mode 0700, readable by this user's processes alone. For a machine that is one
     /// trust domain and has no credential store, as the VM's tools keep their sign-ins too.
-    #[cfg(test)]
-    pub fn in_folder(dir: &std::path::Path) -> Self {
+    pub(crate) fn in_folder(dir: &std::path::Path) -> Self {
         Self { program: String::new(), mac: false, files: Some(dir.to_path_buf()) }
     }
 
@@ -1314,6 +1353,7 @@ pub struct Service {
     /// Where the port is kept for the next start; None for a relay that lives for one command.
     port_file: Option<PathBuf>,
     azure: Mutex<Option<Arc<azure::Azure>>>,
+    broker: Option<broker::Client>,
 }
 
 impl std::fmt::Debug for Service {
@@ -1333,6 +1373,7 @@ impl Service {
             upstreams: HashMap::new(),
             port_file,
             azure: Mutex::default(),
+            broker: broker::Client::configured(),
         }
     }
 
@@ -1417,7 +1458,19 @@ impl Service {
         granted: Option<Granted>,
     ) -> Result<Option<Granted>> {
         let _edit = self.edits.lock().unwrap();
-        let secrets = crate::credentials::Store::new(self.keychain.clone()).secret_values()?;
+        let secrets = if let Some(client) = &self.broker {
+            client
+                .list()?
+                .into_iter()
+                .filter(|spec| spec.scope.includes(workspace, project))
+                .map(|spec| {
+                    let value = if spec.host.is_none() { client.expose(&spec.name, session)? } else { String::new() };
+                    Ok((spec, zeroize::Zeroizing::new(value)))
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            crate::credentials::Store::new(self.keychain.clone()).secret_values()?
+        };
         let mut granted = granted;
         for (spec, value) in secrets.into_iter().filter(|(s, _)| s.scope.includes(workspace, project)) {
             let grant = granted.get_or_insert_with(Granted::default);
@@ -1428,31 +1481,17 @@ impl Service {
                 }
                 let relay = relay.as_ref().unwrap();
                 grant.port = relay.port();
-                let methods = if spec.methods.is_empty() { vec!["*".to_string()] } else { spec.methods.clone() };
-                let prefix = spec.path_prefix.as_deref().unwrap_or("/");
-                let rules = methods
-                    .iter()
-                    .flat_map(|method| {
-                        [
-                            Rule::new(host, method, prefix),
-                            Rule::new(host, method, &format!("{}/*", prefix.trim_end_matches('/'))),
-                        ]
-                    })
-                    .collect();
-                let auth = match spec.auth {
-                    atomics_core::secrets::Auth::Bearer => Authorization::Bearer,
-                    atomics_core::secrets::Auth::Header(name) => Authorization::Header(name),
-                    atomics_core::secrets::Auth::Basic(user) => Authorization::Basic(user),
-                    atomics_core::secrets::Auth::Query(name) => Authorization::Query(name),
-                };
-                let credential = Credential::stored(
-                    format!("secret:{}", spec.name),
-                    value.to_string(),
-                    vec![host.clone()],
-                    rules,
-                    auth,
-                );
+                let mut credential = Credential::secret(&spec, value.to_string());
+                if let Some(client) = &self.broker {
+                    credential.source = Source::Broker(client.clone());
+                }
                 let placeholder = relay.grant(session, Arc::new(credential));
+                if let Some(client) = &self.broker
+                    && let Err(error) = client.grant(&spec.name, session, &placeholder)
+                {
+                    relay.revoke(&placeholder);
+                    return Err(error);
+                }
                 grant.secret_placeholders.push(placeholder.clone());
                 grant.secrets.insert(spec.name.clone(), placeholder);
                 let address = if sandbox { atomics_core::isolation::RELAY_HOST } else { "127.0.0.1" };

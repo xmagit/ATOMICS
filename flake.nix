@@ -22,6 +22,9 @@
       vmWithEgress = vm.extendModules {
         modules = [ { atomics.vm = { hardened = true; egress.enable = true; }; } ];
       };
+      vmWithBroker = vm.extendModules {
+        modules = [ { atomics.vm = { hardened = true; host.enable = true; egress.enable = true; secretBroker.enable = true; }; } ];
+      };
     in
     {
       packages = forAllSystems (system:
@@ -71,6 +74,12 @@
             mkdir $out
           '';
           atomics = self.packages.${system}.atomics;
+          atomics-secret-egress = nixpkgs.legacyPackages.${system}.runCommand "atomics-secret-egress-test" {
+            nativeBuildInputs = [ nixpkgs.legacyPackages.${system}.python3 ];
+          } ''
+            python3 ${./nix/tests/secret-egress-test.py} ${./nix/vm/secret-egress.py}
+            mkdir $out
+          '';
           atomics-onboard = onboardTest { };
           atomics-onboard-dotnet-azure = onboardTest {
             name = "atomics-onboard-dotnet-azure-test";
@@ -92,6 +101,12 @@
           atomics-vm-with-host = vmWithHost.config.system.build.toplevel;
           # Builds the enforcing ruleset too, including NixOS's nft --check validation.
           atomics-vm-egress = vmWithEgress.config.system.build.toplevel;
+          atomics-vm-secret-broker-system = vmWithBroker.config.system.build.toplevel;
+          atomics-vm-secret-broker = import ./nix/tests/secret-broker.nix {
+            pkgs = import nixpkgs { inherit system; };
+            vm = vmWithBroker.config;
+            package = self.packages.${system}.atomics;
+          };
           atomics-vm-egress-upgrade = import ./nix/tests/vm-egress-upgrade.nix {
             pkgs = import nixpkgs { inherit system; };
             vm = (vmWithEgress.extendModules {

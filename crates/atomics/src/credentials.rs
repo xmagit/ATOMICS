@@ -70,6 +70,7 @@ pub struct AppGrant {
 #[derive(Clone)]
 pub struct Store {
     keychain: Keychain,
+    broker: Option<crate::relay::broker::Client>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -127,7 +128,11 @@ impl Snapshot {
 
 impl Store {
     pub fn new(keychain: Keychain) -> Self {
-        Self { keychain }
+        Self { keychain, broker: crate::relay::broker::Client::configured() }
+    }
+
+    pub(crate) fn local(keychain: Keychain) -> Self {
+        Self { keychain, broker: None }
     }
 
     fn load(&self) -> Result<Catalog> {

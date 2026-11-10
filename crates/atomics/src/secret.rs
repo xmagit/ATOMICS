@@ -83,12 +83,15 @@ pub fn run(command: Command) -> Result<()> {
         Command::List => {
             for spec in store.secrets()? {
                 println!(
-                    "{}\t{}\t{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}\t{}\tmethods={}\tpath={}\tauth={}",
                     spec.name,
                     spec.kind(),
                     spec.scope.label(),
                     spec.host.as_deref().unwrap_or("—"),
-                    relay.secret_last_use(&spec.name).unwrap_or_else(|| "never".into())
+                    relay.secret_last_use(&spec.name).unwrap_or_else(|| "never".into()),
+                    if spec.methods.is_empty() { "*".into() } else { spec.methods.join(",") },
+                    spec.path_prefix.as_deref().unwrap_or("/"),
+                    serde_json::to_string(&spec.auth)?
                 );
             }
         }
