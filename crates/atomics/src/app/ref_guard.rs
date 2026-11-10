@@ -2,6 +2,30 @@ use super::*;
 use crate::ref_guard::Exempt;
 
 impl State {
+    pub(super) fn integration_claim_alert(&mut self, plan: &str, task: &str, worktree: &Path, details: String) {
+        let mut owners: Vec<_> = self
+            .plans
+            .iter()
+            .flat_map(|plan| {
+                plan.tasks
+                    .iter()
+                    .filter(|task| {
+                        task.worktree.as_ref().is_some_and(|path| {
+                            path == worktree || path.canonicalize().ok().as_deref() == Some(worktree)
+                        })
+                    })
+                    .map(move |task| (plan.id.clone(), task.id.clone()))
+            })
+            .collect();
+        let attempted = (plan.to_string(), task.to_string());
+        if !owners.contains(&attempted) {
+            owners.push(attempted);
+        }
+        for (plan, task) in owners {
+            self.task_ref_alert_at(&plan, &task, details.clone(), None);
+        }
+    }
+
     /// Branches whose moves are legitimate work: those of live agents, unfinished tasks and
     /// worktrees being made. A done task's branch is finished, and moving it is restored. Refs ATOMICS
     /// writes itself, such as integration branches, go through [`crate::ref_guard::host_write`]
@@ -286,6 +310,102 @@ mod tests {
                 }
                 assert_eq!(std::fs::read_to_string(dir.path().join("original-integration/feature")).unwrap(), "second");
                 assert!(!dir.path().join("new-integration").exists());
+            },
+        );
+    }
+
+    #[test]
+    fn a_legacy_plan_adopts_its_existing_integration_checkout_once() {
+        with_app("app::ref_guard::tests::a_legacy_plan_adopts_its_existing_integration_checkout_once", |app, _| {
+            let (dir, repo) = repository();
+            let task = dir.path().join("task");
+            let original = dir.path().join("original-integration");
+            git::add_worktree(&repo, &task, "task", "main").unwrap();
+            git::add_worktree(&repo, &original, "integration", "main").unwrap();
+            app.runtime.config.worktree_path = "{repo_parent}/changed-integration".into();
+            app.runtime.plans = vec![Plan {
+                id: "p".into(),
+                project: Some(repo.clone()),
+                integration: Some("integration".into()),
+                tasks: vec![Task {
+                    id: "t".into(),
+                    branch: Some("task".into()),
+                    worktree: Some(task.clone()),
+                    status: TaskStatus::Review,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }];
+            assert!(app.runtime.plans[0].integration_worktrees.is_empty());
+            for content in ["first", "second"] {
+                std::fs::write(task.join("feature"), content).unwrap();
+                app.runtime.integrate(0, "t", None);
+                let done = app
+                    .runtime
+                    .integrate_rx
+                    .recv_timeout(crate::test_support::scaled_timeout(std::time::Duration::from_secs(10)))
+                    .unwrap();
+                assert_eq!(done.result.as_ref().unwrap().worktree, original);
+                app.runtime.finish_integration(done);
+                app.runtime.plans[0] = Plan::load(&paths::atomics_home().join("plans/p.json")).unwrap();
+                let records = &app.runtime.plans[0].integration_worktrees;
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].path, original);
+                app.runtime.config.worktree_path = "{repo_parent}/changed-again".into();
+            }
+            assert_eq!(std::fs::read_to_string(original.join("feature")).unwrap(), "second");
+            assert!(!dir.path().join("changed-integration").exists());
+            assert!(!dir.path().join("changed-again").exists());
+        });
+    }
+
+    #[test]
+    fn a_symlinked_pinned_head_alerts_its_owner_before_git_can_reject_it() {
+        with_app(
+            "app::ref_guard::tests::a_symlinked_pinned_head_alerts_its_owner_before_git_can_reject_it",
+            |app, _| {
+                let (dir, repo) = repository();
+                let task = dir.path().join("task");
+                let sandbox = dir.path().join("sandbox");
+                git::add_worktree(&repo, &task, "task", "main").unwrap();
+                git::add_worktree(&repo, &sandbox, "sandbox", "main").unwrap();
+                let pins_dir = paths::atomics_home().join("git-pins");
+                crate::sandbox::pin_git(&pins_dir, "atomics-sandbox", &sandbox).unwrap();
+                crate::sandbox_ownership::record_pins(&paths::atomics_home(), "atomics-sandbox", &pins_dir).unwrap();
+                let pins = git::pinned(&sandbox).unwrap();
+                let head = pins.git_dir.as_ref().unwrap().join("HEAD");
+                std::fs::remove_file(&head).unwrap();
+                std::os::unix::fs::symlink("/dev/zero", &head).unwrap();
+                app.runtime.plans = vec![Plan {
+                    id: "p".into(),
+                    project: Some(repo),
+                    integration: Some("integration".into()),
+                    tasks: vec![
+                        Task {
+                            id: "victim".into(),
+                            branch: Some("task".into()),
+                            worktree: Some(task),
+                            status: TaskStatus::Review,
+                            ..Default::default()
+                        },
+                        Task {
+                            id: "owner".into(),
+                            branch: Some("sandbox".into()),
+                            worktree: Some(sandbox.clone()),
+                            status: TaskStatus::Running,
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }];
+                app.runtime.integrate(0, "victim", None);
+                assert!(app.runtime.integrating.is_empty());
+                for task in &app.runtime.plans[0].tasks {
+                    assert!(task.ref_alert.as_ref().unwrap().contains("unsafe admin metadata"));
+                }
+                std::fs::remove_file(&head).unwrap();
+                std::fs::write(head, "ref: refs/heads/sandbox\n").unwrap();
+                git::unpin(&sandbox);
             },
         );
     }
