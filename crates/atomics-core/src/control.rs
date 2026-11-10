@@ -91,7 +91,10 @@ pub enum ControlRequest {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         interactive: bool,
     },
+    /// Starts the chief if it is not running, without opening a window.
+    StartChief,
     /// Types a message and submits it, or with `raw` writes the text as-is (keys).
+    /// Addressing `chief` without `raw` starts it with this first prompt when needed.
     Send {
         session: String,
         text: String,
@@ -183,6 +186,12 @@ pub enum ControlRequest {
         after: Option<u64>,
         #[serde(default)]
         timeout_secs: Option<u64>,
+        /// Compact events and only sessions with status changes. MCP enables this; ctl keeps its legacy default.
+        #[serde(default)]
+        compact: bool,
+        /// Include every session even in a compact answer.
+        #[serde(default)]
+        full_sessions: bool,
     },
     /// What a session produced: status, last prompt, final message, screen tail, diff size.
     Result {
@@ -350,6 +359,34 @@ pub enum ControlRequest {
     AgentTicketComment {
         pane: Option<String>,
         text: String,
+    },
+    /// Propose a fact to the host-resolved task's own plan. Never directly shared with peers.
+    Note {
+        pane: Option<String>,
+        text: String,
+    },
+    /// Read only the pinned facts of the host-resolved task's plan.
+    Notes {
+        pane: Option<String>,
+    },
+    /// Chief-only proposal review and curation; user actions also use Plan::curate_note.
+    PlanNotebook {
+        pane: Option<String>,
+        #[serde(default)]
+        plan: Option<String>,
+        #[serde(default)]
+        id: Option<u64>,
+        #[serde(default)]
+        pinned: Option<bool>,
+        #[serde(default)]
+        delete: bool,
+    },
+    /// User curation from the board or authenticated protocol. Not exposed to task MCP clients.
+    CurateNote {
+        plan: String,
+        id: u64,
+        pinned: Option<bool>,
+        delete: bool,
     },
     /// A sandboxed agent asks for an MCP server it needs: a connected one is loaded into its
     /// sandbox, any other gets a "Connect" banner on its tile (sent by `atomics mcp --agent`).

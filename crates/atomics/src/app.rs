@@ -97,7 +97,7 @@ const WORKTREE_REFRESH: Duration = Duration::from_secs(30);
 const BACKGROUND_REFRESH: Duration = Duration::from_secs(5);
 const FALLBACK_REFRESH: Duration = Duration::from_secs(30);
 /// The answer to a request only a desktop window can serve, in the headless host.
-const NO_WINDOW: &str = "no window: this is the headless host (atomics host); start the desktop for window commands";
+const NO_WINDOW: &str = "no local window: this is the headless host (atomics host); window control commands are not forwarded to connected clients; use the client's UI";
 /// Untracked content kept for a diff off screen; the rest is counted, not loaded.
 const OFF_SCREEN_UNTRACKED: u64 = 1024 * 1024;
 
@@ -383,8 +383,8 @@ struct StatusEvent {
     at: u64,
     plan: Option<String>,
     task: Option<String>,
-    /// Set for a `atomics_report` from the agent: (status, summary, task).
-    report: Option<(String, String, Option<String>)>,
+    /// Set for a `atomics_report` from the agent: (status, summary, task, agent).
+    report: Option<(String, String, Option<String>, String)>,
     /// The pending request the event is about, with its id (`approval_json`).
     approval: Option<serde_json::Value>,
     findings: Option<Vec<atomics_core::heartbeat::Finding>>,
@@ -427,8 +427,9 @@ impl StatusEvent {
         let mut value = json!({ "seq": self.seq, "session": self.session, "title": self.title, "status": self.kind(), "at": self.at });
         value["plan"] = json!(self.plan);
         value["task"] = json!(self.task);
-        if let Some((status, summary, task)) = &self.report {
-            value["report"] = json!({ "status": status, "summary": summary, "task": task });
+        if let Some((status, summary, task, agent)) = &self.report {
+            value["report"] = json!({ "status": status, "summary": summary, "task": task,
+                "provenance": plan::agent_provenance("report", task.as_deref(), agent, self.at) });
         }
         if let Some(findings) = &self.findings {
             value["findings"] = json!(findings);
@@ -454,6 +455,8 @@ struct Waiter {
     sessions: Vec<String>,
     statuses: Vec<String>,
     after: u64,
+    compact: bool,
+    full_sessions: bool,
     deadline: Instant,
     reply: Sender<ControlOutcome>,
 }

@@ -199,6 +199,7 @@ pub(super) const CHIEF_ALLOWED_TOOLS: &[&str] = &[
     "mcp__atomics__atomics_diff",
     "mcp__atomics__atomics_exec",
     "mcp__atomics__atomics_plan_get",
+    "mcp__atomics__atomics_plan_notebook",
     "mcp__atomics__atomics_plan_close",
     "mcp__atomics__atomics_plan_set",
     "mcp__atomics__atomics_plan_update",

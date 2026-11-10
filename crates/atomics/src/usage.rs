@@ -261,7 +261,7 @@ mod tests {
         changed["payload"]["rate_limits"]["primary"]["used_percent"] = json!(25);
         std::fs::write(path, changed.to_string()).unwrap();
         let Report::Codex(usage) = rx.recv_timeout(Duration::from_secs(2)).unwrap() else { panic!("codex report") };
-        assert_eq!(usage.session.unwrap().remaining, 75.0);
+        assert_eq!(usage.session.unwrap().left_percent, 75.0);
         stop.send(()).unwrap();
         worker.join().unwrap();
     }
@@ -278,9 +278,9 @@ mod tests {
         let [Report::Codex(codex_usage), Report::Claude(claude_usage)] = reports.as_slice() else {
             panic!("a Codex report, then a Claude report");
         };
-        assert_eq!((codex_usage.weekly.as_ref().unwrap().remaining, codex_usage.observed_at), (88.0, 1_793_359_940));
-        assert_eq!(claude_usage.session.as_ref().unwrap().remaining, 60.0);
-        assert_eq!(claude_usage.weekly.as_ref().unwrap().remaining, 90.0);
+        assert_eq!((codex_usage.weekly.as_ref().unwrap().left_percent, codex_usage.observed_at), (88.0, 1_793_359_940));
+        assert_eq!(claude_usage.session.as_ref().unwrap().left_percent, 60.0);
+        assert_eq!(claude_usage.weekly.as_ref().unwrap().left_percent, 90.0);
         assert_eq!(claude_usage.observed_at, 1_793_360_900, "the status line file's time, not the read's");
 
         // The agent writes all of it: a future time would hide every real report after it.
@@ -324,7 +324,7 @@ mod tests {
         assert_eq!(newest_rollout(dir.path()).unwrap(), newest);
         assert!(read_codex(dir.path()).is_none(), "must not read an old event outside the tail");
         std::fs::write(&newest, format!("{}\n{event}\n{{\"partial\":", "x".repeat(TAIL_BYTES as usize))).unwrap();
-        assert_eq!(read_codex(dir.path()).unwrap().session.unwrap().remaining, 85.0);
+        assert_eq!(read_codex(dir.path()).unwrap().session.unwrap().left_percent, 85.0);
         assert!(read_codex(&dir.path().join("missing")).is_none());
     }
 
@@ -341,7 +341,7 @@ mod tests {
         assert_eq!(tail.len(), TAIL_BYTES as usize);
         let path = day.join("rollout-boundary.jsonl");
         std::fs::write(&path, format!("ignored prefix\n{tail}")).unwrap();
-        assert_eq!(read_codex(dir.path()).unwrap().weekly.unwrap().remaining, 90.0);
+        assert_eq!(read_codex(dir.path()).unwrap().weekly.unwrap().left_percent, 90.0);
         std::fs::write(&path, format!("ignored prefix{tail}")).unwrap();
         assert!(read_codex(dir.path()).is_none(), "a fragment at the boundary is not an event");
     }

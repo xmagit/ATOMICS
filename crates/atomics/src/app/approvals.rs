@@ -507,7 +507,8 @@ impl State {
             session.allowed.push(pending.request);
         }
         session.status = if session.approvals.is_empty() { AgentStatus::Working } else { AgentStatus::NeedsInput };
-        if azure && !session.approvals.is_empty() {
+        // Waiters must hear about the next request even when the status stays "needs you".
+        if !session.approvals.is_empty() {
             self.last_status.remove(&session.id);
         }
         self.record_resolution(id, disposition(decision));
@@ -1901,6 +1902,8 @@ mod tests {
                 let (wait_tx, wait_rx) = channel();
                 app.runtime.control(
                     ControlRequest::Wait {
+                        compact: false,
+                        full_sessions: false,
                         sessions: vec!["worker-one".into()],
                         statuses: vec!["needs you".into()],
                         after: Some(app.runtime.event_seq),

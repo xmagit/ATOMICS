@@ -528,6 +528,27 @@ fn agents(ui: &mut egui::Ui, client: &mut Client, enabled: bool, info: &Manageme
         }
     }
     note(ui, &p, "Agents are the [[agents]] entries in the config: see Advanced.");
+    subheading(ui, &p, "Chief's task agent preference");
+    let values = &info.config["values"];
+    if let Some(prefer) = values["chief.prefer"]["value"].as_array() {
+        let names: Vec<_> = prefer.iter().filter_map(|name| name.as_str()).collect();
+        ui.label(if names.is_empty() { "No preference; choose by task fit".into() } else { names.join(", then ") });
+    }
+    let minimums: Vec<_> = values
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(key, entry)| {
+            let provider = key.strip_prefix("chief.min_left_percent.")?;
+            Some(format!("{provider}: {}% left", entry["value"]))
+        })
+        .collect();
+    note(ui, &p, if minimums.is_empty() { "No quota minimums configured".into() } else { minimums.join(" · ") });
+    note(
+        ui,
+        &p,
+        "Minimums apply to session and weekly quota left. Plans below them warn and can still be saved. Change [chief] prefer and min_left_percent in the config: see Advanced.",
+    );
     subheading(ui, &p, "What they need");
     super::setup::programs(ui, client, enabled, &info.setup);
     subheading(ui, &p, "Docker Sandboxes");

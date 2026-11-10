@@ -55,6 +55,8 @@ fn registered_host_mcp_reports_and_scoped_ticket_requests_cross_the_stand_in_gat
         json!({"id":4,"method":"tools/call","params":{"name":"atomics_agent_ticket_get","arguments":{"plan":true}}}),
         json!({"id":5,"method":"tools/call","params":{"name":"atomics_agent_ticket_comment","arguments":{"text":"Task details"}}}),
         json!({"id":8,"method":"tools/call","params":{"name":"atomics_mcp_connect","arguments":{"server":"linear-check","url":"https://mcp.linear.app/mcp"}}}),
+        json!({"id":10,"method":"tools/call","params":{"name":"atomics_note","arguments":{"text":"Portable builds"}}}),
+        json!({"id":11,"method":"tools/call","params":{"name":"atomics_notes","arguments":{}}}),
         json!({"id":6,"method":"tools/call","params":{"name":"atomics_start","arguments":{}}}),
         json!({"id":7,"method":"tools/call","params":{"name":"atomics_agent_ticket_get","arguments":{"pane":"another-session"}}}),
         json!({"id":9,"method":"tools/call","params":{"name":"atomics_mcp_connect","arguments":{"server":"linear-check","pane":"another-session"}}}),
@@ -69,6 +71,8 @@ fn registered_host_mcp_reports_and_scoped_ticket_requests_cross_the_stand_in_gat
         json!({"cmd":"agent_ticket_get","pane":"atomics-session-a","plan":true}),
         json!({"cmd":"agent_ticket_comment","pane":"atomics-session-a","text":"Task details"}),
         json!({"cmd":"mcp_connect","pane":"atomics-session-a","server":"linear-check","url":"https://mcp.linear.app/mcp"}),
+        json!({"cmd":"note","pane":"atomics-session-a","text":"Portable builds"}),
+        json!({"cmd":"notes","pane":"atomics-session-a"}),
     ] {
         let mut stream = loop {
             child.check_timeout().unwrap();
@@ -88,12 +92,12 @@ fn registered_host_mcp_reports_and_scoped_ticket_requests_cross_the_stand_in_gat
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     let replies: Vec<Value> =
         String::from_utf8(output.stdout).unwrap().lines().map(|s| serde_json::from_str(s).unwrap()).collect();
-    assert_eq!(replies.len(), 9);
-    assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 4);
-    for reply in &replies[2..6] {
+    assert_eq!(replies.len(), 11);
+    assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 6);
+    for reply in &replies[2..8] {
         assert_eq!(reply["result"]["isError"], false, "{reply}");
     }
-    for reply in &replies[6..] {
+    for reply in &replies[8..] {
         assert_eq!(reply["result"]["isError"], true, "{reply}");
     }
     assert!(

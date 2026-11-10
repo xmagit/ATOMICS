@@ -401,8 +401,14 @@ mod tests {
     fn wait_for_config(app: &mut Desktop<'_>, _ctx: &egui::Context) -> std::sync::mpsc::Receiver<ControlOutcome> {
         let (tx, rx) = std::sync::mpsc::channel();
         let after = app.runtime.event_seq;
-        let wait =
-            ControlRequest::Wait { sessions: vec![], statuses: vec![], after: Some(after), timeout_secs: Some(30) };
+        let wait = ControlRequest::Wait {
+            compact: false,
+            full_sessions: false,
+            sessions: vec![],
+            statuses: vec![],
+            after: Some(after),
+            timeout_secs: Some(30),
+        };
         app.runtime.control(wait, tx);
         assert!(rx.try_recv().is_err(), "nothing happened yet");
         rx
