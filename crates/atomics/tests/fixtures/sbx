@@ -308,6 +308,9 @@ case "$1" in
     if [ "$1" != timeout ]; then HOME=$dir exec "$@"; fi
     tenths=$(($4 * 10))
     shift 4
+    # Model the sandbox's shell, not this host's /etc/profile or logout title hooks.
+    unset BASH_ENV ENV
+    if [ "$1 $2" = 'bash -lc' ]; then shift 2; set -- bash --noprofile --norc -c "$@"; fi
     HOME=$dir "$@" &
     pid=$!
     while kill -0 "$pid" 2>/dev/null; do

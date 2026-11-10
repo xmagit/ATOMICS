@@ -72,15 +72,7 @@ impl State {
             env.insert("PATH".into(), shell_path.clone());
         }
         let scrollback = self.config.terminal.scrollback;
-        match Terminal::spawn(
-            self.wake.clone(),
-            self.theme.terminal_colors(),
-            program,
-            args,
-            root,
-            env,
-            scrollback,
-        ) {
+        match Terminal::spawn(self.wake.clone(), self.theme.terminal_colors(), program, args, root, env, scrollback) {
             Ok(editor) => {
                 // The file is already open; only the theme and the jump to the line are left.
                 editor.type_steps(
@@ -320,26 +312,31 @@ mod tests {
 
     #[test]
     fn a_failed_start_reaches_the_editor_projection_until_the_editor_starts() {
-        with_app("app::editor::tests::a_failed_start_reaches_the_editor_projection_until_the_editor_starts", |app, _| {
-            let dir = crate::test_support::tempdir().unwrap();
-            let root = dir.path();
-            app.runtime.config.editor.command = vec!["atomics-test-no-such-editor".into()];
-            let error = app.runtime.edit_terminal(root, Some("a.rs"), None).unwrap_err();
-            assert_eq!(error, "atomics-test-no-such-editor is not installed on this host ([editor] command)");
-            let infos = app.runtime.editor_infos();
-            assert_eq!(infos.len(), 1);
-            assert!(!infos[0].running);
-            assert_eq!(infos[0].error.as_deref(), Some(error.as_str()));
-            // A path with control characters is refused before anything is typed or started.
-            assert!(app.runtime.edit_terminal(root, Some("a\r.rs"), None).unwrap_err().contains("control characters"));
-            app.runtime.config.editor.command = vec!["/bin/sh".into(), "-c".into(), "sleep 5".into()];
-            app.runtime.config.editor.startup_keys.clear();
-            app.runtime.config.editor.open_keys.clear();
-            app.runtime.edit_terminal(root, None, None).unwrap();
-            let infos = app.runtime.editor_infos();
-            assert_eq!(infos.len(), 1);
-            assert_eq!(infos[0].error, None);
-        });
+        with_app(
+            "app::editor::tests::a_failed_start_reaches_the_editor_projection_until_the_editor_starts",
+            |app, _| {
+                let dir = crate::test_support::tempdir().unwrap();
+                let root = dir.path();
+                app.runtime.config.editor.command = vec!["atomics-test-no-such-editor".into()];
+                let error = app.runtime.edit_terminal(root, Some("a.rs"), None).unwrap_err();
+                assert_eq!(error, "atomics-test-no-such-editor is not installed on this host ([editor] command)");
+                let infos = app.runtime.editor_infos();
+                assert_eq!(infos.len(), 1);
+                assert!(!infos[0].running);
+                assert_eq!(infos[0].error.as_deref(), Some(error.as_str()));
+                // A path with control characters is refused before anything is typed or started.
+                assert!(
+                    app.runtime.edit_terminal(root, Some("a\r.rs"), None).unwrap_err().contains("control characters")
+                );
+                app.runtime.config.editor.command = vec!["/bin/sh".into(), "-c".into(), "sleep 5".into()];
+                app.runtime.config.editor.startup_keys.clear();
+                app.runtime.config.editor.open_keys.clear();
+                app.runtime.edit_terminal(root, None, None).unwrap();
+                let infos = app.runtime.editor_infos();
+                assert_eq!(infos.len(), 1);
+                assert_eq!(infos[0].error, None);
+            },
+        );
     }
 
     #[test]

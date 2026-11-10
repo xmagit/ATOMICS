@@ -1114,7 +1114,7 @@ if [ "$5" = merge-base ]; then
   while [ ! -e "$HOME/release" ]; do
     attempts=$((attempts + 1))
     [ "$attempts" -lt 1000 ] || exit 1
-    /bin/sleep 0.01
+    sleep 0.01
   done
 fi
 exec {} "$@"
