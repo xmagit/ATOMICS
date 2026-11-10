@@ -114,6 +114,17 @@ pub enum Status {
 }
 
 impl Status {
+    pub fn indicator(&self, busy: Option<&str>) -> &'static str {
+        match (self, busy) {
+            (_, Some("stopping")) => "VM stopping",
+            (Status::Starting, _) | (_, Some(_)) => "VM starting",
+            (Status::Running, _) => "VM running",
+            (Status::Stopped, _) => "VM stopped",
+            (Status::NotSetUp, _) => "VM not set up",
+            (Status::Unknown(_), _) => "VM unknown",
+        }
+    }
+
     pub fn label(&self) -> &str {
         match self {
             Status::NotSetUp => "not set up",
@@ -153,11 +164,46 @@ pub fn lima_status(instance: &str) -> Result<Option<String>> {
     if !output.status.success() {
         bail!("limactl list failed: {}", String::from_utf8_lossy(&output.stderr).trim());
     }
-    Ok(parse_list(&String::from_utf8_lossy(&output.stdout)).into_iter().find(|l| l.name == instance).map(|l| l.status))
+    let listed = parse_list(&String::from_utf8_lossy(&output.stdout))?;
+    prune_records(&record_dir(), &listed)?;
+    Ok(listed.into_iter().find(|l| l.name == instance).map(|l| l.status))
 }
 
-fn parse_list(text: &str) -> Vec<Listed> {
-    text.lines().filter_map(|line| serde_json::from_str(line).ok()).collect()
+fn parse_list(text: &str) -> Result<Vec<Listed>> {
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).context("reading limactl list"))
+        .collect()
+}
+
+/// Only a successful, fully parsed list proves that an instance was deleted. Never prune on errors.
+fn prune_records(dir: &Path, listed: &[Listed]) -> Result<()> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type().is_ok_and(|kind| kind.is_file())
+            || entry.path().extension().is_none_or(|ext| ext != "json")
+        {
+            continue;
+        }
+        let record = std::fs::read(entry.path()).ok().and_then(|data| serde_json::from_slice::<Record>(&data).ok());
+        if let Some(record) = record
+            && valid_instance(&record.instance)
+            && entry.file_name() == format!("{}.json", record.instance).as_str()
+            && !listed.iter().any(|instance| instance.name == record.instance)
+        {
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The VM's status for `instance`; `starting` while a start this process made is under way.
@@ -214,6 +260,12 @@ fn forget(instance: &str) {
 /// slot on a shared machine. Inherits stdio; returns whether it succeeded.
 pub fn queued(command: &[String]) -> bool {
     let socket = atomics_core::paths::socket_path();
+    if !socket.exists() && BundleInfo::installed().is_some_and(|(_, info)| info.host.is_some()) {
+        // A VM client has no Mac host or local queue; its VM must start before its host can queue.
+        return command.split_first().is_some_and(|(program, args)| {
+            Command::new(program).args(args).status().is_ok_and(|status| status.success())
+        });
+    }
     crate::governor::run_queued(&socket, atomics_core::governor::SlotClass::Qa, command) == 0
 }
 
@@ -290,7 +342,7 @@ struct Shared {
     busy: Option<&'static str>,
     /// Why the last start or stop failed.
     error: Option<String>,
-    checked: Option<Instant>,
+    viewed: Option<Instant>,
 }
 
 /// How often the UI's view of the VM is refreshed.
@@ -315,12 +367,17 @@ impl Monitor {
         let (_, info) = BundleInfo::installed()?;
         let monitor = Monitor { window, ..Monitor::default() };
         monitor.shared.lock().unwrap().instance = Some(info.instance);
-        let thread = monitor.clone();
+        let shared = Arc::downgrade(&monitor.shared);
+        let window = monitor.window.clone();
         std::thread::Builder::new()
             .name("atomics-vm-monitor".into())
             .spawn(move || {
-                loop {
-                    thread.refresh();
+                while let Some(shared) = shared.upgrade() {
+                    let active = recently_viewed(shared.lock().unwrap().viewed, Instant::now());
+                    if active {
+                        Monitor { shared: shared.clone(), window: window.clone() }.refresh();
+                    }
+                    drop(shared);
                     std::thread::sleep(POLL);
                 }
             })
@@ -338,7 +395,6 @@ impl Monitor {
         let mut shared = self.shared.lock().unwrap();
         let changed = shared.status.as_ref() != Some(&status);
         shared.status = Some(status);
-        shared.checked = Some(Instant::now());
         drop(shared);
         if changed {
             self.window.request_repaint();
@@ -346,7 +402,8 @@ impl Monitor {
     }
 
     pub fn view(&self) -> Option<View> {
-        let shared = self.shared.lock().unwrap();
+        let mut shared = self.shared.lock().unwrap();
+        shared.viewed = Some(Instant::now());
         Some(View {
             instance: shared.instance.clone()?,
             status: shared.status.clone().unwrap_or(Status::Unknown("checking".into())),
@@ -384,6 +441,10 @@ impl Monitor {
     }
 }
 
+fn recently_viewed(viewed: Option<Instant>, now: Instant) -> bool {
+    viewed.is_some_and(|viewed| now.saturating_duration_since(viewed) <= POLL * 2)
+}
+
 /// `atomics vm …` on Linux: the VM path is a Mac's.
 pub const MACOS_ONLY: &str = "The ATOMICS VM is for macOS: on Linux, ATOMICS and its agents run on the machine itself \
      (docs/nixos-vm.md). Build the VM's image here with `nix build .#atomics-vm-image` for a Mac to use.";
@@ -398,11 +459,45 @@ mod tests {
             r#"{"name":"atomics","status":"Stopped","dir":"/home/user/.lima/atomics","cpus":4}"#,
             "\n",
             r#"{"name":"atomics-host","status":"Running","dir":"/home/user/.lima/atomics-host"}"#,
-            "\nnot json\n"
+            "\n"
         );
-        let listed = parse_list(text);
+        let listed = parse_list(text).unwrap();
         assert_eq!(listed.len(), 2);
         assert_eq!((listed[1].name.as_str(), listed[1].status.as_str()), ("atomics-host", "Running"));
+        assert!(parse_list("not json").is_err());
+    }
+
+    #[test]
+    fn deleted_instances_lose_only_their_own_records() {
+        let dir = tempfile::tempdir().unwrap();
+        for instance in ["present", "deleted"] {
+            let record = Record { instance: instance.into(), image: "image".into(), created_at: 1 };
+            std::fs::write(dir.path().join(format!("{instance}.json")), serde_json::to_vec(&record).unwrap()).unwrap();
+        }
+        std::fs::write(dir.path().join("other.json"), "unrelated data").unwrap();
+        std::fs::write(dir.path().join("update.log"), "saved output").unwrap();
+        prune_records(dir.path(), &parse_list(r#"{"name":"present","status":"Stopped"}"#).unwrap()).unwrap();
+        assert!(dir.path().join("present.json").exists());
+        assert!(!dir.path().join("deleted.json").exists());
+        assert!(dir.path().join("other.json").exists());
+        assert!(dir.path().join("update.log").exists());
+    }
+
+    #[test]
+    fn monitoring_sleeps_when_the_view_is_no_longer_drawn() {
+        let now = Instant::now();
+        assert!(!recently_viewed(None, now));
+        assert!(recently_viewed(Some(now), now + POLL));
+        assert!(!recently_viewed(Some(now), now + POLL * 3));
+    }
+
+    #[test]
+    fn each_vm_state_has_its_own_indicator() {
+        let states =
+            [Status::Running, Status::Stopped, Status::Starting, Status::NotSetUp, Status::Unknown("broken".into())];
+        let labels: std::collections::HashSet<_> = states.iter().map(|state| state.indicator(None)).collect();
+        assert_eq!(labels.len(), states.len());
+        assert_eq!(Status::Running.indicator(Some("stopping")), "VM stopping");
     }
 
     #[test]
