@@ -34,6 +34,7 @@ impl Session {
             last_prompt: None,
             last_message: None,
             hooks_active: false,
+            first_run_hint: None,
             activity: heartbeat::Activity::default(),
             approvals: Vec::new(),
             allowed: Vec::new(),
@@ -731,9 +732,11 @@ impl State {
             // A title cannot override even an ambiguous id prefix.
             return matches.next().is_none().then_some(index);
         }
-        self.sessions.iter().position(|s| {
+        let mut titles = self.sessions.iter().enumerate().filter(|(_, s)| {
             self.session_title(s).eq_ignore_ascii_case(reference) || s.title.eq_ignore_ascii_case(reference)
-        })
+        });
+        let (index, _) = titles.next()?;
+        titles.next().is_none().then_some(index)
     }
 
     /// Confirm terminal delivery before answering Codex sends; busy turns can drop input.
@@ -821,6 +824,7 @@ impl State {
         let mut ref_checks = Vec::new();
         let mut menus = Vec::new();
         for (index, session) in self.sessions.iter_mut().enumerate() {
+            session.first_run_hint = None;
             let Some(terminal) = &session.terminal else { continue };
             if !session.approvals.is_empty() {
                 continue;
@@ -854,12 +858,25 @@ impl State {
             // Trust and hook menus can precede hooks, including in bare Codex.
             if session.is_agent()
                 && !terminal.exited()
-                && matches!(session.status, AgentStatus::Starting | AgentStatus::Idle | AgentStatus::Done)
-                && atomics_core::approvals::first_run_prompt(&terminal.screen_text(60))
+                && matches!(
+                    session.status,
+                    AgentStatus::Starting | AgentStatus::Idle | AgentStatus::Done | AgentStatus::NeedsInput
+                )
             {
-                session.status = AgentStatus::NeedsInput;
-                session.activity.observe(session.status);
-                continue;
+                let screen = terminal.screen_text(60);
+                let before_turn = !session.hooks_active
+                    && session.last_prompt.is_none()
+                    && session.last_message.is_none()
+                    && session.activity.working_since.is_none()
+                    && session.status != AgentStatus::Done;
+                if (before_turn || atomics_core::approvals::first_run_menu_visible(&screen))
+                    && atomics_core::approvals::first_run_prompt(&screen)
+                {
+                    session.first_run_hint = atomics_core::approvals::first_run_hint(&screen);
+                    session.status = AgentStatus::NeedsInput;
+                    session.activity.observe(session.status);
+                    continue;
+                }
             }
             let busy_text = self.config.agent(&session.agent).and_then(|a| a.busy_text.clone());
             let busy_text =
@@ -873,10 +890,7 @@ impl State {
             // the turn going on. With no request waiting and no menu left, its busy line says it works.
             if session.sandbox.is_none() && session.status == AgentStatus::NeedsInput {
                 let full = terminal.screen_text(60);
-                if !session.approval_hold
-                    && !atomics_core::approvals::first_run_prompt(&full)
-                    && view_busy(&full, &screen_tail(&full, 12), &busy_text)
-                {
+                if !session.approval_hold && view_busy(&full, &screen_tail(&full, 12), &busy_text) {
                     session.status = AgentStatus::Working;
                     session.activity.observe(session.status);
                 }
@@ -1422,6 +1436,101 @@ mod tests {
     use super::*;
 
     #[test]
+    fn p5_review_finished_agents_ignore_startup_prose() {
+        with_app("app::sessions::tests::p5_review_finished_agents_ignore_startup_prose", |app, _| {
+            use atomics_ui::Backend;
+            let dir = crate::test_support::tempdir().unwrap();
+            for text in [
+                "Next: review hooks in hook.rs",
+                "Added a Login with GitHub button",
+                "Users can sign in with your account",
+                "Review hooks",
+            ] {
+                for status in [AgentStatus::Idle, AgentStatus::Done] {
+                    let terminal = Terminal::spawn(
+                        app.runtime.wake.clone(),
+                        app.runtime.theme.terminal_colors(),
+                        "/bin/sh".into(),
+                        vec!["-c".into(), "printf '%s' \"$1\"; exec sleep 600".into(), "screen".into(), text.into()],
+                        dir.path(),
+                        HashMap::new(),
+                        100,
+                    )
+                    .unwrap();
+                    let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
+                    while !terminal.screen_text(60).contains(text) {
+                        assert!(Instant::now() < deadline);
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    let mut worker = session("worker", AgentKind::Generic, status, dir.path());
+                    worker.hooks_active = true;
+                    worker.last_prompt = Some("Build the page".into());
+                    worker.last_message = Some(text.into());
+                    worker.terminal = Some(terminal);
+                    app.runtime.sessions = vec![worker];
+                    for _ in 0..2 {
+                        app.runtime.busy_checked = Instant::now() - Duration::from_secs(1);
+                        app.runtime.track_busy();
+                        let row = app.runtime.backend().session_row(0).unwrap();
+                        assert_eq!(row.status, status, "{text}");
+                        assert_eq!(row.status_hint, None);
+                        assert!(!row.needs_user());
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn p5_review_rows_use_the_last_sampled_startup_hint() {
+        with_app("app::sessions::tests::p5_review_rows_use_the_last_sampled_startup_hint", |app, _| {
+            use atomics_ui::Backend;
+            app.runtime.config.agents.push(atomics_core::config::AgentConfig {
+                name: "test".into(),
+                command: vec![],
+                kind: AgentKind::Generic,
+                busy_text: Some("esc to interrupt".into()),
+                isolation: None,
+            });
+            let dir = crate::test_support::tempdir().unwrap();
+            let terminal = Terminal::spawn(app.runtime.wake.clone(), app.runtime.theme.terminal_colors(), "/bin/sh".into(),
+                vec!["-c".into(), "printf 'Choose a theme\\n'; read answer; printf '\\033[2J\\033[HWorking (esc to interrupt)\\n› '; exec sleep 600".into()],
+                dir.path(), HashMap::new(), 100).unwrap();
+            let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
+            while !terminal.screen_text(60).contains("Choose a theme") {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let mut worker = session("worker", AgentKind::Generic, AgentStatus::Starting, dir.path());
+            worker.terminal = Some(terminal);
+            app.runtime.sessions = vec![worker];
+            for _ in 0..2 {
+                app.runtime.busy_checked = Instant::now() - Duration::from_secs(1);
+                app.runtime.track_busy();
+                assert_eq!(app.runtime.backend().session_row(0).unwrap().status_label(), "first-run setup");
+            }
+            let terminal = app.runtime.sessions[0].terminal.as_ref().unwrap();
+            terminal.write(b"2\r".to_vec());
+            while !terminal.screen_text(60).contains("esc to interrupt") {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            for _ in 0..10 {
+                assert_eq!(
+                    app.runtime.backend().session_row(0).unwrap().status_label(),
+                    "first-run setup",
+                    "a row reads the sample, not the terminal"
+                );
+            }
+            app.runtime.busy_checked = Instant::now() - Duration::from_secs(1);
+            app.runtime.track_busy();
+            let row = app.runtime.backend().session_row(0).unwrap();
+            assert_eq!(row.status, AgentStatus::Working);
+            assert_eq!(row.status_hint, None);
+        });
+    }
+
+    #[test]
     fn audit_p7_briefs_keep_bare_prompts_private_and_restore_sandbox_mount_permissions() {
         with_app(
             "app::sessions::tests::audit_p7_briefs_keep_bare_prompts_private_and_restore_sandbox_mount_permissions",
@@ -1601,10 +1710,10 @@ mod tests {
         with_app("app::sessions::tests::bare_codex_trust_and_hook_menus_need_input_even_with_hooks", |app, _| {
             let dir = crate::test_support::tempdir().unwrap();
             for text in [
-                "Trust this folder?",
+                "Trust this folder?\n› 1. Trust and continue\n  2. Cancel",
                 "Review hooks\n› 1. Trust hooks\n  2. Cancel",
-                "Sign in with ChatGPT",
-                "Choose a theme",
+                "Sign in with ChatGPT\n› 1. Sign in\n  2. Quit",
+                "Choose a theme\n› 1. Dark\n  2. Light",
             ] {
                 let terminal = Terminal::spawn(
                     app.runtime.wake.clone(),

@@ -1622,6 +1622,15 @@ selection stay with each client; the in-process desktop still saves its own pref
 
 ### Chief trace feed
 
+The live trace is scoped to the conversation identity reported by the current chief. It stays empty
+until that identity is known. New entries use a versioned FNV-1a identity that is stable across Rust
+upgrades. Older entries with an empty identity, or the former unversioned `DefaultHasher` identity,
+cannot reliably be assigned to a conversation: they remain in the plan's trace archive on disk and
+are available through an unscoped archive load, but are deliberately excluded from the live feed.
+The archives are `trace/<plan-id>.jsonl` under the ATOMICS state directory (`trace/chief.jsonl` for calls
+outside plans).
+An upgrade or `/clear` never guesses that calls from a closed plan belong to the new chief conversation.
+
 The `trace` capability carries the chief's cleaned MCP calls separately from the board cursor and replay
 ring. Clients subscribe with `{"kind":"subscribe","topics":[{"topic":"trace"}]}`. The host sends
 `trace_changed` with the current decimal-string `revision`, initially and whenever content changes,

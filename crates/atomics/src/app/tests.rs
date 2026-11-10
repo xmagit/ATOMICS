@@ -15,6 +15,7 @@ pub(super) fn session(id: &str, kind: AgentKind, status: AgentStatus, cwd: &Path
         last_prompt: None,
         last_message: None,
         hooks_active: false,
+        first_run_hint: None,
         activity: heartbeat::Activity::default(),
         approvals: Vec::new(),
         allowed: Vec::new(),
@@ -49,6 +50,13 @@ pub(super) fn with_app(name: &str, test: impl FnOnce(&mut Desktop<'_>, &egui::Co
 
 pub(super) fn with_state(name: &str, test: impl FnOnce(State, &egui::Context)) {
     run_state(name, None::<fn(&Path) -> Vec<(&'static str, std::ffi::OsString)>>, test);
+}
+
+/// Keep asynchronous fixtures' settings consistent with what a runtime reload reads.
+pub(super) fn persist_config(state: &mut State) {
+    std::fs::write(&state.config_path, toml::to_string(&state.config).unwrap()).unwrap();
+    state.reload_config();
+    assert!(state.config_error.is_none(), "fixture config did not reload: {:?}", state.config_error);
 }
 
 /// [`with_state`] in a child that also has the variables `env` gives, which is called in the
@@ -249,6 +257,7 @@ fn osc52_only_copies_from_the_focused_bare_tile_and_names_it() {
         emit(app, 1);
         assert!(frame(app, ctx, 1, &[0, 1], false).is_empty(), "an unfocused window cannot copy");
         assert!(frame(app, ctx, 1, &[0, 1], true).is_empty());
+        std::thread::sleep(Duration::from_secs(1));
         emit(app, 1);
         assert_eq!(frame(app, ctx, 1, &[0, 1], true), ["clipboard"]);
     });
@@ -298,6 +307,37 @@ fn session_ids_and_prefixes_cannot_be_shadowed_by_titles() {
         ));
         assert_eq!(state.find("t1 · Fix the parser"), None, "ambiguous prefixes cannot fall back to task labels");
         state.sessions[0].sandbox = None;
+    });
+}
+
+#[test]
+fn p5_review_duplicate_task_labels_require_a_session_id() {
+    with_state("app::tests::p5_review_duplicate_task_labels_require_a_session_id", |mut state, _| {
+        let root = state.launch_dir.clone();
+        state.sessions = ["first-session", "second-session"]
+            .into_iter()
+            .map(|id| session(id, AgentKind::Generic, AgentStatus::Idle, &root))
+            .collect();
+        state.plans = ["first", "second"]
+            .into_iter()
+            .zip(&state.sessions)
+            .map(|(id, session)| Plan {
+                id: id.into(),
+                tasks: vec![Task {
+                    id: "t1".into(),
+                    title: "Fix the parser".into(),
+                    session: Some(session.id.clone()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .collect();
+        assert_eq!(state.find("t1 · Fix the parser"), None);
+        assert_eq!(state.find("first-session"), Some(0));
+        assert_eq!(state.find("second-"), Some(1));
+        state.sessions[0].rename("Parser investigation");
+        assert_eq!(state.find("Parser investigation"), Some(0));
+        assert_eq!(state.find("t1 · Fix the parser"), Some(1));
     });
 }
 

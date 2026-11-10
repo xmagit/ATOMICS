@@ -270,7 +270,7 @@ fn busy(answer: &Value) -> Result<Vec<String>> {
     Ok(blockers)
 }
 
-fn refuse_busy(blockers: &[String], yes: bool, notice: impl FnOnce(String)) -> Result<()> {
+fn refuse_busy(blockers: &[String], yes: bool) -> Result<()> {
     if !blockers.is_empty() {
         let work = blockers.join("\n  ");
         if !yes {
@@ -278,20 +278,37 @@ fn refuse_busy(blockers: &[String], yes: bool, notice: impl FnOnce(String)) -> R
                 "work in the VM is busy:\n  {work}\nstopped; wait for this work to finish, or use --yes to continue anyway."
             );
         }
-        notice(format!("Continuing with busy work (--yes):\n  {work}"));
     }
     Ok(())
 }
 
-fn check_busy(info: &BundleInfo, yes: bool) -> Result<()> {
-    check_busy_with_notice(info, yes, |message| println!("{message}"))
+#[derive(Default)]
+struct BusyPolicy {
+    yes: bool,
+    announced: bool,
 }
 
-fn check_busy_with_notice(info: &BundleInfo, yes: bool, notice: impl FnOnce(String)) -> Result<()> {
+impl BusyPolicy {
+    fn check(&mut self, blockers: &[String]) -> Result<Option<String>> {
+        refuse_busy(blockers, self.yes)?;
+        if blockers.is_empty() || self.announced {
+            return Ok(None);
+        }
+        self.announced = true;
+        Ok(Some(format!("Continuing with busy work (--yes):\n  {}", blockers.join("\n  "))))
+    }
+}
+
+fn check_busy(info: &BundleInfo, policy: &mut BusyPolicy) -> Result<()> {
     // With the older agents-over-ssh layout this reaches the explicitly forwarded Mac host.
     // Without that forward there is no host to ask, so fail closed rather than interrupt agents.
     let answer = guest(info, r#"exec atomics ctl '{"cmd":"list"}'"#)?;
-    refuse_busy(&busy(&serde_json::from_str(&answer).context("reading the VM host's list")?)?, yes, notice)
+    if let Some(message) =
+        policy.check(&busy(&serde_json::from_str(&answer).context("reading the VM host's list")?)?)?
+    {
+        println!("{message}");
+    }
+    Ok(())
 }
 
 struct Built<'a> {
@@ -551,13 +568,15 @@ pub fn update(options: Update) -> Result<()> {
 
 pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options: Update) -> Result<()> {
     let _lock = crate::update::lock(&atomics_core::paths::atomics_home())?;
-    let state = super::lima_status(&info.instance)?.context("the Lima instance is missing; run atomics vm setup")?;
+    let state = super::lima_status_for_command(&info.instance)?
+        .context("the Lima instance is missing; run atomics vm setup")?;
     match state.as_str() {
         "Running" => {}
         "Stopped" => super::start(&info.instance)?,
         _ => bail!("VM {} is {state}; repair it before updating", info.instance),
     }
-    check_busy(info, options.yes)?;
+    let mut busy_policy = BusyPolicy { yes: options.yes, ..Default::default() };
+    check_busy(info, &mut busy_policy)?;
     let lima = read_lima(&info.instance)?;
     let settings = settings(info, &build_info(info, &lima)?);
     let shares = shared_paths(&lima);
@@ -586,7 +605,7 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
     if Path::new(&info.install_dir).canonicalize()? != installed.canonicalize()? {
         bail!("the installed bundle's installDir differs from its location; nothing was switched");
     }
-    check_busy(info, options.yes)?;
+    check_busy(info, &mut busy_policy)?;
     let backup = local.path().join("previous");
     if !Command::new("/bin/cp").arg("-R").arg(installed).arg(&backup).status()?.success() {
         bail!("could not back up the installed Mac bundle; nothing was switched");
@@ -619,33 +638,57 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
     } else {
         // Work could have started while the bundle was installed and the next boot was selected.
         if restart_owed {
-            // Keep the pre-quit refusal and the final post-quit recheck. Announce an explicit
-            // override only at the latter checkpoint, immediately before stopping the VM.
-            check_busy_with_notice(info, options.yes, |_| {})
+            // Share the notice policy with the post-quit check; both safety checks still run.
+            check_busy(info, &mut busy_policy)
                 .context("restart pending; run atomics vm update again when the VM is idle")?;
         }
-        restart_window(info, restart_owed, options.yes)?;
+        restart_window(info, restart_owed, &mut busy_policy)?;
         println!("VM: {}", if restart_owed { "restarted" } else { "not restarted (system unchanged)" });
     }
     Ok(())
 }
 
-fn restart_window(info: &BundleInfo, changed: bool, yes: bool) -> Result<()> {
+fn restart_window(info: &BundleInfo, changed: bool, busy: &mut BusyPolicy) -> Result<()> {
     let app = crate::setup::executable_path()
         .ok()
         .and_then(|exe| crate::restart::bundle_of(&exe).map(Path::to_path_buf))
         .unwrap_or_else(|| atomics_core::paths::home().join("Applications/ATOMICS.app"));
-    quit_windows(Command::new("osascript"))?;
-    let restart = if changed {
-        check_busy(info, yes).and_then(|()| super::stop(&info.instance)).and_then(|()| super::start(&info.instance))
-    } else {
-        Ok(())
-    };
-    // Reopen even if Lima could not restart, so the window can show the VM's state.
-    if app.is_dir() && !reopen(&app, std::env::vars_os()).status()?.success() {
-        bail!("the update is installed, but the ATOMICS window could not reopen");
+    quit_then_reopen(
+        || quit_windows(Command::new("osascript")),
+        || {
+            if changed {
+                check_busy(info, busy).context("restart pending; run atomics vm update again when the VM is idle")?;
+                restart_guest(|| super::stop(&info.instance), || super::start(&info.instance))?;
+            }
+            Ok(())
+        },
+        || {
+            if app.is_dir() && !reopen(&app, std::env::vars_os()).status()?.success() {
+                bail!("the update is installed, but the ATOMICS window could not reopen");
+            }
+            Ok(())
+        },
+    )
+}
+
+fn restart_guest(stop: impl FnOnce() -> Result<()>, start: impl FnOnce() -> Result<()>) -> Result<()> {
+    stop().context("restart pending: could not stop the VM; run atomics vm update again when ready")?;
+    start().context("the new boot is installed, but the VM is stopped; run atomics vm start")
+}
+
+/// Even a partial quit must reopen the app. Keep the primary failure if reopening also fails.
+fn quit_then_reopen(
+    quit: impl FnOnce() -> Result<()>,
+    restart: impl FnOnce() -> Result<()>,
+    reopen: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let result = quit().and_then(|()| restart());
+    let opened = reopen();
+    match (result, opened) {
+        (Err(error), Err(open)) => Err(error.context(format!("also could not reopen the app: {open:#}"))),
+        (Err(error), _) => Err(error),
+        (Ok(()), opened) => opened,
     }
-    restart.context("restart pending: the next boot is installed; run atomics vm update again when ready")
 }
 
 /// LaunchServices can run several instances of one bundle. Address every instance, rather than the

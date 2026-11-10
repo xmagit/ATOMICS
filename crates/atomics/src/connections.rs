@@ -157,10 +157,10 @@ pub fn remember(home: &Path, found: &[Definition]) -> Result<Vec<Definition>> {
 pub fn added(name: &str, url: &str) -> Option<Definition> {
     let name = mcp_import::sbx_name(name)?;
     atomics_ui::markdown::web_url(url)?;
-    // Check the original spelling before URL parsing can turn Unicode into ASCII, remove
-    // controls, or reinterpret backslashes. International hosts must be supplied as punycode.
+    // web_url checks the original spelling before parsing can normalize hidden characters
+    // or turn a Unicode host into ASCII. MCP endpoints also forbid credentials.
     let authority = url.split_once("://")?.1.split(['/', '?', '#']).next()?;
-    if !authority.is_ascii() || authority.contains(['@', '%']) || url.len() > 2048 || url.chars().any(hidden_url_char) {
+    if authority.contains('@') || url.len() > 2048 {
         return None;
     }
     let parsed = url::Url::parse(url).ok()?;
@@ -178,19 +178,10 @@ pub fn added(name: &str, url: &str) -> Option<Definition> {
     })
 }
 
-fn hidden_url_char(c: char) -> bool {
-    use unicode_general_category::{GeneralCategory, get_general_category};
-    matches!(get_general_category(c), GeneralCategory::Control | GeneralCategory::Format)
-        // Other invisible characters, including fillers and variation selectors.
-        || matches!(c,
-            '\u{34f}' | '\u{115f}'..='\u{1160}' | '\u{17b4}'..='\u{17b5}' | '\u{180b}'..='\u{180f}'
-            | '\u{2060}'..='\u{206f}' | '\u{3164}' | '\u{fe00}'..='\u{fe0f}' | '\u{ffa0}'
-            | '\u{e0000}'..='\u{e0fff}')
-}
-
 /// The domain to emphasize before connecting, plus a warning for a familiar name on another domain.
 /// This is an aid to reviewing consent, not an assertion that a server is trustworthy.
 pub fn server_identity(name: &str, url: &str) -> Option<(String, Option<String>)> {
+    atomics_ui::markdown::web_url(url)?;
     let parsed = url::Url::parse(url).ok()?;
     let domain = match parsed.host()? {
         url::Host::Domain(host) => {
@@ -298,9 +289,10 @@ pub fn registered(program: &str) -> Result<Vec<Registered>> {
 const WINDOWS_START: &str = "cmd";
 
 /// The arguments cmd.exe gets to open `url`, quoted as one piece so `&` and `?` in the address stay in it.
-/// An address with a quote or a control character is refused instead of escaped.
+/// Quotes, control characters and `%` (expanded by cmd even inside quotes) are refused.
 pub(crate) fn windows_start_args(url: &str) -> Option<String> {
-    (atomics_ui::markdown::web_url(url).is_some() && !url.contains('"')).then(|| format!("/c start \"\" \"{url}\""))
+    (atomics_ui::markdown::web_url(url).is_some() && !url.contains(['"', '%']))
+        .then(|| format!("/c start \"\" \"{url}\""))
 }
 
 /// How ATOMICS opens an authorization page: `open` on macOS, `xdg-open` on Linux, `cmd /c start` on Windows.
@@ -712,6 +704,14 @@ pub(crate) mod tests {
         assert!(windows_start_args("https://a.example/\" & calc").is_none());
         assert!(windows_start_args("calc.exe").is_none());
         assert!(windows_start_args("https://a.example/\n").is_none());
+    }
+
+    #[test]
+    fn windows_refuses_environment_expansion_even_inside_a_quoted_url() {
+        for url in ["https://example.com/%COMSPEC%", "https://example.com/?q=%PATH%", "https://example.com/%25PATH%25"]
+        {
+            assert!(windows_start_args(url).is_none(), "{url}");
+        }
     }
 
     /// A browser that records each URL it is asked to open in `opened` beside it.

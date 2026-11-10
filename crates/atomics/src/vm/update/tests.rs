@@ -113,10 +113,9 @@ fn busy_refuses_turns_and_user_waits_and_yes_is_an_explicit_override() {
     for status in ["working", "starting", "needs you"] {
         let answer = json!({"ok":true,"result":{"sessions":[{"title":"worker","status":status}]}});
         let blockers = busy(&answer).unwrap();
-        let error =
-            refuse_busy(&blockers, false, |_| panic!("a refusal must not print an override")).unwrap_err().to_string();
+        let error = refuse_busy(&blockers, false).unwrap_err().to_string();
         assert!(error.contains("wait for this work to finish") && error.contains("--yes"));
-        assert!(refuse_busy(&blockers, true, |_| {}).is_ok());
+        assert!(refuse_busy(&blockers, true).is_ok());
     }
     let answer = json!({"ok":true,"result":{"sessions":[],"update_blockers":["editor open", "background work"]}});
     assert_eq!(busy(&answer).unwrap(), ["editor open", "background work"]);
@@ -127,14 +126,16 @@ fn busy_refuses_turns_and_user_waits_and_yes_is_an_explicit_override() {
 #[test]
 fn review_p7_restart_rechecks_busy_work_without_announcing_the_same_override_twice() {
     let blockers = vec!["worker is active".to_string()];
-    let mut notices = Vec::new();
-    // The pre-quit checkpoint still refuses without --yes, but leaves the override notice
-    // to the final post-quit checkpoint so the same busy work is announced just once.
-    assert!(refuse_busy(&blockers, false, |_| {}).is_err());
-    refuse_busy(&blockers, true, |_| {}).unwrap();
-    refuse_busy(&blockers, true, |message| notices.push(message)).unwrap();
+    let mut policy = BusyPolicy { yes: true, ..Default::default() };
+    let notices: Vec<_> =
+        [policy.check(&blockers).unwrap(), policy.check(&blockers).unwrap()].into_iter().flatten().collect();
     assert_eq!(notices.len(), 1);
     assert!(notices[0].contains("Continuing with busy work (--yes)"));
+    // Work can start after the pre-quit check. The post-quit checkpoint must still refuse it
+    // when there is no explicit override, even though the earlier checkpoint was idle.
+    let mut refuse = BusyPolicy::default();
+    assert!(refuse.check(&[]).unwrap().is_none());
+    assert!(refuse.check(&blockers).is_err());
 }
 
 #[test]
@@ -287,6 +288,70 @@ fn a_window_that_refuses_to_quit_is_named_and_keeps_the_restart_pending() {
         error.contains("restart pending") && error.contains("pid 1234") && error.contains("vm update again"),
         "{error}"
     );
+}
+
+#[test]
+fn a_partial_quit_reopens_the_app_and_does_not_restart_the_vm() {
+    let calls = std::cell::RefCell::new(Vec::new());
+    let result = quit_then_reopen(
+        || {
+            calls.borrow_mut().push("quit");
+            bail!("one window (pid 1234) refused to quit");
+        },
+        || {
+            calls.borrow_mut().push("restart");
+            Ok(())
+        },
+        || {
+            calls.borrow_mut().push("reopen");
+            Ok(())
+        },
+    );
+    assert!(format!("{:#}", result.unwrap_err()).contains("pid 1234"));
+    assert_eq!(*calls.borrow(), ["quit", "reopen"]);
+}
+
+#[test]
+fn a_failed_start_after_a_successful_stop_names_vm_start_and_reopens_the_app() {
+    let calls = std::cell::RefCell::new(Vec::new());
+    let result = quit_then_reopen(
+        || {
+            calls.borrow_mut().push("quit");
+            Ok(())
+        },
+        || {
+            restart_guest(
+                || {
+                    calls.borrow_mut().push("stop");
+                    Ok(())
+                },
+                || {
+                    calls.borrow_mut().push("start");
+                    bail!("start failed");
+                },
+            )
+        },
+        || {
+            calls.borrow_mut().push("reopen");
+            Ok(())
+        },
+    );
+    let error = format!("{:#}", result.unwrap_err());
+    assert!(error.contains("VM is stopped") && error.contains("atomics vm start"), "{error}");
+    assert!(!error.contains("atomics vm update"), "{error}");
+    assert_eq!(*calls.borrow(), ["quit", "stop", "start", "reopen"]);
+}
+
+#[test]
+fn repeated_busy_checks_announce_yes_only_once_without_skipping_refusals() {
+    let blockers = vec!["agent working".into()];
+    let mut policy = BusyPolicy { yes: true, ..Default::default() };
+    assert!(policy.check(&[]).unwrap().is_none());
+    assert!(policy.check(&blockers).unwrap().unwrap().contains("Continuing with busy work (--yes)"));
+    assert!(policy.check(&blockers).unwrap().is_none());
+    let mut refuse = BusyPolicy::default();
+    assert!(refuse.check(&blockers).is_err());
+    assert!(refuse.check(&blockers).is_err());
 }
 
 #[test]

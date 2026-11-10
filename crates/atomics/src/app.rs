@@ -130,6 +130,8 @@ pub struct Session {
     pub last_prompt: Option<String>,
     pub last_message: Option<String>,
     hooks_active: bool,
+    /// Last startup screen sampled by track_busy; drawing a row never reads the terminal.
+    first_run_hint: Option<&'static str>,
     activity: heartbeat::Activity,
     approvals: Vec<PendingApproval>,
     allowed: Vec<ApprovalRequest>,
@@ -1706,7 +1708,7 @@ impl Desktop<'_> {
                 window_focused && focused.is_some_and(|view| view.shows_in_frame(terminal, ctx)),
                 session.sandbox.is_some(),
             );
-            if let Some(text) = terminal.shared.take_clipboard(allowed) {
+            if let Some(text) = terminal.take_clipboard(allowed) {
                 ctx.copy_text(text);
                 notice = Some(format!(
                     "Clipboard set by {} ({})",
@@ -1718,7 +1720,7 @@ impl Desktop<'_> {
         for (root, terminal) in &self.runtime.editors {
             let allowed =
                 policy.allows(window_focused && focused.is_some_and(|view| view.shows_in_frame(terminal, ctx)), false);
-            if let Some(text) = terminal.shared.take_clipboard(allowed) {
+            if let Some(text) = terminal.take_clipboard(allowed) {
                 ctx.copy_text(text);
                 notice = Some(format!("Clipboard set by editor: {}", truncate(&paths::display(root), 60)));
             }

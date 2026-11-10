@@ -527,7 +527,6 @@ dependencies = [
  "toml",
  "tungstenite",
  "two-face",
- "unicode-general-category",
  "ureq",
  "url",
  "uuid",
@@ -570,6 +569,7 @@ dependencies = [
  "egui",
  "qrcodegen",
  "serde_json",
+ "unicode-general-category",
 ]
 
 [[package]]
