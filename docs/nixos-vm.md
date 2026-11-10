@@ -371,20 +371,37 @@ running commands and open editors. `--yes` explicitly continues despite reported
 unreachable host is an error; it is never taken to mean idle. In the older agents-over-ssh layout this
 needs the socket forward to the Mac's host.
 
-The build waits for a test slot and starting the VM waits for a QA slot, using the existing queue.
+With a host on the Mac, the build waits for its test slot. A VM client builds directly through the
+guest's system connection: its queue lives in the VM, so it does not try a missing Mac socket.
+Starting the VM uses the Mac's QA queue when a local host is available.
 Nothing is selected until both outputs are built, fetched and checked. If a build or installation
 fails, the VM keeps its current boot selection; a boot-staging failure restores the previous profile
 and bootloader. The update uses `switch-to-configuration boot`, leaving the running system alone
 until the restart. It never deletes or recreates the instance, its disk or its sign-ins.
 
+The command compares the build with `/run/current-system`, the running system. If an earlier update
+staged this build but did not restart, it reports **restart pending** and retries the restart once the
+host is idle. It checks for busy work again immediately before restarting. The boot profile alone
+never makes that update count as unchanged.
+
 The command prints whether the system changed, the bundle was reinstalled and the VM restarted. It
-quits and reopens `ATOMICS.app` if installed, restarting the VM **only** when the system changed. The
+asks every running instance of `ATOMICS.app` to quit gracefully and reopens the app after installation,
+restarting the VM when the running system differs. If a window refuses to quit, the error identifies
+its process and leaves the restart pending; close it and rerun `atomics vm update`. The
 window reopens as the Dock would open it, without the command's own `ATOMICS_*` variables: an update run
 from a shell that points `ATOMICS_CONFIG` or `ATOMICS_HOME` at a scratch setup still reopens the VM's
 client, on the app's own config. With
 `--no-restart` it leaves both the window and VM running; a changed system takes effect on the next
 boot. If restarting fails after installation, the command says the next boot is already installed and
 how to start the VM again.
+
+In the VM client, **Machine** has a VM section with its state, Start, Stop, Check and Update. Stop asks
+for confirmation because agents stop with the VM. Check and Update show their command output there;
+the latest output is also saved in `~/.atomics/vm/<instance>-controls.log`, including across the app's
+update restart. If the host disconnects, a previously mirrored board gives way to the VM's state and
+Start button when it is stopped, or “starting” while the instance runs but its host is not connected.
+Status polling stops when the window is no longer drawing. A successful Lima list also removes setup
+records for deleted instances; failed or malformed lists leave them alone.
 
 Keep the fresh-image route for a broken VM or disk-size changes: build a new image with
 `scripts/macos-vm-build.sh`, delete the old instance with `limactl delete <instance>`, and run
@@ -854,8 +871,11 @@ user alone, and that sshd replaces stale sockets; with the forward running, it a
 for its sessions. With the host in the VM it checks instead that the `atomics-host` service runs, that
 its socket folder is the user's alone, that its protocol server listens on `127.0.0.1:<port>` and
 nowhere else, and that an agent it starts (a shell, through `atomics ctl`) runs in the guest, in a
-shared Mac folder: the process's working folder is checked through `/proc`. `atomics vm check` runs
-it from the Mac. It clones a file with `cp --reflink=always` and runs a shell in a `linux/amd64`
+shared Mac folder, or in `~/repos` on the guest's disk when hardened mode has only read-only shares:
+the process's working folder is checked through `/proc`. `atomics vm check` runs it from the Mac. In
+hardened mode, only `sudo sshd -T` runs over the admin connection; its output is passed to the guest
+user's checks, which need no sudo and keep testing that user's host and rootless Docker. It clones a
+file with `cp --reflink=always` and runs a shell in a `linux/amd64`
 container, which works only through Rosetta. Then it runs the checks in `/etc/atomics/check.d` in name
 order (`atomics.vm.checks`); each one fails the run by exiting non-zero.
 

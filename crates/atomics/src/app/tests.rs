@@ -140,6 +140,164 @@ fn run_state(
 }
 
 #[test]
+fn osc52_only_copies_from_the_focused_bare_tile_and_names_it() {
+    fn frame(
+        app: &mut Desktop<'_>,
+        ctx: &egui::Context,
+        focus: usize,
+        visible: &[usize],
+        window_focused: bool,
+    ) -> Vec<String> {
+        let output = ctx.run_ui(
+            egui::RawInput {
+                focused: window_focused,
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(900.0, 700.0))),
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    ui.memory_mut(|m| m.request_focus(egui::Id::NULL.with(("clipboard-tile", focus))));
+                    let p = app.palette();
+                    let metrics = Metrics::new(ui, &p, 13.0);
+                    for &index in visible {
+                        let id = egui::Id::NULL.with(("clipboard-tile", index));
+                        let rect = Rect::from_min_size(pos2(10.0, 10.0 + index as f32 * 300.0), vec2(850.0, 280.0));
+                        let terminal = app.runtime.sessions[index].terminal.as_ref().unwrap();
+                        app.client.terminal_views.entry(id).or_default().show(terminal, ui, rect, id, &metrics, &p);
+                    }
+                    app.terminal_clipboard(ctx);
+                });
+            },
+        );
+        let copies = output
+            .platform_output
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                egui::OutputCommand::CopyText(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        output.drop_without_applying_deltas();
+        copies
+    }
+
+    fn emit(app: &Desktop<'_>, index: usize) {
+        let terminal = app.runtime.sessions[index].terminal.as_ref().unwrap();
+        terminal.shared.title.lock().unwrap().take();
+        terminal.write(b"copy\n".to_vec());
+        let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(5));
+        while terminal.shared.title.lock().unwrap().as_deref() != Some("copied") {
+            assert!(Instant::now() < deadline, "terminal did not emit OSC 52");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    with_app("app::tests::osc52_only_copies_from_the_focused_bare_tile_and_names_it", |app, ctx| {
+        app.runtime.sessions.clear();
+        for id in ["tile-a", "tile-b"] {
+            let mut tile = session(id, AgentKind::Shell, AgentStatus::Idle, &app.runtime.launch_dir);
+            tile.terminal = Some(
+                Terminal::spawn(
+                    app.runtime.wake.clone(),
+                    app.runtime.theme.terminal_colors(),
+                    "/bin/sh".into(),
+                    vec![
+                        "-c".into(),
+                        "while IFS= read -r line; do printf '\\033]52;c;Y2xpcGJvYXJk\\007\\033]2;copied\\007'; done"
+                            .into(),
+                    ],
+                    &app.runtime.launch_dir,
+                    HashMap::new(),
+                    100,
+                )
+                .unwrap(),
+            );
+            app.runtime.sessions.push(tile);
+        }
+        // The active session alone is insufficient: the actual keyboard focus determines access.
+        app.runtime.active = Some("tile-a".into());
+        assert!(frame(app, ctx, 1, &[0, 1], true).is_empty());
+        emit(app, 0);
+        emit(app, 1);
+        assert_eq!(frame(app, ctx, 1, &[0, 1], true), ["clipboard"]);
+        assert_eq!(app.runtime.toast.as_ref().unwrap().0, "Clipboard set by tile-b (tile-b)");
+        assert!(frame(app, ctx, 0, &[0, 1], true).is_empty(), "background writes cannot be replayed");
+
+        emit(app, 0);
+        assert!(frame(app, ctx, 1, &[0, 1], true).is_empty(), "losing focus drops a pending copy");
+        emit(app, 1);
+        app.runtime.config.terminal.clipboard = atomics_core::config::ClipboardPolicy::Off;
+        assert!(frame(app, ctx, 1, &[0, 1], true).is_empty(), "off discards pending copies");
+        emit(app, 1);
+        app.runtime.config.terminal.clipboard = atomics_core::config::ClipboardPolicy::Focused;
+        assert!(frame(app, ctx, 1, &[0, 1], true).is_empty());
+
+        app.runtime.sessions[1].sandbox = Some("sandboxed".into());
+        assert!(frame(app, ctx, 1, &[0, 1], true).is_empty());
+        emit(app, 1);
+        assert!(frame(app, ctx, 1, &[0, 1], true).is_empty(), "focused sandboxes stay off");
+        app.runtime.sessions[1].sandbox = None;
+        assert!(frame(app, ctx, 1, &[0, 1], true).is_empty());
+        emit(app, 1);
+        assert!(frame(app, ctx, 1, &[0], true).is_empty(), "hidden tiles cannot copy through stale focus");
+        assert!(frame(app, ctx, 1, &[0, 1], false).is_empty());
+        emit(app, 1);
+        assert!(frame(app, ctx, 1, &[0, 1], false).is_empty(), "an unfocused window cannot copy");
+        assert!(frame(app, ctx, 1, &[0, 1], true).is_empty());
+        emit(app, 1);
+        assert_eq!(frame(app, ctx, 1, &[0, 1], true), ["clipboard"]);
+    });
+}
+
+#[test]
+fn session_ids_and_prefixes_cannot_be_shadowed_by_titles() {
+    with_state("app::tests::session_ids_and_prefixes_cannot_be_shadowed_by_titles", |mut state, _ctx| {
+        let mut attacker = session("other-id", AgentKind::Shell, AgentStatus::Idle, &state.launch_dir);
+        attacker.title = "target-id".into();
+        attacker.sandbox = Some("untrusted".into());
+        state.sessions =
+            vec![attacker, session("target-id-long", AgentKind::Shell, AgentStatus::Idle, &state.launch_dir)];
+        assert_eq!(state.find("target-id"), Some(1), "a title cannot steal a unique id prefix");
+        state.sessions[0].title = "target-id-long".into();
+        assert_eq!(state.find("target-id-long"), Some(1), "exact ids take precedence too");
+        state.sessions[0].title = "target".into();
+        state.sessions.push(session("target-other", AgentKind::Shell, AgentStatus::Idle, &state.launch_dir));
+        assert_eq!(state.find("target"), None, "ambiguous prefixes cannot fall back to titles");
+        state.sessions[0].title = "Display name".into();
+        assert_eq!(state.find(" display NAME "), Some(0));
+        assert_eq!(state.find("  "), None);
+        state.plans = vec![Plan {
+            id: "lookup".into(),
+            tasks: vec![Task {
+                id: "t1".into(),
+                title: "Fix the parser".into(),
+                session: Some("other-id".into()),
+                ..Task::default()
+            }],
+            ..Plan::default()
+        }];
+        assert_eq!(state.find(" T1 · FIX THE PARSER "), Some(0), "task labels are searchable");
+        assert_eq!(state.find("Display name"), Some(0), "legacy titles still work");
+        state.sessions.push(session(
+            "t1 · Fix the parser-long",
+            AgentKind::Shell,
+            AgentStatus::Idle,
+            &state.launch_dir,
+        ));
+        assert_eq!(state.find("t1 · Fix the parser"), Some(3), "task labels cannot steal an id prefix");
+        state.sessions.push(session(
+            "t1 · Fix the parser-other",
+            AgentKind::Shell,
+            AgentStatus::Idle,
+            &state.launch_dir,
+        ));
+        assert_eq!(state.find("t1 · Fix the parser"), None, "ambiguous prefixes cannot fall back to task labels");
+        state.sessions[0].sandbox = None;
+    });
+}
+
+#[test]
 fn config_reloads_when_host_overrides_are_created_changed_or_removed() {
     with_state("app::tests::config_reloads_when_host_overrides_are_created_changed_or_removed", |mut state, _ctx| {
         let [base, host_file] = Config::source_paths(&state.config_path);
@@ -755,7 +913,7 @@ fn plan_set_resolves_cached_worktree_projects(app: &mut Desktop<'_>) {
             ticket: None,
             plan: None,
             goal: "ship".into(),
-            tasks: vec![Task { id: "a".into(), repo: Some("/worktree/src".into()), ..Task::default() }],
+            tasks: vec![plan::TaskInput { id: "a".into(), repo: Some("/worktree/src".into()), ..Default::default() }],
             integration: None,
         },
         tx,

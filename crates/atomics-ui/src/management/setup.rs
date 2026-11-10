@@ -407,8 +407,10 @@ fn connect_button(
             }
         }
         "tickets" => {
-            if button(ui, client, "Read how").clicked() {
-                ui.ctx().open_url(egui::OpenUrl::new_tab(TICKETS_GUIDE));
+            if button(ui, client, "Read how").clicked()
+                && let Some(url) = crate::markdown::web_url(TICKETS_GUIDE)
+            {
+                ui.ctx().open_url(egui::OpenUrl::new_tab(url));
             }
         }
         "remote" => {

@@ -55,7 +55,7 @@ impl Source {
     /// build that failed once the checkout had moved.
     pub fn check(&self) -> Result<Option<Found>> {
         self.fetch()?;
-        let behind: u64 = self.git(&["rev-list", "--count", &format!("HEAD..{REMOTE_MAIN}")])?.parse().unwrap_or(0);
+        let behind = commit_count(&self.git(&["rev-list", "--count", &format!("HEAD..{REMOTE_MAIN}")])?)?;
         if behind == 0 && !self.build_lacks_checkout() {
             return Ok(None);
         }
@@ -183,6 +183,10 @@ impl Source {
     }
 }
 
+fn commit_count(output: &str) -> Result<u64> {
+    output.trim().parse().context("Git rev-list returned an invalid commit count; update status is unknown")
+}
+
 /// The script that installs from a checkout on this platform, and what it takes. On a Mac it replaces the bundle
 /// running now, wherever that is.
 fn install_script(macos: bool) -> (&'static str, Vec<OsString>) {
@@ -237,6 +241,16 @@ fn jobs_env(pool: Option<&Path>, jobs: usize, caller_set: bool) -> Vec<(OsString
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn audit_p7_bad_commit_counts_are_errors_instead_of_up_to_date() {
+        for output in ["", "not a count", "-1", "1 2", "18446744073709551616"] {
+            let error = commit_count(output).unwrap_err();
+            assert!(error.to_string().contains("update status is unknown"), "{error}");
+        }
+        assert_eq!(commit_count("0\n").unwrap(), 0);
+        assert_eq!(commit_count(" 12\n").unwrap(), 12);
+    }
 
     fn run(dir: &Path, args: &[&str]) -> String {
         let output = crate::test_support::output(

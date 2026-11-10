@@ -5,8 +5,11 @@ use egui::{RichText, vec2};
 
 use crate::{Backend, Client, Command};
 
+/// Controls owned by a native client, such as the VM it connects to. They stay local to that window.
+pub type Controls = std::sync::Arc<dyn Fn(&mut egui::Ui) + Send + Sync>;
+
 pub fn button(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
-    if backend.machine_available() {
+    if backend.machine_available() || client.machine_controls.is_some() {
         let response = ui.selectable_label(client.machine_open, "Machine");
         crate::topbar::record_item(ui, "Machine", &response);
         if response.clicked() {
@@ -41,6 +44,10 @@ pub fn window(ctx: &egui::Context, backend: &dyn Backend, client: &mut Client) {
                 egui::ScrollArea::vertical().max_height((ctx.content_rect().height() - 100.0).max(100.0)).show(
                     ui,
                     |ui| {
+                        if let Some(controls) = client.machine_controls.clone() {
+                            controls(ui);
+                            ui.separator();
+                        }
                         if let Some(snapshot) = &snapshot {
                             contents(ui, snapshot, backend, client);
                         } else {

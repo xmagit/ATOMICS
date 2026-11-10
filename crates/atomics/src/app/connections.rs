@@ -220,7 +220,9 @@ impl State {
 
     /// Connects a remote server the user added by name and URL.
     pub(super) fn add_connection(&mut self, name: &str, url: &str) -> Result<String, String> {
-        let definition = mcp::added(name, url).ok_or("Give a name and an https:// URL without credentials")?;
+        let definition = mcp::added(name, url).ok_or(
+            "Give a name and an https:// URL with an ASCII or punycode host, no credentials or hidden characters",
+        )?;
         let name = definition.name.clone();
         self.connections.definitions.retain(|known| known.name != name);
         self.connections.definitions.push(definition);
@@ -343,7 +345,9 @@ impl State {
             return ControlResponse::error("give the server's name: lowercase letters, digits, - and _");
         };
         if url.is_some_and(|url| mcp::added(&name, url).is_none()) {
-            return ControlResponse::error("url must be an https:// URL without credentials");
+            return ControlResponse::error(
+                "url must be an https:// URL with an ASCII or punycode host, no credentials or hidden characters",
+            );
         }
         if self.connections.registered.is_none() {
             self.refresh_connections();
@@ -546,7 +550,7 @@ impl State {
                 let name = &needed.name;
                 let env = connections.env_for(name);
                 let busy = connections.busy.contains(name);
-                let label = match (busy, env) {
+                let mut label = match (busy, env) {
                     (true, _) => format!("Connecting {name}…"),
                     (false, 0) => format!("Connect {name}"),
                     (false, env) => format!("Connect {name} (stores {env} env values)"),
@@ -561,7 +565,30 @@ impl State {
                     (None, None, None) if !checked => "checking sbx…".into(),
                     (None, None, None) => "unknown to ATOMICS: add its URL in Settings → Connections".into(),
                 };
-                let detail = if needed.asked { format!("asked by {asker}: {what}") } else { what };
+                // Show the endpoint actually used, even when a known registration supersedes
+                // an agent's URL. Put its registrable domain directly on the Connect button.
+                let endpoint = connections
+                    .registered
+                    .as_ref()
+                    .and_then(|r| r.as_ref().ok())
+                    .and_then(|servers| servers.iter().find(|s| s.name == *name))
+                    .and_then(|s| s.url.as_deref())
+                    .or_else(|| {
+                        connections.definition(name).and_then(|d| match &d.transport {
+                            mcp_import::Transport::Url { url } => Some(url.as_str()),
+                            _ => None,
+                        })
+                    })
+                    .or(needed.url.as_deref());
+                let identity = endpoint.and_then(|url| mcp::server_identity(name, url));
+                if let Some((domain, _)) = &identity {
+                    label.push_str(&format!(" · {domain}"));
+                }
+                let mut detail = if needed.asked { format!("asked by {asker}: {what}") } else { what };
+                if let Some((_, Some(warning))) = identity {
+                    label.insert_str(0, "⚠ ");
+                    detail = format!("{warning}. {detail}");
+                }
                 let enabled = !busy
                     && checked
                     && (connections.status(name).is_some()

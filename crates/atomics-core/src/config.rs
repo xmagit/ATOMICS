@@ -59,6 +59,7 @@ diff_size = 12.5
 
 [terminal]
 scrollback = 5000           # lines each terminal keeps; a full 20000 on a wide terminal takes about 80 MB
+clipboard = "focused"      # OSC 52 writes: "focused" or "off"; always off for sandboxed sessions
 
 [theme]
 name = "claude"             # built in: claude, midnight, atomisk, paper and tide (light); or themes/<name>.toml beside this file
@@ -880,6 +881,22 @@ pub struct FontConfig {
 #[serde(default)]
 pub struct TerminalConfig {
     pub scrollback: usize,
+    pub clipboard: ClipboardPolicy,
+}
+
+/// Whether a terminal program may write the host clipboard with OSC 52.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClipboardPolicy {
+    #[default]
+    Focused,
+    Off,
+}
+
+impl ClipboardPolicy {
+    pub fn allows(self, focused: bool, sandboxed: bool) -> bool {
+        self == Self::Focused && focused && !sandboxed
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1094,7 +1111,7 @@ impl Default for FontConfig {
 
 impl Default for TerminalConfig {
     fn default() -> Self {
-        Self { scrollback: 5000 }
+        Self { scrollback: 5000, clipboard: ClipboardPolicy::default() }
     }
 }
 
@@ -1641,6 +1658,26 @@ kind = "shell"
         assert_eq!(config.layout.sidebar_width, LayoutConfig::default().sidebar_width);
         assert_eq!(config.font.size, 13.0);
         assert_eq!(config.terminal.scrollback, 5000);
+    }
+
+    #[test]
+    fn terminal_clipboard_policy_defaults_to_focus_and_keeps_sandboxes_off() {
+        let default: Config = toml::from_str("").unwrap();
+        assert_eq!(default.terminal.clipboard, ClipboardPolicy::Focused);
+        for value in ["focused", "off"] {
+            let config: Config = toml::from_str(&format!("[terminal]\nclipboard = '{value}'")).unwrap();
+            for focused in [false, true] {
+                for sandboxed in [false, true] {
+                    assert_eq!(
+                        config.terminal.clipboard.allows(focused, sandboxed),
+                        value == "focused" && focused && !sandboxed
+                    );
+                }
+            }
+            let saved = toml::to_string(&config.terminal).unwrap();
+            assert!(saved.contains(&format!("clipboard = \"{value}\"")));
+        }
+        assert!(toml::from_str::<Config>("[terminal]\nclipboard = 'all'").is_err());
     }
 
     #[test]

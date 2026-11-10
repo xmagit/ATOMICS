@@ -555,6 +555,50 @@ fn a_paired_client_gets_in_with_its_own_token() {
 }
 
 #[test]
+fn audit_p7_unpair_and_token_replacement_close_all_matching_live_connections() {
+    let dir = tempfile::tempdir().unwrap();
+    let clients = Arc::new(super::clients::PairedClients::open(dir.path().join("clients.json")).unwrap());
+    let (_, token) = clients.pair("device\u{7}").unwrap();
+    let (_, other) = clients.pair("other").unwrap();
+    let f = start_with(ServerConfig { paired: Some(clients.clone()), ..config() });
+    let mut unaffected = TestClient::connect(f.server.addr(), &other);
+    unaffected.hello();
+    unaffected.step().unwrap();
+    let mut local = TestClient::connect(f.server.addr(), f.server.token());
+    local.hello();
+    local.step().unwrap();
+    for replace in [true, false] {
+        let token = if replace { token.clone() } else { clients.pair("device").unwrap().1 };
+        let mut peers: Vec<_> = (0..2).map(|_| TestClient::connect(f.server.addr(), &token)).collect();
+        for peer in &mut peers {
+            peer.hello();
+            peer.step().unwrap();
+        }
+        assert_eq!(f.server.active_clients(), 4);
+        if replace {
+            clients.pair("device").unwrap();
+        } else {
+            assert!(clients.unpair("device\u{7}").unwrap());
+        }
+        let deadline = Instant::now() + wait(Duration::from_secs(5));
+        while f.server.active_clients() != 2 {
+            assert!(Instant::now() < deadline, "revoked connections stayed open");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        for peer in &mut peers {
+            loop {
+                match peer.ws.read() {
+                    Ok(tungstenite::Message::Close(_)) | Err(tungstenite::Error::ConnectionClosed) => break,
+                    Ok(_) => {}
+                    other => panic!("expected a closed connection, got {other:?}"),
+                }
+            }
+        }
+    }
+    assert!(clients.find(&other).is_some());
+}
+
+#[test]
 fn malformed_unknown_and_version_mismatched_frames_get_typed_errors() {
     let f = start();
     let mut client = TestClient::connect(f.server.addr(), f.server.token());

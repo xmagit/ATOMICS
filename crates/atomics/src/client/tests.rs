@@ -142,6 +142,76 @@ fn a_host_that_cannot_be_found_says_why() {
     assert_eq!(app.unreachable(), Some("the VM atomics is stopped"));
 }
 
+#[test]
+fn a_mirrored_board_does_not_hide_the_stopped_vm_or_its_start_button() {
+    let ctx = egui::Context::default();
+    let dir = tempfile::tempdir().unwrap();
+    let gate = vm::Gate::with(None, dir.path().into(), crate::relay::Keychain::in_folder(dir.path()));
+    gate.set_test_status(crate::vm::Status::Stopped);
+    let mut app = ClientApp::fixed_vm(&ctx, gate.clone(), || anyhow::bail!("host gone"));
+    app.driver.remote.receive(Envelope::host(
+        "old-board",
+        Message::StateSnapshot {
+            cursor: wire::Seq(1),
+            revisions: wire::Revisions {
+                sessions: wire::Seq(1),
+                plans: wire::Seq(1),
+                approvals: wire::Seq(1),
+                diffs: wire::Seq(1),
+                host: wire::Seq(1),
+            },
+            sessions: Vec::new(),
+            plans: Vec::new(),
+            approvals: Vec::new(),
+            diffs: Vec::new(),
+            host: Default::default(),
+            part: None,
+        },
+    ));
+    assert!(app.driver.remote.with_mirror(|mirror| mirror.epoch.is_some()));
+    let mut frame = || {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 700.0))),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| assert!(app.vm_screen(ui)));
+        output.textures_delta.clear();
+        output
+            .shapes
+            .into_iter()
+            .filter_map(|shape| match shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.text().to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let shown = frame();
+    assert!(shown.iter().any(|text| text == "The VM atomics is stopped."), "{shown:?}");
+    assert!(shown.iter().any(|text| text == "Start atomics"), "{shown:?}");
+    gate.set_test_status(crate::vm::Status::Running);
+    let shown = frame();
+    assert!(shown.iter().any(|text| text == "Starting the VM atomics…"), "{shown:?}");
+    assert!(!shown.iter().any(|text| text == "Start atomics"), "an already running VM must wait for its host");
+    app.client.machine_open = true;
+    for _ in 0..3 {
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| app.draw(ui));
+        output.textures_delta.clear();
+    }
+    let mut shown = ctx.run_ui(egui::RawInput::default(), |ui| app.draw(ui));
+    shown.textures_delta.clear();
+    let shown: Vec<_> = shown
+        .shapes
+        .into_iter()
+        .filter_map(|shape| match shape.shape {
+            egui::Shape::Text(text) => Some(text.galley.text().to_string()),
+            _ => None,
+        })
+        .collect();
+    for control in ["VM", "Stop", "Check", "Update"] {
+        assert!(shown.iter().any(|text| text == control), "Machine is missing {control}: {shown:?}");
+    }
+}
+
 /// A `connect` value ATOMICS cannot open names the setting, the file that sets it, and the way out.
 #[test]
 fn a_bad_connect_value_says_where_it_is_set() {

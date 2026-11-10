@@ -303,6 +303,12 @@ const PARENT_SESSION_VARS: &[&str] = &[
 
 fn main() -> eframe::Result {
     let cli = Cli::parse();
+    if matches!(cli.command, None | Some(Command::Host { .. }))
+        && let Err(error) = atomics_core::paths::validate_socket_path(&atomics_core::paths::socket_path())
+    {
+        eprintln!("atomics: {error}");
+        std::process::exit(1);
+    }
     let mut migration_errors = Vec::new();
     if matches!(cli.command, None | Some(Command::Host { .. })) {
         for var in PARENT_SESSION_VARS {

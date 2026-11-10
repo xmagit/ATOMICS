@@ -324,8 +324,9 @@ fn azure_placeholders_reach_claude_and_codex_and_are_revoked_on_close() {
         assert!(!app.runtime.config.isolation.sandbox.azure.enabled);
         let off = app.runtime.start("codex", repo.clone(), None, vec![], None).unwrap();
         let off_name = format!("atomics-{off}");
-        tick_until(app, ctx, "the Azure-disabled sandbox to attach", |_| {
-            fake::calls_to(bin.path(), &["run"]).iter().any(|run| run.contains(&off_name))
+        tick_until(app, ctx, "the Azure-disabled sandbox to attach", |app| {
+            app.runtime.find(&off).is_some_and(|index| app.runtime.sessions[index].terminal.is_some())
+                && fake::calls_to(bin.path(), &["run"]).iter().any(|run| run.contains(&off_name))
         });
         for verb in ["create", "run"] {
             let call = fake::calls_to(bin.path(), &[verb]).into_iter().find(|call| call.contains(&off_name)).unwrap();
@@ -338,8 +339,9 @@ fn azure_placeholders_reach_claude_and_codex_and_are_revoked_on_close() {
         for agent in ["claude", "codex"] {
             let id = app.runtime.start(agent, repo.clone(), None, vec![], None).unwrap();
             let name = format!("atomics-{id}");
-            tick_until(app, ctx, "the Azure-enabled sandbox to attach", |_| {
-                fake::calls_to(bin.path(), &["run"]).iter().any(|run| run.contains(&name))
+            tick_until(app, ctx, "the Azure-enabled sandbox to attach", |app| {
+                app.runtime.find(&id).is_some_and(|index| app.runtime.sessions[index].terminal.is_some())
+                    && fake::calls_to(bin.path(), &["run"]).iter().any(|run| run.contains(&name))
             });
             let index = app.runtime.find(&id).unwrap();
             let granted = app.runtime.sessions[index].relay.clone().unwrap();
