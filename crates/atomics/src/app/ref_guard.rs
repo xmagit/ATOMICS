@@ -153,6 +153,143 @@ mod tests {
     use super::super::tests::{repository, session, with_app};
     use super::*;
 
+    fn forged_integration_claim(app: &mut Desktop<'_>, existing: bool) {
+        let (dir, repo) = repository();
+        let task = dir.path().join("task");
+        let attacker = dir.path().join("sandbox");
+        let attacker_alias = dir.path().join("sandbox-alias");
+        let destination = dir.path().join("integration");
+        git::add_worktree(&repo, &task, "task", "main").unwrap();
+        git::add_worktree(&repo, &attacker, "sandbox", "main").unwrap();
+        std::os::unix::fs::symlink(&attacker, &attacker_alias).unwrap();
+        if existing {
+            git::add_worktree(&repo, &destination, "integration", "main").unwrap();
+        }
+        let home = paths::atomics_home();
+        let pins = home.join("git-pins");
+        crate::sandbox::pin_git(&pins, "atomics-attacker", &attacker).unwrap();
+        crate::sandbox_ownership::record_pins(&home, "atomics-attacker", &pins).unwrap();
+        app.runtime.config.worktree_path = "{repo_parent}/integration".into();
+        app.runtime.plans = vec![Plan {
+            id: "p".into(),
+            project: Some(repo.clone()),
+            integration: Some("integration".into()),
+            tasks: vec![
+                Task {
+                    id: "victim".into(),
+                    branch: Some("task".into()),
+                    worktree: Some(task.clone()),
+                    status: TaskStatus::Review,
+                    ..Default::default()
+                },
+                Task {
+                    id: "attacker".into(),
+                    branch: Some("sandbox".into()),
+                    worktree: Some(attacker_alias),
+                    status: TaskStatus::Running,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }];
+        std::fs::write(task.join("feature"), "uncommitted work").unwrap();
+        std::fs::write(attacker.join(".gitattributes"), "* merge=union\n").unwrap();
+        let source = git::commit_of(&repo, "refs/heads/task").unwrap();
+        let target = git::commit_of(&repo, "refs/heads/integration").unwrap();
+        git::git(&attacker, &["symbolic-ref", "HEAD", "refs/heads/integration"]).unwrap();
+        app.runtime.integrate(0, "victim", None);
+        let done = app
+            .runtime
+            .integrate_rx
+            .recv_timeout(crate::test_support::scaled_timeout(std::time::Duration::from_secs(10)))
+            .unwrap();
+        assert!(done.result.as_ref().unwrap_err().contains("claims integration ref"));
+        // Reverting before queued UI delivery must not erase the attack's alert.
+        git::git(&attacker, &["symbolic-ref", "HEAD", "refs/heads/sandbox"]).unwrap();
+        app.runtime.drain_actions();
+        app.runtime.finish_integration(done);
+        for task in &app.runtime.plans[0].tasks {
+            assert!(task.ref_alert.as_ref().unwrap().contains("claims integration ref"));
+            assert_eq!(task.status, TaskStatus::Blocked);
+        }
+        assert_eq!(git::commit_of(&repo, "refs/heads/task").unwrap(), source);
+        assert_eq!(git::commit_of(&repo, "refs/heads/integration").unwrap(), target);
+        assert!(git::git(&task, &["diff", "--cached"]).unwrap().is_empty());
+        assert_eq!(destination.exists(), existing);
+        for index in 0..2 {
+            let generation = app.runtime.plans[0].tasks[index].ref_alert_generation.clone();
+            app.runtime.acknowledge_refs(0, index, generation);
+        }
+        app.runtime.integrate(0, "victim", None);
+        let done = app
+            .runtime
+            .integrate_rx
+            .recv_timeout(crate::test_support::scaled_timeout(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let result = done.result.as_ref().unwrap();
+        assert_eq!(result.worktree, destination);
+        assert!(destination.join("feature").exists());
+        assert!(!destination.join(".gitattributes").exists());
+        app.runtime.finish_integration(done);
+        git::unpin(&attacker);
+    }
+
+    #[test]
+    fn a_sandbox_cannot_claim_the_destination_before_first_integration() {
+        with_app("app::ref_guard::tests::a_sandbox_cannot_claim_the_destination_before_first_integration", |app, _| {
+            forged_integration_claim(app, false)
+        });
+    }
+
+    #[test]
+    fn a_sandbox_claim_beside_the_real_destination_raises_an_attributable_alert() {
+        with_app(
+            "app::ref_guard::tests::a_sandbox_claim_beside_the_real_destination_raises_an_attributable_alert",
+            |app, _| forged_integration_claim(app, true),
+        );
+    }
+
+    #[test]
+    fn the_host_records_its_integration_path_across_reload_and_template_changes() {
+        with_app(
+            "app::ref_guard::tests::the_host_records_its_integration_path_across_reload_and_template_changes",
+            |app, _| {
+                let (dir, repo) = repository();
+                let task = dir.path().join("task");
+                git::add_worktree(&repo, &task, "task", "main").unwrap();
+                app.runtime.config.worktree_path = "{repo_parent}/original-integration".into();
+                app.runtime.plans = vec![Plan {
+                    id: "p".into(),
+                    project: Some(repo.clone()),
+                    integration: Some("integration".into()),
+                    tasks: vec![Task {
+                        id: "t".into(),
+                        branch: Some("task".into()),
+                        worktree: Some(task.clone()),
+                        status: TaskStatus::Review,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }];
+                for content in ["first", "second"] {
+                    std::fs::write(task.join("feature"), content).unwrap();
+                    app.runtime.integrate(0, "t", None);
+                    let done = app
+                        .runtime
+                        .integrate_rx
+                        .recv_timeout(crate::test_support::scaled_timeout(std::time::Duration::from_secs(10)))
+                        .unwrap();
+                    assert_eq!(done.result.as_ref().unwrap().worktree, dir.path().join("original-integration"));
+                    app.runtime.finish_integration(done);
+                    app.runtime.plans[0] = Plan::load(&paths::atomics_home().join("plans/p.json")).unwrap();
+                    app.runtime.config.worktree_path = "{repo_parent}/new-integration".into();
+                }
+                assert_eq!(std::fs::read_to_string(dir.path().join("original-integration/feature")).unwrap(), "second");
+                assert!(!dir.path().join("new-integration").exists());
+            },
+        );
+    }
+
     #[test]
     fn missing_task_folder_checks_its_snapshot_without_changing_host_head() {
         with_app(

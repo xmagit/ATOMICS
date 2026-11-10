@@ -724,7 +724,7 @@ fn read(
             let url = link.url.as_deref().filter(|url| markdown::web_url(url).is_some());
             let button = ui.add_enabled_ui(url.is_some(), |ui| touch::button(ui, client.touch, text)).inner;
             if let Some(url) = url
-                && button.on_hover_text(url).clicked()
+                && button.on_hover_text(markdown::web_url_hover(url)).clicked()
             {
                 ui.ctx().open_url(egui::OpenUrl::new_tab(url));
             }
@@ -975,7 +975,7 @@ fn plan_dialog(
 }
 
 fn web_link(ui: &mut egui::Ui, label: &str, url: &str) {
-    if markdown::web_url(url).is_some() && ui.link(label).on_hover_text(url).clicked() {
+    if markdown::web_url(url).is_some() && ui.link(label).on_hover_text(markdown::web_url_hover(url)).clicked() {
         ui.ctx().open_url(egui::OpenUrl::new_tab(url));
     }
 }
@@ -1004,7 +1004,9 @@ fn markdown_text(ui: &mut egui::Ui, source: &str, p: &Palette) {
                     }
                     markdown::Inline::Link { text, url } => {
                         let link = ui.link(RichText::new(text).size(size));
-                        if markdown::web_url(url).is_some() && link.on_hover_text(url).clicked() {
+                        if markdown::web_url(url).is_some()
+                            && link.on_hover_text(markdown::web_url_hover(url)).clicked()
+                        {
                             ui.ctx().open_url(egui::OpenUrl::new_tab(url));
                         }
                     }

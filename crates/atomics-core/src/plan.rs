@@ -26,6 +26,9 @@ pub struct Plan {
     /// Branch the tasks are merged into; `atomics/plan-<plan-id>` when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub integration: Option<String>,
+    /// Host-selected destinations, retained when the worktree path template changes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub integration_worktrees: Vec<IntegrationWorktree>,
     /// The external board (board mode) or ticket (ticket mode) this plan follows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ticket: Option<crate::tickets::TicketLink>,
@@ -46,6 +49,13 @@ pub struct Plan {
     pub notebook: Vec<NotebookEntry>,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub notebook_sequence: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegrationWorktree {
+    pub repo: std::path::PathBuf,
+    pub branch: String,
+    pub path: std::path::PathBuf,
 }
 
 pub const MAX_NOTE_CHARS: usize = 300;
