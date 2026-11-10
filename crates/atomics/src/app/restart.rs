@@ -441,8 +441,12 @@ mod tests {
             app.runtime.sessions = vec![chief];
             let exe = paths::atomics_home().join("version-probe");
             crate::test_support::write_program(&exe, "#!/bin/sh\ntest \"$1\" = --version\n");
-            let target =
-                || Ok(crate::restart::Target { executable: exe.clone(), command: vec!["/usr/bin/true".into()] });
+            let target = || {
+                Ok(crate::restart::Target {
+                    executable: exe.clone(),
+                    command: vec![crate::test_support::program("true").into()],
+                })
+            };
             let refused = app.runtime.restart_for(false, None, Some("someone-else"), target);
             assert!(refused.error.unwrap().contains("chief"));
             assert!(!app.runtime.restarting);
@@ -488,7 +492,7 @@ mod tests {
                 let missing = || {
                     Ok(crate::restart::Target {
                         executable: PathBuf::from("/missing/atomics"),
-                        command: vec!["/usr/bin/true".into()],
+                        command: vec![crate::test_support::program("true").into()],
                     })
                 };
                 let refused = app.runtime.restart_using(false, None, missing);
@@ -498,8 +502,12 @@ mod tests {
                 assert!(!app.runtime.restarting);
                 let exe = paths::atomics_home().join("version-probe");
                 crate::test_support::write_program(&exe, "#!/bin/sh\ntest \"$1\" = --version\n");
-                let target =
-                    || Ok(crate::restart::Target { executable: exe.clone(), command: vec!["/usr/bin/true".into()] });
+                let target = || {
+                    Ok(crate::restart::Target {
+                        executable: exe.clone(),
+                        command: vec![crate::test_support::program("true").into()],
+                    })
+                };
                 let store_path = paths::store_file();
                 std::fs::remove_file(&store_path).unwrap();
                 std::fs::create_dir(&store_path).unwrap();
