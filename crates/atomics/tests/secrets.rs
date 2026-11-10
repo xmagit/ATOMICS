@@ -167,7 +167,6 @@ fn terminal_secret_refuses_and_flushes_pasted_lines_before_restoring_echo() {
                 .env_remove(atomics_core::paths::HOST_SOCKET_ENV)
                 .env_remove("ATOMICS_SECRET_BROKER_SOCKET")
                 .env("ATOMICS_CREDENTIALS_DIR", &keychain)
-                .env("SHELL", "/bin/sh")
                 .stdin(Stdio::from(slave.try_clone().unwrap())),
             test_support::CHILD_TIMEOUT,
         )
