@@ -12,6 +12,7 @@
 //! paired one's ([`target`]). Instead of the page's input overlay, [`input`] routes the window's keys and
 //! pointer to the terminal that has the keyboard.
 
+mod credentials;
 mod frame_stats;
 pub mod input;
 pub mod link;
@@ -58,6 +59,7 @@ pub struct ClientApp {
     started: Instant,
     /// The VM's host: what the window does before it can dial (`vm.rs`).
     vm: Option<vm::Gate>,
+    credentials: Option<credentials::Credentials>,
     /// Why forgetting the VM's refused token failed, for the dialog that asks to pair again.
     pair_error: Option<String>,
     /// A start of the VM ended: dial again at once.
@@ -130,6 +132,13 @@ impl ClientApp {
                 action: None,
             },
         });
+        let driver = Driver::direct(&op_prefix());
+        let credentials = vm.as_ref().map(|gate| {
+            driver.remote.enable_native_credentials(crate::secret_copy::unavailable());
+            let mut credentials = credentials::Credentials::new(gate.bundle(), wake.clone());
+            credentials.refresh();
+            credentials
+        });
         Self {
             previews: crate::preview::client::Client::new(wake.clone()),
             open: launch.open,
@@ -137,10 +146,11 @@ impl ClientApp {
             shot_requested: false,
             frame_stats: frame_stats::FrameStats::from_env(),
             vm,
+            credentials,
             vm_started: Arc::default(),
             confirm_local: false,
             switch_error: None,
-            driver: Driver::direct(&op_prefix()),
+            driver,
             client,
             view,
             target,
@@ -207,10 +217,12 @@ impl ClientApp {
         let now = self.now_ms();
         self.driver.tick(now);
         self.take_events();
+        self.pump_credentials();
         self.start_agents();
         self.pump_previews();
         self.driver.flush();
         self.run_outputs();
+        self.pump_credentials();
         self.view.now_ms = now as f64;
     }
 
@@ -219,6 +231,12 @@ impl ClientApp {
     fn pump_previews(&mut self) {
         let link = self.link.as_ref().map(|(socket, link)| (*socket, link.frames()));
         self.previews.pump(&self.driver.remote, link);
+    }
+
+    fn pump_credentials(&mut self) {
+        if let Some(credentials) = &mut self.credentials {
+            credentials.poll(&self.driver.remote);
+        }
     }
 
     /// `--open`: once the host's board is in, each agent is started there, as the + New picker does.
@@ -261,6 +279,7 @@ impl ClientApp {
         if !self.vm_screen(ui) {
             views::draw(ui, &mut self.driver, &mut self.client, &mut self.view);
         }
+        self.pump_credentials();
         self.pump_previews();
         self.driver.flush();
         self.run_outputs();
@@ -489,6 +508,11 @@ impl ClientApp {
                 Event::Open { socket, protocol } => {
                     self.view.unreachable = None;
                     self.driver.socket_open(socket, &protocol);
+                    if self.link.as_ref().is_some_and(|(id, _)| *id == socket)
+                        && let Some(credentials) = &mut self.credentials
+                    {
+                        credentials.refresh();
+                    }
                 }
                 Event::Data { socket, bytes } => self.driver.socket_message(socket, &bytes),
                 Event::Closed { socket, code, unreachable } => {

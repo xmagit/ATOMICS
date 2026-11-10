@@ -12,6 +12,28 @@ use std::path::Path;
 
 const MAX_CONTROL: u64 = 256 * 1024;
 
+/// Runs only in the administrator's SSH process (or sudo in a single trust domain). Neither
+/// the host nor a control socket is involved. Only mutation requests can enter this bridge.
+pub fn admin_stdin() -> Result<()> {
+    let mut bytes = zeroize::Zeroizing::new(Vec::new());
+    std::io::stdin().lock().take(MAX_CONTROL + 1).read_to_end(&mut bytes)?;
+    anyhow::ensure!(bytes.len() <= MAX_CONTROL as usize, "request too large");
+    let request: Request = serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("invalid admin input"))?;
+    anyhow::ensure!(matches!(request, Request::Set { .. } | Request::Remove { .. }), "not an admin mutation");
+    let client = Client { socket: "/run/atomics-secret-broker/admin.sock".into() };
+    // Lima can accept SSH just before systemd has brought the new broker up after a boot.
+    // Both allowed mutations are idempotent, including an acknowledgement lost during restart.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match client.call_ref(&request) {
+            Ok(_) => break,
+            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(250)),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 #[derive(clap::Args)]
 pub struct Options {
     #[arg(long, default_value = "/var/lib/atomics-secret-broker")]
@@ -75,7 +97,11 @@ impl Client {
     }
 
     fn call(&self, request: Request) -> Result<Reply> {
-        let stream = self.connect(&request)?;
+        self.call_ref(&request)
+    }
+
+    fn call_ref(&self, request: &Request) -> Result<Reply> {
+        let stream = self.connect(request)?;
         let mut bytes = zeroize::Zeroizing::new(Vec::new());
         BufReader::new(stream).take(MAX_CONTROL).read_until(b'\n', &mut bytes)?;
         let reply: Reply = serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("invalid broker reply"))?;
@@ -178,14 +204,19 @@ impl Broker {
                 Request::List => reply.secrets = self.store.secrets()?,
                 Request::Set { spec, mut value } => {
                     use zeroize::Zeroize;
-                    let result = self.store.add_secret_rule(spec, &value);
+                    let label = format!("secret:{}", spec.name);
+                    let result = self.store.sync_secret_rule(spec, &value);
                     value.zeroize();
-                    result?;
+                    if result? {
+                        self.engine.grants.lock().unwrap().retain(|_, grant| grant.credential.label != label);
+                    }
                     self.hosts()?;
                     eprintln!("secret-broker: secret set");
                 }
                 Request::Remove { name } => {
-                    self.store.remove_secret(&name)?;
+                    if self.store.secrets()?.iter().any(|spec| spec.name == name) {
+                        self.store.remove_secret(&name)?;
+                    }
                     self.engine
                         .grants
                         .lock()
@@ -463,6 +494,24 @@ mod tests {
         assert_eq!(client.forward(&request(&placeholder), vec![], &mut reply).unwrap().0, 401);
         // A fresh broker has no persisted grants, even though its secret catalog persists.
         assert!(Inner::new(broker.state.join("other.log"), HashMap::new(), true).grants.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn admin_sync_is_idempotent_and_changed_values_revoke_old_grants() {
+        let (_dir, broker, client) = machine();
+        let spec = Secret { name: "KEY".into(), host: Some("api.example.com".into()), ..Default::default() };
+        set(&broker, spec.clone(), "first-private-canary");
+        let placeholder = format!("atomics-{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
+        client.grant("KEY", "s1", &placeholder).unwrap();
+        set(&broker, spec.clone(), "first-private-canary");
+        assert!(broker.engine.grants.lock().unwrap().contains_key(&placeholder));
+        set(&broker, spec, "second-private-canary");
+        assert!(broker.engine.grants.lock().unwrap().is_empty());
+        assert_eq!(broker.store.secret_values().unwrap()[0].1.as_str(), "second-private-canary");
+        for _ in 0..2 {
+            broker.control(Request::Remove { name: "KEY".into() }, true, broker.admin_uid).unwrap();
+        }
+        assert!(client.list().unwrap().is_empty());
     }
 
     #[test]

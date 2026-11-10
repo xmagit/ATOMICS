@@ -90,10 +90,36 @@ pub struct Welcome {
 
 pub struct RemoteBackend {
     native_previews: Cell<bool>,
+    native_credentials: RefCell<Option<NativeCredentials>>,
     state: RefCell<State>,
     /// Operation IDs: this client's random prefix and a counter.
     prefix: String,
     ops: Cell<u64>,
+}
+
+/// Enabled only by the native VM client. Values wait here only until its worker takes the
+/// command; they never enter the mirror, pending mutation journal or outgoing protocol frames.
+struct NativeCredentials {
+    status: serde_json::Value,
+    busy: bool,
+    copy_unavailable: Option<String>,
+    commands: Vec<Command>,
+}
+
+fn credential_command(command: &Command) -> bool {
+    use atomics_core::ops::{HostAction, SettingsTool};
+    matches!(
+        command,
+        Command::CopySecret(_)
+            | Command::Manage(HostAction::SettingsTool {
+                tool: SettingsTool::RefreshCredentials
+                    | SettingsTool::AddSecret { .. }
+                    | SettingsTool::RemoveSecret { .. }
+                    | SettingsTool::PutCredential { .. }
+                    | SettingsTool::RemoveCredential { .. }
+                    | SettingsTool::CleanCredentials
+            })
+    )
 }
 
 struct State {
@@ -367,6 +393,7 @@ impl RemoteBackend {
         };
         Self {
             native_previews: Cell::new(false),
+            native_credentials: RefCell::new(None),
             state: RefCell::new(state),
             prefix: prefix.to_string(),
             ops: Cell::new(0),
@@ -381,6 +408,30 @@ impl RemoteBackend {
     /// Set only by a native platform that implements local TCP listeners.
     pub fn enable_native_previews(&self) {
         self.native_previews.set(true);
+    }
+
+    pub fn enable_native_credentials(&self, copy_unavailable: Option<String>) {
+        *self.native_credentials.borrow_mut() = Some(NativeCredentials {
+            status: serde_json::json!({}),
+            busy: false,
+            copy_unavailable,
+            commands: Vec::new(),
+        });
+    }
+
+    pub fn set_native_credentials(&self, status: serde_json::Value, busy: bool) {
+        if let Some(local) = self.native_credentials.borrow_mut().as_mut() {
+            local.status = status;
+            local.busy = busy;
+        }
+    }
+
+    pub fn take_native_credentials(&self) -> Vec<Command> {
+        self.native_credentials
+            .borrow_mut()
+            .as_mut()
+            .map(|local| std::mem::take(&mut local.commands))
+            .unwrap_or_default()
     }
     pub fn tunnels(&self) -> bool {
         self.native_previews.get()
@@ -1424,6 +1475,12 @@ impl Backend for RemoteBackend {
     }
 
     fn send(&self, command: Command) {
+        if credential_command(&command)
+            && let Some(local) = self.native_credentials.borrow_mut().as_mut()
+        {
+            local.commands.push(command);
+            return;
+        }
         if matches!(command, Command::OpenPreview { .. } | Command::StopPreview { .. }) {
             if self.tunnels() {
                 let mut s = self.state.borrow_mut();
@@ -1485,6 +1542,9 @@ impl Backend for RemoteBackend {
     /// The view commands the frame carries out, a diff's refresh, and what can go to the host now
     /// ([`RemoteBackend::sends`]). Offline nothing can be sent.
     fn available(&self, command: &Command) -> bool {
+        if credential_command(command) && self.native_credentials.borrow().is_some() {
+            return true;
+        }
         if matches!(
             command,
             Command::OpenTicket(_) | Command::SetPanel(PanelMode::Tickets) | Command::ToggleView(PanelMode::Tickets)
@@ -1834,7 +1894,16 @@ impl Backend for RemoteBackend {
     /// The host's saved workspaces and the one open there, which `host_command` opens. Its recent projects are
     /// folders on the host, and a page saves no workspace.
     fn management(&self) -> Option<atomics_core::projection::ManagementInfo> {
-        self.state.borrow().mirror.host.management.clone()
+        let mut info = self.state.borrow().mirror.host.management.clone()?;
+        if let Some(local) = self.native_credentials.borrow().as_ref() {
+            let host_azure = info.tools["credentials"]["azure"].clone();
+            info.tools["credentials"] = local.status.clone();
+            info.tools["credentials"]["azure"] = host_azure;
+            info.tools["credential_busy"] = serde_json::json!(local.busy);
+            info.tools["secret_copy_unavailable"] = serde_json::json!(local.copy_unavailable);
+            info.tools["credentials_local"] = serde_json::json!(true);
+        }
+        Some(info)
     }
 
     fn project_menu(&self) -> ProjectMenu {
@@ -1927,6 +1996,9 @@ impl RemoteBackend {
     /// views ask with what they have in hand, a steer with no target yet or a review with no comment yet, so
     /// these ask as what they will send. A command that names what is gone cannot go.
     fn sends(&self, command: &Command) -> bool {
+        if credential_command(command) && self.native_credentials.borrow().is_some() {
+            return true;
+        }
         if matches!(
             command,
             Command::Edit { .. } | Command::EditorHints(_) | Command::LoadPullRequest(_) | Command::ToggleChief

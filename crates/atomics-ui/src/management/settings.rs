@@ -845,10 +845,12 @@ fn credentials_summary(info: &ManagementInfo) -> String {
 
 fn credentials(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, enabled: bool, info: &ManagementInfo) {
     let p = client.palette.clone();
+    let local_enabled = enabled
+        || backend.available(&Command::Manage(HostAction::SettingsTool { tool: SettingsTool::RefreshCredentials }));
     let status = &info.tools["credentials"];
     let busy = info.tools["credential_busy"] == true;
-    load(client, enabled, busy, SettingsTool::RefreshCredentials);
-    secrets(ui, backend, client, enabled && !busy, info);
+    load(client, local_enabled, busy, SettingsTool::RefreshCredentials);
+    secrets(ui, backend, client, local_enabled && !busy, info);
     note(
         ui,
         &p,
@@ -858,13 +860,21 @@ fn credentials(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, en
         ui.add(egui::Label::new(RichText::new(error).color(p.error)).wrap());
     }
     if busy {
-        note(ui, &p, "Waiting for the OS credential store…");
+        note(
+            ui,
+            &p,
+            if info.tools["credentials_local"] == true {
+                "Waiting for this Mac's keychain or VM secret sync…"
+            } else {
+                "Waiting for the OS credential store…"
+            },
+        );
     } else if status.is_null() && !enabled {
         note(ui, &p, "The host has not read its credential store yet.");
     }
     let entries = status["entries"].as_array().map_or(&[][..], Vec::as_slice);
     for entry in entries {
-        credential(ui, client, enabled && !busy, entry);
+        credential(ui, client, local_enabled && !busy, entry);
     }
     let invalid = status["invalid"].as_u64().unwrap_or(0);
     if invalid > 0 {
@@ -879,14 +889,14 @@ fn credentials(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, en
                 None => {}
             }
         } else {
-            ui.add_enabled_ui(enabled && !busy, |ui| {
+            ui.add_enabled_ui(local_enabled && !busy, |ui| {
                 if button(ui, client, "Remove unknown entries…").clicked() {
                     client.management.confirm = Some(Confirm::CleanCredentials);
                 }
             });
         }
     }
-    ui.add_enabled_ui(enabled && !busy, |ui| {
+    ui.add_enabled_ui(local_enabled && !busy, |ui| {
         credential_form(ui, client, info);
         if ui.add(touch::sized(egui::Button::new("Refresh"), client.touch)).clicked() {
             tool(client, SettingsTool::RefreshCredentials);
@@ -914,17 +924,36 @@ fn secrets(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, enable
     use atomics_core::secrets::{Auth, Scope as SecretScope};
     let p = client.palette.clone();
     subheading(ui, &p, "Secrets");
+    if let Some(warning) = info.tools["credentials"]["vm_warning"].as_str() {
+        note(ui, &p, warning);
+    }
+    if let Some(removals) = info.tools["credentials"]["vm_removals"].as_object() {
+        for (name, state) in removals {
+            note(
+                ui,
+                &p,
+                format!("{name} · VM removal: {} · Refresh credentials to retry", state.as_str().unwrap_or("Pending")),
+            );
+        }
+    }
     if let Some(note_text) = info.tools["credentials"]["copy_note"].as_str() {
         note(ui, &p, note_text);
     }
     note(
         ui,
         &p,
-        "New sessions receive secrets in their scope. Protected values stay in the host store; exposed values can be read and leaked by agents.",
+        if info.tools["credentials_local"] == true {
+            "Secrets live in this Mac's keychain and sync to the VM broker. New VM sessions receive them in scope. Exposed values can be read and leaked by agents."
+        } else {
+            "New sessions receive secrets in their scope. Protected values stay in the host store; exposed values can be read and leaked by agents."
+        },
     );
     for entry in info.tools["credentials"]["secrets"].as_array().into_iter().flatten() {
         let name = entry["spec"]["name"].as_str().unwrap_or_default();
         ui.label(RichText::new(name).strong());
+        if let Some(state) = entry["vm_sync"].as_str() {
+            note(ui, &p, format!("VM: {state}"));
+        }
         note(
             ui,
             &p,

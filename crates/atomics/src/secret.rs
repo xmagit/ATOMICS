@@ -1,5 +1,5 @@
 //! The CLI accepts values on stdin only. There is deliberately no CLI/protocol copy operation.
-use anyhow::Result;
+use anyhow::{Context, Result};
 use atomics_core::secrets::{Auth, Scope, Secret};
 use clap::Subcommand;
 use std::io::{BufRead, IsTerminal, Read, Write};
@@ -12,7 +12,7 @@ pub enum Command {
         /// DNS host or known service: openai, anthropic, github, linear, logo.dev, stripe.
         #[arg(long)]
         host: Option<String>,
-        /// everywhere, workspace:NAME, or project:/path/to/main/checkout
+        /// everywhere, workspace:NAME, or project:/main/checkout (VM path for a VM client)
         #[arg(long, default_value = "everywhere")]
         scope: String,
         /// Send the key in this header instead of Authorization: Bearer.
@@ -39,7 +39,11 @@ pub enum Command {
 
 pub fn run(command: Command) -> Result<()> {
     let relay = crate::relay::Service::new(atomics_core::paths::atomics_home(), crate::relay::Keychain::current());
-    let store = crate::credentials::Store::new(relay.keychain().clone());
+    let store = if cfg!(target_os = "macos") {
+        crate::credentials::Store::local(relay.keychain().clone())
+    } else {
+        crate::credentials::Store::new(relay.keychain().clone())
+    };
     match command {
         Command::Add { name, host, scope, header, basic_user, query, method, path_prefix } => {
             let scope = match scope.as_str() {
@@ -60,6 +64,7 @@ pub fn run(command: Command) -> Result<()> {
             let host = known.map(|(h, _)| h.into()).or_else(|| host.map(|h| h.to_ascii_lowercase()));
             let spec = Secret { name, host, scope, auth, methods: method, path_prefix };
             spec.validate().map_err(anyhow::Error::msg)?;
+            let vm_client = crate::vm::secrets::is_vm_client()?;
             if spec.host.is_none() {
                 eprintln!("{}", atomics_core::secrets::EXPOSED);
             }
@@ -77,7 +82,12 @@ pub fn run(command: Command) -> Result<()> {
                     value.pop();
                 }
             }
-            store.add_secret(spec, &value)?;
+            if vm_client {
+                store.add_secret_rule(spec, &value)?;
+            } else {
+                store.add_secret(spec, &value)?;
+            }
+            sync_vm().context("Secret saved in the local keychain; VM sync is pending")?;
             println!("Secret added. New sessions receive it when in scope.");
         }
         Command::List => {
@@ -97,6 +107,7 @@ pub fn run(command: Command) -> Result<()> {
         }
         Command::Rm { name } => {
             store.remove_secret(&name)?;
+            sync_vm().context("Secret removed from the local keychain; VM removal is pending")?;
             if atomics_core::paths::socket_path().exists()
                 && !crate::ipc::request(&atomics_core::control::ControlRequest::SecretRemoved { name })
                     .is_ok_and(|reply| reply.ok)
@@ -107,6 +118,13 @@ pub fn run(command: Command) -> Result<()> {
             }
             println!("Secret removed. Restart existing sessions to clear their environment.");
         }
+    }
+    Ok(())
+}
+
+fn sync_vm() -> Result<()> {
+    if let Some(info) = crate::vm::secrets::configured()? {
+        crate::vm::secrets::push(&info)?;
     }
     Ok(())
 }

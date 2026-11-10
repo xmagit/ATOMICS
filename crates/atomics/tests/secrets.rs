@@ -44,8 +44,12 @@ fn secret_cli_canary_never_reaches_output_arguments_config_or_logs() {
     assert!(String::from_utf8_lossy(&exposed.stderr).contains("agents can read and leak"));
     let bad_args = run(&["secret", "add", "BAD_KEY", &canary], None);
     let copy = run(&["secret", "copy", "EXAMPLE_KEY"], None);
+    let admin_read =
+        run(&["secret-broker-admin"], Some(&format!(r#"{{"op":"expose","name":"{canary}","session":"s1"}}"#)));
+    let admin_bad = run(&["secret-broker-admin"], Some(&canary));
+    assert!(!admin_read.status.success() && !admin_bad.status.success());
     assert!(!bad_args.status.success() && !copy.status.success());
-    for output in [add, list, exposed, bad_args, copy] {
+    for output in [add, list, exposed, bad_args, copy, admin_read, admin_bad] {
         for bytes in [output.stdout, output.stderr] {
             assert!(!bytes.windows(canary.len()).any(|w| w == canary.as_bytes()));
         }

@@ -59,7 +59,7 @@ mod github;
 mod heartbeat;
 mod input;
 mod integrations;
-mod management;
+pub(crate) mod management;
 mod mutations;
 mod open_link;
 mod plan_cleanup;

@@ -351,45 +351,76 @@ fn credential_tool(
     relay: &crate::relay::Service,
     tool: atomics_core::ops::SettingsTool,
 ) -> Result<serde_json::Value, String> {
-    use atomics_core::ops::SettingsTool;
-    let store = crate::credentials::Store::new(relay.keychain().clone());
+    let label = credential_label(&tool)?;
+    relay.edit(&label, |store| credential_action(store, tool)).map_err(|error| error.to_string())?;
+    credential_status(relay, &crate::credentials::Store::new(relay.keychain().clone()))
+}
+
+/// The VM window owns its keychain. This path explicitly bypasses any broker environment.
+pub(crate) fn local_credential_tool(
+    relay: &crate::relay::Service,
+    tool: atomics_core::ops::SettingsTool,
+) -> Result<serde_json::Value, String> {
+    credential_label(&tool)?;
+    let store = crate::credentials::Store::local(relay.keychain().clone());
     match tool {
-        SettingsTool::RefreshCredentials => {}
-        SettingsTool::AddSecret { spec, value } => {
-            let label = format!("secret:{}", spec.name);
-            relay.edit(&label, |store| store.add_secret(spec, &value)).map_err(|error| error.to_string())?;
-        }
-        SettingsTool::RemoveSecret { name } => {
-            relay
-                .edit(&format!("secret:{name}"), |store| store.remove_secret(&name))
-                .map_err(|error| error.to_string())?;
-        }
-        SettingsTool::PutCredential { kind, value, host } => {
-            let label = if kind == "registry" {
+        // Settings selected a main checkout from the VM's projection. It need not exist on
+        // this Mac, and must keep its VM path when the keychain catalog is synchronized.
+        atomics_core::ops::SettingsTool::AddSecret { spec, value } => store.add_secret_rule(spec, &value),
+        tool => credential_action(&store, tool),
+    }
+    .map_err(|error| error.to_string())?;
+    credential_status(relay, &store)
+}
+
+fn credential_label(tool: &atomics_core::ops::SettingsTool) -> Result<String, String> {
+    use atomics_core::ops::SettingsTool;
+    Ok(match tool {
+        SettingsTool::AddSecret { spec, .. } => format!("secret:{}", spec.name),
+        SettingsTool::RemoveSecret { name } => format!("secret:{name}"),
+        SettingsTool::PutCredential { kind, host, .. } | SettingsTool::RemoveCredential { kind, host } => {
+            let label = crate::credentials::KINDS
+                .iter()
+                .find(|(id, _, _)| *id == kind)
+                .ok_or_else(|| "Unknown credential kind".to_string())?
+                .1;
+            if kind == "registry" {
                 format!("Private registry ({})", host.as_deref().unwrap_or_default())
             } else {
-                crate::credentials::KINDS.iter().find(|(id, _, _)| *id == kind).unwrap().1.into()
-            };
-            relay.edit(&label, |store| store.put(&kind, &value, host.as_deref())).map_err(|error| error.to_string())?;
+                label.into()
+            }
         }
+        SettingsTool::RefreshCredentials | SettingsTool::CleanCredentials => String::new(),
+        _ => return Err("Unknown credential operation".into()),
+    })
+}
+
+fn credential_action(store: &crate::credentials::Store, tool: atomics_core::ops::SettingsTool) -> anyhow::Result<()> {
+    use atomics_core::ops::SettingsTool;
+    match tool {
+        SettingsTool::RefreshCredentials => Ok(()),
+        SettingsTool::AddSecret { spec, value } => store.add_secret(spec, &value),
+        SettingsTool::RemoveSecret { name } => store.remove_secret(&name),
+        SettingsTool::PutCredential { kind, value, host } => store.put(&kind, &value, host.as_deref()),
         SettingsTool::RemoveCredential { kind, host } => {
             let key = match kind.as_str() {
                 "registry" => format!("registry:{}", host.as_deref().unwrap_or_default()),
                 crate::credentials::GITHUB_APP => {
                     crate::credentials::github_app_id(host.as_deref().unwrap_or_default())
                 }
-                _ => kind.clone(),
+                _ => kind,
             };
-            let label = if kind == "registry" {
-                format!("Private registry ({})", host.as_deref().unwrap_or_default())
-            } else {
-                crate::credentials::KINDS.iter().find(|(id, _, _)| *id == kind).unwrap().1.into()
-            };
-            relay.edit(&label, |store| store.remove(&key)).map_err(|error| error.to_string())?;
+            store.remove(&key)
         }
-        SettingsTool::CleanCredentials => store.remove_invalid().map_err(|error| error.to_string())?,
-        _ => unreachable!("credential tool"),
+        SettingsTool::CleanCredentials => store.remove_invalid(),
+        _ => anyhow::bail!("Unknown credential operation"),
     }
+}
+
+fn credential_status(
+    relay: &crate::relay::Service,
+    store: &crate::credentials::Store,
+) -> Result<serde_json::Value, String> {
     let snapshot = store.snapshot().map_err(|error| error.to_string())?;
     let entries: Vec<_> = snapshot
         .entries

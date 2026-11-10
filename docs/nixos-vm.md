@@ -616,6 +616,25 @@ and redacts reflected credentials just as the desktop relay does. When a broker 
 unavailable, session preparation and requests fail; they do not fall back to a readable store.
 Desktop hosts without `ATOMICS_SECRET_BROKER_SOCKET` continue using the OS keychain.
 
+In a Mac window connected with `[client] connect = "vm"`, Settings stores, lists, copies (after a
+fresh OS prompt) and removes secrets in the **Mac keychain**. Adding a secret also sends it directly
+to the VM broker. Each row shows **Pending**, **Synced**, or **Failed** with a reason. Reconnecting or
+refreshing credentials resends the keychain entries, including after the broker has been replaced.
+Project scopes use the VM's main-checkout paths, including directories that exist only in the VM.
+Failed removals stay in a names-only journal on the Mac and retry on reconnect or refresh, even after
+the window has closed. Entries independently installed by an administrator are preserved.
+
+`atomics secret add` and `atomics secret rm` on a Mac with that client setting use the same sync path.
+`atomics vm setup` and `atomics vm update` push keychain secrets too. With `--no-restart`, sync targets
+the currently running broker; if that system predates broker support, the command reports a sync
+failure, keeps the keychain entries, and the next connection after boot retries them.
+
+Sync uses the update command's administrator SSH connection, with connection sharing disabled. The
+value travels only on stdin to the fixed `atomics secret-broker-admin` bridge and its administration
+socket; it never enters the host's protocol or process. Without a separate administrator, sync uses
+the VM user's sudo and displays a **One trust domain** warning: agents can become root and read the
+store. Enable hardened mode to separate those accounts.
+
 Administration uses `/run/atomics-secret-broker/admin.sock`, mode `0660`, accessible only to root
 and `atomics.vm.adminUser` through the `atomics-secret-admin` group. In an admin login:
 

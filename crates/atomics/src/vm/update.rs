@@ -595,6 +595,8 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
         restart_window(info, changed)?;
         println!("VM: {}", if changed { "restarted" } else { "not restarted (system unchanged)" });
     }
+    // With --no-restart the running system still has the previous administrator account.
+    super::secrets::push(if options.no_restart { info } else { &new })?;
     Ok(())
 }
 

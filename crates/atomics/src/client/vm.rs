@@ -87,6 +87,10 @@ impl Gate {
         self.info.as_ref().map(|info| info.instance.as_str())
     }
 
+    pub fn bundle(&self) -> Option<BundleInfo> {
+        self.info.clone()
+    }
+
     pub fn view(&self) -> View {
         let shared = self.shared.lock().unwrap();
         View {

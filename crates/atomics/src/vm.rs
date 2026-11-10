@@ -9,6 +9,7 @@
 //! replaced unless the user confirms it.
 
 pub mod download;
+pub mod secrets;
 pub mod setup;
 pub mod update;
 
@@ -252,9 +253,19 @@ pub fn guest_shell(info: &BundleInfo) -> Result<Command> {
 /// shell sets PATH and the profile up, then hands over to a plain bash: an `exit` in a login shell would source
 /// /etc/bash_logout, which fails under a script's `set -u`.
 pub fn system_shell(info: &BundleInfo) -> Result<Command> {
+    system_command(info, "exec bash -s")
+}
+
+/// Fixed administrator command, leaving stdin entirely available for private data. Shares the
+/// update path's account and explicitly disables SSH connection sharing in hardened mode.
+pub(super) fn system_command(info: &BundleInfo, script: &str) -> Result<Command> {
+    system_command_with(info, script, || guest_shell(info))
+}
+
+fn system_command_with(info: &BundleInfo, script: &str, guest: impl FnOnce() -> Result<Command>) -> Result<Command> {
     let Some(admin) = &info.admin else {
-        let mut command = guest_shell(info)?;
-        command.args(["bash", "--login", "-c", "exec bash -s"]);
+        let mut command = guest()?;
+        command.args(["bash", "--login", "-c", script]);
         return Ok(command);
     };
     let mut command = Command::new("ssh");
@@ -264,7 +275,7 @@ pub fn system_shell(info: &BundleInfo) -> Result<Command> {
         .args(["-o", "LogLevel=ERROR", "-o", "ControlMaster=no", "-o", "ControlPath=none", "-T", "-l", admin])
         .arg(format!("lima-{}", info.instance))
         // ssh hands the remote shell one command line.
-        .arg("bash --login -c 'exec bash -s'");
+        .arg(format!("bash --login -c '{}'", script.replace('\'', "'\\''")));
     Ok(command)
 }
 

@@ -158,6 +158,11 @@ pub fn setup(options: Setup) -> Result<()> {
         check(&info)?;
     }
 
+    say("Sync keychain secrets to the VM broker");
+    // Applying modules may have installed hardened mode and a new administrator account.
+    // Use that bundle's connection metadata, never the initial image's user/sudo path.
+    super::secrets::push(&BundleInfo::read(&installed)?)?;
+
     say("Sign-ins left");
     sign_ins(&info);
 
