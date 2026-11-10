@@ -737,7 +737,10 @@ mod tests {
             crate::test_support::write_program(&program, "#!/bin/sh\ntest \"$1\" = --version\n");
             countdown_over(app);
             app.runtime.restart_when_clear(|| {
-                Ok(crate::restart::Target { executable: program.clone(), command: vec!["/usr/bin/true".into()] })
+                Ok(crate::restart::Target {
+                    executable: program.clone(),
+                    command: vec![crate::test_support::program("true").into()],
+                })
             });
             assert!(app.runtime.restarting);
             assert_eq!(Store::load(&paths::store_file()).restart.unwrap().reason.as_deref(), Some("update to 9.0.0"));
@@ -1234,7 +1237,10 @@ mod tests {
                 crate::test_support::write_program(&program, "#!/bin/sh\ntest \"$1\" = --version\n");
                 countdown_over(app);
                 app.runtime.restart_when_clear(|| {
-                    Ok(crate::restart::Target { executable: program.clone(), command: vec!["/usr/bin/true".into()] })
+                    Ok(crate::restart::Target {
+                        executable: program.clone(),
+                        command: vec![crate::test_support::program("true").into()],
+                    })
                 });
                 assert!(app.runtime.restarting);
             },

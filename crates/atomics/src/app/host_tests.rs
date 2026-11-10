@@ -432,7 +432,7 @@ fn delivery_verification_times_out_without_frames() {
         let terminal = Terminal::spawn(
             state.wake.clone(),
             state.theme.terminal_colors(),
-            "/bin/sleep".into(),
+            crate::test_support::program("sleep"),
             vec!["30".into()],
             &state.launch_dir,
             HashMap::new(),
