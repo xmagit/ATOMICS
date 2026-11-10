@@ -25,6 +25,31 @@ pub(super) fn cycle_problems(plan: &Plan) -> Vec<String> {
 pub(super) const DEFERRED_CHECK: Duration = Duration::from_secs(30);
 
 impl State {
+    /// Advisory only: missing and expired quota cannot establish that a provider is below its floor.
+    pub(super) fn quota_warnings(&self, plan: &Plan) -> Vec<String> {
+        let now = crate::usage::now();
+        let mut warnings = Vec::new();
+        for task in &plan.tasks {
+            let name = if task.agent.is_empty() { "claude" } else { &task.agent };
+            let Some(provider) = self.config.agent(name).and_then(|agent| agent.usage_provider()) else { continue };
+            let Some(minimum) = self.config.chief.min_left_percent.get(provider) else { continue };
+            let usage = match provider {
+                "codex" => &self.usage.codex,
+                "claude" => &self.usage.claude,
+                _ => continue,
+            };
+            for (window_name, window) in [("session", &usage.session), ("weekly", &usage.weekly)] {
+                if let Some(window) = window.as_ref().filter(|w| w.resets_at > now && w.left_percent < *minimum) {
+                    warnings.push(format!(
+                        "Task {}: agent {name} uses {provider}, whose {window_name} quota has {}% left, below chief.min_left_percent.{provider} = {minimum}% (reading {}; resets_at {}). Plan saved; consider another preferred agent or explain the exception in its brief.",
+                        task.id, window.left_percent, atomics_core::usage::age_label(usage.observed_at, now), window.resets_at,
+                    ));
+                }
+            }
+        }
+        warnings
+    }
+
     pub(super) fn show_plan_fleet(&mut self) {
         self.changed_plans.remove(&self.plans[self.selected_plan].id);
         self.view = self.plans[self.selected_plan].project.clone();
@@ -1168,6 +1193,104 @@ impl State {
 mod tests {
     use super::super::tests::{repository, request, session, with_app};
     use super::*;
+
+    #[test]
+    fn list_exposes_provider_quota_left_age_and_chief_budget() {
+        with_app("app::plans::tests::list_exposes_provider_quota_left_age_and_chief_budget", |app, _| {
+            use atomics_core::usage::{Usage, Window};
+            let now = crate::usage::now();
+            app.runtime.usage.codex = Usage {
+                session: Some(Window { left_percent: 8.5, resets_at: now + 300 }),
+                weekly: Some(Window { left_percent: 90.0, resets_at: now + 600 }),
+                observed_at: now - 120,
+                ..Default::default()
+            };
+            app.runtime.config.chief.prefer = vec!["codex".into(), "claude".into()];
+            app.runtime.config.chief.min_left_percent.insert("codex".into(), 10.0);
+            let listed = request(app, json!({"cmd":"list"}));
+            assert!(listed.ok);
+            let reading = &listed.result["usage"]["codex"];
+            assert_eq!(reading["session"], json!({"left_percent":8.5,"resets_at":now+300,"expired":false}));
+            assert_eq!(reading["weekly"]["left_percent"], 90.0);
+            assert_eq!(reading["observed_at"], now - 120);
+            assert!(reading["age_secs"].as_i64().unwrap() >= 120);
+            assert!(listed.result["usage"]["claude"]["age_secs"].is_null());
+            assert!(listed.result["usage"]["claude"]["session"].is_null());
+            assert_eq!(listed.result["chief"]["prefer"], json!(["codex", "claude"]));
+            assert_eq!(listed.result["chief"]["min_left_percent"], json!({"codex":10.0}));
+            let prompt = app.runtime.chief_prompt();
+            assert!(prompt.contains("configured preference is [\"codex\",\"claude\"]"), "{prompt}");
+            assert!(prompt.contains("provider minimums are {\"codex\":10.0}"), "{prompt}");
+            assert!(!prompt.contains("{chief_prefer}"));
+        });
+    }
+
+    #[test]
+    fn plan_set_warns_below_provider_minimum_without_refusing_and_ignores_unknown_or_expired_quota() {
+        with_app(
+            "app::plans::tests::plan_set_warns_below_provider_minimum_without_refusing_and_ignores_unknown_or_expired_quota",
+            |app, _| {
+                use atomics_core::usage::{Usage, Window};
+                let now = crate::usage::now();
+                let mut codex = app.runtime.config.agent("codex").unwrap().clone();
+                codex.name = "codex-small".into();
+                codex.command[0] = "/opt/bin/codex".into();
+                app.runtime.config.agents.push(codex);
+                let mut claude = app.runtime.config.agent("claude").unwrap().clone();
+                claude.name = "claude-small".into();
+                app.runtime.config.agents.push(claude);
+                app.runtime.config.chief.min_left_percent.extend([("codex".into(), 10.0), ("claude".into(), 20.0)]);
+                app.runtime.usage.codex = Usage {
+                    session: Some(Window { left_percent: 9.5, resets_at: now + 300 }),
+                    weekly: Some(Window { left_percent: 10.0, resets_at: now + 600 }),
+                    observed_at: now - 120,
+                    ..Default::default()
+                };
+                app.runtime.usage.claude = Usage {
+                    session: Some(Window { left_percent: 20.0, resets_at: now + 300 }),
+                    weekly: Some(Window { left_percent: 19.5, resets_at: now + 600 }),
+                    observed_at: now - 120,
+                    ..Default::default()
+                };
+                let tasks = json!([
+                    {"id":"code","agent":"codex-small"}, {"id":"design","agent":"claude-small"},
+                    {"id":"shell","agent":"shell"}, {"id":"review","agent":"shell"}
+                ]);
+                let saved = request(app, json!({"cmd":"plan_set","goal":"Budget-aware plan","tasks":tasks}));
+                assert!(saved.ok, "{:?}", saved.error);
+                let warnings = saved.result["warnings"].as_array().unwrap();
+                assert_eq!(warnings.len(), 2, "{warnings:?}");
+                assert!(
+                    warnings[0]
+                        .as_str()
+                        .unwrap()
+                        .contains("Task code: agent codex-small uses codex, whose session quota has 9.5% left")
+                );
+                assert!(
+                    warnings[1]
+                        .as_str()
+                        .unwrap()
+                        .contains("Task design: agent claude-small uses claude, whose weekly quota has 19.5% left")
+                );
+                assert!(warnings[0].as_str().unwrap().contains("reading 2m ago; resets_at"));
+                let id = saved.result["plan"].as_str().unwrap();
+                let stored = Plan::load(&paths::atomics_home().join("plans").join(format!("{id}.json"))).unwrap();
+                assert_eq!(stored.tasks.len(), 4, "a warning still saves the entire plan");
+
+                app.runtime.usage.codex.session.as_mut().unwrap().resets_at = now - 1;
+                app.runtime.usage.claude = Usage::default();
+                let saved = request(app, json!({"cmd":"plan_set","plan":id,"goal":"Budget-aware plan","tasks":tasks}));
+                assert!(saved.ok);
+                assert!(saved.result.get("warnings").is_none(), "{:?}", saved.result);
+
+                app.runtime.usage.codex.session.as_mut().unwrap().resets_at = now + 300;
+                app.runtime.config.chief.min_left_percent.clear();
+                let saved = request(app, json!({"cmd":"plan_set","plan":id,"goal":"Budget-aware plan","tasks":tasks}));
+                assert!(saved.ok);
+                assert!(saved.result.get("warnings").is_none(), "no configured minimum means no warning");
+            },
+        );
+    }
 
     #[test]
     fn plan_set_refuses_dependency_cycles_and_names_them() {

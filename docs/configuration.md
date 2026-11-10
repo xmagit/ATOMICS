@@ -62,6 +62,35 @@ with a warning; see [Repository workflows](repo-workflow.md).
 
 ## The chief's prompt
 
+The chief chooses suitable task agents in `[chief] prefer` order (agent names from `[[agents]]`).
+The default is `["codex", "claude"]`; `[]` leaves the choice to task fit. Set these preferences in
+`config.toml` or this host's `config.d/<host>.toml`:
+
+```toml
+[chief]
+prefer = ["codex", "claude"]
+min_left_percent = { codex = 10, claude = 20 }
+```
+
+`min_left_percent` sets an advisory floor per provider (`codex` or `claude`), from 0 to 100, including
+fractional percentages. By default no minimums are configured. Agent variants share their provider's
+quota: Claude agents use `kind = "claude"`, and Codex agents use `kind = "generic"` with a `codex`
+command (an absolute path is allowed). The preference names agents; the minimums name providers.
+
+`atomics_list` returns `chief.prefer` and `chief.min_left_percent`, plus `usage.claude` and `usage.codex`.
+Each provider has `session` and `weekly` windows with `left_percent` (quota **left**, counting down from
+100 to 0), `resets_at` (Unix seconds, UTC) and `expired`. `observed_at` is the source's Unix timestamp;
+`age_secs` is how old that reading is, even if ATOMICS just polled it. A missing window is `null`;
+before any reading, `observed_at` and `age_secs` are also `null`. Expired windows remain visible as
+historical readings and do not establish current quota. These are the same account readings the sidebar
+shows, shared across local and sandboxed agents, not a per-task allowance or spending limit.
+
+The chief checks the age and reset time, favors providers whose reported, unexpired session and weekly
+windows meet their minimum, and explains its choice and any exception or unknown/stale reading in each
+task's brief. `atomics_plan_set` saves the plan and returns `warnings` when either unexpired window is
+strictly below its provider minimum. It never refuses a plan for quota; a missing or expired reading does
+not trigger a quota warning. **Settings → Agents** shows the effective preference and minimums read-only.
+
 `[chief] wake_secs` wakes an idle or turn-done chief every 180 seconds by default; set it to `0` to disable,
 or to at least `30` seconds. Set it in `config.toml` or this host's `config.d/<host>.toml`.
 Work is open when an open plan has a running or review task, or a non-chief agent session exists.
@@ -186,7 +215,7 @@ people change, and each reads what it shows as it opens:
 | Updates | Only with something to say: this version and the new one, its notes, the Update button, what an update is doing, and why the last check failed. A client always has it, to say which version the host runs. See [Updates](#updates). |
 | Theme | The [themes](themes.md) with their colors. A click shows one at once and saves it. |
 | Shortcuts | The keys every client takes, then the configured ones, which a remote client says are the desktop's. |
-| Agents | The configured agents, whether they run sandboxed, what they need, with [a click or the exact command](isolation.md#fresh-machine-clicks-or-one-guided-command) for each step, the [sandbox checks](isolation.md#check-sandbox-setup) and the Claude hooks. |
+| Agents | The configured agents, the chief's task agent preference and quota-left minimums, whether they run sandboxed, what they need, with [a click or the exact command](isolation.md#fresh-machine-clicks-or-one-guided-command) for each step, the [sandbox checks](isolation.md#check-sandbox-setup) and the Claude hooks. |
 | Connections | [MCP servers](isolation.md#mcp-connections) for sandboxed agents. |
 | Remote devices | Pairing and paired devices, as in the Remote window. |
 | Credentials | [What the OS keychain holds](isolation.md#settings--credentials), never a value, and Azure CLI access. |

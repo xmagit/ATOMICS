@@ -218,6 +218,7 @@ impl State {
                 return;
             }
             ControlRequest::List => {
+                self.usage.drain();
                 // Every session, so each one's prompt and pending request are kept short.
                 let sessions: Vec<_> = (0..self.sessions.len())
                     .map(|i| {
@@ -237,8 +238,16 @@ impl State {
                     "active": self.active,
                     "plan_view": self.plan_view,
                     "resources": self.resources_json(),
+                    "usage": {
+                        "claude": self.usage.claude.chief_json(crate::usage::now()),
+                        "codex": self.usage.codex.chief_json(crate::usage::now()),
+                    },
                     "visible": self.visible_sessions().iter().map(|&i| &self.sessions[i].id).collect::<Vec<_>>(),
-                    "chief": { "open": self.chief_open, "dock": self.chief_dock(), "width": self.store.chief_width },
+                    "chief": {
+                        "open": self.chief_open, "dock": self.chief_dock(), "width": self.store.chief_width,
+                        "prefer": self.config.chief.prefer,
+                        "min_left_percent": self.config.chief.min_left_percent,
+                    },
                     "window": viewport.map(|viewport| viewport.content),
                     "monitor": viewport.and_then(|viewport| viewport.monitor),
                     "layout": layout,
@@ -329,7 +338,9 @@ impl State {
                     candidate.integration = integration.clone();
                 }
                 candidate.project = self.plan_project(&candidate);
-                let (refused, warnings) = self.plan_problems((!new).then_some(target), &candidate);
+                let (refused, mut warnings) = self.plan_problems((!new).then_some(target), &candidate);
+                self.usage.drain();
+                warnings.extend(self.quota_warnings(&candidate));
                 // One line per problem, so a plan of many tasks lists the first ones and counts the rest.
                 if !refused.is_empty() {
                     let error = format!("Plan not saved:\n- {}", clip_list(&refused, 600, 20).join("\n- "));

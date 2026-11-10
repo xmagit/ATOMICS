@@ -373,8 +373,8 @@ fn account_usage_and_governor_state_are_published_without_a_window() {
     instance.ready(&mut host);
     let initial = board(&instance.home(), |m| m.host.resources.as_ref().is_some_and(|r| r.codex.session.is_some()));
     let resources = initial.host.resources.unwrap();
-    assert_eq!(resources.codex.session.unwrap().remaining, 75.0);
-    assert_eq!(resources.codex.weekly.unwrap().remaining, 60.0);
+    assert_eq!(resources.codex.session.unwrap().left_percent, 75.0);
+    assert_eq!(resources.codex.weekly.unwrap().left_percent, 60.0);
     assert!(resources.cores > 0 && resources.test.slots > 0 && resources.qa.slots == 1);
     assert!(resources.sampled_at >= now);
 
@@ -393,8 +393,8 @@ fn account_usage_and_governor_state_are_published_without_a_window() {
     BufReader::new(&statusline).read_line(&mut String::new()).unwrap();
     let updated = board(&instance.home(), |m| m.host.resources.as_ref().is_some_and(|r| r.claude.session.is_some()));
     let resources = updated.host.resources.unwrap();
-    assert_eq!(resources.claude.session.unwrap().remaining, 78.0);
-    assert_eq!(resources.claude.weekly.unwrap().remaining, 88.0);
+    assert_eq!(resources.claude.session.unwrap().left_percent, 78.0);
+    assert_eq!(resources.claude.weekly.unwrap().left_percent, 88.0);
 
     let queue = || {
         let mut stream = UnixStream::connect(instance.socket()).unwrap();

@@ -1498,6 +1498,9 @@ pub fn management() -> FakeHost {
                 "keys.quick_open": {"value":"cmd+p","source":"default"},
                 "keys.toggle_diff": {"value":"cmd+d","source":"default"},
                 "agents": {"value":[{"name":"claude","command":["claude"],"kind":"claude"}],"source":"default"},
+                "chief.prefer": {"value":["codex", "claude"],"source":"default"},
+                "chief.min_left_percent.codex": {"value":10.0,"source":"host"},
+                "chief.min_left_percent.claude": {"value":20.0,"source":"host"},
                 "isolation.mode": {"value":"sandbox","source":"default"},
                 "isolation.sandbox.azure.enabled": {"value":false,"source":"default"},
                 "voice.api_key": {"value":"***","source":"main"},
@@ -1690,8 +1693,8 @@ pub fn resources() -> atomics_core::projection::ResourceInfo {
     use atomics_core::usage::{Usage, Window};
     let now = 1_800_000_000;
     let account = |session, weekly| Usage {
-        session: Some(Window { remaining: session, resets_at: now + 8040 }),
-        weekly: Some(Window { remaining: weekly, resets_at: now + 86400 }),
+        session: Some(Window { left_percent: session, resets_at: now + 8040 }),
+        weekly: Some(Window { left_percent: weekly, resets_at: now + 86400 }),
         observed_at: now - 120,
         plan: None,
     };

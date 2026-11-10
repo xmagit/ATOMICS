@@ -400,7 +400,7 @@ mod tests {
         )
         .unwrap();
         let crate::usage::Report::Claude(usage) = usage_rx.try_recv().unwrap() else { panic!("claude report") };
-        assert_eq!(usage.session.unwrap().remaining, 78.0);
+        assert_eq!(usage.session.unwrap().left_percent, 78.0);
         assert!(usage.weekly.is_none());
         assert!(usage.observed_at > 0);
         assert!(hook_rx.try_recv().is_err(), "usage must not change agent status");
