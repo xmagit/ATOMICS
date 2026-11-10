@@ -154,6 +154,8 @@ pub fn preflight(program: &str) -> Result<Ready, String> {
 /// with the subscription in the OS keychain gets a new placeholder for it, revoked again if
 /// preparation fails, and its sandbox the way to the relay.
 pub fn prepare(job: &Prepare) -> Result<Option<crate::relay::Granted>> {
+    load_owned_pins(&job.home)?;
+    let _source = repository_lease(&job.cwd, false)?;
     let ready = preflight(&job.sbx).map_err(anyhow::Error::msg)?;
     // Fail closed before making anything if this home's ledger cannot be read.
     let owned = ownership::owned(&job.home)?;
@@ -201,6 +203,15 @@ fn make(
         // A sandbox keeps its mounts for life: one made before a main checkout's .git was mounted
         // read-only whole lets its agent replace .git, config and all.
         let mounted = real_paths(&existing).workspaces;
+        if let Some(common) = git::pinned(&job.cwd).and_then(|pins| pins.common_dir) {
+            let logs = common.join("logs").to_string_lossy().into_owned();
+            anyhow::ensure!(
+                !mounted.contains(&logs),
+                "sandbox {} still mounts shared git logs read-write; remove it with `sbx rm {}` and start it again",
+                job.name,
+                job.name
+            );
+        }
         if let Some(missing) = git
             .iter()
             .filter_map(|mount| mount.strip_suffix(":ro"))
@@ -344,16 +355,18 @@ pub(crate) fn check_pins(pins: &git::GitPins) -> Result<()> {
 
 /// Pins every folder ATOMICS recorded for a sandbox in `dir`, as each process that runs git in
 /// them starts.
-pub fn load_pins(dir: &Path) {
-    for pins in read_pins(dir).into_values() {
-        git::pin(pins);
+#[cfg(test)]
+pub fn load_pins(dir: &Path) -> Result<()> {
+    for name in pin_names(dir)? {
+        load_pin_record(&dir.join(format!("{name}.json")), None)?;
     }
+    Ok(())
 }
 
 /// Drops sandbox `name`'s record once the sandbox is removed. Its folder stays pinned while
 /// another sandbox's record covers it.
 pub fn forget_pins(dir: &Path, name: &str) -> Result<()> {
-    let mut records = read_pins(dir);
+    let mut records = read_pins(dir)?;
     let file = dir.join(format!("{name}.json"));
     let pins: git::GitPins = match std::fs::read(&file) {
         Ok(bytes) => serde_json::from_slice(&bytes)?,
@@ -370,6 +383,7 @@ pub fn forget_pins(dir: &Path, name: &str) -> Result<()> {
         std::fs::rename(temporary, retained)?;
     }
     std::fs::remove_file(file)?;
+    git::allow_git(&dir.join(format!("{name}.json")));
     if !unsafe_folder && !records.values().any(|other| other.work_tree == pins.work_tree) {
         git::unpin(&pins.work_tree);
     }
@@ -383,7 +397,13 @@ pub fn forget_pins(dir: &Path, name: &str) -> Result<()> {
 /// sbx is not asked: asking starts its daemon, which outlives ATOMICS. The ledger forgets a dropped
 /// record too, or [`load_owned_pins`] would fail on the missing file at every start.
 pub fn prune_pins(home: &Path, dir: &Path, program: &str) {
-    let records = read_pins(dir);
+    let records = match read_pins(dir) {
+        Ok(records) => records,
+        Err(error) => {
+            eprintln!("ATOMICS: keeping git records: {error:#}");
+            return;
+        }
+    };
     if records.is_empty() || !installed(program) {
         return;
     }
@@ -414,18 +434,18 @@ pub fn prune_pins(home: &Path, dir: &Path, program: &str) {
     }
 }
 
-/// Drops the ledger's note of a sandbox's git record whose file is gone, once the sandbox is gone
-/// too: the ledger owns no such sandbox any more, or sbx no longer has it. Such a note pins nothing,
-/// and [`load_owned_pins`] fails closed on it, which would stop every cleanup for good. While a
-/// sandbox may still exist (sbx lists it, cannot answer, or may be making it) the note stays. Only a
-/// missing file makes sbx be asked.
+/// Recover a broken owned record from the ledger only after its sandbox is confirmed gone.
+/// Cleanup then retains any poisoned checkout's pin before releasing the sandbox's record.
+/// Unknown inventory and legacy records without a backup stay blocked until repaired.
 pub fn heal_pin_records(home: &Path, program: &str) -> Result<()> {
     let missing: Vec<(String, ownership::Owned)> = ownership::owned(home)?
         .into_iter()
         .filter(|(name, entry)| {
             entry.pins.as_ref().is_some_and(|dir| {
-                std::fs::metadata(dir.join(format!("{name}.json")))
-                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                let read = git::read_regular_file(&dir.join(format!("{name}.json")), 64 * 1024)
+                    .ok()
+                    .and_then(|text| serde_json::from_str::<git::GitPins>(&text).ok());
+                read.as_ref().is_none_or(|pins| entry.git_pins.as_ref().is_some_and(|backup| backup != pins))
             })
         })
         .collect();
@@ -439,28 +459,92 @@ pub fn heal_pin_records(home: &Path, program: &str) -> Result<()> {
         let gone = !entry.sandbox
             || (listed.as_ref().is_some_and(|listed| !listed.contains(&name)) && !ownership::may_be_creating(&entry));
         if gone {
+            // A legacy record without a backup cannot identify any poisoned checkout. Keep the
+            // refusal and ledger until its original pin is repaired, even if its VM is gone.
+            if entry.git_pins.is_none() || ownership::building(&entry) {
+                continue;
+            }
+            if let (Some(pins), Some(dir)) = (&entry.git_pins, &entry.pins) {
+                // Recover the record before releasing ownership: poisoned pointers still need a
+                // retained pin even after their sandbox has gone.
+                let file = dir.join(format!("{name}.json"));
+                std::fs::create_dir_all(dir)?;
+                std::fs::write(&file, serde_json::to_vec_pretty(pins)?)?;
+                git::allow_git(&file);
+                forget_pins(dir, &name)?;
+            }
             ownership::removed(home, &name, Resource::Pins)?;
         }
     }
     Ok(())
 }
 
-fn read_pins(dir: &Path) -> std::collections::HashMap<String, git::GitPins> {
-    let Ok(entries) = std::fs::read_dir(dir) else { return Default::default() };
-    entries
-        .flatten()
-        .filter_map(|entry| {
-            let path = entry.path();
-            let name = path.file_name()?.to_str()?.strip_suffix(".json")?.to_string();
-            match std::fs::read(&path).map_err(anyhow::Error::from).and_then(|b| Ok(serde_json::from_slice(&b)?)) {
-                Ok(pins) => Some((name, pins)),
-                Err(error) => {
-                    eprintln!("ATOMICS: reading {} failed: {error:#}", path.display());
-                    None
-                }
-            }
+fn pin_names(dir: &Path) -> Result<Vec<String>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            let reason = format!("Cannot read git pins in {}: {error}; host git is blocked", dir.display());
+            git::refuse_git(dir, None, reason.clone());
+            bail!("{reason}");
+        }
+    };
+    let names = entries
+        .map(|entry| Ok(entry?.file_name().to_str().and_then(|name| name.strip_suffix(".json")).map(str::to_string)))
+        .collect::<Result<Vec<_>>>();
+    match names {
+        Ok(names) => {
+            git::allow_git(dir);
+            Ok(names.into_iter().flatten().collect())
+        }
+        Err(error) => {
+            let reason = format!("Cannot enumerate git pins in {}: {error:#}; host git is blocked", dir.display());
+            git::refuse_git(dir, None, reason.clone());
+            bail!("{reason}");
+        }
+    }
+}
+
+fn read_pins(dir: &Path) -> Result<std::collections::HashMap<String, git::GitPins>> {
+    pin_names(dir)?
+        .into_iter()
+        .map(|name| {
+            let file = dir.join(format!("{name}.json"));
+            let pins = serde_json::from_str(&git::read_regular_file(&file, 64 * 1024)?)
+                .with_context(|| format!("reading {}", file.display()))?;
+            Ok((name, pins))
         })
         .collect()
+}
+
+fn load_pin_record(file: &Path, backup: Option<&git::GitPins>) -> Result<git::GitPins> {
+    if let Some(pins) = backup {
+        git::pin(pins.clone());
+    }
+    let read = || -> Result<git::GitPins> {
+        let pins = serde_json::from_str(&git::read_regular_file(file, 64 * 1024)?)?;
+        anyhow::ensure!(backup.is_none_or(|backup| backup == &pins), "pin differs from its ownership ledger copy");
+        Ok(pins)
+    };
+    match read() {
+        Ok(pins) => {
+            git::pin(pins.clone());
+            git::allow_git(file);
+            Ok(pins)
+        }
+        Err(error) => {
+            let name = file.file_stem().unwrap_or_default().to_string_lossy();
+            let remedy = if backup.is_some() {
+                format!("until the pin is repaired or the sandbox is removed with `sbx rm {name}`")
+            } else {
+                "until the original pin is repaired; no ledger copy identifies its worktree".into()
+            };
+            let reason =
+                format!("Unreadable sandbox git pin {}: {error:#}; host git is blocked {remedy}", file.display());
+            git::refuse_git(file, backup, reason.clone());
+            bail!("{reason}");
+        }
+    }
 }
 
 /// Only real directories inside this worktree may be exposed as writable caches.
@@ -490,14 +574,22 @@ fn warm_mounts(root: &Path, folders: &[String], linux: bool) -> Vec<PathBuf> {
 }
 
 /// The folder a sandbox mounts read-write for `cwd`, its worktree (else `cwd` itself), and
-/// git's folders beside it. A linked worktree gets the common dir's objects, refs and logs and
+/// git's folders beside it. A linked worktree gets the common dir's objects and refs and
 /// its own admin folder, so commits work while the repository's hooks and config stay on this
 /// machine. A main checkout's git dir is mounted whole and read-only: a read-write checkout
 /// around anything less lets the agent replace `.git` itself, config and all, and a mount point
 /// cannot be moved. Agents there edit files; tasks commit in linked worktrees.
 pub fn workspace(cwd: &Path) -> Result<(PathBuf, Vec<String>)> {
     let args = ["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-dir", "--git-common-dir"];
-    let output = git::git(cwd, &args).ok();
+    let output = match git::git(cwd, &args) {
+        Ok(output) => Some(output),
+        Err(error)
+            if git::git_refusal(cwd).is_some() || git::pinned(cwd).is_some_and(|pins| pins.common_dir.is_some()) =>
+        {
+            return Err(error);
+        }
+        Err(_) => None,
+    };
     let top = output.as_deref().and_then(|output| output.lines().next()).map_or(cwd, Path::new);
     if real(&paths::home()).starts_with(real(top)) {
         bail!(
@@ -513,7 +605,7 @@ pub fn workspace(cwd: &Path) -> Result<(PathBuf, Vec<String>)> {
     let mut mounts = Vec::new();
     let existing = |path: PathBuf| path.exists().then(|| path.to_string_lossy().into_owned());
     if git_dir != common {
-        mounts.extend(["objects", "refs", "logs"].into_iter().filter_map(|folder| existing(common.join(folder))));
+        mounts.extend(["objects", "refs"].into_iter().filter_map(|folder| existing(common.join(folder))));
         mounts.push(git_dir.to_string_lossy().into_owned());
     } else {
         mounts.push(format!("{}:ro", git_dir.display()));
@@ -570,6 +662,17 @@ pub fn remove(home: &Path, program: &str, name: &str) -> Result<()> {
     }
     if let Some(entry) = ownership::owned(home)?.get(name) {
         if let Some(dir) = &entry.pins {
+            let file = dir.join(format!("{name}.json"));
+            if load_pin_record(&file, entry.git_pins.as_ref()).is_err() {
+                let pins =
+                    entry.git_pins.as_ref().context("cannot remove a broken legacy pin without its original record")?;
+                // sbx removal succeeded. Restore the trusted copy before retaining any poisoned folder.
+                let temporary = file.with_extension("json.tmp");
+                std::fs::create_dir_all(dir)?;
+                std::fs::write(&temporary, serde_json::to_vec_pretty(pins)?)?;
+                std::fs::rename(temporary, &file)?;
+                git::allow_git(&file);
+            }
             forget_pins(dir, name)?;
             ownership::removed(home, name, Resource::Pins)?;
         }
@@ -591,22 +694,50 @@ pub fn remove(home: &Path, program: &str, name: &str) -> Result<()> {
 /// Fail closed on an unreadable owned record rather than following checkout metadata. A missing
 /// one stays a failure until [`heal_pin_records`] finds its sandbox gone.
 pub fn load_owned_pins(home: &Path) -> Result<()> {
-    load_pins(&home.join("git-pins"));
-    for (name, entry) in ownership::owned(home)? {
+    let ledger = home.join("sandbox-ownership.json");
+    let owned = match ownership::owned(home) {
+        Ok(owned) => {
+            git::allow_git(&ledger);
+            owned
+        }
+        Err(error) => {
+            let reason = format!("Cannot read sandbox ownership: {error:#}; host git is blocked");
+            git::refuse_git(&ledger, None, reason.clone());
+            bail!("{reason}");
+        }
+    };
+    let mut files = std::collections::HashSet::new();
+    let mut errors = Vec::new();
+    for (name, entry) in owned {
         if let Some(dir) = entry.pins {
             let file = dir.join(format!("{name}.json"));
-            let bytes = match std::fs::read(&file) {
-                Ok(bytes) => bytes,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => bail!(
-                    "sandbox {name}'s git record {} is missing, and sbx has not confirmed the sandbox is gone; \
-                     remove it with `sbx rm {name}` and restart ATOMICS",
-                    file.display()
-                ),
-                Err(error) => return Err(error).with_context(|| format!("reading {}", file.display())),
-            };
-            git::pin(serde_json::from_slice(&bytes).with_context(|| format!("reading {}", file.display()))?);
+            files.insert(file.clone());
+            match load_pin_record(&file, entry.git_pins.as_ref()) {
+                Ok(pins) if entry.git_pins.is_none() => {
+                    if let Err(error) = ownership::record_pins(home, &name, &dir) {
+                        let reason = format!(
+                            "Cannot save the ledger copy of {}: {error:#}; host git is blocked",
+                            file.display()
+                        );
+                        git::refuse_git(&file, Some(&pins), reason.clone());
+                        errors.push(reason);
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => errors.push(format!("{error:#}")),
+            }
         }
     }
+    let dir = home.join("git-pins");
+    for name in pin_names(&dir)? {
+        let file = dir.join(format!("{name}.json"));
+        if !files.contains(&file)
+            && let Err(error) = load_pin_record(&file, None)
+        {
+            errors.push(format!("{error:#}"));
+        }
+    }
+    anyhow::ensure!(errors.is_empty(), "{}", errors.join("\n"));
     Ok(())
 }
 
@@ -682,6 +813,60 @@ pub fn in_worktree(home: &Path, program: &str, worktree: &Path) -> Result<Vec<St
         })
         .map(|sandbox| sandbox.name)
         .collect())
+}
+
+/// A source build executes checkout files on the host. Ref recovery is insufficient here:
+/// no sandbox of this repository may exist while an update selects and builds its source.
+pub fn refuse_source_update(home: &Path, program: &str, repo: &Path) -> Result<()> {
+    load_owned_pins(home)?;
+    let common = git::common_dir(repo)?;
+    let owned = ownership::owned(home)?;
+    let recorded = owned.iter().find(|(_, entry)| {
+        entry.sandbox && entry.git_pins.as_ref().is_some_and(|pins| pins.common_dir.as_ref() == Some(&common))
+    });
+    let program = crate::setup::resolve_program(program);
+    let listed = if installed(&program) { list(&program)? } else { Vec::new() };
+    let worktrees: Vec<_> = git::list_worktrees(repo)?.into_iter().map(|tree| real(&tree.path)).collect();
+    let sandbox = recorded.map(|(name, _)| name.as_str()).or_else(|| {
+        listed
+            .iter()
+            .find(|sandbox| {
+                let sandbox = real_paths(sandbox);
+                sandbox.mounts_within(&common)
+                    || sandbox.workspace().is_some_and(|path| worktrees.iter().any(|tree| tree == path))
+            })
+            .map(|sandbox| sandbox.name.as_str())
+    });
+    if let Some(name) = sandbox {
+        bail!(
+            "Source update refused: sandbox {name} of this repository still exists. Remove the repository's sandboxes before updating from source."
+        );
+    }
+    Ok(())
+}
+
+/// Serialize source installation with sandbox creation across processes and ATOMICS homes.
+/// Once creation finishes, inventory/ownership prevents updates until that sandbox is removed.
+pub(crate) fn repository_lease(cwd: &Path, update: bool) -> Result<Option<File>> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let Some(common) = current_pins(cwd)?.common_dir else { return Ok(None) };
+    let file = File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(common.join("atomics-source-update.lock"))?;
+    anyhow::ensure!(file.metadata()?.is_file(), "source update lock is not a regular file");
+    let operation = if update { libc::LOCK_EX } else { libc::LOCK_SH };
+    // SAFETY: file owns the descriptor; closing it releases the lease.
+    anyhow::ensure!(
+        unsafe { libc::flock(file.as_raw_fd(), operation | libc::LOCK_NB) } == 0,
+        "A source update or sandbox creation is in progress for this repository; retry when it finishes"
+    );
+    Ok(Some(file))
 }
 
 /// A sandbox's mounts with links resolved, as git and sbx may each name a folder differently.
@@ -1008,13 +1193,14 @@ mod tests {
         let admin = std::fs::read_to_string(worktree.join(".git")).unwrap();
         let admin = admin.trim().strip_prefix("gitdir: ").unwrap();
         let common = Path::new(admin).parent().unwrap().parent().unwrap();
-        let expected: Vec<String> = ["objects", "refs", "logs"]
+        let expected: Vec<String> = ["objects", "refs"]
             .iter()
             .map(|folder| common.join(folder).display().to_string())
             .chain([admin.to_string()])
             .collect();
         // The admin folder is mounted at the very path the worktree's .git file names.
         assert_eq!(mounts, expected);
+        assert!(!mounts.contains(&common.join("logs").display().to_string()));
         assert!(mounts.iter().all(|m| !m.contains("hooks") && !m.ends_with("config")), "{mounts:?}");
 
         // A main checkout's whole git folder is one read-only mount point, which the agent cannot move.
@@ -1029,6 +1215,73 @@ mod tests {
             let error = workspace(&folder).unwrap_err().to_string();
             assert!(error.contains("whole home folder"), "{error}");
         }
+    }
+
+    #[test]
+    fn broken_owned_pin_files_keep_the_ledger_pin_and_refuse_git_until_repaired() {
+        for missing in [false, true] {
+            let (dir, repo) = repository();
+            let task = dir.path().join("task");
+            git::add_worktree(&repo, &task, "task", "main").unwrap();
+            let home = dir.path().join("state");
+            let pins = home.join("git-pins");
+            pin_git(&pins, "atomics-task", &task).unwrap();
+            ownership::record_pins(&home, "atomics-task", &pins).unwrap();
+            let saved = git::pinned(&task).unwrap();
+            assert_eq!(ownership::owned(&home).unwrap()["atomics-task"].git_pins.as_ref(), Some(&saved));
+            let file = pins.join("atomics-task.json");
+            let bytes = std::fs::read(&file).unwrap();
+            if missing {
+                std::fs::remove_file(&file).unwrap();
+            } else {
+                std::fs::write(&file, "broken json").unwrap();
+            }
+            git::unpin(&saved.work_tree);
+            assert!(load_owned_pins(&home).is_err());
+            assert_eq!(git::pinned(&task).as_ref(), Some(&saved));
+            assert!(format!("{:#}", git::git(&task, &["status"]).unwrap_err()).contains("host git is blocked"));
+            std::fs::write(&file, bytes).unwrap();
+            load_owned_pins(&home).unwrap();
+            git::git(&task, &["status"]).unwrap();
+            git::unpin(&saved.work_tree);
+        }
+    }
+
+    #[test]
+    fn source_installation_and_sandbox_creation_cannot_overlap() {
+        let (_dir, repo) = repository();
+        let bin = crate::test_support::tempdir().unwrap();
+        let sbx = fake::install(bin.path());
+        let task = repo.with_file_name("task");
+        git::add_worktree(&repo, &task, "task", "main").unwrap();
+        let job = job(&sbx, "atomics-lease", &task, SandboxConfig::default());
+        let install = repository_lease(&repo, true).unwrap();
+        assert!(format!("{:#}", prepare(&job).unwrap_err()).contains("source update"));
+        assert!(fake::calls_to(bin.path(), &["create"]).is_empty());
+        drop(install);
+        let creation = repository_lease(&task, false).unwrap();
+        assert!(repository_lease(&repo, true).is_err());
+        drop(creation);
+        prepare(&job).unwrap();
+        git::unpin(&task.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn old_sandboxes_with_writable_shared_reflogs_must_be_recreated() {
+        let (dir, repo) = repository();
+        let bin = crate::test_support::tempdir().unwrap();
+        let sbx = fake::install(bin.path());
+        let task = dir.path().join("task");
+        git::add_worktree(&repo, &task, "task", "main").unwrap();
+        let job = job(&sbx, "atomics-old-logs", &task, SandboxConfig::default());
+        prepare(&job).unwrap();
+        let file = bin.path().join("sandboxes/atomics-old-logs");
+        let mut listed: Listed = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        listed.workspaces.push(repo.join(".git/logs").display().to_string());
+        std::fs::write(&file, serde_json::to_vec(&listed).unwrap()).unwrap();
+        let error = format!("{:#}", prepare(&job).unwrap_err());
+        assert!(error.contains("shared git logs read-write"), "{error}");
+        git::unpin(&task.canonicalize().unwrap());
     }
 
     #[test]
@@ -1316,7 +1569,7 @@ mod tests {
         std::fs::remove_dir(&deleted).unwrap();
         assert!(git::git(&plain, &["status"]).is_err(), "git stays out of a folder outside any repository");
         let records = || {
-            let mut names: Vec<String> = read_pins(&pins).into_keys().collect();
+            let mut names: Vec<String> = read_pins(&pins).unwrap().into_keys().collect();
             names.sort();
             names
         };

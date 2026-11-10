@@ -303,7 +303,7 @@ impl Backend for Local<'_> {
                 .map(|usage| usage.label()),
             sandbox_error: sandboxes.error.clone(),
             queue_note,
-            warning: session.warning.clone(),
+            warning: git::git_refusal(&session.root()).or_else(|| session.warning.clone()),
             connect: match session.sandbox {
                 Some(_) => state.connect_buttons(&session.mcp_needed, &state.session_title(session)),
                 None => Vec::new(),

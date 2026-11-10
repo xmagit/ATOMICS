@@ -14,7 +14,7 @@ pub fn run(
     rust_package: Option<&str>,
 ) -> Result<()> {
     // Before any git runs in a folder a sandbox has worked in.
-    load_pins(&paths::git_pins_dir());
+    load_owned_pins(&paths::atomics_home())?;
     let mut config = Config::load(&paths::config_file())?;
     let saved = workspace_name.map(Workspace::load).transpose()?;
     if let Some(overrides) = saved.as_ref().map(Workspace::isolation).transpose()?.flatten() {
@@ -153,6 +153,7 @@ pub(super) fn build(
         sbx(program, &["policy", "init", config.network.name()], false, TIMEOUT)?;
     }
     load_owned_pins(home)?;
+    let _source = repository_lease(cwd, false)?;
     let name = format!("atomics-template-{}", uuid::Uuid::new_v4());
     // The source remains read-only. Its own pin record and build lease protect the builder
     // from a concurrently starting ATOMICS and let the sweep recover an interrupted build.

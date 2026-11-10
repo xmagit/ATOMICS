@@ -1892,7 +1892,8 @@ mod tests {
         dispatch(&plan.tasks[0]).unwrap();
         std::fs::write(worktree("a").join("api.rs"), "pub fn api() {}\n").unwrap();
         let into = plan.integration_branch();
-        git::integrate(&repo, "atomics/a", "do a (a)", &into, &repo.with_file_name("app-plan"), "main").unwrap();
+        git::integrate(&repo, &worktree("a"), "atomics/a", "do a (a)", &into, &repo.with_file_name("app-plan"), "main")
+            .unwrap();
 
         dispatch(&plan.tasks[1]).unwrap();
         dispatch(&plan.tasks[2]).unwrap();

@@ -135,7 +135,11 @@ fn run_state(
     if let Some(job) = app.startup_cleanup.take() {
         job.join().unwrap();
     }
-    assert_eq!(app.toast.as_ref().unwrap().0, "Migration failed");
+    if std::env::var_os("ATOMICS_TEST_PIN_ERROR").is_some() {
+        assert!(app.toast.as_ref().unwrap().0.starts_with("Migration failed\nUnreadable sandbox git pin "));
+    } else {
+        assert_eq!(app.toast.as_ref().unwrap().0, "Migration failed");
+    }
     test(app, &ctx);
 }
 

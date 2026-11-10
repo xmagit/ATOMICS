@@ -995,7 +995,7 @@ impl State {
     pub(crate) fn build(options: Options, window: crate::host::Window) -> State {
         std::thread::spawn(|| LazyLock::force(&SHELL_PATH));
         // Before any git runs in a folder a sandbox has worked in. Records of sandboxes that are gone go after.
-        crate::sandbox::load_pins(&paths::git_pins_dir());
+        let pin_error = crate::sandbox::load_owned_pins(&paths::atomics_home()).err();
         let sbx = if cfg!(test) { "/nonexistent/atomics-test-sbx" } else { "sbx" };
         let config_path = paths::config_file();
         // No config yet is a first run, and it stays one until the setup screen is finished or skipped. A config someone
@@ -1031,6 +1031,9 @@ impl State {
         };
         // Only the instance that owns the socket owns the pool, so a second ATOMICS never replaces it.
         let mut notices = Vec::new();
+        if let Some(error) = pin_error {
+            notices.push(format!("{error:#}"));
+        }
         let jobserver = match hook_error {
             Some(_) => None,
             None => {
