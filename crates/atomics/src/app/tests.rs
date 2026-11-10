@@ -15,6 +15,7 @@ pub(super) fn session(id: &str, kind: AgentKind, status: AgentStatus, cwd: &Path
         last_prompt: None,
         last_message: None,
         hooks_active: false,
+        first_run_hint: None,
         activity: heartbeat::Activity::default(),
         approvals: Vec::new(),
         allowed: Vec::new(),
@@ -298,6 +299,37 @@ fn session_ids_and_prefixes_cannot_be_shadowed_by_titles() {
         ));
         assert_eq!(state.find("t1 · Fix the parser"), None, "ambiguous prefixes cannot fall back to task labels");
         state.sessions[0].sandbox = None;
+    });
+}
+
+#[test]
+fn p5_review_duplicate_task_labels_require_a_session_id() {
+    with_state("app::tests::p5_review_duplicate_task_labels_require_a_session_id", |mut state, _| {
+        let root = state.launch_dir.clone();
+        state.sessions = ["first-session", "second-session"]
+            .into_iter()
+            .map(|id| session(id, AgentKind::Generic, AgentStatus::Idle, &root))
+            .collect();
+        state.plans = ["first", "second"]
+            .into_iter()
+            .zip(&state.sessions)
+            .map(|(id, session)| Plan {
+                id: id.into(),
+                tasks: vec![Task {
+                    id: "t1".into(),
+                    title: "Fix the parser".into(),
+                    session: Some(session.id.clone()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .collect();
+        assert_eq!(state.find("t1 · Fix the parser"), None);
+        assert_eq!(state.find("first-session"), Some(0));
+        assert_eq!(state.find("second-"), Some(1));
+        state.sessions[0].rename("Parser investigation");
+        assert_eq!(state.find("Parser investigation"), Some(0));
+        assert_eq!(state.find("t1 · Fix the parser"), Some(1));
     });
 }
 

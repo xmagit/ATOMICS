@@ -266,6 +266,47 @@ mod tests {
     use crate::app::tests::{request, session, with_app};
 
     #[test]
+    fn p5_review_unknown_chief_identity_never_guesses_legacy_ownership() {
+        with_app("app::trace::tests::p5_review_unknown_chief_identity_never_guesses_legacy_ownership", |app, _| {
+            let root = app.runtime.launch_dir.clone();
+            let mut chief = session("chief", AgentKind::Claude, AgentStatus::Idle, &root);
+            chief.chief = true;
+            chief.claude_id = None;
+            app.runtime.sessions = vec![chief];
+            let event = atomics_core::hook::HookEvent {
+                name: "PostToolUse".into(),
+                session_id: "chief-conversation".into(),
+                tool_name: Some("mcp__atomics__atomics_wait".into()),
+                ..Default::default()
+            };
+            let mut log = TraceLog::default();
+            let current = log.ingest(&event, None, &Default::default(), 1).unwrap().clone();
+            let mut legacy = current.clone();
+            legacy.seq = 42;
+            legacy.session_id.clear();
+            let path = trace::disk::path(&paths::atomics_home(), None).unwrap();
+            trace::disk::append(&path, &legacy).unwrap();
+            trace::disk::append(&path, &current).unwrap();
+            assert_eq!(request(app, json!({"cmd":"trace_get"})).result["entries"], json!([]));
+            app.runtime.on_hook(HookMessage {
+                pane: Some("chief".into()),
+                ancestors: vec![],
+                delivered: 0,
+                approval_reply: None,
+                event: atomics_core::hook::HookEvent {
+                    name: "SessionStart".into(),
+                    session_id: "chief-conversation".into(),
+                    ..Default::default()
+                },
+            });
+            let entries = request(app, json!({"cmd":"trace_get"})).result["entries"].as_array().unwrap().clone();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0]["session_id"], current.session_id);
+            assert_eq!(trace::disk::load(&path, &Default::default()).unwrap().entries.len(), 2);
+        });
+    }
+
+    #[test]
     fn chief_waiting_for_plan_approval_has_a_reason_and_clear_scopes_its_trace() {
         with_app(
             "app::trace::tests::chief_waiting_for_plan_approval_has_a_reason_and_clear_scopes_its_trace",

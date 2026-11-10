@@ -26,13 +26,12 @@ impl State {
                 "files": p.diff.files.len(), "additions": p.additions, "deletions": p.deletions
             })
         });
-        json!({
+        let mut value = json!({
             "id": s.id,
             "chief": s.chief,
             "title": self.session_title(s),
             "agent": s.agent,
             "status": status.label(),
-            "status_hint": status_hint,
             "folder": s.cwd,
             "worktree": s.worktree.as_ref().map(|w| &w.root),
             "branch": s.branch(),
@@ -56,7 +55,11 @@ impl State {
             }),
             "diff": stats,
             "previews": self.previews_json(index),
-        })
+        });
+        if let Some(hint) = status_hint {
+            value["status_hint"] = json!(hint);
+        }
+        value
     }
 
     /// The session's previews, as clients are offered them: what it declared with atomics_preview, then
@@ -493,47 +496,50 @@ impl State {
                 }),
                 None => done(ControlResponse::error(format!("no plan {id}"))),
             },
-            ControlRequest::PlanUpdate { plan: _, id, status, note, session } => match self.plans[target].task_mut(&id)
-            {
-                None => done(ControlResponse::error(format!("no task {id}"))),
-                Some(task) => {
-                    let old = task.status;
-                    let accepted = note.clone();
-                    if let Some(status) = &status {
-                        match TaskStatus::parse(status) {
-                            Some(status) => task.set_status(status),
-                            None => {
-                                let _ = reply.send(done(ControlResponse::error(format!("unknown status {status}"))));
-                                return;
+            ControlRequest::PlanUpdate { plan: _, id, status, note, session } => {
+                let session = match session {
+                    Some(reference) => match self.find(&reference) {
+                        Some(index) => Some(self.sessions[index].id.clone()),
+                        None => {
+                            let _ = reply
+                                .send(done(ControlResponse::error("No unique session matches; use a session id.")));
+                            return;
+                        }
+                    },
+                    None => None,
+                };
+                match self.plans[target].task_mut(&id) {
+                    None => done(ControlResponse::error(format!("no task {id}"))),
+                    Some(task) => {
+                        let old = task.status;
+                        let accepted = note.clone();
+                        if let Some(status) = &status {
+                            match TaskStatus::parse(status) {
+                                Some(status) => task.set_status(status),
+                                None => {
+                                    let _ =
+                                        reply.send(done(ControlResponse::error(format!("unknown status {status}"))));
+                                    return;
+                                }
                             }
                         }
-                    }
-                    if let Some(note) = note {
-                        task.notes.push(note);
-                    }
-                    if let Some(reference) = session {
-                        let found = self.sessions.iter().find(|s| {
-                            s.id == reference
-                                || s.id.starts_with(&reference)
-                                || s.title == reference
-                                || self.session_title(s) == reference
-                        });
-                        if let (Some(found), Some(task)) =
-                            (found.map(|s| s.id.clone()), self.plans[target].task_mut(&id))
-                        {
-                            task.session = Some(found);
+                        if let Some(note) = note {
+                            task.notes.push(note);
+                        }
+                        if let Some(session) = session {
+                            task.session = Some(session);
                             task.dispatched_at.get_or_insert_with(atomics_core::store::now);
                         }
+                        self.finish_plan_agents();
+                        self.save_plan(target);
+                        if let Some(new) = self.plans[target].tasks.iter().find(|t| t.id == id).map(|t| t.status) {
+                            let author = self.chief_author();
+                            self.ticket_status_changed(target, &id, old, new, accepted.as_deref(), author);
+                        }
+                        done(ControlResponse::ok(self.plan_mutation_json(target, Some(&id))))
                     }
-                    self.finish_plan_agents();
-                    self.save_plan(target);
-                    if let Some(new) = self.plans[target].tasks.iter().find(|t| t.id == id).map(|t| t.status) {
-                        let author = self.chief_author();
-                        self.ticket_status_changed(target, &id, old, new, accepted.as_deref(), author);
-                    }
-                    done(ControlResponse::ok(self.plan_mutation_json(target, Some(&id))))
                 }
-            },
+            }
             ControlRequest::PlanStage { plan, task, stage, url, note } => {
                 let result = self.stage_target(Some(&plan), task.as_deref(), None).and_then(|(index, task)| {
                     self.record_stage(
@@ -1225,6 +1231,67 @@ mod tests {
     use super::*;
     use crate::app::tests::{request, session, with_app};
     use atomics_core::control::shown_len;
+
+    #[test]
+    fn p5_review_task_attachment_uses_the_unique_session_lookup() {
+        with_app("app::control::tests::p5_review_task_attachment_uses_the_unique_session_lookup", |app, _| {
+            let root = app.runtime.launch_dir.clone();
+            let mut alias = session("other-id", AgentKind::Shell, AgentStatus::Idle, &root);
+            alias.title = "target-id".into();
+            app.runtime.sessions = vec![alias, session("target-id-long", AgentKind::Shell, AgentStatus::Idle, &root)];
+            app.runtime.plans = vec![Plan {
+                id: "plan".into(),
+                tasks: vec![Task { id: "a".into(), ..Default::default() }],
+                ..Default::default()
+            }];
+            assert!(request(app, json!({"cmd":"plan_update","plan":"plan","id":"a","session":"target-id"})).ok);
+            assert_eq!(app.runtime.plans[0].tasks[0].session.as_deref(), Some("target-id-long"));
+            app.runtime.sessions.push(session("target-other", AgentKind::Shell, AgentStatus::Idle, &root));
+            app.runtime.sessions[0].title = "target".into();
+            app.runtime.plans[0].tasks[0].session = None;
+            let before = app.runtime.plans[0].tasks[0].clone();
+            for reference in ["", "   ", "target", "missing"] {
+                let response = request(
+                    app,
+                    json!({"cmd":"plan_update","plan":"plan","id":"a","session":reference,"status":"running","note":"must not apply"}),
+                );
+                assert!(!response.ok, "{reference:?}");
+                assert_eq!(app.runtime.plans[0].tasks[0], before, "invalid attachment makes no partial edits");
+            }
+            app.runtime.sessions[0].title = "target-id-long".into();
+            assert!(request(app, json!({"cmd":"plan_update","plan":"plan","id":"a","session":"target-id-long"})).ok);
+            assert_eq!(app.runtime.plans[0].tasks[0].session.as_deref(), Some("target-id-long"));
+            app.runtime.plans.push(Plan {
+                id: "source".into(),
+                tasks: vec![Task {
+                    id: "t2".into(),
+                    title: "Parser".into(),
+                    session: Some("other-id".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+            assert!(request(app, json!({"cmd":"plan_update","plan":"plan","id":"a","session":"t2 · Parser"})).ok);
+            assert_eq!(app.runtime.plans[0].tasks[0].session.as_deref(), Some("other-id"));
+        });
+    }
+
+    #[test]
+    fn p5_review_optional_hints_match_in_list_and_wait() {
+        with_app("app::control::tests::p5_review_optional_hints_match_in_list_and_wait", |app, _| {
+            let root = app.runtime.launch_dir.clone();
+            app.runtime.sessions = vec![session("worker", AgentKind::Generic, AgentStatus::Idle, &root)];
+            for hint in [None, Some("first-run setup")] {
+                app.runtime.sessions[0].first_run_hint = hint;
+                app.runtime.sessions[0].status =
+                    if hint.is_some() { AgentStatus::NeedsInput } else { AgentStatus::Idle };
+                let listed = app.runtime.describe(0);
+                let waited = request(app, json!({"cmd":"wait","timeout_secs":0}));
+                assert_eq!(listed.get("status_hint"), waited.result["sessions"][0].get("status_hint"));
+                assert_eq!(listed.get("status_hint").is_some(), hint.is_some());
+            }
+        });
+    }
 
     fn approval(id: &str, command: &str) -> PendingApproval {
         PendingApproval {
