@@ -846,6 +846,10 @@ repaired. Main checkouts and dirty or locked worktrees stay.
 - **Refs are explicit.** Host git uses fully qualified branch and remote refs, so a tag named
   `origin/main` cannot replace `refs/remotes/origin/main`, and always sets `GIT_NO_REPLACE_OBJECTS=1`.
   Task integration commits only the task's recorded worktree path and checks that it still names that branch.
+  The merge runs only at the host-selected integration path, saved with the plan after integration and
+  reused across worktree-template changes. A sandbox-pinned folder, including its subfolders and aliases,
+  cannot be that destination. A sandbox claiming the integration branch stops integration before staging
+  and raises a persistent ref alert on its task and the task being integrated, even if it changes HEAD back.
 - **Shared reflogs stay on this machine.** Linked sandboxes mount shared objects and refs, and their own
   admin folder; they do not mount the shared `logs` folder. Their own `logs/HEAD` remains writable in the
   admin folder. Sandboxes with the old shared writable logs mount must be removed and recreated.

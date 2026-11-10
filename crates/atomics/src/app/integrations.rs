@@ -377,7 +377,12 @@ impl State {
             return;
         }
         let into = self.plans[index].integration_branch();
-        let into_path = git::worktree_path(&self.config.worktree_path, &repo, &into);
+        let into_path = self.plans[index]
+            .integration_worktrees
+            .iter()
+            .find(|tree| tree.repo == repo && tree.branch == into)
+            .map(|tree| tree.path.clone())
+            .unwrap_or_else(|| git::worktree_path(&self.config.worktree_path, &repo, &into));
         let config = self.project_config(&repo);
         let identity = config.identity.default;
         let (tx, base_ref) = (self.integrate_tx.clone(), config.base_ref);
@@ -409,8 +414,36 @@ impl State {
             let write = crate::ref_guard::host_write(&repo, [&branch, &into]);
             let result = git::integrate_with_identity(
                 &repo, &task_path, &branch, &message, &into, &into_path, &base_ref, &identity,
-            )
-            .map_err(|e| format!("{e:#}"));
+            );
+            if let Some(claim) =
+                result.as_ref().err().and_then(|error| error.downcast_ref::<git::IntegrationRefClaim>())
+            {
+                let (worktree, details) = (claim.worktree.clone(), claim.to_string());
+                let (plan_id, task_id) = (plan.clone(), task.clone());
+                let _ = actions.send(Box::new(move |state| {
+                    let mut owners: Vec<_> = state
+                        .plans
+                        .iter()
+                        .flat_map(|plan| {
+                            plan.tasks
+                                .iter()
+                                .filter(|task| {
+                                    task.worktree.as_ref().is_some_and(|path| {
+                                        path == &worktree || path.canonicalize().ok().as_ref() == Some(&worktree)
+                                    })
+                                })
+                                .map(move |task| (plan.id.clone(), task.id.clone()))
+                        })
+                        .collect();
+                    if !owners.contains(&(plan_id.clone(), task_id.clone())) {
+                        owners.push((plan_id, task_id));
+                    }
+                    for (plan, task) in owners {
+                        state.task_ref_alert_at(&plan, &task, details.clone(), None);
+                    }
+                }));
+            }
+            let result = result.map_err(|e| format!("{e:#}"));
             let commit = result
                 .as_ref()
                 .ok()
@@ -426,6 +459,17 @@ impl State {
         let Some(index) = self.plans.iter().position(|p| p.id == plan) else { return };
         self.integrating.remove(&(plan.clone(), id.clone()));
         self.worktrees_at = None;
+        if let Ok(integration) = &result
+            && let Some(repo) =
+                self.plans[index].tasks.iter().find(|task| task.id == id).and_then(|task| self.task_repo(index, task))
+            && !self.plans[index].integration_worktrees.iter().any(|tree| tree.repo == repo && tree.branch == into)
+        {
+            self.plans[index].integration_worktrees.push(plan::IntegrationWorktree {
+                repo,
+                branch: into.clone(),
+                path: integration.worktree.clone(),
+            });
+        }
         let (note, mut response) = match result {
             Ok(Integration { merge: Merge::Conflict(files), .. }) => {
                 if let Some(task) = self.plans[index].task_mut(&id) {

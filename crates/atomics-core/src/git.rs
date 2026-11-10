@@ -1544,6 +1544,7 @@ pub fn integrate_with_identity(
 ) -> Result<Integration> {
     let lock = worktree_lock(repo)?;
     let _turn = lock.lock().unwrap_or_else(|e| e.into_inner());
+    integration_worktree(repo, into, into_path)?;
     let has_worktree = task_worktree_exists(repo, task_path, branch)?;
     // Check before staging, committing, creating an integration branch or merging.
     let check_identity = || {
@@ -1571,14 +1572,11 @@ pub fn integrate_with_identity(
         false
     };
     ensure_branch(repo, into, base_ref)?;
-    let checked_out: Vec<_> =
-        list_worktrees(repo)?.into_iter().filter(|entry| entry.branch.as_deref() == Some(into)).collect();
-    ensure!(checked_out.len() <= 1, "refs/heads/{into} is claimed by multiple worktrees");
-    let worktree = if let Some(entry) = checked_out.first().filter(|entry| entry.path.exists()) {
-        recorded_worktree(repo, &entry.path, into)?;
-        entry.path.clone()
+    let registered = integration_worktree(repo, into, into_path)?;
+    let worktree = if registered.as_ref().is_some_and(|entry| entry.path.exists()) {
+        into_path.to_path_buf()
     } else {
-        if !checked_out.is_empty() {
+        if registered.is_some() {
             // Prune only when this integration branch has a stale registration.
             git(repo, &["worktree", "prune"])?;
         }
@@ -1601,6 +1599,72 @@ pub fn integrate_with_identity(
     crate::identity::require_clean(&check_identity()?)?;
     let merge = merge_with_identity(&worktree, branch, identity)?;
     Ok(Integration { committed, merge, worktree })
+}
+
+/// A sandbox's writable HEAD cannot authorize host integration in its checkout. Keep the
+/// owning folder in the error so the host can alert that task even after HEAD changes back.
+#[derive(Debug)]
+pub struct IntegrationRefClaim {
+    pub worktree: PathBuf,
+    pub branch: String,
+}
+
+impl std::fmt::Display for IntegrationRefClaim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Sandbox worktree {} claims integration ref refs/heads/{}; restore its task HEAD before integrating",
+            self.worktree.display(),
+            self.branch
+        )
+    }
+}
+
+impl std::error::Error for IntegrationRefClaim {}
+
+fn integration_worktree(repo: &Path, into: &str, into_path: &Path) -> Result<Option<WorktreeEntry>> {
+    let common = common_dir(repo)?;
+    let claimed_ref = format!("refs/heads/{into}");
+    for pins in pinned_all().into_iter().filter(|pins| pins.common_dir.as_ref() == Some(&common)) {
+        // The sandbox can change gitdir as well as HEAD. Attribute the claim using the
+        // host's pinned admin folder even when Git lists it under a forged worktree path.
+        if pins.git_dir.as_ref().is_some_and(|dir| {
+            read_regular_file(&dir.join("HEAD"), 4096)
+                .is_ok_and(|head| head.trim().strip_prefix("ref:").map(str::trim) == Some(claimed_ref.as_str()))
+        }) {
+            return Err(IntegrationRefClaim { worktree: pins.work_tree, branch: into.into() }.into());
+        }
+    }
+    let checked_out: Vec<_> =
+        list_worktrees(repo)?.into_iter().filter(|entry| entry.branch.as_deref() == Some(into)).collect();
+    // Check every claimant before duplicate detection, so a forged claim beside the real
+    // integration checkout raises the same attributable alert as a first-integration attack.
+    for path in checked_out.iter().map(|entry| entry.path.as_path()) {
+        // pinned() also checks ancestors and canonical paths, including aliases into a sandbox.
+        if let Some(pins) = pinned(path) {
+            return Err(IntegrationRefClaim { worktree: pins.work_tree, branch: into.into() }.into());
+        }
+    }
+    ensure!(
+        // A new destination may not exist yet: resolve its parents too, so an alias into
+        // a sandbox cannot bypass pinned() just because its last component is missing.
+        into_path.ancestors().all(|path| pinned(path).is_none()),
+        "integration destination {} is inside a sandbox-pinned folder",
+        into_path.display()
+    );
+    ensure!(checked_out.len() <= 1, "refs/heads/{into} is claimed by multiple worktrees");
+    let Some(entry) = checked_out.into_iter().next() else { return Ok(None) };
+    ensure!(
+        entry.path == into_path
+            || entry.path.canonicalize().ok().is_some_and(|path| into_path.canonicalize().ok().as_ref() == Some(&path)),
+        "refs/heads/{into} is checked out at {}, outside its host-recorded integration path {}",
+        entry.path.display(),
+        into_path.display()
+    );
+    if entry.path.exists() {
+        recorded_worktree(repo, into_path, into)?;
+    }
+    Ok(Some(entry))
 }
 
 /// A missing recorded task folder has no edits to commit. Never substitute another checkout,
@@ -1781,7 +1845,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn integration_reuses_an_existing_target_after_the_path_template_changes() {
+    fn integration_uses_only_the_recorded_unpinned_target() {
         let (_dir, repo) = project();
         let task = repo.with_file_name("task");
         let existing = repo.with_file_name("old-integration-path");
@@ -1792,7 +1856,10 @@ pub(crate) mod tests {
         add_worktree(&repo, &stale, "unrelated", "main").unwrap();
         std::fs::remove_dir_all(&stale).unwrap();
         std::fs::write(task.join("feature"), "feature").unwrap();
-        let done = integrate(&repo, &task, "task", "feature", "integration", &proposed, "main").unwrap();
+        let error = integrate(&repo, &task, "task", "feature", "integration", &proposed, "main").unwrap_err();
+        assert!(error.to_string().contains("host-recorded integration path"), "{error:#}");
+        assert!(git(&task, &["diff", "--cached"]).unwrap().is_empty());
+        let done = integrate(&repo, &task, "task", "feature", "integration", &existing, "main").unwrap();
         assert_eq!(done.worktree, existing);
         assert!(existing.join("feature").exists());
         assert!(!proposed.exists());
@@ -1800,6 +1867,45 @@ pub(crate) mod tests {
             list_worktrees(&repo).unwrap().iter().any(|entry| entry.path == stale),
             "integration must not prune unrelated registrations"
         );
+    }
+
+    #[test]
+    fn integration_rejects_destinations_inside_or_linked_to_a_pinned_folder() {
+        use std::os::unix::fs::symlink;
+        let (_dir, repo) = project();
+        let task = repo.with_file_name("task");
+        let sandbox = repo.with_file_name("sandbox");
+        add_worktree(&repo, &task, "task", "main").unwrap();
+        add_worktree(&repo, &sandbox, "sandbox", "main").unwrap();
+        let pins = resolve_pins(&sandbox).unwrap();
+        pin(pins.clone());
+        let alias = repo.with_file_name("alias");
+        symlink(&sandbox, &alias).unwrap();
+        for destination in [&sandbox, &sandbox.join("nested"), &alias, &alias.join("missing")] {
+            let error = integrate(&repo, &task, "task", "feature", "integration", destination, "main").unwrap_err();
+            assert!(error.to_string().contains("sandbox-pinned folder"), "{error:#}");
+            assert!(!branch_exists(&repo, "integration"));
+        }
+        unpin(&pins.work_tree);
+    }
+
+    #[test]
+    fn integration_attributes_a_claim_even_when_the_sandbox_forges_its_listed_path() {
+        let (_dir, repo) = project();
+        let task = repo.with_file_name("task");
+        let sandbox = repo.with_file_name("sandbox");
+        let destination = repo.with_file_name("integration");
+        add_worktree(&repo, &task, "task", "main").unwrap();
+        add_worktree(&repo, &sandbox, "sandbox", "main").unwrap();
+        let pins = resolve_pins(&sandbox).unwrap();
+        pin(pins.clone());
+        let admin = pins.git_dir.as_ref().unwrap();
+        std::fs::write(admin.join("HEAD"), "ref:   refs/heads/integration\n").unwrap();
+        std::fs::write(admin.join("gitdir"), destination.join(".git").to_str().unwrap()).unwrap();
+        let error = integrate(&repo, &task, "task", "feature", "integration", &destination, "main").unwrap_err();
+        assert_eq!(error.downcast_ref::<IntegrationRefClaim>().unwrap().worktree, pins.work_tree);
+        assert!(!destination.exists());
+        unpin(&pins.work_tree);
     }
 
     #[test]

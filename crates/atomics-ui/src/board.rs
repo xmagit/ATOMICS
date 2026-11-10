@@ -140,7 +140,7 @@ fn ticket_chip(
             let hint = match (read, browser_url) {
                 (true, Some(_)) => Some("click to read it here, with Open in browser".to_string()),
                 (true, None) => Some("click to read it here".to_string()),
-                (false, Some(url)) => Some(format!("click to open {url}")),
+                (false, Some(url)) => Some(crate::markdown::web_url_hover(url)),
                 (false, None) => None,
             };
             if let Some(hint) = hint {

@@ -570,6 +570,7 @@ dependencies = [
  "qrcodegen",
  "serde_json",
  "unicode-general-category",
+ "url",
 ]
 
 [[package]]
