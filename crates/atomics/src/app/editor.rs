@@ -343,6 +343,33 @@ mod tests {
     }
 
     #[test]
+    fn failed_restart_projects_the_error_beside_the_exited_editor() {
+        with_app("app::editor::tests::failed_restart_projects_the_error_beside_the_exited_editor", |app, _ctx| {
+            let dir = crate::test_support::tempdir().unwrap();
+            let root = dir.path();
+            app.runtime.config.editor.command = vec!["/bin/sh".into(), "-c".into(), "exit 0".into()];
+            app.runtime.config.editor.startup_keys.clear();
+            app.runtime.config.editor.open_keys.clear();
+            app.runtime.edit_terminal(root, Some("a.rs"), None).unwrap();
+            let terminal = &app.runtime.editors[root];
+            let process = terminal.process_id();
+            let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(3));
+            while !terminal.exited() {
+                assert!(Instant::now() < deadline, "editor did not exit");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            app.runtime.config.editor.command = vec!["atomics-test-no-such-editor".into()];
+            let error = app.runtime.edit_terminal(root, Some("a.rs"), None).unwrap_err();
+            assert_eq!(app.runtime.editors[root].process_id(), process);
+            let infos = app.runtime.editor_infos();
+            assert_eq!(infos.len(), 1);
+            assert!(!infos[0].running);
+            assert_eq!(infos[0].error.as_deref(), Some(error.as_str()));
+            assert_eq!(infos[0].file.as_deref(), Some("a.rs"));
+        });
+    }
+
+    #[test]
     fn helix_diff_gutter_uses_head_in_a_linked_worktree_with_startup_theme() {
         with_app(
             "app::editor::tests::helix_diff_gutter_uses_head_in_a_linked_worktree_with_startup_theme",

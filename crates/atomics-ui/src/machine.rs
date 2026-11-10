@@ -217,7 +217,9 @@ fn preview_unavailable(port: &atomics_core::machine::Port) -> Option<&'static st
         return Some("This process provides a system or non-web service, not a web preview");
     }
     // Fallback for hidden owners and Docker's generic proxy processes.
-    if matches!(port.port, 22 | 53 | 123 | 445 | 631 | 3306 | 5432 | 5900..=5999 | 6379 | 27017) {
+    if (process.is_empty() || process == "docker-proxy")
+        && matches!(port.port, 22 | 53 | 123 | 445 | 631 | 3306 | 5432 | 5900..=5999 | 6379 | 27017)
+    {
         return Some("This port is normally used by a system or non-web service");
     }
     if !port.loopback_target() {
@@ -284,6 +286,25 @@ mod tests {
             window_title(Some(&snapshot), Some("Agents in VM test-vm")),
             "Machine · test-host · Agents in VM test-vm"
         );
+    }
+
+    #[test]
+    fn known_dev_servers_can_preview_on_conventional_service_ports() {
+        let mut port = Port { address: "127.0.0.1".into(), previewable: true, ..Default::default() };
+        for number in [22, 53, 5432, 5900, 5999] {
+            port.port = number;
+            for process in ["node", "python", "dotnet", "/usr/bin/node"] {
+                port.process = Some(process.into());
+                assert_eq!(preview_unavailable(&port), None, "{process} on {number}");
+            }
+            for process in [None, Some(""), Some("docker-proxy"), Some("/usr/bin/docker-proxy")] {
+                port.process = process.map(str::to_string);
+                assert!(preview_unavailable(&port).is_some(), "{process:?} on {number}");
+            }
+        }
+        port.process = Some("node".into());
+        port.previewable = false;
+        assert!(preview_unavailable(&port).is_some());
     }
 
     #[test]
