@@ -149,6 +149,8 @@ fn new_sessions_start_ungrouped_in_scratch_folders_named_by_their_first_prompt()
 
             // A session without hooks is named after the first line typed into its terminal.
             let typed = start(app, json!({"cmd":"start","agent":"probe"}));
+            let id = app.runtime.sessions[typed].id.clone();
+            super::tests::wait_started(app.runtime, &id);
             assert_eq!(app.runtime.sessions[typed].title, UNTITLED);
             let terminal = app.runtime.sessions[typed].terminal.as_ref().unwrap();
             *terminal.shared.submitted.lock().unwrap() = Some("/login".into());
@@ -218,8 +220,8 @@ fn scratch_sessions_follow_the_isolation_setting_and_go_with_their_sandbox() {
             let bare = start(app, json!({"cmd":"start","agent":"probe","isolation":"bare"}));
             let bare_id = app.runtime.sessions[bare].id.clone();
             let bare_scratch = app.runtime.sessions[bare].scratch.clone().unwrap();
-            assert!(app.runtime.sessions[bare].sandbox.is_none() && app.runtime.sessions[bare].terminal.is_some());
             tick_until(app, ctx, "the bare probe", |_| out.exists());
+            assert!(app.runtime.sessions[bare].sandbox.is_none() && app.runtime.sessions[bare].terminal.is_some());
             assert_eq!(
                 std::fs::read_to_string(&out).unwrap().trim(),
                 bare_scratch.canonicalize().unwrap().display().to_string()

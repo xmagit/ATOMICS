@@ -1,5 +1,5 @@
 //! Exercise stdin and the CLI's public/error surfaces with a fresh, private credential store.
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", debug_assertions))]
 #[path = "../../../tests/support.rs"]
 mod test_support;
 use std::io::Write;

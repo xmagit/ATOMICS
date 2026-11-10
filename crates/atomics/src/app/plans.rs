@@ -2693,6 +2693,7 @@ mod tests {
                         break args;
                     }
                     assert!(Instant::now() < deadline, "resume did not start: {:?}", app.runtime.toast);
+                    app.runtime.runtime_tick();
                     std::thread::sleep(Duration::from_millis(10));
                 };
                 assert!(args.contains(expected), "{args}");

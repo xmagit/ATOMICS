@@ -119,8 +119,7 @@ fn authenticate() -> Result<()> {
         let _: () = msg_send![&*context, setTouchIDAuthenticationAllowableReuseDuration: 0.0f64];
         let text = "Copy a stored ATOMICS secret to the clipboard";
         let reason: objc2::rc::Allocated<AnyObject> = msg_send![class!(NSString), alloc];
-        let reason: Retained<AnyObject> =
-            msg_send![reason, initWithBytes: text.as_ptr(), length: text.len(), encoding: 4usize];
+        let reason: Retained<AnyObject> = msg_send![reason, initWithBytes: text.as_ptr().cast::<std::ffi::c_void>(), length: text.len(), encoding: 4usize];
         let reply = block2::RcBlock::new(move |success: Bool, _error: *mut AnyObject| {
             let _ = tx.send(success.as_bool());
         });

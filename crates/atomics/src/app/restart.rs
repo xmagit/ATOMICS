@@ -462,6 +462,7 @@ mod tests {
             app.runtime.config.chief.command = vec!["/bin/sh".into(), "-c".into(), "exec sleep 30".into()];
             app.runtime.config.chief.args.clear();
             let id = app.runtime.start_chief(None).unwrap();
+            super::super::tests::wait_started(app.runtime, &id);
             let claude_id = app.runtime.sessions[0].claude_id.clone().unwrap();
             app.runtime.plans =
                 vec![Plan { id: "saved-plan".into(), goal: "save all plans".into(), ..Default::default() }];
@@ -569,8 +570,11 @@ mod tests {
                 app.runtime.shutdown();
                 let cc = eframe::CreationContext::_new_kittest(ctx.clone());
                 let mut reopened = State::new(&cc, Options::default(), &crate::load_icon());
+                reopened.relay = app.runtime.relay.clone();
                 reopened.runtime_tick();
                 assert_eq!(reopened.sessions.len(), 1);
+                let id = reopened.sessions[0].id.clone();
+                super::super::tests::wait_started(&mut reopened, &id);
                 let chief = &reopened.sessions[0];
                 assert!(chief.chief);
                 assert_eq!(chief.claude_id.as_deref(), Some("saved-claude-id"));
@@ -620,6 +624,8 @@ mod tests {
             started.runtime_tick();
             started.runtime_tick();
             assert_eq!(started.sessions.iter().filter(|s| s.chief).count(), 1);
+            let id = started.sessions.iter().find(|s| s.chief).unwrap().id.clone();
+            super::super::tests::wait_started(&mut started, &id);
             let chief = started.sessions.iter().find(|s| s.chief).unwrap();
             assert_eq!(chief.claude_id.as_deref(), Some("pinned-claude-id"));
             assert_eq!(chief.cwd, home);
@@ -649,6 +655,8 @@ mod tests {
             let mut restarted = State::new(&cc, Options::default(), &crate::load_icon());
             restarted.runtime_tick();
             restarted.runtime_tick();
+            let id = restarted.sessions.iter().find(|s| s.chief).unwrap().id.clone();
+            super::super::tests::wait_started(&mut restarted, &id);
             let chiefs: Vec<_> = restarted.sessions.iter().filter(|s| s.chief).collect();
             assert_eq!(chiefs.len(), 1);
             assert_eq!(chiefs[0].claude_id.as_deref(), Some("restarted-claude-id"));
@@ -673,6 +681,7 @@ mod tests {
                     json!({"cmd":"start","agent":"stand-in","prompt":"Plan the offsite agenda","isolation":"bare"});
                 let response = request(app, start);
                 assert!(response.ok, "{:?}", response.error);
+                super::super::tests::wait_started(app.runtime, response.result["id"].as_str().unwrap());
                 let scratch = paths::scratch_of(Path::new(response.result["folder"].as_str().unwrap())).unwrap();
                 let orphan = paths::scratch_dir().join("orphan1");
                 std::fs::create_dir(&orphan).unwrap();
@@ -688,9 +697,12 @@ mod tests {
 
                 let cc = eframe::CreationContext::_new_kittest(ctx.clone());
                 let mut reopened = State::new(&cc, Options::default(), &crate::load_icon());
+                reopened.relay = app.runtime.relay.clone();
                 reopened.startup_cleanup.take().unwrap().join().unwrap();
                 assert!(scratch.is_dir() && !orphan.exists(), "only the handoff's scratch folders survive startup");
                 reopened.runtime_tick();
+                let id = reopened.sessions[0].id.clone();
+                super::super::tests::wait_started(&mut reopened, &id);
                 let [session] = &reopened.sessions[..] else { panic!("one resumed session") };
                 assert_eq!(session.scratch.as_ref(), Some(&scratch));
                 assert_eq!(session.cwd, scratch);

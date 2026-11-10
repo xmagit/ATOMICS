@@ -30,7 +30,7 @@ impl Session {
             worktree: None,
             worktree_ready: Some(rx),
             title,
-            status: if agent.kind == AgentKind::Shell { AgentStatus::Idle } else { AgentStatus::Starting },
+            status: AgentStatus::Starting,
             last_prompt: None,
             last_message: None,
             hooks_active: false,
@@ -727,10 +727,16 @@ impl State {
                     self.sessions.len() - 1
                 });
                 self.sessions[index].terminal = Some(terminal);
+                if agent.kind == AgentKind::Shell {
+                    self.sessions[index].status = AgentStatus::Idle;
+                }
                 self.sessions[index].claude_id = claude_id;
                 self.sessions[index].sandbox = sandboxed.map(|sandboxed| sandboxed.name);
                 self.sessions[index].ref_guard = ref_guard;
                 self.sessions[index].relay = relay;
+                if self.active.as_deref() == Some(&id) {
+                    self.focus_terminal = Some(id.clone());
+                }
                 if chief {
                     self.load_chief_trace(&id);
                     self.hub.lock().unwrap().chief_running = true;

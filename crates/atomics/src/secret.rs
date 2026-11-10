@@ -94,14 +94,13 @@ pub fn run(command: Command) -> Result<()> {
         }
         Command::Rm { name } => {
             store.remove_secret(&name)?;
-            if atomics_core::paths::socket_path().exists() {
-                if !crate::ipc::request(&atomics_core::control::ControlRequest::SecretRemoved { name })
+            if atomics_core::paths::socket_path().exists()
+                && !crate::ipc::request(&atomics_core::control::ControlRequest::SecretRemoved { name })
                     .is_ok_and(|reply| reply.ok)
-                {
-                    eprintln!(
-                        "Secret removed from the store; could not notify the running host. Restart its sessions to revoke existing grants."
-                    );
-                }
+            {
+                eprintln!(
+                    "Secret removed from the store; could not notify the running host. Restart its sessions to revoke existing grants."
+                );
             }
             println!("Secret removed. Restart existing sessions to clear their environment.");
         }

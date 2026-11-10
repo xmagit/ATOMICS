@@ -920,7 +920,7 @@ fn secrets(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, enable
     note(
         ui,
         &p,
-        "New sessions receive secrets in their scope. Relayed values stay in the host store; exposed values can be read and leaked by agents.",
+        "New sessions receive secrets in their scope. Protected values stay in the host store; exposed values can be read and leaked by agents.",
     );
     for entry in info.tools["credentials"]["secrets"].as_array().into_iter().flatten() {
         let name = entry["spec"]["name"].as_str().unwrap_or_default();
@@ -929,7 +929,7 @@ fn secrets(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, enable
             ui,
             &p,
             format!(
-                "{} · {} · Host: {} · Last relay use: {}",
+                "{} · {} · Host: {} · Last use: {}",
                 entry["kind"].as_str().unwrap_or_default(),
                 entry["scope"].as_str().unwrap_or_default(),
                 entry["spec"]["host"].as_str().unwrap_or("none"),

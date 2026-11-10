@@ -1358,7 +1358,7 @@ impl State {
             if s.status == AgentStatus::Done {
                 s.status = AgentStatus::Idle;
             }
-            if s.terminal.is_some() {
+            if s.terminal.is_some() || s.status == AgentStatus::Starting {
                 self.focus_terminal = Some(id.to_string());
                 self.window.request_repaint();
             }

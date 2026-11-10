@@ -3,6 +3,7 @@
 //! reply, a plan persists, a loopback protocol client sees the board and types into the shell
 //! under its lease, SIGTERM stops it cleanly, and the home is locked against a second host and
 //! the desktop.
+#![cfg(any(not(target_os = "macos"), debug_assertions))]
 
 #[path = "../../../tests/support.rs"]
 mod test_support;
@@ -57,6 +58,7 @@ impl Instance {
             .env("HOME", self.dir.path())
             .env("ATOMICS_HOME", self.home())
             .env("ATOMICS_CONFIG", self.dir.path().join("config.toml"))
+            .env("ATOMICS_CREDENTIALS_DIR", self.dir.path().join("credentials"))
             .env("ATOMICS_SOCKET", self.socket())
             .env("XDG_RUNTIME_DIR", self.dir.path().join("runtime"))
             .env("CODEX_HOME", self.dir.path().join("codex"))

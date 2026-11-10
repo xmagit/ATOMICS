@@ -51,6 +51,16 @@ pub(super) fn with_state(name: &str, test: impl FnOnce(State, &egui::Context)) {
     run_state(name, None::<fn(&Path) -> Vec<(&'static str, std::ffi::OsString)>>, test);
 }
 
+/// Credential preparation is asynchronous for bare sessions too; wait by driving the host.
+pub(super) fn wait_started(state: &mut State, id: &str) {
+    let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(20));
+    while !state.sessions.iter().any(|s| s.id == id && s.terminal.is_some()) {
+        assert!(Instant::now() < deadline, "session did not finish credential preparation");
+        state.runtime_tick();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// [`with_state`] in a child that also has the variables `env` gives, which is called in the
 /// parent with the child's home folder. The child takes on its login shell's PATH before the
 /// app starts, as `main` does.
@@ -88,6 +98,7 @@ fn run_state(
                 .env("HOME", dir.path())
                 .env("ATOMICS_HOME", dir.path().join("state"))
                 .env("ATOMICS_CONFIG", dir.path().join("config.toml"))
+                .env("ATOMICS_CREDENTIALS_DIR", dir.path().join("credentials"))
                 .env("ATOMICS_SOCKET", dir.path().join("atomics.sock"))
                 .env("XDG_RUNTIME_DIR", runtime)
                 .env("SHELL", shell)

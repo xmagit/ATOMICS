@@ -4,6 +4,8 @@ Run `scripts/check.sh` from the checkout. It acquires an ATOMICS test slot when 
 enters the default Nix development shell, and runs formatting, Clippy with warnings denied, and
 the locked workspace test suite with `--no-fail-fast`.
 
+Real-binary fixtures may set `ATOMICS_CREDENTIALS_DIR` on macOS only in debug builds; macOS release builds ignore it and always use the OS keychain. Linux's explicit directory behavior is unchanged.
+
 ## Historical baseline
 
 These are the historical results supplied for this audit, from separate runs. They are not a

@@ -363,9 +363,8 @@ impl Inner {
         if let Some((status, reason)) = refused {
             self.log.record(
                 session,
-                host,
+                (host, path),
                 &head.method,
-                path,
                 status,
                 started.elapsed(),
                 grant.as_ref().map(|g| g.credential.label.as_str()),
@@ -383,9 +382,8 @@ impl Inner {
             Err((status, reason)) => {
                 self.log.record(
                     session,
-                    host,
+                    (host, path),
                     &head.method,
-                    path,
                     status,
                     started.elapsed(),
                     Some(&grant.credential.label),
@@ -404,9 +402,8 @@ impl Inner {
             if !approved || !self.grants.lock().unwrap().contains_key(head.placeholder().unwrap()) {
                 self.log.record(
                     session,
-                    host,
+                    (host, path),
                     &head.method,
-                    path,
                     403,
                     started.elapsed(),
                     Some(&grant.credential.label),
@@ -426,7 +423,7 @@ impl Inner {
             }
         }
         let (status, whole) = self.forward(&head, route, &grant.credential, body, writer);
-        self.log.record(session, host, &head.method, path, status, started.elapsed(), Some(&grant.credential.label));
+        self.log.record(session, (host, path), &head.method, status, started.elapsed(), Some(&grant.credential.label));
         Ok(whole && head.keep_alive())
     }
 
@@ -932,14 +929,14 @@ impl Log {
     fn record(
         &self,
         session: &str,
-        host: &str,
+        destination: (&str, &str),
         method: &str,
-        path: &str,
         status: u16,
         elapsed: Duration,
         credential: Option<&str>,
     ) {
         use std::os::unix::fs::OpenOptionsExt;
+        let (host, path) = destination;
         let credential = credential.unwrap_or("-").replace(' ', "%20");
         let line = format!(
             "{} {session} {host} {method} {path} {status} {}ms credential={credential}\n",
@@ -1004,10 +1001,11 @@ impl Keychain {
             crate::setup::find_program("secret-tool")
                 .map_or_else(|| "/usr/bin/secret-tool".into(), |path| path.to_string_lossy().into_owned())
         };
-        // Only where it is asked for, and never on a Mac, whose keychain is always there.
+        // An explicit headless Linux store, or isolated debug fixtures on macOS. A macOS
+        // release always keeps credentials in the OS keychain, regardless of the environment.
         let files = atomics_core::paths::env_override("CREDENTIALS_DIR")
             .map(std::path::PathBuf::from)
-            .filter(|dir| !mac && dir.is_absolute());
+            .filter(|dir| folder_override_allowed(mac, cfg!(debug_assertions)) && dir.is_absolute());
         Self { program, mac, files }
     }
 
@@ -1275,6 +1273,10 @@ pub struct Granted {
     /// Values here are session environment only. Debug deliberately omits them.
     pub secrets: HashMap<String, String>,
     secret_placeholders: Vec<String>,
+}
+
+fn folder_override_allowed(mac: bool, debug: bool) -> bool {
+    !mac || debug
 }
 
 impl std::fmt::Debug for Granted {
@@ -1738,6 +1740,13 @@ pub(crate) mod fake {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn macos_release_ignores_the_directory_override_while_linux_remains_explicit() {
+        assert!(!super::folder_override_allowed(true, false), "macOS release must use the OS keychain");
+        assert!(super::folder_override_allowed(true, true), "macOS debug fixtures may isolate their store");
+        assert!(super::folder_override_allowed(false, false));
+        assert!(super::folder_override_allowed(false, true));
+    }
     #[test]
     fn secret_reflections_in_upstream_headers_and_streamed_bodies_do_not_reach_the_session() {
         use super::*;

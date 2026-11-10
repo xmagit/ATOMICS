@@ -981,8 +981,8 @@ fn bare_agents_never_touch_sbx_and_a_repository_can_only_tighten() {
         for (mode, agent) in [(IsolationMode::Bare, "probe"), (IsolationMode::Sandbox, "bare-probe")] {
             app.runtime.config.isolation.mode = mode;
             let id = app.runtime.start(agent, worktree.clone(), None, vec![], None).unwrap();
-            assert!(app.runtime.sessions[app.runtime.find(&id).unwrap()].terminal.is_some(), "{agent} starts at once");
             tick_until(app, ctx, "the bare probe", |_| out.exists());
+            assert!(app.runtime.sessions[app.runtime.find(&id).unwrap()].terminal.is_some());
             std::fs::remove_file(&out).unwrap();
             assert!(app.runtime.sessions[app.runtime.find(&id).unwrap()].sandbox.is_none());
         }
@@ -1209,9 +1209,9 @@ fn the_chief_always_runs_on_this_machine() {
         app.runtime.config.chief.args = Vec::new();
 
         let id = app.runtime.start_chief(None).unwrap();
-        let chief = &app.runtime.sessions[app.runtime.find(&id).unwrap()];
-        assert!(chief.chief && chief.terminal.is_some() && chief.sandbox.is_none(), "the chief starts bare at once");
         tick_until(app, ctx, "the chief", |_| out.exists());
+        let chief = &app.runtime.sessions[app.runtime.find(&id).unwrap()];
+        assert!(chief.chief && chief.terminal.is_some() && chief.sandbox.is_none(), "the chief starts bare");
         assert_eq!(Path::new(std::fs::read_to_string(&out).unwrap().trim()), repo.canonicalize().unwrap());
 
         // Resumed after a restart, it stays on this machine too.
@@ -1230,8 +1230,8 @@ fn the_chief_always_runs_on_this_machine() {
         app.runtime.sessions.clear();
         std::fs::remove_file(&out).unwrap();
         app.runtime.resume_record(record);
-        assert!(app.runtime.sessions[0].chief && app.runtime.sessions[0].terminal.is_some());
         tick_until(app, ctx, "the resumed chief", |_| out.exists());
+        assert!(app.runtime.sessions[0].chief && app.runtime.sessions[0].terminal.is_some());
         assert!(fake::calls(bin.path()).is_empty(), "the chief never calls sbx");
         app.runtime.sessions.clear();
     });
