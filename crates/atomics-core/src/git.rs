@@ -1956,8 +1956,10 @@ pub(crate) mod tests {
         assert!(existing.join("feature").exists());
         assert!(!proposed.exists());
         assert!(
-            list_worktrees(&repo).unwrap().iter().any(|entry| entry.path == stale),
-            "integration must not prune unrelated registrations"
+            list_worktrees(&repo).unwrap().iter().any(|entry| crate::paths::same_location(&entry.path, &stale)),
+            "integration must not prune unrelated registrations: stale={}, entries={:?}",
+            stale.display(),
+            list_worktrees(&repo).unwrap()
         );
     }
 
@@ -2086,7 +2088,10 @@ pub(crate) mod tests {
         let configured = repo.with_file_name("new-integration");
         assert_eq!(integration_path(&repo, "integration", None, &configured, true, &[]).unwrap(), configured);
         add_worktree(&repo, &old, "integration", "main").unwrap();
-        assert_eq!(integration_path(&repo, "integration", None, &configured, true, &[]).unwrap(), old);
+        assert_eq!(
+            integration_path(&repo, "integration", None, &configured, true, &[]).unwrap(),
+            old.canonicalize().unwrap()
+        );
         assert!(integration_path(&repo, "integration", None, &configured, false, &[]).is_err());
         assert!(integration_path(&repo, "integration", Some(&configured), &configured, true, &[]).is_err());
         let pins = resolve_pins(&old).unwrap();
@@ -2126,7 +2131,7 @@ pub(crate) mod tests {
         // A task elsewhere must not prevent a legacy plan from adopting this checkout.
         assert_eq!(
             integration_path(&repo, "integration", None, &configured, true, std::slice::from_ref(&repo)).unwrap(),
-            candidate
+            candidate.canonicalize().unwrap()
         );
         assert!(!configured.exists());
     }
@@ -2200,7 +2205,10 @@ pub(crate) mod tests {
     fn nested_admin_special_files_block_host_writes() {
         use std::os::unix::fs::symlink;
         for kind in ["fifo", "link", "directory link", "socket"] {
-            let (dir, repo) = project();
+            let dir = crate::test_support::tempdir_in("/tmp").unwrap();
+            let repo = dir.path().join("app");
+            std::fs::create_dir(&repo).unwrap();
+            init(&repo);
             let task = repo.with_file_name("task");
             add_worktree(&repo, &task, "task", "main").unwrap();
             let pins = resolve_pins(&task).unwrap();

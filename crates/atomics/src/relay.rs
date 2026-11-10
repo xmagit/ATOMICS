@@ -526,6 +526,7 @@ impl Inner {
         let (Some(grant), Some(route)) = (&grant, &route) else { unreachable!("refused above") };
         if head.header("expect").is_some_and(|value| value.eq_ignore_ascii_case("100-continue")) {
             writer.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+            writer.flush()?;
         }
         let body = match read_body(reader, &head) {
             Ok(body) => body,
@@ -545,7 +546,8 @@ impl Inner {
         if grant.credential.github.is_some()
             && head.method == "POST"
             && route.path.ends_with("/git-receive-pack")
-            && (head.header("content-encoding").is_some() || !self.github_push_allowed(&grant.credential, &body))
+            && (head.header("content-encoding").is_some_and(|value| !value.eq_ignore_ascii_case("identity"))
+                || !self.github_push_allowed(&grant.credential, &body))
         {
             self.log.record(session, (host, path), &head.method, 403, started.elapsed(), Some(&grant.credential.label));
             refuse(writer, 403, "GitHub push refused: default branch or unsupported update")?;
@@ -1010,42 +1012,18 @@ fn read_head(reader: &mut impl BufRead) -> io::Result<Option<Head>> {
 fn read_body(reader: &mut impl BufRead, head: &Head) -> Result<Vec<u8>, (u16, &'static str)> {
     let malformed = (400, "malformed request body");
     let too_large = (413, "request body too large");
+    for header in ["transfer-encoding", "content-length"] {
+        if head.headers.iter().filter(|(name, _)| name.eq_ignore_ascii_case(header)).count() > 1 {
+            return Err(malformed);
+        }
+    }
     match (head.header("transfer-encoding"), head.header("content-length")) {
         (Some(_), Some(_)) => Err(malformed),
         (Some(encoding), None) => {
             if !encoding.eq_ignore_ascii_case("chunked") {
                 return Err((400, "unsupported transfer encoding"));
             }
-            let mut body = Vec::new();
-            loop {
-                let mut line = String::new();
-                reader.by_ref().take(1024).read_line(&mut line).map_err(|_| malformed)?;
-                let size = line.trim().split(';').next().unwrap_or_default();
-                let size = u64::from_str_radix(size.trim(), 16).map_err(|_| malformed)?;
-                if size == 0 {
-                    // Trailers, then the empty line that ends the body.
-                    loop {
-                        let mut trailer = String::new();
-                        if reader.by_ref().take(8192).read_line(&mut trailer).map_err(|_| malformed)? == 0 {
-                            return Err(malformed);
-                        }
-                        if trailer.trim().is_empty() {
-                            return Ok(body);
-                        }
-                    }
-                }
-                if body.len() as u64 + size > MAX_BODY {
-                    return Err(too_large);
-                }
-                let start = body.len();
-                body.resize(start + size as usize, 0);
-                reader.read_exact(&mut body[start..]).map_err(|_| malformed)?;
-                let mut end = [0; 2];
-                reader.read_exact(&mut end).map_err(|_| malformed)?;
-                if &end != b"\r\n" {
-                    return Err(malformed);
-                }
-            }
+            read_chunked_body(reader)
         }
         (None, Some(length)) => {
             let length: u64 = length.parse().map_err(|_| malformed)?;
@@ -1057,6 +1035,109 @@ fn read_body(reader: &mut impl BufRead, head: &Head) -> Result<Vec<u8>, (u16, &'
             Ok(body)
         }
         (None, None) => Ok(Vec::new()),
+    }
+}
+
+/// Consume octets through explicit framing states. Network read boundaries have no
+/// relationship to chunk headers, CRLF, Git pkt-lines, or the terminating trailer section.
+fn read_chunked_body(reader: &mut impl BufRead) -> Result<Vec<u8>, (u16, &'static str)> {
+    enum State {
+        Size,
+        Data(usize),
+        DataEnd,
+        Trailers,
+    }
+    let mut state = State::Size;
+    let mut body = Vec::new();
+    let mut trailer_bytes = 0;
+    loop {
+        state = match state {
+            State::Size => {
+                let line = body_line(reader, 8192).map_err(|_| (400, "incomplete or oversized chunk-size line"))?;
+                if line.iter().any(|byte| (*byte < b' ' && *byte != b'\t') || *byte == 127) {
+                    return Err((400, "malformed chunk extension"));
+                }
+                let size = line.split(|byte| *byte == b';').next().unwrap_or_default();
+                let size = std::str::from_utf8(size).map_err(|_| (400, "malformed chunk size"))?.trim();
+                if size.is_empty() || !size.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    return Err((400, "malformed chunk size"));
+                }
+                let size = u64::from_str_radix(size, 16).map_err(|_| (413, "request chunk size too large"))?;
+                if size > MAX_BODY - body.len() as u64 {
+                    return Err((413, "request body too large"));
+                }
+                if size == 0 { State::Trailers } else { State::Data(size as usize) }
+            }
+            State::Data(left) => {
+                let bytes = loop {
+                    match reader.fill_buf() {
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                        other => break other.map_err(|_| (400, "incomplete chunk data"))?,
+                    }
+                };
+                if bytes.is_empty() {
+                    return Err((400, "incomplete chunk data"));
+                }
+                let count = left.min(bytes.len());
+                body.extend_from_slice(&bytes[..count]);
+                reader.consume(count);
+                if count == left { State::DataEnd } else { State::Data(left - count) }
+            }
+            State::DataEnd => {
+                let mut end = [0; 2];
+                reader.read_exact(&mut end).map_err(|_| (400, "incomplete chunk delimiter"))?;
+                if end != *b"\r\n" {
+                    return Err((400, "malformed chunk delimiter"));
+                }
+                State::Size
+            }
+            State::Trailers => {
+                let line = body_line(reader, MAX_HEAD - trailer_bytes)
+                    .map_err(|_| (400, "incomplete or oversized chunk trailers"))?;
+                trailer_bytes += line.len() + 2;
+                if line.is_empty() {
+                    return Ok(body);
+                }
+                let Some(colon) = line.iter().position(|byte| *byte == b':') else {
+                    return Err((400, "malformed chunk trailer"));
+                };
+                if colon == 0
+                    || !line[..colon]
+                        .iter()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(byte))
+                {
+                    return Err((400, "malformed chunk trailer"));
+                }
+                // Discard trailers; none can replace routing, credentials or framing headers.
+                State::Trailers
+            }
+        };
+    }
+}
+
+fn body_line(reader: &mut impl BufRead, limit: usize) -> io::Result<Vec<u8>> {
+    let mut line = Vec::new();
+    loop {
+        let bytes = match reader.fill_buf() {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            other => other?,
+        };
+        if bytes.is_empty() {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        let count = bytes.iter().position(|byte| *byte == b'\n').map_or(bytes.len(), |at| at + 1);
+        if line.len() + count > limit {
+            return Err(io::Error::other("body framing line too long"));
+        }
+        line.extend_from_slice(&bytes[..count]);
+        reader.consume(count);
+        if line.ends_with(b"\n") {
+            if !line.ends_with(b"\r\n") {
+                return Err(io::Error::other("body framing line has no CRLF"));
+            }
+            line.truncate(line.len() - 2);
+            return Ok(line);
+        }
     }
 }
 
@@ -2481,6 +2562,151 @@ mod tests {
         let long = format!("GET /{} HTTP/1.1\r\n\r\n", "a".repeat(MAX_HEAD));
         assert!(send(relay.port(), &long).0.starts_with("HTTP/1.1 400 "));
         assert_eq!(upstream.seen.lock().unwrap().len(), 1);
+    }
+
+    struct SplitInput<'a> {
+        bytes: &'a [u8],
+        max: usize,
+        seed: u64,
+        calls: usize,
+    }
+
+    impl Read for SplitInput<'_> {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            self.calls += 1;
+            if self.calls.is_multiple_of(17) {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            self.seed = self.seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let limit = if self.max == 1 { 1 } else { (self.seed as usize % self.max) + 1 };
+            let count = self.bytes.len().min(out.len()).min(limit);
+            out[..count].copy_from_slice(&self.bytes[..count]);
+            self.bytes = &self.bytes[count..];
+            Ok(count)
+        }
+    }
+
+    #[test]
+    fn chunked_requests_are_independent_of_reads_and_leave_the_next_request_intact() {
+        let body: Vec<u8> = (0..131_103).map(|index| (index % 251) as u8).collect();
+        let mut wire = b"POST /github.com/group/repo.git/git-receive-pack HTTP/1.1\r\nContent-Length: 4\r\n\r\n0000POST /github.com/group/repo.git/git-receive-pack HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        let mut at = 0;
+        for (index, size) in [1, 15, 16, 65_536, 1, 31, 65_503].into_iter().enumerate() {
+            let count = size.min(body.len() - at);
+            let size = if index % 2 == 0 { format!("{count:08X}") } else { format!("{count:08x}") };
+            wire.extend_from_slice(format!("{size};ignored=\"value;with;semicolons\"\r\n").as_bytes());
+            wire.extend_from_slice(&body[at..at + count]);
+            wire.extend_from_slice(b"\r\n");
+            at += count;
+        }
+        assert_eq!(at, body.len());
+        wire.extend_from_slice(b"000;done=yes\r\nX-Checksum: ignored\r\nX-Other: trailer\r\n\r\nGET /github.com/next HTTP/1.0\r\nConnection: Keep-Alive\r\n\r\n");
+        for max in [1, 2, 7, 1024, 65_536] {
+            for seed in [1, 37, 987654321] {
+                let input = SplitInput { bytes: &wire, max, seed, calls: 0 };
+                let mut reader = BufReader::with_capacity(8192, input);
+                let probe = read_head(&mut reader).unwrap().unwrap();
+                assert_eq!(read_body(&mut reader, &probe).unwrap(), b"0000");
+                let head = read_head(&mut reader).unwrap().unwrap();
+                assert_eq!(read_body(&mut reader, &head).unwrap(), body, "max={max} seed={seed}");
+                let next = read_head(&mut reader).unwrap().unwrap();
+                assert_eq!(next.target, "/github.com/next");
+                assert!(next.keep_alive());
+            }
+        }
+    }
+
+    #[test]
+    fn chunked_truncation_bad_delimiters_and_ambiguous_framing_are_refused() {
+        for body in
+            [b"1\r\nx\r\n0\r\n".as_slice(), b"2\r\nx", b"1\r\nxX\n0\r\n\r\n", b"xyz\r\n", b"0\r\nnot-a-trailer\r\n\r\n"]
+        {
+            let mut reader = body;
+            assert!(read_chunked_body(&mut reader).is_err(), "{body:?}");
+        }
+        let mut reader =
+            b"POST /github.com/repo HTTP/1.1\r\nContent-Length: 4\r\nContent-Length: 0\r\n\r\n0000".as_slice();
+        let head = read_head(&mut reader).unwrap().unwrap();
+        assert!(read_body(&mut reader, &head).is_err());
+        assert_eq!(read_chunked_body(&mut b"ffffffffffffffff\r\n".as_slice()).unwrap_err().0, 413);
+    }
+
+    #[test]
+    fn git_request_shapes_preserve_bodies_and_keep_receive_pack_validation() {
+        let upstream = fake::start();
+        let dir = crate::test_support::tempdir().unwrap();
+        let relay =
+            Relay::start(0, dir.path().join("relay.log"), HashMap::from([("github.com".into(), upstream.url.clone())]))
+                .unwrap();
+        let scope = github::Scope { repository: "group/repo".into(), pulls: false, refuse_default_branch: false };
+        let placeholder = relay.grant("worker", Arc::new(Credential::github("account", TOKEN.into(), scope).unwrap()));
+        let command = format!("{} {} refs/heads/task\0report-status\n", "0".repeat(40), "1".repeat(40));
+        let valid = format!("{:04x}{command}0000PACKpayload", command.len() + 4).into_bytes();
+        // A valid gzip stream containing an empty payload; upload-pack is forwarded opaquely.
+        let gzip = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+        for (path, encoding, body, allowed) in [
+            ("git-receive-pack", "", b"0000".as_slice(), true),
+            ("git-receive-pack", "", valid.as_slice(), true),
+            ("git-upload-pack", "Content-Encoding: gzip\r\n", gzip.as_slice(), true),
+            ("git-receive-pack", "Content-Encoding: gzip\r\n", gzip.as_slice(), false),
+            ("git-receive-pack", "", b"malformed pkt-line", false),
+        ] {
+            let chunked = if body == b"0000" {
+                b"Content-Length: 4\r\n\r\n0000".to_vec()
+            } else {
+                let mut bytes =
+                    format!("Transfer-Encoding: Chunked\r\nTrailer: X-Checksum\r\n\r\n{:08X};test=yes\r\n", body.len())
+                        .into_bytes();
+                bytes.extend_from_slice(body);
+                bytes.extend_from_slice(b"\r\n0\r\nX-Checksum: ignored\r\n\r\n");
+                bytes
+            };
+            let mut wire = format!("POST /github.com/group/repo.git/{path} HTTP/1.0\r\nConnection: Keep-Alive\r\nAuthorization: Bearer {placeholder}\r\n{encoding}").into_bytes();
+            wire.extend(chunked);
+            let mut reader = BufReader::new(SplitInput { bytes: &wire, max: 1, seed: 1, calls: 0 });
+            let head = read_head(&mut reader).unwrap().unwrap();
+            let before = upstream.seen.lock().unwrap().len();
+            let mut response = Vec::new();
+            if allowed {
+                upstream.release.send(()).unwrap();
+            }
+            relay.inner.exchange(head, &mut reader, &mut response).unwrap();
+            if allowed {
+                assert!(response.starts_with(b"HTTP/1.1 200"), "{}", String::from_utf8_lossy(&response));
+                let seen = upstream.seen.lock().unwrap();
+                assert_eq!(seen[before].body, body);
+                if !encoding.is_empty() {
+                    assert_eq!(seen[before].header("content-encoding"), ["gzip"]);
+                }
+            } else {
+                assert!(response.starts_with(b"HTTP/1.1 403"));
+                assert_eq!(upstream.seen.lock().unwrap().len(), before);
+            }
+        }
+    }
+
+    #[test]
+    fn continue_response_arrives_before_the_client_sends_a_body() {
+        let upstream = fake::start();
+        let dir = crate::test_support::tempdir().unwrap();
+        let relay = relay(&upstream, dir.path().join("relay.log"));
+        let placeholder = relay.grant("worker", Arc::new(Credential::claude(TOKEN.into())));
+        let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, relay.port())).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        write!(stream, "POST /{ANTHROPIC}/v1/messages HTTP/1.1\r\nx-api-key: {placeholder}\r\nExpect: 100-continue\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(line, "HTTP/1.1 100 Continue\r\n");
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(line, "\r\n");
+        reader.get_mut().write_all(b"3\r\nhey\r\n0\r\n\r\n").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(line, "HTTP/1.1 200 OK\r\n");
+        upstream.release.send(()).unwrap();
+        assert_eq!(upstream.seen.lock().unwrap()[0].body, b"hey");
     }
 
     #[test]

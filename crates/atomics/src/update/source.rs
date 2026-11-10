@@ -379,7 +379,7 @@ mod tests {
             run(dir.path(), &["clone", "--quiet", origin.to_str().unwrap(), other.to_str().unwrap()]);
             run(&other, &["symbolic-ref", "HEAD", "refs/heads/main"]);
             std::fs::create_dir_all(other.join("scripts")).unwrap();
-            crate::test_support::write_program(other.join("scripts/linux-install.sh"), script);
+            crate::test_support::write_program(other.join(install_script(cfg!(target_os = "macos")).0), script);
             run(&other, &["add", "."]);
             run(&other, &["commit", "--quiet", "-m", "First"]);
             run(&other, &["push", "--quiet", "origin", "main"]);
@@ -450,7 +450,13 @@ mod tests {
         assert_eq!(fixture.head(), new);
         assert_eq!(run(&fixture.source.checkout, &["symbolic-ref", "--short", "HEAD"]), "main", "it stays on main");
         let ran = std::fs::read_to_string(fixture.source.checkout.join("ran")).unwrap();
-        assert_eq!(ran.trim(), "--no-setup", "nobody is at a terminal to answer setup");
+        if cfg!(target_os = "macos") {
+            let expected =
+                install_script(true).1.iter().map(|arg| arg.to_string_lossy()).collect::<Vec<_>>().join("\n");
+            assert_eq!(ran.trim_end_matches('\n'), expected, "the bundle installer receives its destination");
+        } else {
+            assert_eq!(ran.trim(), "--no-setup", "nobody is at a terminal to answer setup");
+        }
         assert!(steps.borrow().iter().any(|step| step.contains("low priority")), "{steps:?}");
     }
 
@@ -475,7 +481,7 @@ mod tests {
         let checkout = &fixture.source.checkout;
         fixture.push_commit("Add the thing");
         let before = fixture.head();
-        std::fs::write(checkout.join("scripts/linux-install.sh"), "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::write(checkout.join(install_script(cfg!(target_os = "macos")).0), "#!/bin/sh\nexit 1\n").unwrap();
         let error = format!("{:#}", fixture.source.install(&|_| {}).unwrap_err());
         assert!(error.contains("uncommitted changes"), "{error}");
         assert_eq!(fixture.head(), before);
@@ -501,7 +507,7 @@ mod tests {
         assert!(error.contains("may already have put the new program in place"), "{error}");
         assert!(error.contains("update.log"), "{error}");
 
-        run(&fixture.other(), &["rm", "--quiet", "scripts/linux-install.sh"]);
+        run(&fixture.other(), &["rm", "--quiet", install_script(cfg!(target_os = "macos")).0]);
         run(&fixture.other(), &["commit", "--quiet", "-m", "No script"]);
         run(&fixture.other(), &["push", "--quiet", "origin", "main"]);
         let error = format!("{:#}", fixture.source.install(&|_| {}).unwrap_err());

@@ -764,12 +764,11 @@ pub fn check_integration_alert(
                 return Ok(alerts);
             }
             let mut alerts = Vec::new();
-            let real = worktree.canonicalize().ok();
             for (name, entry) in crate::sandbox_ownership::owned(&home)? {
                 if !entry
                     .git_pins
                     .as_ref()
-                    .is_some_and(|pins| pins.work_tree == worktree || real.as_ref() == Some(&pins.work_tree))
+                    .is_some_and(|pins| atomics_core::paths::same_location(&pins.work_tree, &worktree))
                 {
                     continue;
                 }

@@ -213,7 +213,11 @@ pub fn is_vm_client() -> Result<bool> {
     if !cfg!(target_os = "macos") {
         return Ok(false);
     }
-    let config = atomics_core::config::Config::load(&atomics_core::paths::config_file())?;
+    config_is_vm_client(&atomics_core::paths::config_file())
+}
+
+fn config_is_vm_client(file: &std::path::Path) -> Result<bool> {
+    let config = atomics_core::config::Config::load_existing(file)?;
     Ok(config.client.connect.trim() == "vm")
 }
 
@@ -221,6 +225,20 @@ pub fn is_vm_client() -> Result<bool> {
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
+
+    #[test]
+    fn missing_client_config_uses_defaults_without_creating_a_file() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        assert!(!config_is_vm_client(&file).unwrap());
+        assert!(!file.exists());
+        std::fs::write(&file, "[client]\nconnect = 'vm'\n").unwrap();
+        assert!(config_is_vm_client(&file).unwrap());
+        std::fs::write(&file, "[client]\nconnect = 'local'\n").unwrap();
+        assert!(!config_is_vm_client(&file).unwrap());
+        std::fs::write(&file, "invalid = [").unwrap();
+        assert!(config_is_vm_client(&file).is_err());
+    }
 
     fn info(admin: bool) -> BundleInfo {
         BundleInfo {

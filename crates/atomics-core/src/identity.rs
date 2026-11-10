@@ -90,6 +90,7 @@ impl IdentityConfig {
     /// Resolve each key: project, workspace, main/host, then Git for unset keys.
     pub fn resolve(&self, project: &str, workspace: Option<&Identity>, expand: impl Fn(&str) -> String) -> Identity {
         let base = workspace.map_or_else(|| self.default.clone(), |ws| self.default.overlay(ws));
+        let project = expand(project);
         self.projects.iter().find(|(path, _)| expand(path) == project).map_or(base.clone(), |(_, id)| base.overlay(id))
     }
 }
@@ -462,6 +463,7 @@ forbidden_words = []
         assert_eq!(workspace.name, ws.name);
         assert_eq!(workspace.forbidden_words, config.default.forbidden_words);
         let project = config.resolve("/example/app", Some(&ws), expand);
+        assert_eq!(config.resolve("~/app", Some(&ws), expand), project);
         assert_eq!(project.email.as_deref(), Some("project@example.com"));
         assert_eq!(project.name.as_deref(), Some("Project Example"));
         assert_eq!(workspace.github.as_deref(), Some("account-one"));

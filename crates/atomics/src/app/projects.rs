@@ -233,7 +233,11 @@ mod tests {
                 assert_eq!(main["identity"]["forbidden_words"], json!(["contoso"]));
                 let ws = scopes.iter().find(|scope| scope["target"] == "workspace").unwrap();
                 assert_eq!(ws["identity"], json!({"email":"workspace@example.com"}));
-                let project = scopes.iter().find(|scope| scope["target"] == repo.to_string_lossy().as_ref()).unwrap();
+                let canonical_repo = repo.canonicalize().unwrap();
+                let project = scopes
+                    .iter()
+                    .find(|scope| scope["target"] == canonical_repo.to_string_lossy().as_ref())
+                    .unwrap_or_else(|| panic!("project {} missing from scopes: {scopes:?}", canonical_repo.display()));
                 assert_eq!(project["identity"], json!({"name":"Project Example"}));
                 assert_eq!(project["path"], json!(["identity", "projects", "~/project-link"]));
                 assert_eq!(info.tools["identities"][0]["override"], json!({"name":"Project Example"}));
@@ -325,7 +329,9 @@ mod tests {
             |mut state, _| {
                 use atomics_core::identity::{Identity, set_worktree_identity};
                 let (dir, repo) = crate::app::tests::repository();
-                let task = dir.path().join("task");
+                let alias = dir.path().join("parent-alias");
+                std::os::unix::fs::symlink(dir.path(), &alias).unwrap();
+                let task = alias.join("task");
                 git::add_worktree(&repo, &task, "task", "main").unwrap();
                 let identity = |name: &str, email: &str| Identity {
                     name: Some(name.into()),

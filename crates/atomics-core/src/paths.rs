@@ -380,6 +380,23 @@ pub fn expand(path: &str) -> PathBuf {
     }
 }
 
+/// Resolve aliases in the existing prefix, retaining the names of removed or not-yet-created children.
+pub fn resolved_path(path: &Path) -> std::io::Result<PathBuf> {
+    let absolute = if path.is_absolute() { path.to_path_buf() } else { std::env::current_dir()?.join(path) };
+    for parent in absolute.ancestors() {
+        match parent.canonicalize() {
+            Ok(parent_path) => return Ok(parent_path.join(absolute.strip_prefix(parent).expect("ancestor prefix"))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(std::io::ErrorKind::NotFound, "path has no existing ancestor"))
+}
+
+pub fn same_location(left: &Path, right: &Path) -> bool {
+    left == right || resolved_path(left).ok().zip(resolved_path(right).ok()).is_some_and(|(left, right)| left == right)
+}
+
 /// Shortens a path under the home directory to `~/…` for display.
 pub fn display(path: &Path) -> String {
     match path.strip_prefix(home()) {
@@ -391,6 +408,17 @@ pub fn display(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aliases_remain_the_same_location_after_a_child_is_removed() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        assert!(same_location(&real.join("missing/child"), &alias.join("missing/child")));
+        assert!(!same_location(&real.join("one"), &alias.join("two")));
+    }
 
     #[test]
     fn audit_p7_long_socket_paths_use_a_short_runtime_or_explain_the_override() {

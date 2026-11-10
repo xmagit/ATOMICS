@@ -128,7 +128,9 @@ impl State {
             for (repo, identity) in projects {
                 let result = (|| -> anyhow::Result<()> {
                     for entry in git::list_worktrees(&repo)?.into_iter().skip(1).filter(|entry| entry.trusted) {
-                        if owned.contains(&entry.path) || atomics_core::identity::is_managed_worktree(&entry.path) {
+                        if owned.iter().any(|path| paths::same_location(path, &entry.path))
+                            || atomics_core::identity::is_managed_worktree(&entry.path)
+                        {
                             atomics_core::identity::sync_worktree_identity(&entry.path, &identity)?;
                         }
                     }

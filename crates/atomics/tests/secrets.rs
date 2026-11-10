@@ -16,6 +16,7 @@ fn secret_cli_canary_never_reaches_output_arguments_config_or_logs() {
             .env("ATOMICS_CONFIG", dir.path().join("config.toml"))
             .env("ATOMICS_SOCKET", dir.path().join("atomics.sock"))
             .env_remove(atomics_core::paths::HOST_SOCKET_ENV)
+            .env_remove("ATOMICS_SECRET_BROKER_SOCKET")
             .env("ATOMICS_CREDENTIALS_DIR", dir.path().join("keychain"))
             .env("SHELL", "/bin/sh")
             .stdin(Stdio::piped())

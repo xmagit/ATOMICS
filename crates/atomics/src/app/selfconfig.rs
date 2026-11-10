@@ -58,7 +58,7 @@ impl State {
         for root in &self.repos {
             let found = main.projects.iter().find(|(path, _)| {
                 let expanded = paths::expand(path);
-                std::fs::canonicalize(&expanded).unwrap_or(expanded) == *root
+                paths::same_location(&expanded, root)
             });
             let (key, identity) = found.map_or_else(
                 || (paths::display(root), Default::default()),
@@ -144,7 +144,7 @@ impl State {
         if let Some(root) = &project
             && let Some((path, identity)) = self.config.identity.projects.iter().find(|(path, _)| {
                 let expanded = paths::expand(path);
-                std::fs::canonicalize(&expanded).unwrap_or(expanded) == *root
+                paths::same_location(&expanded, root)
             })
         {
             for (field, set) in [

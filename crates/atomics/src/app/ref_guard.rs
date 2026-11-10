@@ -393,12 +393,12 @@ mod tests {
                     .integrate_rx
                     .recv_timeout(crate::test_support::scaled_timeout(std::time::Duration::from_secs(10)))
                     .unwrap();
-                assert_eq!(done.result.as_ref().unwrap().worktree, original);
+                assert_eq!(done.result.as_ref().unwrap().worktree, original.canonicalize().unwrap());
                 app.runtime.finish_integration(done);
                 app.runtime.plans[0] = Plan::load(&paths::atomics_home().join("plans/p.json")).unwrap();
                 let records = &app.runtime.plans[0].integration_worktrees;
                 assert_eq!(records.len(), 1);
-                assert_eq!(records[0].path, original);
+                assert_eq!(records[0].path, original.canonicalize().unwrap());
                 app.runtime.config.worktree_path = "{repo_parent}/changed-again".into();
             }
             assert_eq!(std::fs::read_to_string(original.join("feature")).unwrap(), "second");
@@ -543,7 +543,9 @@ mod tests {
             "app::ref_guard::tests::missing_task_folder_checks_its_snapshot_without_changing_host_head",
             |app, _| {
                 let (dir, repo) = repository();
-                let task = dir.path().join("task");
+                let alias = dir.path().join("parent-alias");
+                std::os::unix::fs::symlink(dir.path(), &alias).unwrap();
+                let task = alias.join("task");
                 git::add_worktree(&repo, &task, "task", "main").unwrap();
                 std::fs::write(task.join("feature"), "feature").unwrap();
                 git::commit_all(&task, "feature").unwrap();

@@ -136,8 +136,7 @@ pub enum Domain {
 }
 
 fn resolved_location(path: &Path) -> Option<PathBuf> {
-    let ancestor = path.ancestors().find(|parent| parent.exists())?;
-    Some(ancestor.canonicalize().ok()?.join(path.strip_prefix(ancestor).ok()?))
+    paths::resolved_path(path).ok()
 }
 
 fn forbidden_store(home: &Path, path: &Path, domain: Domain) -> bool {
@@ -171,7 +170,7 @@ fn inside(root: &Path, relative_path: &str) -> Option<PathBuf> {
     if !relative(relative_path) {
         return None;
     }
-    let mut path = root.to_path_buf();
+    let mut path = resolved_location(root)?;
     for part in Path::new(relative_path) {
         // A literal git pathspec is case-sensitive even on a case-insensitive disk.
         // Missing components are allowed for cache setup; existing names must be exact.
@@ -224,7 +223,13 @@ pub struct CacheSetup {
 impl CacheSetup {
     pub fn filter_env(&self, env: &mut BTreeMap<String, String>) {
         env.retain(|key, value| {
-            let skipped = path_variable(key) && self.skipped.iter().any(|path| Path::new(value).starts_with(path));
+            let skipped = path_variable(key)
+                && self.skipped.iter().any(|path| {
+                    Path::new(value).starts_with(path)
+                        || resolved_location(Path::new(value))
+                            .zip(resolved_location(path))
+                            .is_some_and(|(value, path)| value.starts_with(path))
+                });
             if skipped {
                 eprintln!("ATOMICS: ignored cache.env.{key}: cache setup skipped this folder");
             }
@@ -922,7 +927,11 @@ mod tests {
             BTreeMap::from([("NUGET_PACKAGES".into(), guest.join(".nuget/packages").to_string_lossy().into_owned())]);
         resolve_env_paths(&home, &host, &config, &mut guest_env);
         switched.filter_env(&mut guest_env);
-        assert!(guest_env.is_empty(), "host builds must never read sandbox stores");
+        assert!(
+            guest_env.is_empty(),
+            "host builds must never read sandbox stores: env={guest_env:?}, skipped={:?}",
+            switched.skipped
+        );
         assert!(!domain_store_safe(&home, &machine_cache().with_file_name("sccache"), Domain::Host));
         output(&main, "tracked-store");
         git::git(&main, &["add", "tracked-store"]).unwrap();
@@ -930,7 +939,7 @@ mod tests {
         let mut env =
             BTreeMap::from([("SCCACHE_DIR".into(), main.join("tracked-store").to_string_lossy().into_owned())]);
         resolve_env_paths(&home, &host, &config, &mut env);
-        assert!(env.is_empty());
+        assert!(env.is_empty(), "tracked cache environment survived: {env:?}");
         let redirected = repository_store(&home, &main.canonicalize().unwrap(), Domain::Sandbox);
         std::fs::remove_dir_all(&redirected).unwrap();
         std::os::unix::fs::symlink(main.join("tracked-store"), &redirected).unwrap();
@@ -940,6 +949,8 @@ mod tests {
     #[test]
     fn cache_setup_skips_a_failed_folder_and_continues_with_independent_folders() {
         let (dir, _main, work) = project();
+        let alias = dir.path().join("work-alias");
+        std::os::unix::fs::symlink(&work, &alias).unwrap();
         let home = dir.path().join("state");
         let ordinary = dir.path().join("ordinary");
         std::fs::create_dir(&ordinary).unwrap();
@@ -951,9 +962,9 @@ mod tests {
         assert!(work.join(".cache/pip").symlink_metadata().unwrap().file_type().is_symlink());
         assert_eq!(work.join(".cache/wrong").canonicalize().unwrap(), ordinary.canonicalize().unwrap());
         let mut env =
-            BTreeMap::from([("PIP_CACHE_DIR".into(), work.join(".cache/wrong").to_string_lossy().into_owned())]);
+            BTreeMap::from([("PIP_CACHE_DIR".into(), alias.join(".cache/wrong").to_string_lossy().into_owned())]);
         setup.filter_env(&mut env);
-        assert!(env.is_empty());
+        assert!(env.is_empty(), "skipped cache environment survived: env={env:?}, skipped={:?}", setup.skipped);
     }
 
     #[test]
