@@ -6,7 +6,7 @@ use std::process::Command;
 
 #[test]
 fn setup_from_an_empty_machine_creates_config_and_gives_install_commands_without_secret_arguments() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_support::tempdir().unwrap();
     let bin = dir.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
     let shell = dir.path().join("shell");
@@ -146,6 +146,11 @@ fn doctor_checks_real_inputs_and_only_requires_git_and_valid_config() {
 #[test]
 fn doctor_says_where_path_came_from_and_reads_the_codex_version_with_the_login_shells() {
     let dir = crate::test_support::tempdir().unwrap();
+    let started = [dir.path().join("started-a"), dir.path().join("started-b")];
+    for folder in &started {
+        std::fs::create_dir(folder).unwrap();
+    }
+    let initial_path = std::env::join_paths(&started).unwrap();
     let tools = dir.path().join("login-tools");
     std::fs::create_dir(&tools).unwrap();
     test_support::write_program(tools.join("git"), "#!/bin/sh\necho 'git version fixture'\n");
@@ -167,7 +172,7 @@ fn doctor_says_where_path_came_from_and_reads_the_codex_version_with_the_login_s
                 .env("HOME", dir.path())
                 .env("SHELL", &shell)
                 // As a desktop launcher starts it.
-                .env("PATH", "/usr/bin:/bin")
+                .env("PATH", &initial_path)
                 .env("ATOMICS_HOME", dir.path().join("state"))
                 .env("ATOMICS_CONFIG", &config)
                 .env("ATOMICS_HOST", "fixture")
@@ -175,7 +180,8 @@ fn doctor_says_where_path_came_from_and_reads_the_codex_version_with_the_login_s
         );
         String::from_utf8(output.stdout).unwrap()
     };
-    let text = run(&format!("printf '__ATOMICS__{}:/usr/bin:/bin__ATOMICS__'", tools.display()));
+    let login_path = std::env::join_paths(std::iter::once(&tools).chain(started.iter())).unwrap();
+    let text = run(&format!("printf '__ATOMICS__{}__ATOMICS__'", login_path.to_string_lossy()));
     let added =
         format!("✓ PATH of login shell {}: 1 folder added to the PATH ATOMICS was started with", shell.display());
     assert!(text.lines().next().is_some_and(|line| line == added), "{text}");

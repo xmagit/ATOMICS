@@ -102,7 +102,7 @@ pub fn helper_path(root: &Path) -> PathBuf {
         awk grep tr wc sort cut date touch kill ps readlink realpath which find tar gzip unzip openssl ssh
         ssh-keygen python3 node setsid stty ls id uname curl wget install mktemp xargs tee du df readelf
         strip cargo rustc nix nix-build timeout file getconf nice mkfifo printenv seq dd od jq cmp diff
-        stat perl patch xz bzip2 zstd base64 hexdump nc ss"
+        stat perl patch xz bzip2 zstd base64 hexdump nc ss sync"
         .split_whitespace()
     {
         let target = bin.join(name);
@@ -181,8 +181,10 @@ pub fn isolate_environment(command: &mut Command) {
         ("XDG_DATA_HOME", ".local/share"),
     ] {
         if let Some((_, Some(path))) = command.get_envs().find(|(key, _)| *key == name) {
+            // Path-resolution tests deliberately supply relative/empty XDG values;
+            // those are ignored in favor of this fixture's HOME by the XDG rules.
             assert!(
-                fixture_root(Path::new(path)).is_some(),
+                fixture_root(Path::new(path)).is_some() || (name.starts_with("XDG_") && !Path::new(path).is_absolute()),
                 "test {name} {} is outside its fixture directory",
                 Path::new(path).display()
             );

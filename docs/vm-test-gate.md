@@ -182,3 +182,29 @@ The separate CLI-isolation migration checks exposed fixture assumptions (missing
 helpers, repository fakes outside their owner directory, and host PATH lookups). Their failures
 are retained in `/tmp/p3-isolation-binary.log` and `/tmp/p3-isolation-binary-fixed.log` and are not
 represented as intermittent failures in the frozen before measurement.
+
+The first merged stress batch at `fca1dcf` completed all ten runs with **2308 passed,
+11 failed, 42 ignored** each time. Formatting and Clippy also passed in its final gate run.
+All five originally reported tests in the table above passed in all ten runs. The isolation
+support exposed the following additional fixture failures, each **10/10**; none failed in the
+earlier frozen baseline:
+
+| Target | Test | Failures in first merged batch |
+| --- | --- | ---: |
+| `doctor` | `setup_from_an_empty_machine_creates_config_and_gives_install_commands_without_secret_arguments` | 10 |
+| `doctor` | `doctor_says_where_path_came_from_and_reads_the_codex_version_with_the_login_shells` | 10 |
+| `linux_install` | `a_build_that_does_not_run_replaces_nothing_and_no_rust_says_what_to_do` | 10 |
+| `linux_install` | `install_and_update_ask_nothing_and_replace_the_program_atomically` | 10 |
+| `linux_install` | `installer_registers_the_atomics_link_scheme` | 10 |
+| `linux_install` | `setup_finds_what_an_installer_left_in_the_users_own_programs_folder` | 10 |
+| `linux_install` | `setup_with_agents_on_this_machine_needs_one_agent_and_nothing_of_sandboxes` | 10 |
+| `linux_install` | `setup_with_sandboxes_in_use_still_checks_what_they_need` | 10 |
+| `linux_install` | `stopping_setup_reads_as_a_stop_and_it_can_still_ask_for_sandboxes` | 10 |
+| `linux_install` | `the_script_and_the_program_write_the_same_menu_entry` | 10 |
+| `atomics-core` lib | `paths::tests::linux_xdg_paths_and_instance_overrides` | 10 |
+
+Installer and doctor fixtures now register their temporary directories with the shared support.
+The doctor PATH test uses fixture directories while still requiring exactly one added directory
+and a successful Codex version probe. Deliberately relative or empty XDG values remain available
+to the path-resolution tests: the XDG rules ignore them in favor of the isolated HOME.
+Cloud and agent state directories still require fixture paths.
