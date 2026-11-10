@@ -1703,12 +1703,34 @@ fn integration_worktrees(repo: &Path, into: &str) -> Result<Vec<WorktreeEntry>> 
     Ok(checked_out)
 }
 
-/// Older plans may adopt one existing trusted, unpinned checkout once. Recorded destinations
-/// remain authoritative even if a different checkout later claims the integration branch.
-pub fn integration_path(repo: &Path, into: &str, recorded: Option<&Path>, configured: &Path) -> Result<PathBuf> {
+/// Previously integrated plans may adopt one trusted, unpinned checkout outside all open
+/// plans' task worktrees. Recorded destinations remain authoritative after adoption.
+pub fn integration_path(
+    repo: &Path,
+    into: &str,
+    recorded: Option<&Path>,
+    configured: &Path,
+    adopt_existing: bool,
+    task_worktrees: &[PathBuf],
+) -> Result<PathBuf> {
     let entries = integration_worktrees(repo, into)?;
     let path = recorded.unwrap_or_else(|| {
-        entries.first().filter(|entry| entry.trusted).map_or(configured, |entry| entry.path.as_path())
+        entries
+            .first()
+            .filter(|entry| {
+                adopt_existing
+                    && entry.trusted
+                    && !task_worktrees.iter().any(|task| {
+                        entry.path.starts_with(task)
+                            || entry
+                                .path
+                                .canonicalize()
+                                .ok()
+                                .zip(task.canonicalize().ok())
+                                .is_some_and(|(path, task)| path.starts_with(task))
+                    })
+            })
+            .map_or(configured, |entry| entry.path.as_path())
     });
     integration_worktree(repo, into, path)?;
     Ok(path.to_path_buf())
@@ -2062,24 +2084,51 @@ pub(crate) mod tests {
         let (_dir, repo) = project();
         let old = repo.with_file_name("old-integration");
         let configured = repo.with_file_name("new-integration");
-        assert_eq!(integration_path(&repo, "integration", None, &configured).unwrap(), configured);
+        assert_eq!(integration_path(&repo, "integration", None, &configured, true, &[]).unwrap(), configured);
         add_worktree(&repo, &old, "integration", "main").unwrap();
-        assert_eq!(integration_path(&repo, "integration", None, &configured).unwrap(), old);
-        assert!(integration_path(&repo, "integration", Some(&configured), &configured).is_err());
+        assert_eq!(integration_path(&repo, "integration", None, &configured, true, &[]).unwrap(), old);
+        assert!(integration_path(&repo, "integration", None, &configured, false, &[]).is_err());
+        assert!(integration_path(&repo, "integration", Some(&configured), &configured, true, &[]).is_err());
         let pins = resolve_pins(&old).unwrap();
         pin(pins.clone());
-        let error = integration_path(&repo, "integration", None, &configured).unwrap_err();
+        let error = integration_path(&repo, "integration", None, &configured, true, &[]).unwrap_err();
         assert!(error.downcast_ref::<IntegrationRefClaim>().is_some());
         unpin(&pins.work_tree);
         let other = repo.with_file_name("other");
         add_worktree(&repo, &other, "other", "main").unwrap();
         git(&other, &["symbolic-ref", "HEAD", "refs/heads/integration"]).unwrap();
         assert!(
-            integration_path(&repo, "integration", None, &configured).unwrap_err().to_string().contains("multiple")
+            integration_path(&repo, "integration", None, &configured, true, &[])
+                .unwrap_err()
+                .to_string()
+                .contains("multiple")
         );
         git(&other, &["symbolic-ref", "HEAD", "refs/heads/other"]).unwrap();
         std::fs::write(old.join(".git"), "invalid pointer\n").unwrap();
-        assert!(integration_path(&repo, "integration", None, &configured).is_err());
+        assert!(integration_path(&repo, "integration", None, &configured, true, &[]).is_err());
+    }
+
+    #[test]
+    fn integration_adoption_excludes_task_worktrees_and_their_aliases() {
+        let (_dir, repo) = project();
+        let parent = repo.with_file_name("task-parent");
+        std::fs::create_dir(&parent).unwrap();
+        let candidate = parent.join("integration");
+        let configured = repo.with_file_name("host-integration");
+        add_worktree(&repo, &candidate, "integration", "main").unwrap();
+        let alias = repo.with_file_name("task-alias");
+        std::os::unix::fs::symlink(&parent, &alias).unwrap();
+        for task in [&candidate, &parent, &alias, &alias.join("integration")] {
+            let error = integration_path(&repo, "integration", None, &configured, true, std::slice::from_ref(task))
+                .unwrap_err();
+            assert!(error.to_string().contains("host-recorded integration path"), "{error:#}");
+        }
+        // A task elsewhere must not prevent a legacy plan from adopting this checkout.
+        assert_eq!(
+            integration_path(&repo, "integration", None, &configured, true, std::slice::from_ref(&repo)).unwrap(),
+            candidate
+        );
+        assert!(!configured.exists());
     }
 
     #[test]

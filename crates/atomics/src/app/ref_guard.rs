@@ -315,6 +315,46 @@ mod tests {
     }
 
     #[test]
+    fn a_new_plan_does_not_adopt_a_stray_integration_checkout() {
+        with_app("app::ref_guard::tests::a_new_plan_does_not_adopt_a_stray_integration_checkout", |app, _| {
+            let (dir, repo) = repository();
+            let task = dir.path().join("task");
+            let stray = dir.path().join("stray-integration");
+            let configured = dir.path().join("host-integration");
+            git::add_worktree(&repo, &task, "task", "main").unwrap();
+            git::add_worktree(&repo, &stray, "integration", "main").unwrap();
+            std::fs::write(task.join("feature"), "pending").unwrap();
+            app.runtime.config.worktree_path = "{repo_parent}/host-integration".into();
+            app.runtime.plans = vec![Plan {
+                id: "p".into(),
+                project: Some(repo.clone()),
+                integration: Some("integration".into()),
+                tasks: vec![Task {
+                    id: "t".into(),
+                    branch: Some("task".into()),
+                    worktree: Some(task.clone()),
+                    status: TaskStatus::Review,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }];
+            assert!(git::pinned(&stray).is_none());
+            app.runtime.integrate(0, "t", None);
+            let done = app
+                .runtime
+                .integrate_rx
+                .recv_timeout(crate::test_support::scaled_timeout(std::time::Duration::from_secs(10)))
+                .unwrap();
+            assert!(done.result.as_ref().unwrap_err().contains("host-recorded integration path"));
+            app.runtime.finish_integration(done);
+            assert!(app.runtime.plans[0].integration_worktrees.is_empty());
+            assert!(git::git(&task, &["diff", "--cached"]).unwrap().is_empty());
+            assert!(!stray.join("feature").exists());
+            assert!(!configured.exists());
+        });
+    }
+
+    #[test]
     fn a_legacy_plan_adopts_its_existing_integration_checkout_once() {
         with_app("app::ref_guard::tests::a_legacy_plan_adopts_its_existing_integration_checkout_once", |app, _| {
             let (dir, repo) = repository();
@@ -327,13 +367,21 @@ mod tests {
                 id: "p".into(),
                 project: Some(repo.clone()),
                 integration: Some("integration".into()),
-                tasks: vec![Task {
-                    id: "t".into(),
-                    branch: Some("task".into()),
-                    worktree: Some(task.clone()),
-                    status: TaskStatus::Review,
-                    ..Default::default()
-                }],
+                tasks: vec![
+                    Task {
+                        id: "previous".into(),
+                        status: TaskStatus::Done,
+                        integrated: Some("integration".into()),
+                        ..Default::default()
+                    },
+                    Task {
+                        id: "t".into(),
+                        branch: Some("task".into()),
+                        worktree: Some(task.clone()),
+                        status: TaskStatus::Review,
+                        ..Default::default()
+                    },
+                ],
                 ..Default::default()
             }];
             assert!(app.runtime.plans[0].integration_worktrees.is_empty());
@@ -356,6 +404,85 @@ mod tests {
             assert_eq!(std::fs::read_to_string(original.join("feature")).unwrap(), "second");
             assert!(!dir.path().join("changed-integration").exists());
             assert!(!dir.path().join("changed-again").exists());
+        });
+    }
+
+    #[test]
+    fn a_legacy_plan_never_adopts_an_open_plans_task_worktree() {
+        with_app("app::ref_guard::tests::a_legacy_plan_never_adopts_an_open_plans_task_worktree", |app, _| {
+            for (other_plan, nested, alias) in
+                [(false, false, false), (true, false, false), (true, true, false), (true, true, true)]
+            {
+                let (dir, repo) = repository();
+                let task = dir.path().join("task");
+                let owner = dir.path().join("owner");
+                let candidate = if nested { owner.join("integration") } else { owner.clone() };
+                git::add_worktree(&repo, &task, "task", "main").unwrap();
+                if nested {
+                    git::add_worktree(&repo, &owner, "owner", "main").unwrap();
+                }
+                git::add_worktree(&repo, &candidate, "integration", "main").unwrap();
+                let owner_path = if alias {
+                    let path = dir.path().join("owner-alias");
+                    std::os::unix::fs::symlink(&owner, &path).unwrap();
+                    path
+                } else {
+                    owner
+                };
+                let owner_task = Task {
+                    id: "owner".into(),
+                    branch: Some("owner".into()),
+                    worktree: Some(owner_path),
+                    status: TaskStatus::Running,
+                    ..Default::default()
+                };
+                app.runtime.config.worktree_path = "{repo_parent}/host-integration".into();
+                app.runtime.plans = vec![Plan {
+                    id: "p".into(),
+                    project: Some(repo.clone()),
+                    integration: Some("integration".into()),
+                    tasks: vec![
+                        Task {
+                            id: "previous".into(),
+                            status: TaskStatus::Done,
+                            integrated: Some("integration".into()),
+                            ..Default::default()
+                        },
+                        Task {
+                            id: "t".into(),
+                            branch: Some("task".into()),
+                            worktree: Some(task.clone()),
+                            status: TaskStatus::Review,
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }];
+                if other_plan {
+                    app.runtime.plans.push(Plan {
+                        id: "other".into(),
+                        project: Some(repo.clone()),
+                        tasks: vec![owner_task],
+                        ..Default::default()
+                    });
+                } else {
+                    app.runtime.plans[0].tasks.push(owner_task);
+                }
+                std::fs::write(task.join("feature"), "pending").unwrap();
+                assert!(git::pinned(&candidate).is_none());
+                app.runtime.integrate(0, "t", None);
+                let done = app
+                    .runtime
+                    .integrate_rx
+                    .recv_timeout(crate::test_support::scaled_timeout(std::time::Duration::from_secs(10)))
+                    .unwrap();
+                assert!(done.result.as_ref().unwrap_err().contains("host-recorded integration path"));
+                app.runtime.finish_integration(done);
+                assert!(app.runtime.plans[0].integration_worktrees.is_empty());
+                assert!(git::git(&task, &["diff", "--cached"]).unwrap().is_empty());
+                assert!(!candidate.join("feature").exists());
+                assert!(!dir.path().join("host-integration").exists());
+            }
         });
     }
 

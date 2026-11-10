@@ -851,8 +851,10 @@ repaired. Main checkouts and dirty or locked worktrees stay.
   cannot be that destination. A sandbox claiming the integration branch stops integration before staging
   and raises a persistent ref alert on its task and the task being integrated, even if it changes HEAD back.
   Non-regular HEAD files, redirected `gitdir` pointers, and symbolic HEAD chains through pinned refs
-  receive the same attributed refusal; chains are limited to eight hops. Older plans without a saved
-  destination adopt a single trusted, unpinned integration checkout once and save it with the plan.
+  receive the same attributed refusal; chains are limited to eight hops. Plans with a previously
+  integrated task and no saved destination may adopt a single trusted, unpinned integration checkout
+  once and save it with the plan. Adoption excludes every open plan's task worktrees and their
+  subfolders, including aliases. New plans use the host-computed destination.
 - **Shared reflogs stay on this machine.** Linked sandboxes mount shared objects and refs, and their own
   admin folder; they do not mount the shared `logs` folder. Their own `logs/HEAD` remains writable in the
   admin folder. Sandboxes with the old shared writable logs mount must be removed and recreated.

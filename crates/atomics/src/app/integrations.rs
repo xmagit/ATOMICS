@@ -391,6 +391,14 @@ impl State {
             .iter()
             .find(|tree| tree.repo == repo && tree.branch == into)
             .map(|tree| tree.path.clone());
+        let adopt_existing =
+            recorded_path.is_none() && self.plans[index].tasks.iter().any(|task| task.integrated.is_some());
+        let task_worktrees: Vec<_> = self
+            .plans
+            .iter()
+            .filter(|plan| plan.status == PlanStatus::Open)
+            .flat_map(|plan| plan.tasks.iter().filter_map(|task| task.worktree.clone()))
+            .collect();
         let into_path = git::worktree_path(&self.config.worktree_path, &repo, &into);
         let config = self.project_config(&repo);
         let identity = config.identity.default;
@@ -447,13 +455,20 @@ impl State {
                 return;
             }
             // It commits on the task branch and creates or merges into the integration branch.
-            let result =
-                git::integration_path(&repo, &into, recorded_path.as_deref(), &into_path).and_then(|into_path| {
-                    let _write = crate::ref_guard::host_write(&repo, [&branch, &into]);
-                    git::integrate_with_identity(
-                        &repo, &task_path, &branch, &message, &into, &into_path, &base_ref, &identity,
-                    )
-                });
+            let result = git::integration_path(
+                &repo,
+                &into,
+                recorded_path.as_deref(),
+                &into_path,
+                adopt_existing,
+                &task_worktrees,
+            )
+            .and_then(|into_path| {
+                let _write = crate::ref_guard::host_write(&repo, [&branch, &into]);
+                git::integrate_with_identity(
+                    &repo, &task_path, &branch, &message, &into, &into_path, &base_ref, &identity,
+                )
+            });
             if let Err(error) = &result {
                 alert_claim(error);
             }
