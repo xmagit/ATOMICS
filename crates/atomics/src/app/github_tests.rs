@@ -1105,3 +1105,122 @@ fn remote_pull_request_fetches_keep_the_native_selection_and_publish_paged_diffs
         },
     );
 }
+
+#[test]
+fn host_pull_request_button_draws_the_shared_list_and_routes_its_keys() {
+    fn host_frame(app: &mut Desktop<'_>, ctx: &egui::Context, events: Vec<egui::Event>) -> Texts {
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(5120.0, 1000.0))),
+                time: Some(ctx.input(|input| input.time) + 0.1),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                app.shortcuts(ui.ctx());
+                egui::Panel::top("host-pr-top-bar").exact_size(34.0).show(ui, |ui| app.top_bar(ui));
+                app.dialogs(ui.ctx());
+            },
+        );
+        app.runtime.drain_actions();
+        let texts = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(t) => Some((t.galley.text().to_string(), t.pos + t.galley.rect.center().to_vec2())),
+                _ => None,
+            })
+            .collect();
+        output.drop_without_applying_deltas();
+        texts
+    }
+
+    with_app("app::github::tests::host_pull_request_button_draws_the_shared_list_and_routes_its_keys", |app, ctx| {
+        let dir = crate::test_support::tempdir().unwrap();
+        let fake = FakeGithub::start(TOKEN);
+        fake.add_pull(&repo(), fake::pull(1, "contoso", &[], "CLEAN", false));
+        connect_to(app, &fake, dir.path());
+        store(app).put_github_app("github.com", TOKEN).unwrap();
+        poll(app);
+        host_frame(app, ctx, vec![]);
+        let texts = host_frame(app, ctx, vec![]);
+        let pos = at(&texts, "Pull requests · 1");
+        for pressed in [true, false] {
+            host_frame(
+                app,
+                ctx,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: Default::default(),
+                    },
+                ],
+            );
+        }
+        let texts = host_frame(app, ctx, vec![]);
+        assert!(app.client.ui.pull_requests.open);
+        for label in ["Assigned to me", "My pull requests", "View diff", "Open"] {
+            assert!(has(&texts, label), "{label} missing: {texts:?}");
+        }
+        assert!(!app.runtime.github.modal, "the host's native controls remain separate");
+        for key_code in [Key::ArrowDown, Key::ArrowUp] {
+            assert!(route(app, ctx, vec![key(key_code, egui::Modifiers::NONE)]).is_empty());
+        }
+        assert!(route(app, ctx, vec![key(Key::Enter, egui::Modifiers::NONE)]).is_empty());
+        assert!(!app.client.ui.pull_requests.open);
+        assert_eq!(app.client.ui.pr_view.as_ref().map(|p| p.0.as_str()), Some(pr_key(&repo(), 1).as_str()));
+        // With no shared list open, the original shortcut still opens the native controls.
+        route(app, ctx, vec![key(Key::G, primary())]);
+        assert!(app.runtime.github.modal);
+    });
+}
+
+#[test]
+fn pull_request_navigation_leaves_keys_for_text_fields_and_management_windows() {
+    with_app(
+        "app::github::tests::pull_request_navigation_leaves_keys_for_text_fields_and_management_windows",
+        |app, ctx| {
+            let dir = crate::test_support::tempdir().unwrap();
+            let fake = FakeGithub::start(TOKEN);
+            fake.add_pull(&repo(), fake::pull(1, "contoso", &[], "CLEAN", false));
+            connect_to(app, &fake, dir.path());
+            store(app).put_github_app("github.com", TOKEN).unwrap();
+            poll(app);
+            let field = egui::Id::unique("pr-focus-guard-field");
+            for window in ["text", "settings", "project", "remote", "setup"] {
+                app.client.ui.pull_requests.open = true;
+                let management = &mut app.client.ui.management;
+                management.settings = window == "settings";
+                management.project = window == "project";
+                management.remote = window == "remote";
+                management.setup = window == "setup";
+                let mut text = String::new();
+                ctx.run_ui(Default::default(), |ui| {
+                    if window == "text" {
+                        ui.add(egui::TextEdit::singleline(&mut text).id(field)).request_focus();
+                    } else {
+                        ui.memory_mut(|m| m.surrender_focus(field));
+                    }
+                })
+                .drop_without_applying_deltas();
+                assert_eq!(ctx.text_edit_focused(), window == "text");
+                let events: Vec<_> = [Key::ArrowUp, Key::ArrowDown, Key::Enter]
+                    .into_iter()
+                    .map(|k| key(k, egui::Modifiers::NONE))
+                    .collect();
+                ctx.run_ui(egui::RawInput { events: events.clone(), ..Default::default() }, |ui| {
+                    let before = ui.input(|i| i.events.clone());
+                    assert_eq!(before.len(), events.len());
+                    app.draw(|backend, client| atomics_ui::pull_request::keys(ui.ctx(), backend, client));
+                    assert_eq!(ui.input(|i| i.events.clone()), before, "{window} must keep its keys");
+                })
+                .drop_without_applying_deltas();
+                assert!(app.client.ui.pull_requests.open);
+                assert!(app.client.ui.pr_view.is_none());
+            }
+        },
+    );
+}

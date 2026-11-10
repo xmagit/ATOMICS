@@ -72,7 +72,14 @@ pub fn menu(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
 
 /// Consume list navigation before any diff or terminal sees it.
 pub fn keys(ctx: &egui::Context, backend: &dyn Backend, client: &mut Client) {
-    if !client.pull_requests.open {
+    let management = &client.management;
+    if !client.pull_requests.open
+        || ctx.text_edit_focused()
+        || management.settings
+        || management.remote
+        || management.project
+        || management.setup
+    {
         return;
     }
     let pulls = backend.pull_requests();
