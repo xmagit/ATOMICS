@@ -550,7 +550,7 @@ mod tests {
             let (dir, repo) = repository();
             let work = dir.path().join("task");
             git::add_worktree(&repo, &work, "task", "main").unwrap();
-            app.runtime.config.resources.disk_min_gib = u64::MAX;
+            app.runtime.config.resources.disk_min_gib = i64::MAX as u64;
             app.runtime.config.isolation.mode = atomics_core::isolation::IsolationMode::Bare;
             persist_config(app.runtime);
             let id = app.runtime.start("shell", work.clone(), None, vec![], None).unwrap();
@@ -640,7 +640,7 @@ mod tests {
                 let work = dir.path().join("task");
                 git::add_worktree(&repo, &work, "task", "main").unwrap();
                 app.runtime.config.isolation.mode = atomics_core::isolation::IsolationMode::Bare;
-                app.runtime.config.resources.disk_min_gib = u64::MAX;
+                app.runtime.config.resources.disk_min_gib = i64::MAX as u64;
                 app.runtime.config.agents.push(atomics_core::config::AgentConfig {
                     name: "resume-probe".into(),
                     command: vec!["sh".into(), "-c".into(), "sleep 60".into()],
