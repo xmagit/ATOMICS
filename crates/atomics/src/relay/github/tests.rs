@@ -15,6 +15,10 @@ pub(crate) struct Server {
 
 impl Server {
     pub fn start() -> Self {
+        Self::start_with_nonblocking_peer(false)
+    }
+
+    fn start_with_nonblocking_peer(nonblocking_peer: bool) -> Self {
         let root = crate::test_support::tempdir().unwrap();
         let work = root.path().join("work");
         let group = root.path().join("group");
@@ -50,6 +54,9 @@ impl Server {
             while !stop.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        if nonblocking_peer {
+                            stream.set_nonblocking(true).unwrap();
+                        }
                         let (record, branch, project) = (record.clone(), branch.clone(), project.clone());
                         std::thread::spawn(move || serve(stream, &project, record, branch));
                     }
@@ -148,20 +155,85 @@ pub fn git(repo: &std::path::Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap()
 }
 
+/// Keep request reads fragmented and occasionally delayed, independent of TCP buffer sizes.
+struct SmallReads {
+    stream: TcpStream,
+    prefix: Vec<u8>,
+    total: usize,
+    next_pause: usize,
+    error: Option<io::ErrorKind>,
+}
+
+impl SmallReads {
+    fn new(stream: TcpStream) -> Self {
+        // BSD accept can inherit O_NONBLOCK from the polling listener. These
+        // fixture request readers use blocking I/O, regardless of that inheritance.
+        stream.set_nonblocking(false).unwrap();
+        Self { stream, prefix: Vec::new(), total: 0, next_pause: 64 * 1024, error: None }
+    }
+
+    fn rejected(&self, reason: impl std::fmt::Debug) -> ! {
+        let end = self.prefix.windows(4).position(|bytes| bytes == b"\r\n\r\n").map(|at| at + 4);
+        let (head, body) = self.prefix.split_at(end.unwrap_or(self.prefix.len()));
+        let head = String::from_utf8_lossy(head)
+            .lines()
+            .map(|line| {
+                if line.split_once(':').is_some_and(|(name, _)| name.eq_ignore_ascii_case("authorization")) {
+                    "authorization: <redacted>"
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        panic!(
+            "fake Git upstream rejected request: {reason:?}; bytes_read={}, io_error={:?}\n{head}\nfirst 200 body bytes: {:?}",
+            self.total,
+            self.error,
+            String::from_utf8_lossy(&body[..body.len().min(200)])
+        );
+    }
+}
+
+impl Read for SmallReads {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if self.total >= self.next_pause {
+            std::thread::sleep(Duration::from_millis(1));
+            self.next_pause += 64 * 1024;
+        }
+        let count = out.len().min(113);
+        match self.stream.read(&mut out[..count]) {
+            Ok(read) => {
+                self.total += read;
+                let keep = read.min((MAX_HEAD + 200).saturating_sub(self.prefix.len()));
+                self.prefix.extend_from_slice(&out[..keep]);
+                Ok(read)
+            }
+            Err(error) => {
+                self.error = Some(error.kind());
+                Err(error)
+            }
+        }
+    }
+}
+
+fn upstream_request(stream: TcpStream, after_head: impl FnOnce(&TcpStream)) -> Option<(Head, Vec<u8>, TcpStream)> {
+    stream.set_read_timeout(Some(crate::test_support::scaled_timeout(Duration::from_secs(10)))).unwrap();
+    let mut reader = BufReader::with_capacity(257, SmallReads::new(stream));
+    let head = read_head(&mut reader).unwrap_or_else(|error| reader.get_ref().rejected(error))?;
+    after_head(&reader.get_ref().stream);
+    let body = read_body(&mut reader, &head).unwrap_or_else(|error| reader.get_ref().rejected(error));
+    Some((head, body, reader.into_inner().stream))
+}
+
 fn serve(stream: TcpStream, root: &std::path::Path, record: Requests, branch: Arc<Mutex<String>>) {
-    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    let mut reader = BufReader::new(stream);
-    let Some(head) = read_head(&mut reader).unwrap() else {
-        return;
-    };
-    let body = read_body(&mut reader, &head).unwrap();
+    let Some((head, body, mut writer)) = upstream_request(stream, |_| {}) else { return };
     record.lock().unwrap().push((
         head.target.clone(),
         head.header("authorization").unwrap_or_default().into(),
         body.clone(),
     ));
     let (path, query) = head.target.split_once('?').unwrap_or((&head.target, ""));
-    let mut writer = reader.into_inner();
     if path.starts_with("/repos/") {
         let payload = if path == "/repos/group/repo" {
             serde_json::json!({"default_branch": *branch.lock().unwrap()})
@@ -320,9 +392,206 @@ fn github_account_scope_and_generic_secret_grants_do_not_leak_or_broaden_it() {
 
 #[test]
 fn github_large_push_streams_after_the_empty_probe_through_the_relay() {
-    let server = Server::start();
+    let server = Server::start_with_nonblocking_peer(true);
     server.commit_large_blob();
     server.assert_large_push(&server.relay());
+}
+
+#[test]
+fn fake_upstream_waits_for_a_body_on_an_inherited_nonblocking_socket() {
+    use std::os::fd::AsRawFd;
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    {
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (peer, _) = listener.accept().unwrap();
+        client.write_all(b"POST /repos/group/repo HTTP/1.1\r\nContent-Length: 5\r\n\r\n").unwrap();
+        let mut reader = BufReader::new(SmallReads::new(peer));
+        // Reintroduce the old BSD-inherited flag with the body still in flight:
+        // the blocking parser then reports the exact failure seen on the Mac.
+        reader.get_mut().stream.set_nonblocking(true).unwrap();
+        let head = read_head(&mut reader).unwrap().unwrap();
+        assert_eq!(read_body(&mut reader, &head).unwrap_err(), (400, "malformed request body"));
+        assert_eq!(reader.get_ref().error, Some(io::ErrorKind::WouldBlock));
+    }
+    let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (peer, _) = listener.accept().unwrap();
+    peer.set_nonblocking(true).unwrap();
+    client.write_all(b"POST /repos/group/repo HTTP/1.1\r\nContent-Length: 5\r\n\r\n").unwrap();
+    let (parsed, ready) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        upstream_request(peer, |socket| {
+            // SAFETY: F_GETFL only reads flags from this live fixture descriptor.
+            let flags = unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_GETFL) };
+            assert!(
+                flags >= 0 && flags & libc::O_NONBLOCK == 0,
+                "fake upstream still has nonblocking flags: {flags:#x}"
+            );
+            parsed.send(()).unwrap();
+        })
+        .unwrap()
+        .1
+    });
+    ready.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(10))).unwrap();
+    for bytes in [b"h".as_slice(), b"el", b"lo"] {
+        client.write_all(bytes).unwrap();
+        std::thread::yield_now();
+    }
+    assert_eq!(worker.join().unwrap(), b"hello");
+}
+
+#[test]
+fn apple_curl_push_write_pattern_has_exact_length_framing_upstream() {
+    use base64::Engine as _;
+    use std::collections::BTreeMap;
+
+    let sizes: Vec<usize> = std::iter::once(65_159)
+        .chain(std::iter::repeat_n(65_521, 32))
+        .chain(std::iter::repeat_n(65_524, 14))
+        .chain(std::iter::repeat_n(8192, 8))
+        .chain([730, 1946])
+        .collect();
+    let mut body: Vec<u8> = (0..sizes.iter().sum::<usize>()).map(|at| (at % 251) as u8).collect();
+    let command = format!(
+        "{} {} refs/heads/task\0report-status-v2 side-band-64k quiet object-format=sha1 agent=git/2.50.1-Darwin\n",
+        "0".repeat(40),
+        "1".repeat(40)
+    );
+    let prefix = format!("{:04x}{command}0000PACK", command.len() + 4);
+    body[..prefix.len()].copy_from_slice(prefix.as_bytes());
+    let mut pieces = Vec::new();
+    let mut at = 0;
+    for (index, size) in sizes.into_iter().enumerate() {
+        let mut piece = if index == 0 {
+            format!("{size:x}\r\n").into_bytes()
+        } else if index <= 32 {
+            // Exercise size lines sent separately from their data and trailing CRLF.
+            pieces.push(format!("{size:08x}\r\n").into_bytes());
+            Vec::new()
+        } else {
+            format!("{size:04x}\r\n").into_bytes()
+        };
+        piece.extend_from_slice(&body[at..at + size]);
+        piece.extend_from_slice(b"\r\n");
+        pieces.push(piece);
+        at += size;
+    }
+    pieces.push(b"0\r\n\r\n".to_vec());
+    assert_eq!(pieces.len(), 90);
+    let mut counts = BTreeMap::new();
+    for piece in &pieces {
+        *counts.entry(piece.len()).or_insert(0) += 1;
+    }
+    assert_eq!(
+        counts,
+        BTreeMap::from([(65_167, 1), (65_523, 32), (65_532, 14), (8200, 8), (10, 32), (738, 1), (1954, 1), (5, 1)])
+    );
+    assert!(pieces[0].starts_with(b"fe87\r\n"));
+
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let upstream = std::thread::spawn(move || {
+        let mut observed = Vec::new();
+        for _ in 0..2 {
+            let (peer, _) = listener.accept().unwrap();
+            peer.set_nonblocking(true).unwrap(); // Model the BSD listener inheritance on Linux too.
+            peer.set_read_timeout(Some(crate::test_support::scaled_timeout(Duration::from_secs(30)))).unwrap();
+            let mut reader = BufReader::with_capacity(31, SmallReads::new(peer));
+            // Independent wire capture: neither read_head nor read_body is used here.
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                reader.read_exact(&mut byte).unwrap_or_else(|error| reader.get_ref().rejected(error));
+                head.push(byte[0]);
+                assert!(head.len() <= MAX_HEAD);
+            }
+            let text = std::str::from_utf8(&head).unwrap();
+            let lengths: Vec<usize> = text
+                .lines()
+                .skip(1)
+                .filter_map(|line| line.split_once(':'))
+                .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                .map(|(_, value)| value.trim().parse().unwrap())
+                .collect();
+            assert_eq!(lengths.len(), 1, "unexpected upstream framing: {text}");
+            assert!(lengths[0] <= MAX_BODY as usize);
+            let mut bytes = vec![0; lengths[0]];
+            reader.read_exact(&mut bytes).unwrap_or_else(|error| reader.get_ref().rejected(error));
+            reader
+                .into_inner()
+                .stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            observed.push((head, bytes));
+        }
+        observed
+    });
+    let dir = crate::test_support::tempdir().unwrap();
+    let relay = Relay::start(
+        0,
+        dir.path().join("relay.log"),
+        HashMap::from([("github.com".into(), format!("http://{address}"))]),
+    )
+    .unwrap();
+    let token = "ghp_FORWARDING_FIXTURE";
+    let scope = Scope { repository: "group/repo".into(), pulls: false, refuse_default_branch: false };
+    let placeholder =
+        relay.grant("apple-push", Arc::new(Credential::github("account-one", token.into(), scope).unwrap()));
+    let stream = TcpStream::connect((Ipv4Addr::LOCALHOST, relay.port())).unwrap();
+    stream.set_nodelay(true).unwrap();
+    stream.set_read_timeout(Some(crate::test_support::scaled_timeout(Duration::from_secs(30)))).unwrap();
+    let mut client = BufReader::new(stream);
+    let headers = format!(
+        "POST /github.com/group/repo.git/git-receive-pack HTTP/1.1\r\nAuthorization: Bearer {placeholder}\r\nAccept-Encoding: deflate, gzip\r\nContent-Type: application/x-git-receive-pack-request\r\n"
+    );
+    client.get_mut().write_all(format!("{headers}Content-Length: 4\r\n\r\n0000").as_bytes()).unwrap();
+    fn response(client: &mut BufReader<TcpStream>) {
+        let mut status = String::new();
+        client.read_line(&mut status).unwrap();
+        assert_eq!(status, "HTTP/1.1 200 OK\r\n");
+        loop {
+            let mut line = String::new();
+            assert_ne!(client.read_line(&mut line).unwrap(), 0);
+            if line == "\r\n" {
+                break;
+            }
+        }
+        assert!(super::super::fake::chunk(client).is_empty());
+    }
+    response(&mut client);
+    client.get_mut().write_all(format!("{headers}Transfer-Encoding: chunked\r\n\r\n").as_bytes()).unwrap();
+    for piece in pieces {
+        client.get_mut().write_all(&piece).unwrap();
+        std::thread::yield_now();
+    }
+    response(&mut client);
+    for ((head, bytes), expected) in upstream.join().unwrap().into_iter().zip([b"0000".as_slice(), body.as_slice()]) {
+        let text = std::str::from_utf8(&head).unwrap();
+        assert_eq!(text.lines().next(), Some("POST /group/repo.git/git-receive-pack HTTP/1.1"));
+        let headers: Vec<_> = text
+            .lines()
+            .skip(1)
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_owned()))
+            .collect();
+        assert_eq!(headers.len(), 5, "all upstream headers: {text}");
+        assert_eq!(
+            headers.into_iter().collect::<BTreeMap<_, _>>(),
+            BTreeMap::from([
+                ("host".into(), address.to_string()),
+                ("content-length".into(), expected.len().to_string()),
+                ("content-type".into(), "application/x-git-receive-pack-request".into()),
+                ("accept-encoding".into(), "identity".into()),
+                (
+                    "authorization".into(),
+                    format!(
+                        "Basic {}",
+                        base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"))
+                    )
+                ),
+            ])
+        );
+        assert_eq!(bytes, expected, "the complete decoded body must reach upstream unchanged");
+    }
 }
 
 #[test]

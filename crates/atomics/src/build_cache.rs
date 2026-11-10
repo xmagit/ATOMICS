@@ -343,6 +343,8 @@ pub fn stores(home: &Path, worktree: &Path, config: &CacheConfig, domain: Domain
 /// Git must ignore the directory itself using a repository-owned rule. Below an
 /// already ignored directory Git never consults nested .gitignore files.
 fn ignore_provenance(root: &Path, folder: &str) -> Result<()> {
+    let canonical_root = root.canonicalize().context("resolving output worktree")?;
+    let root = canonical_root.as_path();
     // A trailing slash alone is insufficient: target/* also matches target/,
     // although Git still enters target and reads target/.gitignore. Check both
     // spellings to prove the directory itself is excluded from traversal.
@@ -672,7 +674,10 @@ mod tests {
     #[test]
     fn cleanup_preserves_nested_repositories_and_registered_worktrees_in_ignored_output() {
         for kind in ["linked", "registered-without-marker", "registered-with-quoted-path", "independent"] {
-            let (_dir, main, work) = project();
+            let (dir, main, work) = project();
+            let alias = dir.path().join("parent-alias");
+            std::os::unix::fs::symlink(dir.path(), &alias).unwrap();
+            let work = alias.join(work.file_name().unwrap());
             let nested = work.join(if kind == "registered-with-quoted-path" {
                 "target/experiment\nquoted"
             } else {
@@ -690,7 +695,18 @@ mod tests {
             std::fs::write(nested.join("new.rs"), "uncommitted source").unwrap();
             std::fs::create_dir(nested.join("out")).unwrap();
             std::fs::write(nested.join("out/new.rs"), "more source").unwrap();
-            assert!(disposable(&work, "target"), "outer Git cannot see nested work");
+            let status = git::git(
+                &work,
+                &["status", "--porcelain", "--untracked-files=all", "--ignored=no", "--", ":(literal,icase)target"],
+            );
+            let tracked = git::git(&work, &["ls-files", "--", ":(literal,icase)target"]);
+            let ignored = git::git(&work, &["check-ignore", "-v", "--no-index", "--", "target/", "target"]);
+            let disposable = ensure_disposable(&work, "target");
+            assert!(
+                disposable.is_ok(),
+                "outer Git cannot see nested work: kind={kind}, root={}, status={status:?}, tracked={tracked:?}, ignore={ignored:?}, validation={disposable:?}",
+                work.display()
+            );
             let config = CacheConfig {
                 outputs: vec![nested.join("out").strip_prefix(&work).unwrap().to_string_lossy().into_owned()],
                 ..Default::default()
