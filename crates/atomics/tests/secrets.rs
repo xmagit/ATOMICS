@@ -140,10 +140,17 @@ fn terminal_secret_refuses_and_flushes_pasted_lines_before_restoring_echo() {
     ] {
         let dir = test_support::tempdir().unwrap();
         // SAFETY: openpty returns two owned descriptors, each transferred to exactly one File.
+        // Darwin requires mutable termios/winsize pointers; these nulls also coerce to Linux's const pointers.
         let (mut master, mut slave) = unsafe {
             let (mut master, mut slave) = (-1, -1);
             assert_eq!(
-                libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null(), std::ptr::null()),
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                ),
                 0
             );
             (File::from_raw_fd(master), File::from_raw_fd(slave))
