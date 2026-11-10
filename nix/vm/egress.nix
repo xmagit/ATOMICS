@@ -68,7 +68,8 @@ in
       description = ''
         Refuse connections outside the list. False only logs them ("atomics-egress refused" in the kernel log,
         `journalctl -k -g atomics-egress`), to learn what a team needs before enforcing. Names outside the list
-        are refused by dnsmasq either way. Lima's host address is always refused except for resolver DNS.
+        are refused by dnsmasq either way. New connections to Lima's host address are always refused
+        except for resolver DNS.
       '';
     };
 
@@ -159,14 +160,16 @@ in
         ${lib.concatMapStrings sets rules}
         chain output {
           type filter hook output priority filter; policy accept;
+          # Replies to Mac-initiated SSH/forwarded connections can target the gateway address.
+          # Accept established flows first to preserve those sessions; new flows still face the rules below.
+          ct state established,related accept
           # Lima exposes Mac services on this address, including Mac loopback listeners. Only the
-          # resolver may use its DNS port. Keep this before exemptions, conntrack and domain sets.
+          # resolver may open connections to its DNS port. Keep this before UID exemptions and domain sets.
           ip daddr 192.168.5.2 meta skuid ${resolverUid} udp dport 53 accept
           ip daddr 192.168.5.2 meta skuid ${resolverUid} tcp dport 53 accept
           ip daddr 192.168.5.2 reject with icmp type admin-prohibited
           meta skuid { ${exemptUids} } accept
           oifname "lo" accept
-          ct state established,related accept
           ${lib.concatMapStrings allow rules}
           limit rate 20/second burst 50 packets log prefix "atomics-egress refused: " level info
           ${if cfg.enforce then ''

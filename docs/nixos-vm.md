@@ -108,6 +108,7 @@ your Mac account ([The socket forward](#the-socket-forward)). Inside the VM ther
 | `cpus` | `4` | virtual CPUs in the Lima definition |
 | `memoryGiB` | `8` | memory in the Lima definition |
 | `diskGiB` | `100` | size of the (sparse) disk image and of the Lima disk |
+| `nixForAgents` | `true` | in hardened mode, preserve agent access to Nix; `false` allows only root and admin ([trade-off](#hardened-mode)) |
 | `host.enable` | `false` | run the ATOMICS host here ([The host in the VM](#the-host-in-the-vm)); `scripts/macos-vm-build.sh --host` sets it |
 | `host.port` | `47800` | its protocol server's port, on the guest's loopback only; the Mac's forward opens the same one |
 | `host.workspace`, `host.projects` | none | `atomics host -w <workspace>` and the projects it opens, in the shared folders |
@@ -618,9 +619,23 @@ keeps root away from `<user>`, and so from the host, the chief, every agent and 
   ssh config (`ssh -F ~/.lima/<instance>/ssh.config -l admin lima-<instance>`), and asks about busy work as
   `<user>`. Build and selection run as the same user, so an agent cannot hand the admin a system of its own.
 
-Only root and the admin may use the Nix daemon (`nix.settings.allowed-users`). Agents use the installed
-toolchains; Nix builds, package installation and development shells that need the daemon must run through
-the admin. This prevents agents from using root’s fetches or networked fixed-output builds as a bypass.
+`atomics.vm.nixForAgents = true` (the default) preserves agents' access to the Nix daemon for builds,
+`nix develop` and `nix-shell`. Build processes, including fixed-output derivations and `builtin:fetchurl`,
+run as build users and are filtered by the network policy. Evaluator fetchers such as
+`builtins.fetchTarball` run as the calling user and are filtered too. Nix
+[switches to the build UID before invoking builtin builders](https://github.com/NixOS/nix/blob/2.34.9/src/libstore/unix/build/derivation-builder.cc#L1335).
+
+The daemon's own substitutions run as root, outside the domain allowlist. An untrusted agent can trigger
+cache lookups and downloads for store paths it chooses. It cannot add arbitrary cache URLs: the daemon
+[limits untrusted substituters to configured or explicitly trusted URLs](https://github.com/NixOS/nix/blob/2.34.9/src/libstore/daemon.cc#L231).
+Cache responses and redirects still drive root-owned transfers; filtering build UIDs does not cover
+those requests. Do not add agents to `nix.settings.trusted-users`, which would let them change
+substituters and other restricted daemon settings.
+
+For a stricter boundary, set `atomics.vm.nixForAgents = false` in hardened mode. This forces
+`nix.settings.allowed-users` to root and the admin, closing agents' access to daemon-owned fetching.
+Agents can still use installed toolchains, but Nix builds and development shells that require the daemon
+must then go through the admin.
 
 The first update that turns it on still runs as `<user>`, with sudo; later ones run as the admin. Sign-ins
 stay `<user>`'s, in plain-text files every agent can read, as above.
@@ -634,10 +649,12 @@ asks the Mac's, and so its VPN's) and refuses every other name, so a lookup cann
 Each address it hands out for a listed domain goes into an nftables set, and only those addresses are
 allowed, on ports 80 and 443 (`webPorts`), or on a rule's own ports. Loopback and replies to established
 connections are allowed. Only root and dnsmasq bypass the domain allowlist; other system users do not.
-Lima’s host address (`192.168.5.2`) is refused for every UID, including root, before any exception or
-domain rule. Only dnsmasq may reach TCP/UDP port 53 there, so agents cannot query Lima’s resolver
-directly or reach Mac services through it. Use it with [hardened mode](#hardened-mode): without it any
-agent can become root and lift it.
+New connections to Lima’s host address (`192.168.5.2`) are refused for every UID, including root, before
+UID exemptions or domain rules. Only dnsmasq may open TCP/UDP connections to port 53 there, so agents
+cannot query Lima’s resolver directly or initiate connections to Mac services through it. Established
+and related traffic is accepted first so replies to Mac-initiated SSH and forwarded connections still
+work when Lima presents the gateway address as their source. Use it with [hardened mode](#hardened-mode):
+without it any agent can become root and lift it.
 
 ```nix
 atomics.vm.egress = {
@@ -653,7 +670,7 @@ MCR, NixOS, and documentation (Microsoft Learn, Stack Overflow and Stack Exchang
 A team adds its cloud, ticket system and databases. Refused connections are logged:
 `journalctl -k -g atomics-egress` lists each with its destination; a refused name shows in a tool's own
 error. With `enforce = false` connections outside the domain allowlist are only logged, which helps to
-learn what work needs before enforcing. Names outside the list and access to Lima’s host address
+learn what work needs before enforcing. Names outside the list and new connections to Lima’s host address
 (except resolver DNS) remain refused.
 
 Limits: an allowed address is allowed whatever name led there, which matters behind shared CDNs, and an
