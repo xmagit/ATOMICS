@@ -165,14 +165,14 @@ on 14 available CPUs. The initial ENOSPC build attempt executed no tests and is 
 Both measured phases disable Cargo incremental compilation to avoid regrowing its disk cache;
 the shared build jobserver and normal parallel test harness remain enabled.
 
-| Test | Failures in 10 before runs | Other agents' reported failures |
-| --- | ---: | ---: |
-| `machine::docker::tests::missing_failing_and_timed_out_docker_have_distinct_status` | 0 | 1 |
-| `app::tickets::tests::failures_show_on_the_link_and_never_block_the_plan` | 1 | 1 |
-| `update::tests::a_crash_leaves_nothing_the_next_update_keeps_and_only_one_update_runs_at_a_time` | 0 | 1 |
-| `app::key_tests::escape_closes_settings_and_the_project_picker_and_the_terminal_sees_neither` | 0 | 1 |
-| `relay::tests::audit_p7_idle_and_trickling_clients_have_separate_short_auth_slots` | 0 | 1 in the previous gate |
-| `ipc::tests::audit_p7_stale_socket_recovery_has_one_owner_and_cleanup_keeps_a_replacement` | 0 | 1 |
+| Test | Failures in 10 before runs | Other agents' reported failures | Failures in final 10 runs |
+| --- | ---: | ---: | ---: |
+| `machine::docker::tests::missing_failing_and_timed_out_docker_have_distinct_status` | 0 | 1 | 0 |
+| `app::tickets::tests::failures_show_on_the_link_and_never_block_the_plan` | 1 | 1 | 0 |
+| `update::tests::a_crash_leaves_nothing_the_next_update_keeps_and_only_one_update_runs_at_a_time` | 0 | 1 | 0 |
+| `app::key_tests::escape_closes_settings_and_the_project_picker_and_the_terminal_sees_neither` | 0 | 1 | 0 |
+| `relay::tests::audit_p7_idle_and_trickling_clients_have_separate_short_auth_slots` | 0 | 1 in the previous gate | 0 |
+| `ipc::tests::audit_p7_stale_socket_recovery_has_one_owner_and_cleanup_keeps_a_replacement` | 0 | 1 | 0 |
 
 The external reports have no shared denominator and are not added to the ten-run rates.
 The ticket assertion was the only failure observed in those ten runs. The relay test belongs to
@@ -190,19 +190,19 @@ All reported tests in the table above passed in all ten runs. The isolation
 support exposed the following additional fixture failures, each **10/10**; none failed in the
 earlier frozen baseline:
 
-| Target | Test | Failures in first merged batch |
-| --- | --- | ---: |
-| `doctor` | `setup_from_an_empty_machine_creates_config_and_gives_install_commands_without_secret_arguments` | 10 |
-| `doctor` | `doctor_says_where_path_came_from_and_reads_the_codex_version_with_the_login_shells` | 10 |
-| `linux_install` | `a_build_that_does_not_run_replaces_nothing_and_no_rust_says_what_to_do` | 10 |
-| `linux_install` | `install_and_update_ask_nothing_and_replace_the_program_atomically` | 10 |
-| `linux_install` | `installer_registers_the_atomics_link_scheme` | 10 |
-| `linux_install` | `setup_finds_what_an_installer_left_in_the_users_own_programs_folder` | 10 |
-| `linux_install` | `setup_with_agents_on_this_machine_needs_one_agent_and_nothing_of_sandboxes` | 10 |
-| `linux_install` | `setup_with_sandboxes_in_use_still_checks_what_they_need` | 10 |
-| `linux_install` | `stopping_setup_reads_as_a_stop_and_it_can_still_ask_for_sandboxes` | 10 |
-| `linux_install` | `the_script_and_the_program_write_the_same_menu_entry` | 10 |
-| `atomics-core` lib | `paths::tests::linux_xdg_paths_and_instance_overrides` | 10 |
+| Target | Test | Failures in first merged batch | Failures in final 10 runs |
+| --- | --- | ---: | ---: |
+| `doctor` | `setup_from_an_empty_machine_creates_config_and_gives_install_commands_without_secret_arguments` | 10 | 0 |
+| `doctor` | `doctor_says_where_path_came_from_and_reads_the_codex_version_with_the_login_shells` | 10 | 0 |
+| `linux_install` | `a_build_that_does_not_run_replaces_nothing_and_no_rust_says_what_to_do` | 10 | 0 |
+| `linux_install` | `install_and_update_ask_nothing_and_replace_the_program_atomically` | 10 | 0 |
+| `linux_install` | `installer_registers_the_atomics_link_scheme` | 10 | 0 |
+| `linux_install` | `setup_finds_what_an_installer_left_in_the_users_own_programs_folder` | 10 | 0 |
+| `linux_install` | `setup_with_agents_on_this_machine_needs_one_agent_and_nothing_of_sandboxes` | 10 | 0 |
+| `linux_install` | `setup_with_sandboxes_in_use_still_checks_what_they_need` | 10 | 0 |
+| `linux_install` | `stopping_setup_reads_as_a_stop_and_it_can_still_ask_for_sandboxes` | 10 | 0 |
+| `linux_install` | `the_script_and_the_program_write_the_same_menu_entry` | 10 | 0 |
+| `atomics-core` lib | `paths::tests::linux_xdg_paths_and_instance_overrides` | 10 | 0 |
 
 Installer and doctor fixtures now register their temporary directories with the shared support.
 The doctor PATH test uses fixture directories while still requiring exactly one added directory
@@ -222,10 +222,10 @@ Eight were green; two each passed 2318 and failed one test, with 42 ignored in e
 These additional intermittent failures were absent from the frozen before measurement and
 the earlier green batch:
 
-| Later observed test | Failures in 10 runs at `086d912` |
-| --- | ---: |
-| `app::github::tests::github_connect_uses_gh_after_one_confirmation` | 1 |
-| `credentials::tests::credentials_relay_rules_restrict_hosts_and_capabilities_and_track_usage` | 1 |
+| Later observed test | Failures in 10 runs at `086d912` | Failures in final 10 runs |
+| --- | ---: | ---: |
+| `app::github::tests::github_connect_uses_gh_after_one_confirmation` | 1 | 0 |
+| `credentials::tests::credentials_relay_rules_restrict_hosts_and_capabilities_and_track_usage` | 1 | 0 |
 
 The GitHub fixture now waits for the applied disconnect result, including its revoke action.
 A poll can clear the viewer after keychain deletion before that result arrives; an absent viewer
@@ -246,3 +246,31 @@ the socket in a child and waits for that child's exit before starting its two si
 attempts. The one-owner check, refusal to steal a live listener, replacement-inode cleanup and
 regular-file preservation checks are retained. The ownership assertion also prints both bind results.
 The corrected stale-socket test passed 30 consecutive targeted runs.
+
+The final measurement at `33855a6`, after bringing in integration tip `0422626`,
+passed **all ten consecutive full workspace runs**: **2319 passed, 0 failed, 42 ignored** in each.
+There were no source changes during the batch. The tenth run executed the complete
+`scripts/check.sh --run-gate` inside the held ATOMICS test slot and Nix shell; formatting and
+workspace Clippy with warnings denied passed too. No failed test was retried within a run.
+The shared jobserver and ordinary parallel test harness remained enabled on 14 available CPUs.
+Start-of-run one-minute loads ranged from 0.96 to 6.92; once-per-second
+samples reached 8.40. All original reported regressions, all eleven fixture failures,
+and the later GitHub/usage-writer races above measured **0/10 failures** in the final batch.
+
+The complete run commands, revisions, exit codes, counts, loads and per-test failures are retained in:
+
+- Before: `/tmp/p3-reliability-before-nuvs90t2/summary.json`.
+- First merged batch: `/tmp/p3-reliability-after-ys2up5wt/summary.json`.
+- Earlier green batch: `/tmp/p3-reliability-final-kn4m490o/summary.json`.
+- Further loaded batch: `/tmp/p3-reliability-final_source-klgom9d5/summary.json`.
+- Final batch: `/tmp/p3-reliability-verified_source-dmrieyy_/summary.json`.
+
+Final native target counts at the measured revision:
+
+| Scope | Passed | Failed | Ignored |
+| --- | ---: | ---: | ---: |
+| `atomics` binary tests | 1313 | 0 | 3 |
+| `headless_host` integration target | 23 | 0 | 0 |
+| `install_and_update` integration target | 13 | 0 | 0 |
+| `linux_install` integration target | 14 | 0 | 0 |
+| Entire native workspace | 2319 | 0 | 42 |
