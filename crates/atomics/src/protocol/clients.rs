@@ -10,13 +10,15 @@
 //! `unpair_client` forgets it. A paired client is a controller, and its name is the lease holder
 //! other clients see.
 
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use ring::digest;
 use serde::{Deserialize, Serialize};
 
+use super::link::{Link, LinkError, Waker};
 use super::session::PeerDevice;
 
 /// The longest name a client may pair under: the lease holder label, shown in a pane's header.
@@ -87,8 +89,9 @@ impl PairedClients {
 
     /// Forget the client paired as `name`; whether there was one.
     pub fn unpair(&self, name: &str) -> io::Result<bool> {
+        let Some(name) = clean_name(name) else { return Ok(false) };
         let mut clients = self.lock();
-        let next: Vec<Paired> = clients.iter().filter(|c| c.name != name.trim()).cloned().collect();
+        let next: Vec<Paired> = clients.iter().filter(|c| c.name != name).cloned().collect();
         if next.len() == clients.len() {
             return Ok(false);
         }
@@ -99,6 +102,10 @@ impl PairedClients {
 
     pub fn list(&self) -> Vec<Paired> {
         self.lock().clone()
+    }
+
+    fn contains(&self, device: &PeerDevice) -> bool {
+        self.lock().iter().any(|client| device.id == format!("paired-{}", &client.digest[..16]))
     }
 
     /// The paired client `token` belongs to. Every digest is compared in full, so the time taken says
@@ -120,20 +127,61 @@ impl PairedClients {
 
 /// The file, readable by this user only, replaced whole.
 fn write(path: &Path, clients: &[Paired]) -> io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+    atomics_core::store::write_private(path, &serde_json::to_vec_pretty(clients).map_err(io::Error::other)?)
+}
+
+/// Check the allowlist throughout a live session, including either side of a blocking read.
+/// Unpairing or replacing a token closes all of its links by the next session tick, even idle ones.
+pub(super) struct PairedLink<'a> {
+    pub inner: &'a mut dyn Link,
+    pub clients: &'a PairedClients,
+    pub device: &'a PeerDevice,
+}
+
+impl Link for PairedLink<'_> {
+    fn send(&mut self, frame: &str) -> Result<(), LinkError> {
+        if !self.clients.contains(self.device) {
+            return Err(LinkError::Closed);
+        }
+        self.inner.send(frame)
     }
-    let tmp = path.with_extension("json.tmp");
-    let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
-    file.write_all(serde_json::to_string_pretty(clients).map_err(io::Error::other)?.as_bytes())?;
-    file.sync_all()?;
-    std::fs::rename(tmp, path)
+
+    fn recv(&mut self, wait: Duration) -> Result<Option<String>, LinkError> {
+        if !self.clients.contains(self.device) {
+            return Err(LinkError::Closed);
+        }
+        let frame = self.inner.recv(wait)?;
+        if !self.clients.contains(self.device) {
+            return Err(LinkError::Closed);
+        }
+        Ok(frame)
+    }
+
+    fn close(&mut self, reason: &str) {
+        self.inner.close(reason);
+    }
+    fn close_with(&mut self, code: u16, reason: &str) {
+        self.inner.close_with(code, reason);
+    }
+    fn waker(&self) -> Option<Arc<Waker>> {
+        self.inner.waker()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit_p7_unpair_normalizes_names_as_pair_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let clients = PairedClients::open(dir.path().join("clients.json")).unwrap();
+        for name in ["  de\u{7}vice  ".to_string(), "device".repeat(20)] {
+            let (_, token) = clients.pair(&name).unwrap();
+            assert!(clients.unpair(&name).unwrap());
+            assert!(clients.find(&token).is_none());
+        }
+    }
 
     #[test]
     fn a_paired_token_finds_its_client_and_the_file_holds_no_token() {

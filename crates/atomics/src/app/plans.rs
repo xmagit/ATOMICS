@@ -3246,6 +3246,8 @@ mod tests {
                         checks: Vec::new(),
                     });
                     task.integrated = legacy.integration.clone();
+                    task.start_commit = Some("recorded-start".into());
+                    task.ref_alert = Some("Keep this ref warning".into());
                 }
                 legacy.save(&paths::plan_file()).unwrap();
                 app.runtime.plans = plan::load_plans(&paths::atomics_home()).unwrap().0;
@@ -3269,6 +3271,8 @@ mod tests {
                     assert_eq!(task.notes, old.notes);
                     assert_eq!(task.report, old.report);
                     assert_eq!(task.integrated, old.integrated);
+                    assert_eq!(task.start_commit, old.start_commit);
+                    assert_eq!(task.ref_alert, old.ref_alert);
                 }
                 let original = app.runtime.plans[0].clone();
                 for goal in ["Deliver the API", "Another goal"] {

@@ -597,6 +597,7 @@ pub(crate) struct State {
     /// How approvals ended lately, newest last: for a late decision and `approval_resolved`.
     resolved: std::collections::VecDeque<(String, Disposition)>,
     hook_error: Option<String>,
+    hook_socket: Option<ipc::SocketGuard>,
     /// Machine-wide limits for the agents' heavy work.
     governor: Arc<Governor>,
     /// Compiler job pool every agent inherits; None when this instance does not own the socket.
@@ -1021,8 +1022,13 @@ impl State {
         let governor = Arc::new(Governor::new(config.resources.clone(), window.clone()));
         let channels =
             Channels { hooks: hook_tx, control: control_tx.clone(), usage: usage_tx, governor: governor.clone() };
-        let hook_error =
-            ipc::serve(&paths::socket_path(), hub.clone(), channels, window.clone()).err().map(|e| format!("{e:#}"));
+        let (hook_socket, hook_error) = match ipc::serve(&paths::socket_path(), hub.clone(), channels, window.clone()) {
+            Ok(socket) => (Some(socket), None),
+            Err(error) => {
+                eprintln!("atomics: the control socket is unavailable: {error:#}");
+                (None, Some(format!("{error:#}")))
+            }
+        };
         // Only the instance that owns the socket owns the pool, so a second ATOMICS never replaces it.
         let mut notices = Vec::new();
         let jobserver = match hook_error {
@@ -1149,6 +1155,7 @@ impl State {
             op_replies: Vec::new(),
             resolved: Default::default(),
             hook_error,
+            hook_socket,
             governor,
             jobserver,
             resources: Default::default(),
@@ -1324,6 +1331,12 @@ impl State {
         self.hook_error.as_deref()
     }
 
+    pub(crate) fn stop_accepting_control(&self) {
+        if let Some(socket) = &self.hook_socket {
+            socket.unlink();
+        }
+    }
+
     /// With no window attached nothing consumes client events. Answer the ones a caller waits on
     /// and drop the rest, so they never pile up in the headless host.
     pub(crate) fn drop_client_events(&mut self) {
@@ -1493,10 +1506,8 @@ impl State {
         if let Some(job) = self.startup_cleanup.take() {
             let _ = job.join();
         }
-        // A second instance never owned the socket; removing it would cut the first off.
-        if self.hook_error.is_none() {
-            let _ = std::fs::remove_file(paths::socket_path());
-        }
+        // Remove our socket name while still holding its ownership lock.
+        self.hook_socket.take();
     }
 
     /// Removes scratch folders and the sandboxes that worked in them, once their agents are stopped.
