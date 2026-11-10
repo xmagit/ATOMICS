@@ -720,15 +720,18 @@ impl State {
     /// Finds a session by id, id prefix, or title.
     pub(super) fn find(&self, reference: &str) -> Option<usize> {
         let reference = reference.trim();
-        self.sessions
-            .iter()
-            .position(|s| s.id == reference)
-            .or_else(|| self.sessions.iter().position(|s| s.title.eq_ignore_ascii_case(reference)))
-            .or_else(|| {
-                let matches: Vec<usize> =
-                    (0..self.sessions.len()).filter(|&i| self.sessions[i].id.starts_with(reference)).collect();
-                (matches.len() == 1).then(|| matches[0])
-            })
+        if reference.is_empty() {
+            return None;
+        }
+        if let Some(index) = self.sessions.iter().position(|s| s.id == reference) {
+            return Some(index);
+        }
+        let mut matches = self.sessions.iter().enumerate().filter(|(_, s)| s.id.starts_with(reference));
+        if let Some((index, _)) = matches.next() {
+            // A title cannot override even an ambiguous id prefix.
+            return matches.next().is_none().then_some(index);
+        }
+        self.sessions.iter().position(|s| s.title.eq_ignore_ascii_case(reference))
     }
 
     /// Confirm terminal delivery before answering Codex sends; busy turns can drop input.

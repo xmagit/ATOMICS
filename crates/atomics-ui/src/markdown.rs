@@ -163,10 +163,15 @@ pub fn sections(source: &str) -> Vec<(String, String)> {
     parts
 }
 
-/// The URL to open for a markdown link: web addresses only.
+/// The shared check for every URL opened in a browser, including URLs supplied by a host or agent.
+/// Keep the authority explicit and refuse characters browsers might silently normalize.
 pub fn web_url(url: &str) -> Option<&str> {
-    let lower = url.get(..8).unwrap_or(url).to_ascii_lowercase();
-    (lower.starts_with("https://") || lower.starts_with("http://")).then_some(url)
+    let (scheme, rest) = url.split_once("://")?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    ((scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+        && !authority.is_empty()
+        && !url.chars().any(|c| c.is_whitespace() || c.is_control() || c == '\\'))
+    .then_some(url)
 }
 
 #[cfg(test)]
@@ -212,6 +217,32 @@ mod tests {
         assert_eq!(web_url("https://x.example"), Some("https://x.example"));
         assert_eq!(web_url("javascript:alert(1)"), None);
         assert_eq!(web_url("file:///etc/passwd"), None);
+    }
+
+    #[test]
+    fn browser_urls_allow_only_explicit_http_and_https_addresses() {
+        for url in ["http://example.com", "https://example.com/path?q=1#part", "HTTPS://example.com"] {
+            assert_eq!(web_url(url), Some(url));
+        }
+        for url in [
+            "javascript:alert(1)",
+            "data:text/html,test",
+            "file:///tmp/test",
+            "mailto:mail@example.com",
+            "httpx://example.com",
+            "https:example.com",
+            "//example.com",
+            "https:///missing",
+            "https://?query",
+            "https://#fragment",
+            "https://",
+            " https://example.com",
+            "https://example.com/\nfile:///tmp/test",
+            "https://example.com/\u{7f}",
+            "https://example.com\\file",
+        ] {
+            assert_eq!(web_url(url), None, "{url:?}");
+        }
     }
 
     #[test]

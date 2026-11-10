@@ -39,6 +39,12 @@ impl InputHistory {
     }
 }
 
+#[derive(Default)]
+struct Clipboard {
+    enabled: bool,
+    text: Option<String>,
+}
+
 pub struct Shared {
     pub title: Mutex<Option<String>>,
     /// The last line typed into this terminal and sent with Enter.
@@ -47,7 +53,9 @@ pub struct Shared {
     pub bell: AtomicBool,
     pub changed: AtomicBool,
     revision: AtomicU64,
-    pub clipboard: Mutex<Option<String>>,
+    // Only a desktop that focuses this terminal can enable OSC 52. Headless and remote
+    // terminals start disabled; rejected writes are never saved for a later focus change.
+    clipboard: Mutex<Clipboard>,
     wake: crate::host::Wake,
     size: Mutex<WindowSize>,
     shown: Mutex<Option<(Instant, bool)>>,
@@ -80,7 +88,7 @@ impl Shared {
             bell: AtomicBool::new(false),
             changed: AtomicBool::new(false),
             revision: AtomicU64::new(0),
-            clipboard: Mutex::new(None),
+            clipboard: Mutex::new(Clipboard::default()),
             wake,
             size: Mutex::new(size),
             shown: Mutex::new(None),
@@ -99,6 +107,14 @@ impl Shared {
         *self.screen_title.lock().unwrap() = title.as_deref().map(|t| atomics_core::screen::clip_title(t).to_string());
         self.screen_changes.fetch_add(1, Ordering::Release);
         *self.title.lock().unwrap() = title;
+    }
+
+    /// Update permission and drain the pending write atomically. Losing focus or disabling
+    /// clipboard access drops a queued write too, even if it arrived while access was allowed.
+    pub fn take_clipboard(&self, enabled: bool) -> Option<String> {
+        let mut clipboard = self.clipboard.lock().unwrap();
+        clipboard.enabled = enabled;
+        clipboard.text.take().filter(|_| enabled)
     }
 }
 
@@ -126,7 +142,12 @@ impl EventListener for Listener {
                 }
             }
             TermEvent::TextAreaSizeRequest(format) => write(format(*self.shared.size.lock().unwrap())),
-            TermEvent::ClipboardStore(_, text) => *self.shared.clipboard.lock().unwrap() = Some(text),
+            TermEvent::ClipboardStore(_, text) => {
+                let mut clipboard = self.shared.clipboard.lock().unwrap();
+                if clipboard.enabled {
+                    clipboard.text = Some(text);
+                }
+            }
             TermEvent::Bell => self.shared.bell.store(true, Ordering::Relaxed),
             TermEvent::ChildExit(_) | TermEvent::Exit => self.shared.exited.store(true, Ordering::Release),
             TermEvent::ClipboardLoad(..) => return,
@@ -892,5 +913,22 @@ mod tests {
         assert!(now.elapsed() < Duration::from_secs(1));
         assert!(shared.exited.load(Ordering::Acquire));
         assert!(shared.changed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn osc52_discards_denied_writes_and_pending_writes_when_focus_is_lost() {
+        let terminal = Detached::new(80, 24, 100);
+        let shared = &terminal.handle.shared;
+        let copy = b"\x1b]52;c;Y2xpcGJvYXJk\x07";
+        terminal.feed(copy);
+        assert_eq!(shared.take_clipboard(true), None, "disabled writes cannot be replayed on focus");
+        terminal.feed(copy);
+        assert_eq!(shared.take_clipboard(true).as_deref(), Some("clipboard"));
+        terminal.feed(copy);
+        assert_eq!(shared.take_clipboard(false), None, "losing focus discards a pending write");
+        terminal.feed(copy);
+        assert_eq!(shared.take_clipboard(true), None, "background writes are not buffered");
+        terminal.feed(copy);
+        assert_eq!(shared.take_clipboard(true).as_deref(), Some("clipboard"));
     }
 }
