@@ -3227,14 +3227,91 @@ fn a_host_that_does_not_offer_its_own_state_leaves_the_page_as_it_was() {
 }
 
 #[test]
+fn identity_settings_edit_only_selected_scope_keys_and_clear_words_explicitly() {
+    use atomics_core::identity::Identity;
+    for size in [WIDE, PHONE] {
+        let mut host = fake_host::management();
+        let root = "/host/app";
+        host.board.host.workspace = Some("team".into());
+        let info = host.board.host.management.as_mut().unwrap();
+        info.config["identity_scopes"] = json!([
+            {"target":"main", "path":["identity"], "identity":{"name":"Main Example", "email":"main@example.com", "forbidden_words":["contoso"]}},
+            {"target":"workspace", "path":["identity"], "identity":{"email":"workspace@example.com"}},
+            {"target":root, "path":["identity","projects","~/app"], "identity":{"name":"Project Example"}}
+        ]);
+        info.tools["identities"] = json!([{"project":root, "display":"~/app", "label":"Project Example <workspace@example.com>", "identity":{"name":"Project Example", "email":"workspace@example.com", "forbidden_words":["contoso"]}, "override":{"name":"Project Example"}}]);
+        let (ctx, mut world, mut client, mut view) = live_with(host);
+        client
+            .management
+            .show_identity(root.into(), Identity { name: Some("Project Example".into()), ..Default::default() });
+        settled(&ctx, &mut world, &mut client, &mut view, size);
+        let shown = section(&ctx, &mut world, &mut client, &mut view, size, "Theme");
+        assert!(has(&shown, "Commit email (blank inherits)"), "the inherited email is not prefilled: {shown:?}");
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "Commit email (blank inherits)")));
+        drawn(&ctx, &mut world, &mut client, &mut view, size, vec![egui::Event::Text("edited@example.com".into())]);
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        let shown = settings_scroll_to(&ctx, &mut world, &mut client, &mut view, size, shown, "Review identity change");
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "Review identity change")));
+        settled(&ctx, &mut world, &mut client, &mut view, size);
+        let action = world
+            .host
+            .host_commands
+            .iter()
+            .rev()
+            .find(|action| matches!(action, HostAction::ConfigPropose { .. }))
+            .unwrap();
+        let HostAction::ConfigPropose { scope, toml, remove, .. } = action else { unreachable!() };
+        assert_eq!(*scope, atomics_core::selfconfig::Scope::Main);
+        assert!(toml.contains("email = \"edited@example.com\""), "{toml}");
+        assert!(toml.contains("identity.projects.\"~/app\""), "the original config key is kept: {toml}");
+        assert!(!toml.contains("name =") && !toml.contains("forbidden_words"));
+        assert!(remove.is_empty());
+
+        client
+            .management
+            .show_identity(root.into(), Identity { name: Some("Project Example".into()), ..Default::default() });
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        let shown = settings_scroll_to(&ctx, &mut world, &mut client, &mut view, size, shown, "Clear inherited words");
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "Clear inherited words")));
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "Review identity change")));
+        settled(&ctx, &mut world, &mut client, &mut view, size);
+        let action = world
+            .host
+            .host_commands
+            .iter()
+            .rev()
+            .find(|action| matches!(action, HostAction::ConfigPropose { .. }))
+            .unwrap();
+        let HostAction::ConfigPropose { toml, .. } = action else { unreachable!() };
+        assert!(toml.contains("forbidden_words = []"), "{toml}");
+        assert!(!toml.contains("name =") && !toml.contains("email ="));
+
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "Project: /host/app")));
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        let option = shown.iter().rev().find(|(text, _)| text == "Workspace: team").unwrap().1.center();
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(option));
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(has(&shown, "workspace@example.com"), "the selected scope is prefilled: {shown:?}");
+        assert!(
+            has(&shown, "Commit name (blank inherits)"),
+            "the project name is not carried to the workspace: {shown:?}"
+        );
+    }
+}
+
+#[test]
 fn shared_settings_remote_and_host_folder_picker_work_in_both_layouts() {
     for size in [WIDE, PHONE] {
         let (ctx, mut world, mut client, mut view) = live_with(fake_host::management());
         client.management.settings = true;
         settled(&ctx, &mut world, &mut client, &mut view, size);
         section(&ctx, &mut world, &mut client, &mut view, size, "Theme");
-        let shown = section(&ctx, &mut world, &mut client, &mut view, size, "Advanced");
-        assert!(has(&shown, "Effective configuration") && has(&shown, "layout.min_tile_width"), "{size:?}: {shown:?}");
+        let shown = settings_content(&ctx, &mut world, &mut client, &mut view, size, "Advanced", "chief.prefer");
+        assert!(has(&shown, "Effective configuration") && has(&shown, "chief.prefer"), "{size:?}: {shown:?}");
+        let shown = settings_scroll_to(&ctx, &mut world, &mut client, &mut view, size, shown, "layout.min_tile_width");
+        assert!(has(&shown, "layout.min_tile_width"), "{size:?}: {shown:?}");
         section(&ctx, &mut world, &mut client, &mut view, size, "Advanced");
         section(&ctx, &mut world, &mut client, &mut view, size, "Theme");
         client.management.settings = false;
@@ -3400,6 +3477,55 @@ fn tools_sent(world: &World) -> Vec<atomics_core::ops::SettingsTool> {
         .collect()
 }
 
+/// Lower sections on a phone need scrolling after they open.
+fn settings_content(
+    ctx: &egui::Context,
+    world: &mut World,
+    client: &mut Client,
+    view: &mut View,
+    size: (f32, f32),
+    label: &str,
+    text: &str,
+) -> Vec<(String, Rect)> {
+    let shown = section(ctx, world, client, view, size, label);
+    settings_scroll_to(ctx, world, client, view, size, shown, text)
+}
+
+fn settings_scroll_to(
+    ctx: &egui::Context,
+    world: &mut World,
+    client: &mut Client,
+    view: &mut View,
+    size: (f32, f32),
+    mut shown: Vec<(String, Rect)>,
+    text: &str,
+) -> Vec<(String, Rect)> {
+    for _ in 0..6 {
+        if has(&shown, text) {
+            break;
+        }
+        drawn(
+            ctx,
+            world,
+            client,
+            view,
+            size,
+            vec![
+                egui::Event::PointerMoved(pos2(size.0 / 2.0, size.1 / 2.0)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: vec2(0.0, -100.0),
+                    source: egui::MouseWheelSource::Wheel,
+                    phase: egui::TouchPhase::Move,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        shown = settled(ctx, world, client, view, size);
+    }
+    shown
+}
+
 #[test]
 fn settings_lead_with_what_people_change_and_each_section_shows_its_content_as_it_opens() {
     use atomics_core::ops::SettingsTool;
@@ -3408,7 +3534,9 @@ fn settings_lead_with_what_people_change_and_each_section_shows_its_content_as_i
         client.management.settings = true;
         let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
         let mut last = 0.0;
-        for label in ["Theme", "Shortcuts", "Agents", "Connections", "Remote devices", "Credentials", "Advanced"] {
+        for label in
+            ["Theme", "Shortcuts", "Identity", "Agents", "Connections", "Remote devices", "Credentials", "Advanced"]
+        {
             let top = row(&shown, label).top();
             assert!(top > last, "{label} comes in order on {size:?}: {shown:?}");
             last = top;
@@ -3419,6 +3547,7 @@ fn settings_lead_with_what_people_change_and_each_section_shows_its_content_as_i
         assert!(tools_sent(&world).is_empty(), "nothing is read before it is opened");
 
         for (label, expected, content) in [
+            ("Identity", vec![], "Project overrides workspace"),
             ("Agents", vec![SettingsTool::CheckSandbox, SettingsTool::CheckPrograms], "Docker Sandboxes"),
             ("Connections", vec![SettingsTool::RefreshConnections], "linear"),
             ("Credentials", vec![SettingsTool::RefreshCredentials], "Claude subscription"),
@@ -3426,8 +3555,15 @@ fn settings_lead_with_what_people_change_and_each_section_shows_its_content_as_i
             ("Advanced", vec![], "Effective configuration"),
         ] {
             let before = tools_sent(&world).len();
-            let shown = section(&ctx, &mut world, &mut client, &mut view, size, label);
+            let shown = settings_content(&ctx, &mut world, &mut client, &mut view, size, label, content);
             assert!(has(&shown, content), "{label} shows {content} on {size:?}: {shown:?}");
+            if label == "Agents" {
+                for text in
+                    ["Chief's task agent preference", "codex, then claude", "claude: 20.0% left · codex: 10.0% left"]
+                {
+                    assert!(has(&shown, text), "the chief budget is visible on {size:?}: {shown:?}");
+                }
+            }
             settled(&ctx, &mut world, &mut client, &mut view, size);
             let sent = tools_sent(&world);
             assert_eq!(&sent[before..], expected.as_slice(), "{label} reads once, by itself, on {size:?}");
@@ -3776,7 +3912,7 @@ fn usage_and_load_reach_the_wide_frame_and_the_phones_overflow_and_update_live()
         let mut host = world.host.board.host.clone();
         let resources = host.resources.as_mut().unwrap();
         resources.load = Some(7.3);
-        resources.claude.session.as_mut().unwrap().remaining = 53.0;
+        resources.claude.session.as_mut().unwrap().left_percent = 53.0;
         resources.test.waiting = 0;
         resources.sampled_at += 120;
         let frames = world.host.publish_host(host);

@@ -33,6 +33,7 @@ pub struct State {
     pub remove: String,
     pub reason: String,
     pub theme: String,
+    identity: settings::IdentityForm,
     pub connection_name: String,
     pub connection_url: String,
     pub credential_kind: String,
@@ -56,6 +57,12 @@ pub struct State {
 }
 
 impl State {
+    pub fn show_identity(&mut self, project: String, identity: atomics_core::identity::Identity) {
+        self.settings = true;
+        self.open_section = Some("Identity".into());
+        self.identity.select(project, identity);
+    }
+
     /// What lives as long as Settings is open goes when it closes: above all a value typed and never saved.
     fn forget_settings(&mut self) {
         self.credential_value.clear();
