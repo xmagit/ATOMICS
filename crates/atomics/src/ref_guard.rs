@@ -373,6 +373,11 @@ impl RefGuard {
     /// Load the original snapshot on reattach, before the agent gets another turn. The file
     /// lives outside every VM mount, so an agent cannot replace its own baseline.
     pub fn open(cwd: &Path, file: PathBuf) -> Result<Option<Self>> {
+        // Closing a scratch session can remove its folder while sbx is still creating it.
+        // There is no Git to guard there; the completed preparation takes the normal cleanup path.
+        if cwd.symlink_metadata().is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) {
+            return Ok(None);
+        }
         if git::pinned(cwd).is_some_and(|pins| pins.common_dir.is_none()) {
             return Ok(None);
         }

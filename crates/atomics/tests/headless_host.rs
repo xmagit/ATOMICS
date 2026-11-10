@@ -1053,12 +1053,15 @@ fn the_host_start_drops_cleanup_failures_it_no_longer_finds_and_keeps_alerts() {
     let instance = Instance::new(None);
     use std::os::unix::fs::DirBuilderExt;
     std::fs::DirBuilder::new().mode(0o700).create(instance.home()).unwrap();
-    // An earlier version left the ledger noting a git record whose file and sandbox are gone, so
-    // every start and plan cleanup failed on it, and kept those failures forever.
+    // A missing record can heal from its ledger copy once its sandbox and original folder are gone.
+    // An unreadable legacy record without that copy must instead stay blocked.
     let record = instance.home().join("git-pins/atomics-gone.json");
     std::fs::write(
         instance.home().join("sandbox-ownership.json"),
-        json!({"atomics-gone": {"created": 0, "pins": instance.home().join("git-pins")}}).to_string(),
+        json!({"atomics-gone": {"created": 0, "pins": instance.home().join("git-pins"),
+            "git_pins": {"work_tree": instance.dir.path().join("gone-project"),
+                "git_dir": null, "common_dir": null}}})
+        .to_string(),
     )
     .unwrap();
     let missing = format!("reading {}: No such file or directory (os error 2)", record.display());

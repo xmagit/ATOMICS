@@ -2285,7 +2285,7 @@ while [ ! -e ready ]; do
 done
 case "$5" in
   rev-parse) pwd ;;
-  symbolic-ref) printf 'feature\n' ;;
+  symbolic-ref) printf 'refs/heads/feature\n' ;;
 esac
 "#,
         );
