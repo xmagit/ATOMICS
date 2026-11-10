@@ -16,6 +16,18 @@ let
   exemptNames = lib.concatMapStringsSep ", " builtins.toJSON exemptUsers;
   # Keep Mac services blocked even when DNS is forwarded to a separate upstream.
   gateway = "192.168.5.2";
+  ipv4Octet = "(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])";
+  isIPv4 = value: builtins.match "${ipv4Octet}(\\.${ipv4Octet}){3}" value != null;
+  isIPv6 = value:
+    let
+      tail = lib.last (lib.splitString ":" value);
+      # The library parser handles hex IPv6; an embedded IPv4 tail occupies two hex groups.
+      hex = if isIPv4 tail then lib.removeSuffix tail value + "0:0" else value;
+    in
+    lib.hasInfix ":" value
+    && builtins.match "[0-9A-Fa-f:]+" hex != null
+    && lib.all (part: builtins.stringLength part <= 4) (lib.splitString ":" hex)
+    && (builtins.tryEval (builtins.deepSeq (lib.network.ipv6.fromString hex).address true)).success;
   upstreamFamily = if lib.hasInfix ":" cfg.upstream then "ip6" else "ip";
   table = "atomics_egress";
   rules = [ { name = "web"; ports = cfg.webPorts; domains = cfg.domains; } ]
@@ -70,7 +82,7 @@ in
         Refuse connections outside the list. False only logs them ("atomics-egress refused" in the kernel log,
         `journalctl -k -g atomics-egress`), to learn what a team needs before enforcing. Names outside the list
         are refused by dnsmasq either way. New connections to Lima's host address are always refused
-        except for resolver DNS.
+        except for resolver DNS and root's DHCP renewals.
       '';
     };
 
@@ -112,7 +124,9 @@ in
     };
 
     upstream = mkOption {
-      type = types.str;
+      type = (types.addCheck types.str (value: isIPv4 value || isIPv6 value)) // {
+        description = "IPv4 or IPv6 address literal (not a hostname, port, zone or CIDR prefix)";
+      };
       default = gateway;
       description = "The resolver IP address listed names are forwarded to; defaults to Lima's gateway resolver.";
     };
@@ -171,6 +185,8 @@ in
           # exemptions and domain sets. Names handle dynamically allocated UIDs on upgraded guests.
           ${upstreamFamily} daddr ${cfg.upstream} meta skuid "dnsmasq" udp dport 53 accept
           ${upstreamFamily} daddr ${cfg.upstream} meta skuid "dnsmasq" tcp dport 53 accept
+          # dhcpcd runs as root and unicasts lease renewals to Lima's DHCP server on the gateway.
+          ip daddr ${gateway} meta skuid "root" udp dport 67 accept
           ip daddr ${gateway} reject with icmp type admin-prohibited
           meta skuid { ${exemptNames} } accept
           oifname "lo" accept

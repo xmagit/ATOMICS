@@ -79,7 +79,7 @@
             pkgs = import nixpkgs { inherit system; };
             vm = (vmWithEgress.extendModules {
               modules = [ { atomics.vm.egress.upstream = "192.0.2.53"; } ];
-            }).config;
+            });
           };
           atomics-vm-host = import ./nix/tests/vm-host.nix {
             pkgs = import nixpkgs { inherit system; };
