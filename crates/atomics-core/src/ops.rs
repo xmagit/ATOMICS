@@ -285,7 +285,7 @@ pub enum HostAction {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "tool", rename_all = "snake_case")]
 pub enum SettingsTool {
     InstallHooks,
@@ -304,6 +304,13 @@ pub enum SettingsTool {
         url: String,
     },
     RefreshCredentials,
+    AddSecret {
+        spec: crate::secrets::Secret,
+        value: String,
+    },
+    RemoveSecret {
+        name: String,
+    },
     PutCredential {
         kind: String,
         value: String,
@@ -348,6 +355,16 @@ pub enum SettingsTool {
         id: String,
         later: bool,
     },
+}
+
+impl std::fmt::Debug for SettingsTool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut metadata = serde_json::to_value(self).map_err(|_| std::fmt::Error)?;
+        if metadata.get("value").is_some() {
+            metadata["value"] = "<hidden>".into();
+        }
+        write!(f, "SettingsTool({metadata})")
+    }
 }
 
 /// What became of an operation.
@@ -661,6 +678,13 @@ impl HostCommand {
                 }
                 SettingsTool::PutCredential { kind, value, host } => {
                     bounds.id("kind", Some(kind)).id("host", host.as_deref()).text("value", Some(value));
+                }
+                SettingsTool::AddSecret { spec, value } => {
+                    bounds.id("name", Some(&spec.name)).text("value", Some(value));
+                    spec.validate().map_err(|message| WireError::new(ErrorCode::Malformed, message))?;
+                }
+                SettingsTool::RemoveSecret { name } => {
+                    bounds.id("name", Some(name));
                 }
                 SettingsTool::RemoveCredential { kind, host } => {
                     bounds.id("kind", Some(kind)).id("host", host.as_deref());

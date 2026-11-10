@@ -326,6 +326,7 @@ mod tests {
             briefs: None,
             pins: dir.path().join("git-pins"),
             relay: None,
+            secret_workspace: None,
         };
         prepare(&job).unwrap();
         assert!(

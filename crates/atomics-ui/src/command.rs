@@ -196,6 +196,8 @@ pub enum Command {
 
     // ── Projects and worktrees ───────────────────────────────────────────────────────────────────────
     Manage(HostAction),
+    /// Native window on the credential host only. Deliberately has no wire mapping.
+    CopySecret(String),
     OpenProject(PathBuf),
     CloseProject(PathBuf),
     /// Open a saved workspace, by name, in place of the open projects.

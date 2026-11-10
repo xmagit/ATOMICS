@@ -77,6 +77,33 @@ untrusted agent data. Reports retain at most 12 checks, 240 characters per check
 2048 at the end of each output, and 8000 in the summary. Terminal control characters are stripped,
 with line breaks and tabs kept. Reports saved before checks were introduced still load.
 
+## Secrets and session scope
+
+Add secrets in **Settings → Credentials → Add secret** or with `atomics secret add NAME`.
+The value is accepted on stdin only (masked in a terminal), never as a flag or argument.
+`atomics secret list` shows metadata and last relay use; `atomics secret rm NAME` removes one.
+Secret values and scope metadata live together in the existing credential catalog, outside TOML.
+
+Use `--scope everywhere` (default), `--scope workspace:daily`, or
+`--scope project:/path/to/main/checkout`. A project's scope follows all its linked worktrees, like
+`[identity.projects]`; a workspace scope applies only while that saved workspace is open.
+Every new bare or Docker session receives its secrets in scope automatically. Changes require a
+new or resumed session. A name is unique in the catalog, so remove it before replacing its value.
+
+With `--host api.example.com`, the session receives a placeholder and `NAME_RELAY_URL`. Configure
+the tool to use that base URL: the relay forwards only to the named host and adds the real value.
+Known services (for example `--host openai`) select their host and auth style. Authentication can
+be bearer, `--header x-api-key`, `--basic-user api` (value = password), or `--query api_key`.
+`--method GET,POST` and `--path-prefix /v1` limit requests. With no host the secret is **exposed:
+agents can read and leak its real value** from their session environment. This warning also
+appears in Settings and CLI listings. Docker setup is automatic; no user-run `sbx` step is needed.
+
+Copy requires fresh OS authentication in a native window on the credential machine. Remote
+windows, protocol clients, ctl and MCP cannot copy or display values. Linux's fresh-auth polkit
+policy ships in the package and NixOS module; for a standalone install enable it with
+`sudo atomics install --secret-copy-policy`. A missing policy or OS prompt fails closed. See
+[Settings → Credentials](isolation.md#settings--credentials) for routes and prerequisites.
+
 ## Commit identity and word guard
 
 Set a default in your main config (or its host override):

@@ -46,6 +46,7 @@ pub mod projection;
 pub mod remote;
 pub mod repo_workflow;
 pub mod screen;
+pub mod secrets;
 pub mod selfconfig;
 pub mod session;
 pub mod stash;

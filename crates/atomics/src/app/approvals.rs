@@ -520,7 +520,20 @@ impl State {
         }
         let pending = session.approvals.remove(0);
         let id = pending.id.clone();
-        let answered = Answered { request: pending.request.clone(), menu: pending.native.map(|menu| menu.kind) };
+        let task = self.plans.iter().flat_map(|p| &p.tasks).find(|t| t.session.as_deref() == Some(&session.id));
+        let agent = task
+            .map(|t| atomics_core::tickets::model_label(&t.agent, &t.args))
+            .unwrap_or_else(|| session.agent.clone());
+        let answered = Answered {
+            request: pending.request.clone(),
+            menu: pending.native.map(|menu| menu.kind),
+            provenance: plan::agent_provenance(
+                "approval request",
+                task.map(|t| t.id.as_str()),
+                &agent,
+                atomics_core::store::now(),
+            ),
+        };
         // A menu read off the screen answers only itself; a hook's exact request may be allowed again,
         // unless it may not be allowed always (an Azure request, a stash drop), which answered it once above.
         if decision == Decision::AllowAlways && answered.menu.is_none() {
@@ -555,6 +568,7 @@ const ANSWERED_MENU_LINGER: Duration = Duration::from_secs(3);
 pub(super) struct Answered {
     pub request: ApprovalRequest,
     pub menu: Option<atomics_core::approvals::MenuKind>,
+    provenance: serde_json::Value,
 }
 
 impl Answered {
@@ -566,6 +580,7 @@ impl Answered {
             "command": self.request.command,
             "reason": self.request.reason,
             "menu": self.menu.map(|menu| menu.label()),
+            "provenance": self.provenance,
         })
     }
 }
@@ -976,6 +991,9 @@ mod tests {
                                 answer_pending(app, json!({"cmd":"approve", "session":"worker", "decision":"allow"}));
                             assert!(answer.ok, "{answer:?}");
                             assert_eq!(answer.result["command"], "touch live");
+                            assert_eq!(answer.result["provenance"]["source"], "agent");
+                            assert_eq!(answer.result["provenance"]["agent"], "test");
+                            assert!(answer.result["provenance"]["at"].as_u64().is_some());
                         }
                         _ => unreachable!(),
                     }

@@ -230,6 +230,9 @@ pub fn run_cli() -> i32 {
         Ok(installed) => {
             println!("Installed ATOMICS {} at {}.", env!("CARGO_PKG_VERSION"), installed.at.display());
             println!("Open it from your applications menu. Its first run opens a setup screen.");
+            if cfg!(target_os = "linux") && crate::secret_copy::unavailable().is_some() {
+                println!("To enable authenticated secret Copy, run: sudo atomics install --secret-copy-policy");
+            }
             if let Some(line) = installed.path_line {
                 println!("To run atomics from a terminal too, add this to your shell's startup file: {line}");
             }

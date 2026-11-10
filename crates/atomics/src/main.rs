@@ -37,6 +37,8 @@ mod restart;
 mod sandbox;
 mod sandbox_ownership;
 mod sandbox_usage;
+mod secret;
+mod secret_copy;
 mod setup;
 mod statusline;
 mod terminal;
@@ -92,6 +94,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Store secrets once for sessions in scope; values are accepted on stdin only.
+    Secret {
+        #[command(subcommand)]
+        command: secret::Command,
+    },
     /// Guide fresh-machine sandbox setup (safe to run again)
     Setup {
         /// Store one credential; the value is read from stdin only
@@ -109,7 +116,11 @@ enum Command {
     /// Check required tools, configuration and integrations
     Doctor,
     /// Install this program for your user: where it goes, its menu entry and icon, and on a Mac `atomics` on PATH
-    Install,
+    Install {
+        /// Install the Linux fresh-auth Copy policy system-wide (requires root).
+        #[arg(long)]
+        secret_copy_policy: bool,
+    },
     /// Go back to the version the last update replaced; run it again to go forward again
     Rollback,
     /// Sign in to or out of the ticket system's MCP server (browser OAuth)
@@ -302,7 +313,13 @@ const PARENT_SESSION_VARS: &[&str] = &[
 ];
 
 fn main() -> eframe::Result {
-    let cli = Cli::parse();
+    let cli = Cli::try_parse().unwrap_or_else(|error| {
+        if std::env::args_os().any(|arg| arg == "secret") && !matches!(error.kind(), clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion) {
+            eprintln!("Invalid secret command (arguments hidden). Use atomics secret --help. Values are accepted on stdin only.");
+            std::process::exit(2);
+        }
+        error.exit()
+    });
     let mut migration_errors = Vec::new();
     if matches!(cli.command, None | Some(Command::Host { .. })) {
         for var in PARENT_SESSION_VARS {
@@ -345,17 +362,25 @@ fn main() -> eframe::Result {
             Command::Host { .. }
                 | Command::Doctor
                 | Command::Setup { .. }
+                | Command::Secret { .. }
                 | Command::Sandbox { .. }
                 | Command::Tickets { .. }
                 | Command::Queue { .. }
                 | Command::Update { .. }
-                | Command::Install
+                | Command::Install { .. }
         )
     ) {
         // SAFETY: no other thread exists yet.
         unsafe { setup::adopt_login_path() };
     }
     match cli.command {
+        Some(Command::Secret { command }) => {
+            if let Err(error) = secret::run(command) {
+                eprintln!("Secret operation failed: {error}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
         Some(Command::Setup { credential: Some(kind), registry_host }) => {
             if let Err(error) = sandbox::setup::credential_setup(&kind, registry_host.as_deref()) {
                 eprintln!("Credential setup failed: {error}");
@@ -460,7 +485,17 @@ fn main() -> eframe::Result {
             std::process::exit(1);
         }
         Some(Command::Update { check }) => std::process::exit(update::run_cli(check)),
-        Some(Command::Install) => std::process::exit(install::run_cli()),
+        Some(Command::Install { secret_copy_policy: true }) => {
+            match secret_copy::install_policy() {
+                Ok(()) => println!("Secret Copy authentication policy installed"),
+                Err(error) => {
+                    eprintln!("{error}");
+                    std::process::exit(1);
+                }
+            }
+            return Ok(());
+        }
+        Some(Command::Install { secret_copy_policy: false }) => std::process::exit(install::run_cli()),
         Some(Command::Rollback) => std::process::exit(update::run_rollback_cli()),
         Some(Command::Queue { class, command }) => {
             let class =

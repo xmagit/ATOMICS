@@ -205,7 +205,9 @@ impl State {
         };
         let runtime = job.as_ref().map_or(AgentRuntime::Bare, |job| AgentRuntime::Sandbox(job.sandboxed()));
         // Codex's hooks call ATOMICS on this machine, which a sandboxed Codex cannot reach.
-        let codex = agent.is_codex() && job.is_none();
+        if agent.is_codex() && job.is_none() {
+            self.codex_version(resolve_program(&agent.command[0]));
+        }
         let launch = AgentLaunch {
             id: id.clone(),
             agent,
@@ -253,32 +255,53 @@ impl State {
             self.activate(&id, false);
             return Ok(id);
         }
-        if launch.agent.kind == AgentKind::Claude && self.effective_isolation().bare_relay {
-            self.sessions.push(Session::starting(id.clone(), &launch.agent, launch.cwd.clone(), chief, &self.wake));
-            let (tx, rx) = self.wake.channel();
-            let relay = self.relay.clone();
-            let session = id.clone();
-            std::thread::spawn(move || {
-                let ready = relay
-                    .grant_claude(&session)
-                    .and_then(|grant| {
-                        grant.ok_or_else(|| {
-                            anyhow::anyhow!("bare relay requires a Claude subscription in Settings → Credentials")
-                        })
+        self.sessions.push(Session::starting(id.clone(), &launch.agent, launch.cwd.clone(), chief, &self.wake));
+        let (tx, rx) = self.wake.channel();
+        let relay = self.relay.clone();
+        let session = id.clone();
+        let workspace = self.workspace.clone();
+        let secret_cwd = launch.cwd.clone();
+        let claude = launch.agent.kind == AgentKind::Claude && self.effective_isolation().bare_relay;
+        std::thread::spawn(move || {
+            let project = workspace::project_root(&secret_cwd).ok();
+            let ready = (|| {
+                let grant = if claude {
+                    Some(relay.grant_claude(&session)?.ok_or_else(|| {
+                        anyhow::anyhow!("bare relay requires a Claude subscription in Settings → Credentials")
+                    })?)
+                } else {
+                    None
+                };
+                relay
+                    .grant_secrets(
+                        &session,
+                        workspace.as_deref(),
+                        project.as_deref().and_then(Path::to_str),
+                        false,
+                        grant.clone(),
+                    )
+                    .inspect_err(|_| {
+                        if let Some(grant) = &grant {
+                            relay.revoke(grant);
+                        }
                     })
-                    .map(|grant| (None, Some(grant), Vec::new()))
-                    .map_err(|error| super::NotPrepared::Other(error.to_string()));
-                let _ = tx.send(ready);
-            });
-            self.pending_sandbox.push((launch, rx));
-            self.activate(&id, false);
-            return Ok(id);
-        }
+            })()
+            .map(|grant| (None, grant, Vec::new()))
+            .map_err(|error: anyhow::Error| super::NotPrepared::Other(error.to_string()));
+            let _ = tx.send(ready);
+        });
+        self.pending_sandbox.push((launch, rx));
+        self.activate(&id, false);
+        Ok(id)
+    }
+
+    pub(super) fn launch_prepared(&mut self, launch: AgentLaunch) -> Result<String, String> {
+        let id = launch.id.clone();
+        let codex = launch.agent.is_codex() && matches!(launch.runtime, AgentRuntime::Bare);
         if codex {
             let program = resolve_program(&launch.agent.command[0]);
             let ready = self.codex_version(program);
             let Some(supported) = ready.get().copied() else {
-                self.sessions.push(Session::starting(id.clone(), &launch.agent, launch.cwd.clone(), chief, &self.wake));
                 self.pending_codex.push((launch, ready));
                 self.activate(&id, false);
                 return Ok(id);
@@ -334,6 +357,7 @@ impl State {
             briefs,
             pins: paths::git_pins_dir(),
             relay: Some(self.relay.clone()),
+            secret_workspace: self.workspace.clone(),
         }))
     }
 
@@ -465,7 +489,7 @@ impl State {
             env.extend(crate::setup::instance_agent_env());
         }
         if sandboxed.is_none()
-            && let Some(granted) = &relay
+            && let Some(granted) = relay.as_ref().filter(|g| !g.placeholder.is_empty())
         {
             env.insert("CLAUDE_CODE_OAUTH_TOKEN".into(), granted.placeholder.clone());
             env.insert("ANTHROPIC_API_KEY".into(), String::new());
@@ -602,7 +626,7 @@ impl State {
                     } else {
                         atomics_core::hook::session_settings(&hooks_exe, Path::new(&socket), &id, false)
                     };
-                    if let Some(granted) = &relay {
+                    if let Some(granted) = relay.as_ref().filter(|g| !g.placeholder.is_empty()) {
                         settings["apiKeyHelper"] = "".into();
                         settings["env"] = json!({
                             "ANTHROPIC_BASE_URL": format!("http://127.0.0.1:{}/api.anthropic.com", granted.port),
@@ -655,6 +679,9 @@ impl State {
             }
             _ => None,
         };
+        if let Some(granted) = &relay {
+            env.extend(granted.secrets.clone());
+        }
         let nice = self.config.resources.agent_nice;
         let (program, args) = match &sandboxed {
             Some(sandboxed) => {
@@ -666,6 +693,12 @@ impl State {
                         .into_iter()
                         .flat_map(|(name, value)| ["--env".into(), format!("{name}={value}")]);
                     run.splice(position..position, env);
+                    let position = run.iter().position(|arg| arg == "--").unwrap_or(run.len());
+                    // Bare names copy the session environment; values never enter argv or sandbox config.
+                    run.splice(
+                        position..position,
+                        relay.secrets.keys().flat_map(|name| ["--env".into(), name.clone()]),
+                    );
                 }
                 (program, run)
             }
@@ -1649,6 +1682,7 @@ mod tests {
             let home = paths::atomics_home();
             while !home.join("claude/.claude.json").exists() {
                 assert!(Instant::now() < deadline);
+                app.runtime.runtime_tick();
                 std::thread::sleep(Duration::from_millis(10));
             }
             assert_eq!(std::fs::read_to_string(home.join("codex/config.toml")).unwrap(), "trusted\n");
@@ -1724,6 +1758,7 @@ mod tests {
                 let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(60));
                 while !out.exists() {
                     assert!(Instant::now() < deadline, "the probe agent never wrote its environment");
+                    app.runtime.runtime_tick();
                     std::thread::sleep(Duration::from_millis(20));
                 }
                 let env = std::fs::read_to_string(&out).unwrap();
@@ -1770,6 +1805,7 @@ mod tests {
             let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
             while !out.exists() {
                 assert!(Instant::now() < deadline, "the .NET probe never wrote its environment");
+                app.runtime.runtime_tick();
                 std::thread::sleep(Duration::from_millis(20));
             }
             let env = std::fs::read_to_string(out).unwrap();
@@ -1849,11 +1885,11 @@ fi
                 ids.push(app.runtime.start(name, dir.path().into(), None, vec![], None).unwrap());
             }
             let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(5));
-            while ids
-                .iter()
-                .any(|id| !app.runtime.sessions[app.runtime.find(id).unwrap()].terminal.as_ref().unwrap().exited())
-            {
+            while ids.iter().any(|id| {
+                app.runtime.sessions[app.runtime.find(id).unwrap()].terminal.as_ref().is_none_or(|t| !t.exited())
+            }) {
                 assert!(Instant::now() < deadline, "finite fake agents must exit before teardown");
+                app.runtime.runtime_tick();
                 std::thread::sleep(Duration::from_millis(10));
             }
             assert!(

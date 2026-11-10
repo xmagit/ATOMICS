@@ -3746,6 +3746,32 @@ fn only_what_cannot_be_undone_asks_first() {
 }
 
 #[test]
+fn secret_rows_label_exposure_refuse_remote_copy_and_ask_before_removal() {
+    use atomics_core::ops::SettingsTool;
+    let mut host = fake_host::management();
+    let tools = &mut host.board.host.management.as_mut().unwrap().tools;
+    tools["credentials"]["entries"] = json!([]);
+    tools["credentials"]["secrets"] = json!([{
+        "spec": {"name":"EXAMPLE_KEY", "host":null},
+        "kind": atomics_core::secrets::EXPOSED, "scope":"Everywhere", "last_used":null
+    }]);
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    client.management.settings = true;
+    let shown = section(&ctx, &mut world, &mut client, &mut view, WIDE, "Credentials");
+    assert!(shown.iter().any(|(text, _)| text.contains("agents can read and leak this value")), "{shown:?}");
+    assert!(shown.iter().any(|(text, _)| text.contains("remote and protocol clients cannot copy")), "{shown:?}");
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(on(&shown, "Copy (OS authentication)")));
+    assert!(tools_sent(&world).iter().all(|t| matches!(t, SettingsTool::RefreshCredentials)));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(on(&shown, "Remove…")));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(!tools_sent(&world).iter().any(|t| matches!(t, SettingsTool::RemoveSecret { .. })));
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(exactly(&shown, "Remove secret")));
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert_eq!(tools_sent(&world).last(), Some(&SettingsTool::RemoveSecret { name: "EXAMPLE_KEY".into() }));
+}
+
+#[test]
 fn a_typed_credential_stays_masked_replacing_asks_and_closing_settings_forgets_it() {
     use atomics_core::ops::SettingsTool;
     const SECRET: &str = "sk-typed-secret";

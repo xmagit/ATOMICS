@@ -63,6 +63,7 @@ rustPlatform.buildRustPackage {
   # git is a fallback after the user's own PATH, so agent terminals keep finding their git first.
   postInstall = ''
     wrapProgram "$out/bin/atomics" --suffix PATH : "${lib.makeBinPath [ git ]}"
+    install -Dm644 assets/com.atomics.copy-secret.policy "$out/share/polkit-1/actions/com.atomics.copy-secret.policy"
   '';
 
   meta = {

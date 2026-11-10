@@ -42,6 +42,9 @@ fn installed_revision_and_hook_path_come_from_the_wrapper_package() {
     }
     let hooks = run(root.path(), &["print-hook-settings", "--agent", "claude"]);
     assert!(hooks.contains(wrapper.to_str().unwrap()), "{hooks}");
+    run(root.path(), &["install-hooks"]);
+    let installed_hooks = std::fs::read_to_string(root.path().join(".claude/settings.json")).unwrap();
+    assert!(installed_hooks.contains(wrapper.to_str().unwrap()), "global hooks also use the stable wrapper");
 
     // Changing only the metadata changes the reported revision, with the very same binary.
     metadata(root.path(), &binary, json!("def5678"));

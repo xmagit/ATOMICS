@@ -9,6 +9,10 @@ use crate::diff::{FileStatus, LineKind, WorktreeDiff};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum ControlRequest {
+    /// A local CLI edit: invalidate placeholders only. This cannot read or copy a value.
+    SecretRemoved {
+        name: String,
+    },
     Preview {
         #[serde(default)]
         pane: Option<String>,

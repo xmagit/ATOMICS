@@ -43,6 +43,10 @@ zeroize = "1.9.1"
 qrcodegen = "1.8.0"
 url = "2.5.8"
 base64 = "0.22.1"
+arboard = { version = "3.7.0", default-features = false, features = ["wayland-data-control"] }
+# HTTP dependencies log query strings at trace level. This credential-holding binary must
+# never format those records, even if a runtime enables verbose logging.
+log = { version = "0.4.34", features = ["max_level_info"] }
 ureq = { version = "3.5.0", default-features = false, features = ["rustls"] }
 syntect = { version = "5.3.0", default-features = false, features = ["default-onig"] }
 two-face = { version = "0.5.2", default-features = false, features = ["syntect-onig"] }
@@ -56,6 +60,7 @@ similar = "3.2.1"
 # macOS delivers atomics:// links as an Apple event.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.5"
+block2 = "0.6.2"
 mach2 = "0.6.0"
 
 [dev-dependencies]

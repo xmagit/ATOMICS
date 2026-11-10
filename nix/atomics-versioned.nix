@@ -7,6 +7,7 @@ runCommand "atomics-${atomics.version}" {
   passthru.unwrapped = atomics;
 } ''
   mkdir -p "$out/bin" "$out/share/atomics"
+  ln -s ${atomics}/share/polkit-1 "$out/share/polkit-1"
   cat > "$out/share/atomics/build.json" <<'JSON'
   ${builtins.toJSON { binary = "${atomics}/bin/.atomics-wrapped"; inherit revision; }}
   JSON

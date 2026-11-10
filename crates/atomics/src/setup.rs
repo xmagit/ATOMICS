@@ -577,7 +577,7 @@ pub(crate) fn agent_codex_home() -> PathBuf {
 }
 
 pub fn global_hooks_installed() -> bool {
-    let Ok(exe) = executable_path() else { return false };
+    let Ok(exe) = hook_executable() else { return false };
     std::fs::read_to_string(claude_settings_path()).is_ok_and(|text| text.contains(&format!("{} hook", exe.display())))
 }
 
@@ -590,7 +590,7 @@ pub fn legacy_hooks_installed() -> bool {
 
 pub fn install_global_hooks() -> anyhow::Result<PathBuf> {
     let path = claude_settings_path();
-    let exe = executable_path()?;
+    let exe = hook_executable()?;
     let mut settings: serde_json::Value = match std::fs::read_to_string(&path) {
         Ok(text) => {
             std::fs::write(path.with_extension("json.atomics-backup"), &text)?;

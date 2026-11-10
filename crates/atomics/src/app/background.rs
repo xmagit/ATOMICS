@@ -76,12 +76,19 @@ impl State {
         let pending = std::mem::take(&mut self.pending_codex);
         for (launch, ready) in pending {
             if self.find(&launch.id).is_none() {
+                if let Some(granted) = &launch.relay {
+                    self.relay.revoke(granted);
+                }
                 continue;
             }
             if let Some(supported) = ready.get().copied() {
                 changed = true;
                 let id = launch.id.clone();
+                let granted = launch.relay.clone();
                 if let Err(error) = self.launch_codex(launch, supported) {
+                    if let Some(granted) = &granted {
+                        self.relay.revoke(granted);
+                    }
                     if let Some(index) = self.find(&id) {
                         self.sessions[index].status = AgentStatus::Exited;
                         self.sessions[index].last_message = Some(error.clone());
@@ -144,7 +151,7 @@ impl State {
                     self.ref_alert(&id, alerts.join("\n"));
                 }
                 let relay = granted.clone();
-                let launched = self.launch_agent(AgentLaunch { ref_guard: guard, relay, ..launch }, None);
+                let launched = self.launch_prepared(AgentLaunch { ref_guard: guard, relay, ..launch });
                 if launched.is_err()
                     && let Some(granted) = granted
                 {

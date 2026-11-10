@@ -328,6 +328,7 @@ pub fn request_at(path: &Path, request: &ControlRequest) -> Result<ControlRespon
         .map_err(|e| RequestError::NotRunning(format!("ATOMICS is not running ({}: {e})", path.display())))?;
     // A sandbox command may wait its timeout for a slot, then run for as long.
     let timeout = match request {
+        ControlRequest::SecretRemoved { .. } => 5,
         ControlRequest::Exec { timeout_secs, .. } => 2 * crate::sandbox::exec::timeout(*timeout_secs).as_secs() + 120,
         _ => 320,
     };

@@ -154,6 +154,20 @@ impl State {
             self.selected_plan
         };
         let outcome = match request {
+            ControlRequest::SecretRemoved { name } => {
+                if atomics_core::secrets::valid_name(&name) {
+                    let relay = self.relay.clone();
+                    std::thread::spawn(move || {
+                        // Serialize with a worker that may already have read the old catalog,
+                        // then revoke its grant too. Waiting for that worker never blocks State.
+                        let _ = relay.edit(&format!("secret:{name}"), |_| Ok(()));
+                        let _ = reply.send(done(ControlResponse::ok(json!({"revoked": true}))));
+                    });
+                    return;
+                } else {
+                    done(ControlResponse::error("Invalid secret name"))
+                }
+            }
             ControlRequest::CurateNote { plan, id, pinned, delete } => {
                 let result = self
                     .plans

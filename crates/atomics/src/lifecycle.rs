@@ -799,6 +799,7 @@ mod tests {
             socket: dir.path().join("unused.sock"),
             briefs: None,
             relay: None,
+            secret_workspace: None,
         };
         assert!(sandbox::prepare(&attempt).unwrap_err().to_string().contains("not owned"));
         assert!(ownership::owned(&a).unwrap().is_empty());

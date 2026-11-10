@@ -91,6 +91,9 @@ impl Backend for Local<'_> {
 
     /// The desktop carries out every command. Its ticket reader needs a ticket system to read from.
     fn available(&self, command: &atomics_ui::Command) -> bool {
+        if matches!(command, atomics_ui::Command::CopySecret(_)) {
+            return self.0.window.is_attached();
+        }
         if let atomics_ui::Command::CurateNote { plan, delete: false, .. } = command {
             return self.0.plans.get(*plan).is_some_and(|p| p.is_open()) && self.0.notebook_enabled(*plan);
         }

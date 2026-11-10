@@ -46,7 +46,11 @@
 
       # `nix develop .#default` keeps Cargo's toolchain and libraries, rather than the wrapper's.
       devShells = forAllSystems (system: {
-        default = self.packages.${system}.atomics.unwrapped;
+        default = nixpkgs.legacyPackages.${system}.mkShell {
+          inputsFrom = [ self.packages.${system}.atomics.unwrapped ];
+          # The terminal and keychain fixtures are executable Python scripts.
+          packages = [ nixpkgs.legacyPackages.${system}.python3 ];
+        };
       });
 
       checks = forAllSystems (system:

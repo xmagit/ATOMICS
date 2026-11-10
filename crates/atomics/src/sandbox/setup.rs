@@ -539,9 +539,9 @@ pub(crate) fn private_command_until(
 }
 
 /// Restore terminal echo even when token input or validation fails.
-struct Echo(Option<libc::termios>);
+pub(crate) struct Echo(Option<libc::termios>);
 impl Echo {
-    fn hide(terminal: bool) -> Result<Self> {
+    pub(crate) fn hide(terminal: bool) -> Result<Self> {
         if !terminal {
             return Ok(Self(None));
         }

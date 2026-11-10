@@ -39,6 +39,11 @@ pub struct State {
     pub credential_kind: String,
     pub credential_host: String,
     pub credential_value: String,
+    secret: atomics_core::secrets::Secret,
+    secret_value: String,
+    secret_methods: String,
+    secret_path: String,
+    adding_secret: bool,
     pub scope: Option<Scope>,
     pub revoke: Option<String>,
     pub proposal_seen: Option<(String, f64)>,
@@ -66,6 +71,8 @@ impl State {
     /// What lives as long as Settings is open goes when it closes: above all a value typed and never saved.
     fn forget_settings(&mut self) {
         self.credential_value.clear();
+        self.secret_value.clear();
+        self.adding_secret = false;
         self.setup_values.clear();
         self.setup_confirm = None;
         self.confirm = None;

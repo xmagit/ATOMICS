@@ -13,6 +13,7 @@ use egui::{Align, Color32, FontSelection, Rect, Sense, Stroke, Vec2};
 /// What Settings asks about first, because it cannot be undone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Confirm {
+    RemoveSecret(String),
     RemoveCredential {
         kind: String,
         host: Option<String>,
@@ -108,7 +109,7 @@ pub(super) fn draw(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
         remote::draw(ui, backend, client, info)
     });
     section(ui, &p, forced, "Credentials", &credentials_summary(info), false, |ui| {
-        credentials(ui, client, enabled, info)
+        credentials(ui, backend, client, enabled, info)
     });
     section(ui, &p, forced, "Advanced", "", false, |ui| advanced(ui, backend, client, enabled, info));
     // The VM panel can be inserted as another Settings section without changing the shell.
@@ -838,14 +839,16 @@ fn remote_summary(info: &ManagementInfo) -> String {
 fn credentials_summary(info: &ManagementInfo) -> String {
     let Some(entries) = info.tools["credentials"]["entries"].as_array() else { return String::new() };
     let set = entries.iter().filter(|entry| entry["present"] == true).count();
-    format!("{set} of {} set", entries.len())
+    let secrets = info.tools["credentials"]["secrets"].as_array().map_or(0, Vec::len);
+    format!("{secrets} secrets · {set} of {} integrations set", entries.len())
 }
 
-fn credentials(ui: &mut egui::Ui, client: &mut Client, enabled: bool, info: &ManagementInfo) {
+fn credentials(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, enabled: bool, info: &ManagementInfo) {
     let p = client.palette.clone();
     let status = &info.tools["credentials"];
     let busy = info.tools["credential_busy"] == true;
     load(client, enabled, busy, SettingsTool::RefreshCredentials);
+    secrets(ui, backend, client, enabled && !busy, info);
     note(
         ui,
         &p,
@@ -907,6 +910,207 @@ fn credentials(ui: &mut egui::Ui, client: &mut Client, enabled: bool, info: &Man
 }
 
 /// One entry of the credential store: whether it is set, where its value goes, who used it, and what can change it.
+fn secrets(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, enabled: bool, info: &ManagementInfo) {
+    use atomics_core::secrets::{Auth, Scope as SecretScope};
+    let p = client.palette.clone();
+    subheading(ui, &p, "Secrets");
+    if let Some(note_text) = info.tools["credentials"]["copy_note"].as_str() {
+        note(ui, &p, note_text);
+    }
+    note(
+        ui,
+        &p,
+        "New sessions receive secrets in their scope. Relayed values stay in the host store; exposed values can be read and leaked by agents.",
+    );
+    for entry in info.tools["credentials"]["secrets"].as_array().into_iter().flatten() {
+        let name = entry["spec"]["name"].as_str().unwrap_or_default();
+        ui.label(RichText::new(name).strong());
+        note(
+            ui,
+            &p,
+            format!(
+                "{} · {} · Host: {} · Last relay use: {}",
+                entry["kind"].as_str().unwrap_or_default(),
+                entry["scope"].as_str().unwrap_or_default(),
+                entry["spec"]["host"].as_str().unwrap_or("none"),
+                entry["last_used"].as_str().unwrap_or("never")
+            ),
+        );
+        let copy = Command::CopySecret(name.into());
+        let local = backend.available(&copy);
+        let unavailable = if !local {
+            Some(
+                "Copy is available only in a native window on the machine holding the credential store. Open ATOMICS there; remote and protocol clients cannot copy.",
+            )
+        } else {
+            info.tools["secret_copy_unavailable"].as_str()
+        };
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(enabled && local && unavailable.is_none(), egui::Button::new("Copy (OS authentication)"))
+                .clicked()
+            {
+                client.send(copy);
+            }
+            if ui.add_enabled(enabled, egui::Button::new("Remove…")).clicked() {
+                client.management.confirm = Some(Confirm::RemoveSecret(name.into()));
+            }
+        });
+        if let Some(reason) = unavailable {
+            note(ui, &p, reason);
+        }
+        if client.management.confirm == Some(Confirm::RemoveSecret(name.into())) {
+            match ask(
+                ui,
+                client,
+                &format!("Remove {name}? This cannot be undone. Restart existing sessions to clear their environment."),
+                "Remove secret",
+            ) {
+                Some(true) => {
+                    client.management.confirm = None;
+                    tool(client, SettingsTool::RemoveSecret { name: name.into() });
+                }
+                Some(false) => client.management.confirm = None,
+                None => {}
+            }
+        }
+        ui.add_space(4.0);
+    }
+    if ui.add_enabled(enabled, egui::Button::new("Add secret")).clicked() {
+        client.management.adding_secret = true;
+    }
+    if !client.management.adding_secret {
+        ui.separator();
+        return;
+    }
+    ui.add_enabled_ui(enabled, |ui| {
+        let state = &mut client.management;
+        ui.label("Environment variable name");
+        if ui.add(crate::controls::single_line(&mut state.secret.name).hint_text("LOGO_DEV_API_KEY")).changed() {
+            let known = atomics_core::secrets::service(&state.secret.name);
+            state.secret.host = known.as_ref().map(|(host, _)| host.to_string());
+            state.secret.auth = known.map(|(_, auth)| auth).unwrap_or_default();
+        }
+        ui.label("Value");
+        ui.add(crate::controls::single_line(&mut state.secret_value).password(true).hint_text("New value (hidden)"));
+        ui.label("Used with host (optional)");
+        let mut host = state.secret.host.clone().unwrap_or_default();
+        if ui
+            .add(crate::controls::single_line(&mut host).hint_text("api.example.com or a service such as openai"))
+            .changed()
+        {
+            let known = atomics_core::secrets::service(host.trim());
+            state.secret.host = if host.trim().is_empty() {
+                None
+            } else {
+                Some(known.as_ref().map_or_else(|| host.trim().to_ascii_lowercase(), |(h, _)| h.to_string()))
+            };
+            if let Some((_, auth)) = known {
+                state.secret.auth = auth;
+            }
+            if state.secret.host.is_none() {
+                state.secret.auth = Auth::Bearer;
+                state.secret_methods.clear();
+                state.secret_path.clear();
+            }
+        }
+        ui.label(state.secret.kind());
+        egui::ComboBox::from_label("Secret scope").selected_text(state.secret.scope.label()).show_ui(ui, |ui| {
+            ui.selectable_value(&mut state.secret.scope, SecretScope::Everywhere, "Everywhere");
+            for workspace in info.tools["secret_workspaces"].as_array().into_iter().flatten().filter_map(|s| s.as_str())
+            {
+                ui.selectable_value(
+                    &mut state.secret.scope,
+                    SecretScope::Workspace(workspace.into()),
+                    format!("Workspace: {workspace}"),
+                );
+            }
+            for project in
+                info.tools["identities"].as_array().into_iter().flatten().filter_map(|s| s["project"].as_str())
+            {
+                ui.selectable_value(
+                    &mut state.secret.scope,
+                    SecretScope::Project(project.into()),
+                    format!("Project: {project}"),
+                );
+            }
+        });
+        if state.secret.host.is_some() {
+            let selected = match &state.secret.auth {
+                Auth::Bearer => "Authorization bearer",
+                Auth::Header(_) => "Named header",
+                Auth::Basic(_) => "Basic auth",
+                Auth::Query(_) => "Query parameter",
+            };
+            egui::ComboBox::from_label("Authentication").selected_text(selected).show_ui(ui, |ui| {
+                for (auth, label) in [
+                    (Auth::Bearer, "Authorization bearer"),
+                    (Auth::Header(String::new()), "Named header"),
+                    (Auth::Basic(String::new()), "Basic auth"),
+                    (Auth::Query(String::new()), "Query parameter"),
+                ] {
+                    if ui
+                        .selectable_label(
+                            std::mem::discriminant(&state.secret.auth) == std::mem::discriminant(&auth),
+                            label,
+                        )
+                        .clicked()
+                    {
+                        state.secret.auth = auth;
+                    }
+                }
+            });
+            match &mut state.secret.auth {
+                Auth::Header(name) => {
+                    ui.add(crate::controls::single_line(name).hint_text("Header name, e.g. x-api-key"));
+                }
+                Auth::Basic(user) => {
+                    ui.add(
+                        crate::controls::single_line(user).hint_text("Public username (value above is the password)"),
+                    );
+                }
+                Auth::Query(name) => {
+                    ui.add(crate::controls::single_line(name).hint_text("Query parameter name, e.g. api_key"));
+                }
+                _ => {}
+            }
+            ui.add(
+                crate::controls::single_line(&mut state.secret_methods)
+                    .hint_text("Allowed methods, e.g. GET,POST (empty: all)"),
+            );
+            ui.add(
+                crate::controls::single_line(&mut state.secret_path).hint_text("Path prefix, e.g. /v1 (empty: all)"),
+            );
+        }
+        state.secret.methods = state
+            .secret_methods
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_ascii_uppercase)
+            .collect();
+        state.secret.path_prefix = (!state.secret_path.trim().is_empty()).then(|| state.secret_path.trim().into());
+        let validation = state.secret.validate();
+        if let Err(reason) = validation {
+            note(ui, &p, reason);
+        }
+        let save = ui
+            .add_enabled(validation.is_ok() && !state.secret_value.is_empty(), egui::Button::new("Save secret"))
+            .clicked();
+        let cancel = ui.button("Cancel").clicked();
+        if save {
+            let spec = state.secret.clone();
+            let value = std::mem::take(&mut state.secret_value);
+            state.adding_secret = false;
+            tool(client, SettingsTool::AddSecret { spec, value });
+        } else if cancel {
+            state.secret_value.clear();
+            state.adding_secret = false;
+        }
+    });
+    ui.separator();
+}
+
 fn credential(ui: &mut egui::Ui, client: &mut Client, enabled: bool, entry: &serde_json::Value) {
     let p = client.palette.clone();
     let label = entry["label"].as_str().unwrap_or_default();

@@ -1014,9 +1014,75 @@ path remains unavailable in the display.
 
 ## Settings → Credentials
 
+**Add secret** stores a name (an environment variable such as `LOGO_DEV_API_KEY`), a masked value,
+an optional **Used with host**, and a scope: everywhere, one saved workspace, or one project by its
+main checkout. Project scopes follow linked worktrees. Names are unique in this machine's catalog;
+remove an existing entry before adding a replacement. Values are never saved in ATOMICS config.
+The service catalog recognises OpenAI, Anthropic, GitHub, Linear, logo.dev and Stripe, including
+their common environment names, and fills in the host and authentication style. Unknown names
+leave the host empty for you to fill in.
+
+- **Relayed**, with a host: each session in scope receives a fresh placeholder in the named
+  variable and `<NAME>_RELAY_URL`, such as `http://127.0.0.1:<port>/api.example.com` on this machine
+  or `http://host.docker.internal:<port>/api.example.com` inside Docker. Point the API client's base
+  URL there. `OPENAI_API_KEY` also sets `OPENAI_BASE_URL` (including `/v1`), and `ANTHROPIC_API_KEY`
+  sets `ANTHROPIC_BASE_URL`. The relay accepts the placeholder as a bearer token or in the selected
+  API placement, and adds the real value only for the exact allowed host. Choose bearer (default),
+  a named header, basic auth (the public username is metadata; the secret is its password), or a
+  query parameter. Optional HTTP methods and a plain path prefix narrow access further; a prefix
+  allows itself and its descendants. Redirects are not followed. The relay scrubs literal values
+  and their standard query/basic encodings from upstream response headers and bodies, including
+  matches split across streamed chunks, and requests uncompressed responses for this check.
+- **Exposed**, without a host: the session receives the real value in its environment. **Agents
+  can read and leak this value.** Settings and CLI listings say so. Use this only when the tool
+  needs to read the value itself and cannot use an HTTP relay.
+
+An explicit scoped `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` takes precedence over the older
+Claude subscription entry for that session. Exposed model values travel only in the session
+environment, never in Claude's `--settings` argument.
+
+The list shows name, kind, scope, host and last relay use from `relay.log`, never a value. Bare and
+Docker sessions receive secrets automatically when they start or resume, including shells and the
+chief. Docker gets its per-sandbox loopback relay rule automatically; no manual `sbx` command is
+needed. Session environment is applied at attach time, rather than writing general secret values
+into the sandbox's persistent configuration. A failed credential-store read blocks startup with
+an error. Remove asks first, revokes that host's active relay grants and affects new sessions;
+restart existing sessions to clear exposed values from their environment.
+
+**Copy (OS authentication)** is available only in a native window on the machine holding the
+credential store. It authenticates afresh before reading the value and sends it straight to that
+machine's clipboard; it never draws it. macOS uses LocalAuthentication. Linux uses the dedicated
+`com.atomics.copy-secret` polkit action with `auth_self` (no cached authorisation). The package
+ships its policy and the NixOS module enables polkit and installs it for desktops and the VM.
+For a standalone Linux install, run `sudo atomics install --secret-copy-policy`; this writes
+`/usr/share/polkit-1/actions/com.atomics.copy-secret.policy`. On NixOS enable `programs.atomics`
+and run `sudo nixos-rebuild switch`. A desktop polkit authentication agent and `pkcheck` must be
+available. An unavailable Copy row explains the missing prerequisite and exact policy step.
+Cancellation, a missing policy or an unavailable OS prompt always fails closed. Remote windows,
+protocol clients, `atomics ctl` and MCP have no Copy operation, even when connected to a local host.
+
+The CLI accepts values only on stdin, hidden when entered in a terminal; there is no value flag,
+positional value, show command or copy command:
+
+```sh
+atomics secret add EXAMPLE_API_KEY --host api.example.com
+atomics secret add OPENAI_API_KEY --host openai --scope workspace:daily
+atomics secret add EXAMPLE_PASSWORD --scope project:/path/to/main/checkout
+atomics secret list
+atomics secret rm EXAMPLE_API_KEY
+```
+
+`--header x-api-key`, `--basic-user api`, or `--query api_key` selects authentication;
+`--method GET,POST --path-prefix /v1` limits requests. Enter the value when prompted or supply it
+over a pipe. CLI parse errors hide arguments to avoid echoing an accidentally pasted value.
+`cargo test -p atomics secret` and `cargo test -p atomics --test secrets` include canary checks for
+the store, CLI surfaces, OS-auth cancellation, scopes and session injection.
+
 ATOMICS keeps its credential catalog in one OS keychain item, `atomics-credentials-v1`, under account
 `atomics`. macOS uses `security`; Linux uses `secret-tool` and an unlocked Secret Service. There is
-no plaintext-file fallback. Values travel to these helpers on stdin, including macOS's interactive
+no automatic plaintext-file fallback. A headless VM can explicitly select the private folder store
+with `ATOMICS_CREDENTIALS_DIR` (see [the VM trust model](nixos-vm.md)); this uses the same catalog and
+is protected by file permissions rather than an OS keychain. Values travel to keychain helpers on stdin, including macOS's interactive
 command mode. Reads drain bounded stdout/stderr pipes in memory; credential output never passes
 through temporary capture files. The JSON catalog is hex encoded for that command parser; the OS keychain supplies
 its encryption and access control. Oversized catalogs are rejected before writing (macOS
@@ -1041,7 +1107,7 @@ operations run off the UI thread.
 | Private registries | One entry per explicit DNS host | GET/HEAD; Bearer authentication |
 
 These rules restrict relay requests; they do not expand the permissions of the underlying token.
-Integrations request a per-session placeholder from the relay for a catalog identifier (`claude`,
+These older integration entries are separate from the general secrets above. Integrations request a per-session placeholder from the relay for a catalog identifier (`claude`,
 `openai`, `linear`, `github`, or `registry:<host>`). Storing a credential does not automatically grant
 it to every session. Claude's subscription is granted automatically when it starts sandboxed.
 Sandbox Codex continues to use sbx's own OpenAI credential proxy. If you choose the API key option, guided setup saves a new OpenAI
