@@ -89,6 +89,13 @@ impl State {
                 "credentials": self.credential_status,
                 "credential_busy": self.credential_busy,
                 "credential_kinds": crate::credentials::KINDS.iter().map(|(id, label, _)| json!({"id":id, "label":label})).collect::<Vec<_>>(),
+                "identities": self.repos.iter().map(|repo| {
+                    let configured = self.project_identity(repo);
+                    let identity = self.git_identities.get(repo).map_or(configured.clone(), |git| git.overlay(&configured));
+                    let label = self.tickets.workspace_identity_error.clone().unwrap_or_else(|| if identity.name.is_none() && identity.email.is_none() { "Git identity".to_string() } else { identity.label() });
+                    json!({"project": repo.to_string_lossy(), "display": paths::display(repo), "label": label, "identity": identity})
+                }).collect::<Vec<_>>(),
+                "identity_error": self.tickets.workspace_identity_error,
             }),
             remote,
             themes: self.themes.clone(),

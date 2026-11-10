@@ -12,7 +12,7 @@ a diff until you apply or reject it.
 | `default` | built into ATOMICS | everything | every setting; ATOMICS writes them, with comments, into a new `config.toml` |
 | `main` | `~/.config/atomics/config.toml` | every machine that shares the file | every setting |
 | `host` | `config.d/<host>.toml` beside it | this machine | every setting |
-| `workspace` | `workspaces/<host>/<name>.toml`, or a flat `workspaces/<name>.toml` shared by every host | the open workspace | `projects`, `[tickets]`, `[workflow]`, `[isolation]`, `[chief] prompt` and how its chief starts (`[chief] cwd`, `resume`, `autostart`) |
+| `workspace` | `workspaces/<host>/<name>.toml`, or a flat `workspaces/<name>.toml` shared by every host | the open workspace | `projects`, `[identity]`, `[tickets]`, `[workflow]`, `[isolation]`, `[chief] prompt` and how its chief starts (`[chief] cwd`, `resume`, `autostart`) |
 | `repo` | `<main checkout>/.atomics/config.toml` | one repository | allowlisted declarative workflow settings; see [Repository workflows](repo-workflow.md) |
 | `theme` | `themes/<name>.toml` beside `config.toml` | whatever selects the theme | theme tokens; see [themes](themes.md) |
 
@@ -38,7 +38,7 @@ saved ones have `[tickets]`), the open workspace has no `[tickets]`, or its sect
 
 The scope of a proposed change is `main`, `host`, `workspace` or `theme`. Use `host` for anything that is true of one
 machine only: its core count, its programs' paths, its repositories. A workspace change may touch `[tickets]`, `[workflow]`,
-`[isolation]` and `[chief] prompt`; open and close its projects in ATOMICS instead. A theme change writes one theme file; showing
+`[isolation]`, `[identity]` and `[chief] prompt`; open and close its projects in ATOMICS instead. A theme change writes one theme file; showing
 that theme is a separate `main` or `host` change to `[theme] name`.
 
 ## Merge order
@@ -54,11 +54,68 @@ ATOMICS starts from the built-in defaults, then applies `config.toml`, then this
   `mode = "sandbox"`; see [Agent isolation](isolation.md). A config file that names no `[isolation] mode` means
   `sandbox`; the file a new install starts with says `bare`.
 - Repository config overlays only its documented declarative keys; `[tickets] branch` keeps the workspace provider.
+- Identity keys resolve from the user-owned project override, then workspace, then main/host config, then Git.
 - `[chief] prompt` adds up instead of replacing; see below.
 
 A main, host or workspace file that does not parse leaves ATOMICS on the last configuration that loaded.
 The top bar or toast says so, and `atomics doctor` names the file. A broken repository config is ignored
 with a warning; see [Repository workflows](repo-workflow.md).
+
+## Commit identity and word guard
+
+Set a default in your main config (or its host override):
+
+```toml
+[identity]
+name = "Example Contributor"
+email = "contributor@example.com"
+forbidden_words = ["contoso"]
+
+# Also in your user config, keyed by the project's main checkout, never a task worktree.
+[identity.projects."~/repos/app"]
+name = "Project Contributor"
+email = "project@example.com"
+forbidden_words = ["contoso", "internal-example"]
+```
+
+A workspace file can set the same three keys in `[identity]`. Each key uses the most specific
+setting: `identity.projects.<main checkout>` in the user's main/host config, then the open
+workspace's `[identity]`, then main/host `[identity]`, then Git's own name and email. Paths expand
+`~` and resolve to the main checkout, including when a task runs in a linked worktree. An omitted
+word list inherits; `forbidden_words = []` clears it. Matching is case-insensitive and finds literal
+substrings. Repository `.atomics/config.toml` files cannot set identities or project identity maps.
+
+The explorer's project row shows its active identity; its **Change identity…** menu opens
+**Settings → Identity**. Choose the main config, the open workspace or a project, enter the name,
+email and words, then review and Apply the proposed change. Workspace changes update the display
+and existing ATOMICS worktrees. Existing commits keep their original authorship. Remove an override
+in the config to inherit from the next scope.
+
+New and reused ATOMICS worktrees receive a conditional repository-local Git config include for just
+that worktree. Its identity file lives under the common Git directory's `atomics-identities/`, outside
+the sandbox's writable directories. This preserves the main checkout's Git identity and does not
+enable `extensions.worktreeConfig`. ATOMICS also supplies the selected identity explicitly for its
+automatic task commit and integration merge, for both author and committer.
+
+Before integration, ATOMICS checks the task branch name, every new commit's raw author, committer,
+message and added lines, plus the current diff and all untracked files. It also checks text it will
+put into its own commits. A forbidden word or an author email different from the configured email
+blocks integration before staging or merging. A mailmap cannot hide a different author. Matches in
+earlier commits still block even if later commits removed them. Fix the content or commit history,
+then integrate again.
+
+Readiness checks show guard failures on the board and in the chief's plan tools. Findings contain
+only a file, a 1-based line number and the reason, never the matched word, email or surrounding text.
+Commit metadata uses `.git/objects/<commit>` with raw commit-object line numbers; branch names use
+`.git/refs/heads/<branch>:1`; pending automatic messages use `.git/COMMIT_EDITMSG` or `.git/MERGE_MSG`.
+The guard checks author email when configured; it does not rewrite commits.
+
+`atomics doctor` reports the resolved name and email for every open project (including the saved
+workspace) and warns if a workspace defines an identity but a missing key still comes from Git's
+global identity.
+
+If a workspace identity is invalid, ATOMICS shows the problem and blocks new agents and integration
+until it is fixed, preserving existing worktree settings while the problem is unresolved.
 
 ## The chief's prompt
 
@@ -215,6 +272,7 @@ people change, and each reads what it shows as it opens:
 | Updates | Only with something to say: this version and the new one, its notes, the Update button, what an update is doing, and why the last check failed. A client always has it, to say which version the host runs. See [Updates](#updates). |
 | Theme | The [themes](themes.md) with their colors. A click shows one at once and saves it. |
 | Shortcuts | The keys every client takes, then the configured ones, which a remote client says are the desktop's. |
+| Identity | The active identity per project, and a form to review and apply a main, workspace or project override. |
 | Agents | The configured agents, the chief's task agent preference and quota-left minimums, whether they run sandboxed, what they need, with [a click or the exact command](isolation.md#fresh-machine-clicks-or-one-guided-command) for each step, the [sandbox checks](isolation.md#check-sandbox-setup) and the Claude hooks. |
 | Connections | [MCP servers](isolation.md#mcp-connections) for sandboxed agents. |
 | Remote devices | Pairing and paired devices, as in the Remote window. |
