@@ -85,9 +85,12 @@ pub fn load(ui: &mut egui::Ui, backend: &dyn Backend, p: &Palette, in_menu: bool
 }
 
 fn load_button(ui: &mut egui::Ui, label: &str, color: Color32, available: bool, details: &str) -> egui::Response {
-    ui.add_enabled(available, egui::Button::new(RichText::new(label).color(color).size(12.0)))
-        .on_hover_text(format!("Open Machine\n{details}"))
-        .on_disabled_hover_text(format!("Machine is unavailable from this host\n{details}"))
+    let text = RichText::new(label).color(color).size(12.0);
+    if available {
+        ui.add(egui::Button::new(text)).on_hover_text(format!("Open Machine\n{details}"))
+    } else {
+        ui.add(egui::Label::new(text).sense(Sense::hover())).on_hover_text(details)
+    }
 }
 
 fn load_details(state: &ResourceInfo) -> String {
@@ -108,6 +111,23 @@ fn load_details(state: &ResourceInfo) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn load_gauge_keeps_warning_and_error_colors_when_machine_is_unavailable() {
+        let p = Palette::new(&Default::default(), Default::default());
+        for color in [p.warning, p.error] {
+            let ctx = egui::Context::default();
+            let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let response = load_button(ui, "load 1.0", color, false, "Load details");
+                assert!(response.enabled(), "load colors must not be faded by a disabled widget");
+            });
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Text(text) if text.galley.job.text == "load 1.0"
+                    && text.galley.job.sections.iter().all(|section| section.format.color == color)
+            )));
+            output.drop_without_applying_deltas();
+        }
+    }
 
     #[test]
     fn load_gauge_has_a_button_frame_hover_and_load_colors() {

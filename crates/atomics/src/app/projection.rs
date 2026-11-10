@@ -183,7 +183,7 @@ impl State {
                     running: !terminal.exited(),
                     file: self.editor_files.get(root).cloned(),
                     inlay_hints: !self.config.editor.inlay_hints_keys.is_empty(),
-                    error: None,
+                    error: if terminal.exited() { self.editor_errors.get(root).cloned() } else { None },
                 }
             })
             .collect();
