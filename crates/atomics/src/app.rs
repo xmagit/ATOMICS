@@ -429,7 +429,7 @@ impl StatusEvent {
         value["task"] = json!(self.task);
         if let Some((status, summary, task, agent)) = &self.report {
             value["report"] = json!({ "status": status, "summary": summary, "task": task,
-                "provenance": plan::agent_provenance("report", task.as_deref(), agent, self.at) });
+                "data_notice": plan::REPORT_DATA_NOTICE, "provenance": plan::agent_provenance("report", task.as_deref(), agent, self.at) });
         }
         if let Some(findings) = &self.findings {
             value["findings"] = json!(findings);
@@ -1271,6 +1271,11 @@ impl State {
 
     fn apply_config(&mut self) {
         self.management_config.take();
+        for index in 0..self.plans.len() {
+            if self.plans[index].is_open() && self.plans[index].select_review_agent(&self.config) {
+                self.save_plan(index);
+            }
+        }
         if !self.effective_isolation().sandbox.azure.enabled {
             self.relay.revoke_azure();
         }
