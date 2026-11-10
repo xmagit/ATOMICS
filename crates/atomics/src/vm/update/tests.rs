@@ -124,6 +124,21 @@ fn busy_refuses_turns_and_user_waits_and_yes_is_an_explicit_override() {
 }
 
 #[test]
+fn review_p7_restart_rechecks_busy_work_without_announcing_the_same_override_twice() {
+    let blockers = vec!["worker is active".to_string()];
+    let mut policy = BusyPolicy { yes: true, ..Default::default() };
+    let notices: Vec<_> =
+        [policy.check(&blockers).unwrap(), policy.check(&blockers).unwrap()].into_iter().flatten().collect();
+    assert_eq!(notices.len(), 1);
+    assert!(notices[0].contains("Continuing with busy work (--yes)"));
+    // Work can start after the pre-quit check. The post-quit checkpoint must still refuse it
+    // when there is no explicit override, even though the earlier checkpoint was idle.
+    let mut refuse = BusyPolicy::default();
+    assert!(refuse.check(&[]).unwrap().is_none());
+    assert!(refuse.check(&blockers).is_err());
+}
+
+#[test]
 fn expression_and_nix_arguments_preserve_settings_paths_and_copied_modules() {
     let dir = tempfile::tempdir().unwrap();
     crate::test_support::write_program(

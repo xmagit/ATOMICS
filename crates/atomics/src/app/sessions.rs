@@ -1331,8 +1331,21 @@ fn brief_file(session: &str, text: &str, sandboxed: bool) -> Result<String, Stri
     atomics_core::store::private_dir(&paths::atomics_home()).map_err(|e| format!("creating state: {e}"))?;
     atomics_core::store::private_dir(&paths::briefs_dir()).map_err(|e| format!("creating briefs: {e}"))?;
     let path = if sandboxed { dir.join("brief.md") } else { dir.join(format!("{session}.md")) };
-    atomics_core::store::write_private(&path, text.as_bytes())
-        .map_err(|e| format!("writing {}: {e}", path.display()))?;
+    if sandboxed {
+        use std::os::unix::fs::PermissionsExt;
+        // sbx mounts this session directory read-only. Preserve its previous 0755/0644
+        // access: the guest agent may have a different uid from the host user. Bare briefs
+        // remain private; do not require host ownership through an unverified uid mapping.
+        std::fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("setting permissions on {}: {e}", dir.display()))?;
+        std::fs::write(&path, text).map_err(|e| format!("writing {}: {e}", path.display()))?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .map_err(|e| format!("setting permissions on {}: {e}", path.display()))?;
+    } else {
+        atomics_core::store::write_private(&path, text.as_bytes())
+            .map_err(|e| format!("writing {}: {e}", path.display()))?;
+    }
     Ok(format!("Your task brief is in {}. Read it first and follow it exactly.", path.display()))
 }
 
@@ -1520,12 +1533,17 @@ mod tests {
     }
 
     #[test]
-    fn audit_p7_prompt_briefs_are_private_for_bare_and_sandboxed_sessions() {
+    fn audit_p7_briefs_keep_bare_prompts_private_and_restore_sandbox_mount_permissions() {
         with_app(
-            "app::sessions::tests::audit_p7_prompt_briefs_are_private_for_bare_and_sandboxed_sessions",
+            "app::sessions::tests::audit_p7_briefs_keep_bare_prompts_private_and_restore_sandbox_mount_permissions",
             |_app, _| {
                 use std::os::unix::fs::PermissionsExt;
                 for sandboxed in [false, true] {
+                    if sandboxed {
+                        // Repair a session directory and brief tightened by the previous version too.
+                        atomics_core::store::write_private(&paths::briefs_dir().join("worker/brief.md"), b"old")
+                            .unwrap();
+                    }
                     brief_file("worker", "private prompt", sandboxed).unwrap();
                     let path = if sandboxed {
                         paths::briefs_dir().join("worker/brief.md")
@@ -1533,8 +1551,15 @@ mod tests {
                         paths::briefs_dir().join("worker.md")
                     };
                     assert_eq!(std::fs::read_to_string(&path).unwrap(), "private prompt");
-                    assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
-                    for dir in [paths::atomics_home(), paths::briefs_dir(), path.parent().unwrap().to_path_buf()] {
+                    assert_eq!(
+                        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                        if sandboxed { 0o644 } else { 0o600 }
+                    );
+                    assert_eq!(
+                        std::fs::metadata(path.parent().unwrap()).unwrap().permissions().mode() & 0o777,
+                        if sandboxed { 0o755 } else { 0o700 }
+                    );
+                    for dir in [paths::atomics_home(), paths::briefs_dir()] {
                         assert_eq!(std::fs::metadata(dir).unwrap().permissions().mode() & 0o777, 0o700);
                     }
                 }

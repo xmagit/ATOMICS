@@ -309,11 +309,8 @@ const PARENT_SESSION_VARS: &[&str] = &[
 
 fn main() -> eframe::Result {
     let cli = Cli::parse();
-    if matches!(cli.command, None | Some(Command::Host { .. }))
-        && let Err(error) = atomics_core::paths::validate_socket_path(&atomics_core::paths::socket_path())
-    {
-        eprintln!("atomics: {error}");
-        std::process::exit(1);
+    if matches!(cli.command, Some(Command::Host { .. })) {
+        validate_control_socket();
     }
     let mut migration_errors = Vec::new();
     if matches!(cli.command, None | Some(Command::Host { .. })) {
@@ -564,6 +561,8 @@ fn main() -> eframe::Result {
         };
         return client::run(target, launch, native_options(size, load_icon()));
     }
+    // Only a local host binds this socket; --connect and [client] connect use the remote host's.
+    validate_control_socket();
     // A link goes to the ATOMICS that is running, and this process ends; otherwise it is handled
     // once the app has loaded.
     let link =
@@ -665,6 +664,13 @@ fn load_icon() -> egui::IconData {
     let info = reader.next_frame(&mut rgba).expect("embedded icon must decode");
     rgba.truncate(info.buffer_size());
     egui::IconData { rgba, width: info.width, height: info.height }
+}
+
+fn validate_control_socket() {
+    if let Err(error) = atomics_core::paths::validate_socket_path(&atomics_core::paths::socket_path()) {
+        eprintln!("atomics: {error}");
+        std::process::exit(1);
+    }
 }
 
 #[cfg(test)]
