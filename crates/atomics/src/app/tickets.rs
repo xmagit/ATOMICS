@@ -298,7 +298,9 @@ impl State {
             .chief
             .system_prompt
             .replace("{projects}", &projects.join(", "))
-            .replace("{base_ref}", &self.config.base_ref);
+            .replace("{base_ref}", &self.config.base_ref)
+            .replace("{chief_prefer}", &json!(self.config.chief.prefer).to_string())
+            .replace("{chief_min_left_percent}", &json!(self.config.chief.min_left_percent).to_string());
         prompt.push_str(&format!("\n\nWorkflow: done = {:?}; ordered stages: {}. Acceptance still unblocks dependencies. Report lifecycle stages with atomics_plan_stage (plan, optional task, stage, optional url/note); external bridges use atomics_stage_event. Completion and the ticket done mapping wait for the configured milestone. ci_failed never proves success.\n", self.workflow().done, self.workflow().stages.join(", ")));
         if let Some(config) = self.ticket_config() {
             prompt.push_str("\n\n");
@@ -2535,6 +2537,8 @@ mod tests {
     fn wait_for(app: &mut Desktop<'_>, _ctx: &egui::Context, statuses: &[&str]) -> Receiver<ControlOutcome> {
         let (tx, rx) = channel();
         let request = ControlRequest::Wait {
+            compact: false,
+            full_sessions: false,
             // Ticket events reach waiters watching other sessions too.
             sessions: vec!["agent-a".into()],
             statuses: statuses.iter().map(|s| s.to_string()).collect(),

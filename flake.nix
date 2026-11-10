@@ -26,7 +26,9 @@
           pkgs = import nixpkgs { inherit system; };
         in
         {
-          atomics = pkgs.callPackage ./nix/atomics.nix { };
+          atomics = pkgs.callPackage ./nix/atomics.nix {
+            buildRevision = self.shortRev or self.dirtyShortRev or null;
+          };
           atomics-onboard = pkgs.callPackage ./nix/vm/onboard.nix { };
           default = self.packages.${system}.atomics;
         } // nixpkgs.lib.optionalAttrs (system == "aarch64-linux") {
@@ -70,6 +72,13 @@
           atomics-vm-generic = vmRelease.config.system.build.toplevel;
           atomics-vm-generic-mac = vmRelease.config.programs.atomics.macDesktop.bundle;
           atomics-vm-with-host = vmWithHost.config.system.build.toplevel;
+          atomics-vm-config = import ./nix/tests/vm-config.nix {
+            pkgs = import nixpkgs { inherit system; };
+            vm = vm.config;
+            vmWithHost = vmWithHost.config;
+            vmRelease = vmRelease.config;
+            desktop = self.nixosConfigurations.atomics-test.config;
+          };
           atomics-vm-host = import ./nix/tests/vm-host.nix {
             pkgs = import nixpkgs { inherit system; };
             vm = vmWithHost.config;

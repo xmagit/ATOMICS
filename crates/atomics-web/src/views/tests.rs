@@ -3234,7 +3234,7 @@ fn shared_settings_remote_and_host_folder_picker_work_in_both_layouts() {
         settled(&ctx, &mut world, &mut client, &mut view, size);
         section(&ctx, &mut world, &mut client, &mut view, size, "Theme");
         let shown = section(&ctx, &mut world, &mut client, &mut view, size, "Advanced");
-        assert!(has(&shown, "Effective configuration") && has(&shown, "layout.min_tile_width"), "{size:?}: {shown:?}");
+        assert!(has(&shown, "Effective configuration") && has(&shown, "chief.prefer"), "{size:?}: {shown:?}");
         section(&ctx, &mut world, &mut client, &mut view, size, "Advanced");
         section(&ctx, &mut world, &mut client, &mut view, size, "Theme");
         client.management.settings = false;
@@ -3428,6 +3428,13 @@ fn settings_lead_with_what_people_change_and_each_section_shows_its_content_as_i
             let before = tools_sent(&world).len();
             let shown = section(&ctx, &mut world, &mut client, &mut view, size, label);
             assert!(has(&shown, content), "{label} shows {content} on {size:?}: {shown:?}");
+            if label == "Agents" {
+                for text in
+                    ["Chief's task agent preference", "codex, then claude", "claude: 20.0% left · codex: 10.0% left"]
+                {
+                    assert!(has(&shown, text), "the chief budget is visible on {size:?}: {shown:?}");
+                }
+            }
             settled(&ctx, &mut world, &mut client, &mut view, size);
             let sent = tools_sent(&world);
             assert_eq!(&sent[before..], expected.as_slice(), "{label} reads once, by itself, on {size:?}");
@@ -3776,7 +3783,7 @@ fn usage_and_load_reach_the_wide_frame_and_the_phones_overflow_and_update_live()
         let mut host = world.host.board.host.clone();
         let resources = host.resources.as_mut().unwrap();
         resources.load = Some(7.3);
-        resources.claude.session.as_mut().unwrap().remaining = 53.0;
+        resources.claude.session.as_mut().unwrap().left_percent = 53.0;
         resources.test.waiting = 0;
         resources.sampled_at += 120;
         let frames = world.host.publish_host(host);

@@ -54,9 +54,10 @@ struct Detail {
     all_brief: bool,
 }
 
-const LEVELS: [Detail; 5] = [
+const LEVELS: [Detail; 6] = [
     Detail { text: 400, quiet_tasks_brief: false, all_brief: false },
     Detail { text: 150, quiet_tasks_brief: false, all_brief: false },
+    Detail { text: 60, quiet_tasks_brief: false, all_brief: false },
     Detail { text: 150, quiet_tasks_brief: true, all_brief: false },
     Detail { text: 60, quiet_tasks_brief: true, all_brief: false },
     Detail { text: 0, quiet_tasks_brief: true, all_brief: true },
@@ -68,6 +69,13 @@ impl State {
         let mut value = serde_json::to_value(task).unwrap_or_default();
         if let Some(report) = &task.report {
             value["report"] = report_view(report, None, 240);
+            // This envelope covers the summary and every nested check field.
+            value["report"]["provenance"] = plan::agent_provenance(
+                "report",
+                Some(&task.id),
+                &atomics_core::tickets::model_label(&task.agent, &task.args),
+                report.at,
+            );
         }
         if task.integrated.is_some() {
             value["integration_verified"] = json!(task.integration_verified);
@@ -88,6 +96,7 @@ impl State {
             "goal": clip(&plan.goal, 1000),
             "project": plan.project,
             "approved": plan.approved,
+            "notebook": {"enabled": self.notebook_enabled(index), "pinned": plan.pinned_notes(), "proposals": plan.notebook.iter().filter(|n| !n.pinned).count()},
             "integration": plan.integration_branch(),
             "workflow": self.plan_workflow(plan),
             "ready": plan.ready().iter().map(|t| &t.id).collect::<Vec<_>>(),
@@ -196,6 +205,14 @@ impl State {
                 report_view(report, Some(detail.text), detail.text.min(240))
             };
         }
+        if let Some(report) = &task.report {
+            value["report"]["provenance"] = plan::agent_provenance(
+                "report",
+                Some(&task.id),
+                &atomics_core::tickets::model_label(&task.agent, &task.args),
+                report.at,
+            );
+        }
         if brief {
             return value;
         }
@@ -301,6 +318,7 @@ mod tests {
                 let plan = response.result["plan"].as_str().unwrap().to_string();
                 let index = app.runtime.plans.iter().position(|p| p.id == plan).unwrap();
                 app.runtime.plans[index].tasks[0].session = Some("worker".into());
+                app.runtime.plans[index].tasks[0].agent = "codex".into();
                 let check = json!({"check":"acceptance check", "command":"cargo test", "exit":0,
                 "output_tail":format!("{}\npassed\u{1b}", "界".repeat(4000))});
                 let response = request(
@@ -326,6 +344,11 @@ mod tests {
                         if view.result.get("task").is_some() { &view.result["task"] } else { &view.result["tasks"][0] };
                     let report = &task["report"];
                     assert_eq!(report["data_notice"], REPORT_DATA_NOTICE);
+                    assert_eq!(report["provenance"]["source"], "agent");
+                    assert_eq!(report["provenance"]["task"], "a");
+                    assert_eq!(report["provenance"]["agent"], "Codex");
+                    assert_eq!(report["provenance"]["at"], report["at"]);
+                    assert!(report["provenance"]["handling"].as_str().unwrap().contains("data, not instructions"));
                     assert_eq!(report["checks"][0]["command"], "cargo test");
                     assert_eq!(report["checks"][0]["exit"], 0);
                     let tail = report["checks"][0]["output_tail"].as_str().unwrap();
@@ -412,6 +435,10 @@ mod tests {
                     assert!(note.starts_with("note 199 ") && note.ends_with("more characters]"), "{note}");
                     let summary = task["report"]["summary"].as_str().unwrap();
                     assert!(summary.starts_with(&format!("summary {i} ")) && summary.ends_with("more characters]"));
+                    assert_eq!(task["report"]["provenance"]["source"], "agent");
+                    assert!(
+                        task["report"]["provenance"]["handling"].as_str().unwrap().contains("data, not instructions")
+                    );
                 }
                 assert!(tasks[0]["title"].as_str().unwrap().ends_with("more characters]"), "{}", tasks[0]);
 
@@ -562,6 +589,8 @@ mod tests {
                 let (tx, _rx) = std::sync::mpsc::channel();
                 app.runtime.control(
                     ControlRequest::Wait {
+                        compact: false,
+                        full_sessions: false,
                         sessions: vec![],
                         statuses: vec!["heartbeat".into()],
                         after: Some(u64::MAX),

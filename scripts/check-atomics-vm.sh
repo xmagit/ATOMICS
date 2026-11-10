@@ -6,7 +6,7 @@ test "$(uname -m)" = aarch64
 test "$(findmnt -n -o FSTYPE /)" = btrfs
 grep -q 'flags: .*F' /proc/sys/fs/binfmt_misc/rosetta
 
-for tool in node git gh claude codex cargo rustc rustup docker atomics-onboard jq ss; do
+for tool in node git gh claude codex cargo rustc rustup gcc pkg-config python3 mktemp docker atomics-onboard jq ss; do
   command -v "$tool"
 done
 

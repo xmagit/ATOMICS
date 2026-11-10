@@ -1,5 +1,6 @@
 { lib, rustPlatform, pkg-config, patchelf, alsa-lib, wayland, libxkbcommon
-, vulkan-loader, mesa, fontconfig, git, libx11, libxcursor, libxrandr, libxi, makeWrapper }:
+, vulkan-loader, mesa, fontconfig, git, libx11, libxcursor, libxrandr, libxi, makeWrapper
+, buildRevision ? null }:
 
 let
   runtimeLibraries = [
@@ -26,8 +27,8 @@ let
     else
       lib.fileset.difference root
         (lib.fileset.unions (map (name: lib.fileset.maybeMissing (root + "/${name}")) [ ".git" ".atomics" "target" ]));
-  # Of those, what the build reads: an edit to the docs, the Nix files or another script then leaves
-  # the package (and every VM image built with it) as it was.
+  # Of those, what the build reads: docs, Nix files and unrelated scripts stay out of the source.
+  # The flake revision still records which checkout the package was built from.
   buildInputsOnly = lib.fileset.intersection tracked (lib.fileset.unions [
     (root + "/Cargo.toml")
     (root + "/Cargo.lock")
@@ -48,6 +49,9 @@ rustPlatform.buildRustPackage {
   cargoLock.lockFile = ../Cargo.lock;
   cargoBuildFlags = [ "-p" "atomics" ];
   doCheck = false;
+  env = lib.optionalAttrs (buildRevision != null) {
+    ATOMICS_BUILD_REVISION = buildRevision;
+  };
 
   nativeBuildInputs = [ pkg-config patchelf makeWrapper ];
   buildInputs = runtimeLibraries;
