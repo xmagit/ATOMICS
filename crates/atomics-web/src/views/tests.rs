@@ -50,6 +50,17 @@ fn drawn(
     let mut output = ctx.run_ui(input, |ui| draw(ui, &mut world.driver, client, view));
     output.textures_delta.clear();
     world.pump();
+    let visible_text: Vec<String> = output
+        .shapes
+        .iter()
+        .filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if shape.clip_rect.contains_rect(text.visual_bounding_rect()) => {
+                Some(text.galley.text().to_string())
+            }
+            _ => None,
+        })
+        .collect();
+    ctx.data_mut(|data| data.insert_temp(egui::Id::NULL.with("visible-view-text"), visible_text));
     output
         .shapes
         .iter()
@@ -3513,7 +3524,13 @@ fn settings_scroll_to(
     text: &str,
 ) -> Vec<(String, Rect)> {
     for _ in 0..24 {
-        if has(&shown, text) {
+        // A partly painted button label can still have its click target below the scroll area's edge.
+        let visible = ctx
+            .data(|data| data.get_temp::<Vec<String>>(egui::Id::NULL.with("visible-view-text")))
+            .unwrap_or_default()
+            .iter()
+            .any(|shown| shown.starts_with(text));
+        if has(&shown, text) && visible {
             break;
         }
         drawn(

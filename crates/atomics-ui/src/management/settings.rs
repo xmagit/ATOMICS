@@ -674,7 +674,7 @@ impl ShortcutForm {
         if !self.problems(os).is_empty() {
             return None;
         }
-        let values = self.bindings.iter().map(|(key, text)| (key.clone(), text.trim().into())).collect();
+        let values = self.bindings.iter().map(|(key, text)| (key.clone(), text.clone().into())).collect();
         form_proposal(self.scope, &self.original, &values, "Update keyboard shortcuts")
     }
 }
@@ -1606,7 +1606,10 @@ mod settings_tests {
 
     #[test]
     fn shortcut_form_detects_client_aliases_fixed_keys_and_invalid_chords() {
-        let mut form = ShortcutForm::new(ShortcutForm::values(&ManagementInfo::default()));
+        let mut values = ShortcutForm::values(&ManagementInfo::default());
+        values.insert("keys.quick_open".into(), " cmd+p ".into());
+        let mut form = ShortcutForm::new(values);
+        assert!(form.proposal(OperatingSystem::Nix).is_none(), "opening the form preserves existing whitespace");
         assert!(form.problems(OperatingSystem::Mac).is_empty());
         assert!(form.problems(OperatingSystem::Nix).is_empty());
         form.bindings.insert("keys.quick_open".into(), "ctrl+shift+d".into());
