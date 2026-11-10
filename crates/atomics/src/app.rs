@@ -631,6 +631,8 @@ pub(crate) struct State {
     panel: PanelMode,
     editors: HashMap<PathBuf, Terminal>,
     editor_files: HashMap<PathBuf, String>,
+    /// Why the editor of a worktree could not start, until it starts: shown in every client's editor panel.
+    editor_errors: HashMap<PathBuf, String>,
     events: Vec<StatusEvent>,
     event_seq: u64,
     last_status: HashMap<String, AgentStatus>,
@@ -1176,6 +1178,7 @@ impl State {
             panel: PanelMode::Diff,
             editors: HashMap::new(),
             editor_files: HashMap::new(),
+            editor_errors: HashMap::new(),
             events: Vec::new(),
             event_seq: 0,
             last_status: HashMap::new(),

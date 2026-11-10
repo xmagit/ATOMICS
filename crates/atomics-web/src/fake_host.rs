@@ -948,6 +948,7 @@ impl FakeHost {
                     file: path,
                     running: true,
                     inlay_hints: true,
+                    error: None,
                 });
                 let _ = self.publish_host(host);
                 return Outcome::done(serde_json::Value::Null);
@@ -1632,6 +1633,7 @@ pub fn panels_host() -> FakeHost {
         running: true,
         file: Some("src/a.rs".into()),
         inlay_hints: true,
+        error: None,
     });
     for (key, repo) in [
         ("pull:example/repo#7", "example/repo"),
