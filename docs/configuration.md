@@ -326,9 +326,15 @@ bar folds and has room for it. Each section reads what it shows as it opens:
 
 The Chief model picker offers aliases accepted by its command (Claude Code: `fable`, `opus`, `sonnet`, `haiku`)
 and a custom full model name. It writes `[chief] model`, translated to `--model` on launch. An existing model flag
-in `chief.args` stays in use and shows as **Custom (args)** until a model is selected. Explicit `model` replaces
-only that model flag at launch and preserves the rest of `args`. Model and autostart apply on the next chief start;
+in a higher layer's `chief.args` wins over a lower layer's `model` and shows as **Custom (args)**. Within one
+layer, explicit `model` replaces only the model flag at launch and preserves the rest of `args`. `-m` is a model
+flag only for commands named `claude` or `codex`; wrappers keep their other short flags. Model names cannot be
+blank, start with `-`, or contain whitespace. Alias signatures name the Claude family and mark it as an alias;
+only a full model ID identifies a concrete version. Model and autostart apply on the next chief start;
 intervals and dock changes apply while it runs.
+
+Closing Settings discards unsaved Chief and Shortcut edits, while remembering the selected section. Review
+creates a separate pending proposal, which remains available to Apply or Reject after Settings closes.
 
 What can be undone acts at once: picking a theme, the Azure CLI switch, connecting and disconnecting a server. Only what
 cannot asks first: removing or replacing a credential, removing unknown entries, revoking a device. **Edit config**
@@ -414,7 +420,9 @@ The chief learns the outcome from a `config` event in `atomics_wait`:
 
 `outcome` is `applied`, `rejected` or `failed` (with `error`). `backup` is missing when the change created the
 file. Each config file keeps its newest ten backups, with one copy per distinct content, including applies in the
-same second. Applying an unchanged file adds no backup. Waiting proposals block `atomics_restart` and do not survive a restart.
+same second. Cleanup is best-effort and always keeps the snapshot just returned, including when the clock moves
+backwards. A cleanup failure never changes a successful apply into a failure. Applying an unchanged file adds no
+backup. Waiting proposals block `atomics_restart` and do not survive a restart.
 
 ## Trust model
 

@@ -3966,6 +3966,37 @@ fn chief_model_and_startup_changes_are_proposed_from_desktop_and_phone_layouts()
 }
 
 #[test]
+fn custom_chief_model_explains_empty_and_invalid_values_and_closing_discards_the_draft() {
+    for size in [WIDE, PHONE] {
+        let (ctx, mut world, mut client, mut view) = live_with(fake_host::management());
+        client.management.settings = true;
+        let shown = section(&ctx, &mut world, &mut client, &mut view, size, "Chief");
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(exactly(&shown, "Custom (args)")));
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "Custom model…")));
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(has(&shown, "Enter a model name."), "{size:?}: {shown:?}");
+        drawn(
+            &ctx,
+            &mut world,
+            &mut client,
+            &mut view,
+            size,
+            click(on(&shown, "Full model name accepted by the command")),
+        );
+        drawn(&ctx, &mut world, &mut client, &mut view, size, text("-invalid"));
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(has(&shown, "A model name cannot start with '-' or contain whitespace."), "{shown:?}");
+        drawn(&ctx, &mut world, &mut client, &mut view, size, press(egui::Key::Escape, egui::Modifiers::NONE));
+        client.management.settings = true;
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(has(&shown, "Custom (args)"));
+        assert!(!has(&shown, "-invalid") && !has(&shown, "Enter a model name."));
+        assert!(!world.host.host_commands.iter().any(|action| matches!(action, HostAction::ConfigPropose { .. })));
+    }
+}
+
+#[test]
 fn shortcut_edits_report_conflicts_and_only_valid_edits_can_be_proposed() {
     for size in [WIDE, PHONE] {
         let (ctx, mut world, mut client, mut view) = live_with(fake_host::management());
