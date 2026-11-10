@@ -161,23 +161,25 @@ pub fn save_deferred(home: &Path, deferred: &[Deferred]) -> Result<()> {
 }
 
 /// The processes of this user that use `dir`: their working directory is in it, or they hold a file
-/// open under it. Each as `<pid> <name>`; never this process. Empty when none do, or when this
-/// machine cannot tell (no `/proc`, no `lsof`).
+/// open under it. Each as `<pid> <name>`. Includes this process and mapped executables/libraries.
+/// An unavailable inspector is reported as a user, so destructive cleanup fails closed.
 pub fn processes_in(dir: &Path) -> Vec<String> {
     let dir = real(dir);
     let inside = |path: &Path| path.starts_with(&dir);
-    let me = std::process::id();
     let mut found = Vec::new();
     if let Ok(entries) = std::fs::read_dir("/proc") {
         for entry in entries.flatten() {
             let Some(pid) = entry.file_name().to_str().and_then(|name| name.parse::<u32>().ok()) else { continue };
-            if pid == me {
-                continue;
-            }
             let base = entry.path();
             let uses = std::fs::read_link(base.join("cwd")).is_ok_and(|cwd| inside(&cwd))
+                || std::fs::read_link(base.join("exe")).is_ok_and(|exe| inside(&exe))
                 || std::fs::read_dir(base.join("fd"))
-                    .is_ok_and(|fds| fds.flatten().any(|fd| std::fs::read_link(fd.path()).is_ok_and(|f| inside(&f))));
+                    .is_ok_and(|fds| fds.flatten().any(|fd| std::fs::read_link(fd.path()).is_ok_and(|f| inside(&f))))
+                || std::fs::read_to_string(base.join("maps")).is_ok_and(|maps| {
+                    maps.lines()
+                        .filter_map(|line| line.find('/').map(|at| &line[at..]))
+                        .any(|path| inside(Path::new(path)))
+                });
             if uses {
                 let name = std::fs::read_to_string(base.join("comm")).unwrap_or_default();
                 found.push(format!("{pid} {}", name.trim()));
@@ -193,21 +195,35 @@ pub fn processes_in(dir: &Path) -> Vec<String> {
         .stderr(std::process::Stdio::null())
         .output()
     else {
-        return found;
+        return vec!["process-use check unavailable".into()];
     };
+    lsof_users(&output, &dir)
+}
+
+// lsof may return 1 for permission warnings while still producing a complete useful
+// listing. Require a parsed process/file record; empty or malformed output fails closed.
+fn lsof_users(output: &std::process::Output, dir: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut parsed = false;
     let (mut pid, mut name, mut counted) = (0u32, String::new(), false);
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         match line.split_at_checked(1) {
-            Some(("p", value)) => (pid, counted) = (value.parse().unwrap_or(0), false),
+            Some(("p", value)) => {
+                (pid, counted) = (value.parse().unwrap_or(0), false);
+                name.clear();
+            }
             Some(("c", value)) => name = value.to_string(),
-            Some(("n", value)) if !counted && pid != 0 && pid != me && inside(Path::new(value)) => {
-                counted = true;
-                found.push(format!("{pid} {name}"));
+            Some(("n", value)) if pid != 0 && !name.is_empty() && Path::new(value).is_absolute() => {
+                parsed = true;
+                if !counted && Path::new(value).starts_with(dir) {
+                    counted = true;
+                    found.push(format!("{pid} {name}"));
+                }
             }
             _ => {}
         }
     }
-    found
+    if parsed { found } else { vec!["process-use check unavailable or malformed".into()] }
 }
 
 pub fn clean_plan(home: &Path, plan: &Plan, sbx: &str, protected: &[PathBuf]) -> Cleaned {
@@ -724,6 +740,24 @@ fn sweep_warm_stages(root: &Path, folders: &[String], notes: &mut Vec<String>) -
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lsof_permission_warning_output_is_usable_but_empty_or_malformed_output_is_not() {
+        use std::os::unix::process::ExitStatusExt;
+        let failed = |text: &str| std::process::Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: text.as_bytes().to_vec(),
+            stderr: b"permission warning".to_vec(),
+        };
+        let output = failed("p42\nccompiler\nfcwd\nn/work/task\nf3\nn/work/task/target/a\np43\ncother\nn/elsewhere\n");
+        assert!(!output.status.success());
+        // Parsing is independent of lsof's exit status (1 can mean permission warnings).
+        assert_eq!(super::lsof_users(&output, std::path::Path::new("/work/task")), ["42 compiler"]);
+        assert!(super::lsof_users(&output, std::path::Path::new("/idle")).is_empty());
+        for output in ["", "permission denied", "pbad\ncother\nn/work/task"] {
+            assert!(!super::lsof_users(&failed(output), std::path::Path::new("/idle")).is_empty());
+        }
+    }
+
     use super::*;
     use crate::sandbox::fake;
     use atomics_core::{
@@ -794,6 +828,7 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             config: Default::default(),
             warm: Vec::new(),
+            cache: Default::default(),
             pins: a.join("git-pins"),
             exe: "/atomics".into(),
             socket: dir.path().join("unused.sock"),

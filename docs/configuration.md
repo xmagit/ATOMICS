@@ -61,6 +61,104 @@ A main, host or workspace file that does not parse leaves ATOMICS on the last co
 The top bar or toast says so, and `atomics doctor` names the file. A broken repository config is ignored
 with a warning; see [Repository workflows](repo-workflow.md).
 
+## Build caches and disk space
+
+Non-Shell agents in trusted linked Cargo worktrees default to `CARGO_INCREMENTAL=0`,
+`CARGO_PROFILE_DEV_DEBUG=line-tables-only`, and `CARGO_PROFILE_TEST_DEBUG=line-tables-only`.
+When `sccache` is on the session's PATH, ATOMICS selects it as `RUSTC_WRAPPER`, unless a wrapper
+is already configured. Bare agents use `$XDG_CACHE_HOME/atomics/sccache-host-v2`
+(or `~/.cache/atomics/sccache-host-v2`) with `SCCACHE_CACHE_SIZE=10G` and a separate server socket
+for each effective store. Sandboxes use private compiler stores under
+`$ATOMICS_HOME/build-caches/sandboxes-v2/`; these are never mounted from the host compiler store.
+The VM and dev shell include sccache. A missing sccache wrapper is disabled with a warning;
+server I/O errors fall back to rustc unless explicitly configured otherwise.
+Shells, the chief, and agents in the main checkout retain their inherited build profile.
+Bare sessions preserve inherited environment overrides; sandbox preparation detects sccache inside
+the sandbox image. Explicit `[cache] env` values override the defaults for subsequent sessions.
+
+```toml
+[cache]
+shared = [".npm/_cacache"]
+env = { npm_config_cache = ".npm/_cacache", CARGO_PROFILE_DEV_DEBUG = "full" }
+outputs = ["web/dist", "src/app/bin", "src/app/obj"]
+
+[resources]
+disk_warn_gib = 30
+disk_min_gib = 10
+```
+
+`shared` links absent folders in new linked worktrees to a store under
+`$ATOMICS_HOME/build-caches/host-repos-v2/<repository-id>/` for bare agents, or
+`build-caches/sandbox-repos-v2/<repository-id>/` for sandboxed agents. The stores are separate trust domains;
+links to another domain are never reused. Links into legacy or forbidden stores are removed on the
+next worktree use at configured shared paths and the five repository-allowlisted cache paths, including
+allowlisted links left after cache configuration was removed. Repair never scans build output or dependency
+trees. Store contents are kept; no cached data is migrated. Link repair pins and rechecks the link through
+its parent directory descriptor before unlinking it. Unix has no atomic unlink conditioned on an inode;
+an outside writer replacing a link after that final check can still race repair. Each failed or removed
+cache folder is skipped independently, and its cache environment path is dropped for that launch. Cache setup errors never refuse a session.
+Stores containing tracked files are refused. Checkout-relative cache paths with non-ASCII components
+are skipped because Git cannot reliably verify their index case aliases; Unicode checkout roots and
+cache directories outside repositories remain supported. Existing real folders are left alone, and the main checkout is
+never linked. Existing sandboxes retain their mounts and start without cache environment settings for
+missing mounts, with a hint to recreate them. Relative cache environment paths resolve from the worktree root.
+All sandboxes of one repository share its `sandbox-repos-v2` package/download stores and can modify each
+other's cached packages: they form one repository trust domain. Different repositories and bare host
+builds use separate stores. Compiler stores under `sandboxes-v2` remain private to each sandbox.
+
+The CoW `[worktrees] warm` setting still makes independent copies. A `target` warmed from a main-checkout
+build with a different Cargo profile will rebuild under the lean agent profile. Use matching profiles when
+warming Cargo output, or set `warm = []` and rely on compiler-cache reuse across independent targets.
+
+In your own configuration, `shared` accepts any relative folder and `env` accepts any variable.
+Sharing `target`, `node_modules`, `bin`, or `obj` is unsafe for concurrent worktrees: Settings and doctor
+warn about these entries. Do not set one common `CARGO_TARGET_DIR`: Cargo locks that directory and
+serializes builds across agents. Each worktree keeps its own target; sccache shares reusable compilation
+results. Enabling incremental compilation with sccache also requires opting out of the wrapper or
+configuring sccache's incremental policy. [sccache's Rust documentation](https://github.com/mozilla/sccache/blob/main/docs/Rust.md)
+describes its cacheable compilation modes; metadata-only `cargo check` is not the measurement of reuse.
+
+`outputs` adds disposable output folders. Cargo worktrees automatically include `target`.
+Your own configuration may name any relative output folder. The directory itself must be ignored by a
+tracked `.gitignore` at or above it, or by `.git/info/exclude`. Cleanup verifies the matching rule with
+`git check-ignore -v --no-index` and disables the user's global `core.excludesFile` for both ignore and status
+checks. An untracked ignore file at or above the output cannot declare it disposable, even if that file
+hides itself with `*`. Nested `.gitignore` files below an already-ignored output are allowed: Git does not
+read them to decide whether the output is ignored. Review tracked ignore rules and `.git/info/exclude`
+carefully: they declare which untracked files are disposable. Repository configuration has a stricter
+allowlist, described in
+[Repository workflows](repo-workflow.md#shared-caches-and-disposable-output).
+
+Acceptance plus integration, and session closure, schedule output cleanup even when the worktree is kept.
+Only trusted linked worktrees are eligible. Cleanup refuses tracked files, non-ignored untracked files,
+case-mismatched or non-ASCII output paths (Git cannot reliably verify Unicode index case aliases),
+nested repositories and registered worktrees, mount/device boundaries, links outside
+the worktree, shared stores and the main checkout. Removal uses directory descriptors with `O_NOFOLLOW`
+and never traverses symlinks or crosses filesystem devices (or Linux mount identities). On Linux,
+cleanup requires `statx` with `STATX_MNT_ID` (Linux 5.8 or newer); kernels without it refuse all output
+cleanup because mount identity cannot be verified. Preflight checks write and search access on every
+directory and the output parent before deleting anything. If permissions or other conditions change
+during deletion, a toast and log report partial removal and the bytes left (or that size is unavailable).
+Cleanup is scheduled once when a task finishes or a session closes. Automatic cleanup retries an exiting
+process up to five times, with waits of 5, 15, 30 and 60 seconds, then stops. Starting a session cancels pending
+retries. Live sessions are protected. A manual cleanup skips busy/protected worktrees without queuing retries;
+the toast names skipped worktrees and asks you to close their sessions before retrying.
+Resume and restart preserve output.
+
+Disk sampling continues without an open Machine window. Below `disk_warn_gib`, the board and Machine
+view show a warning with the largest output folders and every refused output with its reason. Hard-linked
+files count once across the inventory. Refused outputs that cannot be safely measured show that their size
+is unavailable. The load button uses the warning colour, and the
+chief receives a `low_disk` heartbeat finding. Tree-size inventory runs on a worker at most every 120 seconds
+or after requested cleanup; dispatch checks use the cached inventory. Below `disk_min_gib`, new task dispatches,
+new worktrees and new non-chief agent sessions are refused after checking their destination filesystem.
+The chief, Shell sessions and resumed sessions continue with a warning, so cleanup and restart recovery remain available.
+The board, Machine view and
+`atomics_list` offer **Clean build caches of idle worktrees** (`atomics_clean_build_caches` for the chief).
+The action applies the same cleanup safeguards; it keeps worktrees and shared stores.
+
+For a reproducible two-worktree comparison and its measured scope, see [Build cache measurement](build-cache-measurement.md).
+
 ## Terminal clipboard
 
 `[terminal] clipboard = "focused"` (the default) lets a terminal program write the host clipboard

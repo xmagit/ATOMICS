@@ -333,6 +333,7 @@ pub enum SettingsTool {
         host: Option<String>,
     },
     CleanCredentials,
+    CleanBuildCaches,
     /// Look for git and the agents again, with the login shell's PATH as it is now.
     CheckPrograms,
     /// Where agents run on this machine, in this host's own config file. The user's own switch, so no proposal.

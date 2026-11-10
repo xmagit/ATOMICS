@@ -35,6 +35,7 @@ impl State {
             self.resume_record(record);
             changed = true;
         }
+        changed |= self.poll_build_caches();
         if std::mem::take(&mut self.chief_autostart) && !self.sessions.iter().any(|s| s.chief) {
             match self.start_chief(None) {
                 Ok(_) => self.chief_open = true,
@@ -114,7 +115,7 @@ impl State {
             if !self.sessions.iter().any(|s| s.id == launch.id) {
                 // Closed while its sandbox was made: leave the sandbox stopped for reuse or cleanup,
                 // or remove a scratch session's, which nothing resumes. Its placeholder goes either way.
-                if let Ok((_, Some(granted), _)) = &result {
+                if let Ok((_, Some(granted), _, _)) = &result {
                     self.relay.revoke(granted);
                 }
                 if let AgentRuntime::Sandbox(sandboxed) = &launch.runtime {
@@ -145,7 +146,11 @@ impl State {
                 }
                 result => result.map_err(String::from),
             };
-            let launched = result.and_then(|(guard, granted, needed)| {
+            let launched = result.and_then(|(guard, granted, needed, cache_env)| {
+                let mut launch = launch;
+                if let AgentRuntime::Sandbox(sandbox) = &mut launch.runtime {
+                    sandbox.cache_env = cache_env;
+                }
                 let (guard, alerts) = guard.unzip();
                 if let Some(alerts) = alerts.filter(|alerts| !alerts.is_empty()) {
                     self.ref_alert_at(
@@ -761,6 +766,7 @@ impl State {
                     chief: false,
                     pending: None,
                     sandbox: None,
+                    cache_env: Vec::new(),
                     relay: None,
                     screen_busy: false,
                     busy_absent_since: None,

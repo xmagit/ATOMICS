@@ -63,6 +63,7 @@ pub fn window(ctx: &egui::Context, backend: &dyn Backend, client: &mut Client) {
 
 pub fn contents(ui: &mut egui::Ui, snapshot: &Machine, backend: &dyn Backend, client: &mut Client) {
     let p = client.palette.clone();
+    crate::resources::disk_warning(ui, backend, client);
     if snapshot.truncated {
         ui.label(RichText::new("Some rows omitted to fit the snapshot limit").color(p.muted));
     }

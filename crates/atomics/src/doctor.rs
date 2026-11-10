@@ -218,6 +218,9 @@ fn report(workspace: Option<&str>, for_agent: bool, projects: &[PathBuf]) -> Rep
     };
     lines.extend(crate::credentials::doctor_lines(&crate::credentials::Store::new(credential_keychain.clone())));
     if let Ok((config, _)) = &config {
+        for warning in config.cache.warnings() {
+            lines.push(check_line(false, &warning, "review [cache] in your configuration"));
+        }
         let azure = crate::sandbox::checks::setup_config(config, workspace)
             .map(|sandbox| sandbox.azure.enabled)
             .unwrap_or(false);

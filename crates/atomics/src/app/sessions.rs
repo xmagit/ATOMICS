@@ -45,6 +45,7 @@ impl Session {
             chief,
             pending: None,
             sandbox: None,
+            cache_env: Vec::new(),
             relay: None,
             screen_busy: false,
             busy_absent_since: None,
@@ -175,6 +176,13 @@ impl State {
         prompt: Option<String>,
         role: Role,
     ) -> Result<String, String> {
+        self.session_disk_guard(
+            &cwd,
+            role == Role::Chief,
+            resume.is_some(),
+            self.config.agent(agent_name).is_some_and(|agent| agent.kind == AgentKind::Shell),
+        )?;
+        self.cancel_cache_cleanup(&cwd);
         let interactive = std::mem::take(&mut self.interactive_start);
         let chief = role == Role::Chief;
         if !chief && let Some(error) = &self.tickets.workspace_identity_error {
@@ -231,7 +239,8 @@ impl State {
             std::thread::spawn(move || {
                 // A previous close may still be stopping this session's resumable sandbox, or a cleanup
                 // removing its worktree. This thread waits for that, never the UI thread.
-                crate::lifecycle::wait_for(&jobs, Some(&job.name), Some(&job.cwd));
+                let root = crate::build_cache::root(&job.cwd);
+                crate::lifecycle::wait_for(&jobs, Some(&job.name), Some(&root));
                 let ready = crate::sandbox::prepare(&job)
                     .map_err(|err| super::NotPrepared::Sandbox(format!("Could not start the sandbox: {err:#}")))
                     .and_then(|granted| {
@@ -247,7 +256,7 @@ impl State {
                             let (sbx, mcp) = (&job.sbx, &job.config.mcp);
                             let needed =
                                 crate::connections::load_into(&job.home, sbx, &job.name, mcp, job.config.ssh_agent);
-                            (opened, granted, needed)
+                            (opened, granted, needed, crate::sandbox::cache_env(&job))
                         })
                     });
                 let _ = tx.send(ready);
@@ -295,7 +304,7 @@ impl State {
                         }
                     })
             })()
-            .map(|grant| (None, grant, Vec::new()))
+            .map(|grant| (None, grant, Vec::new(), Vec::new()))
             .map_err(|error: anyhow::Error| super::NotPrepared::Other(error.to_string()));
             let _ = tx.send(ready);
         });
@@ -359,6 +368,7 @@ impl State {
             agent: sbx_agent,
             cwd: cwd.to_path_buf(),
             warm: config.worktrees.warm.clone(),
+            cache: config.cache.clone(),
             config: config.isolation.sandbox.with_defaults(&config.resources, self.governor.cores),
             exe,
             socket: paths::socket_path(),
@@ -476,6 +486,12 @@ impl State {
 
     pub(super) fn launch_agent(&mut self, launch: AgentLaunch, codex: Option<bool>) -> Result<String, String> {
         let AgentLaunch { id, agent, cwd, resume, extra_args, prompt, chief, runtime, ref_guard, relay, .. } = launch;
+        self.session_disk_guard(&cwd, chief, resume.is_some(), agent.kind == AgentKind::Shell)?;
+        self.cancel_cache_cleanup(&cwd);
+        let worktree_root = crate::build_cache::root(&cwd);
+        if self.lifecycle_jobs.iter().any(|job| !job.is_finished() && job.touches(None, Some(&worktree_root))) {
+            return Err("Worktree cleanup is still running; start the session again once it finishes.".into());
+        }
         let sandboxed = match runtime {
             AgentRuntime::Sandbox(sandboxed) => Some(sandboxed),
             AgentRuntime::Bare => None,
@@ -523,7 +539,26 @@ impl State {
             if let Some(jobserver) = &self.jobserver {
                 env.extend(jobserver.env());
             }
-            env.extend(compile_cache_env(&cwd));
+            if crate::build_cache::lean_worktree(&cwd) {
+                let cache = self.project_config(&cwd).cache;
+                let lean = !chief && agent.kind != AgentKind::Shell;
+                let policy = if lean { cache.clone() } else { Default::default() };
+                let setup = crate::build_cache::link(
+                    &paths::atomics_home(),
+                    &crate::build_cache::root(&cwd),
+                    &policy,
+                    crate::build_cache::Domain::Host,
+                );
+                let mut cache_env = if lean { crate::build_cache::agent_env(&cwd, &cache) } else { Default::default() };
+                match setup {
+                    Ok(setup) => setup.filter_env(&mut cache_env),
+                    Err(error) => {
+                        eprintln!("ATOMICS: cache setup skipped: {error:#}");
+                        crate::build_cache::CacheSetup { skipped: vec![PathBuf::from("/")] }.filter_env(&mut cache_env);
+                    }
+                }
+                env.extend(cache_env);
+            }
             env.extend(crate::governor::toolchain_env(&cwd, &self.config.resources, self.governor.cores));
         }
 
@@ -741,6 +776,8 @@ impl State {
                     self.sessions[index].status = AgentStatus::Idle;
                 }
                 self.sessions[index].claude_id = claude_id;
+                self.sessions[index].cache_env =
+                    sandboxed.as_ref().map(|sandbox| sandbox.cache_env.clone()).unwrap_or_default();
                 self.sessions[index].sandbox = sandboxed.map(|sandboxed| sandboxed.name);
                 self.sessions[index].ref_guard = ref_guard;
                 self.sessions[index].relay = relay;
@@ -999,6 +1036,17 @@ impl State {
     }
 
     pub(super) fn close(&mut self, id: &str) {
+        self.close_session(id, !self.restarting);
+    }
+
+    pub(super) fn close_for_resume(&mut self, id: &str) {
+        if let Some(session) = self.sessions.iter().find(|s| s.id == id) {
+            self.cancel_cache_cleanup(&session.root());
+        }
+        self.close_session(id, false);
+    }
+
+    fn close_session(&mut self, id: &str, cleanup: bool) {
         self.pending_questions.remove(id);
         if let Some(i) = self.sessions.iter().position(|s| s.id == id) {
             if let Some(granted) = self.sessions[i].relay.take() {
@@ -1028,7 +1076,12 @@ impl State {
                 let (actions, checks) = (self.action_tx.clone(), self.ref_checks.clone());
                 let id = id.to_string();
                 session.terminal.take();
-                let scope = Scope { sandboxes: vec![name.clone()], worktrees: Some(scratch.iter().cloned().collect()) };
+                let scope = Scope {
+                    sandboxes: vec![name.clone()],
+                    worktrees: Some(
+                        scratch.iter().cloned().chain(worktree.iter().filter(|_| cleanup).cloned()).collect(),
+                    ),
+                };
                 self.lifecycle(scope, move || {
                     let home = paths::atomics_home();
                     let stopped = crate::sandbox::stop(&home, &sbx, &name);
@@ -1078,7 +1131,9 @@ impl State {
             {
                 self.dismissed.insert(cid);
             }
-            if let Some(worktree) = worktree {
+            session.terminal.take();
+            if cleanup && let Some(worktree) = worktree {
+                self.schedule_cache_cleanup(&worktree);
                 self.clean_after_session(id, &worktree);
             }
         }
@@ -1397,8 +1452,6 @@ fn brief_file(session: &str, text: &str, sandboxed: bool) -> Result<String, Stri
     Ok(format!("Your task brief is in {}. Read it first and follow it exactly.", path.display()))
 }
 
-/// RUSTC_WRAPPER for sccache when it is installed and neither the user nor the project under
-/// `cwd` chose a wrapper (an exported variable would override their cargo config).
 /// Authentication failures must remain actionable even when the provider exits normally.
 pub(super) fn credential_failure(screen: &str) -> Option<String> {
     screen
@@ -1414,22 +1467,6 @@ pub(super) fn credential_failure(screen: &str) -> Option<String> {
                     && (text.contains("error") || text.contains("unauthorized") || text.contains("http"))
         })
         .map(|line| format!("Credential error: {}", line.trim()))
-}
-
-fn compile_cache_env(cwd: &Path) -> Vec<(String, String)> {
-    let user_config = std::env::var_os("CARGO_HOME").map(PathBuf::from).unwrap_or_else(|| paths::home().join(".cargo"));
-    let configs = cwd.ancestors().map(|dir| dir.join(".cargo")).chain([user_config]);
-    let wrapper_set = ["RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER"].iter().any(|var| std::env::var_os(var).is_some())
-        || configs.into_iter().any(|dir| {
-            ["config.toml", "config"]
-                .iter()
-                .any(|name| std::fs::read_to_string(dir.join(name)).is_ok_and(|text| text.contains("rustc-wrapper")))
-        });
-    let sccache = resolve_program("sccache");
-    if wrapper_set || !Path::new(&sccache).is_absolute() {
-        return Vec::new();
-    }
-    vec![("RUSTC_WRAPPER".into(), sccache), ("SCCACHE_IGNORE_SERVER_IO_ERROR".into(), "1".into())]
 }
 
 #[cfg(test)]

@@ -13,7 +13,7 @@ let
     in lib.last (lib.splitString " " rule);
   tools = map lib.getName vm.environment.systemPackages;
 in
-assert lib.all (name: builtins.elem name tools) [ "gcc-wrapper" "pkg-config-wrapper" "python3" "coreutils-full" ];
+assert lib.all (name: builtins.elem name tools) [ "gcc-wrapper" "pkg-config-wrapper" "python3" "coreutils-full" "sccache" ];
 assert vm.programs.atomics.settings == { };
 assert vm.security.polkit.enable && desktop.security.polkit.enable;
 assert builtins.elem "/share/polkit-1" vm.environment.pathsToLink;

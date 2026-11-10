@@ -46,6 +46,7 @@ mod approvals;
 mod backend;
 mod background;
 mod board;
+mod build_cache;
 mod chief;
 mod commands;
 mod connections;
@@ -148,6 +149,7 @@ pub struct Session {
     pending: Option<Pending>,
     /// The sandbox a sandboxed agent runs in.
     sandbox: Option<String>,
+    cache_env: Vec<(String, String)>,
     /// Its placeholder for the Claude subscription, revoked when its agent exits or it closes.
     relay: Option<crate::relay::Granted>,
     screen_busy: bool,
@@ -219,7 +221,8 @@ struct AgentLaunch {
 
 /// What preparing a sandbox gives its launch: the ref guard with what its first check found, the
 /// session's relay placeholder and the MCP servers it needs that are not connected.
-type Prepared = Result<(crate::ref_guard::Opened, Option<crate::relay::Granted>, Vec<String>), NotPrepared>;
+type Prepared =
+    Result<(crate::ref_guard::Opened, Option<crate::relay::Granted>, Vec<String>, Vec<(String, String)>), NotPrepared>;
 
 /// Why a launch did not get as far as starting its agent.
 #[derive(Debug)]
@@ -609,6 +612,7 @@ pub(crate) struct State {
     /// Account usage and governor state published to every client.
     resources: atomics_core::projection::ResourceInfo,
     resources_checked: Instant,
+    build_caches: build_cache::Caches,
     /// What the update check found, and an update under way.
     update: update::Updates,
     busy_checked: Instant,
@@ -1168,6 +1172,7 @@ impl State {
             jobserver,
             resources: Default::default(),
             resources_checked: Instant::now() - Duration::from_secs(10),
+            build_caches: Default::default(),
             update,
             busy_checked: Instant::now(),
             output_delay: None,
@@ -1318,6 +1323,8 @@ impl State {
             "slots": { "test": self.governor.slots(SlotClass::Test), "qa": self.governor.slots(SlotClass::Qa) },
             "running": running,
             "waiting": waiting,
+            "disk": self.resources.disk,
+            "cleanup": { "label": atomics_core::machine::CLEAN_BUILD_CACHES, "tool": "atomics_clean_build_caches" },
         })
     }
 

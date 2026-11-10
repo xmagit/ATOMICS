@@ -29,6 +29,7 @@ pub fn run() -> Result<()> {
             ..SandboxConfig::default()
         },
         warm: Vec::new(),
+        cache: Default::default(),
         exe: crate::setup::executable_path()?,
         socket: paths::socket_path(),
         briefs: None,

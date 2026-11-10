@@ -8,7 +8,7 @@ pub(super) fn load() -> Option<[f64; 3]> {
 }
 
 #[allow(clippy::unnecessary_cast)] // statvfs field widths vary across Unix targets.
-pub(super) fn disk(path: PathBuf) -> Option<Disk> {
+pub(crate) fn disk(path: PathBuf) -> Option<Disk> {
     let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
     let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
     // SAFETY: the path is NUL-terminated and stat points to a full writable statvfs structure.

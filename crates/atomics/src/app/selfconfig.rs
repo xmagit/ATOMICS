@@ -185,6 +185,7 @@ impl State {
             "files": files,
             "workspace": workspace,
             "project": project,
+            "cache_warnings": effective.cache.warnings(),
             "load_error": load_error,
             "running_on_last_good_config": self.config_error.is_some(),
             "values": values,

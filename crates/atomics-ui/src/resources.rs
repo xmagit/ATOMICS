@@ -7,6 +7,22 @@ use egui::{Color32, RichText, Sense, vec2};
 use crate::Backend;
 use crate::theme::Palette;
 
+pub fn disk_warning(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut crate::Client) {
+    let Some(resources) = backend.resources() else { return };
+    if resources.disk.is_empty() {
+        return;
+    }
+    for warning in resources.disk {
+        ui.colored_label(client.palette.warning, warning.message());
+    }
+    let action = crate::Command::Manage(atomics_core::ops::HostAction::SettingsTool {
+        tool: atomics_core::ops::SettingsTool::CleanBuildCaches,
+    });
+    if backend.available(&action) && ui.button(atomics_core::machine::CLEAN_BUILD_CACHES).clicked() {
+        client.send(action);
+    }
+}
+
 /// USAGE at the top of a wide sidebar, or in the phone's overflow menu.
 pub fn section(ui: &mut egui::Ui, backend: &dyn Backend, p: &Palette) {
     let Some(state) = backend.resources() else { return };
@@ -68,10 +84,14 @@ fn remaining_color(window: &Window, p: &Palette) -> Color32 {
 /// where a phone has no hover.
 pub fn load(ui: &mut egui::Ui, backend: &dyn Backend, p: &Palette, in_menu: bool) -> bool {
     let Some(state) = backend.resources() else { return false };
-    let color = match state.load.map(|load| load / state.cores.max(1) as f64) {
-        Some(load) if load >= 1.0 => p.error,
-        Some(load) if load >= 0.7 => p.warning,
-        _ => p.muted,
+    let color = if !state.disk.is_empty() {
+        p.warning
+    } else {
+        match state.load.map(|load| load / state.cores.max(1) as f64) {
+            Some(load) if load >= 1.0 => p.error,
+            Some(load) if load >= 0.7 => p.warning,
+            _ => p.muted,
+        }
     };
     let label = state.load.map_or_else(|| "load —".into(), |load| format!("load {load:.1}"));
     let details = load_details(&state);
@@ -104,6 +124,9 @@ fn load_details(state: &ResourceInfo) -> String {
     }
     for (name, pool) in [("test", &state.test), ("qa", &state.qa)] {
         details.push_str(&format!("\n{name} slots: {}/{} in use, {} waiting", pool.running, pool.slots, pool.waiting));
+    }
+    for warning in &state.disk {
+        details.push_str(&format!("\n{}", warning.message()));
     }
     details
 }

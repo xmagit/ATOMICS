@@ -285,6 +285,10 @@ impl State {
                 self.request_trace(session, limit, reply);
                 return;
             }
+            ControlRequest::CleanBuildCaches => {
+                self.clean_build_caches();
+                done(ControlResponse::ok(json!({ "queued": true })))
+            }
             ControlRequest::List => {
                 self.usage.drain();
                 // Every session, so each one's prompt and pending request are kept short.
@@ -985,6 +989,7 @@ impl State {
         let job = crate::sandbox::exec::Exec {
             sbx: resolve_program(&self.sbx),
             sandbox: sandbox.clone(),
+            env: s.cache_env.clone(),
             // The sandbox mounts the worktree where its links lead.
             workdir: std::fs::canonicalize(&root).unwrap_or(root),
             command,

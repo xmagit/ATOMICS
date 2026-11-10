@@ -82,6 +82,9 @@ stages = ["accepted", "integrated", "pr_opened", "ci_passed", "security_approved
 | `base_ref` | string | Base ref for project diffs, worktrees, branch guards, integration and cleanup. New worktrees fetch its remote first; a local `main` or `master` starts them from the remote's default branch instead. |
 | `worktrees.warm` | array of strings | Relative cache folders or glob patterns to expand in the main checkout and clone into new worktrees. `*` matches one path component; `**` matches directory levels. Patterns look at most 8 levels deep and match at most 256 folders in all (later ones start cold, with a warning). A matched folder is cloned whole, and the pattern that matched it looks no further inside; a later pattern still can. Folders are cloned in pattern order, and one whose destination already exists is skipped: list `target` before `target/debug`, or `target/debug`'s clone creates `target` and the rest of `target` starts cold. Existing path and CoW safeguards apply. |
 | `tickets.branch` | string | Branch template; overrides the workspace's `[tickets] branch` for this project. |
+| `cache.shared` | array of strings | Known safe compiler/download cache folders linked to a per-repository store; the list below is exhaustive. |
+| `cache.env` | table of strings | Known cache or lean-build variables, with path values relative to and inside the checkout; the list below is exhaustive. |
+| `cache.outputs` | array of strings | Relative disposable output folders ending in a known build-output name, listed below. Tracked folders and shared stores are always protected. |
 | `pr_title` | string | PR title template hint for agents, conventionally `{key}` and `{title}`. ATOMICS does not create PRs or expand this hint. |
 | `test_commands`, `qa_commands` | arrays of strings | Command hints passed to agents. ATOMICS never executes them. |
 | `review_policy` | string | Review instructions passed to agents. |
@@ -107,3 +110,68 @@ Lifecycle milestones are described in [Lifecycle and completion](tickets.md#life
 The chief's `atomics_config_get` with `project` shows these effective settings and `source: "repo"`, plus
 file existence and warnings. Without `project` it shows workspace settings. The configuration proposal
 tool edits main, host and workspace files only; edit and review repository workflow files through Git.
+
+## Shared caches and disposable output
+
+A repository may configure only these concurrency-safe folders in `cache.shared`:
+
+| Folder | Tool and reason |
+| --- | --- |
+| `.cache/sccache` | Compiler cache; content keyed results and a cache server support concurrent clients. Cargo still uses a separate `target` per worktree. |
+| `.npm/_cacache` | npm's content-addressed download cache, rather than the installed dependency tree. |
+| `.cache/pip` | pip's HTTP and wheel caches, rather than a virtual environment or installed packages. |
+| `.yarn/cache` | Yarn's package archive cache, rather than install state or `node_modules`. |
+| `.nuget/packages` | NuGet's package cache, rather than MSBuild's mutable `bin` and `obj` output. |
+
+Cargo's registry/git downloads, npm downloads, pip downloads and NuGet packages normally already use
+user-global caches. Keep those defaults unless a repository specifically needs local cache paths.
+This feature does not redirect them automatically. Gradle build trees, Maven targets, virtual environments,
+`node_modules`, `.next`, `bin`, `obj` and Cargo `target` are mutable installed/build state and are not
+repository-allowlisted shared caches. Do not share one `CARGO_TARGET_DIR`: Cargo's directory lock would
+serialize agents. Sharing sccache results leaves independent Cargo build directories free to build concurrently.
+
+Repository `cache.env` accepts these variables only:
+
+- `npm_config_cache`, `NPM_CONFIG_CACHE`, `PIP_CACHE_DIR`, `YARN_CACHE_FOLDER`, `NUGET_PACKAGES`:
+  relative paths inside the checkout, without `..`, `.git`, or links escaping the main checkout.
+- `RUSTC_WRAPPER`: `sccache` or the empty string.
+- `CARGO_INCREMENTAL`, `SCCACHE_IGNORE_SERVER_IO_ERROR`: `0` or `1`.
+- `CARGO_PROFILE_DEV_DEBUG`, `CARGO_PROFILE_TEST_DEBUG`: `0`, `1`, `2`, `none`, `limited`, `full`,
+  `line-tables-only`, or `line-directives-only`.
+- `SCCACHE_CACHE_SIZE`: an unsigned size, optionally ending in `K`, `M`, `G`, or `T`.
+
+`cache.outputs` accepts relative folders whose final component is `target`, `bin`, `obj`, `build`,
+`dist`, `.next`, or `out`. No globs are expanded. These names only make a folder eligible: cleanup still
+refuses tracked files (including index names with different case), non-ignored untracked work,
+case-mismatched or non-ASCII output paths, nested repositories/worktrees, mount/device boundaries, symlinks, shared caches
+and the main checkout. Cleanup disables global `core.excludesFile` rules and verifies that the directory
+itself is ignored by a tracked `.gitignore` at or above it, or by `.git/info/exclude`, using
+`git check-ignore -v --no-index`. An untracked ignore file at or above it cannot hide new work and make it
+disposable. Nested `.gitignore` files inside an already-ignored output are allowed because Git does not
+consult them for the output. Refused outputs remain visible in the disk inventory and warning with their
+reason. Preflight checks write/search permissions before removal; unexpected failures after deletion
+starts report partial removal and the remaining size. Linux cleanup requires `STATX_MNT_ID` (Linux 5.8 or
+newer); kernels without it refuse all cleanup. Worktrees with live sessions are protected; exiting processes get
+bounded automatic retries, while manual cleanup skips busy worktrees and names them in the toast.
+Your own config can name other relative output folders or shared folders and any environment variable;
+known unsafe sharing choices produce Settings and doctor warnings.
+
+```toml
+[cache]
+shared = [".npm/_cacache"]
+outputs = ["web/dist", "src/app/bin", "src/app/obj"]
+env = { npm_config_cache = ".npm/_cacache", CARGO_PROFILE_TEST_DEBUG = "line-tables-only" }
+```
+
+Host and sandbox shared stores occupy separate namespaces. Repository configuration cannot set `SCCACHE_DIR`;
+ATOMICS chooses an isolated compiler store and server. Stores containing tracked files are refused.
+All sandboxes of the same repository share its package/download store and can affect one another's cached
+packages; this is one repository trust domain. Each sandbox's compiler store is separate. Legacy or
+foreign-domain cache links are removed on the next worktree use without deleting or copying store data.
+Cache setup failures skip the affected folder and its environment path, while other folders and the
+session continue.
+
+Repository cache arrays replace the corresponding user arrays; `cache.env` supplies variables only when the
+user has not explicitly set the same key.
+Omitted cache keys keep user settings and detected defaults. See [Configuration](configuration.md#build-caches-and-disk-space)
+for Cargo defaults, disk thresholds and cleanup actions.

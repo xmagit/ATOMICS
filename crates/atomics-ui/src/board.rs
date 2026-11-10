@@ -407,6 +407,7 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
 /// The board's header, then its columns, or on a phone its statuses one under the other.
 fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn Backend, client: &mut Client) {
     let p = client.palette.clone();
+    crate::resources::disk_warning(ui, backend, client);
     let touch = client.touch;
     let now = board.now;
     let plan = &board.plan;

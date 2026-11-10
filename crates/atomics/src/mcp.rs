@@ -153,6 +153,7 @@ fn sandboxable_agent_tools() -> Value {
 const CHIEF_ONLY: &[&str] = &[
     "atomics_publish",
     "atomics_plan_notebook",
+    "atomics_clean_build_caches",
     "atomics_trace_get",
     "atomics_restart",
     "atomics_config_get",
@@ -543,6 +544,11 @@ fn tools() -> Value {
         all.extend(more);
     }
     if let Some(all) = tools.as_array_mut() {
+        all.push(json!({
+            "name": "atomics_clean_build_caches",
+            "description": "Clean build caches of idle worktrees. Removes only untracked output folders from linked worktrees; skips active processes, shared stores and the main checkout. Returns queued; atomics_list resources.disk shows pressure and the largest output folders.",
+            "inputSchema": { "type": "object", "properties": {} }
+        }));
         all.push(exec_tool(&session));
         all.push(json!({
             "name": "atomics_plan_notebook",
@@ -734,6 +740,7 @@ pub(crate) fn request_for_tool(name: &str, mut args: Value) -> Result<ControlReq
     }
     let cmd = match name {
         "atomics_list" => "list",
+        "atomics_clean_build_caches" => "clean_build_caches",
         "atomics_trace_get" => "trace_get",
         "atomics_restart" => "restart",
         "atomics_start" => "start",

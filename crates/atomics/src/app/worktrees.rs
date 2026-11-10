@@ -22,6 +22,10 @@ impl State {
             .and_then(|(plan, task)| self.plans.iter().position(|p| p.id == *plan).map(|index| (index, task)))
             .map(|(index, task)| self.plan_worktree_path(index, Some(task), &repo, &branch))
             .unwrap_or_else(|| git::worktree_path(&self.config.worktree_path, &repo, &branch));
+        if let Err(error) = self.check_disk(&path) {
+            let _ = self.worktree_tx.send((branch, Err(error), launch, repo));
+            return;
+        }
         let config = self.project_config(&repo);
         let (tx, base_ref) = (self.worktree_tx.clone(), config.base_ref);
         let warm = config.worktrees.warm;

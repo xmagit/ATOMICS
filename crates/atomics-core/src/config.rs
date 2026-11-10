@@ -42,6 +42,11 @@ archived_plans = true         # remove clean task worktrees; keep branches
 # Paths are relative to the repository root. [] turns warming off.
 warm = ["target"]
 
+[cache]
+shared = []               # concurrency-safe caches linked to a per-repository store
+env = {}                  # explicit agent environment overrides
+outputs = []              # additional untracked build outputs to clean in idle worktrees
+
 [layout]
 min_tile_width = 520.0      # below this a terminal tile collapses into a tab
 min_tile_height = 280.0
@@ -447,6 +452,8 @@ notebook = false
 # jobs = 16          # jobserver tokens; unset = cores minus 2; 0 = no pool (build scripts that run Apple make)
 # test_slots = 3     # whole test runs at once; unset = one per 6 cores
 # qa_slots = 1       # QA instances at once
+disk_warn_gib = 30  # warn on the filesystem holding worktrees
+disk_min_gib = 10   # refuse new tasks and sessions below this
 agent_nice = 10      # niceness agent terminals start at; 0 = normal priority
 
 [resources.dotnet]
@@ -574,6 +581,7 @@ pub struct Config {
     pub repos: Vec<String>,
     pub worktree_path: String,
     pub worktrees: WorktreeConfig,
+    pub cache: crate::cache::CacheConfig,
     pub cleanup: CleanupConfig,
     pub layout: LayoutConfig,
     pub font: FontConfig,
@@ -1139,6 +1147,7 @@ impl Default for Config {
             repos: Vec::new(),
             worktree_path: "{repo_parent}/{repo}-{slug}".into(),
             worktrees: WorktreeConfig::default(),
+            cache: crate::cache::CacheConfig::default(),
             cleanup: CleanupConfig::default(),
             layout: LayoutConfig::default(),
             font: FontConfig::default(),

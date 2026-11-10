@@ -265,6 +265,7 @@ impl State {
                     let _ = actions.send(Box::new(move |state| state.toast(message)));
                 });
             }
+            SettingsTool::CleanBuildCaches => self.clean_build_caches(),
             SettingsTool::CheckPrograms => self.check_programs(),
             SettingsTool::SetIsolation { mode } => {
                 self.set_isolation(mode).map_err(|e| WireError::new(ErrorCode::Rejected, e))?;

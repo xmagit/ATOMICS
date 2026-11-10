@@ -137,6 +137,9 @@ pub(super) fn draw(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
     if let Some(problem) = info.config["load_error"].as_str() {
         ui.colored_label(p.warning, problem);
     }
+    for warning in info.config["cache_warnings"].as_array().into_iter().flatten().filter_map(|v| v.as_str()) {
+        ui.colored_label(p.warning, warning);
+    }
     let height = height - ui.min_size().y;
     if ui.available_width() < 600.0 {
         if client.management.section_list {

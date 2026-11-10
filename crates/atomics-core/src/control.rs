@@ -33,6 +33,7 @@ pub enum ControlRequest {
         remove: bool,
     },
     List,
+    CleanBuildCaches,
     /// The protocol server's address and the rendezvous's status: phase, registered, online,
     /// channels and why it waits. Never a token or pass.
     Remote,

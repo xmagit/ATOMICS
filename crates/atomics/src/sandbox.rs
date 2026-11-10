@@ -48,13 +48,19 @@ pub struct Sandboxed {
     /// The sbx agent it runs, such as `claude`.
     pub agent: &'static str,
     pub ssh_agent: bool,
+    pub cache_env: Vec<(String, String)>,
 }
 
 impl Sandboxed {
     /// What the tile's PTY runs: `sbx run` for `agent_args`. Without SSH agent forwarding, sbx
     /// runs without `SSH_AUTH_SOCK`, so there is no agent for it to forward.
     pub fn command(&self, agent_args: &[String]) -> (String, Vec<String>) {
-        let run = isolation::run_args(&self.name, self.agent, agent_args);
+        let mut run = isolation::run_args(&self.name, self.agent, agent_args);
+        let position = run.iter().position(|arg| arg == "--").unwrap_or(run.len());
+        run.splice(
+            position..position,
+            self.cache_env.iter().flat_map(|(key, value)| ["--env".into(), format!("{key}={value}")]),
+        );
         if self.ssh_agent {
             (self.sbx.clone(), run)
         } else {
@@ -76,6 +82,7 @@ pub struct Prepare {
     pub cwd: PathBuf,
     pub config: SandboxConfig,
     pub warm: Vec<String>,
+    pub cache: atomics_core::cache::CacheConfig,
     /// ATOMICS's executable and socket, for the MCP server agents report through.
     pub exe: PathBuf,
     pub socket: PathBuf,
@@ -98,8 +105,96 @@ impl Prepare {
             name: self.name.clone(),
             agent: self.agent,
             ssh_agent: self.config.ssh_agent,
+            cache_env: Vec::new(),
         }
     }
+}
+
+/// Probe the sandbox's PATH, never assume that a tool installed on the host is in its image.
+/// This runs on the preparation worker, for new and resumed sessions alike.
+fn compiler_store(job: &Prepare) -> PathBuf {
+    job.home.join("build-caches/sandboxes-v2").join(paths::runtime_home_hash(Path::new(&job.name))).join("sccache")
+}
+
+/// Shell-quoted assignments for `atomics_exec`, after the VM's login shell has loaded.
+/// `sbx run --env` is also supported for reattachment: https://docs.docker.com/reference/cli/sbx/run/
+pub(super) fn with_cache_env(command: &str, env: &[(String, String)]) -> String {
+    if env.is_empty() {
+        return command.into();
+    }
+    let quote = |value: &str| format!("'{}'", value.replace('\'', "'\"'\"'"));
+    let assignments = env
+        .iter()
+        .filter(|(key, _)| {
+            key.starts_with(|ch: char| ch.is_ascii_alphabetic() || ch == '_')
+                && key.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        })
+        .map(|(key, value)| format!("export {key}={};", quote(value)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("{assignments} {command}")
+}
+
+pub fn cache_env(job: &Prepare) -> Vec<(String, String)> {
+    if job.agent == "shell" || !crate::build_cache::lean_worktree(&job.cwd) {
+        return Vec::new();
+    }
+    let root = crate::build_cache::root(&job.cwd);
+    let cargo = root.join("Cargo.toml").is_file();
+    let probe = isolation::exec_args(&job.name, &job.cwd, "command -v sccache", 5);
+    let sccache = sbx(&job.sbx, &probe, job.config.ssh_agent, Duration::from_secs(10))
+        .ok()
+        .filter(|path| Path::new(path.trim()).is_absolute())
+        .map(|path| path.trim().to_string());
+    let store = compiler_store(job);
+    let mounted = list(&job.sbx)
+        .ok()
+        .and_then(|sandboxes| sandboxes.into_iter().find(|sandbox| sandbox.name == job.name))
+        .map(|sandbox| real_paths(&sandbox).workspaces)
+        .unwrap_or_default();
+    let has_store = crate::build_cache::store_allowed(&job.home, &store, crate::build_cache::Domain::Sandbox)
+        && mounted.contains(&real(&store).to_string_lossy().into_owned());
+    let mut env = job.cache.agent_env(cargo, sccache.as_deref(), &store.to_string_lossy(), |_| None);
+    // Sandboxes can never select a host store, including explicit user overrides.
+    if has_store {
+        env.insert("SCCACHE_DIR".into(), store.to_string_lossy().into_owned());
+        env.insert("SCCACHE_SERVER_UDS".into(), "/tmp/atomics-sccache-v2.sock".into());
+    } else {
+        env.remove("SCCACHE_DIR");
+        env.remove("SCCACHE_SERVER_UDS");
+        for key in ["RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER"] {
+            if env.get(key).is_some_and(|value| atomics_core::cache::is_sccache(value)) {
+                env.insert(key.into(), String::new());
+            }
+        }
+        if cargo {
+            eprintln!(
+                "ATOMICS: sandbox {} has no private compiler-cache mount; continuing without sccache. Recreate it to enable the cache.",
+                job.name
+            );
+        }
+    }
+    crate::build_cache::resolve_env_paths_in(
+        &job.home,
+        &root,
+        &job.cache,
+        &mut env,
+        crate::build_cache::Domain::Sandbox,
+    );
+    // Older sandboxes may lack newly configured shared mounts. Drop only affected env.
+    env.retain(|key, value| {
+        if !atomics_core::cache::path_variable(key) { return true; }
+        let path = real(Path::new(value));
+        let store_path = real(&job.home.join("build-caches"));
+        let missing_shared = job.cache.shared.iter().filter(|folder| atomics_core::cache::relative(folder)).any(|folder| {
+            let shared = real(&root.join(folder));
+            path.starts_with(&shared) && !mounted.contains(&shared.to_string_lossy().into_owned())
+        });
+        let available = !missing_shared && (!path.starts_with(&store_path) || mounted.iter().any(|mount| path.starts_with(Path::new(mount))));
+        if !available { eprintln!("ATOMICS: sandbox {} cache {key} is not mounted; continuing without it. Recreate the sandbox to enable it.", job.name); }
+        available
+    });
+    env.into_iter().collect()
 }
 
 /// What sbx said when it was checked.
@@ -232,6 +327,24 @@ fn make(
     granted: Option<&crate::relay::Granted>,
 ) -> Result<()> {
     let ssh = job.config.ssh_agent;
+    // New namespace: stores writable by a guest are never read by bare host builds.
+    let cache_policy = if existing.is_none() { job.cache.clone() } else { Default::default() };
+    if let Err(error) =
+        crate::build_cache::link(&job.home, &workspace, &cache_policy, crate::build_cache::Domain::Sandbox)
+    {
+        eprintln!("ATOMICS: sandbox cache setup skipped: {error:#}");
+    }
+    let mut shared_mounts =
+        crate::build_cache::stores(&job.home, &workspace, &job.cache, crate::build_cache::Domain::Sandbox);
+    if workspace.join("Cargo.toml").is_file() && existing.is_none() {
+        let store = compiler_store(job);
+        if crate::build_cache::store_allowed(&job.home, &store, crate::build_cache::Domain::Sandbox) {
+            match std::fs::create_dir_all(&store) {
+                Ok(()) => shared_mounts.push(store),
+                Err(error) => eprintln!("ATOMICS: sandbox compiler cache skipped: {error:#}"),
+            }
+        }
+    }
     if let Some(existing) = existing {
         // A sandbox keeps its mounts for life: one made before a main checkout's .git was mounted
         // read-only whole lets its agent replace .git, config and all.
@@ -257,6 +370,14 @@ fn make(
                 job.name
             );
         }
+        for missing in shared_mounts.iter().filter(|path| !mounted.contains(&real(path).to_string_lossy().into_owned()))
+        {
+            eprintln!(
+                "ATOMICS: sandbox {} has no cache mount for {}; continuing without that cache. Recreate the sandbox to enable it.",
+                job.name,
+                missing.display()
+            );
+        }
         // Made before Claude used the relay, before the relay moved to another port, or used by a Claude
         // that no longer has a subscription to relay.
         return relay_rule(job, granted.map(|granted| granted.port).filter(|port| *port != 0));
@@ -276,10 +397,12 @@ fn make(
     }
     let mut read_only: Vec<PathBuf> = job.config.mounts.iter().map(|mount| paths::expand(mount)).collect();
     read_only.extend(job.briefs.iter().cloned());
+    let mut cache_mounts = warm_mounts(&workspace, &job.warm, cfg!(target_os = "linux"));
+    cache_mounts.extend(shared_mounts);
     let spec = Spec {
         name: job.name.clone(),
         agent: job.agent,
-        warm: warm_mounts(&workspace, &job.warm, cfg!(target_os = "linux")),
+        warm: cache_mounts,
         workspace,
         git,
         read_only,
@@ -908,6 +1031,17 @@ pub fn in_worktree(home: &Path, program: &str, worktree: &Path) -> Result<Vec<St
         .collect())
 }
 
+/// Guests can hold output files without a host fd. Only a confirmed stopped guest is idle.
+pub fn build_cache_users(program: &str, worktree: &Path) -> Result<Vec<String>> {
+    let worktree = real(worktree);
+    Ok(list(program)?
+        .iter()
+        .map(real_paths)
+        .filter(|sandbox| !sandbox.status.eq_ignore_ascii_case("stopped") && sandbox.mounts_within(&worktree))
+        .map(|sandbox| sandbox.name)
+        .collect())
+}
+
 /// A source build executes checkout files on the host. Ref recovery is insufficient here:
 /// no sandbox of this repository may exist while an update selects and builds its source.
 pub fn refuse_source_update(home: &Path, program: &str, repo: &Path) -> Result<()> {
@@ -1269,6 +1403,7 @@ mod tests {
             cwd: cwd.to_path_buf(),
             config,
             warm: Vec::new(),
+            cache: Default::default(),
             exe: "/Applications/ATOMICS.app/Contents/MacOS/atomics".into(),
             socket: "/run/user/501/atomics/atomics.sock".into(),
             briefs: None,
@@ -1277,6 +1412,79 @@ mod tests {
             secret_workspace: None,
             github_account: None,
         }
+    }
+
+    #[test]
+    fn existing_sandboxes_without_cache_mounts_reattach_with_available_environment_only() {
+        let (dir, repo) = repository();
+        let work = dir.path().join("task");
+        git::add_worktree(&repo, &work, "task", "main").unwrap();
+        let bin = crate::test_support::tempdir().unwrap();
+        let sbx = fake::install(bin.path());
+        let mut launch = job(&sbx, "atomics-existing", &work, SandboxConfig::default());
+        prepare(&launch).unwrap();
+        std::fs::write(work.join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(bin.path().join("sccache-path"), "/usr/bin/sccache\n").unwrap();
+        launch.cache.shared.push(".cache/pip".into());
+        launch.cache.env.insert("PIP_CACHE_DIR".into(), ".cache/pip".into());
+        launch.cache.repo_paths.insert("PIP_CACHE_DIR".into());
+        launch.cache.env.insert("RUSTC_WRAPPER".into(), "sccache".into());
+        prepare(&launch).unwrap();
+        assert_eq!(fake::calls_to(bin.path(), &["create"]).len(), 1);
+        assert!(work.join(".cache/pip").symlink_metadata().is_err(), "reattachment must not create an unmounted link");
+        let env: std::collections::BTreeMap<_, _> = cache_env(&launch).into_iter().collect();
+        assert_eq!(env["CARGO_INCREMENTAL"], "0");
+        assert_eq!(env["RUSTC_WRAPPER"], "");
+        assert!(!env.contains_key("SCCACHE_DIR"));
+        assert!(!env.contains_key("PIP_CACHE_DIR"));
+        launch.agent = "shell";
+        assert!(cache_env(&launch).is_empty());
+    }
+
+    #[test]
+    fn sandbox_compiler_cache_stores_are_private_and_missing_wrappers_degrade() {
+        let (dir, repo) = repository();
+        let work = dir.path().join("task");
+        git::add_worktree(&repo, &work, "task", "main").unwrap();
+        std::fs::write(work.join("Cargo.toml"), "[workspace]\n").unwrap();
+        let bin = crate::test_support::tempdir().unwrap();
+        let sbx = fake::install(bin.path());
+        let mut launch = job(&sbx, "atomics-private", &work, SandboxConfig::default());
+        launch.cache.env.insert("RUSTC_WRAPPER".into(), "sccache".into());
+        prepare(&launch).unwrap();
+        let mounted = real_paths(&list(&launch.sbx).unwrap()[0]).workspaces;
+        assert!(mounted.contains(&real(&compiler_store(&launch)).to_string_lossy().into_owned()));
+        assert!(!mounted.contains(&crate::build_cache::machine_cache().to_string_lossy().into_owned()));
+        let env: std::collections::BTreeMap<_, _> = cache_env(&launch).into_iter().collect();
+        assert_eq!(env["RUSTC_WRAPPER"], "");
+        std::fs::write(bin.path().join("sccache-path"), "/usr/bin/sccache\n").unwrap();
+        let env: std::collections::BTreeMap<_, _> = cache_env(&launch).into_iter().collect();
+        assert_eq!(env["RUSTC_WRAPPER"], "/usr/bin/sccache");
+        assert_eq!(env["SCCACHE_DIR"], compiler_store(&launch).to_string_lossy());
+        assert_eq!(env["SCCACHE_IGNORE_SERVER_IO_ERROR"], "1");
+        assert_eq!(env["SCCACHE_SERVER_UDS"], "/tmp/atomics-sccache-v2.sock");
+        let another = job(&sbx, "atomics-other", &work, SandboxConfig::default());
+        assert_ne!(compiler_store(&launch), compiler_store(&another));
+        launch.cache.env.insert("CARGO_INCREMENTAL".into(), "1".into());
+        launch.agent = "shell";
+        assert!(cache_env(&launch).is_empty());
+    }
+
+    #[test]
+    fn sandbox_run_passes_cache_environment_before_agent_arguments() {
+        let sandbox = Sandboxed {
+            sbx: "/bin/sbx".into(),
+            name: "atomics-env".into(),
+            agent: "codex",
+            ssh_agent: true,
+            cache_env: vec![("CARGO_INCREMENTAL".into(), "0".into())],
+        };
+        let (_, args) = sandbox.command(&["--resume".into()]);
+        let env = args.iter().position(|arg| arg == "--env").unwrap();
+        let separator = args.iter().position(|arg| arg == "--").unwrap();
+        assert!(env < separator);
+        assert_eq!(args[env + 1], "CARGO_INCREMENTAL=0");
+        assert_eq!(args[separator + 1], "--resume");
     }
 
     #[test]
@@ -1924,6 +2132,7 @@ mod tests {
             name: "atomics-s1".into(),
             agent: "claude",
             ssh_agent: false,
+            cache_env: Vec::new(),
         };
         let args = ["--resume".to_string(), "abc".to_string()];
         assert_eq!(
