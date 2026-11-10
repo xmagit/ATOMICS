@@ -1164,3 +1164,48 @@ They contact the relay on `127.0.0.1` and receive a placeholder in their environ
 settings. Inherited Anthropic API/auth keys are cleared. The token stays on the host side of the
 relay; native hooks remain enabled. A missing subscription blocks this launch instead of falling
 back to a real environment token. The default remains the native Claude login for bare sessions.
+
+## GitHub publishing and the shared UID
+
+Connect a GitHub account in the window that holds the keychain. For a VM this is the Mac client;
+it stores the token locally and syncs it over the administrator SSH path to the private broker,
+like other relayed secrets. Each connected account has its own secret. The optional
+`[identity] github` login selects one for a project, using the usual identity precedence; the
+sidebar shows that selection. A session receives only a fresh placeholder and Git URL/header
+settings, never the GitHub token in a file, environment variable or log. A hardened VM's broker
+store is owned by its separate service user. Without hardening, the existing root-access limit
+still applies.
+
+Git fetch and push need no `gh` installation. The account grant is narrowed to the project's
+origin repository on github.com: smart-HTTP discovery, upload-pack and receive-pack, plus the REST
+paths that list, create and update its pull requests. Other repositories, hosts, account APIs,
+merges and workflow endpoints are refused. The broker checks these paths independently of the
+outer relay, never follows redirects and redacts reflected credentials in replies. It checks the
+current default branch before forwarding receive-pack; failed metadata lookup or malformed
+updates fail closed. The account secret's `refuse_default_branch` setting defaults to true.
+Turning off **Refuse pushes to the default branch** explicitly permits ordinary updates to it in
+new sessions; the setting is synchronized through the same admin path and old grants are revoked.
+
+**The VM host and bare agents share a UID.** The use socket accepts that UID's grant-management
+calls. Repository/account selection is therefore a trusted host/session convention; a process with
+that UID can request a different scoped grant. The broker still enforces the repository on each
+individual grant and never returns a relayed token. Agents with a scoped credential are allowed
+to push and open or update PRs directly, without a window or click. This is intentional.
+
+The chief's `atomics_publish` workflow raises a board card and waits for the user's Publish click.
+Only that workflow's click pushes its reviewed commit and opens or updates the PR; its result URL
+is saved on the plan and records `pr_opened`. The chief's prompt and the app/MCP tool boundary
+enforce this convention. **It is not a broker guarantee inside the VM:** no signed grants are used,
+and agents can call their allowed git/REST endpoints directly. On a desktop, sandboxed agents
+reach the relay with placeholders; bare agents run as the keychain holder and share that user's
+access. A Publish card cannot create a stronger boundary between processes sharing that UID.
+
+See [github.md](github.md#git-and-pull-requests-through-the-broker) for account selection,
+configuration and the full Publish card flow.
+
+In the normal chief-to-agent flow, the chief asks the user and then tells the task agent to push
+and open its own PR. The agent may attach `pull_request` (`url`, `number`, `head`, `base`) to
+`atomics_report`. ATOMICS binds that metadata to the reporting task, shows the PR on its card and
+records `pr_opened`, without treating a report as task acceptance or independently verifying it
+against GitHub. Remote branch protection remains the first line of protection; the secret's
+default-on refusal of default-branch pushes is a second line.

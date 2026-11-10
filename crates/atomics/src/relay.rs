@@ -22,6 +22,7 @@ use anyhow::{Context, Result};
 
 pub mod azure;
 pub mod broker;
+pub mod github;
 
 fn log_path(log: &std::path::Path) -> PathBuf {
     log.with_file_name("credential-usage.json")
@@ -65,6 +66,7 @@ pub struct Credential {
     pub hosts: Vec<String>,
     /// What its requests may do there; anything else is refused.
     pub rules: Vec<Rule>,
+    github: Option<github::Scope>,
 }
 
 enum Source {
@@ -88,6 +90,7 @@ impl Credential {
     /// nothing on its account or OAuth endpoints.
     pub fn claude(token: String) -> Self {
         Self {
+            github: None,
             label: "Claude subscription".into(),
             source: Source::Static(token),
             authorization: Authorization::Bearer,
@@ -104,6 +107,7 @@ impl Credential {
 
     pub fn azure(azure: Arc<azure::Azure>) -> Self {
         Self {
+            github: None,
             label: "Azure CLI".into(),
             authorization: Authorization::Bearer,
             hosts: azure.config.resources.keys().cloned().collect(),
@@ -119,7 +123,7 @@ impl Credential {
         rules: Vec<Rule>,
         authorization: Authorization,
     ) -> Self {
-        Self { label, source: Source::Static(token), authorization, prefix: "atomics-", hosts, rules }
+        Self { label, source: Source::Static(token), authorization, prefix: "atomics-", hosts, rules, github: None }
     }
     fn secret(spec: &atomics_core::secrets::Secret, value: String) -> Self {
         let host = spec.host.as_deref().expect("relayed secret");
@@ -443,9 +447,10 @@ impl Inner {
                 if !credential.hosts.iter().any(|allowed| allowed.eq_ignore_ascii_case(&route.host)) {
                     Some((403, "this credential may not reach that host"))
                 } else if !match &credential.source {
-                    Source::Static(_) | Source::Broker(_) => {
-                        credential.rules.iter().any(|rule| rule.allows(&route.host, &head.method, &route.path))
-                    }
+                    Source::Static(_) | Source::Broker(_) => credential.github.as_ref().map_or_else(
+                        || credential.rules.iter().any(|rule| rule.allows(&route.host, &head.method, &route.path)),
+                        |scope| scope.allows(&head.method, route),
+                    ),
                     Source::Azure(_) => matches!(head.method.as_str(), "GET" | "POST" | "PUT" | "PATCH" | "DELETE"),
                 } {
                     Some((403, "this credential may not make that request"))
@@ -486,6 +491,15 @@ impl Inner {
                 return Ok(false);
             }
         };
+        if grant.credential.github.is_some()
+            && head.method == "POST"
+            && route.path.ends_with("/git-receive-pack")
+            && (head.header("content-encoding").is_some() || !self.github_push_allowed(&grant.credential, &body))
+        {
+            self.log.record(session, (host, path), &head.method, 403, started.elapsed(), Some(&grant.credential.label));
+            refuse(writer, 403, "GitHub push refused: default branch or unsupported update")?;
+            return Ok(false);
+        }
         if let Source::Azure(azure) = &grant.credential.source
             && !azure.read(host, &head.method, path)
         {
@@ -626,21 +640,25 @@ impl Inner {
             }
             request = request.header(name.as_str(), value.as_str());
         }
-        request = match &credential.authorization {
-            Authorization::Bearer => request.header("authorization", format!("Bearer {secret}")),
-            Authorization::ApiKey => request.header("authorization", &secret),
-            Authorization::Header(name) => request.header(name, &secret),
-            Authorization::Basic(username) => {
-                use base64::Engine;
-                request.header(
-                    "authorization",
-                    format!(
-                        "Basic {}",
-                        base64::engine::general_purpose::STANDARD.encode(format!("{username}:{secret}"))
-                    ),
-                )
+        request = if credential.github.is_some() && route.host == "api.github.com" {
+            request.header("authorization", format!("Bearer {secret}"))
+        } else {
+            match &credential.authorization {
+                Authorization::Bearer => request.header("authorization", format!("Bearer {secret}")),
+                Authorization::ApiKey => request.header("authorization", &secret),
+                Authorization::Header(name) => request.header(name, &secret),
+                Authorization::Basic(username) => {
+                    use base64::Engine;
+                    request.header(
+                        "authorization",
+                        format!(
+                            "Basic {}",
+                            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{secret}"))
+                        ),
+                    )
+                }
+                Authorization::Query(_) => request,
             }
-            Authorization::Query(_) => request,
         };
         request = request.header("accept-encoding", "identity");
         let sent = if body.is_empty() && !matches!(head.method.as_str(), "POST" | "PUT" | "PATCH") {
@@ -1539,7 +1557,10 @@ impl Service {
             crate::credentials::Store::new(self.keychain.clone()).secret_values()?
         };
         let mut granted = granted;
-        for (spec, value) in secrets.into_iter().filter(|(s, _)| s.scope.includes(workspace, project)) {
+        for (spec, value) in secrets
+            .into_iter()
+            .filter(|(s, _)| s.scope.includes(workspace, project) && !s.name.starts_with(github::ACCOUNT_PREFIX))
+        {
             let grant = granted.get_or_insert_with(Granted::default);
             if let Some(host) = &spec.host {
                 let mut relay = self.relay.lock().unwrap();

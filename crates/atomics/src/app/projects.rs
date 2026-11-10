@@ -206,6 +206,7 @@ mod tests {
                     name: Some("Main Example".into()),
                     email: Some("main@example.com".into()),
                     forbidden_words: Some(vec!["contoso".into()]),
+                    github: None,
                 };
                 state.config.identity.projects.insert(
                     "~/project-link".into(),

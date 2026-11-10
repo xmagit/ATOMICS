@@ -134,6 +134,7 @@ fn startup_cleanup_does_not_block_the_runtime_while_sbx_is_waiting() {
             briefs: None,
             relay: None,
             secret_workspace: None,
+            github_account: None,
         };
         crate::sandbox::prepare(&job).unwrap();
         let gate = bin.path().join("wait-ls");
@@ -1080,6 +1081,7 @@ fn the_cleanup_dialog_removes_a_worktrees_sandbox_and_chosen_orphans() {
                 pins: paths::git_pins_dir(),
                 relay: None,
                 secret_workspace: None,
+                github_account: None,
             };
             crate::sandbox::prepare(&job).unwrap();
             worktrees.push(path);

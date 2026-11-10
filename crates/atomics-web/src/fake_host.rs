@@ -823,7 +823,9 @@ impl FakeHost {
                 }
                 plan.notebook = notebook.notebook;
             }
-            PlanAction::Set { .. } => return refused(ErrorCode::Rejected, "not in this fake"),
+            PlanAction::Set { .. } | PlanAction::PublishDecision { .. } => {
+                return refused(ErrorCode::Rejected, "not in this fake");
+            }
         }
         let _ = self.event(|cursor| Message::PlanUpsert { cursor, plan });
         Outcome::done(serde_json::Value::Null)
@@ -1288,6 +1290,7 @@ pub fn board() -> Board {
         pending_approvals: u32::from(!chief),
     };
     let task = |id: &str, status, depends_on: &[&str]| TaskInfo {
+        pull_request: None,
         id: id.into(),
         title: format!("Task {id}"),
         status,
@@ -1314,6 +1317,8 @@ pub fn board() -> Board {
     Board {
         sessions: vec![session("chief", "Chief", true), session("s1", "Fix the parser", false)],
         plans: vec![PlanInfo {
+            publish: None,
+            pull_request: None,
             notebook: Vec::new(),
             ticket_tree: None,
             id: "p1".into(),
@@ -1369,6 +1374,8 @@ pub fn file_diff(path: &str, lines: u32) -> FileDiff {
 /// A finished plan with no tasks.
 pub fn closed_plan(id: &str, status: atomics_core::plan::PlanStatus, goal: &str) -> PlanInfo {
     PlanInfo {
+        publish: None,
+        pull_request: None,
         notebook: Vec::new(),
         ticket_tree: None,
         id: id.into(),
@@ -1390,6 +1397,7 @@ pub fn working() -> FakeHost {
     use atomics_core::session::AgentStatus;
     let mut host = self::host();
     let branched = |id: &str, status| TaskInfo {
+        pull_request: None,
         id: id.into(),
         title: format!("Task {id}"),
         status,

@@ -90,6 +90,8 @@ pub struct ReportInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<crate::plan::PullRequest>,
     pub id: String,
     pub title: String,
     pub status: TaskStatus,
@@ -110,6 +112,10 @@ pub struct TaskInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<crate::plan::PullRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish: Option<crate::plan::Publish>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notebook: Vec<crate::plan::NotebookEntry>,
     /// Full safe links for the shared ticket sidebar, chunked with their plan.

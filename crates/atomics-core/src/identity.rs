@@ -10,6 +10,8 @@ pub struct Identity {
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub github: Option<String>,
     /// None inherits; an explicit empty list clears the inherited guard.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub forbidden_words: Option<Vec<String>>,
@@ -29,6 +31,7 @@ impl Identity {
         Self {
             name: other.name.clone().or_else(|| self.name.clone()),
             email: other.email.clone().or_else(|| self.email.clone()),
+            github: other.github.clone().or_else(|| self.github.clone()),
             forbidden_words: other.forbidden_words.clone().or_else(|| self.forbidden_words.clone()),
         }
     }
@@ -43,6 +46,13 @@ impl Identity {
                     "identity.{key} must be nonempty and contain no control characters or angle brackets"
                 ));
             }
+        }
+        if self
+            .github
+            .as_ref()
+            .is_some_and(|v| v.is_empty() || v.len() > 39 || !v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+        {
+            return Err("identity.github must name a GitHub account".into());
         }
         if self
             .forbidden_words
@@ -228,7 +238,7 @@ mod native {
         into: Option<&str>,
         identity: &Identity,
     ) -> Result<Vec<Hit>> {
-        check_task_impl(repo, None, true, branch, base_ref, into, identity)
+        check_task_impl(repo, None, true, branch, base_ref, into, identity, None)
     }
 
     pub fn check_task_at(
@@ -239,7 +249,7 @@ mod native {
         into: Option<&str>,
         identity: &Identity,
     ) -> Result<Vec<Hit>> {
-        check_task_impl(repo, Some(worktree), false, branch, base_ref, into, identity)
+        check_task_impl(repo, Some(worktree), false, branch, base_ref, into, identity, None)
     }
 
     /// Historical tasks with no remaining worktree are checked without discovering a checkout
@@ -251,9 +261,19 @@ mod native {
         into: Option<&str>,
         identity: &Identity,
     ) -> Result<Vec<Hit>> {
-        check_task_impl(repo, None, false, branch, base_ref, into, identity)
+        check_task_impl(repo, None, false, branch, base_ref, into, identity, None)
     }
 
+    /// Publication checks immutable objects, so concurrent branch movement cannot swap in unchecked authors.
+    pub fn check_publish(repo: &Path, branch: &str, commit: &str, base: &str, identity: &Identity) -> Result<Vec<Hit>> {
+        ensure!(
+            matches!(commit.len(), 40 | 64) && commit.bytes().all(|b| b.is_ascii_hexdigit()),
+            "invalid publish commit"
+        );
+        check_task_impl(repo, None, false, branch, base, None, identity, Some(commit))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn check_task_impl(
         repo: &Path,
         worktree: Option<&Path>,
@@ -262,6 +282,7 @@ mod native {
         base_ref: &str,
         into: Option<&str>,
         identity: &Identity,
+        snapshot: Option<&str>,
     ) -> Result<Vec<Hit>> {
         identity.validate().map_err(anyhow::Error::msg)?;
         if !identity.guarded() {
@@ -271,7 +292,8 @@ mod native {
         let read = |dir: &Path, args: &[&str]| {
             git::git(dir, args).map_err(|_| anyhow::anyhow!("identity guard could not read task Git data"))
         };
-        let reference = format!("refs/heads/{branch}");
+        let branch_ref = format!("refs/heads/{branch}");
+        let reference = snapshot.unwrap_or(&branch_ref);
         let base = git::resolve_base(repo, base_ref)
             .map_err(|_| anyhow::anyhow!("identity guard could not resolve its base"))?;
         // Author identity applies only to work not already accepted into the integration
@@ -289,7 +311,7 @@ mod native {
         };
         let base = read(repo, &["merge-base", &base, &reference])?;
         let mut hits = Vec::new();
-        text_hits(&mut hits, identity, &format!(".git/{reference}"), 1, branch);
+        text_hits(&mut hits, identity, &format!(".git/{branch_ref}"), 1, branch);
         let commits = read(repo, &["rev-list", &format!("{}..{reference}", base.trim())])?;
         for commit in commits.lines() {
             let raw = read(repo, &["cat-file", "commit", commit])?;
@@ -420,10 +442,12 @@ mod tests {
             r#"
 name = "Main Example"
 email = "main@example.com"
+github = "account-one"
 forbidden_words = ["contoso"]
 [projects."~/app"]
 name = "Project Example"
 email = "project@example.com"
+github = "account-two"
 forbidden_words = []
 "#,
         )
@@ -438,6 +462,8 @@ forbidden_words = []
         let project = config.resolve("/example/app", Some(&ws), expand);
         assert_eq!(project.email.as_deref(), Some("project@example.com"));
         assert_eq!(project.name.as_deref(), Some("Project Example"));
+        assert_eq!(workspace.github.as_deref(), Some("account-one"));
+        assert_eq!(project.github.as_deref(), Some("account-two"));
         assert_eq!(project.forbidden_words, Some(vec![]));
         assert_eq!(IdentityConfig::default().resolve("/other", None, expand), Identity::default());
     }
@@ -456,6 +482,7 @@ forbidden_words = []
             name: Some("Context Example".into()),
             email: Some("context@example.com".into()),
             forbidden_words: Some(vec!["contoso".into()]),
+            github: None,
         };
         (dir, repo, identity)
     }
@@ -717,6 +744,27 @@ forbidden_words = []
                 &email_only
             )
             .is_err()
+        );
+    }
+    #[test]
+    #[cfg(feature = "native")]
+    fn identity_publish_guard_checks_the_reviewed_commit_after_branch_moves() {
+        let (dir, repo, identity) = project();
+        let task = dir.path().join("task");
+        crate::git::add_worktree(&repo, &task, "task", "main").unwrap();
+        std::fs::write(task.join("work.txt"), "safe").unwrap();
+        crate::git::commit_all_with_identity(&task, "reviewed", &identity).unwrap();
+        let reviewed = crate::git::git(&task, &["rev-parse", "HEAD"]).unwrap();
+        std::fs::write(task.join("work.txt"), "changed").unwrap();
+        let other = Identity { email: Some("other@example.invalid".into()), ..identity.clone() };
+        crate::git::commit_all_with_identity(&task, "changed", &other).unwrap();
+        let changed = crate::git::git(&task, &["rev-parse", "HEAD"]).unwrap();
+        assert!(check_publish(&repo, "task", reviewed.trim(), "main", &identity).unwrap().is_empty());
+        assert!(
+            check_publish(&repo, "task", changed.trim(), "main", &identity)
+                .unwrap()
+                .iter()
+                .any(|hit| hit.reason == "author email differs from active identity")
         );
     }
 }

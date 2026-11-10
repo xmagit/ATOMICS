@@ -77,6 +77,10 @@ pub struct PlanCommand {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum PlanAction {
+    PublishDecision {
+        request: String,
+        approve: bool,
+    },
     /// User curation of a notebook proposal, visible to every board client.
     Notebook {
         id: u64,
@@ -311,6 +315,10 @@ pub enum SettingsTool {
     RemoveSecret {
         name: String,
     },
+    SetGithubPolicy {
+        name: String,
+        refuse_default_branch: bool,
+    },
     PutCredential {
         kind: String,
         value: String,
@@ -523,6 +531,9 @@ impl PlanCommand {
         let mut bounds = Bounds::new(&self.op);
         bounds.id("plan", self.plan.as_deref()).id("digest", self.digest.as_deref());
         match &self.action {
+            PlanAction::PublishDecision { request, .. } => {
+                bounds.id("publish request", Some(request));
+            }
             PlanAction::Set { goal, tasks, integration } => {
                 bounds.text("goal", Some(goal)).id("integration", integration.as_deref());
                 if tasks.len() > MAX_TASKS {
@@ -683,7 +694,7 @@ impl HostCommand {
                     bounds.id("name", Some(&spec.name)).text("value", Some(value));
                     spec.validate().map_err(|message| WireError::new(ErrorCode::Malformed, message))?;
                 }
-                SettingsTool::RemoveSecret { name } => {
+                SettingsTool::SetGithubPolicy { name, .. } | SettingsTool::RemoveSecret { name } => {
                     bounds.id("name", Some(name));
                 }
                 SettingsTool::RemoveCredential { kind, host } => {

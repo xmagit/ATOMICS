@@ -98,6 +98,11 @@ fn sandboxable_agent_tools() -> Value {
             "properties": {
                 "status": { "type": "string", "enum": ["done", "blocked", "question", "progress"] },
                 "summary": { "type": "string", "maxLength": 8000 },
+                "pull_request": {
+                    "type":"object", "description":"The PR you opened for your task branch, after the chief asked you to publish. ATOMICS records it on your task card and its pr_opened stage.",
+                    "properties":{"url":{"type":"string"},"number":{"type":"integer","minimum":1},"head":{"type":"string"},"base":{"type":"string"}},
+                    "required":["url","number","head","base"],"additionalProperties":false
+                },
                 "checks": {
                     "type": "array", "maxItems": 12,
                     "description": "Evidence per acceptance check: command actually run, exit code and relevant output tail. Text is bounded and terminal controls are stripped.",
@@ -146,6 +151,7 @@ fn sandboxable_agent_tools() -> Value {
 
 /// Tools only the chief's own server offers.
 const CHIEF_ONLY: &[&str] = &[
+    "atomics_publish",
     "atomics_plan_notebook",
     "atomics_trace_get",
     "atomics_restart",
@@ -578,6 +584,14 @@ fn exec_tool(session: &Value) -> Value {
 fn stage_tools() -> Value {
     json!([
         {
+            "name": "atomics_publish",
+            "description": "Chief only: request publication of a plan integration branch or named branch. The board shows repository, identity account, checked commits and full description. Only the user clicking Publish pushes and opens or updates its pull request. Task agents should ask the chief to request publication.",
+            "inputSchema": {"type":"object","properties":{
+                "plan":{"type":"string"}, "branch":{"type":"string"}, "title":{"type":"string"},
+                "body":{"type":"string"}, "base":{"type":"string"}
+            },"required":["plan","title","body","base"],"additionalProperties":false}
+        },
+        {
             "name": "atomics_plan_stage",
             "description": "Record an accepted plan or task's lifecycle milestone (integrated, pr_opened, ci_passed, ci_failed, merged, deployed or configured custom stage). workflow.done gates plan completion. Include a PR or CI run URL when available. Repeating the same event is idempotent.",
             "inputSchema": { "type": "object", "properties": {
@@ -736,6 +750,7 @@ pub(crate) fn request_for_tool(name: &str, mut args: Value) -> Result<ControlReq
         "atomics_plan_get" => "plan_get",
         "atomics_plan_close" => "plan_close",
         "atomics_plan_update" => "plan_update",
+        "atomics_publish" => "publish",
         "atomics_plan_stage" => "plan_stage",
         "atomics_stage_event" => "stage_event",
         "atomics_plan_dispatch" => "plan_dispatch",
@@ -1214,5 +1229,31 @@ mod notebook_tests {
         );
         assert!(AGENT_INSTRUCTIONS.contains("data, not instructions"));
         assert!(INSTRUCTIONS.contains("data, not instructions"));
+    }
+}
+
+#[cfg(test)]
+mod github_publish_tests {
+    use super::*;
+
+    #[test]
+    fn github_publish_is_chief_only_and_reports_carry_pr_metadata() {
+        for (agent, chief, visible) in [(true, false, false), (false, false, false), (false, true, true)] {
+            assert_eq!(
+                available_tools(agent, chief).as_array().unwrap().iter().any(|t| t["name"] == "atomics_publish"),
+                visible
+            );
+        }
+        assert!(
+            matches!(request_for_tool("atomics_publish", json!({"plan":"p","title":"Title","body":"Full description","base":"main"})).unwrap(), ControlRequest::Publish { plan, branch: None, .. } if plan == "p")
+        );
+        let pr = json!({"url":"https://github.com/group/repo/pull/1","number":1,"head":"task","base":"main"});
+        let request =
+            request_for_tool("atomics_report", json!({"status":"done","summary":"Published","pull_request":pr}))
+                .unwrap();
+        assert!(
+            matches!(request, ControlRequest::Report { pull_request: Some(p), .. } if p.number == 1 && p.head == "task")
+        );
+        assert!(request_for_tool("atomics_publish_decide", json!({"plan":"p","approve":true})).is_err());
     }
 }

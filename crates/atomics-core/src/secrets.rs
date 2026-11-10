@@ -40,10 +40,13 @@ pub enum Auth {
     Query(String),
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Secret {
     pub name: String,
+    /// GitHub account secrets refuse default-branch pushes unless explicitly disabled.
+    #[serde(default = "refuse_default_branch")]
+    pub refuse_default_branch: bool,
     pub host: Option<String>,
     #[serde(default)]
     pub scope: Scope,
@@ -53,6 +56,24 @@ pub struct Secret {
     pub methods: Vec<String>,
     #[serde(default)]
     pub path_prefix: Option<String>,
+}
+
+fn refuse_default_branch() -> bool {
+    true
+}
+
+impl Default for Secret {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            host: None,
+            scope: Scope::default(),
+            auth: Auth::default(),
+            methods: Vec::new(),
+            path_prefix: None,
+            refuse_default_branch: true,
+        }
+    }
 }
 
 pub const EXPOSED: &str = "Exposed — agents can read and leak this value";

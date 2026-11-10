@@ -279,6 +279,9 @@ pub(crate) fn task_result_for(
         {
             ui.label(RichText::new(line).color(p.muted).size(12.0));
         }
+        if let Some(pr) = &task.pull_request {
+            ui.hyperlink_to(format!("PR #{} · {} → {}", pr.number, pr.head, pr.base), &pr.url);
+        }
         if let Some(report) = &task.report {
             let summary = if expanded {
                 report.summary.clone()
@@ -496,6 +499,32 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
     });
     if !plan.goal.is_empty() {
         ui.label(RichText::new(&plan.goal).color(board.state.color(&p)).size(13.0));
+    }
+    if let Some(request) = &plan.publish {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.heading("Publish pull request");
+            ui.label(format!("{} · GitHub account: {}", request.repository, request.account));
+            ui.label(format!("{} → {} · {}", request.branch, request.base, request.head_sha));
+            ui.strong(&request.title);
+            ui.label(&request.body);
+            ui.monospace(&request.commits);
+            if let Some(url) = &request.url {
+                ui.hyperlink(url);
+            } else {
+                if let Some(error) = &request.error {
+                    ui.colored_label(p.error, error);
+                }
+                ui.horizontal(|ui| {
+                    for (label, approve) in [("Publish", true), ("Dismiss", false)] {
+                        let command = Command::PublishDecision { plan: index, request: request.id.clone(), approve };
+                        if ui.add_enabled(!read_only && backend.available(&command), egui::Button::new(label)).clicked()
+                        {
+                            client.send(command);
+                        }
+                    }
+                });
+            }
+        });
     }
     let integration = plan.integration_branch();
     if !plan.tasks.is_empty() {

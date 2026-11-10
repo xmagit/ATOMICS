@@ -195,6 +195,22 @@ impl State {
             Command::HostCommand(host) => {
                 return Started::Now(self.host_command(host).map_or_else(Outcome::refused, Outcome::done));
             }
+            Command::PlanCommand(PlanCommand {
+                plan,
+                action: PlanAction::PublishDecision { request, approve },
+                ..
+            }) => {
+                let result = plan
+                    .and_then(|id| self.plans.iter().position(|p| p.id == id))
+                    .ok_or_else(|| not_found("No such plan"))
+                    .and_then(|index| {
+                        self.decide_publish(index, &request, approve)
+                            .map_err(|e| WireError::new(ErrorCode::Malformed, e))
+                    });
+                return Started::Now(
+                    result.map_or_else(Outcome::refused, |_| Outcome::done(json!({"accepted": true}))),
+                );
+            }
             Command::PlanCommand(plan) => self.plan_request(plan),
             Command::SessionCommand(session) => self.session_request(session),
         };
@@ -318,6 +334,9 @@ impl State {
             if found { Ok(()) } else { Err(not_found(format!("no task {id}"))) }
         };
         Ok(match action {
+            PlanAction::PublishDecision { .. } => {
+                return Err(WireError::new(ErrorCode::Malformed, "Publish decisions require the user interface"));
+            }
             PlanAction::Notebook { id, pinned, delete } => {
                 ControlRequest::CurateNote { plan: plan.unwrap_or_default(), id, pinned, delete }
             }

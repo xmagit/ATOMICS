@@ -87,6 +87,7 @@ pub struct Prepare {
     /// the OS keychain holds one.
     pub relay: Option<std::sync::Arc<crate::relay::Service>>,
     pub secret_workspace: Option<String>,
+    pub github_account: Option<String>,
 }
 
 impl Prepare {
@@ -189,7 +190,20 @@ pub fn prepare(job: &Prepare) -> Result<Option<crate::relay::Granted>> {
                 true,
                 granted.clone(),
             ) {
-                Ok(granted) => granted,
+                Ok(granted) => {
+                    if let (Some(account), Some(project)) = (&job.github_account, &project) {
+                        relay.grant_project_github(
+                            &job.name,
+                            account,
+                            project,
+                            job.secret_workspace.as_deref(),
+                            true,
+                            granted,
+                        )?
+                    } else {
+                        granted
+                    }
+                }
                 Err(error) => {
                     if let Some(granted) = &granted {
                         relay.revoke(granted);
@@ -1147,6 +1161,7 @@ mod tests {
             pins: sbx.with_file_name("git-pins"),
             relay: None,
             secret_workspace: None,
+            github_account: None,
         }
     }
 

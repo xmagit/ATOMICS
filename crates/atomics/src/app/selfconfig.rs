@@ -150,6 +150,7 @@ impl State {
             for (field, set) in [
                 ("name", identity.name.is_some()),
                 ("email", identity.email.is_some()),
+                ("github", identity.github.is_some()),
                 ("forbidden_words", identity.forbidden_words.is_some()),
             ] {
                 if set && let Some(entry) = values.get_mut(&format!("identity.{field}")) {

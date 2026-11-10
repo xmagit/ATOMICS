@@ -800,6 +800,7 @@ mod tests {
             briefs: None,
             relay: None,
             secret_workspace: None,
+            github_account: None,
         };
         assert!(sandbox::prepare(&attempt).unwrap_err().to_string().contains("not owned"));
         assert!(ownership::owned(&a).unwrap().is_empty());

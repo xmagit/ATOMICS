@@ -30,6 +30,7 @@ pub fn run(app_id: &str) -> Result<u64> {
         pins: paths::git_pins_dir(),
         relay: Some(relay.clone()),
         secret_workspace: None,
+        github_account: None,
     };
     let checked = check(&job, &relay, &app_id.to_string());
     let removed = remove(&home, &job.sbx, &job.name).and_then(|()| Ok(std::fs::remove_dir_all(folder)?));

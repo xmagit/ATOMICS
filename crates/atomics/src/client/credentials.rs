@@ -41,11 +41,22 @@ impl Credentials {
                     let mut copy_note = None;
                     let mut sync;
                     let result = match command {
+                        Command::ConnectGithub => {
+                            sync = true;
+                            let connected = connect_github(&relay, |device| {
+                                let mut status = refresh().unwrap_or_else(|_| json!({}));
+                                status["github_device"] = device;
+                                let _ = updates.send((status, false));
+                                wake();
+                            });
+                            connected.and_then(|()| refresh())
+                        }
                         Command::Manage(HostAction::SettingsTool { tool }) => {
                             sync = matches!(
                                 tool,
                                 SettingsTool::AddSecret { .. }
                                     | SettingsTool::RemoveSecret { .. }
+                                    | SettingsTool::SetGithubPolicy { .. }
                                     | SettingsTool::RefreshCredentials
                             );
                             crate::app::management::local_credential_tool(&relay, tool)
@@ -140,6 +151,38 @@ fn decorate(status: &mut Value, info: &Option<BundleInfo>, report: Option<&Resul
         }
         None => json!({}),
     };
+}
+
+/// Device authorization runs where the keychain is: never on the VM host protocol.
+fn connect_github(relay: &crate::relay::Service, show: impl Fn(Value)) -> Result<(), String> {
+    use std::time::{Duration, Instant};
+    let api = crate::github::Endpoints::default().api("github.com", None);
+    let code = api.device_code(atomics_core::github::DEFAULT_CLIENT_ID).map_err(|e| e.to_string())?;
+    show(json!({"code":code.user_code,"url":code.verification_uri}));
+    let _ = crate::connections::Browser::current().open(&code.verification_uri);
+    let deadline = Instant::now() + Duration::from_secs(code.expires_in);
+    let mut interval = code.interval;
+    loop {
+        std::thread::sleep(Duration::from_secs(interval));
+        if Instant::now() >= deadline {
+            return Err("GitHub code expired; connect again".into());
+        }
+        match api.device_token(atomics_core::github::DEFAULT_CLIENT_ID, &code.device_code).map_err(|e| e.to_string())? {
+            crate::github::DevicePoll::Pending => {}
+            crate::github::DevicePoll::SlowDown => interval += 5,
+            crate::github::DevicePoll::Failed(error) => return Err(error),
+            crate::github::DevicePoll::Token(grant) => {
+                let login = crate::github::Endpoints::default()
+                    .api("github.com", Some(grant.token.clone()))
+                    .viewer()
+                    .map_err(|e| e.to_string())?;
+                crate::credentials::Store::local(relay.keychain().clone())
+                    .connect_github_account(&login, grant.token.secret())
+                    .map_err(|e| e.to_string())?;
+                return Ok(());
+            }
+        }
+    }
 }
 
 #[cfg(test)]

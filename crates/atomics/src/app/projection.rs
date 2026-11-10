@@ -434,6 +434,8 @@ impl State {
         self.plans
             .iter()
             .map(|p| PlanInfo {
+                publish: p.publish.clone(),
+                pull_request: p.pull_request.clone(),
                 notebook: p.notebook.clone(),
                 ticket_tree: self.ticket_tree(p),
                 id: p.id.clone(),
@@ -446,6 +448,7 @@ impl State {
                     .tasks
                     .iter()
                     .map(|t| TaskInfo {
+                        pull_request: t.pull_request.clone(),
                         id: t.id.clone(),
                         title: t.title.clone(),
                         status: t.status,

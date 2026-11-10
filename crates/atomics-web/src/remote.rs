@@ -110,11 +110,13 @@ fn credential_command(command: &Command) -> bool {
     use atomics_core::ops::{HostAction, SettingsTool};
     matches!(
         command,
-        Command::CopySecret(_)
+        Command::ConnectGithub
+            | Command::CopySecret(_)
             | Command::Manage(HostAction::SettingsTool {
                 tool: SettingsTool::RefreshCredentials
                     | SettingsTool::AddSecret { .. }
                     | SettingsTool::RemoveSecret { .. }
+                    | SettingsTool::SetGithubPolicy { .. }
                     | SettingsTool::PutCredential { .. }
                     | SettingsTool::RemoveCredential { .. }
                     | SettingsTool::CleanCredentials
@@ -1307,6 +1309,7 @@ fn ticket(key: &Option<String>) -> Option<TicketLink> {
 
 fn task(info: &TaskInfo) -> Task {
     Task {
+        pull_request: info.pull_request.clone(),
         id: info.id.clone(),
         title: info.title.clone(),
         depends_on: info.depends_on.clone(),
@@ -1335,6 +1338,8 @@ fn task(info: &TaskInfo) -> Task {
 fn plan(info: &PlanInfo) -> Plan {
     Plan {
         notebook: info.notebook.clone(),
+        publish: info.publish.clone(),
+        pull_request: info.pull_request.clone(),
         id: info.id.clone(),
         status: info.status,
         goal: info.goal.clone(),

@@ -19,7 +19,10 @@ pub fn admin_stdin() -> Result<()> {
     std::io::stdin().lock().take(MAX_CONTROL + 1).read_to_end(&mut bytes)?;
     anyhow::ensure!(bytes.len() <= MAX_CONTROL as usize, "request too large");
     let request: Request = serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("invalid admin input"))?;
-    anyhow::ensure!(matches!(request, Request::Set { .. } | Request::Remove { .. }), "not an admin mutation");
+    anyhow::ensure!(
+        matches!(request, Request::Set { .. } | Request::Remove { .. } | Request::SetGithubPolicy { .. }),
+        "not an admin mutation"
+    );
     let client = Client { socket: "/run/atomics-secret-broker/admin.sock".into() };
     // Lima can accept SSH just before systemd has brought the new broker up after a boot.
     // Both allowed mutations are idempotent, including an acknowledgement lost during restart.
@@ -53,9 +56,11 @@ pub struct Options {
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
     List,
+    SetGithubPolicy { name: String, refuse_default_branch: bool },
     Set { spec: Secret, value: String },
     Remove { name: String },
     Grant { name: String, session: String, placeholder: String },
+    GithubGrant { account: String, session: String, placeholder: String, scope: github::Scope },
     Revoke { placeholder: String },
     Expose { name: String, session: String },
     Relay,
@@ -118,6 +123,11 @@ impl Client {
         Ok(())
     }
 
+    pub fn github_policy(&self, name: &str, refuse_default_branch: bool) -> Result<()> {
+        self.admin().call(Request::SetGithubPolicy { name: name.into(), refuse_default_branch })?;
+        Ok(())
+    }
+
     pub fn remove(&self, name: &str) -> Result<()> {
         self.admin().call(Request::Remove { name: name.into() })?;
         Ok(())
@@ -133,6 +143,22 @@ impl Client {
 
     pub(super) fn grant(&self, name: &str, session: &str, placeholder: &str) -> Result<()> {
         self.call(Request::Grant { name: name.into(), session: session.into(), placeholder: placeholder.into() })?;
+        Ok(())
+    }
+
+    pub(super) fn grant_github(
+        &self,
+        account: &str,
+        session: &str,
+        placeholder: &str,
+        scope: github::Scope,
+    ) -> Result<()> {
+        self.call(Request::GithubGrant {
+            account: account.into(),
+            session: session.into(),
+            placeholder: placeholder.into(),
+            scope,
+        })?;
         Ok(())
     }
 
@@ -188,6 +214,9 @@ struct Broker {
 impl Broker {
     fn hosts(&self) -> Result<()> {
         let mut hosts: Vec<_> = self.store.secrets()?.into_iter().filter_map(|spec| spec.host).collect();
+        if self.store.secrets()?.iter().any(|s| s.name.starts_with(github::ACCOUNT_PREFIX)) {
+            hosts.push("api.github.com".into());
+        }
         hosts.sort();
         hosts.dedup();
         // A root-owned path unit consumes only this validated, value-free projection.
@@ -202,6 +231,14 @@ impl Broker {
             anyhow::ensure!(uid == 0 || uid == self.admin_uid, "admin peer refused");
             match request {
                 Request::List => reply.secrets = self.store.secrets()?,
+                Request::SetGithubPolicy { name, refuse_default_branch } => {
+                    self.store.set_github_policy(&name, refuse_default_branch)?;
+                    self.engine
+                        .grants
+                        .lock()
+                        .unwrap()
+                        .retain(|_, grant| grant.credential.label != format!("secret:{name}"));
+                }
                 Request::Set { spec, mut value } => {
                     use zeroize::Zeroize;
                     let label = format!("secret:{}", spec.name);
@@ -242,11 +279,36 @@ impl Broker {
                         .store
                         .secret_values()?
                         .into_iter()
-                        .find(|(spec, _)| spec.name == name && spec.host.is_some())
+                        .find(|(spec, _)| {
+                            spec.name == name && spec.host.is_some() && !name.starts_with(github::ACCOUNT_PREFIX)
+                        })
                         .ok_or_else(|| anyhow::anyhow!("unknown relayed secret"))?;
                     // This immutable snapshot stays exclusively in the broker. An in-flight
                     // request cannot acquire a replacement secret under an older rule.
                     let credential = Arc::new(Credential::secret(&spec, value.to_string()));
+                    let mut grants = self.engine.grants.lock().unwrap();
+                    anyhow::ensure!(
+                        grants.len() < 4096 && !grants.contains_key(&placeholder),
+                        "grant limit or collision"
+                    );
+                    grants.insert(placeholder, Grant { session, credential, replies: Arc::default() });
+                }
+                Request::GithubGrant { account, session, placeholder, mut scope } => {
+                    anyhow::ensure!(valid_session(&session) && valid_placeholder(&placeholder), "invalid grant");
+                    let spec = github::account_spec(&account)?;
+                    let (stored_spec, value) = self
+                        .store
+                        .secret_values()?
+                        .into_iter()
+                        .find(|(s, _)| {
+                            s.name == spec.name
+                                && s.host == spec.host
+                                && s.auth == spec.auth
+                                && s.path_prefix == spec.path_prefix
+                        })
+                        .ok_or_else(|| anyhow::anyhow!("unknown GitHub account"))?;
+                    scope.refuse_default_branch = stored_spec.refuse_default_branch;
+                    let credential = Arc::new(Credential::github(&account, value.to_string(), scope)?);
                     let mut grants = self.engine.grants.lock().unwrap();
                     anyhow::ensure!(
                         grants.len() < 4096 && !grants.contains_key(&placeholder),
@@ -610,5 +672,79 @@ mod tests {
         assert!(fake::chunk(&mut response).contains("message_stop"));
         host.revoke(&granted);
         assert!(broker.engine.grants.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn github_broker_keeps_accounts_private_and_enforces_repository_and_default_policy() {
+        let fake = github::tests::Server::start();
+        let (dir, broker, client) = machine_with(fake.upstreams());
+        let spec = github::account_spec("account-one").unwrap();
+        set(&broker, spec.clone(), "ghp_CANARY_BROKER_GITHUB");
+        assert!(client.grant(&spec.name, "s1", "atomics-invalid").is_err());
+        assert!(client.expose(&spec.name, "s1").is_err());
+        let mut service = Service::with_upstreams(
+            dir.path().join("host"),
+            Keychain::in_folder(&dir.path().join("empty-host-keychain")),
+            HashMap::new(),
+        );
+        service.broker = Some(client.clone());
+        let mut scope = github::Scope::from_project(&fake.work, true).unwrap();
+        scope.refuse_default_branch = false; // the caller cannot weaken the stored rule
+        let grant = service.grant_github("s1", "account-one", scope.clone(), false, None).unwrap().unwrap();
+        let run = |grant: &Granted, args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&fake.work)
+                .args(args)
+                .envs(&grant.secrets)
+                .output()
+                .unwrap()
+        };
+        assert!(run(&grant, &["push", "origin", "task"]).status.success());
+        assert!(run(&grant, &["fetch", "origin"]).status.success());
+        assert!(!run(&grant, &["push", "origin", "task:main"]).status.success());
+        assert!(!run(&grant, &["push", "https://github.com/other/repo.git", "task"]).status.success());
+        let base = format!("http://127.0.0.1:{}/api.github.com", grant.port);
+        let header = format!("Bearer {}", grant.secrets["ATOMICS_GITHUB_PLACEHOLDER"]);
+        let agent = ureq::Agent::config_builder().proxy(None).http_status_as_error(false).build().new_agent();
+        assert_eq!(agent.get(format!("{base}/user")).header("authorization", &header).call().unwrap().status(), 403);
+        assert_eq!(
+            agent
+                .post(format!("{base}/repos/group/repo/pulls"))
+                .header("authorization", &header)
+                .send(b"{}")
+                .unwrap()
+                .status(),
+            200
+        );
+        assert_eq!(
+            agent
+                .patch(format!("{base}/repos/group/repo/pulls/1"))
+                .header("authorization", &header)
+                .send(b"{}")
+                .unwrap()
+                .status(),
+            200
+        );
+        assert_eq!(
+            agent
+                .post(format!("{base}/repos/other/repo/pulls"))
+                .header("authorization", &header)
+                .send(b"{}")
+                .unwrap()
+                .status(),
+            403
+        );
+        let mut readable = format!("{:?}{:?}", grant, grant.secrets);
+        readable += &std::fs::read_to_string(dir.path().join("host/relay.log")).unwrap();
+        assert!(!readable.contains("CANARY"));
+        assert!(crate::credentials::Store::local(service.keychain().clone()).secret_values().unwrap().is_empty());
+        // Changing the secret rule invalidates old grants and explicitly permits a default push.
+        broker
+            .control(Request::SetGithubPolicy { name: spec.name, refuse_default_branch: false }, true, broker.admin_uid)
+            .unwrap();
+        assert!(!run(&grant, &["fetch", "origin"]).status.success());
+        let grant = service.grant_github("s2", "account-one", scope, false, None).unwrap().unwrap();
+        assert!(run(&grant, &["push", "origin", "task:main"]).status.success());
+        service.revoke(&grant);
     }
 }

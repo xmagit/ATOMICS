@@ -135,15 +135,80 @@ token from the keychain and shows a **Revoke on GitHub** link to
 remove the app's authorization fully. ATOMICS does not call GitHub's revoke API, which needs the app's
 secret.
 
-The token is kept in the OS keychain's credential catalog as the `github-app`
-entry, or `github-app:<host>` for an Enterprise host. It goes nowhere else:
+Connected github.com accounts are also stored as relayed secrets in the OS keychain. Each account
+has its own entry, so connecting another account keeps earlier accounts. In a VM client, use
+**Settings → Credentials → Connect GitHub account** in the Mac window: its device code and browser
+sign-in run there, and the secret syncs over the VM administrator connection to the private broker.
+The host protocol carries metadata and session placeholders, never the token. Refresh credentials
+retries an offline sync. The legacy app entry still serves the host's pull-request controls;
+Enterprise connections keep their existing controls and are not publishing accounts.
 
-- it is not written to a log, a plan or the config, and it is not shown;
-- it is not a relay credential, so no agent and no sandbox can get it.
+Choose the publishing account with the optional GitHub login in the identity settings:
 
-The separate `github` entry in Settings → Credentials is the read-only token for agents, and it is
-unchanged. To use a personal access token instead of Connect GitHub, add it in Settings → Credentials as
-**GitHub app sign-in**, with your Enterprise host in the host field if you have one.
+```toml
+[identity]
+github = "account-one"
+
+[identity.projects."~/project"]
+github = "account-two"
+```
+
+The same project → workspace → host/main precedence as commit identity applies. The sidebar shows
+**GitHub: account-two** for that project; the identity editor can change it. An unset account grants
+no publishing credential. A named account must be connected and its secret must include the
+project's scope. Tokens and placeholders are omitted from diagnostic representations.
+
+## Git and pull requests through the broker
+
+Sessions receive Git's URL rewrite and HTTP header settings in their environment. Both HTTPS and
+GitHub SSH origin URLs are routed through the relay; ordinary `git fetch` and `git push origin task`
+work without `gh`. Only a session placeholder enters that environment. No token, credential helper
+containing a token, or token-bearing URL is written into the worktree or Git config.
+
+The account's credential permits only this project's `owner/repo`:
+
+- Git smart HTTP: `GET owner/repo.git/info/refs` for upload/receive discovery and
+  `POST owner/repo.git/git-upload-pack` or `git-receive-pack`.
+- REST: list/create `/repos/owner/repo/pulls` and update `/repos/owner/repo/pulls/<number>`.
+  Merge, workflow, account, other repository and other API paths are refused.
+- Before a push, the broker privately reads that repository's current default branch. A request
+  that changes or deletes that branch is refused before any update reaches GitHub. Malformed or
+  compressed receive-pack requests, signed pushes, tags and other ref namespaces are unsupported.
+  Redirects are never followed. A failed default-branch lookup fails closed.
+
+**Refuse pushes to the default branch** is a setting on each connected account secret, on by
+default (metadata field `refuse_default_branch = true`). Turn it off under Settings → Credentials
+only when that account is meant to push default branches. The change revokes old grants, syncs to
+the VM broker and takes effect in new sessions. Reconnecting preserves the setting and scope.
+When off, ordinary branch updates, including default-branch updates, are allowed. This is a secret
+rule, not an unconditional restriction.
+
+Agents can also call the permitted PR endpoints using `ATOMICS_GITHUB_API_URL` and
+`Authorization: Bearer $ATOMICS_GITHUB_PLACEHOLDER`. The broker substitutes the account's real token.
+They may push and open or update pull requests directly, headless included, within this rule.
+
+## The chief's Publish card
+
+The chief's `atomics_publish` tool takes `plan`, an optional `branch` (the integration branch by
+default), `title`, `body` and `base`. It prepares a card on the plan's board, with repository,
+account, branch, commit IDs and authors, title and the full description. The identity guard checks
+commit authors and forbidden words before the card is prepared. No push or PR API call happens
+while preparing it.
+
+Click **Publish** to push the exact reviewed commit and create or update the branch's open PR.
+The worker checks the branch, base, origin and identity again. Changed work requires a new request.
+Double clicks are suppressed. A failure remains on the card; a successful PR URL is saved on the
+plan's card and recorded as its `pr_opened` lifecycle stage. **Dismiss** removes the pending card.
+Task agents ask the chief to use this tool; neither the tool nor a card-decision operation is
+exposed in their MCP tools. Connected board clients can also review and click the card.
+
+This is the chief's review workflow, enforced at the app and tool boundary. **Inside the VM it is
+a convention, not a guarantee:** agents share the host UID and may use their scoped GitHub
+credential directly, including making PR calls without a card or click. The broker does not require
+a signed write grant. A desktop bare agent likewise shares the credential holder's UID. See
+[isolation.md](isolation.md#github-publishing-and-the-shared-uid) for the trust boundary.
+
+The separate read-only `github` credential in Settings remains available for its existing uses.
 
 ## Configuration
 
@@ -255,3 +320,29 @@ inputs = { environment = "test" }
 
 Azure DevOps Server (on premises) is not supported yet.
 
+
+## An agent reports its PR
+
+The normal flow is chief to agent: after asking the user, the chief tells the task agent to push
+its branch and open a PR using its scoped credential. The agent includes the PR in its report:
+
+```json
+{
+  "status": "done",
+  "summary": "Pushed the branch and opened the requested pull request.",
+  "pull_request": {
+    "url": "https://github.com/group/repo/pull/12",
+    "number": 12,
+    "head": "task",
+    "base": "main"
+  }
+}
+```
+
+ATOMICS binds the report to that agent's own task. The head must match its task branch and the
+GitHub URL must match the PR number. It saves the metadata on the task, shows a PR link with
+`head → base` on the card, and records the task's `pr_opened` stage, including before acceptance.
+Repeated reports of the same PR do not duplicate the stage. These are agent-reported details;
+recording them does not independently verify the PR with GitHub or accept the task. The chief can
+read them with `atomics_plan_get`. The chief's integration-branch Publish workflow similarly
+records its result URL and `pr_opened` on the plan.

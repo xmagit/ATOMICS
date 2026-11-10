@@ -62,7 +62,7 @@ pub fn run(command: Command) -> Result<()> {
                 _ => known.as_ref().map(|(_, a)| a.clone()).unwrap_or_default(),
             };
             let host = known.map(|(h, _)| h.into()).or_else(|| host.map(|h| h.to_ascii_lowercase()));
-            let spec = Secret { name, host, scope, auth, methods: method, path_prefix };
+            let spec = Secret { name, host, scope, auth, methods: method, path_prefix, ..Default::default() };
             spec.validate().map_err(anyhow::Error::msg)?;
             let vm_client = crate::vm::secrets::is_vm_client()?;
             if spec.host.is_none() {
