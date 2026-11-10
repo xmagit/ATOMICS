@@ -181,20 +181,24 @@ impl State {
             self.tickets.workspace_file = Some((file, stamp));
             self.management_config.take();
             let previous_identity_error = self.tickets.workspace_identity_error.take();
+            let identity = match self.workspace.as_deref() {
+                Some(name) => Workspace::load_identity(name),
+                None => Ok(None),
+            };
+            match identity {
+                Ok(identity) => self.tickets.workspace_identity = identity,
+                Err(_) => {
+                    let error = "Workspace identity cannot be determined; fix its [identity] or unreadable TOML before starting agents or integrating.".to_string();
+                    self.tickets.workspace_identity_error = Some(error.clone());
+                    self.toast(error);
+                }
+            }
             let loaded = match self.workspace.clone().filter(|_| stamp.is_some()) {
                 Some(name) => Workspace::load(&name).map(Some).map_err(|err| format!("{err:#}")),
                 None => Ok(None),
             };
             match loaded {
                 Ok(Some(workspace)) => {
-                    match workspace.identity() {
-                        Ok(identity) => self.tickets.workspace_identity = identity,
-                        Err(_) => {
-                            let error = "Workspace identity does not load; fix its [identity] before starting agents or integrating.".to_string();
-                            self.tickets.workspace_identity_error = Some(error.clone());
-                            self.toast(error);
-                        }
-                    }
                     match workspace.tickets() {
                         Ok(config) => self.tickets.workspace_config = config,
                         Err(err) => self.toast(format!("Workspace tickets: {}", err.message())),
@@ -223,15 +227,12 @@ impl State {
                 }
                 Ok(None) => {
                     self.tickets.workspace_config = None;
-                    self.tickets.workspace_identity = None;
                     self.tickets.workspace_workflow = None;
                     self.tickets.workspace_isolation = None;
                     self.tickets.workspace_chief = None;
                 }
                 // Broken settings keep their last good values.
                 Err(err) => {
-                    self.tickets.workspace_identity_error =
-                        Some("Workspace file does not load; fix it before starting agents or integrating.".into());
                     self.toast(format!("Workspace tickets/workflow: {err}"));
                 }
             }

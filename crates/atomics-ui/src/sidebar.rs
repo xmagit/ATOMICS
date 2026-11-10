@@ -302,7 +302,7 @@ pub fn explorer(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
                     if let Some(row) = identity
                         && ui.button("Change identity…").clicked()
                     {
-                        if let Ok(identity) = serde_json::from_value(row["identity"].clone()) {
+                        if let Ok(identity) = serde_json::from_value(row["override"].clone()) {
                             client.management.show_identity(root.to_string_lossy().into_owned(), identity);
                         }
                         ui.close();

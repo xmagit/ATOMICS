@@ -107,11 +107,18 @@ email and words, then review and Apply the proposed change. Workspace changes up
 and existing ATOMICS worktrees. Existing commits keep their original authorship. Remove an override
 in the config to inherit from the next scope.
 
+The form prefills only keys stored in the selected scope, and proposes only keys you change.
+Inherited values shown in the project row are not copied into an override. Blank fields inherit:
+blanking an existing value removes that scope's key. Blank forbidden words never clear an inherited
+guard; **Clear inherited words** explicitly writes `forbidden_words = []`. Enter words one per line.
+
 New and reused ATOMICS worktrees receive a conditional repository-local Git config include for just
 that worktree. Its identity file lives under the common Git directory's `atomics-identities/`, outside
 the sandbox's writable directories. This preserves the main checkout's Git identity and does not
 enable `extensions.worktreeConfig`. ATOMICS also supplies the selected identity explicitly for its
 automatic task commit and integration merge, for both author and committer.
+With no configured name or email, ATOMICS creates no identity file or Git config entry. Removing the
+last configured name/email removes ATOMICS's identity include and restores Git's own settings.
 
 Before integration, ATOMICS checks the task branch name, every new commit's raw author, committer,
 message and added lines, plus the current diff and all untracked files. It also checks text it will
@@ -119,6 +126,14 @@ put into its own commits. A forbidden word or an author email different from the
 blocks integration before staging or merging. A mailmap cannot hide a different author. Matches in
 earlier commits still block even if later commits removed them. Fix the content or commit history,
 then integrate again.
+
+Author email comparison is case-insensitive. It applies only to task commits not already reachable
+from the plan's integration branch or the base. Accepted history retains its original authorship,
+so enabling an identity mid-plan does not reject authors inherited from already integrated work.
+The forbidden-word checks still examine the task's diff and commit metadata.
+
+Each untracked file is scanned up to 4 MiB. An oversized file blocks integration with its file name,
+line 1 and an oversize reason; it is never silently skipped or included in the diagnostic text.
 
 Readiness checks show guard failures on the board and in the chief's plan tools. Findings contain
 only a file, a 1-based line number and the reason, never the matched word, email or surrounding text.
@@ -130,8 +145,10 @@ The guard checks author email when configured; it does not rewrite commits.
 workspace) and warns if a workspace defines an identity but a missing key still comes from Git's
 global identity.
 
-If a workspace identity is invalid, ATOMICS shows the problem and blocks new agents and integration
-until it is fixed, preserving existing worktree settings while the problem is unresolved.
+ATOMICS reads workspace identity independently of other workspace settings. An unrelated validation
+error, such as an invalid projects list, does not block agents or integration when identity can be
+determined. An invalid `[identity]`, unreadable file, or TOML syntax error that prevents determining
+identity blocks those operations until fixed, preserving existing worktree settings meanwhile.
 
 ## The chief's prompt
 
