@@ -703,11 +703,11 @@ impl State {
             }
             ControlRequest::Report { pane, status, summary, checks, pull_request } => {
                 let pane = self.pane_session(pane);
-                if let Some(pr) = &pull_request {
-                    if let Err(error) = self.validate_reported_pull_request(pane.as_deref(), pr) {
-                        done(ControlResponse::error(error));
-                        return;
-                    }
+                if let Some(pr) = &pull_request
+                    && let Err(error) = self.validate_reported_pull_request(pane.as_deref(), pr)
+                {
+                    done(ControlResponse::error(error));
+                    return;
                 }
                 let task = self.report_with_checks(pane.as_deref(), &status, &summary, checks);
                 if let Some(pr) = pull_request {

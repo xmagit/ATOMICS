@@ -84,11 +84,11 @@ impl Scope {
     pub(super) fn allows(&self, method: &str, route: &Route) -> bool {
         let git = format!("/{}.git", self.repository);
         if route.host == "github.com" {
-            return match (method, route.path.strip_prefix(&git), route.query.as_deref()) {
-                ("GET", Some("/info/refs"), Some("service=git-upload-pack" | "service=git-receive-pack")) => true,
-                ("POST", Some("/git-upload-pack" | "/git-receive-pack"), None) => true,
-                _ => false,
-            };
+            return matches!(
+                (method, route.path.strip_prefix(&git), route.query.as_deref()),
+                ("GET", Some("/info/refs"), Some("service=git-upload-pack" | "service=git-receive-pack"))
+                    | ("POST", Some("/git-upload-pack" | "/git-receive-pack"), None)
+            );
         }
         if !self.pulls || route.host != "api.github.com" {
             return false;
@@ -162,6 +162,11 @@ impl Inner {
 /// Only ordinary branch updates are supported. Reject malformed packets, signed pushes,
 /// tags, alternate ref namespaces and the default branch, before sending any bytes upstream.
 fn receive_pack_allowed(mut bytes: &[u8], default: &str) -> bool {
+    // Git probes receive-pack before streaming a push larger than http.postBuffer.
+    // Only this exact flush-only body performs no updates.
+    if bytes == b"0000" {
+        return true;
+    }
     let mut commands = 0;
     loop {
         let Some(prefix) = bytes.get(..4).and_then(|p| std::str::from_utf8(p).ok()) else {

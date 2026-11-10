@@ -747,4 +747,63 @@ mod tests {
         assert!(run(&grant, &["push", "origin", "task:main"]).status.success());
         service.revoke(&grant);
     }
+    #[test]
+    fn github_large_push_streams_after_the_empty_probe_through_the_broker() {
+        let server = github::tests::Server::start();
+        server.commit_large_blob();
+        let (dir, broker, client) = machine_with(server.upstreams());
+        set(&broker, github::account_spec("account-one").unwrap(), "ghp_CANARY_BROKER_GITHUB");
+        let mut host =
+            Service::transient(dir.path().join("host"), Keychain::in_folder(&dir.path().join("host-keychain")));
+        host.broker = Some(client);
+        let scope = github::Scope::from_project(&server.work, false).unwrap();
+        let grant = host.grant_github("connection-check", "account-one", scope, false, None).unwrap().unwrap();
+        let (head, mut body) = fake::send(
+            grant.port,
+            &format!(
+                "GET /github.com/group/repo.git/info/refs?service=git-receive-pack HTTP/1.1\r\nHost: relay\r\nAuthorization: Bearer {}\r\n\r\n",
+                grant.secrets["ATOMICS_GITHUB_PLACEHOLDER"]
+            ),
+        );
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert!(head.to_ascii_lowercase().contains("\r\nconnection: close\r\n"), "{head}");
+        io::copy(&mut body, &mut io::sink()).unwrap();
+        host.revoke(&grant);
+        server.assert_large_push(&host);
+        assert!(broker.engine.grants.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn partial_secret_grant_failure_revokes_new_placeholders_on_host_and_broker() {
+        let (dir, broker, client) = machine();
+        for name in ["A_KEY", "B_KEY"] {
+            set(
+                &broker,
+                Secret { name: name.into(), host: Some("api.example.com".into()), ..Default::default() },
+                "canary",
+            );
+        }
+        set(&broker, github::account_spec("account-one").unwrap(), "ghp_CANARY_BROKER_GITHUB");
+        let mut host =
+            Service::transient(dir.path().join("host"), Keychain::in_folder(&dir.path().join("host-keychain")));
+        host.broker = Some(client);
+        let scope = github::Scope { repository: "group/repo".into(), pulls: false, refuse_default_branch: true };
+        let existing = host.grant_github("existing", "account-one", scope, false, None).unwrap().unwrap();
+        let credential = Arc::new(Credential::claude("unused".into()));
+        // Leave room for exactly one new mapping, so the next secret fails at the real broker limit.
+        for i in 0..4094 {
+            broker.engine.grants.lock().unwrap().insert(
+                format!("fixture-{i}"),
+                Grant { session: "other".into(), credential: credential.clone(), replies: Arc::default() },
+            );
+        }
+        assert!(host.grant_secrets("failed-session", None, None, false, Some(existing.clone())).is_err());
+        assert_eq!(host.live_grants(), 1, "the earlier session's grant remains usable");
+        let grants = broker.engine.grants.lock().unwrap();
+        assert_eq!(grants.len(), 4095);
+        assert_eq!(grants.values().filter(|g| g.session == "existing").count(), 1);
+        assert!(grants.values().all(|g| g.session != "failed-session"));
+        drop(grants);
+        host.revoke(&existing);
+    }
 }

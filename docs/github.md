@@ -173,7 +173,8 @@ The account's credential permits only this project's `owner/repo`:
   Merge, workflow, account, other repository and other API paths are refused.
 - Before a push, the broker privately reads that repository's current default branch. A request
   that changes or deletes that branch is refused before any update reaches GitHub. Malformed or
-  compressed receive-pack requests, signed pushes, tags and other ref namespaces are unsupported.
+  compressed receive-pack requests, pushes from shallow clones, signed pushes, tags and other ref
+  namespaces are unsupported.
   Redirects are never followed. A failed default-branch lookup fails closed.
 
 **Refuse pushes to the default branch** is a setting on each connected account secret, on by
