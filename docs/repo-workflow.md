@@ -142,15 +142,16 @@ Repository `cache.env` accepts these variables only:
 
 `cache.outputs` accepts relative folders whose final component is `target`, `bin`, `obj`, `build`,
 `dist`, `.next`, or `out`. No globs are expanded. These names only make a folder eligible: cleanup still
-refuses tracked files, non-ignored untracked work, case-mismatched paths, symlinks, shared caches, the main checkout and worktrees used by processes.
+refuses tracked files, non-ignored untracked work, case-mismatched paths, symlinks, shared caches,
+the main checkout and worktrees used by processes.
 Your own config can name other relative output folders or shared folders and any environment variable;
 known unsafe sharing choices produce Settings and doctor warnings.
 
 ```toml
 [cache]
-shared = [".cache/sccache"]
+shared = [".npm/_cacache"]
 outputs = ["web/dist", "src/app/bin", "src/app/obj"]
-env = { CARGO_PROFILE_TEST_DEBUG = "line-tables-only" }
+env = { npm_config_cache = ".npm/_cacache", CARGO_PROFILE_TEST_DEBUG = "line-tables-only" }
 ```
 
 Host and sandbox shared stores occupy separate namespaces. Repository configuration cannot set `SCCACHE_DIR`;

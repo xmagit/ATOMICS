@@ -150,8 +150,8 @@ pub fn cache_env(job: &Prepare) -> Vec<(String, String)> {
         .and_then(|sandboxes| sandboxes.into_iter().find(|sandbox| sandbox.name == job.name))
         .map(|sandbox| real_paths(&sandbox).workspaces)
         .unwrap_or_default();
-    let has_store =
-        crate::build_cache::safe_store(&store) && mounted.contains(&real(&store).to_string_lossy().into_owned());
+    let has_store = crate::build_cache::store_allowed(&job.home, &store, crate::build_cache::Domain::Sandbox)
+        && mounted.contains(&real(&store).to_string_lossy().into_owned());
     let mut env = job.cache.agent_env(cargo, sccache.as_deref(), &store.to_string_lossy(), |_| None);
     // Sandboxes can never select a host store, including explicit user overrides.
     if has_store {
@@ -184,7 +184,11 @@ pub fn cache_env(job: &Prepare) -> Vec<(String, String)> {
         if !atomics_core::cache::path_variable(key) { return true; }
         let path = real(Path::new(value));
         let store_path = real(&job.home.join("build-caches"));
-        let available = !path.starts_with(&store_path) || mounted.iter().any(|mount| path.starts_with(Path::new(mount)));
+        let missing_shared = job.cache.shared.iter().filter(|folder| atomics_core::cache::relative(folder)).any(|folder| {
+            let shared = real(&root.join(folder));
+            path.starts_with(&shared) && !mounted.contains(&shared.to_string_lossy().into_owned())
+        });
+        let available = !missing_shared && (!path.starts_with(&store_path) || mounted.iter().any(|mount| path.starts_with(Path::new(mount))));
         if !available { eprintln!("ATOMICS: sandbox {} cache {key} is not mounted; continuing without it. Recreate the sandbox to enable it.", job.name); }
         available
     });
@@ -291,7 +295,9 @@ fn make(
 ) -> Result<()> {
     let ssh = job.config.ssh_agent;
     // New namespace: stores writable by a guest are never read by bare host builds.
-    if let Err(error) = crate::build_cache::link(&job.home, &workspace, &job.cache, crate::build_cache::Domain::Sandbox)
+    if existing.is_none()
+        && let Err(error) =
+            crate::build_cache::link(&job.home, &workspace, &job.cache, crate::build_cache::Domain::Sandbox)
     {
         eprintln!("ATOMICS: sandbox cache setup skipped: {error:#}");
     }
@@ -299,7 +305,7 @@ fn make(
         crate::build_cache::stores(&job.home, &workspace, &job.cache, crate::build_cache::Domain::Sandbox);
     if workspace.join("Cargo.toml").is_file() && existing.is_none() {
         let store = compiler_store(job);
-        if crate::build_cache::safe_store(&store) {
+        if crate::build_cache::store_allowed(&job.home, &store, crate::build_cache::Domain::Sandbox) {
             std::fs::create_dir_all(&store)?;
             shared_mounts.push(store);
         }
@@ -1380,6 +1386,7 @@ mod tests {
         launch.cache.env.insert("RUSTC_WRAPPER".into(), "sccache".into());
         prepare(&launch).unwrap();
         assert_eq!(fake::calls_to(bin.path(), &["create"]).len(), 1);
+        assert!(work.join(".cache/pip").symlink_metadata().is_err(), "reattachment must not create an unmounted link");
         let env: std::collections::BTreeMap<_, _> = cache_env(&launch).into_iter().collect();
         assert_eq!(env["CARGO_INCREMENTAL"], "0");
         assert_eq!(env["RUSTC_WRAPPER"], "");
@@ -1390,7 +1397,7 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_compiler_stores_are_private_and_missing_wrappers_degrade() {
+    fn sandbox_compiler_cache_stores_are_private_and_missing_wrappers_degrade() {
         let (dir, repo) = repository();
         let work = dir.path().join("task");
         git::add_worktree(&repo, &work, "task", "main").unwrap();

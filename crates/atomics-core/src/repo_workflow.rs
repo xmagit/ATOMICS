@@ -479,14 +479,14 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), dir.path().join(".cache")).unwrap();
         std::fs::write(
             dir.path().join(".atomics/config.toml"),
-            "[cache.env]\nSCCACHE_DIR = '.cache/sccache'\nCARGO_INCREMENTAL = '0'\n",
+            "[cache.env]\nPIP_CACHE_DIR = '.cache/pip'\nCARGO_INCREMENTAL = '0'\n",
         )
         .unwrap();
         let workflow = RepoWorkflow::read(dir.path());
         let env = workflow.apply(&Default::default()).cache.env;
-        assert!(!env.contains_key("SCCACHE_DIR"));
+        assert!(!env.contains_key("PIP_CACHE_DIR"));
         assert_eq!(env["CARGO_INCREMENTAL"], "0");
-        assert!(workflow.warnings.iter().any(|w| w.contains("cache.env.SCCACHE_DIR")));
+        assert!(workflow.warnings.iter().any(|w| w.contains("cache.env.PIP_CACHE_DIR")));
     }
 
     #[cfg(unix)]

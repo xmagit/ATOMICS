@@ -15,6 +15,7 @@ pub(super) struct Caches {
     cleanup_at: Option<Instant>,
     cleaned: HashSet<PathBuf>,
     inventory_at: Option<Instant>,
+    inventory_after_cleanup: bool,
 }
 
 fn outputs_for_device(
@@ -27,6 +28,10 @@ fn outputs_for_device(
     matching.sort_by_key(|output| std::cmp::Reverse(output.bytes));
     matching.truncate(5);
     matching
+}
+
+fn protected_worktree(protected: &HashSet<PathBuf>, path: &Path) -> bool {
+    protected.iter().any(|busy| busy.starts_with(path) || path.starts_with(busy))
 }
 
 impl State {
@@ -71,13 +76,18 @@ impl State {
 
     pub(super) fn cancel_cache_cleanup(&mut self, path: &Path) {
         let root = crate::build_cache::root(path);
-        self.build_caches.cleanup.retain(|candidate, _| candidate != path && candidate != &root);
-        self.build_caches.cleaned.retain(|candidate| candidate != path && candidate != &root);
+        let root = root.canonicalize().unwrap_or(root);
+        self.build_caches
+            .cleanup
+            .retain(|candidate, _| candidate.canonicalize().as_ref().unwrap_or(candidate) != &root);
+        self.build_caches.cleaned.retain(|candidate| candidate.canonicalize().as_ref().unwrap_or(candidate) != &root);
     }
 
     pub(super) fn schedule_cache_cleanup(&mut self, path: &Path) {
-        if !self.build_caches.cleaned.contains(path) {
-            self.build_caches.cleanup.insert(path.to_path_buf(), self.project_config(path).cache);
+        let path = crate::build_cache::root(path);
+        let path = path.canonicalize().unwrap_or(path);
+        if !self.build_caches.cleaned.contains(&path) {
+            self.build_caches.cleanup.insert(path.clone(), self.project_config(&path).cache);
         }
     }
 
@@ -90,7 +100,10 @@ impl State {
                     || s.screen_busy
                     || s.pending.is_some()
             })
-            .map(Session::root)
+            .map(|session| {
+                let root = session.root();
+                root.canonicalize().unwrap_or(root)
+            })
             .chain(self.resume.iter().map(|record| crate::build_cache::root(&record.cwd)))
             .collect()
     }
@@ -99,10 +112,11 @@ impl State {
         let protected = self.cache_protected();
         // Busy or protected entries are discarded by this batch, never retried later.
         for (path, config) in self.cache_worktrees() {
-            if !protected.contains(&path) {
+            if !protected_worktree(&protected, &path) {
                 self.build_caches.cleanup.insert(path, config);
             }
         }
+        self.build_caches.inventory_after_cleanup = true;
         self.poll_build_caches();
         self.toast("Cleaning build caches of idle worktrees…");
     }
@@ -191,10 +205,13 @@ impl State {
                 })
                 .collect();
             let protected = self.cache_protected();
-            let targets: HashMap<_, _> = targets.into_iter().filter(|(path, _)| !protected.contains(path)).collect();
+            let targets: HashMap<_, _> =
+                targets.into_iter().filter(|(path, _)| !protected_worktree(&protected, path)).collect();
             if targets.is_empty() {
+                self.build_caches.inventory_after_cleanup = false;
                 return changed;
             }
+            let refresh_inventory = std::mem::take(&mut self.build_caches.inventory_after_cleanup);
             self.build_caches.cleaning = true;
             let jobs = self.running_lifecycle();
             let sbx = resolve_program(&self.sbx);
@@ -225,9 +242,12 @@ impl State {
                     let _ = actions.send(Box::new(move |state| {
                         state.build_caches.cleaning = false;
                         state.build_caches.cleaned.extend(cleaned);
-                        // Refresh inventory after a requested cleanup, still on the sampler worker.
+                        // Automatic cleanup refreshes free space, keeping the 120 s tree-walk
+                        // limit. Only a manual request asks for a fresh folder inventory.
                         state.build_caches.checked = None;
-                        state.build_caches.inventory_at = None;
+                        if refresh_inventory {
+                            state.build_caches.inventory_at = None;
+                        }
                     }));
                 },
             );
@@ -417,7 +437,7 @@ mod tests {
                 assert!(app.runtime.build_caches.cleanup.is_empty());
                 assert!(!app.runtime.build_caches.cleaning);
                 app.runtime.sessions.clear();
-                app.runtime.build_caches.cleaned.insert(work.clone());
+                app.runtime.build_caches.cleaned.insert(work.canonicalize().unwrap());
                 app.runtime.schedule_cache_cleanup(&work);
                 assert!(app.runtime.build_caches.cleanup.is_empty());
                 app.runtime.plans = vec![Plan {
@@ -436,6 +456,12 @@ mod tests {
                     app.runtime.finish_plan_agents();
                 }
                 assert!(app.runtime.build_caches.cleanup.is_empty(), "already finished tasks must not re-arm cleanup");
+                app.runtime.plans[0].tasks[0].finished_at = None;
+                app.runtime.finish_plan_agents();
+                assert_eq!(app.runtime.build_caches.cleanup.len(), 1, "the finished transition schedules once");
+                app.runtime.build_caches.cleanup.clear();
+                app.runtime.finish_plan_agents();
+                assert!(app.runtime.build_caches.cleanup.is_empty());
                 app.runtime.schedule_cache_cleanup(&work);
                 assert_eq!(app.runtime.build_caches.cleanup.len(), 1);
                 app.runtime.cancel_cache_cleanup(&work);
@@ -449,7 +475,15 @@ mod tests {
         with_app(
             "app::build_cache::tests::disk_guard_uses_cached_inventory_and_frequent_samples_do_not_rewalk_outputs",
             |app, _| {
-                let (_dir, repo) = repository();
+                let (dir, repo) = repository();
+                std::fs::write(repo.join("Cargo.toml"), "[workspace]\n").unwrap();
+                std::fs::write(repo.join(".gitignore"), "target/\n").unwrap();
+                git::git(&repo, &["add", "."]).unwrap();
+                git::git(&repo, &["commit", "-qm", "workspace"]).unwrap();
+                let work = dir.path().join("task");
+                git::add_worktree(&repo, &work, "task", "main").unwrap();
+                std::fs::create_dir(work.join("target")).unwrap();
+                std::fs::write(work.join("target/artifact"), "compiled").unwrap();
                 app.runtime.repos = vec![repo.clone()];
                 app.runtime.config.resources.disk_min_gib = u64::MAX;
                 let cached = BuildOutput { path: repo.join("cached-only").to_string_lossy().into_owned(), bytes: 1024 };
@@ -457,7 +491,12 @@ mod tests {
                 app.runtime.build_caches.inventory_at = Some(Instant::now());
                 assert!(app.runtime.check_disk(&repo).unwrap_err().contains("cached-only"));
                 app.runtime.build_caches.largest.clear();
-                assert!(!app.runtime.check_disk(&repo).unwrap_err().contains("cached-only"));
+                let warning = app.runtime.check_disk(&work).unwrap_err();
+                assert!(!warning.contains("cached-only"));
+                assert!(
+                    !warning.contains(work.join("target").to_string_lossy().as_ref()),
+                    "launch checks must not inventory output when the cache is empty"
+                );
                 app.runtime.build_caches.largest = vec![cached.clone()];
                 app.runtime.poll_build_caches();
                 let deadline = Instant::now() + Duration::from_secs(10);

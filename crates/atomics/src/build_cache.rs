@@ -147,6 +147,10 @@ fn domain_store_safe(home: &Path, path: &Path, domain: Domain) -> bool {
     !forbidden.iter().filter_map(|root| resolve(root)).any(|root| path.starts_with(root))
 }
 
+pub fn store_allowed(home: &Path, path: &Path, domain: Domain) -> bool {
+    safe_store(path) && domain_store_safe(home, path, domain)
+}
+
 fn repository_store(home: &Path, main: &Path, domain: Domain) -> PathBuf {
     let namespace = match domain {
         Domain::Host => "host-repos-v2",
@@ -490,7 +494,7 @@ mod tests {
         link(&state, &two, &config, Domain::Host).unwrap();
         let first = one.join(".cache/sccache").canonicalize().unwrap();
         assert_eq!(first, two.join(".cache/sccache").canonicalize().unwrap());
-        assert!(first.starts_with(state.join("build-caches/host-repos-v2")));
+        assert!(first.starts_with(state.canonicalize().unwrap().join("build-caches/host-repos-v2")));
         assert!(link(&state, &main, &config, Domain::Host).is_err());
         let (_other_dir, _other_main, other) = project();
         link(&state, &other, &config, Domain::Host).unwrap();
@@ -530,7 +534,7 @@ mod tests {
             BTreeMap::from([("SCCACHE_DIR".into(), main.join("tracked-store").to_string_lossy().into_owned())]);
         resolve_env_paths(&home, &host, &config, &mut env);
         assert!(env.is_empty());
-        let redirected = repository_store(&home, &main, Domain::Sandbox);
+        let redirected = repository_store(&home, &main.canonicalize().unwrap(), Domain::Sandbox);
         std::fs::remove_dir_all(&redirected).unwrap();
         std::os::unix::fs::symlink(main.join("tracked-store"), &redirected).unwrap();
         assert!(stores(&home, &guest, &config, Domain::Sandbox).is_empty());

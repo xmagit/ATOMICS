@@ -758,6 +758,7 @@ impl State {
                     chief: false,
                     pending: None,
                     sandbox: None,
+                    cache_env: Vec::new(),
                     relay: None,
                     screen_busy: false,
                     busy_absent_since: None,
