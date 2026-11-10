@@ -67,7 +67,8 @@ Every plan ends with a final review. With both Claude and Codex configured, ATOM
 provider from the one assigned most of the plan's tasks (excluding the review). A tie chooses Codex.
 If the other provider is unavailable, it uses a configured coding agent. Set `[plan] review_agent = "codex"`
 (or another configured agent name) in the main or host config to override this choice. The review card
-explains the selection; a review that has already started keeps its agent.
+explains the selection; an override naming an unconfigured agent falls back to the default choice
+with an explanation on the card. A review that has already started keeps its agent.
 
 Agents can attach acceptance evidence to `atomics_report` using optional
 `checks: [{check, command, exit, output_tail}]`. `exit` is an integer or `null` when unavailable.

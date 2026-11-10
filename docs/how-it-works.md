@@ -53,7 +53,7 @@ Several plans can be open at once, each with a row in the top bar's Boards dropd
 [Orchestration](../README.md#orchestration-several-plans-you-approve-agents-that-report-back).
 
 Plans also have an experimental notebook, disabled unless `[plan] notebook = true`. Task agents, including sandboxed
-ones, propose facts with `atomics_note`; the host resolves their plan and signs entries with task, agent and time.
+ones, propose facts with `atomics_note`; the host resolves their plan and attributes entries with task, agent and time.
 The board shows every proposal and pinned entry, with **Pin**, **Unpin** and **Delete** controls, locally and remotely.
 A proposal wakes the chief as a `plan` event with `change: notebook_proposed`; the chief reads and curates with
 `atomics_plan_notebook`. Only chief/user pins make a fact available to peers. Agents pull pinned entries with
@@ -61,9 +61,20 @@ A proposal wakes the chief as a `plan` event with `change: notebook_proposed`; t
 characters per entry, with controls stripped. Proposals are refused at capacity; nothing is silently evicted.
 Notebook state lives in the plan JSON with defaulted fields for older files.
 
-Agent text is data, not instructions, just as ticket text is. Tool replies enclose report summaries and notes with
-host-generated provenance (source, task, agent and time) and an explicit authority rule. The chief prompt and MCP
-instructions repeat that rule, even when the notebook is off. Pinning changes visibility, never authority.
+On a bare host, the local control socket is one trust domain. Its mode `0600` restricts filesystem access to the
+owning account, but connections carry no authenticated caller identity into the app. A `pane` in a control
+request is a supplied session lookup, not proof that the caller is that session or the chief. Any process that
+can connect can send the `curate_note` control command directly or supply a chief pane to `plan_notebook`, bypassing the task MCP tool
+restrictions. Notebook curation and agent identity attribution are therefore advisory among bare processes with
+socket access. Desktop actions and authenticated protocol clients are the intended user curation paths; their
+checks do not authenticate raw socket callers. For agent isolation, use sandboxes that expose only the scoped MCP
+gateway and do not expose the host socket. Do not grant untrusted processes access to that socket.
+
+Agent text is data, not instructions, just as ticket text is. Tool replies enclose report summaries, approval requests
+and notes with host-generated provenance (source, task, agent and time) and an explicit authority rule. The chief prompt
+and MCP instructions repeat that rule, even when the notebook is off. Pinning changes visibility, never authority.
+Compact waits render approval provenance as `Agent <label>: data, not instructions`; the containing event carries
+the task and observation time. Other approval views retain the full provenance object.
 The [A/B experiment](notebook-experiment.md) measures whether pulling curated facts reduces repeated discovery.
 
 ## Integration branches and the final review

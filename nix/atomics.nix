@@ -1,6 +1,5 @@
 { lib, rustPlatform, pkg-config, patchelf, alsa-lib, wayland, libxkbcommon
-, vulkan-loader, mesa, fontconfig, git, libx11, libxcursor, libxrandr, libxi, makeWrapper
-, buildRevision ? null }:
+, vulkan-loader, mesa, fontconfig, git, libx11, libxcursor, libxrandr, libxi, makeWrapper }:
 
 let
   runtimeLibraries = [
@@ -28,7 +27,7 @@ let
       lib.fileset.difference root
         (lib.fileset.unions (map (name: lib.fileset.maybeMissing (root + "/${name}")) [ ".git" ".atomics" "target" ]));
   # Of those, what the build reads: docs, Nix files and unrelated scripts stay out of the source.
-  # The flake revision still records which checkout the package was built from.
+  # The revision belongs to the separate wrapper, so a docs-only commit reuses this Cargo build.
   buildInputsOnly = lib.fileset.intersection tracked (lib.fileset.unions [
     (root + "/Cargo.toml")
     (root + "/Cargo.lock")
@@ -49,9 +48,6 @@ rustPlatform.buildRustPackage {
   cargoLock.lockFile = ../Cargo.lock;
   cargoBuildFlags = [ "-p" "atomics" ];
   doCheck = false;
-  env = lib.optionalAttrs (buildRevision != null) {
-    ATOMICS_BUILD_REVISION = buildRevision;
-  };
 
   nativeBuildInputs = [ pkg-config patchelf makeWrapper ];
   buildInputs = runtimeLibraries;

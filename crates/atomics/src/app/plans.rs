@@ -1141,6 +1141,9 @@ impl State {
         Ok(())
     }
 
+    /// The pane check enforces the MCP role convention; it does not authenticate a raw
+    /// local socket caller. Bare-host curation shares the socket's trust domain, as
+    /// documented in docs/how-it-works.md.
     pub(super) fn chief_notebook(
         &mut self,
         pane: Option<&str>,
@@ -1343,6 +1346,55 @@ mod tests {
                 assert_eq!(saved.tasks.last().unwrap().reviewer_reason, review.reviewer_reason);
             }
         });
+    }
+
+    #[test]
+    fn reviewer_and_quota_warning_use_configured_names_with_unknown_override_fallback() {
+        with_app(
+            "app::plans::tests::reviewer_and_quota_warning_use_configured_names_with_unknown_override_fallback",
+            |app, _| {
+                use atomics_core::usage::{Usage, Window};
+                for agent in &mut app.runtime.config.agents {
+                    match agent.name.as_str() {
+                        "codex" => agent.name = "writer".into(),
+                        "claude" => agent.name = "reviewer".into(),
+                        _ => {}
+                    }
+                }
+                app.runtime.config.chief.min_left_percent.insert("claude".into(), 20.0);
+                let now = crate::usage::now();
+                app.runtime.usage.claude = Usage {
+                    session: Some(Window { left_percent: 5.0, resets_at: now + 300 }),
+                    observed_at: now,
+                    ..Default::default()
+                };
+                for override_name in [None, Some("reviewer"), Some("missing")] {
+                    app.runtime.config.plan.review_agent = override_name.map(str::to_string);
+                    let set = request(
+                        app,
+                        json!({"cmd":"plan_set", "goal":"Configured reviewer", "tasks":[{"id":"a", "agent":"writer"}]}),
+                    );
+                    assert!(set.ok, "{set:?}");
+                    let id = set.result["plan"].as_str().unwrap();
+                    let plan = app.runtime.plans.iter().find(|plan| plan.id == id).unwrap();
+                    let reviewer = plan.tasks.last().unwrap();
+                    assert_eq!(reviewer.agent, "reviewer");
+                    assert!(app.runtime.config.agent(&reviewer.agent).is_some());
+                    let warnings = set.result["warnings"].as_array().unwrap();
+                    assert_eq!(warnings.len(), 1, "{warnings:?}");
+                    assert!(warnings[0].as_str().unwrap().contains("Task review: agent reviewer uses claude"));
+                    let reason = reviewer.reviewer_reason.as_deref().unwrap();
+                    assert!(
+                        reason.contains(match override_name {
+                            None => "other provider",
+                            Some("missing") => "unconfigured agent",
+                            _ => "override",
+                        }),
+                        "{reason}"
+                    );
+                }
+            },
+        );
     }
 
     #[test]
@@ -3177,6 +3229,7 @@ mod tests {
                 legacy.replace(
                     "Ship the API".into(),
                     vec![Task { id: "a".into(), title: "Build API".into(), ..Task::default() }],
+                    &app.runtime.config,
                 );
                 legacy.approved = true;
                 legacy.integration = Some("atomics/already-integrated".into());

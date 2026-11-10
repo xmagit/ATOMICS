@@ -887,6 +887,8 @@ impl State {
         }
         if event.name == "PermissionRequest" {
             self.last_status.insert(id.clone(), AgentStatus::NeedsInput);
+            let at = atomics_core::store::now();
+            let approval = self.sessions[index].approvals.last().map(|p| self.approval_json(index, p, at));
             self.event_seq += 1;
             self.events.push(StatusEvent {
                 seq: self.event_seq,
@@ -900,9 +902,9 @@ impl State {
                 session: id,
                 title,
                 status: AgentStatus::NeedsInput,
-                at: atomics_core::store::now(),
+                at,
                 report: None,
-                approval: self.sessions[index].approvals.last().map(PendingApproval::json),
+                approval,
                 findings: None,
                 config: None,
                 ticket: None,

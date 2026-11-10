@@ -8,6 +8,8 @@ use std::path::Path;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use crate::config::Config;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Plan {
     #[serde(default)]
@@ -640,7 +642,7 @@ impl Plan {
         format!("{hash:x}")[..12].to_string()
     }
 
-    pub fn replace(&mut self, goal: String, mut tasks: Vec<Task>) {
+    pub fn replace(&mut self, goal: String, mut tasks: Vec<Task>, config: &Config) {
         Plan::assign_task_ids(&mut tasks);
         let approved = self.approved && self.goal == goal && self.keeps_approval_scope(&tasks);
         for task in tasks.iter_mut() {
@@ -677,6 +679,7 @@ impl Plan {
         self.tasks = tasks;
         self.approved = approved;
         self.add_review_task();
+        self.select_review_agent(config);
     }
 
     /// Whether `tasks` leave the approval scope of this plan's tasks as it is. Dropping a dependency
@@ -729,11 +732,10 @@ impl Plan {
             review.repo = repo;
         }
         self.tasks.push(review);
-        self.select_review_agent(&crate::config::Config::default());
     }
 
     /// Choose only before review starts; a running review retains its agent and explanation.
-    pub fn select_review_agent(&mut self, config: &crate::config::Config) -> bool {
+    pub fn select_review_agent(&mut self, config: &Config) -> bool {
         use crate::config::AgentKind;
         let provider = |agent: &crate::config::AgentConfig| match agent.kind {
             AgentKind::Claude => Some("Claude"),
@@ -752,8 +754,10 @@ impl Plan {
         }
         let majority = if claude >= codex { "Claude" } else { "Codex" };
         let other = if majority == "Claude" { "Codex" } else { "Claude" };
-        let chosen = if let Some(name) = config.plan.review_agent.as_deref().filter(|name| !name.trim().is_empty()) {
-            Some((name.to_string(), "Selected by [plan] review_agent override.".into()))
+        let override_name = config.plan.review_agent.as_deref().filter(|name| !name.trim().is_empty());
+        let override_agent = override_name.and_then(|name| config.agent(name));
+        let chosen = if let Some(agent) = override_agent {
+            Some((agent.name.clone(), "Selected by [plan] review_agent override.".into()))
         } else if claude + codex > 0
             && let Some(agent) = config.agents.iter().find(|agent| provider(agent) == Some(other))
         {
@@ -785,16 +789,20 @@ impl Plan {
             && review.session.is_none()
         {
             let before = (review.agent.clone(), review.reviewer_reason.clone());
-            if let Some((agent, reason)) = chosen {
-                if review.agent != agent {
-                    review.args.clear();
-                }
-                review.agent = agent;
-                review.reviewer_reason = Some(reason);
-            } else {
-                review.agent.clear();
-                review.reviewer_reason = Some("No coding agent is configured; configure one before dispatch.".into());
+            let (agent, reason) = chosen.unwrap_or_else(|| {
+                (String::new(), "No coding agent is configured; configure one before dispatch.".into())
+            });
+            if review.agent != agent {
+                review.args.clear();
             }
+            review.agent = agent;
+            review.reviewer_reason = Some(if override_name.is_some() && override_agent.is_none() {
+                format!(
+                    "The [plan] review_agent override names an unconfigured agent; using the default choice. {reason}"
+                )
+            } else {
+                reason
+            });
             return before != (review.agent.clone(), review.reviewer_reason.clone());
         }
         false
@@ -1032,6 +1040,7 @@ mod tests {
                 repo: Some("ATOMICS".into()),
                 ..Default::default()
             }],
+            &Config::default(),
         );
         // Independently calculated SHA-256 of sorted, compact UTF-8 JSON.
         assert_eq!(plan.digest(), "cedf306324d4");
@@ -1055,7 +1064,7 @@ mod tests {
             }
             assert_ne!(changed.digest(), digest, "{field}");
             let mut replaced = plan.clone();
-            replaced.replace(changed.goal, changed.tasks);
+            replaced.replace(changed.goal, changed.tasks, &Config::default());
             assert!(!replaced.approved, "{field}");
             assert_ne!(replaced.digest(), digest, "{field}");
         }
@@ -1070,7 +1079,7 @@ mod tests {
         runtime.tasks[1].brief = "a revised final review".into();
         assert_eq!(runtime.digest(), digest, "branches, progress and review do not grant approval scope");
         let mut replaced = plan.clone();
-        replaced.replace(runtime.goal, runtime.tasks);
+        replaced.replace(runtime.goal, runtime.tasks, &Config::default());
         assert!(replaced.approved);
         assert_eq!(replaced.digest(), digest);
         let mut reordered = plan.clone();
@@ -1084,31 +1093,40 @@ mod tests {
     fn branch_only_plan_edits_preserve_approval_but_scope_edits_require_review() {
         let mut plan = Plan::default();
         let mut tasks = vec![Task { id: "a".into(), title: "Implement".into(), ..Default::default() }];
-        plan.replace("Ship".into(), tasks.clone());
+        plan.replace("Ship".into(), tasks.clone(), &Config::default());
         plan.approved = true;
         tasks[0].branch = Some("feature".into());
-        plan.replace("Ship".into(), tasks.clone());
+        plan.replace("Ship".into(), tasks.clone(), &Config::default());
         assert!(plan.approved);
         tasks[0].acceptance.push("Another requirement".into());
-        plan.replace("Ship".into(), tasks);
+        plan.replace("Ship".into(), tasks, &Config::default());
         assert!(!plan.approved);
     }
 
     #[test]
     fn dependency_cycles_name_every_path_that_keeps_tasks_from_starting() {
         let mut plan = Plan::default();
-        plan.replace("Acyclic".into(), vec![task("a", &[]), task("b", &["a"]), task("c", &["a", "b", "zz"])]);
+        plan.replace(
+            "Acyclic".into(),
+            vec![task("a", &[]), task("b", &["a"]), task("c", &["a", "b", "zz"])],
+            &Config::default(),
+        );
         assert!(plan.dependency_cycles().is_empty(), "unknown dependencies are not cycles");
         // Follow-ups that wait for the final review, which waits for them.
         plan.replace(
             "Follow-ups".into(),
             vec![task("a", &[]), task("f1", &["review"]), task("f2", &["a", "review"]), task("f3", &["review"])],
+            &Config::default(),
         );
         let cycles = plan.dependency_cycles();
         let paths: Vec<String> = cycles.iter().map(|cycle| cycle.join(" → ")).collect();
         assert_eq!(paths, ["f1 → review → f1", "f2 → review → f2", "f3 → review → f3"]);
         let path = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect::<Vec<_>>();
-        plan.replace("Loops".into(), vec![task("a", &["c"]), task("b", &["a"]), task("c", &["b"]), task("d", &["d"])]);
+        plan.replace(
+            "Loops".into(),
+            vec![task("a", &["c"]), task("b", &["a"]), task("c", &["b"]), task("d", &["d"])],
+            &Config::default(),
+        );
         assert_eq!(plan.dependency_cycles(), [path(&["a", "c", "b", "a"]), path(&["d", "d"])]);
     }
 
@@ -1117,11 +1135,11 @@ mod tests {
         // An approved plan from before plan_set refused cycles.
         let mut plan = Plan::default();
         let tasks = vec![task("a", &[]), task("b", &["a", "review"]), task("c", &["b"])];
-        plan.replace("Ship".into(), tasks.clone());
+        plan.replace("Ship".into(), tasks.clone(), &Config::default());
         plan.approved = true;
         let fixed = vec![task("a", &[]), task("b", &["a"]), task("c", &["b"])];
         let mut kept = plan.clone();
-        kept.replace("Ship".into(), fixed.clone());
+        kept.replace("Ship".into(), fixed.clone(), &Config::default());
         assert!(kept.approved, "b could never have started: dropping review from it changes no approved work");
         assert!(kept.dependency_cycles().is_empty());
         for (what, edit) in [
@@ -1133,18 +1151,18 @@ mod tests {
             ("reordering dependencies", vec![task("a", &[]), task("b", &["review", "a"]), task("c", &["b"])]),
         ] {
             let mut changed = plan.clone();
-            changed.replace("Ship".into(), edit);
+            changed.replace("Ship".into(), edit, &Config::default());
             assert!(!changed.approved, "{what}");
         }
         let mut reworded = fixed;
         reworded[1].brief = "Another brief".into();
         let mut changed = plan.clone();
-        changed.replace("Ship".into(), reworded);
+        changed.replace("Ship".into(), reworded, &Config::default());
         assert!(!changed.approved, "a fix together with a scope change needs approval");
         let mut acyclic = Plan::default();
-        acyclic.replace("Ship".into(), vec![task("a", &[]), task("b", &["a"])]);
+        acyclic.replace("Ship".into(), vec![task("a", &[]), task("b", &["a"])], &Config::default());
         acyclic.approved = true;
-        acyclic.replace("Ship".into(), vec![task("a", &[]), task("b", &[])]);
+        acyclic.replace("Ship".into(), vec![task("a", &[]), task("b", &[])], &Config::default());
         assert!(!acyclic.approved, "dropping a dependency that held no cycle needs approval");
     }
 
@@ -1333,7 +1351,7 @@ mod tests {
         assert_eq!(task.reported_line(1600).as_deref(), Some("reported 25 min ago"));
         assert_eq!(task.reported_line(0).as_deref(), Some("reported 0 min ago"));
         let mut plan = Plan { tasks: vec![task.clone()], ..Plan::default() };
-        plan.replace("new goal".into(), vec![Task { id: "code".into(), ..Task::default() }]);
+        plan.replace("new goal".into(), vec![Task { id: "code".into(), ..Task::default() }], &Config::default());
         assert_eq!(plan.tasks[0], task);
         let old: Task = serde_json::from_str(r#"{"id":"old"}"#).unwrap();
         assert!(old.dispatched_at.is_none() && old.finished_at.is_none());
@@ -1358,7 +1376,7 @@ mod tests {
     fn migrates_once_without_overwriting_existing_or_archived_plans() {
         let dir = crate::test_support::tempdir().unwrap();
         let mut old = Plan::default();
-        old.replace("Ship it".into(), vec![task("a", &[])]);
+        old.replace("Ship it".into(), vec![task("a", &[])], &Config::default());
         old.approved = true;
         old.tasks[0].session = Some("legacy-agent".into());
         old.save(&dir.path().join("plan.json")).unwrap();
@@ -1464,7 +1482,7 @@ mod tests {
         let mut plans = Vec::new();
         for goal in ["API", "API", "UI"] {
             let mut plan = Plan { id: unique_id(goal, &plans, dir.path()), ..Plan::default() };
-            plan.replace(goal.into(), vec![task("a", &[])]);
+            plan.replace(goal.into(), vec![task("a", &[])], &Config::default());
             plan.save_in(dir.path()).unwrap();
             plans.push(plan);
         }
@@ -1509,7 +1527,7 @@ mod tests {
     #[test]
     fn summary_and_tab_attention_follow_only_this_plans_tasks() {
         let mut plan = Plan { id: "one".into(), ..Plan::default() };
-        plan.replace("First".into(), vec![task("a", &[])]);
+        plan.replace("First".into(), vec![task("a", &[])], &Config::default());
         assert_eq!(plan.attention(), "needs you");
         plan.approved = true;
         assert_eq!(plan.attention(), "working");
@@ -1527,7 +1545,7 @@ mod tests {
     #[test]
     fn rewording_goal_preserves_task_and_review_progress() {
         let mut plan = Plan::default();
-        plan.replace("Old goal".into(), vec![task("a", &[])]);
+        plan.replace("Old goal".into(), vec![task("a", &[])], &Config::default());
         plan.approved = true;
         plan.integration = Some("existing-integration".into());
         for task in &mut plan.tasks {
@@ -1539,7 +1557,7 @@ mod tests {
                 Some(Report { status: "blocked".into(), summary: "waiting".into(), at: 42, checks: Vec::new() });
             task.integrated = Some("existing-integration".into());
         }
-        plan.replace("Reworded goal".into(), vec![task("a", &[]), task(REVIEW_TASK, &[])]);
+        plan.replace("Reworded goal".into(), vec![task("a", &[]), task(REVIEW_TASK, &[])], &Config::default());
         assert_eq!(plan.goal, "Reworded goal");
         assert!(!plan.approved);
         assert_eq!(plan.integration.as_deref(), Some("existing-integration"));
@@ -1571,7 +1589,7 @@ mod tests {
     #[test]
     fn ready_respects_dependencies() {
         let mut plan = Plan::default();
-        plan.replace("ship it".into(), vec![task("a", &[]), task("b", &["a"]), task("c", &[])]);
+        plan.replace("ship it".into(), vec![task("a", &[]), task("b", &["a"]), task("c", &[])], &Config::default());
         plan.task_mut("a").unwrap().branch = Some("task-a".into());
         let ready: Vec<&str> = plan.ready().iter().map(|t| t.id.as_str()).collect();
         assert_eq!(ready, ["a", "c"]);
@@ -1595,12 +1613,12 @@ mod tests {
     #[test]
     fn replacing_keeps_progress_and_asks_for_approval_again() {
         let mut plan = Plan::default();
-        plan.replace("v1".into(), vec![task("a", &[])]);
+        plan.replace("v1".into(), vec![task("a", &[])], &Config::default());
         plan.approved = true;
         plan.task_mut("a").unwrap().status = TaskStatus::Running;
         plan.task_mut("a").unwrap().session = Some("s1".into());
         plan.task_mut("a").unwrap().branch = Some("atomics/a-do-a".into());
-        plan.replace("v1".into(), vec![task("a", &[]), task("", &["zz"])]);
+        plan.replace("v1".into(), vec![task("a", &[]), task("", &["zz"])], &Config::default());
         assert!(!plan.approved);
         assert_eq!(plan.tasks[0].status, TaskStatus::Running);
         assert_eq!(plan.tasks[0].session.as_deref(), Some("s1"));
@@ -1615,7 +1633,7 @@ mod tests {
         use crate::isolation::IsolationMode::Bare;
         let mut plan = Plan::default();
         let bare = Task { isolation: Some(Bare), ..task("a", &[]) };
-        plan.replace("g".into(), vec![bare.clone()]);
+        plan.replace("g".into(), vec![bare.clone()], &Config::default());
         plan.task_mut("a").unwrap().status = TaskStatus::Running;
         let saved = serde_json::to_value(&plan).unwrap();
         assert_eq!(saved["tasks"][0]["isolation"], "bare");
@@ -1625,39 +1643,38 @@ mod tests {
         let old: Task = serde_json::from_str(r#"{"id":"a","agent":"codex"}"#).unwrap();
         assert_eq!(old.isolation, None, "tasks saved before the field load");
         // atomics_plan_set replaces the setting, keeping the task's progress.
-        plan.replace("g".into(), vec![task("a", &[])]);
+        plan.replace("g".into(), vec![task("a", &[])], &Config::default());
         assert_eq!((plan.tasks[0].isolation, plan.tasks[0].status), (None, TaskStatus::Running));
-        plan.replace("g".into(), vec![bare]);
+        plan.replace("g".into(), vec![bare], &Config::default());
         assert_eq!(plan.tasks[0].isolation, Some(Bare));
     }
 
     #[test]
     fn every_plan_ends_with_a_review_of_all_tasks() {
         let mut plan = Plan::default();
-        plan.replace("g".into(), vec![task("a", &[]), task("b", &["a"])]);
+        plan.replace("g".into(), vec![task("a", &[]), task("b", &["a"])], &Config::default());
         let review = plan.tasks.last().unwrap();
         assert_eq!(review.id, REVIEW_TASK);
         assert_eq!(review.depends_on, ["a", "b"]);
-        plan.replace("g".into(), vec![task("a", &[])]);
+        plan.replace("g".into(), vec![task("a", &[])], &Config::default());
         assert_eq!(plan.tasks.iter().filter(|t| t.id == REVIEW_TASK).count(), 1);
         assert_eq!(plan.tasks.last().unwrap().depends_on, ["a"]);
-        plan.replace("g".into(), Vec::new());
+        plan.replace("g".into(), Vec::new(), &Config::default());
         assert!(plan.tasks.is_empty());
     }
 
     #[test]
     fn review_uses_the_other_provider_and_honors_the_config_override() {
-        use crate::config::Config;
         for (author, reviewer) in [("claude", "codex"), ("codex", "claude")] {
             let mut plan = Plan::default();
             let mut work = task("a", &[]);
             work.agent = author.into();
-            plan.replace("g".into(), vec![work.clone()]);
+            plan.replace("g".into(), vec![work.clone()], &Config::default());
             assert_eq!(plan.tasks.last().unwrap().agent, reviewer);
             assert!(plan.tasks.last().unwrap().reviewer_reason.as_ref().unwrap().contains("most tasks"));
 
             let config: Config = toml::from_str(&format!("[plan]\nreview_agent = '{author}'")).unwrap();
-            plan.select_review_agent(&config);
+            plan.replace("g".into(), vec![work], &config);
             let review = plan.tasks.last().unwrap();
             assert_eq!(review.agent, author);
             assert!(review.reviewer_reason.as_ref().unwrap().contains("override"));
@@ -1681,8 +1698,8 @@ mod tests {
                 .enumerate()
                 .map(|(i, agent)| Task { id: format!("t{i}"), agent: agent.into(), ..Task::default() })
                 .collect(),
+            &config,
         );
-        plan.select_review_agent(&config);
         assert_eq!(plan.tasks.last().unwrap().agent, "claude");
         assert!(plan.tasks.last().unwrap().reviewer_reason.as_ref().unwrap().contains("1 Claude, 2 Codex"));
         assert!(!plan.select_review_agent(&config), "the review does not change the author counts");
@@ -1695,6 +1712,26 @@ mod tests {
         let review = plan.tasks.last().unwrap();
         assert_eq!(review.agent, "worker");
         assert!(review.reviewer_reason.as_ref().unwrap().contains("not configured"));
+    }
+
+    #[test]
+    fn unknown_review_override_falls_back_to_a_configured_agent_and_explains_why() {
+        for (author, expected, single_provider) in
+            [("claude", "codex", false), ("codex", "claude", false), ("claude", "claude", true)]
+        {
+            let mut config = Config::default();
+            config.plan.review_agent = Some("missing".into());
+            if single_provider {
+                config.agents.retain(|agent| agent.name == author);
+            }
+            let mut plan = Plan::default();
+            plan.replace("g".into(), vec![Task { id: "a".into(), agent: author.into(), ..Task::default() }], &config);
+            let review = plan.tasks.last().unwrap();
+            assert_eq!(review.agent, expected);
+            assert!(config.agent(&review.agent).is_some());
+            let reason = review.reviewer_reason.as_deref().unwrap();
+            assert!(reason.contains("unconfigured agent") && reason.contains("default choice"), "{reason}");
+        }
     }
 
     #[test]
@@ -1736,14 +1773,14 @@ mod tests {
     fn integration_branch_defaults_to_goal_and_preserves_explicit_override() {
         let mut plan = Plan::default();
         assert_eq!(plan.integration_branch(), "atomics/plan");
-        plan.replace("ATOMICS v0.2: brand, CI".into(), vec![task("a", &[]), task("b", &["a"])]);
+        plan.replace("ATOMICS v0.2: brand, CI".into(), vec![task("a", &[]), task("b", &["a"])], &Config::default());
         assert_eq!(plan.integration_branch(), "atomics/plan-atomics-v0-2-brand-ci");
         assert_eq!(plan.start_branch(&plan.tasks[0]), None);
         assert_eq!(plan.start_branch(&plan.tasks[1]).as_deref(), Some("atomics/plan-atomics-v0-2-brand-ci"));
         plan.integration = Some("feature/v0.2".into());
-        plan.replace("ATOMICS v0.2: brand, CI".into(), vec![task("a", &[])]);
+        plan.replace("ATOMICS v0.2: brand, CI".into(), vec![task("a", &[])], &Config::default());
         assert_eq!(plan.integration_branch(), "feature/v0.2");
-        plan.replace("Something else".into(), vec![task("a", &[])]);
+        plan.replace("Something else".into(), vec![task("a", &[])], &Config::default());
         assert_eq!(plan.integration_branch(), "feature/v0.2");
     }
 
@@ -1752,7 +1789,11 @@ mod tests {
     fn dependents_branch_from_the_integration_branch() {
         let (_dir, repo) = crate::git::tests::project();
         let mut plan = Plan::default();
-        plan.replace("Ship the API".into(), vec![task("a", &[]), task("b", &["a"]), task("c", &[])]);
+        plan.replace(
+            "Ship the API".into(),
+            vec![task("a", &[]), task("b", &["a"]), task("c", &[])],
+            &Config::default(),
+        );
         let worktree = |id: &str| repo.with_file_name(format!("app-{id}"));
         let dispatch = |t: &Task| {
             let start = plan.start_branch(t);
