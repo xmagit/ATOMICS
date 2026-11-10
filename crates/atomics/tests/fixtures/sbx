@@ -290,6 +290,12 @@ case "$1" in
     fi
     ;;
   exec)
+    case "$*" in
+      *"command -v sccache")
+        if [ -f "$dir/sccache-path" ]; then cat "$dir/sccache-path"; exit 0; fi
+        exit 1
+        ;;
+    esac
     [ -e "$dir/exec-runs" ] || exit 0
     shift
     workdir=.

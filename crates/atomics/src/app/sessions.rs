@@ -44,6 +44,7 @@ impl Session {
             chief,
             pending: None,
             sandbox: None,
+            cache_env: Vec::new(),
             relay: None,
             screen_busy: false,
             busy_absent_since: None,
@@ -174,7 +175,12 @@ impl State {
         prompt: Option<String>,
         role: Role,
     ) -> Result<String, String> {
-        self.check_disk(&cwd)?;
+        self.session_disk_guard(&cwd, role == Role::Chief, resume.is_some())?;
+        let worktree_root = crate::build_cache::root(&cwd);
+        if self.lifecycle_jobs.iter().any(|job| !job.is_finished() && job.touches(None, Some(&worktree_root))) {
+            return Err("Worktree cleanup is still running; start the session again once it finishes.".into());
+        }
+        self.cancel_cache_cleanup(&cwd);
         let interactive = std::mem::take(&mut self.interactive_start);
         let chief = role == Role::Chief;
         if !chief && let Some(error) = &self.tickets.workspace_identity_error {
@@ -444,8 +450,10 @@ impl State {
 
     pub(super) fn launch_agent(&mut self, launch: AgentLaunch, codex: Option<bool>) -> Result<String, String> {
         let AgentLaunch { id, agent, cwd, resume, extra_args, prompt, chief, runtime, ref_guard, relay, .. } = launch;
-        self.check_disk(&cwd)?;
-        if self.lifecycle_jobs.iter().any(|job| !job.is_finished() && job.touches(None, Some(&cwd))) {
+        self.session_disk_guard(&cwd, chief, resume.is_some())?;
+        self.cancel_cache_cleanup(&cwd);
+        let worktree_root = crate::build_cache::root(&cwd);
+        if self.lifecycle_jobs.iter().any(|job| !job.is_finished() && job.touches(None, Some(&worktree_root))) {
             return Err("Worktree cleanup is still running; start the session again once it finishes.".into());
         }
         let sandboxed = match runtime {
@@ -495,8 +503,17 @@ impl State {
             if let Some(jobserver) = &self.jobserver {
                 env.extend(jobserver.env());
             }
-            let cache = self.project_config(&cwd).cache;
-            env.extend(crate::build_cache::agent_env(&cwd, &cache));
+            if !chief && agent.kind != AgentKind::Shell && crate::build_cache::lean_worktree(&cwd) {
+                let cache = self.project_config(&cwd).cache;
+                crate::build_cache::link(
+                    &paths::atomics_home(),
+                    &crate::build_cache::root(&cwd),
+                    &cache,
+                    crate::build_cache::Domain::Host,
+                )
+                .map_err(|error| format!("Cache setup refused: {error:#}"))?;
+                env.extend(crate::build_cache::agent_env(&cwd, &cache));
+            }
             env.extend(crate::governor::toolchain_env(&cwd, &self.config.resources, self.governor.cores));
         }
 
@@ -702,6 +719,8 @@ impl State {
                 });
                 self.sessions[index].terminal = Some(terminal);
                 self.sessions[index].claude_id = claude_id;
+                self.sessions[index].cache_env =
+                    sandboxed.as_ref().map(|sandbox| sandbox.cache_env.clone()).unwrap_or_default();
                 self.sessions[index].sandbox = sandboxed.map(|sandboxed| sandboxed.name);
                 self.sessions[index].ref_guard = ref_guard;
                 self.sessions[index].relay = relay;
@@ -944,6 +963,17 @@ impl State {
     }
 
     pub(super) fn close(&mut self, id: &str) {
+        self.close_session(id, !self.restarting);
+    }
+
+    pub(super) fn close_for_resume(&mut self, id: &str) {
+        if let Some(session) = self.sessions.iter().find(|s| s.id == id) {
+            self.cancel_cache_cleanup(&session.root());
+        }
+        self.close_session(id, false);
+    }
+
+    fn close_session(&mut self, id: &str, cleanup: bool) {
         self.pending_questions.remove(id);
         if let Some(i) = self.sessions.iter().position(|s| s.id == id) {
             if let Some(granted) = self.sessions[i].relay.take() {
@@ -975,7 +1005,9 @@ impl State {
                 session.terminal.take();
                 let scope = Scope {
                     sandboxes: vec![name.clone()],
-                    worktrees: Some(scratch.iter().cloned().chain(worktree.iter().cloned()).collect()),
+                    worktrees: Some(
+                        scratch.iter().cloned().chain(worktree.iter().filter(|_| cleanup).cloned()).collect(),
+                    ),
                 };
                 self.lifecycle(scope, move || {
                     let home = paths::atomics_home();
@@ -1025,7 +1057,7 @@ impl State {
                 self.dismissed.insert(cid);
             }
             session.terminal.take();
-            if let Some(worktree) = worktree {
+            if cleanup && let Some(worktree) = worktree {
                 self.schedule_cache_cleanup(&worktree);
                 self.clean_after_session(id, &worktree);
             }

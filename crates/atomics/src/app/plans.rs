@@ -87,6 +87,12 @@ impl State {
                     self.accepted_agent_finished(session, task, &self.plans[index]).then(|| session.id.clone())
                 })
                 .collect();
+            let finished: HashSet<_> = self.plans[index]
+                .tasks
+                .iter()
+                .filter(|task| task.finished_at.is_some())
+                .map(|task| task.id.clone())
+                .collect();
             let mut changed = self.plans[index].finish_tasks_with(now, &workflow, |task| {
                 task.session.as_ref().is_some_and(|id| closable.contains(id))
             });
@@ -121,7 +127,7 @@ impl State {
             let outputs: Vec<_> = self.plans[index]
                 .tasks
                 .iter()
-                .filter(|task| task.finished_at.is_some())
+                .filter(|task| task.finished_at.is_some() && !finished.contains(&task.id))
                 .filter_map(|task| task.worktree.clone())
                 .collect();
             for path in outputs {

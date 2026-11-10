@@ -563,6 +563,7 @@ mod tests {
             let message = requests.recv().unwrap();
             let ControlRequest::Exec { session, command, .. } = message.request else { panic!("an exec request") };
             let job = crate::sandbox::exec::Exec {
+                env: Vec::new(),
                 sbx,
                 sandbox: "atomics-s1".into(),
                 workdir,

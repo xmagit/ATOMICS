@@ -954,6 +954,7 @@ impl State {
         let job = crate::sandbox::exec::Exec {
             sbx: resolve_program(&self.sbx),
             sandbox: sandbox.clone(),
+            env: s.cache_env.clone(),
             // The sandbox mounts the worktree where its links lead.
             workdir: std::fs::canonicalize(&root).unwrap_or(root),
             command,

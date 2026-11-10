@@ -146,6 +146,7 @@ pub struct Session {
     pending: Option<Pending>,
     /// The sandbox a sandboxed agent runs in.
     sandbox: Option<String>,
+    cache_env: Vec<(String, String)>,
     /// Its placeholder for the Claude subscription, revoked when its agent exits or it closes.
     relay: Option<crate::relay::Granted>,
     screen_busy: bool,

@@ -97,8 +97,16 @@ impl RepoWorkflow {
                 }
             }
             if let Some(env) = cache.get("env").and_then(toml::Value::as_table) {
-                config.cache.repo_paths.extend(env.keys().filter(|key| crate::cache::path_variable(key)).cloned());
-                config.cache.env.extend(env.iter().filter_map(|(key, v)| Some((key.clone(), v.as_str()?.into()))));
+                for (key, value) in env {
+                    if !config.cache.env.contains_key(key)
+                        && let Some(value) = value.as_str()
+                    {
+                        config.cache.env.insert(key.clone(), value.into());
+                        if crate::cache::path_variable(key) {
+                            config.cache.repo_paths.insert(key.clone());
+                        }
+                    }
+                }
             }
         }
         // A repository may require sandbox mode and select a template built from it; host access
@@ -425,14 +433,14 @@ mod tests {
         assert_eq!(user.cache.outputs, ["custom"]);
         assert_eq!(user.cache.env["CUSTOM_TOOL"], "custom");
         assert_eq!(user.cache.warnings().len(), 1);
-        let (table, warnings) = declarative(&toml::from_str("[cache]\nshared = ['.cache/sccache', '.npm/_cacache']\noutputs = ['target', 'src/app/obj']\nenv = { CARGO_INCREMENTAL = '0', SCCACHE_DIR = '.cache/sccache' }").unwrap());
+        let (table, warnings) = declarative(&toml::from_str("[cache]\nshared = ['.cache/sccache', '.npm/_cacache']\noutputs = ['target', 'src/app/obj']\nenv = { CARGO_INCREMENTAL = '0', PIP_CACHE_DIR = '.cache/pip' }").unwrap());
         assert!(warnings.is_empty());
         let mut workflow = RepoWorkflow::default();
         workflow.config.table = table;
         let effective = workflow.apply(&user);
         assert_eq!(effective.cache.shared, [".cache/sccache", ".npm/_cacache"]);
         assert_eq!(effective.cache.env["CUSTOM_TOOL"], "custom");
-        assert_eq!(effective.cache.env["SCCACHE_DIR"], ".cache/sccache");
+        assert_eq!(effective.cache.env["PIP_CACHE_DIR"], ".cache/pip");
         for entry in [
             "shared = ['target']",
             "shared = ['node_modules']",
@@ -440,12 +448,26 @@ mod tests {
             "outputs = ['source']",
             "env = { PATH = 'tools' }",
             "env = { SCCACHE_DIR = '/outside' }",
+            "env = { SCCACHE_DIR = '.cache/sccache' }",
             "env = { RUSTC_WRAPPER = 'command' }",
         ] {
             let (table, warnings) = declarative(&toml::from_str(&format!("[cache]\n{entry}")).unwrap());
             assert!(table.get("cache").is_none(), "{entry}: {table:?}");
             assert!(!warnings.is_empty());
         }
+    }
+
+    #[test]
+    fn explicit_user_cache_values_win_and_keep_user_provenance() {
+        let user: crate::config::Config =
+            toml::from_str("[cache.env]\nCARGO_INCREMENTAL = '1'\nPIP_CACHE_DIR = '/user/cache'\n").unwrap();
+        let mut workflow = RepoWorkflow::default();
+        workflow.config.table = declarative(&toml::from_str("[cache.env]\nCARGO_INCREMENTAL = '0'\nPIP_CACHE_DIR = '.cache/pip'\nCARGO_PROFILE_DEV_DEBUG = 'limited'\n").unwrap()).0;
+        let effective = workflow.apply(&user);
+        assert_eq!(effective.cache.env["CARGO_INCREMENTAL"], "1");
+        assert_eq!(effective.cache.env["PIP_CACHE_DIR"], "/user/cache");
+        assert_eq!(effective.cache.env["CARGO_PROFILE_DEV_DEBUG"], "limited");
+        assert!(!effective.cache.repo_paths.contains("PIP_CACHE_DIR"));
     }
 
     #[cfg(unix)]

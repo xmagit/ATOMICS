@@ -26,7 +26,6 @@ impl State {
         let mut machine_paths = self.open_projects.clone();
         machine_paths.push(paths::atomics_home());
         changed |= self.machine.tick(machine_paths, machine_roots, self.wake.clone());
-        changed |= self.poll_build_caches();
         changed |= self.poll_sandbox_check();
         changed |= self.poll_programs_check();
         changed |= self.poll_setup_look_again();
@@ -36,6 +35,7 @@ impl State {
             self.resume_record(record);
             changed = true;
         }
+        changed |= self.poll_build_caches();
         if std::mem::take(&mut self.chief_autostart) && !self.sessions.iter().any(|s| s.chief) {
             match self.start_chief(None) {
                 Ok(_) => self.chief_open = true,
