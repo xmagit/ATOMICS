@@ -600,6 +600,57 @@ VM sees only the shares, and ATOMICS's control socket only if you forward it
 give every agent, scoped to what they work on, and keep personal or administrative credentials on the
 Mac. sshd takes only Lima's key: password and keyboard-interactive logins and root logins are off.
 
+**Brokered secrets.** Enable `atomics.vm.secretBroker.enable = true` alongside
+`atomics.vm.hardened = true` and `atomics.vm.egress.enable = true` for general secrets added with
+`atomics secret`. The headless `atomics-secret-broker.service` runs as the system user
+`atomics-secret-broker`, with no login shell and `NoNewPrivileges`. Its persistent store is
+`/var/lib/atomics-secret-broker`, mode `0700`. The host and agents cannot read it in hardened mode.
+**Without hardened mode, agents can become root through sudo or Docker and read the broker's store.**
+Enabling the broker alone does not protect secrets from those agents.
+
+The host receives metadata and issues random session placeholders. The broker holds the mappings,
+rejects unknown or revoked placeholders, checks the stored host, method, path and authentication rule,
+adds the value and makes the HTTPS request itself. The host's existing loopback relay forwards to
+`/run/atomics-secret-broker/use.sock`; no connected window is needed. The broker streams responses
+and redacts reflected credentials just as the desktop relay does. When a broker is configured but
+unavailable, session preparation and requests fail; they do not fall back to a readable store.
+Desktop hosts without `ATOMICS_SECRET_BROKER_SOCKET` continue using the OS keychain.
+
+Administration uses `/run/atomics-secret-broker/admin.sock`, mode `0660`, accessible only to root
+and `atomics.vm.adminUser` through the `atomics-secret-admin` group. In an admin login:
+
+```sh
+export ATOMICS_SECRET_BROKER_SOCKET=/run/atomics-secret-broker/use.sock
+# Read the value from stdin, masked if entered at a terminal. Never put it in an argument.
+atomics secret add SERVICE_KEY --host api.example.com --method GET --path-prefix /v1
+atomics secret list
+atomics secret rm SERVICE_KEY
+```
+
+`list` shows names, scopes and rules, never values. No admin operation reads or copies a value.
+Removing a secret immediately revokes its broker mappings; start new sessions to clear old environment
+entries. Omit `--host` only for an **exposed** secret: the broker then explicitly returns its value to
+the host for the session environment. This separate operation is logged as `EXPOSED` with its name
+and session, never its value. An exposed secret can be read and leaked by agents. A relayed secret
+cannot use that operation. As the host shares the agents' UID, processes of that UID can request
+new grants and exposed values too; session scopes select environment entries, not an isolation
+boundary between those processes.
+
+With egress enabled, the broker has its own nftables chain before the agents' general allowlist.
+It can use the same loopback dnsmasq resolver and HTTPS addresses resolved for stored rules' hosts;
+it receives no blanket UID exemption, including when egress is in logging mode. A root-owned path
+service consumes a validated, value-free projection of rule hosts, clears the broker's address sets
+and restarts dnsmasq when rules change. This can briefly interrupt DNS while a rule is added or removed.
+Like the VM's other DNS-based rules, nftables filters resolved addresses, which may be shared by
+multiple hostnames; the broker additionally checks the exact hostname and TLS certificate and refuses
+redirects. Its service has no firewall capabilities. The checks
+`checks.aarch64-linux.atomics-vm-secret-broker-system` and
+`checks.aarch64-linux.atomics-vm-secret-broker` build the guest configuration and test service identity,
+private modes, cross-UID rejection and rule-driven network access in disposable guests.
+
+The broker covers general `atomics secret` entries. Existing tool-owned sign-ins and legacy credential
+setup still have the file/keychain behavior described below; enabling it does not migrate those files.
+
 **Secrets.** You type each secret into the tool's own prompt, in the guest. `atomics-onboard` never
 reads, prints or stores one. Its checks discard the tools' output, and it writes no log. It never
 touches the Mac: on macOS it refuses to run. The package holds the script alone, so no value enters

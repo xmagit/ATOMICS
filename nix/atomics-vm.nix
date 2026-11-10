@@ -27,6 +27,7 @@ in
     "${modulesPath}/profiles/qemu-guest.nix"
     ./vm/image.nix
     ./vm/hardened.nix
+    ./vm/secret-broker.nix
     ./vm/egress.nix
     ./vm/docker-images.nix
   ];

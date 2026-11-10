@@ -94,6 +94,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Run the headless VM secret broker (a separate system user).
+    SecretBroker(relay::broker::Options),
     /// Store secrets once for sessions in scope; values are accepted on stdin only.
     Secret {
         #[command(subcommand)]
@@ -314,7 +316,7 @@ const PARENT_SESSION_VARS: &[&str] = &[
 
 fn main() -> eframe::Result {
     let cli = Cli::try_parse().unwrap_or_else(|error| {
-        if std::env::args_os().any(|arg| arg == "secret") && !matches!(error.kind(), clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion) {
+        if std::env::args_os().any(|arg| arg == "secret" || arg == "secret-broker") && !matches!(error.kind(), clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion) {
             eprintln!("Invalid secret command (arguments hidden). Use atomics secret --help. Values are accepted on stdin only.");
             std::process::exit(2);
         }
@@ -333,7 +335,8 @@ fn main() -> eframe::Result {
     let in_session = matches!(
         cli.command,
         Some(
-            Command::Hook { .. }
+            Command::SecretBroker(_)
+                | Command::Hook { .. }
                 | Command::Statusline { .. }
                 | Command::HooksJson { .. }
                 | Command::Mcp { .. }
@@ -374,6 +377,13 @@ fn main() -> eframe::Result {
         unsafe { setup::adopt_login_path() };
     }
     match cli.command {
+        Some(Command::SecretBroker(options)) => {
+            if let Err(error) = relay::broker::run(options) {
+                eprintln!("Secret broker failed: {error}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
         Some(Command::Secret { command }) => {
             if let Err(error) = secret::run(command) {
                 eprintln!("Secret operation failed: {error}");
