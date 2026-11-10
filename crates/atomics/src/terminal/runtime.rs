@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -470,14 +470,8 @@ impl Terminal {
             libc::kill(-leader, libc::SIGSTOP);
         }
         if !self.exited()
-            && let Ok(output) = std::process::Command::new("ps").args(["-axo", "pid=,ppid=,pgid="]).output()
-            && output.status.success()
+            && let Some(rows) = process_groups()
         {
-            let rows: Vec<Vec<i32>> = String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .map(|line| line.split_whitespace().filter_map(|part| part.parse().ok()).collect())
-                .filter(|row: &Vec<i32>| row.len() == 3)
-                .collect();
             let mut owned = std::collections::HashSet::from([leader]);
             loop {
                 let before = owned.len();
@@ -509,6 +503,32 @@ impl Terminal {
         let handle = self.screen_handle();
         (&handle as &dyn TerminalControl).local_resize(|| *self.shared.local.lock().unwrap() = size);
     }
+}
+
+/// System locations work with a minimal PATH. Profile fallbacks must be absolute,
+/// so empty entries, `.` and relative folders cannot select a program in the working directory.
+fn process_groups() -> Option<Vec<[i32; 3]>> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let candidates = ["/bin/ps", "/usr/bin/ps", "/run/current-system/sw/bin/ps"]
+        .map(PathBuf::from)
+        .into_iter()
+        .chain(std::env::split_paths(&path).filter(|dir| dir.is_absolute()).map(|dir| dir.join("ps")));
+    for program in candidates {
+        let Ok(output) = std::process::Command::new(program).args(["-axo", "pid=,ppid=,pgid="]).output() else {
+            continue;
+        };
+        if output.status.success() {
+            return Some(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .filter_map(|line| {
+                        line.split_whitespace().filter_map(|part| part.parse().ok()).collect::<Vec<_>>().try_into().ok()
+                    })
+                    .collect(),
+            );
+        }
+    }
+    None
 }
 
 /// Resize the emulator and the PTY, and record the size answered to size queries.
@@ -861,6 +881,28 @@ mod tests {
 
     #[test]
     fn closing_or_replacing_terminal_kills_its_process_group() {
+        const CHILD: &str = "ATOMICS_TERMINAL_CLEANUP_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let dir = crate::test_support::tempdir().unwrap();
+            let bin = dir.path().join("bin");
+            crate::test_support::link_tools(&bin, &["bash", "sleep", "sh", "cat"]);
+            crate::test_support::write_program(dir.path().join("ps"), "#!/bin/sh\n: > ps-ran\nexit 1\n");
+            let path = std::env::join_paths([Path::new(""), Path::new("."), Path::new("relative"), &bin]).unwrap();
+            let output = crate::test_support::output(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "terminal::runtime::tests::closing_or_replacing_terminal_kills_its_process_group",
+                        "--nocapture",
+                    ])
+                    .current_dir(dir.path())
+                    .env(CHILD, "1")
+                    .env("PATH", path),
+            );
+            assert!(output.status.success(), "{output:?}");
+            assert!(!dir.path().join("ps-ran").exists(), "cleanup executed ps from the working directory");
+            return;
+        }
         for job_control in [false, true] {
             let dir = crate::test_support::tempdir().unwrap();
             let spawn = || {
