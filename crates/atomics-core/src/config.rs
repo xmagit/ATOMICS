@@ -1680,8 +1680,13 @@ kind = "shell"
 
     #[test]
     fn default_config_file_matches_built_in_defaults() {
-        let parsed: Config = toml::from_str(DEFAULT_CONFIG).unwrap();
-        let built_in = Config::default();
+        let mut parsed: Config = toml::from_str(DEFAULT_CONFIG).unwrap();
+        let mut built_in = Config::default();
+        // The new model field and legacy args must produce the same command, while all other defaults stay equal.
+        parsed.chief.args = parsed.chief.launch_args();
+        parsed.chief.model = None;
+        built_in.chief.args = built_in.chief.launch_args();
+        built_in.chief.model = None;
         assert_eq!(serde_json::to_value(&parsed).unwrap(), serde_json::to_value(&built_in).unwrap());
         assert_eq!(parsed.agent("claude").unwrap().kind, AgentKind::Claude);
         assert!(parsed.steer.session_context.contains("{base_ref}"));
