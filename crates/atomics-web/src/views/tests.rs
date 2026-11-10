@@ -3227,6 +3227,81 @@ fn a_host_that_does_not_offer_its_own_state_leaves_the_page_as_it_was() {
 }
 
 #[test]
+fn identity_settings_edit_only_selected_scope_keys_and_clear_words_explicitly() {
+    use atomics_core::identity::Identity;
+    for size in [WIDE, PHONE] {
+        let mut host = fake_host::management();
+        let root = "/host/app";
+        host.board.host.workspace = Some("team".into());
+        let info = host.board.host.management.as_mut().unwrap();
+        info.config["identity_scopes"] = json!([
+            {"target":"main", "path":["identity"], "identity":{"name":"Main Example", "email":"main@example.com", "forbidden_words":["contoso"]}},
+            {"target":"workspace", "path":["identity"], "identity":{"email":"workspace@example.com"}},
+            {"target":root, "path":["identity","projects","~/app"], "identity":{"name":"Project Example"}}
+        ]);
+        info.tools["identities"] = json!([{"project":root, "display":"~/app", "label":"Project Example <workspace@example.com>", "identity":{"name":"Project Example", "email":"workspace@example.com", "forbidden_words":["contoso"]}, "override":{"name":"Project Example"}}]);
+        let (ctx, mut world, mut client, mut view) = live_with(host);
+        client
+            .management
+            .show_identity(root.into(), Identity { name: Some("Project Example".into()), ..Default::default() });
+        settled(&ctx, &mut world, &mut client, &mut view, size);
+        let shown = section(&ctx, &mut world, &mut client, &mut view, size, "Theme");
+        assert!(has(&shown, "Commit email (blank inherits)"), "the inherited email is not prefilled: {shown:?}");
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "Commit email (blank inherits)")));
+        drawn(&ctx, &mut world, &mut client, &mut view, size, vec![egui::Event::Text("edited@example.com".into())]);
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        let shown = settings_scroll_to(&ctx, &mut world, &mut client, &mut view, size, shown, "Review identity change");
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "Review identity change")));
+        settled(&ctx, &mut world, &mut client, &mut view, size);
+        let action = world
+            .host
+            .host_commands
+            .iter()
+            .rev()
+            .find(|action| matches!(action, HostAction::ConfigPropose { .. }))
+            .unwrap();
+        let HostAction::ConfigPropose { scope, toml, remove, .. } = action else { unreachable!() };
+        assert_eq!(*scope, atomics_core::selfconfig::Scope::Main);
+        assert!(toml.contains("email = \"edited@example.com\""), "{toml}");
+        assert!(toml.contains("identity.projects.\"~/app\""), "the original config key is kept: {toml}");
+        assert!(!toml.contains("name =") && !toml.contains("forbidden_words"));
+        assert!(remove.is_empty());
+
+        client
+            .management
+            .show_identity(root.into(), Identity { name: Some("Project Example".into()), ..Default::default() });
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        let shown = settings_scroll_to(&ctx, &mut world, &mut client, &mut view, size, shown, "Clear inherited words");
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "Clear inherited words")));
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "Review identity change")));
+        settled(&ctx, &mut world, &mut client, &mut view, size);
+        let action = world
+            .host
+            .host_commands
+            .iter()
+            .rev()
+            .find(|action| matches!(action, HostAction::ConfigPropose { .. }))
+            .unwrap();
+        let HostAction::ConfigPropose { toml, .. } = action else { unreachable!() };
+        assert!(toml.contains("forbidden_words = []"), "{toml}");
+        assert!(!toml.contains("name =") && !toml.contains("email ="));
+
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "Project: /host/app")));
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        let option = shown.iter().rev().find(|(text, _)| text == "Workspace: team").unwrap().1.center();
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(option));
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(has(&shown, "workspace@example.com"), "the selected scope is prefilled: {shown:?}");
+        assert!(
+            has(&shown, "Commit name (blank inherits)"),
+            "the project name is not carried to the workspace: {shown:?}"
+        );
+    }
+}
+
+#[test]
 fn shared_settings_remote_and_host_folder_picker_work_in_both_layouts() {
     for size in [WIDE, PHONE] {
         let (ctx, mut world, mut client, mut view) = live_with(fake_host::management());

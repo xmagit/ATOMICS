@@ -157,12 +157,15 @@ impl State {
                                 anyhow::bail!(error);
                             }
                             if git::branch_exists(&repo, branch) {
-                                atomics_core::identity::require_clean(&atomics_core::identity::check_task(
-                                    &repo,
-                                    branch,
-                                    base.as_deref().unwrap_or("origin/main"),
-                                    &identity,
-                                )?)?;
+                                atomics_core::identity::require_clean(
+                                    &atomics_core::identity::check_task_for_integration(
+                                        &repo,
+                                        branch,
+                                        base.as_deref().unwrap_or("origin/main"),
+                                        Some(&into),
+                                        &identity,
+                                    )?,
+                                )?;
                             }
                             work_in(
                                 &repo,

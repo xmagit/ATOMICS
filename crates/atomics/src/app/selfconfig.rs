@@ -37,6 +37,38 @@ pub(super) struct ProposedChange<'a> {
 }
 
 impl State {
+    /// Raw values in the exact files the identity form edits; inherited values are display-only.
+    fn identity_scopes(&self, layers: &[Layer]) -> Vec<serde_json::Value> {
+        use atomics_core::identity::IdentityConfig;
+        let main: IdentityConfig = layers
+            .iter()
+            .find(|layer| layer.source == Source::Main)
+            .and_then(|layer| layer.table.get("identity"))
+            .and_then(|value| value.clone().try_into().ok())
+            .unwrap_or_default();
+        let mut scopes = vec![json!({"target":"main", "scope":"main", "path":["identity"], "identity":main.default})];
+        if self.workspace.is_some() {
+            let identity = layers
+                .iter()
+                .find(|layer| layer.source == Source::Workspace)
+                .and_then(|layer| workspace::Workspace::identity_in(&layer.table).ok().flatten())
+                .unwrap_or_default();
+            scopes.push(json!({"target":"workspace", "scope":"workspace", "path":["identity"], "identity":identity}));
+        }
+        for root in &self.repos {
+            let found = main.projects.iter().find(|(path, _)| {
+                let expanded = paths::expand(path);
+                std::fs::canonicalize(&expanded).unwrap_or(expanded) == *root
+            });
+            let (key, identity) = found.map_or_else(
+                || (paths::display(root), Default::default()),
+                |(key, identity)| (key.clone(), identity.clone()),
+            );
+            scopes.push(json!({"target":root.to_string_lossy(), "scope":"main", "path":["identity", "projects", key], "identity":identity}));
+        }
+        scopes
+    }
+
     /// The files that make up the configuration, lowest precedence first: the main file,
     /// this host's, the active workspace's, and the project's own when given.
     pub(super) fn config_layers(&self, project: Option<&Path>) -> Vec<Layer> {
@@ -155,6 +187,7 @@ impl State {
             "load_error": load_error,
             "running_on_last_good_config": self.config_error.is_some(),
             "values": values,
+            "identity_scopes": self.identity_scopes(&layers),
             "chief_prompt": {
                 "built_in": effective.chief.system_prompt == atomics_core::config::CHIEF_PROMPT,
                 "sections": sections,

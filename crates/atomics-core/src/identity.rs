@@ -59,6 +59,10 @@ impl Identity {
         self.email.is_some() || self.forbidden_words.as_ref().is_some_and(|words| !words.is_empty())
     }
 
+    pub fn has_git_identity(&self) -> bool {
+        self.name.is_some() || self.email.is_some()
+    }
+
     pub fn label(&self) -> String {
         format!("{} <{}>", self.name.as_deref().unwrap_or("git name"), self.email.as_deref().unwrap_or("git email"))
     }
@@ -90,6 +94,8 @@ mod native {
     use anyhow::{Context, Result, bail, ensure};
     use std::{path::Path, process::Command};
 
+    pub const UNTRACKED_SCAN_LIMIT: u64 = 4 * 1024 * 1024;
+
     fn include_key(dir: &Path) -> String {
         let mut pattern = String::new();
         for ch in dir.to_string_lossy().chars() {
@@ -106,6 +112,7 @@ mod native {
     /// and a sandbox cannot inject executable config into host Git. The main identity is untouched.
     pub fn set_worktree_identity(worktree: &Path, identity: &Identity) -> Result<()> {
         identity.validate().map_err(anyhow::Error::msg)?;
+        ensure!(identity.has_git_identity(), "an empty identity must be removed, not written");
         let pins = git::resolve_pins(worktree)?;
         let common = pins.common_dir.context("worktree has no common git directory")?;
         let dir = pins.git_dir.context("worktree has no git directory")?;
@@ -125,6 +132,18 @@ mod native {
         Ok(())
     }
 
+    /// Unconfigured worktrees get no config entry or identity file. Removing an override
+    /// restores Git's own identity, including when a configured identity becomes empty.
+    pub fn sync_worktree_identity(worktree: &Path, identity: &Identity) -> Result<()> {
+        if identity.has_git_identity() {
+            set_worktree_identity(worktree, identity)
+        } else if is_managed_worktree(worktree) {
+            remove_worktree_identity(worktree, &git::resolve_pins(worktree)?)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Do not leave an identity behind for Git to apply when it reuses an admin directory.
     pub fn remove_worktree_identity(repo: &Path, pins: &git::GitPins) -> Result<()> {
         let (Some(common), Some(dir)) = (&pins.common_dir, &pins.git_dir) else { return Ok(()) };
@@ -141,7 +160,9 @@ mod native {
         if git::git(repo, &["config", "--local", "--get-all", &key]).is_ok() {
             git::git(repo, &["config", "--local", "--unset-all", &key])?;
         }
-        std::fs::remove_file(file)?;
+        std::fs::remove_file(&file)?;
+        // Other worktrees may still use this folder.
+        let _ = std::fs::remove_dir(file.parent().unwrap());
         Ok(())
     }
 
@@ -197,6 +218,16 @@ mod native {
     /// Scan all new commits (without mailmap), their additions, and the live task diff including
     /// every untracked file. No UI diff budget applies. Metadata uses raw Git object line numbers.
     pub fn check_task(repo: &Path, branch: &str, base_ref: &str, identity: &Identity) -> Result<Vec<Hit>> {
+        check_task_for_integration(repo, branch, base_ref, None, identity)
+    }
+
+    pub fn check_task_for_integration(
+        repo: &Path,
+        branch: &str,
+        base_ref: &str,
+        into: Option<&str>,
+        identity: &Identity,
+    ) -> Result<Vec<Hit>> {
         identity.validate().map_err(anyhow::Error::msg)?;
         if !identity.guarded() {
             return Ok(Vec::new());
@@ -208,6 +239,19 @@ mod native {
         let reference = format!("refs/heads/{branch}");
         let base = git::resolve_base(repo, base_ref)
             .map_err(|_| anyhow::anyhow!("identity guard could not resolve its base"))?;
+        // Author identity applies only to work not already accepted into the integration
+        // branch or base. Existing commits may predate the configured identity.
+        let into = into.map(|name| format!("refs/heads/{name}"));
+        let into = into.as_deref().filter(|reference| git::commit_of(repo, reference).ok().flatten().is_some());
+        let mut author_args = vec!["rev-list", &reference, "--not", &base];
+        if let Some(into) = into {
+            author_args.push(into);
+        }
+        let authors: std::collections::HashSet<String> = if identity.email.is_some() {
+            read(repo, &author_args)?.lines().map(str::to_string).collect()
+        } else {
+            Default::default()
+        };
         let base = read(repo, &["merge-base", &base, &reference])?;
         let mut hits = Vec::new();
         text_hits(&mut hits, identity, &format!(".git/{reference}"), 1, branch);
@@ -224,12 +268,13 @@ mod native {
                     text_hits(&mut hits, identity, &file, n + 1, line);
                 }
                 if !message
+                    && authors.contains(commit)
                     && let Some(author) = line.strip_prefix("author ")
                     && let Some(expected) = &identity.email
                 {
                     let email =
                         author.rsplit_once(" <").and_then(|(_, rest)| rest.split_once('>')).map(|(email, _)| email);
-                    if email != Some(expected.as_str()) {
+                    if email.is_none_or(|email| !email.eq_ignore_ascii_case(expected)) {
                         hits.push(Hit {
                             file: file.clone(),
                             line: n + 1,
@@ -273,8 +318,19 @@ mod native {
             );
             let untracked = read(&entry.path, &["ls-files", "--others", "--exclude-standard", "-z"])?;
             for path in untracked.split('\0').filter(|p| !p.is_empty()) {
-                let content = match git::read_worktree_file(&entry.path, path, u64::MAX) {
+                let content = match git::read_worktree_file(&entry.path, path, UNTRACKED_SCAN_LIMIT + 1) {
                     Some(git::WorktreeFile::Link(target)) => target,
+                    Some(git::WorktreeFile::File { len, bytes })
+                        if len > UNTRACKED_SCAN_LIMIT
+                            || bytes.as_ref().is_some_and(|bytes| bytes.len() as u64 > UNTRACKED_SCAN_LIMIT) =>
+                    {
+                        hits.push(Hit {
+                            file: path.into(),
+                            line: 1,
+                            reason: "untracked file exceeds the 4 MiB identity scan limit",
+                        });
+                        continue;
+                    }
                     Some(git::WorktreeFile::File { bytes: Some(bytes), .. }) => {
                         String::from_utf8_lossy(&bytes).into_owned()
                     }
@@ -365,6 +421,95 @@ forbidden_words = []
 
     #[test]
     #[cfg(feature = "native")]
+    fn identity_default_does_not_write_git_config_and_empty_removes_it() {
+        use crate::git;
+        let (dir, repo, identity) = project();
+        let common = git::common_dir(&repo).unwrap();
+        let before = std::fs::read(common.join("config")).unwrap();
+        let task = dir.path().join("task");
+        let into = dir.path().join("integration");
+        git::add_worktree(&repo, &task, "task", "main").unwrap();
+        sync_worktree_identity(&task, &Identity::default()).unwrap();
+        std::fs::write(task.join("work.txt"), "safe\n").unwrap();
+        git::integrate(&repo, "task", "finish", "integration", &into, "main").unwrap();
+        assert_eq!(std::fs::read(common.join("config")).unwrap(), before);
+        assert!(!common.join("atomics-identities").exists());
+        sync_worktree_identity(&task, &identity).unwrap();
+        assert!(is_managed_worktree(&task));
+        sync_worktree_identity(&task, &Identity::default()).unwrap();
+        assert!(!is_managed_worktree(&task));
+        assert!(!common.join("atomics-identities").exists());
+        assert!(!std::fs::read_to_string(common.join("config")).unwrap().contains("includeIf"));
+        assert_eq!(git::git(&task, &["config", "user.email"]).unwrap().trim(), "git@example.com");
+    }
+
+    #[test]
+    #[cfg(feature = "native")]
+    fn identity_author_email_ignores_case_and_already_integrated_history() {
+        use crate::git;
+        let (dir, repo, identity) = project();
+        let into = dir.path().join("integration");
+        git::add_worktree(&repo, &into, "integration", "main").unwrap();
+        std::fs::write(into.join("old.txt"), "old work\n").unwrap();
+        git::commit_all(&into, "work before identity was configured").unwrap();
+        let task = dir.path().join("task");
+        git::add_worktree(&repo, &task, "task", "integration").unwrap();
+        assert!(
+            check_task(&repo, "task", "main", &identity).unwrap().iter().any(|hit| hit.reason.contains("author email"))
+        );
+        assert!(check_task_for_integration(&repo, "task", "main", Some("integration"), &identity).unwrap().is_empty());
+        std::fs::write(task.join("new.txt"), "new work\n").unwrap();
+        let mixed_case = Identity { email: Some("CONTEXT@EXAMPLE.COM".into()), ..identity.clone() };
+        git::commit_all_with_identity(&task, "new identity", &mixed_case).unwrap();
+        assert!(check_task_for_integration(&repo, "task", "main", Some("integration"), &identity).unwrap().is_empty());
+        git::integrate_with_identity(&repo, "task", "finish", "integration", &into, "main", &identity).unwrap();
+        std::fs::write(task.join("wrong.txt"), "wrong author\n").unwrap();
+        git::commit_all_with_identity(
+            &task,
+            "new wrong author",
+            &Identity { email: Some("other@example.com".into()), ..identity.clone() },
+        )
+        .unwrap();
+        let wrong = git::git(&task, &["rev-parse", "HEAD"]).unwrap();
+        let hits = check_task_for_integration(&repo, "task", "main", Some("integration"), &identity).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].file, format!(".git/objects/{}", wrong.trim()));
+        assert!(
+            git::integrate_with_identity(&repo, "task", "finish", "integration", &into, "main", &identity).is_err()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "native")]
+    fn identity_guard_blocks_oversized_untracked_files_with_locations_only() {
+        use crate::git;
+        let (dir, repo, identity) = project();
+        let task = dir.path().join("task");
+        git::add_worktree(&repo, &task, "task", "main").unwrap();
+        std::fs::File::create(task.join("large.txt")).unwrap().set_len(UNTRACKED_SCAN_LIMIT + 1).unwrap();
+        let hits = check_task(&repo, "task", "main", &identity).unwrap();
+        assert_eq!(
+            hits,
+            [Hit { file: "large.txt".into(), line: 1, reason: "untracked file exceeds the 4 MiB identity scan limit" }]
+        );
+        let error = git::integrate_with_identity(
+            &repo,
+            "task",
+            "finish",
+            "integration",
+            &dir.path().join("integration"),
+            "main",
+            &identity,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("large.txt:1:"));
+        assert!(!git::branch_exists(&repo, "integration"));
+        assert!(git::git(&task, &["diff", "--cached"]).unwrap().is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "native")]
     fn identity_worktrees_and_automatic_commits_keep_the_main_identity() {
         use crate::git;
         let (dir, repo, mut identity) = project();
@@ -410,7 +555,7 @@ forbidden_words = []
                 "context@example.com|context@example.com"
             );
         }
-        set_worktree_identity(&task, &Identity::default()).unwrap();
+        sync_worktree_identity(&task, &Identity::default()).unwrap();
         assert_eq!(git::git(&task, &["config", "user.email"]).unwrap().trim(), "git@example.com");
         assert_eq!(git::git(&repo, &["config", "user.name"]).unwrap().trim(), "Git Example");
         git::remove_worktree(&repo, &task, Some("task"), false).unwrap();

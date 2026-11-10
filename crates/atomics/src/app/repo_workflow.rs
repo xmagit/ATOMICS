@@ -76,7 +76,7 @@ impl State {
             std::iter::once(&config.default)
                 .chain(config.projects.values())
                 .chain(ws)
-                .any(|identity| identity.name.is_some() || identity.email.is_some())
+                .any(atomics_core::identity::Identity::has_git_identity)
         };
         let previously =
             self.identity_context.as_ref().is_some_and(|(config, ws, _)| has_identity(config, ws.as_ref()));
@@ -94,13 +94,17 @@ impl State {
             return;
         }
         let projects: Vec<_> = self.repos.iter().map(|repo| (repo.clone(), self.project_identity(repo))).collect();
+        let mut owned = self.identity_worktrees.clone();
+        owned.extend(self.plans.iter().flat_map(|plan| &plan.tasks).filter_map(|task| task.worktree.clone()));
+        owned
+            .extend(self.sessions.iter().filter_map(|session| session.worktree.as_ref().map(|tree| tree.root.clone())));
         let actions = self.action_tx.clone();
         self.identity_updates.run(move || {
             for (repo, identity) in projects {
                 let result = (|| -> anyhow::Result<()> {
                     for entry in git::list_worktrees(&repo)?.into_iter().skip(1).filter(|entry| entry.trusted) {
-                        if atomics_core::identity::is_managed_worktree(&entry.path) {
-                            atomics_core::identity::set_worktree_identity(&entry.path, &identity)?;
+                        if owned.contains(&entry.path) || atomics_core::identity::is_managed_worktree(&entry.path) {
+                            atomics_core::identity::sync_worktree_identity(&entry.path, &identity)?;
                         }
                     }
                     Ok(())

@@ -630,6 +630,7 @@ pub(crate) struct State {
     /// Worktree folder → its project's main checkout.
     worktree_project: HashMap<PathBuf, PathBuf>,
     git_identities: HashMap<PathBuf, atomics_core::identity::Identity>,
+    identity_worktrees: HashSet<PathBuf>,
     title: String,
     /// Diff/editor width set by dragging the divider.
     /// Side by side or unified, picked in the diff header; wins over the config until ATOMICS quits.
@@ -1181,6 +1182,7 @@ impl State {
             workspace_names: Vec::new(),
             worktree_project: HashMap::new(),
             git_identities: HashMap::new(),
+            identity_worktrees: HashSet::new(),
             title: String::new(),
             cleanup: None,
             plan_cleanup: None,

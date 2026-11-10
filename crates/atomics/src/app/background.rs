@@ -181,7 +181,7 @@ impl State {
                     let tx = self.worktree_tx.clone();
                     self.identity_updates.run(move || {
                         let result = result.and_then(|mut prepared| {
-                            atomics_core::identity::set_worktree_identity(&prepared.path, &identity)
+                            atomics_core::identity::sync_worktree_identity(&prepared.path, &identity)
                                 .map_err(|e| format!("{e:#}"))?;
                             prepared.identity = Some(identity);
                             Ok(prepared)
@@ -190,6 +190,7 @@ impl State {
                     });
                     continue;
                 }
+                self.identity_worktrees.insert(prepared.path.clone());
             }
             self.worktrees_at = None;
             if let Some(i) = self.creating.iter().position(|(repo, b, _)| *repo == common && *b == branch) {

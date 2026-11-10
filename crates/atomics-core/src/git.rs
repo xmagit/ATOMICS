@@ -1366,7 +1366,13 @@ pub fn integrate_with_identity(
     let lock = worktree_lock(repo)?;
     let _turn = lock.lock().unwrap_or_else(|e| e.into_inner());
     // Check before staging, committing, creating an integration branch or merging.
-    crate::identity::require_clean(&crate::identity::check_task(repo, branch, base_ref, identity)?)?;
+    crate::identity::require_clean(&crate::identity::check_task_for_integration(
+        repo,
+        branch,
+        base_ref,
+        Some(into),
+        identity,
+    )?)?;
     crate::identity::check_pending(identity, ".git/COMMIT_EDITMSG", message)?;
     crate::identity::check_pending(identity, ".git/MERGE_MSG", &format!("Merge branch '{branch}' into {into}"))?;
     crate::identity::check_pending(identity, ".git/AUTHOR_IDENT", &identity.label())?;
@@ -1388,7 +1394,7 @@ pub fn integrate_with_identity(
     };
     let committed = match checked_out(branch)?.filter(|e| e.path.is_dir()) {
         Some(entry) => {
-            crate::identity::set_worktree_identity(&entry.path, identity)?;
+            crate::identity::sync_worktree_identity(&entry.path, identity)?;
             commit_all_with_identity(&entry.path, message, identity)?
         }
         None => false,
@@ -1405,8 +1411,14 @@ pub fn integrate_with_identity(
             into_path.to_path_buf()
         }
     };
-    crate::identity::set_worktree_identity(&worktree, identity)?;
-    crate::identity::require_clean(&crate::identity::check_task(repo, branch, base_ref, identity)?)?;
+    crate::identity::sync_worktree_identity(&worktree, identity)?;
+    crate::identity::require_clean(&crate::identity::check_task_for_integration(
+        repo,
+        branch,
+        base_ref,
+        Some(into),
+        identity,
+    )?)?;
     let merge = merge_with_identity(&worktree, branch, identity)?;
     Ok(Integration { committed, merge, worktree })
 }

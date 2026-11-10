@@ -343,10 +343,7 @@ fn report(workspace: Option<&str>, for_agent: bool, projects: &[PathBuf]) -> Rep
 
 fn identity_lines(config: &Config, workspace: Option<&str>, repo: &Path) -> Vec<String> {
     use atomics_core::git;
-    let workspace = workspace
-        .map(Workspace::load)
-        .transpose()
-        .and_then(|workspace| workspace.map(|ws| ws.identity()).transpose().map(Option::flatten).map_err(Into::into));
+    let workspace = workspace.map(Workspace::load_identity).transpose().map(Option::flatten);
     let workspace = match workspace {
         Ok(identity) => identity,
         Err(_) => {

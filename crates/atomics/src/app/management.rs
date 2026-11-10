@@ -75,6 +75,7 @@ impl State {
                 })
                 .collect();
         }
+        let identity_scopes = config["identity_scopes"].clone();
         ManagementInfo {
             config,
             proposals,
@@ -93,7 +94,10 @@ impl State {
                     let configured = self.project_identity(repo);
                     let identity = self.git_identities.get(repo).map_or(configured.clone(), |git| git.overlay(&configured));
                     let label = self.tickets.workspace_identity_error.clone().unwrap_or_else(|| if identity.name.is_none() && identity.email.is_none() { "Git identity".to_string() } else { identity.label() });
-                    json!({"project": repo.to_string_lossy(), "display": paths::display(repo), "label": label, "identity": identity})
+                    let scoped = identity_scopes.as_array().into_iter().flatten()
+                        .find(|scope| scope["target"].as_str().is_some_and(|target| Path::new(target) == repo))
+                        .map(|scope| scope["identity"].clone()).unwrap_or_else(|| json!({}));
+                    json!({"project": repo.to_string_lossy(), "display": paths::display(repo), "label": label, "identity": identity, "override": scoped})
                 }).collect::<Vec<_>>(),
                 "identity_error": self.tickets.workspace_identity_error,
             }),

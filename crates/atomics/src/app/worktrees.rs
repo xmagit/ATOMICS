@@ -631,6 +631,7 @@ mod tests {
                     isolation: None,
                 });
                 let supported = git::probe_cache_clone(&repo, repo.parent().unwrap()).unwrap();
+                let config_before = std::fs::read(repo.join(".git/config")).unwrap();
                 for (branch, folders, expected) in [
                     ("missing", vec!["target".into()], "cold"),
                     ("warm", vec!["target".into()], if supported { "main cache" } else { "cold" }),
@@ -687,6 +688,12 @@ mod tests {
                         assert_eq!(state.toast.as_ref().unwrap().0, "warm cache from main");
                     }
                     assert_eq!(std::fs::read_to_string(path.join("launched")).unwrap(), expected);
+                    assert_eq!(
+                        std::fs::read(repo.join(".git/config")).unwrap(),
+                        config_before,
+                        "unconfigured worktrees must not receive identity includes"
+                    );
+                    assert!(!repo.join(".git/atomics-identities").exists());
                 }
             },
         );
