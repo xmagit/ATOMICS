@@ -1,12 +1,14 @@
 use super::*;
 use std::process::{Command, Stdio};
 
+type Requests = Arc<Mutex<Vec<(String, String, Vec<u8>)>>>;
+
 pub(crate) struct Server {
     pub root: crate::test_support::TempDir,
     pub work: PathBuf,
     pub bare: PathBuf,
     pub base: String,
-    pub seen: Arc<Mutex<Vec<(String, String, Vec<u8>)>>>,
+    pub seen: Requests,
     pub default_branch: Arc<Mutex<String>>,
     stopped: Arc<AtomicBool>,
 }
@@ -58,6 +60,65 @@ impl Server {
         Self { root, work, bare, base, seen, default_branch, stopped }
     }
 
+    pub fn commit_large_blob(&self) {
+        use ring::rand::SecureRandom;
+        let mut bytes = vec![0; 3 * 1024 * 1024];
+        ring::rand::SystemRandom::new().fill(&mut bytes).unwrap();
+        std::fs::write(self.work.join("large.bin"), bytes).unwrap();
+        git(&self.work, &["add", "large.bin"]);
+        git(
+            &self.work,
+            &[
+                "-c",
+                "user.name=Contributor",
+                "-c",
+                "user.email=contributor@example.invalid",
+                "commit",
+                "-qm",
+                "large blob",
+            ],
+        );
+    }
+
+    pub fn assert_large_push(&self, relay: &Service) {
+        let scope = Scope::from_project(&self.work, true).unwrap();
+        let grant = relay.grant_github("large-push", "account-one", scope, false, None).unwrap().unwrap();
+        let run = |destination: &str| {
+            Command::new("git")
+                .arg("-C")
+                .arg(&self.work)
+                .args(["-c", "http.postBuffer=1048576", "push", "origin", destination])
+                .envs(&grant.secrets)
+                .output()
+                .unwrap()
+        };
+        let main = git(&self.bare, &["rev-parse", "main"]);
+        assert!(!run("task:main").status.success());
+        assert_eq!(git(&self.bare, &["rev-parse", "main"]), main);
+        assert!(
+            !self
+                .seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(path, _, body)| path.ends_with("/git-receive-pack") && body.len() > 1024 * 1024),
+            "refused updates never reach upstream"
+        );
+        let pushed = run("task");
+        assert!(pushed.status.success(), "{}", String::from_utf8_lossy(&pushed.stderr));
+        assert_eq!(git(&self.bare, &["rev-parse", "task"]), git(&self.work, &["rev-parse", "task"]));
+        let seen = self.seen.lock().unwrap();
+        assert!(
+            seen.iter().any(|(path, _, body)| path.ends_with("/git-receive-pack") && body == b"0000"),
+            "Git's empty probe reached upstream"
+        );
+        assert!(
+            seen.iter().any(|(path, _, body)| path.ends_with("/git-receive-pack") && body.len() > 1024 * 1024),
+            "the streamed pack exceeds postBuffer"
+        );
+        relay.revoke(&grant);
+    }
+
     pub fn upstreams(&self) -> HashMap<String, String> {
         [("github.com".into(), self.base.clone()), ("api.github.com".into(), self.base.clone())].into()
     }
@@ -87,12 +148,7 @@ pub fn git(repo: &std::path::Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap()
 }
 
-fn serve(
-    stream: TcpStream,
-    root: &std::path::Path,
-    record: Arc<Mutex<Vec<(String, String, Vec<u8>)>>>,
-    branch: Arc<Mutex<String>>,
-) {
+fn serve(stream: TcpStream, root: &std::path::Path, record: Requests, branch: Arc<Mutex<String>>) {
     stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     let mut reader = BufReader::new(stream);
     let Some(head) = read_head(&mut reader).unwrap() else {
@@ -234,7 +290,7 @@ fn github_paths_and_packet_parser_fail_closed() {
         let packet = format!("{:04x}{line}0000PACK", line.len() + 4);
         assert_eq!(receive_pack_allowed(packet.as_bytes(), "main"), allowed);
     }
-    for malformed in ["", "0000", "0001", "ffffinvalid", "000bpush-cert0000"] {
+    for malformed in ["", "0001", "ffffinvalid", "000bpush-cert0000"] {
         assert!(!receive_pack_allowed(malformed.as_bytes(), "main"));
     }
 }
@@ -260,4 +316,29 @@ fn github_account_scope_and_generic_secret_grants_do_not_leak_or_broaden_it() {
         service.grant_project_github("daily", "account-one", &fake.work, Some("daily"), false, None).unwrap().unwrap();
     assert!(!format!("{:?}", grant.secrets).contains("CANARY"));
     service.revoke(&grant);
+}
+
+#[test]
+fn github_large_push_streams_after_the_empty_probe_through_the_relay() {
+    let server = Server::start();
+    server.commit_large_blob();
+    server.assert_large_push(&server.relay());
+}
+
+#[test]
+fn github_only_the_exact_empty_probe_is_allowed_without_commands() {
+    for default in ["main", ""] {
+        assert!(receive_pack_allowed(b"0000", default));
+        for body in [b"".as_slice(), b"00000000", b"0000PACK", b"0000\n", b"0000ref-change"] {
+            assert!(!receive_pack_allowed(body, default), "{body:?}");
+        }
+    }
+}
+
+#[test]
+fn github_shallow_push_commands_remain_unsupported() {
+    let shallow = format!("shallow {}\n", "1".repeat(40));
+    let update = format!("{} {} refs/heads/task\0report-status\n", "0".repeat(40), "2".repeat(40));
+    let packet = format!("{:04x}{shallow}{:04x}{update}0000PACK", shallow.len() + 4, update.len() + 4);
+    assert!(!receive_pack_allowed(packet.as_bytes(), "main"));
 }

@@ -707,6 +707,11 @@ fn stream(
     if !bodiless {
         out.extend_from_slice(b"transfer-encoding: chunked\r\n");
     }
+    if !head.keep_alive() {
+        // The broker serves one response per connection. Advertise that before a git client
+        // reuses the connection for a streamed pack that it cannot rewind after a disconnect.
+        out.extend_from_slice(b"connection: close\r\n");
+    }
     out.extend_from_slice(b"\r\n");
     if writer.write_all(&out).and_then(|()| writer.flush()).is_err() {
         return (status.as_u16(), false);
@@ -1557,46 +1562,55 @@ impl Service {
             crate::credentials::Store::new(self.keychain.clone()).secret_values()?
         };
         let mut granted = granted;
-        for (spec, value) in secrets
-            .into_iter()
-            .filter(|(s, _)| s.scope.includes(workspace, project) && !s.name.starts_with(github::ACCOUNT_PREFIX))
-        {
-            let grant = granted.get_or_insert_with(Granted::default);
-            if let Some(host) = &spec.host {
-                let mut relay = self.relay.lock().unwrap();
-                if relay.is_none() {
-                    *relay = Some(self.start()?);
-                }
-                let relay = relay.as_ref().unwrap();
-                grant.port = relay.port();
-                let mut credential = Credential::secret(&spec, value.to_string());
-                if let Some(client) = &self.broker {
-                    credential.source = Source::Broker(client.clone());
-                }
-                let placeholder = relay.grant(session, Arc::new(credential));
-                if let Some(client) = &self.broker
-                    && let Err(error) = client.grant(&spec.name, session, &placeholder)
-                {
-                    relay.revoke(&placeholder);
-                    return Err(error);
-                }
-                grant.secret_placeholders.push(placeholder.clone());
-                grant.secrets.insert(spec.name.clone(), placeholder);
-                let address = if sandbox { atomics_core::isolation::RELAY_HOST } else { "127.0.0.1" };
-                let url = format!("http://{address}:{}/{host}", relay.port());
-                grant.secrets.insert(format!("{}_RELAY_URL", spec.name), url.clone());
-                match spec.name.as_str() {
-                    "OPENAI_API_KEY" => {
-                        grant.secrets.insert("OPENAI_BASE_URL".into(), format!("{url}/v1"));
+        let mut issued = Granted::default();
+        let result = (|| -> Result<()> {
+            for (spec, value) in secrets
+                .into_iter()
+                .filter(|(s, _)| s.scope.includes(workspace, project) && !s.name.starts_with(github::ACCOUNT_PREFIX))
+            {
+                let grant = granted.get_or_insert_with(Granted::default);
+                if let Some(host) = &spec.host {
+                    let mut relay = self.relay.lock().unwrap();
+                    if relay.is_none() {
+                        *relay = Some(self.start()?);
                     }
-                    "ANTHROPIC_API_KEY" | "CLAUDE_CODE_OAUTH_TOKEN" => {
-                        grant.secrets.insert("ANTHROPIC_BASE_URL".into(), url);
+                    let relay = relay.as_ref().unwrap();
+                    grant.port = relay.port();
+                    let mut credential = Credential::secret(&spec, value.to_string());
+                    if let Some(client) = &self.broker {
+                        credential.source = Source::Broker(client.clone());
                     }
-                    _ => {}
+                    let placeholder = relay.grant(session, Arc::new(credential));
+                    issued.secret_placeholders.push(placeholder.clone());
+                    if let Some(client) = &self.broker
+                        && let Err(error) = client.grant(&spec.name, session, &placeholder)
+                    {
+                        relay.revoke(&placeholder);
+                        return Err(error);
+                    }
+                    grant.secret_placeholders.push(placeholder.clone());
+                    grant.secrets.insert(spec.name.clone(), placeholder);
+                    let address = if sandbox { atomics_core::isolation::RELAY_HOST } else { "127.0.0.1" };
+                    let url = format!("http://{address}:{}/{host}", relay.port());
+                    grant.secrets.insert(format!("{}_RELAY_URL", spec.name), url.clone());
+                    match spec.name.as_str() {
+                        "OPENAI_API_KEY" => {
+                            grant.secrets.insert("OPENAI_BASE_URL".into(), format!("{url}/v1"));
+                        }
+                        "ANTHROPIC_API_KEY" | "CLAUDE_CODE_OAUTH_TOKEN" => {
+                            grant.secrets.insert("ANTHROPIC_BASE_URL".into(), url);
+                        }
+                        _ => {}
+                    }
+                } else {
+                    grant.secrets.insert(spec.name, value.to_string());
                 }
-            } else {
-                grant.secrets.insert(spec.name, value.to_string());
             }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.revoke(&issued);
+            return Err(error);
         }
         if let Some(grant) = granted.as_mut()
             && (grant.secrets.contains_key("ANTHROPIC_API_KEY")
@@ -1633,13 +1647,12 @@ impl Service {
             .unwrap_or_default()
     }
 
-    /// Serializes Settings changes with grant preparation. Even an unverified write revokes
-    /// the old grants, since the keychain may have accepted the new value before reporting failure.
+    /// Serialize Settings changes with grant preparation; failed edits keep existing grants.
     pub fn edit(&self, label: &str, update: impl FnOnce(&crate::credentials::Store) -> Result<()>) -> Result<()> {
         let _edit = self.edits.lock().unwrap();
-        let result = update(&crate::credentials::Store::new(self.keychain.clone()));
+        update(&crate::credentials::Store::new(self.keychain.clone()))?;
         self.revoke_credential(label);
-        result
+        Ok(())
     }
 
     /// Only status crosses into Settings; keychain I/O happens on its worker.
@@ -2451,5 +2464,26 @@ mod tests {
         {
             assert_eq!(valid_claude_token(token), valid, "{token}");
         }
+    }
+    #[test]
+    fn failed_secret_add_keeps_live_grants_and_successful_edit_revokes_them() {
+        use atomics_core::secrets::Secret;
+        let dir = crate::test_support::tempdir().unwrap();
+        let keychain = Keychain::in_folder(&dir.path().join("keychain"));
+        let store = crate::credentials::Store::local(keychain.clone());
+        let spec = Secret { name: "KEY".into(), host: Some("api.example.com".into()), ..Default::default() };
+        store.add_secret(spec.clone(), "original-canary").unwrap();
+        let mut service = Service::transient(dir.path().join("relay"), keychain);
+        service.broker = None;
+        let grant = service.grant_secrets("session", None, None, false, None).unwrap().unwrap();
+        let placeholder = grant.secrets["KEY"].clone();
+        assert!(service.edit("secret:KEY", |store| store.add_secret(spec, "replacement-canary")).is_err());
+        assert_eq!(service.live_grants(), 1);
+        assert!(
+            service.relay.lock().unwrap().as_ref().unwrap().inner.grants.lock().unwrap().contains_key(&placeholder)
+        );
+        assert_eq!(store.secret_values().unwrap()[0].1.as_str(), "original-canary");
+        service.edit("secret:KEY", |store| store.remove_secret("KEY")).unwrap();
+        assert_eq!(service.live_grants(), 0);
     }
 }

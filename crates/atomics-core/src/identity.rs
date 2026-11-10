@@ -300,7 +300,7 @@ mod native {
         // branch or base. Existing commits may predate the configured identity.
         let into = into.map(|name| format!("refs/heads/{name}"));
         let into = into.as_deref().filter(|reference| git::commit_of(repo, reference).ok().flatten().is_some());
-        let mut author_args = vec!["rev-list", &reference, "--not", &base];
+        let mut author_args = vec!["rev-list", reference, "--not", &base];
         if let Some(into) = into {
             author_args.push(into);
         }
@@ -309,7 +309,7 @@ mod native {
         } else {
             Default::default()
         };
-        let base = read(repo, &["merge-base", &base, &reference])?;
+        let base = read(repo, &["merge-base", &base, reference])?;
         let mut hits = Vec::new();
         text_hits(&mut hits, identity, &format!(".git/{branch_ref}"), 1, branch);
         let commits = read(repo, &["rev-list", &format!("{}..{reference}", base.trim())])?;

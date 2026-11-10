@@ -73,3 +73,46 @@ fn secret_cli_canary_never_reaches_output_arguments_config_or_logs() {
     assert!(run(&["secret", "rm", "EXPOSED_KEY"], None).status.success());
     assert!(run(&["secret", "list"], None).stdout.is_empty());
 }
+
+#[test]
+fn secret_cli_reads_a_piped_pem_to_eof_and_rejects_an_oversized_value() {
+    let dir = test_support::tempdir().unwrap();
+    let keychain = dir.path().join("keychain");
+    let run = |name: &str, value: &str| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_atomics"))
+            .args(["secret", "add", name])
+            .env("HOME", dir.path())
+            .env("ATOMICS_HOME", dir.path().join("state"))
+            .env("ATOMICS_CONFIG", dir.path().join("config.toml"))
+            .env("ATOMICS_SOCKET", dir.path().join("atomics.sock"))
+            .env_remove(atomics_core::paths::HOST_SOCKET_ENV)
+            .env_remove("ATOMICS_SECRET_BROKER_SOCKET")
+            .env("ATOMICS_CREDENTIALS_DIR", &keychain)
+            .env("SHELL", "/bin/sh")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(value.as_bytes()).unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let pem = "-----BEGIN PRIVATE KEY-----\ncanary-first-line\ncanary-second-line\n-----END PRIVATE KEY-----\n";
+    let output = run("PEM_KEY", pem);
+    assert!(output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("canary"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("canary"));
+    let read_catalog = || {
+        let encoded = std::fs::read_to_string(keychain.join("atomics-credentials-v1@atomics")).unwrap();
+        let bytes: Vec<_> =
+            (0..encoded.len()).step_by(2).map(|i| u8::from_str_radix(&encoded[i..i + 2], 16).unwrap()).collect();
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+    };
+    assert_eq!(read_catalog()["secrets"]["PEM_KEY"]["value"], pem.strip_suffix('\n').unwrap());
+    let overlong = format!("{}\ncanary-hidden-tail", "x".repeat(8192));
+    let output = run("TOO_LARGE", &overlong);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("exceeds 8192 bytes"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("canary"));
+    assert!(read_catalog()["secrets"].get("TOO_LARGE").is_none());
+}

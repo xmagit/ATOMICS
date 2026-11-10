@@ -12,7 +12,7 @@ pub(super) struct Jobs {
 }
 
 enum Event {
-    Prepared { plan: String, result: Result<Publish, String> },
+    Prepared { plan: String, result: Result<Box<Publish>, String> },
     Published { plan: String, request: String, result: Result<plan::PullRequest, String> },
 }
 
@@ -208,7 +208,7 @@ impl State {
         let (tx, rx) = self.wake.channel();
         self.publishing.jobs.push(rx);
         std::thread::spawn(move || {
-            let result = prepare(&repo, identity, branch, title, body, base).map_err(|e| e.to_string());
+            let result = prepare(&repo, identity, branch, title, body, base).map(Box::new).map_err(|e| e.to_string());
             let _ = tx.send(Event::Prepared { plan, result });
         });
         Ok(())
@@ -265,7 +265,7 @@ impl State {
                     match result {
                         Ok(request) => {
                             if let Some(index) = self.plans.iter().position(|p| p.id == plan && p.is_open()) {
-                                self.plans[index].publish = Some(request);
+                                self.plans[index].publish = Some(*request);
                                 self.save_plan(index);
                             }
                         }
@@ -298,6 +298,42 @@ impl State {
             }
         }
         changed
+    }
+}
+
+impl State {
+    pub(super) fn validate_reported_pull_request(
+        &self,
+        pane: Option<&str>,
+        pr: &plan::PullRequest,
+    ) -> Result<(), String> {
+        pr.validate()?;
+        let task = self
+            .plans
+            .iter()
+            .flat_map(|p| &p.tasks)
+            .find(|t| pane.is_some() && t.session.as_deref() == pane)
+            .ok_or("A pull request report must belong to a task session")?;
+        if task.branch.as_ref().is_some_and(|branch| *branch != pr.head) {
+            return Err("Reported pull request head must match your task branch".into());
+        }
+        Ok(())
+    }
+
+    pub(super) fn report_pull_request(&mut self, pane: Option<&str>, pr: plan::PullRequest) {
+        let Some((index, task)) = self.plans.iter().enumerate().find_map(|(i, p)| {
+            p.tasks.iter().find(|t| pane.is_some() && t.session.as_deref() == pane).map(|t| (i, t.id.clone()))
+        }) else {
+            return;
+        };
+        let entry = self.plans[index].task_mut(&task).unwrap();
+        entry.pull_request = Some(pr.clone());
+        let author =
+            atomics_core::tickets::Author::Agent(atomics_core::tickets::model_label(&entry.agent, &entry.args));
+        self.save_plan(index);
+        if let Err(error) = self.record_publication_stage(index, Some(&task), pr.url, author) {
+            self.toast(error);
+        }
     }
 }
 
@@ -406,41 +442,5 @@ mod tests {
         );
         assert!(publish(&fake.relay(), &fake.work, None, &request, &identity).is_err());
         assert!(fake.seen.lock().unwrap().is_empty());
-    }
-}
-
-impl State {
-    pub(super) fn validate_reported_pull_request(
-        &self,
-        pane: Option<&str>,
-        pr: &plan::PullRequest,
-    ) -> Result<(), String> {
-        pr.validate()?;
-        let task = self
-            .plans
-            .iter()
-            .flat_map(|p| &p.tasks)
-            .find(|t| pane.is_some() && t.session.as_deref() == pane)
-            .ok_or("A pull request report must belong to a task session")?;
-        if task.branch.as_ref().is_some_and(|branch| *branch != pr.head) {
-            return Err("Reported pull request head must match your task branch".into());
-        }
-        Ok(())
-    }
-
-    pub(super) fn report_pull_request(&mut self, pane: Option<&str>, pr: plan::PullRequest) {
-        let Some((index, task)) = self.plans.iter().enumerate().find_map(|(i, p)| {
-            p.tasks.iter().find(|t| pane.is_some() && t.session.as_deref() == pane).map(|t| (i, t.id.clone()))
-        }) else {
-            return;
-        };
-        let entry = self.plans[index].task_mut(&task).unwrap();
-        entry.pull_request = Some(pr.clone());
-        let author =
-            atomics_core::tickets::Author::Agent(atomics_core::tickets::model_label(&entry.agent, &entry.args));
-        self.save_plan(index);
-        if let Err(error) = self.record_publication_stage(index, Some(&task), pr.url, author) {
-            self.toast(error);
-        }
     }
 }
