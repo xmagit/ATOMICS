@@ -37,7 +37,7 @@ impl Source {
         Source {
             checkout: atomics_core::paths::expand(path),
             home: atomics_core::paths::atomics_home(),
-            sbx: crate::setup::resolve_program("sbx"),
+            sbx: "sbx".into(),
             queue: vec![program, "queue".into(), "--class".into(), "test".into(), "--".into()],
             jobs: resources.jobs(cores),
             log: atomics_core::paths::atomics_home().join("update.log"),

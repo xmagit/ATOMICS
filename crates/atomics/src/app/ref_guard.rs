@@ -183,7 +183,7 @@ mod tests {
                     .unwrap();
                 git::unpin(&task.canonicalize().unwrap());
                 std::fs::write(pins.join("atomics-task.json"), "broken json").unwrap();
-                Vec::new()
+                vec![("ATOMICS_TEST_PIN_ERROR", "1".into())]
             },
             |mut state, _| {
                 let task = paths::home().join("task");
@@ -220,7 +220,7 @@ mod tests {
                     .unwrap(),
                 )
                 .unwrap();
-                Vec::new()
+                vec![("ATOMICS_TEST_PIN_ERROR", "1".into())]
             },
             |mut state, _| {
                 assert!(git::pinned_all().is_empty());
@@ -363,24 +363,28 @@ mod tests {
                     id: id.into(),
                     repo: Some(repo.to_string_lossy().into_owned()),
                     branch: Some(branch.into()),
+                    worktree: Some(dir.path().join(branch)),
                     status,
                     ..Default::default()
                 };
                 let running = Task { worktree: Some(guarded.clone()), ..task("a", "guarded", TaskStatus::Running) };
                 app.runtime.plans = vec![Plan { id: "first".into(), tasks: vec![running], ..Default::default() }];
 
-                // A check queued before the next plan exists runs only after ATOMICS made that plan's
-                // integration branch: the race that deleted an integration branch end to end.
+                // A check captured before the next plan exists must preserve host-created branches.
+                // Integration now waits for that check before writing its integration branch.
                 let (release, wait) = std::sync::mpsc::channel::<()>();
                 app.runtime.ref_checks.run(move || {
                     let _ = wait.recv();
                 });
                 app.runtime.check_refs(0);
-                git::git(&repo, &["branch", "next-task"]).unwrap();
+                let write = crate::ref_guard::host_write(&repo, ["next-task"]);
+                git::add_worktree(&repo, &dir.path().join("next-task"), "next-task", "main").unwrap();
+                drop(write);
                 let tasks = vec![task("b", "next-task", TaskStatus::Review)];
                 app.runtime.plans.push(Plan { id: "second".into(), approved: true, tasks, ..Default::default() });
                 let into = app.runtime.plans[1].integration_branch();
                 app.runtime.integrate(1, "b", None);
+                release.send(()).unwrap();
                 let integrated = app
                     .runtime
                     .integrate_rx
@@ -390,7 +394,6 @@ mod tests {
                 app.runtime.finish_integration(integrated);
                 // Meanwhile the agent makes a branch of its own.
                 git::git(&guarded, &["branch", "agent-made"]).unwrap();
-                release.send(()).unwrap();
                 // And the next check, with both plans in place.
                 app.runtime.check_refs(0);
                 app.runtime.ref_checks.finish();
@@ -428,7 +431,7 @@ mod tests {
                 for name in ["guarded", "closed"] {
                     git::add_worktree(&repo, &worktree(name), name, "main").unwrap();
                 }
-                git::git(&repo, &["branch", "next-task"]).unwrap();
+                git::add_worktree(&repo, &worktree("next-task"), "next-task", "main").unwrap();
                 let guard = RefGuard::open(&worktree("guarded"), dir.path().join("snapshot.json")).unwrap().unwrap();
                 let mut sandboxed =
                     session("sandboxed", AgentKind::Generic, AgentStatus::Working, &worktree("guarded"));
@@ -441,6 +444,7 @@ mod tests {
                     id: id.into(),
                     repo: Some(repo.to_string_lossy().into_owned()),
                     branch: Some(branch.into()),
+                    worktree: Some(worktree(branch)),
                     status,
                     ..Default::default()
                 };

@@ -1039,6 +1039,24 @@ mod tests {
                 };
                 let notes = clean_plan(&home, &plan, &sbx, &[]).notes;
                 assert!(!marker.exists(), "cleanup followed the sandbox's git config");
+                if redirect_common {
+                    assert!(tree.exists() && notes.iter().any(|note| note.contains("commondir")), "{notes:?}");
+                    sandbox::remove(&home, &sbx, "atomics-task").unwrap();
+                    let saved = git::pinned(&tree).unwrap();
+                    assert!(!pins.join("atomics-task.json").exists());
+                    // The refs backend cannot be trusted with a rewritten commondir. The folder
+                    // stays pinned and cleanup leaves it until its metadata is repaired.
+                    assert!(git::git(&tree, &["status"]).is_err());
+                    std::fs::write(
+                        saved.git_dir.as_ref().unwrap().join("commondir"),
+                        saved.common_dir.as_ref().unwrap().display().to_string(),
+                    )
+                    .unwrap();
+                    git::git(&tree, &["status", "--porcelain"]).unwrap();
+                    assert!(!marker.exists());
+                    git::unpin(&saved.work_tree);
+                    continue;
+                }
                 assert_eq!(tree.exists(), dirty, "{notes:?}");
                 if dirty {
                     assert!(notes.iter().any(|note| note.contains("uncommitted")));

@@ -549,9 +549,7 @@ fn nothing_uncommitted(repo: &Path, branch: &str, recorded: Option<&Path>) -> an
         Some(_) => Ok(true),
         None => {
             anyhow::ensure!(
-                !git::list_worktrees(repo)?
-                    .iter()
-                    .any(|tree| tree.path.exists() && tree.branch.as_deref() == Some(branch)),
+                !git::list_worktrees(repo)?.iter().any(|tree| tree.branch.as_deref() == Some(branch)),
                 "task has no recorded worktree path; its uncommitted work cannot be checked"
             );
             Ok(true)
@@ -815,6 +813,7 @@ mod tests {
                 let plan = app.runtime.plans[index].id.clone();
                 let key = (plan.clone(), "a".to_string());
                 app.runtime.plans[index].approved = true;
+                app.runtime.plans[index].tasks[0].worktree = Some(tree.clone());
                 app.runtime.plans[index].tasks[0].status = TaskStatus::Done;
                 app.runtime.plans[index].tasks[0].integrated = Some("integration".into());
                 app.runtime.refresh_integrations();
@@ -826,7 +825,7 @@ mod tests {
                 }
                 let note = app.runtime.plan_json(index)["tasks"][0]["integration_check"].as_str().unwrap().to_string();
                 assert!(
-                    note.contains("is not as git made it") && note.ends_with("checked again within 30 s"),
+                    note.contains("not listed as git made it") && note.ends_with("checked again within 30 s"),
                     "{note}"
                 );
                 assert_eq!(app.runtime.plans[index].tasks[0].integrated.as_deref(), Some("integration"));
@@ -1318,6 +1317,8 @@ exec {} "$@"
             |app, _| {
                 let (_dir, repo) = repository();
                 git::git(&repo, &["branch", "task-a"]).unwrap();
+                let task_tree = repo.with_file_name("task-a");
+                git::add_worktree(&repo, &task_tree, "task-a", "main").unwrap();
                 git::git(&repo, &["branch", "integration"]).unwrap();
                 let plan = request(
                     app,
@@ -1327,6 +1328,7 @@ exec {} "$@"
                 .result["plan"]
                     .clone();
                 let index = app.runtime.selected_plan;
+                app.runtime.plans[index].tasks[0].worktree = Some(task_tree.clone());
                 app.runtime.plans[index].approved = true;
                 app.runtime.plans[index].tasks[0].status = TaskStatus::Done;
                 app.runtime.plans[index].tasks[0].integrated = Some("integration".into());
@@ -1348,8 +1350,7 @@ exec {} "$@"
                 assert!(request(app, json!({"cmd":"plan_update", "plan":plan, "id":"a", "status":"done"})).ok);
                 assert!(app.runtime.dispatch(index, Some("b")).unwrap_err().contains("integrated dependencies"));
                 app.runtime.plans[index].tasks[0].integrated = Some("integration".into());
-                git::git(&repo, &["switch", "task-a"]).unwrap();
-                git::git(&repo, &["commit", "--allow-empty", "-qm", "new work after integration"]).unwrap();
+                git::git(&task_tree, &["commit", "--allow-empty", "-qm", "new work after integration"]).unwrap();
                 assert!(app.runtime.dispatch(index, Some("b")).unwrap_err().contains("integrated dependencies"));
                 let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(5));
                 while !app.runtime.integration_checks.is_empty() {
@@ -1415,6 +1416,7 @@ exec {} "$@"
                         json!({"cmd":"plan_set", "goal":goal, "tasks":[{"id":"a", "repo":repo, "branch":"task"}]}),
                     );
                     let index = app.runtime.selected_plan;
+                    app.runtime.plans[index].tasks[0].worktree = Some(worktree);
                     app.runtime.plans[index].tasks[0].status = TaskStatus::Done;
                     indices.push(index);
                 }
@@ -1498,6 +1500,7 @@ exec {} "$@"
                 // A commit of its own after its start is work to integrate again.
                 let worktree = repo.parent().unwrap().join("task-b");
                 git::git(&repo, &["worktree", "add", "-q", &worktree.to_string_lossy(), "task-b"]).unwrap();
+                app.runtime.plans[index].tasks[1].worktree = Some(worktree.clone());
                 app.runtime.plans[index].tasks[1].start_commit = tip("task-b");
                 app.runtime.plans[index].tasks[1].status = TaskStatus::Done;
                 git::git(&worktree, &["commit", "--allow-empty", "-qm", "b's own work"]).unwrap();

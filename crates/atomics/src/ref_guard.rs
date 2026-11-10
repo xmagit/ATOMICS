@@ -373,8 +373,14 @@ impl RefGuard {
     /// Load the original snapshot on reattach, before the agent gets another turn. The file
     /// lives outside every VM mount, so an agent cannot replace its own baseline.
     pub fn open(cwd: &Path, file: PathBuf) -> Result<Option<Self>> {
-        if git::worktree_of(cwd).is_none() {
+        if git::pinned(cwd).is_some_and(|pins| pins.common_dir.is_none()) {
             return Ok(None);
+        }
+        if let Err(error) = git::git(cwd, &["rev-parse", "--show-toplevel"]) {
+            if format!("{error:#}").contains("not a git repository") {
+                return Ok(None);
+            }
+            return Err(error);
         }
         let common = common_of(cwd)?;
         let mut guard = if file.exists() {

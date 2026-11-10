@@ -534,10 +534,13 @@ fn load_pin_record(file: &Path, backup: Option<&git::GitPins>) -> Result<git::Gi
         }
         Err(error) => {
             let name = file.file_stem().unwrap_or_default().to_string_lossy();
-            let reason = format!(
-                "Unreadable sandbox git pin {}: {error:#}; host git is blocked until the pin is repaired or the sandbox is removed with `sbx rm {name}`",
-                file.display()
-            );
+            let remedy = if backup.is_some() {
+                format!("until the pin is repaired or the sandbox is removed with `sbx rm {name}`")
+            } else {
+                "until the original pin is repaired; no ledger copy identifies its worktree".into()
+            };
+            let reason =
+                format!("Unreadable sandbox git pin {}: {error:#}; host git is blocked {remedy}", file.display());
             git::refuse_git(file, backup, reason.clone());
             bail!("{reason}");
         }
@@ -578,7 +581,15 @@ fn warm_mounts(root: &Path, folders: &[String], linux: bool) -> Vec<PathBuf> {
 /// cannot be moved. Agents there edit files; tasks commit in linked worktrees.
 pub fn workspace(cwd: &Path) -> Result<(PathBuf, Vec<String>)> {
     let args = ["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-dir", "--git-common-dir"];
-    let output = git::git(cwd, &args).ok();
+    let output = match git::git(cwd, &args) {
+        Ok(output) => Some(output),
+        Err(error)
+            if git::git_refusal(cwd).is_some() || git::pinned(cwd).is_some_and(|pins| pins.common_dir.is_some()) =>
+        {
+            return Err(error);
+        }
+        Err(_) => None,
+    };
     let top = output.as_deref().and_then(|output| output.lines().next()).map_or(cwd, Path::new);
     if real(&paths::home()).starts_with(real(top)) {
         bail!(
@@ -813,7 +824,8 @@ pub fn refuse_source_update(home: &Path, program: &str, repo: &Path) -> Result<(
     let recorded = owned.iter().find(|(_, entry)| {
         entry.sandbox && entry.git_pins.as_ref().is_some_and(|pins| pins.common_dir.as_ref() == Some(&common))
     });
-    let listed = if installed(program) { list(program)? } else { Vec::new() };
+    let program = crate::setup::resolve_program(program);
+    let listed = if installed(&program) { list(&program)? } else { Vec::new() };
     let worktrees: Vec<_> = git::list_worktrees(repo)?.into_iter().map(|tree| real(&tree.path)).collect();
     let sandbox = recorded.map(|(name, _)| name.as_str()).or_else(|| {
         listed

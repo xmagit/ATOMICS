@@ -786,9 +786,10 @@ So when a sandbox is made, before it runs, ATOMICS records where git finds the f
 tree, its git folder and the common dir, in `git-pins/<sandbox>.json` in ATOMICS's state folder, which no
 sandbox mounts, and keeps a second copy in the sandbox ownership ledger. An unreadable, missing or
 mismatched owned pin blocks host git in its worktree and shows a warning on its tile; it never makes that
-folder an unpinned checkout. An older record with no ledger copy blocks all host git until repaired, since
-its folder cannot be identified safely. From then on ATOMICS runs git in that folder with `GIT_DIR`, `GIT_COMMON_DIR` and
-`GIT_WORK_TREE` taken from the record, and never reads them from the folder again, also after a restart and
+folder an unpinned checkout. An unreadable older record with no ledger copy blocks all host git until
+repaired, since its folder cannot be identified safely. From then on ATOMICS runs git in that folder with
+`GIT_DIR`, `GIT_COMMON_DIR` and
+`GIT_WORK_TREE` taken from the record, and never trusts an altered pointer in the folder, also after a restart and
 for bare agents in the same folder. The record goes with its sandbox: when cleanup removes it, when making
 it fails, and when ATOMICS starts and sbx no longer has it, however it was removed. With no records ATOMICS
 does not ask sbx at start: any sbx command starts sbx's daemon. If removing an owned
@@ -796,7 +797,8 @@ sandbox leaves a folder whose git metadata changed, its named record is replaced
 `git-pins/retained-*.json` folder record. The folder stays pinned across restarts until its metadata is
 repaired or the folder is removed; otherwise a later status scan could follow the sandbox's redirect.
 Worktree removal checks for changes using the pins and atomically restores the recorded git pointers
-before asking Git to remove a clean linked checkout. Main checkouts and dirty or locked worktrees stay.
+before asking Git to remove a clean linked checkout. A changed `commondir` blocks git and cleanup until
+repaired. Main checkouts and dirty or locked worktrees stay.
 
 - **Layouts git did not make are refused.** A git folder that does not point back at its worktree, or a
   repository inside the worktree or inside another repository's objects, refs, logs or worktrees, stops
@@ -827,8 +829,14 @@ before asking Git to remove a clean linked checkout. Main checkouts and dirty or
   repository, including your own: a `pre-commit` hook does not run when ATOMICS commits a task before merging it.
 - **Special files stop git.** Before git runs in a repository with a sandbox, ATOMICS checks that each
   sandboxed worktree's git folder, including all nested folders, holds only files and folders. A FIFO,
-  socket or link there stops ATOMICS's git in that repository, with an error naming it, until you remove it; the folder also stays pinned after
-  its sandbox goes.
+  socket or link there stops ATOMICS's git in that repository, with an error naming it, until you remove
+  it; the folder also stays pinned after its sandbox goes.
+- **A changed `commondir` stops git.** Git's refs backend can follow this file for writes even with
+  `GIT_COMMON_DIR` set. ATOMICS checks that every recorded admin folder still names the pinned common
+  dir, and that the common dir has no `commondir` of its own. A mismatch blocks host git, ref recovery
+  and integration until repaired, and never starts an agent without its guard. These checks still race
+  with a sandbox that can rewrite shared metadata; eliminating that race requires stronger repository
+  isolation, beyond this recovery model.
 - **Refs are explicit.** Host git uses fully qualified branch and remote refs, so a tag named
   `origin/main` cannot replace `refs/remotes/origin/main`, and always sets `GIT_NO_REPLACE_OBJECTS=1`.
   Task integration commits only the task's recorded worktree path and checks that it still names that branch.

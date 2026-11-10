@@ -268,9 +268,25 @@ fn git_folders(pinned: &[GitPins]) -> impl Iterator<Item = &Path> {
 /// Checks the git folder of every sandboxed worktree of the repository at `common`: git on this
 /// machine reads them all, to list worktrees or to see which branches they have checked out.
 fn check_admin_folders(pinned: &[GitPins], common: &Path) -> Result<()> {
+    // Git's refs backend can reread commondir instead of honoring GIT_COMMON_DIR. A main
+    // common dir has no such file; linked admin dirs must still name the recorded common dir.
+    ensure!(
+        common.join("commondir").symlink_metadata().is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+        "{} has an unexpected commondir; repair it before host git runs",
+        common.display()
+    );
     for pins in pinned.iter().filter(|pins| pins.common_dir.as_deref() == Some(common)) {
         if let Some(git_dir) = pins.git_dir.as_deref().filter(|git_dir| *git_dir != common) {
             check_admin_folder(git_dir)?;
+            if git_dir.symlink_metadata().is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) {
+                continue;
+            }
+            let recorded = read_regular_file(&git_dir.join("commondir"), 4096)?;
+            ensure!(
+                git_dir.join(recorded.trim()).canonicalize().ok().as_deref() == Some(common),
+                "{}'s commondir changed; repair it before host git runs",
+                git_dir.display()
+            );
         }
     }
     Ok(())
@@ -347,7 +363,8 @@ pub struct GitPins {
 static PINNED: LazyLock<Mutex<Vec<GitPins>>> = LazyLock::new(Mutex::default);
 
 // Keyed by the host-only record, so repairing one record cannot clear another's refusal.
-static REFUSED: LazyLock<Mutex<HashMap<PathBuf, (Option<PathBuf>, String)>>> = LazyLock::new(Mutex::default);
+type GitRefusals = HashMap<PathBuf, (Option<PathBuf>, String)>;
+static REFUSED: LazyLock<Mutex<GitRefusals>> = LazyLock::new(Mutex::default);
 
 pub fn refuse_git(record: &Path, pins: Option<&GitPins>, reason: String) {
     REFUSED
@@ -1458,6 +1475,7 @@ pub fn integrate(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn integrate_with_identity(
     repo: &Path,
     task_path: &Path,
@@ -1898,6 +1916,26 @@ pub(crate) mod tests {
             std::fs::remove_file(&marker).unwrap();
 
             pin(pins.clone());
+            if !matches!(redirect, Redirect::GitFile) {
+                let error = diff_against_base(&folder, "main", None).unwrap_err();
+                assert!(format!("{error:#}").contains("commondir"), "{error:#}");
+                assert!(git_input(&folder, &["update-ref", "--stdin"], b"start\n").is_err());
+                assert!(!marker.exists());
+                unpin(&pins.work_tree);
+                continue;
+            }
+            let tip = commit_of(&repo, "refs/heads/main").unwrap().unwrap();
+            git_input(
+                &folder,
+                &["update-ref", "--stdin"],
+                format!("start\noption no-deref\nupdate refs/heads/host-probe {tip}\nprepare\ncommit\n").as_bytes(),
+            )
+            .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(common.join("refs/heads/host-probe")).unwrap(),
+                format!("{tip}\n"),
+                "{redirect:?}"
+            );
             let diff = diff_against_base(&folder, "main", None).unwrap();
             assert_eq!(diff.files.iter().map(FileDiff::path).collect::<Vec<_>>(), ["a.txt"], "{redirect:?}");
             assert_eq!(worktree_of(&folder).unwrap().branch.as_deref(), Some(&head["refs/heads/".len()..]));

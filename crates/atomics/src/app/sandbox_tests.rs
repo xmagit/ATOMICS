@@ -1278,13 +1278,22 @@ echo new > a.txt
             std::fs::write(bin.path().join("agent"), script).unwrap();
             let id = app.runtime.start("codex", folder.clone(), None, vec![], Some("Do the task".into())).unwrap();
             let name = format!("atomics-{id}");
-            // Ref recovery on exit restores the moved branch with git's update-ref.
+            // A redirected .git file is pinned; a changed on-disk commondir must stop Git's
+            // refs backend, which can ignore GIT_COMMON_DIR when it writes.
+            let expected = if redirect == "git-file" { "Restored refs/heads/other" } else { "Ref guard check FAILED" };
             tick_until(app, ctx, "ref recovery on agent exit", |app| {
-                app.runtime.sessions.iter().any(|s| {
-                    s.id == id && s.last_message.as_deref().is_some_and(|m| m.contains("Restored refs/heads/other"))
-                })
+                app.runtime
+                    .sessions
+                    .iter()
+                    .any(|s| s.id == id && s.last_message.as_deref().is_some_and(|m| m.contains(expected)))
             });
-            assert_eq!(git::git(&repo, &["rev-parse", "other"]).unwrap(), original, "{redirect}");
+            if redirect == "git-file" {
+                assert_eq!(git::git(&repo, &["rev-parse", "refs/heads/other"]).unwrap(), original);
+            } else {
+                let error = git::git(&folder, &["status"]).unwrap_err();
+                assert!(format!("{error:#}").contains("commondir"));
+                assert!(crate::ref_guard::RefGuard::open(&folder, dir.path().join("another-snapshot.json")).is_err());
+            }
             let record: git::GitPins =
                 serde_json::from_slice(&std::fs::read(paths::git_pins_dir().join(format!("{name}.json"))).unwrap())
                     .unwrap();
@@ -1292,10 +1301,10 @@ echo new > a.txt
             assert_eq!(record.common_dir, Some(repo.join(".git").canonicalize().unwrap()));
 
             // The diff ATOMICS polls, and what worktree cleanup asks of git.
-            let diff = git::diff_against_base(&folder, "main", None).unwrap();
-            assert_eq!(diff.files.iter().map(|f| f.path()).collect::<Vec<_>>(), ["a.txt"], "{redirect}");
-            let health = git::worktree_health(&repo, "main").unwrap();
-            if redirect != "main-commondir" {
+            if redirect == "git-file" {
+                let diff = git::diff_against_base(&folder, "main", None).unwrap();
+                assert_eq!(diff.files.iter().map(|f| f.path()).collect::<Vec<_>>(), ["a.txt"], "{redirect}");
+                let health = git::worktree_health(&repo, "main").unwrap();
                 assert_eq!(health[0].dirty_files, 1, "{redirect}: {health:?}");
                 assert!(git::remove_worktree(&repo, &folder, None, false).is_err(), "{redirect}: uncommitted a.txt");
             }
@@ -1306,6 +1315,18 @@ echo new > a.txt
             // Without its record, git follows the planted files to that hook.
             let raw = std::process::Command::new("git").arg("-C").arg(&folder).args(["status"]).output().unwrap();
             assert!(raw.status.success() && marker.exists(), "{redirect}: the planted config must be live");
+            std::fs::remove_file(&marker).unwrap();
+            if redirect == "worktree-commondir" {
+                std::fs::write(
+                    record.git_dir.as_ref().unwrap().join("commondir"),
+                    record.common_dir.as_ref().unwrap().display().to_string(),
+                )
+                .unwrap();
+            } else if redirect == "main-commondir" {
+                std::fs::remove_file(record.common_dir.as_ref().unwrap().join("commondir")).unwrap();
+            }
+            git::git(&folder, &["status"]).unwrap();
+            assert!(!marker.exists());
             app.runtime.sessions.clear();
         }
     });
