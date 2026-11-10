@@ -936,8 +936,9 @@ mod tests {
             crate::test_support::write_program(
                 &shell,
                 format!(
-                    "#!/bin/sh\n[ \"$1 $2 $3\" = '-l -i -c' ] || exit 64\nwhile [ ! -e \"${{0%/*}}/go\" ]; do sleep \
-                     0.05; done\nPATH='{FRESH}'\neval \"$4\"\n"
+                    "#!/bin/sh\n[ \"$1 $2 $3\" = '-l -i -c' ] || exit 64\nwhile [ ! -e \"${{0%/*}}/go\" ]; do '{}' \
+                     0.05; done\nPATH='{FRESH}'\neval \"$4\"\n",
+                    crate::test_support::program("sleep").replace('\'', "'\\''")
                 ),
             );
             std::fs::write(dir.path().join("scenario"), scenario).unwrap();

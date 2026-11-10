@@ -44,14 +44,18 @@
           atomics-vm-mac = vm.config.programs.atomics.macDesktop.bundle;
         });
 
-      # `nix develop .#default` keeps Cargo's toolchain and libraries, rather than the wrapper's.
-      devShells = forAllSystems (system: {
-        default = nixpkgs.legacyPackages.${system}.mkShell {
-          inputsFrom = [ self.packages.${system}.atomics.unwrapped ];
-          # The terminal and keychain fixtures are executable Python scripts.
-          packages = [ nixpkgs.legacyPackages.${system}.python3 ];
-        };
-      });
+      devShells = forAllSystems (system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+        in {
+          default = pkgs.mkShell {
+            inputsFrom = [ self.packages.${system}.atomics.unwrapped ];
+            # All compiler tools must come from the pinned nixpkgs toolchain. A system
+            # clippy-driver can report the same Rust version and still have incompatible metadata.
+            packages = (with pkgs.rustPackages; [ cargo rustc clippy rustfmt ])
+              ++ (with pkgs; [ bash coreutils git gnugrep gnused gnutar gzip openssl pkg-config procps python3 ]);
+          };
+        });
 
       checks = forAllSystems (system:
         let

@@ -370,6 +370,24 @@ config. See [docs/tickets.md](docs/tickets.md). Loading and saving a workspace k
 Keep runtime state (`~/.atomics`, including sessions, sockets and plans) local to each machine.
 [Moving to a new machine](docs/moving-machines.md) covers leaving a machine behind, including plans still in progress.
 
+## Contributing
+
+From a checkout on Linux (including the NixOS guest), run the whole workspace gate with:
+
+```sh
+scripts/check.sh
+```
+
+It enters `nix develop .#default`, checks formatting, runs Clippy with warnings denied, then runs
+`cargo test --workspace --no-fail-fast --locked`. The shell supplies rustc, Clippy and rustfmt from
+the same pinned toolchain, plus the tests' helper programs. In an ATOMICS session the command goes
+through `atomics queue --class test` before starting the gate; allow a long wait for a shared slot.
+During development use `nix develop .#default --command cargo check --workspace --all-targets` and
+run only the tests you change. Reserve the full gate for the end.
+Targeted ticket tests also need `cargo build -p atomics --example fake_ticket_server` in that shell;
+the full workspace command builds the fixture automatically.
+The guest audit's counts and fixture details are recorded in [VM test gate](docs/vm-test-gate.md).
+
 ## Testing on Linux
 
 Docker Desktop (or Docker Engine on Linux) can build, test and capture ATOMICS without installing a Linux toolchain
