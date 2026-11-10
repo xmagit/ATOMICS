@@ -452,6 +452,8 @@ struct Waiter {
     sessions: Vec<String>,
     statuses: Vec<String>,
     after: u64,
+    compact: bool,
+    full_sessions: bool,
     deadline: Instant,
     reply: Sender<ControlOutcome>,
 }

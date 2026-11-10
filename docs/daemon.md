@@ -125,6 +125,19 @@ client concerns; Settings can add a VM section without another platform-specific
 Major mismatch fails before subscription; minor changes are additive and capability-gated.
 Unknown optional fields are ignored; unknown commands fail explicitly. Never silently ignore a mutation.
 Keep native CLI/MCP compatibility through an adapter for `ControlRequest` and `ControlResponse`.
+
+Local `wait` requests retain their legacy full-session response unless `compact: true` is passed.
+`atomics_wait` enables compact responses by default: `sessions` contains only sessions with status
+events after `after` through the returned cursor, while `sessions_unchanged` and the one-line
+`sessions_summary` count the rest. Reports and fleet events alone do not count as status changes.
+Set `full_sessions: true` to include the whole fleet in a compact response. Compact titles use a
+linked task's id and title, and each pending approval appears once per answer; its `input` omits
+fields already shown as `command` or `reason`, retaining other tool arguments. In both formats,
+permission events are omitted unless their request id is still the session's first pending request;
+answered, withdrawn, replaced and queued requests cannot be replayed as actionable permissions.
+Cursor advancement and event pagination still include skipped historical events. Existing ctl
+requests need no changes; ctl can opt in with `{"cmd":"wait","compact":true}`.
+
 UI commands such as activate, resize-window and screenshot target a chosen client, with a clear error
 when none is attached; they do not acquire global focus or write arbitrary server-side screenshot paths.
 

@@ -414,13 +414,14 @@ fn tools() -> Value {
         },
         {
             "name": "atomics_wait",
-            "description": format!("Block until an agent finishes a turn, needs input, exits or reports, or a linked ticket changes in its system (or other `statuses`), then return those events with a `cursor`. Pass the cursor as `after` next time to only see newer events. Use this instead of polling. Heartbeat events contain fleet findings (an empty list means all good). Ticket events say which plan or task's ticket moved from which state to which, and which ATOMICS status that state means. Config events say whether the user applied or rejected a proposed config change. Plan events (ask for `plan`) say a plan was approved, edited, closed or reopened (`change`). Plan-session events include plan and task ids; permission events also include the approval request. `sessions` empty means any. timeout_secs defaults to {DEFAULT_WAIT_SECS} and is at most {MAX_WAIT_SECS}, so the call answers inside the client's 120 s limit for one tool call; with nothing new it answers timed_out, and you call it again. One answer carries about {MAX_WAIT_CHARS} characters of events, with report summaries cut to 8000 and other texts to 2000; when more wait it says so in `more`, and its cursor reads on from the last event shown."),
+            "description": format!("Block until an agent finishes a turn, needs input, exits or reports, or a linked ticket changes in its system (or other `statuses`), then return those events with a `cursor`. Pass the cursor as `after` next time to only see newer events. Use this instead of polling. Heartbeat events contain fleet findings (an empty list means all good). Ticket events say which plan or task's ticket moved from which state to which, and which ATOMICS status that state means. Config events say whether the user applied or rejected a proposed config change. Plan events (ask for `plan`) say a plan was approved, edited, closed or reopened (`change`). Plan-session events include plan and task ids; permission events include each current pending approval once, with repeated command and reason fields removed from input. Answered or replaced requests are omitted. Sessions list only agents whose status changed since after; sessions_summary counts the unchanged fleet. Set full_sessions to true for the full list. Titles use the task id and title for task agents. `sessions` empty means any. timeout_secs defaults to {DEFAULT_WAIT_SECS} and is at most {MAX_WAIT_SECS}, so the call answers inside the client's 120 s limit for one tool call; with nothing new it answers timed_out, and you call it again. One answer carries about {MAX_WAIT_CHARS} characters of events, with report summaries cut to 8000 and other texts to 2000; when more wait it says so in `more`, and its cursor reads on from the last event shown."),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "sessions": { "type": "array", "items": { "type": "string" } },
                     "statuses": { "type": "array", "items": { "type": "string", "enum": ["working", "turn done", "needs you", "idle", "exited", "reported", "heartbeat", "ticket", "config", "plan"] } },
                     "after": { "type": "integer" },
+                    "full_sessions": { "type": "boolean", "default": false, "description": "Include the full session list instead of only sessions whose status changed since after." },
                     "timeout_secs": { "type": "integer", "minimum": 1, "maximum": MAX_WAIT_SECS }
                 }
             }
@@ -718,6 +719,9 @@ pub(crate) fn request_for_tool(name: &str, mut args: Value) -> Result<ControlReq
     };
     if let Some(map) = args.as_object_mut() {
         map.insert("cmd".into(), json!(cmd));
+        if cmd == "wait" {
+            map.insert("compact".into(), json!(true));
+        }
         if cmd == "report" || cmd == "config_propose" || cmd == "restart" {
             map.insert("pane".into(), json!(std::env::var("ATOMICS_PANE").ok()));
         }
@@ -927,7 +931,23 @@ mod tests {
                 .contains(&serde_json::json!("heartbeat"))
         );
         let request = super::request_for_tool("atomics_wait", serde_json::json!({"statuses":["heartbeat"]})).unwrap();
-        assert_eq!(serde_json::to_value(request).unwrap()["statuses"], serde_json::json!(["heartbeat"]));
+        let request = serde_json::to_value(request).unwrap();
+        assert_eq!(request["statuses"], serde_json::json!(["heartbeat"]));
+        assert_eq!(request["compact"], true);
+        assert_eq!(request["full_sessions"], false);
+    }
+
+    #[test]
+    fn wait_defaults_to_compact_for_mcp_and_legacy_for_ctl() {
+        let full = request_for_tool("atomics_wait", json!({"full_sessions":true})).unwrap();
+        assert!(matches!(full, ControlRequest::Wait { compact: true, full_sessions: true, .. }));
+        let legacy: ControlRequest = serde_json::from_value(json!({"cmd":"wait"})).unwrap();
+        assert!(matches!(legacy, ControlRequest::Wait { compact: false, full_sessions: false, .. }));
+        let compact: ControlRequest = serde_json::from_value(json!({"cmd":"wait", "compact":true})).unwrap();
+        assert!(matches!(compact, ControlRequest::Wait { compact: true, .. }));
+        let tools = tools();
+        let wait = tools.as_array().unwrap().iter().find(|tool| tool["name"] == "atomics_wait").unwrap();
+        assert_eq!(wait["inputSchema"]["properties"]["full_sessions"]["default"], false);
     }
 
     use super::*;

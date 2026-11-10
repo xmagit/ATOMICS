@@ -470,6 +470,8 @@ mod tests {
                 let (tx, _rx) = std::sync::mpsc::channel();
                 app.runtime.control(
                     ControlRequest::Wait {
+                        compact: false,
+                        full_sessions: false,
                         sessions: vec![],
                         statuses: vec!["heartbeat".into()],
                         after: Some(u64::MAX),
