@@ -307,6 +307,9 @@ when only documentation changes; other builds use `git describe --always --tags 
 falling back to the crate version. `atomics --version` prints the crate version and then that build, as
 `atomics 0.1.7 (v0.1.7-3-gabc1234)`. An update reads the version from this line.
 
+For Nix builds, `nix eval --raw .#atomics.unwrapped.drvPath` identifies the source-filtered Cargo derivation.
+Documentation-only commits reuse that derivation while the small package wrapper updates its revision metadata.
+
 ## Using ATOMICS on several machines
 
 Share `~/.config/atomics/config.toml` between your machines and put machine overrides beside it in
