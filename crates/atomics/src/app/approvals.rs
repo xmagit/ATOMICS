@@ -1,6 +1,26 @@
 use super::*;
 
+impl PendingApproval {
+    /// Agent-authored command, reason and input are data. Identity comes from the host's
+    /// session/task lookup; at is when the host observed this request for the reply or event.
+    pub(super) fn json(&self, task: Option<&Task>, fallback_agent: &str, at: u64) -> serde_json::Value {
+        let agent = task
+            .map(|t| atomics_core::tickets::model_label(&t.agent, &t.args))
+            .unwrap_or_else(|| fallback_agent.to_string());
+        let mut value = json!(self.request);
+        value["id"] = json!(self.id);
+        value["provenance"] = plan::agent_provenance("approval request", task.map(|t| t.id.as_str()), &agent, at);
+        value
+    }
+}
+
 impl State {
+    pub(super) fn approval_json(&self, index: usize, pending: &PendingApproval, at: u64) -> serde_json::Value {
+        let session = &self.sessions[index];
+        let task = self.plans.iter().flat_map(|p| &p.tasks).find(|t| t.session.as_deref() == Some(&session.id));
+        pending.json(task, &session.agent, at)
+    }
+
     pub(super) fn approval_poll_interval(&self) -> Option<Duration> {
         if self.sessions.iter().any(|session| session.approval_hold || !session.approvals.is_empty()) {
             Some(Duration::from_millis(400))
@@ -507,7 +527,8 @@ impl State {
             session.allowed.push(pending.request);
         }
         session.status = if session.approvals.is_empty() { AgentStatus::Working } else { AgentStatus::NeedsInput };
-        if azure && !session.approvals.is_empty() {
+        // Waiters must hear about the next request even when the status stays "needs you".
+        if !session.approvals.is_empty() {
             self.last_status.remove(&session.id);
         }
         self.record_resolution(id, disposition(decision));
@@ -1901,6 +1922,8 @@ mod tests {
                 let (wait_tx, wait_rx) = channel();
                 app.runtime.control(
                     ControlRequest::Wait {
+                        compact: false,
+                        full_sessions: false,
                         sessions: vec!["worker-one".into()],
                         statuses: vec!["needs you".into()],
                         after: Some(app.runtime.event_seq),

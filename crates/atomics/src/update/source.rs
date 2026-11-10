@@ -37,7 +37,7 @@ impl Source {
             queue: vec![program, "queue".into(), "--class".into(), "test".into(), "--".into()],
             jobs: resources.jobs(cores),
             log: atomics_core::paths::atomics_home().join("update.log"),
-            version: crate::restart::VERSION.into(),
+            version: crate::restart::version().into(),
         }
     }
 

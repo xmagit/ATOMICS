@@ -1505,7 +1505,7 @@ mod tests {
         assert!(output.len() < 20_000, "the VM keeps only the end of the rollout: {} bytes", output.len());
         let reports = crate::usage::sandbox_reports(&output, i64::MAX);
         let [crate::usage::Report::Codex(usage)] = reports.as_slice() else { panic!("one Codex report: {output}") };
-        assert_eq!(usage.weekly.as_ref().unwrap().remaining, 88.0, "from the newest rollout");
+        assert_eq!(usage.weekly.as_ref().unwrap().left_percent, 88.0, "from the newest rollout");
         assert!(read_usage(&sbx, "atomics-gone").is_err());
     }
 

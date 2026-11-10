@@ -27,7 +27,7 @@ fn host() -> crate::projection::HostInfo {
         resources: Some(crate::projection::ResourceInfo {
             claude: crate::usage::Usage {
                 observed_at: 100,
-                session: Some(crate::usage::Window { remaining: 76.5, resets_at: 200 }),
+                session: Some(crate::usage::Window { left_percent: 76.5, resets_at: 200 }),
                 ..Default::default()
             },
             load: Some(4.2),
@@ -52,6 +52,7 @@ fn host() -> crate::projection::HostInfo {
 
 fn plan() -> PlanInfo {
     PlanInfo {
+        notebook: Vec::new(),
         ticket_tree: None,
         id: "p".into(),
         status: PlanStatus::Open,
@@ -64,6 +65,7 @@ fn plan() -> PlanInfo {
             title: "do".into(),
             status: TaskStatus::Review,
             agent: "claude".into(),
+            reviewer_reason: None,
             depends_on: vec![],
             session: Some("s1".into()),
             branch: None,
@@ -79,7 +81,7 @@ fn plan() -> PlanInfo {
 }
 
 fn report() -> ReportInfo {
-    ReportInfo { status: "done".into(), summary: "ok".into(), at: 9 }
+    ReportInfo { status: "done".into(), summary: "ok".into(), at: 9, checks: Vec::new() }
 }
 
 fn approval() -> ApprovalInfo {
