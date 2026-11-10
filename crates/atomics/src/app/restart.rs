@@ -153,7 +153,7 @@ impl State {
             Ok(())
         })();
         match result {
-            Ok(()) => ControlResponse::ok(json!({"restarting":true, "old_version":crate::restart::VERSION})),
+            Ok(()) => ControlResponse::ok(json!({"restarting":true, "old_version":crate::restart::version()})),
             Err(error) => ControlResponse::error(format!("{error:#}")),
         }
     }
@@ -188,7 +188,7 @@ impl State {
         self.store.projects = self.open_projects.clone();
         self.store.chief_dock = Some(self.chief_dock());
         self.store.restart = Some(RestartState {
-            old_version: crate::restart::VERSION.into(),
+            old_version: crate::restart::version().into(),
             reason,
             sessions,
             chief_open: self.chief_open,
@@ -225,12 +225,12 @@ impl State {
         let message = format!(
             "restarted: {} -> {}, reason {}",
             restart.old_version,
-            crate::restart::VERSION,
+            crate::restart::version(),
             restart.reason.as_deref().unwrap_or("not specified")
         );
         self.restart_event = Some(json!({
             "seq":self.event_seq, "status":"restarted", "message":message,
-            "old_version":restart.old_version, "new_version":crate::restart::VERSION,
+            "old_version":restart.old_version, "new_version":crate::restart::version(),
             "reason":restart.reason, "at":atomics_core::store::now()
         }));
         self.resume = restart.sessions.clone();

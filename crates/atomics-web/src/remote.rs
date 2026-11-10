@@ -1260,6 +1260,7 @@ fn task(info: &TaskInfo) -> Task {
         title: info.title.clone(),
         depends_on: info.depends_on.clone(),
         agent: info.agent.clone(),
+        reviewer_reason: info.reviewer_reason.clone(),
         branch: info.branch.clone(),
         status: info.status,
         integrated: info.integrated.clone(),
@@ -1268,7 +1269,12 @@ fn task(info: &TaskInfo) -> Task {
         session: info.session.clone(),
         additions: info.additions,
         deletions: info.deletions,
-        report: info.report.as_ref().map(|r| Report { status: r.status.clone(), summary: r.summary.clone(), at: r.at }),
+        report: info.report.as_ref().map(|r| Report {
+            status: r.status.clone(),
+            summary: r.summary.clone(),
+            at: r.at,
+            checks: r.checks.clone(),
+        }),
         ticket: ticket(&info.ticket),
         ..Task::default()
     }
@@ -1277,6 +1283,7 @@ fn task(info: &TaskInfo) -> Task {
 /// The plan as its projection carries it: briefs, acceptance and the host's own bookkeeping stay there.
 fn plan(info: &PlanInfo) -> Plan {
     Plan {
+        notebook: info.notebook.clone(),
         id: info.id.clone(),
         status: info.status,
         goal: info.goal.clone(),

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
-pub const VERSION: &str = env!("ATOMICS_BUILD_VERSION");
+pub use crate::build_info::revision as version;
 
 pub struct Target {
     pub executable: PathBuf,

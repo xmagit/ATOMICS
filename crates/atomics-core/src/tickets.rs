@@ -4014,14 +4014,26 @@ arguments = {{ key = "{{nonce}}", nested = ["{{nonce}}", "{{body}}"] }}"#
         assert_eq!(TicketLink::relink(None, Some(&old)), Some(old.clone()));
 
         let mut plan = Plan::default();
-        plan.replace("g".into(), vec![Task { id: "a".into(), ticket: Some(old.clone()), ..Task::default() }]);
+        plan.replace(
+            "g".into(),
+            vec![Task { id: "a".into(), ticket: Some(old.clone()), ..Task::default() }],
+            &crate::config::Config::default(),
+        );
         let fresh = plan.tasks[0].ticket.clone().unwrap();
         assert_eq!((fresh.synced_at, fresh.pushed_state, fresh.error), (None, None, None), "new links start fresh");
         assert_eq!(fresh.state.as_deref(), Some("Doing"));
         plan.tasks[0].ticket = Some(old.clone());
-        plan.replace("reworded".into(), vec![Task { id: "a".into(), ..Task::default() }]);
+        plan.replace(
+            "reworded".into(),
+            vec![Task { id: "a".into(), ..Task::default() }],
+            &crate::config::Config::default(),
+        );
         assert_eq!(plan.tasks[0].ticket.as_ref(), Some(&old), "omitting a ticket keeps it");
-        plan.replace("g".into(), vec![Task { id: "a".into(), ticket: Some(link("7")), ..Task::default() }]);
+        plan.replace(
+            "g".into(),
+            vec![Task { id: "a".into(), ticket: Some(link("7")), ..Task::default() }],
+            &crate::config::Config::default(),
+        );
         assert_eq!(plan.tasks[0].ticket.as_ref().unwrap().pushed_state.as_deref(), Some("Doing"));
         assert!(plan.tasks.iter().any(|t| t.id == crate::plan::REVIEW_TASK && t.ticket.is_none()));
     }

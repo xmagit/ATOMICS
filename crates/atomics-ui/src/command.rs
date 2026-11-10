@@ -53,6 +53,12 @@ pub enum Command {
         task: String,
         brief: String,
     },
+    CurateNote {
+        plan: usize,
+        id: u64,
+        pinned: Option<bool>,
+        delete: bool,
+    },
     /// Start a ready task.
     StartTask {
         plan: usize,
@@ -393,6 +399,11 @@ impl Command {
                 message: None,
             })],
             Command::ApprovePlan(index) => plan(*index, PlanAction::Approve, op).into_iter().collect(),
+            Command::CurateNote { plan: index, id, pinned, delete } => {
+                plan(*index, PlanAction::Notebook { id: *id, pinned: *pinned, delete: *delete }, op)
+                    .into_iter()
+                    .collect()
+            }
             Command::StartTask { plan: index, task } => {
                 plan(*index, PlanAction::Dispatch { task: Some(task.clone()) }, op).into_iter().collect()
             }

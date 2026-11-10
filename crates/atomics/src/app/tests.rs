@@ -435,6 +435,8 @@ fn permission_hooks_wake_waiters_and_accept_decisions(app: &mut Desktop<'_>, _ct
         let (wait_tx, wait_rx) = channel();
         app.runtime.control(
             ControlRequest::Wait {
+                compact: false,
+                full_sessions: false,
                 sessions: vec!["codex".into()],
                 statuses: vec!["needs you".into()],
                 after: Some(app.runtime.event_seq),

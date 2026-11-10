@@ -305,6 +305,9 @@ pub fn shell_program() -> String {
 
 /// The installed path, including after an atomic update of a running Linux app.
 pub fn executable_path() -> std::io::Result<PathBuf> {
+    if let Some(executable) = crate::build_info::executable() {
+        return Ok(executable.to_path_buf());
+    }
     let executable = std::env::current_exe()?;
     #[cfg(target_os = "linux")]
     {
