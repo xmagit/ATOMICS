@@ -121,18 +121,17 @@ fn private_runtime_dir(base: &Path, home: &Path) -> Option<PathBuf> {
 }
 
 fn socket_runtime_dir(home: &Path) -> Option<PathBuf> {
-    runtime_dir_for(home).or_else(|| {
-        // On macOS a private per-user temporary directory can provide a short socket path.
-        // Leave the jobserver's existing placement alone; only the socket needs this fallback.
-        #[cfg(target_os = "macos")]
-        {
-            private_runtime_dir(&std::env::temp_dir(), home)
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            None
-        }
-    })
+    let runtime = runtime_dir_for(home);
+    // On macOS a private per-user temporary directory can provide a short socket path.
+    // Leave the jobserver's existing placement alone; only the socket needs this fallback.
+    #[cfg(target_os = "macos")]
+    {
+        runtime.or_else(|| private_runtime_dir(&std::env::temp_dir(), home))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        runtime
+    }
 }
 
 pub fn config_file() -> PathBuf {
