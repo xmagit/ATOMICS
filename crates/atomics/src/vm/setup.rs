@@ -99,7 +99,7 @@ pub fn setup(options: Setup) -> Result<()> {
 
     say(&format!("The Lima instance {}", info.instance));
     let mut created = false;
-    match super::lima_status(&info.instance)? {
+    match super::lima_status_for_command(&info.instance)? {
         Some(state) if super::created_here(&info.instance) => {
             println!("{} exists ({}); it was set up here before, so it is kept", info.instance, state.to_lowercase());
         }
@@ -307,7 +307,7 @@ fn installed() -> Result<BundleInfo> {
 
 pub fn status() -> Result<()> {
     let info = installed()?;
-    let status = super::status(&info.instance, false);
+    let status = super::status_for_command(&info.instance);
     println!("{}: {}", info.instance, status.label());
     if let Some(host) = &info.host {
         println!("ATOMICS host in the VM: 127.0.0.1:{} on the guest's loopback", host.port);
@@ -317,7 +317,7 @@ pub fn status() -> Result<()> {
 
 pub fn start() -> Result<()> {
     let info = installed()?;
-    if !super::created_here(&info.instance) && super::lima_status(&info.instance)?.is_none() {
+    if !super::created_here(&info.instance) && super::lima_status_for_command(&info.instance)?.is_none() {
         bail!("{} does not exist yet; run atomics vm setup", info.instance);
     }
     super::start(&info.instance)?;

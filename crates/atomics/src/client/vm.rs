@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use atomics_web::driver::{Status as LinkStatus, Stop};
 use zeroize::Zeroizing;
 
 use super::link::{Address, Endpoint};
@@ -27,11 +28,33 @@ use crate::vm::{BundleInfo, Status};
 /// The keychain item that holds this Mac's token for a VM's host, by instance.
 pub const KEYCHAIN_SERVICE: &str = "atomics-vm-host-v1";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum State {
+    Vm(Status),
+    HostDisconnected,
+    Unauthorised,
+    Stopping,
+}
+
+impl State {
+    pub fn headline(&self, instance: &str) -> String {
+        match self {
+            Self::Vm(Status::NotSetUp) => "The ATOMICS VM is not set up on this Mac.".into(),
+            Self::Vm(Status::Starting) => format!("Starting the VM {instance}…"),
+            Self::Vm(status) => format!("The VM {instance} is {}.", status.label()),
+            Self::HostDisconnected => format!("VM {instance} running, host not connected"),
+            Self::Unauthorised => format!("VM {instance} running, host refused this Mac's token"),
+            Self::Stopping => format!("Stopping the VM {instance}…"),
+        }
+    }
+}
+
 /// What the window shows of the VM while it is not connected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct View {
     pub instance: String,
     pub status: Status,
+    pub state: State,
     /// What the last dial was doing or why it stopped.
     pub note: Option<String>,
     /// A start is under way.
@@ -44,6 +67,7 @@ pub struct Gate {
     install_dir: PathBuf,
     keychain: Keychain,
     shared: Arc<Mutex<Shared>>,
+    log: PathBuf,
 }
 
 #[derive(Default)]
@@ -56,6 +80,9 @@ struct Shared {
     checked: Option<Instant>,
     busy: Option<&'static str>,
     confirm_stop: bool,
+    output: Option<String>,
+    output_checked: Option<Instant>,
+    reading_output: bool,
 }
 
 /// The bundle's forward, a child of this window, listening on `socket` in `folder`: a folder made for
@@ -79,13 +106,16 @@ impl Gate {
             Some((dir, info)) => (dir, Some(info)),
             None => (crate::vm::installed_dir(), None),
         };
-        Self { info, install_dir, keychain: Keychain::current(), shared: Arc::default() }
+        let instance = info.as_ref().map_or("atomics", |info| info.instance.as_str());
+        let log = atomics_core::paths::atomics_home().join("vm").join(format!("{instance}-controls.log"));
+        Self { info, install_dir, keychain: Keychain::current(), shared: Arc::default(), log }
     }
 
     /// A gate for the bundle `info` in `install_dir`, its token in `keychain`.
     #[cfg(test)]
     pub(crate) fn with(info: Option<BundleInfo>, install_dir: PathBuf, keychain: Keychain) -> Self {
-        Self { info, install_dir, keychain, shared: Arc::default() }
+        let log = install_dir.join("controls.log");
+        Self { info, install_dir, keychain, shared: Arc::default(), log }
     }
 
     #[cfg(test)]
@@ -95,24 +125,25 @@ impl Gate {
         shared.checked = Some(Instant::now());
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_test_busy(&self, busy: Option<&'static str>) {
+        self.shared.lock().unwrap().busy = busy;
+    }
+
     pub fn instance(&self) -> Option<&str> {
         self.info.as_ref().map(|info| info.instance.as_str())
     }
 
-    pub fn view(&self) -> View {
+    pub fn view_for_host(&self, link: &LinkStatus) -> View {
         let shared = self.shared.lock().unwrap();
+        let status = shared.status.clone().unwrap_or(Status::Unknown("checking".into()));
         View {
             instance: self.instance().unwrap_or("atomics").to_string(),
-            status: shared.status.clone().unwrap_or(Status::Unknown("checking".into())),
+            state: host_status(&status, link, shared.busy),
+            status,
             note: shared.note.clone(),
             starting: shared.starting,
         }
-    }
-
-    pub fn view_for_host(&self, live: bool) -> View {
-        let mut view = self.view();
-        view.status = host_status(view.status, live);
-        view
     }
 
     /// A visible window refreshes Lima's state, including while the driver is stopped by an auth error.
@@ -149,14 +180,18 @@ impl Gate {
         }
     }
 
-    pub fn controls(&self, ui: &mut egui::Ui, live: bool, wake: Arc<dyn Fn() + Send + Sync>) {
-        let view = self.view_for_host(live);
+    pub fn controls(&self, ui: &mut egui::Ui, link: &LinkStatus, wake: Arc<dyn Fn() + Send + Sync>) {
+        self.request_output(wake.clone());
+        let view = self.view_for_host(link);
         let (busy, confirm_stop) = {
             let shared = self.shared.lock().unwrap();
             (shared.busy, shared.confirm_stop)
         };
         ui.strong("VM");
-        ui.label(format!("{}: {}", view.instance, busy.unwrap_or(view.status.label())));
+        ui.label(view.state.headline(&view.instance));
+        if let Some(action) = busy.filter(|action| *action != "stop") {
+            ui.label(format!("VM {action} in progress…"));
+        }
         let idle = busy.is_none() && !view.starting;
         ui.horizontal(|ui| {
             if matches!(view.status, Status::Stopped | Status::Unknown(_))
@@ -194,7 +229,8 @@ impl Gate {
         if let Some(note) = view.note {
             ui.label(note);
         }
-        if let Ok(output) = read_output(&self.log_path()) {
+        let output = self.shared.lock().unwrap().output.clone();
+        if let Some(output) = output {
             egui::CollapsingHeader::new("VM command output").default_open(true).show(ui, |ui| {
                 egui::ScrollArea::vertical().id_salt("vm-command-output").max_height(240.0).stick_to_bottom(true).show(
                     ui,
@@ -209,10 +245,39 @@ impl Gate {
         }
     }
 
-    fn log_path(&self) -> PathBuf {
-        atomics_core::paths::atomics_home()
-            .join("vm")
-            .join(format!("{}-controls.log", self.instance().unwrap_or("atomics")))
+    fn log_path(&self) -> &Path {
+        &self.log
+    }
+
+    /// The Machine window draws cached text. Only this worker opens or reads the output file.
+    fn request_output(&self, wake: Arc<dyn Fn() + Send + Sync>) {
+        {
+            let mut shared = self.shared.lock().unwrap();
+            let interval = if shared.busy.is_some() { Duration::from_millis(250) } else { Duration::from_secs(5) };
+            if shared.reading_output || shared.output_checked.is_some_and(|at| at.elapsed() < interval) {
+                return;
+            }
+            shared.reading_output = true;
+        }
+        let gate = self.clone();
+        if std::thread::Builder::new()
+            .name("atomics-vm-output".into())
+            .spawn(move || {
+                let output = read_output(gate.log_path()).ok();
+                let mut shared = gate.shared.lock().unwrap();
+                let changed = shared.output != output;
+                shared.output = output;
+                shared.output_checked = Some(Instant::now());
+                shared.reading_output = false;
+                drop(shared);
+                if changed {
+                    wake();
+                }
+            })
+            .is_err()
+        {
+            self.shared.lock().unwrap().reading_output = false;
+        }
     }
 
     fn command(&self, action: &'static str, wake: Arc<dyn Fn() + Send + Sync>) {
@@ -224,13 +289,15 @@ impl Gate {
             shared.busy = Some(action);
             shared.confirm_stop = false;
             shared.note = None;
+            shared.output_checked = None;
         }
         let gate = self.clone();
         let spawned = std::thread::Builder::new().name("atomics-vm-command".into()).spawn(move || {
-            let result = run_command(crate::setup::executable_path(), action, &gate.log_path());
+            let result = run_command(crate::setup::executable_path(), action, gate.log_path());
             let mut shared = gate.shared.lock().unwrap();
             shared.busy = None;
             shared.checked = None;
+            shared.output_checked = None;
             shared.note = Some(match result {
                 Ok(()) => format!("VM {action} completed"),
                 Err(error) => format!("VM {action} failed: {error:#}"),
@@ -299,8 +366,16 @@ impl Gate {
     }
 }
 
-fn host_status(status: Status, live: bool) -> Status {
-    if status == Status::Running && !live { Status::Starting } else { status }
+fn host_status(status: &Status, link: &LinkStatus, busy: Option<&str>) -> State {
+    if busy == Some("stop") {
+        State::Stopping
+    } else if *status == Status::Running && *link == LinkStatus::Stopped(Stop::Unauthorised) {
+        State::Unauthorised
+    } else if *status == Status::Running && *link != LinkStatus::Live {
+        State::HostDisconnected
+    } else {
+        State::Vm(status.clone())
+    }
 }
 
 fn read_output(path: &Path) -> Result<String> {
@@ -520,11 +595,15 @@ mod tests {
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     #[test]
-    fn an_instance_without_its_host_is_starting_until_the_host_connects() {
-        assert_eq!(host_status(Status::Running, false), Status::Starting);
-        assert_eq!(host_status(Status::Running, true), Status::Running);
-        assert_eq!(host_status(Status::Stopped, false), Status::Stopped);
-        assert_eq!(host_status(Status::NotSetUp, false), Status::NotSetUp);
+    fn instance_and_host_states_are_distinct_and_stopping_takes_precedence() {
+        assert_eq!(host_status(&Status::Running, &LinkStatus::Connecting, None), State::HostDisconnected);
+        assert_eq!(host_status(&Status::Running, &LinkStatus::Live, None), State::Vm(Status::Running));
+        assert_eq!(host_status(&Status::Starting, &LinkStatus::Connecting, None), State::Vm(Status::Starting));
+        assert_eq!(host_status(&Status::Stopped, &LinkStatus::Connecting, None), State::Vm(Status::Stopped));
+        assert_eq!(host_status(&Status::NotSetUp, &LinkStatus::Connecting, None), State::Vm(Status::NotSetUp));
+        let refused = LinkStatus::Stopped(Stop::Unauthorised);
+        assert_eq!(host_status(&Status::Running, &refused, None), State::Unauthorised);
+        assert_eq!(host_status(&Status::Running, &refused, Some("stop")), State::Stopping);
     }
 
     #[test]
@@ -545,6 +624,37 @@ mod tests {
     }
 
     #[test]
+    fn machine_output_is_cached_between_background_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = Gate::with(None, dir.path().into(), Keychain::in_folder(dir.path()));
+        std::fs::write(gate.log_path(), "first output").unwrap();
+        let wait = |expected: &str| {
+            let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(2));
+            loop {
+                let shared = gate.shared.lock().unwrap();
+                if !shared.reading_output && shared.output.as_deref() == Some(expected) {
+                    break;
+                }
+                drop(shared);
+                assert!(Instant::now() < deadline, "the output worker did not publish {expected}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        gate.request_output(Arc::new(|| {}));
+        wait("first output");
+        let checked = gate.shared.lock().unwrap().output_checked;
+        std::fs::write(gate.log_path(), "second output").unwrap();
+        for _ in 0..20 {
+            gate.request_output(Arc::new(|| {}));
+        }
+        assert_eq!(gate.shared.lock().unwrap().output_checked, checked);
+        assert_eq!(gate.shared.lock().unwrap().output.as_deref(), Some("first output"));
+        gate.shared.lock().unwrap().output_checked = None;
+        gate.request_output(Arc::new(|| {}));
+        wait("second output");
+    }
+
+    #[test]
     fn stop_requires_confirmation_and_the_machine_controls_are_visible() {
         let dir = tempfile::tempdir().unwrap();
         let info = bundle(dir.path(), 47800, "#!/bin/sh\nexit 1\n");
@@ -552,8 +662,9 @@ mod tests {
         gate.set_test_status(Status::Running);
         let ctx = egui::Context::default();
         let frame = |events| {
-            let mut output = ctx
-                .run_ui(egui::RawInput { events, ..Default::default() }, |ui| gate.controls(ui, true, Arc::new(|| {})));
+            let mut output = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
+                gate.controls(ui, &LinkStatus::Live, Arc::new(|| {}))
+            });
             output.textures_delta.clear();
             output
                 .shapes
