@@ -177,10 +177,6 @@ impl State {
         role: Role,
     ) -> Result<String, String> {
         self.session_disk_guard(&cwd, role == Role::Chief, resume.is_some())?;
-        let worktree_root = crate::build_cache::root(&cwd);
-        if self.lifecycle_jobs.iter().any(|job| !job.is_finished() && job.touches(None, Some(&worktree_root))) {
-            return Err("Worktree cleanup is still running; start the session again once it finishes.".into());
-        }
         self.cancel_cache_cleanup(&cwd);
         let interactive = std::mem::take(&mut self.interactive_start);
         let chief = role == Role::Chief;
