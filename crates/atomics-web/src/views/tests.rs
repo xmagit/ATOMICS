@@ -5264,3 +5264,20 @@ fn typing_a_comment_leaves_the_code_scrolled_sideways() {
     assert!(shown.iter().any(|(drawn, _)| drawn == "n"), "the box took the text: {shown:?}");
     assert_eq!(left(&shown), scrolled, "typing leaves it");
 }
+
+#[test]
+fn an_editor_that_could_not_start_says_why_in_the_clients_panel() {
+    let mut host = fake_host::panels_host();
+    for editor in host.board.host.editors.iter_mut().filter(|e| e.root == WORKTREE) {
+        editor.running = false;
+        editor.error = Some("hx is not installed on this host ([editor] command)".into());
+    }
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    client.send(Command::SetView(None));
+    client.send(Command::Activate { session: "s1".into(), open_diff: true });
+    client.send(Command::SetPanel(PanelMode::Editor));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(has(&shown, "The editor could not start."), "{shown:?}");
+    assert!(has(&shown, "hx is not installed on this host ([editor] command)"), "{shown:?}");
+    assert!(!has(&shown, "The editor is not running."), "{shown:?}");
+}
