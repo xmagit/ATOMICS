@@ -305,7 +305,7 @@ fn drawer_button(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) 
     for line in [-5.0, 0.0, 5.0] {
         ui.painter().hline((c.x - 8.0)..=(c.x + 8.0), c.y + line, Stroke::new(1.5, color));
     }
-    if backend.session_list().iter().any(|s| s.status.needs_attention() || s.pending_approvals > 0) {
+    if backend.session_list().iter().any(|s| s.needs_user()) {
         ui.painter().circle_filled(c + vec2(9.0, -8.0), 3.5, p.warning);
     }
     if response.on_hover_text("Agents").clicked() {

@@ -249,6 +249,12 @@ enum TicketsCommand {
 
 #[derive(Subcommand)]
 enum SandboxCommand {
+    /// Forget an unreadable legacy pin after removing or rebuilding its sandbox and worktree
+    ForgetPin {
+        name: String,
+        #[arg(long)]
+        confirm_worktree_removed: bool,
+    },
     /// Set up sandboxed agents: tools, Docker sign-in, network policy and credentials (over stdin)
     Setup,
     Template {
@@ -304,11 +310,8 @@ const PARENT_SESSION_VARS: &[&str] = &[
 
 fn main() -> eframe::Result {
     let cli = Cli::parse();
-    if matches!(cli.command, None | Some(Command::Host { .. }))
-        && let Err(error) = atomics_core::paths::validate_socket_path(&atomics_core::paths::socket_path())
-    {
-        eprintln!("atomics: {error}");
-        std::process::exit(1);
+    if matches!(cli.command, Some(Command::Host { .. })) {
+        validate_control_socket();
     }
     let mut migration_errors = Vec::new();
     if matches!(cli.command, None | Some(Command::Host { .. })) {
@@ -397,6 +400,18 @@ fn main() -> eframe::Result {
                 &agent,
                 dotnet_project.as_deref(),
                 rust_package.as_deref(),
+            ) {
+                eprintln!("{error:#}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        Some(Command::Sandbox { command: SandboxCommand::ForgetPin { name, confirm_worktree_removed } }) => {
+            if let Err(error) = sandbox::forget_legacy_pin(
+                &atomics_core::paths::atomics_home(),
+                &setup::resolve_program("sbx"),
+                &name,
+                confirm_worktree_removed,
             ) {
                 eprintln!("{error:#}");
                 std::process::exit(1);
@@ -547,6 +562,8 @@ fn main() -> eframe::Result {
         };
         return client::run(target, launch, native_options(size, load_icon()));
     }
+    // Only a local host binds this socket; --connect and [client] connect use the remote host's.
+    validate_control_socket();
     // A link goes to the ATOMICS that is running, and this process ends; otherwise it is handled
     // once the app has loaded.
     let link =
@@ -650,6 +667,13 @@ fn load_icon() -> egui::IconData {
     egui::IconData { rgba, width: info.width, height: info.height }
 }
 
+fn validate_control_socket() {
+    if let Err(error) = atomics_core::paths::validate_socket_path(&atomics_core::paths::socket_path()) {
+        eprintln!("atomics: {error}");
+        std::process::exit(1);
+    }
+}
+
 #[cfg(test)]
 mod cli_tests {
     use super::*;
@@ -665,6 +689,14 @@ mod cli_tests {
 
     #[test]
     fn setup_and_sandbox_setup_parse() {
+        let cli =
+            Cli::try_parse_from(["atomics", "sandbox", "forget-pin", "atomics-old", "--confirm-worktree-removed"])
+                .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Sandbox { command: SandboxCommand::ForgetPin { confirm_worktree_removed: true, .. } })
+        ));
+        assert!(Cli::try_parse_from(["atomics", "sandbox", "forget-pin"]).is_err());
         let cli = Cli::try_parse_from(["atomics", "setup"]).unwrap();
         assert!(matches!(cli.command, Some(Command::Setup { credential: None, .. })));
         let cli = Cli::try_parse_from(["atomics", "sandbox", "setup"]).unwrap();

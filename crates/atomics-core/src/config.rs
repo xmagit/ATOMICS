@@ -777,7 +777,8 @@ pub struct ChiefConfig {
     pub wake_secs: u64,
     pub dock: ChiefDock,
     pub command: Vec<String>,
-    /// The chief command's model. Explicit model wins over legacy model flags in `args`.
+    /// Within one layer, explicit model wins over legacy model flags in `args`.
+    #[serde(deserialize_with = "deserialize_chief_model")]
     pub model: Option<String>,
     pub args: Vec<String>,
     pub system_prompt: String,
@@ -832,28 +833,56 @@ impl ChiefConfig {
         }
     }
 
-    pub fn legacy_model(args: &[String]) -> bool {
-        args.iter().any(|arg| matches!(arg.as_str(), "--model" | "-m") || arg.starts_with("--model="))
+    fn short_model_flag(command: &[String]) -> bool {
+        matches!(command.first().and_then(|word| word.rsplit('/').next()), Some("claude" | "codex"))
+    }
+
+    pub fn legacy_model(command: &[String], args: &[String]) -> bool {
+        args.iter().any(|arg| {
+            arg == "--model"
+                || arg.starts_with("--model=")
+                || Self::short_model_flag(command) && (arg == "-m" || arg.starts_with("-m="))
+        })
+    }
+
+    pub fn model_problem(model: &str) -> Option<&'static str> {
+        if model.is_empty() {
+            Some("Enter a model name.")
+        } else if model.starts_with('-') || model.chars().any(char::is_whitespace) {
+            Some("A model name cannot start with '-' or contain whitespace.")
+        } else {
+            None
+        }
     }
 
     /// Preserve existing argument lists; a model selected in Settings replaces only their model flag.
     pub fn launch_args(&self) -> Vec<String> {
-        let explicit = self.model.as_deref().map(str::trim).filter(|model| !model.is_empty());
+        let explicit = self.model.as_deref().filter(|model| Self::model_problem(model).is_none());
         let Some(model) = explicit else {
             return self.args.clone();
         };
         let mut args = Vec::new();
         let mut words = self.args.iter();
         while let Some(word) = words.next() {
-            if matches!(word.as_str(), "--model" | "-m") {
+            if word == "--model" || word == "-m" && Self::short_model_flag(&self.command) {
                 words.next();
-            } else if !word.starts_with("--model=") {
+            } else if !(word.starts_with("--model=")
+                || word.starts_with("-m=") && Self::short_model_flag(&self.command))
+            {
                 args.push(word.clone());
             }
         }
         args.extend(["--model".into(), model.into()]);
         args
     }
+}
+
+fn deserialize_chief_model<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    let model = Option::<String>::deserialize(deserializer)?;
+    if let Some(problem) = model.as_deref().and_then(ChiefConfig::model_problem) {
+        return Err(serde::de::Error::custom(format!("chief.model: {problem}")));
+    }
+    Ok(model)
 }
 
 fn deserialize_min_left_percent<'de, D: serde::Deserializer<'de>>(
@@ -1314,6 +1343,24 @@ impl Config {
     pub fn merged(tables: impl IntoIterator<Item = toml::Table>) -> toml::Table {
         let mut merged = toml::Table::new();
         for table in tables {
+            if let Some(chief) = table.get("chief").and_then(toml::Value::as_table)
+                && !chief.contains_key("model")
+                && let Some(args) = chief.get("args").and_then(toml::Value::as_array)
+            {
+                let inherited = merged.get("chief").and_then(toml::Value::as_table);
+                let command = chief
+                    .get("command")
+                    .or_else(|| inherited.and_then(|chief| chief.get("command")))
+                    .and_then(toml::Value::as_array)
+                    .map(|words| words.iter().filter_map(toml::Value::as_str).map(str::to_string).collect())
+                    .unwrap_or_else(|| vec!["claude".into()]);
+                let args = args.iter().filter_map(toml::Value::as_str).map(str::to_string).collect::<Vec<_>>();
+                if ChiefConfig::legacy_model(&command, &args)
+                    && let Some(inherited) = merged.get_mut("chief").and_then(toml::Value::as_table_mut)
+                {
+                    inherited.remove("model");
+                }
+            }
             merge_tables(&mut merged, table);
         }
         merged
@@ -1381,7 +1428,7 @@ mod tests {
         {
             let mut config: Config = toml::from_str(&format!("[chief]\nargs = {args}")).unwrap();
             assert_eq!(config.chief.launch_args(), config.chief.args);
-            assert!(ChiefConfig::legacy_model(&config.chief.args));
+            assert!(ChiefConfig::legacy_model(&config.chief.command, &config.chief.args));
             config.chief.model = Some("sonnet".into());
             assert_eq!(config.chief.launch_args(), ["--verbose", "--model", "sonnet"]);
         }
@@ -1393,6 +1440,38 @@ mod tests {
         assert_eq!(config.chief.launch_args(), defaults.chief.launch_args());
         assert!(Chord::parse("ctrl+a+b").is_none());
         assert!(Chord::parse("ctrl++a").is_none());
+    }
+
+    #[test]
+    fn chief_model_selection_respects_layer_precedence_in_both_directions() {
+        let host = "[chief]\nargs = ['--model', 'sonnet', '--verbose']\n";
+        let config = Config::from_tables([DEFAULT_CONFIG.parse().unwrap(), host.parse().unwrap()]).unwrap();
+        assert!(config.chief.model.is_none(), "Settings must show the higher layer's custom args");
+        assert_eq!(config.chief.launch_args(), ["--model", "sonnet", "--verbose"]);
+        let selected = "[chief]\nmodel = 'haiku'\n";
+        let config = Config::from_tables([host.parse().unwrap(), selected.parse().unwrap()]).unwrap();
+        assert_eq!(config.chief.launch_args(), ["--verbose", "--model", "haiku"]);
+        let both = "[chief]\nmodel = 'opus'\nargs = ['--model=sonnet', '--verbose']\n";
+        let config = Config::from_tables([host.parse().unwrap(), both.parse().unwrap()]).unwrap();
+        assert_eq!(config.chief.launch_args(), ["--verbose", "--model", "opus"]);
+    }
+
+    #[test]
+    fn chief_models_reject_option_like_or_whitespace_values_and_keep_wrapper_short_flags() {
+        for model in ["", "-option", "two words", " sonnet", "sonnet\n", "name\tvalue", "name\u{2003}value"] {
+            let mut table = toml::Table::new();
+            table.insert("chief".into(), toml::Value::Table(toml::Table::from_iter([("model".into(), model.into())])));
+            assert!(Config::from_tables([table]).unwrap_err().to_string().contains("chief.model"));
+        }
+        for command in ["claude", "/tools/codex", "custom-wrapper"] {
+            let config: Config = toml::from_str(&format!("[chief]\ncommand = ['{command}']\nmodel = 'new-model'\nargs = ['-m', 'memory', '--model=old-model', '--verbose']\n")).unwrap();
+            if command == "custom-wrapper" {
+                assert_eq!(config.chief.launch_args(), ["-m", "memory", "--verbose", "--model", "new-model"]);
+                assert!(!ChiefConfig::legacy_model(&config.chief.command, &["-m".into(), "memory".into()]));
+            } else {
+                assert_eq!(config.chief.launch_args(), ["--verbose", "--model", "new-model"]);
+            }
+        }
     }
 
     #[cfg(feature = "native")]

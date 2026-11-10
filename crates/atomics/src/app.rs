@@ -131,6 +131,8 @@ pub struct Session {
     pub last_prompt: Option<String>,
     pub last_message: Option<String>,
     hooks_active: bool,
+    /// Last startup screen sampled by track_busy; drawing a row never reads the terminal.
+    first_run_hint: Option<&'static str>,
     activity: heartbeat::Activity,
     approvals: Vec<PendingApproval>,
     allowed: Vec<ApprovalRequest>,

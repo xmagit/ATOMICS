@@ -50,7 +50,7 @@ impl Source {
     }
 
     fn fetch(&self) -> Result<String> {
-        crate::sandbox::refuse_source_update(&self.home, &self.sbx, &self.checkout)?;
+        crate::sandbox::load_owned_pins(&self.home)?;
         // The response comes from the remote, not from refs the sandbox can rewrite between
         // fetching and reading them. Keep this immutable object id through checkout and build.
         let remote = self.git(&["ls-remote", "--exit-code", "--refs", "--", "origin", "refs/heads/main"])?;
@@ -326,7 +326,13 @@ mod tests {
                     .unwrap();
             }
             let before = fixture.head();
-            assert!(format!("{:#}", fixture.source.check().unwrap_err()).contains("sandbox"));
+            let calls = crate::sandbox::fake::calls_to(&bin, &["ls"]).len();
+            fixture.source.check().unwrap();
+            assert_eq!(
+                crate::sandbox::fake::calls_to(&bin, &["ls"]).len(),
+                calls,
+                "update polls never start or query sbx"
+            );
             let error = format!("{:#}", fixture.source.install(&|_| {}).unwrap_err());
             assert!(error.contains("Source update refused"), "{error}");
             assert_eq!(fixture.head(), before);

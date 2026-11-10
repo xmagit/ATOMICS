@@ -698,8 +698,9 @@ then **Approve plan**: nothing starts before that.
 You can also approve a reviewed plan with `atomics ctl '{"cmd":"plan_approve","plan":"<id>"}'`.
 Changing only branch names keeps approval; changing the goal or task requirements requires review again.
 
-Task sessions show `task id · task title`; their branch is available on hover and as a separate field in
-`atomics_list`. Generated task branches use `atomics/<short plan slug>/<task id>-<short title>`, with plan and
+Task sessions show `task id · task title` by default; an explicit session rename takes precedence and survives
+restart. Their branch is available on hover and as a separate field in `atomics_list`. Use a session id when
+multiple sessions share a label. Generated task branches use `atomics/<short plan slug>/<task id>-<short title>`, with plan and
 title slugs capped at 24 characters. With the default `worktree_path`, their folders are
 `<repo>-<short plan slug>-<task id>`. Custom path templates still apply, and existing branches and saved
 worktree locations stay in use. Collisions add a numeric suffix.

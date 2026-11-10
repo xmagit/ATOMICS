@@ -77,6 +77,8 @@ impl State {
         self.loaded.clear();
         self.focus_credential = false;
         self.section_list = false;
+        self.chief = None;
+        self.shortcuts = None;
         if !self.remote {
             self.revoke = None;
         }

@@ -743,7 +743,7 @@ fn warnings_for(scope: Scope, layers: &[Layer], config: &Config, changes: &[Chan
     let mut warnings = Vec::new();
     for change in changes.iter().filter(|change| change.change != "removed") {
         let known = known.iter().flatten().any(|table| defines(table, &change.path));
-        if !known && change.key != "voice.api_key" {
+        if !known && !matches!(change.key.as_str(), "voice.api_key" | "chief.model") {
             warnings.push(format!("ATOMICS does not know {}, so it would have no effect", change.key));
         }
         if change.key == "voice.api_key" {
@@ -751,6 +751,18 @@ fn warnings_for(scope: Scope, layers: &[Layer], config: &Config, changes: &[Chan
         }
         if let Some(host) = host.filter(|host| scope == Scope::Main && defines(&host.table, &change.path)) {
             warnings.push(format!("{} sets {} too and wins on this machine", host.path, change.key));
+        }
+        if change.key == "chief.model"
+            && scope == Scope::Main
+            && config.chief.model.is_none()
+            && let Some(host) = host
+            && let Some(args) = lookup(&host.table, &["chief", "args"]).and_then(toml::Value::as_array)
+        {
+            let args = args.iter().filter_map(toml::Value::as_str).map(str::to_string).collect::<Vec<_>>();
+            if crate::config::ChiefConfig::legacy_model(&config.chief.command, &args) {
+                warnings
+                    .push(format!("{} selects the chief model through chief.args and wins on this machine", host.path));
+            }
         }
     }
     if workspace_tickets && changes.iter().any(|change| change.path[0] == "tickets") {
@@ -868,9 +880,21 @@ fn detach(item: &mut Item) {
 /// Writes an applied change, only while the file still reads as it did when the change was
 /// proposed: first a copy of the old file next to it, then the new text through a temporary
 /// file in the same folder, with the old file's permissions. A symlinked file is written
-/// through its link. Returns the backup's path, `None` for a file the change creates.
+/// through its link. Returns the backup's path, `None` for a new or unchanged file.
+/// Backup cleanup is best-effort: once the rename succeeds, the apply always succeeds.
 #[cfg(feature = "native")]
 pub fn write(file: &Path, before: Option<&str>, after: &str, stamp: u64) -> anyhow::Result<Option<PathBuf>> {
+    write_with_prune(file, before, after, stamp, prune_config_backups)
+}
+
+#[cfg(feature = "native")]
+fn write_with_prune(
+    file: &Path,
+    before: Option<&str>,
+    after: &str,
+    stamp: u64,
+    prune: impl FnOnce(&Path, Option<&Path>) -> anyhow::Result<()>,
+) -> anyhow::Result<Option<PathBuf>> {
     use anyhow::{Context, bail};
     let current = match std::fs::read_to_string(file) {
         Ok(text) => Some(text),
@@ -888,11 +912,12 @@ pub fn write(file: &Path, before: Option<&str>, after: &str, stamp: u64) -> anyh
         bail!("{} is not a file", file.display());
     };
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    let backups = config_backups(file)?;
+    // An inventory failure must not prevent saving a fresh snapshot of the current file.
+    let backups = config_backups(file).unwrap_or_default();
     let backup = match current.as_deref() {
         Some(text) => {
             let shown = file.file_name().unwrap_or(name).to_string_lossy().into_owned();
-            let folder = file.parent().unwrap_or(dir);
+            let folder = file.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
             let next = backups.iter().filter(|((time, _), _)| *time == stamp).map(|((_, n), _)| n + 1).max();
             let mut n = next.unwrap_or(0);
             let backup_name =
@@ -927,19 +952,40 @@ pub fn write(file: &Path, before: Option<&str>, after: &str, stamp: u64) -> anyh
         let _ = std::fs::remove_file(&temp);
         return Err(err).with_context(|| format!("writing {}", file.display()));
     }
-    // Old installations may already have repeated snapshots. Keep the newest copy of each,
-    // then the newest ten for this file, including distinct changes made in the same second.
+    // The new config is already installed. Maintenance must never turn this into a failed apply.
+    let _ = prune(file, backup.as_deref());
+    Ok(backup)
+}
+
+#[cfg(feature = "native")]
+fn prune_config_backups(file: &Path, protected: Option<&Path>) -> anyhow::Result<()> {
+    let mut backups = config_backups(file)?;
+    backups.reverse();
+    // The clock can go backwards. Count this apply's snapshot first, regardless of its timestamp.
+    if let Some(index) = backups.iter().position(|(_, path)| Some(path.as_path()) == protected) {
+        let latest = backups.remove(index);
+        backups.insert(0, latest);
+    }
     let mut contents = std::collections::HashSet::new();
     let mut kept = 0;
-    for (_, path) in config_backups(file)?.into_iter().rev() {
-        let text = std::fs::read(&path)?;
-        if contents.insert(text) && kept < 10 {
+    for (_, path) in backups {
+        let text = std::fs::read(&path);
+        if Some(path.as_path()) == protected {
+            kept += 1;
+            if let Ok(text) = text {
+                contents.insert(text);
+            }
+            continue;
+        }
+        // Another process may have removed it, or this old snapshot may be unreadable.
+        let Ok(text) = text else { continue };
+        if kept < 10 && contents.insert(text) {
             kept += 1;
         } else {
-            std::fs::remove_file(&path)?;
+            let _ = std::fs::remove_file(&path);
         }
     }
-    Ok(backup)
+    Ok(())
 }
 
 /// Only ATOMICS's numeric timestamp/collision suffix belongs to this config file.
@@ -1560,6 +1606,49 @@ children = [{ auth = { header = "object-secret" }, label = "public" }]
         assert_eq!(backups.len(), 2);
         assert_eq!(backups[0].0, (22, 0));
         assert_eq!(backups[1].0, (100, 0));
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn cleanup_failure_after_rename_never_fails_an_applied_write() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        std::fs::write(&file, "value = 1\n").unwrap();
+        let backup = write_with_prune(&file, Some("value = 1\n"), "value = 2\n", 100, |file, backup| {
+            assert_eq!(std::fs::read_to_string(file).unwrap(), "value = 2\n", "the failure is after commit");
+            assert_eq!(std::fs::read_to_string(backup.unwrap()).unwrap(), "value = 1\n");
+            Err(std::io::Error::new(std::io::ErrorKind::NotFound, "another process pruned an old snapshot").into())
+        })
+        .unwrap()
+        .unwrap();
+        assert!(backup.exists());
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "value = 2\n");
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn cleanup_keeps_the_returned_backup_even_when_the_clock_moves_backwards() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        std::fs::write(&file, "value = 1\n").unwrap();
+        for stamp in 200..212 {
+            std::fs::write(dir.path().join(format!("config.toml.{stamp}.bak")), format!("value = {stamp}\n")).unwrap();
+        }
+        let backup = write(&file, Some("value = 1\n"), "value = 2\n", 100).unwrap().unwrap();
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), "value = 1\n");
+        let backups = config_backups(&file).unwrap();
+        assert_eq!(backups.len(), 10);
+        assert!(backups.iter().any(|(_, path)| *path == backup));
+        assert_eq!(backups[1].0, (203, 0), "the remaining nine snapshots are the newest old ones");
+    }
+
+    #[test]
+    fn proposing_a_main_model_explains_when_host_model_args_win() {
+        let main = layer(Source::Main, crate::config::DEFAULT_CONFIG);
+        let host = layer(Source::Host, "[chief]\nargs = ['--model', 'sonnet']\n");
+        let proposal = propose(Scope::Main, &[main, host], "[chief]\nmodel = 'haiku'", &[]).unwrap();
+        assert_eq!(proposal.warnings.len(), 1, "{:?}", proposal.warnings);
+        assert!(proposal.warnings[0].contains("chief.args and wins"));
     }
 
     #[test]

@@ -151,16 +151,7 @@ impl State {
 
     pub(super) fn task_action(&mut self, index: usize, task_index: usize, action: &str) {
         if action == "acknowledge_refs" {
-            if let Some(guard) = self.plans[index].tasks[task_index]
-                .session
-                .as_ref()
-                .and_then(|id| self.sessions.iter().find(|session| &session.id == id))
-                .and_then(|session| session.ref_guard.as_ref())
-            {
-                guard.acknowledge();
-            }
-            self.plans[index].tasks[task_index].ref_alert = None;
-            self.save_plan(index);
+            self.acknowledge_refs(index, task_index, self.plans[index].tasks[task_index].ref_alert_generation.clone());
             return;
         }
         if action == "resume" && self.plans[index].status != PlanStatus::Open {
@@ -794,7 +785,14 @@ impl State {
                 owned(true)
             };
             if let Some(owner) = owner {
-                let instead = match self.free_branch(branch, repo.as_deref(), common.as_deref(), key, &mut taken) {
+                let instead = match self.free_branch(
+                    branch,
+                    (candidate, task),
+                    repo.as_deref(),
+                    common.as_deref(),
+                    key,
+                    &mut taken,
+                ) {
                     Some(free) => {
                         format!("Use {free} instead, or leave branch out for ATOMICS to choose one at dispatch.")
                     }
@@ -812,7 +810,7 @@ impl State {
             }
             // Dispatch reuses a worktree of the branch only where worktree_path puts it.
             let reusable = || {
-                let path = git::worktree_path(&self.config.worktree_path, repo, branch);
+                let path = git::plan_task_worktree_path(&self.config.worktree_path, repo, candidate, task, branch);
                 path.exists()
                     && git::common_dir(&path).is_ok_and(|dir| dir == *common)
                     && git::worktree_of(&path).and_then(|tree| tree.branch).as_deref() == Some(branch)
@@ -839,10 +837,11 @@ impl State {
                 None
             };
             if let Some(busy) = busy {
-                let instead = match self.free_branch(branch, Some(repo), Some(common), key, &mut taken) {
-                    Some(free) => format!("Use {free} instead"),
-                    None => "Leave branch out instead".into(),
-                };
+                let instead =
+                    match self.free_branch(branch, (candidate, task), Some(repo), Some(common), key, &mut taken) {
+                        Some(free) => format!("Use {free} instead"),
+                        None => "Leave branch out instead".into(),
+                    };
                 notes.push(format!(
                     "Task {id}: branch {branch} {busy}, so dispatching {id} on it would fail or share that work. \
                      {instead}, unless {id} only brings that work into the plan.",
@@ -857,6 +856,7 @@ impl State {
     fn free_branch(
         &self,
         branch: &str,
+        context: (&Plan, &Task),
         repo: Option<&Path>,
         common: Option<&Path>,
         key: &Option<PathBuf>,
@@ -869,7 +869,14 @@ impl State {
                         self.branch_owners(common, name).is_empty()
                             && git::branch_ref_exists(repo, name).is_ok_and(|exists| !exists)
                             && !self.creating.iter().any(|(dir, pending, _)| dir == common && pending == name)
-                            && !git::worktree_path(&self.config.worktree_path, repo, name).exists()
+                            && !git::plan_task_worktree_path(
+                                &self.config.worktree_path,
+                                repo,
+                                context.0,
+                                context.1,
+                                name,
+                            )
+                            .exists()
                     }
                     _ => true,
                 }
@@ -1251,6 +1258,15 @@ impl State {
         if let Some((index, id)) = &owner {
             let task = self.plans[*index].task_mut(id).expect("task owner");
             task.report = Some(report.clone());
+            if task.ref_alert.is_some() && !summary.starts_with("SANDBOX REF GUARD:") && task.status != TaskStatus::Done
+            {
+                match status {
+                    "done" => task.ref_status_before_alert = Some(TaskStatus::Review),
+                    "blocked" | "question" => task.ref_status_before_alert = Some(TaskStatus::Blocked),
+                    "progress" => task.ref_status_before_alert = Some(TaskStatus::Running),
+                    _ => {}
+                }
+            }
             if task.status != TaskStatus::Done && task.ref_alert.is_none() {
                 match status {
                     "done" => task.set_status(TaskStatus::Review),
@@ -1999,6 +2015,39 @@ mod tests {
             let warning = stale.warning.expect("the fetch failed");
             assert!(warning.contains("could not fetch origin"), "{warning}");
             assert_ne!(git::git(&stale.path, &["rev-parse", "HEAD"]).unwrap().trim(), landed, "as fetched before");
+        });
+    }
+
+    #[test]
+    fn p5_review_path_checks_use_task_folders_for_reuse_and_suggestions() {
+        with_app("app::plans::tests::p5_review_path_checks_use_task_folders_for_reuse_and_suggestions", |app, _| {
+            let (dir, repo) = repository();
+            app.runtime.config.base_ref = "main".into();
+            app.runtime.config.worktree_path = "{repo_parent}/{repo}-{slug}".into();
+            let mut candidate = Plan { id: "short-plan".into(), project: Some(repo.clone()), ..Default::default() };
+            let mut task = Task { id: "t1".into(), title: "Fix the parser".into(), ..Default::default() };
+            let branch = candidate.task_branch(&task);
+            task.branch = Some(branch.clone());
+            let path =
+                git::plan_task_worktree_path(&app.runtime.config.worktree_path, &repo, &candidate, &task, &branch);
+            git::add_worktree(&repo, &path, &branch, "main").unwrap();
+            candidate.tasks = vec![task];
+            app.runtime.plans =
+                vec![Plan { id: candidate.id.clone(), project: Some(repo.clone()), ..Default::default() }];
+            assert_eq!(app.runtime.plan_problems(Some(0), &candidate), (Vec::<String>::new(), Vec::<String>::new()));
+            let moved = dir.path().join("elsewhere");
+            git::git(&repo, &["worktree", "move", path.to_str().unwrap(), moved.to_str().unwrap()]).unwrap();
+            let occupied = git::plan_task_worktree_path(
+                &app.runtime.config.worktree_path,
+                &repo,
+                &candidate,
+                &candidate.tasks[0],
+                &format!("{branch}-2"),
+            );
+            std::fs::create_dir_all(occupied).unwrap();
+            let (refused, notes) = app.runtime.plan_problems(Some(0), &candidate);
+            assert!(refused.is_empty(), "{refused:?}");
+            assert!(notes.iter().any(|note| note.contains(&format!("Use {branch}-3 instead"))), "{notes:?}");
         });
     }
 

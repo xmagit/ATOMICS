@@ -111,7 +111,7 @@ impl State {
                 if let Ok((_, Some(granted), _, _)) = &result {
                     self.relay.revoke(granted);
                 }
-                if let (Ok(_), AgentRuntime::Sandbox(sandboxed)) = (&result, &launch.runtime) {
+                if let AgentRuntime::Sandbox(sandboxed) = &launch.runtime {
                     match paths::scratch_of(&launch.cwd) {
                         Some(_) => self.remove_sandbox(sandboxed.name.clone()),
                         None => self.stop_sandbox(sandboxed.name.clone()),
@@ -146,7 +146,11 @@ impl State {
                 }
                 let (guard, alerts) = guard.unzip();
                 if let Some(alerts) = alerts.filter(|alerts| !alerts.is_empty()) {
-                    self.ref_alert(&id, alerts.join("\n"));
+                    self.ref_alert_at(
+                        &id,
+                        alerts.join("\n"),
+                        guard.as_ref().and_then(|guard| guard.alert_generation()),
+                    );
                 }
                 let relay = granted.clone();
                 let launched = self.launch_agent(AgentLaunch { ref_guard: guard, relay, ..launch }, None);
@@ -691,6 +695,7 @@ impl State {
                         s.id.clone(),
                         s.title.clone(),
                         s.status,
+                        s.first_run_hint,
                         s.approvals.len(),
                         s.approval_hold,
                         s.held.len(),
@@ -742,6 +747,7 @@ impl State {
                     last_prompt: None,
                     last_message: None,
                     hooks_active: false,
+                    first_run_hint: None,
                     activity: heartbeat::Activity::default(),
                     approvals: Vec::new(),
                     allowed: Vec::new(),
@@ -787,6 +793,7 @@ impl State {
         }
         session.claude_id = Some(event.session_id.clone());
         session.hooks_active = true;
+        session.first_run_hint = None;
         session.activity.last_event = atomics_core::store::now();
         if event.name == "PermissionRequest" {
             let request = ApprovalRequest { warning: stash_warning, ..ApprovalRequest::from_event(&event) };
