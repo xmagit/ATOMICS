@@ -18,6 +18,9 @@ use ring::signature::KeyPair;
 use test_support::{CHILD_TIMEOUT, TempDir, TestChild, scaled_timeout};
 
 const TARGET: &str = env!("ATOMICS_TARGET");
+// The install script's supported Linux release target is a fixture, independent of
+// the host running these tests. The updater below still selects the real host target.
+const INSTALL_TARGET: &str = "x86_64-unknown-linux-gnu";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const NEW_VERSION: &str = "99.0.0";
 
@@ -77,9 +80,43 @@ struct Machine {
 impl Machine {
     fn new() -> Machine {
         let dir = test_support::tempdir().unwrap();
-        for folder in ["home", "stubs", "feed", "runtime"] {
+        for folder in ["home", "stubs", "tools", "feed", "runtime"] {
             std::fs::create_dir_all(dir.path().join(folder)).unwrap();
         }
+        test_support::link_tools(
+            &dir.path().join("tools"),
+            &[
+                "sh",
+                "bash",
+                "cat",
+                "cp",
+                "mv",
+                "rm",
+                "chmod",
+                "mkdir",
+                "mktemp",
+                "tar",
+                "gzip",
+                "sed",
+                "head",
+                "cut",
+                "grep",
+                "basename",
+                "dirname",
+                "sha256sum",
+                "openssl",
+                "git",
+                "env",
+                "ps",
+                "sleep",
+                "stty",
+                "readlink",
+                "ln",
+                "id",
+                "touch",
+                "nice",
+            ],
+        );
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(dir.path().join("runtime"), std::fs::Permissions::from_mode(0o700)).unwrap();
         // Answers from the feed folder, and with curl's failure where there is nothing at that address.
@@ -88,6 +125,7 @@ impl Machine {
             "#!/bin/sh\nout=''; url=''\nwhile [ $# -gt 0 ]; do\n  case \"$1\" in\n    -o) out=$2; shift 2 ;;\n    --proto|--retry) shift 2 ;;\n    -*) shift ;;\n    *) url=$1; shift ;;\n  esac\ndone\nname=$(printf '%s' \"$url\" | sed 's#^https://##; s#/#_#g')\n[ -f \"$FEED/$name\" ] || exit 22\ncp \"$FEED/$name\" \"$out\"\n",
         );
         program(&dir.path().join("stubs/shell"), "#!/bin/sh\nprintf '__ATOMICS__%s__ATOMICS__' \"$PATH\"\n");
+        Self::installer_platform(dir.path());
         test_support::copy_program(
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keychain"),
             dir.path().join("stubs/secret-tool"),
@@ -99,6 +137,10 @@ impl Machine {
 
     fn path(&self, name: &str) -> PathBuf {
         self.dir.path().join(name)
+    }
+
+    fn installer_platform(dir: &Path) {
+        program(&dir.join("stubs/uname"), "#!/bin/sh\n[ \"$1\" = -s ] && echo Linux || echo x86_64\n");
     }
 
     fn home(&self) -> PathBuf {
@@ -119,7 +161,7 @@ impl Machine {
             "api.github.com/repos/xmagit/ATOMICS/releases/latest",
             format!("{{\n  \"tag_name\": \"v{version}\",\n  \"name\": \"v{version}\"\n}}\n"),
         );
-        let name = format!("atomics-{version}-{TARGET}.tar.gz");
+        let name = format!("atomics-{version}-{INSTALL_TARGET}.tar.gz");
         let base = format!("github.com/xmagit/ATOMICS/releases/download/v{version}");
         self.feed(&format!("{base}/{name}"), archive);
         self.feed(&format!("{base}/{name}.sha256"), sha256_line(archive, &name));
@@ -127,7 +169,7 @@ impl Machine {
     }
 
     fn env<'a>(&self, command: &'a mut Command) -> &'a mut Command {
-        let path = format!("{}:/usr/bin:/bin", self.path("stubs").display());
+        let path = std::env::join_paths([self.path("stubs"), self.path("tools")]).unwrap();
         command
             .env_clear()
             .env("HOME", self.home())
@@ -479,7 +521,7 @@ mod install_script {
     fn a_damaged_download_is_refused_before_it_is_unpacked() {
         let machine = Machine::new();
         let archive = good(&machine);
-        let name = format!("atomics-{VERSION}-{TARGET}.tar.gz");
+        let name = format!("atomics-{VERSION}-{INSTALL_TARGET}.tar.gz");
         let base = format!("github.com/xmagit/ATOMICS/releases/download/v{VERSION}");
         machine.feed(&format!("{base}/{name}"), [archive.as_slice(), b"tampered"].concat());
         refused(&machine, "damaged");
@@ -492,7 +534,7 @@ mod install_script {
     fn a_signature_from_any_other_key_is_refused_whatever_the_release_says_of_itself() {
         let machine = Machine::new();
         let archive = good(&machine);
-        let name = format!("atomics-{VERSION}-{TARGET}.tar.gz");
+        let name = format!("atomics-{VERSION}-{INSTALL_TARGET}.tar.gz");
         let base = format!("github.com/xmagit/ATOMICS/releases/download/v{VERSION}");
         // Consistent with its own checksum: only the key on the main branch tells them apart.
         machine.feed(&format!("{base}/{name}.sig"), ThrowawayKey::new().sign(&archive));
@@ -511,7 +553,7 @@ mod install_script {
             "raw.githubusercontent.com/xmagit/ATOMICS/main/assets/release-signing-key-offline.pub",
             offline.pem(),
         );
-        let name = format!("atomics-{VERSION}-{TARGET}.tar.gz");
+        let name = format!("atomics-{VERSION}-{INSTALL_TARGET}.tar.gz");
         let base = format!("github.com/xmagit/ATOMICS/releases/download/v{VERSION}");
         machine.feed(&format!("{base}/{name}.sig"), offline.sign(&archive));
         let output = machine.install_script();
@@ -572,7 +614,7 @@ mod install_script {
         good(&machine);
         program(&machine.path("stubs/uname"), "#!/bin/sh\n[ \"$1\" = -s ] && echo Linux || echo riscv64\n");
         refused(&machine, "no build for Linux riscv64");
-        std::fs::remove_file(machine.path("stubs/uname")).unwrap();
+        Machine::installer_platform(machine.dir.path());
 
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/install.sh");
         let output = test_support::output(machine.env(Command::new("sh").arg(&script)).env("ATOMICS_VERSION", "9.9.9"));

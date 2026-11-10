@@ -107,12 +107,7 @@ fn a_build_that_does_not_run_replaces_nothing_and_no_rust_says_what_to_do() {
     assert_eq!(names.len(), 1, "nothing is left beside it: {names:?}");
 
     let no_rust = dir.path().join("no-rust");
-    std::fs::create_dir_all(&no_rust).unwrap();
-    for tool in ["sh", "uname", "dirname"] {
-        let found =
-            ["/usr/bin", "/bin"].iter().map(|dir| Path::new(dir).join(tool)).find(|path| path.exists()).unwrap();
-        std::os::unix::fs::symlink(found, no_rust.join(tool)).unwrap();
-    }
+    test_support::link_tools(&no_rust, &["sh", "uname", "dirname"]);
     let output = install(&no_rust.display().to_string());
     assert!(!output.status.success());
     let said = String::from_utf8_lossy(&output.stderr);

@@ -2758,7 +2758,7 @@ mod tests {
                     Terminal::spawn(
                         app.runtime.wake.clone(),
                         app.runtime.theme.terminal_colors(),
-                        "/bin/sleep".into(),
+                        crate::test_support::program("sleep"),
                         vec!["10".into()],
                         &repo,
                         HashMap::new(),
@@ -2997,7 +2997,7 @@ mod tests {
                 app.runtime.config.worktree_path = format!("{}/{{slug}}", dir.path().display());
                 app.runtime.config.agents.push(atomics_core::config::AgentConfig {
                     name: "fixture".into(),
-                    command: vec!["/bin/cat".into()],
+                    command: vec![crate::test_support::program("cat")],
                     kind: AgentKind::Shell,
                     busy_text: None,
                     isolation: None,
@@ -3044,7 +3044,7 @@ mod tests {
                 app.runtime.config.worktree_path = format!("{}/{{slug}}", dir.path().display());
                 app.runtime.config.agents.push(atomics_core::config::AgentConfig {
                     name: "fixture".into(),
-                    command: vec!["/bin/cat".into()],
+                    command: vec![crate::test_support::program("cat")],
                     kind: AgentKind::Shell,
                     busy_text: None,
                     isolation: None,

@@ -897,7 +897,7 @@ mod tests {
                 let terminal = Terminal::spawn(
                     app.runtime.wake.clone(),
                     app.runtime.theme.terminal_colors(),
-                    "/bin/cat".into(),
+                    crate::test_support::program("cat"),
                     vec![],
                     &app.runtime.launch_dir,
                     HashMap::new(),
@@ -1294,7 +1294,7 @@ mod tests {
                         Terminal::spawn(
                             app.runtime.wake.clone(),
                             app.runtime.theme.terminal_colors(),
-                            "/bin/cat".into(),
+                            crate::test_support::program("cat"),
                             vec![],
                             &app.runtime.launch_dir,
                             HashMap::new(),
@@ -1516,7 +1516,7 @@ mod tests {
                 let terminal = Terminal::spawn(
                     app.runtime.wake.clone(),
                     app.runtime.theme.terminal_colors(),
-                    "/bin/sleep".into(),
+                    crate::test_support::program("sleep"),
                     vec!["30".into()],
                     &app.runtime.launch_dir,
                     HashMap::new(),
@@ -1892,7 +1892,7 @@ mod tests {
                         Terminal::spawn(
                             app.runtime.wake.clone(),
                             app.runtime.theme.terminal_colors(),
-                            "/bin/cat".into(),
+                            crate::test_support::program("cat"),
                             vec![],
                             dir.path(),
                             HashMap::new(),

@@ -557,7 +557,7 @@ mod tests {
                 .arg(&repo)
                 .args(["rust", "", "2", package])
                 .env("HOME", &home)
-                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .env("PATH", crate::test_support::path_with(&bin))
                 .output()
                 .unwrap();
             assert_eq!(output.status.code(), Some(if succeeds { 0 } else { 17 }), "{output:?}");
@@ -624,7 +624,7 @@ printf '%s\n' "$@" > "$HOME/build-args"
                 .arg(&repo)
                 .args(["dotnet", "App.csproj", "2"])
                 .env("HOME", &home)
-                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .env("PATH", crate::test_support::path_with(&bin))
                 .output()
                 .unwrap();
             assert!(output.status.success(), "{output:?}");

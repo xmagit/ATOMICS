@@ -2278,10 +2278,10 @@ attempts=0
 while [ ! -e ready ]; do
   attempts=$((attempts + 1))
   if [ "$attempts" -gt 200 ]; then
-    /usr/bin/touch timed-out
+    touch timed-out
     exit 1
   fi
-  /bin/sleep 0.01
+  sleep 0.01
 done
 case "$5" in
   rev-parse) pwd ;;
@@ -2293,7 +2293,7 @@ esac
             std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "app::sessions::tests::session_start_does_not_wait_for_git", "--nocapture"])
                 .env("ATOMICS_START_GIT_TEST", "1")
-                .env("PATH", dir.path())
+                .env("PATH", crate::test_support::path_with(dir.path()))
                 .env("HOME", dir.path())
                 .env("ATOMICS_HOME", dir.path().join("state"))
                 .env("ATOMICS_CONFIG", dir.path().join("config.toml"))

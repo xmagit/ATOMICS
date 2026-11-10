@@ -136,7 +136,7 @@ esac
                 .env("HOME", self.dir.path().join("home"))
                 .env("SHELL", self.dir.path().join("bin/login-shell"))
                 .env("LIMA_HOME", self.dir.path().join("lima"))
-                .env("PATH", format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", self.dir.path().join("bin").display()))
+                .env("PATH", test_support::path_with(&self.dir.path().join("bin")))
                 .env("ATOMICS_HOME", self.dir.path().join("state"))
                 .env("ATOMICS_SOCKET", self.dir.path().join("absent.sock"))
                 .env("ATOMICS_CONFIG", self.dir.path().join("config.toml"))

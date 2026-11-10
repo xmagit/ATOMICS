@@ -427,7 +427,7 @@ fn frames_show_new_pty_output() {
     let terminal = super::Terminal::spawn(
         crate::host::Wake::default(),
         theme.terminal_colors(),
-        "/bin/cat".into(),
+        crate::test_support::program("cat"),
         vec![],
         dir.path(),
         std::collections::HashMap::new(),

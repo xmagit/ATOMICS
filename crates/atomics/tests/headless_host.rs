@@ -37,6 +37,7 @@ impl Instance {
             config = config.replace("\n[remote]\n", &format!("\n[remote]\nenabled = true\nport = {port}\n"));
         }
         std::fs::write(dir.path().join("config.toml"), config).unwrap();
+        test_support::login_shell(&dir.path().join("test-shell"));
         Self { dir }
     }
 
@@ -60,8 +61,9 @@ impl Instance {
             .env("XDG_RUNTIME_DIR", self.dir.path().join("runtime"))
             .env("CODEX_HOME", self.dir.path().join("codex"))
             .env("CLAUDE_CONFIG_DIR", self.dir.path().join("claude"))
-            // A login shell such as zsh would run its first-run wizard in the fresh HOME.
-            .env("SHELL", "/bin/sh")
+            .env("SHELL", self.dir.path().join("test-shell"))
+            .env_remove("BASH_ENV")
+            .env_remove("ENV")
             .env_remove("ATOMICS_PANE")
             .env_remove("TERM_PROGRAM");
         command
