@@ -232,6 +232,8 @@ pub struct ResourceInfo {
     pub compiler_jobs: Option<usize>,
     pub test: SlotInfo,
     pub qa: SlotInfo,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disk: Vec<crate::machine::DiskWarning>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

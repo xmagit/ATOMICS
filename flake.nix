@@ -53,7 +53,7 @@
             # All compiler tools must come from the pinned nixpkgs toolchain. A system
             # clippy-driver can report the same Rust version and still have incompatible metadata.
             packages = (with pkgs.rustPackages; [ cargo rustc clippy rustfmt ])
-              ++ (with pkgs; [ bash coreutils git gnugrep gnused gnutar gzip openssl pkg-config procps python3 ]);
+              ++ (with pkgs; [ bash coreutils sccache git gnugrep gnused gnutar gzip openssl pkg-config procps python3 ]);
           };
         });
 

@@ -61,6 +61,60 @@ A main, host or workspace file that does not parse leaves ATOMICS on the last co
 The top bar or toast says so, and `atomics doctor` names the file. A broken repository config is ignored
 with a warning; see [Repository workflows](repo-workflow.md).
 
+## Build caches and disk space
+
+Agent sessions in a Cargo workspace default to `CARGO_INCREMENTAL=0`,
+`CARGO_PROFILE_DEV_DEBUG=line-tables-only`, and `CARGO_PROFILE_TEST_DEBUG=line-tables-only`.
+When `sccache` is on the session's PATH, ATOMICS selects it as `RUSTC_WRAPPER`, unless a wrapper
+is already configured. Its machine-wide directory defaults to `$XDG_CACHE_HOME/atomics/sccache`
+(or `~/.cache/atomics/sccache`) with `SCCACHE_CACHE_SIZE=10G`. The VM and dev shell include sccache.
+Bare sessions preserve inherited environment overrides; sandbox preparation detects sccache inside
+the sandbox image. Explicit `[cache] env` values override the defaults for subsequent sessions.
+
+```toml
+[cache]
+shared = [".npm/_cacache"]
+env = { npm_config_cache = ".npm/_cacache", CARGO_PROFILE_DEV_DEBUG = "full" }
+outputs = ["web/dist", "src/app/bin", "src/app/obj"]
+
+[resources]
+disk_warn_gib = 30
+disk_min_gib = 10
+```
+
+`shared` links absent folders in new linked worktrees to a store under
+`$ATOMICS_HOME/build-caches/repos/<repository-id>/`. Existing folders are left alone, and the main
+checkout is never linked. Existing sandboxes retain their mounts; ATOMICS asks for recreation if a required
+shared cache mount is missing. Safe shared caches complement the existing CoW `[worktrees] warm` setting;
+warming still makes independent copies. Relative cache environment paths resolve from the worktree root.
+
+In your own configuration, `shared` accepts any relative folder and `env` accepts any variable.
+Sharing `target`, `node_modules`, `bin`, or `obj` is unsafe for concurrent worktrees: Settings and doctor
+warn about these entries. Do not set one common `CARGO_TARGET_DIR`: Cargo locks that directory and
+serializes builds across agents. Each worktree keeps its own target; sccache shares reusable compilation
+results. Enabling incremental compilation with sccache also requires opting out of the wrapper or
+configuring sccache's incremental policy. [sccache's Rust documentation](https://github.com/mozilla/sccache/blob/main/docs/Rust.md)
+describes its cacheable compilation modes; metadata-only `cargo check` is not the measurement of reuse.
+
+`outputs` adds disposable output folders. Cargo worktrees automatically include `target`.
+Your own configuration may name any relative output folder; choose it carefully, because untracked
+files inside it are disposable. Repository configuration has a stricter allowlist, described in
+[Repository workflows](repo-workflow.md#shared-caches-and-disposable-output).
+
+Acceptance plus integration, and session closure, schedule output cleanup even when the worktree is kept.
+Only trusted linked worktrees are eligible. Cleanup refuses tracked files, links and paths outside the
+worktree, shared stores, the main checkout, and worktrees with a process working or holding files there.
+Busy worktrees are retried after they become idle. Live sandbox sessions are protected as well.
+
+Disk sampling continues without an open Machine window. Below `disk_warn_gib`, the board and Machine
+view show a warning with the largest output folders, the load button uses the warning colour, and the
+chief receives a `low_disk` heartbeat finding. Below `disk_min_gib`, new task dispatches and session
+starts are refused after checking their destination filesystem. The board, Machine view and
+`atomics_list` offer **Clean build caches of idle worktrees** (`atomics_clean_build_caches` for the chief).
+The action applies the same cleanup safeguards; it keeps worktrees and shared stores.
+
+For a reproducible two-worktree comparison and its measured scope, see [Build cache measurement](build-cache-measurement.md).
+
 ## Terminal clipboard
 
 `[terminal] clipboard = "focused"` (the default) lets a terminal program write the host clipboard

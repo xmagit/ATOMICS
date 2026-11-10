@@ -8,6 +8,7 @@ mod platform_tests;
 mod test_raster;
 
 mod app;
+mod build_cache;
 mod build_info;
 mod client;
 mod connections;

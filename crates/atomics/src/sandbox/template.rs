@@ -322,6 +322,7 @@ mod tests {
             cwd: repo,
             config,
             warm: Vec::new(),
+            cache: Default::default(),
             exe: "/atomics".into(),
             socket: "/atomics.sock".into(),
             briefs: None,

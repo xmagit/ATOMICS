@@ -174,6 +174,7 @@ impl State {
         prompt: Option<String>,
         role: Role,
     ) -> Result<String, String> {
+        self.check_disk(&cwd)?;
         let interactive = std::mem::take(&mut self.interactive_start);
         let chief = role == Role::Chief;
         if !chief && let Some(error) = &self.tickets.workspace_identity_error {
@@ -244,7 +245,7 @@ impl State {
                             let (sbx, mcp) = (&job.sbx, &job.config.mcp);
                             let needed =
                                 crate::connections::load_into(&job.home, sbx, &job.name, mcp, job.config.ssh_agent);
-                            (opened, granted, needed)
+                            (opened, granted, needed, crate::sandbox::cache_env(&job))
                         })
                     });
                 let _ = tx.send(ready);
@@ -266,7 +267,7 @@ impl State {
                             anyhow::anyhow!("bare relay requires a Claude subscription in Settings → Credentials")
                         })
                     })
-                    .map(|grant| (None, Some(grant), Vec::new()))
+                    .map(|grant| (None, Some(grant), Vec::new(), Vec::new()))
                     .map_err(|error| super::NotPrepared::Other(error.to_string()));
                 let _ = tx.send(ready);
             });
@@ -327,6 +328,7 @@ impl State {
             agent: sbx_agent,
             cwd: cwd.to_path_buf(),
             warm: config.worktrees.warm.clone(),
+            cache: config.cache.clone(),
             config: config.isolation.sandbox.with_defaults(&config.resources, self.governor.cores),
             exe,
             socket: paths::socket_path(),
@@ -442,6 +444,10 @@ impl State {
 
     pub(super) fn launch_agent(&mut self, launch: AgentLaunch, codex: Option<bool>) -> Result<String, String> {
         let AgentLaunch { id, agent, cwd, resume, extra_args, prompt, chief, runtime, ref_guard, relay, .. } = launch;
+        self.check_disk(&cwd)?;
+        if self.lifecycle_jobs.iter().any(|job| !job.is_finished() && job.touches(None, Some(&cwd))) {
+            return Err("Worktree cleanup is still running; start the session again once it finishes.".into());
+        }
         let sandboxed = match runtime {
             AgentRuntime::Sandbox(sandboxed) => Some(sandboxed),
             AgentRuntime::Bare => None,
@@ -489,7 +495,8 @@ impl State {
             if let Some(jobserver) = &self.jobserver {
                 env.extend(jobserver.env());
             }
-            env.extend(compile_cache_env(&cwd));
+            let cache = self.project_config(&cwd).cache;
+            env.extend(crate::build_cache::agent_env(&cwd, &cache));
             env.extend(crate::governor::toolchain_env(&cwd, &self.config.resources, self.governor.cores));
         }
 
@@ -966,7 +973,10 @@ impl State {
                 let (actions, checks) = (self.action_tx.clone(), self.ref_checks.clone());
                 let id = id.to_string();
                 session.terminal.take();
-                let scope = Scope { sandboxes: vec![name.clone()], worktrees: Some(scratch.iter().cloned().collect()) };
+                let scope = Scope {
+                    sandboxes: vec![name.clone()],
+                    worktrees: Some(scratch.iter().cloned().chain(worktree.iter().cloned()).collect()),
+                };
                 self.lifecycle(scope, move || {
                     let home = paths::atomics_home();
                     let stopped = crate::sandbox::stop(&home, &sbx, &name);
@@ -1014,7 +1024,9 @@ impl State {
             {
                 self.dismissed.insert(cid);
             }
+            session.terminal.take();
             if let Some(worktree) = worktree {
+                self.schedule_cache_cleanup(&worktree);
                 self.clean_after_session(id, &worktree);
             }
         }
@@ -1320,8 +1332,6 @@ fn brief_file(session: &str, text: &str, sandboxed: bool) -> Result<String, Stri
     Ok(format!("Your task brief is in {}. Read it first and follow it exactly.", path.display()))
 }
 
-/// RUSTC_WRAPPER for sccache when it is installed and neither the user nor the project under
-/// `cwd` chose a wrapper (an exported variable would override their cargo config).
 /// Authentication failures must remain actionable even when the provider exits normally.
 pub(super) fn credential_failure(screen: &str) -> Option<String> {
     screen
@@ -1337,22 +1347,6 @@ pub(super) fn credential_failure(screen: &str) -> Option<String> {
                     && (text.contains("error") || text.contains("unauthorized") || text.contains("http"))
         })
         .map(|line| format!("Credential error: {}", line.trim()))
-}
-
-fn compile_cache_env(cwd: &Path) -> Vec<(String, String)> {
-    let user_config = std::env::var_os("CARGO_HOME").map(PathBuf::from).unwrap_or_else(|| paths::home().join(".cargo"));
-    let configs = cwd.ancestors().map(|dir| dir.join(".cargo")).chain([user_config]);
-    let wrapper_set = ["RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER"].iter().any(|var| std::env::var_os(var).is_some())
-        || configs.into_iter().any(|dir| {
-            ["config.toml", "config"]
-                .iter()
-                .any(|name| std::fs::read_to_string(dir.join(name)).is_ok_and(|text| text.contains("rustc-wrapper")))
-        });
-    let sccache = resolve_program("sccache");
-    if wrapper_set || !Path::new(&sccache).is_absolute() {
-        return Vec::new();
-    }
-    vec![("RUSTC_WRAPPER".into(), sccache), ("SCCACHE_IGNORE_SERVER_IO_ERROR".into(), "1".into())]
 }
 
 #[cfg(test)]

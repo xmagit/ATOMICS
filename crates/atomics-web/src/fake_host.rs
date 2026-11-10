@@ -1732,6 +1732,7 @@ pub fn resources() -> atomics_core::projection::ResourceInfo {
         compiler_jobs: Some(6),
         test: SlotInfo { slots: 2, running: 1, waiting: 3 },
         qa: SlotInfo { slots: 1, running: 0, waiting: 1 },
+        disk: vec![],
     }
 }
 

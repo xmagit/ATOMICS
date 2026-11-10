@@ -48,13 +48,19 @@ pub struct Sandboxed {
     /// The sbx agent it runs, such as `claude`.
     pub agent: &'static str,
     pub ssh_agent: bool,
+    pub cache_env: Vec<(String, String)>,
 }
 
 impl Sandboxed {
     /// What the tile's PTY runs: `sbx run` for `agent_args`. Without SSH agent forwarding, sbx
     /// runs without `SSH_AUTH_SOCK`, so there is no agent for it to forward.
     pub fn command(&self, agent_args: &[String]) -> (String, Vec<String>) {
-        let run = isolation::run_args(&self.name, self.agent, agent_args);
+        let mut run = isolation::run_args(&self.name, self.agent, agent_args);
+        let position = run.iter().position(|arg| arg == "--").unwrap_or(run.len());
+        run.splice(
+            position..position,
+            self.cache_env.iter().flat_map(|(key, value)| ["--env".into(), format!("{key}={value}")]),
+        );
         if self.ssh_agent {
             (self.sbx.clone(), run)
         } else {
@@ -76,6 +82,7 @@ pub struct Prepare {
     pub cwd: PathBuf,
     pub config: SandboxConfig,
     pub warm: Vec<String>,
+    pub cache: atomics_core::cache::CacheConfig,
     /// ATOMICS's executable and socket, for the MCP server agents report through.
     pub exe: PathBuf,
     pub socket: PathBuf,
@@ -96,8 +103,30 @@ impl Prepare {
             name: self.name.clone(),
             agent: self.agent,
             ssh_agent: self.config.ssh_agent,
+            cache_env: Vec::new(),
         }
     }
+}
+
+/// Probe the sandbox's PATH, never assume that a tool installed on the host is in its image.
+/// This runs on the preparation worker, for new and resumed sessions alike.
+pub fn cache_env(job: &Prepare) -> Vec<(String, String)> {
+    let root = crate::build_cache::root(&job.cwd);
+    let cargo = root.join("Cargo.toml").is_file();
+    let sccache = if cargo {
+        let probe = isolation::exec_args(&job.name, &job.cwd, "command -v sccache", 5);
+        sbx(&job.sbx, &probe, job.config.ssh_agent, Duration::from_secs(10))
+            .ok()
+            .filter(|path| Path::new(path.trim()).is_absolute())
+            .map(|path| path.trim().to_string())
+    } else {
+        None
+    };
+    let mut env =
+        job.cache
+            .agent_env(cargo, sccache.as_deref(), &crate::build_cache::machine_cache().to_string_lossy(), |_| None);
+    crate::build_cache::resolve_env_paths(&job.home, &root, &job.cache, &mut env);
+    env.into_iter().collect()
 }
 
 /// What sbx said when it was checked.
@@ -199,6 +228,13 @@ fn make(
     granted: Option<&crate::relay::Granted>,
 ) -> Result<()> {
     let ssh = job.config.ssh_agent;
+    let _ = crate::build_cache::link(&job.home, &workspace, &job.cache);
+    let mut shared_mounts = crate::build_cache::stores(&job.home, &workspace, &job.cache);
+    if workspace.join("Cargo.toml").is_file() {
+        let machine_cache = crate::build_cache::machine_cache();
+        std::fs::create_dir_all(&machine_cache)?;
+        shared_mounts.push(machine_cache);
+    }
     if let Some(existing) = existing {
         // A sandbox keeps its mounts for life: one made before a main checkout's .git was mounted
         // read-only whole lets its agent replace .git, config and all.
@@ -224,6 +260,16 @@ fn make(
                 job.name
             );
         }
+        if let Some(missing) =
+            shared_mounts.iter().find(|path| !mounted.contains(&real(path).to_string_lossy().into_owned()))
+        {
+            bail!(
+                "sandbox {} has no shared cache mount for {}; recreate it with `sbx rm {}` and start the agent again",
+                job.name,
+                missing.display(),
+                job.name
+            );
+        }
         // Made before Claude used the relay, before the relay moved to another port, or used by a Claude
         // that no longer has a subscription to relay.
         return relay_rule(job, granted.map(|granted| granted.port));
@@ -243,10 +289,12 @@ fn make(
     }
     let mut read_only: Vec<PathBuf> = job.config.mounts.iter().map(|mount| paths::expand(mount)).collect();
     read_only.extend(job.briefs.iter().cloned());
+    let mut cache_mounts = warm_mounts(&workspace, &job.warm, cfg!(target_os = "linux"));
+    cache_mounts.extend(shared_mounts);
     let spec = Spec {
         name: job.name.clone(),
         agent: job.agent,
-        warm: warm_mounts(&workspace, &job.warm, cfg!(target_os = "linux")),
+        warm: cache_mounts,
         workspace,
         git,
         read_only,
@@ -815,6 +863,17 @@ pub fn in_worktree(home: &Path, program: &str, worktree: &Path) -> Result<Vec<St
         .collect())
 }
 
+/// Guests can hold output files without a host fd. Only a confirmed stopped guest is idle.
+pub fn build_cache_users(program: &str, worktree: &Path) -> Result<Vec<String>> {
+    let worktree = real(worktree);
+    Ok(list(program)?
+        .iter()
+        .map(real_paths)
+        .filter(|sandbox| !sandbox.status.eq_ignore_ascii_case("stopped") && sandbox.mounts_within(&worktree))
+        .map(|sandbox| sandbox.name)
+        .collect())
+}
+
 /// A source build executes checkout files on the host. Ref recovery is insufficient here:
 /// no sandbox of this repository may exist while an update selects and builds its source.
 pub fn refuse_source_update(home: &Path, program: &str, repo: &Path) -> Result<()> {
@@ -1122,6 +1181,7 @@ mod tests {
             cwd: cwd.to_path_buf(),
             config,
             warm: Vec::new(),
+            cache: Default::default(),
             exe: "/Applications/ATOMICS.app/Contents/MacOS/atomics".into(),
             socket: "/run/user/501/atomics/atomics.sock".into(),
             briefs: None,
@@ -1769,6 +1829,7 @@ mod tests {
             name: "atomics-s1".into(),
             agent: "claude",
             ssh_agent: false,
+            cache_env: Vec::new(),
         };
         let args = ["--resume".to_string(), "abc".to_string()];
         assert_eq!(

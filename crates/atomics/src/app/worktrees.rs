@@ -22,9 +22,14 @@ impl State {
             .and_then(|(plan, task)| self.plans.iter().position(|p| p.id == *plan).map(|index| (index, task)))
             .map(|(index, task)| self.plan_worktree_path(index, Some(task), &repo, &branch))
             .unwrap_or_else(|| git::worktree_path(&self.config.worktree_path, &repo, &branch));
+        if let Err(error) = self.check_disk(&path) {
+            let _ = self.worktree_tx.send((branch, Err(error), launch, repo));
+            return;
+        }
         let config = self.project_config(&repo);
         let (tx, base_ref) = (self.worktree_tx.clone(), config.base_ref);
         let warm = config.worktrees.warm;
+        let cache = config.cache;
         let common = match git::common_dir(&repo) {
             Ok(common) => common,
             Err(err) => {
@@ -75,6 +80,9 @@ impl State {
                 let new = git::commit_of(&repo, &branch_ref).is_ok_and(|tip| tip.is_none());
                 git::add_worktree_from(&repo, &path, &branch, start.as_deref(), &fresh.base)
                     .map(|()| {
+                        if let Err(error) = crate::build_cache::link(&paths::atomics_home(), &path, &cache) {
+                            eprintln!("ATOMICS: cache setup: {error:#}");
+                        }
                         let warmed = git::warm_worktree(&repo, &path, &warm);
                         let start = new.then(|| git::commit_of(&repo, &branch_ref).ok().flatten()).flatten();
                         PreparedWorktree { path, identity: None, warmed, start, warning: fresh.warning }

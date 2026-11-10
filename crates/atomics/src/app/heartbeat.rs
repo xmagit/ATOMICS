@@ -137,6 +137,7 @@ impl State {
                 .iter()
                 .any(|p| p.id == f.plan && p.tasks.iter().any(|t| t.id == f.task && t.status == TaskStatus::Blocked))
         });
+        let disk = self.resources.disk.clone();
         let (tx, rx) = self.wake.channel();
         self.heartbeat.pending = Some(rx);
         std::thread::spawn(move || {
@@ -150,6 +151,15 @@ impl State {
                 })
                 .collect();
             let mut findings = heartbeat::check(&plans, &sessions, atomics_core::store::now());
+            for warning in disk {
+                findings.push(Finding {
+                    plan: String::new(),
+                    task: String::new(),
+                    session: None,
+                    kind: heartbeat::Kind::LowDisk,
+                    message: Some(warning.message()),
+                });
+            }
             for finding in gone {
                 if !findings.contains(&finding) {
                     findings.push(finding);
@@ -370,8 +380,13 @@ mod tests {
                 style.animation_time = 0.0;
                 style.interaction.tooltip_delay = 0.0;
             });
-            let finding =
-                Finding { plan: "open".into(), task: "task".into(), session: None, kind: heartbeat::Kind::AgentGone };
+            let finding = Finding {
+                plan: "open".into(),
+                task: "task".into(),
+                session: None,
+                kind: heartbeat::Kind::AgentGone,
+                message: None,
+            };
             let mut time = 0.0;
             for (age, label, findings) in
                 [(0, "♥ now", vec![finding]), (120, "♥ 2m", vec![]), (7200, "♥ 2h", vec![]), (172_800, "♥ 2d", vec![])]

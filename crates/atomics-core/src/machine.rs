@@ -46,6 +46,53 @@ pub struct Disk {
     pub free: u64,
 }
 
+pub const CLEAN_BUILD_CACHES: &str = "Clean build caches of idle worktrees";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildOutput {
+    pub path: String,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiskWarning {
+    pub path: String,
+    pub free: u64,
+    pub blocked: bool,
+    pub largest: Vec<BuildOutput>,
+}
+
+impl DiskWarning {
+    pub fn of(disk: &Disk, resources: &crate::governor::ResourceConfig, largest: Vec<BuildOutput>) -> Option<Self> {
+        let gib = 1024u64.pow(3);
+        let blocked = disk.free < resources.disk_min_gib.saturating_mul(gib);
+        (blocked || disk.free < resources.disk_warn_gib.saturating_mul(gib)).then(|| Self {
+            path: disk.path.clone(),
+            free: disk.free,
+            blocked,
+            largest,
+        })
+    }
+
+    pub fn message(&self) -> String {
+        let largest = if self.largest.is_empty() {
+            "no build-output folders found yet".into()
+        } else {
+            self.largest
+                .iter()
+                .map(|folder| format!("{} ({:.2} GiB)", folder.path, folder.bytes as f64 / 1024f64.powi(3)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        format!(
+            "Low disk space at {}: {:.1} GiB free. {}Largest build-output folders: {largest}. {CLEAN_BUILD_CACHES}.",
+            self.path,
+            self.free as f64 / 1024f64.powi(3),
+            if self.blocked { "New tasks and sessions are paused. " } else { "" }
+        )
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Container {
     pub name: String,
@@ -78,6 +125,23 @@ impl Port {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disk_guard_warns_then_blocks_with_strict_thresholds() {
+        let config = crate::governor::ResourceConfig::default();
+        let disk = |gib| Disk { path: "/worktrees".into(), free: gib * 1024u64.pow(3), total: 100 * 1024u64.pow(3) };
+        assert!(DiskWarning::of(&disk(30), &config, vec![]).is_none());
+        assert!(!DiskWarning::of(&disk(10), &config, vec![]).unwrap().blocked);
+        let warning = DiskWarning::of(
+            &disk(9),
+            &config,
+            vec![BuildOutput { path: "/worktrees/task/target".into(), bytes: 1024u64.pow(3) }],
+        )
+        .unwrap();
+        assert!(warning.blocked);
+        assert!(warning.message().contains("task/target (1.00 GiB)"));
+        assert!(warning.message().contains(CLEAN_BUILD_CACHES));
+    }
 
     #[test]
     fn only_snapshot_listeners_reachable_through_the_loopback_relay_are_previewable() {

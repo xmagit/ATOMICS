@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
+pub(crate) use platform::disk;
+
 pub const INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Default)]

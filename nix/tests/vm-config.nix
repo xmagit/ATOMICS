@@ -13,7 +13,7 @@ let
     in lib.last (lib.splitString " " rule);
   tools = map lib.getName vm.environment.systemPackages;
 in
-assert lib.all (name: builtins.elem name tools) [ "gcc-wrapper" "pkg-config-wrapper" "python3" "coreutils-full" ];
+assert lib.all (name: builtins.elem name tools) [ "gcc-wrapper" "pkg-config-wrapper" "python3" "coreutils-full" "sccache" ];
 assert vm.programs.atomics.settings == { };
 pkgs.runCommand "atomics-vm-config-test" {
   nativeBuildInputs = [ pkgs.python3 pkgs.coreutils-full ];

@@ -216,6 +216,7 @@ in
       (lib.hiPrio cargo)
       (lib.hiPrio rustc)
       rustup
+      sccache
       gcc
       pkg-config
       python3

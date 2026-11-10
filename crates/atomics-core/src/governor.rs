@@ -41,13 +41,23 @@ pub struct ResourceConfig {
     pub qa_slots: Option<usize>,
     /// Niceness agent terminals start at, so ATOMICS and the desktop stay responsive.
     pub agent_nice: i32,
+    pub disk_warn_gib: u64,
+    pub disk_min_gib: u64,
     /// Per-process limits for .NET worktrees (there is no MSBuild jobserver).
     pub dotnet: DotnetConfig,
 }
 
 impl Default for ResourceConfig {
     fn default() -> Self {
-        Self { jobs: None, test_slots: None, qa_slots: None, agent_nice: 10, dotnet: DotnetConfig::default() }
+        Self {
+            jobs: None,
+            test_slots: None,
+            qa_slots: None,
+            agent_nice: 10,
+            disk_warn_gib: 30,
+            disk_min_gib: 10,
+            dotnet: DotnetConfig::default(),
+        }
     }
 }
 

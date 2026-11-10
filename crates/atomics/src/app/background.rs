@@ -26,6 +26,7 @@ impl State {
         let mut machine_paths = self.open_projects.clone();
         machine_paths.push(paths::atomics_home());
         changed |= self.machine.tick(machine_paths, machine_roots, self.wake.clone());
+        changed |= self.poll_build_caches();
         changed |= self.poll_sandbox_check();
         changed |= self.poll_programs_check();
         changed |= self.poll_setup_look_again();
@@ -107,7 +108,7 @@ impl State {
             if !self.sessions.iter().any(|s| s.id == launch.id) {
                 // Closed while its sandbox was made: leave the sandbox stopped for reuse or cleanup,
                 // or remove a scratch session's, which nothing resumes. Its placeholder goes either way.
-                if let Ok((_, Some(granted), _)) = &result {
+                if let Ok((_, Some(granted), _, _)) = &result {
                     self.relay.revoke(granted);
                 }
                 if let (Ok(_), AgentRuntime::Sandbox(sandboxed)) = (&result, &launch.runtime) {
@@ -138,7 +139,11 @@ impl State {
                 }
                 result => result.map_err(String::from),
             };
-            let launched = result.and_then(|(guard, granted, needed)| {
+            let launched = result.and_then(|(guard, granted, needed, cache_env)| {
+                let mut launch = launch;
+                if let AgentRuntime::Sandbox(sandbox) = &mut launch.runtime {
+                    sandbox.cache_env = cache_env;
+                }
                 let (guard, alerts) = guard.unzip();
                 if let Some(alerts) = alerts.filter(|alerts| !alerts.is_empty()) {
                     self.ref_alert(&id, alerts.join("\n"));

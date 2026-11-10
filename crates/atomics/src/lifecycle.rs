@@ -161,23 +161,25 @@ pub fn save_deferred(home: &Path, deferred: &[Deferred]) -> Result<()> {
 }
 
 /// The processes of this user that use `dir`: their working directory is in it, or they hold a file
-/// open under it. Each as `<pid> <name>`; never this process. Empty when none do, or when this
-/// machine cannot tell (no `/proc`, no `lsof`).
+/// open under it. Each as `<pid> <name>`. Includes this process and mapped executables/libraries.
+/// An unavailable inspector is reported as a user, so destructive cleanup fails closed.
 pub fn processes_in(dir: &Path) -> Vec<String> {
     let dir = real(dir);
     let inside = |path: &Path| path.starts_with(&dir);
-    let me = std::process::id();
     let mut found = Vec::new();
     if let Ok(entries) = std::fs::read_dir("/proc") {
         for entry in entries.flatten() {
             let Some(pid) = entry.file_name().to_str().and_then(|name| name.parse::<u32>().ok()) else { continue };
-            if pid == me {
-                continue;
-            }
             let base = entry.path();
             let uses = std::fs::read_link(base.join("cwd")).is_ok_and(|cwd| inside(&cwd))
+                || std::fs::read_link(base.join("exe")).is_ok_and(|exe| inside(&exe))
                 || std::fs::read_dir(base.join("fd"))
-                    .is_ok_and(|fds| fds.flatten().any(|fd| std::fs::read_link(fd.path()).is_ok_and(|f| inside(&f))));
+                    .is_ok_and(|fds| fds.flatten().any(|fd| std::fs::read_link(fd.path()).is_ok_and(|f| inside(&f))))
+                || std::fs::read_to_string(base.join("maps")).is_ok_and(|maps| {
+                    maps.lines()
+                        .filter_map(|line| line.find('/').map(|at| &line[at..]))
+                        .any(|path| inside(Path::new(path)))
+                });
             if uses {
                 let name = std::fs::read_to_string(base.join("comm")).unwrap_or_default();
                 found.push(format!("{pid} {}", name.trim()));
@@ -193,14 +195,17 @@ pub fn processes_in(dir: &Path) -> Vec<String> {
         .stderr(std::process::Stdio::null())
         .output()
     else {
-        return found;
+        return vec!["process-use check unavailable".into()];
     };
+    if !output.status.success() {
+        return vec!["process-use check failed".into()];
+    }
     let (mut pid, mut name, mut counted) = (0u32, String::new(), false);
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         match line.split_at_checked(1) {
             Some(("p", value)) => (pid, counted) = (value.parse().unwrap_or(0), false),
             Some(("c", value)) => name = value.to_string(),
-            Some(("n", value)) if !counted && pid != 0 && pid != me && inside(Path::new(value)) => {
+            Some(("n", value)) if !counted && pid != 0 && inside(Path::new(value)) => {
                 counted = true;
                 found.push(format!("{pid} {name}"));
             }
@@ -794,6 +799,7 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             config: Default::default(),
             warm: Vec::new(),
+            cache: Default::default(),
             pins: a.join("git-pins"),
             exe: "/atomics".into(),
             socket: dir.path().join("unused.sock"),

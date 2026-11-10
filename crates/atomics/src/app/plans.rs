@@ -118,6 +118,15 @@ impl State {
                     close.push(session.id.clone());
                 }
             }
+            let outputs: Vec<_> = self.plans[index]
+                .tasks
+                .iter()
+                .filter(|task| task.finished_at.is_some())
+                .filter_map(|task| task.worktree.clone())
+                .collect();
+            for path in outputs {
+                self.schedule_cache_cleanup(&path);
+            }
             for id in close {
                 self.remember(&id);
                 if let Some(cid) = self.sessions.iter().find(|s| s.id == id).and_then(|s| s.claude_id.clone()) {
@@ -1005,6 +1014,9 @@ impl State {
             let Some(repo) = self.task_repo(index, &task) else {
                 return Err("No project is open to branch from; give the task a repo.".into());
             };
+            let probe =
+                self.plan_worktree_path(index, Some(&task.id), &repo, task.branch.as_deref().unwrap_or("disk-probe"));
+            self.check_disk(&probe)?;
             let branch = task
                 .branch
                 .clone()
@@ -1301,6 +1313,7 @@ impl State {
                         task: task.id.clone(),
                         session: task.session.clone(),
                         kind: atomics_core::heartbeat::Kind::AgentGone,
+                        message: None,
                     });
                     task.set_status(TaskStatus::Blocked);
                     task.notes.push("the agent exited before reporting".into());

@@ -25,6 +25,7 @@ impl WakeConditions {
 
 fn wake_message(events: usize, findings: &[Finding], cleanup: &[String]) -> String {
     let kinds: Vec<_> = [
+        (Kind::LowDisk, "low_disk"),
         (Kind::AgentGone, "agent_gone"),
         (Kind::Unreported, "unreported"),
         (Kind::Approval, "approval"),
@@ -39,6 +40,11 @@ fn wake_message(events: usize, findings: &[Finding], cleanup: &[String]) -> Stri
         "ATOMICS wake: {events} new events, {} heartbeat findings ({kinds}). Call atomics_wait and act; if nothing changed, post one short line.",
         findings.len()
     );
+    for finding in findings.iter().filter(|finding| finding.kind == Kind::LowDisk) {
+        if let Some(detail) = &finding.message {
+            message.push_str(&format!("\n{detail} Use atomics_list and atomics_clean_build_caches."));
+        }
+    }
     if !cleanup.is_empty() {
         let listed = cleanup.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
         let more = if cleanup.len() > 5 { format!(" (+{} more)", cleanup.len() - 5) } else { String::new() };
@@ -190,6 +196,7 @@ impl State {
 /// Checks with atomics_exec run in an agent's sandbox, which reaches no more than its agent does.
 pub(super) const CHIEF_ALLOWED_TOOLS: &[&str] = &[
     "mcp__atomics__atomics_list",
+    "mcp__atomics__atomics_clean_build_caches",
     "mcp__atomics__atomics_trace_get",
     "mcp__atomics__atomics_wait",
     "mcp__atomics__atomics_restart",
@@ -348,7 +355,7 @@ mod tests {
             Kind::HeldMessages,
         ]
         .into_iter()
-        .map(|kind| Finding { plan: "plan".into(), task: "task".into(), session: None, kind })
+        .map(|kind| Finding { plan: "plan".into(), task: "task".into(), session: None, kind, message: None })
         .collect();
         assert_eq!(
             wake_message(3, &findings, &[]),
