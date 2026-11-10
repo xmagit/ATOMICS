@@ -142,8 +142,12 @@ Repository `cache.env` accepts these variables only:
 
 `cache.outputs` accepts relative folders whose final component is `target`, `bin`, `obj`, `build`,
 `dist`, `.next`, or `out`. No globs are expanded. These names only make a folder eligible: cleanup still
-refuses tracked files, non-ignored untracked work, case-mismatched paths, symlinks, shared caches,
-the main checkout and worktrees used by processes.
+refuses tracked files (including index names with different case), non-ignored untracked work,
+case-mismatched or non-ASCII output paths, nested repositories/worktrees, mount/device boundaries, symlinks, shared caches
+and the main checkout. Cleanup disables global `core.excludesFile` rules and refuses any output containing
+a `.gitignore`, so an untracked ignore file cannot hide new work. Repository ignore rules still determine
+which remaining files are disposable. Worktrees with live sessions are protected; exiting processes get
+bounded automatic retries, while manual cleanup skips busy worktrees and names them in the toast.
 Your own config can name other relative output folders or shared folders and any environment variable;
 known unsafe sharing choices produce Settings and doctor warnings.
 
@@ -156,6 +160,11 @@ env = { npm_config_cache = ".npm/_cacache", CARGO_PROFILE_TEST_DEBUG = "line-tab
 
 Host and sandbox shared stores occupy separate namespaces. Repository configuration cannot set `SCCACHE_DIR`;
 ATOMICS chooses an isolated compiler store and server. Stores containing tracked files are refused.
+All sandboxes of the same repository share its package/download store and can affect one another's cached
+packages; this is one repository trust domain. Each sandbox's compiler store is separate. Legacy or
+foreign-domain cache links are removed on the next worktree use without deleting or copying store data.
+Cache setup failures skip the affected folder and its environment path, while other folders and the
+session continue.
 
 Repository cache arrays replace the corresponding user arrays; `cache.env` supplies variables only when the
 user has not explicitly set the same key.

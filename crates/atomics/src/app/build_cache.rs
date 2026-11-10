@@ -10,12 +10,45 @@ pub(super) struct Caches {
     checked: Option<Instant>,
     reading: Option<Receiver<Sample>>,
     largest: Vec<BuildOutput>,
-    cleanup: HashMap<PathBuf, CacheConfig>,
+    cleanup: HashMap<PathBuf, PendingCleanup>,
     cleaning: bool,
     cleanup_at: Option<Instant>,
     cleaned: HashSet<PathBuf>,
     inventory_at: Option<Instant>,
     inventory_after_cleanup: bool,
+    manual_skipped: Vec<PathBuf>,
+}
+
+#[derive(Clone)]
+struct PendingCleanup {
+    attempts: usize,
+    due: Instant,
+    manual: bool,
+}
+
+impl PendingCleanup {
+    fn new(manual: bool) -> Self {
+        Self { attempts: 0, due: Instant::now(), manual }
+    }
+
+    fn after_in_use(&self) -> Option<Self> {
+        // Five attempts total, over roughly two minutes. A manual batch never
+        // queues work for later: it promises to clean only currently idle worktrees.
+        let delays = [5, 15, 30, 60];
+        let delay = (!self.manual).then(|| delays.get(self.attempts)).flatten()?;
+        Some(Self { attempts: self.attempts + 1, due: Instant::now() + Duration::from_secs(*delay), manual: false })
+    }
+}
+
+fn cleanup_notice(skipped: &[PathBuf]) -> String {
+    if skipped.is_empty() {
+        "Cleaning build caches of idle worktrees…".into()
+    } else {
+        format!(
+            "Cleaning idle worktrees. Skipped active or protected worktrees: {}. Close their sessions before retrying.",
+            skipped.iter().map(|path| paths::display(path)).collect::<Vec<_>>().join(", ")
+        )
+    }
 }
 
 fn outputs_for_device(
@@ -64,10 +97,19 @@ impl State {
         Ok(())
     }
 
-    pub(super) fn session_disk_guard(&self, path: &Path, chief: bool, resume: bool) -> Result<(), String> {
+    pub(super) fn session_disk_guard(&self, path: &Path, chief: bool, resume: bool, shell: bool) -> Result<(), String> {
         match self.check_disk(path) {
-            Err(warning) if chief || resume => {
-                eprintln!("ATOMICS: {warning} Continuing {}.", if chief { "the chief" } else { "the resumed session" });
+            Err(warning) if chief || resume || shell => {
+                eprintln!(
+                    "ATOMICS: {warning} Continuing {}.",
+                    if shell {
+                        "the shell"
+                    } else if chief {
+                        "the chief"
+                    } else {
+                        "the resumed session"
+                    }
+                );
                 Ok(())
             }
             result => result,
@@ -87,7 +129,7 @@ impl State {
         let path = crate::build_cache::root(path);
         let path = path.canonicalize().unwrap_or(path);
         if !self.build_caches.cleaned.contains(&path) {
-            self.build_caches.cleanup.insert(path.clone(), self.project_config(&path).cache);
+            self.build_caches.cleanup.entry(path).or_insert_with(|| PendingCleanup::new(false));
         }
     }
 
@@ -99,6 +141,7 @@ impl State {
                     || !matches!(s.status, AgentStatus::Idle | AgentStatus::Done | AgentStatus::Exited)
                     || s.screen_busy
                     || s.pending.is_some()
+                    || s.terminal.as_ref().is_some_and(|terminal| !terminal.exited())
             })
             .map(|session| {
                 let root = session.root();
@@ -111,14 +154,20 @@ impl State {
     pub(super) fn clean_build_caches(&mut self) {
         let protected = self.cache_protected();
         // Busy or protected entries are discarded by this batch, never retried later.
-        for (path, config) in self.cache_worktrees() {
-            if !protected_worktree(&protected, &path) {
-                self.build_caches.cleanup.insert(path, config);
+        let mut skipped = Vec::new();
+        for (path, _) in self.cache_worktrees() {
+            if protected_worktree(&protected, &path) {
+                skipped.push(path);
+            } else {
+                self.build_caches.cleanup.entry(path).or_insert_with(|| PendingCleanup::new(true));
             }
         }
-        self.build_caches.inventory_after_cleanup = true;
+        skipped.sort();
+        let queued = self.build_caches.cleanup.values().any(|pending| pending.manual);
+        self.build_caches.manual_skipped = if queued { skipped.clone() } else { Vec::new() };
+        self.build_caches.inventory_after_cleanup = queued;
         self.poll_build_caches();
-        self.toast("Cleaning build caches of idle worktrees…");
+        self.toast(cleanup_notice(&skipped));
     }
 
     pub(super) fn poll_build_caches(&mut self) -> bool {
@@ -192,39 +241,62 @@ impl State {
             });
         }
         if !self.build_caches.cleaning
-            && !self.build_caches.cleanup.is_empty()
+            && self.build_caches.cleanup.values().any(|pending| pending.due <= Instant::now())
             && self.build_caches.cleanup_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(10))
         {
             self.build_caches.cleanup_at = Some(Instant::now());
-            // A user may have changed output policy while an in-use folder waited for retry.
-            let targets: HashMap<_, _> = std::mem::take(&mut self.build_caches.cleanup)
-                .into_keys()
-                .map(|path| {
-                    let cache = self.project_config(&path).cache;
-                    (path, cache)
-                })
+            // Refresh policy on every attempt. Future retries remain cancellable
+            // by a session start and never hold a lifecycle scope while waiting.
+            let now = Instant::now();
+            let due: Vec<_> = self
+                .build_caches
+                .cleanup
+                .iter()
+                .filter(|(_, pending)| pending.due <= now)
+                .map(|(path, _)| path.clone())
                 .collect();
             let protected = self.cache_protected();
-            let targets: HashMap<_, _> =
-                targets.into_iter().filter(|(path, _)| !protected_worktree(&protected, path)).collect();
+            let mut targets = Vec::new();
+            let mut skipped = std::mem::take(&mut self.build_caches.manual_skipped);
+            for path in due {
+                let pending = self.build_caches.cleanup.remove(&path).unwrap();
+                if protected_worktree(&protected, &path) {
+                    if pending.manual {
+                        skipped.push(path);
+                    }
+                    continue;
+                }
+                let cache = self.project_config(&path).cache;
+                targets.push((path, cache, pending));
+            }
             if targets.is_empty() {
                 self.build_caches.inventory_after_cleanup = false;
+                if !skipped.is_empty() {
+                    self.toast(cleanup_notice(&skipped));
+                }
                 return changed;
             }
+            let manual = targets.iter().any(|(_, _, pending)| pending.manual);
             let refresh_inventory = std::mem::take(&mut self.build_caches.inventory_after_cleanup);
             self.build_caches.cleaning = true;
             let jobs = self.running_lifecycle();
             let sbx = resolve_program(&self.sbx);
             let actions = self.action_tx.clone();
             self.lifecycle(
-                Scope { sandboxes: vec![], worktrees: Some(targets.keys().cloned().collect()) },
+                Scope { sandboxes: vec![], worktrees: Some(targets.iter().map(|(path, _, _)| path.clone()).collect()) },
                 move || {
                     let mut cleaned = HashSet::new();
-                    for (path, config) in targets {
+                    let mut retries = HashMap::new();
+                    for (path, config, pending) in targets {
                         crate::lifecycle::wait_for(&jobs, None, Some(&path));
                         if crate::sandbox::installed(&sbx)
                             && !crate::sandbox::build_cache_users(&sbx, &path).is_ok_and(|users| users.is_empty())
                         {
+                            if pending.manual {
+                                skipped.push(path);
+                            } else if let Some(retry) = pending.after_in_use() {
+                                retries.insert(path, retry);
+                            }
                             continue;
                         }
                         match crate::build_cache::clean(&path, &config) {
@@ -236,12 +308,32 @@ impl State {
                             }
                             Err(error) => {
                                 eprintln!("ATOMICS: kept build output in {}: {error:#}", path.display());
+                                if error.to_string().contains("in use") {
+                                    if pending.manual {
+                                        skipped.push(path);
+                                    } else if let Some(retry) = pending.after_in_use() {
+                                        retries.insert(path, retry);
+                                    }
+                                }
                             }
                         }
                     }
                     let _ = actions.send(Box::new(move |state| {
                         state.build_caches.cleaning = false;
                         state.build_caches.cleaned.extend(cleaned);
+                        // A newly started session cancels even a retry returned by
+                        // a worker that was finishing concurrently with that start.
+                        let protected = state.cache_protected();
+                        for (path, retry) in retries {
+                            if !protected_worktree(&protected, &path) {
+                                state.build_caches.cleanup.entry(path).or_insert(retry);
+                            }
+                        }
+                        if manual && !skipped.is_empty() {
+                            skipped.sort();
+                            skipped.dedup();
+                            state.toast(cleanup_notice(&skipped));
+                        }
                         // Automatic cleanup refreshes free space, keeping the 120 s tree-walk
                         // limit. Only a manual request asks for a fresh folder inventory.
                         state.build_caches.checked = None;
@@ -307,6 +399,184 @@ mod tests {
                 app.runtime.close(&id);
             },
         );
+    }
+
+    #[test]
+    fn foreign_or_legacy_cache_links_never_refuse_a_bare_resume_and_other_folders_still_work() {
+        with_app(
+            "app::build_cache::tests::foreign_or_legacy_cache_links_never_refuse_a_bare_resume_and_other_folders_still_work",
+            |app, _| {
+                for namespace in ["repos", "sandbox-repos-v2"] {
+                    let (dir, repo) = repository();
+                    std::fs::write(repo.join("Cargo.toml"), "[workspace]\n").unwrap();
+                    git::git(&repo, &["add", "Cargo.toml"]).unwrap();
+                    git::git(&repo, &["commit", "-qm", "workspace"]).unwrap();
+                    let work = dir.path().join("task");
+                    git::add_worktree(&repo, &work, "task", "main").unwrap();
+                    let store = paths::atomics_home().join("build-caches").join(namespace).join("old/packages");
+                    std::fs::create_dir_all(&store).unwrap();
+                    std::fs::write(store.join("package"), "keep").unwrap();
+                    std::fs::create_dir_all(work.join(".nuget")).unwrap();
+                    std::os::unix::fs::symlink(&store, work.join(".nuget/packages")).unwrap();
+                    app.runtime.config.isolation.mode = atomics_core::isolation::IsolationMode::Bare;
+                    app.runtime.config.cache.shared = vec![".nuget/packages".into(), ".cache/pip".into()];
+                    app.runtime.config.cache.env.insert("NUGET_PACKAGES".into(), ".nuget/packages".into());
+                    app.runtime.config.cache.env.insert("PIP_CACHE_DIR".into(), ".cache/pip".into());
+                    app.runtime.config.cache.env.insert("RUSTC_WRAPPER".into(), String::new());
+                    let output = dir.path().join("env");
+                    let agent = format!("cache-{namespace}");
+                    app.runtime.config.agents.push(atomics_core::config::AgentConfig {
+                        name: agent.clone(),
+                        command: vec![
+                            "sh".into(),
+                            "-c".into(),
+                            format!(
+                                "env > '{}.tmp'; mv '{}.tmp' '{}'; sleep 60",
+                                output.display(),
+                                output.display(),
+                                output.display()
+                            ),
+                        ],
+                        kind: AgentKind::Generic,
+                        busy_text: None,
+                        isolation: None,
+                    });
+                    let id =
+                        app.runtime.start(&agent, work.clone(), Some("conversation".into()), vec![], None).unwrap();
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while !output.exists() {
+                        assert!(Instant::now() < deadline);
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    let env = std::fs::read_to_string(&output).unwrap();
+                    assert!(!env.lines().any(|line| line.starts_with("NUGET_PACKAGES=")));
+                    assert!(env.lines().any(|line| line.starts_with("PIP_CACHE_DIR=")));
+                    assert!(work.join(".cache/pip").symlink_metadata().unwrap().file_type().is_symlink());
+                    assert!(work.join(".nuget/packages").symlink_metadata().is_err());
+                    assert_eq!(std::fs::read_to_string(store.join("package")).unwrap(), "keep");
+                    app.runtime.close_for_resume(&id);
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn cleanup_retries_an_exiting_real_child_and_then_reclaims_output() {
+        with_app(
+            "app::build_cache::tests::cleanup_retries_an_exiting_real_child_and_then_reclaims_output",
+            |app, _| {
+                use std::io::Write;
+                use std::process::{Command, Stdio};
+                let (dir, repo) = repository();
+                std::fs::write(repo.join("Cargo.toml"), "[workspace]\n").unwrap();
+                std::fs::write(repo.join(".gitignore"), "target/\n").unwrap();
+                git::git(&repo, &["add", "."]).unwrap();
+                git::git(&repo, &["commit", "-qm", "workspace"]).unwrap();
+                let work = dir.path().join("task");
+                git::add_worktree(&repo, &work, "task", "main").unwrap();
+                std::fs::create_dir(work.join("target")).unwrap();
+                std::fs::write(work.join("target/artifact"), "compiled").unwrap();
+                let mut child = Command::new(crate::test_support::program("sh"))
+                    .args(["-c", "read finish"])
+                    .current_dir(&work)
+                    .stdin(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                app.runtime.sessions = vec![session("closed", AgentKind::Generic, AgentStatus::Done, &work)];
+                app.runtime.close("closed");
+                app.runtime.poll_build_caches();
+                app.runtime.finish_lifecycle_jobs();
+                app.runtime.drain_actions();
+                let key = work.canonicalize().unwrap();
+                assert_eq!(app.runtime.build_caches.cleanup[&key].attempts, 1);
+                assert!(work.join("target/artifact").is_file());
+                app.runtime.repos = vec![repo];
+                app.runtime.clean_build_caches();
+                assert!(
+                    !app.runtime.build_caches.cleanup[&key].manual,
+                    "a manual request must not cancel an existing automatic retry"
+                );
+                assert_eq!(app.runtime.build_caches.cleanup[&key].attempts, 1);
+                child.stdin.take().unwrap().write_all(b"done\n").unwrap();
+                assert!(child.wait().unwrap().success());
+                app.runtime.build_caches.cleanup.get_mut(&key).unwrap().due = Instant::now();
+                app.runtime.build_caches.cleanup_at = None;
+                app.runtime.poll_build_caches();
+                app.runtime.finish_lifecycle_jobs();
+                app.runtime.drain_actions();
+                assert!(!work.join("target").exists());
+                assert!(app.runtime.build_caches.cleanup.is_empty());
+                assert!(app.runtime.build_caches.cleaned.contains(&key));
+            },
+        );
+    }
+
+    #[test]
+    fn cleanup_backoff_is_bounded_and_manual_batches_never_retry_busy_worktrees() {
+        let start = Instant::now();
+        let mut pending = PendingCleanup::new(false);
+        for (index, delay) in [5, 15, 30, 60].into_iter().enumerate() {
+            pending = pending.after_in_use().unwrap();
+            assert_eq!(pending.attempts, index + 1);
+            assert!(pending.due >= start + Duration::from_secs(delay));
+        }
+        assert!(pending.after_in_use().is_none());
+        assert!(PendingCleanup::new(true).after_in_use().is_none());
+    }
+
+    #[test]
+    fn low_disk_allows_shells_and_cleanup_names_protected_worktrees() {
+        with_app("app::build_cache::tests::low_disk_allows_shells_and_cleanup_names_protected_worktrees", |app, _| {
+            let (dir, repo) = repository();
+            let work = dir.path().join("task");
+            git::add_worktree(&repo, &work, "task", "main").unwrap();
+            app.runtime.config.resources.disk_min_gib = u64::MAX;
+            app.runtime.config.isolation.mode = atomics_core::isolation::IsolationMode::Bare;
+            let id = app.runtime.start("shell", work.clone(), None, vec![], None).unwrap();
+            assert!(app.runtime.sessions[app.runtime.find(&id).unwrap()].terminal.is_some());
+            app.runtime.repos = vec![repo];
+            app.runtime.clean_build_caches();
+            assert!(app.runtime.build_caches.cleanup.is_empty());
+            let notice = cleanup_notice(&[work]);
+            assert!(notice.contains("task"));
+            assert!(notice.contains("Close their sessions"));
+            app.runtime.close_for_resume(&id);
+        });
+    }
+
+    #[test]
+    fn sandbox_preparation_in_a_subfolder_waits_on_the_worktree_root() {
+        with_app("app::build_cache::tests::sandbox_preparation_in_a_subfolder_waits_on_the_worktree_root", |app, _| {
+            let (dir, repo) = repository();
+            let work = dir.path().join("task");
+            git::add_worktree(&repo, &work, "task", "main").unwrap();
+            let subdir = work.join("subdir");
+            std::fs::create_dir(&subdir).unwrap();
+            let bin = crate::test_support::tempdir().unwrap();
+            app.runtime.sbx = crate::sandbox::fake::install(bin.path()).to_string_lossy().into_owned();
+            std::fs::write(bin.path().join("run-waits"), "").unwrap();
+            app.runtime.config.isolation.mode = atomics_core::isolation::IsolationMode::Sandbox;
+            let (release, wait) = channel();
+            app.runtime.lifecycle(Scope { sandboxes: vec![], worktrees: Some(vec![work.clone()]) }, move || {
+                let _ = wait.recv_timeout(Duration::from_secs(10));
+            });
+            let id = app.runtime.start("codex", subdir, None, vec![], None).unwrap();
+            std::thread::sleep(Duration::from_millis(500));
+            assert!(crate::sandbox::fake::calls_to(bin.path(), &["create"]).is_empty());
+            assert!(crate::sandbox::fake::calls_to(bin.path(), &["exec"]).is_empty());
+            release.send(()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                app.runtime.runtime_tick();
+                if app.runtime.find(&id).is_some_and(|i| app.runtime.sessions[i].terminal.is_some()) {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "sandbox did not start after cleanup ended");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(!crate::sandbox::fake::calls_to(bin.path(), &["create"]).is_empty());
+            app.runtime.close_for_resume(&id);
+        });
     }
 
     #[test]
@@ -578,8 +848,15 @@ mod tests {
                 let (_dir, repo) = repository();
                 app.runtime.config.resources.disk_min_gib = u64::MAX;
                 app.runtime.config.resources.disk_warn_gib = u64::MAX;
-                let error = app.runtime.start("shell", repo.clone(), None, vec![], None).unwrap_err();
-                assert!(error.contains("New tasks and sessions are paused"));
+                app.runtime.config.agents.push(atomics_core::config::AgentConfig {
+                    name: "disk-probe".into(),
+                    command: vec!["sh".into()],
+                    kind: AgentKind::Generic,
+                    busy_text: None,
+                    isolation: None,
+                });
+                let error = app.runtime.start("disk-probe", repo.clone(), None, vec![], None).unwrap_err();
+                assert!(error.contains("New tasks and agent sessions are paused"));
                 assert!(error.contains(atomics_core::machine::CLEAN_BUILD_CACHES));
                 assert!(app.runtime.sessions.is_empty());
                 app.runtime.plans = vec![Plan {

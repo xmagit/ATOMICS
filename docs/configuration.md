@@ -90,10 +90,18 @@ disk_min_gib = 10
 `shared` links absent folders in new linked worktrees to a store under
 `$ATOMICS_HOME/build-caches/host-repos-v2/<repository-id>/` for bare agents, or
 `build-caches/sandbox-repos-v2/<repository-id>/` for sandboxed agents. The stores are separate trust domains;
-links to another domain are never reused. Older stores are not migrated into the host namespace.
-Stores containing tracked files are refused. Existing folders are left alone, and the main checkout is
+links to another domain are never reused. Links into legacy or forbidden stores are removed on the
+next worktree use, including links left after cache configuration was removed. Store contents are kept;
+no cached data is migrated. Each failed or removed cache folder is skipped independently, and its cache
+environment path is dropped for that launch. Cache setup errors never refuse a session.
+Stores containing tracked files are refused. Checkout-relative cache paths with non-ASCII components
+are skipped because Git cannot reliably verify their index case aliases; Unicode checkout roots and
+cache directories outside repositories remain supported. Existing real folders are left alone, and the main checkout is
 never linked. Existing sandboxes retain their mounts and start without cache environment settings for
 missing mounts, with a hint to recreate them. Relative cache environment paths resolve from the worktree root.
+All sandboxes of one repository share its `sandbox-repos-v2` package/download stores and can modify each
+other's cached packages: they form one repository trust domain. Different repositories and bare host
+builds use separate stores. Compiler stores under `sandboxes-v2` remain private to each sandbox.
 
 The CoW `[worktrees] warm` setting still makes independent copies. A `target` warmed from a main-checkout
 build with a different Cargo profile will rebuild under the lean agent profile. Use matching profiles when
@@ -108,23 +116,31 @@ configuring sccache's incremental policy. [sccache's Rust documentation](https:/
 describes its cacheable compilation modes; metadata-only `cargo check` is not the measurement of reuse.
 
 `outputs` adds disposable output folders. Cargo worktrees automatically include `target`.
-Your own configuration may name any relative output folder. Files must be ignored by Git to be disposable;
-new non-ignored work is always preserved. Repository configuration has a stricter allowlist, described in
+Your own configuration may name any relative output folder. Files must be ignored by checkout-local Git rules
+to be disposable; the cleanup status check disables the user's global `core.excludesFile`. A `.gitignore`
+inside an output prevents cleanup, including an untracked `.gitignore` that hides itself with `*`.
+Review checkout-local `.gitignore` and `.git/info/exclude` rules carefully: they still declare which
+untracked files are disposable. Repository configuration has a stricter allowlist, described in
 [Repository workflows](repo-workflow.md#shared-caches-and-disposable-output).
 
 Acceptance plus integration, and session closure, schedule output cleanup even when the worktree is kept.
 Only trusted linked worktrees are eligible. Cleanup refuses tracked files, non-ignored untracked files,
-case-mismatched paths, links and paths outside the worktree, shared stores, the main checkout, and worktrees with a process working or holding files there.
-Cleanup is scheduled once when a task finishes or a session closes. Busy or protected worktrees are skipped;
-closing the session or requesting cleanup again supplies a new trigger. Resume and restart preserve output.
-Live sandbox sessions are protected as well.
+case-mismatched or non-ASCII output paths (Git cannot reliably verify Unicode index case aliases),
+nested repositories and registered worktrees, mount/device boundaries, links outside
+the worktree, shared stores and the main checkout. Removal uses directory descriptors with `O_NOFOLLOW`
+and never traverses symlinks or crosses filesystem devices (or Linux mount identities).
+Cleanup is scheduled once when a task finishes or a session closes. Automatic cleanup retries an exiting
+process up to five times, with waits of 5, 15, 30 and 60 seconds, then stops. Starting a session cancels pending
+retries. Live sessions are protected. A manual cleanup skips busy/protected worktrees without queuing retries;
+the toast names skipped worktrees and asks you to close their sessions before retrying.
+Resume and restart preserve output.
 
 Disk sampling continues without an open Machine window. Below `disk_warn_gib`, the board and Machine
 view show a warning with the largest output folders, the load button uses the warning colour, and the
 chief receives a `low_disk` heartbeat finding. Tree-size inventory runs on a worker at most every 120 seconds
 or after requested cleanup; dispatch checks use the cached inventory. Below `disk_min_gib`, new task dispatches,
-new worktrees and new non-chief sessions are refused after checking their destination filesystem.
-The chief and resumed sessions continue with a warning, so cleanup and restart recovery remain available.
+new worktrees and new non-chief agent sessions are refused after checking their destination filesystem.
+The chief, Shell sessions and resumed sessions continue with a warning, so cleanup and restart recovery remain available.
 The board, Machine view and
 `atomics_list` offer **Clean build caches of idle worktrees** (`atomics_clean_build_caches` for the chief).
 The action applies the same cleanup safeguards; it keeps worktrees and shared stores.

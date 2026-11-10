@@ -17,6 +17,12 @@ fn store(app: &Desktop<'_>) -> CredentialStore {
     CredentialStore::new(app.runtime.relay.keychain().clone())
 }
 
+fn disconnected(app: &Desktop<'_>) -> bool {
+    // A poll may clear the viewer after the keychain deletion but before the
+    // disconnect result arrives. That result also makes the revoke action ready.
+    app.runtime.github.viewer("github.com").is_none() && app.runtime.github.revoke.as_deref() == Some("github.com")
+}
+
 /// Points the app at `fake` and lists `octo/widgets`.
 fn connect_to(app: &mut Desktop<'_>, fake: &FakeGithub, dir: &Path) {
     app.runtime.github.endpoints = Endpoints { base: Some(fake.url.clone()), gh: Some(fake::gh(dir, None)), az: None };
@@ -411,7 +417,7 @@ fn github_connect_uses_gh_after_one_confirmation() {
         // Disconnect deletes the stored token and links to GitHub's page for a full revoke.
         click(app, ctx, "GitHub · alice");
         click(app, ctx, "Disconnect");
-        settle(app, "the disconnect", |app| app.runtime.github.viewer("github.com").is_none());
+        settle(app, "the disconnect", disconnected);
         assert!(store(app).github_app_token("github.com").unwrap().is_none());
         click(app, ctx, "Revoke on GitHub");
         settle(app, "the browser", |_| !opened(dir.path()).is_empty());
@@ -466,7 +472,7 @@ fn github_connect_falls_back_to_the_github_app_device_flow() {
         // An [github] client_id for an OAuth app is sent the scopes it needs.
         app.runtime.config.github.client_id = "Ov23liOauthApp".into();
         app.runtime.github_disconnect("github.com".into());
-        settle(app, "the disconnect", |app| app.runtime.github.viewer("github.com").is_none());
+        settle(app, "the disconnect", disconnected);
         app.runtime.github_connect();
         settle(app, "the code", |app| matches!(app.runtime.github.connect, Connect::Device { .. }));
         let request = fake.seen().into_iter().rev().find(|seen| seen.path == "/login/device/code").unwrap();

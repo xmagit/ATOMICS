@@ -16,7 +16,7 @@ fn script(path: &Path, text: &str) {
 /// want it from a terminal.
 #[test]
 fn install_and_update_ask_nothing_and_replace_the_program_atomically() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_support::tempdir().unwrap();
     let home = dir.path().join("fresh home");
     let bin = dir.path().join("tools");
     let target = dir.path().join("target");
@@ -72,7 +72,7 @@ fn install_and_update_ask_nothing_and_replace_the_program_atomically() {
 /// A build that does not run here goes no further, and the stranger with no Rust is told what to do.
 #[test]
 fn a_build_that_does_not_run_replaces_nothing_and_no_rust_says_what_to_do() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_support::tempdir().unwrap();
     let home = dir.path().join("home");
     let bin = dir.path().join("tools");
     let target = dir.path().join("target");
@@ -117,7 +117,7 @@ fn a_build_that_does_not_run_replaces_nothing_and_no_rust_says_what_to_do() {
 /// The script and the program write one menu entry, so that it does not depend on how ATOMICS got here.
 #[test]
 fn the_script_and_the_program_write_the_same_menu_entry() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_support::tempdir().unwrap();
     let home = dir.path().join("home with a space");
     let bin = dir.path().join("tools");
     let target = dir.path().join("target");
@@ -166,7 +166,7 @@ fn the_script_and_the_program_write_the_same_menu_entry() {
 /// The Mac's packager, on any machine, with stand-ins for what only a Mac has: a failure on the way leaves the app there.
 #[test]
 fn the_mac_packager_keeps_the_old_app_until_the_new_one_is_whole_and_keeps_it_after() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_support::tempdir().unwrap();
     let bin = dir.path().join("tools");
     let target = dir.path().join("target");
     let dest = dir.path().join("Applications");
@@ -220,13 +220,13 @@ fn the_mac_packager_keeps_the_old_app_until_the_new_one_is_whole_and_keeps_it_af
 
 /// The real `atomics setup`, in a home with a login shell of its own and only the tools a test puts there.
 struct SetupHome {
-    dir: tempfile::TempDir,
+    dir: test_support::TempDir,
 }
 
 impl SetupHome {
     /// With a config that says `mode`, and these programs on PATH.
     fn new(mode: &str, programs: &[&str]) -> SetupHome {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_support::tempdir().unwrap();
         let bin = dir.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         for program in programs {
@@ -321,7 +321,7 @@ fn setup_with_sandboxes_in_use_still_checks_what_they_need() {
 
 #[test]
 fn installer_registers_the_atomics_link_scheme() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_support::tempdir().unwrap();
     let home = dir.path().join("home");
     let bin = dir.path().join("tools");
     let target = dir.path().join("target");

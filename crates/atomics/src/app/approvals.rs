@@ -1638,7 +1638,7 @@ mod tests {
         with_app(
             "app::approvals::tests::hidden_permission_commands_expand_before_approval_and_running_clears_needs_input",
             |app, _ctx| {
-                let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex");
+                let fixture = crate::app::tests::fixture_agent("codex");
                 app.runtime.config.agents.push(atomics_core::config::AgentConfig {
                     name: "test".into(),
                     command: vec![fixture.to_string_lossy().into_owned()],
