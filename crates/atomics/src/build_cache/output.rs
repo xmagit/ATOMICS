@@ -1,5 +1,6 @@
 //! Destructive output operations are anchored to directory descriptors, never to a
 //! pathname that a guest could redirect between validation and deletion.
+use std::collections::HashSet;
 use std::ffi::{CStr, CString};
 use std::fs::{File, Metadata};
 use std::io;
@@ -98,6 +99,17 @@ impl Directory {
         Ok(entries)
     }
 
+    fn writable(&self) -> io::Result<()> {
+        // SAFETY: the fd and NUL-terminated name are valid. Effective-ID checks
+        // include ACLs and read-only mounts, unlike testing mode bits alone.
+        if unsafe { libc::faccessat(self.0.as_raw_fd(), c".".as_ptr(), libc::W_OK | libc::X_OK, libc::AT_EACCESS) } == 0
+        {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
     fn unlink(&self, name: &CStr, directory: bool) -> io::Result<()> {
         // SAFETY: the directory fd and NUL-terminated name are valid. unlinkat
         // removes an entry relative to this fd and never follows the final link.
@@ -155,8 +167,32 @@ fn mount_id(parent: &Directory, name: &CStr) -> Result<u64> {
     }
     // SAFETY: statx initialized the structure on success; the mask is checked below.
     let stat = unsafe { stat.assume_init() };
-    ensure!(stat.stx_mask & libc::STATX_MNT_ID != 0, "cannot verify output mount identity");
-    Ok(stat.stx_mnt_id)
+    require_mount_id(stat.stx_mask, stat.stx_mnt_id)
+}
+
+#[cfg(target_os = "linux")]
+fn require_mount_id(mask: u32, id: u64) -> Result<u64> {
+    ensure!(
+        mask & libc::STATX_MNT_ID != 0,
+        "cleanup requires STATX_MNT_ID (Linux 5.8 or newer); output mount identity is unavailable"
+    );
+    Ok(id)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) struct Identity {
+    device: u64,
+    inode: u64,
+}
+
+impl Identity {
+    fn metadata(meta: &Metadata) -> Self {
+        Self { device: meta.dev(), inode: meta.ino() }
+    }
+    fn stat(stat: &libc::stat) -> Self {
+        #[allow(clippy::unnecessary_cast)]
+        Self { device: stat.st_dev as u64, inode: stat.st_ino as u64 }
+    }
 }
 
 fn same_directory(meta: &Metadata, stat: &libc::stat) -> bool {
@@ -172,9 +208,8 @@ fn directory(stat: &libc::stat) -> bool {
 
 fn checked_entry(parent: &Directory, name: &CStr, boundary: Boundary) -> Result<libc::stat> {
     ensure!(!name.to_bytes().eq_ignore_ascii_case(b".git"), "output contains a nested repository");
-    // A tracked .gitignore already disqualifies the output via ls-files. Any other
-    // .gitignore must not be allowed to hide uncommitted work from status.
-    ensure!(!name.to_bytes().eq_ignore_ascii_case(b".gitignore"), "output contains an untracked ignore file");
+    // Ignore-rule provenance is checked by the caller for the output directory.
+    // Git never reads nested .gitignore files below an already ignored output.
     let stat = parent.stat(name)?;
     boundary.check(parent, name, &stat)?;
     let kind = stat.st_mode & libc::S_IFMT;
@@ -182,29 +217,104 @@ fn checked_entry(parent: &Directory, name: &CStr, boundary: Boundary) -> Result<
     Ok(stat)
 }
 
-fn walk(parent: &Directory, name: &CStr, boundary: Boundary, depth: usize, remove: bool) -> Result<u64> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WalkMode {
+    Measure,
+    Preflight,
+    Remove,
+}
+
+struct Walk<'a> {
+    boundary: Boundary,
+    expected: Identity,
+    mode: WalkMode,
+    changed: usize,
+    seen: &'a mut HashSet<Identity>,
+    added: Vec<Identity>,
+}
+
+fn walk_tree(
+    parent: &Directory,
+    name: &CStr,
+    depth: usize,
+    state: &mut Walk<'_>,
+    unlink: &mut impl FnMut(&Directory, &CStr, bool) -> io::Result<()>,
+) -> Result<u64> {
     ensure!(depth < 128, "output directory nesting is too deep");
-    let stat = checked_entry(parent, name, boundary)?;
-    ensure!(depth != 0 || directory(&stat), "output is no longer a directory");
+    let stat = checked_entry(parent, name, state.boundary)?;
+    ensure!(
+        depth != 0 || (directory(&stat) && Identity::stat(&stat) == state.expected),
+        "output directory identity changed"
+    );
     if !directory(&stat) {
-        if remove {
-            parent.unlink(name, false)?;
+        let bytes = if stat.st_nlink > 1 {
+            let identity = Identity::stat(&stat);
+            if state.seen.insert(identity) {
+                state.added.push(identity);
+                (stat.st_blocks as u64).saturating_mul(512)
+            } else {
+                0
+            }
+        } else {
+            (stat.st_blocks as u64).saturating_mul(512)
+        };
+        if state.mode == WalkMode::Remove {
+            unlink(parent, name, false)?;
+            state.changed += 1;
         }
-        return Ok((stat.st_blocks as u64).saturating_mul(512));
+        return Ok(bytes);
     }
     let child = parent.open(name)?;
     ensure!(same_directory(&child.0.metadata()?, &stat), "output changed while opening a directory");
-    boundary.check(&child, c"", &child.stat(c".")?)?;
+    state.boundary.check(&child, c"", &child.stat(c".")?)?;
+    if state.mode != WalkMode::Measure {
+        child.writable().map_err(|error| anyhow::anyhow!("output directory lacks write/search access: {error}"))?;
+    }
     let mut bytes = (stat.st_blocks as u64).saturating_mul(512);
     for entry in child.entries()? {
-        bytes = bytes.saturating_add(walk(&child, &entry, boundary, depth + 1, remove)?);
+        bytes = bytes.saturating_add(walk_tree(&child, &entry, depth + 1, state, unlink)?);
     }
-    if remove {
+    if state.mode == WalkMode::Remove {
         ensure!(same_directory(&child.0.metadata()?, &parent.stat(name)?), "output changed during removal");
-        boundary.check(parent, name, &parent.stat(name)?)?;
-        parent.unlink(name, true)?;
+        state.boundary.check(parent, name, &parent.stat(name)?)?;
+        unlink(parent, name, true)?;
+        state.changed += 1;
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+fn walk(parent: &Directory, name: &CStr, boundary: Boundary, depth: usize, remove: bool) -> Result<u64> {
+    let mut seen = HashSet::new();
+    let mut state = Walk {
+        boundary,
+        expected: Identity::stat(&parent.stat(name)?),
+        mode: if remove { WalkMode::Remove } else { WalkMode::Preflight },
+        changed: 0,
+        seen: &mut seen,
+        added: Vec::new(),
+    };
+    walk_tree(parent, name, depth, &mut state, &mut Directory::unlink)
+}
+
+#[derive(Debug)]
+pub(super) struct PartialRemoval {
+    pub path: std::path::PathBuf,
+    pub left: Option<u64>,
+    error: anyhow::Error,
+}
+
+impl std::fmt::Display for PartialRemoval {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let remaining =
+            self.left.map_or_else(|| "remaining size unavailable".into(), |bytes| format!("{bytes} bytes left"));
+        write!(fmt, "partially removed {}: {:#}; {remaining}", self.path.display(), self.error)
+    }
+}
+impl std::error::Error for PartialRemoval {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.error.as_ref())
+    }
 }
 
 pub(super) struct Output {
@@ -213,11 +323,15 @@ pub(super) struct Output {
     parents: Vec<CString>,
     name: CString,
     boundary: Boundary,
+    identity: Identity,
+    directory: Directory,
+    path: std::path::PathBuf,
 }
 
 impl Output {
     pub(super) fn open(root: &Path, folder: &str) -> Result<Self> {
         ensure!(super::relative(folder), "invalid output path");
+        let path = root.join(folder);
         let expected = root.metadata()?;
         let root = Directory::root(root)?;
         let current = root.0.metadata()?;
@@ -244,12 +358,49 @@ impl Output {
             }
         }
         ensure!(parent.entries()?.contains(&name), "output name changed");
-        ensure!(directory(&parent.stat(&name)?), "output is no longer a directory");
-        Ok(Self { root, parent, parents: components, name, boundary })
+        let stat = parent.stat(&name)?;
+        ensure!(directory(&stat), "output is no longer a directory");
+        let directory = parent.open(&name)?;
+        let identity = Identity::metadata(&directory.0.metadata()?);
+        ensure!(identity == Identity::stat(&stat), "output directory changed while opening");
+        Ok(Self { root, parent, parents: components, name, boundary, identity, directory, path })
     }
 
     pub(super) fn inspect(&self) -> Result<u64> {
-        walk(&self.parent, &self.name, self.boundary, 0, false)
+        self.parent.writable().map_err(|error| anyhow::anyhow!("output parent lacks write/search access: {error}"))?;
+        let mut seen = HashSet::new();
+        let mut state = Walk {
+            boundary: self.boundary,
+            expected: self.identity,
+            mode: WalkMode::Preflight,
+            changed: 0,
+            seen: &mut seen,
+            added: Vec::new(),
+        };
+        walk_tree(&self.parent, &self.name, 0, &mut state, &mut Directory::unlink)
+    }
+
+    pub(super) fn measure(&self, seen: &mut HashSet<Identity>) -> Result<u64> {
+        ensure!(Identity::stat(&self.parent.stat(&self.name)?) == self.identity, "output directory identity changed");
+        self.measure_held(seen)
+    }
+
+    fn measure_held(&self, seen: &mut HashSet<Identity>) -> Result<u64> {
+        let mut state = Walk {
+            boundary: self.boundary,
+            expected: self.identity,
+            mode: WalkMode::Measure,
+            changed: 0,
+            seen,
+            added: Vec::new(),
+        };
+        let measured = walk_tree(&self.directory, c".", 0, &mut state, &mut Directory::unlink);
+        if measured.is_err() {
+            for identity in state.added {
+                state.seen.remove(&identity);
+            }
+        }
+        measured
     }
 
     #[cfg(test)]
@@ -258,6 +409,14 @@ impl Output {
     }
 
     pub(super) fn remove_if(self, allowed: impl FnOnce() -> Result<()>) -> Result<()> {
+        self.remove_using(allowed, Directory::unlink)
+    }
+
+    fn remove_using(
+        self,
+        allowed: impl FnOnce() -> Result<()>,
+        mut unlink: impl FnMut(&Directory, &CStr, bool) -> io::Result<()>,
+    ) -> Result<()> {
         // Re-open the route from the held root before removing anything. Even a
         // later swap cannot redirect unlinkat through the anchored parent fd.
         let mut current = Directory(self.root.0.try_clone()?);
@@ -269,8 +428,24 @@ impl Output {
         ensure!(meta.dev() == expected.dev() && meta.ino() == expected.ino(), "output parent moved");
         self.inspect()?;
         allowed()?;
-        walk(&self.parent, &self.name, self.boundary, 0, true)?;
-        Ok(())
+        let mut seen = HashSet::new();
+        let mut state = Walk {
+            boundary: self.boundary,
+            expected: self.identity,
+            mode: WalkMode::Remove,
+            changed: 0,
+            seen: &mut seen,
+            added: Vec::new(),
+        };
+        match walk_tree(&self.parent, &self.name, 0, &mut state, &mut unlink) {
+            Err(error) if state.changed > 0 => Err(PartialRemoval {
+                path: self.path.clone(),
+                left: self.measure_held(&mut HashSet::new()).ok(),
+                error,
+            }
+            .into()),
+            result => result.map(|_| ()),
+        }
     }
 }
 
@@ -297,78 +472,98 @@ impl Directory {
     }
 }
 
-/// Remove only links into forbidden stores, leaving all store contents and other
-/// links alone. Scan through held directory fds without entering nested checkouts
-/// or mount points. This also finds links left by removed cache configuration.
+impl Directory {
+    fn unlink_link(&self, name: &CStr, expected: &libc::stat, after_open: impl FnOnce()) -> Result<()> {
+        // Pin the link itself, never its target, through the same parent fd used
+        // by unlinkat. Holding it also prevents inode reuse during validation.
+        #[cfg(target_os = "linux")]
+        let flags = libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        #[cfg(target_os = "macos")]
+        let flags = libc::O_RDONLY | libc::O_SYMLINK | libc::O_CLOEXEC;
+        // SAFETY: fd/name are valid. File owns the new fd exactly once.
+        let fd = unsafe { libc::openat(self.0.as_raw_fd(), name.as_ptr(), flags) };
+        ensure!(fd >= 0, "cannot pin cache link: {}", io::Error::last_os_error());
+        let link = unsafe { File::from_raw_fd(fd) };
+        let pinned = link.metadata()?;
+        ensure!(
+            pinned.file_type().is_symlink() && same_directory(&pinned, expected),
+            "cache link changed while opening"
+        );
+        after_open();
+        let current = self.stat(name)?;
+        ensure!(
+            current.st_mode & libc::S_IFMT == libc::S_IFLNK && same_directory(&pinned, &current),
+            "cache link changed during repair"
+        );
+        // Unix has no conditional unlink-by-inode. Keep this descriptor-relative
+        // check adjacent to unlink; concurrent outside writers remain documented.
+        self.unlink(name, false)?;
+        Ok(())
+    }
+}
+
+/// Inspect only configured and allowlisted cache routes. Do not enumerate build
+/// output, dependency trees or unrelated worktree folders during a session launch.
 pub(super) fn repair_links(
     root: &Path,
+    locations: &[String],
     protected: &[std::path::PathBuf],
     forbidden: impl Fn(&Path) -> bool,
 ) -> Result<Vec<std::path::PathBuf>> {
-    fn visit(
-        dir: &Directory,
-        path: &Path,
-        boundary: Boundary,
-        forbidden: &impl Fn(&Path) -> bool,
-        protected: &[std::path::PathBuf],
-        removed: &mut Vec<std::path::PathBuf>,
-        depth: usize,
-    ) -> Result<()> {
-        ensure!(depth < 128, "cache link scan is too deeply nested");
-        for (name, kind) in dir.typed_entries()? {
-            // Cache repair needs links and directories, not metadata for every
-            // artifact in a large target tree. Unknown d_type still gets checked.
-            if kind == libc::DT_REG || name.to_bytes().eq_ignore_ascii_case(b".git") {
-                continue;
-            }
-            let child_path = path.join(std::ffi::OsStr::from_bytes(name.to_bytes()));
-            if protected.iter().any(|nested| child_path.starts_with(nested)) {
-                continue;
-            }
-            let result = (|| -> Result<()> {
-                let stat = dir.stat(&name)?;
-                if boundary.check(dir, &name, &stat).is_err() {
-                    return Ok(());
+    let directory = Directory::root(root)?;
+    let boundary = Boundary::of(&directory)?;
+    let mut removed = Vec::new();
+    for location in locations.iter().filter(|path| super::relative(path)) {
+        let result = (|| -> Result<()> {
+            let mut dir = Directory(directory.0.try_clone()?);
+            let mut path = root.to_path_buf();
+            let parts: Vec<_> = Path::new(location).iter().collect();
+            for (index, part) in parts.iter().enumerate() {
+                ensure!(!part.as_bytes().eq_ignore_ascii_case(b".git"), "cache path enters repository metadata");
+                let child_path = path.join(part);
+                if protected.iter().any(|nested| child_path.starts_with(nested)) {
+                    break;
                 }
+                let name = CString::new(part.as_bytes())?;
+                let stat = match dir.stat(&name) {
+                    Ok(stat) => stat,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+                    Err(error) => return Err(error.into()),
+                };
+                boundary.check(&dir, &name, &stat)?;
                 if stat.st_mode & libc::S_IFMT == libc::S_IFLNK {
                     let target = dir.read_link(&name)?;
                     let target = if target.is_absolute() { target } else { path.join(target) };
                     if forbidden(&target) {
-                        let current = dir.stat(&name)?;
-                        ensure!(
-                            current.st_ino == stat.st_ino
-                                && current.st_dev == stat.st_dev
-                                && current.st_mode == stat.st_mode,
-                            "cache link changed during repair"
-                        );
-                        dir.unlink(&name, false)?;
+                        dir.unlink_link(&name, &stat, || {})?;
                         eprintln!(
                             "ATOMICS: removed forbidden cache link {} (store contents kept)",
                             child_path.display()
                         );
-                        removed.push(child_path.clone());
+                        removed.push(child_path);
                     }
-                } else if directory(&stat) {
-                    let child = dir.open(&name)?;
-                    ensure!(same_directory(&child.0.metadata()?, &stat), "cache directory changed during repair");
-                    match child.stat(c".git") {
-                        Ok(_) => return Ok(()),
-                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                        Err(error) => return Err(error.into()),
-                    }
-                    visit(&child, &child_path, boundary, forbidden, protected, removed, depth + 1)?;
+                    break; // Never follow any link, including an ordinary cache link.
                 }
-                Ok(())
-            })();
-            if let Err(error) = result {
-                eprintln!("ATOMICS: cache link scan skipped {}: {error:#}", child_path.display());
+                if !self::directory(&stat) || index + 1 == parts.len() {
+                    break;
+                }
+                let child = dir.open(&name)?;
+                ensure!(same_directory(&child.0.metadata()?, &stat), "cache directory changed during repair");
+                boundary.check(&child, c"", &child.stat(c".")?)?;
+                match child.stat(c".git") {
+                    Ok(_) => break,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+                dir = child;
+                path = child_path;
             }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            eprintln!("ATOMICS: cache link scan skipped {}: {error:#}", root.join(location).display());
         }
-        Ok(())
     }
-    let directory = Directory::root(root)?;
-    let mut removed = Vec::new();
-    visit(&directory, root, Boundary::of(&directory)?, &forbidden, protected, &mut removed, 0)?;
     Ok(removed)
 }
 
@@ -412,6 +607,130 @@ mod tests {
         assert!(outside.path().join("source").is_file());
         assert!(root.path().join("old-target/artifact").is_file());
         assert!(root.path().join("target").symlink_metadata().unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn replacement_directory_after_git_checks_is_never_removed() {
+        let root = crate::test_support::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("target")).unwrap();
+        std::fs::write(root.path().join("target/artifact"), "compiled").unwrap();
+        let output = Output::open(root.path(), "target").unwrap();
+        let result = output.remove_if(|| {
+            std::fs::rename(root.path().join("target"), root.path().join("old-target"))?;
+            std::fs::create_dir(root.path().join("target"))?;
+            std::fs::write(root.path().join("target/new.rs"), "untracked source")?;
+            Ok(())
+        });
+        assert!(result.unwrap_err().to_string().contains("identity changed"));
+        assert_eq!(std::fs::read_to_string(root.path().join("target/new.rs")).unwrap(), "untracked source");
+        assert!(root.path().join("old-target/artifact").is_file());
+    }
+
+    #[test]
+    fn link_repair_pins_and_rechecks_the_link_through_its_parent_descriptor() {
+        let root = crate::test_support::tempdir().unwrap();
+        let outside = crate::test_support::tempdir().unwrap();
+        std::fs::write(outside.path().join("source"), "keep").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("cache")).unwrap();
+        let parent = Directory::root(root.path()).unwrap();
+        let stat = parent.stat(c"cache").unwrap();
+        let result = parent.unlink_link(c"cache", &stat, || {
+            std::fs::rename(root.path().join("cache"), root.path().join("old-link")).unwrap();
+            std::fs::write(root.path().join("cache"), "new source").unwrap();
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(root.path().join("cache")).unwrap(), "new source");
+        assert!(outside.path().join("source").is_file());
+        let stat = parent.stat(c"old-link").unwrap();
+        parent.unlink_link(c"old-link", &stat, || {}).unwrap();
+        assert!(!root.path().join("old-link").exists());
+        assert!(outside.path().join("source").is_file());
+    }
+
+    #[test]
+    fn permission_preflight_preserves_the_entire_output() {
+        use std::os::unix::fs::PermissionsExt;
+        // Run the same regression as an unprivileged child when the test runner
+        // is root, whose effective-ID access checks correctly bypass mode bits.
+        if let Some(root) = std::env::var_os("ATOMICS_PERMISSION_PROBE") {
+            let root = Path::new(&root);
+            let error = Output::open(root, "target").unwrap().remove().unwrap_err();
+            assert!(format!("{error:#}").contains("write/search access"));
+            assert!(root.join("target/artifact").is_file());
+            assert!(root.join("target/locked/artifact").is_file());
+            return;
+        }
+        let root = crate::test_support::tempdir_in("/tmp").unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::fs::create_dir_all(root.path().join("target/locked")).unwrap();
+        std::fs::set_permissions(root.path().join("target"), std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::fs::write(root.path().join("target/artifact"), "compiled").unwrap();
+        std::fs::write(root.path().join("target/locked/artifact"), "compiled").unwrap();
+        std::fs::set_permissions(root.path().join("target/locked"), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let result = if unsafe { libc::geteuid() } == 0 {
+            use std::os::unix::process::CommandExt;
+            let probe = root.path().join("permission-probe");
+            crate::test_support::copy_program(std::env::current_exe().unwrap(), &probe);
+            let mut child = std::process::Command::new(probe);
+            child
+                .args([
+                    "--exact",
+                    "build_cache::output::tests::permission_preflight_preserves_the_entire_output",
+                    "--nocapture",
+                ])
+                .env("ATOMICS_PERMISSION_PROBE", root.path())
+                .uid(65534)
+                .gid(65534);
+            let output = child.output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            Ok(())
+        } else {
+            Output::open(root.path(), "target").unwrap().remove()
+        };
+        std::fs::set_permissions(root.path().join("target/locked"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(format!("{:#}", result.unwrap_err()).contains("write/search access"));
+        }
+        assert!(root.path().join("target/artifact").is_file());
+        assert!(root.path().join("target/locked/artifact").is_file());
+    }
+
+    #[test]
+    fn an_unexpected_unlink_failure_reports_partial_removal_and_remaining_bytes() {
+        let root = crate::test_support::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("target")).unwrap();
+        for file in ["one", "two"] {
+            std::fs::write(root.path().join("target").join(file), vec![1; 8192]).unwrap();
+        }
+        let output = Output::open(root.path(), "target").unwrap();
+        let mut calls = 0;
+        let error = output
+            .remove_using(
+                || Ok(()),
+                |parent, name, directory| {
+                    calls += 1;
+                    if calls == 2 {
+                        Err(io::Error::from(io::ErrorKind::PermissionDenied))
+                    } else {
+                        parent.unlink(name, directory)
+                    }
+                },
+            )
+            .unwrap_err();
+        let partial = error.downcast_ref::<PartialRemoval>().unwrap();
+        assert_eq!(partial.path, root.path().join("target"));
+        assert_eq!(std::fs::read_dir(&partial.path).unwrap().count(), 1);
+        let left = Output::open(root.path(), "target").unwrap().measure(&mut HashSet::new()).unwrap();
+        assert_eq!(partial.left, Some(left));
+        let notice = super::super::partial_removal(&error).unwrap();
+        assert!(notice.contains("partially removed") && notice.contains(&format!("{left} bytes left")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn missing_statx_mount_identity_refuses_cleanup_with_a_supported_kernel_hint() {
+        assert!(require_mount_id(libc::STATX_BASIC_STATS, 123).unwrap_err().to_string().contains("Linux 5.8"));
+        assert_eq!(require_mount_id(libc::STATX_MNT_ID, 123).unwrap(), 123);
     }
 
     #[test]

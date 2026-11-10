@@ -91,9 +91,12 @@ disk_min_gib = 10
 `$ATOMICS_HOME/build-caches/host-repos-v2/<repository-id>/` for bare agents, or
 `build-caches/sandbox-repos-v2/<repository-id>/` for sandboxed agents. The stores are separate trust domains;
 links to another domain are never reused. Links into legacy or forbidden stores are removed on the
-next worktree use, including links left after cache configuration was removed. Store contents are kept;
-no cached data is migrated. Each failed or removed cache folder is skipped independently, and its cache
-environment path is dropped for that launch. Cache setup errors never refuse a session.
+next worktree use at configured shared paths and the five repository-allowlisted cache paths, including
+allowlisted links left after cache configuration was removed. Repair never scans build output or dependency
+trees. Store contents are kept; no cached data is migrated. Link repair pins and rechecks the link through
+its parent directory descriptor before unlinking it. Unix has no atomic unlink conditioned on an inode;
+an outside writer replacing a link after that final check can still race repair. Each failed or removed
+cache folder is skipped independently, and its cache environment path is dropped for that launch. Cache setup errors never refuse a session.
 Stores containing tracked files are refused. Checkout-relative cache paths with non-ASCII components
 are skipped because Git cannot reliably verify their index case aliases; Unicode checkout roots and
 cache directories outside repositories remain supported. Existing real folders are left alone, and the main checkout is
@@ -116,11 +119,14 @@ configuring sccache's incremental policy. [sccache's Rust documentation](https:/
 describes its cacheable compilation modes; metadata-only `cargo check` is not the measurement of reuse.
 
 `outputs` adds disposable output folders. Cargo worktrees automatically include `target`.
-Your own configuration may name any relative output folder. Files must be ignored by checkout-local Git rules
-to be disposable; the cleanup status check disables the user's global `core.excludesFile`. A `.gitignore`
-inside an output prevents cleanup, including an untracked `.gitignore` that hides itself with `*`.
-Review checkout-local `.gitignore` and `.git/info/exclude` rules carefully: they still declare which
-untracked files are disposable. Repository configuration has a stricter allowlist, described in
+Your own configuration may name any relative output folder. The directory itself must be ignored by a
+tracked `.gitignore` at or above it, or by `.git/info/exclude`. Cleanup verifies the matching rule with
+`git check-ignore -v --no-index` and disables the user's global `core.excludesFile` for both ignore and status
+checks. An untracked ignore file at or above the output cannot declare it disposable, even if that file
+hides itself with `*`. Nested `.gitignore` files below an already-ignored output are allowed: Git does not
+read them to decide whether the output is ignored. Review tracked ignore rules and `.git/info/exclude`
+carefully: they declare which untracked files are disposable. Repository configuration has a stricter
+allowlist, described in
 [Repository workflows](repo-workflow.md#shared-caches-and-disposable-output).
 
 Acceptance plus integration, and session closure, schedule output cleanup even when the worktree is kept.
@@ -128,7 +134,11 @@ Only trusted linked worktrees are eligible. Cleanup refuses tracked files, non-i
 case-mismatched or non-ASCII output paths (Git cannot reliably verify Unicode index case aliases),
 nested repositories and registered worktrees, mount/device boundaries, links outside
 the worktree, shared stores and the main checkout. Removal uses directory descriptors with `O_NOFOLLOW`
-and never traverses symlinks or crosses filesystem devices (or Linux mount identities).
+and never traverses symlinks or crosses filesystem devices (or Linux mount identities). On Linux,
+cleanup requires `statx` with `STATX_MNT_ID` (Linux 5.8 or newer); kernels without it refuse all output
+cleanup because mount identity cannot be verified. Preflight checks write and search access on every
+directory and the output parent before deleting anything. If permissions or other conditions change
+during deletion, a toast and log report partial removal and the bytes left (or that size is unavailable).
 Cleanup is scheduled once when a task finishes or a session closes. Automatic cleanup retries an exiting
 process up to five times, with waits of 5, 15, 30 and 60 seconds, then stops. Starting a session cancels pending
 retries. Live sessions are protected. A manual cleanup skips busy/protected worktrees without queuing retries;
@@ -136,7 +146,9 @@ the toast names skipped worktrees and asks you to close their sessions before re
 Resume and restart preserve output.
 
 Disk sampling continues without an open Machine window. Below `disk_warn_gib`, the board and Machine
-view show a warning with the largest output folders, the load button uses the warning colour, and the
+view show a warning with the largest output folders and every refused output with its reason. Hard-linked
+files count once across the inventory. Refused outputs that cannot be safely measured show that their size
+is unavailable. The load button uses the warning colour, and the
 chief receives a `low_disk` heartbeat finding. Tree-size inventory runs on a worker at most every 120 seconds
 or after requested cleanup; dispatch checks use the cached inventory. Below `disk_min_gib`, new task dispatches,
 new worktrees and new non-chief agent sessions are refused after checking their destination filesystem.

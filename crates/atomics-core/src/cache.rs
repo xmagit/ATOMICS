@@ -26,8 +26,10 @@ pub fn relative(path: &str) -> bool {
 }
 
 /// These stores support concurrent access; installed dependencies and build trees do not.
+pub const REPO_SHARED: &[&str] = &[".cache/sccache", ".npm/_cacache", ".cache/pip", ".yarn/cache", ".nuget/packages"];
+
 pub fn repo_shared(path: &str) -> bool {
-    matches!(path, ".cache/sccache" | ".npm/_cacache" | ".cache/pip" | ".yarn/cache" | ".nuget/packages")
+    REPO_SHARED.contains(&path)
 }
 
 pub fn repo_output(path: &str) -> bool {
