@@ -165,7 +165,8 @@ scripts for macOS's own `ssh`, `base64` and `tr`, with no `/nix/store` reference
 Nix. `nix flake check` also builds the guest system with and without the example stack and the host
 (`checks.aarch64-linux.atomics-vm`, `atomics-vm-dotnet-azure`, `atomics-vm-with-host`), and with hardened
 mode and the enforcing network policy (`checks.aarch64-linux.atomics-vm-egress`, including nftables
-ruleset validation). It runs the
+ruleset validation). `checks.aarch64-linux.atomics-vm-egress-upgrade` checks the rules with an existing
+dnsmasq account at UID 994 and an upstream resolver separate from Lima's gateway. The flake also runs the
 bundle's wrappers against the guest helper with an ssh stand-in (`checks.aarch64-linux.atomics-vm-mac`,
 [`nix/tests/mac-desktop.sh`](../nix/tests/mac-desktop.sh)), and runs the host as the service does
 (`checks.aarch64-linux.atomics-vm-host`, [`nix/tests/vm-host.sh`](../nix/tests/vm-host.sh)): the real
@@ -659,15 +660,20 @@ stay `<user>`'s, in plain-text files every agent can read, as above.
 
 `atomics.vm.egress.enable = true` filters every UID except root and dnsmasq, including subordinate UIDs
 in user namespaces and `nixbld*` build users. Their new connections reach only listed domains. dnsmasq
-becomes the guest's resolver: it forwards listed domains, with their subdomains, to Lima's resolver (which
-asks the Mac's, and so its VPN's) and refuses every other name, so a lookup cannot carry data out either.
+becomes the guest's resolver: it forwards listed domains, with their subdomains, to the configured upstream
+(Lima's resolver by default, which asks the Mac's, and so its VPN's) and refuses every other name, so a
+lookup cannot carry data out either.
 Each address it hands out for a listed domain goes into an nftables set, and only those addresses are
 allowed, on ports 80 and 443 (`webPorts`), or on a rule's own ports. Loopback and replies to established
 connections are allowed. Only root and dnsmasq bypass the domain allowlist; other system users do not.
+The rules resolve those account names when nftables loads them, so an upgraded guest keeps working
+with dnsmasq's existing dynamically allocated UID.
+
 New connections to Lima’s host address (`192.168.5.2`) are refused for every UID, including root, before
-UID exemptions or domain rules. Only dnsmasq may open TCP/UDP connections to port 53 there, so agents
-cannot query Lima’s resolver directly or initiate connections to Mac services through it. Established
-and related traffic is accepted first so replies to Mac-initiated SSH and forwarded connections still
+UID exemptions or domain rules. Only dnsmasq may open TCP/UDP connections to port 53 at
+`atomics.vm.egress.upstream` (default `192.168.5.2`), so agents cannot query Lima’s resolver directly or
+initiate connections to Mac services through it. Established and related traffic is accepted first so
+replies to Mac-initiated SSH and forwarded connections still
 work when Lima presents the gateway address as their source. Use it with [hardened mode](#hardened-mode):
 without it any agent can become root and lift it.
 
