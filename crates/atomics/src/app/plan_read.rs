@@ -7,11 +7,12 @@ use super::*;
 
 /// Reports stay inside JSON string values and carry an explicit trust boundary.
 fn report_view(report: &plan::Report, text: Option<usize>, output: usize) -> serde_json::Value {
-    let mut value =
-        json!({ "status": report_text(&report.status, 32, false), "at": report.at, "data_notice": REPORT_DATA_NOTICE });
+    let mut value = json!({ "status": report_text(&report.status, 32, false), "at": report.at });
     let summary = report_text(&report.summary, usize::MAX, false);
     value["summary"] = json!(text.map_or_else(|| summary.clone(), |max| clip(&summary, max)));
     if !report.checks.is_empty() {
+        // Provenance frames every report; reserve this extra notice for check evidence.
+        value["data_notice"] = json!(REPORT_DATA_NOTICE);
         let bounded = report.clone().bounded();
         let field_limit = text.unwrap_or(240).min(240);
         value["checks"] = json!(
@@ -200,7 +201,11 @@ impl State {
         }
         if let Some(report) = &task.report {
             value["report"] = if brief {
-                json!({ "status": report.status, "at": report.at, "checks_count": report.checks.len(), "data_notice": REPORT_DATA_NOTICE })
+                let mut report_value = json!({ "status": report.status, "at": report.at });
+                if !report.checks.is_empty() {
+                    report_value["checks_count"] = json!(report.checks.len());
+                }
+                report_value
             } else {
                 report_view(report, Some(detail.text), detail.text.min(240))
             };

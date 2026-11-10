@@ -730,6 +730,7 @@ pub fn remove_worktree(repo: &Path, path: &Path, branch: Option<&str>, delete_br
             repo.display()
         );
     }
+    let identity_pins = pinned(path).or_else(|| resolve_pins(path).ok());
     if let Some(pins) = pinned(path).filter(|_| path.exists()) {
         // `worktree remove` checks for changes with a git of its own, which follows the worktree's
         // .git file and commondir. Check with the pinned locations, as strictly, then force.
@@ -753,6 +754,9 @@ pub fn remove_worktree(repo: &Path, path: &Path, branch: Option<&str>, delete_br
         git(repo, &["worktree", "remove", "--force", &path_text])?;
     } else {
         git(repo, &["worktree", "remove", &path_text])?;
+    }
+    if let Some(pins) = identity_pins {
+        crate::identity::remove_worktree_identity(repo, &pins)?;
     }
     if delete_branch && let Some(branch) = branch {
         git(repo, &["branch", "-d", branch])?;
@@ -1272,11 +1276,15 @@ pub fn ensure_branch(repo: &Path, branch: &str, base_ref: &str) -> Result<()> {
 /// Commits everything uncommitted in `worktree` (ignored files stay out) with the
 /// repository's own identity. False when there was nothing to commit.
 pub fn commit_all(worktree: &Path, message: &str) -> Result<bool> {
+    commit_all_with_identity(worktree, message, &crate::identity::Identity::default())
+}
+
+pub fn commit_all_with_identity(worktree: &Path, message: &str, identity: &crate::identity::Identity) -> Result<bool> {
     if git(worktree, &["status", "--porcelain"])?.trim().is_empty() {
         return Ok(false);
     }
     git(worktree, &["add", "--all"])?;
-    git(worktree, &["commit", "-q", "-m", message])?;
+    git_with_identity(worktree, &["commit", "-q", "-m", message], identity)?;
     Ok(true)
 }
 
@@ -1291,11 +1299,22 @@ pub enum Merge {
 /// Merges `branch` into the branch checked out in `worktree`. A conflicting merge is
 /// aborted, which leaves the worktree as it was.
 pub fn merge(worktree: &Path, branch: &str) -> Result<Merge> {
+    merge_with_identity(worktree, branch, &crate::identity::Identity::default())
+}
+
+fn git_with_identity(dir: &Path, args: &[&str], identity: &crate::identity::Identity) -> Result<String> {
+    identity.validate().map_err(anyhow::Error::msg)?;
+    let mut command = command(dir, args)?;
+    crate::identity::apply_to_command(&mut command, identity);
+    run(command, args, None, timeout(args))
+}
+
+pub fn merge_with_identity(worktree: &Path, branch: &str, identity: &crate::identity::Identity) -> Result<Merge> {
     if !git(worktree, &["status", "--porcelain", "--untracked-files=no"])?.trim().is_empty() {
         bail!("{} has uncommitted changes", worktree.display());
     }
     let head = git(worktree, &["rev-parse", "HEAD"])?;
-    if let Err(err) = git(worktree, &["merge", "--no-ff", "--no-edit", branch]) {
+    if let Err(err) = git_with_identity(worktree, &["merge", "--no-ff", "--no-edit", branch], identity) {
         let conflicts: Vec<String> = git(worktree, &["diff", "--name-only", "--diff-filter=U", "-z"])?
             .split('\0')
             .filter(|p| !p.is_empty())
@@ -1332,8 +1351,25 @@ pub fn integrate(
     into_path: &Path,
     base_ref: &str,
 ) -> Result<Integration> {
+    integrate_with_identity(repo, branch, message, into, into_path, base_ref, &crate::identity::Identity::default())
+}
+
+pub fn integrate_with_identity(
+    repo: &Path,
+    branch: &str,
+    message: &str,
+    into: &str,
+    into_path: &Path,
+    base_ref: &str,
+    identity: &crate::identity::Identity,
+) -> Result<Integration> {
     let lock = worktree_lock(repo)?;
     let _turn = lock.lock().unwrap_or_else(|e| e.into_inner());
+    // Check before staging, committing, creating an integration branch or merging.
+    crate::identity::require_clean(&crate::identity::check_task(repo, branch, base_ref, identity)?)?;
+    crate::identity::check_pending(identity, ".git/COMMIT_EDITMSG", message)?;
+    crate::identity::check_pending(identity, ".git/MERGE_MSG", &format!("Merge branch '{branch}' into {into}"))?;
+    crate::identity::check_pending(identity, ".git/AUTHOR_IDENT", &identity.label())?;
     check_branch_name(repo, branch, base_ref)?;
     check_branch_name(repo, into, base_ref)?;
     if !branch_exists(repo, branch) {
@@ -1351,7 +1387,10 @@ pub fn integrate(
         Ok(entry)
     };
     let committed = match checked_out(branch)?.filter(|e| e.path.is_dir()) {
-        Some(entry) => commit_all(&entry.path, message)?,
+        Some(entry) => {
+            crate::identity::set_worktree_identity(&entry.path, identity)?;
+            commit_all_with_identity(&entry.path, message, identity)?
+        }
         None => false,
     };
     ensure_branch(repo, into, base_ref)?;
@@ -1366,7 +1405,9 @@ pub fn integrate(
             into_path.to_path_buf()
         }
     };
-    let merge = merge(&worktree, branch)?;
+    crate::identity::set_worktree_identity(&worktree, identity)?;
+    crate::identity::require_clean(&crate::identity::check_task(repo, branch, base_ref, identity)?)?;
+    let merge = merge_with_identity(&worktree, branch, identity)?;
     Ok(Integration { committed, merge, worktree })
 }
 

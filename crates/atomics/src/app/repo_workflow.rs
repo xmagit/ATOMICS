@@ -34,11 +34,12 @@ impl State {
     }
 
     pub(super) fn project_config(&self, repo: &Path) -> Config {
+        let mut config = self.effective_config();
+        config.identity.default = self.project_identity(repo);
         if let Some(workflow) = self.cached_repo_workflow(repo) {
-            return workflow.apply(&self.effective_config());
+            return workflow.apply(&config);
         }
         let root = self.project_root_of(repo);
-        let config = self.effective_config();
         match self.repo_workflows.get(&root) {
             Some(workflow) => workflow.apply(&config),
             None => RepoWorkflow::read(&root).apply(&config),
@@ -48,7 +49,69 @@ impl State {
     /// Reads the repository's settings now rather than from the cache, which can lag by a
     /// reload: a repository that just started requiring sandboxes must never get a bare agent.
     pub(super) fn current_project_config(&self, repo: &Path) -> Config {
-        RepoWorkflow::read(&self.project_root_of(repo)).apply(&self.effective_config())
+        let mut config = self.effective_config();
+        config.identity.default = self.project_identity(repo);
+        RepoWorkflow::read(&self.project_root_of(repo)).apply(&config)
+    }
+
+    pub(super) fn project_identity(&self, repo: &Path) -> atomics_core::identity::Identity {
+        let root = self.project_root_of(repo);
+        self.config.identity.resolve(&root.to_string_lossy(), self.tickets.workspace_identity.as_ref(), |path| {
+            let expanded = paths::expand(path);
+            std::fs::canonicalize(&expanded).unwrap_or(expanded).to_string_lossy().into_owned()
+        })
+    }
+
+    /// Apply a context switch to ATOMICS-created worktrees, off the runtime/UI lock.
+    pub(super) fn refresh_worktree_identities(&mut self) {
+        if self.tickets.workspace_identity_error.is_some() {
+            return;
+        }
+        let context = (self.config.identity.clone(), self.tickets.workspace_identity.clone(), self.repos.clone());
+        if self.identity_context.as_ref() == Some(&context) {
+            return;
+        }
+        let has_identity = |config: &atomics_core::identity::IdentityConfig,
+                            ws: Option<&atomics_core::identity::Identity>| {
+            std::iter::once(&config.default)
+                .chain(config.projects.values())
+                .chain(ws)
+                .any(|identity| identity.name.is_some() || identity.email.is_some())
+        };
+        let previously =
+            self.identity_context.as_ref().is_some_and(|(config, ws, _)| has_identity(config, ws.as_ref()));
+        let enabled = has_identity(&context.0, context.1.as_ref());
+        let policy_changed = self.identity_context.as_ref().map_or_else(
+            || context.0 != atomics_core::identity::IdentityConfig::default() || context.1.is_some(),
+            |(config, ws, _)| config != &context.0 || ws != &context.1,
+        );
+        self.identity_context = Some(context);
+        if policy_changed {
+            self.integration_dirty.store(true, Ordering::Relaxed);
+        }
+        self.management_config.take();
+        if !enabled && !previously {
+            return;
+        }
+        let projects: Vec<_> = self.repos.iter().map(|repo| (repo.clone(), self.project_identity(repo))).collect();
+        let actions = self.action_tx.clone();
+        self.identity_updates.run(move || {
+            for (repo, identity) in projects {
+                let result = (|| -> anyhow::Result<()> {
+                    for entry in git::list_worktrees(&repo)?.into_iter().skip(1).filter(|entry| entry.trusted) {
+                        if atomics_core::identity::is_managed_worktree(&entry.path) {
+                            atomics_core::identity::set_worktree_identity(&entry.path, &identity)?;
+                        }
+                    }
+                    Ok(())
+                })();
+                if result.is_err() {
+                    let _ = actions.send(Box::new(|state| {
+                        state.toast("Could not update a worktree identity; integrate will check again.")
+                    }));
+                }
+            }
+        });
     }
 
     fn project_root_of(&self, repo: &Path) -> PathBuf {

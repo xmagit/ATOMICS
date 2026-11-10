@@ -247,7 +247,7 @@ struct Pending {
 
 type CodexVersion = Arc<OnceLock<Option<bool>>>;
 /// Each repository with the worktrees git lists for it.
-type ListedWorktrees = Vec<(PathBuf, Vec<WorktreeEntry>)>;
+type ListedWorktrees = Vec<(PathBuf, Vec<WorktreeEntry>, atomics_core::identity::Identity)>;
 
 const APPROVAL_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 const APPROVAL_MENU_GRACE: Duration = Duration::from_secs(1);
@@ -311,6 +311,8 @@ struct Launch {
 /// A background worktree job completed all preparation needed before launch.
 struct PreparedWorktree {
     path: PathBuf,
+    /// The context applied on the serial identity worker, checked again before launch.
+    identity: Option<atomics_core::identity::Identity>,
     warmed: bool,
     /// The commit the branch was created at, when this made it.
     start: Option<String>,
@@ -577,6 +579,7 @@ pub(crate) struct State {
     /// Sandboxed launches waiting for their sandbox, and their ref guard with what its first check found.
     pending_sandbox: Vec<(AgentLaunch, Receiver<Prepared>)>,
     ref_checks: crate::ref_guard::Checks,
+    identity_updates: crate::ref_guard::Checks,
     active: Option<String>,
     diff_open: bool,
     /// Worktree picked in the sidebar without an agent; the diff otherwise follows the active session.
@@ -626,6 +629,7 @@ pub(crate) struct State {
     workspace_names: Vec<String>,
     /// Worktree folder → its project's main checkout.
     worktree_project: HashMap<PathBuf, PathBuf>,
+    git_identities: HashMap<PathBuf, atomics_core::identity::Identity>,
     title: String,
     /// Diff/editor width set by dragging the divider.
     /// Side by side or unified, picked in the diff header; wins over the config until ATOMICS quits.
@@ -671,6 +675,8 @@ pub(crate) struct State {
     integration_retries: HashMap<(String, String), Instant>,
     /// Why the last check of a task could not tell whether it is integrated.
     integration_problems: HashMap<(String, String), String>,
+    identity_context:
+        Option<(atomics_core::identity::IdentityConfig, Option<atomics_core::identity::Identity>, Vec<PathBuf>)>,
     dispatch_waiters: Vec<DispatchWaiter>,
     integration_dirty: Arc<AtomicBool>,
     integration_revision: u64,
@@ -1125,6 +1131,7 @@ impl State {
             startup_cleanup: None,
             shutting_down: false,
             ref_checks: crate::ref_guard::Checks::new(),
+            identity_updates: crate::ref_guard::Checks::new(),
             sandbox_usage: Default::default(),
             relay: Arc::new(crate::relay::Service::new(paths::atomics_home(), crate::relay::Keychain::current())),
             connections: Default::default(),
@@ -1173,6 +1180,7 @@ impl State {
             workspace: options.workspace.clone(),
             workspace_names: Vec::new(),
             worktree_project: HashMap::new(),
+            git_identities: HashMap::new(),
             title: String::new(),
             cleanup: None,
             plan_cleanup: None,
@@ -1208,6 +1216,7 @@ impl State {
             integration_checked: HashMap::new(),
             integration_retries: HashMap::new(),
             integration_problems: HashMap::new(),
+            identity_context: None,
             dispatch_waiters: Vec::new(),
             integration_dirty: Arc::new(AtomicBool::new(false)),
             integration_revision: 0,
@@ -1286,6 +1295,7 @@ impl State {
         self.reload_repo_workflows();
         self.worktrees_at = None;
         self.apply_ticket_config();
+        self.refresh_worktree_identities();
     }
 
     fn resources_json(&self) -> serde_json::Value {
@@ -1483,6 +1493,7 @@ impl State {
         }
         self.check_all_refs(&self.exempt_branches());
         self.ref_checks.finish();
+        self.identity_updates.finish();
         if let Some(job) = self.startup_cleanup.take() {
             let _ = job.join();
         }

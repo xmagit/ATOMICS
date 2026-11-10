@@ -175,6 +175,22 @@ impl State {
         }
         while let Ok((branch, result, launch, common)) = self.worktree_rx.try_recv() {
             changed = true;
+            if let Ok(prepared) = &result {
+                let identity = self.project_identity(&prepared.path);
+                if prepared.identity.as_ref() != Some(&identity) && self.tickets.workspace_identity_error.is_none() {
+                    let tx = self.worktree_tx.clone();
+                    self.identity_updates.run(move || {
+                        let result = result.and_then(|mut prepared| {
+                            atomics_core::identity::set_worktree_identity(&prepared.path, &identity)
+                                .map_err(|e| format!("{e:#}"))?;
+                            prepared.identity = Some(identity);
+                            Ok(prepared)
+                        });
+                        let _ = tx.send((branch, result, launch, common));
+                    });
+                    continue;
+                }
+            }
             self.worktrees_at = None;
             if let Some(i) = self.creating.iter().position(|(repo, b, _)| *repo == common && *b == branch) {
                 self.creating.remove(i);
@@ -428,7 +444,17 @@ impl State {
                 let _ = tx.send(
                     repos
                         .into_iter()
-                        .map(|repo| (repo.clone(), git::list_worktrees(&repo).unwrap_or_default()))
+                        .map(|repo| {
+                            let value = |key| {
+                                git::git(&repo, &["config", "--get", key]).ok().map(|value| value.trim().to_string())
+                            };
+                            let identity = atomics_core::identity::Identity {
+                                name: value("user.name"),
+                                email: value("user.email"),
+                                forbidden_words: None,
+                            };
+                            (repo.clone(), git::list_worktrees(&repo).unwrap_or_default(), identity)
+                        })
                         .collect(),
                 );
             });
@@ -442,7 +468,9 @@ impl State {
             changed = true;
             self.worktrees.clear();
             self.worktree_project.clear();
-            for (repo, worktrees) in listed {
+            self.git_identities.clear();
+            for (repo, worktrees, identity) in listed {
+                self.git_identities.insert(repo.clone(), identity);
                 // One listed from files that do not lead back to it is never opened.
                 for worktree in worktrees.into_iter().filter(|worktree| worktree.trusted) {
                     self.worktree_project.insert(worktree.path.clone(), repo.clone());
