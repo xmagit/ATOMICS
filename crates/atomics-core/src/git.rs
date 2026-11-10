@@ -620,7 +620,12 @@ const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 /// the comparison to that exact commit, rather than a merge-base or a fallback branch.
 pub fn diff_against_base(root: &Path, base_ref: &str, untracked_budget: Option<u64>) -> Result<WorktreeDiff> {
     let (resolved_ref, base) = if matches!(base_ref.len(), 40 | 64) && base_ref.bytes().all(|b| b.is_ascii_hexdigit()) {
-        (base_ref.to_string(), commit_of(root, base_ref)?.context("the diff's starting commit is missing")?)
+        match commit_of(root, &format!("{base_ref}^{{commit}}"))? {
+            Some(commit) => (base_ref.to_string(), commit),
+            // An old task's starting object may have been pruned. Show the usual branch diff
+            // rather than making the entire diff view unavailable.
+            None => merge_base(root, "origin/main")?,
+        }
     } else {
         merge_base(root, base_ref)?
     };
@@ -2737,6 +2742,20 @@ pub(crate) mod tests {
         assert!(git(&into, &["status", "--porcelain"]).unwrap().is_empty());
         assert!(git(&into, &["rev-parse", "--verify", "--quiet", "MERGE_HEAD"]).is_err());
         assert_eq!(std::fs::read_to_string(into.join("a.txt")).unwrap(), "one\nTWO\nthree\n");
+    }
+
+    #[test]
+    fn review_p7_a_pruned_task_start_falls_back_to_the_usual_merge_base() {
+        let dir = repo();
+        let root = dir.path();
+        let main = commit_of(root, "main").unwrap().unwrap();
+        run(root, &["switch", "-qc", "task"]);
+        std::fs::write(root.join("own-change"), "task change\n").unwrap();
+        run(root, &["add", "own-change"]);
+        run(root, &["commit", "-qm", "Task change"]);
+        let diff = diff_against_base(root, &"f".repeat(40), None).unwrap();
+        assert_eq!(diff.base, main);
+        assert_eq!(diff.files.iter().map(|file| file.path()).collect::<Vec<_>>(), ["own-change"]);
     }
 
     #[test]

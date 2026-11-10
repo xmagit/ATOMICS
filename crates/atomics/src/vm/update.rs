@@ -270,7 +270,7 @@ fn busy(answer: &Value) -> Result<Vec<String>> {
     Ok(blockers)
 }
 
-fn refuse_busy(blockers: &[String], yes: bool) -> Result<()> {
+fn refuse_busy(blockers: &[String], yes: bool, notice: impl FnOnce(String)) -> Result<()> {
     if !blockers.is_empty() {
         let work = blockers.join("\n  ");
         if !yes {
@@ -278,16 +278,20 @@ fn refuse_busy(blockers: &[String], yes: bool) -> Result<()> {
                 "work in the VM is busy:\n  {work}\nstopped; wait for this work to finish, or use --yes to continue anyway."
             );
         }
-        println!("Continuing with busy work (--yes):\n  {work}");
+        notice(format!("Continuing with busy work (--yes):\n  {work}"));
     }
     Ok(())
 }
 
 fn check_busy(info: &BundleInfo, yes: bool) -> Result<()> {
+    check_busy_with_notice(info, yes, |message| println!("{message}"))
+}
+
+fn check_busy_with_notice(info: &BundleInfo, yes: bool, notice: impl FnOnce(String)) -> Result<()> {
     // With the older agents-over-ssh layout this reaches the explicitly forwarded Mac host.
     // Without that forward there is no host to ask, so fail closed rather than interrupt agents.
     let answer = guest(info, r#"exec atomics ctl '{"cmd":"list"}'"#)?;
-    refuse_busy(&busy(&serde_json::from_str(&answer).context("reading the VM host's list")?)?, yes)
+    refuse_busy(&busy(&serde_json::from_str(&answer).context("reading the VM host's list")?)?, yes, notice)
 }
 
 struct Built<'a> {
@@ -615,7 +619,9 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
     } else {
         // Work could have started while the bundle was installed and the next boot was selected.
         if restart_owed {
-            check_busy(info, options.yes)
+            // Keep the pre-quit refusal and the final post-quit recheck. Announce an explicit
+            // override only at the latter checkpoint, immediately before stopping the VM.
+            check_busy_with_notice(info, options.yes, |_| {})
                 .context("restart pending; run atomics vm update again when the VM is idle")?;
         }
         restart_window(info, restart_owed, options.yes)?;

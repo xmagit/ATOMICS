@@ -171,7 +171,9 @@ macOS's keychain through `security`, Linux's Secret Service through `secret-tool
 1. **The relay.** ATOMICS runs an HTTP relay on this machine's loopback only, `127.0.0.1:<port>`,
    started with the first sandboxed Claude. It keeps its port in `relay-port` in ATOMICS's state folder
    and listens there again after a restart when the port is free, so existing sandboxes keep their way
-   to it.
+   to it. Connections have two seconds to send their first request headers. The separate 32-place
+   authentication pool bounds idle and trickling clients; authenticated connections have 256 places
+   and a five-minute idle timeout. Clients should connect when ready to send their request.
 2. **A placeholder per session.** Each time a sandboxed Claude starts or resumes, its session gets a
    new random placeholder shaped like a subscription token (`sk-ant-oat01-atomics-…`). The relay
    accepts it until the agent exits, its tile closes or its launch fails, then revokes it. The real
@@ -862,7 +864,11 @@ worktree, bare agents' too.
 An agent started in a folder outside any repository gets that folder. ATOMICS refuses to sandbox an agent
 in your home folder or any folder above it, since the sandbox would mount the whole home folder
 read-write. Long briefs for agents other than Claude are written to a folder of the session's own,
-mounted read-only.
+mounted read-only. Bare-session brief files are private (0600), under private state directories
+(0700). A sandbox session's mounted brief directory retains 0755 and its brief file 0644, so
+an agent with a different guest uid can read the mount. The host state and enclosing briefs
+directory remain private. These compatibility modes are retained without assuming a particular
+Docker Sandboxes uid mapping; the permission checks do not substitute for a live sandbox run.
 
 ## How sandboxed agents talk to ATOMICS
 

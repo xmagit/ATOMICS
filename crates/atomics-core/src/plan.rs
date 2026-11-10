@@ -108,8 +108,8 @@ pub fn is_plan_file(path: &Path) -> bool {
 pub fn load_plans(home: &Path) -> Result<(Vec<Plan>, Vec<String>)> {
     let mut errors = Vec::new();
     let dir = home.join("plans");
-    crate::store::private_dir(home)?;
-    crate::store::private_dir(&dir)?;
+    crate::store::readable_state_dir(home)?;
+    crate::store::readable_state_dir(&dir)?;
     let legacy = home.join("plan.json");
     if legacy.exists() && !home.join("plan.json.migrated").exists() {
         match Plan::load(&legacy) {

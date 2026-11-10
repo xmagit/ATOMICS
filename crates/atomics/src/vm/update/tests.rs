@@ -113,14 +113,28 @@ fn busy_refuses_turns_and_user_waits_and_yes_is_an_explicit_override() {
     for status in ["working", "starting", "needs you"] {
         let answer = json!({"ok":true,"result":{"sessions":[{"title":"worker","status":status}]}});
         let blockers = busy(&answer).unwrap();
-        let error = refuse_busy(&blockers, false).unwrap_err().to_string();
+        let error =
+            refuse_busy(&blockers, false, |_| panic!("a refusal must not print an override")).unwrap_err().to_string();
         assert!(error.contains("wait for this work to finish") && error.contains("--yes"));
-        assert!(refuse_busy(&blockers, true).is_ok());
+        assert!(refuse_busy(&blockers, true, |_| {}).is_ok());
     }
     let answer = json!({"ok":true,"result":{"sessions":[],"update_blockers":["editor open", "background work"]}});
     assert_eq!(busy(&answer).unwrap(), ["editor open", "background work"]);
     assert!(busy(&json!({"ok": false, "error": "unreachable"})).is_err());
     assert!(busy(&json!({"ok":true,"result":{"sessions":[]}})).unwrap().is_empty());
+}
+
+#[test]
+fn review_p7_restart_rechecks_busy_work_without_announcing_the_same_override_twice() {
+    let blockers = vec!["worker is active".to_string()];
+    let mut notices = Vec::new();
+    // The pre-quit checkpoint still refuses without --yes, but leaves the override notice
+    // to the final post-quit checkpoint so the same busy work is announced just once.
+    assert!(refuse_busy(&blockers, false, |_| {}).is_err());
+    refuse_busy(&blockers, true, |_| {}).unwrap();
+    refuse_busy(&blockers, true, |message| notices.push(message)).unwrap();
+    assert_eq!(notices.len(), 1);
+    assert!(notices[0].contains("Continuing with busy work (--yes)"));
 }
 
 #[test]
