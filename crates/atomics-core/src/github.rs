@@ -91,7 +91,8 @@ impl Filter {
 }
 
 /// Where a pull request is listed in the controls, in this order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Group {
     /// The viewer's review is requested, directly or through one of their teams.
     Assigned,

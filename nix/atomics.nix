@@ -26,8 +26,8 @@ let
     else
       lib.fileset.difference root
         (lib.fileset.unions (map (name: lib.fileset.maybeMissing (root + "/${name}")) [ ".git" ".atomics" "target" ]));
-  # Of those, what the build reads: an edit to the docs, the Nix files or another script then leaves
-  # the package (and every VM image built with it) as it was.
+  # Of those, what the build reads: docs, Nix files and unrelated scripts stay out of the source.
+  # The revision belongs to the separate wrapper, so a docs-only commit reuses this Cargo build.
   buildInputsOnly = lib.fileset.intersection tracked (lib.fileset.unions [
     (root + "/Cargo.toml")
     (root + "/Cargo.lock")
@@ -63,6 +63,7 @@ rustPlatform.buildRustPackage {
   # git is a fallback after the user's own PATH, so agent terminals keep finding their git first.
   postInstall = ''
     wrapProgram "$out/bin/atomics" --suffix PATH : "${lib.makeBinPath [ git ]}"
+    install -Dm644 assets/com.atomics.copy-secret.policy "$out/share/polkit-1/actions/com.atomics.copy-secret.policy"
   '';
 
   meta = {

@@ -436,7 +436,7 @@ mod tests {
             .drop_without_applying_deltas();
             app.runtime.plans[1].tasks[0].status = TaskStatus::Running;
             app.runtime.plans[1].tasks[0].report =
-                Some(Report { status: "question".into(), summary: "Question".into(), at: 0 });
+                Some(Report { status: "question".into(), summary: "Question".into(), at: 0, checks: Vec::new() });
             assert_eq!(app.runtime.plan_state(1), PlanState::NeedsYou);
             app.runtime.plans[1].tasks[0].report = None;
             app.runtime.sessions[2].approval_hold = true;

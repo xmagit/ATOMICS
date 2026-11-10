@@ -5,6 +5,113 @@ use crate::sandbox::fake;
 use atomics_core::isolation::IsolationMode;
 
 #[test]
+fn scoped_secrets_reach_bare_and_new_docker_sessions_without_values_in_arguments() {
+    with_app(
+        "app::sandbox_tests::scoped_secrets_reach_bare_and_new_docker_sessions_without_values_in_arguments",
+        |app, ctx| {
+            use atomics_core::secrets::{Scope as SecretScope, Secret};
+            let (_dir, repo) = repository();
+            let tree = worktree(&repo, "secret-session");
+            app.runtime.open_project(&repo);
+            let bin = crate::test_support::tempdir().unwrap();
+            app.runtime.sbx = fake::install(bin.path()).display().to_string();
+            let (_keychain_dir, keychain, store) = crate::credentials::tests::machine(cfg!(target_os = "macos"));
+            let upstream = crate::relay::fake::start();
+            app.runtime.relay = Arc::new(crate::relay::Service::with_upstreams(
+                paths::atomics_home(),
+                keychain,
+                HashMap::from([("api.example.com".into(), upstream.url.clone())]),
+            ));
+            let scope = SecretScope::Project(repo.to_string_lossy().into_owned());
+            let relayed = format!("canary-relayed-{}", uuid::Uuid::new_v4().simple());
+            let exposed = format!("canary-exposed-{}", uuid::Uuid::new_v4().simple());
+            let out_of_scope = format!("canary-other-{}", uuid::Uuid::new_v4().simple());
+            store
+                .add_secret(
+                    Secret {
+                        name: "EXAMPLE_KEY".into(),
+                        host: Some("api.example.com".into()),
+                        scope: scope.clone(),
+                        ..Default::default()
+                    },
+                    &relayed,
+                )
+                .unwrap();
+            store.add_secret(Secret { name: "EXPOSED_KEY".into(), scope, ..Default::default() }, &exposed).unwrap();
+            store
+                .add_secret(
+                    Secret {
+                        name: "OTHER_WORKSPACE_KEY".into(),
+                        scope: SecretScope::Workspace("other".into()),
+                        ..Default::default()
+                    },
+                    &out_of_scope,
+                )
+                .unwrap();
+            let out = bin.path().join("session-environment");
+            let script = format!("env > {0}.tmp; mv {0}.tmp {0}; exec sleep 600", out.display());
+            let mut agent = probe("secret-probe", &out, Some(IsolationMode::Bare));
+            agent.command = vec!["/bin/sh".into(), "-c".into(), script.clone()];
+            app.runtime.config.agents.push(agent);
+            for sandbox in [false, true] {
+                if sandbox {
+                    std::fs::remove_file(&out).unwrap();
+                    std::fs::write(bin.path().join("agent"), &script).unwrap();
+                    app.runtime.config.agents.last_mut().unwrap().kind = AgentKind::Shell;
+                    app.runtime.config.agents.last_mut().unwrap().isolation = Some(IsolationMode::Sandbox);
+                }
+                let id = app.runtime.start("secret-probe", tree.clone(), None, vec![], None).unwrap();
+                tick_until(app, ctx, "secret environment to reach the session", |_| out.exists());
+                let env = std::fs::read_to_string(&out).unwrap();
+                assert!(env.lines().any(|line| line == format!("EXPOSED_KEY={exposed}")));
+                assert!(env.lines().any(|line| line.starts_with("EXAMPLE_KEY=atomics-")));
+                assert!(!env.contains(&relayed) && !env.contains("OTHER_WORKSPACE_KEY"));
+                let granted = app.runtime.sessions[app.runtime.find(&id).unwrap()].relay.clone().unwrap();
+                let request = format!(
+                    "GET /api.example.com/v1/models HTTP/1.1\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+                    granted.secrets["EXAMPLE_KEY"]
+                );
+                assert!(crate::relay::fake::send(granted.port, &request).0.starts_with("HTTP/1.1 200 "));
+                if sandbox {
+                    let runs = fake::calls_to(bin.path(), &["run"]);
+                    let run = runs.last().unwrap();
+                    assert!(run.windows(2).any(|pair| pair == ["--env", "EXPOSED_KEY"]));
+                    assert!(run.windows(2).any(|pair| pair == ["--env", "EXAMPLE_KEY"]));
+                    let calls = format!("{:?}", fake::calls(bin.path()));
+                    for canary in [relayed.as_str(), exposed.as_str(), out_of_scope.as_str()] {
+                        assert!(!calls.contains(canary));
+                    }
+                    assert!(fake::calls(bin.path()).iter().any(|call| call
+                        == &atomics_core::isolation::relay_allow_args(&format!("atomics-{id}"), granted.port)));
+                    let creates = fake::calls_to(bin.path(), &["create"]);
+                    assert!(!creates.last().unwrap().iter().any(|arg| arg.contains("EXPOSED_KEY")));
+                }
+                app.runtime.close(&id);
+                tick_until(app, ctx, "secret grant revocation", |app| app.runtime.relay.live_grants() == 0);
+            }
+            finish_agents(app, ctx);
+            let mut folders = vec![paths::atomics_home()];
+            while let Some(folder) = folders.pop() {
+                for entry in std::fs::read_dir(folder).unwrap().flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        folders.push(path);
+                    } else if path.is_file() {
+                        let bytes = std::fs::read(path).unwrap();
+                        for canary in [&relayed, &exposed, &out_of_scope] {
+                            assert!(
+                                !bytes.windows(canary.len()).any(|part| part == canary.as_bytes()),
+                                "canary escaped into host state"
+                            );
+                        }
+                    }
+                }
+            }
+        },
+    );
+}
+
+#[test]
 fn startup_cleanup_does_not_block_the_runtime_while_sbx_is_waiting() {
     with_app("app::sandbox_tests::startup_cleanup_does_not_block_the_runtime_while_sbx_is_waiting", |app, _ctx| {
         if let Some(job) = app.runtime.startup_cleanup.take() {
@@ -26,6 +133,7 @@ fn startup_cleanup_does_not_block_the_runtime_while_sbx_is_waiting() {
             socket: paths::socket_path(),
             briefs: None,
             relay: None,
+            secret_workspace: None,
         };
         crate::sandbox::prepare(&job).unwrap();
         let gate = bin.path().join("wait-ls");
@@ -873,8 +981,8 @@ fn bare_agents_never_touch_sbx_and_a_repository_can_only_tighten() {
         for (mode, agent) in [(IsolationMode::Bare, "probe"), (IsolationMode::Sandbox, "bare-probe")] {
             app.runtime.config.isolation.mode = mode;
             let id = app.runtime.start(agent, worktree.clone(), None, vec![], None).unwrap();
-            assert!(app.runtime.sessions[app.runtime.find(&id).unwrap()].terminal.is_some(), "{agent} starts at once");
             tick_until(app, ctx, "the bare probe", |_| out.exists());
+            assert!(app.runtime.sessions[app.runtime.find(&id).unwrap()].terminal.is_some());
             std::fs::remove_file(&out).unwrap();
             assert!(app.runtime.sessions[app.runtime.find(&id).unwrap()].sandbox.is_none());
         }
@@ -947,6 +1055,7 @@ fn the_cleanup_dialog_removes_a_worktrees_sandbox_and_chosen_orphans() {
                 briefs: None,
                 pins: paths::git_pins_dir(),
                 relay: None,
+                secret_workspace: None,
             };
             crate::sandbox::prepare(&job).unwrap();
             worktrees.push(path);
@@ -1100,9 +1209,9 @@ fn the_chief_always_runs_on_this_machine() {
         app.runtime.config.chief.args = Vec::new();
 
         let id = app.runtime.start_chief(None).unwrap();
-        let chief = &app.runtime.sessions[app.runtime.find(&id).unwrap()];
-        assert!(chief.chief && chief.terminal.is_some() && chief.sandbox.is_none(), "the chief starts bare at once");
         tick_until(app, ctx, "the chief", |_| out.exists());
+        let chief = &app.runtime.sessions[app.runtime.find(&id).unwrap()];
+        assert!(chief.chief && chief.terminal.is_some() && chief.sandbox.is_none(), "the chief starts bare");
         assert_eq!(Path::new(std::fs::read_to_string(&out).unwrap().trim()), repo.canonicalize().unwrap());
 
         // Resumed after a restart, it stays on this machine too.
@@ -1121,8 +1230,8 @@ fn the_chief_always_runs_on_this_machine() {
         app.runtime.sessions.clear();
         std::fs::remove_file(&out).unwrap();
         app.runtime.resume_record(record);
-        assert!(app.runtime.sessions[0].chief && app.runtime.sessions[0].terminal.is_some());
         tick_until(app, ctx, "the resumed chief", |_| out.exists());
+        assert!(app.runtime.sessions[0].chief && app.runtime.sessions[0].terminal.is_some());
         assert!(fake::calls(bin.path()).is_empty(), "the chief never calls sbx");
         app.runtime.sessions.clear();
     });

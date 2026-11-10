@@ -1,6 +1,26 @@
 use super::*;
 
+impl PendingApproval {
+    /// Agent-authored command, reason and input are data. Identity comes from the host's
+    /// session/task lookup; at is when the host observed this request for the reply or event.
+    pub(super) fn json(&self, task: Option<&Task>, fallback_agent: &str, at: u64) -> serde_json::Value {
+        let agent = task
+            .map(|t| atomics_core::tickets::model_label(&t.agent, &t.args))
+            .unwrap_or_else(|| fallback_agent.to_string());
+        let mut value = json!(self.request);
+        value["id"] = json!(self.id);
+        value["provenance"] = plan::agent_provenance("approval request", task.map(|t| t.id.as_str()), &agent, at);
+        value
+    }
+}
+
 impl State {
+    pub(super) fn approval_json(&self, index: usize, pending: &PendingApproval, at: u64) -> serde_json::Value {
+        let session = &self.sessions[index];
+        let task = self.plans.iter().flat_map(|p| &p.tasks).find(|t| t.session.as_deref() == Some(&session.id));
+        pending.json(task, &session.agent, at)
+    }
+
     pub(super) fn approval_poll_interval(&self) -> Option<Duration> {
         if self.sessions.iter().any(|session| session.approval_hold || !session.approvals.is_empty()) {
             Some(Duration::from_millis(400))
@@ -500,14 +520,28 @@ impl State {
         }
         let pending = session.approvals.remove(0);
         let id = pending.id.clone();
-        let answered = Answered { request: pending.request.clone(), menu: pending.native.map(|menu| menu.kind) };
+        let task = self.plans.iter().flat_map(|p| &p.tasks).find(|t| t.session.as_deref() == Some(&session.id));
+        let agent = task
+            .map(|t| atomics_core::tickets::model_label(&t.agent, &t.args))
+            .unwrap_or_else(|| session.agent.clone());
+        let answered = Answered {
+            request: pending.request.clone(),
+            menu: pending.native.map(|menu| menu.kind),
+            provenance: plan::agent_provenance(
+                "approval request",
+                task.map(|t| t.id.as_str()),
+                &agent,
+                atomics_core::store::now(),
+            ),
+        };
         // A menu read off the screen answers only itself; a hook's exact request may be allowed again,
         // unless it may not be allowed always (an Azure request, a stash drop), which answered it once above.
         if decision == Decision::AllowAlways && answered.menu.is_none() {
             session.allowed.push(pending.request);
         }
         session.status = if session.approvals.is_empty() { AgentStatus::Working } else { AgentStatus::NeedsInput };
-        if azure && !session.approvals.is_empty() {
+        // Waiters must hear about the next request even when the status stays "needs you".
+        if !session.approvals.is_empty() {
             self.last_status.remove(&session.id);
         }
         self.record_resolution(id, disposition(decision));
@@ -534,6 +568,7 @@ const ANSWERED_MENU_LINGER: Duration = Duration::from_secs(3);
 pub(super) struct Answered {
     pub request: ApprovalRequest,
     pub menu: Option<atomics_core::approvals::MenuKind>,
+    provenance: serde_json::Value,
 }
 
 impl Answered {
@@ -545,6 +580,7 @@ impl Answered {
             "command": self.request.command,
             "reason": self.request.reason,
             "menu": self.menu.map(|menu| menu.label()),
+            "provenance": self.provenance,
         })
     }
 }
@@ -876,7 +912,7 @@ mod tests {
                 let terminal = Terminal::spawn(
                     app.runtime.wake.clone(),
                     app.runtime.theme.terminal_colors(),
-                    "/bin/cat".into(),
+                    crate::test_support::program("cat"),
                     vec![],
                     &app.runtime.launch_dir,
                     HashMap::new(),
@@ -955,6 +991,9 @@ mod tests {
                                 answer_pending(app, json!({"cmd":"approve", "session":"worker", "decision":"allow"}));
                             assert!(answer.ok, "{answer:?}");
                             assert_eq!(answer.result["command"], "touch live");
+                            assert_eq!(answer.result["provenance"]["source"], "agent");
+                            assert_eq!(answer.result["provenance"]["agent"], "test");
+                            assert!(answer.result["provenance"]["at"].as_u64().is_some());
                         }
                         _ => unreachable!(),
                     }
@@ -1273,7 +1312,7 @@ mod tests {
                         Terminal::spawn(
                             app.runtime.wake.clone(),
                             app.runtime.theme.terminal_colors(),
-                            "/bin/cat".into(),
+                            crate::test_support::program("cat"),
                             vec![],
                             &app.runtime.launch_dir,
                             HashMap::new(),
@@ -1495,7 +1534,7 @@ mod tests {
                 let terminal = Terminal::spawn(
                     app.runtime.wake.clone(),
                     app.runtime.theme.terminal_colors(),
-                    "/bin/sleep".into(),
+                    crate::test_support::program("sleep"),
                     vec!["30".into()],
                     &app.runtime.launch_dir,
                     HashMap::new(),
@@ -1871,7 +1910,7 @@ mod tests {
                         Terminal::spawn(
                             app.runtime.wake.clone(),
                             app.runtime.theme.terminal_colors(),
-                            "/bin/cat".into(),
+                            crate::test_support::program("cat"),
                             vec![],
                             dir.path(),
                             HashMap::new(),
@@ -1901,6 +1940,8 @@ mod tests {
                 let (wait_tx, wait_rx) = channel();
                 app.runtime.control(
                     ControlRequest::Wait {
+                        compact: false,
+                        full_sessions: false,
                         sessions: vec!["worker-one".into()],
                         statuses: vec!["needs you".into()],
                         after: Some(app.runtime.event_seq),

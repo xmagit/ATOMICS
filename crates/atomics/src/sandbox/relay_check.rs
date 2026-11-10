@@ -34,6 +34,7 @@ pub fn run() -> Result<()> {
         briefs: None,
         pins: paths::git_pins_dir(),
         relay: Some(relay.clone()),
+        secret_workspace: None,
     };
     let checked = check(&job, &relay);
     let removed = remove(&home, &program, &name).and_then(|()| Ok(std::fs::remove_dir_all(&folder)?));

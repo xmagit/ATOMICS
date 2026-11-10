@@ -51,6 +51,16 @@ pub(super) fn with_state(name: &str, test: impl FnOnce(State, &egui::Context)) {
     run_state(name, None::<fn(&Path) -> Vec<(&'static str, std::ffi::OsString)>>, test);
 }
 
+/// Credential preparation is asynchronous for bare sessions too; wait by driving the host.
+pub(super) fn wait_started(state: &mut State, id: &str) {
+    let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(20));
+    while !state.sessions.iter().any(|s| s.id == id && s.terminal.is_some()) {
+        assert!(Instant::now() < deadline, "session did not finish credential preparation");
+        state.runtime_tick();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// [`with_state`] in a child that also has the variables `env` gives, which is called in the
 /// parent with the child's home folder. The child takes on its login shell's PATH before the
 /// app starts, as `main` does.
@@ -75,6 +85,8 @@ fn run_state(
         // Not inside `dir`, the child's home and config folder: tests scan that for what the app wrote,
         // and the child's fixtures may hold the secrets they look for.
         let folders = crate::test_support::tempdir().unwrap();
+        let shell = dir.path().join("test-shell");
+        crate::test_support::login_shell(&shell);
         let output = crate::test_support::output(
             std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", name, "--nocapture"])
@@ -86,10 +98,12 @@ fn run_state(
                 .env("HOME", dir.path())
                 .env("ATOMICS_HOME", dir.path().join("state"))
                 .env("ATOMICS_CONFIG", dir.path().join("config.toml"))
+                .env("ATOMICS_CREDENTIALS_DIR", dir.path().join("credentials"))
                 .env("ATOMICS_SOCKET", dir.path().join("atomics.sock"))
                 .env("XDG_RUNTIME_DIR", runtime)
-                // A login shell such as zsh would run its first-run wizard in the fresh HOME.
-                .env("SHELL", "/bin/sh")
+                .env("SHELL", shell)
+                .env_remove("BASH_ENV")
+                .env_remove("ENV")
                 .env_remove("ATOMICS_PANE")
                 .envs(env.map(|env| env(dir.path())).unwrap_or_default()),
         );
@@ -435,6 +449,8 @@ fn permission_hooks_wake_waiters_and_accept_decisions(app: &mut Desktop<'_>, _ct
         let (wait_tx, wait_rx) = channel();
         app.runtime.control(
             ControlRequest::Wait {
+                compact: false,
+                full_sessions: false,
                 sessions: vec!["codex".into()],
                 statuses: vec!["needs you".into()],
                 after: Some(app.runtime.event_seq),

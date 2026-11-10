@@ -40,10 +40,13 @@ const MAX_LOG: u64 = 4 * 1024 * 1024;
 /// The Anthropic API, which Claude Code talks to.
 pub const ANTHROPIC: &str = "api.anthropic.com";
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum Authorization {
     Bearer,
     ApiKey,
+    Header(String),
+    Basic(String),
+    Query(String),
 }
 
 /// A credential the relay uses for sandboxes, the hosts it may reach and what it may do there.
@@ -327,7 +330,15 @@ impl Inner {
         };
         let started = Instant::now();
         let route = Route::parse(&head.target);
-        let grant = head.placeholder().and_then(|placeholder| self.grants.lock().unwrap().get(placeholder).cloned());
+        // Accept a bearer placeholder for every style, or the API's native placement. Never
+        // choose between two credentials in one request.
+        let grant = {
+            let grants = self.grants.lock().unwrap();
+            let mut matching =
+                grants.iter().filter(|(placeholder, grant)| head.carries(placeholder, &grant.credential.authorization));
+            let first = matching.next().map(|(_, grant)| grant.clone());
+            if matching.next().is_some() { None } else { first }
+        };
         let (host, path) = route.as_ref().map_or(("-", "-"), |route| (route.host.as_str(), route.path.as_str()));
         let session = grant.as_ref().map_or("-", |grant| grant.session.as_str());
         let refused = match (&grant, &route) {
@@ -350,7 +361,14 @@ impl Inner {
             }
         };
         if let Some((status, reason)) = refused {
-            self.log.record(session, host, &head.method, path, status, started.elapsed());
+            self.log.record(
+                session,
+                (host, path),
+                &head.method,
+                status,
+                started.elapsed(),
+                grant.as_ref().map(|g| g.credential.label.as_str()),
+            );
             // The body stays unread, so the connection cannot carry another request.
             refuse(writer, status, reason)?;
             return Ok(false);
@@ -362,7 +380,14 @@ impl Inner {
         let body = match read_body(reader, &head) {
             Ok(body) => body,
             Err((status, reason)) => {
-                self.log.record(session, host, &head.method, path, status, started.elapsed());
+                self.log.record(
+                    session,
+                    (host, path),
+                    &head.method,
+                    status,
+                    started.elapsed(),
+                    Some(&grant.credential.label),
+                );
                 refuse(writer, status, reason)?;
                 return Ok(false);
             }
@@ -375,7 +400,14 @@ impl Inner {
             // fails closed. No token is acquired before the decision.
             let approved = self.approve_write(grant, &head, route, &body);
             if !approved || !self.grants.lock().unwrap().contains_key(head.placeholder().unwrap()) {
-                self.log.record(session, host, &head.method, path, 403, started.elapsed());
+                self.log.record(
+                    session,
+                    (host, path),
+                    &head.method,
+                    403,
+                    started.elapsed(),
+                    Some(&grant.credential.label),
+                );
                 refuse(writer, 403, "Azure write was not approved")?;
                 return Ok(false);
             }
@@ -391,7 +423,7 @@ impl Inner {
             }
         }
         let (status, whole) = self.forward(&head, route, &grant.credential, body, writer);
-        self.log.record(session, host, &head.method, path, status, started.elapsed());
+        self.log.record(session, (host, path), &head.method, status, started.elapsed(), Some(&grant.credential.label));
         Ok(whole && head.keep_alive())
     }
 
@@ -454,13 +486,6 @@ impl Inner {
         body: Vec<u8>,
         writer: &mut impl Write,
     ) -> (u16, bool) {
-        let base = self.upstreams.get(&route.host).cloned().unwrap_or_else(|| format!("https://{}", route.host));
-        let query = route.query.as_deref().map(|query| format!("?{query}")).unwrap_or_default();
-        let mut request =
-            ureq::http::Request::builder().method(head.method.as_str()).uri(format!("{base}{}{query}", route.path));
-        for (name, value) in head.headers.iter().filter(|(name, _)| forwarded(name)) {
-            request = request.header(name.as_str(), value.as_str());
-        }
         let secret = match &credential.source {
             Source::Static(secret) => secret.clone(),
             Source::Azure(azure) => match azure.token(&route.host) {
@@ -471,18 +496,53 @@ impl Inner {
                 }
             },
         };
-        let authorization = match credential.authorization {
-            Authorization::Bearer => format!("Bearer {}", secret),
-            Authorization::ApiKey => secret.clone(),
+        let base = self.upstreams.get(&route.host).cloned().unwrap_or_else(|| format!("https://{}", route.host));
+        let query = match &credential.authorization {
+            Authorization::Query(name) => {
+                let mut query = url::form_urlencoded::Serializer::new(String::new());
+                for (key, value) in url::form_urlencoded::parse(route.query.as_deref().unwrap_or_default().as_bytes()) {
+                    if key != name.as_str() {
+                        query.append_pair(&key, &value);
+                    }
+                }
+                query.append_pair(name, &secret);
+                query.finish()
+            }
+            _ => route.query.clone().unwrap_or_default(),
         };
-        let request = request.header("authorization", authorization);
+        let query = if query.is_empty() { query } else { format!("?{query}") };
+        let mut request =
+            ureq::http::Request::builder().method(head.method.as_str()).uri(format!("{base}{}{query}", route.path));
+        for (name, value) in head.headers.iter().filter(|(name, _)| forwarded(name)) {
+            if matches!(&credential.authorization, Authorization::Header(header) if header.eq_ignore_ascii_case(name)) {
+                continue;
+            }
+            request = request.header(name.as_str(), value.as_str());
+        }
+        request = match &credential.authorization {
+            Authorization::Bearer => request.header("authorization", format!("Bearer {secret}")),
+            Authorization::ApiKey => request.header("authorization", &secret),
+            Authorization::Header(name) => request.header(name, &secret),
+            Authorization::Basic(username) => {
+                use base64::Engine;
+                request.header(
+                    "authorization",
+                    format!(
+                        "Basic {}",
+                        base64::engine::general_purpose::STANDARD.encode(format!("{username}:{secret}"))
+                    ),
+                )
+            }
+            Authorization::Query(_) => request,
+        };
+        request = request.header("accept-encoding", "identity");
         let sent = if body.is_empty() && !matches!(head.method.as_str(), "POST" | "PUT" | "PATCH") {
             request.body(()).map(|request| self.agent.run(request))
         } else {
             request.body(body).map(|request| self.agent.run(request))
         };
         let (status, reason) = match sent {
-            Ok(Ok(response)) => return stream(head, response, writer),
+            Ok(Ok(response)) => return stream(head, response, writer, &secret, &credential.authorization),
             Err(_) => (400, "a header could not be forwarded"),
             Ok(Err(_)) => (502, "the upstream host could not be reached"),
         };
@@ -493,7 +553,20 @@ impl Inner {
 
 /// Writes `response` to the client, its body as it arrives so server-sent events stream: its
 /// status, and whether it went out whole.
-fn stream(head: &Head, response: ureq::http::Response<ureq::Body>, writer: &mut impl Write) -> (u16, bool) {
+fn stream(
+    head: &Head,
+    response: ureq::http::Response<ureq::Body>,
+    writer: &mut impl Write,
+    secret: &str,
+    auth: &Authorization,
+) -> (u16, bool) {
+    // An API can echo authentication in an error, a Location header or a response body.
+    // Scrub that too, including matches split across upstream reads, without buffering SSE.
+    let mut redactor = Redactor::new(secret, auth);
+    if response.headers().get("content-encoding").is_some_and(|v| v != "identity") {
+        let _ = refuse(writer, 502, "the upstream ignored the uncompressed response requirement");
+        return (502, false);
+    }
     let status = response.status();
     let bodiless = head.method == "HEAD" || status.as_u16() == 204 || status.as_u16() == 304;
     let mut out = format!("HTTP/1.1 {} {}\r\n", status.as_u16(), status.canonical_reason().unwrap_or("")).into_bytes();
@@ -503,7 +576,7 @@ fn stream(head: &Head, response: ureq::http::Response<ureq::Body>, writer: &mut 
         }
         out.extend_from_slice(name.as_str().as_bytes());
         out.extend_from_slice(b": ");
-        out.extend_from_slice(value.as_bytes());
+        out.extend_from_slice(&redactor.whole(value.as_bytes()));
         out.extend_from_slice(b"\r\n");
     }
     if !bodiless {
@@ -520,21 +593,75 @@ fn stream(head: &Head, response: ureq::http::Response<ureq::Body>, writer: &mut 
     let mut buffer = vec![0; 16 * 1024];
     loop {
         let read = match upstream.read(&mut buffer) {
-            Ok(0) => break,
             Ok(read) => read,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             // Without its last chunk the client sees the response cut short, as it was.
             Err(_) => return (status.as_u16(), false),
         };
-        let mut chunk = format!("{read:x}\r\n").into_bytes();
-        chunk.extend_from_slice(&buffer[..read]);
+        let bytes = redactor.push(&buffer[..read], read == 0);
+        if bytes.is_empty() {
+            if read == 0 {
+                break;
+            }
+            continue;
+        }
+        let mut chunk = format!("{:x}\r\n", bytes.len()).into_bytes();
+        chunk.extend_from_slice(&bytes);
         chunk.extend_from_slice(b"\r\n");
         if writer.write_all(&chunk).and_then(|()| writer.flush()).is_err() {
             return (status.as_u16(), false);
         }
+        if read == 0 {
+            break;
+        }
     }
     let ended = writer.write_all(b"0\r\n\r\n").and_then(|()| writer.flush()).is_ok();
     (status.as_u16(), ended)
+}
+
+struct Redactor {
+    patterns: Vec<Vec<u8>>,
+    pending: Vec<u8>,
+}
+impl Redactor {
+    fn new(secret: &str, auth: &Authorization) -> Self {
+        use base64::Engine;
+        let mut patterns = vec![
+            secret.as_bytes().to_vec(),
+            url::form_urlencoded::byte_serialize(secret.as_bytes()).collect::<String>().into_bytes(),
+        ];
+        if let Authorization::Basic(user) = auth {
+            patterns.push(base64::engine::general_purpose::STANDARD.encode(format!("{user}:{secret}")).into_bytes());
+        }
+        patterns.retain(|p| !p.is_empty());
+        Self { patterns, pending: Vec::new() }
+    }
+    fn whole(&self, bytes: &[u8]) -> Vec<u8> {
+        let mut bytes = bytes.to_vec();
+        for pattern in &self.patterns {
+            for i in 0..=bytes.len().saturating_sub(pattern.len()) {
+                if bytes.get(i..i + pattern.len()) == Some(pattern.as_slice()) {
+                    bytes[i..i + pattern.len()].fill(b'*');
+                }
+            }
+        }
+        bytes
+    }
+    fn push(&mut self, bytes: &[u8], end: bool) -> Vec<u8> {
+        self.pending.extend_from_slice(bytes);
+        self.pending = self.whole(&self.pending);
+        let held = if end {
+            0
+        } else {
+            self.patterns
+                .iter()
+                .flat_map(|pattern| (1..pattern.len()).filter(|&n| self.pending.ends_with(&pattern[..n])))
+                .max()
+                .unwrap_or(0)
+        };
+        let keep = self.pending.split_off(self.pending.len() - held);
+        std::mem::replace(&mut self.pending, keep)
+    }
 }
 
 /// Request headers that do not go upstream: hop-by-hop ones, those ureq sets itself, and every
@@ -545,6 +672,7 @@ fn forwarded(name: &str) -> bool {
             "host",
             "content-length",
             "expect",
+            "accept-encoding",
             "authorization",
             "x-api-key",
             "proxy-authorization",
@@ -594,6 +722,28 @@ struct Head {
 }
 
 impl Head {
+    fn carries(&self, placeholder: &str, auth: &Authorization) -> bool {
+        if self.placeholder() == Some(placeholder) {
+            return true;
+        }
+        match auth {
+            Authorization::Header(name) => self.header(name).is_some_and(|value| value.trim() == placeholder),
+            Authorization::Query(name) => self.target.split_once('?').is_some_and(|(_, query)| {
+                url::form_urlencoded::parse(query.as_bytes())
+                    .any(|(key, value)| key == name.as_str() && value == placeholder)
+            }),
+            Authorization::Basic(username) => {
+                use base64::Engine;
+                self.header("authorization").and_then(|h| h.split_once(' ')).is_some_and(|(scheme, encoded)| {
+                    scheme.eq_ignore_ascii_case("basic")
+                        && base64::engine::general_purpose::STANDARD
+                            .decode(encoded)
+                            .is_ok_and(|bytes| bytes == format!("{username}:{placeholder}").as_bytes())
+                })
+            }
+            _ => false,
+        }
+    }
     fn header(&self, name: &str) -> Option<&str> {
         self.headers.iter().find(|(key, _)| key.eq_ignore_ascii_case(name)).map(|(_, value)| value.as_str())
     }
@@ -776,10 +926,23 @@ struct Log {
 }
 
 impl Log {
-    fn record(&self, session: &str, host: &str, method: &str, path: &str, status: u16, elapsed: Duration) {
+    fn record(
+        &self,
+        session: &str,
+        destination: (&str, &str),
+        method: &str,
+        status: u16,
+        elapsed: Duration,
+        credential: Option<&str>,
+    ) {
         use std::os::unix::fs::OpenOptionsExt;
-        let line =
-            format!("{} {session} {host} {method} {path} {status} {}ms\n", utc(SystemTime::now()), elapsed.as_millis());
+        let (host, path) = destination;
+        let credential = credential.unwrap_or("-").replace(' ', "%20");
+        let line = format!(
+            "{} {session} {host} {method} {path} {status} {}ms credential={credential}\n",
+            utc(SystemTime::now()),
+            elapsed.as_millis()
+        );
         let _write = self.write.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if std::fs::metadata(&self.path).is_ok_and(|file| file.len() > MAX_LOG) {
             let _ = std::fs::rename(&self.path, self.path.with_extension("log.1"));
@@ -838,10 +1001,11 @@ impl Keychain {
             crate::setup::find_program("secret-tool")
                 .map_or_else(|| "/usr/bin/secret-tool".into(), |path| path.to_string_lossy().into_owned())
         };
-        // Only where it is asked for, and never on a Mac, whose keychain is always there.
+        // An explicit headless Linux store, or isolated debug fixtures on macOS. A macOS
+        // release always keeps credentials in the OS keychain, regardless of the environment.
         let files = atomics_core::paths::env_override("CREDENTIALS_DIR")
             .map(std::path::PathBuf::from)
-            .filter(|dir| !mac && dir.is_absolute());
+            .filter(|dir| folder_override_allowed(mac, cfg!(debug_assertions)) && dir.is_absolute());
         Self { program, mac, files }
     }
 
@@ -1100,12 +1264,19 @@ pub fn valid_claude_token(token: &str) -> bool {
 }
 
 /// A session's placeholder for the Claude subscription, and the relay's port.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Default, PartialEq)]
 pub struct Granted {
     pub port: u16,
     /// Empty when the session has Azure but no Claude subscription.
     pub placeholder: String,
     pub azure: Option<String>,
+    /// Values here are session environment only. Debug deliberately omits them.
+    pub secrets: HashMap<String, String>,
+    secret_placeholders: Vec<String>,
+}
+
+fn folder_override_allowed(mac: bool, debug: bool) -> bool {
+    !mac || debug
 }
 
 impl std::fmt::Debug for Granted {
@@ -1205,7 +1376,7 @@ impl Service {
         }
         let relay = relay.as_ref().unwrap();
         let placeholder = relay.grant(session, Arc::new(credential));
-        Ok(Some(Granted { port: relay.port(), placeholder, azure: None }))
+        Ok(Some(Granted { port: relay.port(), placeholder, ..Granted::default() }))
     }
 
     /// Every sandboxed agent can use Azure, independently of its model credentials. Discovery
@@ -1233,10 +1404,92 @@ impl Service {
         }
         let relay = relay.as_ref().unwrap();
         let azure = Some(relay.grant(session, Arc::new(Credential::azure(broker.clone()))));
-        Ok(Some(Granted {
-            azure,
-            ..granted.unwrap_or_else(|| Granted { port: relay.port(), placeholder: String::new(), azure: None })
-        }))
+        Ok(Some(Granted { azure, ..granted.unwrap_or_else(|| Granted { port: relay.port(), ..Granted::default() }) }))
+    }
+
+    /// Add all general secrets in scope. This runs on the session preparation worker.
+    pub fn grant_secrets(
+        &self,
+        session: &str,
+        workspace: Option<&str>,
+        project: Option<&str>,
+        sandbox: bool,
+        granted: Option<Granted>,
+    ) -> Result<Option<Granted>> {
+        let _edit = self.edits.lock().unwrap();
+        let secrets = crate::credentials::Store::new(self.keychain.clone()).secret_values()?;
+        let mut granted = granted;
+        for (spec, value) in secrets.into_iter().filter(|(s, _)| s.scope.includes(workspace, project)) {
+            let grant = granted.get_or_insert_with(Granted::default);
+            if let Some(host) = &spec.host {
+                let mut relay = self.relay.lock().unwrap();
+                if relay.is_none() {
+                    *relay = Some(self.start()?);
+                }
+                let relay = relay.as_ref().unwrap();
+                grant.port = relay.port();
+                let methods = if spec.methods.is_empty() { vec!["*".to_string()] } else { spec.methods.clone() };
+                let prefix = spec.path_prefix.as_deref().unwrap_or("/");
+                let rules = methods
+                    .iter()
+                    .flat_map(|method| {
+                        [
+                            Rule::new(host, method, prefix),
+                            Rule::new(host, method, &format!("{}/*", prefix.trim_end_matches('/'))),
+                        ]
+                    })
+                    .collect();
+                let auth = match spec.auth {
+                    atomics_core::secrets::Auth::Bearer => Authorization::Bearer,
+                    atomics_core::secrets::Auth::Header(name) => Authorization::Header(name),
+                    atomics_core::secrets::Auth::Basic(user) => Authorization::Basic(user),
+                    atomics_core::secrets::Auth::Query(name) => Authorization::Query(name),
+                };
+                let credential = Credential::stored(
+                    format!("secret:{}", spec.name),
+                    value.to_string(),
+                    vec![host.clone()],
+                    rules,
+                    auth,
+                );
+                let placeholder = relay.grant(session, Arc::new(credential));
+                grant.secret_placeholders.push(placeholder.clone());
+                grant.secrets.insert(spec.name.clone(), placeholder);
+                let address = if sandbox { atomics_core::isolation::RELAY_HOST } else { "127.0.0.1" };
+                let url = format!("http://{address}:{}/{host}", relay.port());
+                grant.secrets.insert(format!("{}_RELAY_URL", spec.name), url.clone());
+                match spec.name.as_str() {
+                    "OPENAI_API_KEY" => {
+                        grant.secrets.insert("OPENAI_BASE_URL".into(), format!("{url}/v1"));
+                    }
+                    "ANTHROPIC_API_KEY" | "CLAUDE_CODE_OAUTH_TOKEN" => {
+                        grant.secrets.insert("ANTHROPIC_BASE_URL".into(), url);
+                    }
+                    _ => {}
+                }
+            } else {
+                grant.secrets.insert(spec.name, value.to_string());
+            }
+        }
+        if let Some(grant) = granted.as_mut()
+            && (grant.secrets.contains_key("ANTHROPIC_API_KEY")
+                || grant.secrets.contains_key("CLAUDE_CODE_OAUTH_TOKEN"))
+        {
+            // An explicit scoped model secret wins over the legacy subscription route. In
+            // particular, never serialize an exposed value into Claude's --settings argument.
+            if let Some(relay) = self.relay.lock().unwrap().as_ref() {
+                relay.revoke(&grant.placeholder);
+            }
+            grant.placeholder.clear();
+            if grant.azure.is_none() && grant.secret_placeholders.is_empty() {
+                grant.port = 0;
+            }
+            grant.secrets.entry("ANTHROPIC_BASE_URL".into()).or_insert_with(|| "https://api.anthropic.com".into());
+            for name in ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN"] {
+                grant.secrets.entry(name.into()).or_default();
+            }
+        }
+        Ok(granted)
     }
 
     pub fn revoke_azure(&self) {
@@ -1288,6 +1541,21 @@ impl Service {
         }
     }
 
+    /// General secrets' last use comes from the request audit log, including its rotated tail.
+    pub fn secret_last_use(&self, name: &str) -> Option<String> {
+        let marker = format!("credential=secret:{name}");
+        ["relay.log.1", "relay.log"]
+            .into_iter()
+            .filter_map(|file| std::fs::read_to_string(self.home.join(file)).ok())
+            .flat_map(|text| {
+                text.lines()
+                    .filter(|line| line.split_whitespace().last() == Some(marker.as_str()))
+                    .filter_map(|line| line.split_whitespace().next().map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .max()
+    }
+
     /// Replacing/removing a credential immediately revokes existing placeholders for it.
     pub fn revoke_credential(&self, label: &str) {
         if let Some(relay) = self.relay.lock().unwrap().as_ref() {
@@ -1318,6 +1586,9 @@ impl Service {
             relay.revoke(&granted.placeholder);
             if let Some(azure) = &granted.azure {
                 relay.revoke(azure);
+            }
+            for placeholder in &granted.secret_placeholders {
+                relay.revoke(placeholder);
             }
         }
     }
@@ -1469,6 +1740,154 @@ pub(crate) mod fake {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn macos_release_ignores_the_directory_override_while_linux_remains_explicit() {
+        assert!(!super::folder_override_allowed(true, false), "macOS release must use the OS keychain");
+        assert!(super::folder_override_allowed(true, true), "macOS debug fixtures may isolate their store");
+        assert!(super::folder_override_allowed(false, false));
+        assert!(super::folder_override_allowed(false, true));
+    }
+    #[test]
+    fn secret_reflections_in_upstream_headers_and_streamed_bodies_do_not_reach_the_session() {
+        use super::*;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let canary = "canary-reflected-71+9";
+        let worker = std::thread::spawn(move || {
+            let (mut connection, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(connection.try_clone().unwrap());
+            let head = read_head(&mut reader).unwrap().unwrap();
+            assert!(head.target.contains("key=canary-reflected-71%2B9"));
+            let body = format!("before {canary} after");
+            write!(connection, "HTTP/1.1 302 Found\r\nLocation: https://api.example.com/next?key=canary-reflected-71%2B9\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+            connection.write_all(&body.as_bytes()[..15]).unwrap();
+            connection.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(10));
+            connection.write_all(&body.as_bytes()[15..]).unwrap();
+        });
+        let dir = crate::test_support::tempdir().unwrap();
+        let relay = Relay::start(
+            0,
+            dir.path().join("relay.log"),
+            HashMap::from([("api.example.com".into(), format!("http://{address}"))]),
+        )
+        .unwrap();
+        let placeholder = relay.grant(
+            "s1",
+            Arc::new(Credential::stored(
+                "secret:EXAMPLE_KEY".into(),
+                canary.into(),
+                vec!["api.example.com".into()],
+                vec![Rule::new("api.example.com", "GET", "/v1")],
+                Authorization::Query("key".into()),
+            )),
+        );
+        let (head, mut body) = fake::send(
+            relay.port(),
+            &format!("GET /api.example.com/v1?key={placeholder} HTTP/1.1\r\nConnection: close\r\n\r\n"),
+        );
+        assert!(head.starts_with("HTTP/1.1 302 "));
+        let mut answer = head;
+        loop {
+            let chunk = fake::chunk(&mut body);
+            if chunk.is_empty() {
+                break;
+            }
+            answer.push_str(&chunk);
+        }
+        assert!(!answer.contains(canary) && !answer.contains("canary-reflected-71%2B9"));
+        assert!(answer.contains("before ") && answer.contains(" after"));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn general_secret_auth_styles_enforce_host_method_and_path_and_redact_reflections() {
+        use atomics_core::secrets::{Auth, Secret};
+        use base64::Engine;
+        for auth in [
+            Auth::Bearer,
+            Auth::Header("x-example-key".into()),
+            Auth::Basic("api".into()),
+            Auth::Query("api_key".into()),
+        ] {
+            let upstream = super::fake::start();
+            let (dir, keychain, store) = crate::credentials::tests::machine(false);
+            let canary = "canary-private-78+9";
+            store
+                .add_secret(
+                    Secret {
+                        name: "EXAMPLE_KEY".into(),
+                        host: Some("api.example.com".into()),
+                        auth: auth.clone(),
+                        methods: vec!["GET".into()],
+                        path_prefix: Some("/v1/models".into()),
+                        ..Default::default()
+                    },
+                    canary,
+                )
+                .unwrap();
+            let relay = super::Service::with_upstreams(
+                dir.path().join("state"),
+                keychain,
+                std::collections::HashMap::from([("api.example.com".into(), upstream.url.clone())]),
+            );
+            let granted = relay.grant_secrets("s1", None, None, false, None).unwrap().unwrap();
+            let placeholder = &granted.secrets["EXAMPLE_KEY"];
+            let (header, query) = match &auth {
+                Auth::Bearer => (format!("Authorization: Bearer {placeholder}\r\n"), String::new()),
+                Auth::Header(name) => (format!("{name}: {placeholder}\r\n"), String::new()),
+                Auth::Basic(user) => (
+                    format!(
+                        "Authorization: Basic {}\r\n",
+                        base64::engine::general_purpose::STANDARD.encode(format!("{user}:{placeholder}"))
+                    ),
+                    String::new(),
+                ),
+                Auth::Query(name) => (String::new(), format!("?{name}={placeholder}&page=1")),
+            };
+            let request = |method: &str, host: &str, path: &str| {
+                format!("{method} /{host}{path}{query} HTTP/1.1\r\n{header}Connection: close\r\n\r\n")
+            };
+            for (method, host, path) in [
+                ("GET", "other.example.com", "/v1/models"),
+                ("POST", "api.example.com", "/v1/models"),
+                ("GET", "api.example.com", "/v1/private"),
+            ] {
+                assert!(super::fake::send(granted.port, &request(method, host, path)).0.starts_with("HTTP/1.1 403 "));
+            }
+            let (head, mut body) = super::fake::send(granted.port, &request("GET", "api.example.com", "/v1/models"));
+            assert!(head.starts_with("HTTP/1.1 200 "));
+            while !super::fake::chunk(&mut body).is_empty() {}
+            let seen = upstream.seen.lock().unwrap()[0].clone();
+            match auth {
+                Auth::Bearer => assert_eq!(seen.header("authorization"), [format!("Bearer {canary}")]),
+                Auth::Header(name) => assert_eq!(seen.header(&name), [canary]),
+                Auth::Basic(user) => assert_eq!(
+                    seen.header("authorization"),
+                    [format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("{user}:{canary}")))]
+                ),
+                Auth::Query(_) => {
+                    assert!(seen.line.contains("api_key=canary-private-78%2B9"));
+                    assert!(!seen.line.contains(placeholder));
+                }
+            }
+            let log = std::fs::read_to_string(dir.path().join("state/relay.log")).unwrap();
+            assert!(!log.contains(canary) && !log.contains(placeholder) && !log.contains("page=1"));
+            assert!(relay.secret_last_use("EXAMPLE_KEY").is_some());
+            relay.revoke(&granted);
+            assert!(
+                super::fake::send(granted.port, &request("GET", "api.example.com", "/v1/models"))
+                    .0
+                    .starts_with("HTTP/1.1 401 ")
+            );
+        }
+        let mut redactor = super::Redactor::new("canary-private", &super::Authorization::Bearer);
+        assert_eq!(redactor.push(b"first event\n\n", false), b"first event\n\n");
+        let mut out = redactor.push(b"echo canary-pr", false);
+        out.extend(redactor.push(b"ivate done", true));
+        assert_eq!(out, b"echo ************** done");
+    }
+
     use super::fake::{chunk, send};
     use super::*;
 

@@ -97,7 +97,7 @@ const WORKTREE_REFRESH: Duration = Duration::from_secs(30);
 const BACKGROUND_REFRESH: Duration = Duration::from_secs(5);
 const FALLBACK_REFRESH: Duration = Duration::from_secs(30);
 /// The answer to a request only a desktop window can serve, in the headless host.
-const NO_WINDOW: &str = "no window: this is the headless host (atomics host); start the desktop for window commands";
+const NO_WINDOW: &str = "no local window: this is the headless host (atomics host); window control commands are not forwarded to connected clients; use the client's UI";
 /// Untracked content kept for a diff off screen; the rest is counted, not loaded.
 const OFF_SCREEN_UNTRACKED: u64 = 1024 * 1024;
 
@@ -247,7 +247,7 @@ struct Pending {
 
 type CodexVersion = Arc<OnceLock<Option<bool>>>;
 /// Each repository with the worktrees git lists for it.
-type ListedWorktrees = Vec<(PathBuf, Vec<WorktreeEntry>)>;
+type ListedWorktrees = Vec<(PathBuf, Vec<WorktreeEntry>, atomics_core::identity::Identity)>;
 
 const APPROVAL_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 const APPROVAL_MENU_GRACE: Duration = Duration::from_secs(1);
@@ -311,6 +311,8 @@ struct Launch {
 /// A background worktree job completed all preparation needed before launch.
 struct PreparedWorktree {
     path: PathBuf,
+    /// The context applied on the serial identity worker, checked again before launch.
+    identity: Option<atomics_core::identity::Identity>,
     warmed: bool,
     /// The commit the branch was created at, when this made it.
     start: Option<String>,
@@ -381,8 +383,8 @@ struct StatusEvent {
     at: u64,
     plan: Option<String>,
     task: Option<String>,
-    /// Set for a `atomics_report` from the agent: (status, summary, task).
-    report: Option<(String, String, Option<String>)>,
+    /// Set for a `atomics_report` from the agent: (status, summary, task, agent).
+    report: Option<(String, String, Option<String>, String)>,
     /// The pending request the event is about, with its id (`approval_json`).
     approval: Option<serde_json::Value>,
     findings: Option<Vec<atomics_core::heartbeat::Finding>>,
@@ -392,15 +394,6 @@ struct StatusEvent {
     config: Option<serde_json::Value>,
     /// Set when a plan was approved, edited, closed or reopened.
     change: Option<&'static str>,
-}
-
-impl PendingApproval {
-    /// The request as the chief sees it: its `id`, which `approve` must name, and what it asks.
-    fn json(&self) -> serde_json::Value {
-        let mut value = json!(self.request);
-        value["id"] = json!(self.id);
-        value
-    }
 }
 
 impl StatusEvent {
@@ -425,8 +418,9 @@ impl StatusEvent {
         let mut value = json!({ "seq": self.seq, "session": self.session, "title": self.title, "status": self.kind(), "at": self.at });
         value["plan"] = json!(self.plan);
         value["task"] = json!(self.task);
-        if let Some((status, summary, task)) = &self.report {
-            value["report"] = json!({ "status": status, "summary": summary, "task": task });
+        if let Some((status, summary, task, agent)) = &self.report {
+            value["report"] = json!({ "status": status, "summary": summary, "task": task,
+                "data_notice": plan::REPORT_DATA_NOTICE, "provenance": plan::agent_provenance("report", task.as_deref(), agent, self.at) });
         }
         if let Some(findings) = &self.findings {
             value["findings"] = json!(findings);
@@ -452,6 +446,8 @@ struct Waiter {
     sessions: Vec<String>,
     statuses: Vec<String>,
     after: u64,
+    compact: bool,
+    full_sessions: bool,
     deadline: Instant,
     reply: Sender<ControlOutcome>,
 }
@@ -574,6 +570,7 @@ pub(crate) struct State {
     /// Sandboxed launches waiting for their sandbox, and their ref guard with what its first check found.
     pending_sandbox: Vec<(AgentLaunch, Receiver<Prepared>)>,
     ref_checks: crate::ref_guard::Checks,
+    identity_updates: crate::ref_guard::Checks,
     active: Option<String>,
     diff_open: bool,
     /// Worktree picked in the sidebar without an agent; the diff otherwise follows the active session.
@@ -623,6 +620,8 @@ pub(crate) struct State {
     workspace_names: Vec<String>,
     /// Worktree folder → its project's main checkout.
     worktree_project: HashMap<PathBuf, PathBuf>,
+    git_identities: HashMap<PathBuf, atomics_core::identity::Identity>,
+    identity_worktrees: HashSet<PathBuf>,
     title: String,
     /// Diff/editor width set by dragging the divider.
     /// Side by side or unified, picked in the diff header; wins over the config until ATOMICS quits.
@@ -631,6 +630,8 @@ pub(crate) struct State {
     panel: PanelMode,
     editors: HashMap<PathBuf, Terminal>,
     editor_files: HashMap<PathBuf, String>,
+    /// Why the editor of a worktree could not start, until it starts: shown in every client's editor panel.
+    editor_errors: HashMap<PathBuf, String>,
     events: Vec<StatusEvent>,
     event_seq: u64,
     last_status: HashMap<String, AgentStatus>,
@@ -668,6 +669,8 @@ pub(crate) struct State {
     integration_retries: HashMap<(String, String), Instant>,
     /// Why the last check of a task could not tell whether it is integrated.
     integration_problems: HashMap<(String, String), String>,
+    identity_context:
+        Option<(atomics_core::identity::IdentityConfig, Option<atomics_core::identity::Identity>, Vec<PathBuf>)>,
     dispatch_waiters: Vec<DispatchWaiter>,
     integration_dirty: Arc<AtomicBool>,
     integration_revision: u64,
@@ -1122,6 +1125,7 @@ impl State {
             startup_cleanup: None,
             shutting_down: false,
             ref_checks: crate::ref_guard::Checks::new(),
+            identity_updates: crate::ref_guard::Checks::new(),
             sandbox_usage: Default::default(),
             relay: Arc::new(crate::relay::Service::new(paths::atomics_home(), crate::relay::Keychain::current())),
             connections: Default::default(),
@@ -1170,12 +1174,15 @@ impl State {
             workspace: options.workspace.clone(),
             workspace_names: Vec::new(),
             worktree_project: HashMap::new(),
+            git_identities: HashMap::new(),
+            identity_worktrees: HashSet::new(),
             title: String::new(),
             cleanup: None,
             plan_cleanup: None,
             panel: PanelMode::Diff,
             editors: HashMap::new(),
             editor_files: HashMap::new(),
+            editor_errors: HashMap::new(),
             events: Vec::new(),
             event_seq: 0,
             last_status: HashMap::new(),
@@ -1205,6 +1212,7 @@ impl State {
             integration_checked: HashMap::new(),
             integration_retries: HashMap::new(),
             integration_problems: HashMap::new(),
+            identity_context: None,
             dispatch_waiters: Vec::new(),
             integration_dirty: Arc::new(AtomicBool::new(false)),
             integration_revision: 0,
@@ -1259,6 +1267,11 @@ impl State {
 
     fn apply_config(&mut self) {
         self.management_config.take();
+        for index in 0..self.plans.len() {
+            if self.plans[index].is_open() && self.plans[index].select_review_agent(&self.config) {
+                self.save_plan(index);
+            }
+        }
         if !self.effective_isolation().sandbox.azure.enabled {
             self.relay.revoke_azure();
         }
@@ -1278,6 +1291,7 @@ impl State {
         self.reload_repo_workflows();
         self.worktrees_at = None;
         self.apply_ticket_config();
+        self.refresh_worktree_identities();
     }
 
     fn resources_json(&self) -> serde_json::Value {
@@ -1344,7 +1358,7 @@ impl State {
             if s.status == AgentStatus::Done {
                 s.status = AgentStatus::Idle;
             }
-            if s.terminal.is_some() {
+            if s.terminal.is_some() || s.status == AgentStatus::Starting {
                 self.focus_terminal = Some(id.to_string());
                 self.window.request_repaint();
             }
@@ -1475,6 +1489,7 @@ impl State {
         }
         self.check_all_refs(&self.exempt_branches());
         self.ref_checks.finish();
+        self.identity_updates.finish();
         if let Some(job) = self.startup_cleanup.take() {
             let _ = job.join();
         }

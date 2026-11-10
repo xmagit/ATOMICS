@@ -29,13 +29,17 @@ pub(crate) enum Placement {
 
 pub(crate) fn placement(executable: &Path, home: &Path, macos: bool) -> Placement {
     let resolved = executable.canonicalize().unwrap_or_else(|_| executable.to_path_buf());
+    placement_with_system_bundle(&resolved, home, macos, Path::new("/Applications/ATOMICS.app").exists())
+}
+
+fn placement_with_system_bundle(resolved: &Path, home: &Path, macos: bool, system_bundle: bool) -> Placement {
     if macos {
-        let Some(bundle) = crate::restart::bundle_of(&resolved) else { return Placement::Managed };
+        let Some(bundle) = crate::restart::bundle_of(resolved) else { return Placement::Managed };
         let folder = bundle.parent();
         if folder == Some(&home.join("Applications")) || folder == Some(Path::new("/Applications")) {
             return Placement::Installed;
         }
-        return Placement::Elsewhere { to: bundle_home(home) };
+        return Placement::Elsewhere { to: bundle_destination(home, system_bundle) };
     }
     let bin = home.join(".local/bin");
     if resolved.parent().is_some_and(|folder| folder == bin || bin.canonicalize().is_ok_and(|bin| bin == folder)) {
@@ -52,8 +56,11 @@ pub(crate) fn placement(executable: &Path, home: &Path, macos: bool) -> Placemen
 
 /// A person's own Applications folder, needing no administrator, unless ATOMICS already lives in the system's.
 fn bundle_home(home: &Path) -> PathBuf {
-    let system = Path::new("/Applications/ATOMICS.app");
-    if system.exists() { system.to_path_buf() } else { home.join("Applications/ATOMICS.app") }
+    bundle_destination(home, Path::new("/Applications/ATOMICS.app").exists())
+}
+
+fn bundle_destination(home: &Path, system_bundle: bool) -> PathBuf {
+    if system_bundle { "/Applications/ATOMICS.app".into() } else { home.join("Applications/ATOMICS.app") }
 }
 
 /// The program inside what `to` names.
@@ -230,6 +237,9 @@ pub fn run_cli() -> i32 {
         Ok(installed) => {
             println!("Installed ATOMICS {} at {}.", env!("CARGO_PKG_VERSION"), installed.at.display());
             println!("Open it from your applications menu. Its first run opens a setup screen.");
+            if cfg!(target_os = "linux") && crate::secret_copy::unavailable().is_some() {
+                println!("To enable authenticated secret Copy, run: sudo atomics install --secret-copy-policy");
+            }
             if let Some(line) = installed.path_line {
                 println!("To run atomics from a terminal too, add this to your shell's startup file: {line}");
             }
@@ -249,7 +259,7 @@ mod tests {
     #[test]
     fn a_download_offers_to_install_and_a_build_or_a_package_does_not() {
         let home = Path::new("/home/someone");
-        let linux = |path: &str| placement(Path::new(path), home, false);
+        let linux = |path: &str| placement_with_system_bundle(Path::new(path), home, false, false);
         let to = home.join(".local/bin/atomics");
         assert_eq!(linux("/home/someone/Downloads/atomics-0.1.7/atomics"), Placement::Elsewhere { to: to.clone() });
         assert_eq!(linux("/tmp/x/atomics"), Placement::Elsewhere { to: to.clone() });
@@ -266,13 +276,28 @@ mod tests {
         ] {
             assert_eq!(linux(managed), Placement::Managed, "{managed}");
         }
-        let mac = |path: &str| placement(Path::new(path), home, true);
+        let mac = |path: &str| placement_with_system_bundle(Path::new(path), home, true, false);
         let to = home.join("Applications/ATOMICS.app");
         assert_eq!(mac("/home/someone/Downloads/ATOMICS.app/Contents/MacOS/atomics"), Placement::Elsewhere { to });
         assert_eq!(mac("/home/someone/Applications/ATOMICS.app/Contents/MacOS/atomics"), Placement::Installed);
         assert_eq!(mac("/Applications/ATOMICS.app/Contents/MacOS/atomics"), Placement::Installed);
         assert_eq!(mac("/home/someone/code/target/debug/atomics"), Placement::Managed, "not a bundle");
         assert_eq!(mac("/home/someone/work.app/target/debug/atomics"), Placement::Managed, "only its own program");
+        assert_eq!(
+            placement_with_system_bundle(Path::new("/tmp/ATOMICS.app/Contents/MacOS/atomics"), home, true, true),
+            Placement::Elsewhere { to: "/Applications/ATOMICS.app".into() }
+        );
+    }
+
+    #[test]
+    fn placement_resolves_a_link_to_the_users_installed_program() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let bin = dir.path().join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        crate::test_support::write_program(bin.join("atomics"), "#!/bin/sh\nexit 0\n");
+        let link = dir.path().join("atomics-link");
+        std::os::unix::fs::symlink(bin.join("atomics"), &link).unwrap();
+        assert_eq!(placement(&link, dir.path(), false), Placement::Installed);
     }
 
     #[test]

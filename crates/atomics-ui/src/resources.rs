@@ -31,7 +31,7 @@ pub fn usage(ui: &mut egui::Ui, state: &ResourceInfo, p: &Palette) {
             let missing = missing_label(usage, window);
             let window = window.as_ref().filter(|window| window.resets_at > now);
             let text = match window {
-                Some(window) => format!("{label}  {:.0}% · {}", window.remaining, reset_label(window, weekly, now)),
+                Some(window) => format!("{label}  {:.0}% · {}", window.left_percent, reset_label(window, weekly, now)),
                 None => format!("{label}  {missing}"),
             };
             ui.label(RichText::new(text).font(p.ui(10.5)).color(p.muted))
@@ -41,7 +41,7 @@ pub fn usage(ui: &mut egui::Ui, state: &ResourceInfo, p: &Palette) {
             if let Some(window) = window {
                 let filled = egui::Rect::from_min_size(
                     rect.min,
-                    vec2(rect.width() * window.remaining as f32 / 100.0, rect.height()),
+                    vec2(rect.width() * window.left_percent as f32 / 100.0, rect.height()),
                 );
                 ui.painter().rect_filled(filled, 1.0, remaining_color(window, p));
             }
@@ -55,9 +55,9 @@ fn missing_label(usage: &Usage, window: &Option<Window>) -> &'static str {
 }
 
 fn remaining_color(window: &Window, p: &Palette) -> Color32 {
-    if window.remaining < 10.0 {
+    if window.left_percent < 10.0 {
         p.error
-    } else if window.remaining < 30.0 {
+    } else if window.left_percent < 30.0 {
         p.warning
     } else {
         p.success
@@ -75,16 +75,22 @@ pub fn load(ui: &mut egui::Ui, backend: &dyn Backend, p: &Palette, in_menu: bool
     };
     let label = state.load.map_or_else(|| "load —".into(), |load| format!("load {load:.1}"));
     let details = load_details(&state);
-    let sense = if backend.machine_available() { Sense::click() } else { Sense::hover() };
-    let response = ui.add(egui::Label::new(RichText::new(label).color(color).size(12.0)).sense(sense)).on_hover_text(
-        if backend.machine_available() { format!("{details}\nClick to open Machine") } else { details.clone() },
-    );
+    let response = load_button(ui, &label, color, backend.machine_available(), &details);
     crate::topbar::record_item(ui, "load", &response);
     let response = if backend.machine_available() { crate::touch::reach(ui, response) } else { response };
     if in_menu {
         ui.label(RichText::new(details).font(p.ui(10.5)).color(p.muted));
     }
     backend.machine_available() && response.clicked()
+}
+
+fn load_button(ui: &mut egui::Ui, label: &str, color: Color32, available: bool, details: &str) -> egui::Response {
+    let text = RichText::new(label).color(color).size(12.0);
+    if available {
+        ui.add(egui::Button::new(text)).on_hover_text(format!("Open Machine\n{details}"))
+    } else {
+        ui.add(egui::Label::new(text).sense(Sense::hover())).on_hover_text(details)
+    }
 }
 
 fn load_details(state: &ResourceInfo) -> String {
@@ -107,6 +113,61 @@ mod tests {
     use super::*;
 
     #[test]
+    fn load_gauge_keeps_warning_and_error_colors_when_machine_is_unavailable() {
+        let p = Palette::new(&Default::default(), Default::default());
+        for color in [p.warning, p.error] {
+            let ctx = egui::Context::default();
+            let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let response = load_button(ui, "load 1.0", color, false, "Load details");
+                assert!(response.enabled(), "load colors must not be faded by a disabled widget");
+            });
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Text(text) if text.galley.job.text == "load 1.0"
+                    && text.galley.job.sections.iter().all(|section| section.format.color == color)
+            )));
+            output.drop_without_applying_deltas();
+        }
+    }
+
+    #[test]
+    fn load_gauge_has_a_button_frame_hover_and_load_colors() {
+        let p = Palette::new(&Default::default(), Default::default());
+        for color in [p.muted, p.warning, p.error] {
+            let ctx = egui::Context::default();
+            let mut rect = egui::Rect::NOTHING;
+            for hovered in [false, true] {
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(250.0, 100.0))),
+                        events: if hovered { vec![egui::Event::PointerMoved(rect.center())] } else { vec![] },
+                        ..Default::default()
+                    },
+                    |ui| {
+                        let response = load_button(ui, "load 1.0", color, true, "Load details");
+                        assert!(response.sense.senses_click());
+                        assert_eq!(response.hovered(), hovered);
+                        rect = response.rect;
+                    },
+                );
+                assert!(
+                    output.shapes.iter().any(|shape| matches!(&shape.shape,
+                        egui::Shape::Rect(frame) if frame.rect == rect && frame.fill != Color32::TRANSPARENT
+                    )),
+                    "the load control must paint its button frame"
+                );
+                assert!(
+                    output.shapes.iter().any(|shape| matches!(&shape.shape,
+                        egui::Shape::Text(text) if text.galley.job.text == "load 1.0"
+                            && text.galley.job.sections.iter().all(|section| section.format.color == color)
+                    )),
+                    "button text must retain the load color"
+                );
+                output.drop_without_applying_deltas();
+            }
+        }
+    }
+
+    #[test]
     fn panel_accepts_latest_account_reports_and_draws_expired_windows_as_missing() {
         let ctx = egui::Context::default();
         let now = 1_800_000_000;
@@ -114,7 +175,7 @@ mod tests {
         for observed_at in [now - 1, now, now - 2] {
             state.claude.update(Usage {
                 observed_at,
-                session: Some(Window { remaining: 73.0, resets_at: now - 1 }),
+                session: Some(Window { left_percent: 73.0, resets_at: now - 1 }),
                 ..Usage::default()
             });
         }
@@ -191,7 +252,7 @@ mod tests {
     fn populated_panel_renders_remaining_reset_age_and_proportional_bars() {
         let ctx = egui::Context::default();
         let now = 1_800_000_000;
-        let window = |remaining| Some(Window { remaining, resets_at: now + 8040 });
+        let window = |remaining| Some(Window { left_percent: remaining, resets_at: now + 8040 });
         let state = ResourceInfo {
             claude: Usage { session: window(76.0), weekly: window(24.0), observed_at: now - 120, plan: None },
             codex: Usage { session: window(9.0), weekly: window(100.0), observed_at: now - 7200, plan: None },
@@ -248,7 +309,7 @@ mod tests {
     fn colors_use_strict_remaining_thresholds_and_missing_is_explicit() {
         let p = Palette::new(&Default::default(), Default::default());
         for (remaining, expected) in [(30.0, p.success), (29.9, p.warning), (10.0, p.warning), (9.9, p.error)] {
-            assert_eq!(remaining_color(&Window { remaining, resets_at: 1 }, &p), expected);
+            assert_eq!(remaining_color(&Window { left_percent: remaining, resets_at: 1 }, &p), expected);
         }
         assert_eq!(missing_label(&Usage::default(), &None), "no data yet");
         assert_eq!(

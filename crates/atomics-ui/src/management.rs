@@ -33,11 +33,17 @@ pub struct State {
     pub remove: String,
     pub reason: String,
     pub theme: String,
+    identity: settings::IdentityForm,
     pub connection_name: String,
     pub connection_url: String,
     pub credential_kind: String,
     pub credential_host: String,
     pub credential_value: String,
+    secret: atomics_core::secrets::Secret,
+    secret_value: String,
+    secret_methods: String,
+    secret_path: String,
+    adding_secret: bool,
     pub scope: Option<Scope>,
     pub revoke: Option<String>,
     pub proposal_seen: Option<(String, f64)>,
@@ -56,9 +62,17 @@ pub struct State {
 }
 
 impl State {
+    pub fn show_identity(&mut self, project: String, identity: atomics_core::identity::Identity) {
+        self.settings = true;
+        self.open_section = Some("Identity".into());
+        self.identity.select(project, identity);
+    }
+
     /// What lives as long as Settings is open goes when it closes: above all a value typed and never saved.
     fn forget_settings(&mut self) {
         self.credential_value.clear();
+        self.secret_value.clear();
+        self.adding_secret = false;
         self.setup_values.clear();
         self.setup_confirm = None;
         self.confirm = None;
@@ -70,9 +84,13 @@ impl State {
     }
 }
 
-/// Whether Settings, Remote, the setup screen or the project picker is open.
+/// Whether a shared window (Settings, Remote, setup, project picker or pull requests) is open.
 pub fn window_open(client: &Client) -> bool {
-    client.management.settings || client.management.remote || client.management.project || client.management.setup
+    client.pull_requests.open
+        || client.management.settings
+        || client.management.remote
+        || client.management.project
+        || client.management.setup
 }
 
 /// The windows' share of the keyboard. Every client calls this as its frame begins, before it draws anything that
@@ -87,7 +105,9 @@ pub fn begin_frame(ctx: &egui::Context, backend: &dyn Backend, client: &mut Clie
         && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
     {
         let state = &mut client.management;
-        let top = if state.project {
+        let top = if client.pull_requests.open {
+            &mut client.pull_requests.open
+        } else if state.project {
             &mut state.project
         } else if state.remote {
             &mut state.remote

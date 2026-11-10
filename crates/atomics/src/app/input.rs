@@ -37,6 +37,11 @@ impl Desktop<'_> {
     }
 
     pub(super) fn shortcuts(&mut self, ctx: &egui::Context) {
+        // A list opened from the shared top bar owns its navigation and closing chord. Otherwise
+        // the host keeps its native GitHub controls and their existing shortcut.
+        if self.client.ui.pull_requests.open {
+            self.draw(|backend, client| window_keys::pull_requests(ctx, backend, client));
+        }
         atomics_ui::trace_lane::shortcuts(ctx, &mut self.client.ui, &self.runtime.trace_data());
         let keys = self.runtime.config.keys.clone();
         let pressed = |text: &str| shortcut(text).is_some_and(|s| ctx.input_mut(|i| i.consume_shortcut(&s)));
@@ -248,6 +253,7 @@ impl Desktop<'_> {
         if let Some(open) = self.client.show_settings.take() {
             self.client.ui.management.settings = open;
         }
+        self.draw(|backend, client| atomics_ui::pull_request::dialog(ctx, backend, client));
         self.draw(|backend, client| atomics_ui::management::dialogs(ctx, backend, client));
         self.cleanup_dialog(ctx);
 

@@ -75,6 +75,7 @@ impl State {
                 })
                 .collect();
         }
+        let identity_scopes = config["identity_scopes"].clone();
         ManagementInfo {
             config,
             proposals,
@@ -87,8 +88,20 @@ impl State {
                 "sandbox_busy": self.sandbox_check.is_some(),
                 "connections": self.connections.management_info(),
                 "credentials": self.credential_status,
+                "secret_copy_unavailable": crate::secret_copy::unavailable(),
+                "secret_workspaces": self.workspace_names,
                 "credential_busy": self.credential_busy,
                 "credential_kinds": crate::credentials::KINDS.iter().map(|(id, label, _)| json!({"id":id, "label":label})).collect::<Vec<_>>(),
+                "identities": self.repos.iter().map(|repo| {
+                    let configured = self.project_identity(repo);
+                    let identity = self.git_identities.get(repo).map_or(configured.clone(), |git| git.overlay(&configured));
+                    let label = self.tickets.workspace_identity_error.clone().unwrap_or_else(|| if identity.name.is_none() && identity.email.is_none() { "Git identity".to_string() } else { identity.label() });
+                    let scoped = identity_scopes.as_array().into_iter().flatten()
+                        .find(|scope| scope["target"].as_str().is_some_and(|target| Path::new(target) == repo))
+                        .map(|scope| scope["identity"].clone()).unwrap_or_else(|| json!({}));
+                    json!({"project": repo.to_string_lossy(), "display": paths::display(repo), "label": label, "identity": identity, "override": scoped})
+                }).collect::<Vec<_>>(),
+                "identity_error": self.tickets.workspace_identity_error,
             }),
             remote,
             themes: self.themes.clone(),
@@ -342,6 +355,15 @@ fn credential_tool(
     let store = crate::credentials::Store::new(relay.keychain().clone());
     match tool {
         SettingsTool::RefreshCredentials => {}
+        SettingsTool::AddSecret { spec, value } => {
+            let label = format!("secret:{}", spec.name);
+            relay.edit(&label, |store| store.add_secret(spec, &value)).map_err(|error| error.to_string())?;
+        }
+        SettingsTool::RemoveSecret { name } => {
+            relay
+                .edit(&format!("secret:{name}"), |store| store.remove_secret(&name))
+                .map_err(|error| error.to_string())?;
+        }
         SettingsTool::PutCredential { kind, value, host } => {
             let label = if kind == "registry" {
                 format!("Private registry ({})", host.as_deref().unwrap_or_default())
@@ -394,7 +416,10 @@ fn credential_tool(
         status.logged_in,
         if sessions.is_empty() { "none".into() } else { sessions.join(", ") }
     );
-    Ok(json!({ "entries": entries, "invalid": snapshot.invalid, "azure": azure }))
+    let secrets = store.secrets().map_err(|error| error.to_string())?.into_iter().map(|spec| {
+        json!({"kind": spec.kind(), "scope": spec.scope.label(), "last_used": relay.secret_last_use(&spec.name), "spec": spec})
+    }).collect::<Vec<_>>();
+    Ok(json!({ "entries": entries, "secrets": secrets, "invalid": snapshot.invalid, "azure": azure }))
 }
 
 #[cfg(test)]

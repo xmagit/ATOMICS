@@ -13,6 +13,7 @@ use egui::{Align, Color32, FontSelection, Rect, Sense, Stroke, Vec2};
 /// What Settings asks about first, because it cannot be undone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Confirm {
+    RemoveSecret(String),
     RemoveCredential {
         kind: String,
         host: Option<String>,
@@ -98,6 +99,7 @@ pub(super) fn draw(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
     let selected = info.themes.choices.iter().find(|choice| choice.selected).map_or("", |choice| &choice.name);
     section(ui, &p, forced, "Theme", selected, true, |ui| theme(ui, backend, client, info));
     section(ui, &p, forced, "Shortcuts", "", false, |ui| shortcuts(ui, backend, client, info));
+    section(ui, &p, forced, "Identity", "", false, |ui| identity(ui, backend, client, enabled, info));
     section(ui, &p, forced, AGENTS, &agents_summary(info), false, |ui| agents(ui, client, enabled, info));
     section(ui, &p, forced, "Getting started", "", false, |ui| getting_started(ui, client));
     section(ui, &p, forced, "Connections", &connections_summary(info), false, |ui| {
@@ -107,7 +109,7 @@ pub(super) fn draw(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
         remote::draw(ui, backend, client, info)
     });
     section(ui, &p, forced, "Credentials", &credentials_summary(info), false, |ui| {
-        credentials(ui, client, enabled, info)
+        credentials(ui, backend, client, enabled, info)
     });
     section(ui, &p, forced, "Advanced", "", false, |ui| advanced(ui, backend, client, enabled, info));
     // The VM panel can be inserted as another Settings section without changing the shell.
@@ -148,6 +150,181 @@ pub(super) fn note(ui: &mut egui::Ui, p: &Palette, text: impl Into<String>) {
 fn subheading(ui: &mut egui::Ui, p: &Palette, text: &str) {
     ui.add_space(4.0);
     ui.label(RichText::new(text).strong().color(p.foreground));
+}
+
+#[derive(Default)]
+pub(super) struct IdentityForm {
+    target: String,
+    original: atomics_core::identity::Identity,
+    name: String,
+    email: String,
+    words: String,
+    clear_words: bool,
+}
+
+impl IdentityForm {
+    pub(super) fn select(&mut self, target: String, identity: atomics_core::identity::Identity) {
+        self.target = target;
+        self.name = identity.name.clone().unwrap_or_default();
+        self.email = identity.email.clone().unwrap_or_default();
+        self.words = identity.forbidden_words.as_ref().map(|words| words.join("\n")).unwrap_or_default();
+        self.clear_words = identity.forbidden_words.as_ref().is_some_and(Vec::is_empty);
+        self.original = identity;
+    }
+
+    /// Only edited keys are proposed. Empty fields inherit; clearing the word guard is explicit.
+    fn changes(&self) -> (atomics_core::identity::Identity, Vec<&'static str>) {
+        let mut patch = atomics_core::identity::Identity::default();
+        let mut remove = Vec::new();
+        for (key, text, old, value) in [
+            ("name", &self.name, &self.original.name, &mut patch.name),
+            ("email", &self.email, &self.original.email, &mut patch.email),
+        ] {
+            if text != old.as_deref().unwrap_or("") {
+                let text = text.trim();
+                if text.is_empty() {
+                    remove.push(key);
+                } else {
+                    *value = Some(text.into());
+                }
+            }
+        }
+        let original_words = self.original.forbidden_words.as_ref().map(|words| words.join("\n")).unwrap_or_default();
+        let original_clear = self.original.forbidden_words.as_ref().is_some_and(Vec::is_empty);
+        if self.words == original_words && self.clear_words == original_clear {
+            return (patch, remove);
+        }
+        let words = if self.clear_words {
+            Some(Vec::new())
+        } else {
+            let words: Vec<String> =
+                self.words.lines().map(str::trim).filter(|word| !word.is_empty()).map(str::to_string).collect();
+            (!words.is_empty()).then_some(words)
+        };
+        if words != self.original.forbidden_words {
+            match words {
+                Some(words) => patch.forbidden_words = Some(words),
+                None if self.original.forbidden_words.is_some() => remove.push("forbidden_words"),
+                None => {}
+            }
+        }
+        (patch, remove)
+    }
+
+    fn proposal(&self, path: &[String]) -> Option<HostAction> {
+        let (patch, remove) = self.changes();
+        if patch == Default::default() && remove.is_empty() {
+            return None;
+        }
+        let fields = serde_json::to_value(patch).ok()?;
+        let fields = fields.as_object()?.iter().map(|(key, value)| format!("{key} = {value}\n")).collect::<String>();
+        let toml = if fields.is_empty() {
+            String::new()
+        } else {
+            format!("[{}]\n{fields}", atomics_core::selfconfig::key(path))
+        };
+        let remove = remove
+            .into_iter()
+            .map(|field| {
+                let mut field_path = path.to_vec();
+                field_path.push(field.into());
+                atomics_core::selfconfig::key(&field_path)
+            })
+            .collect();
+        Some(HostAction::ConfigPropose {
+            scope: if self.target == "workspace" { Scope::Workspace } else { Scope::Main },
+            toml,
+            remove,
+            theme: None,
+            reason: Some("Update identity override".into()),
+        })
+    }
+}
+
+fn identity(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, enabled: bool, info: &ManagementInfo) {
+    let p = client.palette.clone();
+    if let Some(error) = info.tools["identity_error"].as_str() {
+        ui.colored_label(p.warning, error);
+    }
+    let rows = info.tools["identities"].as_array().map_or(&[][..], Vec::as_slice);
+    let scopes = info.config["identity_scopes"].as_array().map_or(&[][..], Vec::as_slice);
+    for row in rows {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(row["display"].as_str().unwrap_or_default());
+            ui.label(RichText::new(row["label"].as_str().unwrap_or("Git identity")).strong());
+            if ui.add_enabled(enabled, egui::Button::new("Change…")).clicked()
+                && let Ok(identity) = serde_json::from_value(row["override"].clone())
+            {
+                client.management.show_identity(row["project"].as_str().unwrap_or_default().into(), identity);
+            }
+        });
+    }
+    note(
+        ui,
+        &p,
+        "Project overrides workspace, then main config, then Git. Switching workspace changes its identity and updates ATOMICS worktrees.",
+    );
+    let workspace = backend.project_menu().current;
+    ui.add_enabled_ui(enabled, |ui| {
+        let form = &mut client.management.identity;
+        let previous = form.target.clone();
+        if form.target.is_empty() || form.target == "workspace" && workspace.is_none() {
+            form.target = if workspace.is_some() { "workspace" } else { "main" }.into();
+        }
+        let selected = match form.target.as_str() {
+            "main" => "Main config".to_string(),
+            "workspace" => format!("Workspace: {}", workspace.as_deref().unwrap_or("none")),
+            project => format!("Project: {project}"),
+        };
+        egui::ComboBox::from_label("Identity for").selected_text(selected).show_ui(ui, |ui| {
+            ui.selectable_value(&mut form.target, "main".into(), "Main config");
+            if let Some(workspace) = &workspace {
+                ui.selectable_value(&mut form.target, "workspace".into(), format!("Workspace: {workspace}"));
+            }
+            for row in rows {
+                let path = row["project"].as_str().unwrap_or_default();
+                ui.selectable_value(
+                    &mut form.target,
+                    path.into(),
+                    format!("Project: {}", row["display"].as_str().unwrap_or(path)),
+                );
+            }
+        });
+        let scope = scopes.iter().find(|scope| scope["target"] == form.target);
+        if previous != form.target {
+            let raw =
+                scope.and_then(|scope| serde_json::from_value(scope["identity"].clone()).ok()).unwrap_or_default();
+            form.select(form.target.clone(), raw);
+        }
+        ui.add(
+            crate::controls::single_line(&mut form.name)
+                .hint_text("Commit name (blank inherits)")
+                .desired_width(ui.available_width()),
+        );
+        ui.add(
+            crate::controls::single_line(&mut form.email)
+                .hint_text("Commit email (blank inherits)")
+                .desired_width(ui.available_width()),
+        );
+        ui.add_enabled(
+            !form.clear_words,
+            egui::TextEdit::multiline(&mut form.words)
+                .hint_text("Forbidden words, one per line (blank inherits)")
+                .desired_rows(3)
+                .desired_width(ui.available_width()),
+        );
+        ui.checkbox(&mut form.clear_words, "Clear inherited words");
+        let path = scope.and_then(|scope| serde_json::from_value::<Vec<String>>(scope["path"].clone()).ok());
+        let proposal = path.as_deref().and_then(|path| form.proposal(path));
+        if ui.add_enabled(proposal.is_some(), egui::Button::new("Review identity change")).clicked() {
+            client.send(Command::Manage(proposal.unwrap()));
+        }
+    });
+    note(
+        ui,
+        &p,
+        "Only changed keys are saved in the selected scope. Blank fields inherit; clearing inherited words requires the checkbox. Review and Apply saves the change in your config. The guard reports file and line only.",
+    );
 }
 
 pub(super) fn button(ui: &mut egui::Ui, client: &Client, text: impl Into<String>) -> egui::Response {
@@ -429,6 +606,27 @@ fn agents(ui: &mut egui::Ui, client: &mut Client, enabled: bool, info: &Manageme
         }
     }
     note(ui, &p, "Agents are the [[agents]] entries in the config: see Advanced.");
+    subheading(ui, &p, "Chief's task agent preference");
+    let values = &info.config["values"];
+    if let Some(prefer) = values["chief.prefer"]["value"].as_array() {
+        let names: Vec<_> = prefer.iter().filter_map(|name| name.as_str()).collect();
+        ui.label(if names.is_empty() { "No preference; choose by task fit".into() } else { names.join(", then ") });
+    }
+    let minimums: Vec<_> = values
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(key, entry)| {
+            let provider = key.strip_prefix("chief.min_left_percent.")?;
+            Some(format!("{provider}: {}% left", entry["value"]))
+        })
+        .collect();
+    note(ui, &p, if minimums.is_empty() { "No quota minimums configured".into() } else { minimums.join(" · ") });
+    note(
+        ui,
+        &p,
+        "Minimums apply to session and weekly quota left. Plans below them warn and can still be saved. Change [chief] prefer and min_left_percent in the config: see Advanced.",
+    );
     subheading(ui, &p, "What they need");
     super::setup::programs(ui, client, enabled, &info.setup);
     subheading(ui, &p, "Docker Sandboxes");
@@ -641,14 +839,16 @@ fn remote_summary(info: &ManagementInfo) -> String {
 fn credentials_summary(info: &ManagementInfo) -> String {
     let Some(entries) = info.tools["credentials"]["entries"].as_array() else { return String::new() };
     let set = entries.iter().filter(|entry| entry["present"] == true).count();
-    format!("{set} of {} set", entries.len())
+    let secrets = info.tools["credentials"]["secrets"].as_array().map_or(0, Vec::len);
+    format!("{secrets} secrets · {set} of {} integrations set", entries.len())
 }
 
-fn credentials(ui: &mut egui::Ui, client: &mut Client, enabled: bool, info: &ManagementInfo) {
+fn credentials(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, enabled: bool, info: &ManagementInfo) {
     let p = client.palette.clone();
     let status = &info.tools["credentials"];
     let busy = info.tools["credential_busy"] == true;
     load(client, enabled, busy, SettingsTool::RefreshCredentials);
+    secrets(ui, backend, client, enabled && !busy, info);
     note(
         ui,
         &p,
@@ -710,6 +910,207 @@ fn credentials(ui: &mut egui::Ui, client: &mut Client, enabled: bool, info: &Man
 }
 
 /// One entry of the credential store: whether it is set, where its value goes, who used it, and what can change it.
+fn secrets(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, enabled: bool, info: &ManagementInfo) {
+    use atomics_core::secrets::{Auth, Scope as SecretScope};
+    let p = client.palette.clone();
+    subheading(ui, &p, "Secrets");
+    if let Some(note_text) = info.tools["credentials"]["copy_note"].as_str() {
+        note(ui, &p, note_text);
+    }
+    note(
+        ui,
+        &p,
+        "New sessions receive secrets in their scope. Protected values stay in the host store; exposed values can be read and leaked by agents.",
+    );
+    for entry in info.tools["credentials"]["secrets"].as_array().into_iter().flatten() {
+        let name = entry["spec"]["name"].as_str().unwrap_or_default();
+        ui.label(RichText::new(name).strong());
+        note(
+            ui,
+            &p,
+            format!(
+                "{} · {} · Host: {} · Last use: {}",
+                entry["kind"].as_str().unwrap_or_default(),
+                entry["scope"].as_str().unwrap_or_default(),
+                entry["spec"]["host"].as_str().unwrap_or("none"),
+                entry["last_used"].as_str().unwrap_or("never")
+            ),
+        );
+        let copy = Command::CopySecret(name.into());
+        let local = backend.available(&copy);
+        let unavailable = if !local {
+            Some(
+                "Copy is available only in a native window on the machine holding the credential store. Open ATOMICS there; remote and protocol clients cannot copy.",
+            )
+        } else {
+            info.tools["secret_copy_unavailable"].as_str()
+        };
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(enabled && local && unavailable.is_none(), egui::Button::new("Copy (OS authentication)"))
+                .clicked()
+            {
+                client.send(copy);
+            }
+            if ui.add_enabled(enabled, egui::Button::new("Remove…")).clicked() {
+                client.management.confirm = Some(Confirm::RemoveSecret(name.into()));
+            }
+        });
+        if let Some(reason) = unavailable {
+            note(ui, &p, reason);
+        }
+        if client.management.confirm == Some(Confirm::RemoveSecret(name.into())) {
+            match ask(
+                ui,
+                client,
+                &format!("Remove {name}? This cannot be undone. Restart existing sessions to clear their environment."),
+                "Remove secret",
+            ) {
+                Some(true) => {
+                    client.management.confirm = None;
+                    tool(client, SettingsTool::RemoveSecret { name: name.into() });
+                }
+                Some(false) => client.management.confirm = None,
+                None => {}
+            }
+        }
+        ui.add_space(4.0);
+    }
+    if ui.add_enabled(enabled, egui::Button::new("Add secret")).clicked() {
+        client.management.adding_secret = true;
+    }
+    if !client.management.adding_secret {
+        ui.separator();
+        return;
+    }
+    ui.add_enabled_ui(enabled, |ui| {
+        let state = &mut client.management;
+        ui.label("Environment variable name");
+        if ui.add(crate::controls::single_line(&mut state.secret.name).hint_text("LOGO_DEV_API_KEY")).changed() {
+            let known = atomics_core::secrets::service(&state.secret.name);
+            state.secret.host = known.as_ref().map(|(host, _)| host.to_string());
+            state.secret.auth = known.map(|(_, auth)| auth).unwrap_or_default();
+        }
+        ui.label("Value");
+        ui.add(crate::controls::single_line(&mut state.secret_value).password(true).hint_text("New value (hidden)"));
+        ui.label("Used with host (optional)");
+        let mut host = state.secret.host.clone().unwrap_or_default();
+        if ui
+            .add(crate::controls::single_line(&mut host).hint_text("api.example.com or a service such as openai"))
+            .changed()
+        {
+            let known = atomics_core::secrets::service(host.trim());
+            state.secret.host = if host.trim().is_empty() {
+                None
+            } else {
+                Some(known.as_ref().map_or_else(|| host.trim().to_ascii_lowercase(), |(h, _)| h.to_string()))
+            };
+            if let Some((_, auth)) = known {
+                state.secret.auth = auth;
+            }
+            if state.secret.host.is_none() {
+                state.secret.auth = Auth::Bearer;
+                state.secret_methods.clear();
+                state.secret_path.clear();
+            }
+        }
+        ui.label(state.secret.kind());
+        egui::ComboBox::from_label("Secret scope").selected_text(state.secret.scope.label()).show_ui(ui, |ui| {
+            ui.selectable_value(&mut state.secret.scope, SecretScope::Everywhere, "Everywhere");
+            for workspace in info.tools["secret_workspaces"].as_array().into_iter().flatten().filter_map(|s| s.as_str())
+            {
+                ui.selectable_value(
+                    &mut state.secret.scope,
+                    SecretScope::Workspace(workspace.into()),
+                    format!("Workspace: {workspace}"),
+                );
+            }
+            for project in
+                info.tools["identities"].as_array().into_iter().flatten().filter_map(|s| s["project"].as_str())
+            {
+                ui.selectable_value(
+                    &mut state.secret.scope,
+                    SecretScope::Project(project.into()),
+                    format!("Project: {project}"),
+                );
+            }
+        });
+        if state.secret.host.is_some() {
+            let selected = match &state.secret.auth {
+                Auth::Bearer => "Authorization bearer",
+                Auth::Header(_) => "Named header",
+                Auth::Basic(_) => "Basic auth",
+                Auth::Query(_) => "Query parameter",
+            };
+            egui::ComboBox::from_label("Authentication").selected_text(selected).show_ui(ui, |ui| {
+                for (auth, label) in [
+                    (Auth::Bearer, "Authorization bearer"),
+                    (Auth::Header(String::new()), "Named header"),
+                    (Auth::Basic(String::new()), "Basic auth"),
+                    (Auth::Query(String::new()), "Query parameter"),
+                ] {
+                    if ui
+                        .selectable_label(
+                            std::mem::discriminant(&state.secret.auth) == std::mem::discriminant(&auth),
+                            label,
+                        )
+                        .clicked()
+                    {
+                        state.secret.auth = auth;
+                    }
+                }
+            });
+            match &mut state.secret.auth {
+                Auth::Header(name) => {
+                    ui.add(crate::controls::single_line(name).hint_text("Header name, e.g. x-api-key"));
+                }
+                Auth::Basic(user) => {
+                    ui.add(
+                        crate::controls::single_line(user).hint_text("Public username (value above is the password)"),
+                    );
+                }
+                Auth::Query(name) => {
+                    ui.add(crate::controls::single_line(name).hint_text("Query parameter name, e.g. api_key"));
+                }
+                _ => {}
+            }
+            ui.add(
+                crate::controls::single_line(&mut state.secret_methods)
+                    .hint_text("Allowed methods, e.g. GET,POST (empty: all)"),
+            );
+            ui.add(
+                crate::controls::single_line(&mut state.secret_path).hint_text("Path prefix, e.g. /v1 (empty: all)"),
+            );
+        }
+        state.secret.methods = state
+            .secret_methods
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_ascii_uppercase)
+            .collect();
+        state.secret.path_prefix = (!state.secret_path.trim().is_empty()).then(|| state.secret_path.trim().into());
+        let validation = state.secret.validate();
+        if let Err(reason) = validation {
+            note(ui, &p, reason);
+        }
+        let save = ui
+            .add_enabled(validation.is_ok() && !state.secret_value.is_empty(), egui::Button::new("Save secret"))
+            .clicked();
+        let cancel = ui.button("Cancel").clicked();
+        if save {
+            let spec = state.secret.clone();
+            let value = std::mem::take(&mut state.secret_value);
+            state.adding_secret = false;
+            tool(client, SettingsTool::AddSecret { spec, value });
+        } else if cancel {
+            state.secret_value.clear();
+            state.adding_secret = false;
+        }
+    });
+    ui.separator();
+}
+
 fn credential(ui: &mut egui::Ui, client: &mut Client, enabled: bool, entry: &serde_json::Value) {
     let p = client.palette.clone();
     let label = entry["label"].as_str().unwrap_or_default();
@@ -953,4 +1354,74 @@ fn advanced(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, enabl
             client.send(Command::Manage(action));
         }
     });
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    use atomics_core::identity::Identity;
+
+    #[test]
+    fn identity_form_preserves_inheritance_and_only_proposes_edited_keys() {
+        let mut form = IdentityForm::default();
+        form.select("/example/app".into(), Identity { name: Some("Project Example".into()), ..Default::default() });
+        assert_eq!(form.name, "Project Example");
+        assert!(form.email.is_empty() && form.words.is_empty());
+        let path = vec!["identity".into(), "projects".into(), "~/app".into()];
+        assert!(form.proposal(&path).is_none());
+        form.email = "project@example.com".into();
+        let HostAction::ConfigPropose { scope, toml, remove, .. } = form.proposal(&path).unwrap() else {
+            panic!("proposal")
+        };
+        assert_eq!(scope, Scope::Main);
+        assert!(remove.is_empty());
+        assert!(toml.contains("email = \"project@example.com\""));
+        assert!(!toml.contains("name =") && !toml.contains("forbidden_words"));
+        let proposal = atomics_core::selfconfig::edit(
+            "[identity]\nforbidden_words = ['contoso']\n[identity.projects.'~/app']\nname = 'Project Example'\n",
+            &toml,
+            &remove,
+        )
+        .unwrap();
+        let config = atomics_core::config::Config::from_tables([proposal.parse().unwrap()]).unwrap();
+        let resolved = config.identity.resolve("~/app", None, str::to_string);
+        assert_eq!(resolved.forbidden_words, Some(vec!["contoso".into()]));
+        assert_eq!(config.identity.projects["~/app"].name.as_deref(), Some("Project Example"));
+
+        // Changing scope discards the other scope's prefill and draft.
+        form.select("workspace".into(), Identity { email: Some("workspace@example.com".into()), ..Default::default() });
+        assert!(form.name.is_empty() && form.words.is_empty());
+        assert_eq!(form.email, "workspace@example.com");
+        assert!(form.proposal(&["identity".into()]).is_none());
+    }
+
+    #[test]
+    fn identity_form_clears_the_guard_only_with_the_explicit_toggle() {
+        let path = vec!["identity".into()];
+        let mut form = IdentityForm::default();
+        form.select("workspace".into(), Identity::default());
+        form.name = "Workspace Example".into();
+        let HostAction::ConfigPropose { toml, .. } = form.proposal(&path).unwrap() else { panic!("proposal") };
+        assert!(!toml.contains("forbidden_words"));
+        form.clear_words = true;
+        let HostAction::ConfigPropose { toml, .. } = form.proposal(&path).unwrap() else { panic!("proposal") };
+        assert!(toml.contains("forbidden_words = []"));
+
+        form.select(
+            "workspace".into(),
+            Identity {
+                forbidden_words: Some(vec![" contoso ".into(), "example, internal".into()]),
+                ..Default::default()
+            },
+        );
+        assert!(form.proposal(&path).is_none(), "unchanged words are never normalized into an edit");
+        form.words.clear();
+        let HostAction::ConfigPropose { toml, remove, .. } = form.proposal(&path).unwrap() else { panic!("proposal") };
+        assert!(toml.is_empty());
+        assert_eq!(
+            remove,
+            ["identity.forbidden_words"],
+            "blank restores inheritance, never clears the inherited guard"
+        );
+    }
 }

@@ -219,7 +219,16 @@ impl Keyboard {
                 true
             }
             Event::Key { modifiers, .. } if shortcut(*modifiers) => false,
-            event if before_terminal(event, OperatingSystem::from_target_os(), overlay.editor) => false,
+            event
+                if before_terminal(event, OperatingSystem::from_target_os(), overlay.editor)
+                    || atomics_ui::window_keys::github_key(
+                        event,
+                        &overlay.github_key,
+                        OperatingSystem::from_target_os(),
+                    ) =>
+            {
+                false
+            }
             Event::Key { key, pressed, modifiers, .. } => {
                 if *pressed {
                     let name = key_name(*key)
@@ -501,5 +510,27 @@ mod tests {
         keyboard.follow(&mut overlay, &mut inputs);
         assert!(!keyboard.focused);
         assert_eq!(inputs, vec![TermInput::Focus(true), TermInput::Focus(false)]);
+    }
+}
+
+#[cfg(test)]
+mod github_key_tests {
+    use super::*;
+    #[test]
+    fn configured_github_chord_stays_out_of_a_focused_terminal() {
+        let mut keyboard = Keyboard { focused: true, ..Default::default() };
+        let overlay = Overlay { github_key: "ctrl+g".into(), writable: true, ..Default::default() };
+        let event = Event::Key {
+            key: Key::G,
+            physical_key: Some(Key::U),
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::CTRL,
+        };
+        let mut raw = RawInput { events: vec![event.clone()], ..Default::default() };
+        let mut inputs = Vec::new();
+        keyboard.route(&mut raw, &overlay, false, 1.0, &mut inputs, &mut |_| {});
+        assert_eq!(raw.events, vec![event]);
+        assert!(inputs.is_empty());
     }
 }

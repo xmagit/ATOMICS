@@ -86,6 +86,7 @@ pub struct Prepare {
     /// For a Claude agent: the relay that gives it a placeholder for the Claude subscription, when
     /// the OS keychain holds one.
     pub relay: Option<std::sync::Arc<crate::relay::Service>>,
+    pub secret_workspace: Option<String>,
 }
 
 impl Prepare {
@@ -176,7 +177,25 @@ pub fn prepare(job: &Prepare) -> Result<Option<crate::relay::Granted>> {
     let (workspace, git) = workspace(&job.cwd)?;
     // First, so a new sandbox's environment can name the relay's port.
     let granted = match &job.relay {
-        Some(relay) => relay.grant_session(&job.name, job.agent == "claude", &job.config.azure)?,
+        Some(relay) => {
+            let granted = relay.grant_session(&job.name, job.agent == "claude", &job.config.azure)?;
+            let project = atomics_core::workspace::project_root(&job.cwd).ok();
+            match relay.grant_secrets(
+                &job.name,
+                job.secret_workspace.as_deref(),
+                project.as_deref().and_then(Path::to_str),
+                true,
+                granted.clone(),
+            ) {
+                Ok(granted) => granted,
+                Err(error) => {
+                    if let Some(granted) = &granted {
+                        relay.revoke(granted);
+                    }
+                    return Err(error);
+                }
+            }
+        }
         None => None,
     };
     let made = make(job, &ready, existing, workspace, git, granted.as_ref());
@@ -215,7 +234,7 @@ fn make(
         }
         // Made before Claude used the relay, before the relay moved to another port, or used by a Claude
         // that no longer has a subscription to relay.
-        return relay_rule(job, granted.map(|granted| granted.port));
+        return relay_rule(job, granted.map(|granted| granted.port).filter(|port| *port != 0));
     }
     // A machine's first sandbox needs sbx's global network policy; one already set up is left alone.
     if !ready.diagnosis.policy_initialized() {
@@ -277,7 +296,7 @@ fn make(
             sbx(&job.sbx, &isolation::allow_hosts_args(&job.name, &hosts), ssh, TIMEOUT)
                 .context("allowing the repository's hosts")?;
         }
-        relay_rule(job, granted.map(|granted| granted.port))
+        relay_rule(job, granted.map(|granted| granted.port).filter(|port| *port != 0))
     };
     // A half-made sandbox would be reattached to as it is: remove it so the next start makes it whole.
     finish().inspect_err(|_| {
@@ -942,6 +961,7 @@ mod tests {
             briefs: None,
             pins: sbx.with_file_name("git-pins"),
             relay: None,
+            secret_workspace: None,
         }
     }
 
@@ -1505,7 +1525,7 @@ mod tests {
         assert!(output.len() < 20_000, "the VM keeps only the end of the rollout: {} bytes", output.len());
         let reports = crate::usage::sandbox_reports(&output, i64::MAX);
         let [crate::usage::Report::Codex(usage)] = reports.as_slice() else { panic!("one Codex report: {output}") };
-        assert_eq!(usage.weekly.as_ref().unwrap().remaining, 88.0, "from the newest rollout");
+        assert_eq!(usage.weekly.as_ref().unwrap().left_percent, 88.0, "from the newest rollout");
         assert!(read_usage(&sbx, "atomics-gone").is_err());
     }
 

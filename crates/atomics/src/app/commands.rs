@@ -102,6 +102,11 @@ impl Local<'_> {
             Command::EditBrief { plan, task, brief } => {
                 state.post_plan(plan, move |state, index| state.edit_task_brief(index, &task, brief))
             }
+            Command::CurateNote { plan, id, pinned, delete } => state.post_plan(plan, move |state, index| {
+                if let Err(error) = state.curate_notebook(index, id, pinned, delete) {
+                    state.toast(error);
+                }
+            }),
             Command::StartTask { plan, task } => {
                 state.post_plan(plan, move |state, index| state.dispatch_when_checked(index, Some(task), None))
             }
@@ -229,6 +234,25 @@ impl Local<'_> {
                     state.toast(message);
                 }
             }),
+            Command::CopySecret(name) => {
+                // No ctl, MCP, protocol, or connected native client can construct this command
+                // on the credential host. Check the actual window again before OS authentication.
+                if !state.window.is_attached() {
+                    return;
+                }
+                let keychain = state.relay.keychain().clone();
+                let actions = state.action_tx.clone();
+                std::thread::spawn(move || {
+                    let message = match crate::secret_copy::copy(keychain, &name) {
+                        Ok(()) => "Secret copied after OS authentication".to_string(),
+                        Err(error) => error.to_string(),
+                    };
+                    let _ = actions.send(Box::new(move |state| {
+                        state.credential_status["copy_note"] = json!(message);
+                        state.toast(message);
+                    }));
+                });
+            }
             Command::OpenProject(root) => state.post(move |state| state.open_project(&root)),
             Command::CloseProject(root) => state.post(move |state| state.close_project(&root)),
             Command::OpenWorkspace(name) => state.post(move |state| {

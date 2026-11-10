@@ -305,6 +305,9 @@ pub fn shell_program() -> String {
 
 /// The installed path, including after an atomic update of a running Linux app.
 pub fn executable_path() -> std::io::Result<PathBuf> {
+    if let Some(executable) = crate::build_info::executable() {
+        return Ok(executable.to_path_buf());
+    }
     let executable = std::env::current_exe()?;
     #[cfg(target_os = "linux")]
     {
@@ -488,13 +491,7 @@ pub(crate) fn find_on_path(program: &str, path: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
 }
 
-/// Resolve the configured editor, including distributions that name Helix `helix`.
-pub fn editor_program(program: &str) -> String {
-    editor_on_path(program, find_program)
-        .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_else(|| program.into())
-}
-
+/// Finds the configured editor, including distributions that name Helix `helix`.
 pub(crate) fn editor_on_path(program: &str, find: impl Fn(&str) -> Option<PathBuf>) -> Option<PathBuf> {
     find(program).or_else(|| if program == "hx" { find("helix") } else { None })
 }
@@ -580,7 +577,7 @@ pub(crate) fn agent_codex_home() -> PathBuf {
 }
 
 pub fn global_hooks_installed() -> bool {
-    let Ok(exe) = executable_path() else { return false };
+    let Ok(exe) = hook_executable() else { return false };
     std::fs::read_to_string(claude_settings_path()).is_ok_and(|text| text.contains(&format!("{} hook", exe.display())))
 }
 
@@ -593,7 +590,7 @@ pub fn legacy_hooks_installed() -> bool {
 
 pub fn install_global_hooks() -> anyhow::Result<PathBuf> {
     let path = claude_settings_path();
-    let exe = executable_path()?;
+    let exe = hook_executable()?;
     let mut settings: serde_json::Value = match std::fs::read_to_string(&path) {
         Ok(text) => {
             std::fs::write(path.with_extension("json.atomics-backup"), &text)?;
@@ -939,8 +936,9 @@ mod tests {
             crate::test_support::write_program(
                 &shell,
                 format!(
-                    "#!/bin/sh\n[ \"$1 $2 $3\" = '-l -i -c' ] || exit 64\nwhile [ ! -e \"${{0%/*}}/go\" ]; do sleep \
-                     0.05; done\nPATH='{FRESH}'\neval \"$4\"\n"
+                    "#!/bin/sh\n[ \"$1 $2 $3\" = '-l -i -c' ] || exit 64\nwhile [ ! -e \"${{0%/*}}/go\" ]; do '{}' \
+                     0.05; done\nPATH='{FRESH}'\neval \"$4\"\n",
+                    crate::test_support::program("sleep").replace('\'', "'\\''")
                 ),
             );
             std::fs::write(dir.path().join("scenario"), scenario).unwrap();

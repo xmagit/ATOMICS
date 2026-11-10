@@ -328,6 +328,7 @@ pub fn request_at(path: &Path, request: &ControlRequest) -> Result<ControlRespon
         .map_err(|e| RequestError::NotRunning(format!("ATOMICS is not running ({}: {e})", path.display())))?;
     // A sandbox command may wait its timeout for a slot, then run for as long.
     let timeout = match request {
+        ControlRequest::SecretRemoved { .. } => 5,
         ControlRequest::Exec { timeout_secs, .. } => 2 * crate::sandbox::exec::timeout(*timeout_secs).as_secs() + 120,
         _ => 320,
     };
@@ -400,7 +401,7 @@ mod tests {
         )
         .unwrap();
         let crate::usage::Report::Claude(usage) = usage_rx.try_recv().unwrap() else { panic!("claude report") };
-        assert_eq!(usage.session.unwrap().remaining, 78.0);
+        assert_eq!(usage.session.unwrap().left_percent, 78.0);
         assert!(usage.weekly.is_none());
         assert!(usage.observed_at > 0);
         assert!(hook_rx.try_recv().is_err(), "usage must not change agent status");
