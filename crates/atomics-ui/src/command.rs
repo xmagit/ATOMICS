@@ -53,6 +53,12 @@ pub enum Command {
         task: String,
         brief: String,
     },
+    CurateNote {
+        plan: usize,
+        id: u64,
+        pinned: Option<bool>,
+        delete: bool,
+    },
     /// Start a ready task.
     StartTask {
         plan: usize,
@@ -72,6 +78,7 @@ pub enum Command {
     AcknowledgeRefs {
         plan: usize,
         task: usize,
+        generation: Option<String>,
     },
     /// Move a task to another column.
     SetTaskStatus {
@@ -176,6 +183,11 @@ pub enum Command {
     // ── The ticket system's sign-in ────────────────────────────────────────────────────────────────────
     /// Open the GitHub controls and start connecting; only a host's own window can.
     ConnectGithub,
+    PublishDecision {
+        plan: usize,
+        request: String,
+        approve: bool,
+    },
     /// Sign in to the ticket system, or again after the server refused the saved sign-in: the host's
     /// sign-in job, after which its ticket worker connects again. A desktop host may open its browser.
     SignInTickets,
@@ -190,6 +202,8 @@ pub enum Command {
 
     // ── Projects and worktrees ───────────────────────────────────────────────────────────────────────
     Manage(HostAction),
+    /// Native window on the credential host only. Deliberately has no wire mapping.
+    CopySecret(String),
     OpenProject(PathBuf),
     CloseProject(PathBuf),
     /// Open a saved workspace, by name, in place of the open projects.
@@ -392,7 +406,17 @@ impl Command {
                 decision: *decision,
                 message: None,
             })],
+            Command::PublishDecision { plan: index, request, approve } => {
+                plan(*index, PlanAction::PublishDecision { request: request.clone(), approve: *approve }, op)
+                    .into_iter()
+                    .collect()
+            }
             Command::ApprovePlan(index) => plan(*index, PlanAction::Approve, op).into_iter().collect(),
+            Command::CurateNote { plan: index, id, pinned, delete } => {
+                plan(*index, PlanAction::Notebook { id: *id, pinned: *pinned, delete: *delete }, op)
+                    .into_iter()
+                    .collect()
+            }
             Command::StartTask { plan: index, task } => {
                 plan(*index, PlanAction::Dispatch { task: Some(task.clone()) }, op).into_iter().collect()
             }
@@ -492,13 +516,12 @@ impl Command {
         Remote::Send(sent)
     }
 
-    /// A task card's `diff`, `resume` or `acknowledge_refs` button, for the task at position `task` of the
+    /// A task card's `diff` or `resume` button, for the task at position `task` of the
     /// plan at `plan`; `None` for any other action.
     pub fn task(plan: usize, task: usize, action: &str) -> Option<Command> {
         match action {
             "diff" => Some(Command::ShowTaskDiff { plan, task }),
             "resume" => Some(Command::ResumeTask { plan, task }),
-            "acknowledge_refs" => Some(Command::AcknowledgeRefs { plan, task }),
             _ => None,
         }
     }
@@ -513,4 +536,15 @@ pub enum Remote {
     Client,
     /// atomics.v1 has no operation for it yet, so a remote client does not offer it.
     Unsupported,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_shortcuts_cannot_acknowledge_without_an_alert_generation() {
+        assert!(Command::task(0, 0, "acknowledge_refs").is_none());
+        assert!(matches!(Command::task(0, 0, "resume"), Some(Command::ResumeTask { .. })));
+    }
 }

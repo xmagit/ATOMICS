@@ -37,6 +37,38 @@ pub(super) struct ProposedChange<'a> {
 }
 
 impl State {
+    /// Raw values in the exact files the identity form edits; inherited values are display-only.
+    fn identity_scopes(&self, layers: &[Layer]) -> Vec<serde_json::Value> {
+        use atomics_core::identity::IdentityConfig;
+        let main: IdentityConfig = layers
+            .iter()
+            .find(|layer| layer.source == Source::Main)
+            .and_then(|layer| layer.table.get("identity"))
+            .and_then(|value| value.clone().try_into().ok())
+            .unwrap_or_default();
+        let mut scopes = vec![json!({"target":"main", "scope":"main", "path":["identity"], "identity":main.default})];
+        if self.workspace.is_some() {
+            let identity = layers
+                .iter()
+                .find(|layer| layer.source == Source::Workspace)
+                .and_then(|layer| workspace::Workspace::identity_in(&layer.table).ok().flatten())
+                .unwrap_or_default();
+            scopes.push(json!({"target":"workspace", "scope":"workspace", "path":["identity"], "identity":identity}));
+        }
+        for root in &self.repos {
+            let found = main.projects.iter().find(|(path, _)| {
+                let expanded = paths::expand(path);
+                paths::same_location(&expanded, root)
+            });
+            let (key, identity) = found.map_or_else(
+                || (paths::display(root), Default::default()),
+                |(key, identity)| (key.clone(), identity.clone()),
+            );
+            scopes.push(json!({"target":root.to_string_lossy(), "scope":"main", "path":["identity", "projects", key], "identity":identity}));
+        }
+        scopes
+    }
+
     /// The files that make up the configuration, lowest precedence first: the main file,
     /// this host's, the active workspace's, and the project's own when given.
     pub(super) fn config_layers(&self, project: Option<&Path>) -> Vec<Layer> {
@@ -51,12 +83,16 @@ impl State {
 
     /// The configuration ATOMICS runs with, the workspace's tickets, workflow and isolation included.
     pub(super) fn effective_config(&self) -> Config {
-        Config {
+        let mut config = Config {
             tickets: self.effective_tickets(),
             workflow: self.workflow().clone(),
             isolation: self.effective_isolation(),
             ..self.config.clone()
+        };
+        if let Some(identity) = &self.tickets.workspace_identity {
+            config.identity.default = config.identity.default.overlay(identity);
         }
+        config
     }
 
     /// The cleaner for everything the configuration tools return: built from the secrets
@@ -80,6 +116,9 @@ impl State {
         layers.extend(repo_workflow.as_ref().map(|repo| repo.config.clone()));
         let cleaner = self.config_cleaner(&layers);
         let mut effective = self.effective_config();
+        if let Some(project) = project.as_deref() {
+            effective.identity.default = self.project_identity(project);
+        }
         if let Some(layer) = layers.iter().find(|layer| layer.source == Source::Repo) {
             let repo = atomics_core::repo_workflow::RepoWorkflow { config: layer.clone(), ..Default::default() };
             effective = repo.apply(&effective);
@@ -101,6 +140,28 @@ impl State {
                 "projects": self.open_projects.iter().map(|p| paths::display(p)).collect::<Vec<_>>(),
             })
         });
+        let mut values = selfconfig::values(&effective, &layers, &cleaner, key);
+        if let Some(root) = &project
+            && let Some((path, identity)) = self.config.identity.projects.iter().find(|(path, _)| {
+                let expanded = paths::expand(path);
+                paths::same_location(&expanded, root)
+            })
+        {
+            for (field, set) in [
+                ("name", identity.name.is_some()),
+                ("email", identity.email.is_some()),
+                ("github", identity.github.is_some()),
+                ("forbidden_words", identity.forbidden_words.is_some()),
+            ] {
+                if set && let Some(entry) = values.get_mut(&format!("identity.{field}")) {
+                    let source = selfconfig::source_of(
+                        &layers,
+                        &["identity".into(), "projects".into(), path.clone(), field.into()],
+                    );
+                    entry["source"] = json!(source);
+                }
+            }
+        }
         let project = project.map(|root| {
             json!({
                 "path": paths::display(&root),
@@ -120,13 +181,15 @@ impl State {
         // agent-visible string gets credential syntax masking as well as known secrets.
         Ok(cleaner.setting(json!({
             "host": paths::host_name(),
-            "merge": "Built-in defaults, then config.toml, then config.d/<host>.toml: tables merge key by key, arrays and other values replace. A workspace's [tickets] and [workflow] replace each section as a whole; its [isolation] merges key by key. A project overlays allowlisted .atomics/config.toml settings; its [workflow] replaces the workspace workflow, and its isolation.mode can only tighten to sandbox.",
+            "merge": "Built-in defaults, then config.toml, then config.d/<host>.toml: tables merge key by key, arrays and other values replace. A workspace's [tickets] and [workflow] replace each section as a whole; its [isolation] and [identity] merge key by key. Identity keys prefer user-owned identity.projects.<main checkout>, then workspace, then main/host, then Git. A project overlays allowlisted .atomics/config.toml settings; its [workflow] replaces the workspace workflow, and its isolation.mode can only tighten to sandbox. Repository files cannot set identity.",
             "files": files,
             "workspace": workspace,
             "project": project,
+            "cache_warnings": effective.cache.warnings(),
             "load_error": load_error,
             "running_on_last_good_config": self.config_error.is_some(),
-            "values": selfconfig::values(&effective, &layers, &cleaner, key),
+            "values": values,
+            "identity_scopes": self.identity_scopes(&layers),
             "chief_prompt": {
                 "built_in": effective.chief.system_prompt == atomics_core::config::CHIEF_PROMPT,
                 "sections": sections,
@@ -373,8 +436,14 @@ mod tests {
     fn wait_for_config(app: &mut Desktop<'_>, _ctx: &egui::Context) -> std::sync::mpsc::Receiver<ControlOutcome> {
         let (tx, rx) = std::sync::mpsc::channel();
         let after = app.runtime.event_seq;
-        let wait =
-            ControlRequest::Wait { sessions: vec![], statuses: vec![], after: Some(after), timeout_secs: Some(30) };
+        let wait = ControlRequest::Wait {
+            compact: false,
+            full_sessions: false,
+            sessions: vec![],
+            statuses: vec![],
+            after: Some(after),
+            timeout_secs: Some(30),
+        };
         app.runtime.control(wait, tx);
         assert!(rx.try_recv().is_err(), "nothing happened yet");
         rx
@@ -398,6 +467,33 @@ mod tests {
             .collect();
         found.sort();
         found
+    }
+
+    #[test]
+    fn chief_settings_proposal_reloads_model_intervals_and_saved_dock() {
+        with_app("app::selfconfig::tests::chief_settings_proposal_reloads_model_intervals_and_saved_dock", |app, _| {
+            let main = app.runtime.config_path.clone();
+            std::fs::write(&main, "[isolation]\nmode = 'bare'\n[chief]\nargs = ['--model', 'custom-chief', '--verbose']\ndock = 'floating'\n").unwrap();
+            app.runtime.reload_config();
+            app.runtime.store.chief_dock = Some(atomics_core::config::ChiefDock::Floating);
+            let proposed = app.runtime.propose_config(ProposedChange {
+                scope: Scope::Main,
+                toml: "[chief]\nmodel = 'sonnet'\ndock = 'docked'\nautostart = true\nheartbeat_secs = 120\nwake_secs = 60\n",
+                remove: &[], theme: None,
+            }, None, None).unwrap();
+            assert_eq!(
+                app.runtime.config.chief.launch_args(),
+                ["--model", "custom-chief", "--verbose"],
+                "a proposal waits for Apply"
+            );
+            app.runtime.apply_proposal(proposed["proposal"].as_str().unwrap(), String::new());
+            assert_eq!(app.runtime.config.chief.launch_args(), ["--verbose", "--model", "sonnet"]);
+            assert_eq!(app.runtime.config.chief.heartbeat_secs, 120);
+            assert_eq!(app.runtime.config.chief.wake_secs, 60);
+            assert!(app.runtime.config.chief.autostart);
+            assert_eq!(app.runtime.store.chief_dock, None);
+            assert_eq!(app.runtime.chief_dock(), atomics_core::config::ChiefDock::Docked);
+        });
     }
 
     #[test]

@@ -102,6 +102,16 @@ impl Local<'_> {
             Command::EditBrief { plan, task, brief } => {
                 state.post_plan(plan, move |state, index| state.edit_task_brief(index, &task, brief))
             }
+            Command::PublishDecision { plan, request, approve } => state.post_plan(plan, move |state, index| {
+                if let Err(error) = state.decide_publish(index, &request, approve) {
+                    state.toast(error);
+                }
+            }),
+            Command::CurateNote { plan, id, pinned, delete } => state.post_plan(plan, move |state, index| {
+                if let Err(error) = state.curate_notebook(index, id, pinned, delete) {
+                    state.toast(error);
+                }
+            }),
             Command::StartTask { plan, task } => {
                 state.post_plan(plan, move |state, index| state.dispatch_when_checked(index, Some(task), None))
             }
@@ -109,7 +119,14 @@ impl Local<'_> {
                 state.post_plan(plan, move |state, index| state.integrate(index, &task, None))
             }
             Command::ResumeTask { plan, task } => state.post_task(plan, task, "resume"),
-            Command::AcknowledgeRefs { plan, task } => state.post_task(plan, task, "acknowledge_refs"),
+            Command::AcknowledgeRefs { plan, task, generation } => {
+                let task = state.plans[plan].tasks[task].id.clone();
+                state.post_plan(plan, move |state, index| {
+                    if let Some(task) = state.plans[index].tasks.iter().position(|t| t.id == task) {
+                        state.acknowledge_refs(index, task, generation);
+                    }
+                });
+            }
             Command::SetTaskStatus { plan, task, status } => state.post_plan(plan, move |state, index| {
                 if state.plans[index].status != PlanStatus::Open {
                     return;
@@ -229,6 +246,25 @@ impl Local<'_> {
                     state.toast(message);
                 }
             }),
+            Command::CopySecret(name) => {
+                // No ctl, MCP, protocol, or connected native client can construct this command
+                // on the credential host. Check the actual window again before OS authentication.
+                if !state.window.is_attached() {
+                    return;
+                }
+                let keychain = state.relay.keychain().clone();
+                let actions = state.action_tx.clone();
+                std::thread::spawn(move || {
+                    let message = match crate::secret_copy::copy(keychain, &name) {
+                        Ok(()) => "Secret copied after OS authentication".to_string(),
+                        Err(error) => error.to_string(),
+                    };
+                    let _ = actions.send(Box::new(move |state| {
+                        state.credential_status["copy_note"] = json!(message);
+                        state.toast(message);
+                    }));
+                });
+            }
             Command::OpenProject(root) => state.post(move |state| state.open_project(&root)),
             Command::CloseProject(root) => state.post(move |state| state.close_project(&root)),
             Command::OpenWorkspace(name) => state.post(move |state| {

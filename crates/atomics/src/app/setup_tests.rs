@@ -20,6 +20,17 @@ fn frame(app: &mut Desktop<'_>, ctx: &egui::Context, events: Vec<egui::Event>) -
         |ui| app.paint(ui),
     );
     app.runtime.drain_actions();
+    let visible: Texts = output
+        .shapes
+        .iter()
+        .filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if shape.clip_rect.contains_rect(text.visual_bounding_rect()) => {
+                Some((text.galley.text().to_string(), text.visual_bounding_rect().center()))
+            }
+            _ => None,
+        })
+        .collect();
+    ctx.data_mut(|data| data.insert_temp(egui::Id::NULL.with("visible-setup-text"), visible));
     let texts = output
         .shapes
         .iter()
@@ -65,15 +76,34 @@ fn click(app: &mut Desktop<'_>, ctx: &egui::Context, label: &str) -> Texts {
 
 /// The text `label` on the row of `row`.
 fn click_beside(app: &mut Desktop<'_>, ctx: &egui::Context, row: &str, label: &str) -> Texts {
-    let shown = settle(app, ctx);
-    let y = shown.iter().find(|(text, _)| text == row).unwrap_or_else(|| panic!("{row} in {shown:?}")).1.y;
-    let pos = shown
-        .iter()
-        .filter(|(text, _)| text == label)
-        .min_by(|a, b| (a.1.y - y).abs().total_cmp(&(b.1.y - y).abs()))
-        .unwrap_or_else(|| panic!("{label} in {shown:?}"))
-        .1;
-    click_at(app, ctx, pos)
+    for _ in 0..24 {
+        settle(app, ctx);
+        let visible =
+            ctx.data(|data| data.get_temp::<Texts>(egui::Id::NULL.with("visible-setup-text"))).unwrap_or_default();
+        if let Some((_, at)) = visible.iter().find(|(text, _)| text == row)
+            && let Some((_, pos)) = visible
+                .iter()
+                .filter(|(text, _)| text == label)
+                .min_by(|a, b| (a.1.y - at.y).abs().total_cmp(&(b.1.y - at.y).abs()))
+        {
+            return click_at(app, ctx, *pos);
+        }
+        frame(
+            app,
+            ctx,
+            vec![
+                egui::Event::PointerMoved(pos2(700.0, 500.0)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: vec2(0.0, -100.0),
+                    source: egui::MouseWheelSource::Wheel,
+                    phase: egui::TouchPhase::Move,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+    }
+    panic!("{label} beside {row} is not visible: {:?}", settle(app, ctx));
 }
 
 /// The window's own control requests, as `App` hands them to the host, with the replies a window applies.
@@ -88,11 +118,14 @@ fn run_requests(app: &mut Desktop<'_>) {
 /// A home with nothing in it, as a person's has, whose login shell's PATH finds these programs.
 fn fresh_home(home: &Path, programs: &[&str]) -> Vec<(&'static str, std::ffi::OsString)> {
     let tools = home.join("login-tools");
-    std::fs::create_dir(&tools).unwrap();
+    crate::test_support::link_tools(
+        &tools,
+        &["cat", "chmod", "mkdir", "sleep", "git", "env", "sh", "rm", "cp", "stty", "ps", "touch"],
+    );
     for program in programs {
         crate::test_support::write_program(tools.join(program), "#!/bin/sh\nexec cat\n");
     }
-    let login = format!("{}:{}", tools.display(), std::env::var("PATH").unwrap());
+    let login = tools.display().to_string();
     let shell = home.join("login-shell");
     crate::test_support::write_program(
         &shell,
@@ -100,6 +133,7 @@ fn fresh_home(home: &Path, programs: &[&str]) -> Vec<(&'static str, std::ffi::Os
     );
     vec![
         (super::tests::FRESH_HOME, "1".into()),
+        ("PATH", login.into()),
         ("XDG_CONFIG_HOME", home.join("xdg-config").into_os_string()),
         ("SHELL", shell.into_os_string()),
     ]
@@ -316,13 +350,26 @@ fn a_step_shows_its_progress_can_be_stopped_and_a_failure_says_why_with_the_comm
 
 #[test]
 fn settings_runs_every_sandbox_step_with_clicks_and_reads_back_what_is_left() {
-    with_app(
+    super::tests::with_app_env(
         "app::setup_tests::settings_runs_every_sandbox_step_with_clicks_and_reads_back_what_is_left",
-        |app, ctx| {
-            let bin = crate::test_support::tempdir().unwrap();
-            app.runtime.sbx = crate::sandbox::fake::install(bin.path()).display().to_string();
+        |home| {
+            let bin = home.join("sandbox-tools");
+            std::fs::create_dir(&bin).unwrap();
+            crate::sandbox::fake::install(&bin);
+            for name in ["claude", "codex", "secret-tool"] {
+                crate::test_support::write_program(bin.join(name), "#!/bin/sh\nexit 0\n");
+            }
             for marker in ["signed-out", "no-policy", "removed-anthropic", "no-openai"] {
-                std::fs::write(bin.path().join(marker), "").unwrap();
+                std::fs::write(bin.join(marker), "").unwrap();
+            }
+            vec![("PATH", crate::test_support::path_with(&bin))]
+        },
+        |app, ctx| {
+            let bin = paths::home().join("sandbox-tools");
+            let bin = bin.as_path();
+            app.runtime.sbx = bin.join("sbx").display().to_string();
+            for marker in ["signed-out", "no-policy", "removed-anthropic", "no-openai"] {
+                std::fs::write(bin.join(marker), "").unwrap();
             }
             let wait = |app: &mut Desktop<'_>| {
                 frame(app, ctx, vec![]);
@@ -336,11 +383,6 @@ fn settings_runs_every_sandbox_step_with_clicks_and_reads_back_what_is_left() {
             };
             app.client.ui.management.settings = true;
             settle(app, ctx);
-            click(app, ctx, "Theme  ·  claude");
-            let shown = settle(app, ctx);
-            let row = shown.iter().find(|(text, _)| text.starts_with("Agents  ·")).expect("the section");
-            let pos = row.1;
-            click_at(app, ctx, pos);
             wait(app);
             let shown = settle(app, ctx);
             assert!(has(&shown, "Docker account") && has(&shown, "Network policy"), "{shown:?}");
@@ -350,12 +392,12 @@ fn settings_runs_every_sandbox_step_with_clicks_and_reads_back_what_is_left() {
             click_beside(app, ctx, "Docker account", "Sign in");
             let shown = wait(app);
             assert!(!shown.iter().any(|(text, _)| text == "Sign in"), "signed in: {shown:?}");
-            assert_eq!(crate::sandbox::fake::calls_to(bin.path(), &["login"]).len(), 1);
+            assert_eq!(crate::sandbox::fake::calls_to(bin, &["login"]).len(), 1);
 
             click_beside(app, ctx, "Network policy", "Use balanced");
             let shown = wait(app);
             assert!(!has(&shown, "Use balanced"), "{shown:?}");
-            assert_eq!(crate::sandbox::fake::calls_to(bin.path(), &["policy", "init"]).len(), 1);
+            assert_eq!(crate::sandbox::fake::calls_to(bin, &["policy", "init"]).len(), 1);
 
             // A pasted value leaves the field as it is sent, reaches no argument, and shows nowhere.
             const FIELD: &str = "Anthropic API key or token";
@@ -378,10 +420,10 @@ fn settings_runs_every_sandbox_step_with_clicks_and_reads_back_what_is_left() {
             click_beside(app, ctx, "Claude in sandboxes", "Save");
             let shown = wait(app);
             assert!(!format!("{shown:?}").contains("PRIVATE"), "{shown:?}");
-            assert!(!format!("{:?}", crate::sandbox::fake::calls(bin.path())).contains("PRIVATE"));
+            assert!(!format!("{:?}", crate::sandbox::fake::calls(bin)).contains("PRIVATE"));
             assert!(!format!("{:?}", app.runtime.management_info().setup).contains("PRIVATE"));
             assert_eq!(
-                std::fs::read_to_string(bin.path().join("secret-stdin")).unwrap().trim(),
+                std::fs::read_to_string(bin.join("secret-stdin")).unwrap().trim(),
                 "sk-ant-api03-PRIVATE-pasted"
             );
             assert!(!has(&shown, FIELD), "stored, so there is no field to fill: {shown:?}");

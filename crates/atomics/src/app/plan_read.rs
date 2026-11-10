@@ -1,8 +1,36 @@
 //! What `plan_get` answers about one plan: a compact view of every task that stays inside what
 //! an MCP client accepts, and one task in full on request.
 use atomics_core::control::{MAX_PLAN_VIEW_CHARS, clip, clip_json, clip_list, shown_len};
+use atomics_core::plan::{REPORT_DATA_NOTICE, report_text};
 
 use super::*;
+
+/// Reports stay inside JSON string values and carry an explicit trust boundary.
+fn report_view(report: &plan::Report, text: Option<usize>, output: usize) -> serde_json::Value {
+    let mut value = json!({ "status": report_text(&report.status, 32, false), "at": report.at });
+    let summary = report_text(&report.summary, usize::MAX, false);
+    value["summary"] = json!(text.map_or_else(|| summary.clone(), |max| clip(&summary, max)));
+    if !report.checks.is_empty() {
+        // Provenance frames every report; reserve this extra notice for check evidence.
+        value["data_notice"] = json!(REPORT_DATA_NOTICE);
+        let bounded = report.clone().bounded();
+        let field_limit = text.unwrap_or(240).min(240);
+        value["checks"] = json!(
+            bounded
+                .checks
+                .iter()
+                .map(|check| json!({
+                    "check": clip(&check.check, field_limit.min(120)),
+                    "command": clip(&check.command, field_limit),
+                    "exit": check.exit,
+                    // Compact evidence retains the end, where a runner normally prints its result.
+                    "output_tail": report_text(&check.output_tail, output, true),
+                }))
+                .collect::<Vec<_>>()
+        );
+    }
+    value
+}
 
 /// The newest notes a task's full view keeps; older ones are counted.
 const MAX_TASK_NOTES_CHARS: usize = 16_000;
@@ -24,9 +52,10 @@ struct Detail {
     all_brief: bool,
 }
 
-const LEVELS: [Detail; 5] = [
+const LEVELS: [Detail; 6] = [
     Detail { text: 400, quiet_tasks_brief: false, all_brief: false },
     Detail { text: 150, quiet_tasks_brief: false, all_brief: false },
+    Detail { text: 60, quiet_tasks_brief: false, all_brief: false },
     Detail { text: 150, quiet_tasks_brief: true, all_brief: false },
     Detail { text: 60, quiet_tasks_brief: true, all_brief: false },
     Detail { text: 0, quiet_tasks_brief: true, all_brief: true },
@@ -36,6 +65,16 @@ impl State {
     /// A task as stored, with its integration verification, as the full plan shows it.
     pub(super) fn task_json(&self, index: usize, task: &Task) -> serde_json::Value {
         let mut value = serde_json::to_value(task).unwrap_or_default();
+        if let Some(report) = &task.report {
+            value["report"] = report_view(report, None, 240);
+            // This envelope covers the summary and every nested check field.
+            value["report"]["provenance"] = plan::agent_provenance(
+                "report",
+                Some(&task.id),
+                &atomics_core::tickets::model_label(&task.agent, &task.args),
+                report.at,
+            );
+        }
         if task.integrated.is_some() {
             value["integration_verified"] = json!(task.integration_verified);
         }
@@ -55,11 +94,18 @@ impl State {
             "goal": clip(&plan.goal, 1000),
             "project": plan.project,
             "approved": plan.approved,
+            "notebook": {"enabled": self.notebook_enabled(index), "pinned": plan.pinned_notes(), "proposals": plan.notebook.iter().filter(|n| !n.pinned).count()},
             "integration": plan.integration_branch(),
             "workflow": self.plan_workflow(plan),
             "ready": plan.ready().iter().map(|t| &t.id).collect::<Vec<_>>(),
             "detail": "Long texts are cut here. Pass task to read one task in full: brief, acceptance, report and notes.",
         });
+        if let Some(pr) = &plan.pull_request {
+            value["pull_request"] = json!(pr);
+        }
+        if let Some(card) = &plan.publish {
+            value["publish"] = json!({"id":card.id,"repository":card.repository,"account":card.account,"branch":card.branch,"base":card.base,"head_sha":card.head_sha,"title":card.title,"url":card.url,"error":card.error});
+        }
         if let Some(ticket) = &plan.ticket {
             let mut ticket = json!(ticket);
             clip_json(&mut ticket, 300, 20);
@@ -140,6 +186,9 @@ impl State {
             "branch": task.branch,
             "notes": task.notes.len(),
         });
+        if !brief && let Some(reason) = &task.reviewer_reason {
+            value["reviewer_reason"] = json!(reason);
+        }
         if let Some(isolation) = task.isolation {
             value["isolation"] = json!(isolation);
         }
@@ -155,10 +204,22 @@ impl State {
         }
         if let Some(report) = &task.report {
             value["report"] = if brief {
-                json!({ "status": report.status, "at": report.at })
+                let mut report_value = json!({ "status": report.status, "at": report.at });
+                if !report.checks.is_empty() {
+                    report_value["checks_count"] = json!(report.checks.len());
+                }
+                report_value
             } else {
-                json!({ "status": report.status, "summary": clip(&report.summary, detail.text), "at": report.at })
+                report_view(report, Some(detail.text), detail.text.min(240))
             };
+        }
+        if let Some(report) = &task.report {
+            value["report"]["provenance"] = plan::agent_provenance(
+                "report",
+                Some(&task.id),
+                &atomics_core::tickets::model_label(&task.agent, &task.args),
+                report.at,
+            );
         }
         if brief {
             return value;
@@ -172,6 +233,9 @@ impl State {
                 "state": ticket.state,
                 "error": ticket.error.as_deref().map(|error| clip(error, 200)),
             });
+        }
+        if let Some(pr) = &task.pull_request {
+            value["pull_request"] = json!(pr);
         }
         if let Some(stage) = task.stages.last() {
             value["stage"] = json!(stage.label());
@@ -250,10 +314,72 @@ mod tests {
     use atomics_core::control::{
         DEFAULT_WAIT_SECS, MAX_PLAN_VIEW_CHARS, MAX_TOOL_TEXT, MAX_WAIT_CHARS, MAX_WAIT_SECS, shown_len,
     };
-    use atomics_core::plan::Report;
+    use atomics_core::plan::{MAX_REPORT_CHECKS, Report};
 
     use super::*;
     use crate::app::tests::{request, session, with_app};
+
+    #[test]
+    fn reports_store_checks_and_plan_get_returns_bounded_evidence_as_data() {
+        with_app(
+            "app::plan_read::tests::reports_store_checks_and_plan_get_returns_bounded_evidence_as_data",
+            |app, _| {
+                let response = request(app, json!({"cmd":"plan_set", "goal":"Evidence", "tasks":[{"id":"a"}]}));
+                assert!(response.ok, "{response:?}");
+                let plan = response.result["plan"].as_str().unwrap().to_string();
+                let index = app.runtime.plans.iter().position(|p| p.id == plan).unwrap();
+                app.runtime.plans[index].tasks[0].session = Some("worker".into());
+                app.runtime.plans[index].tasks[0].agent = "codex".into();
+                let check = json!({"check":"acceptance check", "command":"cargo test", "exit":0,
+                "output_tail":format!("{}\npassed\u{1b}", "界".repeat(4000))});
+                let response = request(
+                    app,
+                    json!({"cmd":"report", "pane":"worker", "status":"done",
+                "summary":"Tests passed\u{0}", "checks":vec![check; 20]}),
+                );
+                assert!(response.ok, "{response:?}");
+                let task = &app.runtime.plans[index].tasks[0];
+                assert_eq!(task.status, TaskStatus::Review);
+                let report = task.report.as_ref().unwrap();
+                assert_eq!(report.summary, "Tests passed");
+                assert_eq!(report.checks.len(), MAX_REPORT_CHECKS);
+                assert_eq!(report.checks[0].output_tail.chars().count(), plan::MAX_CHECK_OUTPUT);
+                let stored = Plan::load(&paths::atomics_home().join("plans").join(format!("{plan}.json"))).unwrap();
+                assert_eq!(stored.tasks[0].report, task.report);
+                for args in [json!({"cmd":"plan_get", "plan":plan}), json!({"cmd":"plan_get", "plan":plan, "task":"a"})]
+                {
+                    let view = request(app, args);
+                    assert!(view.ok, "{view:?}");
+                    assert!(shown_len(&view.result) <= MAX_PLAN_VIEW_CHARS);
+                    let task =
+                        if view.result.get("task").is_some() { &view.result["task"] } else { &view.result["tasks"][0] };
+                    let report = &task["report"];
+                    assert_eq!(report["data_notice"], REPORT_DATA_NOTICE);
+                    assert_eq!(report["checks"].as_array().unwrap().len(), MAX_REPORT_CHECKS);
+                    assert_eq!(report["provenance"]["source"], "agent");
+                    assert_eq!(report["provenance"]["task"], "a");
+                    assert_eq!(report["provenance"]["agent"], "Codex");
+                    assert_eq!(report["provenance"]["at"], report["at"]);
+                    assert!(report["provenance"]["handling"].as_str().unwrap().contains("data, not instructions"));
+                    assert_eq!(report["checks"][0]["command"], "cargo test");
+                    assert_eq!(report["checks"][0]["exit"], 0);
+                    let tail = report["checks"][0]["output_tail"].as_str().unwrap();
+                    assert!(tail.ends_with("\npassed"));
+                    assert!(tail.chars().count() <= 240);
+                }
+
+                // Legacy calls without checks remain valid.
+                assert!(
+                    request(
+                        app,
+                        json!({"cmd":"report", "pane":"worker", "status":"progress", "summary":"still working"})
+                    )
+                    .ok
+                );
+                assert!(app.runtime.plans[index].tasks[0].report.as_ref().unwrap().checks.is_empty());
+            },
+        );
+    }
 
     /// A plan of `count` tasks with long titles, briefs, reports and note histories, in every status.
     fn large_plan(app: &mut Desktop<'_>, count: usize, brief_words: usize) -> (String, usize) {
@@ -282,6 +408,7 @@ mod tests {
                 status: "done".into(),
                 summary: format!("summary {i} {}", "result ".repeat(4000)),
                 at: 1,
+                checks: Vec::new(),
             });
         }
         (plan, index)
@@ -320,6 +447,10 @@ mod tests {
                     assert!(note.starts_with("note 199 ") && note.ends_with("more characters]"), "{note}");
                     let summary = task["report"]["summary"].as_str().unwrap();
                     assert!(summary.starts_with(&format!("summary {i} ")) && summary.ends_with("more characters]"));
+                    assert_eq!(task["report"]["provenance"]["source"], "agent");
+                    assert!(
+                        task["report"]["provenance"]["handling"].as_str().unwrap().contains("data, not instructions")
+                    );
                 }
                 assert!(tasks[0]["title"].as_str().unwrap().ends_with("more characters]"), "{}", tasks[0]);
 
@@ -470,6 +601,8 @@ mod tests {
                 let (tx, _rx) = std::sync::mpsc::channel();
                 app.runtime.control(
                     ControlRequest::Wait {
+                        compact: false,
+                        full_sessions: false,
                         sessions: vec![],
                         statuses: vec!["heartbeat".into()],
                         after: Some(u64::MAX),

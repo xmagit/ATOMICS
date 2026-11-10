@@ -1,4 +1,4 @@
-//! One OS-keychain item holds the credential catalog. Only fixed identifiers, validated hosts and
+//! One OS-keychain item holds the credential catalog. Only validated secret metadata, hosts and
 //! status leave this module; malformed entries are counted, never quoted. No plaintext fallback.
 //! Besides relay credentials it holds MCP servers' environments (`mcp-env:<server>`), stored with
 //! the user's consent when a connection is imported and read by `atomics mcp-host` as sbx starts it.
@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::relay::{Authorization, Credential, Keychain, Rule};
+pub mod secrets;
 
 pub const KINDS: [(&str, &str, &str); 6] = [
     ("claude", "Claude subscription", "OS keychain → ATOMICS relay → api.anthropic.com (inference)"),
@@ -43,6 +44,8 @@ pub fn github_app_id(host: &str) -> String {
 struct Catalog {
     #[serde(default)]
     entries: BTreeMap<String, Entry>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    secrets: BTreeMap<String, secrets::Stored>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -67,6 +70,7 @@ pub struct AppGrant {
 #[derive(Clone)]
 pub struct Store {
     keychain: Keychain,
+    broker: Option<crate::relay::broker::Client>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -124,7 +128,11 @@ impl Snapshot {
 
 impl Store {
     pub fn new(keychain: Keychain) -> Self {
-        Self { keychain }
+        Self { keychain, broker: crate::relay::broker::Client::configured() }
+    }
+
+    pub(crate) fn local(keychain: Keychain) -> Self {
+        Self { keychain, broker: None }
     }
 
     fn load(&self) -> Result<Catalog> {
@@ -1050,12 +1058,14 @@ pub(crate) mod tests {
             service.revoke_credential("GitHub");
             assert!(request("api.github.com", "GET", "/v1/models").contains(" 401 "));
             assert!(service.usage("GitHub").1.is_empty());
-            let output = format!(
-                "{}\n{}\n{:?}",
-                wait_for_relay_log(&home, 4),
-                std::fs::read_to_string(home.join("credential-usage.json")).unwrap(),
-                grant
-            );
+            let log = wait_for_relay_log(&home, 4);
+            // Request logging and usage persistence have separate workers. Shutdown
+            // joins the usage writer, so inspect the persisted snapshot only then.
+            drop(service);
+            let usage = std::fs::read_to_string(home.join("credential-usage.json")).unwrap();
+            let saved: serde_json::Value = serde_json::from_str(&usage).unwrap();
+            assert_eq!(saved["GitHub"].as_u64(), last, "the final usage snapshot is persisted");
+            let output = format!("{}\n{}\n{:?}", log, usage, grant);
             assert!(!output.contains(VALUES[3].1) && !output.contains(&grant.placeholder));
         }
     }

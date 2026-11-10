@@ -114,13 +114,28 @@ fn busy_refuses_turns_and_user_waits_and_yes_is_an_explicit_override() {
         let answer = json!({"ok":true,"result":{"sessions":[{"title":"worker","status":status}]}});
         let blockers = busy(&answer).unwrap();
         let error = refuse_busy(&blockers, false).unwrap_err().to_string();
-        assert!(error.contains("stopped; nothing changed") && error.contains("--yes"));
+        assert!(error.contains("wait for this work to finish") && error.contains("--yes"));
         assert!(refuse_busy(&blockers, true).is_ok());
     }
     let answer = json!({"ok":true,"result":{"sessions":[],"update_blockers":["editor open", "background work"]}});
     assert_eq!(busy(&answer).unwrap(), ["editor open", "background work"]);
     assert!(busy(&json!({"ok": false, "error": "unreachable"})).is_err());
     assert!(busy(&json!({"ok":true,"result":{"sessions":[]}})).unwrap().is_empty());
+}
+
+#[test]
+fn review_p7_restart_rechecks_busy_work_without_announcing_the_same_override_twice() {
+    let blockers = vec!["worker is active".to_string()];
+    let mut policy = BusyPolicy { yes: true, ..Default::default() };
+    let notices: Vec<_> =
+        [policy.check(&blockers).unwrap(), policy.check(&blockers).unwrap()].into_iter().flatten().collect();
+    assert_eq!(notices.len(), 1);
+    assert!(notices[0].contains("Continuing with busy work (--yes)"));
+    // Work can start after the pre-quit check. The post-quit checkpoint must still refuse it
+    // when there is no explicit override, even though the earlier checkpoint was idle.
+    let mut refuse = BusyPolicy::default();
+    assert!(refuse.check(&[]).unwrap().is_none());
+    assert!(refuse.check(&blockers).is_err());
 }
 
 #[test]
@@ -240,11 +255,103 @@ case "$0" in */new/*) test -z "${FAIL_BOOT-}" ;; *) exit 0 ;; esac
     assert!(std::fs::read_to_string(dir.path().join("log")).unwrap().contains("/old/bin/switch-to-configuration"));
     assert!(run(&next, false).status.success());
     assert_eq!(std::fs::read_link(&profile).unwrap(), next);
+    // A failed window quit or --no-restart leaves this exact state. Retrying still owes a restart,
+    // even though the boot profile already points to the new build; do not stage it a second time.
+    let before = std::fs::read_to_string(dir.path().join("log")).unwrap();
+    let retry = run(&next, false);
+    assert!(retry.status.success());
+    assert_eq!(String::from_utf8(retry.stdout).unwrap().trim(), "restart-pending");
+    assert_eq!(std::fs::read_to_string(dir.path().join("log")).unwrap(), before);
+    let booted = switch_script(next.to_str().unwrap())
+        .replace("/run/current-system", next.to_str().unwrap())
+        .replace("/nix/var/nix/profiles/system", profile.to_str().unwrap());
+    let booted = Command::new("bash").args(["-c", &booted]).output().unwrap();
+    assert!(booted.status.success());
+    assert_eq!(String::from_utf8(booted.stdout).unwrap().trim(), "unchanged");
     // After --no-restart, selecting the running system must also undo the pending next boot.
     let restored = run(&current, false);
     assert!(restored.status.success());
     assert_eq!(String::from_utf8(restored.stdout).unwrap().trim(), "unchanged");
     assert_eq!(std::fs::read_link(profile).unwrap(), current);
+}
+
+#[test]
+fn a_window_that_refuses_to_quit_is_named_and_keeps_the_restart_pending() {
+    let dir = tempfile::tempdir().unwrap();
+    let program = dir.path().join("osascript");
+    crate::test_support::write_program(
+        &program,
+        "#!/bin/sh\nprintf 'Could not quit: ATOMICS (pid 1234)\\n' >&2\nexit 1\n",
+    );
+    let error = quit_windows(Command::new(program)).unwrap_err().to_string();
+    assert!(
+        error.contains("restart pending") && error.contains("pid 1234") && error.contains("vm update again"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_partial_quit_reopens_the_app_and_does_not_restart_the_vm() {
+    let calls = std::cell::RefCell::new(Vec::new());
+    let result = quit_then_reopen(
+        || {
+            calls.borrow_mut().push("quit");
+            bail!("one window (pid 1234) refused to quit");
+        },
+        || {
+            calls.borrow_mut().push("restart");
+            Ok(())
+        },
+        || {
+            calls.borrow_mut().push("reopen");
+            Ok(())
+        },
+    );
+    assert!(format!("{:#}", result.unwrap_err()).contains("pid 1234"));
+    assert_eq!(*calls.borrow(), ["quit", "reopen"]);
+}
+
+#[test]
+fn a_failed_start_after_a_successful_stop_names_vm_start_and_reopens_the_app() {
+    let calls = std::cell::RefCell::new(Vec::new());
+    let result = quit_then_reopen(
+        || {
+            calls.borrow_mut().push("quit");
+            Ok(())
+        },
+        || {
+            restart_guest(
+                || {
+                    calls.borrow_mut().push("stop");
+                    Ok(())
+                },
+                || {
+                    calls.borrow_mut().push("start");
+                    bail!("start failed");
+                },
+            )
+        },
+        || {
+            calls.borrow_mut().push("reopen");
+            Ok(())
+        },
+    );
+    let error = format!("{:#}", result.unwrap_err());
+    assert!(error.contains("VM is stopped") && error.contains("atomics vm start"), "{error}");
+    assert!(!error.contains("atomics vm update"), "{error}");
+    assert_eq!(*calls.borrow(), ["quit", "stop", "start", "reopen"]);
+}
+
+#[test]
+fn repeated_busy_checks_announce_yes_only_once_without_skipping_refusals() {
+    let blockers = vec!["agent working".into()];
+    let mut policy = BusyPolicy { yes: true, ..Default::default() };
+    assert!(policy.check(&[]).unwrap().is_none());
+    assert!(policy.check(&blockers).unwrap().unwrap().contains("Continuing with busy work (--yes)"));
+    assert!(policy.check(&blockers).unwrap().is_none());
+    let mut refuse = BusyPolicy::default();
+    assert!(refuse.check(&blockers).is_err());
+    assert!(refuse.check(&blockers).is_err());
 }
 
 #[test]
@@ -267,4 +374,117 @@ fn the_window_reopens_without_the_updaters_atomics_variables() {
         command.get_envs().filter_map(|(key, value)| Some((key.to_str()?, value?.to_str()?))).collect();
     passed.sort();
     assert_eq!(passed, [("HOME", "/Users/alice"), ("LANG", "en_US.UTF-8"), ("PATH", "/usr/bin:/bin")]);
+}
+
+fn hardened() -> BundleInfo {
+    BundleInfo { admin: Some("admin".into()), ..info() }
+}
+
+/// One ustar entry, as GNU tar writes it.
+fn entry(name: &str, kind: u8, mode: u32, data: &[u8]) -> Vec<u8> {
+    let mut header = [0_u8; 512];
+    header[..name.len()].copy_from_slice(name.as_bytes());
+    header[100..108].copy_from_slice(format!("{mode:07o}\0").as_bytes());
+    header[124..136].copy_from_slice(format!("{:011o}\0", data.len()).as_bytes());
+    header[156] = kind;
+    header[257..263].copy_from_slice(b"ustar\0");
+    header[263..265].copy_from_slice(b"00");
+    header[148..156].fill(b' ');
+    let sum: u32 = header.iter().map(|&b| u32::from(b)).sum();
+    header[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    let mut out = header.to_vec();
+    out.extend_from_slice(data);
+    out.resize(out.len().div_ceil(512) * 512, 0);
+    out
+}
+
+fn archive(entries: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = entries.concat();
+    out.extend_from_slice(&[0; 1024]);
+    out
+}
+
+#[test]
+fn the_mac_bundle_never_comes_through_the_vms_own_user_in_hardened_mode() {
+    // `limactl copy` and `limactl shell` log in as the agents' user, whose ssh login an agent can hook to
+    // serve a tree of its own, which install.sh would then run on the Mac.
+    let source = include_str!("../update.rs");
+    assert!(!source.contains(r#""copy""#), "the bundle must not be copied with limactl copy");
+    let command = bundle_source(&hardened()).unwrap();
+    assert_eq!(command.get_program(), "ssh", "the admin's own ssh connection, not limactl");
+    let args: Vec<_> = command.get_args().map(|arg| arg.to_str().unwrap()).collect();
+    assert!(args.windows(2).any(|pair| pair == ["-l", "admin"]), "{args:?}");
+    assert!(args.contains(&"ControlMaster=no") && args.contains(&"ControlPath=none"), "no shared master: {args:?}");
+
+    // The stream from that connection unpacks into exactly the built tree.
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    crate::test_support::write_program(
+        bin.join("ssh"),
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$SSH_LOG\"\nexec bash -s\n",
+    );
+    let store = dir.path().join("store");
+    std::fs::create_dir_all(store.join("bin")).unwrap();
+    std::fs::write(store.join("install.sh"), "#!/bin/sh\n").unwrap();
+    std::fs::write(store.join("bin/claude"), "#!/bin/sh\n").unwrap();
+    std::fs::write(store.join("atomics-vm.json"), "{}").unwrap();
+    std::process::Command::new("chmod").args(["0755"]).arg(store.join("bin/claude")).status().unwrap();
+    let fetch = |store: &Path, target: &Path| {
+        let mut command = bundle_source(&hardened()).unwrap();
+        command
+            .env("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()))
+            .env("SSH_LOG", dir.path().join("ssh.log"));
+        fetch_bundle(command, store.to_str().unwrap(), target)
+    };
+    let target = dir.path().join("bundle");
+    fetch(&store, &target).unwrap();
+    assert!(std::fs::read_to_string(dir.path().join("ssh.log")).unwrap().contains("admin\n"));
+    assert_eq!(std::fs::read_to_string(target.join("install.sh")).unwrap(), "#!/bin/sh\n");
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(std::fs::metadata(target.join("bin/claude")).unwrap().permissions().mode() & 0o777, 0o755);
+    assert_eq!(std::fs::metadata(target.join("install.sh")).unwrap().permissions().mode() & 0o777, 0o644);
+    validate_bundle(&target).unwrap();
+
+    // A tree with a link in it is refused while unpacking, before anything could run.
+    std::os::unix::fs::symlink("/etc", store.join("bin/elsewhere")).unwrap();
+    assert!(fetch(&store, &dir.path().join("linked")).is_err());
+}
+
+#[test]
+fn the_bundle_stream_holds_only_plain_files_and_folders_inside_the_bundle() {
+    let unpack = |entries: &[Vec<u8>]| {
+        let dir = tempfile::tempdir().unwrap();
+        let result = extract_bundle(&archive(entries)[..], &dir.path().join("bundle"));
+        (dir, result)
+    };
+    let (dir, ok) = unpack(&[
+        entry("./", b'5', 0o755, b""),
+        entry("./bin/", b'5', 0o755, b""),
+        entry("./bin/codex", b'0', 0o555, b"#!/bin/sh\n"),
+        entry("./install.sh", b'0', 0o444, &[b'x'; 700]),
+    ]);
+    ok.unwrap();
+    assert_eq!(std::fs::read(dir.path().join("bundle/install.sh")).unwrap(), [b'x'; 700]);
+    assert_eq!(std::fs::read(dir.path().join("bundle/bin/codex")).unwrap(), b"#!/bin/sh\n");
+
+    for (what, bad) in [
+        ("a symlink", entry("./install.sh", b'2', 0o777, b"")),
+        ("a hard link", entry("./install.sh", b'1', 0o644, b"")),
+        ("a GNU long name", entry("././@LongLink", b'L', 0o644, b"install.sh\0")),
+        ("a pax header", entry("./PaxHeaders/x", b'x', 0o644, b"")),
+        ("a device", entry("./dev", b'3', 0o644, b"")),
+        ("a parent path", entry("../install.sh", b'0', 0o644, b"")),
+        ("an absolute path", entry("/tmp/install.sh", b'0', 0o644, b"")),
+    ] {
+        assert!(unpack(&[bad]).1.is_err(), "{what} must be refused");
+    }
+    let twice = entry("./install.sh", b'0', 0o644, b"a");
+    assert!(unpack(&[twice.clone(), twice]).1.is_err(), "an entry twice must be refused");
+    assert!(unpack(&[entry("./bin/x", b'0', 0o644, b"")]).1.is_err(), "a file before its folder");
+    let mut corrupt = entry("./install.sh", b'0', 0o644, b"a");
+    corrupt[0] = b'X';
+    assert!(unpack(&[corrupt]).1.is_err(), "a bad checksum must be refused");
+    let truncated = entry("./install.sh", b'0', 0o644, b"abc");
+    assert!(extract_bundle(&truncated[..512], &tempfile::tempdir().unwrap().path().join("b")).is_err());
 }

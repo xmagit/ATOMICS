@@ -6,6 +6,7 @@ use crate::session::AgentStatus;
 
 fn session() -> SessionInfo {
     SessionInfo {
+        status_hint: None,
         previews: Vec::new(),
         id: "s1".into(),
         agent: "claude".into(),
@@ -27,7 +28,7 @@ fn host() -> crate::projection::HostInfo {
         resources: Some(crate::projection::ResourceInfo {
             claude: crate::usage::Usage {
                 observed_at: 100,
-                session: Some(crate::usage::Window { remaining: 76.5, resets_at: 200 }),
+                session: Some(crate::usage::Window { left_percent: 76.5, resets_at: 200 }),
                 ..Default::default()
             },
             load: Some(4.2),
@@ -52,6 +53,9 @@ fn host() -> crate::projection::HostInfo {
 
 fn plan() -> PlanInfo {
     PlanInfo {
+        publish: None,
+        pull_request: None,
+        notebook: Vec::new(),
         ticket_tree: None,
         id: "p".into(),
         status: PlanStatus::Open,
@@ -60,10 +64,12 @@ fn plan() -> PlanInfo {
         approved: true,
         integration: None,
         tasks: vec![TaskInfo {
+            pull_request: None,
             id: "t".into(),
             title: "do".into(),
             status: TaskStatus::Review,
             agent: "claude".into(),
+            reviewer_reason: None,
             depends_on: vec![],
             session: Some("s1".into()),
             branch: None,
@@ -79,7 +85,7 @@ fn plan() -> PlanInfo {
 }
 
 fn report() -> ReportInfo {
-    ReportInfo { status: "done".into(), summary: "ok".into(), at: 9 }
+    ReportInfo { status: "done".into(), summary: "ok".into(), at: 9, checks: Vec::new() }
 }
 
 fn approval() -> ApprovalInfo {
@@ -320,7 +326,7 @@ fn every_message() -> Vec<Message> {
             digest: None,
             action: crate::ops::PlanAction::Set {
                 goal: "g".into(),
-                tasks: vec![crate::plan::Task { id: "t1".into(), title: "do".into(), ..Default::default() }],
+                tasks: vec![crate::plan::TaskInput { id: "t1".into(), title: "do".into(), ..Default::default() }],
                 integration: Some("atomics/plan-g".into()),
             },
         }),

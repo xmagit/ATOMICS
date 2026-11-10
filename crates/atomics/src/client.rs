@@ -12,6 +12,7 @@
 //! paired one's ([`target`]). Instead of the page's input overlay, [`input`] routes the window's keys and
 //! pointer to the terminal that has the keyboard.
 
+mod credentials;
 mod frame_stats;
 pub mod input;
 pub mod link;
@@ -58,6 +59,7 @@ pub struct ClientApp {
     started: Instant,
     /// The VM's host: what the window does before it can dial (`vm.rs`).
     vm: Option<vm::Gate>,
+    credentials: Option<credentials::Credentials>,
     /// Why forgetting the VM's refused token failed, for the dialog that asks to pair again.
     pair_error: Option<String>,
     /// A start of the VM ended: dial again at once.
@@ -130,6 +132,13 @@ impl ClientApp {
                 action: None,
             },
         });
+        let driver = Driver::direct(&op_prefix());
+        let credentials = vm.as_ref().map(|gate| {
+            driver.remote.enable_native_credentials(crate::secret_copy::unavailable());
+            let mut credentials = credentials::Credentials::new(gate.bundle(), wake.clone());
+            credentials.refresh();
+            credentials
+        });
         Self {
             previews: crate::preview::client::Client::new(wake.clone()),
             open: launch.open,
@@ -137,10 +146,11 @@ impl ClientApp {
             shot_requested: false,
             frame_stats: frame_stats::FrameStats::from_env(),
             vm,
+            credentials,
             vm_started: Arc::default(),
             confirm_local: false,
             switch_error: None,
-            driver: Driver::direct(&op_prefix()),
+            driver,
             client,
             view,
             target,
@@ -207,10 +217,12 @@ impl ClientApp {
         let now = self.now_ms();
         self.driver.tick(now);
         self.take_events();
+        self.pump_credentials();
         self.start_agents();
         self.pump_previews();
         self.driver.flush();
         self.run_outputs();
+        self.pump_credentials();
         self.view.now_ms = now as f64;
     }
 
@@ -219,6 +231,12 @@ impl ClientApp {
     fn pump_previews(&mut self) {
         let link = self.link.as_ref().map(|(socket, link)| (*socket, link.frames()));
         self.previews.pump(&self.driver.remote, link);
+    }
+
+    fn pump_credentials(&mut self) {
+        if let Some(credentials) = &mut self.credentials {
+            credentials.poll(&self.driver.remote);
+        }
     }
 
     /// `--open`: once the host's board is in, each agent is started there, as the + New picker does.
@@ -258,9 +276,29 @@ impl ClientApp {
 
     /// One frame of the window, after the terminal took its share of the input.
     pub(crate) fn draw(&mut self, ui: &mut egui::Ui) {
-        if !self.vm_screen(ui) {
-            views::draw(ui, &mut self.driver, &mut self.client, &mut self.view);
+        if let Some(gate) = &self.vm {
+            if !ui.ctx().input(|input| input.viewport().minimized.unwrap_or(false)) {
+                gate.poll(self.wake.clone());
+                ui.ctx().request_repaint_after(Duration::from_secs(5));
+            }
+            let (gate, wake) = (gate.clone(), self.wake.clone());
+            let link = self.driver.status().clone();
+            self.client.machine_controls = Some(Arc::new(move |ui| gate.controls(ui, &link, wake.clone())));
         }
+        if !self.vm_screen(ui) {
+            if let Some(gate) = &self.vm {
+                let view = gate.view_for_host(self.driver.status());
+                if matches!(view.state, vm::State::HostDisconnected | vm::State::Stopping) {
+                    egui::Panel::top("vm-host-state").show(ui, |ui| {
+                        ui.label(view.state.headline(&view.instance));
+                    });
+                }
+            }
+            views::draw(ui, &mut self.driver, &mut self.client, &mut self.view);
+        } else {
+            atomics_ui::machine::window(ui.ctx(), &self.driver.remote, &mut self.client);
+        }
+        self.pump_credentials();
         self.pump_previews();
         self.driver.flush();
         self.run_outputs();
@@ -323,13 +361,19 @@ impl ClientApp {
         self.confirm_local |= local;
     }
 
-    /// While the VM is not running and there is no board: its state and a Start button, never an empty
-    /// window. True when it drew that.
+    /// Show stopped/starting VMs directly, retaining a mirrored board during link recovery.
     fn vm_screen(&mut self, ui: &mut egui::Ui) -> bool {
         let Some(gate) = &self.vm else { return false };
-        let has_board = self.driver.remote.with_mirror(|m| m.epoch.is_some());
-        let view = gate.view();
-        if has_board || matches!(self.driver.status(), Status::Live) || view.status == crate::vm::Status::Running {
+        let view = gate.view_for_host(self.driver.status());
+        let recovering = matches!(self.driver.status(), Status::Connecting | Status::Reconnecting { .. });
+        let has_board = self.driver.remote.with_mirror(|mirror| mirror.epoch.is_some());
+        let unavailable = matches!(
+            view.status,
+            crate::vm::Status::Stopped | crate::vm::Status::NotSetUp | crate::vm::Status::Starting
+        );
+        if matches!(self.driver.status(), Status::Live)
+            || (recovering && has_board && !unavailable && view.state != vm::State::Stopping)
+        {
             return false;
         }
         let p = self.client.palette.clone();
@@ -339,11 +383,7 @@ impl ClientApp {
                 ui.add_space((ui.available_height() / 4.0).min(160.0));
                 ui.label(RichText::new("ATOMICS").strong().size(18.0).color(p.accent).monospace());
                 ui.add_space(12.0);
-                let headline = match &view.status {
-                    crate::vm::Status::NotSetUp => "The ATOMICS VM is not set up on this Mac.".to_string(),
-                    crate::vm::Status::Starting => format!("Starting the VM {}…", view.instance),
-                    status => format!("The VM {} is {}.", view.instance, status.label()),
-                };
+                let headline = view.state.headline(&view.instance);
                 ui.label(RichText::new(headline).size(16.0));
                 ui.add_space(6.0);
                 ui.label(
@@ -351,13 +391,23 @@ impl ClientApp {
                         .color(p.muted),
                 );
                 ui.add_space(14.0);
-                match &view.status {
-                    crate::vm::Status::NotSetUp => {
+                match &view.state {
+                    vm::State::Vm(crate::vm::Status::NotSetUp) => {
                         ui.label("Run atomics vm setup to download and set up this version's Linux VM.");
                     }
-                    _ if view.starting => {
+                    vm::State::Vm(crate::vm::Status::Starting) => {
                         ui.spinner();
                     }
+                    vm::State::HostDisconnected => {
+                        ui.label("Waiting to reconnect to the VM's host…");
+                    }
+                    vm::State::Unauthorised => {
+                        ui.label("Pair again to reconnect to the VM's host.");
+                    }
+                    vm::State::Stopping => {
+                        ui.spinner();
+                    }
+                    vm::State::Vm(crate::vm::Status::Running) => {}
                     _ => start = ui.button(RichText::new(format!("Start {}", view.instance)).size(14.0)).clicked(),
                 }
                 if let Some(note) = view.note.as_ref().filter(|_| !view.starting) {
@@ -365,6 +415,9 @@ impl ClientApp {
                     ui.label(RichText::new(note).color(p.warning).small());
                 }
                 ui.add_space(18.0);
+                if ui.button("Machine").clicked() {
+                    self.client.machine_open = true;
+                }
                 if ui.small_button("Use this Mac instead").clicked() {
                     self.confirm_local = true;
                 }
@@ -489,6 +542,11 @@ impl ClientApp {
                 Event::Open { socket, protocol } => {
                     self.view.unreachable = None;
                     self.driver.socket_open(socket, &protocol);
+                    if self.link.as_ref().is_some_and(|(id, _)| *id == socket)
+                        && let Some(credentials) = &mut self.credentials
+                    {
+                        credentials.refresh();
+                    }
                 }
                 Event::Data { socket, bytes } => self.driver.socket_message(socket, &bytes),
                 Event::Closed { socket, code, unreachable } => {

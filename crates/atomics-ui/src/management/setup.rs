@@ -45,6 +45,15 @@ pub fn page(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
                 if let Some(text) = backend.notices().toast {
                     ui.add(egui::Label::new(RichText::new(text).color(client.palette.warning)).wrap());
                 }
+                if let Some(code) = info.tools["credentials"]["github_device"]["code"].as_str() {
+                    ui.label(format!("GitHub authorization code: {code}"));
+                    if let Some(url) = info.tools["credentials"]["github_device"]["url"].as_str() {
+                        ui.hyperlink(url);
+                    }
+                }
+                if let Some(error) = info.tools["credentials"]["error"].as_str() {
+                    ui.label(error);
+                }
                 steps(ui, backend, client, &info);
                 ui.add_space(12.0);
             });
@@ -359,11 +368,21 @@ fn connection(
     row: &SetupConnection,
 ) {
     let p = client.palette.clone();
+    let local_accounts = (row.id == "github").then(|| backend.management()).flatten().and_then(|info| {
+        let accounts: Vec<_> = info.tools["credentials"]["secrets"]
+            .as_array()?
+            .iter()
+            .filter_map(|row| row["github_account"].as_str())
+            .map(str::to_string)
+            .collect();
+        (!accounts.is_empty()).then(|| accounts.join(", "))
+    });
+    let connected_as = row.connected.as_ref().or(local_accounts.as_ref());
     ui.horizontal_wrapped(|ui| {
-        let connected = row.connected.is_some();
+        let connected = connected_as.is_some();
         mark(ui, if connected { Mark::Check } else { Mark::Ring }, if connected { p.accent } else { p.muted });
         ui.label(RichText::new(&row.name).strong());
-        if let Some(who) = &row.connected {
+        if let Some(who) = connected_as {
             note(ui, &p, who.clone());
         } else if setup.later.contains(&row.id) {
             note(ui, &p, "Later");
@@ -377,7 +396,7 @@ fn connection(
             }
         }
     });
-    if row.connected.is_none() && !setup.later.contains(&row.id) {
+    if connected_as.is_none() && !setup.later.contains(&row.id) {
         note(ui, &p, row.note.clone());
         if let Some(click) = &row.click {
             failure(ui, client, setup, click.action);
@@ -407,8 +426,10 @@ fn connect_button(
             }
         }
         "tickets" => {
-            if button(ui, client, "Read how").clicked() {
-                ui.ctx().open_url(egui::OpenUrl::new_tab(TICKETS_GUIDE));
+            if button(ui, client, "Read how").clicked()
+                && let Some(url) = crate::markdown::web_url(TICKETS_GUIDE)
+            {
+                ui.ctx().open_url(egui::OpenUrl::new_tab(url));
             }
         }
         "remote" => {

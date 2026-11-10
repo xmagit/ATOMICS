@@ -210,11 +210,17 @@ pub fn spawn_with<T: Clone + Send + 'static>(
     done: crate::host::Sender<(T, Result<TicketOutput, String>)>,
     oauth: OAuth,
 ) -> Sender<TicketJob<T>> {
+    spawn_worker(done, Worker { oauth: Some(oauth), ..Worker::default() })
+}
+
+fn spawn_worker<T: Clone + Send + 'static>(
+    done: crate::host::Sender<(T, Result<TicketOutput, String>)>,
+    mut worker: Worker,
+) -> Sender<TicketJob<T>> {
     let (tx, rx) = std::sync::mpsc::channel::<TicketJob<T>>();
     std::thread::Builder::new()
         .name("atomics-tickets".into())
         .spawn(move || {
-            let mut worker = Worker { oauth: Some(oauth), ..Worker::default() };
             let mut outboxes: Vec<(Arc<TicketConfig>, PathBuf, String, T)> = Vec::new();
             loop {
                 match rx.recv_timeout(Duration::from_secs(1)) {
@@ -270,6 +276,8 @@ pub fn spawn_with<T: Clone + Send + 'static>(
 
 #[derive(Default)]
 struct Worker {
+    #[cfg(test)]
+    clock: Option<crate::mcp_client::tests::Clock>,
     /// The connection, with the server and token it was made with.
     client: Option<(McpServer, Option<String>, McpClient)>,
     /// The token the current job's connection should authenticate with, as it resolves now.
@@ -295,6 +303,14 @@ struct Worker {
 }
 
 impl Worker {
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(clock) = &self.clock {
+            return clock.now();
+        }
+        Instant::now()
+    }
+
     /// Resolves the job's credentials as they are now. Everything the job brings back is
     /// cleaned with them, so a result arriving after a config change never carries the old
     /// ones. A connection made with another token is replaced, and the job is cleaned for
@@ -1052,7 +1068,7 @@ impl Worker {
         }
         if let Some((server, since, error)) = &self.down
             && *server == config.server
-            && since.elapsed() < BACKOFF
+            && self.now().saturating_duration_since(*since) < BACKOFF
         {
             return Err(format!("{} is unavailable: {error}", config.system));
         }
@@ -1127,7 +1143,7 @@ impl Worker {
         let request = operation.http_request(http, vars, arguments)?;
         if let Some((down, since, error)) = &self.http_down
             && *down == api
-            && since.elapsed() < BACKOFF
+            && self.now().saturating_duration_since(*since) < BACKOFF
         {
             return Err(format!("{} is unavailable: {error}", config.system));
         }
@@ -1173,7 +1189,7 @@ impl Worker {
                 self.refusal = config.remote.errors.classify(&format!("{message} {details}"))
             }
             McpError::Transport { message, retryable: true } => {
-                self.http_down = Some((api.clone(), Instant::now(), self.cleaner.error(message)));
+                self.http_down = Some((api.clone(), self.now(), self.cleaner.error(message)));
             }
             McpError::Transport { .. } => {}
         }
@@ -1190,7 +1206,7 @@ impl Worker {
         }
         if let McpError::Transport { message, .. } = &err {
             self.client = None;
-            self.down = Some((server.clone(), Instant::now(), self.cleaner.error(message)));
+            self.down = Some((server.clone(), self.now(), self.cleaner.error(message)));
         }
         err.to_string()
     }
@@ -1221,6 +1237,24 @@ pub(crate) mod tests {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
     use std::sync::mpsc::Receiver;
+
+    /// Initialize before installing the behavioral clock: startup is fixture readiness,
+    /// while the hung call and the worker's backoff advance only when the test says so.
+    pub(crate) fn spawn_with_clock<T: Clone + Send + 'static>(
+        done: crate::host::Sender<(T, Result<TicketOutput, String>)>,
+        config: &TicketConfig,
+        clock: crate::mcp_client::tests::Clock,
+        timeout: Duration,
+    ) -> Sender<TicketJob<T>> {
+        let mut client =
+            McpClient::connect(&config.server, crate::test_support::scaled_timeout(Duration::from_secs(30)), |_| None)
+                .expect("initialize the fake ticket server before testing its deadline");
+        clock.attach(&mut client, timeout);
+        spawn_worker(
+            done,
+            Worker { client: Some((config.server.clone(), None, client)), clock: Some(clock), ..Worker::default() },
+        )
+    }
 
     pub(crate) fn remote_profile(prefix: &str, path: &std::path::Path) -> TicketConfig {
         let mut config = crate::mcp_client::tests::example_profile("meaning-example", path);

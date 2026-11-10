@@ -325,7 +325,7 @@ impl State {
 
     /// Starts a poll when one is due, and applies what the workers finished.
     pub(super) fn github_tick(&mut self) -> bool {
-        let changed = self.poll_github_jobs();
+        let changed = self.poll_github_jobs() | self.poll_publishing();
         if !self.config.github.enabled || self.github.polling {
             return changed;
         }
@@ -616,12 +616,17 @@ impl State {
                     Err(error) => break Err(error.to_string()),
                     Ok(gh::DevicePoll::Token(grant)) => {
                         let now = SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-                        break store
-                            .put_github_app_grant(&host, &grant.stored(now))
-                            .map_err(|error| error.to_string())
-                            .and_then(|()| {
-                                endpoints.api(&host, Some(grant.token)).viewer().map_err(|e| e.to_string())
-                            });
+                        break (|| {
+                            let login =
+                                endpoints.api(&host, Some(grant.token.clone())).viewer().map_err(|e| e.to_string())?;
+                            if host == "github.com" {
+                                store
+                                    .connect_github_account(&login, grant.token.secret())
+                                    .map_err(|e| e.to_string())?;
+                            }
+                            store.put_github_app_grant(&host, &grant.stored(now)).map_err(|e| e.to_string())?;
+                            Ok(login)
+                        })();
                     }
                 }
             };
@@ -640,7 +645,14 @@ impl State {
         self.github.connect = Connect::Checking;
         let store = Github::store(&self.relay);
         self.github_job(move |tx| {
-            let result = store.put_github_app(&host, token.secret()).map(|()| login).map_err(|error| error.to_string());
+            let result = (|| {
+                if host == "github.com" {
+                    store.connect_github_account(&login, token.secret())?;
+                }
+                store.put_github_app(&host, token.secret())?;
+                Ok(login)
+            })()
+            .map_err(|error: anyhow::Error| error.to_string());
             let _ = tx.send(Done::Connected { host, result });
         });
     }
@@ -654,8 +666,22 @@ impl State {
 
     pub(super) fn github_disconnect(&mut self, host: String) {
         let store = Github::store(&self.relay);
+        let account = (host == "github.com").then(|| self.github.viewer(&host).map(str::to_string)).flatten();
+        let relay = self.relay.clone();
         self.github_job(move |tx| {
-            let result = store.remove_github_app(&host).map_err(|error| error.to_string());
+            let result = (|| {
+                if let Some(account) = account {
+                    let name = crate::relay::github::account_name(&account)?;
+                    relay.edit_removal(&format!("secret:{name}"), |store| {
+                        if store.secrets()?.iter().any(|s| s.name == name) {
+                            store.remove_secret(&name)?;
+                        }
+                        Ok(())
+                    })?;
+                }
+                store.remove_github_app(&host)
+            })()
+            .map_err(|error: anyhow::Error| error.to_string());
             let _ = tx.send(Done::Disconnected { host, result });
         });
     }
@@ -910,42 +936,15 @@ pub(super) fn revoke_url(host: &str) -> String {
 pub(super) fn github_shortcut(
     keys: &atomics_core::config::KeyConfig,
 ) -> (Option<egui::KeyboardShortcut>, Option<String>) {
-    let mut taken: Vec<(String, egui::KeyboardShortcut)> = [
-        ("toggle_diff", &keys.toggle_diff),
-        ("next_attention", &keys.next_attention),
-        ("focus_steer", &keys.focus_steer),
-        ("new_session", &keys.new_session),
-        ("refresh_diff", &keys.refresh_diff),
-        ("close_session", &keys.close_session),
-        ("quick_open", &keys.quick_open),
-        ("toggle_editor", &keys.toggle_editor),
-        ("toggle_plan", &keys.toggle_plan),
-        ("toggle_chief", &keys.toggle_chief),
-        ("toggle_tickets", &keys.toggle_tickets),
-        ("voice", &keys.voice),
-        ("back", &keys.back),
-        ("forward", &keys.forward),
-    ]
-    .into_iter()
-    .filter_map(|(name, text)| Some((format!("[keys] {name}"), shortcut(text)?)))
-    .collect();
-    let agent = if cfg!(target_os = "macos") { egui::Modifiers::MAC_CMD } else { egui::Modifiers::CTRL };
-    for (n, key) in [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9]
-        .into_iter()
-        .enumerate()
-    {
-        taken.push((format!("the agent chord for agent {}", n + 1), egui::KeyboardShortcut::new(agent, key)));
-        taken.push((
-            format!("the ticket filter chord for chip {}", n + 1),
-            egui::KeyboardShortcut::new(egui::Modifiers::ALT, key),
-        ));
+    if keys.github.trim().is_empty() {
+        return (None, None);
     }
-    let owner = |chord: &egui::KeyboardShortcut| {
-        taken
-            .iter()
-            .find(|(_, other)| other.modifiers == chord.modifiers && other.logical_key == chord.logical_key)
-            .map(|(name, _)| name.clone())
-    };
+    let taken = atomics_ui::keys::taken_shortcuts(
+        atomics_ui::keys::bindings(keys),
+        "github",
+        egui::os::OperatingSystem::from_target_os(),
+    );
+    let owner = |chord: &egui::KeyboardShortcut| atomics_ui::keys::shortcut_owner(&taken, chord).map(str::to_string);
     let problem = match shortcut(&keys.github) {
         None => format!("[keys] github = {:?} is not a shortcut", keys.github),
         Some(chord) => match owner(&chord) {
@@ -961,6 +960,12 @@ pub(super) fn github_shortcut(
 /// What the config asks for that cannot work, as one top-bar line; the rest of the config applies.
 pub(super) fn config_problems(config: &Config) -> Option<String> {
     let mut problems = config.github.problems();
+    problems.extend(
+        atomics_ui::keys::invalid_bindings(&config.keys, egui::os::OperatingSystem::from_target_os())
+            .into_iter()
+            .filter(|name| *name != "github")
+            .map(|name| format!("[keys] {name} is not a shortcut")),
+    );
     problems.extend(github_shortcut(&config.keys).1);
     (!problems.is_empty()).then(|| problems.join("; "))
 }
@@ -1706,6 +1711,9 @@ impl State {
                 rows.insert(
                     key.clone(),
                     atomics_core::projection::PullRequestInfo {
+                        group: self.github.viewer(&repo.host).map(|viewer| Group::of(pull, viewer)),
+                        author: Some(pull.author.clone()),
+                        draft: Some(pull.draft),
                         key,
                         repo: repo.to_string(),
                         number: pull.number,
@@ -1721,10 +1729,19 @@ impl State {
             }
         }
         for (key, view) in &self.github.pr_diffs {
-            let url = rows.get(key).map(|v| v.url.clone()).unwrap_or_default();
+            if let Some(row) = rows.get_mut(key) {
+                row.head_sha = view.head_sha.clone();
+                row.loading = view.prepared.is_none();
+                row.error = view.prepared.as_ref().and_then(|p| p.as_ref().err().cloned());
+                continue;
+            }
+            let url = String::new();
             rows.insert(
                 key.clone(),
                 atomics_core::projection::PullRequestInfo {
+                    group: None,
+                    author: None,
+                    draft: None,
                     key: key.clone(),
                     repo: view.repo.to_string(),
                     number: view.number,

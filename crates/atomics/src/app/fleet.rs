@@ -82,6 +82,11 @@ impl State {
     /// sandbox by its record.
     pub(super) fn resume_exited(&mut self, id: &str) {
         let Some(index) = self.sessions.iter().position(|s| s.id == id) else { return };
+        let root = crate::build_cache::root(&self.sessions[index].root());
+        if self.lifecycle_jobs.iter().any(|job| !job.is_finished() && job.touches(None, Some(&root))) {
+            self.toast("Worktree cleanup is still running; resume once it finishes.");
+            return;
+        }
         let s = &self.sessions[index];
         let record = SessionRecord {
             chief: s.chief,
@@ -89,7 +94,7 @@ impl State {
             claude_session_id: s.claude_id.clone().unwrap_or_default(),
             agent: s.agent.clone(),
             cwd: s.cwd.clone(),
-            title: s.title.clone(),
+            title: self.session_title(s),
             last_prompt: None,
             updated: 0,
             sandbox: s.sandbox.clone(),
@@ -98,7 +103,7 @@ impl State {
         if self.sessions[index].scratch.take().is_some() && record.sandbox.is_some() {
             self.store.upsert(record.clone());
         }
-        self.close(id);
+        self.close_for_resume(id);
         self.resume.push(record);
     }
 }
@@ -380,6 +385,7 @@ mod tests {
                         status: "done".into(),
                         summary: "Report first line\nReport second line\nReport third line\nHidden fourth line".into(),
                         at: 890,
+                        checks: Vec::new(),
                     }),
                     additions: 412,
                     deletions: 88,

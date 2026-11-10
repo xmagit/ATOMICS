@@ -125,8 +125,23 @@ client concerns; Settings can add a VM section without another platform-specific
 Major mismatch fails before subscription; minor changes are additive and capability-gated.
 Unknown optional fields are ignored; unknown commands fail explicitly. Never silently ignore a mutation.
 Keep native CLI/MCP compatibility through an adapter for `ControlRequest` and `ControlResponse`.
-UI commands such as activate, resize-window and screenshot target a chosen client, with a clear error
-when none is attached; they do not acquire global focus or write arbitrary server-side screenshot paths.
+
+Local `wait` requests retain their legacy full-session response unless `compact: true` is passed.
+`atomics_wait` enables compact responses by default: `sessions` contains only sessions with status
+events after `after` through the returned cursor, while `sessions_unchanged` and the one-line
+`sessions_summary` count the rest. Reports and fleet events alone do not count as status changes.
+Set `full_sessions: true` to include the whole fleet in a compact response. Compact titles use a
+linked task's id and title, and each pending approval appears once per answer; its `input` omits
+fields already shown as `command` or `reason`, retaining other tool arguments. In both formats,
+permission events are omitted unless their request id is still the session's first pending request;
+answered, withdrawn, replaced and queued requests cannot be replayed as actionable permissions.
+Cursor advancement and event pagination still include skipped historical events. Existing ctl
+requests need no changes; ctl can opt in with `{"cmd":"wait","compact":true}`.
+
+Local control commands `screenshot`, `resize` and `show_settings` target only the embedded desktop's
+local window. A headless host rejects them even with a client connected: these commands are not forwarded
+to clients. Use the connected client's UI for its window and Settings. `activate` changes the host's selected
+session; it does not focus a connected client's window or acquire its terminal lease.
 
 The host serializes state transitions and assigns a monotonic event cursor; per-entity revisions detect
 stale plan edits and reviews. Replies distinguish accepted work from a completed merge or delivered message.
@@ -614,9 +629,14 @@ another with `host_command`.
   to it; the headless host attaches none, so every repaint is a no-op and `ctl list` reports `window: null`.
   `Host::start`, `ipc::serve`, the governor and the usage pollers take the `Window`, and runtime methods no longer
   take an `egui::Context`. The palette is still loaded on the host for diff highlighting (moving it is slice S5).
-- **No client attached.** The runtime thread answers and drops client events nobody consumes (a screenshot
-  reply gets an error), so they never accumulate. `screenshot`, `resize` and `show_settings` fail with "no window";
+- **Local window commands.** The runtime thread answers and drops local desktop events nobody consumes (a screenshot
+  reply gets an error), so they never accumulate. `screenshot`, `resize` and `show_settings` fail with
+  "no local window" and explain that commands are not forwarded to connected clients, even when one is attached;
   `restart` is refused, since a service manager restarts the host. Notices the desktop shows as toasts go to stderr.
+- **Chief control without a window.** `atomics ctl '{"cmd":"start_chief"}'` starts the configured chief if needed
+  and returns its session. `atomics ctl '{"cmd":"send","session":"chief","text":"Plan the next task"}'`
+  starts it with that first prompt when none is running, or delivers to the existing chief with the usual permission
+  holds and delivery confirmation. Neither command opens a window. Raw key sends do not start the chief.
 - **One owner per home.** `instance.lock` in `ATOMICS_HOME`, by `flock`: the host holds it exclusively and records
   its pid, and every desktop holds it shared. A host refuses a home a desktop or another host is using, and a desktop
   refuses a home a host is using; desktops still start side by side (the second runs without the socket, as before).
@@ -1440,7 +1460,13 @@ Persist a private user home and repositories/worktrees on user-scoped volumes, a
 so git worktree metadata and recorded cwd values remain valid across pod replacement.
 Set `ATOMICS_HOME=/data/atomics`, `ATOMICS_CONFIG=/data/config/atomics/config.toml` and
 `ATOMICS_SOCKET=/run/atomics/atomics.sock` explicitly. The socket and PID/lease files are ephemeral.
+The socket's parent directory must belong to the host user and must not be writable by other users;
+use a private directory rather than placing the socket directly in `/tmp`. This also protects its
+ownership lock from pre-creation by another user. Control requests are bounded to accommodate the
+plan task/text limits and JSON escaping, rather than imposing a smaller one-MiB plan limit.
 Persist `sessions.json`, `plans/`, `briefs/`, saved workspaces and the operation journal with restrictive modes.
+State directory permissions are tightened only for directories owned by the current user. Loading
+readable plans still works when a filesystem refuses chmod; writes keep private file permissions.
 Use atomic replacement for records and backups; version on-disk changes and test restoration before rollout.
 Enforce one writer per volume with a host lock and deployment fencing; a rolling update must not start
 two hosts against the same worktrees. Retain project files and uncommitted changes on shutdown.
@@ -1595,6 +1621,15 @@ moving another client's window. Docking, floating, minimizing, the width and tra
 selection stay with each client; the in-process desktop still saves its own preferences.
 
 ### Chief trace feed
+
+The live trace is scoped to the conversation identity reported by the current chief. It stays empty
+until that identity is known. New entries use a versioned FNV-1a identity that is stable across Rust
+upgrades. Older entries with an empty identity, or the former unversioned `DefaultHasher` identity,
+cannot reliably be assigned to a conversation: they remain in the plan's trace archive on disk and
+are available through an unscoped archive load, but are deliberately excluded from the live feed.
+The archives are `trace/<plan-id>.jsonl` under the ATOMICS state directory (`trace/chief.jsonl` for calls
+outside plans).
+An upgrade or `/clear` never guesses that calls from a closed plan belong to the new chief conversation.
 
 The `trace` capability carries the chief's cleaned MCP calls separately from the board cursor and replay
 ring. Clients subscribe with `{"kind":"subscribe","topics":[{"topic":"trace"}]}`. The host sends

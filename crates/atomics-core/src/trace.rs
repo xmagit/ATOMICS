@@ -2,7 +2,6 @@
 //! Classification and ingestion are pure; only `disk` requires the native feature.
 
 use std::collections::VecDeque;
-use std::hash::{Hash, Hasher};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -157,6 +156,10 @@ pub struct TracePlan {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TraceEntry {
+    /// Versioned, stable conversation identity. Empty or unversioned legacy identities remain in
+    /// archives but cannot safely be attributed to the current chief after `/clear` or an upgrade.
+    #[serde(default)]
+    pub session_id: String,
     pub seq: u64,
     /// Unix milliseconds, also allowing deterministic ingestion in tests and browser clients.
     pub at: u64,
@@ -200,9 +203,11 @@ fn text(cleaner: &Cleaner, value: &str, chars: usize) -> String {
 // Hook call ids often look exactly like tokens. Keep an opaque correlation id so
 // token heuristics cannot collapse concurrent calls to the same `[redacted]` id.
 fn call_id(id: &str) -> String {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    id.hash(&mut hasher);
-    format!("call:{:016x}", hasher.finish())
+    // FNV-1a has a fixed definition, unlike DefaultHasher. These persisted identities must survive
+    // toolchain upgrades. The prefix distinguishes them from the former unversioned hashes.
+    let hash =
+        id.bytes().fold(0xcbf29ce484222325_u64, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3));
+    format!("call:fnv1a:{hash:016x}")
 }
 
 fn summary(input: &Value, cleaner: &Cleaner) -> String {
@@ -329,6 +334,7 @@ fn clean_value(value: Value, cleaner: &Cleaner) -> Value {
 }
 
 fn bounded(mut entry: TraceEntry) -> TraceEntry {
+    entry.session_id = entry.session_id.chars().take(128).collect();
     entry.summary = cut(&entry.summary, 1024);
     entry.server = entry.server.chars().take(200).collect();
     entry.tool = entry.tool.chars().take(200).collect();
@@ -381,6 +387,7 @@ pub fn ingest(event: &HookEvent, config: Option<&TicketConfig>, cleaner: &Cleane
         classification.op = TraceOp::SemanticSearch;
     }
     let mut entry = TraceEntry {
+        session_id: call_id(&event.session_id),
         seq: 0,
         at,
         phase,
@@ -509,6 +516,7 @@ impl TraceLog {
         if let Some(previous) = self.entries.iter().find(|old| {
             entry.tool_use_id.is_some()
                 && old.tool_use_id == entry.tool_use_id
+                && old.session_id == entry.session_id
                 && old.server == entry.server
                 && old.tool == entry.tool
                 && old.state == TraceState::Running
@@ -646,6 +654,11 @@ pub mod disk {
     }
 
     pub fn load(path: &Path, cleaner: &Cleaner) -> io::Result<TraceLog> {
+        load_for_session(path, cleaner, None)
+    }
+
+    pub fn load_for_session(path: &Path, cleaner: &Cleaner, session: Option<&str>) -> io::Result<TraceLog> {
+        let session = session.map(call_id);
         let mut log = TraceLog::default();
         if !path.exists() {
             return Ok(log);
@@ -661,11 +674,18 @@ pub mod disk {
                 continue;
             }
             if let Ok(entry) = serde_json::from_slice::<TraceEntry>(line) {
+                // Do not guess which conversation owns a legacy entry. Unscoped load() still
+                // exposes the complete archive; this filter never rewrites or deletes it.
+                if session.as_ref().is_some_and(|id| entry.session_id != *id) {
+                    continue;
+                }
+                let session_id = entry.session_id.clone();
                 // Internal plan ids are validated filenames, rather than server text.
                 let plan_id = entry.plan_id.as_ref().map(|id| cleaner.text(id));
                 let cards: Vec<_> = entry.cards.iter().cloned().map(|card| cleaner.card(card)).collect();
                 let value = clean_value(serde_json::to_value(TraceEntry { cards: Vec::new(), ..entry })?, cleaner);
                 if let Ok(mut entry) = serde_json::from_value::<TraceEntry>(value) {
+                    entry.session_id = session_id;
                     entry.plan_id = plan_id;
                     entry.cards = cards;
                     log.insert(bounded(entry));
@@ -687,6 +707,39 @@ pub mod disk {
 mod tests {
     use super::*;
     use crate::tickets::{FieldPaths, Operation, TicketLink};
+
+    #[test]
+    #[cfg(feature = "native")]
+    fn p5_review_trace_keys_are_stable_and_legacy_entries_remain_archived() {
+        assert_eq!(call_id("hello"), "call:fnv1a:a430d84680aabd0b");
+        let cleaner = Cleaner::default();
+        let mut log = TraceLog::default();
+        let current = log
+            .ingest(
+                &event("PostToolUse", "call", "mcp__atomics__atomics_wait", Value::Null, Value::Null),
+                None,
+                &cleaner,
+                1,
+            )
+            .unwrap()
+            .clone();
+        let dir = tempfile::tempdir().unwrap();
+        let path = disk::path(dir.path(), Some("legacy")).unwrap();
+        let mut legacy = current.clone();
+        legacy.seq = 42;
+        legacy.session_id.clear();
+        disk::append(&path, &legacy).unwrap();
+        legacy.seq = 43;
+        legacy.session_id = "call:0123456789abcdef".into();
+        disk::append(&path, &legacy).unwrap();
+        disk::append(&path, &current).unwrap();
+        let saved = std::fs::read(&path).unwrap();
+        let scoped = disk::load_for_session(&path, &cleaner, Some("chief-session")).unwrap();
+        assert_eq!(scoped.entries.len(), 1);
+        assert_eq!(scoped.entries[0].session_id, current.session_id);
+        assert_eq!(disk::load(&path, &cleaner).unwrap().entries.len(), 3);
+        assert_eq!(std::fs::read(path).unwrap(), saved, "loading never discards archived calls");
+    }
 
     fn event(name: &str, id: &str, tool: &str, input: Value, response: Value) -> HookEvent {
         HookEvent::from_payload(&json!({"hook_event_name": name, "session_id": "chief-session",

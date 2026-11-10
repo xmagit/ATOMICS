@@ -24,6 +24,59 @@ struct BoardFrame {
     opened: Vec<String>,
 }
 
+#[test]
+fn review_reason_is_visible_and_check_evidence_expands_on_the_card() {
+    tests::with_app("app::board_tests::review_reason_is_visible_and_check_evidence_expands_on_the_card", |app, ctx| {
+        app.runtime.plans[0].tasks = vec![Task {
+            id: "review".into(),
+            title: "Final review".into(),
+            agent: "codex".into(),
+            reviewer_reason: Some("Selected by [plan] review_agent override.".into()),
+            report: Some(Report {
+                status: "done".into(),
+                summary: "Checked".into(),
+                at: 1,
+                checks: vec![plan::Check {
+                    check: "Acceptance check".into(),
+                    command: "cargo test".into(),
+                    exit: Some(0),
+                    output_tail: "test result: ok".into(),
+                }],
+            }),
+            ..Task::default()
+        }];
+        frame(app, ctx, 1600.0, 0.0, vec![]);
+        let rendered = frame(app, ctx, 1600.0, 0.5, vec![]);
+        let labels: Vec<_> = rendered.text.iter().map(|text| text.galley.text()).collect();
+        assert!(labels.contains(&"Selected by [plan] review_agent override."));
+        assert!(!labels.contains(&"cargo test"), "evidence starts collapsed");
+        let heading = rendered.text.iter().find(|text| text.galley.text() == "Checks (1)").expect("checks expander");
+        let pos = heading.visual_bounding_rect().center();
+        for (time, pressed) in [(1.0, true), (1.1, false)] {
+            frame(
+                app,
+                ctx,
+                1600.0,
+                time,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        let rendered = frame(app, ctx, 1600.0, 2.0, vec![]);
+        let labels: Vec<_> = rendered.text.iter().map(|text| text.galley.text()).collect();
+        for expected in ["Acceptance check", "cargo test", "exit 0", "test result: ok"] {
+            assert!(labels.contains(&expected), "{expected}: {labels:?}");
+        }
+    });
+}
+
 fn frame(app: &mut Desktop<'_>, ctx: &egui::Context, width: f32, time: f64, events: Vec<egui::Event>) -> BoardFrame {
     let output = ctx.run_ui(
         egui::RawInput {
@@ -103,6 +156,7 @@ fn populate(app: &mut Desktop<'_>) {
                 status: "progress".into(),
                 summary: "Reports keep their ordinary words together.".into(),
                 at: 0,
+                checks: Vec::new(),
             }),
             notes: vec!["Keep the original task note".into()],
             ..Task::default()
@@ -343,6 +397,13 @@ fn a_ticket_chip_without_a_reader_for_it_opens_its_address() {
         assert_eq!(click_chip(app, ctx, "TASK-1", 3.0), address);
         assert_ne!(app.runtime.panel, PanelMode::Tickets);
         assert!(app.runtime.tickets.panel.read.is_none());
+        for (index, url) in ["file:///tmp/test", "javascript:alert(1)", "data:text/html,test", "httpx://example.com"]
+            .into_iter()
+            .enumerate()
+        {
+            app.runtime.plans[0].tasks[0].ticket.as_mut().unwrap().url = Some(url.into());
+            assert!(click_chip(app, ctx, "TASK-1", 4.0 + index as f64).is_empty(), "{url}");
+        }
     });
 }
 
@@ -356,12 +417,14 @@ fn a_ticket_chip_says_what_a_click_does() {
             frame(app, ctx, 1600.0, time + 1.0, vec![egui::Event::PointerMoved(pos)]);
             frame(app, ctx, 1600.0, time + 2.0, vec![]);
             let rendered = frame(app, ctx, 1600.0, time + 3.0, vec![]);
-            let says = |t: &&egui::epaint::TextShape| t.galley.text().starts_with("click to");
+            let says = |t: &&egui::epaint::TextShape| {
+                t.galley.text().starts_with("click to") || t.galley.text().starts_with("Open ")
+            };
             rendered.text.iter().find(says).map(|t| t.galley.text().to_string())
         };
         ticketed(app, "demo");
         app.runtime.tickets.config = None;
-        let opens = "click to open https://tickets.example/TASK-1";
+        let opens = "Open tickets.example\nhttps://tickets.example/TASK-1";
         assert_eq!(hint(app, ctx, "TASK-1", 1.0).as_deref(), Some(opens));
         assert_eq!(hint(app, ctx, "PLAN-1", 5.0), None);
         app.runtime.tickets.config =
@@ -369,6 +432,12 @@ fn a_ticket_chip_says_what_a_click_does() {
         let reads = "click to read it here, with Open in browser";
         assert_eq!(hint(app, ctx, "TASK-1", 9.0).as_deref(), Some(reads));
         assert_eq!(hint(app, ctx, "PLAN-1", 13.0).as_deref(), Some("click to read it here"));
+        app.runtime.tickets.config = None;
+        app.runtime.plans[0].tasks[0].ticket.as_mut().unwrap().url = Some("https://github.com@evil.example".into());
+        assert_eq!(
+            hint(app, ctx, "TASK-1", 17.0).as_deref(),
+            Some("Open evil.example\nhttps://github.com@evil.example")
+        );
     });
 }
 
@@ -569,6 +638,129 @@ fn a_refused_sign_in_shows_reconnect_on_the_board_and_a_click_signs_in_again() {
             assert!(texts.contains(&"Waiting for the sign-in…".to_string()), "{texts:?}");
             assert!(texts.contains(&"Open link".to_string()) && texts.contains(&"Use it".to_string()), "{texts:?}");
             let _ = app.runtime.cancel_sign_in();
+        },
+    );
+}
+
+#[test]
+fn notebook_shows_proposals_and_authors_and_user_can_pin_and_delete() {
+    tests::with_app(
+        "app::board_tests::notebook_shows_proposals_and_authors_and_user_can_pin_and_delete",
+        |app, ctx| {
+            app.runtime.config.plan.notebook = true;
+            app.runtime.plans[0].id = "notebook-board".into();
+            app.runtime.plans[0]
+                .propose_note("task-a", "Agent", atomics_core::store::now(), "Build in the Nix shell")
+                .unwrap();
+            let rendered = frame(app, ctx, 1600.0, 0.0, vec![]);
+            let labels: Vec<_> = rendered.text.iter().map(|t| t.galley.text()).collect();
+            assert!(labels.iter().any(|s| s.contains("0 pinned · 1 proposals")), "{labels:?}");
+            assert!(labels.iter().any(|s| s.contains("task-a · Agent") && s.contains("s ago")), "{labels:?}");
+            assert!(labels.contains(&"Build in the Nix shell"));
+            click_chip(app, ctx, "Pin", 1.0);
+            assert!(app.runtime.plans[0].notebook[0].pinned);
+            click_chip(app, ctx, "Delete", 2.0);
+            assert!(app.runtime.plans[0].notebook.is_empty());
+            assert!(Plan::load(&paths::atomics_home().join("plans/notebook-board.json")).unwrap().notebook.is_empty());
+        },
+    );
+}
+
+#[test]
+fn github_agent_report_records_pull_request_and_shows_it_on_task_card() {
+    tests::with_app(
+        "app::board_tests::github_agent_report_records_pull_request_and_shows_it_on_task_card",
+        |app, ctx| {
+            app.runtime.plans[0].tasks = vec![Task {
+                id: "work".into(),
+                title: "Work".into(),
+                session: Some("task-session".into()),
+                branch: Some("task".into()),
+                status: TaskStatus::Running,
+                ..Default::default()
+            }];
+            let request: ControlRequest = serde_json::from_value(json!({
+                "cmd":"report", "pane":"task-session", "status":"done", "summary":"Opened the requested PR",
+                "pull_request":{"url":"https://github.com/group/repo/pull/12","number":12,"head":"task","base":"main"}
+            }))
+            .unwrap();
+            let (tx, rx) = channel();
+            app.runtime.control(request.clone(), tx);
+            let crate::ipc::ControlOutcome::Done(response) = rx.recv().unwrap() else { panic!("report outcome") };
+            assert!(response.ok);
+            let task = &app.runtime.plans[0].tasks[0];
+            assert_eq!(task.status, TaskStatus::Review);
+            assert_eq!(task.pull_request.as_ref().unwrap().number, 12);
+            assert!(
+                task.stages.iter().any(
+                    |s| s.stage == "pr_opened" && s.url.as_deref() == Some("https://github.com/group/repo/pull/12")
+                )
+            );
+            let count = task.stages.len();
+            let (tx, _rx) = channel();
+            app.runtime.control(request, tx);
+            assert_eq!(app.runtime.plans[0].tasks[0].stages.len(), count, "duplicate report is idempotent");
+            frame(app, ctx, 1400.0, 0.0, vec![]);
+            let rendered = frame(app, ctx, 1400.0, 0.5, vec![]);
+            assert!(rendered.text.iter().any(|t| t.galley.text() == "PR #12 · task → main"));
+            assert_eq!(app.runtime.task_view(0, "work").unwrap()["task"]["pull_request"]["number"], 12);
+        },
+    );
+}
+
+#[test]
+fn github_publish_card_shows_full_request_and_dismiss_click_removes_it() {
+    tests::with_app(
+        "app::board_tests::github_publish_card_shows_full_request_and_dismiss_click_removes_it",
+        |app, ctx| {
+            app.runtime.plans[0].approved = true;
+            app.runtime.plans[0].publish = Some(plan::Publish {
+                id: "publish-request".into(),
+                repository: "group/repo".into(),
+                account: "account-two".into(),
+                branch: "task".into(),
+                base: "main".into(),
+                head_sha: "1".repeat(40),
+                base_sha: "0".repeat(40),
+                title: "Reviewed changes".into(),
+                body: "Full description\nSecond paragraph with all details.".into(),
+                commits: "1234567 Contributor <contributor@example.invalid> Reviewed changes".into(),
+                identity_digest: String::new(),
+                url: None,
+                error: None,
+            });
+            frame(app, ctx, 1400.0, 0.0, vec![]);
+            let rendered = frame(app, ctx, 1400.0, 0.5, vec![]);
+            for expected in [
+                "group/repo · GitHub account: account-two",
+                "Reviewed changes",
+                "Full description\nSecond paragraph with all details.",
+                "1234567 Contributor <contributor@example.invalid> Reviewed changes",
+                "Publish",
+                "Dismiss",
+            ] {
+                assert!(rendered.text.iter().any(|t| t.galley.text() == expected), "missing {expected}");
+            }
+            let button =
+                rendered.text.iter().find(|t| t.galley.text() == "Dismiss").unwrap().visual_bounding_rect().center();
+            for (time, pressed) in [(1.0, true), (1.1, false)] {
+                frame(
+                    app,
+                    ctx,
+                    1400.0,
+                    time,
+                    vec![
+                        egui::Event::PointerMoved(button),
+                        egui::Event::PointerButton {
+                            pos: button,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+            assert!(app.runtime.plans[0].publish.is_none());
         },
     );
 }

@@ -97,23 +97,40 @@ pub fn runtime_home_hash(home: &Path) -> String {
 pub fn runtime_dir_for(home: &Path) -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
     {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-        let base = xdg_dir("XDG_RUNTIME_DIR")?;
-        let metadata = base.symlink_metadata().ok()?;
-        // SAFETY: getuid has no preconditions.
-        if !metadata.is_dir()
-            || metadata.uid() != unsafe { libc::getuid() }
-            || metadata.permissions().mode() & 0o077 != 0
-        {
-            return None;
-        }
-        Some(base.join("atomics").join(runtime_home_hash(home)))
+        private_runtime_dir(&xdg_dir("XDG_RUNTIME_DIR")?, home)
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = home;
         None
+    }
+}
+
+fn private_runtime_dir(base: &Path, home: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let metadata = base.symlink_metadata().ok()?;
+    // SAFETY: getuid has no preconditions.
+    if !base.is_absolute()
+        || !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::getuid() }
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return None;
+    }
+    Some(base.join("atomics").join(runtime_home_hash(home)))
+}
+
+fn socket_runtime_dir(home: &Path) -> Option<PathBuf> {
+    let runtime = runtime_dir_for(home);
+    // On macOS a private per-user temporary directory can provide a short socket path.
+    // Leave the jobserver's existing placement alone; only the socket needs this fallback.
+    #[cfg(target_os = "macos")]
+    {
+        runtime.or_else(|| private_runtime_dir(&std::env::temp_dir(), home))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        runtime
     }
 }
 
@@ -146,14 +163,42 @@ pub fn socket_path() -> PathBuf {
         return path;
     }
     let state = atomics_home();
-    // Explicit instance homes and existing installs retain their socket location.
-    if env_override("HOME").is_none()
-        && state != home().join(".atomics")
-        && let Some(runtime) = runtime_dir_for(&state)
+    let prefer_runtime = env_override("HOME").is_none() && state != home().join(".atomics");
+    default_socket(&state, socket_runtime_dir(&state), prefer_runtime)
+}
+
+fn default_socket(state: &Path, runtime: Option<PathBuf>, prefer_runtime: bool) -> PathBuf {
+    let persistent = state.join("atomics.sock");
+    // Explicit homes and old installs retain their location when it fits. A long state path
+    // can still use the private runtime directory, with a stable per-instance name.
+    if (prefer_runtime || validate_socket_path(&persistent).is_err())
+        && let Some(path) = runtime.map(|dir| dir.join("atomics.sock"))
+        && validate_socket_path(&path).is_ok()
     {
-        return runtime.join("atomics.sock");
+        return path;
     }
-    state.join("atomics.sock")
+    persistent
+}
+
+/// Validate before the desktop installs crash logging or opens a window, so startup failures
+/// reach stderr. Unix socket limits count bytes, including the final NUL.
+pub fn validate_socket_path(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    // SAFETY: all-zero bytes are a valid sockaddr_un and it is used only for its array's length.
+    let address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    let limit = address.sun_path.len() - 1;
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.len() > limit || bytes.contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "control socket path {} is invalid ({} bytes; platform limit {limit} bytes). Set ATOMICS_SOCKET to a shorter socket path in a private directory, or ATOMICS_HOME to a shorter state directory",
+                path.display(),
+                bytes.len(),
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// `ATOMICS_SOCKET`, unless it is only the socket a host gave its terminal ([`HOST_SOCKET_ENV`]) and
@@ -225,9 +270,7 @@ fn rewrite_moved_paths(old: &Path, new: &Path) -> std::io::Result<()> {
                 .replace(&format!("\"{old}/"), &format!("\"{new}/"))
                 .replace(&format!("\"{old}\""), &format!("\"{new}\""));
             if updated != text {
-                let temporary = path.with_extension("json.migration");
-                std::fs::write(&temporary, updated)?;
-                std::fs::rename(&temporary, &path)?;
+                crate::store::write_private(&path, updated.as_bytes())?;
             }
         }
     }
@@ -337,6 +380,23 @@ pub fn expand(path: &str) -> PathBuf {
     }
 }
 
+/// Resolve aliases in the existing prefix, retaining the names of removed or not-yet-created children.
+pub fn resolved_path(path: &Path) -> std::io::Result<PathBuf> {
+    let absolute = if path.is_absolute() { path.to_path_buf() } else { std::env::current_dir()?.join(path) };
+    for parent in absolute.ancestors() {
+        match parent.canonicalize() {
+            Ok(parent_path) => return Ok(parent_path.join(absolute.strip_prefix(parent).expect("ancestor prefix"))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(std::io::ErrorKind::NotFound, "path has no existing ancestor"))
+}
+
+pub fn same_location(left: &Path, right: &Path) -> bool {
+    left == right || resolved_path(left).ok().zip(resolved_path(right).ok()).is_some_and(|(left, right)| left == right)
+}
+
 /// Shortens a path under the home directory to `~/…` for display.
 pub fn display(path: &Path) -> String {
     match path.strip_prefix(home()) {
@@ -348,6 +408,39 @@ pub fn display(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aliases_remain_the_same_location_after_a_child_is_removed() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        assert!(same_location(&real.join("missing/child"), &alias.join("missing/child")));
+        assert!(!same_location(&real.join("one"), &alias.join("two")));
+    }
+
+    #[test]
+    fn audit_p7_long_socket_paths_use_a_short_runtime_or_explain_the_override() {
+        use std::os::unix::fs::PermissionsExt;
+        let state = PathBuf::from(format!("/{}", "long-state/".repeat(20)));
+        let runtime = PathBuf::from("/run/private/instance");
+        assert_eq!(default_socket(&state, Some(runtime.clone()), false), runtime.join("atomics.sock"));
+        assert_eq!(default_socket(Path::new("/short"), Some(runtime), false), Path::new("/short/atomics.sock"));
+        for runtime in [None, Some(state.clone())] {
+            let path = default_socket(&state, runtime, false);
+            let error = validate_socket_path(&path).unwrap_err().to_string();
+            assert!(error.contains("platform limit"), "{error}");
+            assert!(error.contains("ATOMICS_SOCKET") && error.contains("ATOMICS_HOME"), "{error}");
+        }
+        // Count UTF-8 bytes, rather than characters, just as bind does.
+        assert!(validate_socket_path(Path::new(&format!("/{}", "é".repeat(60)))).is_err());
+        let dir = crate::test_support::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(private_runtime_dir(dir.path(), &state).is_some());
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(private_runtime_dir(dir.path(), &state).is_none());
+    }
 
     #[test]
     fn runtime_home_folder_name_is_stable() {

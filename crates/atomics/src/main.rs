@@ -8,6 +8,8 @@ mod platform_tests;
 mod test_raster;
 
 mod app;
+mod build_cache;
+mod build_info;
 mod client;
 mod connections;
 mod crash;
@@ -36,6 +38,8 @@ mod restart;
 mod sandbox;
 mod sandbox_ownership;
 mod sandbox_usage;
+mod secret;
+mod secret_copy;
 mod setup;
 mod statusline;
 mod terminal;
@@ -59,7 +63,7 @@ use clap::{Parser, Subcommand};
 // An update reads the version from the first word after the name: see `update::must_report`.
 #[command(
     name = "atomics",
-    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("ATOMICS_BUILD_VERSION"), ")"),
+    version = crate::build_info::version(),
     about = "Review-first workspace for coding agents"
 )]
 struct Cli {
@@ -91,6 +95,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Run the headless VM secret broker (a separate system user).
+    SecretBroker(relay::broker::Options),
+    /// Private stdin-only bridge to the broker's administration socket.
+    #[command(hide = true)]
+    SecretBrokerAdmin,
+    /// Store secrets once for sessions in scope; values are accepted on stdin only.
+    Secret {
+        #[command(subcommand)]
+        command: secret::Command,
+    },
     /// Guide fresh-machine sandbox setup (safe to run again)
     Setup {
         /// Store one credential; the value is read from stdin only
@@ -108,7 +122,11 @@ enum Command {
     /// Check required tools, configuration and integrations
     Doctor,
     /// Install this program for your user: where it goes, its menu entry and icon, and on a Mac `atomics` on PATH
-    Install,
+    Install {
+        /// Install the Linux fresh-auth Copy policy system-wide (requires root).
+        #[arg(long)]
+        secret_copy_policy: bool,
+    },
     /// Go back to the version the last update replaced; run it again to go forward again
     Rollback,
     /// Sign in to or out of the ticket system's MCP server (browser OAuth)
@@ -247,6 +265,12 @@ enum TicketsCommand {
 
 #[derive(Subcommand)]
 enum SandboxCommand {
+    /// Forget an unreadable legacy pin after removing or rebuilding its sandbox and worktree
+    ForgetPin {
+        name: String,
+        #[arg(long)]
+        confirm_worktree_removed: bool,
+    },
     /// Set up sandboxed agents: tools, Docker sign-in, network policy and credentials (over stdin)
     Setup,
     Template {
@@ -301,7 +325,16 @@ const PARENT_SESSION_VARS: &[&str] = &[
 ];
 
 fn main() -> eframe::Result {
-    let cli = Cli::parse();
+    let cli = Cli::try_parse().unwrap_or_else(|error| {
+        if std::env::args_os().any(|arg| arg == "secret" || arg == "secret-broker" || arg == "secret-broker-admin") && !matches!(error.kind(), clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion) {
+            eprintln!("Invalid secret command (arguments hidden). Use atomics secret --help. Values are accepted on stdin only.");
+            std::process::exit(2);
+        }
+        error.exit()
+    });
+    if matches!(cli.command, Some(Command::Host { .. })) {
+        validate_control_socket();
+    }
     let mut migration_errors = Vec::new();
     if matches!(cli.command, None | Some(Command::Host { .. })) {
         for var in PARENT_SESSION_VARS {
@@ -315,7 +348,9 @@ fn main() -> eframe::Result {
     let in_session = matches!(
         cli.command,
         Some(
-            Command::Hook { .. }
+            Command::SecretBroker(_)
+                | Command::SecretBrokerAdmin
+                | Command::Hook { .. }
                 | Command::Statusline { .. }
                 | Command::HooksJson { .. }
                 | Command::Mcp { .. }
@@ -344,17 +379,39 @@ fn main() -> eframe::Result {
             Command::Host { .. }
                 | Command::Doctor
                 | Command::Setup { .. }
+                | Command::Secret { .. }
                 | Command::Sandbox { .. }
                 | Command::Tickets { .. }
                 | Command::Queue { .. }
                 | Command::Update { .. }
-                | Command::Install
+                | Command::Install { .. }
         )
     ) {
         // SAFETY: no other thread exists yet.
         unsafe { setup::adopt_login_path() };
     }
     match cli.command {
+        Some(Command::SecretBrokerAdmin) => {
+            if relay::broker::admin_stdin().is_err() {
+                eprintln!("Secret broker administration failed (contents hidden)");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        Some(Command::SecretBroker(options)) => {
+            if let Err(error) = relay::broker::run(options) {
+                eprintln!("Secret broker failed: {error}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        Some(Command::Secret { command }) => {
+            if let Err(error) = secret::run(command) {
+                eprintln!("Secret operation failed: {error}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
         Some(Command::Setup { credential: Some(kind), registry_host }) => {
             if let Err(error) = sandbox::setup::credential_setup(&kind, registry_host.as_deref()) {
                 eprintln!("Credential setup failed: {error}");
@@ -389,6 +446,18 @@ fn main() -> eframe::Result {
                 &agent,
                 dotnet_project.as_deref(),
                 rust_package.as_deref(),
+            ) {
+                eprintln!("{error:#}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        Some(Command::Sandbox { command: SandboxCommand::ForgetPin { name, confirm_worktree_removed } }) => {
+            if let Err(error) = sandbox::forget_legacy_pin(
+                &atomics_core::paths::atomics_home(),
+                &setup::resolve_program("sbx"),
+                &name,
+                confirm_worktree_removed,
             ) {
                 eprintln!("{error:#}");
                 std::process::exit(1);
@@ -459,7 +528,17 @@ fn main() -> eframe::Result {
             std::process::exit(1);
         }
         Some(Command::Update { check }) => std::process::exit(update::run_cli(check)),
-        Some(Command::Install) => std::process::exit(install::run_cli()),
+        Some(Command::Install { secret_copy_policy: true }) => {
+            match secret_copy::install_policy() {
+                Ok(()) => println!("Secret Copy authentication policy installed"),
+                Err(error) => {
+                    eprintln!("{error}");
+                    std::process::exit(1);
+                }
+            }
+            return Ok(());
+        }
+        Some(Command::Install { secret_copy_policy: false }) => std::process::exit(install::run_cli()),
         Some(Command::Rollback) => std::process::exit(update::run_rollback_cli()),
         Some(Command::Queue { class, command }) => {
             let class =
@@ -539,6 +618,8 @@ fn main() -> eframe::Result {
         };
         return client::run(target, launch, native_options(size, load_icon()));
     }
+    // Only a local host binds this socket; --connect and [client] connect use the remote host's.
+    validate_control_socket();
     // A link goes to the ATOMICS that is running, and this process ends; otherwise it is handled
     // once the app has loaded.
     let link =
@@ -642,6 +723,13 @@ fn load_icon() -> egui::IconData {
     egui::IconData { rgba, width: info.width, height: info.height }
 }
 
+fn validate_control_socket() {
+    if let Err(error) = atomics_core::paths::validate_socket_path(&atomics_core::paths::socket_path()) {
+        eprintln!("atomics: {error}");
+        std::process::exit(1);
+    }
+}
+
 #[cfg(test)]
 mod cli_tests {
     use super::*;
@@ -657,6 +745,14 @@ mod cli_tests {
 
     #[test]
     fn setup_and_sandbox_setup_parse() {
+        let cli =
+            Cli::try_parse_from(["atomics", "sandbox", "forget-pin", "atomics-old", "--confirm-worktree-removed"])
+                .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Sandbox { command: SandboxCommand::ForgetPin { confirm_worktree_removed: true, .. } })
+        ));
+        assert!(Cli::try_parse_from(["atomics", "sandbox", "forget-pin"]).is_err());
         let cli = Cli::try_parse_from(["atomics", "setup"]).unwrap();
         assert!(matches!(cli.command, Some(Command::Setup { credential: None, .. })));
         let cli = Cli::try_parse_from(["atomics", "sandbox", "setup"]).unwrap();

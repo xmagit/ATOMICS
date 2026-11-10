@@ -5,33 +5,178 @@ use atomics_core::layout::DiffSplit;
 use egui::Rect;
 use std::path::Path;
 
-pub fn menu(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
-    let pulls = backend.pull_requests();
-    if pulls.is_empty() {
+/// The list belongs to a window, including its folds and keyboard selection.
+#[derive(Default)]
+pub struct List {
+    pub open: bool,
+    selected: Option<String>,
+    others_open: Option<bool>,
+    scroll_selected: bool,
+}
+
+fn visible<'a>(
+    pulls: &'a [atomics_core::projection::PullRequestInfo],
+    list: &List,
+) -> Vec<&'a atomics_core::projection::PullRequestInfo> {
+    use atomics_core::github::Group;
+    let others = pulls.iter().filter(|p| p.group.unwrap_or_default() == Group::Other).count();
+    let expanded = list.others_open.unwrap_or(others <= 8 || others == pulls.len());
+    let mut rows: Vec<_> = pulls.iter().filter(|p| expanded || p.group.unwrap_or_default() != Group::Other).collect();
+    rows.sort_by_key(|p| p.group.unwrap_or_default());
+    rows
+}
+
+fn load(
+    ctx: &egui::Context,
+    backend: &dyn Backend,
+    client: &mut Client,
+    pull: &atomics_core::projection::PullRequestInfo,
+) {
+    let command = Command::LoadPullRequest(pull.key.clone());
+    let may_load = backend.available(&command);
+    if !may_load && pull.head_sha.is_none() {
         return;
     }
-    ui.menu_button(format!("Pull requests · {}", pulls.len()), |ui| {
-        for pull in pulls {
-            let load = Command::LoadPullRequest(pull.key.clone());
-            let may_load = backend.available(&load);
-            if ui
-                .add_enabled(
-                    may_load || pull.head_sha.is_some(),
-                    egui::Button::new(format!("{}#{} {}", pull.repo, pull.number, pull.title)),
-                )
-                .clicked()
-            {
-                client.pr_target = None;
-                client.pr_view = Some((pull.key.clone(), DiffState::default()));
-                if may_load {
-                    client.send(load);
-                }
-                client.send(Command::SetPanel(PanelMode::Diff));
-                client.send(Command::OpenDiff);
-                ui.close();
-            }
-        }
+    client.pr_target = None;
+    client.pr_view = Some((pull.key.clone(), DiffState::default()));
+    if may_load {
+        client.send(command);
+    }
+    client.send(Command::SetPanel(PanelMode::Diff));
+    client.send(Command::OpenDiff);
+    client.pull_requests.open = false;
+    crate::window_keys::Keyboard::Panel.settle(ctx, client);
+}
+
+fn open_url(ctx: &egui::Context, url: &str) {
+    if crate::markdown::web_url(url).is_some() {
+        ctx.open_url(egui::OpenUrl::new_tab(url));
+    }
+}
+
+pub fn menu(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
+    let count = backend.pull_requests().len();
+    if count > 0 && ui.button(format!("Pull requests · {count}")).clicked() {
+        client.pull_requests.open = !client.pull_requests.open;
+    }
+}
+
+/// Consume list navigation before any diff or terminal sees it.
+pub fn keys(ctx: &egui::Context, backend: &dyn Backend, client: &mut Client) {
+    let management = &client.management;
+    if !client.pull_requests.open
+        || ctx.text_edit_focused()
+        || management.settings
+        || management.remote
+        || management.project
+        || management.setup
+    {
+        return;
+    }
+    let pulls = backend.pull_requests();
+    let rows = visible(&pulls, &client.pull_requests);
+    let index = rows.iter().position(|p| Some(&p.key) == client.pull_requests.selected.as_ref()).unwrap_or(0);
+    let (down, up, enter) = ctx.input_mut(|i| {
+        (
+            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+            i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+        )
     });
+    let index = if down {
+        (index + 1).min(rows.len().saturating_sub(1))
+    } else if up {
+        index.saturating_sub(1)
+    } else {
+        index
+    };
+    client.pull_requests.scroll_selected |= down || up;
+    client.pull_requests.selected = rows.get(index).map(|p| p.key.clone());
+    if enter && let Some(pull) = rows.get(index) {
+        load(ctx, backend, client, pull);
+    }
+}
+
+pub fn dialog(ctx: &egui::Context, backend: &dyn Backend, client: &mut Client) {
+    use atomics_core::github::Group;
+    if !client.pull_requests.open {
+        return;
+    }
+    let pulls = backend.pull_requests();
+    let rows = visible(&pulls, &client.pull_requests);
+    let scroll_selected = std::mem::take(&mut client.pull_requests.scroll_selected);
+    let muted = client.palette.muted;
+    let mut open = true;
+    egui::Window::new("Pull requests")
+        .id(egui::Id::unique("client_pull_requests"))
+        .open(&mut open)
+        .default_width(620.0)
+        .show(ctx, |ui| {
+            egui::ScrollArea::vertical().max_height(480.0).show(ui, |ui| {
+                for group in [Group::Assigned, Group::Mine, Group::Other] {
+                    let count = pulls.iter().filter(|p| p.group.unwrap_or_default() == group).count();
+                    if group == Group::Other && count > 0 {
+                        let expanded = rows.iter().any(|p| p.group.unwrap_or_default() == Group::Other);
+                        if ui.button(format!("{} Other · {count}", if expanded { "▾" } else { "▸" })).clicked() {
+                            client.pull_requests.others_open = Some(!expanded);
+                        }
+                    } else {
+                        ui.strong(group.label());
+                    }
+                    for pull in rows.iter().filter(|p| p.group.unwrap_or_default() == group) {
+                        ui.push_id(&pull.key, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                let selected = client.pull_requests.selected.as_ref() == Some(&pull.key);
+                                let title = if pull.draft == Some(true) {
+                                    format!("{} · Draft", pull.title)
+                                } else {
+                                    pull.title.clone()
+                                };
+                                let response = ui.selectable_label(selected, title).on_hover_text("Load diff");
+                                if selected && scroll_selected {
+                                    response.scroll_to_me(Some(egui::Align::Center));
+                                }
+                                if response.clicked() {
+                                    load(ctx, backend, client, pull);
+                                }
+                                if ui
+                                    .add_enabled(
+                                        backend.available(&Command::LoadPullRequest(pull.key.clone()))
+                                            || pull.head_sha.is_some(),
+                                        egui::Button::new("View diff"),
+                                    )
+                                    .clicked()
+                                {
+                                    load(ctx, backend, client, pull);
+                                }
+                                if ui
+                                    .add_enabled(
+                                        crate::markdown::web_url(&pull.url).is_some(),
+                                        egui::Button::new("Open"),
+                                    )
+                                    .on_hover_text("Open in browser")
+                                    .clicked()
+                                {
+                                    open_url(ctx, &pull.url);
+                                }
+                            });
+                            let author = pull.author.as_deref().map(|a| format!(" · {a}")).unwrap_or_default();
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{}#{}{} · {} → {}",
+                                    pull.repo, pull.number, author, pull.head, pull.base
+                                ))
+                                .color(muted),
+                            );
+                        });
+                    }
+                }
+                if pulls.is_empty() {
+                    ui.label("No pull requests");
+                }
+            });
+        });
+    client.pull_requests.open &= open;
 }
 
 /// True while this client has a PR selected. Comments and editor actions are absent: PR files do not
@@ -95,4 +240,69 @@ pub fn panel(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &mut 
         _ => {}
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use atomics_core::{github::Group, projection::PullRequestInfo};
+
+    fn pull(group: Option<Group>, number: u64) -> PullRequestInfo {
+        PullRequestInfo {
+            group,
+            author: Some("contoso".into()),
+            draft: Some(false),
+            key: format!("pull:contoso/repo#{number}"),
+            repo: "contoso/repo".into(),
+            number,
+            title: "Update parser".into(),
+            head: "feature".into(),
+            base: "main".into(),
+            url: "https://example.com/pull/1".into(),
+            head_sha: None,
+            loading: false,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn groups_order_rows_and_fold_only_a_long_other_group_with_personal_rows() {
+        let mut pulls: Vec<_> = (1..=9).map(|n| pull(None, n)).collect();
+        assert_eq!(visible(&pulls, &List::default()).len(), 9, "old hosts remain fully visible");
+        pulls.push(pull(Some(Group::Mine), 10));
+        pulls.push(pull(Some(Group::Assigned), 11));
+        let rows = visible(&pulls, &List::default());
+        assert_eq!(rows.iter().map(|p| p.number).collect::<Vec<_>>(), [11, 10]);
+        let list = List { others_open: Some(true), ..Default::default() };
+        assert_eq!(visible(&pulls, &list).len(), 11);
+        pulls.remove(0);
+        assert_eq!(visible(&pulls, &List::default()).len(), 10, "eight others start expanded");
+    }
+
+    #[test]
+    fn browser_output_accepts_only_http_and_https() {
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            for url in [
+                "file:///tmp/review",
+                "javascript:alert(1)",
+                "data:text/html,test",
+                "mailto:review@example.com",
+                "//example.com",
+                "https:///missing",
+                "https://example.com\nfile:///tmp/test",
+            ] {
+                open_url(ui.ctx(), url);
+            }
+        });
+        output.textures_delta.clear();
+        assert!(output.platform_output.commands.is_empty());
+        for url in ["https://example.com/pull/1", "http://example.com/pull/1", "HTTPS://example.com/pull/1"] {
+            let mut output = ctx.run_ui(Default::default(), |ui| open_url(ui.ctx(), url));
+            output.textures_delta.clear();
+            assert!(
+                matches!(&output.platform_output.commands[..], [egui::OutputCommand::OpenUrl(open)] if open.url == url)
+            );
+        }
+    }
 }

@@ -61,6 +61,9 @@ pub struct TaskLink {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionInfo {
+    /// Why the session waits for the user, when its ordinary status is insufficient.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_hint: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub previews: Vec<crate::preview::Preview>,
     pub id: String,
@@ -81,14 +84,20 @@ pub struct ReportInfo {
     pub status: String,
     pub summary: String,
     pub at: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<crate::plan::Check>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<crate::plan::PullRequest>,
     pub id: String,
     pub title: String,
     pub status: TaskStatus,
     pub agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_reason: Option<String>,
     pub depends_on: Vec<String>,
     pub session: Option<String>,
     pub branch: Option<String>,
@@ -103,6 +112,12 @@ pub struct TaskInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<crate::plan::PullRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish: Option<crate::plan::Publish>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notebook: Vec<crate::plan::NotebookEntry>,
     /// Full safe links for the shared ticket sidebar, chunked with their plan.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ticket_tree: Option<crate::ticket_ui::TicketTree>,
@@ -223,6 +238,8 @@ pub struct ResourceInfo {
     pub compiler_jobs: Option<usize>,
     pub test: SlotInfo,
     pub qa: SlotInfo,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disk: Vec<crate::machine::DiskWarning>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -239,11 +256,21 @@ pub struct EditorInfo {
     pub running: bool,
     pub file: Option<String>,
     pub inlay_hints: bool,
+    /// Why the editor could not start, such as a program that is not installed on the host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// A PR's metadata. Its diff uses the usual paged `diff_get`, under `key`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRequestInfo {
+    /// Additive metadata: older hosts omit these fields. Unknown membership stays unclassified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<crate::github::Group>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft: Option<bool>,
     pub key: String,
     pub repo: String,
     pub number: u64,
@@ -823,6 +850,7 @@ mod tests {
 
     fn session(id: &str, status: AgentStatus) -> SessionInfo {
         SessionInfo {
+            status_hint: None,
             previews: Vec::new(),
             id: id.into(),
             agent: "claude".into(),
@@ -892,5 +920,19 @@ mod tests {
         }
         writer.join().unwrap();
         assert_eq!(p.sessions.load().revision, 200);
+    }
+}
+
+#[cfg(test)]
+mod pull_request_tests {
+    #[test]
+    fn old_pull_request_metadata_is_still_readable() {
+        let pull: super::PullRequestInfo = serde_json::from_value(serde_json::json!({
+            "key": "pull:contoso/repo#1", "repo": "contoso/repo", "number": 1,
+            "title": "Update parser", "head": "feature", "base": "main",
+            "url": "https://example.com/pull/1", "head_sha": null, "loading": false, "error": null
+        }))
+        .unwrap();
+        assert_eq!((pull.group, pull.author, pull.draft), (None, None, None));
     }
 }

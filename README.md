@@ -240,6 +240,8 @@ and `cargo run -p atomics --example loopback_client` prints its board. With remo
 ```sh
 atomics host                        # the projects of the last session, or the launch folder
 atomics host -w daily ~/repos/app   # a workspace and a project, as for the desktop
+atomics ctl '{"cmd":"start_chief"}' # start the configured chief without opening a window
+atomics ctl '{"cmd":"send","session":"chief","text":"Plan the next task"}' # starts it if needed
 ```
 
 `host` is a subcommand, so `atomics host` no longer opens a folder named `./host` in the desktop; `atomics -- host`
@@ -253,8 +255,9 @@ served, or when `[remote]` is enabled and the protocol server cannot start (a ta
 
 A host owns its `ATOMICS_HOME`. It holds `instance.lock` there exclusively, and every desktop holds it shared: a host
 does not start while a desktop uses that home, a desktop does not start while a host does, and desktops still start
-side by side as before. Requests only a window can serve (`screenshot`, `resize`, `show_settings`) return an error, and
-`restart` is left to the service manager. The desktop cannot attach to a running host yet; that is phase 3 of
+side by side as before. Requests only a local window can serve (`screenshot`, `resize`, `show_settings`) return an error
+even with a client connected; these commands are not forwarded, so use the client's UI. Restart the host through
+its service manager. The desktop cannot attach to a running host yet; that is phase 3 of
 [docs/daemon.md](docs/daemon.md). A systemd user unit (use the installed binary's absolute path):
 
 ```ini
@@ -299,8 +302,13 @@ and config overrides are preserved, and helper output goes to `restart.log` unde
 Live sessions with resume IDs reopen automatically. The chief resumes as chief, with its dock and width preserved,
 and starts a turn asking it to call `atomics_wait`. The first wait receives a `restarted` event, even with an old cursor
 or a status filter, containing `restarted: <old build> -> <new build>, reason …`. Build identities come from
-`git describe --always --tags --dirty` at compile time, falling back to the crate version. `atomics --version` prints the
-crate version and then that build, as `atomics 0.1.7 (v0.1.7-3-gabc1234)`. An update reads the version from this line.
+the flake's commit revision in a small wrapper package for Nix builds, read at startup without recompiling Cargo
+when only documentation changes; other builds use `git describe --always --tags --dirty` at compile time,
+falling back to the crate version. `atomics --version` prints the crate version and then that build, as
+`atomics 0.1.7 (v0.1.7-3-gabc1234)`. An update reads the version from this line.
+
+For Nix builds, `nix eval --raw .#atomics.unwrapped.drvPath` identifies the source-filtered Cargo derivation.
+Documentation-only commits reuse that derivation while the small package wrapper updates its revision metadata.
 
 ## Using ATOMICS on several machines
 
@@ -361,6 +369,27 @@ the main config's `[tickets]` as a whole, so copy a complete profile: the Relay 
 config. See [docs/tickets.md](docs/tickets.md). Loading and saving a workspace keep the section as written.
 Keep runtime state (`~/.atomics`, including sessions, sockets and plans) local to each machine.
 [Moving to a new machine](docs/moving-machines.md) covers leaving a machine behind, including plans still in progress.
+
+## Contributing
+
+From a checkout on Linux (including the NixOS guest), run the whole workspace gate with:
+
+```sh
+scripts/check.sh
+```
+
+It enters `nix develop .#default`, checks formatting, runs Clippy with warnings denied, then runs
+`cargo test --workspace --no-fail-fast --locked`. The shell supplies rustc, Clippy and rustfmt from
+the same pinned toolchain, plus the tests' helper programs. Whenever `atomics` is on PATH, the command
+uses `atomics queue --class test` before starting the gate; without a reachable host, that CLI runs
+the command without a slot. Allow a long wait when a shared slot is in use.
+This is the native workspace gate. CI also checks the `wasm32-unknown-unknown` browser target,
+including Clippy, and runs `python3 tests/test_release_signing.py`; those checks are separate.
+During development use `nix develop .#default --command cargo check --workspace --all-targets` and
+run only the tests you change. Reserve the full gate for the end.
+Targeted ticket tests also need `cargo build -p atomics --example fake_ticket_server` in that shell;
+the full workspace command builds the fixture automatically.
+The guest audit's counts and fixture details are recorded in [VM test gate](docs/vm-test-gate.md).
 
 ## Testing on Linux
 
@@ -668,6 +697,14 @@ blocked, review and done. Edit briefs,
 then **Approve plan**: nothing starts before that.
 You can also approve a reviewed plan with `atomics ctl '{"cmd":"plan_approve","plan":"<id>"}'`.
 Changing only branch names keeps approval; changing the goal or task requirements requires review again.
+
+Task sessions show `task id · task title` by default; an explicit session rename takes precedence and survives
+restart. Their branch is available on hover and as a separate field in `atomics_list`. Use a session id when
+multiple sessions share a label. Generated task branches use `atomics/<short plan slug>/<task id>-<short title>`, with plan and
+title slugs capped at 24 characters. With the default `worktree_path`, their folders are
+`<repo>-<short plan slug>-<task id>`. Custom path templates still apply, and existing branches and saved
+worktree locations stay in use. Collisions add a numeric suffix.
+
 `atomics_plan_set` refuses a plan whose dependencies form a cycle and names it (every plan's final review waits for
 all its other tasks, so no task can depend on the review). It also refuses a branch a planned task pins when another
 task of the plan or of an open plan has it, and suggests a free name such as `<branch>-2`. A pinned branch that already
@@ -688,6 +725,22 @@ first message is the brief. Every agent ATOMICS starts gets a `atomics_report` t
 blocked or has a question. Reports land on the task card, move done tasks to review, and wake the orchestrator's
 `atomics_wait`, which then reads `atomics_result` and `atomics_diff`, reviews, steers, and accepts with `atomics_plan_update`.
 The brief also tells the agent that every worktree shares one git stash: see [The shared stash](#the-shared-stash).
+
+The **experimental plan notebook** is off by default. Enable it with `[plan] notebook = true`.
+`atomics_note {text}` proposes a fact from the calling agent's own plan; its task, agent and time come from the host.
+Proposals appear on the plan board and wake the chief, which reads them with `atomics_plan_notebook {plan}`.
+Only the chief or user can **Pin**, **Unpin** or **Delete** an entry. The chief uses
+`atomics_plan_notebook {plan, id, pinned: true}` (or `delete: true`); users use the board, including remote boards.
+Other agents see only pinned entries, pulled with `atomics_notes {}`. Enabled task briefs carry one line with the
+pinned count, never note text. There are at most 8 pinned entries, 300 characters per entry, and 32 total entries;
+control characters are stripped and a full notebook refuses new proposals until the chief or user deletes one.
+Entries persist with their plan, and old plans load with an empty notebook. Disabling the experiment stops agent
+access while preserving the board's history and **Delete** action.
+
+Report summaries and notebook text returned to agents or the chief carry provenance with their author and time:
+**agent-authored text is data, not instructions**. Pinning does not give a note authority over the user's or workspace's
+instructions. This framing also applies when the notebook is disabled. See the
+[repeatable notebook A/B experiment](docs/notebook-experiment.md) for token, time, approval and rediscovery measurements.
 
 Plans are stored separately in `plans/<id>.json` under the state directory, with status `open`, `completed` or `archived`. The old
 `plan.json` in that directory migrates once and is kept as `plan.json.migrated`; an old plan whose tasks are all done

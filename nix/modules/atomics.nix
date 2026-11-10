@@ -10,6 +10,9 @@ let
   userGroup = if user.group == "" then "users" else user.group;
   configDir = "${user.home}/.config/atomics";
   seedFile = toml.generate "atomics-config.toml" cfg.settings;
+  copyPolicy = pkgs.runCommand "atomics-secret-copy-policy" { } ''
+    install -Dm644 ${../../assets/com.atomics.copy-secret.policy} "$out/share/polkit-1/actions/com.atomics.copy-secret.policy"
+  '';
 
   # Text settings whose names suggest a credential, which the Nix store would show every local user.
   # Names of variables, files or commands that hold one (`api_key_env`) are fine.
@@ -58,7 +61,11 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    environment.systemPackages = [ cfg.package ];
+    environment.systemPackages = [ cfg.package copyPolicy ];
+    # Fresh per-copy authentication, including on a headless VM (whose remote clients still
+    # cannot copy). Linking the package's policy into the system path makes polkit load it.
+    security.polkit.enable = true;
+    environment.pathsToLink = [ "/share/polkit-1" ];
     assertions = [ {
       assertion = !hasSeed || (cfg.user != "" && user != null);
       message = "programs.atomics.user must name an existing NixOS user when programs.atomics.settings is non-empty";

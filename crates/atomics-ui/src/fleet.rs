@@ -74,7 +74,7 @@ pub fn tab_strip(
                 } else {
                     button.frame_when_inactive(false)
                 };
-                let response = ui.add(button);
+                let response = ui.add(button).on_hover_text(s.hover());
                 if response.clicked() {
                     clicked = Some(s.id.clone());
                 }
@@ -237,11 +237,11 @@ pub fn tiles(
         let title_color = if title_response.hovered() || active { p.accent } else { p.foreground };
         let place = match (row.scratch, row.branch.as_deref()) {
             (true, _) => format!("{} · scratch · ", row.agent),
-            (false, Some(branch)) => format!("{} · {} · ", row.agent, branch),
-            (false, None) => format!("{} · ", row.agent),
+            (false, Some(branch)) if row.task.is_none() => format!("{} · {} · ", row.agent, branch),
+            (false, _) => format!("{} · ", row.agent),
         };
         let note = view.queue_note.as_ref().map(|note| format!(" · {note}")).unwrap_or_default();
-        let subtitle = format!("{place}{}{note}", row.status.label());
+        let subtitle = format!("{place}{}{note}", row.status_label());
         let galley = ui.fonts_mut(|f| f.layout_no_wrap(row.title.clone(), p.ui(13.0), title_color));
         let title_width = galley.size().x;
         ui.painter().with_clip_rect(title_rect).galley(
@@ -253,7 +253,7 @@ pub fn tiles(
         let mut job = egui::text::LayoutJob::default();
         let format = |color| egui::TextFormat { font_id: p.ui(11.0), color, ..Default::default() };
         job.append(&place, 0.0, format(p.muted));
-        job.append(row.status.label(), 0.0, format(status_color(row.status, &p)));
+        job.append(row.status_label(), 0.0, format(status_color(row.status, &p)));
         job.append(&note, 0.0, format(p.muted));
         let galley = ui.fonts_mut(|f| f.layout_job(job));
         ui.painter().with_clip_rect(title_rect).galley(
@@ -280,7 +280,7 @@ pub fn tiles(
             )
         };
         let title_response =
-            title_response.on_hover_text(format!("{}\n{subtitle}{preview_details}\n{action}", row.title));
+            title_response.on_hover_text(format!("{}\n{subtitle}{preview_details}\n{action}", row.hover()));
         if title_response.double_clicked() && can_rename {
             rename = Some(row.id.clone());
         } else if title_response.clicked() {
@@ -344,7 +344,7 @@ pub fn tiles(
             body.min.y = banner.bottom();
         }
         let term_id = ui.scope_id().with(("term", &row.id));
-        if let Some(warning) = &view.warning {
+        for warning in row.status_hint.iter().chain(view.warning.iter()) {
             let wrap = (body.width() - 16.0).max(40.0);
             let galley = ui.fonts_mut(|f| f.layout(warning.clone(), p.ui(12.0), p.warning, wrap));
             let banner = body.with_max_y((body.top() + galley.size().y + 10.0).min(body.bottom()));

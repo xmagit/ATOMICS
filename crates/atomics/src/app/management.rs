@@ -75,6 +75,7 @@ impl State {
                 })
                 .collect();
         }
+        let identity_scopes = config["identity_scopes"].clone();
         ManagementInfo {
             config,
             proposals,
@@ -87,8 +88,20 @@ impl State {
                 "sandbox_busy": self.sandbox_check.is_some(),
                 "connections": self.connections.management_info(),
                 "credentials": self.credential_status,
+                "secret_copy_unavailable": crate::secret_copy::unavailable(),
+                "secret_workspaces": self.workspace_names,
                 "credential_busy": self.credential_busy,
                 "credential_kinds": crate::credentials::KINDS.iter().map(|(id, label, _)| json!({"id":id, "label":label})).collect::<Vec<_>>(),
+                "identities": self.repos.iter().map(|repo| {
+                    let configured = self.project_identity(repo);
+                    let identity = self.git_identities.get(repo).map_or(configured.clone(), |git| git.overlay(&configured));
+                    let label = self.tickets.workspace_identity_error.clone().unwrap_or_else(|| if identity.name.is_none() && identity.email.is_none() { "Git identity".to_string() } else { identity.label() });
+                    let scoped = identity_scopes.as_array().into_iter().flatten()
+                        .find(|scope| scope["target"].as_str().is_some_and(|target| Path::new(target) == repo))
+                        .map(|scope| scope["identity"].clone()).unwrap_or_else(|| json!({}));
+                    json!({"project": repo.to_string_lossy(), "display": paths::display(repo), "label": label, "github": identity.github,  "identity": identity, "override": scoped})
+                }).collect::<Vec<_>>(),
+                "identity_error": self.tickets.workspace_identity_error,
             }),
             remote,
             themes: self.themes.clone(),
@@ -252,6 +265,7 @@ impl State {
                     let _ = actions.send(Box::new(move |state| state.toast(message)));
                 });
             }
+            SettingsTool::CleanBuildCaches => self.clean_build_caches(),
             SettingsTool::CheckPrograms => self.check_programs(),
             SettingsTool::SetIsolation { mode } => {
                 self.set_isolation(mode).map_err(|e| WireError::new(ErrorCode::Rejected, e))?;
@@ -338,36 +352,87 @@ fn credential_tool(
     relay: &crate::relay::Service,
     tool: atomics_core::ops::SettingsTool,
 ) -> Result<serde_json::Value, String> {
-    use atomics_core::ops::SettingsTool;
-    let store = crate::credentials::Store::new(relay.keychain().clone());
+    let label = credential_label(&tool)?;
+    let result = if matches!(
+        &tool,
+        atomics_core::ops::SettingsTool::RemoveSecret { .. } | atomics_core::ops::SettingsTool::RemoveCredential { .. }
+    ) {
+        relay.edit_removal(&label, |store| credential_action(store, tool))
+    } else {
+        relay.edit(&label, |store| credential_action(store, tool))
+    };
+    result.map_err(|error| error.to_string())?;
+    credential_status(relay, &crate::credentials::Store::new(relay.keychain().clone()))
+}
+
+/// The VM window owns its keychain. This path explicitly bypasses any broker environment.
+pub(crate) fn local_credential_tool(
+    relay: &crate::relay::Service,
+    tool: atomics_core::ops::SettingsTool,
+) -> Result<serde_json::Value, String> {
+    credential_label(&tool)?;
+    let store = crate::credentials::Store::local(relay.keychain().clone());
     match tool {
-        SettingsTool::RefreshCredentials => {}
-        SettingsTool::PutCredential { kind, value, host } => {
-            let label = if kind == "registry" {
+        // Settings selected a main checkout from the VM's projection. It need not exist on
+        // this Mac, and must keep its VM path when the keychain catalog is synchronized.
+        atomics_core::ops::SettingsTool::AddSecret { spec, value } => store.add_secret_rule(spec, &value),
+        tool => credential_action(&store, tool),
+    }
+    .map_err(|error| error.to_string())?;
+    credential_status(relay, &store)
+}
+
+fn credential_label(tool: &atomics_core::ops::SettingsTool) -> Result<String, String> {
+    use atomics_core::ops::SettingsTool;
+    Ok(match tool {
+        SettingsTool::AddSecret { spec, .. } => format!("secret:{}", spec.name),
+        SettingsTool::SetGithubPolicy { name, .. } | SettingsTool::RemoveSecret { name } => format!("secret:{name}"),
+        SettingsTool::PutCredential { kind, host, .. } | SettingsTool::RemoveCredential { kind, host } => {
+            let label = crate::credentials::KINDS
+                .iter()
+                .find(|(id, _, _)| *id == kind)
+                .ok_or_else(|| "Unknown credential kind".to_string())?
+                .1;
+            if kind == "registry" {
                 format!("Private registry ({})", host.as_deref().unwrap_or_default())
             } else {
-                crate::credentials::KINDS.iter().find(|(id, _, _)| *id == kind).unwrap().1.into()
-            };
-            relay.edit(&label, |store| store.put(&kind, &value, host.as_deref())).map_err(|error| error.to_string())?;
+                label.into()
+            }
         }
+        SettingsTool::RefreshCredentials | SettingsTool::CleanCredentials => String::new(),
+        _ => return Err("Unknown credential operation".into()),
+    })
+}
+
+fn credential_action(store: &crate::credentials::Store, tool: atomics_core::ops::SettingsTool) -> anyhow::Result<()> {
+    use atomics_core::ops::SettingsTool;
+    match tool {
+        SettingsTool::SetGithubPolicy { name, refuse_default_branch } => {
+            store.set_github_policy(&name, refuse_default_branch)
+        }
+        SettingsTool::RefreshCredentials => Ok(()),
+        SettingsTool::AddSecret { spec, value } => store.add_secret(spec, &value),
+        SettingsTool::RemoveSecret { name } => store.remove_secret(&name),
+        SettingsTool::PutCredential { kind, value, host } => store.put(&kind, &value, host.as_deref()),
         SettingsTool::RemoveCredential { kind, host } => {
             let key = match kind.as_str() {
                 "registry" => format!("registry:{}", host.as_deref().unwrap_or_default()),
                 crate::credentials::GITHUB_APP => {
                     crate::credentials::github_app_id(host.as_deref().unwrap_or_default())
                 }
-                _ => kind.clone(),
+                _ => kind,
             };
-            let label = if kind == "registry" {
-                format!("Private registry ({})", host.as_deref().unwrap_or_default())
-            } else {
-                crate::credentials::KINDS.iter().find(|(id, _, _)| *id == kind).unwrap().1.into()
-            };
-            relay.edit(&label, |store| store.remove(&key)).map_err(|error| error.to_string())?;
+            store.remove(&key)
         }
-        SettingsTool::CleanCredentials => store.remove_invalid().map_err(|error| error.to_string())?,
-        _ => unreachable!("credential tool"),
+        SettingsTool::CleanCredentials => store.remove_invalid(),
+        _ => anyhow::bail!("Unknown credential operation"),
     }
+}
+
+fn credential_status(
+    relay: &crate::relay::Service,
+    store: &crate::credentials::Store,
+) -> Result<serde_json::Value, String> {
     let snapshot = store.snapshot().map_err(|error| error.to_string())?;
     let entries: Vec<_> = snapshot
         .entries
@@ -394,7 +459,10 @@ fn credential_tool(
         status.logged_in,
         if sessions.is_empty() { "none".into() } else { sessions.join(", ") }
     );
-    Ok(json!({ "entries": entries, "invalid": snapshot.invalid, "azure": azure }))
+    let secrets = store.secrets().map_err(|error| error.to_string())?.into_iter().map(|spec| {
+        json!({"kind": spec.kind(), "scope": spec.scope.label(), "last_used": relay.secret_last_use(&spec.name), "github_account": crate::relay::github::account_login(&spec.name), "spec": spec})
+    }).collect::<Vec<_>>();
+    Ok(json!({ "entries": entries, "secrets": secrets, "invalid": snapshot.invalid, "azure": azure }))
 }
 
 #[cfg(test)]
@@ -633,5 +701,25 @@ mod tests {
                 );
             },
         );
+    }
+    #[test]
+    fn secret_removal_error_in_settings_still_revokes_the_live_grant() {
+        let (dir, keychain, store) = crate::credentials::tests::machine(false);
+        store
+            .add_secret(
+                atomics_core::secrets::Secret {
+                    name: "KEY".into(),
+                    host: Some("api.example.com".into()),
+                    ..Default::default()
+                },
+                "canary",
+            )
+            .unwrap();
+        let relay = crate::relay::Service::transient(dir.path().join("relay"), keychain);
+        let _grant = relay.grant_secrets("session", None, None, false, None).unwrap().unwrap();
+        // The previous removal reached storage, but its acknowledgement was lost.
+        store.remove_secret("KEY").unwrap();
+        assert!(credential_tool(&relay, atomics_core::ops::SettingsTool::RemoveSecret { name: "KEY".into() }).is_err());
+        assert_eq!(relay.live_grants(), 0);
     }
 }

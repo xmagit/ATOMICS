@@ -174,6 +174,8 @@ fn waiter_wakes_on_a_hook_status_change_without_frames() {
         state.sessions = vec![session("worker", AgentKind::Claude, AgentStatus::Working, &state.launch_dir)];
         let host = state.into_host();
         let wait = host.command(ControlRequest::Wait {
+            compact: false,
+            full_sessions: false,
             sessions: vec!["worker".into()],
             statuses: vec!["turn done".into()],
             after: Some(0),
@@ -430,7 +432,7 @@ fn delivery_verification_times_out_without_frames() {
         let terminal = Terminal::spawn(
             state.wake.clone(),
             state.theme.terminal_colors(),
-            "/bin/sleep".into(),
+            crate::test_support::program("sleep"),
             vec!["30".into()],
             &state.launch_dir,
             HashMap::new(),
@@ -493,7 +495,7 @@ fn worktree_changes_publish_a_fresh_diff_without_frames() {
 #[test]
 fn held_terminal_input_gets_a_receipt_without_frames() {
     with_state("app::host_tests::held_terminal_input_gets_a_receipt_without_frames", |mut state, _| {
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex");
+        let fixture = crate::app::tests::fixture_agent("codex");
         state.config.agents.push(atomics_core::config::AgentConfig {
             name: "fake-codex".into(),
             command: vec![fixture.to_string_lossy().into_owned()],
@@ -566,6 +568,7 @@ fn desktop_actions_launch_and_deliver_on_the_host_without_frames() {
             }))
             .unwrap();
         let id = rx.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(5))).unwrap();
+        eventually(&host, |state| state.sessions.iter().any(|s| s.id == id && s.terminal.is_some()));
         let session = id.clone();
         actions
             .send(Box::new(move |state| {
@@ -602,6 +605,8 @@ fn blocked_project_picker_does_not_block_hooks_or_waits() {
             .drop_without_applying_deltas();
         }
         let wait = app.host.command(ControlRequest::Wait {
+            compact: false,
+            full_sessions: false,
             sessions: vec!["worker".into()],
             statuses: vec!["turn done".into()],
             after: Some(0),
@@ -1141,11 +1146,14 @@ fn the_desktop_selects_its_own_new_agent_when_its_start_reply_arrives() {
             app.replies.push((true, app.host.command(request)));
             let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
             let mut frame = eframe::Frame::_new_kittest();
-            while !app.replies.is_empty() {
+            while !app.replies.is_empty()
+                || !app.host.state().sessions.iter().any(|s| s.id != "foreground" && s.terminal.is_some())
+            {
                 assert!(Instant::now() < deadline, "desktop did not receive its start reply");
                 eframe::App::logic(&mut app, ctx, &mut frame);
                 std::thread::sleep(Duration::from_millis(5));
             }
+            eframe::App::logic(&mut app, ctx, &mut frame);
             let state = app.host.state();
             let started = state.sessions.iter().find(|s| s.id != "foreground").unwrap();
             assert_eq!(state.active.as_deref(), Some(started.id.as_str()));

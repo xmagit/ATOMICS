@@ -48,13 +48,19 @@ pub struct Sandboxed {
     /// The sbx agent it runs, such as `claude`.
     pub agent: &'static str,
     pub ssh_agent: bool,
+    pub cache_env: Vec<(String, String)>,
 }
 
 impl Sandboxed {
     /// What the tile's PTY runs: `sbx run` for `agent_args`. Without SSH agent forwarding, sbx
     /// runs without `SSH_AUTH_SOCK`, so there is no agent for it to forward.
     pub fn command(&self, agent_args: &[String]) -> (String, Vec<String>) {
-        let run = isolation::run_args(&self.name, self.agent, agent_args);
+        let mut run = isolation::run_args(&self.name, self.agent, agent_args);
+        let position = run.iter().position(|arg| arg == "--").unwrap_or(run.len());
+        run.splice(
+            position..position,
+            self.cache_env.iter().flat_map(|(key, value)| ["--env".into(), format!("{key}={value}")]),
+        );
         if self.ssh_agent {
             (self.sbx.clone(), run)
         } else {
@@ -76,6 +82,7 @@ pub struct Prepare {
     pub cwd: PathBuf,
     pub config: SandboxConfig,
     pub warm: Vec<String>,
+    pub cache: atomics_core::cache::CacheConfig,
     /// ATOMICS's executable and socket, for the MCP server agents report through.
     pub exe: PathBuf,
     pub socket: PathBuf,
@@ -86,6 +93,8 @@ pub struct Prepare {
     /// For a Claude agent: the relay that gives it a placeholder for the Claude subscription, when
     /// the OS keychain holds one.
     pub relay: Option<std::sync::Arc<crate::relay::Service>>,
+    pub secret_workspace: Option<String>,
+    pub github_account: Option<String>,
 }
 
 impl Prepare {
@@ -96,8 +105,96 @@ impl Prepare {
             name: self.name.clone(),
             agent: self.agent,
             ssh_agent: self.config.ssh_agent,
+            cache_env: Vec::new(),
         }
     }
+}
+
+/// Probe the sandbox's PATH, never assume that a tool installed on the host is in its image.
+/// This runs on the preparation worker, for new and resumed sessions alike.
+fn compiler_store(job: &Prepare) -> PathBuf {
+    job.home.join("build-caches/sandboxes-v2").join(paths::runtime_home_hash(Path::new(&job.name))).join("sccache")
+}
+
+/// Shell-quoted assignments for `atomics_exec`, after the VM's login shell has loaded.
+/// `sbx run --env` is also supported for reattachment: https://docs.docker.com/reference/cli/sbx/run/
+pub(super) fn with_cache_env(command: &str, env: &[(String, String)]) -> String {
+    if env.is_empty() {
+        return command.into();
+    }
+    let quote = |value: &str| format!("'{}'", value.replace('\'', "'\"'\"'"));
+    let assignments = env
+        .iter()
+        .filter(|(key, _)| {
+            key.starts_with(|ch: char| ch.is_ascii_alphabetic() || ch == '_')
+                && key.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        })
+        .map(|(key, value)| format!("export {key}={};", quote(value)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("{assignments} {command}")
+}
+
+pub fn cache_env(job: &Prepare) -> Vec<(String, String)> {
+    if job.agent == "shell" || !crate::build_cache::lean_worktree(&job.cwd) {
+        return Vec::new();
+    }
+    let root = crate::build_cache::root(&job.cwd);
+    let cargo = root.join("Cargo.toml").is_file();
+    let probe = isolation::exec_args(&job.name, &job.cwd, "command -v sccache", 5);
+    let sccache = sbx(&job.sbx, &probe, job.config.ssh_agent, Duration::from_secs(10))
+        .ok()
+        .filter(|path| Path::new(path.trim()).is_absolute())
+        .map(|path| path.trim().to_string());
+    let store = compiler_store(job);
+    let mounted = list(&job.sbx)
+        .ok()
+        .and_then(|sandboxes| sandboxes.into_iter().find(|sandbox| sandbox.name == job.name))
+        .map(|sandbox| real_paths(&sandbox).workspaces)
+        .unwrap_or_default();
+    let has_store = crate::build_cache::store_allowed(&job.home, &store, crate::build_cache::Domain::Sandbox)
+        && mounted.contains(&real(&store).to_string_lossy().into_owned());
+    let mut env = job.cache.agent_env(cargo, sccache.as_deref(), &store.to_string_lossy(), |_| None);
+    // Sandboxes can never select a host store, including explicit user overrides.
+    if has_store {
+        env.insert("SCCACHE_DIR".into(), store.to_string_lossy().into_owned());
+        env.insert("SCCACHE_SERVER_UDS".into(), "/tmp/atomics-sccache-v2.sock".into());
+    } else {
+        env.remove("SCCACHE_DIR");
+        env.remove("SCCACHE_SERVER_UDS");
+        for key in ["RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER"] {
+            if env.get(key).is_some_and(|value| atomics_core::cache::is_sccache(value)) {
+                env.insert(key.into(), String::new());
+            }
+        }
+        if cargo {
+            eprintln!(
+                "ATOMICS: sandbox {} has no private compiler-cache mount; continuing without sccache. Recreate it to enable the cache.",
+                job.name
+            );
+        }
+    }
+    crate::build_cache::resolve_env_paths_in(
+        &job.home,
+        &root,
+        &job.cache,
+        &mut env,
+        crate::build_cache::Domain::Sandbox,
+    );
+    // Older sandboxes may lack newly configured shared mounts. Drop only affected env.
+    env.retain(|key, value| {
+        if !atomics_core::cache::path_variable(key) { return true; }
+        let path = real(Path::new(value));
+        let store_path = real(&job.home.join("build-caches"));
+        let missing_shared = job.cache.shared.iter().filter(|folder| atomics_core::cache::relative(folder)).any(|folder| {
+            let shared = real(&root.join(folder));
+            path.starts_with(&shared) && !mounted.contains(&shared.to_string_lossy().into_owned())
+        });
+        let available = !missing_shared && (!path.starts_with(&store_path) || mounted.iter().any(|mount| path.starts_with(Path::new(mount))));
+        if !available { eprintln!("ATOMICS: sandbox {} cache {key} is not mounted; continuing without it. Recreate the sandbox to enable it.", job.name); }
+        available
+    });
+    env.into_iter().collect()
 }
 
 /// What sbx said when it was checked.
@@ -154,6 +251,8 @@ pub fn preflight(program: &str) -> Result<Ready, String> {
 /// with the subscription in the OS keychain gets a new placeholder for it, revoked again if
 /// preparation fails, and its sandbox the way to the relay.
 pub fn prepare(job: &Prepare) -> Result<Option<crate::relay::Granted>> {
+    load_owned_pins(&job.home)?;
+    let _source = repository_lease(&job.cwd, false)?;
     let ready = preflight(&job.sbx).map_err(anyhow::Error::msg)?;
     // Fail closed before making anything if this home's ledger cannot be read.
     let owned = ownership::owned(&job.home)?;
@@ -176,7 +275,38 @@ pub fn prepare(job: &Prepare) -> Result<Option<crate::relay::Granted>> {
     let (workspace, git) = workspace(&job.cwd)?;
     // First, so a new sandbox's environment can name the relay's port.
     let granted = match &job.relay {
-        Some(relay) => relay.grant_session(&job.name, job.agent == "claude", &job.config.azure)?,
+        Some(relay) => {
+            let granted = relay.grant_session(&job.name, job.agent == "claude", &job.config.azure)?;
+            let project = atomics_core::workspace::project_root(&job.cwd).ok();
+            match relay.grant_secrets(
+                &job.name,
+                job.secret_workspace.as_deref(),
+                project.as_deref().and_then(Path::to_str),
+                true,
+                granted.clone(),
+            ) {
+                Ok(granted) => {
+                    if let (Some(account), Some(project)) = (&job.github_account, &project) {
+                        relay.grant_project_github(
+                            &job.name,
+                            account,
+                            project,
+                            job.secret_workspace.as_deref(),
+                            true,
+                            granted,
+                        )?
+                    } else {
+                        granted
+                    }
+                }
+                Err(error) => {
+                    if let Some(granted) = &granted {
+                        relay.revoke(granted);
+                    }
+                    return Err(error);
+                }
+            }
+        }
         None => None,
     };
     let made = make(job, &ready, existing, workspace, git, granted.as_ref());
@@ -197,10 +327,37 @@ fn make(
     granted: Option<&crate::relay::Granted>,
 ) -> Result<()> {
     let ssh = job.config.ssh_agent;
+    // New namespace: stores writable by a guest are never read by bare host builds.
+    let cache_policy = if existing.is_none() { job.cache.clone() } else { Default::default() };
+    if let Err(error) =
+        crate::build_cache::link(&job.home, &workspace, &cache_policy, crate::build_cache::Domain::Sandbox)
+    {
+        eprintln!("ATOMICS: sandbox cache setup skipped: {error:#}");
+    }
+    let mut shared_mounts =
+        crate::build_cache::stores(&job.home, &workspace, &job.cache, crate::build_cache::Domain::Sandbox);
+    if workspace.join("Cargo.toml").is_file() && existing.is_none() {
+        let store = compiler_store(job);
+        if crate::build_cache::store_allowed(&job.home, &store, crate::build_cache::Domain::Sandbox) {
+            match std::fs::create_dir_all(&store) {
+                Ok(()) => shared_mounts.push(store),
+                Err(error) => eprintln!("ATOMICS: sandbox compiler cache skipped: {error:#}"),
+            }
+        }
+    }
     if let Some(existing) = existing {
         // A sandbox keeps its mounts for life: one made before a main checkout's .git was mounted
         // read-only whole lets its agent replace .git, config and all.
         let mounted = real_paths(&existing).workspaces;
+        if let Some(common) = git::pinned(&job.cwd).and_then(|pins| pins.common_dir) {
+            let logs = common.join("logs").to_string_lossy().into_owned();
+            anyhow::ensure!(
+                !mounted.contains(&logs),
+                "sandbox {} still mounts shared git logs read-write; remove it with `sbx rm {}` and start it again",
+                job.name,
+                job.name
+            );
+        }
         if let Some(missing) = git
             .iter()
             .filter_map(|mount| mount.strip_suffix(":ro"))
@@ -213,9 +370,17 @@ fn make(
                 job.name
             );
         }
+        for missing in shared_mounts.iter().filter(|path| !mounted.contains(&real(path).to_string_lossy().into_owned()))
+        {
+            eprintln!(
+                "ATOMICS: sandbox {} has no cache mount for {}; continuing without that cache. Recreate the sandbox to enable it.",
+                job.name,
+                missing.display()
+            );
+        }
         // Made before Claude used the relay, before the relay moved to another port, or used by a Claude
         // that no longer has a subscription to relay.
-        return relay_rule(job, granted.map(|granted| granted.port));
+        return relay_rule(job, granted.map(|granted| granted.port).filter(|port| *port != 0));
     }
     // A machine's first sandbox needs sbx's global network policy; one already set up is left alone.
     if !ready.diagnosis.policy_initialized() {
@@ -232,10 +397,12 @@ fn make(
     }
     let mut read_only: Vec<PathBuf> = job.config.mounts.iter().map(|mount| paths::expand(mount)).collect();
     read_only.extend(job.briefs.iter().cloned());
+    let mut cache_mounts = warm_mounts(&workspace, &job.warm, cfg!(target_os = "linux"));
+    cache_mounts.extend(shared_mounts);
     let spec = Spec {
         name: job.name.clone(),
         agent: job.agent,
-        warm: warm_mounts(&workspace, &job.warm, cfg!(target_os = "linux")),
+        warm: cache_mounts,
         workspace,
         git,
         read_only,
@@ -277,7 +444,7 @@ fn make(
             sbx(&job.sbx, &isolation::allow_hosts_args(&job.name, &hosts), ssh, TIMEOUT)
                 .context("allowing the repository's hosts")?;
         }
-        relay_rule(job, granted.map(|granted| granted.port))
+        relay_rule(job, granted.map(|granted| granted.port).filter(|port| *port != 0))
     };
     // A half-made sandbox would be reattached to as it is: remove it so the next start makes it whole.
     finish().inspect_err(|_| {
@@ -344,16 +511,18 @@ pub(crate) fn check_pins(pins: &git::GitPins) -> Result<()> {
 
 /// Pins every folder ATOMICS recorded for a sandbox in `dir`, as each process that runs git in
 /// them starts.
-pub fn load_pins(dir: &Path) {
-    for pins in read_pins(dir).into_values() {
-        git::pin(pins);
+#[cfg(test)]
+pub fn load_pins(dir: &Path) -> Result<()> {
+    for name in pin_names(dir)? {
+        load_pin_record(&dir.join(format!("{name}.json")), None)?;
     }
+    Ok(())
 }
 
 /// Drops sandbox `name`'s record once the sandbox is removed. Its folder stays pinned while
 /// another sandbox's record covers it.
 pub fn forget_pins(dir: &Path, name: &str) -> Result<()> {
-    let mut records = read_pins(dir);
+    let mut records = read_pins(dir)?;
     let file = dir.join(format!("{name}.json"));
     let pins: git::GitPins = match std::fs::read(&file) {
         Ok(bytes) => serde_json::from_slice(&bytes)?,
@@ -370,6 +539,7 @@ pub fn forget_pins(dir: &Path, name: &str) -> Result<()> {
         std::fs::rename(temporary, retained)?;
     }
     std::fs::remove_file(file)?;
+    git::allow_git(&dir.join(format!("{name}.json")));
     if !unsafe_folder && !records.values().any(|other| other.work_tree == pins.work_tree) {
         git::unpin(&pins.work_tree);
     }
@@ -383,7 +553,13 @@ pub fn forget_pins(dir: &Path, name: &str) -> Result<()> {
 /// sbx is not asked: asking starts its daemon, which outlives ATOMICS. The ledger forgets a dropped
 /// record too, or [`load_owned_pins`] would fail on the missing file at every start.
 pub fn prune_pins(home: &Path, dir: &Path, program: &str) {
-    let records = read_pins(dir);
+    let records = match read_pins(dir) {
+        Ok(records) => records,
+        Err(error) => {
+            eprintln!("ATOMICS: keeping git records: {error:#}");
+            return;
+        }
+    };
     if records.is_empty() || !installed(program) {
         return;
     }
@@ -414,18 +590,18 @@ pub fn prune_pins(home: &Path, dir: &Path, program: &str) {
     }
 }
 
-/// Drops the ledger's note of a sandbox's git record whose file is gone, once the sandbox is gone
-/// too: the ledger owns no such sandbox any more, or sbx no longer has it. Such a note pins nothing,
-/// and [`load_owned_pins`] fails closed on it, which would stop every cleanup for good. While a
-/// sandbox may still exist (sbx lists it, cannot answer, or may be making it) the note stays. Only a
-/// missing file makes sbx be asked.
+/// Recover a broken owned record from the ledger only after its sandbox is confirmed gone.
+/// Cleanup then retains any poisoned checkout's pin before releasing the sandbox's record.
+/// Unknown inventory and legacy records without a backup stay blocked until repaired.
 pub fn heal_pin_records(home: &Path, program: &str) -> Result<()> {
     let missing: Vec<(String, ownership::Owned)> = ownership::owned(home)?
         .into_iter()
         .filter(|(name, entry)| {
             entry.pins.as_ref().is_some_and(|dir| {
-                std::fs::metadata(dir.join(format!("{name}.json")))
-                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                let read = git::read_regular_file(&dir.join(format!("{name}.json")), 64 * 1024)
+                    .ok()
+                    .and_then(|text| serde_json::from_str::<git::GitPins>(&text).ok());
+                read.as_ref().is_none_or(|pins| entry.git_pins.as_ref().is_some_and(|backup| backup != pins))
             })
         })
         .collect();
@@ -439,28 +615,138 @@ pub fn heal_pin_records(home: &Path, program: &str) -> Result<()> {
         let gone = !entry.sandbox
             || (listed.as_ref().is_some_and(|listed| !listed.contains(&name)) && !ownership::may_be_creating(&entry));
         if gone {
+            // A legacy record without a backup cannot identify any poisoned checkout. Keep the
+            // refusal and ledger until its original pin is repaired, even if its VM is gone.
+            if entry.git_pins.is_none() || ownership::building(&entry) {
+                continue;
+            }
+            if let (Some(pins), Some(dir)) = (&entry.git_pins, &entry.pins) {
+                // Recover the record before releasing ownership: poisoned pointers still need a
+                // retained pin even after their sandbox has gone.
+                let file = dir.join(format!("{name}.json"));
+                std::fs::create_dir_all(dir)?;
+                let temporary = file.with_extension("json.tmp");
+                std::fs::write(&temporary, serde_json::to_vec_pretty(pins)?)?;
+                std::fs::rename(temporary, &file)?;
+                git::allow_git(&file);
+                forget_pins(dir, &name)?;
+            }
             ownership::removed(home, &name, Resource::Pins)?;
         }
     }
     Ok(())
 }
 
-fn read_pins(dir: &Path) -> std::collections::HashMap<String, git::GitPins> {
-    let Ok(entries) = std::fs::read_dir(dir) else { return Default::default() };
-    entries
-        .flatten()
-        .filter_map(|entry| {
-            let path = entry.path();
-            let name = path.file_name()?.to_str()?.strip_suffix(".json")?.to_string();
-            match std::fs::read(&path).map_err(anyhow::Error::from).and_then(|b| Ok(serde_json::from_slice(&b)?)) {
-                Ok(pins) => Some((name, pins)),
-                Err(error) => {
-                    eprintln!("ATOMICS: reading {} failed: {error:#}", path.display());
-                    None
-                }
-            }
+/// Explicit recovery for old records that cannot identify the checkout they protected. The
+/// confirmation attests that the old checkout was removed or rebuilt; inventory alone cannot.
+pub fn forget_legacy_pin(home: &Path, program: &str, name: &str, confirmed: bool) -> Result<()> {
+    anyhow::ensure!(confirmed, "Remove or rebuild the old sandbox and worktree, then pass --confirm-worktree-removed");
+    let entry = ownership::owned(home)?.remove(name).context("no owned sandbox with that name")?;
+    anyhow::ensure!(
+        !ownership::building(&entry) && !ownership::may_be_creating(&entry),
+        "sandbox may still be being created"
+    );
+    let dir = entry.pins.context("sandbox has no pin record")?;
+    let file = dir.join(format!("{name}.json"));
+    anyhow::ensure!(
+        entry.git_pins.is_none()
+            && git::read_regular_file(&file, 64 * 1024)
+                .ok()
+                .and_then(|text| serde_json::from_str::<git::GitPins>(&text).ok())
+                .is_none(),
+        "pin identifies a worktree; use normal sandbox cleanup to retain its protection"
+    );
+    anyhow::ensure!(
+        !entry.sandbox || installed(program),
+        "cannot confirm sandbox inventory; restore sbx and remove the old sandbox first"
+    );
+    if installed(program) {
+        anyhow::ensure!(
+            !list(program)?.iter().any(|sandbox| sandbox.name == name),
+            "remove the old sandbox with `sbx rm {name}` first"
+        );
+    }
+    match std::fs::remove_file(&file) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    ownership::removed(home, name, Resource::Pins)?;
+    git::allow_git(&file);
+    load_owned_pins(home)
+}
+
+fn pin_names(dir: &Path) -> Result<Vec<String>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            git::allow_git(dir);
+            return Ok(Vec::new());
+        }
+        Err(error) => {
+            let reason = format!("Cannot read git pins in {}: {error}; host git is blocked", dir.display());
+            git::refuse_git(dir, None, reason.clone());
+            bail!("{reason}");
+        }
+    };
+    let names = entries
+        .map(|entry| Ok(entry?.file_name().to_str().and_then(|name| name.strip_suffix(".json")).map(str::to_string)))
+        .collect::<Result<Vec<_>>>();
+    match names {
+        Ok(names) => {
+            git::allow_git(dir);
+            Ok(names.into_iter().flatten().collect())
+        }
+        Err(error) => {
+            let reason = format!("Cannot enumerate git pins in {}: {error:#}; host git is blocked", dir.display());
+            git::refuse_git(dir, None, reason.clone());
+            bail!("{reason}");
+        }
+    }
+}
+
+fn read_pins(dir: &Path) -> Result<std::collections::HashMap<String, git::GitPins>> {
+    pin_names(dir)?
+        .into_iter()
+        .map(|name| {
+            let file = dir.join(format!("{name}.json"));
+            let pins = serde_json::from_str(&git::read_regular_file(&file, 64 * 1024)?)
+                .with_context(|| format!("reading {}", file.display()))?;
+            Ok((name, pins))
         })
         .collect()
+}
+
+fn load_pin_record(file: &Path, backup: Option<&git::GitPins>) -> Result<git::GitPins> {
+    if let Some(pins) = backup {
+        git::pin(pins.clone());
+    }
+    let read = || -> Result<git::GitPins> {
+        let pins = serde_json::from_str(&git::read_regular_file(file, 64 * 1024)?)?;
+        anyhow::ensure!(backup.is_none_or(|backup| backup == &pins), "pin differs from its ownership ledger copy");
+        Ok(pins)
+    };
+    match read() {
+        Ok(pins) => {
+            git::pin(pins.clone());
+            git::allow_git(file);
+            Ok(pins)
+        }
+        Err(error) => {
+            let name = file.file_stem().unwrap_or_default().to_string_lossy();
+            let remedy = if backup.is_some() {
+                format!("until the pin is repaired or the sandbox is removed with `sbx rm {name}`")
+            } else {
+                format!(
+                    "until the original pin is repaired; after removing or rebuilding the old sandbox and worktree, run `atomics sandbox forget-pin {name} --confirm-worktree-removed` (no ledger copy identifies its worktree)"
+                )
+            };
+            let reason =
+                format!("Unreadable sandbox git pin {}: {error:#}; host git is blocked {remedy}", file.display());
+            git::refuse_git(file, backup, reason.clone());
+            bail!("{reason}");
+        }
+    }
 }
 
 /// Only real directories inside this worktree may be exposed as writable caches.
@@ -490,14 +776,22 @@ fn warm_mounts(root: &Path, folders: &[String], linux: bool) -> Vec<PathBuf> {
 }
 
 /// The folder a sandbox mounts read-write for `cwd`, its worktree (else `cwd` itself), and
-/// git's folders beside it. A linked worktree gets the common dir's objects, refs and logs and
+/// git's folders beside it. A linked worktree gets the common dir's objects and refs and
 /// its own admin folder, so commits work while the repository's hooks and config stay on this
 /// machine. A main checkout's git dir is mounted whole and read-only: a read-write checkout
 /// around anything less lets the agent replace `.git` itself, config and all, and a mount point
 /// cannot be moved. Agents there edit files; tasks commit in linked worktrees.
 pub fn workspace(cwd: &Path) -> Result<(PathBuf, Vec<String>)> {
     let args = ["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-dir", "--git-common-dir"];
-    let output = git::git(cwd, &args).ok();
+    let output = match git::git(cwd, &args) {
+        Ok(output) => Some(output),
+        Err(error)
+            if git::git_refusal(cwd).is_some() || git::pinned(cwd).is_some_and(|pins| pins.common_dir.is_some()) =>
+        {
+            return Err(error);
+        }
+        Err(_) => None,
+    };
     let top = output.as_deref().and_then(|output| output.lines().next()).map_or(cwd, Path::new);
     if real(&paths::home()).starts_with(real(top)) {
         bail!(
@@ -513,7 +807,7 @@ pub fn workspace(cwd: &Path) -> Result<(PathBuf, Vec<String>)> {
     let mut mounts = Vec::new();
     let existing = |path: PathBuf| path.exists().then(|| path.to_string_lossy().into_owned());
     if git_dir != common {
-        mounts.extend(["objects", "refs", "logs"].into_iter().filter_map(|folder| existing(common.join(folder))));
+        mounts.extend(["objects", "refs"].into_iter().filter_map(|folder| existing(common.join(folder))));
         mounts.push(git_dir.to_string_lossy().into_owned());
     } else {
         mounts.push(format!("{}:ro", git_dir.display()));
@@ -570,6 +864,17 @@ pub fn remove(home: &Path, program: &str, name: &str) -> Result<()> {
     }
     if let Some(entry) = ownership::owned(home)?.get(name) {
         if let Some(dir) = &entry.pins {
+            let file = dir.join(format!("{name}.json"));
+            if load_pin_record(&file, entry.git_pins.as_ref()).is_err() {
+                let pins =
+                    entry.git_pins.as_ref().context("cannot remove a broken legacy pin without its original record")?;
+                // sbx removal succeeded. Restore the trusted copy before retaining any poisoned folder.
+                let temporary = file.with_extension("json.tmp");
+                std::fs::create_dir_all(dir)?;
+                std::fs::write(&temporary, serde_json::to_vec_pretty(pins)?)?;
+                std::fs::rename(temporary, &file)?;
+                git::allow_git(&file);
+            }
             forget_pins(dir, name)?;
             ownership::removed(home, name, Resource::Pins)?;
         }
@@ -591,22 +896,64 @@ pub fn remove(home: &Path, program: &str, name: &str) -> Result<()> {
 /// Fail closed on an unreadable owned record rather than following checkout metadata. A missing
 /// one stays a failure until [`heal_pin_records`] finds its sandbox gone.
 pub fn load_owned_pins(home: &Path) -> Result<()> {
-    load_pins(&home.join("git-pins"));
-    for (name, entry) in ownership::owned(home)? {
+    let ledger = home.join("sandbox-ownership.json");
+    let owned = match ownership::owned(home) {
+        Ok(owned) => {
+            git::allow_git(&ledger);
+            owned
+        }
+        Err(error) => {
+            let reason = format!("Cannot read sandbox ownership: {error:#}; host git is blocked");
+            git::refuse_git(&ledger, None, reason.clone());
+            bail!("{reason}");
+        }
+    };
+    let mut files = std::collections::HashSet::new();
+    let mut scanned_dirs = std::collections::HashSet::from([home.join("git-pins")]);
+    let mut errors = Vec::new();
+    for (name, entry) in owned {
         if let Some(dir) = entry.pins {
+            scanned_dirs.insert(dir.clone());
             let file = dir.join(format!("{name}.json"));
-            let bytes = match std::fs::read(&file) {
-                Ok(bytes) => bytes,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => bail!(
-                    "sandbox {name}'s git record {} is missing, and sbx has not confirmed the sandbox is gone; \
-                     remove it with `sbx rm {name}` and restart ATOMICS",
-                    file.display()
-                ),
-                Err(error) => return Err(error).with_context(|| format!("reading {}", file.display())),
-            };
-            git::pin(serde_json::from_slice(&bytes).with_context(|| format!("reading {}", file.display()))?);
+            files.insert(file.clone());
+            match load_pin_record(&file, entry.git_pins.as_ref()) {
+                Ok(pins) if entry.git_pins.is_none() => {
+                    if let Err(error) = ownership::record_pins(home, &name, &dir) {
+                        let reason = format!(
+                            "Cannot save the ledger copy of {}: {error:#}; host git is blocked",
+                            file.display()
+                        );
+                        git::refuse_git(&file, Some(&pins), reason.clone());
+                        errors.push(reason);
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => errors.push(format!("{error:#}")),
+            }
         }
     }
+    let mut unreadable = std::collections::HashSet::new();
+    for dir in scanned_dirs {
+        files.insert(dir.clone());
+        let names = match pin_names(&dir) {
+            Ok(names) => names,
+            Err(error) => {
+                unreadable.insert(dir);
+                errors.push(format!("{error:#}"));
+                continue;
+            }
+        };
+        for name in names {
+            let file = dir.join(format!("{name}.json"));
+            if files.insert(file.clone())
+                && let Err(error) = load_pin_record(&file, None)
+            {
+                errors.push(format!("{error:#}"));
+            }
+        }
+    }
+    git::refresh_git_refusals(home, files, &unreadable);
+    anyhow::ensure!(errors.is_empty(), "{}", errors.join("\n"));
     Ok(())
 }
 
@@ -682,6 +1029,71 @@ pub fn in_worktree(home: &Path, program: &str, worktree: &Path) -> Result<Vec<St
         })
         .map(|sandbox| sandbox.name)
         .collect())
+}
+
+/// Guests can hold output files without a host fd. Only a confirmed stopped guest is idle.
+pub fn build_cache_users(program: &str, worktree: &Path) -> Result<Vec<String>> {
+    let worktree = real(worktree);
+    Ok(list(program)?
+        .iter()
+        .map(real_paths)
+        .filter(|sandbox| !sandbox.status.eq_ignore_ascii_case("stopped") && sandbox.mounts_within(&worktree))
+        .map(|sandbox| sandbox.name)
+        .collect())
+}
+
+/// A source build executes checkout files on the host. Ref recovery is insufficient here:
+/// no sandbox of this repository may exist while an update selects and builds its source.
+pub fn refuse_source_update(home: &Path, program: &str, repo: &Path) -> Result<()> {
+    load_owned_pins(home)?;
+    let common = git::common_dir(repo)?;
+    let owned = ownership::owned(home)?;
+    let recorded = owned.iter().find(|(_, entry)| {
+        entry.sandbox && entry.git_pins.as_ref().is_some_and(|pins| pins.common_dir.as_ref() == Some(&common))
+    });
+    let program = crate::setup::resolve_program(program);
+    let listed = if installed(&program) { list(&program)? } else { Vec::new() };
+    let worktrees: Vec<_> = git::list_worktrees(repo)?.into_iter().map(|tree| real(&tree.path)).collect();
+    let sandbox = recorded.map(|(name, _)| name.as_str()).or_else(|| {
+        listed
+            .iter()
+            .find(|sandbox| {
+                let sandbox = real_paths(sandbox);
+                sandbox.mounts_within(&common)
+                    || sandbox.workspace().is_some_and(|path| worktrees.iter().any(|tree| tree == path))
+            })
+            .map(|sandbox| sandbox.name.as_str())
+    });
+    if let Some(name) = sandbox {
+        bail!(
+            "Source update refused: sandbox {name} of this repository still exists. Remove the repository's sandboxes before updating from source."
+        );
+    }
+    Ok(())
+}
+
+/// Serialize source installation with sandbox creation across processes and ATOMICS homes.
+/// Once creation finishes, inventory/ownership prevents updates until that sandbox is removed.
+pub(crate) fn repository_lease(cwd: &Path, update: bool) -> Result<Option<File>> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let Some(common) = current_pins(cwd)?.common_dir else { return Ok(None) };
+    let file = File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(common.join("atomics-source-update.lock"))?;
+    anyhow::ensure!(file.metadata()?.is_file(), "source update lock is not a regular file");
+    let operation = if update { libc::LOCK_EX } else { libc::LOCK_SH };
+    // SAFETY: file owns the descriptor; closing it releases the lease.
+    anyhow::ensure!(
+        unsafe { libc::flock(file.as_raw_fd(), operation | libc::LOCK_NB) } == 0,
+        "A source update or sandbox creation is in progress for this repository; retry when it finishes"
+    );
+    Ok(Some(file))
 }
 
 /// A sandbox's mounts with links resolved, as git and sbx may each name a folder differently.
@@ -807,10 +1219,18 @@ fn sbx_command(
     stdout: &File,
     stderr: &File,
 ) -> Result<Command> {
+    #[cfg(test)]
+    if let Some(name) = Path::new(program).file_name().and_then(|name| name.to_str()) {
+        crate::test_support::assert_fixture_program(name, Path::new(program));
+    }
     let mut command = Command::new(program);
     command.args(args.iter().map(AsRef::as_ref)).stdin(Stdio::null());
     command.stdout(stdout.try_clone()?).stderr(stderr.try_clone()?).process_group(0);
     sbx_env(&mut command, ssh_agent);
+    #[cfg(test)]
+    if let Some(name) = Path::new(program).file_name().and_then(|name| name.to_str()) {
+        crate::test_support::fixture_command(&mut command, name);
+    }
     Ok(command)
 }
 
@@ -892,6 +1312,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn garbage_admin_head_cannot_disable_a_reattached_sandboxes_guard() {
+        let (dir, repo) = repository();
+        let task = dir.path().join("task");
+        git::add_worktree(&repo, &task, "task", "main").unwrap();
+        let bin = crate::test_support::tempdir().unwrap();
+        let sbx = fake::install(bin.path());
+        let job = job(&sbx, "atomics-task", &task, SandboxConfig::default());
+        prepare(&job).unwrap();
+        let checks = crate::ref_guard::Checks::new();
+        let snapshot = job.home.join("ref-guards/atomics-task.json");
+        assert!(
+            crate::ref_guard::open_and_check(&checks, &task, snapshot.clone(), Default::default()).unwrap().is_some()
+        );
+        let saved = git::pinned(&task).unwrap();
+        std::fs::write(saved.git_dir.as_ref().unwrap().join("HEAD"), "garbage\n").unwrap();
+        load_owned_pins(&job.home).unwrap();
+        assert!(
+            crate::ref_guard::open_and_check(&checks, &task, snapshot, Default::default()).is_err(),
+            "a damaged pinned repository must refuse agent startup"
+        );
+        assert!(fake::calls_to(bin.path(), &["run"]).is_empty());
+        git::unpin(&saved.work_tree);
+    }
+
+    #[test]
+    fn healing_a_pin_atomically_replaces_a_link_instead_of_writing_through_it() {
+        use std::os::unix::fs::symlink;
+        let (dir, repo) = repository();
+        let home = dir.path().join("state");
+        let pins = home.join("git-pins");
+        pin_git(&pins, "atomics-task", &repo).unwrap();
+        ownership::record_pins(&home, "atomics-task", &pins).unwrap();
+        let file = pins.join("atomics-task.json");
+        let untouched = dir.path().join("untouched");
+        std::fs::write(&untouched, "original").unwrap();
+        std::fs::remove_file(&file).unwrap();
+        symlink(&untouched, &file).unwrap();
+        heal_pin_records(&home, "missing-sbx").unwrap();
+        assert_eq!(std::fs::read_to_string(untouched).unwrap(), "original");
+        assert!(!file.exists());
+        assert!(!file.with_extension("json.tmp").exists());
+        assert!(!ownership::owned(&home).unwrap().values().any(|entry| entry.pins.is_some()));
+        git::unpin(&repo);
+    }
+
+    #[test]
     fn sbx_commands_carry_none_of_atomics_routing() {
         let mut command = Command::new("sbx");
         sbx_env(&mut command, true);
@@ -937,12 +1403,88 @@ mod tests {
             cwd: cwd.to_path_buf(),
             config,
             warm: Vec::new(),
+            cache: Default::default(),
             exe: "/Applications/ATOMICS.app/Contents/MacOS/atomics".into(),
             socket: "/run/user/501/atomics/atomics.sock".into(),
             briefs: None,
             pins: sbx.with_file_name("git-pins"),
             relay: None,
+            secret_workspace: None,
+            github_account: None,
         }
+    }
+
+    #[test]
+    fn existing_sandboxes_without_cache_mounts_reattach_with_available_environment_only() {
+        let (dir, repo) = repository();
+        let work = dir.path().join("task");
+        git::add_worktree(&repo, &work, "task", "main").unwrap();
+        let bin = crate::test_support::tempdir().unwrap();
+        let sbx = fake::install(bin.path());
+        let mut launch = job(&sbx, "atomics-existing", &work, SandboxConfig::default());
+        prepare(&launch).unwrap();
+        std::fs::write(work.join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(bin.path().join("sccache-path"), "/usr/bin/sccache\n").unwrap();
+        launch.cache.shared.push(".cache/pip".into());
+        launch.cache.env.insert("PIP_CACHE_DIR".into(), ".cache/pip".into());
+        launch.cache.repo_paths.insert("PIP_CACHE_DIR".into());
+        launch.cache.env.insert("RUSTC_WRAPPER".into(), "sccache".into());
+        prepare(&launch).unwrap();
+        assert_eq!(fake::calls_to(bin.path(), &["create"]).len(), 1);
+        assert!(work.join(".cache/pip").symlink_metadata().is_err(), "reattachment must not create an unmounted link");
+        let env: std::collections::BTreeMap<_, _> = cache_env(&launch).into_iter().collect();
+        assert_eq!(env["CARGO_INCREMENTAL"], "0");
+        assert_eq!(env["RUSTC_WRAPPER"], "");
+        assert!(!env.contains_key("SCCACHE_DIR"));
+        assert!(!env.contains_key("PIP_CACHE_DIR"));
+        launch.agent = "shell";
+        assert!(cache_env(&launch).is_empty());
+    }
+
+    #[test]
+    fn sandbox_compiler_cache_stores_are_private_and_missing_wrappers_degrade() {
+        let (dir, repo) = repository();
+        let work = dir.path().join("task");
+        git::add_worktree(&repo, &work, "task", "main").unwrap();
+        std::fs::write(work.join("Cargo.toml"), "[workspace]\n").unwrap();
+        let bin = crate::test_support::tempdir().unwrap();
+        let sbx = fake::install(bin.path());
+        let mut launch = job(&sbx, "atomics-private", &work, SandboxConfig::default());
+        launch.cache.env.insert("RUSTC_WRAPPER".into(), "sccache".into());
+        prepare(&launch).unwrap();
+        let mounted = real_paths(&list(&launch.sbx).unwrap()[0]).workspaces;
+        assert!(mounted.contains(&real(&compiler_store(&launch)).to_string_lossy().into_owned()));
+        assert!(!mounted.contains(&crate::build_cache::machine_cache().to_string_lossy().into_owned()));
+        let env: std::collections::BTreeMap<_, _> = cache_env(&launch).into_iter().collect();
+        assert_eq!(env["RUSTC_WRAPPER"], "");
+        std::fs::write(bin.path().join("sccache-path"), "/usr/bin/sccache\n").unwrap();
+        let env: std::collections::BTreeMap<_, _> = cache_env(&launch).into_iter().collect();
+        assert_eq!(env["RUSTC_WRAPPER"], "/usr/bin/sccache");
+        assert_eq!(env["SCCACHE_DIR"], compiler_store(&launch).to_string_lossy());
+        assert_eq!(env["SCCACHE_IGNORE_SERVER_IO_ERROR"], "1");
+        assert_eq!(env["SCCACHE_SERVER_UDS"], "/tmp/atomics-sccache-v2.sock");
+        let another = job(&sbx, "atomics-other", &work, SandboxConfig::default());
+        assert_ne!(compiler_store(&launch), compiler_store(&another));
+        launch.cache.env.insert("CARGO_INCREMENTAL".into(), "1".into());
+        launch.agent = "shell";
+        assert!(cache_env(&launch).is_empty());
+    }
+
+    #[test]
+    fn sandbox_run_passes_cache_environment_before_agent_arguments() {
+        let sandbox = Sandboxed {
+            sbx: "/bin/sbx".into(),
+            name: "atomics-env".into(),
+            agent: "codex",
+            ssh_agent: true,
+            cache_env: vec![("CARGO_INCREMENTAL".into(), "0".into())],
+        };
+        let (_, args) = sandbox.command(&["--resume".into()]);
+        let env = args.iter().position(|arg| arg == "--env").unwrap();
+        let separator = args.iter().position(|arg| arg == "--").unwrap();
+        assert!(env < separator);
+        assert_eq!(args[env + 1], "CARGO_INCREMENTAL=0");
+        assert_eq!(args[separator + 1], "--resume");
     }
 
     #[test]
@@ -1008,13 +1550,14 @@ mod tests {
         let admin = std::fs::read_to_string(worktree.join(".git")).unwrap();
         let admin = admin.trim().strip_prefix("gitdir: ").unwrap();
         let common = Path::new(admin).parent().unwrap().parent().unwrap();
-        let expected: Vec<String> = ["objects", "refs", "logs"]
+        let expected: Vec<String> = ["objects", "refs"]
             .iter()
             .map(|folder| common.join(folder).display().to_string())
             .chain([admin.to_string()])
             .collect();
         // The admin folder is mounted at the very path the worktree's .git file names.
         assert_eq!(mounts, expected);
+        assert!(!mounts.contains(&common.join("logs").display().to_string()));
         assert!(mounts.iter().all(|m| !m.contains("hooks") && !m.ends_with("config")), "{mounts:?}");
 
         // A main checkout's whole git folder is one read-only mount point, which the agent cannot move.
@@ -1029,6 +1572,73 @@ mod tests {
             let error = workspace(&folder).unwrap_err().to_string();
             assert!(error.contains("whole home folder"), "{error}");
         }
+    }
+
+    #[test]
+    fn broken_owned_pin_files_keep_the_ledger_pin_and_refuse_git_until_repaired() {
+        for missing in [false, true] {
+            let (dir, repo) = repository();
+            let task = dir.path().join("task");
+            git::add_worktree(&repo, &task, "task", "main").unwrap();
+            let home = dir.path().join("state");
+            let pins = home.join("git-pins");
+            pin_git(&pins, "atomics-task", &task).unwrap();
+            ownership::record_pins(&home, "atomics-task", &pins).unwrap();
+            let saved = git::pinned(&task).unwrap();
+            assert_eq!(ownership::owned(&home).unwrap()["atomics-task"].git_pins.as_ref(), Some(&saved));
+            let file = pins.join("atomics-task.json");
+            let bytes = std::fs::read(&file).unwrap();
+            if missing {
+                std::fs::remove_file(&file).unwrap();
+            } else {
+                std::fs::write(&file, "broken json").unwrap();
+            }
+            git::unpin(&saved.work_tree);
+            assert!(load_owned_pins(&home).is_err());
+            assert_eq!(git::pinned(&task).as_ref(), Some(&saved));
+            assert!(format!("{:#}", git::git(&task, &["status"]).unwrap_err()).contains("host git is blocked"));
+            std::fs::write(&file, bytes).unwrap();
+            load_owned_pins(&home).unwrap();
+            git::git(&task, &["status"]).unwrap();
+            git::unpin(&saved.work_tree);
+        }
+    }
+
+    #[test]
+    fn source_installation_and_sandbox_creation_cannot_overlap() {
+        let (_dir, repo) = repository();
+        let bin = crate::test_support::tempdir().unwrap();
+        let sbx = fake::install(bin.path());
+        let task = repo.with_file_name("task");
+        git::add_worktree(&repo, &task, "task", "main").unwrap();
+        let job = job(&sbx, "atomics-lease", &task, SandboxConfig::default());
+        let install = repository_lease(&repo, true).unwrap();
+        assert!(format!("{:#}", prepare(&job).unwrap_err()).contains("source update"));
+        assert!(fake::calls_to(bin.path(), &["create"]).is_empty());
+        drop(install);
+        let creation = repository_lease(&task, false).unwrap();
+        assert!(repository_lease(&repo, true).is_err());
+        drop(creation);
+        prepare(&job).unwrap();
+        git::unpin(&task.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn old_sandboxes_with_writable_shared_reflogs_must_be_recreated() {
+        let (dir, repo) = repository();
+        let bin = crate::test_support::tempdir().unwrap();
+        let sbx = fake::install(bin.path());
+        let task = dir.path().join("task");
+        git::add_worktree(&repo, &task, "task", "main").unwrap();
+        let job = job(&sbx, "atomics-old-logs", &task, SandboxConfig::default());
+        prepare(&job).unwrap();
+        let file = bin.path().join("sandboxes/atomics-old-logs");
+        let mut listed: Listed = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        listed.workspaces.push(repo.join(".git/logs").display().to_string());
+        std::fs::write(&file, serde_json::to_vec(&listed).unwrap()).unwrap();
+        let error = format!("{:#}", prepare(&job).unwrap_err());
+        assert!(error.contains("shared git logs read-write"), "{error}");
+        git::unpin(&task.canonicalize().unwrap());
     }
 
     #[test]
@@ -1216,7 +1826,8 @@ mod tests {
                     "sandbox::tests::a_crash_while_sbx_creates_leaves_owned_resources_the_next_sweep_removes",
                     "--nocapture",
                 ])
-                .env("ATOMICS_CREATE_CRASH_TEST", dir.path()),
+                .env("ATOMICS_CREATE_CRASH_TEST", dir.path())
+                .env("HOME", dir.path()),
             crate::test_support::CHILD_TIMEOUT,
         )
         .unwrap();
@@ -1316,7 +1927,7 @@ mod tests {
         std::fs::remove_dir(&deleted).unwrap();
         assert!(git::git(&plain, &["status"]).is_err(), "git stays out of a folder outside any repository");
         let records = || {
-            let mut names: Vec<String> = read_pins(&pins).into_keys().collect();
+            let mut names: Vec<String> = read_pins(&pins).unwrap().into_keys().collect();
             names.sort();
             names
         };
@@ -1360,6 +1971,11 @@ mod tests {
 
     #[test]
     fn preflight_refuses_a_missing_old_or_signed_out_sbx_with_what_to_do() {
+        if !crate::test_support::isolated_test(
+            "sandbox::tests::preflight_refuses_a_missing_old_or_signed_out_sbx_with_what_to_do",
+        ) {
+            return;
+        }
         let bin = crate::test_support::tempdir().unwrap();
         let sbx = fake::install(bin.path()).display().to_string();
         let ready = preflight(&sbx).unwrap();
@@ -1505,7 +2121,7 @@ mod tests {
         assert!(output.len() < 20_000, "the VM keeps only the end of the rollout: {} bytes", output.len());
         let reports = crate::usage::sandbox_reports(&output, i64::MAX);
         let [crate::usage::Report::Codex(usage)] = reports.as_slice() else { panic!("one Codex report: {output}") };
-        assert_eq!(usage.weekly.as_ref().unwrap().remaining, 88.0, "from the newest rollout");
+        assert_eq!(usage.weekly.as_ref().unwrap().left_percent, 88.0, "from the newest rollout");
         assert!(read_usage(&sbx, "atomics-gone").is_err());
     }
 
@@ -1516,6 +2132,7 @@ mod tests {
             name: "atomics-s1".into(),
             agent: "claude",
             ssh_agent: false,
+            cache_env: Vec::new(),
         };
         let args = ["--resume".to_string(), "abc".to_string()];
         assert_eq!(

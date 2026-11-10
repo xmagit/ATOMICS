@@ -17,6 +17,12 @@ fn store(app: &Desktop<'_>) -> CredentialStore {
     CredentialStore::new(app.runtime.relay.keychain().clone())
 }
 
+fn disconnected(app: &Desktop<'_>) -> bool {
+    // A poll may clear the viewer after the keychain deletion but before the
+    // disconnect result arrives. That result also makes the revoke action ready.
+    app.runtime.github.viewer("github.com").is_none() && app.runtime.github.revoke.as_deref() == Some("github.com")
+}
+
 /// Points the app at `fake` and lists `octo/widgets`.
 fn connect_to(app: &mut Desktop<'_>, fake: &FakeGithub, dir: &Path) {
     app.runtime.github.endpoints = Endpoints { base: Some(fake.url.clone()), gh: Some(fake::gh(dir, None)), az: None };
@@ -411,7 +417,7 @@ fn github_connect_uses_gh_after_one_confirmation() {
         // Disconnect deletes the stored token and links to GitHub's page for a full revoke.
         click(app, ctx, "GitHub · alice");
         click(app, ctx, "Disconnect");
-        settle(app, "the disconnect", |app| app.runtime.github.viewer("github.com").is_none());
+        settle(app, "the disconnect", disconnected);
         assert!(store(app).github_app_token("github.com").unwrap().is_none());
         click(app, ctx, "Revoke on GitHub");
         settle(app, "the browser", |_| !opened(dir.path()).is_empty());
@@ -466,7 +472,7 @@ fn github_connect_falls_back_to_the_github_app_device_flow() {
         // An [github] client_id for an OAuth app is sent the scopes it needs.
         app.runtime.config.github.client_id = "Ov23liOauthApp".into();
         app.runtime.github_disconnect("github.com".into());
-        settle(app, "the disconnect", |app| app.runtime.github.viewer("github.com").is_none());
+        settle(app, "the disconnect", disconnected);
         app.runtime.github_connect();
         settle(app, "the code", |app| matches!(app.runtime.github.connect, Connect::Device { .. }));
         let request = fake.seen().into_iter().rev().find(|seen| seen.path == "/login/device/code").unwrap();
@@ -678,6 +684,8 @@ fn github_shortcut_conflicts_are_reported_and_fall_back() {
     assert!(github_shortcut(&other).1.unwrap().contains("is already [keys] toggle_diff"));
     let tickets = atomics_core::config::KeyConfig { github: keys.toggle_tickets.clone(), ..keys.clone() };
     assert!(github_shortcut(&tickets).1.unwrap().contains("is already [keys] toggle_tickets"));
+    let plan = atomics_core::config::KeyConfig { github: keys.plan_with_chief.clone(), ..keys.clone() };
+    assert!(github_shortcut(&plan).1.unwrap().contains("is already [keys] plan_with_chief"));
     let taken = atomics_core::config::KeyConfig { toggle_diff: "primary+g".into(), ..keys.clone() };
     let (chord, problem) = github_shortcut(&taken);
     assert!(chord.is_none() && problem.unwrap().ends_with("no GitHub shortcut"));
@@ -686,6 +694,24 @@ fn github_shortcut_conflicts_are_reported_and_fall_back() {
     let config = Config { keys: agent, ..Config::default() };
     assert!(config_problems(&config).unwrap().contains("[keys] github"));
     assert!(config_problems(&Config::default()).is_none());
+}
+
+#[test]
+fn config_problems_names_each_invalid_binding_and_honors_disabled_shortcuts() {
+    let config = Config {
+        keys: atomics_core::config::KeyConfig {
+            quick_open: "cmd+d+e".into(),
+            new_session: "ctrl+notakey".into(),
+            github: String::new(),
+            ..Default::default()
+        },
+        ..Config::default()
+    };
+    let problems = config_problems(&config).unwrap();
+    assert!(problems.contains("[keys] quick_open is not a shortcut"), "{problems}");
+    assert!(problems.contains("[keys] new_session is not a shortcut"), "{problems}");
+    assert!(!problems.contains("[keys] github"));
+    assert_eq!(github_shortcut(&config.keys), (None, None));
 }
 
 #[test]
@@ -1081,11 +1107,20 @@ fn remote_pull_request_fetches_keep_the_native_selection_and_publish_paged_diffs
                 .pull;
             app.runtime.github_view_diff(repo(), &pull);
             let key = pr_key(&repo(), 8);
+            let metadata = app.runtime.pull_request_infos().into_iter().find(|p| p.key == key).unwrap();
+            assert_eq!(metadata.group, Some(atomics_core::github::Group::Assigned));
+            assert!(metadata.author.is_some());
+            assert_eq!(metadata.draft, Some(false));
             assert!(app.runtime.load_pull_request(&key));
             settle(app, "both cached diffs", |app| app.runtime.pull_request_bodies().count() == 2);
             assert_eq!(app.runtime.github.pr_diff.as_ref().unwrap().number, 7);
             let host = app.runtime.host_info();
-            assert!(host.pull_requests.iter().any(|p| p.key == key && p.head_sha.as_deref() == Some("sha-8")));
+            let loaded = host.pull_requests.iter().find(|p| p.key == key).unwrap();
+            assert_eq!(loaded.head_sha.as_deref(), Some("sha-8"));
+            assert_eq!(
+                (&loaded.group, &loaded.author, &loaded.draft, &loaded.url),
+                (&metadata.group, &metadata.author, &metadata.draft, &metadata.url)
+            );
             let projections = atomics_core::projection::Projections::default();
             let bodies = super::super::projection::DiffBodies::default();
             app.runtime.publish_projections(&projections, &mut Default::default(), &bodies);
@@ -1093,6 +1128,125 @@ fn remote_pull_request_fetches_keep_the_native_selection_and_publish_paged_diffs
             use crate::protocol::DiffSource;
             assert!(bodies.file(&key, "src/pr8.rs").is_some());
             assert!(!app.runtime.load_pull_request("pull:unknown/repo#99"));
+        },
+    );
+}
+
+#[test]
+fn host_pull_request_button_draws_the_shared_list_and_routes_its_keys() {
+    fn host_frame(app: &mut Desktop<'_>, ctx: &egui::Context, events: Vec<egui::Event>) -> Texts {
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(5120.0, 1000.0))),
+                time: Some(ctx.input(|input| input.time) + 0.1),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                app.shortcuts(ui.ctx());
+                egui::Panel::top("host-pr-top-bar").exact_size(34.0).show(ui, |ui| app.top_bar(ui));
+                app.dialogs(ui.ctx());
+            },
+        );
+        app.runtime.drain_actions();
+        let texts = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(t) => Some((t.galley.text().to_string(), t.pos + t.galley.rect.center().to_vec2())),
+                _ => None,
+            })
+            .collect();
+        output.drop_without_applying_deltas();
+        texts
+    }
+
+    with_app("app::github::tests::host_pull_request_button_draws_the_shared_list_and_routes_its_keys", |app, ctx| {
+        let dir = crate::test_support::tempdir().unwrap();
+        let fake = FakeGithub::start(TOKEN);
+        fake.add_pull(&repo(), fake::pull(1, "contoso", &[], "CLEAN", false));
+        connect_to(app, &fake, dir.path());
+        store(app).put_github_app("github.com", TOKEN).unwrap();
+        poll(app);
+        host_frame(app, ctx, vec![]);
+        let texts = host_frame(app, ctx, vec![]);
+        let pos = at(&texts, "Pull requests · 1");
+        for pressed in [true, false] {
+            host_frame(
+                app,
+                ctx,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: Default::default(),
+                    },
+                ],
+            );
+        }
+        let texts = host_frame(app, ctx, vec![]);
+        assert!(app.client.ui.pull_requests.open);
+        for label in ["Assigned to me", "My pull requests", "View diff", "Open"] {
+            assert!(has(&texts, label), "{label} missing: {texts:?}");
+        }
+        assert!(!app.runtime.github.modal, "the host's native controls remain separate");
+        for key_code in [Key::ArrowDown, Key::ArrowUp] {
+            assert!(route(app, ctx, vec![key(key_code, egui::Modifiers::NONE)]).is_empty());
+        }
+        assert!(route(app, ctx, vec![key(Key::Enter, egui::Modifiers::NONE)]).is_empty());
+        assert!(!app.client.ui.pull_requests.open);
+        assert_eq!(app.client.ui.pr_view.as_ref().map(|p| p.0.as_str()), Some(pr_key(&repo(), 1).as_str()));
+        // With no shared list open, the original shortcut still opens the native controls.
+        route(app, ctx, vec![key(Key::G, primary())]);
+        assert!(app.runtime.github.modal);
+    });
+}
+
+#[test]
+fn pull_request_navigation_leaves_keys_for_text_fields_and_management_windows() {
+    with_app(
+        "app::github::tests::pull_request_navigation_leaves_keys_for_text_fields_and_management_windows",
+        |app, ctx| {
+            let dir = crate::test_support::tempdir().unwrap();
+            let fake = FakeGithub::start(TOKEN);
+            fake.add_pull(&repo(), fake::pull(1, "contoso", &[], "CLEAN", false));
+            connect_to(app, &fake, dir.path());
+            store(app).put_github_app("github.com", TOKEN).unwrap();
+            poll(app);
+            let field = egui::Id::unique("pr-focus-guard-field");
+            for window in ["text", "settings", "project", "remote", "setup"] {
+                app.client.ui.pull_requests.open = true;
+                let management = &mut app.client.ui.management;
+                management.settings = window == "settings";
+                management.project = window == "project";
+                management.remote = window == "remote";
+                management.setup = window == "setup";
+                let mut text = String::new();
+                ctx.run_ui(Default::default(), |ui| {
+                    if window == "text" {
+                        ui.add(egui::TextEdit::singleline(&mut text).id(field)).request_focus();
+                    } else {
+                        ui.memory_mut(|m| m.surrender_focus(field));
+                    }
+                })
+                .drop_without_applying_deltas();
+                assert_eq!(ctx.text_edit_focused(), window == "text");
+                let events: Vec<_> = [Key::ArrowUp, Key::ArrowDown, Key::Enter]
+                    .into_iter()
+                    .map(|k| key(k, egui::Modifiers::NONE))
+                    .collect();
+                ctx.run_ui(egui::RawInput { events: events.clone(), ..Default::default() }, |ui| {
+                    let before = ui.input(|i| i.events.clone());
+                    assert_eq!(before.len(), events.len());
+                    app.draw(|backend, client| atomics_ui::pull_request::keys(ui.ctx(), backend, client));
+                    assert_eq!(ui.input(|i| i.events.clone()), before, "{window} must keep its keys");
+                })
+                .drop_without_applying_deltas();
+                assert!(app.client.ui.pull_requests.open);
+                assert!(app.client.ui.pr_view.is_none());
+            }
         },
     );
 }

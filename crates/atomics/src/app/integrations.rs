@@ -115,7 +115,11 @@ impl State {
                 let task = &self.plans[index].tasks[position];
                 let key = (plan.clone(), task.id.clone());
                 let retry = self.integration_retries.get(&key).is_some_and(|at| *at <= now);
-                if !checked_task(task, &into)
+                let guarded_review = task.status == TaskStatus::Review
+                    && task.branch.is_some()
+                    && (self.tickets.workspace_identity_error.is_some()
+                        || self.task_repo(index, task).is_some_and(|repo| self.project_identity(&repo).guarded()));
+                if !(checked_task(task, &into) || guarded_review)
                     || !retry
                         && self.integration_checked.get(&key).is_some_and(|(revision, branch, checked)| {
                             *revision == self.integration_revision && branch == &into && same_work(checked, task)
@@ -140,6 +144,8 @@ impl State {
         let revision = self.integration_revision;
         for (id, plan, task, into, repo) in jobs {
             let base = repo.as_deref().map(|repo| self.project_config(repo).base_ref);
+            let identity = repo.as_deref().map(|repo| self.project_identity(repo)).unwrap_or_default();
+            let identity_error = self.tickets.workspace_identity_error.clone();
             let tx = self.integration_check_tx.clone();
             // A thread for each check: a slow repository or worktree holds up no other task.
             std::thread::spawn(move || {
@@ -147,6 +153,30 @@ impl State {
                 let found =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match (task.branch.as_deref(), repo) {
                         (Some(branch), Some(repo)) if matches!(task.status, TaskStatus::Review | TaskStatus::Done) => {
+                            if let Some(error) = identity_error {
+                                anyhow::bail!(error);
+                            }
+                            anyhow::ensure!(task.ref_alert.is_none(), "task has an unacknowledged ref-guard alert");
+                            if git::branch_exists(&repo, branch) {
+                                let hits = match task.worktree.as_deref().filter(|path| path.exists()) {
+                                    Some(path) => atomics_core::identity::check_task_at(
+                                        &repo,
+                                        path,
+                                        branch,
+                                        base.as_deref().unwrap_or("origin/main"),
+                                        Some(&into),
+                                        &identity,
+                                    )?,
+                                    None => atomics_core::identity::check_task_history(
+                                        &repo,
+                                        branch,
+                                        base.as_deref().unwrap_or("origin/main"),
+                                        Some(&into),
+                                        &identity,
+                                    )?,
+                                };
+                                atomics_core::identity::require_clean(&hits)?;
+                            }
                             work_in(
                                 &repo,
                                 branch,
@@ -154,6 +184,7 @@ impl State {
                                 base.as_deref(),
                                 (task.integrated_commit.as_deref(), task.start_commit.as_deref()),
                                 &mut commit,
+                                task.worktree.as_deref(),
                             )
                         }
                         (None, _) => Err(anyhow::anyhow!("it has no branch")),
@@ -200,7 +231,7 @@ impl State {
         if self.integration_checks.contains_key(&key) {
             return Some(format!("checking whether it is in {into}"));
         }
-        let shown = checked_task(task, &into) && !task.integration_verified;
+        let shown = (checked_task(task, &into) || task.status == TaskStatus::Review) && !task.integration_verified;
         let problem = self.integration_problems.get(&key).filter(|_| shown)?;
         Some(format!("not verified: {problem}; checked again within {} s", INTEGRATION_RETRY.as_secs()))
     }
@@ -296,6 +327,9 @@ impl State {
     /// integration branch, off the UI thread; the outcome lands on the task.
     pub(super) fn integrate(&mut self, index: usize, id: &str, reply: Option<Sender<ControlOutcome>>) {
         let job = match self.plans[index].tasks.iter().find(|t| t.id == id) {
+            _ if self.tickets.workspace_identity_error.is_some() => {
+                Err(self.tickets.workspace_identity_error.clone().unwrap())
+            }
             _ if self.plans[index].status != PlanStatus::Open => {
                 Err("Reopen the plan before integrating tasks.".into())
             }
@@ -303,19 +337,25 @@ impl State {
             Some(_) if id == plan::REVIEW_TASK => {
                 Err("The review task cannot be integrated: it only reviews the plan's integration branch.".into())
             }
+            Some(task) if task.ref_alert.is_some() => {
+                Err(format!("Task {id} has a ref-guard alert. Acknowledge it on the board before integrating."))
+            }
             Some(task) if !matches!(task.status, TaskStatus::Review | TaskStatus::Done) => {
                 Err(format!("Task {id} is {}: only tasks in review or done can be integrated.", task.status.label()))
             }
             Some(_) if self.integrating.contains(&(self.plans[index].id.clone(), id.to_string())) => {
                 Err(format!("Task {id} is already being integrated."))
             }
-            Some(task) => match (task.branch.clone(), self.task_repo(index, task)) {
-                (None, _) => Err(format!("Task {id} has no branch yet: dispatch it first.")),
-                (_, None) => Err("No project is open to integrate into; give the task a repo.".into()),
-                (Some(branch), Some(repo)) => Ok((repo, branch, format!("{} ({})", task.title.trim(), task.id))),
+            Some(task) => match (task.branch.clone(), self.task_repo(index, task), task.worktree.clone()) {
+                (None, _, _) => Err(format!("Task {id} has no branch yet: dispatch it first.")),
+                (_, None, _) => Err("No project is open to integrate into; give the task a repo.".into()),
+                (_, _, None) => Err(format!("Task {id} has no recorded worktree.")),
+                (Some(branch), Some(repo), Some(path)) => {
+                    Ok((repo, branch, path, task.session.clone(), format!("{} ({})", task.title.trim(), task.id)))
+                }
             },
         };
-        let (repo, branch, message) = match job {
+        let (repo, branch, task_path, session, message) = match job {
             Ok(job) => job,
             Err(err) => {
                 match reply {
@@ -328,6 +368,15 @@ impl State {
             }
         };
         if let Err(err) = self.pin_ticket_integration(index) {
+            let err = if let Err(error) = git::check_integration_claims(&repo, &self.plans[index].integration_branch())
+                && let Some(claim) = error.downcast_ref::<git::IntegrationRefClaim>()
+            {
+                let details = claim.to_string();
+                self.integration_claim_alert(&self.plans[index].id.clone(), id, &claim.worktree, details.clone());
+                details
+            } else {
+                err
+            };
             match reply {
                 Some(reply) => {
                     let _ = reply.send(ControlOutcome::Done(ControlResponse::error(err)));
@@ -337,22 +386,98 @@ impl State {
             return;
         }
         let into = self.plans[index].integration_branch();
+        let recorded_path = self.plans[index]
+            .integration_worktrees
+            .iter()
+            .find(|tree| tree.repo == repo && tree.branch == into)
+            .map(|tree| tree.path.clone());
+        let adopt_existing =
+            recorded_path.is_none() && self.plans[index].tasks.iter().any(|task| task.integrated.is_some());
+        let task_worktrees: Vec<_> = self
+            .plans
+            .iter()
+            .filter(|plan| plan.status == PlanStatus::Open)
+            .flat_map(|plan| plan.tasks.iter().filter_map(|task| task.worktree.clone()))
+            .collect();
         let into_path = git::worktree_path(&self.config.worktree_path, &repo, &into);
-        let (tx, base_ref) = (self.integrate_tx.clone(), self.project_config(&repo).base_ref);
+        let config = self.project_config(&repo);
+        let identity = config.identity.default;
+        let (tx, base_ref) = (self.integrate_tx.clone(), config.base_ref);
         let task = id.to_string();
+        let guard = session
+            .as_ref()
+            .and_then(|id| self.sessions.iter().find(|s| &s.id == id))
+            .and_then(|session| session.ref_guard.clone());
+        let (checks, exempt, actions) = (self.ref_checks.clone(), self.exempt_branches(), self.action_tx.clone());
+        let home = paths::atomics_home();
         let plan = self.plans[index].id.clone();
         self.integrating.insert((plan.clone(), task.clone()));
         std::thread::spawn(move || {
+            let alert_claim = |error: &anyhow::Error| {
+                let Some(claim) = error.downcast_ref::<git::IntegrationRefClaim>() else { return false };
+                let (worktree, details) = (claim.worktree.clone(), claim.to_string());
+                let (plan, task) = (plan.clone(), task.clone());
+                let _ = actions
+                    .send(Box::new(move |state| state.integration_claim_alert(&plan, &task, &worktree, details)));
+                true
+            };
+            if let Err(error) =
+                crate::sandbox::load_owned_pins(&home).and_then(|()| git::check_integration_claims(&repo, &into))
+            {
+                if !alert_claim(&error) {
+                    let (plan, task, details) =
+                        (plan.clone(), task.clone(), format!("Ref guard check FAILED: {error:#}"));
+                    let _ = actions.send(Box::new(move |state| state.task_ref_alert_at(&plan, &task, details, None)));
+                }
+                let _ = tx.send(Integrated {
+                    commit: None,
+                    plan,
+                    task,
+                    branch,
+                    into,
+                    result: Err(format!("{error:#}")),
+                    reply,
+                });
+                return;
+            }
+            let checked = crate::ref_guard::check_integration_alert(&checks, guard, &home, &repo, &task_path, exempt);
+            let guard_error = match checked.result {
+                Ok(alerts) if alerts.is_empty() => None,
+                Ok(alerts) => Some(alerts.join("\n")),
+                Err(error) => Some(format!("Ref guard check FAILED: {error:#}")),
+            };
+            if let Some(error) = guard_error {
+                let (plan_id, task_id, details) = (plan.clone(), task.clone(), error.clone());
+                let _ = actions.send(Box::new(move |state| {
+                    state.task_ref_alert_at(&plan_id, &task_id, details, checked.generation)
+                }));
+                let _ = tx.send(Integrated { commit: None, plan, task, branch, into, result: Err(error), reply });
+                return;
+            }
             // It commits on the task branch and creates or merges into the integration branch.
-            let write = crate::ref_guard::host_write(&repo, [&branch, &into]);
-            let result =
-                git::integrate(&repo, &branch, &message, &into, &into_path, &base_ref).map_err(|e| format!("{e:#}"));
+            let result = git::integration_path(
+                &repo,
+                &into,
+                recorded_path.as_deref(),
+                &into_path,
+                adopt_existing,
+                &task_worktrees,
+            )
+            .and_then(|into_path| {
+                let _write = crate::ref_guard::host_write(&repo, [&branch, &into]);
+                git::integrate_with_identity(
+                    &repo, &task_path, &branch, &message, &into, &into_path, &base_ref, &identity,
+                )
+            });
+            if let Err(error) = &result {
+                alert_claim(error);
+            }
+            let result = result.map_err(|e| format!("{e:#}"));
             let commit = result
                 .as_ref()
                 .ok()
                 .and_then(|_| git::git(&repo, &["rev-parse", "--verify", &format!("refs/heads/{branch}")]).ok())
                 .map(|tip| tip.trim().to_string());
-            drop(write);
             let _ = tx.send(Integrated { commit, plan, task, branch, into, result, reply });
         });
     }
@@ -362,6 +487,17 @@ impl State {
         let Some(index) = self.plans.iter().position(|p| p.id == plan) else { return };
         self.integrating.remove(&(plan.clone(), id.clone()));
         self.worktrees_at = None;
+        if let Ok(integration) = &result
+            && let Some(repo) =
+                self.plans[index].tasks.iter().find(|task| task.id == id).and_then(|task| self.task_repo(index, task))
+            && !self.plans[index].integration_worktrees.iter().any(|tree| tree.repo == repo && tree.branch == into)
+        {
+            self.plans[index].integration_worktrees.push(plan::IntegrationWorktree {
+                repo,
+                branch: into.clone(),
+                path: integration.worktree.clone(),
+            });
+        }
         let (note, mut response) = match result {
             Ok(Integration { merge: Merge::Conflict(files), .. }) => {
                 if let Some(task) = self.plans[index].task_mut(&id) {
@@ -441,6 +577,7 @@ fn work_in(
     base: Option<&str>,
     (saved, start): (Option<&str>, Option<&str>),
     commit: &mut Option<String>,
+    worktree: Option<&Path>,
 ) -> anyhow::Result<bool> {
     let branch_ref = format!("refs/heads/{branch}");
     let source = match git::commit_of(repo, &branch_ref)? {
@@ -457,7 +594,7 @@ fn work_in(
     };
     *commit = Some(source.clone());
     if start == Some(source.as_str()) {
-        return nothing_uncommitted(repo, branch);
+        return nothing_uncommitted(repo, branch, worktree);
     }
     let target = format!("refs/heads/{into}");
     let target_exists = git::commit_of(repo, &target)?.is_some();
@@ -467,7 +604,7 @@ fn work_in(
         (false, None) => anyhow::bail!("{into} does not exist yet"),
     };
     match git::is_ancestor(repo, &source, target)? {
-        Some(true) => nothing_uncommitted(repo, branch),
+        Some(true) => nothing_uncommitted(repo, branch, worktree),
         Some(false) if target_exists => Ok(false),
         Some(false) => anyhow::bail!("{into} does not exist yet, and {target} does not contain {branch}"),
         None => anyhow::bail!("git could not compare {branch} with {target}"),
@@ -477,15 +614,20 @@ fn work_in(
 /// Whether `branch`'s worktree, if it still has one, holds nothing uncommitted: a branch with no new
 /// commits can still have uncommitted work. Host git never runs in a worktree a sandbox may have moved,
 /// so its work cannot count as checked.
-fn nothing_uncommitted(repo: &Path, branch: &str) -> anyhow::Result<bool> {
-    let trees = git::list_worktrees(repo)?;
-    match trees.iter().find(|tree| tree.branch.as_deref() == Some(branch)) {
-        Some(tree) if !tree.trusted => anyhow::bail!(
-            "its worktree {} is not as git made it, so git does not look there for uncommitted work",
-            tree.path.display()
-        ),
-        Some(tree) => Ok(git::git(&tree.path, &["status", "--porcelain", "--untracked-files=all"])?.is_empty()),
-        None => Ok(true),
+fn nothing_uncommitted(repo: &Path, branch: &str, recorded: Option<&Path>) -> anyhow::Result<bool> {
+    match recorded {
+        Some(path) if path.exists() => {
+            git::recorded_worktree(repo, path, branch)?;
+            Ok(git::git(path, &["status", "--porcelain", "--untracked-files=all"])?.is_empty())
+        }
+        Some(_) => Ok(true),
+        None => {
+            anyhow::ensure!(
+                !git::list_worktrees(repo)?.iter().any(|tree| tree.branch.as_deref() == Some(branch)),
+                "task has no recorded worktree path; its uncommitted work cannot be checked"
+            );
+            Ok(true)
+        }
     }
 }
 
@@ -496,6 +638,8 @@ fn same_work(a: &Task, b: &Task) -> bool {
         id: task.id.clone(),
         status: task.status,
         repo: task.repo.clone(),
+        worktree: task.worktree.clone(),
+        ref_alert: task.ref_alert.clone(),
         session: task.session.clone(),
         branch: task.branch.clone(),
         integrated: task.integrated.clone(),
@@ -512,6 +656,79 @@ mod tests {
     use super::super::sandbox_tests::{finish_agents, tick_until};
     use super::super::tests::{repository, request, with_app};
     use super::*;
+
+    #[test]
+    fn identity_guard_is_visible_to_chief_and_board_and_blocks_integrate() {
+        with_app(
+            "app::integrations::tests::identity_guard_is_visible_to_chief_and_board_and_blocks_integrate",
+            |app, ctx| {
+                use atomics_ui::Backend;
+                let (_dir, repo) = repository();
+                app.runtime.config.identity.default = atomics_core::identity::Identity {
+                    name: Some("Context Example".into()),
+                    email: Some("context@example.com".into()),
+                    forbidden_words: Some(vec!["contoso".into()]),
+                    github: None,
+                };
+                app.runtime.config.agents.push(atomics_core::config::AgentConfig {
+                    name: "identity-fixture".into(),
+                    command: vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
+                    kind: AgentKind::Generic,
+                    busy_text: None,
+                    isolation: Some(atomics_core::isolation::IsolationMode::Bare),
+                });
+                app.runtime.add_project(&repo);
+                app.runtime.identity_updates.finish();
+                let plan = request(
+                    app,
+                    json!({"cmd":"plan_set", "goal":"Identity guard", "tasks":[{
+                        "id":"a", "title":"Guarded change", "repo":repo, "agent":"identity-fixture"
+                    }]}),
+                )
+                .result["plan"]
+                    .clone();
+                let index = app.runtime.selected_plan;
+                app.runtime.plans[index].approved = true;
+                let started = control(app, ctx, json!({"cmd":"plan_dispatch", "plan":plan}));
+                assert!(started.ok, "{started:?}");
+                tick_until(app, ctx, "identity worktree", |app| app.runtime.plans[index].tasks[0].worktree.is_some());
+                let task = app.runtime.plans[index].tasks[0].clone();
+                let tree = task.worktree.unwrap();
+                assert_eq!(git::git(&tree, &["config", "user.email"]).unwrap().trim(), "context@example.com");
+                std::fs::write(tree.join("guard.txt"), "safe\nCoNtOsO surrounding private text\n").unwrap();
+                assert!(request(app, json!({"cmd":"plan_update", "plan":plan, "id":"a", "status":"review"})).ok);
+                app.runtime.integration_dirty.store(true, Ordering::Relaxed);
+                app.runtime.refresh_integrations();
+                tick_until(app, ctx, "identity check", |app| {
+                    app.runtime.integration_checks.is_empty()
+                        && app
+                            .runtime
+                            .integration_problems
+                            .values()
+                            .any(|note| note.contains("guard.txt:2: forbidden word"))
+                });
+                let task = &app.runtime.plans[index].tasks[0];
+                let chief = app.runtime.task_json(index, task);
+                assert!(chief["integration_check"].as_str().unwrap().contains("guard.txt:2: forbidden word"));
+                let board = app.runtime.backend().board(index).unwrap();
+                assert!(board.integration_notes["a"].0.contains("guard.txt:2: forbidden word"));
+                assert!(!board.integration_notes["a"].0.contains("surrounding"));
+                let blocked = control(app, ctx, json!({"cmd":"plan_integrate", "plan":plan, "id":"a"}));
+                assert!(!blocked.ok, "{blocked:?}");
+                assert!(!git::branch_exists(&repo, &app.runtime.plans[index].integration_branch()));
+                std::fs::write(tree.join("guard.txt"), "safe\n").unwrap();
+                let integrated = control(app, ctx, json!({"cmd":"plan_integrate", "plan":plan, "id":"a"}));
+                assert!(integrated.ok, "{integrated:?}");
+                let into = paths::expand(integrated.result["worktree"].as_str().unwrap());
+                assert_eq!(
+                    git::git(&into, &["log", "-1", "--format=%ae|%ce"]).unwrap().trim(),
+                    "context@example.com|context@example.com"
+                );
+                assert_eq!(git::git(&repo, &["config", "user.email"]).unwrap().trim(), "test@example.org");
+                app.runtime.identity_updates.finish();
+            },
+        );
+    }
 
     /// A control request answered now or later, as the chief's MCP server waits for it.
     fn control(app: &mut Desktop<'_>, ctx: &egui::Context, value: serde_json::Value) -> ControlResponse {
@@ -671,6 +888,7 @@ mod tests {
                 let plan = app.runtime.plans[index].id.clone();
                 let key = (plan.clone(), "a".to_string());
                 app.runtime.plans[index].approved = true;
+                app.runtime.plans[index].tasks[0].worktree = Some(tree.clone());
                 app.runtime.plans[index].tasks[0].status = TaskStatus::Done;
                 app.runtime.plans[index].tasks[0].integrated = Some("integration".into());
                 app.runtime.refresh_integrations();
@@ -682,7 +900,7 @@ mod tests {
                 }
                 let note = app.runtime.plan_json(index)["tasks"][0]["integration_check"].as_str().unwrap().to_string();
                 assert!(
-                    note.contains("is not as git made it") && note.ends_with("checked again within 30 s"),
+                    note.contains("not listed as git made it") && note.ends_with("checked again within 30 s"),
                     "{note}"
                 );
                 assert_eq!(app.runtime.plans[index].tasks[0].integrated.as_deref(), Some("integration"));
@@ -1016,7 +1234,7 @@ if [ "$5" = merge-base ]; then
   while [ ! -e "$HOME/release" ]; do
     attempts=$((attempts + 1))
     [ "$attempts" -lt 1000 ] || exit 1
-    /bin/sleep 0.01
+    sleep 0.01
   done
 fi
 exec {} "$@"
@@ -1174,6 +1392,8 @@ exec {} "$@"
             |app, _| {
                 let (_dir, repo) = repository();
                 git::git(&repo, &["branch", "task-a"]).unwrap();
+                let task_tree = repo.with_file_name("task-a");
+                git::add_worktree(&repo, &task_tree, "task-a", "main").unwrap();
                 git::git(&repo, &["branch", "integration"]).unwrap();
                 let plan = request(
                     app,
@@ -1183,6 +1403,7 @@ exec {} "$@"
                 .result["plan"]
                     .clone();
                 let index = app.runtime.selected_plan;
+                app.runtime.plans[index].tasks[0].worktree = Some(task_tree.clone());
                 app.runtime.plans[index].approved = true;
                 app.runtime.plans[index].tasks[0].status = TaskStatus::Done;
                 app.runtime.plans[index].tasks[0].integrated = Some("integration".into());
@@ -1204,8 +1425,7 @@ exec {} "$@"
                 assert!(request(app, json!({"cmd":"plan_update", "plan":plan, "id":"a", "status":"done"})).ok);
                 assert!(app.runtime.dispatch(index, Some("b")).unwrap_err().contains("integrated dependencies"));
                 app.runtime.plans[index].tasks[0].integrated = Some("integration".into());
-                git::git(&repo, &["switch", "task-a"]).unwrap();
-                git::git(&repo, &["commit", "--allow-empty", "-qm", "new work after integration"]).unwrap();
+                git::git(&task_tree, &["commit", "--allow-empty", "-qm", "new work after integration"]).unwrap();
                 assert!(app.runtime.dispatch(index, Some("b")).unwrap_err().contains("integrated dependencies"));
                 let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(5));
                 while !app.runtime.integration_checks.is_empty() {
@@ -1244,21 +1464,6 @@ exec {} "$@"
                 let (_dir2, repo2) = repository();
                 let started = dir1.path().join("started");
                 let release = dir1.path().join("release");
-                let hook = repo1.join(".git/hooks/pre-commit");
-                // The hook holds the first integration until `release` exists. It must never outlive
-                // the test: a failed test drops its folder (often before the hook sees `release`), so
-                // the hook also stops when the folder is gone, and after a few minutes at most.
-                // Otherwise every failure would leave a loop starting processes and loading the machine.
-                crate::test_support::write_program(
-                    &hook,
-                    format!(
-                        "#!/bin/sh\ntouch '{}'\nattempts=0\nwhile [ ! -f '{}' ]; do\n  [ -d '{}' ] || exit 1\n  \
-                         attempts=$((attempts + 1))\n  [ \"$attempts\" -lt 6000 ] || exit 1\n  sleep 0.02\ndone\n",
-                        started.display(),
-                        release.display(),
-                        dir1.path().display()
-                    ),
-                );
                 app.runtime.config.worktree_path = "{repo_parent}/{slug}".into();
                 let mut indices = Vec::new();
                 for (goal, repo) in [("One", &repo1), ("Two", &repo2)] {
@@ -1271,9 +1476,24 @@ exec {} "$@"
                         json!({"cmd":"plan_set", "goal":goal, "tasks":[{"id":"a", "repo":repo, "branch":"task"}]}),
                     );
                     let index = app.runtime.selected_plan;
+                    app.runtime.plans[index].tasks[0].worktree = Some(worktree);
                     app.runtime.plans[index].tasks[0].status = TaskStatus::Done;
                     indices.push(index);
                 }
+                // Plumbing commits bypass pre-commit. Pause the ref transaction instead, installing
+                // the hook after branch creation so only integration is held. It must never outlive
+                // the test: stop when the fixture disappears, or after a few minutes at most.
+                crate::test_support::write_program(
+                    repo1.join(".git/hooks/reference-transaction"),
+                    format!(
+                        "#!/bin/sh\n[ \"$1\" = prepared ] || exit 0\ntouch '{}'\nattempts=0\nwhile [ ! -f '{}' ]; do\n  \
+                         [ -d '{}' ] || exit 1\n  attempts=$((attempts + 1))\n  [ \"$attempts\" -lt 6000 ] || exit 1\n  \
+                         sleep 0.02\ndone\n",
+                        started.display(),
+                        release.display(),
+                        dir1.path().display()
+                    ),
+                );
                 // The first integration cannot finish before `release` exists, so a second integration
                 // that waited for it would never arrive in time. The bound only has to outlast a loaded
                 // machine: while the whole suite runs, a single git call can take half a second.
@@ -1354,6 +1574,7 @@ exec {} "$@"
                 // A commit of its own after its start is work to integrate again.
                 let worktree = repo.parent().unwrap().join("task-b");
                 git::git(&repo, &["worktree", "add", "-q", &worktree.to_string_lossy(), "task-b"]).unwrap();
+                app.runtime.plans[index].tasks[1].worktree = Some(worktree.clone());
                 app.runtime.plans[index].tasks[1].start_commit = tip("task-b");
                 app.runtime.plans[index].tasks[1].status = TaskStatus::Done;
                 git::git(&worktree, &["commit", "--allow-empty", "-qm", "b's own work"]).unwrap();

@@ -24,11 +24,14 @@ pub fn run(app_id: &str) -> Result<u64> {
         cwd: folder.clone(),
         config: SandboxConfig { memory: Some("2g".into()), cpus: Some(2), azure, ..Default::default() },
         warm: Vec::new(),
+        cache: Default::default(),
         exe: crate::setup::executable_path()?,
         socket: paths::socket_path(),
         briefs: None,
         pins: paths::git_pins_dir(),
         relay: Some(relay.clone()),
+        secret_workspace: None,
+        github_account: None,
     };
     let checked = check(&job, &relay, &app_id.to_string());
     let removed = remove(&home, &job.sbx, &job.name).and_then(|()| Ok(std::fs::remove_dir_all(folder)?));

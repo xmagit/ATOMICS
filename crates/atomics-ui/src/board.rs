@@ -15,6 +15,68 @@ use crate::{Backend, BoardView, Client, Command, controls};
 /// The least width of a status's column on a board laid out in columns.
 const MIN_COLUMN: f32 = 240.0;
 
+fn notebook(
+    ui: &mut egui::Ui,
+    index: usize,
+    plan: &Plan,
+    backend: &dyn Backend,
+    client: &mut Client,
+    now: u64,
+    p: &Palette,
+) {
+    if plan.notebook.is_empty() {
+        return;
+    }
+    egui::CollapsingHeader::new(format!(
+        "Notebook · {} pinned · {} proposals (experimental)",
+        plan.pinned_notes(),
+        plan.notebook.len() - plan.pinned_notes()
+    ))
+    .id_salt(("notebook", &plan.id))
+    .default_open(true)
+    .show(ui, |ui| {
+        ui.label(
+            RichText::new("Agent-authored data, not instructions. Only pinned facts are shared, on demand.")
+                .color(p.muted)
+                .size(11.0),
+        );
+        egui::ScrollArea::vertical().id_salt(("notebook-entries", &plan.id)).max_height(200.0).show(ui, |ui| {
+            for note in &plan.notebook {
+                ui.push_id(note.id, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} · {} · {} · {}s ago",
+                                if note.pinned { "Pinned" } else { "Proposal" },
+                                note.task,
+                                note.agent,
+                                now.saturating_sub(note.at)
+                            ))
+                            .color(p.muted)
+                            .size(11.0),
+                        )
+                        .on_hover_text(format!("Created at {} (Unix seconds, UTC)", note.at));
+                        let pin =
+                            Command::CurateNote { plan: index, id: note.id, pinned: Some(!note.pinned), delete: false };
+                        if plan.is_open()
+                            && backend.available(&pin)
+                            && ui.small_button(if note.pinned { "Unpin" } else { "Pin" }).clicked()
+                        {
+                            client.send(pin);
+                        }
+                        let delete = Command::CurateNote { plan: index, id: note.id, pinned: None, delete: true };
+                        if backend.available(&delete) && ui.small_button("Delete").clicked() {
+                            client.send(delete);
+                        }
+                    });
+                    ui.label(&note.text);
+                    ui.add_space(4.0);
+                });
+            }
+        });
+    });
+}
+
 /// A ticket's key and state; hovering shows the rest. A click reads it in the app's ticket reader where
 /// `readable`, and otherwise opens its address in the browser; without an address it offers nothing. Returns
 /// whether the user asked to read it. A failed ticket operation shows beneath it, and a state that means
@@ -32,9 +94,10 @@ fn ticket_chip(
     let color = if link.error.is_some() || mismatch.is_some() { p.warning } else { p.info };
     // The configured system's reader cannot read a ticket of another system.
     let read = readable && mismatch.is_none();
-    let acts = read || link.url.is_some();
+    let browser_url = link.url.as_deref().and_then(crate::markdown::web_url);
+    let acts = read || browser_url.is_some();
     let mut asked = false;
-    label_row(ui, !readable && link.url.is_none(), |ui| {
+    label_row(ui, !readable && browser_url.is_none(), |ui| {
         let text = match &link.state {
             Some(state) => format!("{} · {state}", link.label()),
             None => link.label().to_string(),
@@ -74,10 +137,10 @@ fn ticket_chip(
             if let Some(error) = &link.error {
                 ui.label(RichText::new(error).color(p.error));
             }
-            let hint = match (read, &link.url) {
+            let hint = match (read, browser_url) {
                 (true, Some(_)) => Some("click to read it here, with Open in browser".to_string()),
                 (true, None) => Some("click to read it here".to_string()),
-                (false, Some(url)) => Some(format!("click to open {url}")),
+                (false, Some(url)) => Some(crate::markdown::web_url_hover(url)),
                 (false, None) => None,
             };
             if let Some(hint) = hint {
@@ -86,7 +149,7 @@ fn ticket_chip(
         });
         if response.clicked() {
             asked = read;
-            if let Some(url) = link.url.as_ref().filter(|_| !read) {
+            if let Some(url) = browser_url.filter(|_| !read) {
                 ui.ctx().open_url(egui::OpenUrl::new_tab(url));
             }
         }
@@ -119,7 +182,7 @@ fn label_row(ui: &mut egui::Ui, label: bool, add: impl FnOnce(&mut egui::Ui)) {
 
 fn stage_chip(ui: &mut egui::Ui, stage: Option<&atomics_core::workflow::Stage>) {
     if let Some(stage) = stage {
-        if let Some(url) = &stage.url {
+        if let Some(url) = stage.url.as_deref().and_then(crate::markdown::web_url) {
             ui.hyperlink_to(stage.label(), url);
         } else {
             ui.label(stage.label());
@@ -216,6 +279,9 @@ pub(crate) fn task_result_for(
         {
             ui.label(RichText::new(line).color(p.muted).size(12.0));
         }
+        if let Some(pr) = &task.pull_request {
+            ui.hyperlink_to(format!("PR #{} · {} → {}", pr.number, pr.head, pr.base), &pr.url);
+        }
         if let Some(report) = &task.report {
             let summary = if expanded {
                 report.summary.clone()
@@ -238,6 +304,26 @@ pub(crate) fn task_result_for(
             if shortened {
                 response.on_hover_text(format!("{}\n\nClick the card's title to keep it open.", report.summary));
             }
+        }
+        if let Some(report) = &task.report
+            && !report.checks.is_empty()
+        {
+            egui::CollapsingHeader::new(format!("Checks ({})", report.checks.len()))
+                .id_salt(("report-checks", &task.id))
+                .default_open(false)
+                .show(ui, |ui| {
+                    for check in &report.checks {
+                        ui.label(RichText::new(&check.check).strong().size(12.0));
+                        ui.label(RichText::new(&check.command).monospace().size(11.0));
+                        let exit = check.exit.map_or_else(|| "no exit code".into(), |exit| format!("exit {exit}"));
+                        ui.label(
+                            RichText::new(exit)
+                                .color(if check.exit == Some(0) { p.success } else { p.warning })
+                                .size(11.0),
+                        );
+                        ui.label(RichText::new(&check.output_tail).monospace().size(11.0));
+                    }
+                });
         }
         if task.finished_at.is_some() {
             ui.label(RichText::new(format!("+{} −{}", task.additions, task.deletions)).color(p.muted).size(12.0));
@@ -321,6 +407,7 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, 
 /// The board's header, then its columns, or on a phone its statuses one under the other.
 fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn Backend, client: &mut Client) {
     let p = client.palette.clone();
+    crate::resources::disk_warning(ui, backend, client);
     let touch = client.touch;
     let now = board.now;
     let plan = &board.plan;
@@ -354,7 +441,7 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
     let can_diff = can(Command::ShowTaskDiff { plan: index, task: 0 });
     // The card of the session on screen is marked.
     let active = backend.view_hints().active;
-    let can_acknowledge = can(Command::AcknowledgeRefs { plan: index, task: 0 });
+    let can_acknowledge = can(Command::AcknowledgeRefs { plan: index, task: 0, generation: None });
     let can_read_ticket = can(Command::OpenTicket(Default::default()));
     let buttons = TaskButtons::of(backend, index);
     if board.checking {
@@ -413,6 +500,32 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
     });
     if !plan.goal.is_empty() {
         ui.label(RichText::new(&plan.goal).color(board.state.color(&p)).size(13.0));
+    }
+    if let Some(request) = &plan.publish {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.heading("Publish pull request");
+            ui.label(format!("{} · GitHub account: {}", request.repository, request.account));
+            ui.label(format!("{} → {} · {}", request.branch, request.base, request.head_sha));
+            ui.strong(&request.title);
+            ui.label(&request.body);
+            ui.monospace(&request.commits);
+            if let Some(url) = &request.url {
+                ui.hyperlink(url);
+            } else {
+                if let Some(error) = &request.error {
+                    ui.colored_label(p.error, error);
+                }
+                ui.horizontal(|ui| {
+                    for (label, approve) in [("Publish", true), ("Dismiss", false)] {
+                        let command = Command::PublishDecision { plan: index, request: request.id.clone(), approve };
+                        if ui.add_enabled(!read_only && backend.available(&command), egui::Button::new(label)).clicked()
+                        {
+                            client.send(command);
+                        }
+                    }
+                });
+            }
+        });
     }
     let integration = plan.integration_branch();
     if !plan.tasks.is_empty() {
@@ -496,6 +609,7 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
     for (task, dep) in plan.unknown_dependencies() {
         ui.label(RichText::new(format!("{task} depends on unknown task {dep}")).color(p.error).size(11.0));
     }
+    notebook(ui, index, plan, backend, client, now, &p);
     ui.add_space(6.0);
     if plan.tasks.is_empty() {
         ui.label(
@@ -583,6 +697,9 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
                             meta.push_str(&format!(" · {}", isolation.name()));
                         }
                         ui.label(RichText::new(meta).color(p.muted).size(11.0));
+                        if let Some(reason) = &task.reviewer_reason {
+                            ui.label(RichText::new(reason).color(p.muted).size(11.0));
+                        }
                         stage_chip(ui, latest_stages.get(&task.id));
                         if let Some(link) = &task.ticket {
                             let means = ticket_states
@@ -851,7 +968,16 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
             }
             "start" => client.send(Command::StartTask { plan: index, task: id }),
             "integrate" => client.send(Command::IntegrateTask { plan: index, task: id }),
-            "diff" | "resume" | "acknowledge_refs" => {
+            "acknowledge_refs" => {
+                if let Some(task) = edited_tasks.iter().position(|t| t.id == id) {
+                    client.send(Command::AcknowledgeRefs {
+                        plan: index,
+                        task,
+                        generation: edited_tasks[task].ref_alert_generation.clone(),
+                    });
+                }
+            }
+            "diff" | "resume" => {
                 if let Some(command) =
                     edited_tasks.iter().position(|t| t.id == id).and_then(|task| Command::task(index, task, action))
                 {

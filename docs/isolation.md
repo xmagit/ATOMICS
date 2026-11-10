@@ -171,7 +171,9 @@ macOS's keychain through `security`, Linux's Secret Service through `secret-tool
 1. **The relay.** ATOMICS runs an HTTP relay on this machine's loopback only, `127.0.0.1:<port>`,
    started with the first sandboxed Claude. It keeps its port in `relay-port` in ATOMICS's state folder
    and listens there again after a restart when the port is free, so existing sandboxes keep their way
-   to it.
+   to it. Connections have two seconds to send their first request headers. The separate 32-place
+   authentication pool bounds idle and trickling clients; authenticated connections have 256 places
+   and a five-minute idle timeout. Clients should connect when ready to send their request.
 2. **A placeholder per session.** Each time a sandboxed Claude starts or resumes, its session gets a
    new random placeholder shaped like a subscription token (`sk-ant-oat01-atomics-…`). The relay
    accepts it until the agent exits, its tile closes or its launch fails, then revokes it. The real
@@ -784,8 +786,16 @@ main checkout, and never open a folder `git worktree list` names inside a `.git`
 
 So when a sandbox is made, before it runs, ATOMICS records where git finds the folder's repository: the work
 tree, its git folder and the common dir, in `git-pins/<sandbox>.json` in ATOMICS's state folder, which no
-sandbox mounts. From then on ATOMICS runs git in that folder with `GIT_DIR`, `GIT_COMMON_DIR` and
-`GIT_WORK_TREE` taken from the record, and never reads them from the folder again, also after a restart and
+sandbox mounts, and keeps a second copy in the sandbox ownership ledger. An unreadable, missing or
+mismatched owned pin blocks host git in its worktree and shows a warning on its tile; it never makes that
+folder an unpinned checkout. An unreadable older record with no ledger copy blocks all host git, since
+its folder cannot be identified safely. Restore the original pin, or remove or rebuild the old sandbox
+and its worktree, then run `atomics sandbox forget-pin <sandbox> --confirm-worktree-removed`. This explicit
+confirmation releases only unreadable legacy records; readable pins and ledger copies use normal cleanup,
+and a sandbox still listed by sbx must be removed first. Reloading records also clears refusals for records
+another process removed. From then on ATOMICS runs git in that folder with
+`GIT_DIR`, `GIT_COMMON_DIR` and
+`GIT_WORK_TREE` taken from the record, and never trusts an altered pointer in the folder, also after a restart and
 for bare agents in the same folder. The record goes with its sandbox: when cleanup removes it, when making
 it fails, and when ATOMICS starts and sbx no longer has it, however it was removed. With no records ATOMICS
 does not ask sbx at start: any sbx command starts sbx's daemon. If removing an owned
@@ -793,7 +803,8 @@ sandbox leaves a folder whose git metadata changed, its named record is replaced
 `git-pins/retained-*.json` folder record. The folder stays pinned across restarts until its metadata is
 repaired or the folder is removed; otherwise a later status scan could follow the sandbox's redirect.
 Worktree removal checks for changes using the pins and atomically restores the recorded git pointers
-before asking Git to remove a clean linked checkout. Main checkouts and dirty or locked worktrees stay.
+before asking Git to remove a clean linked checkout. A changed `commondir` blocks git and cleanup until
+repaired. Main checkouts and dirty or locked worktrees stay.
 
 - **Layouts git did not make are refused.** A git folder that does not point back at its worktree, or a
   repository inside the worktree or inside another repository's objects, refs, logs or worktrees, stops
@@ -823,9 +834,34 @@ before asking Git to remove a clean linked checkout. Main checkouts and dirty or
   `-c core.fsmonitor=false -c core.hooksPath=/dev/null`. So no hook runs for git that ATOMICS runs in such a
   repository, including your own: a `pre-commit` hook does not run when ATOMICS commits a task before merging it.
 - **Special files stop git.** Before git runs in a repository with a sandbox, ATOMICS checks that each
-  sandboxed worktree's git folder holds only files and folders. A FIFO, socket or link there stops ATOMICS's
-  git in that repository, with an error naming it, until you remove it; the folder also stays pinned after
-  its sandbox goes.
+  sandboxed worktree's git folder, including all nested folders, holds only files and folders. A FIFO,
+  socket or link there stops ATOMICS's git in that repository, with an error naming it, until you remove
+  it; the folder also stays pinned after its sandbox goes.
+- **A changed `commondir` stops git.** Git's refs backend can follow this file for writes even with
+  `GIT_COMMON_DIR` set. ATOMICS checks that every recorded admin folder still names the pinned common
+  dir, and that the common dir has no `commondir` of its own. A mismatch blocks host git, ref recovery
+  and integration until repaired, and never starts an agent without its guard. These checks still race
+  with a sandbox that can rewrite shared metadata; eliminating that race requires stronger repository
+  isolation, beyond this recovery model.
+- **Refs are explicit.** Host git uses fully qualified branch and remote refs, so a tag named
+  `origin/main` cannot replace `refs/remotes/origin/main`, and always sets `GIT_NO_REPLACE_OBJECTS=1`.
+  Task integration commits only the task's recorded worktree path and checks that it still names that branch.
+  The merge runs only at the host-selected integration path, saved with the plan after integration and
+  reused across worktree-template changes. A sandbox-pinned folder, including its subfolders and aliases,
+  cannot be that destination. A sandbox claiming the integration branch stops integration before staging
+  and raises a persistent ref alert on its task and the task being integrated, even if it changes HEAD back.
+  Non-regular HEAD files, redirected `gitdir` pointers, and symbolic HEAD chains through pinned refs
+  receive the same attributed refusal; chains are limited to eight hops. Plans with a previously
+  integrated task and no saved destination may adopt a single trusted, unpinned integration checkout
+  once and save it with the plan. Adoption excludes every open plan's task worktrees and their
+  subfolders, including aliases. New plans use the host-computed destination.
+- **Shared reflogs stay on this machine.** Linked sandboxes mount shared objects and refs, and their own
+  admin folder; they do not mount the shared `logs` folder. Their own `logs/HEAD` remains writable in the
+  admin folder. Sandboxes with the old shared writable logs mount must be removed and recreated.
+- **Source updates require this repository's sandboxes to be removed first**, including stopped sandboxes.
+  The commit to build comes from `ls-remote`, and that object ID is used through checkout and build;
+  mutable remote-tracking refs never select executable source. A repository lock prevents sandbox
+  creation from overlapping the source install.
 - **Git has time limits.** ATOMICS stops git it runs after 2 minutes, or 30 for checkouts, commits, merges
   and fetches, in case the agent swaps in such a file after the check or puts one elsewhere git reads.
   The worktree list ATOMICS refreshes every 30 seconds is read off the window's thread.
@@ -841,7 +877,11 @@ worktree, bare agents' too.
 An agent started in a folder outside any repository gets that folder. ATOMICS refuses to sandbox an agent
 in your home folder or any folder above it, since the sandbox would mount the whole home folder
 read-write. Long briefs for agents other than Claude are written to a folder of the session's own,
-mounted read-only.
+mounted read-only. Bare-session brief files are private (0600), under private state directories
+(0700). A sandbox session's mounted brief directory retains 0755 and its brief file 0644, so
+an agent with a different guest uid can read the mount. The host state and enclosing briefs
+directory remain private. These compatibility modes are retained without assuming a particular
+Docker Sandboxes uid mapping; the permission checks do not substitute for a live sandbox run.
 
 ## How sandboxed agents talk to ATOMICS
 
@@ -920,8 +960,9 @@ tests there, in a worktree that starts from the integration branch.
   identify which concurrent writer moved a ref. Review the diff and branch before integrating.
   Every check is strict, whether the session ran a turn since the last one or sat idle: a process the
   agent left running in its sandbox can write at any time, and a turn's own writes are checked after its
-  status already shows done. A report from the agent, progress or done, clears the session's needs-you
-  state, the task's Blocked status and its red alert; a blocked or question report sets them again.
+  status already shows done. Only the user's acknowledgement on the board clears a ref-guard alert.
+  An agent's progress or done report leaves the alert and blocked status in place. Integration refuses an unacknowledged alert and
+  runs a fresh guard check before any integration writes; recovery or a failed check blocks it too.
 - **What this machine wrote is kept.** A check keeps, since the previous check:
   - refs ATOMICS wrote itself: integrations, new task branches, cleanup, and the Clean up… dialog's
     `fetch --prune` (`refs/remotes/` and `refs/tags/`), at the values ATOMICS left;
@@ -933,12 +974,11 @@ tests there, in a worktree that starts from the integration branch.
     `FETCH_HEAD`, and those such a fetch may have pruned;
   - `refs/stash`, which every checkout shares, at whatever it is: it is never restored.
 
-  These traces are in git folders no sandbox mounts, so an agent cannot leave them, with one exception:
-  the main checkout's HEAD log is in the shared `logs` folder. A check trusts that shared log only for the
+  These traces are in git folders no sandbox mounts. Older sandboxes that mounted shared logs writable
+  are refused on reattach and must be recreated. A check trusts the main checkout's log only for the
   branch the host-only main `HEAD` names now, stopping at the latest checkout entry. It cannot attribute
-  older moves to other branches from shared checkout messages. Future-dated entries are ignored. A
-  forged log can still vouch for the branch currently checked out on main: this remains recovery, not
-  proof of its writer. If you commit on main and then switch away before the check, that old branch
+  older moves to other branches from shared checkout messages. Future-dated entries are ignored. This
+  remains ref recovery, not write isolation: the sandbox still shares objects and refs. If you commit on main and then switch away before the check, that old branch
   move has no trusted trace and may be restored. A
   branch you create other than by switching to it (`git branch x`), delete, or move while no checkout
   here has it checked out (`git branch -f`, `git update-ref`) leaves no such trace and is put back like
@@ -1014,9 +1054,75 @@ path remains unavailable in the display.
 
 ## Settings → Credentials
 
+**Add secret** stores a name (an environment variable such as `LOGO_DEV_API_KEY`), a masked value,
+an optional **Used with host**, and a scope: everywhere, one saved workspace, or one project by its
+main checkout. Project scopes follow linked worktrees. Names are unique in this machine's catalog;
+remove an existing entry before adding a replacement. Values are never saved in ATOMICS config.
+The service catalog recognises OpenAI, Anthropic, GitHub, Linear, logo.dev and Stripe, including
+their common environment names, and fills in the host and authentication style. Unknown names
+leave the host empty for you to fill in.
+
+- **Relayed**, with a host: each session in scope receives a fresh placeholder in the named
+  variable and `<NAME>_RELAY_URL`, such as `http://127.0.0.1:<port>/api.example.com` on this machine
+  or `http://host.docker.internal:<port>/api.example.com` inside Docker. Point the API client's base
+  URL there. `OPENAI_API_KEY` also sets `OPENAI_BASE_URL` (including `/v1`), and `ANTHROPIC_API_KEY`
+  sets `ANTHROPIC_BASE_URL`. The relay accepts the placeholder as a bearer token or in the selected
+  API placement, and adds the real value only for the exact allowed host. Choose bearer (default),
+  a named header, basic auth (the public username is metadata; the secret is its password), or a
+  query parameter. Optional HTTP methods and a plain path prefix narrow access further; a prefix
+  allows itself and its descendants. Redirects are not followed. The relay scrubs literal values
+  and their standard query/basic encodings from upstream response headers and bodies, including
+  matches split across streamed chunks, and requests uncompressed responses for this check.
+- **Exposed**, without a host: the session receives the real value in its environment. **Agents
+  can read and leak this value.** Settings and CLI listings say so. Use this only when the tool
+  needs to read the value itself and cannot use an HTTP relay.
+
+An explicit scoped `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` takes precedence over the older
+Claude subscription entry for that session. Exposed model values travel only in the session
+environment, never in Claude's `--settings` argument.
+
+The list shows name, kind, scope, host and last relay use from `relay.log`, never a value. Bare and
+Docker sessions receive secrets automatically when they start or resume, including shells and the
+chief. Docker gets its per-sandbox loopback relay rule automatically; no manual `sbx` command is
+needed. Session environment is applied at attach time, rather than writing general secret values
+into the sandbox's persistent configuration. A failed credential-store read blocks startup with
+an error. Remove asks first, revokes that host's active relay grants and affects new sessions;
+restart existing sessions to clear exposed values from their environment.
+
+**Copy (OS authentication)** is available only in a native window on the machine holding the
+credential store. It authenticates afresh before reading the value and sends it straight to that
+machine's clipboard; it never draws it. macOS uses LocalAuthentication. Linux uses the dedicated
+`com.atomics.copy-secret` polkit action with `auth_self` (no cached authorisation). The package
+ships its policy and the NixOS module enables polkit and installs it for desktops and the VM.
+For a standalone Linux install, run `sudo atomics install --secret-copy-policy`; this writes
+`/usr/share/polkit-1/actions/com.atomics.copy-secret.policy`. On NixOS enable `programs.atomics`
+and run `sudo nixos-rebuild switch`. A desktop polkit authentication agent and `pkcheck` must be
+available. An unavailable Copy row explains the missing prerequisite and exact policy step.
+Cancellation, a missing policy or an unavailable OS prompt always fails closed. Remote windows,
+protocol clients, `atomics ctl` and MCP have no Copy operation, even when connected to a local host.
+
+The CLI accepts values only on stdin, hidden when entered in a terminal; there is no value flag,
+positional value, show command or copy command:
+
+```sh
+atomics secret add EXAMPLE_API_KEY --host api.example.com
+atomics secret add OPENAI_API_KEY --host openai --scope workspace:daily
+atomics secret add EXAMPLE_PASSWORD --scope project:/path/to/main/checkout
+atomics secret list
+atomics secret rm EXAMPLE_API_KEY
+```
+
+`--header x-api-key`, `--basic-user api`, or `--query api_key` selects authentication;
+`--method GET,POST --path-prefix /v1` limits requests. Enter the value when prompted or supply it
+over a pipe. CLI parse errors hide arguments to avoid echoing an accidentally pasted value.
+`cargo test -p atomics secret` and `cargo test -p atomics --test secrets` include canary checks for
+the store, CLI surfaces, OS-auth cancellation, scopes and session injection.
+
 ATOMICS keeps its credential catalog in one OS keychain item, `atomics-credentials-v1`, under account
 `atomics`. macOS uses `security`; Linux uses `secret-tool` and an unlocked Secret Service. There is
-no plaintext-file fallback. Values travel to these helpers on stdin, including macOS's interactive
+no automatic plaintext-file fallback. A headless VM can explicitly select the private folder store
+with `ATOMICS_CREDENTIALS_DIR` (see [the VM trust model](nixos-vm.md)); this uses the same catalog and
+is protected by file permissions rather than an OS keychain. Values travel to keychain helpers on stdin, including macOS's interactive
 command mode. Reads drain bounded stdout/stderr pipes in memory; credential output never passes
 through temporary capture files. The JSON catalog is hex encoded for that command parser; the OS keychain supplies
 its encryption and access control. Oversized catalogs are rejected before writing (macOS
@@ -1041,7 +1147,7 @@ operations run off the UI thread.
 | Private registries | One entry per explicit DNS host | GET/HEAD; Bearer authentication |
 
 These rules restrict relay requests; they do not expand the permissions of the underlying token.
-Integrations request a per-session placeholder from the relay for a catalog identifier (`claude`,
+These older integration entries are separate from the general secrets above. Integrations request a per-session placeholder from the relay for a catalog identifier (`claude`,
 `openai`, `linear`, `github`, or `registry:<host>`). Storing a credential does not automatically grant
 it to every session. Claude's subscription is granted automatically when it starts sandboxed.
 Sandbox Codex continues to use sbx's own OpenAI credential proxy. If you choose the API key option, guided setup saves a new OpenAI
@@ -1077,3 +1183,48 @@ They contact the relay on `127.0.0.1` and receive a placeholder in their environ
 settings. Inherited Anthropic API/auth keys are cleared. The token stays on the host side of the
 relay; native hooks remain enabled. A missing subscription blocks this launch instead of falling
 back to a real environment token. The default remains the native Claude login for bare sessions.
+
+## GitHub publishing and the shared UID
+
+Connect a GitHub account in the window that holds the keychain. For a VM this is the Mac client;
+it stores the token locally and syncs it over the administrator SSH path to the private broker,
+like other relayed secrets. Each connected account has its own secret. The optional
+`[identity] github` login selects one for a project, using the usual identity precedence; the
+sidebar shows that selection. A session receives only a fresh placeholder and Git URL/header
+settings, never the GitHub token in a file, environment variable or log. A hardened VM's broker
+store is owned by its separate service user. Without hardening, the existing root-access limit
+still applies.
+
+Git fetch and push need no `gh` installation. The account grant is narrowed to the project's
+origin repository on github.com: smart-HTTP discovery, upload-pack and receive-pack, plus the REST
+paths that list, create and update its pull requests. Other repositories, hosts, account APIs,
+merges and workflow endpoints are refused. The broker checks these paths independently of the
+outer relay, never follows redirects and redacts reflected credentials in replies. It checks the
+current default branch before forwarding receive-pack; failed metadata lookup or malformed
+updates fail closed. The account secret's `refuse_default_branch` setting defaults to true.
+Turning off **Refuse pushes to the default branch** explicitly permits ordinary updates to it in
+new sessions; the setting is synchronized through the same admin path and old grants are revoked.
+
+**The VM host and bare agents share a UID.** The use socket accepts that UID's grant-management
+calls. Repository/account selection is therefore a trusted host/session convention; a process with
+that UID can request a different scoped grant. The broker still enforces the repository on each
+individual grant and never returns a relayed token. Agents with a scoped credential are allowed
+to push and open or update PRs directly, without a window or click. This is intentional.
+
+The chief's `atomics_publish` workflow raises a board card and waits for the user's Publish click.
+Only that workflow's click pushes its reviewed commit and opens or updates the PR; its result URL
+is saved on the plan and records `pr_opened`. The chief's prompt and the app/MCP tool boundary
+enforce this convention. **It is not a broker guarantee inside the VM:** no signed grants are used,
+and agents can call their allowed git/REST endpoints directly. On a desktop, sandboxed agents
+reach the relay with placeholders; bare agents run as the keychain holder and share that user's
+access. A Publish card cannot create a stronger boundary between processes sharing that UID.
+
+See [github.md](github.md#git-and-pull-requests-through-the-broker) for account selection,
+configuration and the full Publish card flow.
+
+In the normal chief-to-agent flow, the chief asks the user and then tells the task agent to push
+and open its own PR. The agent may attach `pull_request` (`url`, `number`, `head`, `base`) to
+`atomics_report`. ATOMICS binds that metadata to the reporting task, shows the PR on its card and
+records `pr_opened`, without treating a report as task acceptance or independently verifying it
+against GitHub. Remote branch protection remains the first line of protection; the secret's
+default-on refusal of default-branch pushes is a second line.

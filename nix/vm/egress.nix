@@ -1,17 +1,36 @@
-# An outbound allowlist for the VM's user (docs/nixos-vm.md, Network policy): the host, the chief, every
-# agent and the user's rootless containers reach only the listed domains, on the listed ports.
+# An outbound allowlist for every non-exempt UID (docs/nixos-vm.md, Network policy), including agents,
+# subordinate UIDs in user namespaces and Nix builders.
 #
 # dnsmasq becomes the guest's resolver. It forwards only listed domains, to Lima's resolver (which asks the
 # Mac's, and so its VPN's), and refuses every other name, so a lookup cannot carry data out either. Each
-# address it hands out for a listed domain goes into an nftables set, and nftables lets the user's new
-# connections through only to those addresses. Root and system services are not filtered, but resolve
+# address it hands out for a listed domain goes into an nftables set, and nftables lets new connections
+# through only to those addresses. Only root and dnsmasq are exempt, but resolve
 # through the same dnsmasq. Without atomics.vm.hardened an agent can become root and lift all of this.
-{ config, lib, ... }:
+{ config, lib, pkgs, ... }:
 
 let
   inherit (lib) mkOption types;
   cfg = config.atomics.vm.egress;
-  uid = toString config.users.users.${config.atomics.vm.user}.uid;
+  broker = config.atomics.vm.secretBroker.enable;
+  brokerRuntime = "/run/atomics-secret-egress";
+  # Explicit names, never a UID range: nixbld users are system users too, but must be filtered.
+  exemptUsers = [ "root" "dnsmasq" ];
+  exemptNames = lib.concatMapStringsSep ", " builtins.toJSON exemptUsers;
+  # Keep Mac services blocked even when DNS is forwarded to a separate upstream.
+  gateway = "192.168.5.2";
+  ipv4Octet = "(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])";
+  isIPv4 = value: builtins.match "${ipv4Octet}(\\.${ipv4Octet}){3}" value != null;
+  isIPv6 = value:
+    let
+      tail = lib.last (lib.splitString ":" value);
+      # The library parser handles hex IPv6; an embedded IPv4 tail occupies two hex groups.
+      hex = if isIPv4 tail then lib.removeSuffix tail value + "0:0" else value;
+    in
+    lib.hasInfix ":" value
+    && builtins.match "[0-9A-Fa-f:]+" hex != null
+    && lib.all (part: builtins.stringLength part <= 4) (lib.splitString ":" hex)
+    && (builtins.tryEval (builtins.deepSeq (lib.network.ipv6.fromString hex).address true)).success;
+  upstreamFamily = if lib.hasInfix ":" cfg.upstream then "ip6" else "ip";
   table = "atomics_egress";
   rules = [ { name = "web"; ports = cfg.webPorts; domains = cfg.domains; } ]
     ++ lib.imap0 (i: rule: rule // { name = "rule${toString i}"; }) cfg.rules;
@@ -54,8 +73,8 @@ in
 {
   options.atomics.vm.egress = {
     enable = lib.mkEnableOption ''
-      an outbound allowlist for the VM's user: the host, the chief, agents and their rootless containers reach
-      only listed domains. Pair it with atomics.vm.hardened, or an agent can become root and lift it
+      an outbound allowlist for all users except root and dnsmasq, including subordinate UIDs and Nix
+      builders. Pair it with atomics.vm.hardened, or an agent can become root and lift it
     '';
 
     enforce = mkOption {
@@ -64,7 +83,8 @@ in
       description = ''
         Refuse connections outside the list. False only logs them ("atomics-egress refused" in the kernel log,
         `journalctl -k -g atomics-egress`), to learn what a team needs before enforcing. Names outside the list
-        are refused by dnsmasq either way.
+        are refused by dnsmasq either way. New connections to Lima's host address are always refused
+        except for resolver DNS and root's DHCP renewals.
       '';
     };
 
@@ -106,9 +126,11 @@ in
     };
 
     upstream = mkOption {
-      type = types.str;
-      default = "192.168.5.2";
-      description = "The resolver listed names are forwarded to: Lima's, on its user-mode network's gateway.";
+      type = (types.addCheck types.str (value: isIPv4 value || isIPv6 value)) // {
+        description = "IPv4 or IPv6 address literal (not a hostname, port, zone or CIDR prefix)";
+      };
+      default = gateway;
+      description = "The resolver IP address listed names are forwarded to; defaults to Lima's gateway resolver.";
     };
   };
 
@@ -126,6 +148,7 @@ in
         bind-interfaces = true;
         # Only the listed domains have a server; every other name is refused.
         no-resolv = true;
+        conf-file = lib.mkIf broker [ "/etc/dnsmasq-conf.conf" "${brokerRuntime}/dnsmasq.conf" ];
         server = map (domain: "/${domain}/${cfg.upstream}") domains;
         nftset = lib.concatMap
           (rule: map (domain: "/${domain}/4#inet#${table}#${rule.name}4,6#inet#${table}#${rule.name}6") rule.domains)
@@ -145,16 +168,74 @@ in
       requires = [ "nftables.service" ];
     };
 
+    # Root projects validated hostnames into resolver configuration. The broker never receives
+    # CAP_NET_ADMIN; its UID is checked before the agents' broad domain/loopback allowances.
+    systemd.tmpfiles.rules = lib.optionals broker [
+      "d ${brokerRuntime} 0755 root root - -"
+      "f ${brokerRuntime}/dnsmasq.conf 0644 root root - -"
+    ];
+    systemd.paths.atomics-secret-egress = lib.mkIf broker {
+      wantedBy = [ "multi-user.target" ];
+      pathConfig.PathChanged = "/var/lib/atomics-secret-broker/rule-hosts.json";
+    };
+    systemd.services.atomics-secret-egress = lib.mkIf broker {
+      description = "Project secret rules into the broker network policy";
+      wantedBy = [ "multi-user.target" ];
+      requires = [ "atomics-secret-broker.service" "nftables.service" ];
+      # This job synchronously stops/starts dnsmasq. An ordering edge to dnsmasq would
+      # make that stop wait for this oneshot's start job, deadlocking both jobs.
+      after = [ "atomics-secret-broker.service" "nftables.service" ];
+      partOf = [ "nftables.service" ];
+      path = [ pkgs.nftables pkgs.systemd ];
+      serviceConfig = {
+        Type = "oneshot";
+        ExecStart = "${pkgs.python3}/bin/python3 ${./secret-egress.py} /var/lib/atomics-secret-broker/rule-hosts.json ${brokerRuntime}/dnsmasq.conf ${cfg.upstream} ${pkgs.writeText "atomics-egress-domains.json" (builtins.toJSON rules)}";
+        NoNewPrivileges = true;
+        ProtectSystem = "strict";
+        ProtectHome = true;
+        ReadWritePaths = [ brokerRuntime ];
+      };
+    };
+
     networking.nftables.enable = true;
+    # The build sandbox has no dnsmasq account. Substitute only in its disposable check copy;
+    # the installed rules resolve account names against the guest's existing passwd at load time.
+    networking.nftables.preCheckRuleset = ''
+      sed -i 's/"dnsmasq"/65534/g; s/"atomics-secret-broker"/65533/g' ruleset.conf
+    '';
     networking.nftables.tables.${table} = {
       family = "inet";
       content = ''
         ${lib.concatMapStrings sets rules}
+        ${lib.optionalString broker ''
+          set broker4 { type ipv4_addr; flags timeout; timeout 1d; }
+          set broker6 { type ipv6_addr; flags timeout; timeout 1d; }
+          chain broker {
+            ct state established,related accept
+            ip daddr 127.0.0.1 udp dport 53 accept
+            ip daddr 127.0.0.1 tcp dport 53 accept
+            ip daddr ${gateway} reject
+            tcp dport 443 ip daddr @broker4 accept
+            tcp dport 443 ip6 daddr @broker6 accept
+            reject with icmpx type admin-prohibited
+          }
+        ''}
         chain output {
           type filter hook output priority filter; policy accept;
-          meta skuid != ${uid} accept
-          oifname "lo" accept
+          ${lib.optionalString broker ''meta skuid "atomics-secret-broker" jump broker''}
+          # Replies to Mac-initiated SSH/forwarded connections can target the gateway address.
+          # Accept established flows first to preserve those sessions; new flows still face the rules below.
           ct state established,related accept
+          # Lima exposes Mac services on this address, including Mac loopback listeners. Only the
+          # resolver may open DNS connections to the configured upstream. Keep this before UID
+          # exemptions and domain sets. Names handle dynamically allocated UIDs on upgraded guests.
+          ${upstreamFamily} daddr ${cfg.upstream} meta skuid "dnsmasq" udp dport 53 accept
+          ${upstreamFamily} daddr ${cfg.upstream} meta skuid "dnsmasq" tcp dport 53 accept
+          # dhcpcd runs as root and unicasts lease renewals to Lima's DHCP server on the gateway.
+          ip daddr ${gateway} meta skuid "root" udp dport 67 accept
+          ip daddr ${gateway} reject with icmp type admin-prohibited
+          meta skuid { ${exemptNames} } accept
+          oifname "lo" accept
           ${lib.concatMapStrings allow rules}
           limit rate 20/second burst 50 packets log prefix "atomics-egress refused: " level info
           ${if cfg.enforce then ''

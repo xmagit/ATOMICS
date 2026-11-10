@@ -9,6 +9,18 @@ use crate::diff::{FileStatus, LineKind, WorktreeDiff};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum ControlRequest {
+    /// A local CLI edit: invalidate placeholders only. This cannot read or copy a value.
+    Publish {
+        plan: String,
+        #[serde(default)]
+        branch: Option<String>,
+        title: String,
+        body: String,
+        base: String,
+    },
+    SecretRemoved {
+        name: String,
+    },
     Preview {
         #[serde(default)]
         pane: Option<String>,
@@ -21,6 +33,7 @@ pub enum ControlRequest {
         remove: bool,
     },
     List,
+    CleanBuildCaches,
     /// The protocol server's address and the rendezvous's status: phase, registered, online,
     /// channels and why it waits. Never a token or pass.
     Remote,
@@ -91,7 +104,10 @@ pub enum ControlRequest {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         interactive: bool,
     },
+    /// Starts the chief if it is not running, without opening a window.
+    StartChief,
     /// Types a message and submits it, or with `raw` writes the text as-is (keys).
+    /// Addressing `chief` without `raw` starts it with this first prompt when needed.
     Send {
         session: String,
         text: String,
@@ -183,6 +199,12 @@ pub enum ControlRequest {
         after: Option<u64>,
         #[serde(default)]
         timeout_secs: Option<u64>,
+        /// Compact events and only sessions with status changes. MCP enables this; ctl keeps its legacy default.
+        #[serde(default)]
+        compact: bool,
+        /// Include every session even in a compact answer.
+        #[serde(default)]
+        full_sessions: bool,
     },
     /// What a session produced: status, last prompt, final message, screen tail, diff size.
     Result {
@@ -194,7 +216,7 @@ pub enum ControlRequest {
         #[serde(default)]
         plan: Option<String>,
         goal: String,
-        tasks: Vec<crate::plan::Task>,
+        tasks: Vec<crate::plan::TaskInput>,
         /// Branch the tasks are merged into; kept unless explicitly overridden.
         #[serde(default)]
         integration: Option<String>,
@@ -351,6 +373,34 @@ pub enum ControlRequest {
         pane: Option<String>,
         text: String,
     },
+    /// Propose a fact to the host-resolved task's own plan. Never directly shared with peers.
+    Note {
+        pane: Option<String>,
+        text: String,
+    },
+    /// Read only the pinned facts of the host-resolved task's plan.
+    Notes {
+        pane: Option<String>,
+    },
+    /// Chief-only proposal review and curation; user actions also use Plan::curate_note.
+    PlanNotebook {
+        pane: Option<String>,
+        #[serde(default)]
+        plan: Option<String>,
+        #[serde(default)]
+        id: Option<u64>,
+        #[serde(default)]
+        pinned: Option<bool>,
+        #[serde(default)]
+        delete: bool,
+    },
+    /// User curation from the board or authenticated protocol. Not exposed to task MCP clients.
+    CurateNote {
+        plan: String,
+        id: u64,
+        pinned: Option<bool>,
+        delete: bool,
+    },
     /// A sandboxed agent asks for an MCP server it needs: a connected one is loaded into its
     /// sandbox, any other gets a "Connect" banner on its tile (sent by `atomics mcp --agent`).
     McpConnect {
@@ -393,9 +443,13 @@ pub enum ControlRequest {
     },
     /// A sub-agent reporting on its task (sent by `atomics mcp --agent`).
     Report {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pull_request: Option<crate::plan::PullRequest>,
         pane: Option<String>,
         status: String,
         summary: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        checks: Vec<crate::plan::Check>,
     },
     /// Toggles inlay hints in the editor of the session's worktree.
     InlayHints {

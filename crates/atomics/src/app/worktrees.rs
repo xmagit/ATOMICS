@@ -1,10 +1,31 @@
 use super::*;
 
 impl State {
+    pub(super) fn plan_worktree_path(&self, index: usize, task: Option<&str>, repo: &Path, branch: &str) -> PathBuf {
+        let plan = &self.plans[index];
+        match task.and_then(|id| plan.tasks.iter().find(|task| task.id == id)) {
+            Some(task) => git::plan_task_worktree_path(&self.config.worktree_path, repo, plan, task, branch),
+            None => git::worktree_path(&self.config.worktree_path, repo, branch),
+        }
+    }
+
     /// Checks out `branch` in a new worktree, from `start` (a plan's integration branch)
     /// or base_ref, and starts `launch` in it.
     pub(super) fn create_worktree(&mut self, repo: PathBuf, branch: String, start: Option<String>, launch: Launch) {
-        let path = git::worktree_path(&self.config.worktree_path, &repo, &branch);
+        if let Some(error) = &self.tickets.workspace_identity_error {
+            let _ = self.worktree_tx.send((branch, Err(error.clone()), launch, repo));
+            return;
+        }
+        let path = launch
+            .task
+            .as_ref()
+            .and_then(|(plan, task)| self.plans.iter().position(|p| p.id == *plan).map(|index| (index, task)))
+            .map(|(index, task)| self.plan_worktree_path(index, Some(task), &repo, &branch))
+            .unwrap_or_else(|| git::worktree_path(&self.config.worktree_path, &repo, &branch));
+        if let Err(error) = self.check_disk(&path) {
+            let _ = self.worktree_tx.send((branch, Err(error), launch, repo));
+            return;
+        }
         let config = self.project_config(&repo);
         let (tx, base_ref) = (self.worktree_tx.clone(), config.base_ref);
         let warm = config.worktrees.warm;
@@ -38,7 +59,7 @@ impl State {
             let result = if conflict {
                 Err(format!("Branch {branch} is already owned by another task or plan in {}", repo.display()))
             } else if existing {
-                Ok(PreparedWorktree { path, warmed: false, start: None, warning: None })
+                Ok(PreparedWorktree { path, identity: None, warmed: false, start: None, warning: None })
             } else {
                 // New work starts from the remote as it is now, not as this machine last fetched it. Only
                 // where it starts from base_ref: an integration branch that exists is its own start.
@@ -60,7 +81,7 @@ impl State {
                     .map(|()| {
                         let warmed = git::warm_worktree(&repo, &path, &warm);
                         let start = new.then(|| git::commit_of(&repo, &branch_ref).ok().flatten()).flatten();
-                        PreparedWorktree { path, warmed, start, warning: fresh.warning }
+                        PreparedWorktree { path, identity: None, warmed, start, warning: fresh.warning }
                     })
                     .map_err(|e| format!("{e:#}"))
             };
@@ -501,8 +522,8 @@ mod tests {
                     "#!/usr/bin/env atomics-test-node\nif [ \"$1\" = --version ]; then printf 'codex-cli 0.165.0\\n'; \
                      else printf '%s\\n' \"$@\" > launch-args; fi\n",
                 );
-                // Git and the rest stay where this test found them.
-                let login = format!("{}:{}", tools.display(), std::env::var("PATH").unwrap());
+                let helpers = crate::test_support::helper_path(home);
+                let login = format!("{}:{}", tools.display(), helpers.display());
                 let shell = home.join("login-shell");
                 crate::test_support::write_program(
                     &shell,
@@ -510,14 +531,22 @@ mod tests {
                         "#!/bin/sh\n[ \"$1 $2 $3\" = '-l -i -c' ] || exit 64\nPATH='{login}'\nexport PATH\neval \"$4\"\n"
                     ),
                 );
-                vec![("SHELL", shell.into()), ("PATH", "/usr/bin:/bin".into())]
+                let started = [home.join("started-a"), home.join("started-b")];
+                for dir in &started {
+                    std::fs::create_dir(dir).unwrap();
+                }
+                vec![("SHELL", shell.into()), ("PATH", std::env::join_paths(started).unwrap())]
             },
             |mut state, _ctx| {
                 let tools = paths::home().join("login-tools");
                 let path = std::env::var("PATH").unwrap();
                 assert!(path.starts_with(&format!("{}:", tools.display())), "{path}");
-                for started in ["/usr/bin", "/bin"] {
-                    assert!(path.split(':').any(|folder| folder == started), "{started} stays: {path}");
+                for started in [paths::home().join("started-a"), paths::home().join("started-b")] {
+                    assert!(
+                        std::env::split_paths(&path).any(|folder| folder == started),
+                        "{} stays: {path}",
+                        started.display()
+                    );
                 }
                 assert!(crate::setup::login_path().added.is_some_and(|added| added > 0));
 
@@ -627,6 +656,7 @@ mod tests {
                     isolation: None,
                 });
                 let supported = git::probe_cache_clone(&repo, repo.parent().unwrap()).unwrap();
+                let config_before = std::fs::read(repo.join(".git/config")).unwrap();
                 for (branch, folders, expected) in [
                     ("missing", vec!["target".into()], "cold"),
                     ("warm", vec!["target".into()], if supported { "main cache" } else { "cold" }),
@@ -673,15 +703,22 @@ mod tests {
                     }
                     state.worktree_tx.send(event).unwrap();
                     state.runtime_tick();
-                    if branch == "warm" && supported {
-                        assert_eq!(state.toast.as_ref().unwrap().0, "warm cache from main");
-                    }
                     let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(5));
                     while !path.join("launched").exists() {
                         assert!(Instant::now() < deadline, "agent never launched for {branch}");
+                        state.runtime_tick();
                         std::thread::sleep(Duration::from_millis(10));
                     }
+                    if branch == "warm" && supported {
+                        assert_eq!(state.toast.as_ref().unwrap().0, "warm cache from main");
+                    }
                     assert_eq!(std::fs::read_to_string(path.join("launched")).unwrap(), expected);
+                    assert_eq!(
+                        std::fs::read(repo.join(".git/config")).unwrap(),
+                        config_before,
+                        "unconfigured worktrees must not receive identity includes"
+                    );
+                    assert!(!repo.join(".git/atomics-identities").exists());
                 }
             },
         );

@@ -173,7 +173,12 @@ fn http_crosses_the_protocol_and_native_listener_in_both_directions_past_one_win
     atomics_ui::Backend::send(&remote, atomics_ui::Command::StopPreview { port });
     native.pump(&remote, None);
     assert!(!native.active());
-    assert!(TcpStream::connect((Ipv4Addr::LOCALHOST, local)).is_err());
+    // Stopping the listener signals its worker; wait for that thread to release the socket.
+    let deadline = Instant::now() + wait(Duration::from_secs(5));
+    while TcpStream::connect((Ipv4Addr::LOCALHOST, local)).is_ok() {
+        assert!(Instant::now() < deadline, "stopped preview listener is still accepting connections");
+        std::thread::sleep(Duration::from_millis(5));
+    }
     let url = native.open(None, info.previews[0].clone()).unwrap();
     assert_eq!(url, info.previews[0].url(port), "reuse the original port when free");
     protocol.ws.get_mut().set_read_timeout(Some(wait(Duration::from_secs(5)))).unwrap();

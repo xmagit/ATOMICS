@@ -22,6 +22,8 @@ pub struct Status {
 
 pub fn status(program: Option<PathBuf>) -> Status {
     let Some(program) = program else { return Status::default() };
+    #[cfg(test)]
+    crate::test_support::assert_fixture_program("az", &program);
     let mut command = Command::new(program);
     command
         .args(["account", "show", "--output", "none", "--only-show-errors"])
@@ -31,6 +33,8 @@ pub fn status(program: Option<PathBuf>) -> Status {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .process_group(0);
+    #[cfg(test)]
+    crate::test_support::fixture_command(&mut command, "az");
     let Ok(mut child) = command.spawn() else { return Status { found: true, logged_in: false } };
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -76,6 +80,8 @@ impl Azure {
     }
 
     pub fn new(program: PathBuf, config: AzureConfig) -> Self {
+        #[cfg(test)]
+        crate::test_support::assert_fixture_program("az", &program);
         Self { program, config, tokens: Mutex::default() }
     }
 
@@ -129,6 +135,8 @@ impl Azure {
         if let Some(path) = crate::setup::login_path_now().as_ref() {
             command.env("PATH", path);
         }
+        #[cfg(test)]
+        crate::test_support::fixture_command(&mut command, "az");
         use crate::sandbox::setup::{OutputError, private_output};
         let output = private_output(&mut command, timeout).map_err(|error| match error {
             OutputError::Start => "could not start host Azure CLI",
@@ -222,20 +230,25 @@ pub(crate) mod tests {
         }
         let dir = crate::test_support::tempdir().unwrap();
         fake(dir.path());
+        let tools = dir.path().join("tools");
+        crate::test_support::link_tools(&tools, &["cat", "dirname", "wc", "tr"]);
+        let login = std::env::join_paths([dir.path(), tools.as_path()]).unwrap();
         let shell = dir.path().join("shell");
         let script = format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" > '{0}/shell-argv'\nprintf '__ATOMICS__{0}:/usr/bin:/bin__ATOMICS__'\n",
-            dir.path().display()
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" > '{}/shell-argv'\nprintf '__ATOMICS__{}__ATOMICS__'\n",
+            dir.path().display(),
+            login.to_string_lossy()
         );
         crate::test_support::write_program(&shell, script);
         let output = crate::test_support::output(
             Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "relay::azure::tests::azure_is_found_on_the_login_shell_path_on_both_hosts"])
                 .env(CHILD, "1")
+                .env("HOME", dir.path())
                 .env("SHELL", shell)
-                .env("PATH", "/usr/bin:/bin"),
+                .env("PATH", &tools),
         );
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(output.status.success(), "{output:?}");
         assert!(std::fs::read_to_string(dir.path().join("shell-argv")).unwrap().starts_with("-l -i -c"));
     }
 
@@ -288,8 +301,21 @@ pub(crate) mod tests {
         assert!(args.contains("account get-access-token --resource https://api.applicationinsights.io --output json"));
         assert!(args.contains("--resource https://management.azure.com/"));
         // Only the fake executable contains the token prefix; no command capture, token cache or log.
-        for entry in std::fs::read_dir(dir.path()).unwrap().flatten().filter(|e| e.file_name() != "az") {
-            assert!(!std::fs::read_to_string(entry.path()).unwrap().contains("AZURE-REAL"));
+        let mut folders = vec![dir.path().to_path_buf()];
+        while let Some(folder) = folders.pop() {
+            for entry in std::fs::read_dir(folder).unwrap().flatten() {
+                let kind = entry.file_type().unwrap();
+                if kind.is_dir() {
+                    folders.push(entry.path());
+                } else if kind.is_file() && entry.path() != dir.path().join("az") {
+                    let bytes = std::fs::read(entry.path()).unwrap();
+                    assert!(
+                        !bytes.windows(b"AZURE-REAL".len()).any(|part| part == b"AZURE-REAL"),
+                        "{} contains a token",
+                        entry.path().display()
+                    );
+                }
+            }
         }
     }
 

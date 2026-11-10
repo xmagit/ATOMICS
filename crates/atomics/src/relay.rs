@@ -21,6 +21,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 
 pub mod azure;
+pub mod broker;
+pub mod github;
 
 fn log_path(log: &std::path::Path) -> PathBuf {
     log.with_file_name("credential-usage.json")
@@ -34,16 +36,22 @@ const MAX_BODY: u64 = 64 * 1024 * 1024;
 const IDLE: Duration = Duration::from_secs(300);
 /// Connections served at once, so a misbehaving client cannot start threads without bound.
 const MAX_CONNECTIONS: usize = 256;
+/// Unauthenticated clients have a separate, short, absolute header deadline.
+const MAX_PRE_AUTH: usize = 32;
+const AUTH_DEADLINE: Duration = Duration::from_secs(2);
 /// The log moves to `relay.log.1` past this size.
 const MAX_LOG: u64 = 4 * 1024 * 1024;
 
 /// The Anthropic API, which Claude Code talks to.
 pub const ANTHROPIC: &str = "api.anthropic.com";
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum Authorization {
     Bearer,
     ApiKey,
+    Header(String),
+    Basic(String),
+    Query(String),
 }
 
 /// A credential the relay uses for sandboxes, the hosts it may reach and what it may do there.
@@ -58,11 +66,13 @@ pub struct Credential {
     pub hosts: Vec<String>,
     /// What its requests may do there; anything else is refused.
     pub rules: Vec<Rule>,
+    github: Option<github::Scope>,
 }
 
 enum Source {
     Static(String),
     Azure(Arc<azure::Azure>),
+    Broker(broker::Client),
 }
 
 impl std::fmt::Debug for Credential {
@@ -80,6 +90,7 @@ impl Credential {
     /// nothing on its account or OAuth endpoints.
     pub fn claude(token: String) -> Self {
         Self {
+            github: None,
             label: "Claude subscription".into(),
             source: Source::Static(token),
             authorization: Authorization::Bearer,
@@ -96,6 +107,7 @@ impl Credential {
 
     pub fn azure(azure: Arc<azure::Azure>) -> Self {
         Self {
+            github: None,
             label: "Azure CLI".into(),
             authorization: Authorization::Bearer,
             hosts: azure.config.resources.keys().cloned().collect(),
@@ -111,7 +123,28 @@ impl Credential {
         rules: Vec<Rule>,
         authorization: Authorization,
     ) -> Self {
-        Self { label, source: Source::Static(token), authorization, prefix: "atomics-", hosts, rules }
+        Self { label, source: Source::Static(token), authorization, prefix: "atomics-", hosts, rules, github: None }
+    }
+    fn secret(spec: &atomics_core::secrets::Secret, value: String) -> Self {
+        let host = spec.host.as_deref().expect("relayed secret");
+        let methods = if spec.methods.is_empty() { vec!["*".into()] } else { spec.methods.clone() };
+        let prefix = spec.path_prefix.as_deref().unwrap_or("/");
+        let rules = methods
+            .iter()
+            .flat_map(|method| {
+                [
+                    Rule::new(host, method, prefix),
+                    Rule::new(host, method, &format!("{}/*", prefix.trim_end_matches('/'))),
+                ]
+            })
+            .collect();
+        let auth = match &spec.auth {
+            atomics_core::secrets::Auth::Bearer => Authorization::Bearer,
+            atomics_core::secrets::Auth::Header(name) => Authorization::Header(name.clone()),
+            atomics_core::secrets::Auth::Basic(user) => Authorization::Basic(user.clone()),
+            atomics_core::secrets::Auth::Query(name) => Authorization::Query(name.clone()),
+        };
+        Self::stored(format!("secret:{}", spec.name), value, vec![host.into()], rules, auth)
     }
 }
 
@@ -160,6 +193,7 @@ pub struct Relay {
     inner: Arc<Inner>,
     port: u16,
     accept: Option<std::thread::JoinHandle<()>>,
+    usage_writer: Option<std::thread::JoinHandle<()>>,
 }
 
 struct Inner {
@@ -172,12 +206,15 @@ struct Inner {
     upstreams: HashMap<String, String>,
     stopped: AtomicBool,
     connections: AtomicUsize,
+    pending: AtomicUsize,
     usage: Mutex<HashMap<String, u64>>,
+    usage_updates: std::sync::mpsc::SyncSender<()>,
 }
 
 /// One Azure write waiting for the same approval banner as command permissions. The full
 /// bounded request is shown for review; it is never written to the audit log.
 pub struct WriteApproval {
+    placeholder: String,
     pub session: String,
     pub request: atomics_core::approvals::ApprovalRequest,
     pub reply: Arc<crate::ipc::ApprovalReply>,
@@ -189,37 +226,11 @@ impl Relay {
     pub fn start(port: u16, log: PathBuf, upstreams: HashMap<String, String>) -> io::Result<Self> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
         let port = listener.local_addr()?.port();
-        let config = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .max_redirects(0)
-            // The client's own headers go upstream as they are, and ureq adds none of its own.
-            .user_agent(ureq::config::AutoHeaderValue::None)
-            .accept(ureq::config::AutoHeaderValue::None)
-            .accept_encoding(ureq::config::AutoHeaderValue::None)
-            .timeout_connect(Some(Duration::from_secs(30)))
-            // A long non-streaming answer can take minutes before its first byte; a stream has no end in sight.
-            .timeout_recv_response(Some(Duration::from_secs(15 * 60)));
-        // Local fakes are never reached through this machine's proxy.
-        let config = if upstreams.is_empty() { config } else { config.proxy(None) };
-        let inner = Arc::new(Inner {
-            grants: Mutex::default(),
-            approvals: Mutex::default(),
-            log: Log { path: log.clone(), write: Mutex::new(()) },
-            agent: config.build().into(),
-            upstreams,
-            stopped: AtomicBool::new(false),
-            connections: AtomicUsize::new(0),
-            usage: Mutex::new(
-                std::fs::read(log_path(&log))
-                    .ok()
-                    .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-                    .unwrap_or_default(),
-            ),
-        });
+        let (inner, usage_writer) = Inner::new(log, upstreams, false)?;
         let accepting = inner.clone();
         let accept =
             std::thread::Builder::new().name("atomics-relay".into()).spawn(move || accepting.accept(listener))?;
-        Ok(Self { inner, port, accept: Some(accept) })
+        Ok(Self { inner, port, accept: Some(accept), usage_writer: Some(usage_writer) })
     }
 
     pub fn port(&self) -> u16 {
@@ -238,9 +249,12 @@ impl Relay {
     /// Stops accepting `placeholder`. A request already under way finishes.
     pub fn revoke(&self, placeholder: &str) {
         if let Some(grant) = self.inner.grants.lock().unwrap().remove(placeholder) {
+            if let Source::Broker(client) = &grant.credential.source {
+                let _ = client.revoke(placeholder);
+            }
             grant.cancel_writes();
             self.inner.approvals.lock().unwrap().retain(|approval| {
-                if approval.session != grant.session {
+                if approval.placeholder != placeholder {
                     return true;
                 }
                 approval.reply.answer(atomics_core::hook::HookReply::default());
@@ -253,7 +267,13 @@ impl Relay {
 impl Drop for Relay {
     fn drop(&mut self) {
         self.inner.stopped.store(true, Ordering::Release);
-        for (_, grant) in self.inner.grants.lock().unwrap().drain() {
+        // Wait for an active append and forbid later handlers from recreating the log.
+        self.inner.log.close();
+        let _ = self.inner.usage_updates.try_send(());
+        for (placeholder, grant) in self.inner.grants.lock().unwrap().drain() {
+            if let Source::Broker(client) = &grant.credential.source {
+                let _ = client.revoke(&placeholder);
+            }
             grant.cancel_writes();
         }
         // Wakes the accept loop, which then sees it has stopped.
@@ -261,19 +281,140 @@ impl Drop for Relay {
         if let Some(accept) = self.accept.take() {
             let _ = accept.join();
         }
+        if let Some(writer) = self.usage_writer.take() {
+            let _ = writer.join();
+        }
     }
 }
 
-/// One connection's share of [`Inner::connections`].
-struct Slot(Arc<Inner>);
+fn run_usage_writer(
+    inner: std::sync::Weak<Inner>,
+    updates: std::sync::mpsc::Receiver<()>,
+    mut write: impl FnMut(&HashMap<String, u64>),
+) {
+    for () in updates {
+        let Some(inner) = inner.upgrade() else { break };
+        let stopping = inner.stopped.load(Ordering::Acquire);
+        let snapshot = inner.usage.lock().unwrap().clone();
+        drop(inner);
+        if !snapshot.is_empty() {
+            write(&snapshot);
+        }
+        if stopping {
+            break;
+        }
+    }
+}
+
+/// Usage is advisory metadata: replace it atomically without a durability barrier or chmod.
+/// Only this worker writes it, so an older snapshot cannot overwrite a newer one.
+fn persist_usage(path: &std::path::Path, snapshot: &HashMap<String, u64>) -> io::Result<()> {
+    let parent = path.parent().filter(|path| !path.as_os_str().is_empty()).unwrap_or_else(|| std::path::Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    tmp.write_all(&serde_json::to_vec(snapshot).map_err(io::Error::other)?)?;
+    tmp.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
+
+/// One connection's place in the pending or authenticated pool.
+struct Slot {
+    inner: Arc<Inner>,
+    authenticated: bool,
+}
+
+fn take_slot(counter: &AtomicUsize, limit: usize) -> bool {
+    if counter.fetch_add(1, Ordering::AcqRel) >= limit {
+        counter.fetch_sub(1, Ordering::AcqRel);
+        return false;
+    }
+    true
+}
+
+impl Slot {
+    fn authenticate(&mut self) -> bool {
+        if self.authenticated {
+            return true;
+        }
+        if !take_slot(&self.inner.connections, MAX_CONNECTIONS) {
+            return false;
+        }
+        self.inner.pending.fetch_sub(1, Ordering::AcqRel);
+        self.authenticated = true;
+        true
+    }
+}
 
 impl Drop for Slot {
     fn drop(&mut self) {
-        self.0.connections.fetch_sub(1, Ordering::AcqRel);
+        let counter = if self.authenticated { &self.inner.connections } else { &self.inner.pending };
+        counter.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct DeadlineRead {
+    stream: TcpStream,
+    deadline: Option<Instant>,
+}
+
+impl Read for DeadlineRead {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        if let Some(deadline) = self.deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            self.stream.set_read_timeout(Some(remaining))?;
+        }
+        self.stream.read(bytes)
     }
 }
 
 impl Inner {
+    fn new(
+        log: PathBuf,
+        upstreams: HashMap<String, String>,
+        direct: bool,
+    ) -> io::Result<(Arc<Self>, std::thread::JoinHandle<()>)> {
+        let config = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .max_redirects(0)
+            // The client's own headers go upstream as they are, and ureq adds none of its own.
+            .user_agent(ureq::config::AutoHeaderValue::None)
+            .accept(ureq::config::AutoHeaderValue::None)
+            .accept_encoding(ureq::config::AutoHeaderValue::None)
+            .timeout_connect(Some(Duration::from_secs(30)))
+            // A long non-streaming answer can take minutes before its first byte; a stream has no end in sight.
+            .timeout_recv_response(Some(Duration::from_secs(15 * 60)));
+        // Local fakes are never reached through this machine's proxy.
+        let config = if direct || !upstreams.is_empty() { config.proxy(None) } else { config };
+        let (usage_updates, updates) = std::sync::mpsc::sync_channel(1);
+        let inner = Arc::new(Self {
+            grants: Mutex::default(),
+            approvals: Mutex::default(),
+            log: Log { path: log.clone(), closed: Mutex::new(false) },
+            agent: config.build().into(),
+            upstreams,
+            stopped: AtomicBool::new(false),
+            connections: AtomicUsize::new(0),
+            pending: AtomicUsize::new(0),
+            usage: Mutex::new(
+                std::fs::read(log_path(&log))
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                    .unwrap_or_default(),
+            ),
+            usage_updates,
+        });
+        let usage_path = log_path(&log);
+        let usage_inner = Arc::downgrade(&inner);
+        let usage_writer = std::thread::Builder::new().name("atomics-relay-usage".into()).spawn(move || {
+            run_usage_writer(usage_inner, updates, |snapshot| {
+                let _ = persist_usage(&usage_path, snapshot);
+            });
+        })?;
+        Ok((inner, usage_writer))
+    }
+
     fn accept(self: Arc<Self>, listener: TcpListener) {
         for stream in listener.incoming() {
             if self.stopped.load(Ordering::Acquire) {
@@ -283,27 +424,45 @@ impl Inner {
             if !stream.peer_addr().is_ok_and(|peer| peer.ip().is_loopback()) {
                 continue;
             }
-            if self.connections.fetch_add(1, Ordering::AcqRel) >= MAX_CONNECTIONS {
-                self.connections.fetch_sub(1, Ordering::AcqRel);
+            if !take_slot(&self.pending, MAX_PRE_AUTH) {
                 continue;
             }
-            let slot = Slot(self.clone());
+            let mut slot = Slot { inner: self.clone(), authenticated: false };
             let _ = std::thread::Builder::new().name("atomics-relay-connection".into()).spawn(move || {
-                slot.0.serve(stream);
-                drop(slot);
+                let inner = slot.inner.clone();
+                inner.serve(stream, &mut slot);
             });
         }
     }
 
-    fn serve(&self, stream: TcpStream) {
-        let _ = stream.set_read_timeout(Some(IDLE));
+    fn serve(&self, stream: TcpStream, slot: &mut Slot) {
         let _ = stream.set_nodelay(true);
         let Ok(read) = stream.try_clone() else { return };
-        let mut reader = BufReader::new(read);
+        let mut reader = BufReader::new(DeadlineRead { stream: read, deadline: Some(Instant::now() + AUTH_DEADLINE) });
         let mut writer = stream;
         // Each request is read and answered in turn, until the client or the relay is done.
         loop {
-            if self.stopped.load(Ordering::Acquire) || !self.exchange(&mut reader, &mut writer).unwrap_or(false) {
+            if self.stopped.load(Ordering::Acquire) {
+                break;
+            }
+            let head = match read_head(&mut reader) {
+                Ok(Some(head)) => head,
+                Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                    let _ = refuse(&mut writer, 400, "malformed request");
+                    break;
+                }
+                _ => break,
+            };
+            let authenticated = self.matching_grant(&head).is_some();
+            if authenticated {
+                if !slot.authenticate() {
+                    let _ = refuse(&mut writer, 503, "too many authenticated connections");
+                    break;
+                }
+                reader.get_mut().deadline = None;
+                let _ = writer.set_read_timeout(Some(IDLE));
+            }
+            if !self.exchange(head, &mut reader, &mut writer).unwrap_or(false) {
                 break;
             }
         }
@@ -314,20 +473,21 @@ impl Inner {
         let _ = io::copy(&mut reader.take(1 << 20), &mut io::sink());
     }
 
+    /// Accept a bearer placeholder or its native header/query placement, with exactly one grant.
+    /// Admission and forwarding use the same matching rule so native auth gets a full connection slot.
+    fn matching_grant(&self, head: &Head) -> Option<Grant> {
+        let grants = self.grants.lock().unwrap();
+        let mut matching =
+            grants.iter().filter(|(placeholder, grant)| head.carries(placeholder, &grant.credential.authorization));
+        let first = matching.next().map(|(_, grant)| grant.clone());
+        if matching.next().is_some() { None } else { first }
+    }
+
     /// Serves one request; true when the connection can carry another.
-    fn exchange(&self, reader: &mut impl BufRead, writer: &mut impl Write) -> io::Result<bool> {
-        let head = match read_head(reader) {
-            Ok(Some(head)) => head,
-            Ok(None) => return Ok(false),
-            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
-                refuse(writer, 400, "malformed request")?;
-                return Ok(false);
-            }
-            Err(error) => return Err(error),
-        };
+    fn exchange(&self, head: Head, reader: &mut impl BufRead, writer: &mut impl Write) -> io::Result<bool> {
         let started = Instant::now();
         let route = Route::parse(&head.target);
-        let grant = head.placeholder().and_then(|placeholder| self.grants.lock().unwrap().get(placeholder).cloned());
+        let grant = self.matching_grant(&head);
         let (host, path) = route.as_ref().map_or(("-", "-"), |route| (route.host.as_str(), route.path.as_str()));
         let session = grant.as_ref().map_or("-", |grant| grant.session.as_str());
         let refused = match (&grant, &route) {
@@ -338,9 +498,10 @@ impl Inner {
                 if !credential.hosts.iter().any(|allowed| allowed.eq_ignore_ascii_case(&route.host)) {
                     Some((403, "this credential may not reach that host"))
                 } else if !match &credential.source {
-                    Source::Static(_) => {
-                        credential.rules.iter().any(|rule| rule.allows(&route.host, &head.method, &route.path))
-                    }
+                    Source::Static(_) | Source::Broker(_) => credential.github.as_ref().map_or_else(
+                        || credential.rules.iter().any(|rule| rule.allows(&route.host, &head.method, &route.path)),
+                        |scope| scope.allows(&head.method, route),
+                    ),
                     Source::Azure(_) => matches!(head.method.as_str(), "GET" | "POST" | "PUT" | "PATCH" | "DELETE"),
                 } {
                     Some((403, "this credential may not make that request"))
@@ -350,7 +511,14 @@ impl Inner {
             }
         };
         if let Some((status, reason)) = refused {
-            self.log.record(session, host, &head.method, path, status, started.elapsed());
+            self.log.record(
+                session,
+                (host, path),
+                &head.method,
+                status,
+                started.elapsed(),
+                grant.as_ref().map(|g| g.credential.label.as_str()),
+            );
             // The body stays unread, so the connection cannot carry another request.
             refuse(writer, status, reason)?;
             return Ok(false);
@@ -358,15 +526,33 @@ impl Inner {
         let (Some(grant), Some(route)) = (&grant, &route) else { unreachable!("refused above") };
         if head.header("expect").is_some_and(|value| value.eq_ignore_ascii_case("100-continue")) {
             writer.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+            writer.flush()?;
         }
         let body = match read_body(reader, &head) {
             Ok(body) => body,
             Err((status, reason)) => {
-                self.log.record(session, host, &head.method, path, status, started.elapsed());
+                self.log.record(
+                    session,
+                    (host, path),
+                    &head.method,
+                    status,
+                    started.elapsed(),
+                    Some(&grant.credential.label),
+                );
                 refuse(writer, status, reason)?;
                 return Ok(false);
             }
         };
+        if grant.credential.github.is_some()
+            && head.method == "POST"
+            && route.path.ends_with("/git-receive-pack")
+            && (head.header("content-encoding").is_some_and(|value| !value.eq_ignore_ascii_case("identity"))
+                || !self.github_push_allowed(&grant.credential, &body))
+        {
+            self.log.record(session, (host, path), &head.method, 403, started.elapsed(), Some(&grant.credential.label));
+            refuse(writer, 403, "GitHub push refused: default branch or unsupported update")?;
+            return Ok(false);
+        }
         if let Source::Azure(azure) = &grant.credential.source
             && !azure.read(host, &head.method, path)
         {
@@ -375,24 +561,38 @@ impl Inner {
             // fails closed. No token is acquired before the decision.
             let approved = self.approve_write(grant, &head, route, &body);
             if !approved || !self.grants.lock().unwrap().contains_key(head.placeholder().unwrap()) {
-                self.log.record(session, host, &head.method, path, 403, started.elapsed());
+                self.log.record(
+                    session,
+                    (host, path),
+                    &head.method,
+                    403,
+                    started.elapsed(),
+                    Some(&grant.credential.label),
+                );
                 refuse(writer, 403, "Azure write was not approved")?;
                 return Ok(false);
             }
         }
+        self.record_usage(
+            &grant.credential.label,
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+        );
+        let (status, whole) = self.forward(&head, route, &grant.credential, body, writer);
+        self.log.record(session, (host, path), &head.method, status, started.elapsed(), Some(&grant.credential.label));
+        Ok(whole && head.keep_alive())
+    }
+
+    fn record_usage(&self, label: &str, now: u64) {
         {
             let mut usage = self.usage.lock().unwrap();
-            usage.insert(
-                grant.credential.label.clone(),
-                SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
-            );
-            if let Ok(bytes) = serde_json::to_vec(&*usage) {
-                let _ = std::fs::write(log_path(&self.log.path), bytes);
+            if usage.get(label) == Some(&now) {
+                return;
             }
+            usage.insert(label.to_string(), now);
         }
-        let (status, whole) = self.forward(&head, route, &grant.credential, body, writer);
-        self.log.record(session, host, &head.method, path, status, started.elapsed());
-        Ok(whole && head.keep_alive())
+        // Coalesce notifications, not snapshots: a queued wake always saves the latest map.
+        // Request handling and usage readers never wait for filesystem I/O.
+        let _ = self.usage_updates.try_send(());
     }
 
     fn approve_write(&self, grant: &Grant, head: &Head, route: &Route, body: &[u8]) -> bool {
@@ -432,6 +632,7 @@ impl Inner {
             replies.retain(|reply| reply.strong_count() > 0);
             replies.push(Arc::downgrade(&reply));
             self.approvals.lock().unwrap().push(WriteApproval {
+                placeholder: head.placeholder().unwrap().to_string(),
                 session: grant.session.clone(),
                 request,
                 reply: reply.clone(),
@@ -454,14 +655,14 @@ impl Inner {
         body: Vec<u8>,
         writer: &mut impl Write,
     ) -> (u16, bool) {
-        let base = self.upstreams.get(&route.host).cloned().unwrap_or_else(|| format!("https://{}", route.host));
-        let query = route.query.as_deref().map(|query| format!("?{query}")).unwrap_or_default();
-        let mut request =
-            ureq::http::Request::builder().method(head.method.as_str()).uri(format!("{base}{}{query}", route.path));
-        for (name, value) in head.headers.iter().filter(|(name, _)| forwarded(name)) {
-            request = request.header(name.as_str(), value.as_str());
+        if let Source::Broker(client) = &credential.source {
+            return client.forward(head, body, writer).unwrap_or_else(|_| {
+                let _ = refuse(writer, 502, "secret broker unavailable");
+                (502, false)
+            });
         }
         let secret = match &credential.source {
+            Source::Broker(_) => unreachable!(),
             Source::Static(secret) => secret.clone(),
             Source::Azure(azure) => match azure.token(&route.host) {
                 Ok(secret) => secret,
@@ -471,18 +672,57 @@ impl Inner {
                 }
             },
         };
-        let authorization = match credential.authorization {
-            Authorization::Bearer => format!("Bearer {}", secret),
-            Authorization::ApiKey => secret.clone(),
+        let base = self.upstreams.get(&route.host).cloned().unwrap_or_else(|| format!("https://{}", route.host));
+        let query = match &credential.authorization {
+            Authorization::Query(name) => {
+                let mut query = url::form_urlencoded::Serializer::new(String::new());
+                for (key, value) in url::form_urlencoded::parse(route.query.as_deref().unwrap_or_default().as_bytes()) {
+                    if key != name.as_str() {
+                        query.append_pair(&key, &value);
+                    }
+                }
+                query.append_pair(name, &secret);
+                query.finish()
+            }
+            _ => route.query.clone().unwrap_or_default(),
         };
-        let request = request.header("authorization", authorization);
+        let query = if query.is_empty() { query } else { format!("?{query}") };
+        let mut request =
+            ureq::http::Request::builder().method(head.method.as_str()).uri(format!("{base}{}{query}", route.path));
+        for (name, value) in head.headers.iter().filter(|(name, _)| forwarded(name)) {
+            if matches!(&credential.authorization, Authorization::Header(header) if header.eq_ignore_ascii_case(name)) {
+                continue;
+            }
+            request = request.header(name.as_str(), value.as_str());
+        }
+        request = if credential.github.is_some() && route.host == "api.github.com" {
+            request.header("authorization", format!("Bearer {secret}"))
+        } else {
+            match &credential.authorization {
+                Authorization::Bearer => request.header("authorization", format!("Bearer {secret}")),
+                Authorization::ApiKey => request.header("authorization", &secret),
+                Authorization::Header(name) => request.header(name, &secret),
+                Authorization::Basic(username) => {
+                    use base64::Engine;
+                    request.header(
+                        "authorization",
+                        format!(
+                            "Basic {}",
+                            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{secret}"))
+                        ),
+                    )
+                }
+                Authorization::Query(_) => request,
+            }
+        };
+        request = request.header("accept-encoding", "identity");
         let sent = if body.is_empty() && !matches!(head.method.as_str(), "POST" | "PUT" | "PATCH") {
             request.body(()).map(|request| self.agent.run(request))
         } else {
             request.body(body).map(|request| self.agent.run(request))
         };
         let (status, reason) = match sent {
-            Ok(Ok(response)) => return stream(head, response, writer),
+            Ok(Ok(response)) => return stream(head, response, writer, &secret, &credential.authorization),
             Err(_) => (400, "a header could not be forwarded"),
             Ok(Err(_)) => (502, "the upstream host could not be reached"),
         };
@@ -493,7 +733,20 @@ impl Inner {
 
 /// Writes `response` to the client, its body as it arrives so server-sent events stream: its
 /// status, and whether it went out whole.
-fn stream(head: &Head, response: ureq::http::Response<ureq::Body>, writer: &mut impl Write) -> (u16, bool) {
+fn stream(
+    head: &Head,
+    response: ureq::http::Response<ureq::Body>,
+    writer: &mut impl Write,
+    secret: &str,
+    auth: &Authorization,
+) -> (u16, bool) {
+    // An API can echo authentication in an error, a Location header or a response body.
+    // Scrub that too, including matches split across upstream reads, without buffering SSE.
+    let mut redactor = Redactor::new(secret, auth);
+    if response.headers().get("content-encoding").is_some_and(|v| v != "identity") {
+        let _ = refuse(writer, 502, "the upstream ignored the uncompressed response requirement");
+        return (502, false);
+    }
     let status = response.status();
     let bodiless = head.method == "HEAD" || status.as_u16() == 204 || status.as_u16() == 304;
     let mut out = format!("HTTP/1.1 {} {}\r\n", status.as_u16(), status.canonical_reason().unwrap_or("")).into_bytes();
@@ -503,11 +756,16 @@ fn stream(head: &Head, response: ureq::http::Response<ureq::Body>, writer: &mut 
         }
         out.extend_from_slice(name.as_str().as_bytes());
         out.extend_from_slice(b": ");
-        out.extend_from_slice(value.as_bytes());
+        out.extend_from_slice(&redactor.whole(value.as_bytes()));
         out.extend_from_slice(b"\r\n");
     }
     if !bodiless {
         out.extend_from_slice(b"transfer-encoding: chunked\r\n");
+    }
+    if !head.keep_alive() {
+        // The broker serves one response per connection. Advertise that before a git client
+        // reuses the connection for a streamed pack that it cannot rewind after a disconnect.
+        out.extend_from_slice(b"connection: close\r\n");
     }
     out.extend_from_slice(b"\r\n");
     if writer.write_all(&out).and_then(|()| writer.flush()).is_err() {
@@ -520,21 +778,75 @@ fn stream(head: &Head, response: ureq::http::Response<ureq::Body>, writer: &mut 
     let mut buffer = vec![0; 16 * 1024];
     loop {
         let read = match upstream.read(&mut buffer) {
-            Ok(0) => break,
             Ok(read) => read,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             // Without its last chunk the client sees the response cut short, as it was.
             Err(_) => return (status.as_u16(), false),
         };
-        let mut chunk = format!("{read:x}\r\n").into_bytes();
-        chunk.extend_from_slice(&buffer[..read]);
+        let bytes = redactor.push(&buffer[..read], read == 0);
+        if bytes.is_empty() {
+            if read == 0 {
+                break;
+            }
+            continue;
+        }
+        let mut chunk = format!("{:x}\r\n", bytes.len()).into_bytes();
+        chunk.extend_from_slice(&bytes);
         chunk.extend_from_slice(b"\r\n");
         if writer.write_all(&chunk).and_then(|()| writer.flush()).is_err() {
             return (status.as_u16(), false);
         }
+        if read == 0 {
+            break;
+        }
     }
     let ended = writer.write_all(b"0\r\n\r\n").and_then(|()| writer.flush()).is_ok();
     (status.as_u16(), ended)
+}
+
+struct Redactor {
+    patterns: Vec<Vec<u8>>,
+    pending: Vec<u8>,
+}
+impl Redactor {
+    fn new(secret: &str, auth: &Authorization) -> Self {
+        use base64::Engine;
+        let mut patterns = vec![
+            secret.as_bytes().to_vec(),
+            url::form_urlencoded::byte_serialize(secret.as_bytes()).collect::<String>().into_bytes(),
+        ];
+        if let Authorization::Basic(user) = auth {
+            patterns.push(base64::engine::general_purpose::STANDARD.encode(format!("{user}:{secret}")).into_bytes());
+        }
+        patterns.retain(|p| !p.is_empty());
+        Self { patterns, pending: Vec::new() }
+    }
+    fn whole(&self, bytes: &[u8]) -> Vec<u8> {
+        let mut bytes = bytes.to_vec();
+        for pattern in &self.patterns {
+            for i in 0..=bytes.len().saturating_sub(pattern.len()) {
+                if bytes.get(i..i + pattern.len()) == Some(pattern.as_slice()) {
+                    bytes[i..i + pattern.len()].fill(b'*');
+                }
+            }
+        }
+        bytes
+    }
+    fn push(&mut self, bytes: &[u8], end: bool) -> Vec<u8> {
+        self.pending.extend_from_slice(bytes);
+        self.pending = self.whole(&self.pending);
+        let held = if end {
+            0
+        } else {
+            self.patterns
+                .iter()
+                .flat_map(|pattern| (1..pattern.len()).filter(|&n| self.pending.ends_with(&pattern[..n])))
+                .max()
+                .unwrap_or(0)
+        };
+        let keep = self.pending.split_off(self.pending.len() - held);
+        std::mem::replace(&mut self.pending, keep)
+    }
 }
 
 /// Request headers that do not go upstream: hop-by-hop ones, those ureq sets itself, and every
@@ -545,6 +857,7 @@ fn forwarded(name: &str) -> bool {
             "host",
             "content-length",
             "expect",
+            "accept-encoding",
             "authorization",
             "x-api-key",
             "proxy-authorization",
@@ -594,6 +907,28 @@ struct Head {
 }
 
 impl Head {
+    fn carries(&self, placeholder: &str, auth: &Authorization) -> bool {
+        if self.placeholder() == Some(placeholder) {
+            return true;
+        }
+        match auth {
+            Authorization::Header(name) => self.header(name).is_some_and(|value| value.trim() == placeholder),
+            Authorization::Query(name) => self.target.split_once('?').is_some_and(|(_, query)| {
+                url::form_urlencoded::parse(query.as_bytes())
+                    .any(|(key, value)| key == name.as_str() && value == placeholder)
+            }),
+            Authorization::Basic(username) => {
+                use base64::Engine;
+                self.header("authorization").and_then(|h| h.split_once(' ')).is_some_and(|(scheme, encoded)| {
+                    scheme.eq_ignore_ascii_case("basic")
+                        && base64::engine::general_purpose::STANDARD
+                            .decode(encoded)
+                            .is_ok_and(|bytes| bytes == format!("{username}:{placeholder}").as_bytes())
+                })
+            }
+            _ => false,
+        }
+    }
     fn header(&self, name: &str) -> Option<&str> {
         self.headers.iter().find(|(key, _)| key.eq_ignore_ascii_case(name)).map(|(_, value)| value.as_str())
     }
@@ -677,42 +1012,18 @@ fn read_head(reader: &mut impl BufRead) -> io::Result<Option<Head>> {
 fn read_body(reader: &mut impl BufRead, head: &Head) -> Result<Vec<u8>, (u16, &'static str)> {
     let malformed = (400, "malformed request body");
     let too_large = (413, "request body too large");
+    for header in ["transfer-encoding", "content-length"] {
+        if head.headers.iter().filter(|(name, _)| name.eq_ignore_ascii_case(header)).count() > 1 {
+            return Err(malformed);
+        }
+    }
     match (head.header("transfer-encoding"), head.header("content-length")) {
         (Some(_), Some(_)) => Err(malformed),
         (Some(encoding), None) => {
             if !encoding.eq_ignore_ascii_case("chunked") {
                 return Err((400, "unsupported transfer encoding"));
             }
-            let mut body = Vec::new();
-            loop {
-                let mut line = String::new();
-                reader.by_ref().take(1024).read_line(&mut line).map_err(|_| malformed)?;
-                let size = line.trim().split(';').next().unwrap_or_default();
-                let size = u64::from_str_radix(size.trim(), 16).map_err(|_| malformed)?;
-                if size == 0 {
-                    // Trailers, then the empty line that ends the body.
-                    loop {
-                        let mut trailer = String::new();
-                        if reader.by_ref().take(8192).read_line(&mut trailer).map_err(|_| malformed)? == 0 {
-                            return Err(malformed);
-                        }
-                        if trailer.trim().is_empty() {
-                            return Ok(body);
-                        }
-                    }
-                }
-                if body.len() as u64 + size > MAX_BODY {
-                    return Err(too_large);
-                }
-                let start = body.len();
-                body.resize(start + size as usize, 0);
-                reader.read_exact(&mut body[start..]).map_err(|_| malformed)?;
-                let mut end = [0; 2];
-                reader.read_exact(&mut end).map_err(|_| malformed)?;
-                if &end != b"\r\n" {
-                    return Err(malformed);
-                }
-            }
+            read_chunked_body(reader)
         }
         (None, Some(length)) => {
             let length: u64 = length.parse().map_err(|_| malformed)?;
@@ -724,6 +1035,109 @@ fn read_body(reader: &mut impl BufRead, head: &Head) -> Result<Vec<u8>, (u16, &'
             Ok(body)
         }
         (None, None) => Ok(Vec::new()),
+    }
+}
+
+/// Consume octets through explicit framing states. Network read boundaries have no
+/// relationship to chunk headers, CRLF, Git pkt-lines, or the terminating trailer section.
+fn read_chunked_body(reader: &mut impl BufRead) -> Result<Vec<u8>, (u16, &'static str)> {
+    enum State {
+        Size,
+        Data(usize),
+        DataEnd,
+        Trailers,
+    }
+    let mut state = State::Size;
+    let mut body = Vec::new();
+    let mut trailer_bytes = 0;
+    loop {
+        state = match state {
+            State::Size => {
+                let line = body_line(reader, 8192).map_err(|_| (400, "incomplete or oversized chunk-size line"))?;
+                if line.iter().any(|byte| (*byte < b' ' && *byte != b'\t') || *byte == 127) {
+                    return Err((400, "malformed chunk extension"));
+                }
+                let size = line.split(|byte| *byte == b';').next().unwrap_or_default();
+                let size = std::str::from_utf8(size).map_err(|_| (400, "malformed chunk size"))?.trim();
+                if size.is_empty() || !size.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    return Err((400, "malformed chunk size"));
+                }
+                let size = u64::from_str_radix(size, 16).map_err(|_| (413, "request chunk size too large"))?;
+                if size > MAX_BODY - body.len() as u64 {
+                    return Err((413, "request body too large"));
+                }
+                if size == 0 { State::Trailers } else { State::Data(size as usize) }
+            }
+            State::Data(left) => {
+                let bytes = loop {
+                    match reader.fill_buf() {
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                        other => break other.map_err(|_| (400, "incomplete chunk data"))?,
+                    }
+                };
+                if bytes.is_empty() {
+                    return Err((400, "incomplete chunk data"));
+                }
+                let count = left.min(bytes.len());
+                body.extend_from_slice(&bytes[..count]);
+                reader.consume(count);
+                if count == left { State::DataEnd } else { State::Data(left - count) }
+            }
+            State::DataEnd => {
+                let mut end = [0; 2];
+                reader.read_exact(&mut end).map_err(|_| (400, "incomplete chunk delimiter"))?;
+                if end != *b"\r\n" {
+                    return Err((400, "malformed chunk delimiter"));
+                }
+                State::Size
+            }
+            State::Trailers => {
+                let line = body_line(reader, MAX_HEAD - trailer_bytes)
+                    .map_err(|_| (400, "incomplete or oversized chunk trailers"))?;
+                trailer_bytes += line.len() + 2;
+                if line.is_empty() {
+                    return Ok(body);
+                }
+                let Some(colon) = line.iter().position(|byte| *byte == b':') else {
+                    return Err((400, "malformed chunk trailer"));
+                };
+                if colon == 0
+                    || !line[..colon]
+                        .iter()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(byte))
+                {
+                    return Err((400, "malformed chunk trailer"));
+                }
+                // Discard trailers; none can replace routing, credentials or framing headers.
+                State::Trailers
+            }
+        };
+    }
+}
+
+fn body_line(reader: &mut impl BufRead, limit: usize) -> io::Result<Vec<u8>> {
+    let mut line = Vec::new();
+    loop {
+        let bytes = match reader.fill_buf() {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            other => other?,
+        };
+        if bytes.is_empty() {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        let count = bytes.iter().position(|byte| *byte == b'\n').map_or(bytes.len(), |at| at + 1);
+        if line.len() + count > limit {
+            return Err(io::Error::other("body framing line too long"));
+        }
+        line.extend_from_slice(&bytes[..count]);
+        reader.consume(count);
+        if line.ends_with(b"\n") {
+            if !line.ends_with(b"\r\n") {
+                return Err(io::Error::other("body framing line has no CRLF"));
+            }
+            line.truncate(line.len() - 2);
+            return Ok(line);
+        }
     }
 }
 
@@ -772,15 +1186,35 @@ impl Route {
 /// `relay.log`: one line per request, never a value.
 struct Log {
     path: PathBuf,
-    write: Mutex<()>,
+    closed: Mutex<bool>,
 }
 
 impl Log {
-    fn record(&self, session: &str, host: &str, method: &str, path: &str, status: u16, elapsed: Duration) {
+    fn close(&self) {
+        *self.closed.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+    }
+
+    fn record(
+        &self,
+        session: &str,
+        destination: (&str, &str),
+        method: &str,
+        status: u16,
+        elapsed: Duration,
+        credential: Option<&str>,
+    ) {
         use std::os::unix::fs::OpenOptionsExt;
-        let line =
-            format!("{} {session} {host} {method} {path} {status} {}ms\n", utc(SystemTime::now()), elapsed.as_millis());
-        let _write = self.write.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (host, path) = destination;
+        let credential = credential.unwrap_or("-").replace(' ', "%20");
+        let line = format!(
+            "{} {session} {host} {method} {path} {status} {}ms credential={credential}\n",
+            utc(SystemTime::now()),
+            elapsed.as_millis()
+        );
+        let closed = self.closed.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *closed {
+            return;
+        }
         if std::fs::metadata(&self.path).is_ok_and(|file| file.len() > MAX_LOG) {
             let _ = std::fs::rename(&self.path, self.path.with_extension("log.1"));
         }
@@ -838,10 +1272,11 @@ impl Keychain {
             crate::setup::find_program("secret-tool")
                 .map_or_else(|| "/usr/bin/secret-tool".into(), |path| path.to_string_lossy().into_owned())
         };
-        // Only where it is asked for, and never on a Mac, whose keychain is always there.
+        // An explicit headless Linux store, or isolated debug fixtures on macOS. A macOS
+        // release always keeps credentials in the OS keychain, regardless of the environment.
         let files = atomics_core::paths::env_override("CREDENTIALS_DIR")
             .map(std::path::PathBuf::from)
-            .filter(|dir| !mac && dir.is_absolute());
+            .filter(|dir| folder_override_allowed(mac, cfg!(debug_assertions)) && dir.is_absolute());
         Self { program, mac, files }
     }
 
@@ -853,8 +1288,7 @@ impl Keychain {
     /// A folder of private files instead of an OS credential store: each item a file of mode 0600 in
     /// a folder of mode 0700, readable by this user's processes alone. For a machine that is one
     /// trust domain and has no credential store, as the VM's tools keep their sign-ins too.
-    #[cfg(test)]
-    pub fn in_folder(dir: &std::path::Path) -> Self {
+    pub(crate) fn in_folder(dir: &std::path::Path) -> Self {
         Self { program: String::new(), mac: false, files: Some(dir.to_path_buf()) }
     }
 
@@ -1100,12 +1534,19 @@ pub fn valid_claude_token(token: &str) -> bool {
 }
 
 /// A session's placeholder for the Claude subscription, and the relay's port.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Default, PartialEq)]
 pub struct Granted {
     pub port: u16,
     /// Empty when the session has Azure but no Claude subscription.
     pub placeholder: String,
     pub azure: Option<String>,
+    /// Values here are session environment only. Debug deliberately omits them.
+    pub secrets: HashMap<String, String>,
+    secret_placeholders: Vec<String>,
+}
+
+fn folder_override_allowed(mac: bool, debug: bool) -> bool {
+    !mac || debug
 }
 
 impl std::fmt::Debug for Granted {
@@ -1143,6 +1584,7 @@ pub struct Service {
     /// Where the port is kept for the next start; None for a relay that lives for one command.
     port_file: Option<PathBuf>,
     azure: Mutex<Option<Arc<azure::Azure>>>,
+    broker: Option<broker::Client>,
 }
 
 impl std::fmt::Debug for Service {
@@ -1162,6 +1604,7 @@ impl Service {
             upstreams: HashMap::new(),
             port_file,
             azure: Mutex::default(),
+            broker: broker::Client::configured(),
         }
     }
 
@@ -1205,7 +1648,7 @@ impl Service {
         }
         let relay = relay.as_ref().unwrap();
         let placeholder = relay.grant(session, Arc::new(credential));
-        Ok(Some(Granted { port: relay.port(), placeholder, azure: None }))
+        Ok(Some(Granted { port: relay.port(), placeholder, ..Granted::default() }))
     }
 
     /// Every sandboxed agent can use Azure, independently of its model credentials. Discovery
@@ -1233,10 +1676,102 @@ impl Service {
         }
         let relay = relay.as_ref().unwrap();
         let azure = Some(relay.grant(session, Arc::new(Credential::azure(broker.clone()))));
-        Ok(Some(Granted {
-            azure,
-            ..granted.unwrap_or_else(|| Granted { port: relay.port(), placeholder: String::new(), azure: None })
-        }))
+        Ok(Some(Granted { azure, ..granted.unwrap_or_else(|| Granted { port: relay.port(), ..Granted::default() }) }))
+    }
+
+    /// Add all general secrets in scope. This runs on the session preparation worker.
+    pub fn grant_secrets(
+        &self,
+        session: &str,
+        workspace: Option<&str>,
+        project: Option<&str>,
+        sandbox: bool,
+        granted: Option<Granted>,
+    ) -> Result<Option<Granted>> {
+        let _edit = self.edits.lock().unwrap();
+        let secrets = if let Some(client) = &self.broker {
+            client
+                .list()?
+                .into_iter()
+                .filter(|spec| spec.scope.includes(workspace, project))
+                .map(|spec| {
+                    let value = if spec.host.is_none() { client.expose(&spec.name, session)? } else { String::new() };
+                    Ok((spec, zeroize::Zeroizing::new(value)))
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            crate::credentials::Store::new(self.keychain.clone()).secret_values()?
+        };
+        let mut granted = granted;
+        let mut issued = Granted::default();
+        let result = (|| -> Result<()> {
+            for (spec, value) in secrets
+                .into_iter()
+                .filter(|(s, _)| s.scope.includes(workspace, project) && !s.name.starts_with(github::ACCOUNT_PREFIX))
+            {
+                let grant = granted.get_or_insert_with(Granted::default);
+                if let Some(host) = &spec.host {
+                    let mut relay = self.relay.lock().unwrap();
+                    if relay.is_none() {
+                        *relay = Some(self.start()?);
+                    }
+                    let relay = relay.as_ref().unwrap();
+                    grant.port = relay.port();
+                    let mut credential = Credential::secret(&spec, value.to_string());
+                    if let Some(client) = &self.broker {
+                        credential.source = Source::Broker(client.clone());
+                    }
+                    let placeholder = relay.grant(session, Arc::new(credential));
+                    issued.secret_placeholders.push(placeholder.clone());
+                    if let Some(client) = &self.broker
+                        && let Err(error) = client.grant(&spec.name, session, &placeholder)
+                    {
+                        relay.revoke(&placeholder);
+                        return Err(error);
+                    }
+                    grant.secret_placeholders.push(placeholder.clone());
+                    grant.secrets.insert(spec.name.clone(), placeholder);
+                    let address = if sandbox { atomics_core::isolation::RELAY_HOST } else { "127.0.0.1" };
+                    let url = format!("http://{address}:{}/{host}", relay.port());
+                    grant.secrets.insert(format!("{}_RELAY_URL", spec.name), url.clone());
+                    match spec.name.as_str() {
+                        "OPENAI_API_KEY" => {
+                            grant.secrets.insert("OPENAI_BASE_URL".into(), format!("{url}/v1"));
+                        }
+                        "ANTHROPIC_API_KEY" | "CLAUDE_CODE_OAUTH_TOKEN" => {
+                            grant.secrets.insert("ANTHROPIC_BASE_URL".into(), url);
+                        }
+                        _ => {}
+                    }
+                } else {
+                    grant.secrets.insert(spec.name, value.to_string());
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.revoke(&issued);
+            return Err(error);
+        }
+        if let Some(grant) = granted.as_mut()
+            && (grant.secrets.contains_key("ANTHROPIC_API_KEY")
+                || grant.secrets.contains_key("CLAUDE_CODE_OAUTH_TOKEN"))
+        {
+            // An explicit scoped model secret wins over the legacy subscription route. In
+            // particular, never serialize an exposed value into Claude's --settings argument.
+            if let Some(relay) = self.relay.lock().unwrap().as_ref() {
+                relay.revoke(&grant.placeholder);
+            }
+            grant.placeholder.clear();
+            if grant.azure.is_none() && grant.secret_placeholders.is_empty() {
+                grant.port = 0;
+            }
+            grant.secrets.entry("ANTHROPIC_BASE_URL".into()).or_insert_with(|| "https://api.anthropic.com".into());
+            for name in ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN"] {
+                grant.secrets.entry(name.into()).or_default();
+            }
+        }
+        Ok(granted)
     }
 
     pub fn revoke_azure(&self) {
@@ -1253,12 +1788,31 @@ impl Service {
             .unwrap_or_default()
     }
 
-    /// Serializes Settings changes with grant preparation. Even an unverified write revokes
-    /// the old grants, since the keychain may have accepted the new value before reporting failure.
+    /// Serialize Settings changes with grant preparation; failed edits keep existing grants.
     pub fn edit(&self, label: &str, update: impl FnOnce(&crate::credentials::Store) -> Result<()>) -> Result<()> {
+        self.edit_with_revocation(label, false, update)
+    }
+
+    /// A removal may reach the keychain before its acknowledgement fails; revoke on either result.
+    pub fn edit_removal(
+        &self,
+        label: &str,
+        remove: impl FnOnce(&crate::credentials::Store) -> Result<()>,
+    ) -> Result<()> {
+        self.edit_with_revocation(label, true, remove)
+    }
+
+    fn edit_with_revocation(
+        &self,
+        label: &str,
+        revoke_on_error: bool,
+        update: impl FnOnce(&crate::credentials::Store) -> Result<()>,
+    ) -> Result<()> {
         let _edit = self.edits.lock().unwrap();
         let result = update(&crate::credentials::Store::new(self.keychain.clone()));
-        self.revoke_credential(label);
+        if revoke_on_error || result.is_ok() {
+            self.revoke_credential(label);
+        }
         result
     }
 
@@ -1286,6 +1840,21 @@ impl Service {
                 .unwrap_or_default();
             (used.get(label).copied(), Vec::new())
         }
+    }
+
+    /// General secrets' last use comes from the request audit log, including its rotated tail.
+    pub fn secret_last_use(&self, name: &str) -> Option<String> {
+        let marker = format!("credential=secret:{name}");
+        ["relay.log.1", "relay.log"]
+            .into_iter()
+            .filter_map(|file| std::fs::read_to_string(self.home.join(file)).ok())
+            .flat_map(|text| {
+                text.lines()
+                    .filter(|line| line.split_whitespace().last() == Some(marker.as_str()))
+                    .filter_map(|line| line.split_whitespace().next().map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .max()
     }
 
     /// Replacing/removing a credential immediately revokes existing placeholders for it.
@@ -1319,6 +1888,9 @@ impl Service {
             if let Some(azure) = &granted.azure {
                 relay.revoke(azure);
             }
+            for placeholder in &granted.secret_placeholders {
+                relay.revoke(placeholder);
+            }
         }
     }
 
@@ -1326,14 +1898,15 @@ impl Service {
         let file = self.port_file.as_ref();
         let last = file.and_then(|file| std::fs::read_to_string(file).ok()).and_then(|text| text.trim().parse().ok());
         let log = self.home.join("relay.log");
-        std::fs::create_dir_all(&self.home)?;
+        atomics_core::store::private_dir(&self.home)?;
         let relay = Relay::start(last.unwrap_or(0), log.clone(), self.upstreams.clone())
             .or_else(|_| Relay::start(0, log, self.upstreams.clone()))
             .context("starting ATOMICS's credential relay")?;
         if let Some(file) = file
             && last != Some(relay.port())
         {
-            std::fs::write(file, relay.port().to_string()).with_context(|| format!("writing {}", file.display()))?;
+            atomics_core::store::write_private(file, relay.port().to_string().as_bytes())
+                .with_context(|| format!("writing {}", file.display()))?;
         }
         Ok(relay)
     }
@@ -1469,10 +2042,318 @@ pub(crate) mod fake {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn macos_release_ignores_the_directory_override_while_linux_remains_explicit() {
+        assert!(!super::folder_override_allowed(true, false), "macOS release must use the OS keychain");
+        assert!(super::folder_override_allowed(true, true), "macOS debug fixtures may isolate their store");
+        assert!(super::folder_override_allowed(false, false));
+        assert!(super::folder_override_allowed(false, true));
+    }
+    #[test]
+    fn secret_reflections_in_upstream_headers_and_streamed_bodies_do_not_reach_the_session() {
+        use super::*;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let canary = "canary-reflected-71+9";
+        let worker = std::thread::spawn(move || {
+            let (mut connection, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(connection.try_clone().unwrap());
+            let head = read_head(&mut reader).unwrap().unwrap();
+            assert!(head.target.contains("key=canary-reflected-71%2B9"));
+            let body = format!("before {canary} after");
+            write!(connection, "HTTP/1.1 302 Found\r\nLocation: https://api.example.com/next?key=canary-reflected-71%2B9\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+            connection.write_all(&body.as_bytes()[..15]).unwrap();
+            connection.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(10));
+            connection.write_all(&body.as_bytes()[15..]).unwrap();
+        });
+        let dir = crate::test_support::tempdir().unwrap();
+        let relay = Relay::start(
+            0,
+            dir.path().join("relay.log"),
+            HashMap::from([("api.example.com".into(), format!("http://{address}"))]),
+        )
+        .unwrap();
+        let placeholder = relay.grant(
+            "s1",
+            Arc::new(Credential::stored(
+                "secret:EXAMPLE_KEY".into(),
+                canary.into(),
+                vec!["api.example.com".into()],
+                vec![Rule::new("api.example.com", "GET", "/v1")],
+                Authorization::Query("key".into()),
+            )),
+        );
+        let (head, mut body) = fake::send(
+            relay.port(),
+            &format!("GET /api.example.com/v1?key={placeholder} HTTP/1.1\r\nConnection: close\r\n\r\n"),
+        );
+        assert!(head.starts_with("HTTP/1.1 302 "));
+        let mut answer = head;
+        loop {
+            let chunk = fake::chunk(&mut body);
+            if chunk.is_empty() {
+                break;
+            }
+            answer.push_str(&chunk);
+        }
+        assert!(!answer.contains(canary) && !answer.contains("canary-reflected-71%2B9"));
+        assert!(answer.contains("before ") && answer.contains(" after"));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn general_secret_auth_styles_enforce_host_method_and_path_and_redact_reflections() {
+        use atomics_core::secrets::{Auth, Secret};
+        use base64::Engine;
+        for auth in [
+            Auth::Bearer,
+            Auth::Header("x-example-key".into()),
+            Auth::Basic("api".into()),
+            Auth::Query("api_key".into()),
+        ] {
+            let upstream = super::fake::start();
+            let (dir, keychain, store) = crate::credentials::tests::machine(false);
+            let canary = "canary-private-78+9";
+            store
+                .add_secret(
+                    Secret {
+                        name: "EXAMPLE_KEY".into(),
+                        host: Some("api.example.com".into()),
+                        auth: auth.clone(),
+                        methods: vec!["GET".into()],
+                        path_prefix: Some("/v1/models".into()),
+                        ..Default::default()
+                    },
+                    canary,
+                )
+                .unwrap();
+            let relay = super::Service::with_upstreams(
+                dir.path().join("state"),
+                keychain,
+                std::collections::HashMap::from([("api.example.com".into(), upstream.url.clone())]),
+            );
+            let granted = relay.grant_secrets("s1", None, None, false, None).unwrap().unwrap();
+            let placeholder = &granted.secrets["EXAMPLE_KEY"];
+            let (header, query) = match &auth {
+                Auth::Bearer => (format!("Authorization: Bearer {placeholder}\r\n"), String::new()),
+                Auth::Header(name) => (format!("{name}: {placeholder}\r\n"), String::new()),
+                Auth::Basic(user) => (
+                    format!(
+                        "Authorization: Basic {}\r\n",
+                        base64::engine::general_purpose::STANDARD.encode(format!("{user}:{placeholder}"))
+                    ),
+                    String::new(),
+                ),
+                Auth::Query(name) => (String::new(), format!("?{name}={placeholder}&page=1")),
+            };
+            let request = |method: &str, host: &str, path: &str| {
+                format!("{method} /{host}{path}{query} HTTP/1.1\r\n{header}Connection: close\r\n\r\n")
+            };
+            for (method, host, path) in [
+                ("GET", "other.example.com", "/v1/models"),
+                ("POST", "api.example.com", "/v1/models"),
+                ("GET", "api.example.com", "/v1/private"),
+            ] {
+                assert!(super::fake::send(granted.port, &request(method, host, path)).0.starts_with("HTTP/1.1 403 "));
+            }
+            let (head, mut body) = super::fake::send(granted.port, &request("GET", "api.example.com", "/v1/models"));
+            assert!(head.starts_with("HTTP/1.1 200 "));
+            while !super::fake::chunk(&mut body).is_empty() {}
+            let seen = upstream.seen.lock().unwrap()[0].clone();
+            match auth {
+                Auth::Bearer => assert_eq!(seen.header("authorization"), [format!("Bearer {canary}")]),
+                Auth::Header(name) => assert_eq!(seen.header(&name), [canary]),
+                Auth::Basic(user) => assert_eq!(
+                    seen.header("authorization"),
+                    [format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("{user}:{canary}")))]
+                ),
+                Auth::Query(_) => {
+                    assert!(seen.line.contains("api_key=canary-private-78%2B9"));
+                    assert!(!seen.line.contains(placeholder));
+                }
+            }
+            let log = std::fs::read_to_string(dir.path().join("state/relay.log")).unwrap();
+            assert!(!log.contains(canary) && !log.contains(placeholder) && !log.contains("page=1"));
+            assert!(relay.secret_last_use("EXAMPLE_KEY").is_some());
+            relay.revoke(&granted);
+            assert!(
+                super::fake::send(granted.port, &request("GET", "api.example.com", "/v1/models"))
+                    .0
+                    .starts_with("HTTP/1.1 401 ")
+            );
+        }
+        let mut redactor = super::Redactor::new("canary-private", &super::Authorization::Bearer);
+        assert_eq!(redactor.push(b"first event\n\n", false), b"first event\n\n");
+        let mut out = redactor.push(b"echo canary-pr", false);
+        out.extend(redactor.push(b"ivate done", true));
+        assert_eq!(out, b"echo ************** done");
+    }
+
     use super::fake::{chunk, send};
     use super::*;
 
     const TOKEN: &str = "sk-ant-oat01-REAL-subscription-token";
+
+    #[test]
+    fn audit_p7_revoking_one_placeholder_keeps_its_sessions_other_write_approval() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let relay = Relay::start(0, dir.path().join("relay.log"), HashMap::new()).unwrap();
+        let credential = Arc::new(Credential::claude(TOKEN.into()));
+        let first = relay.grant("same-session", credential.clone());
+        let second = relay.grant("same-session", credential);
+        let wait_for_write = |key: &str| {
+            let head = read_head(
+                &mut format!("PUT /{ANTHROPIC}/v1/models HTTP/1.1\r\nauthorization: Bearer {key}\r\n\r\n").as_bytes(),
+            )
+            .unwrap()
+            .unwrap();
+            let grant = relay.inner.grants.lock().unwrap()[key].clone();
+            let inner = relay.inner.clone();
+            std::thread::spawn(move || inner.approve_write(&grant, &head, &Route::parse(&head.target).unwrap(), b"{}"))
+        };
+        let (one, two) = (wait_for_write(&first), wait_for_write(&second));
+        let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(5));
+        while relay.inner.approvals.lock().unwrap().len() != 2 {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        relay.revoke(&first);
+        assert!(!one.join().unwrap());
+        let other = relay.inner.approvals.lock().unwrap().pop().expect("the second grant still awaits approval");
+        assert_eq!(other.placeholder, second);
+        assert!(other.reply.answer(atomics_core::hook::HookReply {
+            stdout: Some(atomics_core::approvals::Decision::Allow.output(None))
+        }));
+        assert!(two.join().unwrap());
+    }
+
+    #[test]
+    fn audit_p7_idle_and_trickling_clients_have_separate_short_auth_slots() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let upstream = fake::start();
+        let relay = relay(&upstream, dir.path().join("relay.log"));
+        let peers: Vec<_> =
+            (0..MAX_PRE_AUTH).map(|_| TcpStream::connect((Ipv4Addr::LOCALHOST, relay.port())).unwrap()).collect();
+        let mut trickle = peers[0].try_clone().unwrap();
+        let trickler = std::thread::spawn(move || {
+            while trickle.write_all(b"G").is_ok() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(8));
+        while relay.inner.pending.load(Ordering::Acquire) < MAX_PRE_AUTH {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(relay.inner.connections.load(Ordering::Acquire), 0);
+        while relay.inner.pending.load(Ordering::Acquire) != 0 {
+            assert!(Instant::now() < deadline, "a trickling peer held its auth slot beyond the absolute deadline");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        trickler.join().unwrap();
+        let placeholder = relay.grant("worker", Arc::new(Credential::claude(TOKEN.into())));
+        let (head, mut reader) = send(
+            relay.port(),
+            &format!(
+                "GET /{ANTHROPIC}/v1/models HTTP/1.1\r\nauthorization: Bearer {placeholder}\r\nconnection: close\r\n\r\n"
+            ),
+        );
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        while !chunk(&mut reader).is_empty() {}
+        drop(reader);
+        drop(peers);
+        drop(relay); // Finish usage writes and close the audit log before TempDir removes it.
+    }
+
+    #[test]
+    fn review_p7_a_late_connection_handler_cannot_recreate_the_log_after_shutdown() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let path = dir.path().join("relay.log");
+        let relay = Relay::start(0, path.clone(), HashMap::new()).unwrap();
+        relay.inner.log.record("worker", (ANTHROPIC, "/v1/models"), "GET", 200, Duration::ZERO, None);
+        let inner = relay.inner.clone();
+        let (release, resumed) = std::sync::mpsc::channel();
+        let handler = std::thread::spawn(move || {
+            resumed.recv().unwrap();
+            inner.log.record("worker", (ANTHROPIC, "/v1/models"), "GET", 200, Duration::ZERO, None);
+        });
+        drop(relay);
+        std::fs::remove_file(&path).unwrap();
+        release.send(()).unwrap();
+        handler.join().unwrap();
+        assert!(!path.exists(), "a handler recreated the audit log during directory teardown");
+    }
+
+    #[test]
+    fn audit_p7_usage_snapshots_replace_atomically_and_skip_unchanged_timestamps() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = crate::test_support::tempdir().unwrap();
+        let relay = Relay::start(0, dir.path().join("relay.log"), HashMap::new()).unwrap();
+        let path = log_path(&relay.inner.log.path);
+        let wait_for_entries = |count| {
+            let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(5));
+            loop {
+                let saved = std::fs::read(&path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<HashMap<String, u64>>(&bytes).ok());
+                if saved.is_some_and(|saved| saved.len() == count) {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "usage was not published");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        relay.inner.record_usage("credential", 1);
+        wait_for_entries(1);
+        let mut old = std::fs::File::open(&path).unwrap();
+        let inode = old.metadata().unwrap().ino();
+        relay.inner.record_usage("credential", 1);
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        relay.inner.record_usage("other", 2);
+        wait_for_entries(2);
+        let mut original = String::new();
+        old.read_to_string(&mut original).unwrap();
+        assert_eq!(serde_json::from_str::<HashMap<String, u64>>(&original).unwrap().len(), 1);
+        let latest: HashMap<String, u64> = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(latest.len(), 2);
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn review_p7_usage_persistence_releases_the_map_lock_and_keeps_updates_during_a_slow_write() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let relay = Relay::start(0, dir.path().join("relay.log"), HashMap::new()).unwrap();
+        let (wake, updates) = std::sync::mpsc::sync_channel(1);
+        let (entered, writing) = std::sync::mpsc::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let saved = writes.clone();
+        let inner = Arc::downgrade(&relay.inner);
+        let worker = std::thread::spawn(move || {
+            let mut first = true;
+            run_usage_writer(inner, updates, |snapshot| {
+                if first {
+                    first = false;
+                    entered.send(()).unwrap();
+                    resume.recv().unwrap();
+                }
+                saved.lock().unwrap().push(snapshot.clone());
+            });
+        });
+        relay.inner.usage.lock().unwrap().insert("first".into(), 1);
+        wake.send(()).unwrap();
+        writing.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(5))).unwrap();
+        relay.inner.usage.try_lock().expect("disk I/O must not hold the usage map").insert("second".into(), 2);
+        wake.send(()).unwrap();
+        drop(wake);
+        release.send(()).unwrap();
+        worker.join().unwrap();
+        let snapshots = writes.lock().unwrap();
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].len(), 1);
+        assert_eq!(snapshots[1].len(), 2);
+    }
 
     fn relay(upstream: &fake::Upstream, log: PathBuf) -> Relay {
         Relay::start(0, log, HashMap::from([(ANTHROPIC.to_string(), upstream.url.clone())])).unwrap()
@@ -1683,6 +2564,151 @@ mod tests {
         assert_eq!(upstream.seen.lock().unwrap().len(), 1);
     }
 
+    struct SplitInput<'a> {
+        bytes: &'a [u8],
+        max: usize,
+        seed: u64,
+        calls: usize,
+    }
+
+    impl Read for SplitInput<'_> {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            self.calls += 1;
+            if self.calls.is_multiple_of(17) {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            self.seed = self.seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let limit = if self.max == 1 { 1 } else { (self.seed as usize % self.max) + 1 };
+            let count = self.bytes.len().min(out.len()).min(limit);
+            out[..count].copy_from_slice(&self.bytes[..count]);
+            self.bytes = &self.bytes[count..];
+            Ok(count)
+        }
+    }
+
+    #[test]
+    fn chunked_requests_are_independent_of_reads_and_leave_the_next_request_intact() {
+        let body: Vec<u8> = (0..131_103).map(|index| (index % 251) as u8).collect();
+        let mut wire = b"POST /github.com/group/repo.git/git-receive-pack HTTP/1.1\r\nContent-Length: 4\r\n\r\n0000POST /github.com/group/repo.git/git-receive-pack HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        let mut at = 0;
+        for (index, size) in [1, 15, 16, 65_536, 1, 31, 65_503].into_iter().enumerate() {
+            let count = size.min(body.len() - at);
+            let size = if index % 2 == 0 { format!("{count:08X}") } else { format!("{count:08x}") };
+            wire.extend_from_slice(format!("{size};ignored=\"value;with;semicolons\"\r\n").as_bytes());
+            wire.extend_from_slice(&body[at..at + count]);
+            wire.extend_from_slice(b"\r\n");
+            at += count;
+        }
+        assert_eq!(at, body.len());
+        wire.extend_from_slice(b"000;done=yes\r\nX-Checksum: ignored\r\nX-Other: trailer\r\n\r\nGET /github.com/next HTTP/1.0\r\nConnection: Keep-Alive\r\n\r\n");
+        for max in [1, 2, 7, 1024, 65_536] {
+            for seed in [1, 37, 987654321] {
+                let input = SplitInput { bytes: &wire, max, seed, calls: 0 };
+                let mut reader = BufReader::with_capacity(8192, input);
+                let probe = read_head(&mut reader).unwrap().unwrap();
+                assert_eq!(read_body(&mut reader, &probe).unwrap(), b"0000");
+                let head = read_head(&mut reader).unwrap().unwrap();
+                assert_eq!(read_body(&mut reader, &head).unwrap(), body, "max={max} seed={seed}");
+                let next = read_head(&mut reader).unwrap().unwrap();
+                assert_eq!(next.target, "/github.com/next");
+                assert!(next.keep_alive());
+            }
+        }
+    }
+
+    #[test]
+    fn chunked_truncation_bad_delimiters_and_ambiguous_framing_are_refused() {
+        for body in
+            [b"1\r\nx\r\n0\r\n".as_slice(), b"2\r\nx", b"1\r\nxX\n0\r\n\r\n", b"xyz\r\n", b"0\r\nnot-a-trailer\r\n\r\n"]
+        {
+            let mut reader = body;
+            assert!(read_chunked_body(&mut reader).is_err(), "{body:?}");
+        }
+        let mut reader =
+            b"POST /github.com/repo HTTP/1.1\r\nContent-Length: 4\r\nContent-Length: 0\r\n\r\n0000".as_slice();
+        let head = read_head(&mut reader).unwrap().unwrap();
+        assert!(read_body(&mut reader, &head).is_err());
+        assert_eq!(read_chunked_body(&mut b"ffffffffffffffff\r\n".as_slice()).unwrap_err().0, 413);
+    }
+
+    #[test]
+    fn git_request_shapes_preserve_bodies_and_keep_receive_pack_validation() {
+        let upstream = fake::start();
+        let dir = crate::test_support::tempdir().unwrap();
+        let relay =
+            Relay::start(0, dir.path().join("relay.log"), HashMap::from([("github.com".into(), upstream.url.clone())]))
+                .unwrap();
+        let scope = github::Scope { repository: "group/repo".into(), pulls: false, refuse_default_branch: false };
+        let placeholder = relay.grant("worker", Arc::new(Credential::github("account", TOKEN.into(), scope).unwrap()));
+        let command = format!("{} {} refs/heads/task\0report-status\n", "0".repeat(40), "1".repeat(40));
+        let valid = format!("{:04x}{command}0000PACKpayload", command.len() + 4).into_bytes();
+        // A valid gzip stream containing an empty payload; upload-pack is forwarded opaquely.
+        let gzip = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+        for (path, encoding, body, allowed) in [
+            ("git-receive-pack", "", b"0000".as_slice(), true),
+            ("git-receive-pack", "", valid.as_slice(), true),
+            ("git-upload-pack", "Content-Encoding: gzip\r\n", gzip.as_slice(), true),
+            ("git-receive-pack", "Content-Encoding: gzip\r\n", gzip.as_slice(), false),
+            ("git-receive-pack", "", b"malformed pkt-line", false),
+        ] {
+            let chunked = if body == b"0000" {
+                b"Content-Length: 4\r\n\r\n0000".to_vec()
+            } else {
+                let mut bytes =
+                    format!("Transfer-Encoding: Chunked\r\nTrailer: X-Checksum\r\n\r\n{:08X};test=yes\r\n", body.len())
+                        .into_bytes();
+                bytes.extend_from_slice(body);
+                bytes.extend_from_slice(b"\r\n0\r\nX-Checksum: ignored\r\n\r\n");
+                bytes
+            };
+            let mut wire = format!("POST /github.com/group/repo.git/{path} HTTP/1.0\r\nConnection: Keep-Alive\r\nAuthorization: Bearer {placeholder}\r\n{encoding}").into_bytes();
+            wire.extend(chunked);
+            let mut reader = BufReader::new(SplitInput { bytes: &wire, max: 1, seed: 1, calls: 0 });
+            let head = read_head(&mut reader).unwrap().unwrap();
+            let before = upstream.seen.lock().unwrap().len();
+            let mut response = Vec::new();
+            if allowed {
+                upstream.release.send(()).unwrap();
+            }
+            relay.inner.exchange(head, &mut reader, &mut response).unwrap();
+            if allowed {
+                assert!(response.starts_with(b"HTTP/1.1 200"), "{}", String::from_utf8_lossy(&response));
+                let seen = upstream.seen.lock().unwrap();
+                assert_eq!(seen[before].body, body);
+                if !encoding.is_empty() {
+                    assert_eq!(seen[before].header("content-encoding"), ["gzip"]);
+                }
+            } else {
+                assert!(response.starts_with(b"HTTP/1.1 403"));
+                assert_eq!(upstream.seen.lock().unwrap().len(), before);
+            }
+        }
+    }
+
+    #[test]
+    fn continue_response_arrives_before_the_client_sends_a_body() {
+        let upstream = fake::start();
+        let dir = crate::test_support::tempdir().unwrap();
+        let relay = relay(&upstream, dir.path().join("relay.log"));
+        let placeholder = relay.grant("worker", Arc::new(Credential::claude(TOKEN.into())));
+        let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, relay.port())).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        write!(stream, "POST /{ANTHROPIC}/v1/messages HTTP/1.1\r\nx-api-key: {placeholder}\r\nExpect: 100-continue\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(line, "HTTP/1.1 100 Continue\r\n");
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(line, "\r\n");
+        reader.get_mut().write_all(b"3\r\nhey\r\n0\r\n\r\n").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(line, "HTTP/1.1 200 OK\r\n");
+        upstream.release.send(()).unwrap();
+        assert_eq!(upstream.seen.lock().unwrap()[0].body, b"hey");
+    }
+
     #[test]
     fn an_unreachable_upstream_is_a_502() {
         let dir = crate::test_support::tempdir().unwrap();
@@ -1749,7 +2775,15 @@ mod tests {
             std::fs::write(dir.path().join("keychain-value"), format!("{TOKEN}\n")).unwrap();
             let granted = service.grant_claude("atomics-s1").unwrap().unwrap();
             assert_eq!(std::fs::read_to_string(home.join("relay-port")).unwrap(), granted.port.to_string());
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let port_snapshot = std::fs::File::open(home.join("relay-port")).unwrap();
+            assert_eq!(port_snapshot.metadata().unwrap().permissions().mode() & 0o777, 0o600);
             let other = service.grant_claude("atomics-s2").unwrap().unwrap();
+            assert_eq!(
+                std::fs::metadata(home.join("relay-port")).unwrap().ino(),
+                port_snapshot.metadata().unwrap().ino(),
+                "granting another placeholder keeps the published port file"
+            );
             assert_eq!(other.port, granted.port);
             assert_ne!(other.placeholder, granted.placeholder);
             let models = |granted: &Granted| {
@@ -1806,6 +2840,60 @@ mod tests {
             [(TOKEN, true), ("sk-ant-oat01-", false), ("sk-ant-api03-key", false), ("sk-ant-oat01-a b", false)]
         {
             assert_eq!(valid_claude_token(token), valid, "{token}");
+        }
+    }
+    #[test]
+    fn failed_secret_add_keeps_live_grants_and_successful_edit_revokes_them() {
+        use atomics_core::secrets::Secret;
+        let dir = crate::test_support::tempdir().unwrap();
+        let keychain = Keychain::in_folder(&dir.path().join("keychain"));
+        let store = crate::credentials::Store::local(keychain.clone());
+        let spec = Secret { name: "KEY".into(), host: Some("api.example.com".into()), ..Default::default() };
+        store.add_secret(spec.clone(), "original-canary").unwrap();
+        let mut service = Service::transient(dir.path().join("relay"), keychain);
+        service.broker = None;
+        let grant = service.grant_secrets("session", None, None, false, None).unwrap().unwrap();
+        let placeholder = grant.secrets["KEY"].clone();
+        assert!(service.edit("secret:KEY", |store| store.add_secret(spec, "replacement-canary")).is_err());
+        assert_eq!(service.live_grants(), 1);
+        assert!(
+            service.relay.lock().unwrap().as_ref().unwrap().inner.grants.lock().unwrap().contains_key(&placeholder)
+        );
+        assert_eq!(store.secret_values().unwrap()[0].1.as_str(), "original-canary");
+        service.edit("secret:KEY", |store| store.remove_secret("KEY")).unwrap();
+        assert_eq!(service.live_grants(), 0);
+    }
+    #[test]
+    fn failed_secret_removal_revokes_grants_even_after_the_keychain_changed() {
+        use atomics_core::secrets::Secret;
+        for removed in [false, true] {
+            let dir = crate::test_support::tempdir().unwrap();
+            let keychain = Keychain::in_folder(&dir.path().join("keychain"));
+            let store = crate::credentials::Store::local(keychain.clone());
+            for name in ["KEY", "OTHER_KEY"] {
+                store
+                    .add_secret(
+                        Secret { name: name.into(), host: Some("api.example.com".into()), ..Default::default() },
+                        "canary",
+                    )
+                    .unwrap();
+            }
+            let mut service = Service::transient(dir.path().join("relay"), keychain);
+            service.broker = None;
+            let grant = service.grant_secrets("session", None, None, false, None).unwrap().unwrap();
+            let result = service.edit_removal("secret:KEY", |store| {
+                if removed {
+                    store.remove_secret("KEY")?;
+                }
+                anyhow::bail!("keychain removal acknowledgement failed")
+            });
+            assert!(result.is_err());
+            assert_eq!(service.live_grants(), 1);
+            let relay = service.relay.lock().unwrap();
+            let grants = relay.as_ref().unwrap().inner.grants.lock().unwrap();
+            assert!(!grants.contains_key(&grant.secrets["KEY"]));
+            assert!(grants.contains_key(&grant.secrets["OTHER_KEY"]));
+            assert_eq!(store.secrets().unwrap().iter().any(|s| s.name == "KEY"), !removed);
         }
     }
 }

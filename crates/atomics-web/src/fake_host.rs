@@ -816,7 +816,16 @@ impl FakeHost {
             }
             PlanAction::Archive => plan.status = PlanStatus::Archived,
             PlanAction::Complete => plan.status = PlanStatus::Completed,
-            PlanAction::Set { .. } => return refused(ErrorCode::Rejected, "not in this fake"),
+            PlanAction::Notebook { id, pinned, delete } => {
+                let mut notebook = atomics_core::plan::Plan { notebook: plan.notebook.clone(), ..Default::default() };
+                if let Err(error) = notebook.curate_note(id, pinned, delete) {
+                    return refused(ErrorCode::Rejected, &error);
+                }
+                plan.notebook = notebook.notebook;
+            }
+            PlanAction::Set { .. } | PlanAction::PublishDecision { .. } => {
+                return refused(ErrorCode::Rejected, "not in this fake");
+            }
         }
         let _ = self.event(|cursor| Message::PlanUpsert { cursor, plan });
         Outcome::done(serde_json::Value::Null)
@@ -870,6 +879,7 @@ impl FakeHost {
             SessionAction::Start { agent, folder, .. } => {
                 let id = format!("new-{}", self.head());
                 let session = SessionInfo {
+                    status_hint: None,
                     previews: Vec::new(),
                     id: id.clone(),
                     title: "new session".into(),
@@ -948,6 +958,7 @@ impl FakeHost {
                     file: path,
                     running: true,
                     inlay_hints: true,
+                    error: None,
                 });
                 let _ = self.publish_host(host);
                 return Outcome::done(serde_json::Value::Null);
@@ -1265,6 +1276,7 @@ pub fn board() -> Board {
     use atomics_core::projection::{DiffFileSummary, TaskLink};
     use atomics_core::session::AgentStatus;
     let session = |id: &str, title: &str, chief: bool| SessionInfo {
+        status_hint: None,
         previews: Vec::new(),
         id: id.into(),
         agent: "claude".into(),
@@ -1278,10 +1290,12 @@ pub fn board() -> Board {
         pending_approvals: u32::from(!chief),
     };
     let task = |id: &str, status, depends_on: &[&str]| TaskInfo {
+        pull_request: None,
         id: id.into(),
         title: format!("Task {id}"),
         status,
         agent: "claude".into(),
+        reviewer_reason: None,
         depends_on: depends_on.iter().map(|d| d.to_string()).collect(),
         session: (id == "t1").then(|| "s1".into()),
         branch: (id == "t1").then(|| "atomics/t1".into()),
@@ -1303,6 +1317,9 @@ pub fn board() -> Board {
     Board {
         sessions: vec![session("chief", "Chief", true), session("s1", "Fix the parser", false)],
         plans: vec![PlanInfo {
+            publish: None,
+            pull_request: None,
+            notebook: Vec::new(),
             ticket_tree: None,
             id: "p1".into(),
             status: PlanStatus::Open,
@@ -1357,6 +1374,9 @@ pub fn file_diff(path: &str, lines: u32) -> FileDiff {
 /// A finished plan with no tasks.
 pub fn closed_plan(id: &str, status: atomics_core::plan::PlanStatus, goal: &str) -> PlanInfo {
     PlanInfo {
+        publish: None,
+        pull_request: None,
+        notebook: Vec::new(),
         ticket_tree: None,
         id: id.into(),
         status,
@@ -1377,6 +1397,7 @@ pub fn working() -> FakeHost {
     use atomics_core::session::AgentStatus;
     let mut host = self::host();
     let branched = |id: &str, status| TaskInfo {
+        pull_request: None,
         id: id.into(),
         title: format!("Task {id}"),
         status,
@@ -1385,6 +1406,7 @@ pub fn working() -> FakeHost {
         session: None,
         branch: Some(format!("atomics/{id}")),
         integrated: None,
+        reviewer_reason: None,
         additions: 0,
         deletions: 0,
         report: None,
@@ -1498,6 +1520,15 @@ pub fn management() -> FakeHost {
                 "keys.quick_open": {"value":"cmd+p","source":"default"},
                 "keys.toggle_diff": {"value":"cmd+d","source":"default"},
                 "agents": {"value":[{"name":"claude","command":["claude"],"kind":"claude"}],"source":"default"},
+                "chief.prefer": {"value":["codex", "claude"],"source":"default"},
+                "chief.command": {"value":["claude"],"source":"default"},
+                "chief.args": {"value":["--model", "custom-chief"],"source":"main"},
+                "chief.dock": {"value":"floating","source":"default"},
+                "chief.autostart": {"value":false,"source":"default"},
+                "chief.heartbeat_secs": {"value":300,"source":"default"},
+                "chief.wake_secs": {"value":180,"source":"default"},
+                "chief.min_left_percent.codex": {"value":10.0,"source":"host"},
+                "chief.min_left_percent.claude": {"value":20.0,"source":"host"},
                 "isolation.mode": {"value":"sandbox","source":"default"},
                 "isolation.sandbox.azure.enabled": {"value":false,"source":"default"},
                 "voice.api_key": {"value":"***","source":"main"},
@@ -1604,6 +1635,7 @@ pub fn panels_host() -> FakeHost {
     let mut host = host();
     host.trace.session = Some("chief".into());
     host.trace.entries.push(atomics_core::trace::TraceEntry {
+        session_id: String::new(),
         seq: 1,
         at: 0,
         phase: atomics_core::trace::TracePhase::Post,
@@ -1632,6 +1664,7 @@ pub fn panels_host() -> FakeHost {
         running: true,
         file: Some("src/a.rs".into()),
         inlay_hints: true,
+        error: None,
     });
     for (key, repo) in [
         ("pull:example/repo#7", "example/repo"),
@@ -1647,6 +1680,9 @@ pub fn panels_host() -> FakeHost {
         host.board.diffs.push(DiffSummary::new(key, 1, &diff));
         host.files.insert((key.into(), "src/pull.rs".into()), file);
         host.board.host.pull_requests.push(PullRequestInfo {
+            group: Some(atomics_core::github::Group::Assigned),
+            author: Some("contoso".into()),
+            draft: Some(false),
             key: key.into(),
             repo: repo.into(),
             number: if repo.starts_with("dev.azure") { 8 } else { 7 },
@@ -1690,8 +1726,8 @@ pub fn resources() -> atomics_core::projection::ResourceInfo {
     use atomics_core::usage::{Usage, Window};
     let now = 1_800_000_000;
     let account = |session, weekly| Usage {
-        session: Some(Window { remaining: session, resets_at: now + 8040 }),
-        weekly: Some(Window { remaining: weekly, resets_at: now + 86400 }),
+        session: Some(Window { left_percent: session, resets_at: now + 8040 }),
+        weekly: Some(Window { left_percent: weekly, resets_at: now + 86400 }),
         observed_at: now - 120,
         plan: None,
     };
@@ -1704,6 +1740,7 @@ pub fn resources() -> atomics_core::projection::ResourceInfo {
         compiler_jobs: Some(6),
         test: SlotInfo { slots: 2, running: 1, waiting: 3 },
         qa: SlotInfo { slots: 1, running: 0, waiting: 1 },
+        disk: vec![],
     }
 }
 

@@ -35,6 +35,7 @@ impl State {
             self.resume_record(record);
             changed = true;
         }
+        changed |= self.poll_build_caches();
         if std::mem::take(&mut self.chief_autostart) && !self.sessions.iter().any(|s| s.chief) {
             match self.start_chief(None) {
                 Ok(_) => self.chief_open = true,
@@ -76,12 +77,19 @@ impl State {
         let pending = std::mem::take(&mut self.pending_codex);
         for (launch, ready) in pending {
             if self.find(&launch.id).is_none() {
+                if let Some(granted) = &launch.relay {
+                    self.relay.revoke(granted);
+                }
                 continue;
             }
             if let Some(supported) = ready.get().copied() {
                 changed = true;
                 let id = launch.id.clone();
+                let granted = launch.relay.clone();
                 if let Err(error) = self.launch_codex(launch, supported) {
+                    if let Some(granted) = &granted {
+                        self.relay.revoke(granted);
+                    }
                     if let Some(index) = self.find(&id) {
                         self.sessions[index].status = AgentStatus::Exited;
                         self.sessions[index].last_message = Some(error.clone());
@@ -107,10 +115,10 @@ impl State {
             if !self.sessions.iter().any(|s| s.id == launch.id) {
                 // Closed while its sandbox was made: leave the sandbox stopped for reuse or cleanup,
                 // or remove a scratch session's, which nothing resumes. Its placeholder goes either way.
-                if let Ok((_, Some(granted), _)) = &result {
+                if let Ok((_, Some(granted), _, _)) = &result {
                     self.relay.revoke(granted);
                 }
-                if let (Ok(_), AgentRuntime::Sandbox(sandboxed)) = (&result, &launch.runtime) {
+                if let AgentRuntime::Sandbox(sandboxed) = &launch.runtime {
                     match paths::scratch_of(&launch.cwd) {
                         Some(_) => self.remove_sandbox(sandboxed.name.clone()),
                         None => self.stop_sandbox(sandboxed.name.clone()),
@@ -138,13 +146,21 @@ impl State {
                 }
                 result => result.map_err(String::from),
             };
-            let launched = result.and_then(|(guard, granted, needed)| {
+            let launched = result.and_then(|(guard, granted, needed, cache_env)| {
+                let mut launch = launch;
+                if let AgentRuntime::Sandbox(sandbox) = &mut launch.runtime {
+                    sandbox.cache_env = cache_env;
+                }
                 let (guard, alerts) = guard.unzip();
                 if let Some(alerts) = alerts.filter(|alerts| !alerts.is_empty()) {
-                    self.ref_alert(&id, alerts.join("\n"));
+                    self.ref_alert_at(
+                        &id,
+                        alerts.join("\n"),
+                        guard.as_ref().and_then(|guard| guard.alert_generation()),
+                    );
                 }
                 let relay = granted.clone();
-                let launched = self.launch_agent(AgentLaunch { ref_guard: guard, relay, ..launch }, None);
+                let launched = self.launch_prepared(AgentLaunch { ref_guard: guard, relay, ..launch });
                 if launched.is_err()
                     && let Some(granted) = granted
                 {
@@ -175,6 +191,23 @@ impl State {
         }
         while let Ok((branch, result, launch, common)) = self.worktree_rx.try_recv() {
             changed = true;
+            if let Ok(prepared) = &result {
+                let identity = self.project_identity(&prepared.path);
+                if prepared.identity.as_ref() != Some(&identity) && self.tickets.workspace_identity_error.is_none() {
+                    let tx = self.worktree_tx.clone();
+                    self.identity_updates.run(move || {
+                        let result = result.and_then(|mut prepared| {
+                            atomics_core::identity::sync_worktree_identity(&prepared.path, &identity)
+                                .map_err(|e| format!("{e:#}"))?;
+                            prepared.identity = Some(identity);
+                            Ok(prepared)
+                        });
+                        let _ = tx.send((branch, result, launch, common));
+                    });
+                    continue;
+                }
+                self.identity_worktrees.insert(prepared.path.clone());
+            }
             self.worktrees_at = None;
             if let Some(i) = self.creating.iter().position(|(repo, b, _)| *repo == common && *b == branch) {
                 self.creating.remove(i);
@@ -428,7 +461,18 @@ impl State {
                 let _ = tx.send(
                     repos
                         .into_iter()
-                        .map(|repo| (repo.clone(), git::list_worktrees(&repo).unwrap_or_default()))
+                        .map(|repo| {
+                            let value = |key| {
+                                git::git(&repo, &["config", "--get", key]).ok().map(|value| value.trim().to_string())
+                            };
+                            let identity = atomics_core::identity::Identity {
+                                name: value("user.name"),
+                                email: value("user.email"),
+                                forbidden_words: None,
+                                github: None,
+                            };
+                            (repo.clone(), git::list_worktrees(&repo).unwrap_or_default(), identity)
+                        })
                         .collect(),
                 );
             });
@@ -442,7 +486,9 @@ impl State {
             changed = true;
             self.worktrees.clear();
             self.worktree_project.clear();
-            for (repo, worktrees) in listed {
+            self.git_identities.clear();
+            for (repo, worktrees, identity) in listed {
+                self.git_identities.insert(repo.clone(), identity);
                 // One listed from files that do not lead back to it is never opened.
                 for worktree in worktrees.into_iter().filter(|worktree| worktree.trusted) {
                     self.worktree_project.insert(worktree.path.clone(), repo.clone());
@@ -491,7 +537,7 @@ impl State {
         for root in &roots {
             self.resolve_project_root(root);
         }
-        let bases: HashMap<_, _> = roots.into_iter().map(|root| (root.clone(), self.project_base_ref(&root))).collect();
+        let bases: HashMap<_, _> = roots.into_iter().map(|root| (root.clone(), self.diff_base_ref(&root))).collect();
         for (root, state) in &mut self.diffs {
             // The diff on screen follows every change; the others at most every few seconds,
             // with only some of their untracked content.
@@ -541,6 +587,10 @@ impl State {
                     }
                 }
                 let github_changed = config.github != self.config.github;
+                if config.chief.dock != self.config.chief.dock {
+                    self.store.chief_dock = None;
+                    self.save_chief_preferences();
+                }
                 self.config = config;
                 self.config_error = None;
                 self.config_problems = github::config_problems(&self.config);
@@ -653,6 +703,7 @@ impl State {
                         s.id.clone(),
                         s.title.clone(),
                         s.status,
+                        s.first_run_hint,
                         s.approvals.len(),
                         s.approval_hold,
                         s.held.len(),
@@ -704,6 +755,7 @@ impl State {
                     last_prompt: None,
                     last_message: None,
                     hooks_active: false,
+                    first_run_hint: None,
                     activity: heartbeat::Activity::default(),
                     approvals: Vec::new(),
                     allowed: Vec::new(),
@@ -714,6 +766,7 @@ impl State {
                     chief: false,
                     pending: None,
                     sandbox: None,
+                    cache_env: Vec::new(),
                     relay: None,
                     screen_busy: false,
                     busy_absent_since: None,
@@ -744,8 +797,12 @@ impl State {
             leave_to_agent(message.approval_reply);
             return;
         }
+        if main && event.name == "SessionStart" && session.claude_id.as_deref() != Some(&event.session_id) {
+            self.traces.remove(&session.id);
+        }
         session.claude_id = Some(event.session_id.clone());
         session.hooks_active = true;
+        session.first_run_hint = None;
         session.activity.last_event = atomics_core::store::now();
         if event.name == "PermissionRequest" {
             let request = ApprovalRequest { warning: stash_warning, ..ApprovalRequest::from_event(&event) };
@@ -828,7 +885,8 @@ impl State {
         }
         session.activity.observe(session.status);
         let root = session.root();
-        let (id, title) = (session.id.clone(), session.title.clone());
+        let id = session.id.clone();
+        let title = self.session_title(&self.sessions[index]);
         self.capture_chief_trace(index, &event);
         if main && self.sessions[index].chief && matches!(event.name.as_str(), "UserPromptSubmit" | "Stop") {
             self.tickets.remote.chief_turn = Some(Instant::now());
@@ -858,6 +916,8 @@ impl State {
         }
         if event.name == "PermissionRequest" {
             self.last_status.insert(id.clone(), AgentStatus::NeedsInput);
+            let at = atomics_core::store::now();
+            let approval = self.sessions[index].approvals.last().map(|p| self.approval_json(index, p, at));
             self.event_seq += 1;
             self.events.push(StatusEvent {
                 seq: self.event_seq,
@@ -871,9 +931,9 @@ impl State {
                 session: id,
                 title,
                 status: AgentStatus::NeedsInput,
-                at: atomics_core::store::now(),
+                at,
                 report: None,
-                approval: self.sessions[index].approvals.last().map(PendingApproval::json),
+                approval,
                 findings: None,
                 config: None,
                 ticket: None,

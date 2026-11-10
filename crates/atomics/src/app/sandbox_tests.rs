@@ -1,8 +1,115 @@
 //! Agents in Docker Sandboxes, against the fake `sbx` in tests/fixtures.
-use super::tests::{repository, request, with_app};
+use super::tests::{persist_config, repository, request, with_app};
 use super::*;
 use crate::sandbox::fake;
 use atomics_core::isolation::IsolationMode;
+
+#[test]
+fn scoped_secrets_reach_bare_and_new_docker_sessions_without_values_in_arguments() {
+    with_app(
+        "app::sandbox_tests::scoped_secrets_reach_bare_and_new_docker_sessions_without_values_in_arguments",
+        |app, ctx| {
+            use atomics_core::secrets::{Scope as SecretScope, Secret};
+            let (_dir, repo) = repository();
+            let tree = worktree(&repo, "secret-session");
+            app.runtime.open_project(&repo);
+            let bin = crate::test_support::tempdir().unwrap();
+            app.runtime.sbx = fake::install(bin.path()).display().to_string();
+            let (_keychain_dir, keychain, store) = crate::credentials::tests::machine(cfg!(target_os = "macos"));
+            let upstream = crate::relay::fake::start();
+            app.runtime.relay = Arc::new(crate::relay::Service::with_upstreams(
+                paths::atomics_home(),
+                keychain,
+                HashMap::from([("api.example.com".into(), upstream.url.clone())]),
+            ));
+            let scope = SecretScope::Project(repo.to_string_lossy().into_owned());
+            let relayed = format!("canary-relayed-{}", uuid::Uuid::new_v4().simple());
+            let exposed = format!("canary-exposed-{}", uuid::Uuid::new_v4().simple());
+            let out_of_scope = format!("canary-other-{}", uuid::Uuid::new_v4().simple());
+            store
+                .add_secret(
+                    Secret {
+                        name: "EXAMPLE_KEY".into(),
+                        host: Some("api.example.com".into()),
+                        scope: scope.clone(),
+                        ..Default::default()
+                    },
+                    &relayed,
+                )
+                .unwrap();
+            store.add_secret(Secret { name: "EXPOSED_KEY".into(), scope, ..Default::default() }, &exposed).unwrap();
+            store
+                .add_secret(
+                    Secret {
+                        name: "OTHER_WORKSPACE_KEY".into(),
+                        scope: SecretScope::Workspace("other".into()),
+                        ..Default::default()
+                    },
+                    &out_of_scope,
+                )
+                .unwrap();
+            let out = bin.path().join("session-environment");
+            let script = format!("env > {0}.tmp; mv {0}.tmp {0}; exec sleep 600", out.display());
+            let mut agent = probe("secret-probe", &out, Some(IsolationMode::Bare));
+            agent.command = vec!["/bin/sh".into(), "-c".into(), script.clone()];
+            app.runtime.config.agents.push(agent);
+            for sandbox in [false, true] {
+                if sandbox {
+                    std::fs::remove_file(&out).unwrap();
+                    std::fs::write(bin.path().join("agent"), &script).unwrap();
+                    app.runtime.config.agents.last_mut().unwrap().kind = AgentKind::Shell;
+                    app.runtime.config.agents.last_mut().unwrap().isolation = Some(IsolationMode::Sandbox);
+                }
+                let id = app.runtime.start("secret-probe", tree.clone(), None, vec![], None).unwrap();
+                tick_until(app, ctx, "secret environment to reach the session", |_| out.exists());
+                let env = std::fs::read_to_string(&out).unwrap();
+                assert!(env.lines().any(|line| line == format!("EXPOSED_KEY={exposed}")));
+                assert!(env.lines().any(|line| line.starts_with("EXAMPLE_KEY=atomics-")));
+                assert!(!env.contains(&relayed) && !env.contains("OTHER_WORKSPACE_KEY"));
+                let granted = app.runtime.sessions[app.runtime.find(&id).unwrap()].relay.clone().unwrap();
+                let request = format!(
+                    "GET /api.example.com/v1/models HTTP/1.1\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+                    granted.secrets["EXAMPLE_KEY"]
+                );
+                assert!(crate::relay::fake::send(granted.port, &request).0.starts_with("HTTP/1.1 200 "));
+                if sandbox {
+                    let runs = fake::calls_to(bin.path(), &["run"]);
+                    let run = runs.last().unwrap();
+                    assert!(run.windows(2).any(|pair| pair == ["--env", "EXPOSED_KEY"]));
+                    assert!(run.windows(2).any(|pair| pair == ["--env", "EXAMPLE_KEY"]));
+                    let calls = format!("{:?}", fake::calls(bin.path()));
+                    for canary in [relayed.as_str(), exposed.as_str(), out_of_scope.as_str()] {
+                        assert!(!calls.contains(canary));
+                    }
+                    assert!(fake::calls(bin.path()).iter().any(|call| call
+                        == &atomics_core::isolation::relay_allow_args(&format!("atomics-{id}"), granted.port)));
+                    let creates = fake::calls_to(bin.path(), &["create"]);
+                    assert!(!creates.last().unwrap().iter().any(|arg| arg.contains("EXPOSED_KEY")));
+                }
+                app.runtime.close(&id);
+                tick_until(app, ctx, "secret grant revocation", |app| app.runtime.relay.live_grants() == 0);
+            }
+            finish_agents(app, ctx);
+            let mut folders = vec![paths::atomics_home()];
+            while let Some(folder) = folders.pop() {
+                for entry in std::fs::read_dir(folder).unwrap().flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        folders.push(path);
+                    } else if path.is_file() {
+                        let bytes = std::fs::read(path).unwrap();
+                        for canary in [&relayed, &exposed, &out_of_scope] {
+                            assert!(
+                                !bytes.windows(canary.len()).any(|part| part == canary.as_bytes()),
+                                "canary escaped into host state"
+                            );
+                        }
+                    }
+                }
+            }
+        },
+    );
+}
 
 #[test]
 fn startup_cleanup_does_not_block_the_runtime_while_sbx_is_waiting() {
@@ -21,11 +128,14 @@ fn startup_cleanup_does_not_block_the_runtime_while_sbx_is_waiting() {
             cwd: repo,
             config: Default::default(),
             warm: Vec::new(),
+            cache: Default::default(),
             pins: paths::git_pins_dir(),
             exe: "/atomics".into(),
             socket: paths::socket_path(),
             briefs: None,
             relay: None,
+            secret_workspace: None,
+            github_account: None,
         };
         crate::sandbox::prepare(&job).unwrap();
         let gate = bin.path().join("wait-ls");
@@ -314,18 +424,26 @@ fn azure_placeholders_reach_claude_and_codex_and_are_revoked_on_close() {
         let (_dir, repo) = repository();
         let bin = crate::test_support::tempdir().unwrap();
         app.runtime.sbx = fake::install(bin.path()).display().to_string();
+        // This test checks revocation on close; an immediately exiting fake revokes on exit first.
+        std::fs::write(bin.path().join("run-waits"), "").unwrap();
         app.runtime.config.isolation.mode = IsolationMode::Sandbox;
         let config = atomics_core::isolation::AzureConfig { enabled: true, ..Default::default() };
+        persist_config(app.runtime);
         let program = crate::relay::azure::tests::fake(bin.path());
-        app.runtime.relay = Arc::new(
-            crate::relay::Service::new(paths::atomics_home(), app.runtime.relay.keychain().clone())
-                .with_azure(crate::relay::azure::Azure::new(program, config.clone())),
-        );
+        let keychain = app.runtime.relay.keychain().clone();
+        let relay = || {
+            Arc::new(
+                crate::relay::Service::new(paths::atomics_home(), keychain.clone())
+                    .with_azure(crate::relay::azure::Azure::new(program.clone(), config.clone())),
+            )
+        };
+        app.runtime.relay = relay();
         assert!(!app.runtime.config.isolation.sandbox.azure.enabled);
         let off = app.runtime.start("codex", repo.clone(), None, vec![], None).unwrap();
         let off_name = format!("atomics-{off}");
-        tick_until(app, ctx, "the Azure-disabled sandbox to attach", |_| {
-            fake::calls_to(bin.path(), &["run"]).iter().any(|run| run.contains(&off_name))
+        tick_until(app, ctx, "the Azure-disabled sandbox to attach", |app| {
+            app.runtime.find(&off).is_some_and(|index| app.runtime.sessions[index].terminal.is_some())
+                && fake::calls_to(bin.path(), &["run"]).iter().any(|run| run.contains(&off_name))
         });
         for verb in ["create", "run"] {
             let call = fake::calls_to(bin.path(), &[verb]).into_iter().find(|call| call.contains(&off_name)).unwrap();
@@ -335,16 +453,31 @@ fn azure_placeholders_reach_claude_and_codex_and_are_revoked_on_close() {
         assert!(app.runtime.sessions[app.runtime.find(&off).unwrap()].relay.is_none());
         app.runtime.close(&off);
         app.runtime.config.isolation.sandbox.azure = config.clone();
+        persist_config(app.runtime);
+        // A config apply in the disabled phase can revoke its broker. Start the enabled phase
+        // with a fresh fixture after the enabled settings have reached disk and been applied.
+        app.runtime.relay = relay();
+        let saved = std::fs::read_to_string(&app.runtime.config_path).unwrap();
         for agent in ["claude", "codex"] {
             let id = app.runtime.start(agent, repo.clone(), None, vec![], None).unwrap();
+            // Exercise a real file reload during preparation instead of racing the one-second poll.
+            std::fs::write(&app.runtime.config_path, format!("# reload while {agent} starts\n{saved}")).unwrap();
+            app.runtime.reload_config();
             let name = format!("atomics-{id}");
-            tick_until(app, ctx, "the Azure-enabled sandbox to attach", |_| {
-                fake::calls_to(bin.path(), &["run"]).iter().any(|run| run.contains(&name))
+            tick_until(app, ctx, "the Azure-enabled sandbox to attach", |app| {
+                app.runtime.find(&id).is_some_and(|index| app.runtime.sessions[index].terminal.is_some())
+                    && fake::calls_to(bin.path(), &["run"]).iter().any(|run| run.contains(&name))
             });
             let index = app.runtime.find(&id).unwrap();
-            let granted = app.runtime.sessions[index].relay.clone().unwrap();
+            assert_ne!(app.runtime.sessions[index].status, AgentStatus::Exited, "{agent} must stay live until close");
+            let granted = app.runtime.sessions[index]
+                .relay
+                .as_ref()
+                .unwrap_or_else(|| panic!("Azure-enabled {agent} session must retain its relay grant after reload"));
             assert!(granted.placeholder.is_empty());
-            let placeholder = granted.azure.as_ref().unwrap();
+            let placeholder = granted.azure.as_ref().unwrap_or_else(|| {
+                panic!("Azure-enabled {agent} session must receive an Azure placeholder after reload")
+            });
             assert!(placeholder.starts_with("atomics-azure-"));
             for verb in ["create", "run"] {
                 let call = fake::calls_to(bin.path(), &[verb]).into_iter().find(|call| call.contains(&name)).unwrap();
@@ -437,6 +570,7 @@ fn subscription(app: &mut Desktop<'_>, bin: &Path) -> crate::relay::fake::Upstre
     crate::test_support::copy_program(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keychain"), &keychain);
     std::fs::write(bin.join("keychain-value"), SUBSCRIPTION).unwrap();
     let upstream = crate::relay::fake::start();
+    persist_config(app.runtime);
     app.runtime.relay = Arc::new(crate::relay::Service::with_upstreams(
         paths::atomics_home(),
         crate::relay::Keychain::at(&keychain, cfg!(target_os = "macos")),
@@ -873,8 +1007,8 @@ fn bare_agents_never_touch_sbx_and_a_repository_can_only_tighten() {
         for (mode, agent) in [(IsolationMode::Bare, "probe"), (IsolationMode::Sandbox, "bare-probe")] {
             app.runtime.config.isolation.mode = mode;
             let id = app.runtime.start(agent, worktree.clone(), None, vec![], None).unwrap();
-            assert!(app.runtime.sessions[app.runtime.find(&id).unwrap()].terminal.is_some(), "{agent} starts at once");
             tick_until(app, ctx, "the bare probe", |_| out.exists());
+            assert!(app.runtime.sessions[app.runtime.find(&id).unwrap()].terminal.is_some());
             std::fs::remove_file(&out).unwrap();
             assert!(app.runtime.sessions[app.runtime.find(&id).unwrap()].sandbox.is_none());
         }
@@ -942,11 +1076,14 @@ fn the_cleanup_dialog_removes_a_worktrees_sandbox_and_chosen_orphans() {
                 cwd: path.clone(),
                 config: Default::default(),
                 warm: Vec::new(),
+                cache: Default::default(),
                 exe: "/atomics".into(),
                 socket: "/atomics.sock".into(),
                 briefs: None,
                 pins: paths::git_pins_dir(),
                 relay: None,
+                secret_workspace: None,
+                github_account: None,
             };
             crate::sandbox::prepare(&job).unwrap();
             worktrees.push(path);
@@ -1100,9 +1237,9 @@ fn the_chief_always_runs_on_this_machine() {
         app.runtime.config.chief.args = Vec::new();
 
         let id = app.runtime.start_chief(None).unwrap();
-        let chief = &app.runtime.sessions[app.runtime.find(&id).unwrap()];
-        assert!(chief.chief && chief.terminal.is_some() && chief.sandbox.is_none(), "the chief starts bare at once");
         tick_until(app, ctx, "the chief", |_| out.exists());
+        let chief = &app.runtime.sessions[app.runtime.find(&id).unwrap()];
+        assert!(chief.chief && chief.terminal.is_some() && chief.sandbox.is_none(), "the chief starts bare");
         assert_eq!(Path::new(std::fs::read_to_string(&out).unwrap().trim()), repo.canonicalize().unwrap());
 
         // Resumed after a restart, it stays on this machine too.
@@ -1121,8 +1258,8 @@ fn the_chief_always_runs_on_this_machine() {
         app.runtime.sessions.clear();
         std::fs::remove_file(&out).unwrap();
         app.runtime.resume_record(record);
-        assert!(app.runtime.sessions[0].chief && app.runtime.sessions[0].terminal.is_some());
         tick_until(app, ctx, "the resumed chief", |_| out.exists());
+        assert!(app.runtime.sessions[0].chief && app.runtime.sessions[0].terminal.is_some());
         assert!(fake::calls(bin.path()).is_empty(), "the chief never calls sbx");
         app.runtime.sessions.clear();
     });
@@ -1264,8 +1401,8 @@ gd=$(git rev-parse --path-format=absolute --git-dir)
 common=$(git rev-parse --path-format=absolute --git-common-dir)
 evil="$gd/evil"
 mkdir -p "$evil/hooks"
-ln -s "$common/objects" "$evil/objects"
-ln -s "$common/refs" "$evil/refs"
+cp -R "$common/objects" "$evil/objects"
+cp -R "$common/refs" "$evil/refs"
 cp "$gd/HEAD" "$evil/HEAD"
 printf '#!/bin/sh\n: > %s\n' '{marker}' > "$evil/hooks/reference-transaction"
 chmod +x "$evil/hooks/reference-transaction"
@@ -1278,13 +1415,22 @@ echo new > a.txt
             std::fs::write(bin.path().join("agent"), script).unwrap();
             let id = app.runtime.start("codex", folder.clone(), None, vec![], Some("Do the task".into())).unwrap();
             let name = format!("atomics-{id}");
-            // Ref recovery on exit restores the moved branch with git's update-ref.
+            // A redirected .git file is pinned; a changed on-disk commondir must stop Git's
+            // refs backend, which can ignore GIT_COMMON_DIR when it writes.
+            let expected = if redirect == "git-file" { "Restored refs/heads/other" } else { "Ref guard check FAILED" };
             tick_until(app, ctx, "ref recovery on agent exit", |app| {
-                app.runtime.sessions.iter().any(|s| {
-                    s.id == id && s.last_message.as_deref().is_some_and(|m| m.contains("Restored refs/heads/other"))
-                })
+                app.runtime
+                    .sessions
+                    .iter()
+                    .any(|s| s.id == id && s.last_message.as_deref().is_some_and(|m| m.contains(expected)))
             });
-            assert_eq!(git::git(&repo, &["rev-parse", "other"]).unwrap(), original, "{redirect}");
+            if redirect == "git-file" {
+                assert_eq!(git::git(&repo, &["rev-parse", "refs/heads/other"]).unwrap(), original);
+            } else {
+                let error = git::git(&folder, &["status"]).unwrap_err();
+                assert!(format!("{error:#}").contains("commondir"));
+                assert!(crate::ref_guard::RefGuard::open(&folder, dir.path().join("another-snapshot.json")).is_err());
+            }
             let record: git::GitPins =
                 serde_json::from_slice(&std::fs::read(paths::git_pins_dir().join(format!("{name}.json"))).unwrap())
                     .unwrap();
@@ -1292,10 +1438,10 @@ echo new > a.txt
             assert_eq!(record.common_dir, Some(repo.join(".git").canonicalize().unwrap()));
 
             // The diff ATOMICS polls, and what worktree cleanup asks of git.
-            let diff = git::diff_against_base(&folder, "main", None).unwrap();
-            assert_eq!(diff.files.iter().map(|f| f.path()).collect::<Vec<_>>(), ["a.txt"], "{redirect}");
-            let health = git::worktree_health(&repo, "main").unwrap();
-            if redirect != "main-commondir" {
+            if redirect == "git-file" {
+                let diff = git::diff_against_base(&folder, "main", None).unwrap();
+                assert_eq!(diff.files.iter().map(|f| f.path()).collect::<Vec<_>>(), ["a.txt"], "{redirect}");
+                let health = git::worktree_health(&repo, "main").unwrap();
                 assert_eq!(health[0].dirty_files, 1, "{redirect}: {health:?}");
                 assert!(git::remove_worktree(&repo, &folder, None, false).is_err(), "{redirect}: uncommitted a.txt");
             }
@@ -1306,6 +1452,18 @@ echo new > a.txt
             // Without its record, git follows the planted files to that hook.
             let raw = std::process::Command::new("git").arg("-C").arg(&folder).args(["status"]).output().unwrap();
             assert!(raw.status.success() && marker.exists(), "{redirect}: the planted config must be live");
+            std::fs::remove_file(&marker).unwrap();
+            if redirect == "worktree-commondir" {
+                std::fs::write(
+                    record.git_dir.as_ref().unwrap().join("commondir"),
+                    record.common_dir.as_ref().unwrap().display().to_string(),
+                )
+                .unwrap();
+            } else if redirect == "main-commondir" {
+                std::fs::remove_file(record.common_dir.as_ref().unwrap().join("commondir")).unwrap();
+            }
+            git::git(&folder, &["status"]).unwrap();
+            assert!(!marker.exists());
             app.runtime.sessions.clear();
         }
     });

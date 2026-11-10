@@ -1,4 +1,4 @@
-use atomics_ui::window_keys;
+use atomics_ui::{Backend, window_keys};
 
 use super::*;
 
@@ -37,6 +37,11 @@ impl Desktop<'_> {
     }
 
     pub(super) fn shortcuts(&mut self, ctx: &egui::Context) {
+        // A list opened from the shared top bar owns its navigation and closing chord. Otherwise
+        // the host keeps its native GitHub controls and their existing shortcut.
+        if self.client.ui.pull_requests.open {
+            self.draw(|backend, client| window_keys::pull_requests(ctx, backend, client));
+        }
         atomics_ui::trace_lane::shortcuts(ctx, &mut self.client.ui, &self.runtime.trace_data());
         let keys = self.runtime.config.keys.clone();
         let pressed = |text: &str| shortcut(text).is_some_and(|s| ctx.input_mut(|i| i.consume_shortcut(&s)));
@@ -192,8 +197,9 @@ impl Desktop<'_> {
         if pressed(&keys.next_attention) {
             let start = self.runtime.active_index().map(|i| i + 1).unwrap_or(0);
             let n = self.runtime.sessions.len();
-            if let Some(i) =
-                (0..n).map(|k| (start + k) % n).find(|&i| self.runtime.sessions[i].status.needs_attention())
+            if let Some(i) = (0..n)
+                .map(|k| (start + k) % n)
+                .find(|&i| self.runtime.backend().session_row(i).is_some_and(|row| row.needs_user()))
             {
                 let session = self.runtime.sessions[i].id.clone();
                 self.send(Command::Activate { session, open_diff: true });
@@ -248,6 +254,7 @@ impl Desktop<'_> {
         if let Some(open) = self.client.show_settings.take() {
             self.client.ui.management.settings = open;
         }
+        self.draw(|backend, client| atomics_ui::pull_request::dialog(ctx, backend, client));
         self.draw(|backend, client| atomics_ui::management::dialogs(ctx, backend, client));
         self.cleanup_dialog(ctx);
 
@@ -494,7 +501,8 @@ impl Desktop<'_> {
     /// Opens the rename dialog for a session.
     pub(super) fn begin_rename(&mut self, id: &str) {
         if let Some(session) = self.runtime.sessions.iter().find(|s| s.id == id && !s.chief) {
-            self.client.rename = Some(Rename { session: id.into(), title: session.title.clone(), focus: true });
+            self.client.rename =
+                Some(Rename { session: id.into(), title: self.runtime.session_title(session), focus: true });
         }
     }
 }
@@ -571,6 +579,38 @@ mod tests {
         .drop_without_applying_deltas();
         app.runtime.drain_actions();
         remaining
+    }
+
+    #[test]
+    fn p5_review_next_attention_uses_the_displayed_status() {
+        with_app("app::input::tests::p5_review_next_attention_uses_the_displayed_status", |app, ctx| {
+            let root = app.runtime.launch_dir.clone();
+            app.runtime.config.keys.next_attention = "f6".into();
+            app.runtime.sessions = vec![
+                session("finished", AgentKind::Generic, AgentStatus::Done, &root),
+                session("working", AgentKind::Generic, AgentStatus::Working, &root),
+                session("blocked", AgentKind::Generic, AgentStatus::Idle, &root),
+            ];
+            app.runtime.plans = vec![Plan {
+                id: "plan".into(),
+                tasks: [
+                    ("finished", TaskStatus::Done),
+                    ("working", TaskStatus::Blocked),
+                    ("blocked", TaskStatus::Blocked),
+                ]
+                .into_iter()
+                .map(|(id, status)| Task { id: id.into(), status, session: Some(id.into()), ..Default::default() })
+                .collect(),
+                ..Default::default()
+            }];
+            app.runtime.active = Some("finished".into());
+            route(app, ctx, egui::Id::NULL.with("attention"), vec![key(Key::F6, Key::F6, egui::Modifiers::NONE)]);
+            assert_eq!(app.runtime.active.as_deref(), Some("blocked"), "skip finished and actively working agents");
+            app.runtime.plans[0].tasks[2].status = TaskStatus::Done;
+            route(app, ctx, egui::Id::NULL.with("attention"), vec![key(Key::F6, Key::F6, egui::Modifiers::NONE)]);
+            assert_eq!(app.runtime.active.as_deref(), Some("blocked"));
+            assert_eq!(app.runtime.toast.as_ref().unwrap().0, "Nothing needs you right now");
+        });
     }
 
     #[test]
@@ -1308,7 +1348,7 @@ mod tests {
                     text
                 };
                 let text = frame(app, vec![]);
-                for part in ["Ship it", "Do the thing", "a · needs you"] {
+                for part in ["Ship it", "Do the thing", "t · Do the thing · needs you"] {
                     assert!(text.iter().any(|t| t == part), "the location names {part}: {text:?}");
                 }
                 // Every project's tab: the sidebar groups the sessions under their plan, the rest outside plans.

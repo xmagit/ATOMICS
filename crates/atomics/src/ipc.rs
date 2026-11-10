@@ -136,22 +136,86 @@ impl Hub {
     }
 }
 
-/// Binds the socket, refusing to steal it from another running ATOMICS.
-pub fn serve(path: &Path, hub: Arc<Mutex<Hub>>, channels: Channels, window: Window) -> Result<()> {
-    if path.exists() {
-        if UnixStream::connect(path).is_ok() {
-            bail!("another ATOMICS is already listening on {}", path.display());
+/// Serializes stale-socket recovery and owns the socket name until runtime shutdown.
+/// The lock file stays in place: unlinking it would let two processes lock different inodes.
+#[derive(Debug)]
+pub struct SocketGuard {
+    _lock: std::fs::File,
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+impl SocketGuard {
+    pub(crate) fn unlink(&self) {
+        use std::os::unix::fs::MetadataExt;
+        if std::fs::symlink_metadata(&self.path).is_ok_and(|meta| meta.dev() == self.device && meta.ino() == self.inode)
+        {
+            let _ = std::fs::remove_file(&self.path);
         }
-        std::fs::remove_file(path)?;
     }
+}
+
+impl Drop for SocketGuard {
+    fn drop(&mut self) {
+        self.unlink();
+    }
+}
+
+fn bind(path: &Path) -> Result<(UnixListener, SocketGuard)> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+    atomics_core::paths::validate_socket_path(path)?;
     if let Some(parent) = path.parent() {
         use std::os::unix::fs::DirBuilderExt;
         std::fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
+        let metadata = std::fs::metadata(parent)?;
+        // A public writable parent lets another user pre-create either the socket or its lock.
+        // SAFETY: geteuid has no preconditions.
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.permissions().mode() & 0o022 != 0 {
+            bail!("ATOMICS_SOCKET must be in a directory you own that other users cannot write: {}", parent.display());
+        }
+    }
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(PathBuf::from(lock_path))?;
+    // SAFETY: the descriptor stays open in SocketGuard for the whole ownership interval.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        bail!("cannot own control socket {}: {}", path.display(), std::io::Error::last_os_error());
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if !meta.file_type().is_socket() {
+                bail!("refusing to remove non-socket {}", path.display());
+            }
+            match UnixStream::connect(path) {
+                Ok(_) => bail!("another ATOMICS is already listening on {}", path.display()),
+                Err(error)
+                    if matches!(error.kind(), std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound) => {
+                }
+                Err(error) => return Err(error.into()),
+            }
+            std::fs::remove_file(path)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
     let listener = UnixListener::bind(path)?;
-    use std::os::unix::fs::PermissionsExt;
+    let meta = std::fs::symlink_metadata(path)?;
+    let guard = SocketGuard { _lock: lock, path: path.to_path_buf(), device: meta.dev(), inode: meta.ino() };
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    let path: PathBuf = path.to_path_buf();
+    Ok((listener, guard))
+}
+
+/// Binds the socket, refusing to steal it from another running ATOMICS.
+pub fn serve(path: &Path, hub: Arc<Mutex<Hub>>, channels: Channels, window: Window) -> Result<SocketGuard> {
+    let (listener, guard) = bind(path)?;
     std::thread::Builder::new().name("atomics-hooks".into()).spawn(move || {
         let channels = Arc::new(channels);
         for stream in listener.incoming().flatten() {
@@ -162,9 +226,27 @@ pub fn serve(path: &Path, hub: Arc<Mutex<Hub>>, channels: Channels, window: Wind
                 }
             });
         }
-        let _ = std::fs::remove_file(path);
     })?;
-    Ok(())
+    Ok(guard)
+}
+
+// A full plan can carry MAX_TASKS text payloads plus its goal. JSON escaping can expand
+// each text byte to six bytes; reserve a frame for ids, field names and other metadata.
+const MAX_REQUEST: usize =
+    (atomics_core::ops::MAX_TASKS + 1) * atomics_core::ops::MAX_TEXT_BYTES * 6 + atomics_core::wire::MAX_FRAME_BYTES;
+const MAX_RESPONSE: usize = 32 * 1024 * 1024;
+
+fn read_line_bounded(reader: impl BufRead, limit: usize) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader.take((limit + 1) as u64).read_until(b'\n', &mut bytes)?;
+    if bytes.len() > limit || !bytes.ends_with(b"\n") {
+        bail!("control socket line exceeds {limit} bytes or is missing its newline");
+    }
+    Ok(bytes)
+}
+
+fn read_request(reader: impl BufRead) -> Result<Value> {
+    Ok(serde_json::from_slice(&read_line_bounded(reader, MAX_REQUEST)?)?)
 }
 
 fn handle(stream: UnixStream, hub: &Mutex<Hub>, channels: &Channels, window: &Window) -> Result<()> {
@@ -180,9 +262,7 @@ fn handle_with_wait_duration(
     wait_duration: impl Fn(u64) -> Duration,
 ) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    let mut line = String::new();
-    BufReader::new(&stream).read_line(&mut line)?;
-    let value: Value = serde_json::from_str(&line)?;
+    let value = read_request(BufReader::new(&stream))?;
     if let Some(payload) = value.get("statusline") {
         if payload["rate_limits"].is_object() {
             let usage = atomics_core::usage::Usage::claude(payload, crate::usage::now());
@@ -328,6 +408,7 @@ pub fn request_at(path: &Path, request: &ControlRequest) -> Result<ControlRespon
         .map_err(|e| RequestError::NotRunning(format!("ATOMICS is not running ({}: {e})", path.display())))?;
     // A sandbox command may wait its timeout for a slot, then run for as long.
     let timeout = match request {
+        ControlRequest::SecretRemoved { .. } => 5,
         ControlRequest::Exec { timeout_secs, .. } => 2 * crate::sandbox::exec::timeout(*timeout_secs).as_secs() + 120,
         _ => 320,
     };
@@ -335,9 +416,7 @@ pub fn request_at(path: &Path, request: &ControlRequest) -> Result<ControlRespon
     let mut writer = &stream;
     writer.write_all(serde_json::to_string(request)?.as_bytes())?;
     writer.write_all(b"\n")?;
-    let mut line = String::new();
-    BufReader::new(&stream).read_line(&mut line)?;
-    Ok(serde_json::from_str(&line)?)
+    Ok(serde_json::from_slice(&read_line_bounded(BufReader::new(&stream), MAX_RESPONSE)?)?)
 }
 
 #[cfg(test)]
@@ -345,6 +424,91 @@ mod tests {
     use super::*;
     use serde_json::{Value, json};
     use std::io::Read;
+
+    #[test]
+    fn audit_p7_control_requests_stop_at_the_byte_limit() {
+        const LIMIT: usize = 128;
+        let mut oversized = std::io::Cursor::new(vec![b'x'; LIMIT * 2]);
+        assert!(read_line_bounded(&mut oversized, LIMIT).unwrap_err().to_string().contains("exceeds"));
+        assert_eq!(oversized.position(), (LIMIT + 1) as u64);
+        assert!(read_request(&b"{\"cmd\":\"list\"}"[..]).is_err());
+        assert_eq!(read_request(&b"{\"cmd\":\"list\"}\n"[..]).unwrap()["cmd"], "list");
+        let padded = format!("{}{{\"cmd\":\"list\"}}\n", " ".repeat(LIMIT - 15));
+        assert_eq!(padded.len(), LIMIT);
+        assert!(read_line_bounded(padded.as_bytes(), LIMIT).is_ok());
+    }
+
+    #[test]
+    fn review_p7_control_socket_accepts_a_plan_at_the_task_and_text_limits() {
+        use atomics_core::ops::{MAX_TASKS, MAX_TEXT_BYTES};
+        let tasks: Vec<_> =
+            (0..MAX_TASKS).map(|id| json!({"id":id.to_string(), "brief":"b".repeat(MAX_TEXT_BYTES)})).collect();
+        let mut encoded = serde_json::to_vec(&json!({"cmd":"plan_set", "goal":"large plan", "tasks":tasks})).unwrap();
+        encoded.push(b'\n');
+        assert!(encoded.len() > 1024 * 1024);
+        let request = read_request(encoded.as_slice()).unwrap();
+        assert_eq!(request["tasks"].as_array().unwrap().len(), MAX_TASKS);
+    }
+
+    #[test]
+    fn review_p7_public_writable_socket_parents_are_refused_before_creating_a_lock() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_support::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let socket = dir.path().join("control.sock");
+        let error = bind(&socket).unwrap_err().to_string();
+        assert!(error.contains("ATOMICS_SOCKET") && error.contains("other users"), "{error}");
+        assert!(!socket.exists());
+        assert!(!dir.path().join("control.sock.lock").exists());
+    }
+
+    #[test]
+    fn audit_p7_stale_socket_recovery_has_one_owner_and_cleanup_keeps_a_replacement() {
+        const STALE: &str = "ATOMICS_STALE_SOCKET_FIXTURE";
+        const TEST: &str = "ipc::tests::audit_p7_stale_socket_recovery_has_one_owner_and_cleanup_keeps_a_replacement";
+        if let Some(path) = std::env::var_os(STALE) {
+            drop(UnixListener::bind(path).unwrap());
+            return;
+        }
+        let dir = crate::test_support::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        // A parallel test can fork while a parent-created listener is open and
+        // keep it live after this test closes it. Only this child owns the setup
+        // descriptor; its exit makes the socket stale before either contender runs.
+        let created = crate::test_support::output(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(STALE, &path)
+                .env("HOME", dir.path()),
+        );
+        assert!(created.status.success(), "{created:?}");
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let results = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let (barrier, path) = (barrier.clone(), &path);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        bind(path)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect::<Vec<_>>()
+        });
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1, "{results:?}");
+        assert!(UnixStream::connect(&path).is_ok());
+        assert!(bind(&path).is_err());
+        // Ownership cleanup must not unlink someone else's replacement inode.
+        std::fs::remove_file(&path).unwrap();
+        let replacement = UnixListener::bind(&path).unwrap();
+        drop(results);
+        assert!(UnixStream::connect(&path).is_ok());
+        drop(replacement);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"keep this regular file").unwrap();
+        assert!(bind(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"keep this regular file");
+    }
 
     #[test]
     fn control_socket_wakes_the_runtime_before_its_next_tick() {
@@ -400,7 +564,7 @@ mod tests {
         )
         .unwrap();
         let crate::usage::Report::Claude(usage) = usage_rx.try_recv().unwrap() else { panic!("claude report") };
-        assert_eq!(usage.session.unwrap().remaining, 78.0);
+        assert_eq!(usage.session.unwrap().left_percent, 78.0);
         assert!(usage.weekly.is_none());
         assert!(usage.observed_at > 0);
         assert!(hook_rx.try_recv().is_err(), "usage must not change agent status");
@@ -449,6 +613,7 @@ mod tests {
             let message = requests.recv().unwrap();
             let ControlRequest::Exec { session, command, .. } = message.request else { panic!("an exec request") };
             let job = crate::sandbox::exec::Exec {
+                env: Vec::new(),
                 sbx,
                 sandbox: "atomics-s1".into(),
                 workdir,

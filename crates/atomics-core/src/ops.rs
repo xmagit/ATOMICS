@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::approvals::Decision;
-use crate::plan::{Task, TaskStatus};
+use crate::plan::{TaskInput, TaskStatus};
 use crate::wire::{ErrorCode, MAX_ID_BYTES, Message, Revision, WireError};
 
 /// The longest text a mutation carries: a steering message, a comment, a note or a goal.
@@ -77,11 +77,23 @@ pub struct PlanCommand {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum PlanAction {
+    PublishDecision {
+        request: String,
+        approve: bool,
+    },
+    /// User curation of a notebook proposal, visible to every board client.
+    Notebook {
+        id: u64,
+        #[serde(default)]
+        pinned: Option<bool>,
+        #[serde(default)]
+        delete: bool,
+    },
     /// Write the goal and tasks, as the chief's `plan_set` does. An approved plan stays approved
     /// only if its approval scope is unchanged.
     Set {
         goal: String,
-        tasks: Vec<Task>,
+        tasks: Vec<TaskInput>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         integration: Option<String>,
     },
@@ -277,7 +289,7 @@ pub enum HostAction {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "tool", rename_all = "snake_case")]
 pub enum SettingsTool {
     InstallHooks,
@@ -296,6 +308,17 @@ pub enum SettingsTool {
         url: String,
     },
     RefreshCredentials,
+    AddSecret {
+        spec: crate::secrets::Secret,
+        value: String,
+    },
+    RemoveSecret {
+        name: String,
+    },
+    SetGithubPolicy {
+        name: String,
+        refuse_default_branch: bool,
+    },
     PutCredential {
         kind: String,
         value: String,
@@ -310,6 +333,7 @@ pub enum SettingsTool {
         host: Option<String>,
     },
     CleanCredentials,
+    CleanBuildCaches,
     /// Look for git and the agents again, with the login shell's PATH as it is now.
     CheckPrograms,
     /// Where agents run on this machine, in this host's own config file. The user's own switch, so no proposal.
@@ -340,6 +364,16 @@ pub enum SettingsTool {
         id: String,
         later: bool,
     },
+}
+
+impl std::fmt::Debug for SettingsTool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut metadata = serde_json::to_value(self).map_err(|_| std::fmt::Error)?;
+        if metadata.get("value").is_some() {
+            metadata["value"] = "<hidden>".into();
+        }
+        write!(f, "SettingsTool({metadata})")
+    }
 }
 
 /// What became of an operation.
@@ -498,6 +532,9 @@ impl PlanCommand {
         let mut bounds = Bounds::new(&self.op);
         bounds.id("plan", self.plan.as_deref()).id("digest", self.digest.as_deref());
         match &self.action {
+            PlanAction::PublishDecision { request, .. } => {
+                bounds.id("publish request", Some(request));
+            }
             PlanAction::Set { goal, tasks, integration } => {
                 bounds.text("goal", Some(goal)).id("integration", integration.as_deref());
                 if tasks.len() > MAX_TASKS {
@@ -516,7 +553,7 @@ impl PlanCommand {
             PlanAction::Integrate { task } => {
                 bounds.id("task", Some(task));
             }
-            PlanAction::Approve | PlanAction::Archive | PlanAction::Complete => {}
+            PlanAction::Notebook { .. } | PlanAction::Approve | PlanAction::Archive | PlanAction::Complete => {}
         }
         bounds.check()?;
         if self.plan.is_none() && !matches!(self.action, PlanAction::Set { .. }) {
@@ -653,6 +690,13 @@ impl HostCommand {
                 }
                 SettingsTool::PutCredential { kind, value, host } => {
                     bounds.id("kind", Some(kind)).id("host", host.as_deref()).text("value", Some(value));
+                }
+                SettingsTool::AddSecret { spec, value } => {
+                    bounds.id("name", Some(&spec.name)).text("value", Some(value));
+                    spec.validate().map_err(|message| WireError::new(ErrorCode::Malformed, message))?;
+                }
+                SettingsTool::SetGithubPolicy { name, .. } | SettingsTool::RemoveSecret { name } => {
+                    bounds.id("name", Some(name));
                 }
                 SettingsTool::RemoveCredential { kind, host } => {
                     bounds.id("kind", Some(kind)).id("host", host.as_deref());
@@ -795,7 +839,7 @@ mod tests {
             digest: None,
             action: PlanAction::Set {
                 goal: "g".into(),
-                tasks: vec![Task::default(); MAX_TASKS + 1],
+                tasks: vec![TaskInput::default(); MAX_TASKS + 1],
                 integration: None,
             },
         });

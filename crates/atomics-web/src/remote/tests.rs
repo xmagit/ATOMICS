@@ -11,6 +11,27 @@ use crate::fake_host::{self, WORKTREE};
 
 const EPOCH: &str = "e1";
 
+#[test]
+fn task_cards_keep_report_evidence_and_reviewer_reason_from_the_host() {
+    let mut info = fake_host::board().plans[0].tasks[0].clone();
+    info.reviewer_reason = Some("Selected by [plan] review_agent override.".into());
+    let check = atomics_core::plan::Check {
+        check: "Tests pass".into(),
+        command: "cargo test".into(),
+        exit: Some(0),
+        output_tail: "passed".into(),
+    };
+    info.report = Some(atomics_core::projection::ReportInfo {
+        status: "done".into(),
+        summary: "Checked".into(),
+        at: 1,
+        checks: vec![check.clone()],
+    });
+    let card = task(&info);
+    assert_eq!(card.reviewer_reason, info.reviewer_reason);
+    assert_eq!(card.report.unwrap().checks, [check]);
+}
+
 fn welcome(role: Role) -> Envelope {
     let capabilities: Vec<String> = CAPABILITIES.iter().map(|c| c.to_string()).collect();
     let may = role.may(&capabilities);
@@ -1498,4 +1519,35 @@ fn answers_to_an_earlier_read_do_not_touch_the_new_one() {
     assert_eq!(lines_shown(&remote, "src/a.rs"), Some(7), "the late answer is dropped");
     answer(&remote, &refreshed[0].0, "src/a.rs", 6, 9, None);
     assert_eq!(lines_shown(&remote, "src/a.rs"), Some(10));
+}
+
+#[test]
+fn native_vm_credentials_bypass_the_protocol_even_offline_and_copy_stays_local() {
+    use atomics_core::ops::SettingsTool;
+    let remote = RemoteBackend::new("native");
+    let add = || {
+        Command::Manage(HostAction::SettingsTool {
+            tool: SettingsTool::AddSecret {
+                spec: atomics_core::secrets::Secret { name: "KEY".into(), ..Default::default() },
+                value: "canary-client-only".into(),
+            },
+        })
+    };
+    assert!(!remote.available(&Command::CopySecret("KEY".into())), "browser cannot copy");
+    remote.enable_native_credentials(None);
+    for command in [
+        add(),
+        Command::CopySecret("KEY".into()),
+        Command::Manage(HostAction::SettingsTool { tool: SettingsTool::RemoveSecret { name: "KEY".into() } }),
+    ] {
+        assert!(remote.available(&command));
+        remote.send(command);
+    }
+    let commands = remote.take_native_credentials();
+    assert_eq!(commands.len(), 3);
+    assert!(matches!(&commands[0], Command::Manage(HostAction::SettingsTool {
+        tool: SettingsTool::AddSecret { value, .. }
+    }) if value == "canary-client-only"));
+    assert!(remote.take_outgoing().is_empty(), "no value, copy or mutation goes to the host");
+    assert!(remote.take_native_credentials().is_empty());
 }

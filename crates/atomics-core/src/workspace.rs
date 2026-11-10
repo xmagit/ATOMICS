@@ -24,6 +24,20 @@ pub struct Workspace {
 }
 
 impl Workspace {
+    pub fn identity(&self) -> Result<Option<crate::identity::Identity>, toml::de::Error> {
+        Self::identity_in(&self.extra)
+    }
+
+    /// Determine identity without deserializing unrelated workspace settings.
+    pub fn identity_in(table: &toml::Table) -> Result<Option<crate::identity::Identity>, toml::de::Error> {
+        let identity: Option<crate::identity::Identity> =
+            table.get("identity").map(|section| section.clone().try_into()).transpose()?;
+        if let Some(identity) = &identity {
+            identity.validate().map_err(<toml::de::Error as serde::de::Error>::custom)?;
+        }
+        Ok(identity)
+    }
+
     /// This workspace's ticket system, read from its `[tickets]`. The section stays in
     /// `extra` as written, so saving never drops, rewrites or duplicates it.
     pub fn tickets(&self) -> Result<Option<crate::tickets::TicketConfig>, toml::de::Error> {
@@ -68,6 +82,16 @@ pub fn project_root(dir: &Path) -> Result<PathBuf> {
 
 #[cfg(feature = "native")]
 impl Workspace {
+    pub fn load_identity(name: &str) -> Result<Option<crate::identity::Identity>> {
+        let text = match std::fs::read_to_string(Self::file(name)?) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let table = toml::from_str::<toml::Table>(&text)?;
+        Ok(Self::identity_in(&table)?)
+    }
+
     pub fn load(name: &str) -> Result<Workspace> {
         let file = Self::file(name)?;
         let text = std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;

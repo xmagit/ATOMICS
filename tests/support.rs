@@ -1,7 +1,14 @@
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
+
+const CLOUD_PROGRAMS: &[&str] = &["az", "gh", "sbx", "claude", "codex", "limactl"];
+pub const FIXTURE_ROOT: &str = "ATOMICS_TEST_FIXTURE_ROOT";
+static FIXTURE_DIRS: LazyLock<Mutex<Vec<PathBuf>>> = LazyLock::new(Mutex::default);
+static BLOCKED_PROGRAMS: LazyLock<Mutex<Vec<String>>> = LazyLock::new(Mutex::default);
 
 /// Unlike tempfile's best-effort Drop, test cleanup must report failures and verify removal.
 pub struct TempDir(Option<tempfile::TempDir>);
@@ -17,12 +24,216 @@ pub fn tempdir() -> io::Result<TempDir> {
         Some(parent) => tempfile::tempdir_in(parent),
         None => tempfile::tempdir(),
     }
-    .map(|dir| TempDir(Some(dir)))
+    .map(register_dir)
 }
 
 #[allow(dead_code)] // Used by the Linux reflink test; this support file is shared by test crates.
 pub fn tempdir_in(parent: impl AsRef<std::path::Path>) -> io::Result<TempDir> {
-    tempfile::tempdir_in(parent).map(|dir| TempDir(Some(dir)))
+    tempfile::tempdir_in(parent).map(register_dir)
+}
+
+fn register_dir(dir: tempfile::TempDir) -> TempDir {
+    FIXTURE_DIRS.lock().unwrap().push(dir.path().to_path_buf());
+    TempDir(Some(dir))
+}
+
+fn fixture_root(path: &Path) -> Option<PathBuf> {
+    let mut roots = FIXTURE_DIRS.lock().unwrap().clone();
+    roots.extend([FIXTURE_ROOT, CHILD_FOLDERS].into_iter().filter_map(std::env::var_os).map(PathBuf::from));
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    roots
+        .into_iter()
+        .find(|root| path.starts_with(root) || root.canonicalize().is_ok_and(|root| canonical.starts_with(root)))
+}
+
+#[allow(dead_code)]
+pub fn is_fixture_path(path: &Path) -> bool {
+    fixture_root(path).is_some()
+}
+
+/// Block installed cloud/agent/VM tools even when a test accidentally consults a login PATH.
+/// Canonicalize the target too: a symlink in a fixture must not smuggle in an installed CLI.
+#[allow(dead_code)] // This support module is shared by several test crates.
+pub fn check_fixture_program(name: &str, resolved: &Path) -> Result<(), String> {
+    if !CLOUD_PROGRAMS.contains(&name) {
+        return Ok(());
+    }
+    let candidate = if resolved.components().count() == 1 {
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|dir| dir.join(resolved))
+            .find(|path| path.is_file())
+            .unwrap_or_else(|| resolved.to_path_buf())
+    } else {
+        resolved.to_path_buf()
+    };
+    let Ok(target) = candidate.canonicalize() else { return Ok(()) };
+    if fixture_root(&target).is_some() {
+        Ok(())
+    } else {
+        Err(format!(
+            "test tried to resolve real {name} at {}; install a fake inside its fixture directory",
+            target.display()
+        ))
+    }
+}
+
+#[allow(dead_code)]
+pub fn assert_fixture_program(name: &str, resolved: &Path) {
+    if let Err(error) = check_fixture_program(name, resolved) {
+        BLOCKED_PROGRAMS.lock().unwrap().push(error.clone());
+        panic!("{error}");
+    }
+}
+
+/// Detached discovery workers must fail the owning fixture too, not just their own thread.
+#[allow(dead_code)]
+pub fn assert_no_real_programs() {
+    let blocked = BLOCKED_PROGRAMS.lock().unwrap();
+    assert!(blocked.is_empty(), "blocked host programs in test workers: {}", blocked.join("\n"));
+}
+
+/// A fixture-only PATH of ordinary helpers, deliberately excluding cloud, agent and VM CLIs.
+/// Tests add their own implementations of those programs in another fixture directory.
+pub fn helper_path(root: &Path) -> PathBuf {
+    let bin = root.join("test-helpers");
+    std::fs::create_dir_all(&bin).unwrap();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    for name in "sh bash git cat sleep true false env chmod mkdir rmdir rm cp mv ln dirname basename head tail sed
+        awk grep tr wc sort cut date touch kill ps readlink realpath which find tar gzip unzip openssl ssh
+        ssh-keygen python3 node setsid stty ls id uname curl wget install mktemp xargs tee du df readelf
+        strip cargo rustc nix nix-build timeout file getconf nice mkfifo printenv seq dd od jq cmp diff
+        stat perl patch xz bzip2 zstd base64 hexdump nc ss sync"
+        .split_whitespace()
+    {
+        let target = bin.join(name);
+        if target.exists() {
+            continue;
+        }
+        let source = std::env::split_paths(&path).map(|dir| dir.join(name)).find(|path| {
+            use std::os::unix::fs::PermissionsExt;
+            path.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        });
+        if let Some(source) = source {
+            match std::os::unix::fs::symlink(source, target) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => panic!("link fixture helper {name}: {error}"),
+            }
+        }
+    }
+    bin
+}
+
+fn isolated_path(root: &Path, path: &std::ffi::OsStr) -> std::ffi::OsString {
+    let helpers = helper_path(root);
+    let mut dirs = Vec::new();
+    for dir in std::env::split_paths(path) {
+        let canonical = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+        let dir = if fixture_root(&canonical).is_some() {
+            dir
+        } else if dir.is_dir() {
+            helpers.clone()
+        } else {
+            continue;
+        };
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    std::env::join_paths(dirs).unwrap()
+}
+
+/// Apply before starting a fixture child, including a production binary whose cfg(test) guards
+/// are absent. Preserve deliberately empty/fixture-only PATHs and all explicit fake programs.
+pub fn isolate_environment(command: &mut Command) {
+    let explicit =
+        |name: &str| command.get_envs().find(|(key, _)| *key == name).map(|(_, value)| value.map(ToOwned::to_owned));
+    let home = match explicit("HOME") {
+        Some(Some(home)) => PathBuf::from(home),
+        Some(None) => return,
+        None if std::env::var_os(FIXTURE_ROOT).is_some() => PathBuf::from(std::env::var_os("HOME").unwrap()),
+        None => return,
+    };
+    let root =
+        fixture_root(&home).unwrap_or_else(|| panic!("test HOME {} is outside its fixture directory", home.display()));
+    let path = explicit("PATH").flatten().unwrap_or_else(|| std::env::var_os("PATH").unwrap_or_default());
+    let path = isolated_path(&root, &path);
+    let shell = explicit("SHELL")
+        .flatten()
+        .or_else(|| std::env::var_os("SHELL").filter(|shell| fixture_root(Path::new(shell)).is_some()));
+    if let Some(shell) = &shell {
+        let shell = Path::new(shell);
+        assert!(
+            !shell.exists() || fixture_root(shell).is_some(),
+            "test login shell {} is outside its fixture directory",
+            shell.display()
+        );
+    }
+    command.env(FIXTURE_ROOT, &root).env("PATH", path).env("HOME", &home);
+    for (name, suffix) in [
+        ("AZURE_CONFIG_DIR", ".azure"),
+        ("GH_CONFIG_DIR", ".config/gh"),
+        ("LIMA_HOME", ".lima"),
+        ("CODEX_HOME", ".codex"),
+        ("CLAUDE_CONFIG_DIR", ".claude"),
+        ("XDG_CONFIG_HOME", ".config"),
+        ("XDG_CACHE_HOME", ".cache"),
+        ("XDG_DATA_HOME", ".local/share"),
+    ] {
+        if let Some((_, Some(path))) = command.get_envs().find(|(key, _)| *key == name) {
+            // Path-resolution tests deliberately supply relative/empty XDG values;
+            // those are ignored in favor of this fixture's HOME by the XDG rules.
+            assert!(
+                fixture_root(Path::new(path)).is_some() || (name.starts_with("XDG_") && !Path::new(path).is_absolute()),
+                "test {name} {} is outside its fixture directory",
+                Path::new(path).display()
+            );
+        } else {
+            command.env(name, home.join(suffix));
+        }
+    }
+    if shell.is_none() {
+        let shell = root.join("test-login-shell");
+        if !shell.exists() {
+            login_shell(&shell);
+        }
+        command.env("SHELL", shell);
+    }
+    command.env_remove("BASH_ENV").env_remove("ENV");
+}
+
+/// Direct unit-test CLI calls need the same home/state isolation as test child processes.
+#[allow(dead_code)]
+pub fn fixture_command(command: &mut Command, name: &str) {
+    if !CLOUD_PROGRAMS.contains(&name) {
+        return;
+    }
+    let program = Path::new(command.get_program());
+    let path = command
+        .get_envs()
+        .find(|(key, _)| *key == "PATH")
+        .and_then(|(_, value)| value.map(ToOwned::to_owned))
+        .or_else(|| std::env::var_os("PATH"))
+        .unwrap_or_default();
+    let resolved = if program.components().count() > 1 {
+        program.to_path_buf()
+    } else {
+        std::env::split_paths(&path)
+            .map(|dir| dir.join(program))
+            .find(|path| path.is_file())
+            .unwrap_or_else(|| program.to_path_buf())
+    };
+    assert_fixture_program(name, &resolved);
+    let Ok(program) = resolved.canonicalize() else {
+        return;
+    };
+    let root = fixture_root(&program).expect("fixture CLI has an owner");
+    if std::env::var_os(FIXTURE_ROOT).is_none() {
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        command.env("HOME", home);
+    }
+    isolate_environment(command);
 }
 
 impl TempDir {
@@ -33,7 +244,11 @@ impl TempDir {
 
 impl Drop for TempDir {
     fn drop(&mut self) {
+        if std::env::var_os(FIXTURE_ROOT).is_some() && !std::thread::panicking() {
+            assert_no_real_programs();
+        }
         let dir = self.0.take().unwrap();
+        FIXTURE_DIRS.lock().unwrap().retain(|path| path != dir.path());
         if std::env::var_os(CHILD_FOLDERS).is_some_and(|parent| dir.path().starts_with(parent)) {
             let _ = dir.keep();
             return;
@@ -84,6 +299,46 @@ pub fn nothing_yet(error: &io::Error) -> bool {
     matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted)
 }
 
+/// Resolve a fixture's helper on the development shell's PATH, including Nix profiles.
+#[allow(dead_code)] // Shared by unit and integration test crates.
+pub fn program(name: &str) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let found = std::env::split_paths(&std::env::var_os("PATH").expect("test helpers need PATH"))
+        .map(|dir| dir.join(name))
+        .find(|path| path.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
+        .unwrap_or_else(|| panic!("test helper {name} is missing from PATH; use scripts/check.sh"));
+    assert_fixture_program(name, &found);
+    found.to_string_lossy().into_owned()
+}
+
+/// A PATH containing only the named helpers, so installed agents cannot enter a fixture.
+#[allow(dead_code)]
+pub fn link_tools(dir: &std::path::Path, names: &[&str]) {
+    std::fs::create_dir_all(dir).unwrap();
+    for name in names {
+        std::os::unix::fs::symlink(program(name), dir.join(name)).unwrap();
+    }
+}
+
+/// Put fixture overrides before the real helper PATH, without assuming /usr/bin or /bin.
+#[allow(dead_code)]
+pub fn path_with(dir: &std::path::Path) -> std::ffi::OsString {
+    let root = fixture_root(dir).expect("PATH overrides belong in a test fixture");
+    std::env::join_paths([dir.to_path_buf(), helper_path(&root)]).unwrap()
+}
+
+/// A login shell that preserves the fixture's PATH and reads no user or system startup files.
+#[allow(dead_code)]
+pub fn login_shell(path: &std::path::Path) {
+    let bash = program("bash").replace('\'', "'\\''");
+    write_program(
+        path,
+        format!(
+            "#!/bin/sh\nunset BASH_ENV ENV\n[ \"${{1:-}}\" != -l ] || shift\nexec '{bash}' --noprofile --norc \"$@\"\n"
+        ),
+    );
+}
+
 /// Writes a program that a test will run, or that a program it runs will run, such as a git hook.
 /// Make such a file only here or with [`copy_program`], never with `std::fs::write` or
 /// `std::fs::copy`: whatever a parallel test forks while the file is open for writing holds a copy
@@ -92,7 +347,7 @@ pub fn nothing_yet(error: &io::Error) -> bool {
 /// it has exited when this returns.
 pub fn write_program(path: impl AsRef<std::path::Path>, text: impl AsRef<[u8]>) {
     let path = path.as_ref();
-    let mut writer = Command::new("/bin/sh")
+    let mut writer = Command::new(program("sh"))
         .args(["-c", "exec cat > \"$0\""])
         .arg(path)
         .stdin(Stdio::piped())
@@ -159,6 +414,26 @@ pub struct TestChild {
 
 impl TestChild {
     pub fn spawn(command: &mut Command, timeout: Duration) -> io::Result<Self> {
+        isolate_environment(command);
+        let program = Path::new(command.get_program());
+        if let Some(name) =
+            program.file_name().and_then(|name| name.to_str()).filter(|name| CLOUD_PROGRAMS.contains(name))
+        {
+            let path = command
+                .get_envs()
+                .find(|(key, _)| *key == "PATH")
+                .and_then(|(_, value)| value.map(ToOwned::to_owned))
+                .or_else(|| std::env::var_os("PATH"))
+                .unwrap_or_default();
+            let resolved = if program.components().count() > 1 {
+                Some(program.to_path_buf())
+            } else {
+                std::env::split_paths(&path).map(|dir| dir.join(program)).find(|path| path.is_file())
+            };
+            if let Some(resolved) = resolved {
+                assert_fixture_program(name, &resolved);
+            }
+        }
         let timeout = scaled_timeout(timeout);
         let stdout = tempfile::tempfile()?;
         let stderr = tempfile::tempfile()?;
@@ -235,9 +510,55 @@ pub fn output(command: &mut Command) -> Output {
     child.wait_output().expect("test child must finish within its timeout")
 }
 
+/// Run a unit test with a fixture HOME, PATH and login shell, without changing a parallel
+/// harness's environment. Returns true only in the selected test's isolated child.
+#[allow(dead_code)]
+pub fn isolated_test(name: &str) -> bool {
+    const CHILD: &str = "ATOMICS_ISOLATED_TEST";
+    if std::env::var(CHILD).as_deref() == Ok(name) {
+        return true;
+    }
+    let dir = tempdir().unwrap();
+    let result = output(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env(CHILD, name)
+            .env("HOME", dir.path()),
+    );
+    assert!(
+        result.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cloud_programs_must_be_fixture_files_even_through_symlinks() {
+        let fixture = tempdir().unwrap();
+        // Deliberately unregistered: models a developer's installed executables.
+        let installed = tempfile::tempdir().unwrap();
+        for name in CLOUD_PROGRAMS {
+            let real = installed.path().join(name);
+            write_program(&real, "#!/bin/sh\nexit 91\n");
+            assert!(check_fixture_program(name, &real).unwrap_err().contains("test tried to resolve real"));
+            let fake = fixture.path().join(name);
+            write_program(&fake, "#!/bin/sh\nexit 0\n");
+            assert!(check_fixture_program(name, &fake).is_ok());
+            let link = fixture.path().join(format!("linked-{name}"));
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            assert!(check_fixture_program(name, &link).is_err(), "a fixture symlink must not permit real {name}");
+        }
+        let helpers = helper_path(fixture.path());
+        for name in CLOUD_PROGRAMS {
+            assert!(!helpers.join(name).exists(), "ordinary helper PATH must exclude {name}");
+        }
+    }
 
     #[test]
     fn programs_are_written_and_copied_whole_and_run_at_once() {

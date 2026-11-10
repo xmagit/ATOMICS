@@ -8,15 +8,18 @@ impl Desktop<'_> {
     /// are the bundle's wrappers; `atomics --connect vm` runs the window on the VM's host instead.
     fn vm_indicator(&mut self, ui: &mut egui::Ui, in_menu: bool) {
         use crate::vm::Status;
+        if ui.ctx().input(|input| input.viewport().minimized.unwrap_or(false)) {
+            return;
+        }
         let Some(monitor) = self.runtime.vm.clone() else { return };
         let Some(view) = monitor.view() else { return };
+        ui.ctx().request_repaint_after(std::time::Duration::from_secs(5));
         let palette = self.palette();
-        let (text, color) = match (&view.status, view.busy) {
-            (_, Some("stopping")) => ("VM …", palette.muted),
-            (Status::Starting, _) | (_, Some(_)) => ("VM …", palette.muted),
-            (Status::Running, _) => ("VM ●", palette.success),
-            (Status::Stopped, _) => ("VM ○", palette.muted),
-            (Status::NotSetUp | Status::Unknown(_), _) => ("VM ●", palette.warning),
+        let text = view.status.indicator(view.busy);
+        let color = match (&view.status, view.busy) {
+            (_, Some(_)) | (Status::Starting | Status::Stopped, _) => palette.muted,
+            (Status::Running, _) => palette.success,
+            (Status::NotSetUp | Status::Unknown(_), _) => palette.warning,
         };
         let state = match view.busy {
             Some(busy) => busy.to_string(),
@@ -24,6 +27,7 @@ impl Desktop<'_> {
         };
         let label = RichText::new(text).color(color);
         let items = |ui: &mut egui::Ui| {
+            let confirm_id = ui.scope_id().with(("stop-vm", &view.instance));
             ui.label(RichText::new(format!("ATOMICS VM {}: {state}", view.instance)).strong());
             if let Some(error) = &view.error {
                 ui.label(RichText::new(error).color(palette.warning));
@@ -37,20 +41,37 @@ impl Desktop<'_> {
                     ui.button("Start").clicked().then_some(true)
                 }
                 Status::Running if view.busy.is_none() => {
-                    ui.button("Stop").on_hover_text("Agents running in the VM stop with it").clicked().then_some(false)
+                    if ui.button("Stop").on_hover_text("Agents running in the VM stop with it").clicked() {
+                        ui.data_mut(|data| data.insert_temp(confirm_id, true));
+                    }
+                    None
                 }
                 _ => None,
             };
+            if ui.data(|data| data.get_temp::<bool>(confirm_id).unwrap_or(false)) {
+                ui.label("Stop the VM? Agents running in it stop with it.");
+                if ui.button("Stop VM").clicked() {
+                    ui.data_mut(|data| data.remove::<bool>(confirm_id));
+                    monitor.set_running(false);
+                    ui.close();
+                }
+                if ui.button("Cancel").clicked() {
+                    ui.data_mut(|data| data.remove::<bool>(confirm_id));
+                    ui.close();
+                }
+            }
             if let Some(run) = run {
                 monitor.set_running(run);
                 ui.close();
             }
         };
         // Folded into the Actions menu where the bar has no room for it, as Settings is.
+        let config =
+            egui::containers::menu::MenuConfig::new().close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
         let (response, _) = if in_menu || egui::containers::menu::is_in_menu(ui) {
-            egui::containers::menu::SubMenuButton::new(label).ui(ui, items)
+            egui::containers::menu::SubMenuButton::new(label).config(config).ui(ui, items)
         } else {
-            egui::containers::menu::MenuButton::new(label).ui(ui, items)
+            egui::containers::menu::MenuButton::new(label).config(config).ui(ui, items)
         };
         record_item(ui, "VM", &response);
         response.on_hover_text(format!("The ATOMICS VM {} is {state}", view.instance));
@@ -192,6 +213,49 @@ mod tests {
         app.runtime.hook_error = Some("Offline hook fixture".into());
         app.runtime.heartbeat.last = Some((atomics_core::store::now(), vec![]));
         app.runtime.resources.load = Some(123.4);
+    }
+
+    #[test]
+    fn vm_stop_confirmation_stays_visible_in_the_bar_and_actions_menu() {
+        with_app("app::topbar::tests::vm_stop_confirmation_stays_visible_in_the_bar_and_actions_menu", |app, ctx| {
+            let monitor = crate::vm::Monitor::with_view(crate::vm::View {
+                instance: "vm-test".into(),
+                status: crate::vm::Status::Running,
+                busy: None,
+                error: None,
+            });
+            app.runtime.vm = Some(monitor.clone());
+            app.runtime.toast = None;
+            for width in [2400.0, 1100.0] {
+                if width < 2000.0 {
+                    click(app, ctx, width, "Actions");
+                }
+                click(app, ctx, width, "VM");
+                // Let the submenu's measured size settle before clicking its entry.
+                for _ in 0..2 {
+                    render(app, ctx, width, Vec::new()).1.drop_without_applying_deltas();
+                }
+                click(app, ctx, width, "Stop");
+                let (_, output) = render(app, ctx, width, Vec::new());
+                let shown: Vec<_> = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) => Some(text.galley.text().to_string()),
+                        _ => None,
+                    })
+                    .collect();
+                output.drop_without_applying_deltas();
+                assert!(
+                    shown.iter().any(|text| text == "Stop the VM? Agents running in it stop with it."),
+                    "{width}: {shown:?}"
+                );
+                assert!(shown.iter().any(|text| text == "Stop VM"), "{width}: {shown:?}");
+                assert!(monitor.view().unwrap().busy.is_none(), "Stop must ask before changing the VM");
+                click(app, ctx, width, "Cancel");
+                assert!(monitor.view().unwrap().busy.is_none());
+            }
+        });
     }
 
     #[test]
@@ -891,7 +955,7 @@ mod tests {
                 }
                 click(app, ctx, width, "+ New");
                 assert!(app.client.new_dialog.is_some(), "width={width}: new action");
-                for (action, entry) in [("Project", "Open project…"), ("Settings", "Shortcuts")] {
+                for (action, entry) in [("Project", "Open project…"), ("Settings", "Where agents run")] {
                     if collapsed {
                         click(app, ctx, width, "Actions");
                     }

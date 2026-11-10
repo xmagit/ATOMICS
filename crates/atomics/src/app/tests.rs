@@ -15,6 +15,7 @@ pub(super) fn session(id: &str, kind: AgentKind, status: AgentStatus, cwd: &Path
         last_prompt: None,
         last_message: None,
         hooks_active: false,
+        first_run_hint: None,
         activity: heartbeat::Activity::default(),
         approvals: Vec::new(),
         allowed: Vec::new(),
@@ -25,6 +26,7 @@ pub(super) fn session(id: &str, kind: AgentKind, status: AgentStatus, cwd: &Path
         chief: false,
         pending: None,
         sandbox: None,
+        cache_env: Vec::new(),
         relay: None,
         screen_busy: false,
         busy_absent_since: None,
@@ -47,8 +49,63 @@ pub(super) fn with_app(name: &str, test: impl FnOnce(&mut Desktop<'_>, &egui::Co
     });
 }
 
+pub(super) fn with_app_env(
+    name: &str,
+    env: impl FnOnce(&Path) -> Vec<(&'static str, std::ffi::OsString)>,
+    test: impl FnOnce(&mut Desktop<'_>, &egui::Context),
+) {
+    with_login_state(name, env, |mut state, ctx| {
+        let mut client = Client::new(ctx, &mut Options::default(), &crate::load_icon());
+        test(&mut Desktop { runtime: &mut state, client: &mut client }, ctx);
+        state.shutdown();
+    });
+}
+
+pub(super) fn fixture_agent(name: &str) -> PathBuf {
+    let bin = paths::home().join("test-agents");
+    std::fs::create_dir_all(&bin).unwrap();
+    let program = bin.join(name);
+    if !program.exists() {
+        crate::test_support::copy_program(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name),
+            &program,
+        );
+    }
+    program
+}
+
+#[test]
+fn app_fixtures_cannot_find_installed_cloud_agent_or_vm_programs() {
+    with_state("app::tests::app_fixtures_cannot_find_installed_cloud_agent_or_vm_programs", |_state, _| {
+        for name in ["az", "gh", "sbx", "claude", "codex", "limactl"] {
+            assert!(crate::setup::find_program(name).is_none(), "{name} must require an explicit fixture");
+        }
+        let home = paths::home();
+        for name in ["AZURE_CONFIG_DIR", "GH_CONFIG_DIR", "LIMA_HOME", "CODEX_HOME", "CLAUDE_CONFIG_DIR"] {
+            assert!(PathBuf::from(std::env::var_os(name).unwrap()).starts_with(&home), "{name} belongs to this test");
+        }
+    });
+}
+
 pub(super) fn with_state(name: &str, test: impl FnOnce(State, &egui::Context)) {
     run_state(name, None::<fn(&Path) -> Vec<(&'static str, std::ffi::OsString)>>, test);
+}
+
+/// Credential preparation is asynchronous for bare sessions too; wait by driving the host.
+pub(super) fn wait_started(state: &mut State, id: &str) {
+    let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(20));
+    while !state.sessions.iter().any(|s| s.id == id && s.terminal.is_some()) {
+        assert!(Instant::now() < deadline, "session did not finish credential preparation");
+        state.runtime_tick();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Keep asynchronous fixtures' settings consistent with what a runtime reload reads.
+pub(super) fn persist_config(state: &mut State) {
+    std::fs::write(&state.config_path, toml::to_string(&state.config).unwrap()).unwrap();
+    state.reload_config();
+    assert!(state.config_error.is_none(), "fixture config did not reload: {:?}", state.config_error);
 }
 
 /// [`with_state`] in a child that also has the variables `env` gives, which is called in the
@@ -75,6 +132,8 @@ fn run_state(
         // Not inside `dir`, the child's home and config folder: tests scan that for what the app wrote,
         // and the child's fixtures may hold the secrets they look for.
         let folders = crate::test_support::tempdir().unwrap();
+        let shell = dir.path().join("test-shell");
+        crate::test_support::login_shell(&shell);
         let output = crate::test_support::output(
             std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", name, "--nocapture"])
@@ -86,10 +145,12 @@ fn run_state(
                 .env("HOME", dir.path())
                 .env("ATOMICS_HOME", dir.path().join("state"))
                 .env("ATOMICS_CONFIG", dir.path().join("config.toml"))
+                .env("ATOMICS_CREDENTIALS_DIR", dir.path().join("credentials"))
                 .env("ATOMICS_SOCKET", dir.path().join("atomics.sock"))
                 .env("XDG_RUNTIME_DIR", runtime)
-                // A login shell such as zsh would run its first-run wizard in the fresh HOME.
-                .env("SHELL", "/bin/sh")
+                .env("SHELL", shell)
+                .env_remove("BASH_ENV")
+                .env_remove("ENV")
                 .env_remove("ATOMICS_PANE")
                 .envs(env.map(|env| env(dir.path())).unwrap_or_default()),
         );
@@ -132,8 +193,203 @@ fn run_state(
     if let Some(job) = app.startup_cleanup.take() {
         job.join().unwrap();
     }
-    assert_eq!(app.toast.as_ref().unwrap().0, "Migration failed");
+    if std::env::var_os("ATOMICS_TEST_PIN_ERROR").is_some() {
+        assert!(app.toast.as_ref().unwrap().0.starts_with("Migration failed\nUnreadable sandbox git pin "));
+    } else {
+        assert_eq!(app.toast.as_ref().unwrap().0, "Migration failed");
+    }
     test(app, &ctx);
+    crate::test_support::assert_no_real_programs();
+}
+
+#[test]
+fn osc52_only_copies_from_the_focused_bare_tile_and_names_it() {
+    fn frame(
+        app: &mut Desktop<'_>,
+        ctx: &egui::Context,
+        focus: usize,
+        visible: &[usize],
+        window_focused: bool,
+    ) -> Vec<String> {
+        let output = ctx.run_ui(
+            egui::RawInput {
+                focused: window_focused,
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(900.0, 700.0))),
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    ui.memory_mut(|m| m.request_focus(egui::Id::NULL.with(("clipboard-tile", focus))));
+                    let p = app.palette();
+                    let metrics = Metrics::new(ui, &p, 13.0);
+                    for &index in visible {
+                        let id = egui::Id::NULL.with(("clipboard-tile", index));
+                        let rect = Rect::from_min_size(pos2(10.0, 10.0 + index as f32 * 300.0), vec2(850.0, 280.0));
+                        let terminal = app.runtime.sessions[index].terminal.as_ref().unwrap();
+                        app.client.terminal_views.entry(id).or_default().show(terminal, ui, rect, id, &metrics, &p);
+                    }
+                    app.terminal_clipboard(ctx);
+                });
+            },
+        );
+        let copies = output
+            .platform_output
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                egui::OutputCommand::CopyText(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        output.drop_without_applying_deltas();
+        copies
+    }
+
+    fn emit(app: &Desktop<'_>, index: usize) {
+        let terminal = app.runtime.sessions[index].terminal.as_ref().unwrap();
+        terminal.shared.title.lock().unwrap().take();
+        terminal.write(b"copy\n".to_vec());
+        let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(5));
+        while terminal.shared.title.lock().unwrap().as_deref() != Some("copied") {
+            assert!(Instant::now() < deadline, "terminal did not emit OSC 52");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    with_app("app::tests::osc52_only_copies_from_the_focused_bare_tile_and_names_it", |app, ctx| {
+        app.runtime.sessions.clear();
+        for id in ["tile-a", "tile-b"] {
+            let mut tile = session(id, AgentKind::Shell, AgentStatus::Idle, &app.runtime.launch_dir);
+            tile.terminal = Some(
+                Terminal::spawn(
+                    app.runtime.wake.clone(),
+                    app.runtime.theme.terminal_colors(),
+                    "/bin/sh".into(),
+                    vec![
+                        "-c".into(),
+                        "while IFS= read -r line; do printf '\\033]52;c;Y2xpcGJvYXJk\\007\\033]2;copied\\007'; done"
+                            .into(),
+                    ],
+                    &app.runtime.launch_dir,
+                    HashMap::new(),
+                    100,
+                )
+                .unwrap(),
+            );
+            app.runtime.sessions.push(tile);
+        }
+        // The active session alone is insufficient: the actual keyboard focus determines access.
+        app.runtime.active = Some("tile-a".into());
+        assert!(frame(app, ctx, 1, &[0, 1], true).is_empty());
+        emit(app, 0);
+        emit(app, 1);
+        assert_eq!(frame(app, ctx, 1, &[0, 1], true), ["clipboard"]);
+        assert_eq!(app.runtime.toast.as_ref().unwrap().0, "Clipboard set by tile-b (tile-b)");
+        assert!(frame(app, ctx, 0, &[0, 1], true).is_empty(), "background writes cannot be replayed");
+
+        emit(app, 0);
+        assert!(frame(app, ctx, 1, &[0, 1], true).is_empty(), "losing focus drops a pending copy");
+        emit(app, 1);
+        app.runtime.config.terminal.clipboard = atomics_core::config::ClipboardPolicy::Off;
+        assert!(frame(app, ctx, 1, &[0, 1], true).is_empty(), "off discards pending copies");
+        emit(app, 1);
+        app.runtime.config.terminal.clipboard = atomics_core::config::ClipboardPolicy::Focused;
+        assert!(frame(app, ctx, 1, &[0, 1], true).is_empty());
+
+        app.runtime.sessions[1].sandbox = Some("sandboxed".into());
+        assert!(frame(app, ctx, 1, &[0, 1], true).is_empty());
+        emit(app, 1);
+        assert!(frame(app, ctx, 1, &[0, 1], true).is_empty(), "focused sandboxes stay off");
+        app.runtime.sessions[1].sandbox = None;
+        assert!(frame(app, ctx, 1, &[0, 1], true).is_empty());
+        emit(app, 1);
+        assert!(frame(app, ctx, 1, &[0], true).is_empty(), "hidden tiles cannot copy through stale focus");
+        assert!(frame(app, ctx, 1, &[0, 1], false).is_empty());
+        emit(app, 1);
+        assert!(frame(app, ctx, 1, &[0, 1], false).is_empty(), "an unfocused window cannot copy");
+        assert!(frame(app, ctx, 1, &[0, 1], true).is_empty());
+        std::thread::sleep(Duration::from_secs(1));
+        emit(app, 1);
+        assert_eq!(frame(app, ctx, 1, &[0, 1], true), ["clipboard"]);
+    });
+}
+
+#[test]
+fn session_ids_and_prefixes_cannot_be_shadowed_by_titles() {
+    with_state("app::tests::session_ids_and_prefixes_cannot_be_shadowed_by_titles", |mut state, _ctx| {
+        let mut attacker = session("other-id", AgentKind::Shell, AgentStatus::Idle, &state.launch_dir);
+        attacker.title = "target-id".into();
+        attacker.sandbox = Some("untrusted".into());
+        state.sessions =
+            vec![attacker, session("target-id-long", AgentKind::Shell, AgentStatus::Idle, &state.launch_dir)];
+        assert_eq!(state.find("target-id"), Some(1), "a title cannot steal a unique id prefix");
+        state.sessions[0].title = "target-id-long".into();
+        assert_eq!(state.find("target-id-long"), Some(1), "exact ids take precedence too");
+        state.sessions[0].title = "target".into();
+        state.sessions.push(session("target-other", AgentKind::Shell, AgentStatus::Idle, &state.launch_dir));
+        assert_eq!(state.find("target"), None, "ambiguous prefixes cannot fall back to titles");
+        state.sessions[0].title = "Display name".into();
+        assert_eq!(state.find(" display NAME "), Some(0));
+        assert_eq!(state.find("  "), None);
+        state.plans = vec![Plan {
+            id: "lookup".into(),
+            tasks: vec![Task {
+                id: "t1".into(),
+                title: "Fix the parser".into(),
+                session: Some("other-id".into()),
+                ..Task::default()
+            }],
+            ..Plan::default()
+        }];
+        assert_eq!(state.find(" T1 · FIX THE PARSER "), Some(0), "task labels are searchable");
+        assert_eq!(state.find("Display name"), Some(0), "legacy titles still work");
+        state.sessions.push(session(
+            "t1 · Fix the parser-long",
+            AgentKind::Shell,
+            AgentStatus::Idle,
+            &state.launch_dir,
+        ));
+        assert_eq!(state.find("t1 · Fix the parser"), Some(3), "task labels cannot steal an id prefix");
+        state.sessions.push(session(
+            "t1 · Fix the parser-other",
+            AgentKind::Shell,
+            AgentStatus::Idle,
+            &state.launch_dir,
+        ));
+        assert_eq!(state.find("t1 · Fix the parser"), None, "ambiguous prefixes cannot fall back to task labels");
+        state.sessions[0].sandbox = None;
+    });
+}
+
+#[test]
+fn p5_review_duplicate_task_labels_require_a_session_id() {
+    with_state("app::tests::p5_review_duplicate_task_labels_require_a_session_id", |mut state, _| {
+        let root = state.launch_dir.clone();
+        state.sessions = ["first-session", "second-session"]
+            .into_iter()
+            .map(|id| session(id, AgentKind::Generic, AgentStatus::Idle, &root))
+            .collect();
+        state.plans = ["first", "second"]
+            .into_iter()
+            .zip(&state.sessions)
+            .map(|(id, session)| Plan {
+                id: id.into(),
+                tasks: vec![Task {
+                    id: "t1".into(),
+                    title: "Fix the parser".into(),
+                    session: Some(session.id.clone()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .collect();
+        assert_eq!(state.find("t1 · Fix the parser"), None);
+        assert_eq!(state.find("first-session"), Some(0));
+        assert_eq!(state.find("second-"), Some(1));
+        state.sessions[0].rename("Parser investigation");
+        assert_eq!(state.find("Parser investigation"), Some(0));
+        assert_eq!(state.find("t1 · Fix the parser"), Some(1));
+    });
 }
 
 #[test]
@@ -435,6 +691,8 @@ fn permission_hooks_wake_waiters_and_accept_decisions(app: &mut Desktop<'_>, _ct
         let (wait_tx, wait_rx) = channel();
         app.runtime.control(
             ControlRequest::Wait {
+                compact: false,
+                full_sessions: false,
                 sessions: vec!["codex".into()],
                 statuses: vec!["needs you".into()],
                 after: Some(app.runtime.event_seq),
@@ -750,7 +1008,7 @@ fn plan_set_resolves_cached_worktree_projects(app: &mut Desktop<'_>) {
             ticket: None,
             plan: None,
             goal: "ship".into(),
-            tasks: vec![Task { id: "a".into(), repo: Some("/worktree/src".into()), ..Task::default() }],
+            tasks: vec![plan::TaskInput { id: "a".into(), repo: Some("/worktree/src".into()), ..Default::default() }],
             integration: None,
         },
         tx,
