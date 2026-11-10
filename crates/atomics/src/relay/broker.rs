@@ -49,6 +49,9 @@ pub struct Options {
     host_uid: u32,
     #[arg(long)]
     admin_uid: u32,
+    /// Dedicated group permitted to connect to the use socket. Defaults to this process's group.
+    #[arg(long)]
+    use_group: Option<String>,
 }
 
 // No Debug: Set carries a secret. No generic get/read/copy operation exists.
@@ -209,18 +212,38 @@ struct Broker {
     host_uid: u32,
     admin_uid: u32,
     edits: Mutex<()>,
+    hosts_dirty: AtomicBool,
 }
 
 impl Broker {
     fn hosts(&self) -> Result<()> {
-        let mut hosts: Vec<_> = self.store.secrets()?.into_iter().filter_map(|spec| spec.host).collect();
-        if self.store.secrets()?.iter().any(|s| s.name.starts_with(github::ACCOUNT_PREFIX)) {
+        // A failed projection must be retried even if the catalog mutation was already saved.
+        self.hosts_dirty.store(true, Ordering::Relaxed);
+        self.write_hosts()?;
+        self.hosts_dirty.store(false, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn write_hosts(&self) -> Result<()> {
+        let secrets = self.store.secrets()?;
+        let mut hosts: Vec<_> = secrets.iter().filter_map(|spec| spec.host.clone()).collect();
+        if secrets.iter().any(|s| s.name.starts_with(github::ACCOUNT_PREFIX)) {
             hosts.push("api.github.com".into());
         }
         hosts.sort();
         hosts.dedup();
+        // Every replacement wakes root's DNS reconciliation. A restart, a rotated value, or
+        // another rule for an existing host must leave this inode and its content unchanged.
+        let file = self.state.join("rule-hosts.json");
+        let content = serde_json::to_string(&hosts)?;
+        match std::fs::read(&file) {
+            Ok(bytes) if bytes == content.as_bytes() => return Ok(()),
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         // A root-owned path unit consumes only this validated, value-free projection.
-        write_private(&self.state, &self.state.join("rule-hosts.json"), &serde_json::to_string(&hosts)?)?;
+        write_private(&self.state, &file, &content)?;
         Ok(())
     }
 
@@ -244,14 +267,18 @@ impl Broker {
                     let label = format!("secret:{}", spec.name);
                     let result = self.store.sync_secret_rule(spec, &value);
                     value.zeroize();
-                    if result? {
+                    let changed = result?;
+                    if changed {
                         self.engine.grants.lock().unwrap().retain(|_, grant| grant.credential.label != label);
                     }
-                    self.hosts()?;
+                    if changed || self.hosts_dirty.load(Ordering::Relaxed) {
+                        self.hosts()?;
+                    }
                     eprintln!("secret-broker: secret set");
                 }
                 Request::Remove { name } => {
-                    if self.store.secrets()?.iter().any(|spec| spec.name == name) {
+                    let changed = self.store.secrets()?.iter().any(|spec| spec.name == name);
+                    if changed {
                         self.store.remove_secret(&name)?;
                     }
                     self.engine
@@ -259,7 +286,9 @@ impl Broker {
                         .lock()
                         .unwrap()
                         .retain(|_, grant| grant.credential.label != format!("secret:{name}"));
-                    self.hosts()?;
+                    if changed || self.hosts_dirty.load(Ordering::Relaxed) {
+                        self.hosts()?;
+                    }
                     eprintln!("secret-broker: secret removed");
                 }
                 _ => anyhow::bail!("operation unavailable on admin socket"),
@@ -336,17 +365,19 @@ impl Broker {
         Ok(reply)
     }
 
-    fn serve(&self, socket: UnixStream, admin: bool) -> Result<()> {
-        socket.set_read_timeout(Some(IDLE))?;
+    fn serve(&self, socket: UnixStream, admin: bool, slot: &mut Slot) -> Result<()> {
         socket.set_write_timeout(Some(IDLE))?;
         let uid = peer_uid(&socket)?;
-        let mut reader = BufReader::new(socket.try_clone()?);
+        anyhow::ensure!(uid == 0 || uid == self.admin_uid || (!admin && uid == self.host_uid), "broker peer refused");
+        let mut reader =
+            BufReader::new(BrokerRead { stream: socket.try_clone()?, deadline: Some(Instant::now() + AUTH_DEADLINE) });
         let mut writer = socket;
         let mut bytes = zeroize::Zeroizing::new(Vec::new());
         reader.by_ref().take(MAX_CONTROL).read_until(b'\n', &mut bytes)?;
         let request: Request = serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("invalid broker request"))?;
         if matches!(request, Request::Relay) && !admin {
-            // Any peer may present a placeholder; the engine accepts only a host-issued mapping.
+            // A peer admitted to this socket may present a placeholder; the engine accepts
+            // only a host-issued mapping.
             let head = match read_head(&mut reader) {
                 Ok(Some(head)) => head,
                 Ok(None) => return Ok(()),
@@ -356,8 +387,14 @@ impl Broker {
                 }
                 Err(error) => return Err(error.into()),
             };
+            // A complete Relay marker is not authentication: require a valid placeholder
+            // before allowing an idle/streaming request to occupy an authenticated slot.
+            if self.engine.matching_grant(&head).is_some() {
+                reader.get_mut().authenticate(slot)?;
+            }
             self.engine.exchange(head, &mut reader, &mut writer)?;
         } else {
+            reader.get_mut().authenticate(slot)?;
             let reply = self.control(request, admin, uid).unwrap_or_else(|_| {
                 eprintln!("secret-broker: control operation refused uid={uid} admin={admin}");
                 Reply::default()
@@ -367,6 +404,35 @@ impl Broker {
             writer.write_all(b"\n")?;
         }
         Ok(())
+    }
+}
+
+/// The JSON preamble and, for Relay, the HTTP headers share one absolute deadline. A peer
+/// trickling bytes cannot renew it. Authenticated streams retain the regular relay timeout.
+struct BrokerRead {
+    stream: UnixStream,
+    deadline: Option<Instant>,
+}
+
+impl BrokerRead {
+    fn authenticate(&mut self, slot: &mut Slot) -> Result<()> {
+        anyhow::ensure!(slot.authenticate(), "broker authenticated connection limit");
+        self.deadline = None;
+        self.stream.set_read_timeout(Some(IDLE))?;
+        Ok(())
+    }
+}
+
+impl Read for BrokerRead {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        if let Some(deadline) = self.deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            self.stream.set_read_timeout(Some(remaining))?;
+        }
+        self.stream.read(bytes)
     }
 }
 
@@ -405,13 +471,32 @@ fn peer_uid(_: &UnixStream) -> io::Result<u32> {
     Err(io::Error::other("the VM broker requires Linux"))
 }
 
-fn listen(path: &Path, mode: u32) -> Result<UnixListener> {
+fn listen(path: &Path, mode: u32, group: Option<u32>) -> Result<UnixListener> {
     if path.exists() {
         std::fs::remove_file(path)?;
     }
     let socket = UnixListener::bind(path)?;
+    if let Some(group) = group {
+        std::os::unix::fs::chown(path, None, Some(group))?;
+    }
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
     Ok(socket)
+}
+
+fn group_id(name: &str) -> Result<u32> {
+    let name = std::ffi::CString::new(name)?;
+    let mut entry = std::mem::MaybeUninit::<libc::group>::uninit();
+    let mut found = std::ptr::null_mut();
+    // The dedicated group has only the VM and admin accounts. Bound NSS allocation and
+    // fail closed if its entry is missing or exceeds the buffer; never use a shared buffer.
+    let mut buffer = vec![0u8; 64 * 1024];
+    // SAFETY: the name is NUL-terminated, all writable buffers have the declared sizes,
+    // and entry is read only after getgrnam_r reports a successful lookup.
+    let result = unsafe {
+        libc::getgrnam_r(name.as_ptr(), entry.as_mut_ptr(), buffer.as_mut_ptr().cast(), buffer.len(), &mut found)
+    };
+    anyhow::ensure!(result == 0 && !found.is_null(), "broker use group is unavailable");
+    Ok(unsafe { entry.assume_init() }.gr_gid)
 }
 
 pub fn run(options: Options) -> Result<()> {
@@ -427,10 +512,12 @@ pub fn run(options: Options) -> Result<()> {
         host_uid: options.host_uid,
         admin_uid: options.admin_uid,
         edits: Mutex::new(()),
+        hosts_dirty: AtomicBool::new(false),
     });
     broker.hosts()?;
-    let use_socket = listen(&options.use_socket, 0o666)?;
-    let admin_socket = listen(&options.admin_socket, 0o660)?;
+    let use_group = options.use_group.as_deref().map(group_id).transpose()?;
+    let use_socket = listen(&options.use_socket, 0o660, use_group)?;
+    let admin_socket = listen(&options.admin_socket, 0o660, None)?;
     let accepting = broker.clone();
     std::thread::Builder::new()
         .name("secret-broker-admin".into())
@@ -441,19 +528,20 @@ pub fn run(options: Options) -> Result<()> {
 
 fn accept(broker: Arc<Broker>, listener: UnixListener, admin: bool) {
     for socket in listener.incoming().flatten() {
-        if broker.engine.connections.fetch_add(1, Ordering::AcqRel) >= MAX_CONNECTIONS {
-            broker.engine.connections.fetch_sub(1, Ordering::AcqRel);
-            continue;
-        }
-        let slot = Slot { inner: broker.engine.clone(), authenticated: true };
-        let broker = broker.clone();
-        let _ = std::thread::Builder::new().name("secret-broker-request".into()).spawn(move || {
-            if broker.serve(socket, admin).is_err() {
-                eprintln!("secret-broker: malformed or failed request (contents hidden)");
-            }
-            drop(slot);
-        });
+        start_request(broker.clone(), socket, admin);
     }
+}
+
+fn start_request(broker: Arc<Broker>, socket: UnixStream, admin: bool) {
+    if !take_slot(&broker.engine.pending, MAX_PRE_AUTH) {
+        return;
+    }
+    let mut slot = Slot { inner: broker.engine.clone(), authenticated: false };
+    let _ = std::thread::Builder::new().name("secret-broker-request".into()).spawn(move || {
+        if broker.serve(socket, admin, &mut slot).is_err() {
+            eprintln!("secret-broker: malformed or failed request (contents hidden)");
+        }
+    });
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -475,8 +563,9 @@ mod tests {
             host_uid: unsafe { libc::getuid() },
             admin_uid: unsafe { libc::getuid() },
             edits: Mutex::new(()),
+            hosts_dirty: AtomicBool::new(false),
         });
-        let listener = listen(&socket, 0o666).unwrap();
+        let listener = listen(&socket, 0o660, Some(unsafe { libc::getegid() })).unwrap();
         let serving = broker.clone();
         // Test listeners exit when their temporary path is removed; no global environment changes.
         listener.set_nonblocking(true).unwrap();
@@ -484,10 +573,7 @@ mod tests {
         std::thread::spawn(move || {
             while path.exists() {
                 if let Ok((socket, _)) = listener.accept() {
-                    let serving = serving.clone();
-                    std::thread::spawn(move || {
-                        let _ = serving.serve(socket, false);
-                    });
+                    start_request(serving.clone(), socket, false);
                 } else {
                     std::thread::sleep(Duration::from_millis(5));
                 }
@@ -498,6 +584,154 @@ mod tests {
 
     fn set(broker: &Broker, spec: Secret, value: &str) {
         assert!(broker.control(Request::Set { spec, value: value.into() }, true, broker.admin_uid).unwrap().ok);
+    }
+
+    #[test]
+    fn host_projection_changes_only_with_the_effective_host_list() {
+        use std::os::unix::fs::MetadataExt;
+        let (dir, broker, _) = machine();
+        let path = dir.path().join("rule-hosts.json");
+        broker.hosts().unwrap();
+        let empty = std::fs::File::open(&path).unwrap();
+        broker.hosts().unwrap(); // The same projection at broker restart.
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), empty.metadata().unwrap().ino());
+        set(&broker, Secret { name: "EXPOSED".into(), ..Default::default() }, "private-exposed");
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), empty.metadata().unwrap().ino());
+
+        let spec = Secret { name: "FIRST".into(), host: Some("api.example.com".into()), ..Default::default() };
+        set(&broker, spec.clone(), "private-first");
+        let projected = std::fs::File::open(&path).unwrap();
+        for _ in 0..8 {
+            set(&broker, spec.clone(), "private-first");
+        }
+        set(&broker, spec, "private-rotated");
+        set(
+            &broker,
+            Secret { name: "SECOND".into(), host: Some("api.example.com".into()), ..Default::default() },
+            "private-second",
+        );
+        for name in ["FIRST", "EXPOSED", "MISSING"] {
+            broker.control(Request::Remove { name: name.into() }, true, broker.admin_uid).unwrap();
+        }
+        broker.hosts().unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), projected.metadata().unwrap().ino());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[\"api.example.com\"]");
+        broker.control(Request::Remove { name: "SECOND".into() }, true, broker.admin_uid).unwrap();
+        assert_ne!(std::fs::metadata(&path).unwrap().ino(), projected.metadata().unwrap().ino());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[]");
+    }
+
+    #[test]
+    fn no_op_sets_skip_projection_and_failed_projection_is_retried() {
+        let (dir, broker, _) = machine();
+        let path = dir.path().join("rule-hosts.json");
+        let spec = Secret { name: "KEY".into(), host: Some("api.example.com".into()), ..Default::default() };
+        set(&broker, spec.clone(), "private-canary");
+        // An unreadable projection must not be consulted for an acknowledged no-op.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        set(&broker, spec.clone(), "private-canary");
+        assert!(!broker.hosts_dirty.load(Ordering::Relaxed));
+        let mut changed = spec.clone();
+        changed.host = Some("other.example.com".into());
+        assert!(
+            broker
+                .control(Request::Set { spec: changed.clone(), value: "private-canary".into() }, true, broker.admin_uid)
+                .is_err()
+        );
+        assert!(broker.hosts_dirty.load(Ordering::Relaxed));
+        std::fs::remove_dir(&path).unwrap();
+        // The catalog already contains this rule; the retry still repairs its projection.
+        set(&broker, changed, "private-canary");
+        assert!(!broker.hosts_dirty.load(Ordering::Relaxed));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[\"other.example.com\"]");
+    }
+
+    #[test]
+    fn use_socket_permissions_are_limited_to_its_access_group() {
+        use std::os::unix::fs::MetadataExt;
+        let (dir, _, _) = machine();
+        let meta = std::fs::metadata(dir.path().join("use.sock")).unwrap();
+        assert_eq!(meta.mode() & 0o777, 0o660);
+        assert_eq!(meta.gid(), unsafe { libc::getegid() });
+        assert_eq!(group_id("root").unwrap(), 0);
+        assert!(group_id(&format!("absent-{}", uuid::Uuid::new_v4().simple())).is_err());
+    }
+
+    #[test]
+    fn idle_and_trickling_peers_do_not_occupy_authenticated_broker_slots() {
+        let (_dir, broker, client) = machine();
+        let mut peers = Vec::new();
+        let mut trickler = None;
+        let mut peak_pending = 0;
+        for index in 0..MAX_PRE_AUTH + 4 {
+            let (mut peer, socket) = UnixStream::pair().unwrap();
+            if index == 0 {
+                // A complete JSON Relay preamble still needs complete authenticated HTTP headers.
+                peer.write_all(b"{\"op\":\"relay\"}\nGET /api.example.com/ HTTP/1.1\r\n").unwrap();
+            }
+            // The real accept loop uses this handler. Paired sockets let us assert the cap
+            // after every admission without racing the listener's backlog or polling thread.
+            start_request(broker.clone(), socket, false);
+            if index == 1 {
+                let mut trickle = peer.try_clone().unwrap();
+                trickler = Some(std::thread::spawn(move || {
+                    while trickle.write_all(b" ").is_ok() {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                }));
+            }
+            let pending = broker.engine.pending.load(Ordering::Acquire);
+            assert!(pending <= MAX_PRE_AUTH, "pending peers exceeded their separate pool");
+            peak_pending = peak_pending.max(pending);
+            peers.push(peer);
+        }
+        assert!(peak_pending > 0, "broker never admitted a pending peer");
+        let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(8));
+        assert_eq!(broker.engine.connections.load(Ordering::Acquire), 0);
+        while broker.engine.pending.load(Ordering::Acquire) != 0 {
+            assert!(Instant::now() < deadline, "idle/trickling peers outlived the absolute auth deadline");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        trickler.unwrap().join().unwrap();
+        assert!(client.list().unwrap().is_empty(), "host calls work after pending peers expire");
+    }
+
+    #[test]
+    fn authenticated_relay_body_may_arrive_after_the_pre_auth_deadline() {
+        let upstream = fake::start();
+        let (_dir, broker, client) = machine_with(HashMap::from([("api.example.com".into(), upstream.url.clone())]));
+        set(
+            &broker,
+            Secret { name: "KEY".into(), host: Some("api.example.com".into()), ..Default::default() },
+            "private-canary",
+        );
+        let placeholder = format!("atomics-{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
+        client.grant("KEY", "s1", &placeholder).unwrap();
+        let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(8));
+        while broker.engine.connections.load(Ordering::Acquire) != 0
+            || broker.engine.pending.load(Ordering::Acquire) != 0
+        {
+            assert!(Instant::now() < deadline, "grant control connection did not finish");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut peer = client.connect(&Request::Relay).unwrap();
+        peer.write_all(format!("POST /api.example.com/v1/messages HTTP/1.1\r\nAuthorization: Bearer {placeholder}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n").as_bytes()).unwrap();
+        let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(8));
+        while broker.engine.connections.load(Ordering::Acquire) != 1
+            || broker.engine.pending.load(Ordering::Acquire) != 0
+        {
+            assert!(Instant::now() < deadline, "relay did not authenticate");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(broker.engine.pending.load(Ordering::Acquire), 0);
+        std::thread::sleep(AUTH_DEADLINE + Duration::from_millis(100));
+        peer.write_all(b"{}").unwrap();
+        upstream.release.send(()).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(8))).unwrap();
+        let mut response = String::new();
+        peer.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     }
 
     #[test]

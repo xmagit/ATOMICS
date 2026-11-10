@@ -129,6 +129,9 @@ fn reconcile(
             }
         }
     }
+    // List exposes rules, not a value revision or proof of the broker's current value. A saved
+    // Mac acknowledgement cannot detect replacement brokers or independent admin changes.
+    // Resend for correctness; the broker's no-op path preserves grants and DNS configuration.
     for (spec, value) in values {
         let state = match broker.set(&spec, &value) {
             Ok(()) => "Synced".into(),

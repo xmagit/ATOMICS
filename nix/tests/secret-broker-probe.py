@@ -26,9 +26,21 @@ elif operation == "private":
             raise AssertionError("private broker resource accessible")
 elif operation == "forged-grant":
     with socket.socket(socket.AF_UNIX) as peer:
-        peer.connect("/run/atomics-secret-broker/use.sock")
-        peer.sendall(json.dumps({"op": "grant", "name": "KEY", "session": "forged", "placeholder": "atomics-" + "0" * 64}).encode() + b"\n")
-        assert not json.loads(peer.makefile("rb").readline())["ok"]
+        try:
+            peer.connect("/run/atomics-secret-broker/use.sock")
+        except PermissionError:
+            pass
+        else:
+            peer.sendall(json.dumps({"op": "grant", "name": "KEY", "session": "forged", "placeholder": "atomics-" + "0" * 64}).encode() + b"\n")
+            assert not json.loads(peer.makefile("rb").readline())["ok"]
+elif operation == "use-private":
+    with socket.socket(socket.AF_UNIX) as peer:
+        try:
+            peer.connect("/run/atomics-secret-broker/use.sock")
+        except PermissionError:
+            pass
+        else:
+            raise AssertionError("broker use socket accessible to an unrelated user")
 elif operation == "connect":
     allowed = sys.argv[2] == "yes"
     try:
