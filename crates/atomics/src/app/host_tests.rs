@@ -174,6 +174,8 @@ fn waiter_wakes_on_a_hook_status_change_without_frames() {
         state.sessions = vec![session("worker", AgentKind::Claude, AgentStatus::Working, &state.launch_dir)];
         let host = state.into_host();
         let wait = host.command(ControlRequest::Wait {
+            compact: false,
+            full_sessions: false,
             sessions: vec!["worker".into()],
             statuses: vec!["turn done".into()],
             after: Some(0),
@@ -602,6 +604,8 @@ fn blocked_project_picker_does_not_block_hooks_or_waits() {
             .drop_without_applying_deltas();
         }
         let wait = app.host.command(ControlRequest::Wait {
+            compact: false,
+            full_sessions: false,
             sessions: vec!["worker".into()],
             statuses: vec!["turn done".into()],
             after: Some(0),

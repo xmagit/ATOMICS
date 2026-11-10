@@ -2535,6 +2535,8 @@ mod tests {
     fn wait_for(app: &mut Desktop<'_>, _ctx: &egui::Context, statuses: &[&str]) -> Receiver<ControlOutcome> {
         let (tx, rx) = channel();
         let request = ControlRequest::Wait {
+            compact: false,
+            full_sessions: false,
             // Ticket events reach waiters watching other sessions too.
             sessions: vec!["agent-a".into()],
             statuses: statuses.iter().map(|s| s.to_string()).collect(),

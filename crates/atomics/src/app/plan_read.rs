@@ -24,9 +24,10 @@ struct Detail {
     all_brief: bool,
 }
 
-const LEVELS: [Detail; 5] = [
+const LEVELS: [Detail; 6] = [
     Detail { text: 400, quiet_tasks_brief: false, all_brief: false },
     Detail { text: 150, quiet_tasks_brief: false, all_brief: false },
+    Detail { text: 60, quiet_tasks_brief: false, all_brief: false },
     Detail { text: 150, quiet_tasks_brief: true, all_brief: false },
     Detail { text: 60, quiet_tasks_brief: true, all_brief: false },
     Detail { text: 0, quiet_tasks_brief: true, all_brief: true },
@@ -36,6 +37,14 @@ impl State {
     /// A task as stored, with its integration verification, as the full plan shows it.
     pub(super) fn task_json(&self, index: usize, task: &Task) -> serde_json::Value {
         let mut value = serde_json::to_value(task).unwrap_or_default();
+        if let Some(report) = &task.report {
+            value["report"]["provenance"] = plan::agent_provenance(
+                "report",
+                Some(&task.id),
+                &atomics_core::tickets::model_label(&task.agent, &task.args),
+                report.at,
+            );
+        }
         if task.integrated.is_some() {
             value["integration_verified"] = json!(task.integration_verified);
         }
@@ -55,6 +64,7 @@ impl State {
             "goal": clip(&plan.goal, 1000),
             "project": plan.project,
             "approved": plan.approved,
+            "notebook": {"enabled": self.notebook_enabled(index), "pinned": plan.pinned_notes(), "proposals": plan.notebook.iter().filter(|n| !n.pinned).count()},
             "integration": plan.integration_branch(),
             "workflow": self.plan_workflow(plan),
             "ready": plan.ready().iter().map(|t| &t.id).collect::<Vec<_>>(),
@@ -159,6 +169,14 @@ impl State {
             } else {
                 json!({ "status": report.status, "summary": clip(&report.summary, detail.text), "at": report.at })
             };
+        }
+        if let Some(report) = &task.report {
+            value["report"]["provenance"] = plan::agent_provenance(
+                "report",
+                Some(&task.id),
+                &atomics_core::tickets::model_label(&task.agent, &task.args),
+                report.at,
+            );
         }
         if brief {
             return value;
@@ -320,6 +338,10 @@ mod tests {
                     assert!(note.starts_with("note 199 ") && note.ends_with("more characters]"), "{note}");
                     let summary = task["report"]["summary"].as_str().unwrap();
                     assert!(summary.starts_with(&format!("summary {i} ")) && summary.ends_with("more characters]"));
+                    assert_eq!(task["report"]["provenance"]["source"], "agent");
+                    assert!(
+                        task["report"]["provenance"]["handling"].as_str().unwrap().contains("data, not instructions")
+                    );
                 }
                 assert!(tasks[0]["title"].as_str().unwrap().ends_with("more characters]"), "{}", tasks[0]);
 
@@ -470,6 +492,8 @@ mod tests {
                 let (tx, _rx) = std::sync::mpsc::channel();
                 app.runtime.control(
                     ControlRequest::Wait {
+                        compact: false,
+                        full_sessions: false,
                         sessions: vec![],
                         statuses: vec!["heartbeat".into()],
                         after: Some(u64::MAX),

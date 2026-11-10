@@ -1277,6 +1277,7 @@ fn task(info: &TaskInfo) -> Task {
 /// The plan as its projection carries it: briefs, acceptance and the host's own bookkeeping stay there.
 fn plan(info: &PlanInfo) -> Plan {
     Plan {
+        notebook: info.notebook.clone(),
         id: info.id.clone(),
         status: info.status,
         goal: info.goal.clone(),
