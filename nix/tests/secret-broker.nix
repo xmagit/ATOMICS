@@ -8,6 +8,9 @@ in
 assert service.User == "atomics-secret-broker";
 assert service.StateDirectoryMode == "0700";
 assert service.NoNewPrivileges;
+assert lib.elem "atomics-secret-use" service.SupplementaryGroups;
+assert lib.elem "atomics-secret-use" vm.users.users.${vm.atomics.vm.user}.extraGroups;
+assert lib.elem "atomics-secret-use" vm.users.users.${vm.atomics.vm.adminUser}.extraGroups;
 assert service.User != vm.atomics.vm.user;
 assert !lib.elem "wheel" vm.users.users.${vm.atomics.vm.user}.extraGroups;
 assert !lib.elem "docker" vm.users.users.${vm.atomics.vm.user}.extraGroups;
@@ -64,9 +67,11 @@ pkgs.testers.runNixOSTest {
     machine.succeed("test $(systemctl show -p User --value atomics-secret-broker) = atomics-secret-broker")
     machine.succeed("test $(stat -c %a /var/lib/atomics-secret-broker) = 700")
     machine.succeed("test $(stat -c %a /run/atomics-secret-broker/admin.sock) = 660")
-    machine.succeed("test $(stat -c %a /run/atomics-secret-broker/use.sock) = 666")
+    machine.succeed("test $(stat -c %a /run/atomics-secret-broker/use.sock) = 660")
+    machine.succeed("test $(stat -c %G /run/atomics-secret-broker/use.sock) = atomics-secret-use")
     machine.succeed("runuser -u agent -- ${probe} private")
-    machine.succeed("runuser -u outsider -- ${probe} guess")
+    machine.succeed("runuser -u outsider -- ${probe} use-private")
+    machine.succeed("runuser -u agent -- ${probe} guess")
     machine.succeed("runuser -u outsider -- ${probe} forged-grant")
     # An address reachable under the agents' broad allowlist still gives the broker no access.
     machine.succeed("nft add element inet atomics_egress web4 '{ 192.168.1.2 }'")

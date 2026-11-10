@@ -635,15 +635,22 @@ Enabling the broker alone does not protect secrets from those agents.
 The host receives metadata and issues random session placeholders. The broker holds the mappings,
 rejects unknown or revoked placeholders, checks the stored host, method, path and authentication rule,
 adds the value and makes the HTTPS request itself. The host's existing loopback relay forwards to
-`/run/atomics-secret-broker/use.sock`; no connected window is needed. The broker streams responses
-and redacts reflected credentials just as the desktop relay does. When a broker is configured but
-unavailable, session preparation and requests fail; they do not fall back to a readable store.
+`/run/atomics-secret-broker/use.sock`; no connected window is needed. That socket has mode `0660`
+and group `atomics-secret-use`, granted to the VM and admin accounts. Unfinished JSON requests
+and relay headers share a two-second authentication deadline
+and a separate pool of 32 pending connections; they cannot occupy the 256 authenticated slots.
+The broker streams responses and redacts reflected credentials just as the desktop relay does.
+When a broker is configured but unavailable, session preparation and requests fail; they do not
+fall back to a readable store.
 Desktop hosts without `ATOMICS_SECRET_BROKER_SOCKET` continue using the OS keychain.
 
 In a Mac window connected with `[client] connect = "vm"`, Settings stores, lists, copies (after a
 fresh OS prompt) and removes secrets in the **Mac keychain**. Adding a secret also sends it directly
 to the VM broker. Each row shows **Pending**, **Synced**, or **Failed** with a reason. Reconnecting or
 refreshing credentials resends the keychain entries, including after the broker has been replaced.
+Unchanged rules and values leave the broker's network projection untouched, so resync does not
+restart DNS. Rotating a value or adding another secret for an existing host also preserves that
+projection. Actual host-list changes still reconcile the resolver and its address sets together.
 Project scopes use the VM's main-checkout paths, including directories that exist only in the VM.
 Failed removals stay in a names-only journal on the Mac and retry on reconnect or refresh, even after
 the window has closed. Entries independently installed by an administrator are preserved.

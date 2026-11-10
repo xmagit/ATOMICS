@@ -5,6 +5,7 @@ let
   cfg = vm.secretBroker;
   user = "atomics-secret-broker";
   group = "atomics-secret-admin";
+  useGroup = "atomics-secret-use";
   state = "/var/lib/atomics-secret-broker";
   runtime = "/run/atomics-secret-broker";
 in {
@@ -21,6 +22,8 @@ in {
     warnings = lib.optional (!vm.hardened)
       "atomics.vm.secretBroker without atomics.vm.hardened: agents can become root and read the store.";
     users.groups.${group} = { };
+    users.groups.${useGroup} = { };
+    users.users.${vm.user}.extraGroups = [ useGroup ];
     users.users.${user} = {
       isSystemUser = true;
       group = group;
@@ -30,7 +33,7 @@ in {
     users.users.${vm.adminUser} = {
       isNormalUser = true;
       uid = 1001;
-      extraGroups = [ group ];
+      extraGroups = [ group useGroup ];
     };
     # The broker owns the socket parent; agents cannot unlink or replace either socket.
     systemd.tmpfiles.rules = [ "d ${runtime} 0755 ${user} ${group} - -" ];
@@ -42,11 +45,12 @@ in {
       serviceConfig = {
         User = user;
         Group = group;
+        SupplementaryGroups = [ useGroup ];
         StateDirectory = "atomics-secret-broker";
         StateDirectoryMode = "0700";
         UMask = "0077";
         LimitCORE = 0;
-        ExecStart = "${config.programs.atomics.package}/bin/atomics secret-broker --host-uid ${toString config.users.users.${vm.user}.uid} --admin-uid ${toString config.users.users.${vm.adminUser}.uid}";
+        ExecStart = "${config.programs.atomics.package}/bin/atomics secret-broker --host-uid ${toString config.users.users.${vm.user}.uid} --admin-uid ${toString config.users.users.${vm.adminUser}.uid} --use-group ${useGroup}";
         Restart = "on-failure";
         RestartSec = 2;
         NoNewPrivileges = true;

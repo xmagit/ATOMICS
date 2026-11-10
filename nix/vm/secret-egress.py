@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
 
@@ -37,9 +38,14 @@ def dns_config(hosts, upstream, rules=()):
 
 def reconcile(source, target, upstream, policy=None):
     # Do not follow a link out of the broker's private state directory.
-    fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
-    with os.fdopen(fd) as stream:
-        data = stream.read(65537)
+    fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError("broker host list must be a regular file")
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            data = stream.read(65537)
+    finally:
+        os.close(fd)
     if len(data) > 65536:
         raise ValueError("broker host list too large")
     rules = json.loads(Path(policy).read_text()) if policy else []
