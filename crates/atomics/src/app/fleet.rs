@@ -380,6 +380,7 @@ mod tests {
                         status: "done".into(),
                         summary: "Report first line\nReport second line\nReport third line\nHidden fourth line".into(),
                         at: 890,
+                        checks: Vec::new(),
                     }),
                     additions: 412,
                     deletions: 88,

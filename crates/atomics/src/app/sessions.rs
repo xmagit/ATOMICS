@@ -176,6 +176,9 @@ impl State {
     ) -> Result<String, String> {
         let interactive = std::mem::take(&mut self.interactive_start);
         let chief = role == Role::Chief;
+        if !chief && let Some(error) = &self.tickets.workspace_identity_error {
+            return Err(error.clone());
+        }
         let agent = if chief {
             atomics_core::config::AgentConfig {
                 name: "chief".into(),
@@ -534,7 +537,7 @@ impl State {
                     "--mcp-config".to_string(),
                     config.to_string(),
                     "--allowedTools".to_string(),
-                    "mcp__atomics__atomics_preview,mcp__atomics__atomics_report,mcp__atomics__atomics_agent_ticket_get,mcp__atomics__atomics_agent_ticket_comment".to_string(),
+                    "mcp__atomics__atomics_preview,mcp__atomics__atomics_report,mcp__atomics__atomics_note,mcp__atomics__atomics_notes,mcp__atomics__atomics_agent_ticket_get,mcp__atomics__atomics_agent_ticket_comment".to_string(),
                 ]);
             }
             AgentKind::Generic if codex.is_some() => {

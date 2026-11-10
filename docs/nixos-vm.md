@@ -3,8 +3,9 @@
 `nixosConfigurations.atomics-vm` is an ARM Linux guest for Apple Virtualization (VZ) on Apple Silicon.
 It imports `nixosModules.atomics` and installs the ATOMICS CLI, Docker with Rosetta for amd64 containers,
 Node.js, Git, the GitHub CLI, Helix (`hx`, the default `[editor] command`, which the editor panel runs in
-the guest when the host runs there), Claude Code, Codex, Cargo, rustup and `atomics-onboard`, which signs
-in to them ([Sign in inside the VM](#sign-in-inside-the-vm)). A team adds its own stack (SDKs, cloud CLIs,
+the guest when the host runs there), Claude Code, Codex, Cargo, rustc, rustup, GCC, pkg-config, Python 3,
+coreutils (including `mktemp`) and `atomics-onboard`, which signs in to them
+([Sign in inside the VM](#sign-in-inside-the-vm)). A team adds its own stack (SDKs, cloud CLIs,
 more sign-ins and checks) with a module of its own;
 [`nix/examples/dotnet-azure.nix`](../nix/examples/dotnet-azure.nix) is an example, off by default
 ([Example: .NET and Azure DevOps](#example-net-and-azure-devops)).
@@ -568,6 +569,15 @@ fixed text) and `login_NAME`. `onboard_option NAME HELP HANDLER` adds a `--NAME 
 [`nix/examples/dotnet-azure/onboard.sh`](../nix/examples/dotnet-azure/onboard.sh) is a full example.
 
 ### Trust and secrets
+
+With `atomics.vm.host.enable = true`, a fresh guest host config seeds `[isolation] mode = "bare"`
+and the Codex command `["codex", "--dangerously-bypass-approvals-and-sandbox"]`. Codex runs without
+its own sandbox or approval prompts, so it can write the worktree's git metadata and reach the host's
+queue socket. The VM boundary is then the only sandbox boundary. This seed applies only to the host
+in the VM; desktop host defaults and the agents-over-ssh layout are unchanged. An existing
+`~/.config/atomics/config.toml` is never overwritten by the seed.
+The flake check `checks.aarch64-linux.atomics-vm-config` checks the generated host seeds, the
+unchanged desktop seed and the guest's build tools, including `mktemp`.
 
 Without [hardened mode](#hardened-mode) the VM is one trust domain. Every agent, the chief and everything
 they run (builds, package scripts, containers) run as `<user>`, and each of them can reach all of the following:
