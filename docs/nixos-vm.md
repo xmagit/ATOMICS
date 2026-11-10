@@ -20,7 +20,8 @@ MCP, approvals, plans, worktrees, git and builds all run in the VM, and `ATOMICS
 their window, a client of that host over `atomics.v1` ([The host in the VM](#the-host-in-the-vm)). One
 setting on the Mac, `[client] connect = "vm"`, does it. File access to the Mac is through the shared
 folders. Lima also exposes Mac network services at `192.168.5.2`, including listeners on the Mac’s
-loopback; enable the [network policy](#network-policy) to block that address except for resolver DNS.
+loopback; enable the [network policy](#network-policy) to block that address except for resolver DNS
+and root's DHCP renewals.
 
 The older layout keeps the host on the Mac and starts each agent in the VM over ssh
 ([Agents in the VM](#agents-in-the-vm)); a bundle built without the host has it.
@@ -672,10 +673,13 @@ with dnsmasq's existing dynamically allocated UID.
 New connections to Lima’s host address (`192.168.5.2`) are refused for every UID, including root, before
 UID exemptions or domain rules. Only dnsmasq may open TCP/UDP connections to port 53 at
 `atomics.vm.egress.upstream` (default `192.168.5.2`), so agents cannot query Lima’s resolver directly or
-initiate connections to Mac services through it. Established and related traffic is accepted first so
-replies to Mac-initiated SSH and forwarded connections still
-work when Lima presents the gateway address as their source. Use it with [hardened mode](#hardened-mode):
-without it any agent can become root and lift it.
+initiate connections to Mac services through it. Root alone may send UDP to gateway port 67 so dhcpcd
+can renew the VM's lease by unicast. These exceptions precede the gateway reject, which still precedes
+the general UID exemptions. `upstream` must be an IPv4 or IPv6 address literal; hostnames, ports, zone
+identifiers and CIDR prefixes are rejected during evaluation. Established and related traffic is accepted
+first so replies to Mac-initiated SSH and forwarded connections still work when Lima presents the gateway
+address as their source. Use it with [hardened mode](#hardened-mode): without it any agent can become root
+and lift it.
 
 ```nix
 atomics.vm.egress = {
@@ -692,7 +696,7 @@ A team adds its cloud, ticket system and databases. Refused connections are logg
 `journalctl -k -g atomics-egress` lists each with its destination; a refused name shows in a tool's own
 error. With `enforce = false` connections outside the domain allowlist are only logged, which helps to
 learn what work needs before enforcing. Names outside the list and new connections to Lima’s host address
-(except resolver DNS) remain refused.
+(except resolver DNS and root's DHCP renewals) remain refused.
 
 Limits: an allowed address is allowed whatever name led there, which matters behind shared CDNs, and an
 allowed service that stores data (a GitHub repository, a package feed) can still receive what an agent sends.
