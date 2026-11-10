@@ -211,12 +211,22 @@ fn command(dir: &Path, args: &[&str]) -> Result<Command> {
 /// repository it plants there has a config of its own.
 fn locate(dir: &Path) -> Result<Option<GitPins>> {
     let pinned = PINNED.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let located = locate_pins(dir, &pinned)?;
+    if let Some(common) = located.as_ref().and_then(|pins| pins.common_dir.as_ref()) {
+        check_admin_folders(&pinned, common)?;
+    }
+    Ok(located)
+}
+
+/// Identify only a recorded repository, before inspecting its sandbox-writable admin files.
+/// Git commands must use `locate`, which also validates those files.
+fn locate_pins(dir: &Path, pinned: &[GitPins]) -> Result<Option<GitPins>> {
     if pinned.is_empty() {
         return Ok(None);
     }
     let real = std::fs::canonicalize(dir).ok();
     let given = || std::iter::once(dir).chain(real.as_deref());
-    if let Some(folder) = git_folders(&pinned).find(|folder| given().any(|path| path.starts_with(folder))) {
+    if let Some(folder) = git_folders(pinned).find(|folder| given().any(|path| path.starts_with(folder))) {
         bail!(
             "{} is inside {}, a git folder a sandbox writes, so git does not run there",
             dir.display(),
@@ -228,9 +238,6 @@ fn locate(dir: &Path) -> Result<Option<GitPins>> {
         .filter(|pins| given().any(|path| path.starts_with(&pins.work_tree)))
         .max_by_key(|pins| pins.work_tree.components().count());
     if let Some(pins) = innermost {
-        if let Some(common) = &pins.common_dir {
-            check_admin_folders(&pinned, common)?;
-        }
         return Ok(Some(pins.clone()));
     }
     let Some(real) = real else { return Ok(None) };
@@ -256,7 +263,6 @@ fn locate(dir: &Path) -> Result<Option<GitPins>> {
         };
         (git_dir, common.to_path_buf())
     };
-    check_admin_folders(&pinned, &common)?;
     Ok(Some(GitPins { work_tree: top.to_path_buf(), git_dir: Some(git_dir), common_dir: Some(common) }))
 }
 
@@ -1542,6 +1548,7 @@ pub fn integrate_with_identity(
     base_ref: &str,
     identity: &crate::identity::Identity,
 ) -> Result<Integration> {
+    check_integration_claims(repo, into)?;
     let lock = worktree_lock(repo)?;
     let _turn = lock.lock().unwrap_or_else(|e| e.into_inner());
     integration_worktree(repo, into, into_path)?;
@@ -1613,7 +1620,7 @@ impl std::fmt::Display for IntegrationRefClaim {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Sandbox worktree {} claims integration ref refs/heads/{}; restore its task HEAD before integrating",
+            "Sandbox worktree {} claims integration ref refs/heads/{} or has unsafe admin metadata; restore its task HEAD and gitdir before integrating",
             self.worktree.display(),
             self.branch
         )
@@ -1622,19 +1629,66 @@ impl std::fmt::Display for IntegrationRefClaim {
 
 impl std::error::Error for IntegrationRefClaim {}
 
-fn integration_worktree(repo: &Path, into: &str, into_path: &Path) -> Result<Option<WorktreeEntry>> {
-    let common = common_dir(repo)?;
+/// Attribute unsafe sandbox metadata before Git's general admin checks can obscure the owner.
+/// Resolve refs only through locations in the host's pins, never through commondir or gitdir.
+pub fn check_integration_claims(repo: &Path, into: &str) -> Result<()> {
+    let pinned = pinned_all();
+    let Some(common) = locate_pins(repo, &pinned)?.and_then(|pins| pins.common_dir) else { return Ok(()) };
     let claimed_ref = format!("refs/heads/{into}");
-    for pins in pinned_all().into_iter().filter(|pins| pins.common_dir.as_ref() == Some(&common)) {
-        // The sandbox can change gitdir as well as HEAD. Attribute the claim using the
-        // host's pinned admin folder even when Git lists it under a forged worktree path.
-        if pins.git_dir.as_ref().is_some_and(|dir| {
-            read_regular_file(&dir.join("HEAD"), 4096)
-                .is_ok_and(|head| head.trim().strip_prefix("ref:").map(str::trim) == Some(claimed_ref.as_str()))
-        }) {
+    for pins in pinned.into_iter().filter(|pins| pins.common_dir.as_ref() == Some(&common)) {
+        if pinned_claim(&pins, &claimed_ref).unwrap_or(true) {
             return Err(IntegrationRefClaim { worktree: pins.work_tree, branch: into.into() }.into());
         }
     }
+    Ok(())
+}
+
+fn pinned_claim(pins: &GitPins, claimed_ref: &str) -> Result<bool> {
+    let admin = pins.git_dir.as_ref().context("pinned repository has no admin folder")?;
+    let common = pins.common_dir.as_ref().context("pinned repository has no common folder")?;
+    let metadata = match admin.symlink_metadata() {
+        // Removed worktrees can retain pins; their missing admin folders cannot claim a ref.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        metadata => metadata?,
+    };
+    ensure!(metadata.is_dir(), "pinned admin folder is not a directory");
+    if admin != common {
+        let back = admin.join(read_regular_file(&admin.join("gitdir"), 4096)?.trim());
+        let expected = pins.work_tree.join(".git");
+        ensure!(
+            back == expected
+                || back
+                    .parent()
+                    .and_then(|parent| parent.canonicalize().ok())
+                    .zip(back.file_name())
+                    .is_some_and(|(parent, name)| parent.join(name) == expected),
+            "gitdir no longer names the pinned worktree"
+        );
+    }
+    let mut value = read_regular_file(&admin.join("HEAD"), 4096)?;
+    for _ in 0..8 {
+        let Some(target) = value.trim().strip_prefix("ref:").map(str::trim) else { return Ok(false) };
+        if target == claimed_ref {
+            return Ok(true);
+        }
+        ensure!(target.starts_with("refs/"), "symbolic HEAD leaves pinned refs");
+        let folder =
+            if ["refs/bisect/", "refs/worktree/", "refs/rewritten/"].iter().any(|prefix| target.starts_with(prefix)) {
+                admin
+            } else {
+                common
+            };
+        if !loose_ref_exists(folder, target)? {
+            // Packed refs contain object IDs, not symrefs. An absent loose ref ends this chain.
+            return Ok(false);
+        }
+        value = read_regular_file(&folder.join(target), 4096)?;
+    }
+    bail!("symbolic HEAD exceeds the integration hop limit")
+}
+
+fn integration_worktrees(repo: &Path, into: &str) -> Result<Vec<WorktreeEntry>> {
+    check_integration_claims(repo, into)?;
     let checked_out: Vec<_> =
         list_worktrees(repo)?.into_iter().filter(|entry| entry.branch.as_deref() == Some(into)).collect();
     // Check every claimant before duplicate detection, so a forged claim beside the real
@@ -1645,6 +1699,23 @@ fn integration_worktree(repo: &Path, into: &str, into_path: &Path) -> Result<Opt
             return Err(IntegrationRefClaim { worktree: pins.work_tree, branch: into.into() }.into());
         }
     }
+    ensure!(checked_out.len() <= 1, "refs/heads/{into} is claimed by multiple worktrees");
+    Ok(checked_out)
+}
+
+/// Older plans may adopt one existing trusted, unpinned checkout once. Recorded destinations
+/// remain authoritative even if a different checkout later claims the integration branch.
+pub fn integration_path(repo: &Path, into: &str, recorded: Option<&Path>, configured: &Path) -> Result<PathBuf> {
+    let entries = integration_worktrees(repo, into)?;
+    let path = recorded.unwrap_or_else(|| {
+        entries.first().filter(|entry| entry.trusted).map_or(configured, |entry| entry.path.as_path())
+    });
+    integration_worktree(repo, into, path)?;
+    Ok(path.to_path_buf())
+}
+
+fn integration_worktree(repo: &Path, into: &str, into_path: &Path) -> Result<Option<WorktreeEntry>> {
+    let checked_out = integration_worktrees(repo, into)?;
     ensure!(
         // A new destination may not exist yet: resolve its parents too, so an alias into
         // a sandbox cannot bypass pinned() just because its last component is missing.
@@ -1652,7 +1723,6 @@ fn integration_worktree(repo: &Path, into: &str, into_path: &Path) -> Result<Opt
         "integration destination {} is inside a sandbox-pinned folder",
         into_path.display()
     );
-    ensure!(checked_out.len() <= 1, "refs/heads/{into} is claimed by multiple worktrees");
     let Some(entry) = checked_out.into_iter().next() else { return Ok(None) };
     ensure!(
         entry.path == into_path
@@ -1906,6 +1976,110 @@ pub(crate) mod tests {
         assert_eq!(error.downcast_ref::<IntegrationRefClaim>().unwrap().worktree, pins.work_tree);
         assert!(!destination.exists());
         unpin(&pins.work_tree);
+    }
+
+    fn refuses_unsafe_integration_admin(change: impl FnOnce(&GitPins)) {
+        let (_dir, repo) = project();
+        let task = repo.with_file_name("task");
+        let sandbox = repo.with_file_name("sandbox");
+        let destination = repo.with_file_name("integration");
+        add_worktree(&repo, &task, "task", "main").unwrap();
+        add_worktree(&repo, &sandbox, "sandbox", "main").unwrap();
+        std::fs::write(task.join("pending"), "must not be staged").unwrap();
+        let original = commit_of(&repo, "refs/heads/task").unwrap();
+        let pins = resolve_pins(&sandbox).unwrap();
+        pin(pins.clone());
+        change(&pins);
+        let error = integrate(&repo, &task, "task", "feature", "integration", &destination, "main").unwrap_err();
+        assert_eq!(error.downcast_ref::<IntegrationRefClaim>().unwrap().worktree, pins.work_tree, "{error:#}");
+        assert!(!destination.exists());
+        // Git's generic checks may now refuse this repository; unpin only to inspect the result.
+        unpin(&pins.work_tree);
+        assert_eq!(commit_of(&repo, "refs/heads/task").unwrap(), original);
+        assert!(git(&task, &["diff", "--cached"]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn integration_attributes_non_regular_pinned_heads() {
+        for kind in ["symlink", "directory", "missing", "fifo"] {
+            refuses_unsafe_integration_admin(|pins| {
+                let head = pins.git_dir.as_ref().unwrap().join("HEAD");
+                std::fs::remove_file(&head).unwrap();
+                match kind {
+                    "symlink" => std::os::unix::fs::symlink("/dev/zero", &head).unwrap(),
+                    "directory" => std::fs::create_dir(&head).unwrap(),
+                    "fifo" => {
+                        let path = std::ffi::CString::new(head.as_os_str().as_encoded_bytes()).unwrap();
+                        // SAFETY: the terminated path belongs to this fixture.
+                        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+                    }
+                    _ => {}
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn integration_attributes_chained_pinned_head_symrefs() {
+        for first in ["refs/heads/alias", "refs/worktree/alias"] {
+            refuses_unsafe_integration_admin(|pins| {
+                let admin = pins.git_dir.as_ref().unwrap();
+                let common = pins.common_dir.as_ref().unwrap();
+                let first_file = if first.starts_with("refs/worktree/") { admin } else { common }.join(first);
+                std::fs::create_dir_all(first_file.parent().unwrap()).unwrap();
+                std::fs::write(admin.join("HEAD"), format!("ref: {first}\n")).unwrap();
+                std::fs::write(first_file, "ref: refs/heads/second\n").unwrap();
+                std::fs::write(common.join("refs/heads/second"), "ref: refs/heads/integration\n").unwrap();
+                std::fs::write(admin.join("commondir"), "/untrusted-common\n").unwrap();
+                assert!(pinned_claim(pins, "refs/heads/integration").unwrap());
+            });
+        }
+    }
+
+    #[test]
+    fn integration_head_resolution_rejects_cycles_and_escapes() {
+        for target in ["refs/heads/cycle", "refs/heads/../../outside", "/outside", "refs/heads/linked/alias"] {
+            refuses_unsafe_integration_admin(|pins| {
+                let admin = pins.git_dir.as_ref().unwrap();
+                let common = pins.common_dir.as_ref().unwrap();
+                std::fs::write(admin.join("HEAD"), format!("ref: {target}\n")).unwrap();
+                std::fs::write(common.join("refs/heads/cycle"), "ref: refs/heads/cycle\n").unwrap();
+                std::os::unix::fs::symlink("/", common.join("refs/heads/linked")).unwrap();
+            });
+        }
+    }
+
+    #[test]
+    fn integration_attributes_a_redirected_gitdir_even_with_an_ordinary_head() {
+        refuses_unsafe_integration_admin(|pins| {
+            let admin = pins.git_dir.as_ref().unwrap();
+            std::fs::write(admin.join("gitdir"), "/elsewhere/.git\n").unwrap();
+        });
+    }
+
+    #[test]
+    fn legacy_integration_paths_require_one_trusted_unpinned_checkout() {
+        let (_dir, repo) = project();
+        let old = repo.with_file_name("old-integration");
+        let configured = repo.with_file_name("new-integration");
+        assert_eq!(integration_path(&repo, "integration", None, &configured).unwrap(), configured);
+        add_worktree(&repo, &old, "integration", "main").unwrap();
+        assert_eq!(integration_path(&repo, "integration", None, &configured).unwrap(), old);
+        assert!(integration_path(&repo, "integration", Some(&configured), &configured).is_err());
+        let pins = resolve_pins(&old).unwrap();
+        pin(pins.clone());
+        let error = integration_path(&repo, "integration", None, &configured).unwrap_err();
+        assert!(error.downcast_ref::<IntegrationRefClaim>().is_some());
+        unpin(&pins.work_tree);
+        let other = repo.with_file_name("other");
+        add_worktree(&repo, &other, "other", "main").unwrap();
+        git(&other, &["symbolic-ref", "HEAD", "refs/heads/integration"]).unwrap();
+        assert!(
+            integration_path(&repo, "integration", None, &configured).unwrap_err().to_string().contains("multiple")
+        );
+        git(&other, &["symbolic-ref", "HEAD", "refs/heads/other"]).unwrap();
+        std::fs::write(old.join(".git"), "invalid pointer\n").unwrap();
+        assert!(integration_path(&repo, "integration", None, &configured).is_err());
     }
 
     #[test]
@@ -2420,7 +2594,12 @@ pub(crate) mod tests {
             assert!(listed.exists() && worktree.exists());
             let error =
                 integrate(&repo, &worktree, "task", "task (t1)", "plan", &repo.with_file_name("app-plan"), "main");
-            assert!(format!("{:#}", error.unwrap_err()).contains("not listed as git made it"), "{target}");
+            let error = error.unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<IntegrationRefClaim>().unwrap().worktree,
+                pins.work_tree,
+                "{target}: {error:#}"
+            );
             assert_eq!(main_checkout(&worktree).unwrap(), repo.canonicalize().unwrap());
             diff_against_base(&repo, "main", None).unwrap();
             assert!(!marker.exists(), "{target}: host git ran the sandbox's hook");
