@@ -267,6 +267,32 @@ fn session_ids_and_prefixes_cannot_be_shadowed_by_titles() {
         state.sessions[0].title = "Display name".into();
         assert_eq!(state.find(" display NAME "), Some(0));
         assert_eq!(state.find("  "), None);
+        state.plans = vec![Plan {
+            id: "lookup".into(),
+            tasks: vec![Task {
+                id: "t1".into(),
+                title: "Fix the parser".into(),
+                session: Some("other-id".into()),
+                ..Task::default()
+            }],
+            ..Plan::default()
+        }];
+        assert_eq!(state.find(" T1 · FIX THE PARSER "), Some(0), "task labels are searchable");
+        assert_eq!(state.find("Display name"), Some(0), "legacy titles still work");
+        state.sessions.push(session(
+            "t1 · Fix the parser-long",
+            AgentKind::Shell,
+            AgentStatus::Idle,
+            &state.launch_dir,
+        ));
+        assert_eq!(state.find("t1 · Fix the parser"), Some(3), "task labels cannot steal an id prefix");
+        state.sessions.push(session(
+            "t1 · Fix the parser-other",
+            AgentKind::Shell,
+            AgentStatus::Idle,
+            &state.launch_dir,
+        ));
+        assert_eq!(state.find("t1 · Fix the parser"), None, "ambiguous prefixes cannot fall back to task labels");
         state.sessions[0].sandbox = None;
     });
 }

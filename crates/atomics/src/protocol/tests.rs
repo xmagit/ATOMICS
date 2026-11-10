@@ -22,6 +22,7 @@ pub(crate) fn wait(base: Duration) -> Duration {
 
 pub(crate) fn session(id: &str, title: &str, status: AgentStatus) -> SessionInfo {
     SessionInfo {
+        status_hint: None,
         previews: Vec::new(),
         id: id.into(),
         agent: "claude".into(),

@@ -31,7 +31,7 @@ use atomics_core::approvals::{ApprovalRequest, Decision};
 use atomics_core::control::{ControlRequest, ControlResponse};
 use atomics_core::governor::{SlotClass, Ticket};
 use atomics_core::hook::HookReply;
-use atomics_core::plan::{self, Plan, PlanStatus, Report, Task, TaskStatus, short_slug};
+use atomics_core::plan::{self, Plan, PlanStatus, Report, Task, TaskStatus};
 use atomics_core::wire::{Disposition, ErrorCode, WireError};
 use atomics_core::workspace::{self, Workspace};
 #[cfg(test)]

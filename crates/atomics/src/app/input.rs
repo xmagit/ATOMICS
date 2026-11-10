@@ -1314,7 +1314,7 @@ mod tests {
                     text
                 };
                 let text = frame(app, vec![]);
-                for part in ["Ship it", "Do the thing", "a · needs you"] {
+                for part in ["Ship it", "Do the thing", "t · Do the thing · needs you"] {
                     assert!(text.iter().any(|t| t == part), "the location names {part}: {text:?}");
                 }
                 // Every project's tab: the sidebar groups the sessions under their plan, the rest outside plans.

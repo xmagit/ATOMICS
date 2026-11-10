@@ -253,9 +253,9 @@ fn crumbs(backend: &dyn Backend, p: &Palette) -> Vec<Crumb> {
             });
         }
         crumbs.push(Crumb {
-            text: format!("{} · {}", session.title, session.status.label()),
+            text: format!("{} · {}", session.title, session.status_label()),
             color: status_color(session.status, p),
-            hover: format!("{} in {}", session.agent, backend.display(&session.root)),
+            hover: format!("{}\n{} in {}", session.hover(), session.agent, backend.display(&session.root)),
             command: Some(Command::Activate { session: session.id.clone(), open_diff: true }),
         });
     } else if let Some(root) = &hints.diff_target {

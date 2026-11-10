@@ -371,6 +371,11 @@ pub fn menu_visible(screen: &str) -> bool {
 /// A question an agent asks before its first turn and waits on: Codex's "Trust this folder?",
 /// its update and sign-in screens, Claude's folder trust, or any choice menu.
 pub fn first_run_prompt(screen: &str) -> bool {
+    menu_visible(screen) || first_run_hint(screen).is_some()
+}
+
+/// The known setup screens that can stop an agent before its hooks report a turn.
+pub fn first_run_hint(screen: &str) -> Option<&'static str> {
     const PROMPTS: &[&str] = &[
         "trustthisfolder?",
         "trustandcontinue",
@@ -378,9 +383,33 @@ pub fn first_run_prompt(screen: &str) -> bool {
         "skipuntilnextversion",
         "signinwithchatgpt",
         "pressentertocontinue",
+        "choosetheme",
+        "chooseatheme",
+        "choosethetheme",
+        "selecttheme",
+        "selectatheme",
+        "choosethetextstyle",
+        "reviewhooks",
+        "hooksneedreview",
     ];
     let compact: String = screen.chars().filter(|c| !c.is_whitespace()).flat_map(char::to_lowercase).collect();
-    menu_visible(screen) || PROMPTS.iter().any(|prompt| compact.contains(prompt))
+    if [
+        "signinwithchatgpt",
+        "signinwithyour",
+        "signintocontinue",
+        "loginwith",
+        "selectloginmethod",
+        "selectaloginmethod",
+    ]
+    .iter()
+    .any(|prompt| compact.contains(prompt))
+    {
+        Some("needs sign-in")
+    } else if PROMPTS.iter().any(|prompt| compact.contains(prompt)) {
+        Some("first-run setup")
+    } else {
+        None
+    }
 }
 
 const CODEX_QUESTION: &str = "Would you like to run the following command?";
@@ -980,6 +1009,11 @@ mod tests {
 
     #[test]
     fn first_run_questions_are_prompts_and_an_idle_composer_is_not() {
+        assert_eq!(first_run_hint("Sign in with ChatGPT\nPress Enter to continue"), Some("needs sign-in"));
+        assert_eq!(first_run_hint("Select login method:\n❯ 1. Subscription"), Some("needs sign-in"));
+        assert_eq!(first_run_hint("Choose the text style that looks best with your terminal"), Some("first-run setup"));
+        assert_eq!(first_run_hint("Choose a theme"), Some("first-run setup"));
+        assert_eq!(first_run_hint("Select theme:\n› 1. Dark\n  2. Light"), Some("first-run setup"));
         for screen in [
             "  Trust this folder? Codex can read, edit, and run files here, subject to your\n  permission settings.\n\n  Trust and continue\n  Open restricted",
             "> You are in /repos/app\n\n  Do you trust the files in this folder?\n\n❯ 1. Yes, proceed\n  2. No, exit",

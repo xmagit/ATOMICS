@@ -1312,6 +1312,7 @@ fn project_of(mirror: &Mirror, dir: &Path) -> Option<PathBuf> {
 fn session_row(session: &SessionInfo, mirror: &Mirror) -> SessionRow {
     let root = root(session);
     SessionRow {
+        status_hint: session.status_hint.clone(),
         id: session.id.clone(),
         title: session.title.clone(),
         agent: session.agent.clone(),

@@ -200,6 +200,44 @@ fn live() -> (egui::Context, World, Client, View) {
 }
 
 #[test]
+fn task_names_and_actionable_statuses_reach_every_shared_view() {
+    use atomics_core::{plan::TaskStatus, session::AgentStatus};
+    let mut host = fake_host::host();
+    let worker = host.board.sessions.iter_mut().find(|s| !s.chief).unwrap();
+    worker.title = "t1 · Fix the parser".into();
+    worker.branch = Some("atomics/a-long-plan-name/t1-fix-the-parser".into());
+    worker.status = AgentStatus::Done;
+    worker.pending_approvals = 0;
+    host.board.approvals.clear();
+    host.board.plans[0].tasks[0].title = "Fix the parser".into();
+    host.board.plans[0].tasks[0].status = TaskStatus::Done;
+    let chief = host.board.sessions.iter_mut().find(|s| s.chief).unwrap();
+    chief.status = AgentStatus::NeedsInput;
+    chief.status_hint = Some("waiting for you: approve the next plan".into());
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, BOARD);
+    assert!(has(&shown, "To: t1 · Fix the parser"), "{shown:?}");
+    assert!(has(&shown, "t1 · Fix the parser · turn done"), "location: {shown:?}");
+    assert!(shown.iter().filter(|(text, _)| text == "t1 · Fix the parser").count() >= 2, "tile and sidebar: {shown:?}");
+    assert!(has(&shown, "● 1 needs you"), "only the chief needs input: {shown:?}");
+    assert!(has(&shown, "waiting for you"), "the chief pill: {shown:?}");
+    assert!(has(&shown, "waiting for you: approve the next plan"), "the chief's reason: {shown:?}");
+    let row = world.driver.remote.session_list().into_iter().find(|s| !s.chief).unwrap();
+    assert!(!row.needs_user());
+    assert!(row.hover().contains("atomics/a-long-plan-name/t1-fix-the-parser"));
+
+    for hint in ["needs sign-in", "first-run setup"] {
+        let mut host = fake_host::working();
+        let worker = host.board.sessions.iter_mut().find(|s| !s.chief).unwrap();
+        worker.status = AgentStatus::NeedsInput;
+        worker.status_hint = Some(hint.into());
+        let (ctx, mut world, mut client, mut view) = live_with(host);
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, BOARD);
+        assert!(shown.iter().any(|(text, _)| text.contains(hint)), "{hint} on the tile: {shown:?}");
+    }
+}
+
+#[test]
 fn every_tab_draws_over_a_live_host() {
     let (ctx, mut world, mut client, mut view) = live();
     for tab in [Tab::Agents, Tab::Board, Tab::Approvals, Tab::Diffs, Tab::Terminal, Tab::Chief] {
@@ -4329,6 +4367,7 @@ fn agents() -> fake_host::FakeHost {
     for (id, root, file) in [("s0", "/w/zero", "src/zero.rs"), ("s2", "/w/two", "src/two.rs")] {
         let base = host.board.sessions.iter().find(|s| s.id == "s1").expect("the agent").clone();
         host.board.sessions.push(atomics_core::projection::SessionInfo {
+            status_hint: None,
             previews: Vec::new(),
             id: id.into(),
             title: format!("Agent {id}"),
@@ -4738,6 +4777,7 @@ fn in_editor_mode_the_nth_agents_editor_takes_the_keyboard() {
     let mut host = fake_host::panels_host();
     let base = host.board.sessions.iter().find(|s| s.id == "s1").expect("the agent").clone();
     host.board.sessions.push(atomics_core::projection::SessionInfo {
+        status_hint: None,
         previews: Vec::new(),
         id: "s2".into(),
         task: None,

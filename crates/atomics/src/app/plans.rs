@@ -333,9 +333,9 @@ impl State {
         let mut scope = Scope::none();
         for task in &plan.tasks {
             let repo = task.repo.as_deref().map(paths::expand).or_else(|| plan.project.clone());
-            let made = repo
-                .zip(task.branch.as_ref())
-                .map(|(repo, branch)| git::worktree_path(&self.config.worktree_path, &repo, branch));
+            let made = repo.zip(task.branch.as_ref()).map(|(repo, branch)| {
+                git::plan_task_worktree_path(&self.config.worktree_path, &repo, &plan, task, branch)
+            });
             scope.worktrees.get_or_insert_default().extend(task.worktree.iter().cloned().chain(made));
             scope.sandboxes.extend(task.session.as_deref().map(atomics_core::isolation::sandbox_name));
         }
@@ -803,7 +803,7 @@ impl State {
                 .iter()
                 .find(|s| s.branch() == Some(branch) && git::common_dir(&s.root()).is_ok_and(|dir| dir == *common))
             {
-                Some(format!("is checked out for agent {}", session.title))
+                Some(format!("is checked out for agent {}", self.session_title(session)))
             } else if git::branch_ref_exists(repo, branch).unwrap_or(false) && !reusable() {
                 let tree = git::list_worktrees(repo)
                     .ok()
@@ -865,9 +865,8 @@ impl State {
     ) -> Result<String, String> {
         let common = git::common_dir(repo).map_err(|err| format!("{err:#}"))?;
         let base = self.project_config(repo).base_ref;
-        let preferred_path = git::worktree_path(&self.config.worktree_path, repo, preferred);
-        let fixed_path =
-            preferred_path == git::worktree_path(&self.config.worktree_path, repo, &format!("{preferred}-2"));
+        let preferred_path = self.plan_worktree_path(index, task, repo, preferred);
+        let fixed_path = preferred_path == self.plan_worktree_path(index, task, repo, &format!("{preferred}-2"));
         for attempt in 0..MAX_BRANCH_ALLOCATION_ATTEMPTS {
             let branch = if attempt == 0 { preferred.to_string() } else { format!("{preferred}-{}", attempt + 1) };
             git::check_branch_name(repo, &branch, &base).map_err(|err| format!("{err:#}"))?;
@@ -881,7 +880,7 @@ impl State {
                 ));
             }
             let owned = owners.as_slice() == [(index, task)];
-            let path = git::worktree_path(&self.config.worktree_path, repo, &branch);
+            let path = self.plan_worktree_path(index, task, repo, &branch);
             let reserved_path = self
                 .creating
                 .iter()
@@ -1002,7 +1001,7 @@ impl State {
                 .branch
                 .clone()
                 .or_else(|| self.ticket_branch(index, task.ticket.as_ref(), &repo, Some(&task.id)))
-                .unwrap_or_else(|| format!("atomics/{}-{}-{}", self.plans[index].id, task.id, short_slug(&task.title)));
+                .unwrap_or_else(|| self.plans[index].task_branch(&task));
             let branch = self.available_plan_branch(index, Some(&task.id), &repo, &branch, task.branch.is_some())?;
             let agent = if task.agent.trim().is_empty() { "claude".to_string() } else { task.agent.clone() };
             let config = self.project_config(&repo);
@@ -1211,7 +1210,7 @@ impl State {
         } else if status != "progress" {
             self.pending_questions.remove(&session_id);
         }
-        let title = session.map(|s| s.title.clone()).unwrap_or_else(|| "closed agent".into());
+        let title = session.map(|s| self.session_title(s)).unwrap_or_else(|| "closed agent".into());
         let owner = self.plans.iter().enumerate().find_map(|(index, plan)| {
             plan.tasks.iter().find(|t| t.session.as_deref() == Some(&session_id)).map(|task| (index, task.id.clone()))
         });
@@ -1970,6 +1969,33 @@ mod tests {
             let warning = stale.warning.expect("the fetch failed");
             assert!(warning.contains("could not fetch origin"), "{warning}");
             assert_ne!(git::git(&stale.path, &["rev-parse", "HEAD"]).unwrap().trim(), landed, "as fetched before");
+        });
+    }
+
+    #[test]
+    fn shortened_plan_names_allocate_distinct_branches_and_folders() {
+        with_app("app::plans::tests::shortened_plan_names_allocate_distinct_branches_and_folders", |app, _| {
+            let (_dir, repo) = repository();
+            app.runtime.config.base_ref = "main".into();
+            app.runtime.config.worktree_path = "{repo_parent}/{repo}-{slug}".into();
+            app.runtime.plans = ["a", "b"]
+                .into_iter()
+                .map(|suffix| Plan {
+                    id: format!("a-long-plan-name-with-the-same-prefix-{suffix}"),
+                    project: Some(repo.clone()),
+                    tasks: vec![Task { id: "t1".into(), title: "Fix the parser".into(), ..Default::default() }],
+                    ..Default::default()
+                })
+                .collect();
+            let preferred = app.runtime.plans[0].task_branch(&app.runtime.plans[0].tasks[0]);
+            let first = app.runtime.available_plan_branch(0, Some("t1"), &repo, &preferred, false).unwrap();
+            app.runtime.plans[0].tasks[0].branch = Some(first.clone());
+            let second = app.runtime.available_plan_branch(1, Some("t1"), &repo, &preferred, false).unwrap();
+            assert_eq!(second, format!("{first}-2"));
+            let path = app.runtime.plan_worktree_path(0, Some("t1"), &repo, &first);
+            let next = app.runtime.plan_worktree_path(1, Some("t1"), &repo, &second);
+            assert_eq!(next.to_string_lossy(), format!("{}-2", path.display()));
+            assert!(!path.to_string_lossy().contains("fix-the-parser"));
         });
     }
 

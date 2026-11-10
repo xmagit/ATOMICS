@@ -12,6 +12,64 @@ use super::*;
 pub(super) struct Local<'a>(pub(super) &'a State);
 
 impl State {
+    pub(super) fn session_title(&self, session: &Session) -> String {
+        self.plans
+            .iter()
+            .flat_map(|plan| &plan.tasks)
+            .find(|task| task.session.as_deref() == Some(&session.id))
+            .map(|task| format!("{} · {}", task.id, task.title))
+            .unwrap_or_else(|| session.title.clone())
+    }
+
+    /// Presentation state leaves the agent's hook lifecycle intact while explaining what it waits for.
+    pub(super) fn session_status(&self, session: &Session) -> (AgentStatus, Option<String>) {
+        if session.status != AgentStatus::Exited && session.approvals.is_empty() {
+            let task = self
+                .plans
+                .iter()
+                .flat_map(|plan| &plan.tasks)
+                .find(|task| task.session.as_deref() == Some(&session.id));
+            if self.pending_questions.contains(&session.id) && task.is_none_or(|task| task.status != TaskStatus::Done)
+                || task.is_some_and(|task| task.status == TaskStatus::Blocked)
+            {
+                return (AgentStatus::NeedsInput, None);
+            }
+            if session.chief && session.status == AgentStatus::Working {
+                let mut running = self
+                    .traces
+                    .get(&session.id)
+                    .into_iter()
+                    .flat_map(|log| &log.entries)
+                    .filter(|entry| entry.state == atomics_core::trace::TraceState::Running)
+                    .peekable();
+                let only_waiting = running.peek().is_some() && running.all(|entry| entry.tool == "atomics_wait");
+                let approval =
+                    self.plans.iter().find(|plan| plan.is_open() && !plan.approved && !plan.tasks.is_empty());
+                let active_work =
+                    self.plans.iter().filter(|plan| plan.is_open()).flat_map(|plan| &plan.tasks).any(|task| {
+                        matches!(task.status, TaskStatus::Running | TaskStatus::Review | TaskStatus::Blocked)
+                    });
+                if only_waiting
+                    && !active_work
+                    && let Some(plan) = approval
+                {
+                    return (AgentStatus::NeedsInput, Some(format!("waiting for you: approve {}", plan.goal)));
+                }
+            }
+            if session.is_agent()
+                && matches!(
+                    session.status,
+                    AgentStatus::Starting | AgentStatus::Idle | AgentStatus::Done | AgentStatus::NeedsInput
+                )
+                && let Some(terminal) = session.terminal.as_ref().filter(|terminal| !terminal.exited())
+                && let Some(hint) = atomics_core::approvals::first_run_hint(&terminal.screen_text(60))
+            {
+                return (AgentStatus::NeedsInput, Some(hint.into()));
+            }
+        }
+        (session.status, None)
+    }
+
     pub(super) fn backend(&self) -> Local<'_> {
         Local(self)
     }
@@ -45,12 +103,14 @@ impl Local<'_> {
 
     fn session(&self, session: &Session) -> SessionRow {
         let root = session.root();
+        let (status, status_hint) = self.0.session_status(session);
         SessionRow {
             id: session.id.clone(),
-            title: session.title.clone(),
+            title: self.0.session_title(session),
             agent: session.agent.clone(),
             kind: session.kind,
-            status: session.status,
+            status,
+            status_hint,
             chief: session.chief,
             worktree: session.worktree.as_ref().map(|worktree| worktree.root.clone()),
             branch: session.branch().map(str::to_string),
@@ -151,7 +211,11 @@ impl Backend for Local<'_> {
         Some(BoardView {
             state: state.plan_state(index),
             ready: plan.ready().iter().map(|task| task.id.clone()).collect(),
-            sessions: state.sessions.iter().map(|s| (s.id.clone(), (s.title.clone(), s.status))).collect(),
+            sessions: state
+                .sessions
+                .iter()
+                .map(|s| (s.id.clone(), (state.session_title(s), state.session_status(s).0)))
+                .collect(),
             integration_notes,
             checking: state.integration_checks.keys().any(|(id, _)| id == &plan.id),
             integrating: state
@@ -241,7 +305,7 @@ impl Backend for Local<'_> {
             queue_note,
             warning: session.warning.clone(),
             connect: match session.sandbox {
-                Some(_) => state.connect_buttons(&session.mcp_needed, &session.title),
+                Some(_) => state.connect_buttons(&session.mcp_needed, &state.session_title(session)),
                 None => Vec::new(),
             },
             exited: session.terminal.as_ref().is_some_and(|terminal| terminal.exited()),
@@ -326,7 +390,7 @@ impl Backend for Local<'_> {
         let state = self.0;
         let session = state.active_index().map(|i| &state.sessions[i]);
         let title = session
-            .map(|s| s.title.clone())
+            .map(|s| state.session_title(s))
             .unwrap_or_else(|| root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
         let branch = session
             .and_then(|s| s.branch().map(str::to_string))
@@ -631,7 +695,12 @@ mod tests {
             app.runtime.sessions = vec![planned, chief, loose];
             app.runtime.plans = vec![Plan {
                 id: "plan".into(),
-                tasks: vec![Task { session: Some("planned".into()), ..Task::default() }],
+                tasks: vec![Task {
+                    id: "t1".into(),
+                    title: "Fix the parser".into(),
+                    session: Some("planned".into()),
+                    ..Task::default()
+                }],
                 ..Plan::default()
             }];
             app.runtime.diffs.entry(worktree.clone()).or_default().prepared = Some(Arc::new(diff_view::Prepared {
@@ -652,6 +721,10 @@ mod tests {
             assert_eq!(planned.root, worktree);
             assert_eq!(planned.worktree.as_ref(), Some(&worktree));
             assert_eq!(planned.branch.as_deref(), Some("task"));
+            assert_eq!(planned.title, "t1 · Fix the parser");
+            assert_eq!(app.runtime.describe(0)["title"], "t1 · Fix the parser");
+            assert_eq!(app.runtime.describe(0)["branch"], "task");
+            assert_eq!(loose.title, "loose");
             assert_eq!(planned.project.as_ref(), Some(&repo));
             assert_eq!(planned.changes, Some((12, 3)));
             assert!(!planned.ungrouped);
@@ -720,7 +793,12 @@ mod tests {
             asking.approvals = vec![pending("first", "touch first"), pending("second", "touch second")];
             let quiet = session("quiet", AgentKind::Claude, AgentStatus::Working, dir.path());
             app.runtime.sessions = vec![asking, quiet];
-            let task = |id: &str, status: TaskStatus| Task { id: id.into(), status, ..Task::default() };
+            let task = |id: &str, status: TaskStatus| Task {
+                id: id.into(),
+                title: format!("Task {id}"),
+                status,
+                ..Task::default()
+            };
             app.runtime.plans = vec![
                 Plan { id: "other".into(), ..Plan::default() },
                 Plan {
@@ -750,7 +828,7 @@ mod tests {
             assert_eq!(board.plan, app.runtime.plans[1]);
             assert_eq!(board.state, app.runtime.plan_state(1));
             assert_eq!(board.ready, ["b"]);
-            assert_eq!(board.sessions["asking"], ("Asking".to_string(), AgentStatus::NeedsInput));
+            assert_eq!(board.sessions["asking"], ("a · Task a".to_string(), AgentStatus::NeedsInput));
             assert_eq!(board.sessions.len(), 2);
             let note = format!(
                 "Agent kept open: waiting for its turn and pending messages to finish; checking whether it is in {}",

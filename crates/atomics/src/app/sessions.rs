@@ -731,7 +731,9 @@ impl State {
             // A title cannot override even an ambiguous id prefix.
             return matches.next().is_none().then_some(index);
         }
-        self.sessions.iter().position(|s| s.title.eq_ignore_ascii_case(reference))
+        self.sessions.iter().position(|s| {
+            self.session_title(s).eq_ignore_ascii_case(reference) || s.title.eq_ignore_ascii_case(reference)
+        })
     }
 
     /// Confirm terminal delivery before answering Codex sends; busy turns can drop input.
@@ -1034,7 +1036,7 @@ impl State {
             claude_session_id: claude_id,
             agent: s.agent.clone(),
             cwd: s.cwd.clone(),
-            title: s.title.clone(),
+            title: self.session_title(s),
             last_prompt: s.last_prompt.clone(),
             updated: 0,
             sandbox: s.sandbox.clone(),
@@ -1573,7 +1575,12 @@ mod tests {
     fn bare_codex_trust_and_hook_menus_need_input_even_with_hooks() {
         with_app("app::sessions::tests::bare_codex_trust_and_hook_menus_need_input_even_with_hooks", |app, _| {
             let dir = crate::test_support::tempdir().unwrap();
-            for text in ["Trust this folder?", "Review hooks\n› 1. Trust hooks\n  2. Cancel"] {
+            for text in [
+                "Trust this folder?",
+                "Review hooks\n› 1. Trust hooks\n  2. Cancel",
+                "Sign in with ChatGPT",
+                "Choose a theme",
+            ] {
                 let terminal = Terminal::spawn(
                     app.runtime.wake.clone(),
                     app.runtime.theme.terminal_colors(),
@@ -1585,7 +1592,7 @@ mod tests {
                 )
                 .unwrap();
                 let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
-                while !terminal.screen_text(60).contains("Trust") {
+                while !terminal.screen_text(60).contains(text.lines().next().unwrap()) {
                     assert!(Instant::now() < deadline);
                     std::thread::sleep(Duration::from_millis(10));
                 }
@@ -1597,6 +1604,10 @@ mod tests {
                 app.runtime.track_busy();
                 assert_eq!(app.runtime.sessions[0].status, AgentStatus::NeedsInput);
                 assert!(app.runtime.sessions[0].approvals.is_empty());
+                use atomics_ui::Backend;
+                let row = app.runtime.backend().session_row(0).unwrap();
+                let expected = if text.starts_with("Sign in") { "needs sign-in" } else { "first-run setup" };
+                assert_eq!(row.status_label(), expected);
             }
             app.runtime.sessions.clear();
         });

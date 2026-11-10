@@ -1440,11 +1440,33 @@ pub fn slug(branch: &str) -> String {
 
 /// Fills `{repo_parent}`, `{repo}` and `{slug}` in the configured worktree path.
 pub fn worktree_path(template: &str, repo: &Path, branch: &str) -> PathBuf {
+    worktree_path_with_slug(template, repo, &slug(branch))
+}
+
+pub fn worktree_path_with_slug(template: &str, repo: &Path, slug: &str) -> PathBuf {
+    let slug = self::slug(slug);
     let repo_name = repo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let parent = repo.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
-    let filled =
-        template.replace("{repo_parent}", &parent).replace("{repo}", &repo_name).replace("{slug}", &slug(branch));
+    let filled = template.replace("{repo_parent}", &parent).replace("{repo}", &repo_name).replace("{slug}", &slug);
     crate::paths::expand(&filled)
+}
+
+pub fn plan_task_worktree_path(
+    template: &str,
+    repo: &Path,
+    plan: &crate::plan::Plan,
+    task: &crate::plan::Task,
+    branch: &str,
+) -> PathBuf {
+    if task.branch.as_deref() == Some(branch)
+        && let Some(path) = &task.worktree
+    {
+        return path.clone();
+    }
+    match plan.task_worktree_slug(task, branch) {
+        Some(slug) => worktree_path_with_slug(template, repo, &slug),
+        None => worktree_path(template, repo, branch),
+    }
 }
 
 #[cfg(test)]
@@ -2613,5 +2635,37 @@ pub(crate) mod tests {
     fn worktree_path_template() {
         let path = worktree_path("{repo_parent}/{repo}-{slug}", Path::new("/r/shop"), "issue/42-fix it");
         assert_eq!(path, PathBuf::from("/r/shop-issue-42-fix-it"));
+    }
+
+    #[test]
+    fn plan_task_paths_are_short_and_keep_templates_and_existing_locations() {
+        use crate::plan::{Plan, Task};
+        let repo = Path::new("/r/project");
+        let plan = Plan { id: "ship-the-parser-and-improve-all-the-diagnostics".into(), ..Default::default() };
+        let mut task = Task {
+            id: "t-1".into(),
+            title: "Improve parser diagnostics for incomplete input".into(),
+            ..Default::default()
+        };
+        let branch = plan.task_branch(&task);
+        assert_eq!(branch, "atomics/ship-the-parser-and-impr/t-1-improve-parser-diagnosti");
+        let path =
+            |template: &str, branch: &str, task: &Task| plan_task_worktree_path(template, repo, &plan, task, branch);
+        assert_eq!(
+            path("{repo_parent}/{repo}-{slug}", &branch, &task),
+            Path::new("/r/project-ship-the-parser-and-impr-t-1")
+        );
+        assert_eq!(
+            path("/trees/{slug}/{repo}", &format!("{branch}-2"), &task),
+            Path::new("/trees/ship-the-parser-and-impr-t-1-2/project")
+        );
+        let old = "atomics/ship-the-parser-and-improve-all-the-diagnostics-t-1-improve-parser";
+        assert_eq!(
+            path("{repo_parent}/{repo}-{slug}", old, &task),
+            worktree_path("{repo_parent}/{repo}-{slug}", repo, old)
+        );
+        task.branch = Some(branch.clone());
+        task.worktree = Some(PathBuf::from("/existing/task-folder"));
+        assert_eq!(path("/new/{slug}", &branch, &task), Path::new("/existing/task-folder"));
     }
 }
