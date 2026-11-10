@@ -999,7 +999,7 @@ impl State {
                     // The last check, once the agent cannot write any more.
                     let (done, finished) = std::sync::mpsc::channel();
                     checks.run(move || {
-                        if let Some(guard) = guard {
+                        if let Some(guard) = &guard {
                             match guard.check(&exempt) {
                                 Ok(found) => alerts.extend(found),
                                 Err(err) => alerts.push(format!("Final ref guard check FAILED: {err:#}")),
@@ -1007,7 +1007,9 @@ impl State {
                         }
                         if !alerts.is_empty() {
                             crate::lifecycle::record_leftovers(&paths::atomics_home(), &alerts);
-                            let _ = actions.send(Box::new(move |state| state.ref_alert(&id, alerts.join("\n"))));
+                            let generation = guard.as_ref().and_then(|guard| guard.alert_generation());
+                            let _ = actions
+                                .send(Box::new(move |state| state.ref_alert_at(&id, alerts.join("\n"), generation)));
                         }
                         let _ = done.send(());
                     });

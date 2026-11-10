@@ -1,7 +1,7 @@
 //! Git through the `git` CLI: exact porcelain semantics, and it picks up
 //! `core.fsmonitor`/`core.untrackedCache`, which matter on large repositories.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 #[cfg(any(test, feature = "test-support"))]
@@ -81,7 +81,7 @@ fn timeout(args: &[&str]) -> Duration {
 /// Whether `ancestor` is an ancestor of `descendant` in `dir`'s repository, or `None` when git
 /// answers neither, as when one of them names no commit there.
 pub fn is_ancestor(dir: &Path, ancestor: &str, descendant: &str) -> Result<Option<bool>> {
-    let (ancestor, descendant) = (qualify_ref(dir, ancestor)?, qualify_ref(dir, descendant)?);
+    let (ancestor, descendant) = (qualify_revision(dir, ancestor)?, qualify_revision(dir, descendant)?);
     let args = ["merge-base", "--is-ancestor", "--", &ancestor, &descendant];
     let output = output(command(dir, &args)?, &args, None, timeout(&args))?;
     Ok(match output.status.code() {
@@ -95,7 +95,7 @@ pub fn is_ancestor(dir: &Path, ancestor: &str, descendant: &str) -> Result<Optio
 /// The commit `rev` names in `dir`'s repository, or `None` when it names none there. Unlike
 /// [`git`], a git that did not finish is an error, never `None`.
 pub fn commit_of(dir: &Path, rev: &str) -> Result<Option<String>> {
-    let rev = qualify_ref(dir, rev)?;
+    let rev = qualify_revision(dir, rev)?;
     let args = ["rev-parse", "--verify", "--quiet", "--end-of-options", &rev];
     let output = output(command(dir, &args)?, &args, None, timeout(&args))?;
     Ok(match output.status.code() {
@@ -365,6 +365,23 @@ static PINNED: LazyLock<Mutex<Vec<GitPins>>> = LazyLock::new(Mutex::default);
 // Keyed by the host-only record, so repairing one record cannot clear another's refusal.
 type GitRefusals = HashMap<PathBuf, (Option<PathBuf>, String)>;
 static REFUSED: LazyLock<Mutex<GitRefusals>> = LazyLock::new(Mutex::default);
+static REFUSAL_SCANS: LazyLock<Mutex<HashMap<PathBuf, HashSet<PathBuf>>>> = LazyLock::new(Mutex::default);
+
+/// Forget only refusals whose records disappeared from a successfully read ownership scope.
+/// Other homes, unreadable directories and records still present retain their refusals.
+pub fn refresh_git_refusals(home: &Path, mut records: HashSet<PathBuf>, unreadable: &HashSet<PathBuf>) {
+    let mut scans = REFUSAL_SCANS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(previous) = scans.get(home) {
+        records.extend(previous.iter().filter(|record| unreadable.iter().any(|dir| record.starts_with(dir))).cloned());
+    }
+    let previous = scans.insert(home.into(), records.clone());
+    if let Some(previous) = previous {
+        let mut refused = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
+        for record in previous.difference(&records) {
+            refused.remove(record);
+        }
+    }
+}
 
 pub fn refuse_git(record: &Path, pins: Option<&GitPins>, reason: String) {
     REFUSED
@@ -380,8 +397,19 @@ pub fn allow_git(record: &Path) {
 /// A broken owned pin must not turn a sandboxed folder back into an ordinary Git checkout.
 /// Legacy records without a second copy cannot identify that folder, so they stop all host Git.
 pub fn git_refusal(dir: &Path) -> Option<String> {
-    let real = dir.canonicalize().ok();
-    REFUSED.lock().unwrap_or_else(|e| e.into_inner()).values().find_map(|(folder, reason)| {
+    lookup_git_refusal(&REFUSED.lock().unwrap_or_else(|e| e.into_inner()), dir, || dir.canonicalize().ok())
+}
+
+fn lookup_git_refusal(
+    refused: &GitRefusals,
+    dir: &Path,
+    canonicalize: impl FnOnce() -> Option<PathBuf>,
+) -> Option<String> {
+    if refused.is_empty() {
+        return None;
+    }
+    let real = canonicalize();
+    refused.values().find_map(|(folder, reason)| {
         folder
             .as_ref()
             .is_none_or(|folder| dir.starts_with(folder) || real.as_ref().is_some_and(|r| r.starts_with(folder)))
@@ -599,7 +627,7 @@ pub fn merge_base(root: &Path, base_ref: &str) -> Result<(String, String)> {
     locate(root)?;
     let candidates = [base_ref, "origin/main", "main", "origin/master", "master"];
     for candidate in candidates {
-        let candidate = qualify_ref(root, candidate)?;
+        let Ok(candidate) = qualify_ref(root, candidate) else { continue };
         if let Ok(out) = git(root, &["merge-base", "--", &candidate, "HEAD"]) {
             return Ok((candidate, out.trim().to_string()));
         }
@@ -857,8 +885,10 @@ fn replace_git_file(path: &Path, contents: &str) -> Result<()> {
 /// The first of `base_ref` and the usual fallbacks that exists, so repositories
 /// without an `origin` (or without `main`) still work.
 pub fn resolve_base(repo: &Path, base_ref: &str) -> Result<String> {
+    ensure_git_allowed(repo)?;
+    locate(repo)?;
     for candidate in [base_ref, "origin/main", "main", "origin/master", "master"] {
-        let candidate = qualify_ref(repo, candidate)?;
+        let Ok(candidate) = qualify_ref(repo, candidate) else { continue };
         if commit_of(repo, &format!("{candidate}^{{commit}}"))?.is_some() {
             return Ok(candidate);
         }
@@ -872,10 +902,22 @@ pub fn qualify_ref(repo: &Path, revision: &str) -> Result<String> {
     let end = revision.find(['^', '~']).unwrap_or(revision.len());
     let (name, suffix) = revision.split_at(end);
     ensure!(!name.is_empty() && !name.starts_with('-'), "invalid revision {revision:?}");
-    if name.starts_with("refs/")
-        || ["HEAD", "MERGE_HEAD", "FETCH_HEAD"].contains(&name)
-        || (matches!(name.len(), 40 | 64) && name.bytes().all(|byte| byte.is_ascii_hexdigit()))
-    {
+    if name.starts_with("refs/") || ["HEAD", "MERGE_HEAD", "FETCH_HEAD"].contains(&name) {
+        return Ok(revision.into());
+    }
+    let remote = name.split_once('/').map(|(remote, _)| remote);
+    let is_remote = remote == Some("origin")
+        || match remote {
+            Some(remote) => git(repo, &["remote"])?.lines().any(|known| known == remote),
+            None => false,
+        };
+    if is_remote {
+        return Ok(format!("refs/remotes/{name}{suffix}"));
+    }
+    if branch_ref_exists(repo, name)? {
+        return Ok(format!("refs/heads/{name}{suffix}"));
+    }
+    if matches!(name.len(), 40 | 64) && name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Ok(revision.into());
     }
     if name.len() >= 4 && name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -884,13 +926,17 @@ pub fn qualify_ref(repo: &Path, revision: &str) -> Result<String> {
         ensure!(objects.len() == 1, "object prefix {name} is missing or ambiguous");
         return Ok(format!("{}{suffix}", objects[0]));
     }
-    let remote = name.split_once('/').map(|(remote, _)| remote);
-    let is_remote = remote == Some("origin")
-        || match remote {
-            Some(remote) => git(repo, &["remote"])?.lines().any(|known| known == remote),
-            None => false,
-        };
-    Ok(format!("refs/{}/{name}{suffix}", if is_remote { "remotes" } else { "heads" }))
+    Ok(format!("refs/heads/{name}{suffix}"))
+}
+
+// Callers comparing immutable object IDs must not let an all-hex branch replace a full OID.
+fn qualify_revision(repo: &Path, revision: &str) -> Result<String> {
+    let name = revision.split(['^', '~']).next().unwrap_or(revision);
+    if matches!(name.len(), 40 | 64) && name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(revision.into())
+    } else {
+        qualify_ref(repo, revision)
+    }
 }
 
 /// Refuses branch names ATOMICS must never create or merge into: invalid ones, ones git
@@ -1493,16 +1539,16 @@ pub fn integrate_with_identity(
 ) -> Result<Integration> {
     let lock = worktree_lock(repo)?;
     let _turn = lock.lock().unwrap_or_else(|e| e.into_inner());
-    recorded_worktree(repo, task_path, branch)?;
+    let has_worktree = task_worktree_exists(repo, task_path, branch)?;
     // Check before staging, committing, creating an integration branch or merging.
-    crate::identity::require_clean(&crate::identity::check_task_at(
-        repo,
-        task_path,
-        branch,
-        base_ref,
-        Some(into),
-        identity,
-    )?)?;
+    let check_identity = || {
+        if has_worktree {
+            crate::identity::check_task_at(repo, task_path, branch, base_ref, Some(into), identity)
+        } else {
+            crate::identity::check_task_history(repo, branch, base_ref, Some(into), identity)
+        }
+    };
+    crate::identity::require_clean(&check_identity()?)?;
     crate::identity::check_pending(identity, ".git/COMMIT_EDITMSG", message)?;
     crate::identity::check_pending(identity, ".git/MERGE_MSG", &format!("Merge branch '{branch}' into {into}"))?;
     crate::identity::check_pending(identity, ".git/AUTHOR_IDENT", &identity.label())?;
@@ -1511,13 +1557,26 @@ pub fn integrate_with_identity(
     if !branch_exists(repo, branch) {
         bail!("branch {branch} does not exist in {}", repo.display());
     }
-    crate::identity::sync_worktree_identity(task_path, identity)?;
-    let committed = commit_all_with_identity(task_path, message, identity)?;
-    ensure_branch(repo, into, base_ref)?;
-    if into_path.exists() {
-        recorded_worktree(repo, into_path, into)?;
+    let committed = if has_worktree {
+        crate::identity::sync_worktree_identity(task_path, identity)?;
+        let committed = commit_task_worktree(repo, task_path, branch, message, identity)?;
+        recorded_worktree(repo, task_path, branch)?;
+        committed
     } else {
-        git(repo, &["worktree", "prune"])?;
+        false
+    };
+    ensure_branch(repo, into, base_ref)?;
+    let checked_out: Vec<_> =
+        list_worktrees(repo)?.into_iter().filter(|entry| entry.branch.as_deref() == Some(into)).collect();
+    ensure!(checked_out.len() <= 1, "refs/heads/{into} is claimed by multiple worktrees");
+    let worktree = if let Some(entry) = checked_out.first().filter(|entry| entry.path.exists()) {
+        recorded_worktree(repo, &entry.path, into)?;
+        entry.path.clone()
+    } else {
+        if !checked_out.is_empty() {
+            // Prune only when this integration branch has a stale registration.
+            git(repo, &["worktree", "prune"])?;
+        }
         git(
             repo,
             &[
@@ -1531,19 +1590,57 @@ pub fn integrate_with_identity(
                 &format!("refs/heads/{into}"),
             ],
         )?;
-    }
-    let worktree = into_path.to_path_buf();
+        into_path.to_path_buf()
+    };
     crate::identity::sync_worktree_identity(&worktree, identity)?;
-    crate::identity::require_clean(&crate::identity::check_task_at(
-        repo,
-        task_path,
-        branch,
-        base_ref,
-        Some(into),
-        identity,
-    )?)?;
+    crate::identity::require_clean(&check_identity()?)?;
     let merge = merge_with_identity(&worktree, branch, identity)?;
     Ok(Integration { committed, merge, worktree })
+}
+
+/// A missing recorded task folder has no edits to commit. Never substitute another checkout,
+/// including a stale registration whose writable HEAD claims the task's branch.
+pub fn task_worktree_exists(repo: &Path, path: &Path, branch: &str) -> Result<bool> {
+    match path.symlink_metadata() {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            ensure!(
+                !list_worktrees(repo)?.iter().any(|entry| entry.branch.as_deref() == Some(branch)),
+                "refs/heads/{branch} still has a worktree registration; inspect it and prune stale registrations before integrating"
+            );
+            Ok(false)
+        }
+        Err(error) => Err(error.into()),
+        Ok(_) => {
+            recorded_worktree(repo, path, branch)?;
+            Ok(true)
+        }
+    }
+}
+
+/// Commit to a literal task ref with compare-and-swap. HEAD is sandbox-writable and may switch
+/// after path validation; neither the parent nor the ref written here comes from HEAD.
+fn commit_task_worktree(
+    repo: &Path,
+    path: &Path,
+    branch: &str,
+    message: &str,
+    identity: &crate::identity::Identity,
+) -> Result<bool> {
+    let reference = format!("refs/heads/{branch}");
+    let parent = commit_of(repo, &reference)?.context("task branch no longer names a commit")?;
+    git(path, &["add", "--all"])?;
+    let tree = git(path, &["write-tree"])?;
+    let before = git(repo, &["rev-parse", "--verify", &format!("{parent}^{{tree}}")])?;
+    if tree.trim() == before.trim() {
+        return Ok(false);
+    }
+    let args = ["commit-tree", tree.trim(), "-p", &parent, "-F", "-"];
+    let mut command = command(path, &args)?;
+    identity.validate().map_err(anyhow::Error::msg)?;
+    crate::identity::apply_to_command(&mut command, identity);
+    let commit = run(command, &args, Some(message.as_bytes()), SLOW)?;
+    git(repo, &["update-ref", "--no-deref", &reference, commit.trim(), &parent])?;
+    Ok(true)
 }
 
 /// Use a task's host-recorded path, even when another writable HEAD claims its branch.
@@ -1613,6 +1710,112 @@ pub fn plan_task_worktree_path(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn hex_branches_and_missing_hex_bases_resolve_without_shadowing_objects() {
+        let (_dir, repo) = project();
+        let initial = commit_of(&repo, "HEAD").unwrap().unwrap();
+        for name in ["added", "cafe", "2024"] {
+            git(&repo, &["branch", name]).unwrap();
+            assert_eq!(qualify_ref(&repo, name).unwrap(), format!("refs/heads/{name}"));
+            assert_eq!(resolve_base(&repo, name).unwrap(), format!("refs/heads/{name}"));
+            assert_eq!(merge_base(&repo, name).unwrap().1, initial);
+        }
+        assert_eq!(resolve_base(&repo, "deadbeef").unwrap(), "refs/heads/main");
+        assert_eq!(merge_base(&repo, "deadbeef").unwrap().1, initial);
+        git(&repo, &["commit", "--allow-empty", "-qm", "next"]).unwrap();
+        git(&repo, &["branch", &initial]).unwrap();
+        assert_eq!(qualify_ref(&repo, &initial).unwrap(), format!("refs/heads/{initial}"));
+        assert_eq!(commit_of(&repo, &initial).unwrap().unwrap(), initial);
+    }
+
+    #[test]
+    fn a_missing_task_worktree_integrates_history_but_never_substitutes_another() {
+        let (_dir, repo) = project();
+        let task = repo.with_file_name("task");
+        add_worktree(&repo, &task, "task", "main").unwrap();
+        std::fs::write(task.join("feature"), "feature").unwrap();
+        commit_all(&task, "feature").unwrap();
+        git(&repo, &["worktree", "remove", task.to_str().unwrap()]).unwrap();
+        let into = repo.with_file_name("integration");
+        let done = integrate(&repo, &task, "task", "finished", "integration", &into, "main").unwrap();
+        assert!(!done.committed);
+        assert!(into.join("feature").exists());
+        let other = repo.with_file_name("other");
+        git(&repo, &["worktree", "add", "-B", "task", "--", other.to_str().unwrap(), "refs/heads/task"]).unwrap();
+        assert!(task_worktree_exists(&repo, &task, "task").is_err());
+        std::fs::remove_dir_all(&other).unwrap();
+        assert!(task_worktree_exists(&repo, &task, "task").is_err(), "stale registrations also refuse substitution");
+    }
+
+    #[test]
+    fn task_commit_writes_only_its_literal_ref_after_a_head_switch() {
+        let (_dir, repo) = project();
+        let task = repo.with_file_name("task");
+        add_worktree(&repo, &task, "task", "main").unwrap();
+        git(&repo, &["branch", "integration"]).unwrap();
+        let initial = commit_of(&repo, "refs/heads/integration").unwrap().unwrap();
+        recorded_worktree(&repo, &task, "task").unwrap();
+        // The sandbox switches HEAD between validation and the host commit.
+        git(&task, &["symbolic-ref", "HEAD", "refs/heads/integration"]).unwrap();
+        std::fs::write(task.join("feature"), "feature").unwrap();
+        let identity = crate::identity::Identity {
+            name: Some("Test".into()),
+            email: Some("test@example.org".into()),
+            ..Default::default()
+        };
+        assert!(commit_task_worktree(&repo, &task, "task", "feature", &identity).unwrap());
+        assert_eq!(commit_of(&repo, "refs/heads/integration").unwrap().unwrap(), initial);
+        let tip = commit_of(&repo, "refs/heads/task").unwrap().unwrap();
+        assert_ne!(tip, initial);
+        assert_eq!(
+            git(&repo, &["show", "-s", "--format=%P:%ae", &tip]).unwrap().trim(),
+            format!("{initial}:test@example.org")
+        );
+        assert!(recorded_worktree(&repo, &task, "task").is_err());
+    }
+
+    #[test]
+    fn integration_reuses_an_existing_target_after_the_path_template_changes() {
+        let (_dir, repo) = project();
+        let task = repo.with_file_name("task");
+        let existing = repo.with_file_name("old-integration-path");
+        let proposed = repo.with_file_name("new-integration-path");
+        add_worktree(&repo, &task, "task", "main").unwrap();
+        add_worktree(&repo, &existing, "integration", "main").unwrap();
+        let stale = repo.with_file_name("unrelated-stale");
+        add_worktree(&repo, &stale, "unrelated", "main").unwrap();
+        std::fs::remove_dir_all(&stale).unwrap();
+        std::fs::write(task.join("feature"), "feature").unwrap();
+        let done = integrate(&repo, &task, "task", "feature", "integration", &proposed, "main").unwrap();
+        assert_eq!(done.worktree, existing);
+        assert!(existing.join("feature").exists());
+        assert!(!proposed.exists());
+        assert!(
+            list_worktrees(&repo).unwrap().iter().any(|entry| entry.path == stale),
+            "integration must not prune unrelated registrations"
+        );
+    }
+
+    #[test]
+    fn an_empty_refusal_map_does_no_path_io() {
+        assert_eq!(
+            lookup_git_refusal(&HashMap::new(), Path::new("/any"), || panic!("canonicalized an empty refusal map")),
+            None
+        );
+    }
+
+    #[test]
+    fn history_identity_checks_do_not_discover_a_worktree_from_head() {
+        let (_dir, repo) = project();
+        let task = repo.with_file_name("task");
+        add_worktree(&repo, &task, "task", "main").unwrap();
+        std::fs::write(task.join("untracked"), "privateword").unwrap();
+        let identity =
+            crate::identity::Identity { forbidden_words: Some(vec!["privateword".into()]), ..Default::default() };
+        assert!(!crate::identity::check_task_at(&repo, &task, "task", "main", None, &identity).unwrap().is_empty());
+        assert!(crate::identity::check_task_history(&repo, "task", "main", None, &identity).unwrap().is_empty());
+    }
 
     #[test]
     fn host_bases_ignore_refs_that_shadow_remote_and_local_names() {

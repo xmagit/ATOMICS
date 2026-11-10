@@ -136,16 +136,7 @@ impl State {
 
     pub(super) fn task_action(&mut self, index: usize, task_index: usize, action: &str) {
         if action == "acknowledge_refs" {
-            if let Some(guard) = self.plans[index].tasks[task_index]
-                .session
-                .as_ref()
-                .and_then(|id| self.sessions.iter().find(|session| &session.id == id))
-                .and_then(|session| session.ref_guard.as_ref())
-            {
-                guard.acknowledge();
-            }
-            self.plans[index].tasks[task_index].ref_alert = None;
-            self.save_plan(index);
+            self.acknowledge_refs(index, task_index, self.plans[index].tasks[task_index].ref_alert_generation.clone());
             return;
         }
         if action == "resume" && self.plans[index].status != PlanStatus::Open {
@@ -1249,6 +1240,15 @@ impl State {
         if let Some((index, id)) = &owner {
             let task = self.plans[*index].task_mut(id).expect("task owner");
             task.report = Some(report.clone());
+            if task.ref_alert.is_some() && !summary.starts_with("SANDBOX REF GUARD:") && task.status != TaskStatus::Done
+            {
+                match status {
+                    "done" => task.ref_status_before_alert = Some(TaskStatus::Review),
+                    "blocked" | "question" => task.ref_status_before_alert = Some(TaskStatus::Blocked),
+                    "progress" => task.ref_status_before_alert = Some(TaskStatus::Running),
+                    _ => {}
+                }
+            }
             if task.status != TaskStatus::Done && task.ref_alert.is_none() {
                 match status {
                     "done" => task.set_status(TaskStatus::Review),

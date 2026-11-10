@@ -50,12 +50,24 @@ impl State {
             let alerts =
                 guard.check(&exempt).unwrap_or_else(|error| vec![format!("Ref guard check FAILED: {error:#}")]);
             if !alerts.is_empty() {
-                let _ = actions.send(Box::new(move |state| state.ref_alert(&id, alerts.join("\n"))));
+                let generation = guard.alert_generation();
+                let _ = actions.send(Box::new(move |state| state.ref_alert_at(&id, alerts.join("\n"), generation)));
             }
         });
     }
 
+    #[cfg(test)]
     pub(super) fn ref_alert(&mut self, id: &str, details: String) {
+        let generation = self
+            .sessions
+            .iter()
+            .find(|s| s.id == id)
+            .and_then(|s| s.ref_guard.as_ref())
+            .and_then(|g| g.alert_generation());
+        self.ref_alert_at(id, details, generation);
+    }
+
+    pub(super) fn ref_alert_at(&mut self, id: &str, details: String, generation: Option<String>) {
         let summary = format!("SANDBOX REF GUARD: {details}");
         if let Some(index) = self.sessions.iter().position(|s| s.id == id) {
             self.sessions[index].last_message = Some(summary.clone());
@@ -63,7 +75,11 @@ impl State {
         let mut owners = Vec::new();
         for (index, plan) in self.plans.iter_mut().enumerate() {
             for task in plan.tasks.iter_mut().filter(|task| task.session.as_deref() == Some(id)) {
+                if task.ref_alert.is_none() {
+                    task.ref_status_before_alert = Some(task.status);
+                }
                 task.ref_alert = Some(summary.clone());
+                task.ref_alert_generation = generation.clone().or_else(|| Some(uuid::Uuid::new_v4().to_string()));
                 task.integration_verified = false;
                 if task.status != TaskStatus::Done {
                     task.set_status(TaskStatus::Blocked);
@@ -80,14 +96,23 @@ impl State {
         self.report(Some(id), "blocked", &summary);
     }
 
+    #[cfg(test)]
     pub(super) fn task_ref_alert(&mut self, plan: &str, task: &str, details: String) {
+        self.task_ref_alert_at(plan, task, details, None);
+    }
+
+    pub(super) fn task_ref_alert_at(&mut self, plan: &str, task: &str, details: String, generation: Option<String>) {
         let Some(index) = self.plans.iter().position(|p| p.id == plan) else { return };
         let Some(task) = self.plans[index].task_mut(task) else { return };
         if let Some(session) = task.session.clone() {
-            self.ref_alert(&session, details);
+            self.ref_alert_at(&session, details, generation);
         } else {
             let summary = format!("SANDBOX REF GUARD: {details}");
+            if task.ref_alert.is_none() {
+                task.ref_status_before_alert = Some(task.status);
+            }
             task.ref_alert = Some(summary.clone());
+            task.ref_alert_generation = Some(uuid::Uuid::new_v4().to_string());
             task.integration_verified = false;
             if task.status != TaskStatus::Done {
                 task.set_status(TaskStatus::Blocked);
@@ -97,12 +122,171 @@ impl State {
             self.save_plan(index);
         }
     }
+
+    pub(super) fn acknowledge_refs(&mut self, index: usize, task_index: usize, seen: Option<String>) {
+        let task = &self.plans[index].tasks[task_index];
+        if task.ref_alert_generation != seen {
+            return;
+        }
+        if let Some(guard) = task
+            .session
+            .as_ref()
+            .and_then(|id| self.sessions.iter().find(|s| &s.id == id))
+            .and_then(|s| s.ref_guard.as_ref())
+            && let Some(seen) = &seen
+        {
+            guard.acknowledge(seen);
+        }
+        let task = &mut self.plans[index].tasks[task_index];
+        task.ref_alert = None;
+        task.ref_alert_generation = None;
+        if let Some(status) = task.ref_status_before_alert.take() {
+            task.set_status(status);
+        }
+        self.changed_plans.insert(self.plans[index].id.clone());
+        self.save_plan(index);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::tests::{repository, session, with_app};
     use super::*;
+
+    #[test]
+    fn missing_task_folder_checks_its_snapshot_without_changing_host_head() {
+        with_app(
+            "app::ref_guard::tests::missing_task_folder_checks_its_snapshot_without_changing_host_head",
+            |app, _| {
+                let (dir, repo) = repository();
+                let task = dir.path().join("task");
+                git::add_worktree(&repo, &task, "task", "main").unwrap();
+                std::fs::write(task.join("feature"), "feature").unwrap();
+                git::commit_all(&task, "feature").unwrap();
+                let home = dir.path().join("state");
+                let pins = home.join("git-pins");
+                crate::sandbox::pin_git(&pins, "atomics-task", &task).unwrap();
+                crate::sandbox_ownership::record_pins(&home, "atomics-task", &pins).unwrap();
+                crate::ref_guard::RefGuard::open(&task, home.join("ref-guards/atomics-task.json")).unwrap().unwrap();
+                git::git(&repo, &["worktree", "remove", task.to_str().unwrap()]).unwrap();
+                let checked = crate::ref_guard::check_integration(
+                    &app.runtime.ref_checks,
+                    None,
+                    &home,
+                    &repo,
+                    &task,
+                    Exempt::default(),
+                )
+                .unwrap();
+                assert!(checked.is_empty(), "{checked:?}");
+                assert_eq!(git::git(&repo, &["symbolic-ref", "HEAD"]).unwrap().trim(), "refs/heads/main");
+                let into = dir.path().join("integration");
+                git::integrate(&repo, &task, "task", "finished", "integration", &into, "main").unwrap();
+                assert!(into.join("feature").exists());
+                let tip = git::commit_of(&repo, "refs/heads/main").unwrap().unwrap();
+                git::git(&repo, &["update-ref", "refs/heads/unexpected", &tip]).unwrap();
+                let alerts = crate::ref_guard::check_integration(
+                    &app.runtime.ref_checks,
+                    None,
+                    &home,
+                    &repo,
+                    &task,
+                    Exempt::default(),
+                )
+                .unwrap();
+                assert!(alerts.iter().any(|a| a.contains("Restored refs/heads/unexpected")), "{alerts:?}");
+                assert_eq!(git::git(&repo, &["symbolic-ref", "HEAD"]).unwrap().trim(), "refs/heads/main");
+                git::unpin(&task);
+            },
+        );
+    }
+
+    #[test]
+    fn missing_legacy_pin_has_explicit_recovery_and_expired_refusals_are_reloaded() {
+        with_app(
+            "app::ref_guard::tests::missing_legacy_pin_has_explicit_recovery_and_expired_refusals_are_reloaded",
+            |_app, _| {
+                let (dir, repo) = repository();
+                let original = git::resolve_pins(&repo).unwrap();
+                let home = dir.path().join("state");
+                let pins = home.join("git-pins");
+                std::fs::create_dir_all(&pins).unwrap();
+                let file = pins.join("atomics-legacy.json");
+                let ledger = home.join("sandbox-ownership.json");
+                let legacy = serde_json::json!({"atomics-legacy": {"pins": pins}});
+                std::fs::write(&ledger, serde_json::to_vec(&legacy).unwrap()).unwrap();
+                let error = format!("{:#}", crate::sandbox::load_owned_pins(&home).unwrap_err());
+                assert!(
+                    error.contains("atomics sandbox forget-pin atomics-legacy --confirm-worktree-removed"),
+                    "{error}"
+                );
+                assert!(git::git(&repo, &["status"]).is_err());
+                assert!(crate::sandbox::forget_legacy_pin(&home, "missing-sbx", "atomics-legacy", false).is_err());
+                assert!(git::git(&repo, &["status"]).is_err());
+                let bin = dir.path().join("bin");
+                std::fs::create_dir(&bin).unwrap();
+                let sbx = crate::sandbox::fake::install(&bin);
+                std::fs::create_dir_all(bin.join("sandboxes")).unwrap();
+                let listed = bin.join("sandboxes/atomics-legacy");
+                std::fs::write(
+                    &listed,
+                    serde_json::to_vec(&atomics_core::isolation::Listed {
+                        name: "atomics-legacy".into(),
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+                assert!(
+                    crate::sandbox::forget_legacy_pin(&home, sbx.to_str().unwrap(), "atomics-legacy", true).is_err(),
+                    "a live sandbox must be removed first"
+                );
+                std::fs::remove_file(listed).unwrap();
+                crate::sandbox::forget_legacy_pin(&home, "missing-sbx", "atomics-legacy", true).unwrap();
+                git::git(&repo, &["status"]).unwrap();
+                // A separate process can remove the ledger entry and its file too.
+                std::fs::write(&ledger, serde_json::to_vec(&legacy).unwrap()).unwrap();
+                assert!(crate::sandbox::load_owned_pins(&home).is_err());
+                std::fs::write(&ledger, b"{}").unwrap();
+                crate::sandbox::load_owned_pins(&home).unwrap();
+                git::git(&repo, &["status"]).unwrap();
+                // Repairing a legacy file migrates it and also clears the old refusal.
+                std::fs::write(&ledger, serde_json::to_vec(&legacy).unwrap()).unwrap();
+                assert!(crate::sandbox::load_owned_pins(&home).is_err());
+                let saved = git::resolve_pins(&repo); // blocked until the original host record is repaired
+                assert!(saved.is_err());
+                std::fs::write(&file, serde_json::to_vec(&original).unwrap()).unwrap();
+                crate::sandbox::load_owned_pins(&home).unwrap();
+                git::git(&repo, &["status"]).unwrap();
+                assert!(crate::sandbox::forget_legacy_pin(&home, "missing-sbx", "atomics-legacy", true).is_err());
+                git::unpin(&repo);
+            },
+        );
+    }
+
+    #[test]
+    fn removing_an_unreadable_custom_pin_directory_expires_its_refusals() {
+        with_app(
+            "app::ref_guard::tests::removing_an_unreadable_custom_pin_directory_expires_its_refusals",
+            |_app, _| {
+                let (dir, repo) = repository();
+                let home = dir.path().join("state");
+                std::fs::create_dir(&home).unwrap();
+                let pins = home.join("old-pins");
+                // ENOTDIR is deterministic even when tests run with elevated permissions.
+                std::fs::write(&pins, "not a directory").unwrap();
+                let ledger = home.join("sandbox-ownership.json");
+                std::fs::write(&ledger, json!({"atomics-legacy": {"pins": pins}}).to_string()).unwrap();
+                assert!(crate::sandbox::load_owned_pins(&home).is_err());
+                assert!(git::git(&repo, &["status"]).is_err());
+                // Another process removes both the obsolete ledger entry and its directory.
+                std::fs::write(&ledger, b"{}").unwrap();
+                std::fs::remove_file(&pins).unwrap();
+                crate::sandbox::load_owned_pins(&home).unwrap();
+                git::git(&repo, &["status"]).unwrap();
+            },
+        );
+    }
 
     #[test]
     fn integration_cannot_overtake_a_ref_alert_waiting_for_the_ui() {
@@ -122,6 +306,7 @@ mod tests {
                 &app.runtime.ref_checks,
                 Some(guard.clone()),
                 &home,
+                &repo,
                 &task,
                 Exempt::default(),
             );
@@ -134,12 +319,33 @@ mod tests {
                 tasks: vec![Task { id: "t".into(), session: Some("s".into()), ..Default::default() }],
                 ..Default::default()
             }];
+            app.runtime.ref_alert("s", "first alert".into());
+            let first = app.runtime.plans[0].tasks[0].ref_alert_generation.clone();
+            // A2 is detected on the guard worker but is still queued behind the user's A1 acknowledgement.
+            git::git(&repo, &["update-ref", "refs/heads/second-unexpected", &initial]).unwrap();
+            assert!(!guard.check(&Exempt::default()).unwrap().is_empty());
+            app.runtime.acknowledge_refs(0, 0, first.clone());
+            assert!(
+                crate::ref_guard::check_integration(
+                    &app.runtime.ref_checks,
+                    Some(guard.clone()),
+                    &home,
+                    &repo,
+                    &task,
+                    Exempt::default()
+                )
+                .is_err()
+            );
+            app.runtime.ref_alert("s", "second alert".into());
+            app.runtime.acknowledge_refs(0, 0, first);
+            assert!(app.runtime.plans[0].tasks[0].ref_alert.is_some(), "a stale UI command must not dismiss A2");
             app.runtime.task_action(0, 0, "acknowledge_refs");
             assert!(
                 crate::ref_guard::check_integration(
                     &app.runtime.ref_checks,
                     Some(guard),
                     &home,
+                    &repo,
                     &task,
                     Exempt::default()
                 )
@@ -148,6 +354,30 @@ mod tests {
             );
             app.runtime.sessions.clear();
         });
+    }
+
+    #[test]
+    fn acknowledgement_restores_the_status_saved_before_an_alert_across_reload() {
+        with_app(
+            "app::ref_guard::tests::acknowledgement_restores_the_status_saved_before_an_alert_across_reload",
+            |app, _| {
+                for status in [TaskStatus::Review, TaskStatus::Running, TaskStatus::Done] {
+                    app.runtime.plans = vec![Plan {
+                        id: "p".into(),
+                        tasks: vec![Task { id: "t".into(), status, ..Default::default() }],
+                        ..Default::default()
+                    }];
+                    app.runtime.task_ref_alert("p", "t", "moved".into());
+                    let saved = serde_json::to_vec(&app.runtime.plans[0]).unwrap();
+                    app.runtime.plans[0] = serde_json::from_slice(&saved).unwrap();
+                    let seen = app.runtime.plans[0].tasks[0].ref_alert_generation.clone();
+                    app.runtime.acknowledge_refs(0, 0, seen);
+                    let task = &app.runtime.plans[0].tasks[0];
+                    assert!(task.ref_alert.is_none());
+                    assert_eq!(task.status, status);
+                }
+            },
+        );
     }
 
     #[test]
@@ -666,6 +896,7 @@ mod tests {
             }
             app.runtime.task_action(0, 0, "acknowledge_refs");
             assert!(app.runtime.plans[0].tasks[0].ref_alert.is_none());
+            assert_eq!(app.runtime.plans[0].tasks[0].status, TaskStatus::Review);
             app.runtime.report(Some("s"), "done", "ready for review");
             assert_eq!(app.runtime.plans[0].tasks[0].status, TaskStatus::Review);
             app.runtime.sessions.clear();

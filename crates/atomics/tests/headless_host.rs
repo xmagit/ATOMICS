@@ -1106,6 +1106,38 @@ fn a_service_port_and_a_paired_client_reach_the_headless_host() {
 }
 
 #[test]
+fn a_missing_legacy_pin_can_be_forgotten_from_the_cli_only_after_confirmation() {
+    let instance = Instance::new(None);
+    std::fs::create_dir(instance.home()).unwrap();
+    let ledger = instance.home().join("sandbox-ownership.json");
+    std::fs::write(
+        &ledger,
+        json!({"atomics-legacy": {"created": 0, "sandbox": true, "pins": instance.home().join("git-pins")}})
+            .to_string(),
+    )
+    .unwrap();
+    let bin = instance.dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    test_support::write_program(bin.join("sbx"), "#!/bin/sh\n[ \"$*\" = 'ls --json' ] || exit 1\nprintf '[]\\n'\n");
+    let run = |confirmed: bool| {
+        let mut args = vec!["sandbox", "forget-pin", "atomics-legacy"];
+        if confirmed {
+            args.push("--confirm-worktree-removed");
+        }
+        test_support::output(instance.command(args).env("PATH", test_support::path_with(&bin)))
+    };
+    let refused = run(false);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("--confirm-worktree-removed"));
+    let owned: Value = serde_json::from_slice(&std::fs::read(&ledger).unwrap()).unwrap();
+    assert!(owned["atomics-legacy"]["pins"].is_string());
+    let forgotten = run(true);
+    assert!(forgotten.status.success(), "{}", String::from_utf8_lossy(&forgotten.stderr));
+    let owned: Value = serde_json::from_slice(&std::fs::read(&ledger).unwrap()).unwrap();
+    assert!(owned["atomics-legacy"]["pins"].is_null());
+}
+
+#[test]
 fn the_host_start_drops_cleanup_failures_it_no_longer_finds_and_keeps_alerts() {
     let instance = Instance::new(None);
     use std::os::unix::fs::DirBuilderExt;
