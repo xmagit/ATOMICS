@@ -53,6 +53,8 @@ fn host() -> crate::projection::HostInfo {
 
 fn plan() -> PlanInfo {
     PlanInfo {
+        publish: None,
+        pull_request: None,
         notebook: Vec::new(),
         ticket_tree: None,
         id: "p".into(),
@@ -62,6 +64,7 @@ fn plan() -> PlanInfo {
         approved: true,
         integration: None,
         tasks: vec![TaskInfo {
+            pull_request: None,
             id: "t".into(),
             title: "do".into(),
             status: TaskStatus::Review,

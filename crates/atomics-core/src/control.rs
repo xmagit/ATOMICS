@@ -10,6 +10,14 @@ use crate::diff::{FileStatus, LineKind, WorktreeDiff};
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum ControlRequest {
     /// A local CLI edit: invalidate placeholders only. This cannot read or copy a value.
+    Publish {
+        plan: String,
+        #[serde(default)]
+        branch: Option<String>,
+        title: String,
+        body: String,
+        base: String,
+    },
     SecretRemoved {
         name: String,
     },
@@ -434,6 +442,8 @@ pub enum ControlRequest {
     },
     /// A sub-agent reporting on its task (sent by `atomics mcp --agent`).
     Report {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pull_request: Option<crate::plan::PullRequest>,
         pane: Option<String>,
         status: String,
         summary: String,

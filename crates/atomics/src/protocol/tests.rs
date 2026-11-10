@@ -39,6 +39,8 @@ pub(crate) fn session(id: &str, title: &str, status: AgentStatus) -> SessionInfo
 
 fn plan(id: &str, goal: &str) -> PlanInfo {
     PlanInfo {
+        publish: None,
+        pull_request: None,
         notebook: Vec::new(),
         ticket_tree: None,
         id: id.into(),

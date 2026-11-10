@@ -182,6 +182,11 @@ pub enum Command {
     // ── The ticket system's sign-in ────────────────────────────────────────────────────────────────────
     /// Open the GitHub controls and start connecting; only a host's own window can.
     ConnectGithub,
+    PublishDecision {
+        plan: usize,
+        request: String,
+        approve: bool,
+    },
     /// Sign in to the ticket system, or again after the server refused the saved sign-in: the host's
     /// sign-in job, after which its ticket worker connects again. A desktop host may open its browser.
     SignInTickets,
@@ -400,6 +405,11 @@ impl Command {
                 decision: *decision,
                 message: None,
             })],
+            Command::PublishDecision { plan: index, request, approve } => {
+                plan(*index, PlanAction::PublishDecision { request: request.clone(), approve: *approve }, op)
+                    .into_iter()
+                    .collect()
+            }
             Command::ApprovePlan(index) => plan(*index, PlanAction::Approve, op).into_iter().collect(),
             Command::CurateNote { plan: index, id, pinned, delete } => {
                 plan(*index, PlanAction::Notebook { id: *id, pinned: *pinned, delete: *delete }, op)

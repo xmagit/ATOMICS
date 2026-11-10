@@ -100,6 +100,12 @@ impl State {
             "ready": plan.ready().iter().map(|t| &t.id).collect::<Vec<_>>(),
             "detail": "Long texts are cut here. Pass task to read one task in full: brief, acceptance, report and notes.",
         });
+        if let Some(pr) = &plan.pull_request {
+            value["pull_request"] = json!(pr);
+        }
+        if let Some(card) = &plan.publish {
+            value["publish"] = json!({"id":card.id,"repository":card.repository,"account":card.account,"branch":card.branch,"base":card.base,"head_sha":card.head_sha,"title":card.title,"url":card.url,"error":card.error});
+        }
         if let Some(ticket) = &plan.ticket {
             let mut ticket = json!(ticket);
             clip_json(&mut ticket, 300, 20);
@@ -227,6 +233,9 @@ impl State {
                 "state": ticket.state,
                 "error": ticket.error.as_deref().map(|error| clip(error, 200)),
             });
+        }
+        if let Some(pr) = &task.pull_request {
+            value["pull_request"] = json!(pr);
         }
         if let Some(stage) = task.stages.last() {
             value["stage"] = json!(stage.label());

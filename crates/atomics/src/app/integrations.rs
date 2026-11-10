@@ -594,6 +594,7 @@ mod tests {
                     name: Some("Context Example".into()),
                     email: Some("context@example.com".into()),
                     forbidden_words: Some(vec!["contoso".into()]),
+                    github: None,
                 };
                 app.runtime.config.agents.push(atomics_core::config::AgentConfig {
                     name: "identity-fixture".into(),

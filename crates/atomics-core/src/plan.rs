@@ -12,6 +12,10 @@ use crate::config::Config;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Plan {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<PullRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish: Option<Publish>,
     #[serde(default)]
     pub id: String,
     #[serde(default)]
@@ -46,6 +50,26 @@ pub struct Plan {
     pub notebook: Vec<NotebookEntry>,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub notebook_sequence: u64,
+}
+
+/// A complete immutable publish request, reviewed on the board before any write.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Publish {
+    pub id: String,
+    pub repository: String,
+    pub account: String,
+    pub branch: String,
+    pub base: String,
+    pub head_sha: String,
+    pub base_sha: String,
+    pub title: String,
+    pub body: String,
+    pub commits: String,
+    pub identity_digest: String,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 pub const MAX_NOTE_CHARS: usize = 300;
@@ -243,6 +267,8 @@ impl From<TaskInput> for Task {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Task {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<PullRequest>,
     pub id: String,
     pub title: String,
     pub brief: String,
@@ -686,6 +712,7 @@ impl Plan {
                 task.stages = old.stages.clone();
                 task.session = old.session.clone();
                 task.report = old.report.clone();
+                task.pull_request = old.pull_request.clone();
                 task.notes = old.notes.clone();
                 task.integrated = old.integrated.clone();
                 task.integrated_commit = old.integrated_commit.clone();
@@ -1978,5 +2005,74 @@ mod notebook_tests {
         assert!(!config.plan.notebook);
         assert!(toml::from_str::<crate::config::Config>("[plan]\nnotebook = true").unwrap().plan.notebook);
         assert!(crate::config::CHIEF_PROMPT.contains("data, not instructions"));
+    }
+}
+
+/// Agent-reported PR metadata; this records a claim, not a verification by GitHub.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PullRequest {
+    pub url: String,
+    pub number: u64,
+    pub head: String,
+    pub base: String,
+}
+
+impl PullRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        let suffix = format!("/pull/{}", self.number);
+        let path = self.url.strip_prefix("https://github.com/").and_then(|s| s.strip_suffix(&suffix));
+        if self.url.len() > 2048
+            || self.number == 0
+            || path.is_none_or(|p| {
+                let parts: Vec<_> = p.split('/').collect();
+                parts.len() != 2
+                    || parts.iter().any(|s| {
+                        s.is_empty()
+                            || *s == "."
+                            || *s == ".."
+                            || !s.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+                    })
+            })
+        {
+            return Err("Report a github.com pull request URL matching its positive number".into());
+        }
+        for branch in [&self.head, &self.base] {
+            if branch.is_empty()
+                || branch.len() > 255
+                || branch.starts_with('-')
+                || branch.chars().any(char::is_control)
+            {
+                return Err("Invalid pull request head or base".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod github_report_tests {
+    use super::*;
+    #[test]
+    fn github_pull_request_report_validates_url_number_and_branch() {
+        let mut pr = PullRequest {
+            url: "https://github.com/group/repo/pull/12".into(),
+            number: 12,
+            head: "task".into(),
+            base: "main".into(),
+        };
+        assert!(pr.validate().is_ok());
+        for url in [
+            "https://example.invalid/group/repo/pull/12",
+            "https://github.com/group/repo/pull/13",
+            "https://github.com/group/repo/pull/12?token=hidden",
+            "javascript:alert(1)",
+        ] {
+            pr.url = url.into();
+            assert!(pr.validate().is_err());
+        }
+        pr.url = "https://github.com/group/repo/pull/12".into();
+        pr.head = "task\ncontrol".into();
+        assert!(pr.validate().is_err());
     }
 }

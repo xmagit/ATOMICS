@@ -159,6 +159,12 @@ impl State {
             self.selected_plan
         };
         let outcome = match request {
+            ControlRequest::Publish { plan, branch, title, body, base } => {
+                done(match self.request_publish(&plan, branch, title, body, base) {
+                    Ok(()) => ControlResponse::ok(json!({"requested": true, "approval": "user click on board"})),
+                    Err(error) => ControlResponse::error(error),
+                })
+            }
             ControlRequest::SecretRemoved { name } => {
                 if atomics_core::secrets::valid_name(&name) {
                     let relay = self.relay.clone();
@@ -695,9 +701,18 @@ impl State {
                     Err(error) => done(ControlResponse::error(error)),
                 }
             }
-            ControlRequest::Report { pane, status, summary, checks } => {
+            ControlRequest::Report { pane, status, summary, checks, pull_request } => {
                 let pane = self.pane_session(pane);
+                if let Some(pr) = &pull_request {
+                    if let Err(error) = self.validate_reported_pull_request(pane.as_deref(), pr) {
+                        done(ControlResponse::error(error));
+                        return;
+                    }
+                }
                 let task = self.report_with_checks(pane.as_deref(), &status, &summary, checks);
+                if let Some(pr) = pull_request {
+                    self.report_pull_request(pane.as_deref(), pr);
+                }
                 done(ControlResponse::ok(json!({ "recorded": true, "task": task })))
             }
             ControlRequest::InlayHints { session } => match self.find(&session) {

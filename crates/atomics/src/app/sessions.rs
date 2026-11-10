@@ -262,6 +262,7 @@ impl State {
         let session = id.clone();
         let workspace = self.workspace.clone();
         let secret_cwd = launch.cwd.clone();
+        let github_account = self.project_identity(&launch.cwd).github;
         let claude = launch.agent.kind == AgentKind::Claude && self.effective_isolation().bare_relay;
         std::thread::spawn(move || {
             let project = workspace::project_root(&secret_cwd).ok();
@@ -281,6 +282,13 @@ impl State {
                         false,
                         grant.clone(),
                     )
+                    .and_then(|granted| {
+                        if let (Some(account), Some(project)) = (&github_account, &project) {
+                            relay.grant_project_github(&session, account, project, workspace.as_deref(), false, granted)
+                        } else {
+                            Ok(granted)
+                        }
+                    })
                     .inspect_err(|_| {
                         if let Some(grant) = &grant {
                             relay.revoke(grant);
@@ -359,6 +367,7 @@ impl State {
             pins: paths::git_pins_dir(),
             relay: Some(self.relay.clone()),
             secret_workspace: self.workspace.clone(),
+            github_account: self.project_identity(cwd).github,
         }))
     }
 

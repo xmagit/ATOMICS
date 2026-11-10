@@ -296,6 +296,9 @@ pub fn explorer(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
             if response.clicked() && !selected {
                 switch_to = Some(root.clone());
             }
+            if let Some(account) = identity.and_then(|row| row["github"].as_str()) {
+                ui.label(RichText::new(format!("GitHub: {account}")).color(p.muted).size(11.0));
+            }
             let detail = identity.and_then(|row| row["label"].as_str()).unwrap_or_default();
             let response = response.on_hover_text(format!("{}\n{detail}", backend.display(&root)));
             if !agent_names.is_empty() || can_add_worktree || can_close || identity.is_some() {

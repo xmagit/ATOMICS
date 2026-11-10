@@ -460,6 +460,7 @@ impl State {
                                 name: value("user.name"),
                                 email: value("user.email"),
                                 forbidden_words: None,
+                                github: None,
                             };
                             (repo.clone(), git::list_worktrees(&repo).unwrap_or_default(), identity)
                         })

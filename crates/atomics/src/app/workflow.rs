@@ -10,9 +10,43 @@ impl State {
         event: Stage,
         author: Author,
     ) -> Result<serde_json::Value, String> {
+        self.record_stage_event(index, task, event, author, false)
+    }
+
+    pub(super) fn record_publication_stage(
+        &mut self,
+        index: usize,
+        task: Option<&str>,
+        url: String,
+        author: Author,
+    ) -> Result<serde_json::Value, String> {
+        let history = match task {
+            Some(id) => &self.plans[index].tasks.iter().find(|t| t.id == id).ok_or("No such task")?.stages,
+            None => &self.plans[index].stages,
+        };
+        if history.iter().any(|event| event.stage == "pr_opened" && event.url.as_deref() == Some(&url)) {
+            return Ok(json!({"recorded": false, "url": url}));
+        }
+        self.record_stage_event(
+            index,
+            task,
+            Stage { stage: "pr_opened".into(), url: Some(url), ..Default::default() },
+            author,
+            true,
+        )
+    }
+
+    fn record_stage_event(
+        &mut self,
+        index: usize,
+        task: Option<&str>,
+        event: Stage,
+        author: Author,
+        publication: bool,
+    ) -> Result<serde_json::Value, String> {
         let workflow = self.plan_workflow(&self.plans[index]);
         workflow.validate()?;
-        if !workflow.allows(&event.stage) {
+        if !workflow.allows(&event.stage) && !publication {
             return Err(self.cleaner().error(&format!("unknown workflow stage {:?}", event.stage)));
         }
         if self.plans[index].status == PlanStatus::Archived {
@@ -36,12 +70,15 @@ impl State {
         let plan = &mut self.plans[index];
         let history = if let Some(id) = task {
             let task = plan.task_mut(id).ok_or_else(|| format!("no task {id}"))?;
-            if task.status != TaskStatus::Done && !(event.stage == "integrated" && task.status == TaskStatus::Review) {
+            if !publication
+                && task.status != TaskStatus::Done
+                && !(event.stage == "integrated" && task.status == TaskStatus::Review)
+            {
                 return Err("Accept the task before reporting a lifecycle stage.".into());
             }
             &mut task.stages
         } else {
-            if plan.tasks.is_empty() || plan.tasks.iter().any(|t| t.status != TaskStatus::Done) {
+            if !publication && (plan.tasks.is_empty() || plan.tasks.iter().any(|t| t.status != TaskStatus::Done)) {
                 return Err("Accept every task before reporting a plan lifecycle stage.".into());
             }
             &mut plan.stages

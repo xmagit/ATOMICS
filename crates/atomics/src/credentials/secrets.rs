@@ -1,5 +1,6 @@
 //! General secrets live in the existing catalog. Only metadata may leave management APIs.
 use super::*;
+use anyhow::Context;
 use atomics_core::secrets::Secret;
 
 #[derive(Serialize, Deserialize)]
@@ -23,6 +24,31 @@ fn valid_value(spec: &Secret, value: &str) -> bool {
 }
 
 impl Store {
+    pub fn connect_github_account(&self, account: &str, token: &str) -> Result<()> {
+        let mut spec = crate::relay::github::account_spec(account)?;
+        if let Some(existing) = self.secrets()?.into_iter().find(|s| s.name == spec.name) {
+            spec.scope = existing.scope;
+            spec.refuse_default_branch = existing.refuse_default_branch;
+        }
+        if let Some(client) = &self.broker {
+            return client.set(spec, token);
+        }
+        self.sync_secret_rule(spec, token)?;
+        Ok(())
+    }
+
+    pub fn set_github_policy(&self, name: &str, refuse_default_branch: bool) -> Result<()> {
+        anyhow::ensure!(name.starts_with(crate::relay::github::ACCOUNT_PREFIX), "Not a GitHub account secret");
+        if let Some(client) = &self.broker {
+            return client.github_policy(name, refuse_default_branch);
+        }
+        let (mut spec, value) =
+            self.secret_values()?.into_iter().find(|(s, _)| s.name == name).context("Unknown GitHub account")?;
+        spec.refuse_default_branch = refuse_default_branch;
+        self.sync_secret_rule(spec, &value)?;
+        Ok(())
+    }
+
     pub fn secrets(&self) -> Result<Vec<Secret>> {
         if let Some(client) = &self.broker {
             return client.list();

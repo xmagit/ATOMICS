@@ -247,6 +247,7 @@ pub(super) struct IdentityForm {
     original: atomics_core::identity::Identity,
     name: String,
     email: String,
+    github: String,
     words: String,
     clear_words: bool,
 }
@@ -256,6 +257,7 @@ impl IdentityForm {
         self.target = target;
         self.name = identity.name.clone().unwrap_or_default();
         self.email = identity.email.clone().unwrap_or_default();
+        self.github = identity.github.clone().unwrap_or_default();
         self.words = identity.forbidden_words.as_ref().map(|words| words.join("\n")).unwrap_or_default();
         self.clear_words = identity.forbidden_words.as_ref().is_some_and(Vec::is_empty);
         self.original = identity;
@@ -268,6 +270,7 @@ impl IdentityForm {
         for (key, text, old, value) in [
             ("name", &self.name, &self.original.name, &mut patch.name),
             ("email", &self.email, &self.original.email, &mut patch.email),
+            ("github", &self.github, &self.original.github, &mut patch.github),
         ] {
             if text != old.as_deref().unwrap_or("") {
                 let text = text.trim();
@@ -393,6 +396,11 @@ fn identity(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, enabl
         ui.add(
             crate::controls::single_line(&mut form.email)
                 .hint_text("Commit email (blank inherits)")
+                .desired_width(ui.available_width()),
+        );
+        ui.add(
+            crate::controls::single_line(&mut form.github)
+                .hint_text("GitHub account (blank inherits)")
                 .desired_width(ui.available_width()),
         );
         ui.add_enabled(
@@ -1308,6 +1316,19 @@ fn credentials(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, en
 fn secrets(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, enabled: bool, info: &ManagementInfo) {
     use atomics_core::secrets::{Auth, Scope as SecretScope};
     let p = client.palette.clone();
+    subheading(ui, &p, "GitHub publishing");
+    if ui
+        .add_enabled(enabled && backend.available(&Command::ConnectGithub), egui::Button::new("Connect GitHub account"))
+        .clicked()
+    {
+        client.send(Command::ConnectGithub);
+    }
+    if let Some(code) = info.tools["credentials"]["github_device"]["code"].as_str() {
+        ui.label(format!("Authorization code: {code}"));
+        if let Some(url) = info.tools["credentials"]["github_device"]["url"].as_str() {
+            ui.hyperlink(url);
+        }
+    }
     subheading(ui, &p, "Secrets");
     if let Some(warning) = info.tools["credentials"]["vm_warning"].as_str() {
         note(ui, &p, warning);
@@ -1335,7 +1356,9 @@ fn secrets(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, enable
     );
     for entry in info.tools["credentials"]["secrets"].as_array().into_iter().flatten() {
         let name = entry["spec"]["name"].as_str().unwrap_or_default();
-        ui.label(RichText::new(name).strong());
+        let label =
+            entry["github_account"].as_str().map_or_else(|| name.to_string(), |account| format!("GitHub · {account}"));
+        ui.label(RichText::new(label).strong());
         if let Some(state) = entry["vm_sync"].as_str() {
             note(ui, &p, format!("VM: {state}"));
         }
@@ -1350,6 +1373,17 @@ fn secrets(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, enable
                 entry["last_used"].as_str().unwrap_or("never")
             ),
         );
+        if name.starts_with("GITHUB_ACCOUNT_") {
+            let mut refuse = entry["spec"]["refuse_default_branch"].as_bool().unwrap_or(true);
+            if ui
+                .add_enabled(enabled, egui::Checkbox::new(&mut refuse, "Refuse pushes to the default branch"))
+                .changed()
+            {
+                client.send(Command::Manage(HostAction::SettingsTool {
+                    tool: SettingsTool::SetGithubPolicy { name: name.into(), refuse_default_branch: refuse },
+                }));
+            }
+        }
         let copy = Command::CopySecret(name.into());
         let local = backend.available(&copy);
         let unavailable = if !local {

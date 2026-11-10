@@ -657,3 +657,102 @@ fn notebook_shows_proposals_and_authors_and_user_can_pin_and_delete() {
         },
     );
 }
+
+#[test]
+fn github_agent_report_records_pull_request_and_shows_it_on_task_card() {
+    tests::with_app(
+        "app::board_tests::github_agent_report_records_pull_request_and_shows_it_on_task_card",
+        |app, ctx| {
+            app.runtime.plans[0].tasks = vec![Task {
+                id: "work".into(),
+                title: "Work".into(),
+                session: Some("task-session".into()),
+                branch: Some("task".into()),
+                status: TaskStatus::Running,
+                ..Default::default()
+            }];
+            let request: ControlRequest = serde_json::from_value(json!({
+                "cmd":"report", "pane":"task-session", "status":"done", "summary":"Opened the requested PR",
+                "pull_request":{"url":"https://github.com/group/repo/pull/12","number":12,"head":"task","base":"main"}
+            }))
+            .unwrap();
+            let (tx, rx) = channel();
+            app.runtime.control(request.clone(), tx);
+            let crate::ipc::ControlOutcome::Done(response) = rx.recv().unwrap() else { panic!("report outcome") };
+            assert!(response.ok);
+            let task = &app.runtime.plans[0].tasks[0];
+            assert_eq!(task.status, TaskStatus::Review);
+            assert_eq!(task.pull_request.as_ref().unwrap().number, 12);
+            assert!(
+                task.stages.iter().any(
+                    |s| s.stage == "pr_opened" && s.url.as_deref() == Some("https://github.com/group/repo/pull/12")
+                )
+            );
+            let count = task.stages.len();
+            let (tx, _rx) = channel();
+            app.runtime.control(request, tx);
+            assert_eq!(app.runtime.plans[0].tasks[0].stages.len(), count, "duplicate report is idempotent");
+            frame(app, ctx, 1400.0, 0.0, vec![]);
+            let rendered = frame(app, ctx, 1400.0, 0.5, vec![]);
+            assert!(rendered.text.iter().any(|t| t.galley.text() == "PR #12 · task → main"));
+            assert_eq!(app.runtime.task_view(0, "work").unwrap()["task"]["pull_request"]["number"], 12);
+        },
+    );
+}
+
+#[test]
+fn github_publish_card_shows_full_request_and_dismiss_click_removes_it() {
+    tests::with_app(
+        "app::board_tests::github_publish_card_shows_full_request_and_dismiss_click_removes_it",
+        |app, ctx| {
+            app.runtime.plans[0].approved = true;
+            app.runtime.plans[0].publish = Some(plan::Publish {
+                id: "publish-request".into(),
+                repository: "group/repo".into(),
+                account: "account-two".into(),
+                branch: "task".into(),
+                base: "main".into(),
+                head_sha: "1".repeat(40),
+                base_sha: "0".repeat(40),
+                title: "Reviewed changes".into(),
+                body: "Full description\nSecond paragraph with all details.".into(),
+                commits: "1234567 Contributor <contributor@example.invalid> Reviewed changes".into(),
+                identity_digest: String::new(),
+                url: None,
+                error: None,
+            });
+            frame(app, ctx, 1400.0, 0.0, vec![]);
+            let rendered = frame(app, ctx, 1400.0, 0.5, vec![]);
+            for expected in [
+                "group/repo · GitHub account: account-two",
+                "Reviewed changes",
+                "Full description\nSecond paragraph with all details.",
+                "1234567 Contributor <contributor@example.invalid> Reviewed changes",
+                "Publish",
+                "Dismiss",
+            ] {
+                assert!(rendered.text.iter().any(|t| t.galley.text() == expected), "missing {expected}");
+            }
+            let button =
+                rendered.text.iter().find(|t| t.galley.text() == "Dismiss").unwrap().visual_bounding_rect().center();
+            for (time, pressed) in [(1.0, true), (1.1, false)] {
+                frame(
+                    app,
+                    ctx,
+                    1400.0,
+                    time,
+                    vec![
+                        egui::Event::PointerMoved(button),
+                        egui::Event::PointerButton {
+                            pos: button,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+            assert!(app.runtime.plans[0].publish.is_none());
+        },
+    );
+}

@@ -99,7 +99,7 @@ impl State {
                     let scoped = identity_scopes.as_array().into_iter().flatten()
                         .find(|scope| scope["target"].as_str().is_some_and(|target| Path::new(target) == repo))
                         .map(|scope| scope["identity"].clone()).unwrap_or_else(|| json!({}));
-                    json!({"project": repo.to_string_lossy(), "display": paths::display(repo), "label": label, "identity": identity, "override": scoped})
+                    json!({"project": repo.to_string_lossy(), "display": paths::display(repo), "label": label, "github": identity.github,  "identity": identity, "override": scoped})
                 }).collect::<Vec<_>>(),
                 "identity_error": self.tickets.workspace_identity_error,
             }),
@@ -377,7 +377,7 @@ fn credential_label(tool: &atomics_core::ops::SettingsTool) -> Result<String, St
     use atomics_core::ops::SettingsTool;
     Ok(match tool {
         SettingsTool::AddSecret { spec, .. } => format!("secret:{}", spec.name),
-        SettingsTool::RemoveSecret { name } => format!("secret:{name}"),
+        SettingsTool::SetGithubPolicy { name, .. } | SettingsTool::RemoveSecret { name } => format!("secret:{name}"),
         SettingsTool::PutCredential { kind, host, .. } | SettingsTool::RemoveCredential { kind, host } => {
             let label = crate::credentials::KINDS
                 .iter()
@@ -398,6 +398,9 @@ fn credential_label(tool: &atomics_core::ops::SettingsTool) -> Result<String, St
 fn credential_action(store: &crate::credentials::Store, tool: atomics_core::ops::SettingsTool) -> anyhow::Result<()> {
     use atomics_core::ops::SettingsTool;
     match tool {
+        SettingsTool::SetGithubPolicy { name, refuse_default_branch } => {
+            store.set_github_policy(&name, refuse_default_branch)
+        }
         SettingsTool::RefreshCredentials => Ok(()),
         SettingsTool::AddSecret { spec, value } => store.add_secret(spec, &value),
         SettingsTool::RemoveSecret { name } => store.remove_secret(&name),
@@ -448,7 +451,7 @@ fn credential_status(
         if sessions.is_empty() { "none".into() } else { sessions.join(", ") }
     );
     let secrets = store.secrets().map_err(|error| error.to_string())?.into_iter().map(|spec| {
-        json!({"kind": spec.kind(), "scope": spec.scope.label(), "last_used": relay.secret_last_use(&spec.name), "spec": spec})
+        json!({"kind": spec.kind(), "scope": spec.scope.label(), "last_used": relay.secret_last_use(&spec.name), "github_account": crate::relay::github::account_login(&spec.name), "spec": spec})
     }).collect::<Vec<_>>();
     Ok(json!({ "entries": entries, "secrets": secrets, "invalid": snapshot.invalid, "azure": azure }))
 }

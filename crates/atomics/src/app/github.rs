@@ -325,7 +325,7 @@ impl State {
 
     /// Starts a poll when one is due, and applies what the workers finished.
     pub(super) fn github_tick(&mut self) -> bool {
-        let changed = self.poll_github_jobs();
+        let changed = self.poll_github_jobs() | self.poll_publishing();
         if !self.config.github.enabled || self.github.polling {
             return changed;
         }
@@ -616,12 +616,17 @@ impl State {
                     Err(error) => break Err(error.to_string()),
                     Ok(gh::DevicePoll::Token(grant)) => {
                         let now = SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-                        break store
-                            .put_github_app_grant(&host, &grant.stored(now))
-                            .map_err(|error| error.to_string())
-                            .and_then(|()| {
-                                endpoints.api(&host, Some(grant.token)).viewer().map_err(|e| e.to_string())
-                            });
+                        break (|| {
+                            let login =
+                                endpoints.api(&host, Some(grant.token.clone())).viewer().map_err(|e| e.to_string())?;
+                            if host == "github.com" {
+                                store
+                                    .connect_github_account(&login, grant.token.secret())
+                                    .map_err(|e| e.to_string())?;
+                            }
+                            store.put_github_app_grant(&host, &grant.stored(now)).map_err(|e| e.to_string())?;
+                            Ok(login)
+                        })();
                     }
                 }
             };
@@ -640,7 +645,14 @@ impl State {
         self.github.connect = Connect::Checking;
         let store = Github::store(&self.relay);
         self.github_job(move |tx| {
-            let result = store.put_github_app(&host, token.secret()).map(|()| login).map_err(|error| error.to_string());
+            let result = (|| {
+                if host == "github.com" {
+                    store.connect_github_account(&login, token.secret())?;
+                }
+                store.put_github_app(&host, token.secret())?;
+                Ok(login)
+            })()
+            .map_err(|error: anyhow::Error| error.to_string());
             let _ = tx.send(Done::Connected { host, result });
         });
     }
@@ -654,8 +666,22 @@ impl State {
 
     pub(super) fn github_disconnect(&mut self, host: String) {
         let store = Github::store(&self.relay);
+        let account = (host == "github.com").then(|| self.github.viewer(&host).map(str::to_string)).flatten();
+        let relay = self.relay.clone();
         self.github_job(move |tx| {
-            let result = store.remove_github_app(&host).map_err(|error| error.to_string());
+            let result = (|| {
+                if let Some(account) = account {
+                    let name = crate::relay::github::account_name(&account)?;
+                    relay.edit(&format!("secret:{name}"), |store| {
+                        if store.secrets()?.iter().any(|s| s.name == name) {
+                            store.remove_secret(&name)?;
+                        }
+                        Ok(())
+                    })?;
+                }
+                store.remove_github_app(&host)
+            })()
+            .map_err(|error: anyhow::Error| error.to_string());
             let _ = tx.send(Done::Disconnected { host, result });
         });
     }

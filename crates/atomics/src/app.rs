@@ -68,6 +68,7 @@ mod plan_view;
 mod plans;
 pub(crate) mod projection;
 mod projects;
+mod publish;
 mod ref_guard;
 mod remote;
 mod repo_workflow;
@@ -539,6 +540,7 @@ pub(crate) struct State {
     connections: connections::Connections,
     /// The GitHub counter and controls: what the API last said, sign-in and actions under way.
     github: github::Github,
+    publishing: publish::Jobs,
     lifecycle_jobs: Vec<crate::lifecycle::Job>,
     /// Closed plans' worktrees whose removal waits for the processes still using them; kept on disk.
     deferred_cleanup: Vec<crate::lifecycle::Deferred>,
@@ -1141,6 +1143,7 @@ impl State {
             relay: Arc::new(crate::relay::Service::new(paths::atomics_home(), crate::relay::Keychain::current())),
             connections: Default::default(),
             github: Default::default(),
+            publishing: Default::default(),
             active: None,
             diff_open: true,
             diff_root: None,
