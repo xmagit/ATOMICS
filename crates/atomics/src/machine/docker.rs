@@ -8,6 +8,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 pub(super) struct Docker {
+    pub timed_out: bool,
     stats: HashMap<String, Stats>,
     checked: Option<Instant>,
     /// How long `docker ps` and `docker stats` may take. The collector runs on its own worker, so a busy
@@ -19,6 +20,7 @@ pub(super) struct Docker {
 impl Default for Docker {
     fn default() -> Self {
         Self {
+            timed_out: false,
             stats: HashMap::new(),
             checked: None,
             ps_timeout: Duration::from_secs(3),
@@ -33,9 +35,11 @@ impl Docker {
     }
 
     fn collect_with(&mut self, executable: &str) -> Option<Vec<Container>> {
+        self.timed_out = false;
         let ps = match output(executable, &["ps", "--format", "{{json .}}"], self.ps_timeout) {
             Ok(ps) => ps,
-            Err(_) => {
+            Err(error) => {
+                self.timed_out = error.kind() == io::ErrorKind::TimedOut;
                 self.stats.clear();
                 return None;
             }
@@ -236,16 +240,22 @@ mod tests {
     }
 
     #[test]
-    fn missing_failing_and_timed_out_docker_are_unavailable() {
+    fn missing_failing_and_timed_out_docker_have_distinct_status() {
         let dir = tempfile::tempdir().unwrap();
         assert!(Docker::default().collect_with(dir.path().join("missing").to_str().unwrap()).is_none());
         let (_dir, path) = executable("exit 1");
-        assert!(Docker::default().collect_with(&path).is_none());
+        let mut failed = Docker::default();
+        assert!(failed.collect_with(&path).is_none());
+        assert!(!failed.timed_out);
         let (_dir, path) = executable("sleep 10");
         let started = Instant::now();
         let mut hung = Docker { ps_timeout: Duration::from_millis(300), ..Docker::default() };
         assert!(hung.collect_with(&path).is_none());
+        assert!(hung.timed_out);
         assert!(started.elapsed() < Duration::from_secs(3));
+        let (_dir, path) = executable("exit 0");
+        assert_eq!(hung.collect_with(&path), Some(Vec::new()));
+        assert!(!hung.timed_out);
     }
 
     #[test]
