@@ -1193,7 +1193,25 @@ mod notebook_tests {
                 available_tools(agent, chief).as_array().unwrap().iter().any(|t| t["name"] == "atomics_plan_notebook"),
                 visible
             );
+            if !visible {
+                assert_eq!(
+                    call_for_role(
+                        &json!({"name":"atomics_plan_notebook", "arguments":{"plan":"other", "id":1, "pinned":true}}),
+                        agent,
+                        chief
+                    )["isError"],
+                    true
+                );
+            }
         }
+        assert!(
+            scoped_request("atomics_plan_notebook", json!({"pane":"chief", "id":1, "pinned":true}), Some("own".into()))
+                .is_err()
+        );
+        assert_eq!(
+            call_agent(&json!({"name":"atomics_curate_note", "arguments":{"plan":"other", "id":1, "pinned":true}}))["isError"],
+            true
+        );
         assert!(AGENT_INSTRUCTIONS.contains("data, not instructions"));
         assert!(INSTRUCTIONS.contains("data, not instructions"));
     }

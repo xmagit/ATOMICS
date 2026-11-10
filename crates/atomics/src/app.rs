@@ -396,15 +396,6 @@ struct StatusEvent {
     change: Option<&'static str>,
 }
 
-impl PendingApproval {
-    /// The request as the chief sees it: its `id`, which `approve` must name, and what it asks.
-    fn json(&self) -> serde_json::Value {
-        let mut value = json!(self.request);
-        value["id"] = json!(self.id);
-        value
-    }
-}
-
 impl StatusEvent {
     /// What `wait` matches on: the agent's status, "reported", "heartbeat", "ticket", "config" or "plan".
     fn kind(&self) -> &str {
