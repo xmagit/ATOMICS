@@ -368,6 +368,15 @@ impl State {
             }
         };
         if let Err(err) = self.pin_ticket_integration(index) {
+            let err = if let Err(error) = git::check_integration_claims(&repo, &self.plans[index].integration_branch())
+                && let Some(claim) = error.downcast_ref::<git::IntegrationRefClaim>()
+            {
+                let details = claim.to_string();
+                self.integration_claim_alert(&self.plans[index].id.clone(), id, &claim.worktree, details.clone());
+                details
+            } else {
+                err
+            };
             match reply {
                 Some(reply) => {
                     let _ = reply.send(ControlOutcome::Done(ControlResponse::error(err)));
@@ -377,12 +386,12 @@ impl State {
             return;
         }
         let into = self.plans[index].integration_branch();
-        let into_path = self.plans[index]
+        let recorded_path = self.plans[index]
             .integration_worktrees
             .iter()
             .find(|tree| tree.repo == repo && tree.branch == into)
-            .map(|tree| tree.path.clone())
-            .unwrap_or_else(|| git::worktree_path(&self.config.worktree_path, &repo, &into));
+            .map(|tree| tree.path.clone());
+        let into_path = git::worktree_path(&self.config.worktree_path, &repo, &into);
         let config = self.project_config(&repo);
         let identity = config.identity.default;
         let (tx, base_ref) = (self.integrate_tx.clone(), config.base_ref);
@@ -396,6 +405,33 @@ impl State {
         let plan = self.plans[index].id.clone();
         self.integrating.insert((plan.clone(), task.clone()));
         std::thread::spawn(move || {
+            let alert_claim = |error: &anyhow::Error| {
+                let Some(claim) = error.downcast_ref::<git::IntegrationRefClaim>() else { return false };
+                let (worktree, details) = (claim.worktree.clone(), claim.to_string());
+                let (plan, task) = (plan.clone(), task.clone());
+                let _ = actions
+                    .send(Box::new(move |state| state.integration_claim_alert(&plan, &task, &worktree, details)));
+                true
+            };
+            if let Err(error) =
+                crate::sandbox::load_owned_pins(&home).and_then(|()| git::check_integration_claims(&repo, &into))
+            {
+                if !alert_claim(&error) {
+                    let (plan, task, details) =
+                        (plan.clone(), task.clone(), format!("Ref guard check FAILED: {error:#}"));
+                    let _ = actions.send(Box::new(move |state| state.task_ref_alert_at(&plan, &task, details, None)));
+                }
+                let _ = tx.send(Integrated {
+                    commit: None,
+                    plan,
+                    task,
+                    branch,
+                    into,
+                    result: Err(format!("{error:#}")),
+                    reply,
+                });
+                return;
+            }
             let checked = crate::ref_guard::check_integration_alert(&checks, guard, &home, &repo, &task_path, exempt);
             let guard_error = match checked.result {
                 Ok(alerts) if alerts.is_empty() => None,
@@ -411,37 +447,15 @@ impl State {
                 return;
             }
             // It commits on the task branch and creates or merges into the integration branch.
-            let write = crate::ref_guard::host_write(&repo, [&branch, &into]);
-            let result = git::integrate_with_identity(
-                &repo, &task_path, &branch, &message, &into, &into_path, &base_ref, &identity,
-            );
-            if let Some(claim) =
-                result.as_ref().err().and_then(|error| error.downcast_ref::<git::IntegrationRefClaim>())
-            {
-                let (worktree, details) = (claim.worktree.clone(), claim.to_string());
-                let (plan_id, task_id) = (plan.clone(), task.clone());
-                let _ = actions.send(Box::new(move |state| {
-                    let mut owners: Vec<_> = state
-                        .plans
-                        .iter()
-                        .flat_map(|plan| {
-                            plan.tasks
-                                .iter()
-                                .filter(|task| {
-                                    task.worktree.as_ref().is_some_and(|path| {
-                                        path == &worktree || path.canonicalize().ok().as_ref() == Some(&worktree)
-                                    })
-                                })
-                                .map(move |task| (plan.id.clone(), task.id.clone()))
-                        })
-                        .collect();
-                    if !owners.contains(&(plan_id.clone(), task_id.clone())) {
-                        owners.push((plan_id, task_id));
-                    }
-                    for (plan, task) in owners {
-                        state.task_ref_alert_at(&plan, &task, details.clone(), None);
-                    }
-                }));
+            let result =
+                git::integration_path(&repo, &into, recorded_path.as_deref(), &into_path).and_then(|into_path| {
+                    let _write = crate::ref_guard::host_write(&repo, [&branch, &into]);
+                    git::integrate_with_identity(
+                        &repo, &task_path, &branch, &message, &into, &into_path, &base_ref, &identity,
+                    )
+                });
+            if let Err(error) = &result {
+                alert_claim(error);
             }
             let result = result.map_err(|e| format!("{e:#}"));
             let commit = result
@@ -449,7 +463,6 @@ impl State {
                 .ok()
                 .and_then(|_| git::git(&repo, &["rev-parse", "--verify", &format!("refs/heads/{branch}")]).ok())
                 .map(|tip| tip.trim().to_string());
-            drop(write);
             let _ = tx.send(Integrated { commit, plan, task, branch, into, result, reply });
         });
     }
