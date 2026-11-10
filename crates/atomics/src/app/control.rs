@@ -379,8 +379,7 @@ impl State {
                 } else {
                     self.plans[target].clone()
                 };
-                candidate.replace(goal.clone(), tasks.clone());
-                candidate.select_review_agent(&self.config);
+                candidate.replace(goal.clone(), tasks.clone(), &self.config);
                 if integration.is_some() {
                     candidate.integration = integration.clone();
                 }
@@ -414,8 +413,7 @@ impl State {
                 if self.plans[index].status == plan::PlanStatus::Completed {
                     self.plans[index].reopen();
                 }
-                self.plans[index].replace(goal, tasks);
-                self.plans[index].select_review_agent(&self.config);
+                self.plans[index].replace(goal, tasks, &self.config);
                 let ticket = self.stamp_system(ticket);
                 if ticket
                     .as_ref()

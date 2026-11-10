@@ -1,7 +1,7 @@
 //! What `plan_get` answers about one plan: a compact view of every task that stays inside what
 //! an MCP client accepts, and one task in full on request.
 use atomics_core::control::{MAX_PLAN_VIEW_CHARS, clip, clip_json, clip_list, shown_len};
-use atomics_core::plan::{MAX_REPORT_CHECKS, REPORT_DATA_NOTICE, report_text};
+use atomics_core::plan::{REPORT_DATA_NOTICE, report_text};
 
 use super::*;
 
@@ -28,9 +28,6 @@ fn report_view(report: &plan::Report, text: Option<usize>, output: usize) -> ser
                 }))
                 .collect::<Vec<_>>()
         );
-        if report.checks.len() > MAX_REPORT_CHECKS {
-            value["checks_omitted"] = json!(report.checks.len() - MAX_REPORT_CHECKS);
-        }
     }
     value
 }
@@ -308,7 +305,7 @@ mod tests {
     use atomics_core::control::{
         DEFAULT_WAIT_SECS, MAX_PLAN_VIEW_CHARS, MAX_TOOL_TEXT, MAX_WAIT_CHARS, MAX_WAIT_SECS, shown_len,
     };
-    use atomics_core::plan::Report;
+    use atomics_core::plan::{MAX_REPORT_CHECKS, Report};
 
     use super::*;
     use crate::app::tests::{request, session, with_app};
@@ -349,6 +346,7 @@ mod tests {
                         if view.result.get("task").is_some() { &view.result["task"] } else { &view.result["tasks"][0] };
                     let report = &task["report"];
                     assert_eq!(report["data_notice"], REPORT_DATA_NOTICE);
+                    assert_eq!(report["checks"].as_array().unwrap().len(), MAX_REPORT_CHECKS);
                     assert_eq!(report["provenance"]["source"], "agent");
                     assert_eq!(report["provenance"]["task"], "a");
                     assert_eq!(report["provenance"]["agent"], "Codex");
