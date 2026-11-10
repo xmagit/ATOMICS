@@ -57,6 +57,7 @@ impl Desktop<'_> {
                 }
                 if ui.button("Cancel").clicked() {
                     ui.data_mut(|data| data.remove::<bool>(confirm_id));
+                    ui.close();
                 }
             }
             if let Some(run) = run {
@@ -65,10 +66,12 @@ impl Desktop<'_> {
             }
         };
         // Folded into the Actions menu where the bar has no room for it, as Settings is.
+        let config =
+            egui::containers::menu::MenuConfig::new().close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
         let (response, _) = if in_menu || egui::containers::menu::is_in_menu(ui) {
-            egui::containers::menu::SubMenuButton::new(label).ui(ui, items)
+            egui::containers::menu::SubMenuButton::new(label).config(config).ui(ui, items)
         } else {
-            egui::containers::menu::MenuButton::new(label).ui(ui, items)
+            egui::containers::menu::MenuButton::new(label).config(config).ui(ui, items)
         };
         record_item(ui, "VM", &response);
         response.on_hover_text(format!("The ATOMICS VM {} is {state}", view.instance));
@@ -210,6 +213,49 @@ mod tests {
         app.runtime.hook_error = Some("Offline hook fixture".into());
         app.runtime.heartbeat.last = Some((atomics_core::store::now(), vec![]));
         app.runtime.resources.load = Some(123.4);
+    }
+
+    #[test]
+    fn vm_stop_confirmation_stays_visible_in_the_bar_and_actions_menu() {
+        with_app("app::topbar::tests::vm_stop_confirmation_stays_visible_in_the_bar_and_actions_menu", |app, ctx| {
+            let monitor = crate::vm::Monitor::with_view(crate::vm::View {
+                instance: "vm-test".into(),
+                status: crate::vm::Status::Running,
+                busy: None,
+                error: None,
+            });
+            app.runtime.vm = Some(monitor.clone());
+            app.runtime.toast = None;
+            for width in [2400.0, 1100.0] {
+                if width < 2000.0 {
+                    click(app, ctx, width, "Actions");
+                }
+                click(app, ctx, width, "VM");
+                // Let the submenu's measured size settle before clicking its entry.
+                for _ in 0..2 {
+                    render(app, ctx, width, Vec::new()).1.drop_without_applying_deltas();
+                }
+                click(app, ctx, width, "Stop");
+                let (_, output) = render(app, ctx, width, Vec::new());
+                let shown: Vec<_> = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) => Some(text.galley.text().to_string()),
+                        _ => None,
+                    })
+                    .collect();
+                output.drop_without_applying_deltas();
+                assert!(
+                    shown.iter().any(|text| text == "Stop the VM? Agents running in it stop with it."),
+                    "{width}: {shown:?}"
+                );
+                assert!(shown.iter().any(|text| text == "Stop VM"), "{width}: {shown:?}");
+                assert!(monitor.view().unwrap().busy.is_none(), "Stop must ask before changing the VM");
+                click(app, ctx, width, "Cancel");
+                assert!(monitor.view().unwrap().busy.is_none());
+            }
+        });
     }
 
     #[test]

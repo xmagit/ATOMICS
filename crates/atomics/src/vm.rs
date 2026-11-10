@@ -160,13 +160,29 @@ struct Listed {
 
 /// Lima's status for `instance`, or `None` when it does not exist.
 pub fn lima_status(instance: &str) -> Result<Option<String>> {
+    Ok(listed_status(instance, &lima_list()?, None, &|warning| eprintln!("{warning}")))
+}
+
+/// Explicit commands may remove obsolete setup records. Background status polls are read-only.
+pub fn lima_status_for_command(instance: &str) -> Result<Option<String>> {
+    Ok(listed_status(instance, &lima_list()?, Some(&record_dir()), &|warning| eprintln!("{warning}")))
+}
+
+fn lima_list() -> Result<Vec<Listed>> {
     let output = limactl_command()?.args(["list", "--json"]).output().context("running limactl list")?;
     if !output.status.success() {
         bail!("limactl list failed: {}", String::from_utf8_lossy(&output.stderr).trim());
     }
-    let listed = parse_list(&String::from_utf8_lossy(&output.stdout))?;
-    prune_records(&record_dir(), &listed)?;
-    Ok(listed.into_iter().find(|l| l.name == instance).map(|l| l.status))
+    parse_list(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn listed_status(instance: &str, listed: &[Listed], cleanup: Option<&Path>, warn: &dyn Fn(String)) -> Option<String> {
+    if let Some(dir) = cleanup
+        && let Err(error) = prune_records(dir, listed)
+    {
+        warn(format!("warning: could not remove obsolete VM setup records: {error:#}"));
+    }
+    listed.iter().find(|entry| entry.name == instance).map(|entry| entry.status.clone())
 }
 
 fn parse_list(text: &str) -> Result<Vec<Listed>> {
@@ -208,7 +224,15 @@ fn prune_records(dir: &Path, listed: &[Listed]) -> Result<()> {
 
 /// The VM's status for `instance`; `starting` while a start this process made is under way.
 pub fn status(instance: &str, starting: bool) -> Status {
-    match lima_status(instance) {
+    status_from_lima(lima_status(instance), starting)
+}
+
+pub fn status_for_command(instance: &str) -> Status {
+    status_from_lima(lima_status_for_command(instance), false)
+}
+
+fn status_from_lima(result: Result<Option<String>>, starting: bool) -> Status {
+    match result {
         Ok(None) => Status::NotSetUp,
         Ok(Some(_)) if starting => Status::Starting,
         Ok(Some(state)) => match state.as_str() {
@@ -260,13 +284,23 @@ fn forget(instance: &str) {
 /// slot on a shared machine. Inherits stdio; returns whether it succeeded.
 pub fn queued(command: &[String]) -> bool {
     let socket = atomics_core::paths::socket_path();
-    if !socket.exists() && BundleInfo::installed().is_some_and(|(_, info)| info.host.is_some()) {
+    queued_at(&socket, BundleInfo::installed().is_some_and(|(_, info)| info.host.is_some()), command)
+}
+
+fn queued_at(socket: &Path, vm_client: bool, command: &[String]) -> bool {
+    use std::os::unix::net::UnixStream;
+    let absent = vm_client
+        && matches!(
+            UnixStream::connect(socket).err().map(|error| error.kind()),
+            Some(std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused)
+        );
+    if absent {
         // A VM client has no Mac host or local queue; its VM must start before its host can queue.
         return command.split_first().is_some_and(|(program, args)| {
             Command::new(program).args(args).status().is_ok_and(|status| status.success())
         });
     }
-    crate::governor::run_queued(&socket, atomics_core::governor::SlotClass::Qa, command) == 0
+    crate::governor::run_queued(socket, atomics_core::governor::SlotClass::Qa, command) == 0
 }
 
 /// Starts the instance (through the QA queue) and waits until Lima reports it running.
@@ -343,6 +377,9 @@ struct Shared {
     /// Why the last start or stop failed.
     error: Option<String>,
     viewed: Option<Instant>,
+    checked: Option<Instant>,
+    refresh_requested: bool,
+    worker: Option<std::thread::Thread>,
 }
 
 /// How often the UI's view of the VM is refreshed.
@@ -358,6 +395,18 @@ pub struct View {
 }
 
 impl Monitor {
+    #[cfg(test)]
+    pub(crate) fn with_view(view: View) -> Self {
+        let monitor = Self::default();
+        *monitor.shared.lock().unwrap() = Shared {
+            instance: Some(view.instance),
+            status: Some(view.status),
+            busy: view.busy,
+            error: view.error,
+            ..Default::default()
+        };
+        monitor
+    }
     /// Only on macOS, and only with a bundle installed: elsewhere the UI shows no VM at all. `window` is
     /// asked to repaint when what it shows changes.
     pub fn start(window: crate::host::Window) -> Option<Self> {
@@ -372,13 +421,21 @@ impl Monitor {
         std::thread::Builder::new()
             .name("atomics-vm-monitor".into())
             .spawn(move || {
+                if let Some(shared) = shared.upgrade() {
+                    shared.lock().unwrap().worker = Some(std::thread::current());
+                }
                 while let Some(shared) = shared.upgrade() {
-                    let active = recently_viewed(shared.lock().unwrap().viewed, Instant::now());
-                    if active {
+                    let refresh_due = {
+                        let shared = shared.lock().unwrap();
+                        recently_viewed(shared.viewed, Instant::now())
+                            && (shared.refresh_requested
+                                || shared.checked.is_none_or(|checked| checked.elapsed() >= POLL))
+                    };
+                    if refresh_due {
                         Monitor { shared: shared.clone(), window: window.clone() }.refresh();
                     }
                     drop(shared);
-                    std::thread::sleep(POLL);
+                    std::thread::park_timeout(POLL);
                 }
             })
             .ok()?;
@@ -395,6 +452,8 @@ impl Monitor {
         let mut shared = self.shared.lock().unwrap();
         let changed = shared.status.as_ref() != Some(&status);
         shared.status = Some(status);
+        shared.checked = Some(Instant::now());
+        shared.refresh_requested = false;
         drop(shared);
         if changed {
             self.window.request_repaint();
@@ -403,6 +462,12 @@ impl Monitor {
 
     pub fn view(&self) -> Option<View> {
         let mut shared = self.shared.lock().unwrap();
+        if shared.viewed.is_none_or(|viewed| viewed.elapsed() >= POLL) {
+            shared.refresh_requested = true;
+            if let Some(worker) = &shared.worker {
+                worker.unpark();
+            }
+        }
         shared.viewed = Some(Instant::now());
         Some(View {
             instance: shared.instance.clone()?,
@@ -489,6 +554,60 @@ mod tests {
         assert!(!recently_viewed(None, now));
         assert!(recently_viewed(Some(now), now + POLL));
         assert!(!recently_viewed(Some(now), now + POLL * 3));
+    }
+
+    #[test]
+    fn restoring_a_paused_view_wakes_its_monitor_without_waiting_for_the_poll() {
+        let monitor =
+            Monitor::with_view(View { instance: "vm-test".into(), status: Status::Stopped, busy: None, error: None });
+        monitor.shared.lock().unwrap().viewed = Some(Instant::now() - POLL - Duration::from_millis(1));
+        // Resume must request a fresh answer even if the last background check was recent.
+        monitor.shared.lock().unwrap().checked = Some(Instant::now());
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (woke_tx, woke_rx) = std::sync::mpsc::channel();
+        let shared = monitor.shared.clone();
+        let guard = crate::test_support::scaled_timeout(Duration::from_secs(1));
+        let worker = std::thread::spawn(move || {
+            shared.lock().unwrap().worker = Some(std::thread::current());
+            ready_tx.send(()).unwrap();
+            std::thread::park_timeout(guard * 5);
+            woke_tx.send(()).unwrap();
+        });
+        ready_rx.recv().unwrap();
+        monitor.view();
+        woke_rx.recv_timeout(guard).expect("view() must wake a paused status poll immediately");
+        assert!(monitor.shared.lock().unwrap().refresh_requested);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn status_polls_leave_records_alone_and_command_cleanup_failures_only_warn() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = Record { instance: "gone".into(), image: "image".into(), created_at: 1 };
+        let path = dir.path().join("gone.json");
+        std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        let listed = parse_list(r#"{"name":"vm-test","status":"Running"}"#).unwrap();
+        let warnings = std::cell::RefCell::new(Vec::new());
+        let warn = |warning| warnings.borrow_mut().push(warning);
+        assert_eq!(listed_status("vm-test", &listed, None, &warn).as_deref(), Some("Running"));
+        assert!(path.exists(), "a background poll cannot delete a setup record from another Lima home");
+        assert_eq!(listed_status("vm-test", &listed, Some(dir.path()), &warn).as_deref(), Some("Running"));
+        assert!(!path.exists(), "an explicit command may prune obsolete records");
+        let not_a_directory = dir.path().join("file");
+        std::fs::write(&not_a_directory, "fixture").unwrap();
+        assert_eq!(listed_status("vm-test", &listed, Some(&not_a_directory), &warn).as_deref(), Some("Running"));
+        assert_eq!(warnings.borrow().len(), 1);
+    }
+
+    #[test]
+    fn vm_start_bypasses_a_stale_local_queue_socket() {
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("stale.sock");
+        drop(UnixListener::bind(&socket).unwrap());
+        assert!(socket.exists());
+        assert!(queued_at(&socket, true, &["sh".into(), "-c".into(), "exit 0".into()]));
+        assert!(!queued_at(&socket, true, &["sh".into(), "-c".into(), "exit 7".into()]));
     }
 
     #[test]

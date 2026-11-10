@@ -276,6 +276,70 @@ fn a_window_that_refuses_to_quit_is_named_and_keeps_the_restart_pending() {
 }
 
 #[test]
+fn a_partial_quit_reopens_the_app_and_does_not_restart_the_vm() {
+    let calls = std::cell::RefCell::new(Vec::new());
+    let result = quit_then_reopen(
+        || {
+            calls.borrow_mut().push("quit");
+            bail!("one window (pid 1234) refused to quit");
+        },
+        || {
+            calls.borrow_mut().push("restart");
+            Ok(())
+        },
+        || {
+            calls.borrow_mut().push("reopen");
+            Ok(())
+        },
+    );
+    assert!(format!("{:#}", result.unwrap_err()).contains("pid 1234"));
+    assert_eq!(*calls.borrow(), ["quit", "reopen"]);
+}
+
+#[test]
+fn a_failed_start_after_a_successful_stop_names_vm_start_and_reopens_the_app() {
+    let calls = std::cell::RefCell::new(Vec::new());
+    let result = quit_then_reopen(
+        || {
+            calls.borrow_mut().push("quit");
+            Ok(())
+        },
+        || {
+            restart_guest(
+                || {
+                    calls.borrow_mut().push("stop");
+                    Ok(())
+                },
+                || {
+                    calls.borrow_mut().push("start");
+                    bail!("start failed");
+                },
+            )
+        },
+        || {
+            calls.borrow_mut().push("reopen");
+            Ok(())
+        },
+    );
+    let error = format!("{:#}", result.unwrap_err());
+    assert!(error.contains("VM is stopped") && error.contains("atomics vm start"), "{error}");
+    assert!(!error.contains("atomics vm update"), "{error}");
+    assert_eq!(*calls.borrow(), ["quit", "stop", "start", "reopen"]);
+}
+
+#[test]
+fn repeated_busy_checks_announce_yes_only_once_without_skipping_refusals() {
+    let blockers = vec!["agent working".into()];
+    let mut policy = BusyPolicy { yes: true, ..Default::default() };
+    assert!(policy.check(&[]).unwrap().is_none());
+    assert!(policy.check(&blockers).unwrap().unwrap().contains("Continuing with busy work (--yes)"));
+    assert!(policy.check(&blockers).unwrap().is_none());
+    let mut refuse = BusyPolicy::default();
+    assert!(refuse.check(&blockers).is_err());
+    assert!(refuse.check(&blockers).is_err());
+}
+
+#[test]
 fn the_window_reopens_without_the_updaters_atomics_variables() {
     let env = [
         ("ATOMICS_CONFIG", "/tmp/scratch/config.toml"),
