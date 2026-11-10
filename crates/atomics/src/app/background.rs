@@ -686,6 +686,7 @@ impl State {
                         s.id.clone(),
                         s.title.clone(),
                         s.status,
+                        s.first_run_hint,
                         s.approvals.len(),
                         s.approval_hold,
                         s.held.len(),
@@ -737,6 +738,7 @@ impl State {
                     last_prompt: None,
                     last_message: None,
                     hooks_active: false,
+                    first_run_hint: None,
                     activity: heartbeat::Activity::default(),
                     approvals: Vec::new(),
                     allowed: Vec::new(),
@@ -782,6 +784,7 @@ impl State {
         }
         session.claude_id = Some(event.session_id.clone());
         session.hooks_active = true;
+        session.first_run_hint = None;
         session.activity.last_event = atomics_core::store::now();
         if event.name == "PermissionRequest" {
             let request = ApprovalRequest { warning: stash_warning, ..ApprovalRequest::from_event(&event) };

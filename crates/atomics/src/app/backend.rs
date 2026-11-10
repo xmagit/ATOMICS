@@ -13,6 +13,9 @@ pub(super) struct Local<'a>(pub(super) &'a State);
 
 impl State {
     pub(super) fn session_title(&self, session: &Session) -> String {
+        if session.naming == Naming::Named {
+            return session.title.clone();
+        }
         self.plans
             .iter()
             .flat_map(|plan| &plan.tasks)
@@ -29,8 +32,10 @@ impl State {
                 .iter()
                 .flat_map(|plan| &plan.tasks)
                 .find(|task| task.session.as_deref() == Some(&session.id));
-            if self.pending_questions.contains(&session.id) && task.is_none_or(|task| task.status != TaskStatus::Done)
-                || task.is_some_and(|task| task.status == TaskStatus::Blocked)
+            if matches!(session.status, AgentStatus::Idle | AgentStatus::Done | AgentStatus::NeedsInput)
+                && (self.pending_questions.contains(&session.id)
+                    && task.is_none_or(|task| task.status != TaskStatus::Done)
+                    || task.is_some_and(|task| task.status == TaskStatus::Blocked))
             {
                 return (AgentStatus::NeedsInput, None);
             }
@@ -53,7 +58,11 @@ impl State {
                     && !active_work
                     && let Some(plan) = approval
                 {
-                    return (AgentStatus::NeedsInput, Some(format!("waiting for you: approve {}", plan.goal)));
+                    let goal = plan.goal.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or("plan");
+                    return (
+                        AgentStatus::NeedsInput,
+                        Some(format!("waiting for you: approve {}", atomics_ui::text::truncate(goal, 60))),
+                    );
                 }
             }
             if session.is_agent()
@@ -61,8 +70,7 @@ impl State {
                     session.status,
                     AgentStatus::Starting | AgentStatus::Idle | AgentStatus::Done | AgentStatus::NeedsInput
                 )
-                && let Some(terminal) = session.terminal.as_ref().filter(|terminal| !terminal.exited())
-                && let Some(hint) = atomics_core::approvals::first_run_hint(&terminal.screen_text(60))
+                && let Some(hint) = session.first_run_hint
             {
                 return (AgentStatus::NeedsInput, Some(hint.into()));
             }
@@ -558,8 +566,104 @@ fn local_time(at: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{session, with_app};
+    use super::super::tests::{request, session, with_app};
     use super::*;
+
+    #[test]
+    fn p5_review_working_agents_are_not_blocked_by_task_metadata() {
+        with_app("app::backend::tests::p5_review_working_agents_are_not_blocked_by_task_metadata", |app, _| {
+            let root = app.runtime.launch_dir.clone();
+            app.runtime.sessions = vec![session("worker", AgentKind::Generic, AgentStatus::Working, &root)];
+            app.runtime.plans = vec![Plan {
+                id: "plan".into(),
+                tasks: vec![Task {
+                    id: "t1".into(),
+                    status: TaskStatus::Blocked,
+                    session: Some("worker".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }];
+            app.runtime.pending_questions.insert("worker".into());
+            for status in [AgentStatus::Working, AgentStatus::Starting] {
+                app.runtime.sessions[0].status = status;
+                let row = app.runtime.backend().session_row(0).unwrap();
+                assert_eq!(row.status, status);
+                assert!(!row.needs_user());
+                let waited = request(app, json!({"cmd":"wait", "timeout_secs":0}));
+                assert_eq!(waited.result["sessions"][0]["status"], status.label());
+            }
+            for status in [AgentStatus::Idle, AgentStatus::Done, AgentStatus::NeedsInput] {
+                app.runtime.sessions[0].status = status;
+                let row = app.runtime.backend().session_row(0).unwrap();
+                assert_eq!(row.status, AgentStatus::NeedsInput);
+                assert!(row.needs_user());
+            }
+            assert_eq!(app.runtime.plans[0].tasks[0].status, TaskStatus::Blocked);
+        });
+    }
+
+    #[test]
+    fn p5_review_user_renames_survive_task_labels_and_session_records() {
+        with_app("app::backend::tests::p5_review_user_renames_survive_task_labels_and_session_records", |app, _| {
+            let root = app.runtime.launch_dir.clone();
+            app.runtime.sessions = vec![session("worker", AgentKind::Generic, AgentStatus::Idle, &root)];
+            app.runtime.plans = vec![Plan {
+                id: "plan".into(),
+                tasks: vec![Task {
+                    id: "t1".into(),
+                    title: "Fix the parser".into(),
+                    session: Some("worker".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }];
+            app.begin_rename("worker");
+            assert_eq!(app.client.rename.as_ref().unwrap().title, "t1 · Fix the parser");
+            app.runtime.sessions[0].rename("Parser investigation");
+            app.runtime.sessions[0].follow_folder();
+            assert_eq!(app.runtime.backend().session_row(0).unwrap().title, "Parser investigation");
+            assert_eq!(app.runtime.describe(0)["title"], "Parser investigation");
+            app.runtime.remember("worker");
+            let saved = app.runtime.store.sessions.iter().find(|r| r.pane.as_deref() == Some("worker")).unwrap();
+            assert!(saved.named);
+            assert_eq!(saved.title, "Parser investigation");
+            let persisted: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(paths::store_file()).unwrap()).unwrap();
+            assert!(persisted["sessions"].as_array().unwrap().iter().any(|r| r["title"] == "Parser investigation"));
+            app.begin_rename("worker");
+            assert_eq!(app.client.rename.as_ref().unwrap().title, "Parser investigation");
+        });
+    }
+
+    #[test]
+    fn p5_review_approval_hint_is_one_short_unicode_line() {
+        with_app("app::backend::tests::p5_review_approval_hint_is_one_short_unicode_line", |app, _| {
+            let root = app.runtime.launch_dir.clone();
+            let mut chief = session("chief", AgentKind::Generic, AgentStatus::Working, &root);
+            chief.chief = true;
+            app.runtime.sessions = vec![chief];
+            app.runtime.plans = vec![Plan {
+                id: "plan".into(),
+                goal: format!("{}\nSecond line", "界".repeat(80)),
+                tasks: vec![Task { id: "t1".into(), ..Default::default() }],
+                ..Default::default()
+            }];
+            let event = atomics_core::hook::HookEvent {
+                name: "PreToolUse".into(),
+                session_id: "chief".into(),
+                tool_name: Some("mcp__atomics__atomics_wait".into()),
+                ..Default::default()
+            };
+            let mut log = atomics_core::trace::TraceLog::default();
+            log.ingest(&event, None, &Default::default(), 1).unwrap();
+            app.runtime.traces.insert("chief".into(), log);
+            let row = app.runtime.backend().session_row(0).unwrap();
+            assert_eq!(row.status, AgentStatus::NeedsInput);
+            assert_eq!(row.status_label(), format!("waiting for you: approve {}…", "界".repeat(60)));
+            assert_eq!(row.status_label().lines().count(), 1);
+        });
+    }
 
     #[test]
     fn commands_map_onto_atomics_v1() {
