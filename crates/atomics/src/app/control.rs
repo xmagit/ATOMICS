@@ -1113,7 +1113,11 @@ impl State {
                         clip(&self.session_title(s), 120)
                     };
                     let (status, status_hint) = self.session_status(s);
-                    json!({ "id": s.id, "title": title, "status": status.label(), "status_hint": status_hint })
+                    let mut info = json!({ "id": s.id, "title": title, "status": status.label() });
+                    if let Some(hint) = status_hint {
+                        info["status_hint"] = json!(hint);
+                    }
+                    info
                 })
                 .collect();
             let mut response = json!({
@@ -1348,7 +1352,9 @@ mod tests {
             let before = shown_len(&legacy.result);
             let after_size = shown_len(&compact.result);
             println!("six-session wait: before={before} bytes, after={after_size} bytes (pretty JSON)");
-            assert!(after_size < 1500, "before={before}, after={after_size}, budget=1500 bytes");
+            // Four task labels now use a UTF-8 middle dot: two extra bytes per label.
+            let budget = 1500 + 4 * 2;
+            assert!(after_size < budget, "before={before}, after={after_size}, budget={budget} bytes");
             assert!(after_size < before, "{before} -> {after_size}");
             assert_eq!(legacy.result["sessions"].as_array().unwrap().len(), 6);
             assert!(legacy.result["events"][0]["approval"]["input"]["command"].is_string());

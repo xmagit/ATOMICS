@@ -793,7 +793,12 @@ mod tests {
             asking.approvals = vec![pending("first", "touch first"), pending("second", "touch second")];
             let quiet = session("quiet", AgentKind::Claude, AgentStatus::Working, dir.path());
             app.runtime.sessions = vec![asking, quiet];
-            let task = |id: &str, status: TaskStatus| Task { id: id.into(), status, ..Task::default() };
+            let task = |id: &str, status: TaskStatus| Task {
+                id: id.into(),
+                title: format!("Task {id}"),
+                status,
+                ..Task::default()
+            };
             app.runtime.plans = vec![
                 Plan { id: "other".into(), ..Plan::default() },
                 Plan {
@@ -823,7 +828,7 @@ mod tests {
             assert_eq!(board.plan, app.runtime.plans[1]);
             assert_eq!(board.state, app.runtime.plan_state(1));
             assert_eq!(board.ready, ["b"]);
-            assert_eq!(board.sessions["asking"], ("Asking".to_string(), AgentStatus::NeedsInput));
+            assert_eq!(board.sessions["asking"], ("a · Task a".to_string(), AgentStatus::NeedsInput));
             assert_eq!(board.sessions.len(), 2);
             let note = format!(
                 "Agent kept open: waiting for its turn and pending messages to finish; checking whether it is in {}",
