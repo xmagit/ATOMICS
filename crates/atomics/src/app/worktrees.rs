@@ -518,8 +518,8 @@ mod tests {
                     "#!/usr/bin/env atomics-test-node\nif [ \"$1\" = --version ]; then printf 'codex-cli 0.165.0\\n'; \
                      else printf '%s\\n' \"$@\" > launch-args; fi\n",
                 );
-                // Git and the rest stay where this test found them.
-                let login = format!("{}:{}", tools.display(), std::env::var("PATH").unwrap());
+                let helpers = crate::test_support::helper_path(home);
+                let login = format!("{}:{}", tools.display(), helpers.display());
                 let shell = home.join("login-shell");
                 crate::test_support::write_program(
                     &shell,
@@ -527,14 +527,22 @@ mod tests {
                         "#!/bin/sh\n[ \"$1 $2 $3\" = '-l -i -c' ] || exit 64\nPATH='{login}'\nexport PATH\neval \"$4\"\n"
                     ),
                 );
-                vec![("SHELL", shell.into()), ("PATH", "/usr/bin:/bin".into())]
+                let started = [home.join("started-a"), home.join("started-b")];
+                for dir in &started {
+                    std::fs::create_dir(dir).unwrap();
+                }
+                vec![("SHELL", shell.into()), ("PATH", std::env::join_paths(started).unwrap())]
             },
             |mut state, _ctx| {
                 let tools = paths::home().join("login-tools");
                 let path = std::env::var("PATH").unwrap();
                 assert!(path.starts_with(&format!("{}:", tools.display())), "{path}");
-                for started in ["/usr/bin", "/bin"] {
-                    assert!(path.split(':').any(|folder| folder == started), "{started} stays: {path}");
+                for started in [paths::home().join("started-a"), paths::home().join("started-b")] {
+                    assert!(
+                        std::env::split_paths(&path).any(|folder| folder == started),
+                        "{} stays: {path}",
+                        started.display()
+                    );
                 }
                 assert!(crate::setup::login_path().added.is_some_and(|added| added > 0));
 

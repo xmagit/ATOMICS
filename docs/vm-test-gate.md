@@ -101,3 +101,84 @@ passed. The only failure was
 `relay::tests::audit_p7_idle_and_trickling_clients_have_separate_short_auth_slots`: its temporary
 directory cleanup found a recreated `relay.log` (`Directory not empty`). That p7 teardown failure
 was reported separately; this follow-up does not claim a green full workspace run.
+
+## Tests on a loaded machine
+
+Wait for a fixture to report readiness with a channel, socket or file before exercising its
+behavior. A sleep does not establish readiness. Keep a deliberately hung fake blocked until
+it is released or killed; a finite sleep can finish while the test is descheduled. Inject time
+when checking a deadline, cache lifetime or backoff, and advance it explicitly across the boundary.
+Keep generous, load-scaled hang guards for fixture startup and teardown separate from those checks.
+
+Write executable fixtures with `test_support::write_program` or `copy_program`. An unrelated
+parallel fork can inherit a writable descriptor and make execution fail with `ETXTBSY` until exec.
+It can also inherit a held `flock`, keeping the lock alive after its test drops it; run assertions
+about releasing and immediately reacquiring a lock in an isolated test child, and finish any
+intentional contender before dropping the owner. Persist configuration before asynchronous work
+that may reload it, and stop or join fixture workers before removing their files.
+
+Repeated full runs measure intermittent failures. Record every failed run and fix the fixture's
+ordering or clock; retrying a failed test does not make the gate green.
+
+Cloud and agent programs require explicit fixtures. Shared child support supplies a PATH of
+ordinary helper links and keeps HOME, AZURE_CONFIG_DIR, GH_CONFIG_DIR, LIMA_HOME and agent state
+inside the fixture. It preserves fixture-only and intentionally empty PATH overrides. Unit-test
+lookup and launch guards reject `az`, `gh`, `sbx`, `claude`, `codex` and `limactl` outside a registered
+fixture, including a symlink pointing outside one. Login-shell probes may read only fixture scripts.
+Production binaries launched by integration tests receive the same isolated environment from
+the child support code, since those binaries do not contain the unit-test guards.
+
+This closes the inherited PATH in every shared app fixture (including
+`app::key_tests::escape_closes_settings_and_the_project_picker_and_the_terminal_sees_neither`)
+and in the headless, updater, installer, statusline and doctor child fixtures. The worktree launch
+test now uses fixture directories for its original and login PATHs while still checking that both
+original directories survive the merge. Azure, GitHub token, sandbox, agent terminal and Lima
+launches also check explicitly supplied program paths. No cloud or agent CLI is a permitted helper.
+
+The isolation audit required explicit changes to these fixtures:
+
+- `sandbox::checks::tests::mcp_checks_registration_and_authorization_without_starting_oauth`,
+  `sandbox::checks::tests::ssh_warns_for_atomics_forwarding_global_forwarding_or_a_fixed_socket`,
+  and `sandbox::tests::preflight_refuses_a_missing_old_or_signed_out_sbx_with_what_to_do`
+  consulted the host PATH. They now run in an isolated child.
+- `app::approvals::tests::hidden_permission_commands_expand_before_approval_and_running_clears_needs_input`,
+  `app::host_tests::held_terminal_input_gets_a_receipt_without_frames`,
+  `app::sessions::tests::busy_codex_sends_wait_for_receipts_retry_and_report_failure`,
+  `app::sessions::tests::codex_clipped_and_repeated_receipts_never_repaste`, and
+  `app::sessions::tests::steering_during_a_pending_codex_send_is_held_and_released`
+  now copy the repository's fake Codex into their own directory before executing it.
+- `app::setup_tests::settings_runs_every_sandbox_step_with_clicks_and_reads_back_what_is_left`
+  now supplies fake sbx, agents and keychain discovery before the app starts.
+  The window login-PATH and worktree dispatch tests use fixture paths throughout.
+  The sandbox crash child also receives its fixture HOME.
+- Direct Azure, GitHub token and sandbox CLI fixtures receive isolated state directories.
+  The Azure no-token-on-disk check now scans descendant files too, without following helper
+  symlinks into the host's tools.
+
+## Loaded-machine measurements
+
+The ten-run before measurement used frozen revision `2dc9614` and
+`cargo test --workspace --no-fail-fast --locked`, through one ATOMICS test queue slot.
+Nine runs passed 2247 tests; run 5 passed 2246 and failed the ticket timeout assertion.
+Every run had 42 ignored tests. Start-of-run one-minute load averages ranged from 5.04 to 15.85
+on 14 available CPUs. The initial ENOSPC build attempt executed no tests and is excluded.
+Both measured phases disable Cargo incremental compilation to avoid regrowing its disk cache;
+the shared build jobserver and normal parallel test harness remain enabled.
+
+| Test | Failures in 10 before runs | Other agents' reported failures |
+| --- | ---: | ---: |
+| `machine::docker::tests::missing_failing_and_timed_out_docker_have_distinct_status` | 0 | 1 |
+| `app::tickets::tests::failures_show_on_the_link_and_never_block_the_plan` | 1 | 1 |
+| `update::tests::a_crash_leaves_nothing_the_next_update_keeps_and_only_one_update_runs_at_a_time` | 0 | 1 |
+| `app::key_tests::escape_closes_settings_and_the_project_picker_and_the_terminal_sees_neither` | 0 | 1 |
+| `relay::tests::audit_p7_idle_and_trickling_clients_have_separate_short_auth_slots` | 0 | 1 in the previous gate |
+
+The external reports have no shared denominator and are not added to the ten-run rates.
+The ticket assertion was the only failure observed in those ten runs. The relay test belongs to
+p7; its integration changes are merged before the after measurement. Docker, ticket and updater
+regressions each passed 30 consecutive targeted runs with the corrected fixtures.
+
+The separate CLI-isolation migration checks exposed fixture assumptions (missing ordinary
+helpers, repository fakes outside their owner directory, and host PATH lookups). Their failures
+are retained in `/tmp/p3-isolation-binary.log` and `/tmp/p3-isolation-binary-fixed.log` and are not
+represented as intermittent failures in the frozen before measurement.

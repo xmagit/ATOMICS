@@ -350,13 +350,26 @@ fn a_step_shows_its_progress_can_be_stopped_and_a_failure_says_why_with_the_comm
 
 #[test]
 fn settings_runs_every_sandbox_step_with_clicks_and_reads_back_what_is_left() {
-    with_app(
+    super::tests::with_app_env(
         "app::setup_tests::settings_runs_every_sandbox_step_with_clicks_and_reads_back_what_is_left",
-        |app, ctx| {
-            let bin = crate::test_support::tempdir().unwrap();
-            app.runtime.sbx = crate::sandbox::fake::install(bin.path()).display().to_string();
+        |home| {
+            let bin = home.join("sandbox-tools");
+            std::fs::create_dir(&bin).unwrap();
+            crate::sandbox::fake::install(&bin);
+            for name in ["claude", "codex", "secret-tool"] {
+                crate::test_support::write_program(bin.join(name), "#!/bin/sh\nexit 0\n");
+            }
             for marker in ["signed-out", "no-policy", "removed-anthropic", "no-openai"] {
-                std::fs::write(bin.path().join(marker), "").unwrap();
+                std::fs::write(bin.join(marker), "").unwrap();
+            }
+            vec![("PATH", crate::test_support::path_with(&bin))]
+        },
+        |app, ctx| {
+            let bin = paths::home().join("sandbox-tools");
+            let bin = bin.as_path();
+            app.runtime.sbx = bin.join("sbx").display().to_string();
+            for marker in ["signed-out", "no-policy", "removed-anthropic", "no-openai"] {
+                std::fs::write(bin.join(marker), "").unwrap();
             }
             let wait = |app: &mut Desktop<'_>| {
                 frame(app, ctx, vec![]);
@@ -379,12 +392,12 @@ fn settings_runs_every_sandbox_step_with_clicks_and_reads_back_what_is_left() {
             click_beside(app, ctx, "Docker account", "Sign in");
             let shown = wait(app);
             assert!(!shown.iter().any(|(text, _)| text == "Sign in"), "signed in: {shown:?}");
-            assert_eq!(crate::sandbox::fake::calls_to(bin.path(), &["login"]).len(), 1);
+            assert_eq!(crate::sandbox::fake::calls_to(bin, &["login"]).len(), 1);
 
             click_beside(app, ctx, "Network policy", "Use balanced");
             let shown = wait(app);
             assert!(!has(&shown, "Use balanced"), "{shown:?}");
-            assert_eq!(crate::sandbox::fake::calls_to(bin.path(), &["policy", "init"]).len(), 1);
+            assert_eq!(crate::sandbox::fake::calls_to(bin, &["policy", "init"]).len(), 1);
 
             // A pasted value leaves the field as it is sent, reaches no argument, and shows nowhere.
             const FIELD: &str = "Anthropic API key or token";
@@ -407,10 +420,10 @@ fn settings_runs_every_sandbox_step_with_clicks_and_reads_back_what_is_left() {
             click_beside(app, ctx, "Claude in sandboxes", "Save");
             let shown = wait(app);
             assert!(!format!("{shown:?}").contains("PRIVATE"), "{shown:?}");
-            assert!(!format!("{:?}", crate::sandbox::fake::calls(bin.path())).contains("PRIVATE"));
+            assert!(!format!("{:?}", crate::sandbox::fake::calls(bin)).contains("PRIVATE"));
             assert!(!format!("{:?}", app.runtime.management_info().setup).contains("PRIVATE"));
             assert_eq!(
-                std::fs::read_to_string(bin.path().join("secret-stdin")).unwrap().trim(),
+                std::fs::read_to_string(bin.join("secret-stdin")).unwrap().trim(),
                 "sk-ant-api03-PRIVATE-pasted"
             );
             assert!(!has(&shown, FIELD), "stored, so there is no field to fill: {shown:?}");

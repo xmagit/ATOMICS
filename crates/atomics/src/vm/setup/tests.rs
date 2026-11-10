@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn hardened_checks_use_admin_ssh_and_probe_the_guests_disk_with_read_only_shares() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_support::tempdir().unwrap();
     let root = dir.path();
     std::fs::create_dir(root.join("bin")).unwrap();
     std::fs::write(root.join("guest-check.sh"), CHECK_SCRIPT).unwrap();
@@ -71,7 +71,7 @@ if [ "$2" = /proc/1234/cwd ]; then cat "$VM_PROBE"; else printf '%s\n' "$2"; fi
     let run = |password: &str, fail_admin: bool| {
         let mut runner = check_runner(&info, &root.join("bin/limactl"), root).unwrap();
         runner
-            .env("PATH", format!("{}:{}", root.join("bin").display(), std::env::var("PATH").unwrap()))
+            .env("PATH", crate::test_support::path_with(&root.join("bin")))
             .env("HOME", root.join("home"))
             .env("VM_SCRIPT", root.join("guest-check.sh"))
             .env("VM_SSH_LOG", root.join("ssh.log"))

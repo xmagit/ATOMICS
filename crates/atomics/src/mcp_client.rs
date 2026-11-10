@@ -121,6 +121,8 @@ struct StdioServer {
     stderr: Arc<Mutex<String>>,
     /// Disconnects once all of stderr is read.
     stderr_read: Receiver<()>,
+    #[cfg(test)]
+    clock: Option<tests::Clock>,
 }
 
 struct HttpServer {
@@ -348,24 +350,36 @@ impl StdioServer {
                 }
             }
         });
-        Ok(StdioServer { program: program.to_string(), child, stdin: input, writes, lines, stderr, stderr_read })
+        Ok(StdioServer {
+            program: program.to_string(),
+            child,
+            stdin: input,
+            writes,
+            lines,
+            stderr,
+            stderr_read,
+            #[cfg(test)]
+            clock: None,
+        })
     }
 
     fn exchange(&mut self, message: &Value, id: Option<u64>, timeout: Duration) -> Result<Option<Value>, McpError> {
-        let deadline = Instant::now() + timeout;
+        let deadline = self.now() + timeout;
         self.write(message, deadline, timeout)?;
         let Some(id) = id else { return Ok(None) };
         loop {
-            if Instant::now() >= deadline {
+            if self.now() >= deadline {
                 return Err(self.timed_out(timeout));
             }
-            let line = match self.lines.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            let line = match self.receive(&self.lines, deadline) {
                 Ok(line) => line,
                 Err(RecvTimeoutError::Timeout) => return Err(self.timed_out(timeout)),
                 Err(RecvTimeoutError::Disconnected) => return Err(self.gone("it exited")),
             };
             // Servers that print banners or logs to stdout still work.
-            let Ok(value) = serde_json::from_str::<Value>(&line) else { continue };
+            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
             if value.get("method").is_some() {
                 if let Some(reply) = server_reply(&value) {
                     self.write(&reply, deadline, timeout)?;
@@ -382,12 +396,36 @@ impl StdioServer {
         if self.stdin.send(message.to_string()).is_err() {
             return Err(self.gone("writing to it failed"));
         }
-        match self.writes.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        match self.receive(&self.writes, deadline) {
             Ok(Ok(())) => Ok(()),
             Ok(Err(err)) => Err(self.gone(&format!("writing to it failed: {err}"))),
             Err(RecvTimeoutError::Timeout) => Err(self.timed_out(timeout)),
             Err(RecvTimeoutError::Disconnected) => Err(self.gone("writing to it failed")),
         }
+    }
+
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(clock) = &self.clock {
+            return clock.now();
+        }
+        Instant::now()
+    }
+
+    fn receive<T>(&self, receiver: &Receiver<T>, deadline: Instant) -> Result<T, RecvTimeoutError> {
+        #[cfg(test)]
+        if self.clock.is_some() {
+            loop {
+                if self.now() >= deadline {
+                    return Err(RecvTimeoutError::Timeout);
+                }
+                match receiver.recv_timeout(Duration::from_millis(10)) {
+                    Err(RecvTimeoutError::Timeout) => continue,
+                    result => return result,
+                }
+            }
+        }
+        receiver.recv_timeout(deadline.saturating_duration_since(self.now()))
     }
 
     fn timed_out(&mut self, timeout: Duration) -> McpError {
@@ -598,6 +636,30 @@ pub(crate) mod tests {
     use super::*;
     use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
+
+    /// A connection's behavioral clock. Fixture readiness still uses real hang guards.
+    #[derive(Clone)]
+    pub(crate) struct Clock(Arc<Mutex<Instant>>);
+
+    impl Clock {
+        pub(crate) fn new() -> Self {
+            Self(Arc::new(Mutex::new(Instant::now())))
+        }
+
+        pub(crate) fn now(&self) -> Instant {
+            *self.0.lock().unwrap()
+        }
+
+        pub(crate) fn advance(&self, elapsed: Duration) {
+            *self.0.lock().unwrap() += elapsed;
+        }
+
+        pub(crate) fn attach(&self, client: &mut McpClient, timeout: Duration) {
+            let Transport::Stdio(server) = &mut client.transport else { panic!("a stdio fixture") };
+            client.timeout = timeout;
+            server.clock = Some(self.clone());
+        }
+    }
 
     /// Exercise the shipped commented blocks rather than maintaining test-only profiles.
     pub(crate) fn example_profile(name: &str, state: &std::path::Path) -> atomics_core::tickets::TicketConfig {

@@ -992,10 +992,18 @@ fn sbx_command(
     stdout: &File,
     stderr: &File,
 ) -> Result<Command> {
+    #[cfg(test)]
+    if let Some(name) = Path::new(program).file_name().and_then(|name| name.to_str()) {
+        crate::test_support::assert_fixture_program(name, Path::new(program));
+    }
     let mut command = Command::new(program);
     command.args(args.iter().map(AsRef::as_ref)).stdin(Stdio::null());
     command.stdout(stdout.try_clone()?).stderr(stderr.try_clone()?).process_group(0);
     sbx_env(&mut command, ssh_agent);
+    #[cfg(test)]
+    if let Some(name) = Path::new(program).file_name().and_then(|name| name.to_str()) {
+        crate::test_support::fixture_command(&mut command, name);
+    }
     Ok(command)
 }
 
@@ -1469,7 +1477,8 @@ mod tests {
                     "sandbox::tests::a_crash_while_sbx_creates_leaves_owned_resources_the_next_sweep_removes",
                     "--nocapture",
                 ])
-                .env("ATOMICS_CREATE_CRASH_TEST", dir.path()),
+                .env("ATOMICS_CREATE_CRASH_TEST", dir.path())
+                .env("HOME", dir.path()),
             crate::test_support::CHILD_TIMEOUT,
         )
         .unwrap();
@@ -1613,6 +1622,11 @@ mod tests {
 
     #[test]
     fn preflight_refuses_a_missing_old_or_signed_out_sbx_with_what_to_do() {
+        if !crate::test_support::isolated_test(
+            "sandbox::tests::preflight_refuses_a_missing_old_or_signed_out_sbx_with_what_to_do",
+        ) {
+            return;
+        }
         let bin = crate::test_support::tempdir().unwrap();
         let sbx = fake::install(bin.path()).display().to_string();
         let ready = preflight(&sbx).unwrap();

@@ -370,6 +370,10 @@ fn login_shell_output(shell: &str, name: &str, timeout: Duration) -> Result<Stri
 /// and prompts in its startup files cannot stop it. Output goes to an unlinked file: nothing left
 /// running can keep a reader waiting.
 fn start_login_shell(shell: &str, name: &str) -> Result<(std::process::Child, std::fs::File), String> {
+    #[cfg(test)]
+    if Path::new(shell).exists() && !crate::test_support::is_fixture_path(Path::new(shell)) {
+        return Err("tests must supply a fixture login shell; host startup files are never read".into());
+    }
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
@@ -486,9 +490,14 @@ pub fn refresh_login_path() -> String {
 }
 
 pub(crate) fn find_on_path(program: &str, path: &str) -> Option<PathBuf> {
-    std::env::split_paths(path)
+    let found = std::env::split_paths(path)
         .map(|dir| dir.join(program))
-        .find(|candidate| candidate.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
+        .find(|candidate| candidate.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0));
+    #[cfg(test)]
+    if let Some(found) = &found {
+        crate::test_support::assert_fixture_program(program, found);
+    }
+    found
 }
 
 /// Finds the configured editor, including distributions that name Helix `helix`.
@@ -498,6 +507,10 @@ pub(crate) fn editor_on_path(program: &str, find: impl Fn(&str) -> Option<PathBu
 
 pub fn resolve_program(program: &str) -> String {
     if program.contains('/') {
+        #[cfg(test)]
+        if let Some(name) = Path::new(program).file_name().and_then(|name| name.to_str()) {
+            crate::test_support::assert_fixture_program(name, Path::new(program));
+        }
         return program.to_string();
     }
     find_program(program).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| program.to_string())
@@ -506,6 +519,8 @@ pub fn resolve_program(program: &str) -> String {
 /// Keep the version probe bounded even when a wrapper hangs or another child inherits stdout.
 /// `path`, when given, is the probe's PATH ([`child_path`]); else it has this process's own.
 pub fn codex_supports_hooks(program: &str, path: Option<&str>, timeout: std::time::Duration) -> Option<bool> {
+    #[cfg(test)]
+    crate::test_support::assert_fixture_program("codex", Path::new(program));
     use std::io::Read;
     use std::os::fd::OwnedFd;
     use std::os::unix::net::UnixStream;
@@ -526,6 +541,8 @@ pub fn codex_supports_hooks(program: &str, path: Option<&str>, timeout: std::tim
     if let Some(path) = path {
         command.env("PATH", path);
     }
+    #[cfg(test)]
+    crate::test_support::fixture_command(&mut command, "codex");
     let mut child = command.spawn().ok()?;
     let deadline = Instant::now() + timeout;
     loop {
@@ -873,10 +890,16 @@ mod tests {
     fn a_window_takes_on_the_recorded_path_at_once_and_reads_the_shell_in_the_background() {
         use crate::test_support::{CHILD_TIMEOUT, TestChild};
         const CHILD: &str = "ATOMICS_WINDOW_LOGIN_PATH_TEST";
-        const RECORDED: &str = "/opt/recorded/bin:/usr/bin";
-        const FRESH: &str = "/opt/fresh/bin:/opt/recorded/bin:/usr/bin";
+        fn fixture_paths(root: &Path) -> (String, String, String, String) {
+            let common = root.join("common").display().to_string();
+            let extra = root.join("extra").display().to_string();
+            let recorded = format!("{}:{common}", root.join("recorded").display());
+            let fresh = format!("{}:{recorded}", root.join("fresh").display());
+            (recorded, fresh, common, extra)
+        }
         if let Some(dir) = std::env::var_os(CHILD) {
             let dir = PathBuf::from(dir);
+            let (recorded_path, fresh_path, _, extra) = fixture_paths(&dir);
             let record = dir.join("login-path.json");
             let started_with = std::env::var("PATH").unwrap();
             // SAFETY: the test harness's own threads only wait for this test; nothing reads the
@@ -891,19 +914,19 @@ mod tests {
             std::fs::write(dir.join("go"), "").unwrap();
 
             let found = login_path();
-            assert_eq!(found.path.as_deref(), Ok(FRESH));
+            assert_eq!(found.path.as_deref(), Ok(fresh_path.as_str()));
             let (ok, text) = found.describe();
             assert!(ok, "{text}");
             // The next start takes on what the shell gives now.
-            assert_eq!(recorded(&record, &shell_program()).as_deref(), Some(FRESH));
+            assert_eq!(recorded(&record, &shell_program()).as_deref(), Some(fresh_path.as_str()));
             match std::fs::read_to_string(dir.join("scenario")).unwrap().as_str() {
                 "dock" => {
-                    assert_eq!(path, "/opt/recorded/bin:/usr/bin:/bin");
+                    assert_eq!(path, format!("{recorded_path}:{extra}"));
                     assert_eq!((found.added, found.late), (Some(1), 1));
                     assert!(
                         text.contains("as recorded at an earlier start") && text.contains("1 folder the shell has now")
                     );
-                    assert_eq!(child_path().as_deref(), Some("/opt/fresh/bin:/opt/recorded/bin:/usr/bin:/bin"));
+                    assert_eq!(child_path().as_deref(), Some(format!("{fresh_path}:{extra}").as_str()));
                 }
                 "terminal" => {
                     assert_eq!(path, started_with);
@@ -915,35 +938,31 @@ mod tests {
                     assert_eq!(path, started_with);
                     assert_eq!((found.added, found.late), (Some(0), 2));
                     assert!(text.contains("2 folders of login shell"), "{text}");
-                    assert_eq!(child_path().as_deref(), Some("/opt/fresh/bin:/opt/recorded/bin:/usr/bin:/bin"));
+                    assert_eq!(child_path().as_deref(), Some(format!("{fresh_path}:{extra}").as_str()));
                 }
                 scenario => panic!("{scenario}"),
             }
             return;
         }
 
-        for (scenario, started_with) in [
-            // Started from the Dock or a launcher, with a PATH recorded at an earlier start.
-            ("dock", "/usr/bin:/bin"),
-            // Started from a terminal, whose PATH has all the login shell's folders.
-            ("terminal", "/bin:/opt/fresh/bin:/usr/bin:/opt/recorded/bin"),
-            // Started with nothing recorded.
-            ("first", "/usr/bin:/bin"),
-        ] {
+        for scenario in ["dock", "terminal", "first"] {
             let dir = crate::test_support::tempdir().unwrap();
+            let (recorded_path, fresh_path, common, extra) = fixture_paths(dir.path());
+            let started_with =
+                if scenario == "terminal" { format!("{extra}:{fresh_path}") } else { format!("{common}:{extra}") };
             // A slow login shell: it gives its PATH only once the test has seen the window start.
             let shell = dir.path().join("login-shell");
             crate::test_support::write_program(
                 &shell,
                 format!(
                     "#!/bin/sh\n[ \"$1 $2 $3\" = '-l -i -c' ] || exit 64\nwhile [ ! -e \"${{0%/*}}/go\" ]; do '{}' \
-                     0.05; done\nPATH='{FRESH}'\neval \"$4\"\n",
+                     0.05; done\nPATH='{fresh_path}'\neval \"$4\"\n",
                     crate::test_support::program("sleep").replace('\'', "'\\''")
                 ),
             );
             std::fs::write(dir.path().join("scenario"), scenario).unwrap();
             if scenario != "first" {
-                record(&dir.path().join("login-path.json"), &shell.to_string_lossy(), RECORDED).unwrap();
+                record(&dir.path().join("login-path.json"), &shell.to_string_lossy(), &recorded_path).unwrap();
             }
             let mut child = TestChild::spawn(
                 std::process::Command::new(std::env::current_exe().unwrap())
