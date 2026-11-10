@@ -91,7 +91,10 @@ pub enum ControlRequest {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         interactive: bool,
     },
+    /// Starts the chief if it is not running, without opening a window.
+    StartChief,
     /// Types a message and submits it, or with `raw` writes the text as-is (keys).
+    /// Addressing `chief` without `raw` starts it with this first prompt when needed.
     Send {
         session: String,
         text: String,

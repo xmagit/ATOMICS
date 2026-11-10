@@ -97,7 +97,7 @@ const WORKTREE_REFRESH: Duration = Duration::from_secs(30);
 const BACKGROUND_REFRESH: Duration = Duration::from_secs(5);
 const FALLBACK_REFRESH: Duration = Duration::from_secs(30);
 /// The answer to a request only a desktop window can serve, in the headless host.
-const NO_WINDOW: &str = "no window: this is the headless host (atomics host); start the desktop for window commands";
+const NO_WINDOW: &str = "no local window: this is the headless host (atomics host); window control commands are not forwarded to connected clients; use the client's UI";
 /// Untracked content kept for a diff off screen; the rest is counted, not loaded.
 const OFF_SCREEN_UNTRACKED: u64 = 1024 * 1024;
 

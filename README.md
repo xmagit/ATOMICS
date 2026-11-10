@@ -240,6 +240,8 @@ and `cargo run -p atomics --example loopback_client` prints its board. With remo
 ```sh
 atomics host                        # the projects of the last session, or the launch folder
 atomics host -w daily ~/repos/app   # a workspace and a project, as for the desktop
+atomics ctl '{"cmd":"start_chief"}' # start the configured chief without opening a window
+atomics ctl '{"cmd":"send","session":"chief","text":"Plan the next task"}' # starts it if needed
 ```
 
 `host` is a subcommand, so `atomics host` no longer opens a folder named `./host` in the desktop; `atomics -- host`
@@ -253,8 +255,9 @@ served, or when `[remote]` is enabled and the protocol server cannot start (a ta
 
 A host owns its `ATOMICS_HOME`. It holds `instance.lock` there exclusively, and every desktop holds it shared: a host
 does not start while a desktop uses that home, a desktop does not start while a host does, and desktops still start
-side by side as before. Requests only a window can serve (`screenshot`, `resize`, `show_settings`) return an error, and
-`restart` is left to the service manager. The desktop cannot attach to a running host yet; that is phase 3 of
+side by side as before. Requests only a local window can serve (`screenshot`, `resize`, `show_settings`) return an error
+even with a client connected; these commands are not forwarded, so use the client's UI. Restart the host through
+its service manager. The desktop cannot attach to a running host yet; that is phase 3 of
 [docs/daemon.md](docs/daemon.md). A systemd user unit (use the installed binary's absolute path):
 
 ```ini
@@ -299,8 +302,9 @@ and config overrides are preserved, and helper output goes to `restart.log` unde
 Live sessions with resume IDs reopen automatically. The chief resumes as chief, with its dock and width preserved,
 and starts a turn asking it to call `atomics_wait`. The first wait receives a `restarted` event, even with an old cursor
 or a status filter, containing `restarted: <old build> -> <new build>, reason …`. Build identities come from
-`git describe --always --tags --dirty` at compile time, falling back to the crate version. `atomics --version` prints the
-crate version and then that build, as `atomics 0.1.7 (v0.1.7-3-gabc1234)`. An update reads the version from this line.
+the flake's commit revision for Nix builds, otherwise `git describe --always --tags --dirty` at compile time,
+falling back to the crate version. `atomics --version` prints the crate version and then that build, as
+`atomics 0.1.7 (v0.1.7-3-gabc1234)`. An update reads the version from this line.
 
 ## Using ATOMICS on several machines
 
