@@ -544,6 +544,25 @@ fn audit_p7_staging_cleanup_preserves_current_and_legacy_rollback_asides() {
 
 #[test]
 fn a_crash_leaves_nothing_the_next_update_keeps_and_only_one_update_runs_at_a_time() {
+    const LOCK_HOME: &str = "ATOMICS_UPDATE_LOCK_TEST_HOME";
+    const PROBE: &str = "ATOMICS_UPDATE_LOCK_TEST_PROBE";
+    const TEST: &str = "update::tests::a_crash_leaves_nothing_the_next_update_keeps_and_only_one_update_runs_at_a_time";
+    if let Some(home) = std::env::var_os(LOCK_HOME) {
+        let home = Path::new(&home);
+        if std::env::var_os(PROBE).is_some() {
+            assert_eq!(lock(home).err().unwrap().to_string(), "Another update is under way.");
+            return;
+        }
+        let held = lock(home).unwrap();
+        assert_eq!(lock(home).err().unwrap().to_string(), "Another update is under way.");
+        let contender = crate::test_support::output(
+            Command::new(std::env::current_exe().unwrap()).args(["--exact", TEST, "--nocapture"]).env(PROBE, "1"),
+        );
+        assert!(contender.status.success(), "{contender:?}");
+        drop(held);
+        lock(home).expect("the next update acquires the released lock without retrying");
+        return;
+    }
     let install = Install::new();
     let stale = install.target.parent().unwrap().join(format!("{STAGING}crashed"));
     std::fs::create_dir(&stale).unwrap();
@@ -556,8 +575,11 @@ fn a_crash_leaves_nothing_the_next_update_keeps_and_only_one_update_runs_at_a_ti
     install.no_leftovers();
 
     let home = install.dir.path().join("state");
-    let held = lock(&home).unwrap();
-    assert_eq!(lock(&home).err().unwrap().to_string(), "Another update is under way.");
-    drop(held);
-    lock(&home).unwrap();
+    // A parallel test's fork can inherit a held flock until exec, keeping it locked
+    // after this test drops it. Isolate the lock lifetime from those unrelated forks.
+    // The child still checks exclusion in this process and in a second process.
+    let owner = crate::test_support::output(
+        Command::new(std::env::current_exe().unwrap()).args(["--exact", TEST, "--nocapture"]).env(LOCK_HOME, &home),
+    );
+    assert!(owner.status.success(), "{owner:?}");
 }

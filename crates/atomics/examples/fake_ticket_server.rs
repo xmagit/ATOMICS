@@ -318,7 +318,9 @@ const TOOLS: &[&str] = &[
 fn list(path: &str, params: &Value) -> Result<Value, String> {
     let state: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     if state["list_hang"] == true {
-        std::thread::sleep(std::time::Duration::from_secs(60));
+        loop {
+            std::thread::park();
+        }
     }
     let names = state["offered_tools"].as_array().cloned().unwrap_or_else(|| TOOLS.iter().map(|n| json!(n)).collect());
     let start = params["cursor"].as_str().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
@@ -344,7 +346,9 @@ fn call(path: &str, params: &Value) -> Result<Value, String> {
     let listed = |key: &str| state[key].as_array().is_some_and(|tools| tools.iter().any(|t| t == name));
     if listed("hang") {
         save(path, &state);
-        std::thread::sleep(std::time::Duration::from_secs(60));
+        loop {
+            std::thread::park();
+        }
     }
     if listed("fail") || state["refuse_text"].as_str().is_some_and(|text| args["text"] == text) {
         save(path, &state);

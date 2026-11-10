@@ -2217,7 +2217,7 @@ fi
     #[test]
     fn busy_codex_sends_wait_for_receipts_retry_and_report_failure() {
         with_app("app::sessions::tests::busy_codex_sends_wait_for_receipts_retry_and_report_failure", |app, _ctx| {
-            let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex");
+            let fixture = crate::app::tests::fixture_agent("codex");
             app.runtime.config.agents.push(atomics_core::config::AgentConfig {
                 name: "fake-codex".into(),
                 command: vec![fixture.to_string_lossy().into_owned()],
@@ -2320,7 +2320,7 @@ fi
     #[test]
     fn codex_clipped_and_repeated_receipts_never_repaste() {
         with_app("app::sessions::tests::codex_clipped_and_repeated_receipts_never_repaste", |app, _ctx| {
-            let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex");
+            let fixture = crate::app::tests::fixture_agent("codex");
             app.runtime.config.agents.push(atomics_core::config::AgentConfig {
                 name: "fake-codex".into(),
                 command: vec![fixture.to_string_lossy().into_owned()],
@@ -2399,7 +2399,7 @@ fi
     #[test]
     fn steering_during_a_pending_codex_send_is_held_and_released() {
         with_app("app::sessions::tests::steering_during_a_pending_codex_send_is_held_and_released", |app, _ctx| {
-            let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex");
+            let fixture = crate::app::tests::fixture_agent("codex");
             app.runtime.config.agents.push(atomics_core::config::AgentConfig {
                 name: "fake-codex".into(),
                 command: vec![fixture.to_string_lossy().into_owned()],

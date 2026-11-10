@@ -906,6 +906,8 @@ pub fn gh_token(program: Option<&Path>, host: &str) -> Option<Token> {
         Some(program) => program.to_path_buf(),
         None => crate::setup::find_program("gh")?,
     };
+    #[cfg(test)]
+    crate::test_support::assert_fixture_program("gh", &program);
     let mut command = Command::new(program);
     command
         .args(["auth", "token", "--hostname", host])
@@ -915,6 +917,8 @@ pub fn gh_token(program: Option<&Path>, host: &str) -> Option<Token> {
     if let Some(path) = crate::setup::login_path_now().as_ref() {
         command.env("PATH", path);
     }
+    #[cfg(test)]
+    crate::test_support::fixture_command(&mut command, "gh");
     let output = command.output().ok()?;
     if !output.status.success() {
         return None;

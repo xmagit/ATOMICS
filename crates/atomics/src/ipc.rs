@@ -463,9 +463,24 @@ mod tests {
 
     #[test]
     fn audit_p7_stale_socket_recovery_has_one_owner_and_cleanup_keeps_a_replacement() {
+        const STALE: &str = "ATOMICS_STALE_SOCKET_FIXTURE";
+        const TEST: &str = "ipc::tests::audit_p7_stale_socket_recovery_has_one_owner_and_cleanup_keeps_a_replacement";
+        if let Some(path) = std::env::var_os(STALE) {
+            drop(UnixListener::bind(path).unwrap());
+            return;
+        }
         let dir = crate::test_support::tempdir().unwrap();
         let path = dir.path().join("control.sock");
-        drop(UnixListener::bind(&path).unwrap()); // Simulate a process that crashed.
+        // A parallel test can fork while a parent-created listener is open and
+        // keep it live after this test closes it. Only this child owns the setup
+        // descriptor; its exit makes the socket stale before either contender runs.
+        let created = crate::test_support::output(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(STALE, &path)
+                .env("HOME", dir.path()),
+        );
+        assert!(created.status.success(), "{created:?}");
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let results = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..2)
@@ -479,7 +494,7 @@ mod tests {
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect::<Vec<_>>()
         });
-        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1, "{results:?}");
         assert!(UnixStream::connect(&path).is_ok());
         assert!(bind(&path).is_err());
         // Ownership cleanup must not unlink someone else's replacement inode.
