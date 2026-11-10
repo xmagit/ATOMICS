@@ -102,6 +102,11 @@ impl Local<'_> {
             Command::EditBrief { plan, task, brief } => {
                 state.post_plan(plan, move |state, index| state.edit_task_brief(index, &task, brief))
             }
+            Command::CurateNote { plan, id, pinned, delete } => state.post_plan(plan, move |state, index| {
+                if let Err(error) = state.curate_notebook(index, id, pinned, delete) {
+                    state.toast(error);
+                }
+            }),
             Command::StartTask { plan, task } => {
                 state.post_plan(plan, move |state, index| state.dispatch_when_checked(index, Some(task), None))
             }

@@ -572,3 +572,27 @@ fn a_refused_sign_in_shows_reconnect_on_the_board_and_a_click_signs_in_again() {
         },
     );
 }
+
+#[test]
+fn notebook_shows_proposals_and_authors_and_user_can_pin_and_delete() {
+    tests::with_app(
+        "app::board_tests::notebook_shows_proposals_and_authors_and_user_can_pin_and_delete",
+        |app, ctx| {
+            app.runtime.config.plan.notebook = true;
+            app.runtime.plans[0].id = "notebook-board".into();
+            app.runtime.plans[0]
+                .propose_note("task-a", "Agent", atomics_core::store::now(), "Build in the Nix shell")
+                .unwrap();
+            let rendered = frame(app, ctx, 1600.0, 0.0, vec![]);
+            let labels: Vec<_> = rendered.text.iter().map(|t| t.galley.text()).collect();
+            assert!(labels.iter().any(|s| s.contains("0 pinned · 1 proposals")), "{labels:?}");
+            assert!(labels.iter().any(|s| s.contains("task-a · Agent") && s.contains("s ago")), "{labels:?}");
+            assert!(labels.contains(&"Build in the Nix shell"));
+            click_chip(app, ctx, "Pin", 1.0);
+            assert!(app.runtime.plans[0].notebook[0].pinned);
+            click_chip(app, ctx, "Delete", 2.0);
+            assert!(app.runtime.plans[0].notebook.is_empty());
+            assert!(Plan::load(&paths::atomics_home().join("plans/notebook-board.json")).unwrap().notebook.is_empty());
+        },
+    );
+}

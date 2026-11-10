@@ -52,6 +52,7 @@ fn host() -> crate::projection::HostInfo {
 
 fn plan() -> PlanInfo {
     PlanInfo {
+        notebook: Vec::new(),
         ticket_tree: None,
         id: "p".into(),
         status: PlanStatus::Open,

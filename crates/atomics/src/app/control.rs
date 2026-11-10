@@ -9,6 +9,15 @@ const MAX_MESSAGE_CHARS: usize = 24_000;
 const MAX_PROMPT_CHARS: usize = 2000;
 
 impl State {
+    fn session_text_provenance(&self, index: usize) -> serde_json::Value {
+        let session = &self.sessions[index];
+        let task = self.plans.iter().flat_map(|p| &p.tasks).find(|t| t.session.as_deref() == Some(&session.id));
+        let agent = task
+            .map(|t| atomics_core::tickets::model_label(&t.agent, &t.args))
+            .unwrap_or_else(|| session.agent.clone());
+        plan::agent_provenance("session output", task.map(|t| t.id.as_str()), &agent, session.activity.last_event)
+    }
+
     pub(super) fn describe(&self, index: usize) -> serde_json::Value {
         let s = &self.sessions[index];
         let stats = self.diffs.get(&s.root()).and_then(|d| d.prepared.as_ref()).map(|p| {
@@ -121,6 +130,7 @@ impl State {
             | ControlRequest::PlanIntegrate { plan, .. }
             | ControlRequest::TicketLink { plan, .. }
             | ControlRequest::TicketComment { plan, .. } => Some(plan.as_deref()),
+            ControlRequest::PlanNotebook { plan, .. } => Some(plan.as_deref()),
             _ => None,
         };
         // plan_set may also name a completed plan, which it reopens once the request is known to be valid.
@@ -144,6 +154,39 @@ impl State {
             self.selected_plan
         };
         let outcome = match request {
+            ControlRequest::CurateNote { plan, id, pinned, delete } => {
+                let result = self
+                    .plans
+                    .iter()
+                    .position(|p| p.id == plan)
+                    .ok_or_else(|| "No such plan.".to_string())
+                    .and_then(|index| self.curate_notebook(index, id, pinned, delete));
+                done(match result {
+                    Ok(()) => ControlResponse::ok(json!({"curated": id})),
+                    Err(error) => ControlResponse::error(error),
+                })
+            }
+            ControlRequest::Note { pane, text } => {
+                let pane = self.pane_session(pane);
+                done(match self.agent_notebook(pane.as_deref(), Some(&text)) {
+                    Ok(value) => ControlResponse::ok(value),
+                    Err(error) => ControlResponse::error(error),
+                })
+            }
+            ControlRequest::Notes { pane } => {
+                let pane = self.pane_session(pane);
+                done(match self.agent_notebook(pane.as_deref(), None) {
+                    Ok(value) => ControlResponse::ok(value),
+                    Err(error) => ControlResponse::error(error),
+                })
+            }
+            ControlRequest::PlanNotebook { pane, id, pinned, delete, .. } => {
+                let pane = self.pane_session(pane);
+                done(match self.chief_notebook(pane.as_deref(), target, id, pinned, delete) {
+                    Ok(value) => ControlResponse::ok(value),
+                    Err(error) => ControlResponse::error(error),
+                })
+            }
             ControlRequest::AgentTicketGet { pane, plan } => {
                 let pane = self.pane_session(pane);
                 self.agent_ticket(pane.as_deref(), plan, None, reply);
@@ -302,6 +345,7 @@ impl State {
                     let mut result = self.describe(index);
                     result["last_message"] = json!(s.last_message.as_deref().map(|m| clip(m, MAX_MESSAGE_CHARS)));
                     result["screen"] = json!(screen);
+                    result["provenance"] = self.session_text_provenance(index);
                     done(ControlResponse::ok(result))
                 }
             },
@@ -745,10 +789,12 @@ impl State {
                 None => missing(&session),
                 Some(index) => match &self.sessions[index].terminal {
                     Some(terminal) => done(ControlResponse::ok(json!({
+                        "provenance": self.session_text_provenance(index),
                         "status": self.sessions[index].status.label(),
                         "screen": clip_start(&terminal.screen_text(lines.unwrap_or(60).min(MAX_READ_LINES)), MAX_SCREEN_CHARS),
                     }))),
                     None => done(ControlResponse::ok(json!({
+                        "provenance": self.session_text_provenance(index),
                         "status": self.sessions[index].status.label(),
                         "last_prompt": self.sessions[index].last_prompt.as_deref().map(|p| clip(p, MAX_PROMPT_CHARS)),
                         "last_message": self.sessions[index].last_message.as_deref().map(|m| clip(m, MAX_MESSAGE_CHARS)),

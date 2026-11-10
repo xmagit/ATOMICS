@@ -816,6 +816,13 @@ impl FakeHost {
             }
             PlanAction::Archive => plan.status = PlanStatus::Archived,
             PlanAction::Complete => plan.status = PlanStatus::Completed,
+            PlanAction::Notebook { id, pinned, delete } => {
+                let mut notebook = atomics_core::plan::Plan { notebook: plan.notebook.clone(), ..Default::default() };
+                if let Err(error) = notebook.curate_note(id, pinned, delete) {
+                    return refused(ErrorCode::Rejected, &error);
+                }
+                plan.notebook = notebook.notebook;
+            }
             PlanAction::Set { .. } => return refused(ErrorCode::Rejected, "not in this fake"),
         }
         let _ = self.event(|cursor| Message::PlanUpsert { cursor, plan });
@@ -1303,6 +1310,7 @@ pub fn board() -> Board {
     Board {
         sessions: vec![session("chief", "Chief", true), session("s1", "Fix the parser", false)],
         plans: vec![PlanInfo {
+            notebook: Vec::new(),
             ticket_tree: None,
             id: "p1".into(),
             status: PlanStatus::Open,
@@ -1357,6 +1365,7 @@ pub fn file_diff(path: &str, lines: u32) -> FileDiff {
 /// A finished plan with no tasks.
 pub fn closed_plan(id: &str, status: atomics_core::plan::PlanStatus, goal: &str) -> PlanInfo {
     PlanInfo {
+        notebook: Vec::new(),
         ticket_tree: None,
         id: id.into(),
         status,
