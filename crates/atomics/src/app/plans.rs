@@ -1141,6 +1141,9 @@ impl State {
         Ok(())
     }
 
+    /// The pane check enforces the MCP role convention; it does not authenticate a raw
+    /// local socket caller. Bare-host curation shares the socket's trust domain, as
+    /// documented in docs/how-it-works.md.
     pub(super) fn chief_notebook(
         &mut self,
         pane: Option<&str>,
