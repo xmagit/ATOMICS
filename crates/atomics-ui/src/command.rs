@@ -78,6 +78,7 @@ pub enum Command {
     AcknowledgeRefs {
         plan: usize,
         task: usize,
+        generation: Option<String>,
     },
     /// Move a task to another column.
     SetTaskStatus {
@@ -515,13 +516,12 @@ impl Command {
         Remote::Send(sent)
     }
 
-    /// A task card's `diff`, `resume` or `acknowledge_refs` button, for the task at position `task` of the
+    /// A task card's `diff` or `resume` button, for the task at position `task` of the
     /// plan at `plan`; `None` for any other action.
     pub fn task(plan: usize, task: usize, action: &str) -> Option<Command> {
         match action {
             "diff" => Some(Command::ShowTaskDiff { plan, task }),
             "resume" => Some(Command::ResumeTask { plan, task }),
-            "acknowledge_refs" => Some(Command::AcknowledgeRefs { plan, task }),
             _ => None,
         }
     }
@@ -536,4 +536,15 @@ pub enum Remote {
     Client,
     /// atomics.v1 has no operation for it yet, so a remote client does not offer it.
     Unsupported,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_shortcuts_cannot_acknowledge_without_an_alert_generation() {
+        assert!(Command::task(0, 0, "acknowledge_refs").is_none());
+        assert!(matches!(Command::task(0, 0, "resume"), Some(Command::ResumeTask { .. })));
+    }
 }

@@ -715,6 +715,11 @@ mod tests {
 
     #[test]
     fn mcp_checks_registration_and_authorization_without_starting_oauth() {
+        if !crate::test_support::isolated_test(
+            "sandbox::checks::tests::mcp_checks_registration_and_authorization_without_starting_oauth",
+        ) {
+            return;
+        }
         let dir = fixture();
         let dir = dir.path();
         let program = dir.join("sbx");
@@ -738,6 +743,11 @@ mod tests {
 
     #[test]
     fn ssh_warns_for_atomics_forwarding_global_forwarding_or_a_fixed_socket() {
+        if !crate::test_support::isolated_test(
+            "sandbox::checks::tests::ssh_warns_for_atomics_forwarding_global_forwarding_or_a_fixed_socket",
+        ) {
+            return;
+        }
         let dir = fixture();
         let dir = dir.path();
         assert!(line(&report(dir), "SSH agent forwarding").starts_with('✓'));

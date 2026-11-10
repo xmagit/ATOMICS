@@ -45,6 +45,26 @@ fn audit_p7_long_socket_startup_fails_on_stderr_before_opening_a_window() {
 }
 
 #[test]
+fn review_p7_remote_clients_do_not_validate_the_local_host_socket() {
+    let instance = Instance::new(None);
+    let config = instance.dir.path().join("client.toml");
+    std::fs::write(&config, "[client]\nconnect = 'unparseable-address'\n").unwrap();
+    for explicit in [false, true] {
+        let args = if explicit { vec!["--connect", "unparseable-address"] } else { vec![] };
+        let output = test_support::output(
+            instance
+                .command(args)
+                .env("ATOMICS_CONFIG", &config)
+                .env("ATOMICS_SOCKET", instance.home().join("x".repeat(150))),
+        );
+        assert_eq!(output.status.code(), Some(2));
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("unparseable-address"), "{error}");
+        assert!(!error.contains("platform limit"), "a client tried to validate its unused socket: {error}");
+    }
+}
+
+#[test]
 #[cfg(target_os = "linux")]
 fn audit_p7_a_long_instance_home_uses_the_same_runtime_socket_for_host_and_clients() {
     let instance = Instance::new(None);
@@ -1105,6 +1125,38 @@ fn a_service_port_and_a_paired_client_reach_the_headless_host() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
     assert!(!stderr.contains(&token), "the token reached the log");
+}
+
+#[test]
+fn a_missing_legacy_pin_can_be_forgotten_from_the_cli_only_after_confirmation() {
+    let instance = Instance::new(None);
+    std::fs::create_dir(instance.home()).unwrap();
+    let ledger = instance.home().join("sandbox-ownership.json");
+    std::fs::write(
+        &ledger,
+        json!({"atomics-legacy": {"created": 0, "sandbox": true, "pins": instance.home().join("git-pins")}})
+            .to_string(),
+    )
+    .unwrap();
+    let bin = instance.dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    test_support::write_program(bin.join("sbx"), "#!/bin/sh\n[ \"$*\" = 'ls --json' ] || exit 1\nprintf '[]\\n'\n");
+    let run = |confirmed: bool| {
+        let mut args = vec!["sandbox", "forget-pin", "atomics-legacy"];
+        if confirmed {
+            args.push("--confirm-worktree-removed");
+        }
+        test_support::output(instance.command(args).env("PATH", test_support::path_with(&bin)))
+    };
+    let refused = run(false);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("--confirm-worktree-removed"));
+    let owned: Value = serde_json::from_slice(&std::fs::read(&ledger).unwrap()).unwrap();
+    assert!(owned["atomics-legacy"]["pins"].is_string());
+    let forgotten = run(true);
+    assert!(forgotten.status.success(), "{}", String::from_utf8_lossy(&forgotten.stderr));
+    let owned: Value = serde_json::from_slice(&std::fs::read(&ledger).unwrap()).unwrap();
+    assert!(owned["atomics-legacy"]["pins"].is_null());
 }
 
 #[test]

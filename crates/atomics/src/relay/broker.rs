@@ -208,11 +208,23 @@ impl Client {
 struct Broker {
     store: crate::credentials::Store,
     engine: Arc<Inner>,
+    usage_writer: Option<std::thread::JoinHandle<()>>,
     state: PathBuf,
     host_uid: u32,
     admin_uid: u32,
     edits: Mutex<()>,
     hosts_dirty: AtomicBool,
+}
+
+impl Drop for Broker {
+    fn drop(&mut self) {
+        self.engine.stopped.store(true, Ordering::Release);
+        self.engine.log.close();
+        let _ = self.engine.usage_updates.try_send(());
+        if let Some(writer) = self.usage_writer.take() {
+            let _ = writer.join();
+        }
+    }
 }
 
 impl Broker {
@@ -505,9 +517,11 @@ pub fn run(options: Options) -> Result<()> {
     std::fs::create_dir_all(&options.state_dir)?;
     std::fs::set_permissions(&options.state_dir, std::fs::Permissions::from_mode(0o700))?;
     let store = crate::credentials::Store::local(Keychain::in_folder(&options.state_dir));
+    let (engine, usage_writer) = Inner::new(options.state_dir.join("relay.log"), HashMap::new(), true)?;
     let broker = Arc::new(Broker {
         store,
-        engine: Inner::new(options.state_dir.join("relay.log"), HashMap::new(), true),
+        engine,
+        usage_writer: Some(usage_writer),
         state: options.state_dir,
         host_uid: options.host_uid,
         admin_uid: options.admin_uid,
@@ -556,9 +570,11 @@ mod tests {
     fn machine_with(upstreams: HashMap<String, String>) -> (crate::test_support::TempDir, Arc<Broker>, Client) {
         let dir = crate::test_support::tempdir().unwrap();
         let socket = dir.path().join("use.sock");
+        let (engine, usage_writer) = Inner::new(dir.path().join("relay.log"), upstreams, true).unwrap();
         let broker = Arc::new(Broker {
             store: crate::credentials::Store::local(Keychain::in_folder(dir.path())),
-            engine: Inner::new(dir.path().join("relay.log"), upstreams, true),
+            engine,
+            usage_writer: Some(usage_writer),
             state: dir.path().into(),
             host_uid: unsafe { libc::getuid() },
             admin_uid: unsafe { libc::getuid() },
@@ -584,6 +600,29 @@ mod tests {
 
     fn set(broker: &Broker, spec: Secret, value: &str) {
         assert!(broker.control(Request::Set { spec, value: value.into() }, true, broker.admin_uid).unwrap().ok);
+    }
+
+    #[test]
+    fn broker_shutdown_flushes_usage_and_closes_the_audit_log() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let path = dir.path().join("relay.log");
+        let (engine, usage_writer) = Inner::new(path.clone(), HashMap::new(), true).unwrap();
+        let broker = Broker {
+            store: crate::credentials::Store::local(Keychain::in_folder(dir.path())),
+            engine: engine.clone(),
+            usage_writer: Some(usage_writer),
+            state: dir.path().into(),
+            host_uid: unsafe { libc::getuid() },
+            admin_uid: unsafe { libc::getuid() },
+            edits: Mutex::new(()),
+            hosts_dirty: AtomicBool::new(false),
+        };
+        engine.record_usage("secret:KEY", 1);
+        drop(broker);
+        let saved: HashMap<String, u64> = serde_json::from_slice(&std::fs::read(log_path(&path)).unwrap()).unwrap();
+        assert_eq!(saved.get("secret:KEY"), Some(&1));
+        engine.log.record("worker", (ANTHROPIC, "/v1/models"), "GET", 200, Duration::ZERO, Some("secret:KEY"));
+        assert!(!path.exists(), "a late broker handler recreated the audit log after shutdown");
     }
 
     #[test]
@@ -798,7 +837,10 @@ mod tests {
         reply.clear();
         assert_eq!(client.forward(&request(&placeholder), vec![], &mut reply).unwrap().0, 401);
         // A fresh broker has no persisted grants, even though its secret catalog persists.
-        assert!(Inner::new(broker.state.join("other.log"), HashMap::new(), true).grants.lock().unwrap().is_empty());
+        let (engine, writer) = Inner::new(broker.state.join("other.log"), HashMap::new(), true).unwrap();
+        assert!(engine.grants.lock().unwrap().is_empty());
+        drop(engine);
+        writer.join().unwrap();
     }
 
     #[test]

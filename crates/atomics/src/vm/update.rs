@@ -638,6 +638,7 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
     } else {
         // Work could have started while the bundle was installed and the next boot was selected.
         if restart_owed {
+            // Share the notice policy with the post-quit check; both safety checks still run.
             check_busy(info, &mut busy_policy)
                 .context("restart pending; run atomics vm update again when the VM is idle")?;
         }

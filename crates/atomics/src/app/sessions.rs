@@ -1047,7 +1047,7 @@ impl State {
                     // The last check, once the agent cannot write any more.
                     let (done, finished) = std::sync::mpsc::channel();
                     checks.run(move || {
-                        if let Some(guard) = guard {
+                        if let Some(guard) = &guard {
                             match guard.check(&exempt) {
                                 Ok(found) => alerts.extend(found),
                                 Err(err) => alerts.push(format!("Final ref guard check FAILED: {err:#}")),
@@ -1055,7 +1055,9 @@ impl State {
                         }
                         if !alerts.is_empty() {
                             crate::lifecycle::record_leftovers(&paths::atomics_home(), &alerts);
-                            let _ = actions.send(Box::new(move |state| state.ref_alert(&id, alerts.join("\n"))));
+                            let generation = guard.as_ref().and_then(|guard| guard.alert_generation());
+                            let _ = actions
+                                .send(Box::new(move |state| state.ref_alert_at(&id, alerts.join("\n"), generation)));
                         }
                         let _ = done.send(());
                     });
@@ -1377,8 +1379,21 @@ fn brief_file(session: &str, text: &str, sandboxed: bool) -> Result<String, Stri
     atomics_core::store::private_dir(&paths::atomics_home()).map_err(|e| format!("creating state: {e}"))?;
     atomics_core::store::private_dir(&paths::briefs_dir()).map_err(|e| format!("creating briefs: {e}"))?;
     let path = if sandboxed { dir.join("brief.md") } else { dir.join(format!("{session}.md")) };
-    atomics_core::store::write_private(&path, text.as_bytes())
-        .map_err(|e| format!("writing {}: {e}", path.display()))?;
+    if sandboxed {
+        use std::os::unix::fs::PermissionsExt;
+        // sbx mounts this session directory read-only. Preserve its previous 0755/0644
+        // access: the guest agent may have a different uid from the host user. Bare briefs
+        // remain private; do not require host ownership through an unverified uid mapping.
+        std::fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("setting permissions on {}: {e}", dir.display()))?;
+        std::fs::write(&path, text).map_err(|e| format!("writing {}: {e}", path.display()))?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .map_err(|e| format!("setting permissions on {}: {e}", path.display()))?;
+    } else {
+        atomics_core::store::write_private(&path, text.as_bytes())
+            .map_err(|e| format!("writing {}: {e}", path.display()))?;
+    }
     Ok(format!("Your task brief is in {}. Read it first and follow it exactly.", path.display()))
 }
 
@@ -1566,12 +1581,17 @@ mod tests {
     }
 
     #[test]
-    fn audit_p7_prompt_briefs_are_private_for_bare_and_sandboxed_sessions() {
+    fn audit_p7_briefs_keep_bare_prompts_private_and_restore_sandbox_mount_permissions() {
         with_app(
-            "app::sessions::tests::audit_p7_prompt_briefs_are_private_for_bare_and_sandboxed_sessions",
+            "app::sessions::tests::audit_p7_briefs_keep_bare_prompts_private_and_restore_sandbox_mount_permissions",
             |_app, _| {
                 use std::os::unix::fs::PermissionsExt;
                 for sandboxed in [false, true] {
+                    if sandboxed {
+                        // Repair a session directory and brief tightened by the previous version too.
+                        atomics_core::store::write_private(&paths::briefs_dir().join("worker/brief.md"), b"old")
+                            .unwrap();
+                    }
                     brief_file("worker", "private prompt", sandboxed).unwrap();
                     let path = if sandboxed {
                         paths::briefs_dir().join("worker/brief.md")
@@ -1579,8 +1599,15 @@ mod tests {
                         paths::briefs_dir().join("worker.md")
                     };
                     assert_eq!(std::fs::read_to_string(&path).unwrap(), "private prompt");
-                    assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
-                    for dir in [paths::atomics_home(), paths::briefs_dir(), path.parent().unwrap().to_path_buf()] {
+                    assert_eq!(
+                        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                        if sandboxed { 0o644 } else { 0o600 }
+                    );
+                    assert_eq!(
+                        std::fs::metadata(path.parent().unwrap()).unwrap().permissions().mode() & 0o777,
+                        if sandboxed { 0o755 } else { 0o700 }
+                    );
+                    for dir in [paths::atomics_home(), paths::briefs_dir()] {
                         assert_eq!(std::fs::metadata(dir).unwrap().permissions().mode() & 0o777, 0o700);
                     }
                 }
@@ -2204,7 +2231,7 @@ fi
     #[test]
     fn busy_codex_sends_wait_for_receipts_retry_and_report_failure() {
         with_app("app::sessions::tests::busy_codex_sends_wait_for_receipts_retry_and_report_failure", |app, _ctx| {
-            let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex");
+            let fixture = crate::app::tests::fixture_agent("codex");
             app.runtime.config.agents.push(atomics_core::config::AgentConfig {
                 name: "fake-codex".into(),
                 command: vec![fixture.to_string_lossy().into_owned()],
@@ -2307,7 +2334,7 @@ fi
     #[test]
     fn codex_clipped_and_repeated_receipts_never_repaste() {
         with_app("app::sessions::tests::codex_clipped_and_repeated_receipts_never_repaste", |app, _ctx| {
-            let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex");
+            let fixture = crate::app::tests::fixture_agent("codex");
             app.runtime.config.agents.push(atomics_core::config::AgentConfig {
                 name: "fake-codex".into(),
                 command: vec![fixture.to_string_lossy().into_owned()],
@@ -2386,7 +2413,7 @@ fi
     #[test]
     fn steering_during_a_pending_codex_send_is_held_and_released() {
         with_app("app::sessions::tests::steering_during_a_pending_codex_send_is_held_and_released", |app, _ctx| {
-            let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex");
+            let fixture = crate::app::tests::fixture_agent("codex");
             app.runtime.config.agents.push(atomics_core::config::AgentConfig {
                 name: "fake-codex".into(),
                 command: vec![fixture.to_string_lossy().into_owned()],

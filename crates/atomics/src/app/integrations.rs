@@ -377,7 +377,12 @@ impl State {
             return;
         }
         let into = self.plans[index].integration_branch();
-        let into_path = git::worktree_path(&self.config.worktree_path, &repo, &into);
+        let into_path = self.plans[index]
+            .integration_worktrees
+            .iter()
+            .find(|tree| tree.repo == repo && tree.branch == into)
+            .map(|tree| tree.path.clone())
+            .unwrap_or_else(|| git::worktree_path(&self.config.worktree_path, &repo, &into));
         let config = self.project_config(&repo);
         let identity = config.identity.default;
         let (tx, base_ref) = (self.integrate_tx.clone(), config.base_ref);
@@ -391,15 +396,17 @@ impl State {
         let plan = self.plans[index].id.clone();
         self.integrating.insert((plan.clone(), task.clone()));
         std::thread::spawn(move || {
-            let checked = crate::ref_guard::check_integration(&checks, guard, &home, &task_path, exempt);
-            let guard_error = match checked {
+            let checked = crate::ref_guard::check_integration_alert(&checks, guard, &home, &repo, &task_path, exempt);
+            let guard_error = match checked.result {
                 Ok(alerts) if alerts.is_empty() => None,
                 Ok(alerts) => Some(alerts.join("\n")),
                 Err(error) => Some(format!("Ref guard check FAILED: {error:#}")),
             };
             if let Some(error) = guard_error {
                 let (plan_id, task_id, details) = (plan.clone(), task.clone(), error.clone());
-                let _ = actions.send(Box::new(move |state| state.task_ref_alert(&plan_id, &task_id, details)));
+                let _ = actions.send(Box::new(move |state| {
+                    state.task_ref_alert_at(&plan_id, &task_id, details, checked.generation)
+                }));
                 let _ = tx.send(Integrated { commit: None, plan, task, branch, into, result: Err(error), reply });
                 return;
             }
@@ -407,8 +414,36 @@ impl State {
             let write = crate::ref_guard::host_write(&repo, [&branch, &into]);
             let result = git::integrate_with_identity(
                 &repo, &task_path, &branch, &message, &into, &into_path, &base_ref, &identity,
-            )
-            .map_err(|e| format!("{e:#}"));
+            );
+            if let Some(claim) =
+                result.as_ref().err().and_then(|error| error.downcast_ref::<git::IntegrationRefClaim>())
+            {
+                let (worktree, details) = (claim.worktree.clone(), claim.to_string());
+                let (plan_id, task_id) = (plan.clone(), task.clone());
+                let _ = actions.send(Box::new(move |state| {
+                    let mut owners: Vec<_> = state
+                        .plans
+                        .iter()
+                        .flat_map(|plan| {
+                            plan.tasks
+                                .iter()
+                                .filter(|task| {
+                                    task.worktree.as_ref().is_some_and(|path| {
+                                        path == &worktree || path.canonicalize().ok().as_ref() == Some(&worktree)
+                                    })
+                                })
+                                .map(move |task| (plan.id.clone(), task.id.clone()))
+                        })
+                        .collect();
+                    if !owners.contains(&(plan_id.clone(), task_id.clone())) {
+                        owners.push((plan_id, task_id));
+                    }
+                    for (plan, task) in owners {
+                        state.task_ref_alert_at(&plan, &task, details.clone(), None);
+                    }
+                }));
+            }
+            let result = result.map_err(|e| format!("{e:#}"));
             let commit = result
                 .as_ref()
                 .ok()
@@ -424,6 +459,17 @@ impl State {
         let Some(index) = self.plans.iter().position(|p| p.id == plan) else { return };
         self.integrating.remove(&(plan.clone(), id.clone()));
         self.worktrees_at = None;
+        if let Ok(integration) = &result
+            && let Some(repo) =
+                self.plans[index].tasks.iter().find(|task| task.id == id).and_then(|task| self.task_repo(index, task))
+            && !self.plans[index].integration_worktrees.iter().any(|tree| tree.repo == repo && tree.branch == into)
+        {
+            self.plans[index].integration_worktrees.push(plan::IntegrationWorktree {
+                repo,
+                branch: into.clone(),
+                path: integration.worktree.clone(),
+            });
+        }
         let (note, mut response) = match result {
             Ok(Integration { merge: Merge::Conflict(files), .. }) => {
                 if let Some(task) = self.plans[index].task_mut(&id) {
@@ -1390,21 +1436,6 @@ exec {} "$@"
                 let (_dir2, repo2) = repository();
                 let started = dir1.path().join("started");
                 let release = dir1.path().join("release");
-                let hook = repo1.join(".git/hooks/pre-commit");
-                // The hook holds the first integration until `release` exists. It must never outlive
-                // the test: a failed test drops its folder (often before the hook sees `release`), so
-                // the hook also stops when the folder is gone, and after a few minutes at most.
-                // Otherwise every failure would leave a loop starting processes and loading the machine.
-                crate::test_support::write_program(
-                    &hook,
-                    format!(
-                        "#!/bin/sh\ntouch '{}'\nattempts=0\nwhile [ ! -f '{}' ]; do\n  [ -d '{}' ] || exit 1\n  \
-                         attempts=$((attempts + 1))\n  [ \"$attempts\" -lt 6000 ] || exit 1\n  sleep 0.02\ndone\n",
-                        started.display(),
-                        release.display(),
-                        dir1.path().display()
-                    ),
-                );
                 app.runtime.config.worktree_path = "{repo_parent}/{slug}".into();
                 let mut indices = Vec::new();
                 for (goal, repo) in [("One", &repo1), ("Two", &repo2)] {
@@ -1421,6 +1452,20 @@ exec {} "$@"
                     app.runtime.plans[index].tasks[0].status = TaskStatus::Done;
                     indices.push(index);
                 }
+                // Plumbing commits bypass pre-commit. Pause the ref transaction instead, installing
+                // the hook after branch creation so only integration is held. It must never outlive
+                // the test: stop when the fixture disappears, or after a few minutes at most.
+                crate::test_support::write_program(
+                    repo1.join(".git/hooks/reference-transaction"),
+                    format!(
+                        "#!/bin/sh\n[ \"$1\" = prepared ] || exit 0\ntouch '{}'\nattempts=0\nwhile [ ! -f '{}' ]; do\n  \
+                         [ -d '{}' ] || exit 1\n  attempts=$((attempts + 1))\n  [ \"$attempts\" -lt 6000 ] || exit 1\n  \
+                         sleep 0.02\ndone\n",
+                        started.display(),
+                        release.display(),
+                        dir1.path().display()
+                    ),
+                );
                 // The first integration cannot finish before `release` exists, so a second integration
                 // that waited for it would never arrive in time. The bound only has to outlast a loaded
                 // machine: while the whole suite runs, a single git call can take half a second.

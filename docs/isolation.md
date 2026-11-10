@@ -171,7 +171,9 @@ macOS's keychain through `security`, Linux's Secret Service through `secret-tool
 1. **The relay.** ATOMICS runs an HTTP relay on this machine's loopback only, `127.0.0.1:<port>`,
    started with the first sandboxed Claude. It keeps its port in `relay-port` in ATOMICS's state folder
    and listens there again after a restart when the port is free, so existing sandboxes keep their way
-   to it.
+   to it. Connections have two seconds to send their first request headers. The separate 32-place
+   authentication pool bounds idle and trickling clients; authenticated connections have 256 places
+   and a five-minute idle timeout. Clients should connect when ready to send their request.
 2. **A placeholder per session.** Each time a sandboxed Claude starts or resumes, its session gets a
    new random placeholder shaped like a subscription token (`sk-ant-oat01-atomics-…`). The relay
    accepts it until the agent exits, its tile closes or its launch fails, then revokes it. The real
@@ -786,8 +788,12 @@ So when a sandbox is made, before it runs, ATOMICS records where git finds the f
 tree, its git folder and the common dir, in `git-pins/<sandbox>.json` in ATOMICS's state folder, which no
 sandbox mounts, and keeps a second copy in the sandbox ownership ledger. An unreadable, missing or
 mismatched owned pin blocks host git in its worktree and shows a warning on its tile; it never makes that
-folder an unpinned checkout. An unreadable older record with no ledger copy blocks all host git until
-repaired, since its folder cannot be identified safely. From then on ATOMICS runs git in that folder with
+folder an unpinned checkout. An unreadable older record with no ledger copy blocks all host git, since
+its folder cannot be identified safely. Restore the original pin, or remove or rebuild the old sandbox
+and its worktree, then run `atomics sandbox forget-pin <sandbox> --confirm-worktree-removed`. This explicit
+confirmation releases only unreadable legacy records; readable pins and ledger copies use normal cleanup,
+and a sandbox still listed by sbx must be removed first. Reloading records also clears refusals for records
+another process removed. From then on ATOMICS runs git in that folder with
 `GIT_DIR`, `GIT_COMMON_DIR` and
 `GIT_WORK_TREE` taken from the record, and never trusts an altered pointer in the folder, also after a restart and
 for bare agents in the same folder. The record goes with its sandbox: when cleanup removes it, when making
@@ -840,6 +846,10 @@ repaired. Main checkouts and dirty or locked worktrees stay.
 - **Refs are explicit.** Host git uses fully qualified branch and remote refs, so a tag named
   `origin/main` cannot replace `refs/remotes/origin/main`, and always sets `GIT_NO_REPLACE_OBJECTS=1`.
   Task integration commits only the task's recorded worktree path and checks that it still names that branch.
+  The merge runs only at the host-selected integration path, saved with the plan after integration and
+  reused across worktree-template changes. A sandbox-pinned folder, including its subfolders and aliases,
+  cannot be that destination. A sandbox claiming the integration branch stops integration before staging
+  and raises a persistent ref alert on its task and the task being integrated, even if it changes HEAD back.
 - **Shared reflogs stay on this machine.** Linked sandboxes mount shared objects and refs, and their own
   admin folder; they do not mount the shared `logs` folder. Their own `logs/HEAD` remains writable in the
   admin folder. Sandboxes with the old shared writable logs mount must be removed and recreated.
@@ -862,7 +872,11 @@ worktree, bare agents' too.
 An agent started in a folder outside any repository gets that folder. ATOMICS refuses to sandbox an agent
 in your home folder or any folder above it, since the sandbox would mount the whole home folder
 read-write. Long briefs for agents other than Claude are written to a folder of the session's own,
-mounted read-only.
+mounted read-only. Bare-session brief files are private (0600), under private state directories
+(0700). A sandbox session's mounted brief directory retains 0755 and its brief file 0644, so
+an agent with a different guest uid can read the mount. The host state and enclosing briefs
+directory remain private. These compatibility modes are retained without assuming a particular
+Docker Sandboxes uid mapping; the permission checks do not substitute for a live sandbox run.
 
 ## How sandboxed agents talk to ATOMICS
 

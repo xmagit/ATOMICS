@@ -212,6 +212,8 @@ pub fn check(info: &BundleInfo) -> Result<()> {
 /// Inspect sshd through the same admin path as updates, then pass only its output to the ordinary
 /// user's checks. The rest must run as that user to check its host, rootless Docker and permissions.
 fn check_runner(info: &BundleInfo, limactl: &Path, local: &Path) -> Result<Command> {
+    #[cfg(test)]
+    crate::test_support::assert_fixture_program("limactl", limactl);
     let system = super::system_shell(info)?;
     let mut runner = Command::new("/bin/sh");
     runner.args([
@@ -227,6 +229,11 @@ exec "$lima" shell --workdir="$home" "$instance" bash --login -c 'exec bash -s -
         if info.admin.is_some() { "true" } else { "false" },
     ]);
     runner.arg(system.get_program()).args(system.get_args());
+    #[cfg(test)]
+    {
+        runner.env("HOME", local.join("home"));
+        crate::test_support::isolate_environment(&mut runner);
+    }
     Ok(runner)
 }
 

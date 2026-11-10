@@ -193,6 +193,7 @@ pub struct Relay {
     inner: Arc<Inner>,
     port: u16,
     accept: Option<std::thread::JoinHandle<()>>,
+    usage_writer: Option<std::thread::JoinHandle<()>>,
 }
 
 struct Inner {
@@ -207,6 +208,7 @@ struct Inner {
     connections: AtomicUsize,
     pending: AtomicUsize,
     usage: Mutex<HashMap<String, u64>>,
+    usage_updates: std::sync::mpsc::SyncSender<()>,
 }
 
 /// One Azure write waiting for the same approval banner as command permissions. The full
@@ -224,11 +226,11 @@ impl Relay {
     pub fn start(port: u16, log: PathBuf, upstreams: HashMap<String, String>) -> io::Result<Self> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
         let port = listener.local_addr()?.port();
-        let inner = Inner::new(log, upstreams, false);
+        let (inner, usage_writer) = Inner::new(log, upstreams, false)?;
         let accepting = inner.clone();
         let accept =
             std::thread::Builder::new().name("atomics-relay".into()).spawn(move || accepting.accept(listener))?;
-        Ok(Self { inner, port, accept: Some(accept) })
+        Ok(Self { inner, port, accept: Some(accept), usage_writer: Some(usage_writer) })
     }
 
     pub fn port(&self) -> u16 {
@@ -265,6 +267,9 @@ impl Relay {
 impl Drop for Relay {
     fn drop(&mut self) {
         self.inner.stopped.store(true, Ordering::Release);
+        // Wait for an active append and forbid later handlers from recreating the log.
+        self.inner.log.close();
+        let _ = self.inner.usage_updates.try_send(());
         for (placeholder, grant) in self.inner.grants.lock().unwrap().drain() {
             if let Source::Broker(client) = &grant.credential.source {
                 let _ = client.revoke(&placeholder);
@@ -276,7 +281,39 @@ impl Drop for Relay {
         if let Some(accept) = self.accept.take() {
             let _ = accept.join();
         }
+        if let Some(writer) = self.usage_writer.take() {
+            let _ = writer.join();
+        }
     }
+}
+
+fn run_usage_writer(
+    inner: std::sync::Weak<Inner>,
+    updates: std::sync::mpsc::Receiver<()>,
+    mut write: impl FnMut(&HashMap<String, u64>),
+) {
+    for () in updates {
+        let Some(inner) = inner.upgrade() else { break };
+        let stopping = inner.stopped.load(Ordering::Acquire);
+        let snapshot = inner.usage.lock().unwrap().clone();
+        drop(inner);
+        if !snapshot.is_empty() {
+            write(&snapshot);
+        }
+        if stopping {
+            break;
+        }
+    }
+}
+
+/// Usage is advisory metadata: replace it atomically without a durability barrier or chmod.
+/// Only this worker writes it, so an older snapshot cannot overwrite a newer one.
+fn persist_usage(path: &std::path::Path, snapshot: &HashMap<String, u64>) -> io::Result<()> {
+    let parent = path.parent().filter(|path| !path.as_os_str().is_empty()).unwrap_or_else(|| std::path::Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    tmp.write_all(&serde_json::to_vec(snapshot).map_err(io::Error::other)?)?;
+    tmp.persist(path).map_err(|error| error.error)?;
+    Ok(())
 }
 
 /// One connection's place in the pending or authenticated pool.
@@ -333,7 +370,11 @@ impl Read for DeadlineRead {
 }
 
 impl Inner {
-    fn new(log: PathBuf, upstreams: HashMap<String, String>, direct: bool) -> Arc<Self> {
+    fn new(
+        log: PathBuf,
+        upstreams: HashMap<String, String>,
+        direct: bool,
+    ) -> io::Result<(Arc<Self>, std::thread::JoinHandle<()>)> {
         let config = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .max_redirects(0)
@@ -346,10 +387,11 @@ impl Inner {
             .timeout_recv_response(Some(Duration::from_secs(15 * 60)));
         // Local fakes are never reached through this machine's proxy.
         let config = if direct || !upstreams.is_empty() { config.proxy(None) } else { config };
-        Arc::new(Self {
+        let (usage_updates, updates) = std::sync::mpsc::sync_channel(1);
+        let inner = Arc::new(Self {
             grants: Mutex::default(),
             approvals: Mutex::default(),
-            log: Log { path: log.clone(), write: Mutex::new(()) },
+            log: Log { path: log.clone(), closed: Mutex::new(false) },
             agent: config.build().into(),
             upstreams,
             stopped: AtomicBool::new(false),
@@ -361,7 +403,16 @@ impl Inner {
                     .and_then(|bytes| serde_json::from_slice(&bytes).ok())
                     .unwrap_or_default(),
             ),
-        })
+            usage_updates,
+        });
+        let usage_path = log_path(&log);
+        let usage_inner = Arc::downgrade(&inner);
+        let usage_writer = std::thread::Builder::new().name("atomics-relay-usage".into()).spawn(move || {
+            run_usage_writer(usage_inner, updates, |snapshot| {
+                let _ = persist_usage(&usage_path, snapshot);
+            });
+        })?;
+        Ok((inner, usage_writer))
     }
 
     fn accept(self: Arc<Self>, listener: TcpListener) {
@@ -530,14 +581,16 @@ impl Inner {
     }
 
     fn record_usage(&self, label: &str, now: u64) {
-        let mut usage = self.usage.lock().unwrap();
-        if usage.get(label) == Some(&now) {
-            return;
+        {
+            let mut usage = self.usage.lock().unwrap();
+            if usage.get(label) == Some(&now) {
+                return;
+            }
+            usage.insert(label.to_string(), now);
         }
-        usage.insert(label.to_string(), now);
-        if let Ok(bytes) = serde_json::to_vec(&*usage) {
-            let _ = atomics_core::store::write_private(&log_path(&self.log.path), &bytes);
-        }
+        // Coalesce notifications, not snapshots: a queued wake always saves the latest map.
+        // Request handling and usage readers never wait for filesystem I/O.
+        let _ = self.usage_updates.try_send(());
     }
 
     fn approve_write(&self, grant: &Grant, head: &Head, route: &Route, body: &[u8]) -> bool {
@@ -1052,10 +1105,14 @@ impl Route {
 /// `relay.log`: one line per request, never a value.
 struct Log {
     path: PathBuf,
-    write: Mutex<()>,
+    closed: Mutex<bool>,
 }
 
 impl Log {
+    fn close(&self) {
+        *self.closed.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+    }
+
     fn record(
         &self,
         session: &str,
@@ -1073,7 +1130,10 @@ impl Log {
             utc(SystemTime::now()),
             elapsed.as_millis()
         );
-        let _write = self.write.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let closed = self.closed.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *closed {
+            return;
+        }
         if std::fs::metadata(&self.path).is_ok_and(|file| file.len() > MAX_LOG) {
             let _ = std::fs::rename(&self.path, self.path.with_extension("log.1"));
         }
@@ -2120,7 +2180,28 @@ mod tests {
         );
         assert!(head.starts_with("HTTP/1.1 200"), "{head}");
         while !chunk(&mut reader).is_empty() {}
+        drop(reader);
         drop(peers);
+        drop(relay); // Finish usage writes and close the audit log before TempDir removes it.
+    }
+
+    #[test]
+    fn review_p7_a_late_connection_handler_cannot_recreate_the_log_after_shutdown() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let path = dir.path().join("relay.log");
+        let relay = Relay::start(0, path.clone(), HashMap::new()).unwrap();
+        relay.inner.log.record("worker", (ANTHROPIC, "/v1/models"), "GET", 200, Duration::ZERO, None);
+        let inner = relay.inner.clone();
+        let (release, resumed) = std::sync::mpsc::channel();
+        let handler = std::thread::spawn(move || {
+            resumed.recv().unwrap();
+            inner.log.record("worker", (ANTHROPIC, "/v1/models"), "GET", 200, Duration::ZERO, None);
+        });
+        drop(relay);
+        std::fs::remove_file(&path).unwrap();
+        release.send(()).unwrap();
+        handler.join().unwrap();
+        assert!(!path.exists(), "a handler recreated the audit log during directory teardown");
     }
 
     #[test]
@@ -2129,18 +2210,68 @@ mod tests {
         let dir = crate::test_support::tempdir().unwrap();
         let relay = Relay::start(0, dir.path().join("relay.log"), HashMap::new()).unwrap();
         let path = log_path(&relay.inner.log.path);
+        let wait_for_entries = |count| {
+            let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(5));
+            loop {
+                let saved = std::fs::read(&path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<HashMap<String, u64>>(&bytes).ok());
+                if saved.is_some_and(|saved| saved.len() == count) {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "usage was not published");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
         relay.inner.record_usage("credential", 1);
+        wait_for_entries(1);
         let mut old = std::fs::File::open(&path).unwrap();
         let inode = old.metadata().unwrap().ino();
         relay.inner.record_usage("credential", 1);
         assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
         relay.inner.record_usage("other", 2);
+        wait_for_entries(2);
         let mut original = String::new();
         old.read_to_string(&mut original).unwrap();
         assert_eq!(serde_json::from_str::<HashMap<String, u64>>(&original).unwrap().len(), 1);
         let latest: HashMap<String, u64> = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(latest.len(), 2);
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn review_p7_usage_persistence_releases_the_map_lock_and_keeps_updates_during_a_slow_write() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let relay = Relay::start(0, dir.path().join("relay.log"), HashMap::new()).unwrap();
+        let (wake, updates) = std::sync::mpsc::sync_channel(1);
+        let (entered, writing) = std::sync::mpsc::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let saved = writes.clone();
+        let inner = Arc::downgrade(&relay.inner);
+        let worker = std::thread::spawn(move || {
+            let mut first = true;
+            run_usage_writer(inner, updates, |snapshot| {
+                if first {
+                    first = false;
+                    entered.send(()).unwrap();
+                    resume.recv().unwrap();
+                }
+                saved.lock().unwrap().push(snapshot.clone());
+            });
+        });
+        relay.inner.usage.lock().unwrap().insert("first".into(), 1);
+        wake.send(()).unwrap();
+        writing.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(5))).unwrap();
+        relay.inner.usage.try_lock().expect("disk I/O must not hold the usage map").insert("second".into(), 2);
+        wake.send(()).unwrap();
+        drop(wake);
+        release.send(()).unwrap();
+        worker.join().unwrap();
+        let snapshots = writes.lock().unwrap();
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].len(), 1);
+        assert_eq!(snapshots[1].len(), 2);
     }
 
     fn relay(upstream: &fake::Upstream, log: PathBuf) -> Relay {

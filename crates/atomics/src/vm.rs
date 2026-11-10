@@ -139,9 +139,14 @@ impl Status {
 
 /// `limactl`, found on the login shell's PATH or where Homebrew puts it; a Mac app's own PATH has neither.
 pub fn limactl() -> Option<PathBuf> {
-    crate::setup::find_program("limactl").or_else(|| {
+    let found = crate::setup::find_program("limactl").or_else(|| {
         ["/opt/homebrew/bin/limactl", "/usr/local/bin/limactl"].iter().map(PathBuf::from).find(|path| path.is_file())
-    })
+    });
+    #[cfg(test)]
+    if let Some(found) = &found {
+        crate::test_support::assert_fixture_program("limactl", found);
+    }
+    found
 }
 
 fn limactl_command() -> Result<Command> {
@@ -149,6 +154,8 @@ fn limactl_command() -> Result<Command> {
     let mut command = Command::new(program);
     // limactl asks before some actions on a terminal; here it never may.
     command.env("LIMA_TTY", "0").stdin(Stdio::null());
+    #[cfg(test)]
+    crate::test_support::fixture_command(&mut command, "limactl");
     Ok(command)
 }
 

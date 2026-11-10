@@ -187,9 +187,28 @@ fn hidden_url_char(c: char) -> bool {
             | '\u{e0000}'..='\u{e0fff}')
 }
 
+/// Show the parsed destination before the full URL, whose user-info can resemble another host.
+pub fn web_url_hover(url: &str) -> String {
+    let host = url::Url::parse(url).ok().and_then(|address| address.host_str().map(str::to_owned));
+    match host {
+        Some(host) => format!("Open {host}\n{url}"),
+        None => format!("Unparseable URL\n{url}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn link_hover_identifies_the_host_after_user_info() {
+        assert_eq!(
+            web_url_hover("https://github.com@evil.example/path"),
+            "Open evil.example\nhttps://github.com@evil.example/path"
+        );
+        assert_eq!(web_url_hover("https://xn--gthub-n2e.com"), "Open xn--gthub-n2e.com\nhttps://xn--gthub-n2e.com");
+        assert_eq!(web_url_hover("invalid"), "Unparseable URL\ninvalid");
+    }
 
     #[test]
     fn blocks_cover_headings_lists_quotes_code_and_paragraphs() {

@@ -495,7 +495,7 @@ fn worktree_changes_publish_a_fresh_diff_without_frames() {
 #[test]
 fn held_terminal_input_gets_a_receipt_without_frames() {
     with_state("app::host_tests::held_terminal_input_gets_a_receipt_without_frames", |mut state, _| {
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex");
+        let fixture = crate::app::tests::fixture_agent("codex");
         state.config.agents.push(atomics_core::config::AgentConfig {
             name: "fake-codex".into(),
             command: vec![fixture.to_string_lossy().into_owned()],

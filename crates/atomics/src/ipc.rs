@@ -168,6 +168,12 @@ fn bind(path: &Path) -> Result<(UnixListener, SocketGuard)> {
     if let Some(parent) = path.parent() {
         use std::os::unix::fs::DirBuilderExt;
         std::fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
+        let metadata = std::fs::metadata(parent)?;
+        // A public writable parent lets another user pre-create either the socket or its lock.
+        // SAFETY: geteuid has no preconditions.
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.permissions().mode() & 0o022 != 0 {
+            bail!("ATOMICS_SOCKET must be in a directory you own that other users cannot write: {}", parent.display());
+        }
     }
     let mut lock_path = path.as_os_str().to_os_string();
     lock_path.push(".lock");
@@ -224,7 +230,10 @@ pub fn serve(path: &Path, hub: Arc<Mutex<Hub>>, channels: Channels, window: Wind
     Ok(guard)
 }
 
-const MAX_REQUEST: usize = 1024 * 1024;
+// A full plan can carry MAX_TASKS text payloads plus its goal. JSON escaping can expand
+// each text byte to six bytes; reserve a frame for ids, field names and other metadata.
+const MAX_REQUEST: usize =
+    (atomics_core::ops::MAX_TASKS + 1) * atomics_core::ops::MAX_TEXT_BYTES * 6 + atomics_core::wire::MAX_FRAME_BYTES;
 const MAX_RESPONSE: usize = 32 * 1024 * 1024;
 
 fn read_line_bounded(reader: impl BufRead, limit: usize) -> Result<Vec<u8>> {
@@ -418,21 +427,61 @@ mod tests {
 
     #[test]
     fn audit_p7_control_requests_stop_at_the_byte_limit() {
-        let mut oversized = std::io::Cursor::new(vec![b'x'; MAX_REQUEST * 2]);
-        assert!(read_request(&mut oversized).unwrap_err().to_string().contains("exceeds"));
-        assert_eq!(oversized.position(), (MAX_REQUEST + 1) as u64);
+        const LIMIT: usize = 128;
+        let mut oversized = std::io::Cursor::new(vec![b'x'; LIMIT * 2]);
+        assert!(read_line_bounded(&mut oversized, LIMIT).unwrap_err().to_string().contains("exceeds"));
+        assert_eq!(oversized.position(), (LIMIT + 1) as u64);
         assert!(read_request(&b"{\"cmd\":\"list\"}"[..]).is_err());
         assert_eq!(read_request(&b"{\"cmd\":\"list\"}\n"[..]).unwrap()["cmd"], "list");
-        let padded = format!("{}{{\"cmd\":\"list\"}}\n", " ".repeat(MAX_REQUEST - 15));
-        assert_eq!(padded.len(), MAX_REQUEST);
-        assert!(read_request(padded.as_bytes()).is_ok());
+        let padded = format!("{}{{\"cmd\":\"list\"}}\n", " ".repeat(LIMIT - 15));
+        assert_eq!(padded.len(), LIMIT);
+        assert!(read_line_bounded(padded.as_bytes(), LIMIT).is_ok());
+    }
+
+    #[test]
+    fn review_p7_control_socket_accepts_a_plan_at_the_task_and_text_limits() {
+        use atomics_core::ops::{MAX_TASKS, MAX_TEXT_BYTES};
+        let tasks: Vec<_> =
+            (0..MAX_TASKS).map(|id| json!({"id":id.to_string(), "brief":"b".repeat(MAX_TEXT_BYTES)})).collect();
+        let mut encoded = serde_json::to_vec(&json!({"cmd":"plan_set", "goal":"large plan", "tasks":tasks})).unwrap();
+        encoded.push(b'\n');
+        assert!(encoded.len() > 1024 * 1024);
+        let request = read_request(encoded.as_slice()).unwrap();
+        assert_eq!(request["tasks"].as_array().unwrap().len(), MAX_TASKS);
+    }
+
+    #[test]
+    fn review_p7_public_writable_socket_parents_are_refused_before_creating_a_lock() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_support::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let socket = dir.path().join("control.sock");
+        let error = bind(&socket).unwrap_err().to_string();
+        assert!(error.contains("ATOMICS_SOCKET") && error.contains("other users"), "{error}");
+        assert!(!socket.exists());
+        assert!(!dir.path().join("control.sock.lock").exists());
     }
 
     #[test]
     fn audit_p7_stale_socket_recovery_has_one_owner_and_cleanup_keeps_a_replacement() {
+        const STALE: &str = "ATOMICS_STALE_SOCKET_FIXTURE";
+        const TEST: &str = "ipc::tests::audit_p7_stale_socket_recovery_has_one_owner_and_cleanup_keeps_a_replacement";
+        if let Some(path) = std::env::var_os(STALE) {
+            drop(UnixListener::bind(path).unwrap());
+            return;
+        }
         let dir = crate::test_support::tempdir().unwrap();
         let path = dir.path().join("control.sock");
-        drop(UnixListener::bind(&path).unwrap()); // Simulate a process that crashed.
+        // A parallel test can fork while a parent-created listener is open and
+        // keep it live after this test closes it. Only this child owns the setup
+        // descriptor; its exit makes the socket stale before either contender runs.
+        let created = crate::test_support::output(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(STALE, &path)
+                .env("HOME", dir.path()),
+        );
+        assert!(created.status.success(), "{created:?}");
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let results = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..2)
@@ -446,7 +495,7 @@ mod tests {
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect::<Vec<_>>()
         });
-        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1, "{results:?}");
         assert!(UnixStream::connect(&path).is_ok());
         assert!(bind(&path).is_err());
         // Ownership cleanup must not unlink someone else's replacement inode.

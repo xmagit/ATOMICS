@@ -1058,12 +1058,14 @@ pub(crate) mod tests {
             service.revoke_credential("GitHub");
             assert!(request("api.github.com", "GET", "/v1/models").contains(" 401 "));
             assert!(service.usage("GitHub").1.is_empty());
-            let output = format!(
-                "{}\n{}\n{:?}",
-                wait_for_relay_log(&home, 4),
-                std::fs::read_to_string(home.join("credential-usage.json")).unwrap(),
-                grant
-            );
+            let log = wait_for_relay_log(&home, 4);
+            // Request logging and usage persistence have separate workers. Shutdown
+            // joins the usage writer, so inspect the persisted snapshot only then.
+            drop(service);
+            let usage = std::fs::read_to_string(home.join("credential-usage.json")).unwrap();
+            let saved: serde_json::Value = serde_json::from_str(&usage).unwrap();
+            assert_eq!(saved["GitHub"].as_u64(), last, "the final usage snapshot is persisted");
+            let output = format!("{}\n{}\n{:?}", log, usage, grant);
             assert!(!output.contains(VALUES[3].1) && !output.contains(&grant.placeholder));
         }
     }

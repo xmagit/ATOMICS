@@ -30,6 +30,9 @@ pub struct Plan {
     /// Branch the tasks are merged into; `atomics/plan-<plan-id>` when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub integration: Option<String>,
+    /// Host-selected destinations, retained when the worktree path template changes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub integration_worktrees: Vec<IntegrationWorktree>,
     /// The external board (board mode) or ticket (ticket mode) this plan follows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ticket: Option<crate::tickets::TicketLink>,
@@ -70,6 +73,13 @@ pub struct Publish {
     pub url: Option<String>,
     #[serde(default)]
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegrationWorktree {
+    pub repo: std::path::PathBuf,
+    pub branch: String,
+    pub path: std::path::PathBuf,
 }
 
 pub const MAX_NOTE_CHARS: usize = 300;
@@ -132,8 +142,8 @@ pub fn is_plan_file(path: &Path) -> bool {
 pub fn load_plans(home: &Path) -> Result<(Vec<Plan>, Vec<String>)> {
     let mut errors = Vec::new();
     let dir = home.join("plans");
-    crate::store::private_dir(home)?;
-    crate::store::private_dir(&dir)?;
+    crate::store::readable_state_dir(home)?;
+    crate::store::readable_state_dir(&dir)?;
     let legacy = home.join("plan.json");
     if legacy.exists() && !home.join("plan.json.migrated").exists() {
         match Plan::load(&legacy) {
@@ -312,6 +322,10 @@ pub struct Task {
     /// A persistent host-side ref guard warning, acknowledged on the board.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ref_alert: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ref_alert_generation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ref_status_before_alert: Option<TaskStatus>,
     /// The external ticket saying what this task is for.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ticket: Option<crate::tickets::TicketLink>,
@@ -718,6 +732,8 @@ impl Plan {
                 task.integrated_commit = old.integrated_commit.clone();
                 task.start_commit = old.start_commit.clone();
                 task.ref_alert = old.ref_alert.clone();
+                task.ref_alert_generation = old.ref_alert_generation.clone();
+                task.ref_status_before_alert = old.ref_status_before_alert;
                 task.dispatched_at = old.dispatched_at;
                 task.finished_at = old.finished_at;
                 task.worktree = old.worktree.clone();

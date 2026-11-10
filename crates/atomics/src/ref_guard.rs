@@ -16,7 +16,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -367,22 +367,23 @@ pub struct RefGuard {
     cwd: PathBuf,
     #[serde(skip)]
     file: PathBuf,
+    #[serde(skip)]
+    verify_head: bool,
 }
 
 impl RefGuard {
     /// Load the original snapshot on reattach, before the agent gets another turn. The file
     /// lives outside every VM mount, so an agent cannot replace its own baseline.
     pub fn open(cwd: &Path, file: PathBuf) -> Result<Option<Self>> {
-        // Closing a scratch session can remove its folder while sbx is still creating it.
-        // There is no Git to guard there; the completed preparation takes the normal cleanup path.
-        if cwd.symlink_metadata().is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) {
-            return Ok(None);
-        }
-        if git::pinned(cwd).is_some_and(|pins| pins.common_dir.is_none()) {
+        let pins = git::pinned(cwd);
+        if pins.as_ref().is_some_and(|pins| pins.common_dir.is_none()) {
             return Ok(None);
         }
         if let Err(error) = git::git(cwd, &["rev-parse", "--show-toplevel"]) {
-            if format!("{error:#}").contains("not a git repository") {
+            if pins.is_none()
+                && (format!("{error:#}").contains("not a git repository")
+                    || cwd.symlink_metadata().is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound))
+            {
                 return Ok(None);
             }
             return Err(error);
@@ -407,10 +408,12 @@ impl RefGuard {
                 refs: read_refs(cwd)?,
                 cwd: cwd.into(),
                 file: file.clone(),
+                verify_head: true,
             }
         };
         guard.cwd = cwd.into();
         guard.file = file;
+        guard.verify_head = true;
         guard.save()?;
         Ok(Some(guard))
     }
@@ -531,8 +534,10 @@ impl RefGuard {
             });
         }
         // Do not change the pinned branch if the agent switches HEAD to another task's branch.
-        let head = git::git(&self.cwd, &["symbolic-ref", "-q", "HEAD"]).ok().map(|s| s.trim().to_string());
-        if head != self.branch {
+        let head = self
+            .verify_head
+            .then(|| git::git(&self.cwd, &["symbolic-ref", "-q", "HEAD"]).ok().map(|s| s.trim().to_string()));
+        if let Some(head) = head.filter(|head| *head != self.branch) {
             alerts.push(format!("Worktree HEAD changed: {head:?}; task branch is {:?}", self.branch));
             if let Some(branch) = &self.branch {
                 git::git(&self.cwd, &["symbolic-ref", "HEAD", branch]).context("restoring task HEAD")?;
@@ -569,7 +574,9 @@ pub struct Shared {
     pub branch: Option<String>,
     guard: Arc<Mutex<RefGuard>>,
     /// Set before the UI receives an alert, so integration cannot overtake its queued delivery.
-    unacknowledged: Arc<AtomicBool>,
+    epoch: String,
+    generation: Arc<AtomicU64>,
+    acknowledged: Arc<AtomicU64>,
 }
 
 impl Shared {
@@ -579,23 +586,55 @@ impl Shared {
         let mut open = OPEN.lock().unwrap_or_else(|e| e.into_inner());
         open.retain(|open| open.strong_count() > 0);
         open.push(Arc::downgrade(&guard));
-        Self { common, branch, guard, unacknowledged: Arc::new(AtomicBool::new(false)) }
+        Self {
+            common,
+            branch,
+            guard,
+            epoch: uuid::Uuid::new_v4().to_string(),
+            generation: Arc::new(AtomicU64::new(0)),
+            acknowledged: Arc::new(AtomicU64::new(0)),
+        }
     }
 
     /// Runs git: call it on [`Checks`]' thread.
     pub fn check(&self, exempt: &Exempt) -> Result<Vec<String>> {
+        self.check_using(exempt, None)
+    }
+
+    fn check_using(&self, exempt: &Exempt, repo: Option<&Path>) -> Result<Vec<String>> {
         let mut concurrent = exempt.resolve(&self.common);
         let (pending, written) = host_writes(&self.common);
         concurrent.extend(pending);
-        let checked = self.guard.lock().unwrap_or_else(|e| e.into_inner()).check(&concurrent, &written);
+        let mut guard = self.guard.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = guard.cwd.clone();
+        let verify_head = guard.verify_head;
+        if let Some(repo) = repo {
+            anyhow::ensure!(common_of(repo)? == self.common, "task ref guard belongs to another repository");
+            guard.cwd = repo.into();
+            guard.verify_head = false;
+        }
+        let checked = guard.check(&concurrent, &written);
+        guard.cwd = cwd;
+        guard.verify_head = verify_head;
         if !checked.as_ref().is_ok_and(|alerts| alerts.is_empty()) {
-            self.unacknowledged.store(true, Ordering::SeqCst);
+            self.generation.fetch_add(1, Ordering::SeqCst);
         }
         checked
     }
 
-    pub fn acknowledge(&self) {
-        self.unacknowledged.store(false, Ordering::SeqCst);
+    pub fn alert_generation(&self) -> Option<String> {
+        let generation = self.generation.load(Ordering::SeqCst);
+        (generation > 0).then(|| format!("{}:{generation}", self.epoch))
+    }
+
+    pub fn acknowledge(&self, seen: &str) {
+        if let Some(generation) = seen.strip_prefix(&format!("{}:", self.epoch)).and_then(|s| s.parse::<u64>().ok()) {
+            self.acknowledged.fetch_max(generation.min(self.generation.load(Ordering::SeqCst)), Ordering::SeqCst);
+        }
+    }
+
+    fn has_unacknowledged(&self) -> bool {
+        self.generation.load(Ordering::SeqCst) > self.acknowledged.load(Ordering::SeqCst)
     }
 }
 
@@ -684,46 +723,87 @@ pub fn open_and_check(checks: &Checks, cwd: &Path, file: PathBuf, exempt: Exempt
 
 /// Check before integration writes anything, in order with all turn/exit checks. Closed sessions
 /// use their host-only snapshot; a missing or unreadable snapshot is never a new baseline.
+#[cfg(test)]
 pub fn check_integration(
     checks: &Checks,
     live: Option<Shared>,
     home: &Path,
+    repo: &Path,
     worktree: &Path,
     exempt: Exempt,
 ) -> Result<Vec<String>> {
-    let (home, worktree) = (home.to_path_buf(), worktree.to_path_buf());
+    check_integration_alert(checks, live, home, repo, worktree, exempt).result
+}
+
+pub struct IntegrationCheck {
+    pub result: Result<Vec<String>>,
+    pub generation: Option<String>,
+}
+
+pub fn check_integration_alert(
+    checks: &Checks,
+    live: Option<Shared>,
+    home: &Path,
+    repo: &Path,
+    worktree: &Path,
+    exempt: Exempt,
+) -> IntegrationCheck {
+    let (home, repo, worktree) = (home.to_path_buf(), repo.to_path_buf(), worktree.to_path_buf());
     let (done, result) = channel();
     checks.run(move || {
         let check = || -> Result<Vec<String>> {
             crate::sandbox::load_owned_pins(&home)?;
-            if let Some(guard) = live {
-                let alerts = guard.check(&exempt)?;
+            if let Some(guard) = &live {
+                let missing =
+                    worktree.symlink_metadata().is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+                let alerts = guard.check_using(&exempt, missing.then_some(repo.as_path()))?;
                 if !alerts.is_empty() {
                     return Ok(alerts);
                 }
-                anyhow::ensure!(
-                    !guard.unacknowledged.load(Ordering::SeqCst),
-                    "task has an unacknowledged ref-guard alert"
-                );
+                anyhow::ensure!(!guard.has_unacknowledged(), "task has an unacknowledged ref-guard alert");
                 return Ok(alerts);
             }
-            let real = worktree.canonicalize()?;
             let mut alerts = Vec::new();
+            let real = worktree.canonicalize().ok();
             for (name, entry) in crate::sandbox_ownership::owned(&home)? {
-                if !entry.git_pins.as_ref().is_some_and(|pins| pins.work_tree == real) {
+                if !entry
+                    .git_pins
+                    .as_ref()
+                    .is_some_and(|pins| pins.work_tree == worktree || real.as_ref() == Some(&pins.work_tree))
+                {
                     continue;
                 }
                 let file = home.join("ref-guards").join(format!("{name}.json"));
-                git::read_regular_file(&file, 16 * 1024 * 1024).context("reading task's ref guard snapshot")?;
                 let guard =
-                    RefGuard::open(&worktree, file)?.context("task's ref guard could not open its repository")?;
+                    if worktree.symlink_metadata().is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) {
+                        let mut guard: RefGuard =
+                            serde_json::from_str(&git::read_regular_file(&file, 16 * 1024 * 1024)?)?;
+                        anyhow::ensure!(
+                            Some(&guard.common) == entry.git_pins.as_ref().and_then(|pins| pins.common_dir.as_ref())
+                                && common_of(&repo)? == guard.common,
+                            "task ref guard belongs to another repository"
+                        );
+                        guard.cwd = repo.clone();
+                        guard.file = file;
+                        guard.verify_head = false;
+                        guard
+                    } else {
+                        git::read_regular_file(&file, 16 * 1024 * 1024).context("reading task's ref guard snapshot")?;
+                        RefGuard::open(&worktree, file)?.context("task's ref guard could not open its repository")?
+                    };
                 alerts.extend(Shared::new(guard).check(&exempt)?);
             }
             Ok(alerts)
         };
-        let _ = done.send(check());
+        let result = check();
+        // Capture on this ordered worker, before a subsequent check can queue a newer alert.
+        let generation = live.as_ref().and_then(Shared::alert_generation);
+        let _ = done.send(IntegrationCheck { result, generation });
     });
-    result.recv().context("ref guard worker stopped before integration")?
+    result.recv().unwrap_or_else(|_| IntegrationCheck {
+        result: Err(anyhow::anyhow!("ref guard worker stopped before integration")),
+        generation: None,
+    })
 }
 
 fn read_refs(cwd: &Path) -> Result<BTreeMap<String, RefValue>> {

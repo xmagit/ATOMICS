@@ -331,6 +331,10 @@ impl Terminal {
         mut env: HashMap<String, String>,
         scrollback: usize,
     ) -> Result<Terminal> {
+        #[cfg(test)]
+        if let Some(name) = Path::new(&program).file_name().and_then(|name| name.to_str()) {
+            crate::test_support::assert_fixture_program(name, Path::new(&program));
+        }
         let hook_pane = env.remove(atomics_core::hook::HOOK_PANE_ENV);
         // This process is the host whose terminal this is: its socket is the one to reach.
         let socket = atomics_core::paths::socket_path();

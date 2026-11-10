@@ -48,6 +48,44 @@ pub(super) fn with_app(name: &str, test: impl FnOnce(&mut Desktop<'_>, &egui::Co
     });
 }
 
+pub(super) fn with_app_env(
+    name: &str,
+    env: impl FnOnce(&Path) -> Vec<(&'static str, std::ffi::OsString)>,
+    test: impl FnOnce(&mut Desktop<'_>, &egui::Context),
+) {
+    with_login_state(name, env, |mut state, ctx| {
+        let mut client = Client::new(ctx, &mut Options::default(), &crate::load_icon());
+        test(&mut Desktop { runtime: &mut state, client: &mut client }, ctx);
+        state.shutdown();
+    });
+}
+
+pub(super) fn fixture_agent(name: &str) -> PathBuf {
+    let bin = paths::home().join("test-agents");
+    std::fs::create_dir_all(&bin).unwrap();
+    let program = bin.join(name);
+    if !program.exists() {
+        crate::test_support::copy_program(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name),
+            &program,
+        );
+    }
+    program
+}
+
+#[test]
+fn app_fixtures_cannot_find_installed_cloud_agent_or_vm_programs() {
+    with_state("app::tests::app_fixtures_cannot_find_installed_cloud_agent_or_vm_programs", |_state, _| {
+        for name in ["az", "gh", "sbx", "claude", "codex", "limactl"] {
+            assert!(crate::setup::find_program(name).is_none(), "{name} must require an explicit fixture");
+        }
+        let home = paths::home();
+        for name in ["AZURE_CONFIG_DIR", "GH_CONFIG_DIR", "LIMA_HOME", "CODEX_HOME", "CLAUDE_CONFIG_DIR"] {
+            assert!(PathBuf::from(std::env::var_os(name).unwrap()).starts_with(&home), "{name} belongs to this test");
+        }
+    });
+}
+
 pub(super) fn with_state(name: &str, test: impl FnOnce(State, &egui::Context)) {
     run_state(name, None::<fn(&Path) -> Vec<(&'static str, std::ffi::OsString)>>, test);
 }
@@ -160,6 +198,7 @@ fn run_state(
         assert_eq!(app.toast.as_ref().unwrap().0, "Migration failed");
     }
     test(app, &ctx);
+    crate::test_support::assert_no_real_programs();
 }
 
 #[test]

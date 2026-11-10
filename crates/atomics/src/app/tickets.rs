@@ -3059,22 +3059,39 @@ mod tests {
             settle(app);
             assert_ne!(moves(&state)[4]["arguments"]["idempotencyKey"], attempts[0]["arguments"]["idempotencyKey"]);
 
-            // A server that stops answering times out, and the next jobs fail at once.
-            app.runtime.config.tickets.timeout_secs = 1;
-            // Use a fresh worker/connection for the deliberately short behavior deadline.
-            app.runtime.tickets.jobs.take();
-            app.runtime.apply_ticket_config();
+            // Complete initialization before installing the behavioral clock. Only
+            // the hung request consumes its one-second deadline, regardless of load.
+            let clock = crate::mcp_client::tests::Clock::new();
+            let timeout = Duration::from_secs(1);
+            app.runtime.tickets.jobs = Some(crate::tickets::tests::spawn_with_clock(
+                app.runtime.tickets.done_tx.clone(),
+                &app.runtime.ticket_config().unwrap(),
+                clock.clone(),
+                timeout,
+            ));
             edit_fake(&state, |fake| fake["hang"] = json!(["card_get"]));
-            let started = Instant::now();
+            let calls_before = tools(&state);
+            let reads_before = count(&state, "card_get");
             app.runtime.ticket_heartbeat();
-            settle(app);
-            assert!(link(app, index, 0).error.unwrap().contains("did not answer within 1 s"));
+            let guard = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(30));
+            while count(&state, "card_get") == reads_before {
+                assert!(Instant::now() < guard, "the fake server never received the hung read");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // The server is still blocked and the clock has not reached the deadline:
+            // changing the plan must finish before the worker can answer anything.
             assert!(request(app, json!({"cmd":"plan_update", "plan":plan, "id":"a", "status":"review"})).ok);
+            assert_eq!(app.runtime.plans[index].tasks[0].status, TaskStatus::Review);
+            assert!(app.runtime.tickets.pending > 0, "the ticket read is still waiting");
+            clock.advance(timeout);
             settle(app);
-            assert!(started.elapsed() < Duration::from_secs(10));
             let error = link(app, index, 0).error.unwrap();
+            assert!(error.contains("did not answer within 1 s"), "{error}");
             assert!(error.contains("setting the state to Check failed: cards is unavailable"), "{error}");
             assert_eq!(app.runtime.plans[index].tasks[0].status, TaskStatus::Review);
+            let calls_after = tools(&state);
+            assert_eq!(&calls_after[..calls_before.len()], &calls_before);
+            assert_eq!(&calls_after[calls_before.len()..], &["card_get"], "backoff sends no further requests");
         });
     }
 

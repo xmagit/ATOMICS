@@ -17,6 +17,7 @@ egui = { version = "0.37", default-features = false, features = ["default_fonts"
 qrcodegen = "1.8.0"
 # Unicode format controls are not covered by char::is_control. Pure Rust, including on wasm32.
 unicode-general-category = "1.1.0"
+url = "2.5.8"
 
 [features]
 # Records where some widgets were drawn, for the desktop's layout and interaction tests (its dev-dependency
