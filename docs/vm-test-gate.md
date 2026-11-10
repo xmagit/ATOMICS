@@ -172,6 +172,7 @@ the shared build jobserver and normal parallel test harness remain enabled.
 | `update::tests::a_crash_leaves_nothing_the_next_update_keeps_and_only_one_update_runs_at_a_time` | 0 | 1 |
 | `app::key_tests::escape_closes_settings_and_the_project_picker_and_the_terminal_sees_neither` | 0 | 1 |
 | `relay::tests::audit_p7_idle_and_trickling_clients_have_separate_short_auth_slots` | 0 | 1 in the previous gate |
+| `ipc::tests::audit_p7_stale_socket_recovery_has_one_owner_and_cleanup_keeps_a_replacement` | 0 | 1 |
 
 The external reports have no shared denominator and are not added to the ten-run rates.
 The ticket assertion was the only failure observed in those ten runs. The relay test belongs to
@@ -185,7 +186,7 @@ represented as intermittent failures in the frozen before measurement.
 
 The first merged stress batch at `fca1dcf` completed all ten runs with **2308 passed,
 11 failed, 42 ignored** each time. Formatting and Clippy also passed in its final gate run.
-All five originally reported tests in the table above passed in all ten runs. The isolation
+All reported tests in the table above passed in all ten runs. The isolation
 support exposed the following additional fixture failures, each **10/10**; none failed in the
 earlier frozen baseline:
 
@@ -208,3 +209,40 @@ The doctor PATH test uses fixture directories while still requiring exactly one 
 and a successful Codex version probe. Deliberately relative or empty XDG values remain available
 to the path-resolution tests: the XDG rules ignore them in favor of the isolated HOME.
 Cloud and agent state directories still require fixture paths.
+
+The next batch, at `1468152`, passed all ten runs with **2319 passed, 0 failed, 42 ignored**
+each, including the complete gate in run 10. Review then found a remaining real deadline in
+the Docker success fixture and an elapsed-time cache assertion. Commit `086d912` freezes the
+success and failure command clocks too; the cache fixture checks reuse at 9.999 seconds and
+refresh at exactly 10 seconds. Both Docker regressions passed 30 consecutive targeted runs.
+Only separate fixture hang guards use real time.
+
+The following ten runs at `086d912` reached a sampled one-minute load of 25.07 on 14 CPUs.
+Eight were green; two each passed 2318 and failed one test, with 42 ignored in every run.
+These additional intermittent failures were absent from the frozen before measurement and
+the earlier green batch:
+
+| Later observed test | Failures in 10 runs at `086d912` |
+| --- | ---: |
+| `app::github::tests::github_connect_uses_gh_after_one_confirmation` | 1 |
+| `credentials::tests::credentials_relay_rules_restrict_hosts_and_capabilities_and_track_usage` | 1 |
+
+The GitHub fixture now waits for the applied disconnect result, including its revoke action.
+A poll can clear the viewer after keychain deletion before that result arrives; an absent viewer
+alone is not readiness. The same predicate covers the related device-flow reconnect fixture.
+The credentials fixture waits for all request logs, then shuts down and joins the service before
+inspecting the usage file: logging and usage persistence use different workers. It also verifies
+that the persisted timestamp equals the in-memory usage timestamp. Existing capability,
+revocation, browser and secret-redaction checks remain in place.
+
+The two GitHub connect fixtures and the credentials usage fixture each passed 30 consecutive
+targeted runs after these completion barriers were corrected.
+
+Another reviewer reported the stale-socket recovery test failing once (zero successful binders
+instead of one), although it passed throughout this worktree's measured batches. Creating and
+closing its initial listener in the parallel harness lets an unrelated fork inherit the descriptor;
+until exec, that process can keep the supposed stale socket listening. The fixture now creates
+the socket in a child and waits for that child's exit before starting its two simultaneous recovery
+attempts. The one-owner check, refusal to steal a live listener, replacement-inode cleanup and
+regular-file preservation checks are retained. The ownership assertion also prints both bind results.
+The corrected stale-socket test passed 30 consecutive targeted runs.
