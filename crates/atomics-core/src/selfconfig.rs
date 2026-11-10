@@ -743,7 +743,7 @@ fn warnings_for(scope: Scope, layers: &[Layer], config: &Config, changes: &[Chan
     let mut warnings = Vec::new();
     for change in changes.iter().filter(|change| change.change != "removed") {
         let known = known.iter().flatten().any(|table| defines(table, &change.path));
-        if !known && change.key != "voice.api_key" {
+        if !known && !matches!(change.key.as_str(), "voice.api_key" | "chief.model") {
             warnings.push(format!("ATOMICS does not know {}, so it would have no effect", change.key));
         }
         if change.key == "voice.api_key" {
@@ -751,6 +751,18 @@ fn warnings_for(scope: Scope, layers: &[Layer], config: &Config, changes: &[Chan
         }
         if let Some(host) = host.filter(|host| scope == Scope::Main && defines(&host.table, &change.path)) {
             warnings.push(format!("{} sets {} too and wins on this machine", host.path, change.key));
+        }
+        if change.key == "chief.model"
+            && scope == Scope::Main
+            && config.chief.model.is_none()
+            && let Some(host) = host
+            && let Some(args) = lookup(&host.table, &["chief", "args"]).and_then(toml::Value::as_array)
+        {
+            let args = args.iter().filter_map(toml::Value::as_str).map(str::to_string).collect::<Vec<_>>();
+            if crate::config::ChiefConfig::legacy_model(&config.chief.command, &args) {
+                warnings
+                    .push(format!("{} selects the chief model through chief.args and wins on this machine", host.path));
+            }
         }
     }
     if workspace_tickets && changes.iter().any(|change| change.path[0] == "tickets") {
@@ -868,9 +880,21 @@ fn detach(item: &mut Item) {
 /// Writes an applied change, only while the file still reads as it did when the change was
 /// proposed: first a copy of the old file next to it, then the new text through a temporary
 /// file in the same folder, with the old file's permissions. A symlinked file is written
-/// through its link. Returns the backup's path, `None` for a file the change creates.
+/// through its link. Returns the backup's path, `None` for a new or unchanged file.
+/// Backup cleanup is best-effort: once the rename succeeds, the apply always succeeds.
 #[cfg(feature = "native")]
 pub fn write(file: &Path, before: Option<&str>, after: &str, stamp: u64) -> anyhow::Result<Option<PathBuf>> {
+    write_with_prune(file, before, after, stamp, prune_config_backups)
+}
+
+#[cfg(feature = "native")]
+fn write_with_prune(
+    file: &Path,
+    before: Option<&str>,
+    after: &str,
+    stamp: u64,
+    prune: impl FnOnce(&Path, Option<&Path>) -> anyhow::Result<()>,
+) -> anyhow::Result<Option<PathBuf>> {
     use anyhow::{Context, bail};
     let current = match std::fs::read_to_string(file) {
         Ok(text) => Some(text),
@@ -880,22 +904,37 @@ pub fn write(file: &Path, before: Option<&str>, after: &str, stamp: u64) -> anyh
     if current.as_deref() != before {
         bail!("{} changed since the change was proposed; ask for a new proposal", file.display());
     }
+    if current.as_deref() == Some(after) {
+        return Ok(None);
+    }
     let target = if current.is_some() { std::fs::canonicalize(file)? } else { file.to_path_buf() };
     let (Some(dir), Some(name)) = (target.parent(), target.file_name()) else {
         bail!("{} is not a file", file.display());
     };
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    let backup = match current {
-        Some(_) => {
+    // An inventory failure must not prevent saving a fresh snapshot of the current file.
+    let backups = config_backups(file).unwrap_or_default();
+    let backup = match current.as_deref() {
+        Some(text) => {
             let shown = file.file_name().unwrap_or(name).to_string_lossy().into_owned();
-            let folder = file.parent().unwrap_or(dir);
-            let mut backup = folder.join(format!("{shown}.{stamp}.bak"));
-            let mut n = 1;
+            let folder = file.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+            let next = backups.iter().filter(|((time, _), _)| *time == stamp).map(|((_, n), _)| n + 1).max();
+            let mut n = next.unwrap_or(0);
+            let backup_name =
+                |n| if n == 0 { format!("{shown}.{stamp}.bak") } else { format!("{shown}.{stamp}-{n}.bak") };
+            let mut backup = folder.join(backup_name(n));
             while backup.exists() {
-                backup = folder.join(format!("{shown}.{stamp}-{n}.bak"));
                 n += 1;
+                backup = folder.join(backup_name(n));
             }
-            std::fs::copy(&target, &backup).with_context(|| format!("backing up to {}", backup.display()))?;
+            if let Some(existing) =
+                backups.iter().find(|(_, path)| std::fs::read(path).ok().as_deref() == Some(text.as_bytes()))
+            {
+                // Refresh its date without retaining another copy of the same content.
+                std::fs::rename(&existing.1, &backup)?;
+            } else {
+                std::fs::copy(&target, &backup).with_context(|| format!("backing up to {}", backup.display()))?;
+            }
             Some(backup)
         }
         None => None,
@@ -903,7 +942,7 @@ pub fn write(file: &Path, before: Option<&str>, after: &str, stamp: u64) -> anyh
     let temp = dir.join(format!(".{}.{stamp}.atomics-tmp", name.to_string_lossy()));
     let written = (|| -> anyhow::Result<()> {
         std::fs::write(&temp, after)?;
-        if backup.is_some() {
+        if current.is_some() {
             std::fs::set_permissions(&temp, std::fs::metadata(&target)?.permissions())?;
         }
         std::fs::rename(&temp, &target)?;
@@ -913,7 +952,68 @@ pub fn write(file: &Path, before: Option<&str>, after: &str, stamp: u64) -> anyh
         let _ = std::fs::remove_file(&temp);
         return Err(err).with_context(|| format!("writing {}", file.display()));
     }
+    // The new config is already installed. Maintenance must never turn this into a failed apply.
+    let _ = prune(file, backup.as_deref());
     Ok(backup)
+}
+
+#[cfg(feature = "native")]
+fn prune_config_backups(file: &Path, protected: Option<&Path>) -> anyhow::Result<()> {
+    let mut backups = config_backups(file)?;
+    backups.reverse();
+    // The clock can go backwards. Count this apply's snapshot first, regardless of its timestamp.
+    if let Some(index) = backups.iter().position(|(_, path)| Some(path.as_path()) == protected) {
+        let latest = backups.remove(index);
+        backups.insert(0, latest);
+    }
+    let mut contents = std::collections::HashSet::new();
+    let mut kept = 0;
+    for (_, path) in backups {
+        let text = std::fs::read(&path);
+        if Some(path.as_path()) == protected {
+            kept += 1;
+            if let Ok(text) = text {
+                contents.insert(text);
+            }
+            continue;
+        }
+        // Another process may have removed it, or this old snapshot may be unreadable.
+        let Ok(text) = text else { continue };
+        if kept < 10 && contents.insert(text) {
+            kept += 1;
+        } else {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    Ok(())
+}
+
+/// Only ATOMICS's numeric timestamp/collision suffix belongs to this config file.
+#[cfg(feature = "native")]
+fn config_backups(file: &Path) -> anyhow::Result<Vec<((u64, u64), PathBuf)>> {
+    let prefix = format!("{}.", file.file_name().unwrap_or_default().to_string_lossy());
+    let mut backups = Vec::new();
+    let folder = file.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    if !folder.exists() {
+        return Ok(backups);
+    }
+    for entry in std::fs::read_dir(folder)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(suffix) = name.to_str().and_then(|s| s.strip_prefix(&prefix)).and_then(|s| s.strip_suffix(".bak"))
+        else {
+            continue;
+        };
+        let (stamp, collision) = suffix.split_once('-').unwrap_or((suffix, "0"));
+        if let (Ok(stamp), Ok(collision)) = (stamp.parse::<u64>(), collision.parse::<u64>()) {
+            backups.push(((stamp, collision), entry.path()));
+        }
+    }
+    backups.sort_by_key(|(order, _)| *order);
+    Ok(backups)
 }
 
 #[cfg(test)]
@@ -1458,6 +1558,97 @@ children = [{ auth = { header = "object-secret" }, label = "public" }]
             .filter(|name| name.contains("atomics-tmp"))
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn backups_keep_ten_distinct_contents_per_file_even_in_one_second() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        std::fs::write(&file, "v = 0\n").unwrap();
+        let unrelated = dir.path().join("host.toml.1.bak");
+        let manual = dir.path().join("config.toml.manual.bak");
+        std::fs::write(&unrelated, "other file").unwrap();
+        std::fs::write(&manual, "manual copy").unwrap();
+        for i in 0..24 {
+            write(&file, Some(&format!("v = {i}\n")), &format!("v = {}\n", i + 1), 100).unwrap();
+            assert!(config_backups(&file).unwrap().len() <= 10);
+        }
+        let backups = config_backups(&file).unwrap();
+        let contents: Vec<_> = backups.iter().map(|(_, path)| std::fs::read_to_string(path).unwrap()).collect();
+        assert_eq!(contents, (14..24).map(|i| format!("v = {i}\n")).collect::<Vec<_>>());
+        // Return to an earlier value and apply again: refresh its existing snapshot, rather than duplicate it.
+        write(&file, Some("v = 24\n"), "v = 20\n", 101).unwrap();
+        let reused = write(&file, Some("v = 20\n"), "v = 25\n", 101).unwrap().unwrap();
+        assert!(reused.exists());
+        let backups = config_backups(&file).unwrap();
+        let contents: std::collections::HashSet<_> =
+            backups.iter().map(|(_, path)| std::fs::read(path).unwrap()).collect();
+        assert_eq!(backups.len(), 10);
+        assert_eq!(contents.len(), 10);
+        assert_eq!(write(&file, Some("v = 25\n"), "v = 25\n", 101).unwrap(), None);
+        assert_eq!(config_backups(&file).unwrap().len(), 10);
+        assert_eq!(std::fs::read_to_string(unrelated).unwrap(), "other file");
+        assert_eq!(std::fs::read_to_string(manual).unwrap(), "manual copy");
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn an_apply_also_prunes_old_duplicate_backups() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        std::fs::write(&file, "v = 1\n").unwrap();
+        for i in 0..23 {
+            std::fs::write(dir.path().join(format!("config.toml.{i}.bak")), "old content").unwrap();
+        }
+        write(&file, Some("v = 1\n"), "v = 2\n", 100).unwrap();
+        let backups = config_backups(&file).unwrap();
+        assert_eq!(backups.len(), 2);
+        assert_eq!(backups[0].0, (22, 0));
+        assert_eq!(backups[1].0, (100, 0));
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn cleanup_failure_after_rename_never_fails_an_applied_write() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        std::fs::write(&file, "value = 1\n").unwrap();
+        let backup = write_with_prune(&file, Some("value = 1\n"), "value = 2\n", 100, |file, backup| {
+            assert_eq!(std::fs::read_to_string(file).unwrap(), "value = 2\n", "the failure is after commit");
+            assert_eq!(std::fs::read_to_string(backup.unwrap()).unwrap(), "value = 1\n");
+            Err(std::io::Error::new(std::io::ErrorKind::NotFound, "another process pruned an old snapshot").into())
+        })
+        .unwrap()
+        .unwrap();
+        assert!(backup.exists());
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "value = 2\n");
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn cleanup_keeps_the_returned_backup_even_when_the_clock_moves_backwards() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        std::fs::write(&file, "value = 1\n").unwrap();
+        for stamp in 200..212 {
+            std::fs::write(dir.path().join(format!("config.toml.{stamp}.bak")), format!("value = {stamp}\n")).unwrap();
+        }
+        let backup = write(&file, Some("value = 1\n"), "value = 2\n", 100).unwrap().unwrap();
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), "value = 1\n");
+        let backups = config_backups(&file).unwrap();
+        assert_eq!(backups.len(), 10);
+        assert!(backups.iter().any(|(_, path)| *path == backup));
+        assert_eq!(backups[1].0, (203, 0), "the remaining nine snapshots are the newest old ones");
+    }
+
+    #[test]
+    fn proposing_a_main_model_explains_when_host_model_args_win() {
+        let main = layer(Source::Main, crate::config::DEFAULT_CONFIG);
+        let host = layer(Source::Host, "[chief]\nargs = ['--model', 'sonnet']\n");
+        let proposal = propose(Scope::Main, &[main, host], "[chief]\nmodel = 'haiku'", &[]).unwrap();
+        assert_eq!(proposal.warnings.len(), 1, "{:?}", proposal.warnings);
+        assert!(proposal.warnings[0].contains("chief.args and wins"));
     }
 
     #[test]

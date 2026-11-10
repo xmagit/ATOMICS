@@ -59,6 +59,7 @@ diff_size = 12.5
 
 [terminal]
 scrollback = 5000           # lines each terminal keeps; a full 20000 on a wide terminal takes about 80 MB
+clipboard = "focused"      # OSC 52 writes: "focused" or "off"; always off for sandboxed sessions
 
 [theme]
 name = "claude"             # built in: claude, midnight, atomisk, paper and tide (light); or themes/<name>.toml beside this file
@@ -472,7 +473,8 @@ heartbeat_secs = 300         # fleet checks, delivered through atomics_wait
 wake_secs = 180              # wake an idle chief while work is open; 0 = off, minimum 30
 dock = "floating"   # "floating" or "docked"
 command = ["claude"]
-args = ["--model", "claude-opus-5-5"]
+model = "claude-opus-5-5" # Settings also offers the command's model aliases
+args = []                 # old --model arguments still work when model is unset
 # system_prompt = "..."   # built in: plan, wait for approval, dispatch, verify, integrate
 # prompt = "..."          # your own instructions, added after the built-in prompt when the chief starts;
                           # config.d/<host>.toml and the workspace file add theirs after this one
@@ -767,6 +769,9 @@ pub struct ChiefConfig {
     pub wake_secs: u64,
     pub dock: ChiefDock,
     pub command: Vec<String>,
+    /// Within one layer, explicit model wins over legacy model flags in `args`.
+    #[serde(deserialize_with = "deserialize_chief_model")]
+    pub model: Option<String>,
     pub args: Vec<String>,
     pub system_prompt: String,
     /// The user's instructions, added after the built-in prompt. Every file's adds to the
@@ -800,6 +805,7 @@ impl Default for ChiefConfig {
             wake_secs: 180,
             dock: ChiefDock::Floating,
             command: vec!["claude".into()],
+            model: None,
             args: vec!["--model".into(), "claude-opus-5-5".into()],
             system_prompt: CHIEF_PROMPT.into(),
             prompt: String::new(),
@@ -808,6 +814,67 @@ impl Default for ChiefConfig {
             autostart: false,
         }
     }
+}
+
+impl ChiefConfig {
+    /// Stable aliases accepted by Claude Code. Other commands keep their custom model/arguments.
+    pub fn model_choices(command: &[String]) -> &'static [&'static str] {
+        match command.first().and_then(|word| word.rsplit('/').next()) {
+            Some("claude") => &["fable", "opus", "sonnet", "haiku"],
+            _ => &[],
+        }
+    }
+
+    fn short_model_flag(command: &[String]) -> bool {
+        matches!(command.first().and_then(|word| word.rsplit('/').next()), Some("claude" | "codex"))
+    }
+
+    pub fn legacy_model(command: &[String], args: &[String]) -> bool {
+        args.iter().any(|arg| {
+            arg == "--model"
+                || arg.starts_with("--model=")
+                || Self::short_model_flag(command) && (arg == "-m" || arg.starts_with("-m="))
+        })
+    }
+
+    pub fn model_problem(model: &str) -> Option<&'static str> {
+        if model.is_empty() {
+            Some("Enter a model name.")
+        } else if model.starts_with('-') || model.chars().any(char::is_whitespace) {
+            Some("A model name cannot start with '-' or contain whitespace.")
+        } else {
+            None
+        }
+    }
+
+    /// Preserve existing argument lists; a model selected in Settings replaces only their model flag.
+    pub fn launch_args(&self) -> Vec<String> {
+        let explicit = self.model.as_deref().filter(|model| Self::model_problem(model).is_none());
+        let Some(model) = explicit else {
+            return self.args.clone();
+        };
+        let mut args = Vec::new();
+        let mut words = self.args.iter();
+        while let Some(word) = words.next() {
+            if word == "--model" || word == "-m" && Self::short_model_flag(&self.command) {
+                words.next();
+            } else if !(word.starts_with("--model=")
+                || word.starts_with("-m=") && Self::short_model_flag(&self.command))
+            {
+                args.push(word.clone());
+            }
+        }
+        args.extend(["--model".into(), model.into()]);
+        args
+    }
+}
+
+fn deserialize_chief_model<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    let model = Option::<String>::deserialize(deserializer)?;
+    if let Some(problem) = model.as_deref().and_then(ChiefConfig::model_problem) {
+        return Err(serde::de::Error::custom(format!("chief.model: {problem}")));
+    }
+    Ok(model)
 }
 
 fn deserialize_min_left_percent<'de, D: serde::Deserializer<'de>>(
@@ -880,6 +947,22 @@ pub struct FontConfig {
 #[serde(default)]
 pub struct TerminalConfig {
     pub scrollback: usize,
+    pub clipboard: ClipboardPolicy,
+}
+
+/// Whether a terminal program may write the host clipboard with OSC 52.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClipboardPolicy {
+    #[default]
+    Focused,
+    Off,
+}
+
+impl ClipboardPolicy {
+    pub fn allows(self, focused: bool, sandboxed: bool) -> bool {
+        self == Self::Focused && focused && !sandboxed
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1094,7 +1177,7 @@ impl Default for FontConfig {
 
 impl Default for TerminalConfig {
     fn default() -> Self {
-        Self { scrollback: 5000 }
+        Self { scrollback: 5000, clipboard: ClipboardPolicy::default() }
     }
 }
 
@@ -1251,6 +1334,24 @@ impl Config {
     pub fn merged(tables: impl IntoIterator<Item = toml::Table>) -> toml::Table {
         let mut merged = toml::Table::new();
         for table in tables {
+            if let Some(chief) = table.get("chief").and_then(toml::Value::as_table)
+                && !chief.contains_key("model")
+                && let Some(args) = chief.get("args").and_then(toml::Value::as_array)
+            {
+                let inherited = merged.get("chief").and_then(toml::Value::as_table);
+                let command = chief
+                    .get("command")
+                    .or_else(|| inherited.and_then(|chief| chief.get("command")))
+                    .and_then(toml::Value::as_array)
+                    .map(|words| words.iter().filter_map(toml::Value::as_str).map(str::to_string).collect())
+                    .unwrap_or_else(|| vec!["claude".into()]);
+                let args = args.iter().filter_map(toml::Value::as_str).map(str::to_string).collect::<Vec<_>>();
+                if ChiefConfig::legacy_model(&command, &args)
+                    && let Some(inherited) = merged.get_mut("chief").and_then(toml::Value::as_table_mut)
+                {
+                    inherited.remove("model");
+                }
+            }
             merge_tables(&mut merged, table);
         }
         merged
@@ -1286,14 +1387,16 @@ fn merge_tables(base: &mut toml::Table, overrides: toml::Table) {
 impl Chord {
     pub fn parse(text: &str) -> Option<Chord> {
         let mut chord = Chord { cmd: false, primary: false, ctrl: false, alt: false, shift: false, key: String::new() };
-        for part in text.split('+').map(str::trim).filter(|p| !p.is_empty()) {
+        for part in text.split('+').map(str::trim) {
             match part.to_ascii_lowercase().as_str() {
                 "cmd" | "command" | "super" => chord.cmd = true,
                 "primary" => chord.primary = true,
                 "ctrl" | "control" => chord.ctrl = true,
                 "alt" | "option" | "opt" => chord.alt = true,
                 "shift" => chord.shift = true,
-                _ => chord.key = part.to_string(),
+                "" => return None,
+                _ if chord.key.is_empty() => chord.key = part.to_string(),
+                _ => return None,
             }
         }
         (!chord.key.is_empty()).then_some(chord)
@@ -1304,6 +1407,63 @@ impl Chord {
 mod tests {
     use super::*;
     use crate::layout::DiffSplit;
+
+    #[test]
+    fn chief_models_preserve_legacy_args_and_replace_only_the_model_when_selected() {
+        let defaults: Config = toml::from_str("").unwrap();
+        assert_eq!(defaults.chief.launch_args(), ["--model", "claude-opus-5-5"]);
+        let cleared: Config = toml::from_str("[chief]\nargs = []").unwrap();
+        assert!(cleared.chief.launch_args().is_empty(), "an explicitly cleared legacy model stays cleared");
+        for args in
+            ["['--model', 'custom', '--verbose']", "['--model=custom', '--verbose']", "['-m', 'custom', '--verbose']"]
+        {
+            let mut config: Config = toml::from_str(&format!("[chief]\nargs = {args}")).unwrap();
+            assert_eq!(config.chief.launch_args(), config.chief.args);
+            assert!(ChiefConfig::legacy_model(&config.chief.command, &config.chief.args));
+            config.chief.model = Some("sonnet".into());
+            assert_eq!(config.chief.launch_args(), ["--verbose", "--model", "sonnet"]);
+        }
+        let custom: Config = toml::from_str("[chief]\ncommand = ['other-agent']\nargs = ['--verbose']").unwrap();
+        assert!(ChiefConfig::model_choices(&custom.chief.command).is_empty());
+        assert_eq!(custom.chief.launch_args(), ["--verbose"]);
+        let config: Config = toml::from_str(DEFAULT_CONFIG).unwrap();
+        assert_eq!(config.chief.model.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(config.chief.launch_args(), defaults.chief.launch_args());
+        assert!(Chord::parse("ctrl+a+b").is_none());
+        assert!(Chord::parse("ctrl++a").is_none());
+    }
+
+    #[test]
+    fn chief_model_selection_respects_layer_precedence_in_both_directions() {
+        let host = "[chief]\nargs = ['--model', 'sonnet', '--verbose']\n";
+        let config = Config::from_tables([DEFAULT_CONFIG.parse().unwrap(), host.parse().unwrap()]).unwrap();
+        assert!(config.chief.model.is_none(), "Settings must show the higher layer's custom args");
+        assert_eq!(config.chief.launch_args(), ["--model", "sonnet", "--verbose"]);
+        let selected = "[chief]\nmodel = 'haiku'\n";
+        let config = Config::from_tables([host.parse().unwrap(), selected.parse().unwrap()]).unwrap();
+        assert_eq!(config.chief.launch_args(), ["--verbose", "--model", "haiku"]);
+        let both = "[chief]\nmodel = 'opus'\nargs = ['--model=sonnet', '--verbose']\n";
+        let config = Config::from_tables([host.parse().unwrap(), both.parse().unwrap()]).unwrap();
+        assert_eq!(config.chief.launch_args(), ["--verbose", "--model", "opus"]);
+    }
+
+    #[test]
+    fn chief_models_reject_option_like_or_whitespace_values_and_keep_wrapper_short_flags() {
+        for model in ["", "-option", "two words", " sonnet", "sonnet\n", "name\tvalue", "name\u{2003}value"] {
+            let mut table = toml::Table::new();
+            table.insert("chief".into(), toml::Value::Table(toml::Table::from_iter([("model".into(), model.into())])));
+            assert!(Config::from_tables([table]).unwrap_err().to_string().contains("chief.model"));
+        }
+        for command in ["claude", "/tools/codex", "custom-wrapper"] {
+            let config: Config = toml::from_str(&format!("[chief]\ncommand = ['{command}']\nmodel = 'new-model'\nargs = ['-m', 'memory', '--model=old-model', '--verbose']\n")).unwrap();
+            if command == "custom-wrapper" {
+                assert_eq!(config.chief.launch_args(), ["-m", "memory", "--verbose", "--model", "new-model"]);
+                assert!(!ChiefConfig::legacy_model(&config.chief.command, &["-m".into(), "memory".into()]));
+            } else {
+                assert_eq!(config.chief.launch_args(), ["--verbose", "--model", "new-model"]);
+            }
+        }
+    }
 
     #[cfg(feature = "native")]
     #[test]
@@ -1616,8 +1776,13 @@ kind = "shell"
 
     #[test]
     fn default_config_file_matches_built_in_defaults() {
-        let parsed: Config = toml::from_str(DEFAULT_CONFIG).unwrap();
-        let built_in = Config::default();
+        let mut parsed: Config = toml::from_str(DEFAULT_CONFIG).unwrap();
+        let mut built_in = Config::default();
+        // The new model field and legacy args must produce the same command, while all other defaults stay equal.
+        parsed.chief.args = parsed.chief.launch_args();
+        parsed.chief.model = None;
+        built_in.chief.args = built_in.chief.launch_args();
+        built_in.chief.model = None;
         assert_eq!(serde_json::to_value(&parsed).unwrap(), serde_json::to_value(&built_in).unwrap());
         assert_eq!(parsed.agent("claude").unwrap().kind, AgentKind::Claude);
         assert!(parsed.steer.session_context.contains("{base_ref}"));
@@ -1641,6 +1806,26 @@ kind = "shell"
         assert_eq!(config.layout.sidebar_width, LayoutConfig::default().sidebar_width);
         assert_eq!(config.font.size, 13.0);
         assert_eq!(config.terminal.scrollback, 5000);
+    }
+
+    #[test]
+    fn terminal_clipboard_policy_defaults_to_focus_and_keeps_sandboxes_off() {
+        let default: Config = toml::from_str("").unwrap();
+        assert_eq!(default.terminal.clipboard, ClipboardPolicy::Focused);
+        for value in ["focused", "off"] {
+            let config: Config = toml::from_str(&format!("[terminal]\nclipboard = '{value}'")).unwrap();
+            for focused in [false, true] {
+                for sandboxed in [false, true] {
+                    assert_eq!(
+                        config.terminal.clipboard.allows(focused, sandboxed),
+                        value == "focused" && focused && !sandboxed
+                    );
+                }
+            }
+            let saved = toml::to_string(&config.terminal).unwrap();
+            assert!(saved.contains(&format!("clipboard = \"{value}\"")));
+        }
+        assert!(toml::from_str::<Config>("[terminal]\nclipboard = 'all'").is_err());
     }
 
     #[test]

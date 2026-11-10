@@ -78,6 +78,23 @@ impl Store {
         self.save(&catalog)
     }
 
+    /// Administrator sync is idempotent. An unchanged rule/value keeps live grants; a changed
+    /// entry is replaced atomically, and the broker revokes grants made from its old value.
+    pub(crate) fn sync_secret_rule(&self, spec: Secret, value: &str) -> Result<bool> {
+        spec.validate().map_err(anyhow::Error::msg)?;
+        if !valid_value(&spec, value) || self.broker.is_some() {
+            bail!("Invalid private secret sync");
+        }
+        let _lock = self.keychain.catalog_lock()?;
+        let mut catalog = self.load()?;
+        if catalog.secrets.get(&spec.name).is_some_and(|old| old.spec == spec && old.value == value) {
+            return Ok(false);
+        }
+        catalog.secrets.insert(spec.name.clone(), Stored { spec, value: value.into() });
+        self.save(&catalog)?;
+        Ok(true)
+    }
+
     /// Only session preparation and the authenticated native clipboard worker read values.
     pub(crate) fn secret_values(&self) -> Result<Vec<(Secret, Zeroizing<String>)>> {
         if self.broker.is_some() {

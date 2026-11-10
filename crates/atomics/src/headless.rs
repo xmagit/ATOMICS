@@ -63,7 +63,7 @@ pub fn run(options: Options) -> i32 {
         (None, Some(error)) => {
             // A host clients cannot reach is not healthy: say why and let the service manager see it.
             log(&format!("[remote] is enabled but the protocol server cannot start (port {}): {error}", remote.port));
-            stop(host, &socket);
+            stop(host);
             return 1;
         }
         (None, None) => log("protocol server off ([remote] enabled = false)"),
@@ -78,14 +78,14 @@ pub fn run(options: Options) -> i32 {
     }
     let signal = signals.wait();
     log(&format!("{} received; stopping", signal_name(signal)));
-    stop(host, &socket);
+    stop(host);
     0
 }
 
 /// No new hooks, ctl or MCP requests (the socket goes first; its listener thread ends with the
 /// process), then the protocol server and the runtime, then the shutdown the desktop does on quit.
-fn stop(mut host: crate::host::Host, socket: &std::path::Path) {
-    let _ = std::fs::remove_file(socket);
+fn stop(mut host: crate::host::Host) {
+    host.state().stop_accepting_control();
     host.stop();
     host.state().shutdown();
     drop(host);

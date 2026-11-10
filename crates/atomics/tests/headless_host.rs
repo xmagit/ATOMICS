@@ -25,6 +25,63 @@ struct Instance {
     dir: TempDir,
 }
 
+#[test]
+fn audit_p7_long_socket_startup_fails_on_stderr_before_opening_a_window() {
+    let instance = Instance::new(None);
+    for args in [vec![], vec!["host"]] {
+        let output = test_support::output(
+            instance
+                .command(args)
+                .env("ATOMICS_SOCKET", instance.home().join("x".repeat(150)))
+                .env_remove("DISPLAY")
+                .env_remove("WAYLAND_DISPLAY"),
+        );
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("platform limit"), "{error}");
+        assert!(error.contains("ATOMICS_SOCKET"), "{error}");
+        assert!(error.contains("ATOMICS_HOME"), "{error}");
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn audit_p7_a_long_instance_home_uses_the_same_runtime_socket_for_host_and_clients() {
+    let instance = Instance::new(None);
+    let home = instance.home().join("state".repeat(35));
+    let command = |args: Vec<String>| {
+        let mut command = instance.command(args);
+        command.env("ATOMICS_HOME", &home).env_remove("ATOMICS_SOCKET").env_remove("IMACS_SOCKET");
+        command
+    };
+    let mut host = TestChild::spawn(&mut command(vec!["host".into()]), CHILD_TIMEOUT).unwrap();
+    let deadline = Instant::now() + scaled_timeout(Duration::from_secs(30));
+    loop {
+        if let Some(status) = host.child.try_wait().unwrap() {
+            let output = host.wait_output().unwrap();
+            panic!("host exited with {status}: {}", String::from_utf8_lossy(&output.stderr));
+        }
+        let probe = test_support::output(&mut command(vec!["ctl".into(), r#"{"cmd":"list"}"#.into()]));
+        if probe.status.success() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "host and clients did not agree on a runtime socket");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let socket = instance
+        .dir
+        .path()
+        .join("runtime/atomics")
+        .join(atomics_core::paths::runtime_home_hash(&home))
+        .join("atomics.sock");
+    assert!(socket.exists());
+    assert!(!home.join("atomics.sock").exists());
+    // SAFETY: this is the child process that the test owns and has not reaped.
+    assert_eq!(unsafe { libc::kill(host.child.id() as i32, libc::SIGTERM) }, 0);
+    assert!(host.wait_output().unwrap().status.success());
+    assert!(!socket.exists());
+}
+
 impl Instance {
     /// `remote` is the `[remote]` port to enable (0 picks a free one); `None` leaves remote off.
     fn new(remote: Option<u16>) -> Self {
@@ -1055,12 +1112,15 @@ fn the_host_start_drops_cleanup_failures_it_no_longer_finds_and_keeps_alerts() {
     let instance = Instance::new(None);
     use std::os::unix::fs::DirBuilderExt;
     std::fs::DirBuilder::new().mode(0o700).create(instance.home()).unwrap();
-    // An earlier version left the ledger noting a git record whose file and sandbox are gone, so
-    // every start and plan cleanup failed on it, and kept those failures forever.
+    // A missing record can heal from its ledger copy once its sandbox and original folder are gone.
+    // An unreadable legacy record without that copy must instead stay blocked.
     let record = instance.home().join("git-pins/atomics-gone.json");
     std::fs::write(
         instance.home().join("sandbox-ownership.json"),
-        json!({"atomics-gone": {"created": 0, "pins": instance.home().join("git-pins")}}).to_string(),
+        json!({"atomics-gone": {"created": 0, "pins": instance.home().join("git-pins"),
+            "git_pins": {"work_tree": instance.dir.path().join("gone-project"),
+                "git_dir": null, "common_dir": null}}})
+        .to_string(),
     )
     .unwrap();
     let missing = format!("reading {}: No such file or directory (os error 2)", record.display());

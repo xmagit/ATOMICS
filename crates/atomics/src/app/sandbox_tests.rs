@@ -1,5 +1,5 @@
 //! Agents in Docker Sandboxes, against the fake `sbx` in tests/fixtures.
-use super::tests::{repository, request, with_app};
+use super::tests::{persist_config, repository, request, with_app};
 use super::*;
 use crate::sandbox::fake;
 use atomics_core::isolation::IsolationMode;
@@ -422,18 +422,26 @@ fn azure_placeholders_reach_claude_and_codex_and_are_revoked_on_close() {
         let (_dir, repo) = repository();
         let bin = crate::test_support::tempdir().unwrap();
         app.runtime.sbx = fake::install(bin.path()).display().to_string();
+        // This test checks revocation on close; an immediately exiting fake revokes on exit first.
+        std::fs::write(bin.path().join("run-waits"), "").unwrap();
         app.runtime.config.isolation.mode = IsolationMode::Sandbox;
         let config = atomics_core::isolation::AzureConfig { enabled: true, ..Default::default() };
+        persist_config(app.runtime);
         let program = crate::relay::azure::tests::fake(bin.path());
-        app.runtime.relay = Arc::new(
-            crate::relay::Service::new(paths::atomics_home(), app.runtime.relay.keychain().clone())
-                .with_azure(crate::relay::azure::Azure::new(program, config.clone())),
-        );
+        let keychain = app.runtime.relay.keychain().clone();
+        let relay = || {
+            Arc::new(
+                crate::relay::Service::new(paths::atomics_home(), keychain.clone())
+                    .with_azure(crate::relay::azure::Azure::new(program.clone(), config.clone())),
+            )
+        };
+        app.runtime.relay = relay();
         assert!(!app.runtime.config.isolation.sandbox.azure.enabled);
         let off = app.runtime.start("codex", repo.clone(), None, vec![], None).unwrap();
         let off_name = format!("atomics-{off}");
-        tick_until(app, ctx, "the Azure-disabled sandbox to attach", |_| {
-            fake::calls_to(bin.path(), &["run"]).iter().any(|run| run.contains(&off_name))
+        tick_until(app, ctx, "the Azure-disabled sandbox to attach", |app| {
+            app.runtime.find(&off).is_some_and(|index| app.runtime.sessions[index].terminal.is_some())
+                && fake::calls_to(bin.path(), &["run"]).iter().any(|run| run.contains(&off_name))
         });
         for verb in ["create", "run"] {
             let call = fake::calls_to(bin.path(), &[verb]).into_iter().find(|call| call.contains(&off_name)).unwrap();
@@ -443,16 +451,31 @@ fn azure_placeholders_reach_claude_and_codex_and_are_revoked_on_close() {
         assert!(app.runtime.sessions[app.runtime.find(&off).unwrap()].relay.is_none());
         app.runtime.close(&off);
         app.runtime.config.isolation.sandbox.azure = config.clone();
+        persist_config(app.runtime);
+        // A config apply in the disabled phase can revoke its broker. Start the enabled phase
+        // with a fresh fixture after the enabled settings have reached disk and been applied.
+        app.runtime.relay = relay();
+        let saved = std::fs::read_to_string(&app.runtime.config_path).unwrap();
         for agent in ["claude", "codex"] {
             let id = app.runtime.start(agent, repo.clone(), None, vec![], None).unwrap();
+            // Exercise a real file reload during preparation instead of racing the one-second poll.
+            std::fs::write(&app.runtime.config_path, format!("# reload while {agent} starts\n{saved}")).unwrap();
+            app.runtime.reload_config();
             let name = format!("atomics-{id}");
-            tick_until(app, ctx, "the Azure-enabled sandbox to attach", |_| {
-                fake::calls_to(bin.path(), &["run"]).iter().any(|run| run.contains(&name))
+            tick_until(app, ctx, "the Azure-enabled sandbox to attach", |app| {
+                app.runtime.find(&id).is_some_and(|index| app.runtime.sessions[index].terminal.is_some())
+                    && fake::calls_to(bin.path(), &["run"]).iter().any(|run| run.contains(&name))
             });
             let index = app.runtime.find(&id).unwrap();
-            let granted = app.runtime.sessions[index].relay.clone().unwrap();
+            assert_ne!(app.runtime.sessions[index].status, AgentStatus::Exited, "{agent} must stay live until close");
+            let granted = app.runtime.sessions[index]
+                .relay
+                .as_ref()
+                .unwrap_or_else(|| panic!("Azure-enabled {agent} session must retain its relay grant after reload"));
             assert!(granted.placeholder.is_empty());
-            let placeholder = granted.azure.as_ref().unwrap();
+            let placeholder = granted.azure.as_ref().unwrap_or_else(|| {
+                panic!("Azure-enabled {agent} session must receive an Azure placeholder after reload")
+            });
             assert!(placeholder.starts_with("atomics-azure-"));
             for verb in ["create", "run"] {
                 let call = fake::calls_to(bin.path(), &[verb]).into_iter().find(|call| call.contains(&name)).unwrap();
@@ -545,6 +568,7 @@ fn subscription(app: &mut Desktop<'_>, bin: &Path) -> crate::relay::fake::Upstre
     crate::test_support::copy_program(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keychain"), &keychain);
     std::fs::write(bin.join("keychain-value"), SUBSCRIPTION).unwrap();
     let upstream = crate::relay::fake::start();
+    persist_config(app.runtime);
     app.runtime.relay = Arc::new(crate::relay::Service::with_upstreams(
         paths::atomics_home(),
         crate::relay::Keychain::at(&keychain, cfg!(target_os = "macos")),
@@ -1373,8 +1397,8 @@ gd=$(git rev-parse --path-format=absolute --git-dir)
 common=$(git rev-parse --path-format=absolute --git-common-dir)
 evil="$gd/evil"
 mkdir -p "$evil/hooks"
-ln -s "$common/objects" "$evil/objects"
-ln -s "$common/refs" "$evil/refs"
+cp -R "$common/objects" "$evil/objects"
+cp -R "$common/refs" "$evil/refs"
 cp "$gd/HEAD" "$evil/HEAD"
 printf '#!/bin/sh\n: > %s\n' '{marker}' > "$evil/hooks/reference-transaction"
 chmod +x "$evil/hooks/reference-transaction"
@@ -1387,13 +1411,22 @@ echo new > a.txt
             std::fs::write(bin.path().join("agent"), script).unwrap();
             let id = app.runtime.start("codex", folder.clone(), None, vec![], Some("Do the task".into())).unwrap();
             let name = format!("atomics-{id}");
-            // Ref recovery on exit restores the moved branch with git's update-ref.
+            // A redirected .git file is pinned; a changed on-disk commondir must stop Git's
+            // refs backend, which can ignore GIT_COMMON_DIR when it writes.
+            let expected = if redirect == "git-file" { "Restored refs/heads/other" } else { "Ref guard check FAILED" };
             tick_until(app, ctx, "ref recovery on agent exit", |app| {
-                app.runtime.sessions.iter().any(|s| {
-                    s.id == id && s.last_message.as_deref().is_some_and(|m| m.contains("Restored refs/heads/other"))
-                })
+                app.runtime
+                    .sessions
+                    .iter()
+                    .any(|s| s.id == id && s.last_message.as_deref().is_some_and(|m| m.contains(expected)))
             });
-            assert_eq!(git::git(&repo, &["rev-parse", "other"]).unwrap(), original, "{redirect}");
+            if redirect == "git-file" {
+                assert_eq!(git::git(&repo, &["rev-parse", "refs/heads/other"]).unwrap(), original);
+            } else {
+                let error = git::git(&folder, &["status"]).unwrap_err();
+                assert!(format!("{error:#}").contains("commondir"));
+                assert!(crate::ref_guard::RefGuard::open(&folder, dir.path().join("another-snapshot.json")).is_err());
+            }
             let record: git::GitPins =
                 serde_json::from_slice(&std::fs::read(paths::git_pins_dir().join(format!("{name}.json"))).unwrap())
                     .unwrap();
@@ -1401,10 +1434,10 @@ echo new > a.txt
             assert_eq!(record.common_dir, Some(repo.join(".git").canonicalize().unwrap()));
 
             // The diff ATOMICS polls, and what worktree cleanup asks of git.
-            let diff = git::diff_against_base(&folder, "main", None).unwrap();
-            assert_eq!(diff.files.iter().map(|f| f.path()).collect::<Vec<_>>(), ["a.txt"], "{redirect}");
-            let health = git::worktree_health(&repo, "main").unwrap();
-            if redirect != "main-commondir" {
+            if redirect == "git-file" {
+                let diff = git::diff_against_base(&folder, "main", None).unwrap();
+                assert_eq!(diff.files.iter().map(|f| f.path()).collect::<Vec<_>>(), ["a.txt"], "{redirect}");
+                let health = git::worktree_health(&repo, "main").unwrap();
                 assert_eq!(health[0].dirty_files, 1, "{redirect}: {health:?}");
                 assert!(git::remove_worktree(&repo, &folder, None, false).is_err(), "{redirect}: uncommitted a.txt");
             }
@@ -1415,6 +1448,18 @@ echo new > a.txt
             // Without its record, git follows the planted files to that hook.
             let raw = std::process::Command::new("git").arg("-C").arg(&folder).args(["status"]).output().unwrap();
             assert!(raw.status.success() && marker.exists(), "{redirect}: the planted config must be live");
+            std::fs::remove_file(&marker).unwrap();
+            if redirect == "worktree-commondir" {
+                std::fs::write(
+                    record.git_dir.as_ref().unwrap().join("commondir"),
+                    record.common_dir.as_ref().unwrap().display().to_string(),
+                )
+                .unwrap();
+            } else if redirect == "main-commondir" {
+                std::fs::remove_file(record.common_dir.as_ref().unwrap().join("commondir")).unwrap();
+            }
+            git::git(&folder, &["status"]).unwrap();
+            assert!(!marker.exists());
             app.runtime.sessions.clear();
         }
     });

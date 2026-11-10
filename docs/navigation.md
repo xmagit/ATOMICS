@@ -15,7 +15,7 @@ bar. The keys are the last section.
 | A session | The sidebar's AGENTS list, a tile, the tab strip, `cmd+1…9`, `cmd+j`, the notice line. | The sidebar was one flat list; which plan a session worked for, and which ones needed the user, was only in a status word. |
 | The chief | The CHIEF pill (`cmd+o`); on the phone a Chief pane in the bottom bar. | The phone and the desktop put it in different places. |
 | A diff | **Show diff**/**Hide diff**, `cmd+d`, a tile's title, `shift+↓/↑`, the explorer. | Three buttons (Show diff, Plan, Tickets) toggled one panel in three different ways. |
-| Settings | The Settings window (desktop), ⋯ (browser and phone). | — |
+| Settings | The Settings window; a gear beside Actions when the folded bar has room, otherwise inside Actions. | — |
 | Where am I | The selected tab or the name on the Boards button, the active tile's header, the diff panel's title. | No single line said plan › task › session. |
 | Back | — | No way back to the place before: opening a task's diff from the board lost the board. |
 

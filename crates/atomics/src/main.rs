@@ -96,6 +96,9 @@ struct Cli {
 enum Command {
     /// Run the headless VM secret broker (a separate system user).
     SecretBroker(relay::broker::Options),
+    /// Private stdin-only bridge to the broker's administration socket.
+    #[command(hide = true)]
+    SecretBrokerAdmin,
     /// Store secrets once for sessions in scope; values are accepted on stdin only.
     Secret {
         #[command(subcommand)]
@@ -316,12 +319,18 @@ const PARENT_SESSION_VARS: &[&str] = &[
 
 fn main() -> eframe::Result {
     let cli = Cli::try_parse().unwrap_or_else(|error| {
-        if std::env::args_os().any(|arg| arg == "secret" || arg == "secret-broker") && !matches!(error.kind(), clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion) {
+        if std::env::args_os().any(|arg| arg == "secret" || arg == "secret-broker" || arg == "secret-broker-admin") && !matches!(error.kind(), clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion) {
             eprintln!("Invalid secret command (arguments hidden). Use atomics secret --help. Values are accepted on stdin only.");
             std::process::exit(2);
         }
         error.exit()
     });
+    if matches!(cli.command, None | Some(Command::Host { .. }))
+        && let Err(error) = atomics_core::paths::validate_socket_path(&atomics_core::paths::socket_path())
+    {
+        eprintln!("atomics: {error}");
+        std::process::exit(1);
+    }
     let mut migration_errors = Vec::new();
     if matches!(cli.command, None | Some(Command::Host { .. })) {
         for var in PARENT_SESSION_VARS {
@@ -336,6 +345,7 @@ fn main() -> eframe::Result {
         cli.command,
         Some(
             Command::SecretBroker(_)
+                | Command::SecretBrokerAdmin
                 | Command::Hook { .. }
                 | Command::Statusline { .. }
                 | Command::HooksJson { .. }
@@ -377,6 +387,13 @@ fn main() -> eframe::Result {
         unsafe { setup::adopt_login_path() };
     }
     match cli.command {
+        Some(Command::SecretBrokerAdmin) => {
+            if relay::broker::admin_stdin().is_err() {
+                eprintln!("Secret broker administration failed (contents hidden)");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
         Some(Command::SecretBroker(options)) => {
             if let Err(error) = relay::broker::run(options) {
                 eprintln!("Secret broker failed: {error}");

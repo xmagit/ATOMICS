@@ -6,6 +6,7 @@ use crate::session::AgentStatus;
 
 fn session() -> SessionInfo {
     SessionInfo {
+        status_hint: None,
         previews: Vec::new(),
         id: "s1".into(),
         agent: "claude".into(),
@@ -322,7 +323,7 @@ fn every_message() -> Vec<Message> {
             digest: None,
             action: crate::ops::PlanAction::Set {
                 goal: "g".into(),
-                tasks: vec![crate::plan::Task { id: "t1".into(), title: "do".into(), ..Default::default() }],
+                tasks: vec![crate::plan::TaskInput { id: "t1".into(), title: "do".into(), ..Default::default() }],
                 integration: Some("atomics/plan-g".into()),
             },
         }),

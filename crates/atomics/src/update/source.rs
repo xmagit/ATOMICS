@@ -18,6 +18,8 @@ const LOW_PRIORITY: [&str; 3] = ["nice", "-n", "19"];
 #[derive(Clone)]
 pub struct Source {
     checkout: PathBuf,
+    home: PathBuf,
+    sbx: String,
     /// What runs the install script in the build queue; nothing in a test, which has no queue to wait in.
     queue: Vec<OsString>,
     /// `[resources] jobs` here, for a build with no ATOMICS whose job pool it could share.
@@ -34,6 +36,8 @@ impl Source {
         let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
         Source {
             checkout: atomics_core::paths::expand(path),
+            home: atomics_core::paths::atomics_home(),
+            sbx: "sbx".into(),
             queue: vec![program, "queue".into(), "--class".into(), "test".into(), "--".into()],
             jobs: resources.jobs(cores),
             log: atomics_core::paths::atomics_home().join("update.log"),
@@ -45,36 +49,56 @@ impl Source {
         git::git(&self.checkout, args).map(|text| text.trim().to_string())
     }
 
-    fn fetch(&self) -> Result<()> {
-        self.git(&["fetch", "--quiet", "origin", "+refs/heads/main:refs/remotes/origin/main"])
-            .map(|_| ())
-            .with_context(|| format!("Could not fetch {REMOTE_MAIN} in {}", self.checkout.display()))
+    fn fetch(&self) -> Result<String> {
+        crate::sandbox::refuse_source_update(&self.home, &self.sbx, &self.checkout)?;
+        // The response comes from the remote, not from refs the sandbox can rewrite between
+        // fetching and reading them. Keep this immutable object id through checkout and build.
+        let remote = self.git(&["ls-remote", "--exit-code", "--refs", "--", "origin", "refs/heads/main"])?;
+        let commit = remote
+            .lines()
+            .find_map(|line| {
+                let (object, reference) = line.split_once('\t')?;
+                (reference == "refs/heads/main"
+                    && matches!(object.len(), 40 | 64)
+                    && object.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                .then_some(object)
+            })
+            .context("origin did not advertise a main commit")?
+            .to_string();
+        self.git(&["fetch", "--quiet", "--no-tags", "origin", "refs/heads/main"])
+            .with_context(|| format!("Could not fetch {REMOTE_MAIN} in {}", self.checkout.display()))?;
+        self.git(&["cat-file", "-e", &format!("{commit}^{{commit}}")])?;
+        Ok(commit)
     }
 
     /// Newer when the checkout is behind its remote's main, or holds commits this build lacks, such as after a
     /// build that failed once the checkout had moved.
     pub fn check(&self) -> Result<Option<Found>> {
-        self.fetch()?;
-        let behind: u64 = self.git(&["rev-list", "--count", &format!("HEAD..{REMOTE_MAIN}")])?.parse().unwrap_or(0);
+        let commit = self.fetch()?;
+        let behind = commit_count(&self.git(&["rev-list", "--count", &format!("HEAD..{commit}"), "--"])?)?;
         if behind == 0 && !self.build_lacks_checkout() {
             return Ok(None);
         }
         let detail = if behind > 0 {
-            let subject = self.git(&["log", "-1", "--format=%s", REMOTE_MAIN])?;
+            let subject = self.git(&["log", "-1", "--format=%s", &commit, "--"])?;
             let commits = if behind == 1 { "new commit" } else { "new commits" };
             format!("{behind} {commits} on {REMOTE_MAIN}; the latest: {subject}")
         } else {
             format!("This build lacks commits {} already has.", self.checkout.display())
         };
-        let version = self.git(&["rev-parse", "--short", REMOTE_MAIN])?;
+        let version = self.git(&["rev-parse", "--short", &commit])?;
         Ok(Some(Found { version, detail: Some(detail), notes: None, assets: None }))
     }
 
     /// A build's version is git's own description of its commit, which git reads back; a build from elsewhere names
     /// nothing here.
     fn build_lacks_checkout(&self) -> bool {
-        let build = format!("{}^{{commit}}", self.version.trim_end_matches("-dirty"));
-        let Ok(build) = self.git(&["rev-parse", "--verify", "--quiet", &build]) else { return false };
+        let version = self.version.trim_end_matches("-dirty");
+        let object = version.rsplit_once("-g").map_or(version, |(_, object)| object);
+        if !object.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return false;
+        }
+        let Ok(Some(build)) = git::commit_of(&self.checkout, &format!("{object}^{{commit}}")) else { return false };
         matches!(git::is_ancestor(&self.checkout, "HEAD", &build), Ok(Some(false)))
     }
 
@@ -99,6 +123,9 @@ impl Source {
     }
 
     pub fn install(&self, progress: &dyn Fn(String)) -> Result<()> {
+        crate::sandbox::load_owned_pins(&self.home)?;
+        let _sandboxes = crate::sandbox::repository_lease(&self.checkout, true)?;
+        crate::sandbox::refuse_source_update(&self.home, &self.sbx, &self.checkout)?;
         progress(format!("Fetching {REMOTE_MAIN}"));
         let changes = self.git(&["status", "--porcelain", "--untracked-files=no"])?;
         if !changes.is_empty() {
@@ -107,23 +134,24 @@ impl Source {
                 self.checkout.display()
             );
         }
-        self.fetch()?;
-        self.move_to_remote_main()?;
+        let commit = self.fetch()?;
+        self.move_to_remote_main(&commit)?;
+        crate::sandbox::refuse_source_update(&self.home, &self.sbx, &self.checkout)?;
         progress(format!("Building in the queue, at low priority (log: {})", self.log.display()));
         self.run_install_script()
     }
 
     /// Fast-forwards `main` where it is checked out and behind. Anywhere else the checkout detaches, which leaves
     /// its branch as it was; a commit only HEAD holds would be lost, so that is refused.
-    fn move_to_remote_main(&self) -> Result<()> {
-        if self.git(&["rev-parse", "HEAD"])? == self.git(&["rev-parse", REMOTE_MAIN])? {
+    fn move_to_remote_main(&self, commit: &str) -> Result<()> {
+        if self.git(&["rev-parse", "HEAD"])? == commit {
             return Ok(());
         }
-        let branch = self.git(&["symbolic-ref", "--quiet", "--short", "HEAD"]).ok();
-        let moved = if branch.as_deref() == Some("main")
-            && matches!(git::is_ancestor(&self.checkout, "HEAD", REMOTE_MAIN), Ok(Some(true)))
+        let branch = self.git(&["symbolic-ref", "--quiet", "HEAD"]).ok();
+        let moved = if branch.as_deref() == Some("refs/heads/main")
+            && matches!(git::is_ancestor(&self.checkout, "HEAD", commit), Ok(Some(true)))
         {
-            self.git(&["merge", "--quiet", "--ff-only", REMOTE_MAIN])
+            self.git(&["merge", "--quiet", "--ff-only", "--", commit])
         } else {
             let only_here = self.git(&["rev-list", "-1", "HEAD", "--not", "--branches", "--remotes", "--tags"])?;
             if branch.is_none() && !only_here.is_empty() {
@@ -132,7 +160,7 @@ impl Source {
                     self.checkout.display()
                 );
             }
-            self.git(&["switch", "--quiet", "--detach", REMOTE_MAIN])
+            self.git(&["switch", "--quiet", "--detach", "--", commit])
         };
         moved.map(|_| ()).with_context(|| format!("Could not move {} to {REMOTE_MAIN}", self.checkout.display()))
     }
@@ -154,6 +182,7 @@ impl Source {
         let status = Command::new(&argv[0])
             .args(&argv[1..])
             .current_dir(&self.checkout)
+            .env("GIT_NO_REPLACE_OBJECTS", "1")
             // A job pool of the shell this came from is not this build's.
             .env_remove("CARGO_MAKEFLAGS")
             .env_remove("MAKEFLAGS")
@@ -181,6 +210,10 @@ impl Source {
             self.log.display()
         ))
     }
+}
+
+fn commit_count(output: &str) -> Result<u64> {
+    output.trim().parse().context("Git rev-list returned an invalid commit count; update status is unknown")
 }
 
 /// The script that installs from a checkout on this platform, and what it takes. On a Mac it replaces the bundle
@@ -238,6 +271,80 @@ mod tests {
     use super::*;
     use std::process::Command;
 
+    #[test]
+    fn source_updates_build_the_advertised_commit_despite_planted_refs() {
+        let fixture = Fixture::new(RECORDS);
+        let original = fixture.head();
+        let expected = fixture.push_commit("Remote change");
+        for reference in ["refs/tags/origin/main", "refs/origin/main"] {
+            run(&fixture.source.checkout, &["update-ref", reference, &original]);
+        }
+        let found = fixture.source.check().unwrap().unwrap();
+        assert!(expected.starts_with(&found.version));
+        assert!(found.detail.unwrap().contains("Remote change"));
+        let selected = fixture.source.fetch().unwrap();
+        assert_eq!(selected, expected);
+        // The tracking ref can be rewritten even after fetch. Selection never reads it back.
+        run(&fixture.source.checkout, &["update-ref", "refs/remotes/origin/main", &original]);
+        fixture.source.move_to_remote_main(&selected).unwrap();
+        fixture.source.run_install_script().unwrap();
+        assert_eq!(fixture.head(), expected);
+        assert!(fixture.source.checkout.join("ran").exists());
+    }
+
+    #[test]
+    fn source_updates_refuse_owned_and_unowned_sandboxes_of_the_repository() {
+        let mut fixture = Fixture::new(RECORDS);
+        fixture.push_commit("Remote change");
+        let task = fixture.dir.path().join("task");
+        git::add_worktree(&fixture.source.checkout, &task, "task", "main").unwrap();
+        let bin = fixture.dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        fixture.source.sbx = crate::sandbox::fake::install(&bin).display().to_string();
+        std::fs::create_dir_all(bin.join("sandboxes")).unwrap();
+        std::fs::write(
+            bin.join("sandboxes/other-sandbox"),
+            serde_json::to_vec(&atomics_core::isolation::Listed {
+                name: "other-sandbox".into(),
+                workspaces: vec![
+                    task.display().to_string(),
+                    fixture.source.checkout.join(".git/refs").display().to_string(),
+                ],
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        for owned in [false, true] {
+            if owned {
+                std::fs::remove_file(bin.join("sandboxes/other-sandbox")).unwrap();
+                let home = &fixture.source.home;
+                let pins = home.join("git-pins");
+                crate::sandbox::pin_git(&pins, "atomics-task", &task).unwrap();
+                crate::sandbox_ownership::record_pins(home, "atomics-task", &pins).unwrap();
+                crate::sandbox_ownership::created(home, "atomics-task", crate::sandbox_ownership::Resource::Sandbox)
+                    .unwrap();
+            }
+            let before = fixture.head();
+            assert!(format!("{:#}", fixture.source.check().unwrap_err()).contains("sandbox"));
+            let error = format!("{:#}", fixture.source.install(&|_| {}).unwrap_err());
+            assert!(error.contains("Source update refused"), "{error}");
+            assert_eq!(fixture.head(), before);
+            assert!(!fixture.source.checkout.join("ran").exists());
+        }
+        git::unpin(&task.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn audit_p7_bad_commit_counts_are_errors_instead_of_up_to_date() {
+        for output in ["", "not a count", "-1", "1 2", "18446744073709551616"] {
+            let error = commit_count(output).unwrap_err();
+            assert!(error.to_string().contains("update status is unknown"), "{error}");
+        }
+        assert_eq!(commit_count("0\n").unwrap(), 0);
+        assert_eq!(commit_count(" 12\n").unwrap(), 12);
+    }
+
     fn run(dir: &Path, args: &[&str]) -> String {
         let output = crate::test_support::output(
             Command::new("git")
@@ -273,6 +380,8 @@ mod tests {
             run(dir.path(), &["clone", "--quiet", origin.to_str().unwrap(), checkout.to_str().unwrap()]);
             let source = Source {
                 checkout,
+                home: dir.path().join("state"),
+                sbx: dir.path().join("missing-sbx").display().to_string(),
                 queue: Vec::new(),
                 jobs: 2,
                 log: dir.path().join("update.log"),

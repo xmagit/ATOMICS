@@ -50,6 +50,17 @@ fn drawn(
     let mut output = ctx.run_ui(input, |ui| draw(ui, &mut world.driver, client, view));
     output.textures_delta.clear();
     world.pump();
+    let visible_text: Vec<String> = output
+        .shapes
+        .iter()
+        .filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if shape.clip_rect.contains_rect(text.visual_bounding_rect()) => {
+                Some(text.galley.text().to_string())
+            }
+            _ => None,
+        })
+        .collect();
+    ctx.data_mut(|data| data.insert_temp(egui::Id::NULL.with("visible-view-text"), visible_text));
     output
         .shapes
         .iter()
@@ -197,6 +208,44 @@ fn click(at: egui::Pos2) -> Vec<egui::Event> {
 
 fn live() -> (egui::Context, World, Client, View) {
     live_with(fake_host::host())
+}
+
+#[test]
+fn task_names_and_actionable_statuses_reach_every_shared_view() {
+    use atomics_core::{plan::TaskStatus, session::AgentStatus};
+    let mut host = fake_host::host();
+    let worker = host.board.sessions.iter_mut().find(|s| !s.chief).unwrap();
+    worker.title = "t1 · Fix the parser".into();
+    worker.branch = Some("atomics/a-long-plan-name/t1-fix-the-parser".into());
+    worker.status = AgentStatus::Done;
+    worker.pending_approvals = 0;
+    host.board.approvals.clear();
+    host.board.plans[0].tasks[0].title = "Fix the parser".into();
+    host.board.plans[0].tasks[0].status = TaskStatus::Done;
+    let chief = host.board.sessions.iter_mut().find(|s| s.chief).unwrap();
+    chief.status = AgentStatus::NeedsInput;
+    chief.status_hint = Some("waiting for you: approve the next plan".into());
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, BOARD);
+    assert!(has(&shown, "To: t1 · Fix the parser"), "{shown:?}");
+    assert!(has(&shown, "t1 · Fix the parser · turn done"), "location: {shown:?}");
+    assert!(shown.iter().filter(|(text, _)| text == "t1 · Fix the parser").count() >= 2, "tile and sidebar: {shown:?}");
+    assert!(has(&shown, "● 1 needs you"), "only the chief needs input: {shown:?}");
+    assert!(has(&shown, "waiting for you"), "the chief pill: {shown:?}");
+    assert!(has(&shown, "waiting for you: approve the next plan"), "the chief's reason: {shown:?}");
+    let row = world.driver.remote.session_list().into_iter().find(|s| !s.chief).unwrap();
+    assert!(!row.needs_user());
+    assert!(row.hover().contains("atomics/a-long-plan-name/t1-fix-the-parser"));
+
+    for hint in ["needs sign-in", "first-run setup"] {
+        let mut host = fake_host::working();
+        let worker = host.board.sessions.iter_mut().find(|s| !s.chief).unwrap();
+        worker.status = AgentStatus::NeedsInput;
+        worker.status_hint = Some(hint.into());
+        let (ctx, mut world, mut client, mut view) = live_with(host);
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, BOARD);
+        assert!(shown.iter().any(|(text, _)| text.contains(hint)), "{hint} on the tile: {shown:?}");
+    }
 }
 
 #[test]
@@ -2289,6 +2338,44 @@ fn a_tablets_chief_starts_closed_and_opens_over_the_area_to_type_in_at_once() {
 }
 
 #[test]
+fn p5_review_drawer_dot_excludes_finished_sessions() {
+    use atomics_core::session::AgentStatus;
+    for status in [AgentStatus::Done, AgentStatus::NeedsInput] {
+        let mut host = fake_host::working();
+        let worker = host.board.sessions.iter_mut().find(|s| !s.chief).unwrap();
+        worker.status = status;
+        worker.pending_approvals = 0;
+        host.board.approvals.clear();
+        let (ctx, mut world, mut client, mut view) = live_with(host);
+        tablet(&mut view, IPAD);
+        let mut dot = false;
+        for _ in 0..4 {
+            view.now_ms += 16.0;
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(IPAD.0, IPAD.1))),
+                    time: Some(view.now_ms / 1000.0),
+                    ..Default::default()
+                },
+                |ui| draw(ui, &mut world.driver, &mut client, &mut view),
+            );
+            dot = output.shapes.iter().any(|shape| match &shape.shape {
+                egui::Shape::Circle(circle) => {
+                    Rect::from_center_size(DRAWER_BUTTON, vec2(layout::TABLET_TOUCH, layout::TABLET_TOUCH))
+                        .contains(circle.center)
+                        && circle.radius == 3.5
+                }
+                _ => false,
+            });
+            output.drop_without_applying_deltas();
+            world.pump();
+        }
+        assert!(client.sidebar_hidden);
+        assert_eq!(dot, status == AgentStatus::NeedsInput, "{status:?}");
+    }
+}
+
+#[test]
 fn where_the_sidebar_does_not_fit_a_finger_opens_it_as_a_drawer() {
     // The middle of the button that opens it: first in the top bar, a finger's size.
     let button = egui::pos2(10.0 + layout::TABLET_TOUCH / 2.0, 26.0);
@@ -2872,17 +2959,23 @@ fn headless_settings_shots() {
             }
             self.frame(Vec::new())
         }
-        /// Opens or closes a section of the Settings window.
+        /// Selects a section, returning to the list on a phone first.
         fn toggle(&mut self, label: &str) {
-            let output = self.settle();
-            let shown: Vec<_> = output
-                .shapes
-                .iter()
-                .filter_map(|shape| match &shape.shape {
-                    egui::Shape::Text(text) => Some((text.galley.text().to_string(), text.visual_bounding_rect())),
-                    _ => None,
-                })
-                .collect();
+            let texts = |output: egui::FullOutput| -> Vec<(String, Rect)> {
+                output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) => Some((text.galley.text().to_string(), text.visual_bounding_rect())),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            let mut shown = texts(self.settle());
+            if has(&shown, "‹ Back to sections") {
+                self.frame(click(on(&shown, "‹ Back to sections")));
+                shown = texts(self.settle());
+            }
             self.frame(click(row(&shown, label).center()));
         }
         fn save(&mut self, file: PathBuf) {
@@ -2902,6 +2995,7 @@ fn headless_settings_shots() {
         shots.save(out("opened"));
         shots.toggle("Theme");
         for (part, label) in [
+            ("chief", "Chief"),
             ("shortcuts", "Shortcuts"),
             ("agents", "Agents"),
             ("connections", "Connections"),
@@ -3244,8 +3338,7 @@ fn identity_settings_edit_only_selected_scope_keys_and_clear_words_explicitly() 
         client
             .management
             .show_identity(root.into(), Identity { name: Some("Project Example".into()), ..Default::default() });
-        settled(&ctx, &mut world, &mut client, &mut view, size);
-        let shown = section(&ctx, &mut world, &mut client, &mut view, size, "Theme");
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
         assert!(has(&shown, "Commit email (blank inherits)"), "the inherited email is not prefilled: {shown:?}");
         drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "Commit email (blank inherits)")));
         drawn(&ctx, &mut world, &mut client, &mut view, size, vec![egui::Event::Text("edited@example.com".into())]);
@@ -3310,7 +3403,9 @@ fn shared_settings_remote_and_host_folder_picker_work_in_both_layouts() {
         section(&ctx, &mut world, &mut client, &mut view, size, "Theme");
         let shown = settings_content(&ctx, &mut world, &mut client, &mut view, size, "Advanced", "chief.prefer");
         assert!(has(&shown, "Effective configuration") && has(&shown, "chief.prefer"), "{size:?}: {shown:?}");
-        let shown = settings_scroll_to(&ctx, &mut world, &mut client, &mut view, size, shown, "layout.min_tile_width");
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "Find a setting")));
+        drawn(&ctx, &mut world, &mut client, &mut view, size, text("layout.min_tile_width"));
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
         assert!(has(&shown, "layout.min_tile_width"), "{size:?}: {shown:?}");
         section(&ctx, &mut world, &mut client, &mut view, size, "Advanced");
         section(&ctx, &mut world, &mut client, &mut view, size, "Theme");
@@ -3368,7 +3463,7 @@ fn a_client_shows_the_hosts_version_and_a_new_one_and_cannot_start_an_update() {
         assert!(!button(&shown), "{size:?}: {shown:?}");
         client.management.settings = true;
         let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
-        assert!(shown.iter().any(|(text, _)| text.starts_with("Updates")), "{size:?}: {shown:?}");
+        assert!(!has(&shown, "The host runs:"), "Updates waits for selection: {shown:?}");
         let shown = section(&ctx, &mut world, &mut client, &mut view, size, "Updates");
         assert!(has(&shown, "The host runs: 0.1.6"), "{size:?}: {shown:?}");
         client.management.settings = false;
@@ -3384,7 +3479,7 @@ fn a_client_shows_the_hosts_version_and_a_new_one_and_cannot_start_an_update() {
             assert!(!button(&shown), "{shown:?}");
         }
         client.management.settings = true;
-        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        let shown = section(&ctx, &mut world, &mut client, &mut view, size, "Updates");
         for line in ["The host runs: 0.1.6", "New version: 9.0.0", "Release notes"] {
             assert!(has(&shown, line), "{size:?}: {line}: {shown:?}");
         }
@@ -3408,10 +3503,9 @@ fn view_only_clients_read_settings_and_devices_but_cannot_change_them() {
     for size in [WIDE, PHONE] {
         let (ctx, mut world, mut client, mut view) = viewing(fake_host::management());
         client.management.settings = true;
-        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        let shown = section(&ctx, &mut world, &mut client, &mut view, size, "Theme");
         drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "midnight")));
         assert!(has(&shown, "View only: settings changes"), "{size:?}: {shown:?}");
-        // Theme opens by itself and takes most of a phone's height.
         section(&ctx, &mut world, &mut client, &mut view, size, "Theme");
         let shown = section(&ctx, &mut world, &mut client, &mut view, size, "Advanced");
         assert!(has(&shown, "Effective configuration"), "{size:?}: {shown:?}");
@@ -3447,7 +3541,7 @@ fn row(shown: &[(String, Rect)], label: &str) -> Rect {
     found.unwrap_or_else(|| panic!("{label} is not drawn: {shown:?}")).1
 }
 
-/// Opens or closes the section of the Settings window whose row starts with `label`; the text once it has moved.
+/// Select a section, using the back row on narrow windows.
 fn section(
     ctx: &egui::Context,
     world: &mut World,
@@ -3456,7 +3550,12 @@ fn section(
     size: (f32, f32),
     label: &str,
 ) -> Vec<(String, Rect)> {
-    let shown = settled(ctx, world, client, view, size);
+    let mut shown = settled(ctx, world, client, view, size);
+    if has(&shown, "‹ Back to sections") {
+        drawn(ctx, world, client, view, size, click(on(&shown, "‹ Back to sections")));
+        shown = settled(ctx, world, client, view, size);
+    }
+    shown = settings_scroll_to(ctx, world, client, view, size, shown, label);
     drawn(ctx, world, client, view, size, click(row(&shown, label).center()));
     for _ in 0..8 {
         drawn(ctx, world, client, view, size, Vec::new());
@@ -3500,8 +3599,14 @@ fn settings_scroll_to(
     mut shown: Vec<(String, Rect)>,
     text: &str,
 ) -> Vec<(String, Rect)> {
-    for _ in 0..6 {
-        if has(&shown, text) {
+    for _ in 0..24 {
+        // A partly painted button label can still have its click target below the scroll area's edge.
+        let visible = ctx
+            .data(|data| data.get_temp::<Vec<String>>(egui::Id::NULL.with("visible-view-text")))
+            .unwrap_or_default()
+            .iter()
+            .any(|shown| shown.starts_with(text));
+        if has(&shown, text) && visible {
             break;
         }
         drawn(
@@ -3532,23 +3637,38 @@ fn settings_lead_with_what_people_change_and_each_section_shows_its_content_as_i
     for size in [WIDE, PHONE] {
         let (ctx, mut world, mut client, mut view) = live_with(fake_host::management());
         client.management.settings = true;
-        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        let mut shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(has(&shown, "Where agents run"), "Agents opens first: {shown:?}");
+        assert_eq!(tools_sent(&world), [SettingsTool::CheckSandbox, SettingsTool::CheckPrograms]);
+        if size == PHONE {
+            drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "‹ Back to sections")));
+            shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        }
         let mut last = 0.0;
-        for label in
-            ["Theme", "Shortcuts", "Identity", "Agents", "Connections", "Remote devices", "Credentials", "Advanced"]
-        {
+        for label in [
+            "Agents",
+            "Chief",
+            "Identity",
+            "Connections",
+            "Credentials",
+            "Remote devices",
+            "Shortcuts",
+            "Theme",
+            "Updates",
+            "Getting started",
+            "Advanced",
+        ] {
             let top = row(&shown, label).top();
             assert!(top > last, "{label} comes in order on {size:?}: {shown:?}");
             last = top;
         }
-        assert!(has(&shown, "midnight") && has(&shown, "yours"), "the swatches: {shown:?}");
-        assert!(has(&shown, "Only this host (config.d/host.toml)"), "a remote client's words: {shown:?}");
         assert!(!has(&shown, "Effective configuration"), "under Advanced: {shown:?}");
-        assert!(tools_sent(&world).is_empty(), "nothing is read before it is opened");
 
         for (label, expected, content) in [
             ("Identity", vec![], "Project overrides workspace"),
-            ("Agents", vec![SettingsTool::CheckSandbox, SettingsTool::CheckPrograms], "Docker Sandboxes"),
+            ("Agents", vec![], "Docker Sandboxes"),
+            ("Chief", vec![], "Chief's task agent preference"),
+            ("Theme", vec![], "Only this host (config.d/host.toml)"),
             ("Connections", vec![SettingsTool::RefreshConnections], "linear"),
             ("Credentials", vec![SettingsTool::RefreshCredentials], "Claude subscription"),
             ("Remote devices", vec![], "Paired devices"),
@@ -3557,13 +3677,6 @@ fn settings_lead_with_what_people_change_and_each_section_shows_its_content_as_i
             let before = tools_sent(&world).len();
             let shown = settings_content(&ctx, &mut world, &mut client, &mut view, size, label, content);
             assert!(has(&shown, content), "{label} shows {content} on {size:?}: {shown:?}");
-            if label == "Agents" {
-                for text in
-                    ["Chief's task agent preference", "codex, then claude", "claude: 20.0% left · codex: 10.0% left"]
-                {
-                    assert!(has(&shown, text), "the chief budget is visible on {size:?}: {shown:?}");
-                }
-            }
             settled(&ctx, &mut world, &mut client, &mut view, size);
             let sent = tools_sent(&world);
             assert_eq!(&sent[before..], expected.as_slice(), "{label} reads once, by itself, on {size:?}");
@@ -3603,14 +3716,19 @@ fn picking_a_theme_applies_at_once_and_only_the_users_own_choice_goes_to_the_hos
     for size in [WIDE, PHONE] {
         let (ctx, mut world, mut client, mut view) = live_with(fake_host::management());
         client.management.settings = true;
-        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        let shown = section(&ctx, &mut world, &mut client, &mut view, size, "Theme");
         drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "midnight")));
         let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
         drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "dusk")));
         let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
         drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "claude")));
         settled(&ctx, &mut world, &mut client, &mut view, size);
-        let sent: Vec<_> = world.host.host_commands.iter().collect();
+        let sent: Vec<_> = world
+            .host
+            .host_commands
+            .iter()
+            .filter(|action| !matches!(action, HostAction::SettingsTool { .. }))
+            .collect();
         assert_eq!(
             sent,
             [
@@ -3637,7 +3755,7 @@ fn a_host_whose_own_file_picks_a_theme_gets_the_pick_there_so_that_it_shows() {
     host.board.host.management.as_mut().unwrap().themes.host_picks = true;
     let (ctx, mut world, mut client, mut view) = live_with(host);
     client.management.settings = true;
-    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    let shown = section(&ctx, &mut world, &mut client, &mut view, WIDE, "Theme");
     assert!(!has(&shown, "config.d/host.toml picks"), "nothing to warn of yet: {shown:?}");
     drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(on(&shown, "midnight")));
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
@@ -3674,7 +3792,10 @@ fn a_proposal_from_the_chief_opens_above_settings_and_keeps_its_apply() {
     let apply = exactly(&shown, "Apply");
     let layer = ctx.layer_id_at(apply).expect("a window is there");
     assert_eq!(layer.id, egui::Id::NULL.with("config-proposal"), "above Settings");
-    assert_eq!(world.host.host_commands, [], "a proposal asks before it writes");
+    assert!(
+        !world.host.host_commands.iter().any(|action| matches!(action, HostAction::ConfigDecide { .. })),
+        "a proposal asks before it writes"
+    );
     drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(apply));
     settled(&ctx, &mut world, &mut client, &mut view, WIDE);
     assert!(
@@ -3760,8 +3881,11 @@ fn secret_rows_label_exposure_refuse_remote_copy_and_ask_before_removal() {
     let shown = section(&ctx, &mut world, &mut client, &mut view, WIDE, "Credentials");
     assert!(shown.iter().any(|(text, _)| text.contains("agents can read and leak this value")), "{shown:?}");
     assert!(shown.iter().any(|(text, _)| text.contains("remote and protocol clients cannot copy")), "{shown:?}");
+    // Opening Settings first visits Agents and queues its discovery checks. Copy must leave
+    // that command history unchanged, regardless of which sections have already been visited.
+    let before_copy = tools_sent(&world);
     drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(on(&shown, "Copy (OS authentication)")));
-    assert!(tools_sent(&world).iter().all(|t| matches!(t, SettingsTool::RefreshCredentials)));
+    assert_eq!(tools_sent(&world), before_copy, "remote Copy must not send a command");
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
     drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(on(&shown, "Remove…")));
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
@@ -3817,11 +3941,21 @@ fn every_settings_section_fits_a_narrow_screen() {
     for size in [PHONE, (320.0, 640.0), (600.0, 500.0)] {
         let (ctx, mut world, mut client, mut view) = live_with(fake_host::management());
         client.management.settings = true;
-        let mut shown = settled(&ctx, &mut world, &mut client, &mut view, size);
-        for label in ["Theme", "Shortcuts", "Agents", "Connections", "Remote devices", "Credentials", "Advanced"] {
-            if label != "Theme" {
-                shown = section(&ctx, &mut world, &mut client, &mut view, size, label);
-            }
+        settled(&ctx, &mut world, &mut client, &mut view, size);
+        for label in [
+            "Agents",
+            "Chief",
+            "Identity",
+            "Connections",
+            "Credentials",
+            "Remote devices",
+            "Shortcuts",
+            "Theme",
+            "Updates",
+            "Getting started",
+            "Advanced",
+        ] {
+            let shown = section(&ctx, &mut world, &mut client, &mut view, size, label);
             let window = shown.iter().rposition(|(text, _)| text == "Settings").expect("its title");
             for (text, rect) in shown[window..].iter().filter(|(text, _)| !text.is_empty()) {
                 assert!(
@@ -3835,9 +3969,173 @@ fn every_settings_section_fits_a_narrow_screen() {
                 );
             }
             section(&ctx, &mut world, &mut client, &mut view, size, label);
-            shown = settled(&ctx, &mut world, &mut client, &mut view, size);
         }
     }
+}
+
+#[test]
+fn settings_remembers_its_section_in_each_window_and_survives_a_phone_resize() {
+    for size in [WIDE, PHONE] {
+        let (ctx, mut world, mut client, mut view) = live_with(fake_host::management());
+        client.management.settings = true;
+        let shown = section(&ctx, &mut world, &mut client, &mut view, size, "Chief");
+        assert!(has(&shown, "Custom (args)") && has(&shown, "Heartbeat interval"));
+        drawn(&ctx, &mut world, &mut client, &mut view, size, press(egui::Key::Escape, egui::Modifiers::NONE));
+        assert!(!client.management.settings);
+        client.management.settings = true;
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+        assert!(has(&shown, "Custom (args)") && has(&shown, "‹ Back to sections"));
+        assert!(!has(&shown, "Where agents run"));
+        client.management = Default::default();
+        client.management.settings = true;
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(has(&shown, "Where agents run"), "a different window starts at Agents");
+    }
+}
+
+#[test]
+fn chief_model_and_startup_changes_are_proposed_from_desktop_and_phone_layouts() {
+    for size in [WIDE, PHONE] {
+        let (ctx, mut world, mut client, mut view) = live_with(fake_host::management());
+        client.management.settings = true;
+        let shown = section(&ctx, &mut world, &mut client, &mut view, size, "Chief");
+        assert!(has(&shown, "Custom (args)"));
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(exactly(&shown, "Custom (args)")));
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        for model in ["fable", "opus", "sonnet", "haiku"] {
+            assert!(has(&shown, model), "{shown:?}");
+        }
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(exactly(&shown, "sonnet")));
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "Start chief when ATOMICS starts")));
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        let shown = settings_scroll_to(&ctx, &mut world, &mut client, &mut view, size, shown, "Review chief changes");
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "Review chief changes")));
+        settled(&ctx, &mut world, &mut client, &mut view, size);
+        let change = world
+            .host
+            .host_commands
+            .iter()
+            .find_map(|action| match action {
+                HostAction::ConfigPropose { scope, toml, remove, .. } => Some((scope, toml, remove)),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                panic!("Review proposes a config change on {size:?}: {shown:?}; sent {:?}", world.host.host_commands)
+            });
+        assert_eq!(*change.0, atomics_core::selfconfig::Scope::Main);
+        assert!(change.1.contains("chief.model = \"sonnet\""));
+        assert!(change.1.contains("chief.autostart = true"));
+        assert!(!change.1.contains("chief.args"));
+        assert!(change.2.is_empty());
+        assert!(!world.host.host_commands.iter().any(|action| matches!(action, HostAction::ConfigDecide { .. })));
+    }
+}
+
+#[test]
+fn custom_chief_model_explains_empty_and_invalid_values_and_closing_discards_the_draft() {
+    for size in [WIDE, PHONE] {
+        let (ctx, mut world, mut client, mut view) = live_with(fake_host::management());
+        client.management.settings = true;
+        let shown = section(&ctx, &mut world, &mut client, &mut view, size, "Chief");
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(exactly(&shown, "Custom (args)")));
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "Custom model…")));
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(has(&shown, "Enter a model name."), "{size:?}: {shown:?}");
+        drawn(
+            &ctx,
+            &mut world,
+            &mut client,
+            &mut view,
+            size,
+            click(on(&shown, "Full model name accepted by the command")),
+        );
+        drawn(&ctx, &mut world, &mut client, &mut view, size, text("-invalid"));
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(has(&shown, "A model name cannot start with '-' or contain whitespace."), "{shown:?}");
+        drawn(&ctx, &mut world, &mut client, &mut view, size, press(egui::Key::Escape, egui::Modifiers::NONE));
+        client.management.settings = true;
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(has(&shown, "Custom (args)"));
+        assert!(!has(&shown, "-invalid") && !has(&shown, "Enter a model name."));
+        assert!(!world.host.host_commands.iter().any(|action| matches!(action, HostAction::ConfigPropose { .. })));
+    }
+}
+
+#[test]
+fn shortcut_edits_report_conflicts_and_only_valid_edits_can_be_proposed() {
+    for size in [WIDE, PHONE] {
+        let (ctx, mut world, mut client, mut view) = live_with(fake_host::management());
+        client.management.settings = true;
+        let shown = section(&ctx, &mut world, &mut client, &mut view, size, "Shortcuts");
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(exactly(&shown, "cmd+p")));
+        let mut input = press(egui::Key::A, egui::Modifiers::CTRL | egui::Modifiers::COMMAND);
+        input.push(egui::Event::Text("cmd+d".into()));
+        drawn(&ctx, &mut world, &mut client, &mut view, size, input);
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        let shown =
+            settings_scroll_to(&ctx, &mut world, &mut client, &mut view, size, shown, "Review shortcut changes");
+        assert!(has(&shown, "Conflict:"), "{size:?}: {shown:?}");
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "Review shortcut changes")));
+        settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(!world.host.host_commands.iter().any(|action| matches!(action, HostAction::ConfigPropose { .. })));
+        // Re-select resets the scroll to its saved top before editing the same field.
+        section(&ctx, &mut world, &mut client, &mut view, size, "Agents");
+        section(&ctx, &mut world, &mut client, &mut view, size, "Shortcuts");
+        // Scroll upwards to the first editable binding.
+        for _ in 0..10 {
+            drawn(
+                &ctx,
+                &mut world,
+                &mut client,
+                &mut view,
+                size,
+                vec![
+                    egui::Event::PointerMoved(pos2(size.0 / 2.0, size.1 / 2.0)),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: vec2(0.0, 200.0),
+                        source: egui::MouseWheelSource::Wheel,
+                        phase: egui::TouchPhase::Move,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        let field = shown
+            .iter()
+            .filter(|(text, _)| text == "cmd+d")
+            .min_by(|a, b| a.1.top().total_cmp(&b.1.top()))
+            .unwrap()
+            .1
+            .center();
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(field));
+        let mut input = press(egui::Key::A, egui::Modifiers::CTRL | egui::Modifiers::COMMAND);
+        input.push(egui::Event::Text("cmd+alt+p".into()));
+        drawn(&ctx, &mut world, &mut client, &mut view, size, input);
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        let shown =
+            settings_scroll_to(&ctx, &mut world, &mut client, &mut view, size, shown, "Review shortcut changes");
+        assert!(!has(&shown, "Conflict:"), "{shown:?}");
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "Review shortcut changes")));
+        settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(world.host.host_commands.iter().any(|action| matches!(action, HostAction::ConfigPropose { toml, .. } if toml == "keys.quick_open = \"cmd+alt+p\"\n")), "{:?}", world.host.host_commands);
+    }
+}
+
+#[test]
+fn settings_keeps_an_icon_beside_actions_at_laptop_width() {
+    let (ctx, mut world, mut client, mut view) = live_with(fake_host::management());
+    let size = (1100.0, 800.0);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+    assert!(has(&shown, "Actions"));
+    let icon = exactly(&shown, "⚙");
+    assert!(icon.x > on_bar(&shown, "Actions").x && icon.x < size.0);
+    drawn(&ctx, &mut world, &mut client, &mut view, size, click(icon));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+    assert!(client.management.settings && has(&shown, "Where agents run"));
 }
 
 #[test]
@@ -4355,6 +4653,7 @@ fn agents() -> fake_host::FakeHost {
     for (id, root, file) in [("s0", "/w/zero", "src/zero.rs"), ("s2", "/w/two", "src/two.rs")] {
         let base = host.board.sessions.iter().find(|s| s.id == "s1").expect("the agent").clone();
         host.board.sessions.push(atomics_core::projection::SessionInfo {
+            status_hint: None,
             previews: Vec::new(),
             id: id.into(),
             title: format!("Agent {id}"),
@@ -4764,6 +5063,7 @@ fn in_editor_mode_the_nth_agents_editor_takes_the_keyboard() {
     let mut host = fake_host::panels_host();
     let base = host.board.sessions.iter().find(|s| s.id == "s1").expect("the agent").clone();
     host.board.sessions.push(atomics_core::projection::SessionInfo {
+        status_hint: None,
         previews: Vec::new(),
         id: "s2".into(),
         task: None,

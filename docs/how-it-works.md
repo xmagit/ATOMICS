@@ -15,7 +15,8 @@ running. An install that already has a config never sees it.
 
 A session is one agent in a terminal tile: Claude, Codex or a shell. It works in a git worktree of a
 project, an existing folder, or a scratch folder of its own outside any project (the **Ungrouped** tab).
-The diff panel shows the session's worktree against the merge-base with `base_ref`, and review comments
+The diff panel shows a plan task's worktree against its recorded starting commit, so stacked tasks exclude
+their dependencies' changes. Other sessions compare against the merge-base with `base_ref`. Review comments
 on that diff go to the agent as one message while it keeps working. Claude and Codex report their status
 through hooks. The top bar separates agents working from agents open (`2 working · 12 open`). With none working it says
 `12 idle` when every one is, and otherwise `12 open`, with who needs you, has finished or has exited on hover. It takes

@@ -228,6 +228,41 @@ mod native {
         into: Option<&str>,
         identity: &Identity,
     ) -> Result<Vec<Hit>> {
+        check_task_impl(repo, None, true, branch, base_ref, into, identity)
+    }
+
+    pub fn check_task_at(
+        repo: &Path,
+        worktree: &Path,
+        branch: &str,
+        base_ref: &str,
+        into: Option<&str>,
+        identity: &Identity,
+    ) -> Result<Vec<Hit>> {
+        check_task_impl(repo, Some(worktree), false, branch, base_ref, into, identity)
+    }
+
+    /// Historical tasks with no remaining worktree are checked without discovering a checkout
+    /// from its writable HEAD. Live tasks use `check_task_at` with their recorded path.
+    pub fn check_task_history(
+        repo: &Path,
+        branch: &str,
+        base_ref: &str,
+        into: Option<&str>,
+        identity: &Identity,
+    ) -> Result<Vec<Hit>> {
+        check_task_impl(repo, None, false, branch, base_ref, into, identity)
+    }
+
+    fn check_task_impl(
+        repo: &Path,
+        worktree: Option<&Path>,
+        discover: bool,
+        branch: &str,
+        base_ref: &str,
+        into: Option<&str>,
+        identity: &Identity,
+    ) -> Result<Vec<Hit>> {
         identity.validate().map_err(anyhow::Error::msg)?;
         if !identity.guarded() {
             return Ok(Vec::new());
@@ -304,9 +339,15 @@ mod native {
                 )?,
             );
         }
-        let worktrees =
-            git::list_worktrees(repo).map_err(|_| anyhow::anyhow!("identity guard could not list task worktrees"))?;
-        if let Some(entry) = worktrees.iter().find(|e| e.branch.as_deref() == Some(branch) && e.path.is_dir()) {
+        let entry = match worktree {
+            Some(path) => Some(git::recorded_worktree(repo, path, branch)?),
+            None if discover => git::list_worktrees(repo)
+                .map_err(|_| anyhow::anyhow!("identity guard could not list task worktrees"))?
+                .into_iter()
+                .find(|e| e.branch.as_deref() == Some(branch) && e.path.is_dir()),
+            None => None,
+        };
+        if let Some(entry) = entry {
             ensure!(entry.trusted, "identity guard cannot read an untrusted task worktree");
             patch_hits(
                 &mut hits,
@@ -431,7 +472,7 @@ forbidden_words = []
         git::add_worktree(&repo, &task, "task", "main").unwrap();
         sync_worktree_identity(&task, &Identity::default()).unwrap();
         std::fs::write(task.join("work.txt"), "safe\n").unwrap();
-        git::integrate(&repo, "task", "finish", "integration", &into, "main").unwrap();
+        git::integrate(&repo, &task, "task", "finish", "integration", &into, "main").unwrap();
         assert_eq!(std::fs::read(common.join("config")).unwrap(), before);
         assert!(!common.join("atomics-identities").exists());
         sync_worktree_identity(&task, &identity).unwrap();
@@ -462,7 +503,7 @@ forbidden_words = []
         let mixed_case = Identity { email: Some("CONTEXT@EXAMPLE.COM".into()), ..identity.clone() };
         git::commit_all_with_identity(&task, "new identity", &mixed_case).unwrap();
         assert!(check_task_for_integration(&repo, "task", "main", Some("integration"), &identity).unwrap().is_empty());
-        git::integrate_with_identity(&repo, "task", "finish", "integration", &into, "main", &identity).unwrap();
+        git::integrate_with_identity(&repo, &task, "task", "finish", "integration", &into, "main", &identity).unwrap();
         std::fs::write(task.join("wrong.txt"), "wrong author\n").unwrap();
         git::commit_all_with_identity(
             &task,
@@ -475,7 +516,8 @@ forbidden_words = []
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].file, format!(".git/objects/{}", wrong.trim()));
         assert!(
-            git::integrate_with_identity(&repo, "task", "finish", "integration", &into, "main", &identity).is_err()
+            git::integrate_with_identity(&repo, &task, "task", "finish", "integration", &into, "main", &identity)
+                .is_err()
         );
     }
 
@@ -494,6 +536,7 @@ forbidden_words = []
         );
         let error = git::integrate_with_identity(
             &repo,
+            &task,
             "task",
             "finish",
             "integration",
@@ -546,7 +589,8 @@ forbidden_words = []
         );
         std::fs::write(task.join("automatic.txt"), "automatic work\nmore\n").unwrap();
         let done =
-            git::integrate_with_identity(&repo, "task", "finish", "integration", &into, "main", &identity).unwrap();
+            git::integrate_with_identity(&repo, &task, "task", "finish", "integration", &into, "main", &identity)
+                .unwrap();
         assert!(done.committed);
         assert_eq!(done.merge, git::Merge::Merged);
         for path in [&task, &into] {
@@ -575,6 +619,7 @@ forbidden_words = []
         set_worktree_identity(&task, &identity).unwrap();
         let pending = git::integrate_with_identity(
             &repo,
+            &task,
             "task",
             "CoNtOsO private message",
             "integration",
@@ -589,9 +634,10 @@ forbidden_words = []
         std::fs::write(task.join("a.txt"), "one\ntwo\nprivate surrounding CoNtOsO text\n").unwrap();
         std::fs::write(task.join("untracked.txt"), "safe\nCoNtOsO surrounding text\n").unwrap();
         let head = git::git(&task, &["rev-parse", "HEAD"]).unwrap();
-        let error = git::integrate_with_identity(&repo, "task", "finish", "integration", &into, "main", &identity)
-            .unwrap_err()
-            .to_string();
+        let error =
+            git::integrate_with_identity(&repo, &task, "task", "finish", "integration", &into, "main", &identity)
+                .unwrap_err()
+                .to_string();
         assert!(error.contains("a.txt:3: forbidden word"), "{error}");
         assert!(error.contains("untracked.txt:2: forbidden word"), "{error}");
         assert!(!error.contains("surrounding"));
@@ -609,7 +655,8 @@ forbidden_words = []
         assert!(hits.iter().any(|hit| hit.file == "a.txt" && hit.line == 3));
         assert!(hits.iter().any(|hit| hit.file == format!(".git/objects/{}", commit.trim()) && hit.line > 5));
         assert!(
-            git::integrate_with_identity(&repo, "task", "finish", "integration", &into, "main", &identity).is_err()
+            git::integrate_with_identity(&repo, &task, "task", "finish", "integration", &into, "main", &identity)
+                .is_err()
         );
     }
 
@@ -640,10 +687,18 @@ forbidden_words = []
         assert!(
             hits.iter().any(|h| h.reason == "forbidden word" && h.line == 4 && h.file.starts_with(".git/objects/"))
         );
-        let error =
-            git::integrate_with_identity(&repo, "task-CoNtOsO", "finish", "integration", &into, "main", &identity)
-                .unwrap_err()
-                .to_string();
+        let error = git::integrate_with_identity(
+            &repo,
+            &task,
+            "task-CoNtOsO",
+            "finish",
+            "integration",
+            &into,
+            "main",
+            &identity,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(!error.contains("other@example.com"));
         assert!(!error.contains("Contoso Example"));
         let email_only = Identity { forbidden_words: Some(vec![]), ..identity };
@@ -651,8 +706,17 @@ forbidden_words = []
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].reason, "author email differs from active identity");
         assert!(
-            git::integrate_with_identity(&repo, "task-CoNtOsO", "finish", "integration", &into, "main", &email_only)
-                .is_err()
+            git::integrate_with_identity(
+                &repo,
+                &task,
+                "task-CoNtOsO",
+                "finish",
+                "integration",
+                &into,
+                "main",
+                &email_only
+            )
+            .is_err()
         );
     }
 }

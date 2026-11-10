@@ -39,7 +39,11 @@ pub fn compose_review(header: &str, comments: &[ReviewComment]) -> String {
 pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
     let text = text.replace("\r\n", "\n");
     if bracketed {
-        let clean = text.replace("\x1b[201~", "");
+        let mut clean = text;
+        // Removing one terminator can join two fragments into another terminator.
+        while clean.contains("\x1b[201~") {
+            clean = clean.replace("\x1b[201~", "");
+        }
         format!("\x1b[200~{clean}\x1b[201~").into_bytes()
     } else {
         text.replace('\n', "\r").into_bytes()
@@ -96,6 +100,11 @@ mod tests {
     fn paste_is_bracketed_and_cannot_be_escaped() {
         assert_eq!(paste_bytes("a\nb", true), b"\x1b[200~a\nb\x1b[201~");
         assert_eq!(paste_bytes("x\x1b[201~y", true), b"\x1b[200~xy\x1b[201~");
+        let mut nested = "\x1b[201~".to_string();
+        for _ in 0..8 {
+            nested = format!("\x1b[20{nested}1~");
+        }
+        assert_eq!(paste_bytes(&format!("x{nested}y\x1b[201~z"), true), b"\x1b[200~xyz\x1b[201~");
         assert_eq!(paste_bytes("a\nb", false), b"a\rb");
     }
 

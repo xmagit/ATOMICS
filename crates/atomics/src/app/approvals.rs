@@ -1352,6 +1352,8 @@ mod tests {
                 let dir = crate::test_support::tempdir().unwrap();
                 let upstream = crate::relay::fake::start();
                 let config = atomics_core::isolation::AzureConfig { enabled: true, ..Default::default() };
+                app.runtime.config.isolation.sandbox.azure = config.clone();
+                super::super::tests::persist_config(app.runtime);
                 let azure =
                     crate::relay::azure::Azure::new(crate::relay::azure::tests::fake(dir.path()), config.clone());
                 app.runtime.relay = Arc::new(
@@ -1362,13 +1364,19 @@ mod tests {
                     )
                     .with_azure(azure),
                 );
-                let granted = app.runtime.relay.grant_session("atomics-worker", false, &config).unwrap().unwrap();
+                let granted = app
+                    .runtime
+                    .relay
+                    .grant_session("atomics-worker", false, &config)
+                    .unwrap()
+                    .expect("Azure-enabled approval fixture must receive a relay grant");
+                app.runtime.apply_config();
                 app.runtime.sessions =
                     vec![session("worker", AgentKind::Generic, AgentStatus::Working, &app.runtime.launch_dir)];
                 app.runtime.sessions[0].sandbox = Some("atomics-worker".into());
                 for decision in [Decision::Deny, Decision::AllowAlways] {
                     let port = granted.port;
-                    let placeholder = granted.azure.as_ref().unwrap();
+                    let placeholder = granted.azure.as_ref().expect("Azure approval fixture must have a placeholder");
                     let request = format!(
                         "PUT /management.azure.com/v1/models?api-version=2026 HTTP/1.1\r\nauthorization: Bearer {placeholder}\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{{}}"
                     );

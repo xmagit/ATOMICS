@@ -64,6 +64,10 @@ impl State {
         for (index, plan) in self.plans.iter_mut().enumerate() {
             for task in plan.tasks.iter_mut().filter(|task| task.session.as_deref() == Some(id)) {
                 task.ref_alert = Some(summary.clone());
+                task.integration_verified = false;
+                if task.status != TaskStatus::Done {
+                    task.set_status(TaskStatus::Blocked);
+                }
                 task.notes.push(summary.clone());
                 owners.push(index);
             }
@@ -75,12 +79,199 @@ impl State {
         // Reports wake the chief's normal atomics_wait loop, even after the tile was closed.
         self.report(Some(id), "blocked", &summary);
     }
+
+    pub(super) fn task_ref_alert(&mut self, plan: &str, task: &str, details: String) {
+        let Some(index) = self.plans.iter().position(|p| p.id == plan) else { return };
+        let Some(task) = self.plans[index].task_mut(task) else { return };
+        if let Some(session) = task.session.clone() {
+            self.ref_alert(&session, details);
+        } else {
+            let summary = format!("SANDBOX REF GUARD: {details}");
+            task.ref_alert = Some(summary.clone());
+            task.integration_verified = false;
+            if task.status != TaskStatus::Done {
+                task.set_status(TaskStatus::Blocked);
+            }
+            task.notes.push(summary);
+            self.changed_plans.insert(self.plans[index].id.clone());
+            self.save_plan(index);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::tests::{repository, session, with_app};
     use super::*;
+
+    #[test]
+    fn integration_cannot_overtake_a_ref_alert_waiting_for_the_ui() {
+        with_app("app::ref_guard::tests::integration_cannot_overtake_a_ref_alert_waiting_for_the_ui", |app, _| {
+            let (dir, repo) = repository();
+            let task = dir.path().join("task");
+            git::add_worktree(&repo, &task, "task", "main").unwrap();
+            let guard = crate::ref_guard::Shared::new(
+                crate::ref_guard::RefGuard::open(&task, dir.path().join("snapshot.json")).unwrap().unwrap(),
+            );
+            let initial = git::commit_of(&repo, "refs/heads/main").unwrap().unwrap();
+            git::git(&repo, &["update-ref", "refs/heads/unexpected", &initial]).unwrap();
+            assert!(!guard.check(&Exempt::default()).unwrap().is_empty());
+            // The guard has recovered the ref, but its queued UI alert has not been delivered.
+            let home = paths::atomics_home();
+            let checked = crate::ref_guard::check_integration(
+                &app.runtime.ref_checks,
+                Some(guard.clone()),
+                &home,
+                &task,
+                Exempt::default(),
+            );
+            assert!(format!("{:#}", checked.unwrap_err()).contains("unacknowledged"));
+            let mut sandboxed = session("s", AgentKind::Generic, AgentStatus::Done, &task);
+            sandboxed.ref_guard = Some(guard.clone());
+            app.runtime.sessions = vec![sandboxed];
+            app.runtime.plans = vec![Plan {
+                id: "p".into(),
+                tasks: vec![Task { id: "t".into(), session: Some("s".into()), ..Default::default() }],
+                ..Default::default()
+            }];
+            app.runtime.task_action(0, 0, "acknowledge_refs");
+            assert!(
+                crate::ref_guard::check_integration(
+                    &app.runtime.ref_checks,
+                    Some(guard),
+                    &home,
+                    &task,
+                    Exempt::default()
+                )
+                .unwrap()
+                .is_empty()
+            );
+            app.runtime.sessions.clear();
+        });
+    }
+
+    #[test]
+    fn broken_owned_pins_block_startup_doctor_template_and_the_tile() {
+        use atomics_ui::Backend;
+        super::super::tests::with_login_state(
+            "app::ref_guard::tests::broken_owned_pins_block_startup_doctor_template_and_the_tile",
+            |root| {
+                let repo = root.join("repo");
+                let task = root.join("task");
+                std::fs::create_dir(&repo).unwrap();
+                for args in [
+                    &["init", "-qb", "main"][..],
+                    &[
+                        "-c",
+                        "user.name=Test",
+                        "-c",
+                        "user.email=test@example.org",
+                        "commit",
+                        "--allow-empty",
+                        "-qm",
+                        "initial",
+                    ],
+                ] {
+                    git::git(&repo, args).unwrap();
+                }
+                git::add_worktree(&repo, &task, "task", "main").unwrap();
+                let home = root.join("state");
+                let pins = home.join("git-pins");
+                crate::sandbox::pin_git(&pins, "atomics-task", &task).unwrap();
+                crate::sandbox_ownership::record_pins(&home, "atomics-task", &pins).unwrap();
+                crate::sandbox_ownership::created(&home, "atomics-task", crate::sandbox_ownership::Resource::Sandbox)
+                    .unwrap();
+                git::unpin(&task.canonicalize().unwrap());
+                std::fs::write(pins.join("atomics-task.json"), "broken json").unwrap();
+                vec![("ATOMICS_TEST_PIN_ERROR", "1".into())]
+            },
+            |mut state, _| {
+                let task = paths::home().join("task");
+                assert!(git::git_refusal(&task).unwrap().contains("host git is blocked"));
+                assert!(git::git(&task, &["status"]).is_err());
+                state.sessions = vec![session("s", AgentKind::Generic, AgentStatus::Idle, &task)];
+                let warning = state.backend().tile(0).unwrap().warning.unwrap();
+                assert!(warning.contains("Unreadable sandbox git pin"), "{warning}");
+                let doctor = crate::doctor::json(None, std::slice::from_ref(&task)).to_string();
+                assert!(doctor.contains("sandbox git pins") && doctor.contains("host git is blocked"), "{doctor}");
+                let error =
+                    crate::sandbox::template::run(&task.display().to_string(), None, "codex", None, None).unwrap_err();
+                assert!(format!("{error:#}").contains("Unreadable sandbox git pin"));
+                state.sessions.clear();
+                state.shutdown();
+            },
+        );
+    }
+
+    #[test]
+    fn a_broken_legacy_pin_without_a_ledger_copy_blocks_all_host_git() {
+        super::super::tests::with_login_state(
+            "app::ref_guard::tests::a_broken_legacy_pin_without_a_ledger_copy_blocks_all_host_git",
+            |root| {
+                let home = root.join("state");
+                let pins = home.join("git-pins");
+                std::fs::create_dir_all(&pins).unwrap();
+                std::fs::write(pins.join("atomics-legacy.json"), "broken json").unwrap();
+                std::fs::write(
+                    home.join("sandbox-ownership.json"),
+                    serde_json::to_vec(&json!({
+                        "atomics-legacy": {"sandbox":true, "pins":pins}
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+                vec![("ATOMICS_TEST_PIN_ERROR", "1".into())]
+            },
+            |mut state, _| {
+                assert!(git::pinned_all().is_empty());
+                let error = git::git(&paths::home(), &["status"]).unwrap_err();
+                assert!(format!("{error:#}").contains("Unreadable sandbox git pin"));
+                assert!(git::git_refusal(Path::new("/")).is_some());
+                state.shutdown();
+            },
+        );
+    }
+
+    #[test]
+    fn a_failed_ref_check_blocks_integration_before_any_git_write() {
+        with_app("app::ref_guard::tests::a_failed_ref_check_blocks_integration_before_any_git_write", |app, ctx| {
+            let (dir, repo) = repository();
+            let task = dir.path().join("task");
+            git::add_worktree(&repo, &task, "task", "main").unwrap();
+            let guard = crate::ref_guard::RefGuard::open(&task, dir.path().join("snapshot.json")).unwrap().unwrap();
+            let mut sandboxed = session("s", AgentKind::Generic, AgentStatus::Done, &task);
+            sandboxed.sandbox = Some("atomics-s".into());
+            sandboxed.ref_guard = Some(crate::ref_guard::Shared::new(guard));
+            app.runtime.sessions = vec![sandboxed];
+            app.runtime.plans = vec![Plan {
+                id: "p".into(),
+                project: Some(repo.clone()),
+                tasks: vec![Task {
+                    id: "t".into(),
+                    branch: Some("task".into()),
+                    worktree: Some(task.clone()),
+                    session: Some("s".into()),
+                    status: TaskStatus::Review,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }];
+            std::fs::write(task.join("pending.txt"), "must stay uncommitted\n").unwrap();
+            std::fs::write(repo.join(".git/refs/heads/broken"), "invalid object\n").unwrap();
+            app.runtime.integrate(0, "t", None);
+            super::super::sandbox_tests::tick_until(app, ctx, "failed integration guard", |app| {
+                app.runtime.integrating.is_empty() && app.runtime.plans[0].tasks[0].ref_alert.is_some()
+            });
+            assert!(app.runtime.plans[0].tasks[0].ref_alert.as_ref().unwrap().contains("FAILED"));
+            assert!(!git::branch_exists(&repo, "atomics/plan-p"));
+            assert!(git::git(&task, &["diff", "--cached"]).unwrap().is_empty());
+            app.runtime.report(Some("s"), "done", "try again");
+            app.runtime.plans[0].tasks[0].status = TaskStatus::Review;
+            app.runtime.integrate(0, "t", None);
+            assert!(app.runtime.integrating.is_empty(), "an unacknowledged alert prevents integration");
+            app.runtime.sessions.clear();
+        });
+    }
 
     #[test]
     fn checks_run_off_the_state_lock_and_restore_branches_of_done_tasks_and_exited_agents() {
@@ -172,24 +363,28 @@ mod tests {
                     id: id.into(),
                     repo: Some(repo.to_string_lossy().into_owned()),
                     branch: Some(branch.into()),
+                    worktree: Some(dir.path().join(branch)),
                     status,
                     ..Default::default()
                 };
                 let running = Task { worktree: Some(guarded.clone()), ..task("a", "guarded", TaskStatus::Running) };
                 app.runtime.plans = vec![Plan { id: "first".into(), tasks: vec![running], ..Default::default() }];
 
-                // A check queued before the next plan exists runs only after ATOMICS made that plan's
-                // integration branch: the race that deleted an integration branch end to end.
+                // A check captured before the next plan exists must preserve host-created branches.
+                // Integration now waits for that check before writing its integration branch.
                 let (release, wait) = std::sync::mpsc::channel::<()>();
                 app.runtime.ref_checks.run(move || {
                     let _ = wait.recv();
                 });
                 app.runtime.check_refs(0);
-                git::git(&repo, &["branch", "next-task"]).unwrap();
+                let write = crate::ref_guard::host_write(&repo, ["next-task"]);
+                git::add_worktree(&repo, &dir.path().join("next-task"), "next-task", "main").unwrap();
+                drop(write);
                 let tasks = vec![task("b", "next-task", TaskStatus::Review)];
                 app.runtime.plans.push(Plan { id: "second".into(), approved: true, tasks, ..Default::default() });
                 let into = app.runtime.plans[1].integration_branch();
                 app.runtime.integrate(1, "b", None);
+                release.send(()).unwrap();
                 let integrated = app
                     .runtime
                     .integrate_rx
@@ -199,7 +394,6 @@ mod tests {
                 app.runtime.finish_integration(integrated);
                 // Meanwhile the agent makes a branch of its own.
                 git::git(&guarded, &["branch", "agent-made"]).unwrap();
-                release.send(()).unwrap();
                 // And the next check, with both plans in place.
                 app.runtime.check_refs(0);
                 app.runtime.ref_checks.finish();
@@ -237,7 +431,7 @@ mod tests {
                 for name in ["guarded", "closed"] {
                     git::add_worktree(&repo, &worktree(name), name, "main").unwrap();
                 }
-                git::git(&repo, &["branch", "next-task"]).unwrap();
+                git::add_worktree(&repo, &worktree("next-task"), "next-task", "main").unwrap();
                 let guard = RefGuard::open(&worktree("guarded"), dir.path().join("snapshot.json")).unwrap().unwrap();
                 let mut sandboxed =
                     session("sandboxed", AgentKind::Generic, AgentStatus::Working, &worktree("guarded"));
@@ -250,6 +444,7 @@ mod tests {
                     id: id.into(),
                     repo: Some(repo.to_string_lossy().into_owned()),
                     branch: Some(branch.into()),
+                    worktree: Some(worktree(branch)),
                     status,
                     ..Default::default()
                 };
@@ -449,8 +644,8 @@ mod tests {
     }
 
     #[test]
-    fn a_progress_report_clears_the_ref_alert_and_the_blocked_task() {
-        with_app("app::ref_guard::tests::a_progress_report_clears_the_ref_alert_and_the_blocked_task", |app, _| {
+    fn agent_reports_keep_the_ref_alert_until_the_user_acknowledges_it() {
+        with_app("app::ref_guard::tests::agent_reports_keep_the_ref_alert_until_the_user_acknowledges_it", |app, _| {
             let (dir, _repo) = repository();
             let mut sandboxed = session("s", AgentKind::Generic, AgentStatus::NeedsInput, dir.path());
             sandboxed.sandbox = Some("atomics-s".into());
@@ -464,17 +659,15 @@ mod tests {
                 assert_eq!(app.runtime.sessions[0].status, AgentStatus::NeedsInput);
                 app.runtime.report(Some("s"), status, "carrying on");
                 let task = &app.runtime.plans[0].tasks[0];
-                assert!(task.ref_alert.is_none(), "{status}");
-                assert_ne!(task.status, TaskStatus::Blocked, "{status}");
+                assert!(task.ref_alert.is_some(), "{status}");
+                assert_eq!(task.status, TaskStatus::Blocked, "{status}");
                 let session = &app.runtime.sessions[0];
-                assert_ne!(session.status, AgentStatus::NeedsInput, "{status}");
-                // The flip goes through the activity record: progress starts the working clock, done ends the turn.
-                let activity = &session.activity;
-                match status {
-                    "progress" => assert!(activity.working_since.is_some() && activity.wake_since.is_none()),
-                    _ => assert!(activity.turn_ended.is_some() && activity.wake_since.is_some()),
-                }
+                assert_eq!(session.status, AgentStatus::NeedsInput, "{status}");
             }
+            app.runtime.task_action(0, 0, "acknowledge_refs");
+            assert!(app.runtime.plans[0].tasks[0].ref_alert.is_none());
+            app.runtime.report(Some("s"), "done", "ready for review");
+            assert_eq!(app.runtime.plans[0].tasks[0].status, TaskStatus::Review);
             app.runtime.sessions.clear();
         });
     }

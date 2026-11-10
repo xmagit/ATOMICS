@@ -877,6 +877,7 @@ impl FakeHost {
             SessionAction::Start { agent, folder, .. } => {
                 let id = format!("new-{}", self.head());
                 let session = SessionInfo {
+                    status_hint: None,
                     previews: Vec::new(),
                     id: id.clone(),
                     title: "new session".into(),
@@ -1273,6 +1274,7 @@ pub fn board() -> Board {
     use atomics_core::projection::{DiffFileSummary, TaskLink};
     use atomics_core::session::AgentStatus;
     let session = |id: &str, title: &str, chief: bool| SessionInfo {
+        status_hint: None,
         previews: Vec::new(),
         id: id.into(),
         agent: "claude".into(),
@@ -1511,6 +1513,12 @@ pub fn management() -> FakeHost {
                 "keys.toggle_diff": {"value":"cmd+d","source":"default"},
                 "agents": {"value":[{"name":"claude","command":["claude"],"kind":"claude"}],"source":"default"},
                 "chief.prefer": {"value":["codex", "claude"],"source":"default"},
+                "chief.command": {"value":["claude"],"source":"default"},
+                "chief.args": {"value":["--model", "custom-chief"],"source":"main"},
+                "chief.dock": {"value":"floating","source":"default"},
+                "chief.autostart": {"value":false,"source":"default"},
+                "chief.heartbeat_secs": {"value":300,"source":"default"},
+                "chief.wake_secs": {"value":180,"source":"default"},
                 "chief.min_left_percent.codex": {"value":10.0,"source":"host"},
                 "chief.min_left_percent.claude": {"value":20.0,"source":"host"},
                 "isolation.mode": {"value":"sandbox","source":"default"},
@@ -1619,6 +1627,7 @@ pub fn panels_host() -> FakeHost {
     let mut host = host();
     host.trace.session = Some("chief".into());
     host.trace.entries.push(atomics_core::trace::TraceEntry {
+        session_id: String::new(),
         seq: 1,
         at: 0,
         phase: atomics_core::trace::TracePhase::Post,

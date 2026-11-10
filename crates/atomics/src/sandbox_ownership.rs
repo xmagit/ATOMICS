@@ -16,6 +16,9 @@ pub struct Owned {
     pub mcp: bool,
     pub created: u64,
     pub pins: Option<PathBuf>,
+    /// A second host-only copy identifies the folder even if the named pin file is lost or broken.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_pins: Option<atomics_core::git::GitPins>,
     pub scratch: Option<PathBuf>,
     pub builder: Option<u32>,
     /// Process reserving a resource before sbx lists it; cleared when creation returns.
@@ -121,7 +124,10 @@ pub fn removed(home: &Path, name: &str, resource: Resource) -> Result<()> {
                 entry.connections.clear();
             }
             Resource::Mcp => entry.mcp = false,
-            Resource::Pins => entry.pins = None,
+            Resource::Pins => {
+                entry.pins = None;
+                entry.git_pins = None;
+            }
             Resource::Scratch => entry.scratch = None,
             Resource::Builder => entry.builder = None,
             Resource::Relay => entry.relay = None,
@@ -150,8 +156,13 @@ pub fn record_relay(home: &Path, name: &str, port: u16) -> Result<()> {
 }
 
 pub fn record_pins(home: &Path, name: &str, dir: &Path) -> Result<()> {
+    let file = dir.join(format!("{name}.json"));
+    let pins = serde_json::from_str(&atomics_core::git::read_regular_file(&file, 64 * 1024)?)
+        .with_context(|| format!("reading {}", file.display()))?;
     let mut ledger = Ledger::open(home)?;
-    ledger.entry(name).pins = Some(dir.into());
+    let entry = ledger.entry(name);
+    entry.pins = Some(dir.into());
+    entry.git_pins = Some(pins);
     ledger.save()
 }
 

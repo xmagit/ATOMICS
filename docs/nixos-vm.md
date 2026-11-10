@@ -367,24 +367,48 @@ selected. Keep a worktree's Git metadata in the shares too, so the guest can rea
 Before building and again before installing, it asks the host's socket in the guest for `list` and
 refuses busy work: working or starting agents, agents waiting for you, and pending approvals or queue
 work. New hosts also publish the in-app updater's full blocker list, including background work, shells
-running commands and open editors. `--yes` explicitly continues despite reported busy work. An
+running commands and open editors. `--yes` explicitly continues despite reported busy work, announcing
+the override once while still rechecking at every stage. An
 unreachable host is an error; it is never taken to mean idle. In the older agents-over-ssh layout this
 needs the socket forward to the Mac's host.
 
-The build waits for a test slot and starting the VM waits for a QA slot, using the existing queue.
+With a host on the Mac, the build waits for its test slot. A VM client builds directly through the
+guest's system connection: its queue lives in the VM, so it does not try a missing Mac socket.
+Starting the VM uses the Mac's QA queue when a local host is available.
 Nothing is selected until both outputs are built, fetched and checked. If a build or installation
 fails, the VM keeps its current boot selection; a boot-staging failure restores the previous profile
 and bootloader. The update uses `switch-to-configuration boot`, leaving the running system alone
 until the restart. It never deletes or recreates the instance, its disk or its sign-ins.
 
+The command compares the build with `/run/current-system`, the running system. If an earlier update
+staged this build but did not restart, it reports **restart pending** and retries the restart once the
+host is idle. It checks for busy work again immediately before restarting. The boot profile alone
+never makes that update count as unchanged.
+
 The command prints whether the system changed, the bundle was reinstalled and the VM restarted. It
-quits and reopens `ATOMICS.app` if installed, restarting the VM **only** when the system changed. The
+asks every running instance of `ATOMICS.app` to quit gracefully and reopens the app after installation,
+restarting the VM when the running system differs. If a window refuses to quit, the error identifies
+its process, reopens the app after the partial quit, and leaves the restart pending; close the blocking
+window and rerun `atomics vm update`. If stopping succeeds but starting fails, run `atomics vm start`
+to boot the already installed system without rebuilding. The
 window reopens as the Dock would open it, without the command's own `ATOMICS_*` variables: an update run
 from a shell that points `ATOMICS_CONFIG` or `ATOMICS_HOME` at a scratch setup still reopens the VM's
 client, on the app's own config. With
 `--no-restart` it leaves both the window and VM running; a changed system takes effect on the next
 boot. If restarting fails after installation, the command says the next boot is already installed and
 how to start the VM again.
+
+In the VM client, **Machine** has a VM section with its state, Start, Stop, Check and Update. Stop asks
+for confirmation because agents stop with the VM. Check and Update show their command output there;
+the latest output is also saved in `~/.atomics/vm/<instance>-controls.log`, including across the app's
+update restart. The Machine window displays cached output refreshed in the background. While the host
+connects or reconnects, the mirrored board stays visible unless Lima confirms that the VM is stopped
+or not set up. A running VM with no host connection says “VM running, host not connected”; starting,
+stopping and a refused token each have their own text. A stopped VM shows its state and Start.
+Status polling stops when the window is no longer drawing and wakes immediately when a paused view
+returns. Explicit commands such as `vm status`, `vm setup` and `vm update` remove obsolete setup records
+after a successful Lima list; background polls never remove them. Cleanup failures warn without
+changing the reported VM state. A client also bypasses a stale local QA queue socket when starting.
 
 Keep the fresh-image route for a broken VM or disk-size changes: build a new image with
 `scripts/macos-vm-build.sh`, delete the old instance with `limactl delete <instance>`, and run
@@ -615,6 +639,25 @@ adds the value and makes the HTTPS request itself. The host's existing loopback 
 and redacts reflected credentials just as the desktop relay does. When a broker is configured but
 unavailable, session preparation and requests fail; they do not fall back to a readable store.
 Desktop hosts without `ATOMICS_SECRET_BROKER_SOCKET` continue using the OS keychain.
+
+In a Mac window connected with `[client] connect = "vm"`, Settings stores, lists, copies (after a
+fresh OS prompt) and removes secrets in the **Mac keychain**. Adding a secret also sends it directly
+to the VM broker. Each row shows **Pending**, **Synced**, or **Failed** with a reason. Reconnecting or
+refreshing credentials resends the keychain entries, including after the broker has been replaced.
+Project scopes use the VM's main-checkout paths, including directories that exist only in the VM.
+Failed removals stay in a names-only journal on the Mac and retry on reconnect or refresh, even after
+the window has closed. Entries independently installed by an administrator are preserved.
+
+`atomics secret add` and `atomics secret rm` on a Mac with that client setting use the same sync path.
+`atomics vm setup` and `atomics vm update` push keychain secrets too. With `--no-restart`, sync targets
+the currently running broker; if that system predates broker support, the command reports a sync
+failure, keeps the keychain entries, and the next connection after boot retries them.
+
+Sync uses the update command's administrator SSH connection, with connection sharing disabled. The
+value travels only on stdin to the fixed `atomics secret-broker-admin` bridge and its administration
+socket; it never enters the host's protocol or process. Without a separate administrator, sync uses
+the VM user's sudo and displays a **One trust domain** warning: agents can become root and read the
+store. Enable hardened mode to separate those accounts.
 
 Administration uses `/run/atomics-secret-broker/admin.sock`, mode `0660`, accessible only to root
 and `atomics.vm.adminUser` through the `atomics-secret-admin` group. In an admin login:
@@ -905,8 +948,11 @@ user alone, and that sshd replaces stale sockets; with the forward running, it a
 for its sessions. With the host in the VM it checks instead that the `atomics-host` service runs, that
 its socket folder is the user's alone, that its protocol server listens on `127.0.0.1:<port>` and
 nowhere else, and that an agent it starts (a shell, through `atomics ctl`) runs in the guest, in a
-shared Mac folder: the process's working folder is checked through `/proc`. `atomics vm check` runs
-it from the Mac. It clones a file with `cp --reflink=always` and runs a shell in a `linux/amd64`
+shared Mac folder, or in `~/repos` on the guest's disk when hardened mode has only read-only shares:
+the process's working folder is checked through `/proc`. `atomics vm check` runs it from the Mac. In
+hardened mode, only `sudo sshd -T` runs over the admin connection; its output is passed to the guest
+user's checks, which need no sudo and keep testing that user's host and rootless Docker. It clones a
+file with `cp --reflink=always` and runs a shell in a `linux/amd64`
 container, which works only through Rosetta. Then it runs the checks in `/etc/atomics/check.d` in name
 order (`atomics.vm.checks`); each one fails the run by exiting non-zero.
 

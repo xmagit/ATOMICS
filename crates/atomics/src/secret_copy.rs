@@ -62,7 +62,7 @@ fn authenticated_copy(
     auth()?;
     // Read only after fresh authentication. The value goes straight to the native clipboard,
     // never into egui's output, the host's model, a reply, a toast or an edit field.
-    let store = crate::credentials::Store::new(keychain);
+    let store = crate::credentials::Store::local(keychain);
     let Some((_, value)) = store.secret_values()?.into_iter().find(|(spec, _)| spec.name == name) else {
         bail!("Secret no longer exists");
     };

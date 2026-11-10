@@ -374,6 +374,7 @@ mod tests {
                     busy_text: None,
                     isolation: None,
                 });
+                super::super::tests::persist_config(app.runtime);
                 let session = app.runtime.start("relay-probe", dir.path().to_path_buf(), None, vec![], None).unwrap();
                 let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(30));
                 loop {

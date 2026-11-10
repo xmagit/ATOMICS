@@ -408,7 +408,12 @@ fn serve_stream(stream: TcpStream, shared: &session::Shared, up: &Upgrade, pre_a
     let _client = claimed.take();
     let mut link = link::WsLink::new(socket, up.write_timeout)?;
     let peer = peer.take().unwrap_or_else(|| Peer::local(up.role));
-    session::serve(&mut link, &peer, shared);
+    if let (Some(clients), Some(device)) = (&up.paired, &peer.device) {
+        let mut authorised = clients::PairedLink { inner: &mut link, clients, device };
+        session::serve(&mut authorised, &peer, shared);
+    } else {
+        session::serve(&mut link, &peer, shared);
+    }
     Ok(())
 }
 

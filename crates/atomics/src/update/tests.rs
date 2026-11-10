@@ -526,6 +526,23 @@ fn unpacking_gives_the_archives_owner_no_say() {
 }
 
 #[test]
+fn audit_p7_staging_cleanup_preserves_current_and_legacy_rollback_asides() {
+    let dir = crate::test_support::tempdir().unwrap();
+    let stale = dir.path().join(format!("{STAGING}download"));
+    std::fs::create_dir(&stale).unwrap();
+    for prefix in [ROLLBACK_ASIDE.to_string(), format!("{STAGING}rollback-")] {
+        let aside = dir.path().join(format!("{prefix}crashed"));
+        std::fs::create_dir(&aside).unwrap();
+        std::fs::write(aside.join("program"), b"recoverable install").unwrap();
+    }
+    remove_stale_staging(dir.path());
+    assert!(!stale.exists());
+    for prefix in [ROLLBACK_ASIDE.to_string(), format!("{STAGING}rollback-")] {
+        assert_eq!(std::fs::read(dir.path().join(format!("{prefix}crashed/program"))).unwrap(), b"recoverable install");
+    }
+}
+
+#[test]
 fn a_crash_leaves_nothing_the_next_update_keeps_and_only_one_update_runs_at_a_time() {
     let install = Install::new();
     let stale = install.target.parent().unwrap().join(format!("{STAGING}crashed"));

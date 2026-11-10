@@ -678,6 +678,8 @@ fn github_shortcut_conflicts_are_reported_and_fall_back() {
     assert!(github_shortcut(&other).1.unwrap().contains("is already [keys] toggle_diff"));
     let tickets = atomics_core::config::KeyConfig { github: keys.toggle_tickets.clone(), ..keys.clone() };
     assert!(github_shortcut(&tickets).1.unwrap().contains("is already [keys] toggle_tickets"));
+    let plan = atomics_core::config::KeyConfig { github: keys.plan_with_chief.clone(), ..keys.clone() };
+    assert!(github_shortcut(&plan).1.unwrap().contains("is already [keys] plan_with_chief"));
     let taken = atomics_core::config::KeyConfig { toggle_diff: "primary+g".into(), ..keys.clone() };
     let (chord, problem) = github_shortcut(&taken);
     assert!(chord.is_none() && problem.unwrap().ends_with("no GitHub shortcut"));
@@ -686,6 +688,24 @@ fn github_shortcut_conflicts_are_reported_and_fall_back() {
     let config = Config { keys: agent, ..Config::default() };
     assert!(config_problems(&config).unwrap().contains("[keys] github"));
     assert!(config_problems(&Config::default()).is_none());
+}
+
+#[test]
+fn config_problems_names_each_invalid_binding_and_honors_disabled_shortcuts() {
+    let config = Config {
+        keys: atomics_core::config::KeyConfig {
+            quick_open: "cmd+d+e".into(),
+            new_session: "ctrl+notakey".into(),
+            github: String::new(),
+            ..Default::default()
+        },
+        ..Config::default()
+    };
+    let problems = config_problems(&config).unwrap();
+    assert!(problems.contains("[keys] quick_open is not a shortcut"), "{problems}");
+    assert!(problems.contains("[keys] new_session is not a shortcut"), "{problems}");
+    assert!(!problems.contains("[keys] github"));
+    assert_eq!(github_shortcut(&config.keys), (None, None));
 }
 
 #[test]
