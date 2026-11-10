@@ -247,6 +247,13 @@ pub struct EditorInfo {
 /// A PR's metadata. Its diff uses the usual paged `diff_get`, under `key`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRequestInfo {
+    /// Additive metadata: older hosts omit these fields. Unknown membership stays unclassified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<crate::github::Group>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft: Option<bool>,
     pub key: String,
     pub repo: String,
     pub number: u64,
@@ -895,5 +902,19 @@ mod tests {
         }
         writer.join().unwrap();
         assert_eq!(p.sessions.load().revision, 200);
+    }
+}
+
+#[cfg(test)]
+mod pull_request_tests {
+    #[test]
+    fn old_pull_request_metadata_is_still_readable() {
+        let pull: super::PullRequestInfo = serde_json::from_value(serde_json::json!({
+            "key": "pull:contoso/repo#1", "repo": "contoso/repo", "number": 1,
+            "title": "Update parser", "head": "feature", "base": "main",
+            "url": "https://example.com/pull/1", "head_sha": null, "loading": false, "error": null
+        }))
+        .unwrap();
+        assert_eq!((pull.group, pull.author, pull.draft), (None, None, None));
     }
 }

@@ -70,9 +70,13 @@ impl State {
     }
 }
 
-/// Whether Settings, Remote, the setup screen or the project picker is open.
+/// Whether a shared window (Settings, Remote, setup, project picker or pull requests) is open.
 pub fn window_open(client: &Client) -> bool {
-    client.management.settings || client.management.remote || client.management.project || client.management.setup
+    client.pull_requests.open
+        || client.management.settings
+        || client.management.remote
+        || client.management.project
+        || client.management.setup
 }
 
 /// The windows' share of the keyboard. Every client calls this as its frame begins, before it draws anything that
@@ -87,7 +91,9 @@ pub fn begin_frame(ctx: &egui::Context, backend: &dyn Backend, client: &mut Clie
         && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
     {
         let state = &mut client.management;
-        let top = if state.project {
+        let top = if client.pull_requests.open {
+            &mut client.pull_requests.open
+        } else if state.project {
             &mut state.project
         } else if state.remote {
             &mut state.remote
