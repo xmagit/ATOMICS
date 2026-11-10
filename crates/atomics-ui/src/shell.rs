@@ -489,6 +489,8 @@ pub struct TopBarPlan {
     pub show_load: bool,
     /// An update under way stays in the row, beside the folded Actions menu.
     pub update_beside: bool,
+    /// Settings stays beside Actions wherever the icon fits.
+    pub settings_beside: bool,
 }
 
 /// The bar's least inner width for the full pill, and for the pill with its name.
@@ -517,6 +519,7 @@ pub struct TopBarWidths {
     pub load: f32,
     /// An update under way, which stays beside the folded menu where it fits. Nothing while none is.
     pub update: f32,
+    pub settings: f32,
 }
 
 impl TopBarPlan {
@@ -548,16 +551,18 @@ impl TopBarPlan {
             BrandSize::Mark
         };
         let switcher = w.switcher[usize::from(compact_switcher)];
-        // The gauge is a few characters wide and the way to Machine: once the actions fold it stays beside their
-        // menu wherever it fits, before an update under way does.
+        let settings_beside =
+            actions_menu && w.settings > 0.0 && right(w.actions_menu + w.gap + w.settings, switcher) <= side(chief);
+        let beside = w.actions_menu + if settings_beside { w.gap + w.settings } else { 0.0 };
+        // Keep Settings first, then the gauge and an update wherever they also fit.
         let show_load = if actions_menu {
-            w.load > 0.0 && right(w.actions_menu + w.gap + w.load, switcher) <= side(chief)
+            w.load > 0.0 && right(beside + w.gap + w.load, switcher) <= side(chief)
         } else {
             right(w.controls_with_load, w.switcher[0]) <= side(chief)
         };
-        let beside = w.actions_menu + if actions_menu && show_load { w.gap + w.load } else { 0.0 };
+        let beside = beside + if actions_menu && show_load { w.gap + w.load } else { 0.0 };
         let update_beside = actions_menu && w.update > 0.0 && right(beside + w.gap + w.update, switcher) <= side(chief);
-        TopBarPlan { brand, chief, compact_switcher, actions_menu, show_load, update_beside }
+        TopBarPlan { brand, chief, compact_switcher, actions_menu, show_load, update_beside, settings_beside }
     }
 }
 
@@ -592,6 +597,9 @@ pub fn top_bar(ui: &mut egui::Ui, platform: &mut impl Platform) {
             })
         }),
         update: measure(ui, |ui| platform.draw(|backend, client, _| crate::update::status(ui, backend, client))),
+        settings: measure(ui, |ui| {
+            platform.draw(|backend, client, _| crate::management::settings_button(ui, backend, client, true))
+        }),
     };
     let plan = TopBarPlan::choose(&widths);
     let brand_width = widths.brand[plan.brand as usize];
@@ -611,6 +619,7 @@ pub fn top_bar(ui: &mut egui::Ui, platform: &mut impl Platform) {
             widths.actions_menu
                 + if plan.update_beside { widths.update + gap } else { 0.0 }
                 + if plan.show_load { widths.load + gap } else { 0.0 }
+                + if plan.settings_beside { widths.settings + gap } else { 0.0 }
         } else if plan.show_load {
             widths.controls_with_load
         } else {
@@ -635,6 +644,9 @@ pub fn top_bar(ui: &mut egui::Ui, platform: &mut impl Platform) {
             record_item(ui, "Actions", &response);
             if update_inside {
                 read(platform, |backend, _| crate::update::mark_menu(ui, &response, backend, &palette));
+            }
+            if plan.settings_beside {
+                platform.draw(|backend, client, _| crate::management::settings_button(ui, backend, client, true));
             }
         } else {
             top_bar_controls(ui, platform, plan.show_load, false, true);
@@ -772,6 +784,7 @@ mod tests {
             actions_menu: 65.0,
             load: 52.0,
             update: 0.0,
+            settings: 0.0,
         }
     }
 
@@ -794,6 +807,7 @@ mod tests {
             actions_menu: 65.0,
             load: 52.0,
             update: 0.0,
+            settings: 0.0,
         };
         let plan = TopBarPlan::choose(&busy);
         assert_eq!(plan.chief, PillSize::Full);
@@ -833,6 +847,24 @@ mod tests {
     }
 
     #[test]
+    fn settings_stays_beside_actions_before_the_gauge_wherever_it_fits() {
+        for width in (460..1600).step_by(5).map(|w| w as f32) {
+            let w = TopBarWidths { settings: 26.0, ..widths(width) };
+            let plan = TopBarPlan::choose(&w);
+            let side = (width - w.chief[plan.chief as usize]) / 2.0 - w.gap;
+            let switcher = w.switcher[usize::from(plan.compact_switcher)];
+            let base = switcher + w.gap + w.actions_menu;
+            assert_eq!(plan.settings_beside, plan.actions_menu && base + w.gap + w.settings <= side);
+            if plan.actions_menu {
+                let used = base
+                    + if plan.settings_beside { w.gap + w.settings } else { 0.0 }
+                    + if plan.show_load { w.gap + w.load } else { 0.0 };
+                assert!(used <= side, "{width}: {plan:?}");
+            }
+        }
+    }
+
+    #[test]
     fn the_bar_folds_in_one_order_as_it_narrows_and_the_pill_follows_the_width_alone() {
         let rank = |plan: &TopBarPlan| {
             (plan.chief as u8, plan.brand as u8, u8::from(plan.actions_menu), u8::from(plan.compact_switcher))
@@ -846,7 +878,8 @@ mod tests {
                 compact_switcher: false,
                 actions_menu: false,
                 show_load: true,
-                update_beside: false
+                update_beside: false,
+                settings_beside: false
             }
         );
         for width in (460..6000).rev().step_by(5).map(|w| w as f32) {

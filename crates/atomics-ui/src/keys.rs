@@ -92,7 +92,7 @@ pub fn is_digit(key: Key) -> bool {
 
 /// Display exactly the platform modifiers used to consume the configured chord.
 pub fn shortcut_label(ctx: &egui::Context, text: &str) -> String {
-    shortcut(text).map(|chord| ctx.format_shortcut(&chord)).unwrap_or_else(|| text.to_string())
+    shortcut_for_os(text, ctx.os()).map(|chord| ctx.format_shortcut(&chord)).unwrap_or_else(|| text.to_string())
 }
 
 #[cfg(test)]

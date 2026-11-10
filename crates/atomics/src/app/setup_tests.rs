@@ -336,11 +336,6 @@ fn settings_runs_every_sandbox_step_with_clicks_and_reads_back_what_is_left() {
             };
             app.client.ui.management.settings = true;
             settle(app, ctx);
-            click(app, ctx, "Theme  ·  claude");
-            let shown = settle(app, ctx);
-            let row = shown.iter().find(|(text, _)| text.starts_with("Agents  ·")).expect("the section");
-            let pos = row.1;
-            click_at(app, ctx, pos);
             wait(app);
             let shown = settle(app, ctx);
             assert!(has(&shown, "Docker account") && has(&shown, "Network policy"), "{shown:?}");

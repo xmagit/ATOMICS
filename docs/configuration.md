@@ -179,7 +179,7 @@ The chief checks the age and reset time, favors providers whose reported, unexpi
 windows meet their minimum, and explains its choice and any exception or unknown/stale reading in each
 task's brief. `atomics_plan_set` saves the plan and returns `warnings` when either unexpired window is
 strictly below its provider minimum. It never refuses a plan for quota; a missing or expired reading does
-not trigger a quota warning. **Settings → Agents** shows the effective preference and minimums read-only.
+not trigger a quota warning. **Settings → Chief** edits the preference and minimums through a proposal.
 
 `[chief] wake_secs` wakes an idle or turn-done chief every 180 seconds by default; set it to `0` to disable,
 or to at least `30` seconds. Set it in `config.toml` or this host's `config.d/<host>.toml`.
@@ -298,25 +298,35 @@ files. `ok` is true when the required checks pass: git, and a config that loads;
 ## The Settings window
 
 Settings is one window, the same on the desktop and in a browser, and it fits a phone. Its sections lead with what
-people change, and each reads what it shows as it opens:
+people change. A wide window has a section list beside its controls; a narrow window has one column and a back row.
+Each window remembers its last section, starting with Agents. The Settings icon stays beside Actions when the top
+bar folds and has room for it. Each section reads what it shows as it opens:
 
 | Section | What is in it |
 | --- | --- |
-| Updates | Only with something to say: this version and the new one, its notes, the Update button, what an update is doing, and why the last check failed. A client always has it, to say which version the host runs. See [Updates](#updates). |
-| Theme | The [themes](themes.md) with their colors. A click shows one at once and saves it. |
-| Shortcuts | The keys every client takes, then the configured ones, which a remote client says are the desktop's. |
+| Agents | The configured agents, whether they run sandboxed, what they need, with [a click or the exact command](isolation.md#fresh-machine-clicks-or-one-guided-command) for each step, the [sandbox checks](isolation.md#check-sandbox-setup) and the Claude hooks. |
+| Chief | Model, dock, autostart, heartbeat and wake intervals, task agent preference and quota minimums. Review and Apply saves edited fields in main or host config. |
 | Identity | The active identity per project, and a form to review and apply a main, workspace or project override. |
-| Agents | The configured agents, the chief's task agent preference and quota-left minimums, whether they run sandboxed, what they need, with [a click or the exact command](isolation.md#fresh-machine-clicks-or-one-guided-command) for each step, the [sandbox checks](isolation.md#check-sandbox-setup) and the Claude hooks. |
 | Connections | [MCP servers](isolation.md#mcp-connections) for sandboxed agents. |
-| Remote devices | Pairing and paired devices, as in the Remote window. |
 | Credentials | [What the OS keychain holds](isolation.md#settings--credentials), never a value, and Azure CLI access. |
+| Remote devices | Pairing and paired devices, as in the Remote window. |
+| Shortcuts | Fixed navigation keys and editable configured bindings. Invalid keys and conflicts on this client's OS block the proposal. Blank disables a binding. |
+| Theme | The [themes](themes.md) with their colors. A click shows one at once and saves it. |
+| Updates | This version and the new one, its notes, update progress and errors. A remote client shows the host's version. See [Updates](#updates). |
+| Getting started | Reopen the setup screen. |
 | Advanced | The config files, **Edit config**, the effective configuration and raw proposals. |
+
+The Chief model picker offers aliases accepted by its command (Claude Code: `fable`, `opus`, `sonnet`, `haiku`)
+and a custom full model name. It writes `[chief] model`, translated to `--model` on launch. An existing model flag
+in `chief.args` stays in use and shows as **Custom (args)** until a model is selected. Explicit `model` replaces
+only that model flag at launch and preserves the rest of `args`. Model and autostart apply on the next chief start;
+intervals and dock changes apply while it runs.
 
 What can be undone acts at once: picking a theme, the Azure CLI switch, connecting and disconnecting a server. Only what
 cannot asks first: removing or replacing a credential, removing unknown entries, revoking a device. **Edit config**
 opens the file in an editor on the host, so only a window on the host has it; a remote client proposes a change under
 Advanced instead, and a view-only client reads everything and changes nothing. Changes made under Advanced, like the
-chief's, wait for you as proposals.
+chief's, and edits under Chief and Shortcuts wait for you as proposals.
 
 ## Updates
 
@@ -395,7 +405,8 @@ The chief learns the outcome from a `config` event in `atomics_wait`:
 ```
 
 `outcome` is `applied`, `rejected` or `failed` (with `error`). `backup` is missing when the change created the
-file. Waiting proposals block `atomics_restart` and do not survive a restart.
+file. Each config file keeps its newest ten backups, with one copy per distinct content, including applies in the
+same second. Applying an unchanged file adds no backup. Waiting proposals block `atomics_restart` and do not survive a restart.
 
 ## Trust model
 

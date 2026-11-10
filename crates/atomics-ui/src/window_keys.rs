@@ -63,7 +63,7 @@ pub fn command_chords(os: OperatingSystem) -> bool {
     matches!(os, OperatingSystem::Mac | OperatingSystem::IOS)
 }
 
-fn agent_modifiers(os: OperatingSystem) -> Modifiers {
+pub(crate) fn agent_modifiers(os: OperatingSystem) -> Modifiers {
     if command_chords(os) { Modifiers::MAC_CMD } else { Modifiers::CTRL }
 }
 

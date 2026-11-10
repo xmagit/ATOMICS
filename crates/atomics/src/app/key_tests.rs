@@ -1115,6 +1115,8 @@ fn the_desktops_settings_offer_edit_config_and_name_this_machine() {
             output.drop_without_applying_deltas();
             found
         };
+        click_on(app, ctx, "Theme");
+        run(app, ctx, vec![]);
         assert!(draws(app, ctx, "This machine only (config.d/"));
         assert!(draws(app, ctx, "claude"), "the themes are listed");
         for _ in 0..3 {
