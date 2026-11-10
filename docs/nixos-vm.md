@@ -3,9 +3,9 @@
 `nixosConfigurations.atomics-vm` is an ARM Linux guest for Apple Virtualization (VZ) on Apple Silicon.
 It imports `nixosModules.atomics` and installs the ATOMICS CLI, Docker with Rosetta for amd64 containers,
 Node.js, Git, the GitHub CLI, Helix (`hx`, the default `[editor] command`, which the editor panel runs in
-the guest when the host runs there), Claude Code, Codex, Cargo, rustup and `atomics-onboard`, which signs
-in to them, plus rustc, GCC, pkg-config, Python 3 and coreutils (including `mktemp`)
-([Sign in inside the VM](#sign-in-inside-the-vm)). A team adds its own stack (SDKs, cloud CLIs,
+the guest when the host runs there), Claude Code, Codex, Cargo, rustc, rustup, GCC, pkg-config, Python 3,
+coreutils (including `mktemp`) and `atomics-onboard`, which signs in to
+them ([Sign in inside the VM](#sign-in-inside-the-vm)). A team adds its own stack (SDKs, cloud CLIs,
 more sign-ins and checks) with a module of its own;
 [`nix/examples/dotnet-azure.nix`](../nix/examples/dotnet-azure.nix) is an example, off by default
 ([Example: .NET and Azure DevOps](#example-net-and-azure-devops)).

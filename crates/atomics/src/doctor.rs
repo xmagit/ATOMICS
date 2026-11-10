@@ -917,6 +917,7 @@ mod tests {
         let config = dir.path().join("config.toml");
         std::fs::create_dir(&bin).unwrap();
         std::fs::create_dir_all(state.join("plans")).unwrap();
+        crate::test_support::link_tools(&bin, &["git"]);
         let repo = dir.path().canonicalize().unwrap().join("repo");
         std::fs::create_dir(&repo).unwrap();
         atomics_core::git::git(&repo, &["init", "-b", "main"]).unwrap();
@@ -936,7 +937,7 @@ mod tests {
         let shell = bin.join("shell");
         crate::test_support::write_program(
             &shell,
-            format!("#!/bin/sh\nprintf '__ATOMICS__{}:/usr/bin:/bin__ATOMICS__'\n", bin.display()),
+            format!("#!/bin/sh\nprintf '__ATOMICS__{}__ATOMICS__'\n", bin.display()),
         );
         let codex = bin.join("codex");
         for (probe, allow, bad_plan) in [
@@ -968,6 +969,7 @@ mod tests {
                     .env(CHILD, "1")
                     .env("HOME", dir.path())
                     .env("SHELL", &shell)
+                    .env("PATH", &bin)
                     .env("ATOMICS_HOME", &state)
                     .env("ATOMICS_CONFIG", &config)
                     .env("ATOMICS_SOCKET", dir.path().join("absent.sock"))
@@ -976,15 +978,12 @@ mod tests {
             let stdout = String::from_utf8_lossy(&output.stdout);
             assert!(output.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
             let prefix = if bad_plan { '✗' } else { '✓' };
-            // The default editor, hx, is on neither this PATH's bin nor (on a test machine) /usr/bin or /bin.
-            if !["/usr/bin/hx", "/usr/bin/helix", "/bin/hx", "/bin/helix"].iter().any(|p| Path::new(p).exists()) {
-                assert!(
-                    stdout.contains(
-                        "✗ hx not found on login-shell PATH (warning): the editor panel cannot start it ([editor] command)"
-                    ),
-                    "{stdout}"
-                );
-            }
+            assert!(
+                stdout.contains(
+                    "✗ hx not found on login-shell PATH (warning): the editor panel cannot start it ([editor] command)"
+                ),
+                "{stdout}"
+            );
             if probe == "missing" {
                 assert!(stdout.contains("codex not found on login-shell PATH"), "{stdout}");
                 assert!(!stdout.contains("Codex version") && !stdout.contains("Codex supports"), "{stdout}");
@@ -1032,6 +1031,7 @@ mod tests {
                     .env(CHILD, "1")
                     .env("HOME", dir.path())
                     .env("SHELL", &shell)
+                    .env("PATH", &bin)
                     .env("ATOMICS_HOME", &state)
                     .env("ATOMICS_CONFIG", &config)
                     .env("ATOMICS_SOCKET", dir.path().join("absent.sock"))
@@ -1190,10 +1190,11 @@ mod tests {
         let dir = crate::test_support::tempdir().unwrap();
         let bin = dir.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
+        crate::test_support::link_tools(&bin, &["git"]);
         let shell = bin.join("shell");
         crate::test_support::write_program(
             &shell,
-            format!("#!/bin/sh\nprintf '__ATOMICS__{}:/usr/bin:/bin__ATOMICS__'\n", bin.display()),
+            format!("#!/bin/sh\nprintf '__ATOMICS__{}__ATOMICS__'\n", bin.display()),
         );
         let output = crate::test_support::output(
             Command::new(std::env::current_exe().unwrap())
@@ -1205,6 +1206,7 @@ mod tests {
                 .env(CHILD, "1")
                 .env("HOME", dir.path())
                 .env("SHELL", &shell)
+                .env("PATH", &bin)
                 .env("ATOMICS_HOME", dir.path().join("state"))
                 .env(
                     "ATOMICS_CONFIG",

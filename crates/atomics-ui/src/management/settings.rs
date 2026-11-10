@@ -251,10 +251,10 @@ fn identity(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, enabl
         ui.horizontal_wrapped(|ui| {
             ui.label(row["display"].as_str().unwrap_or_default());
             ui.label(RichText::new(row["label"].as_str().unwrap_or("Git identity")).strong());
-            if ui.add_enabled(enabled, egui::Button::new("Change…")).clicked() {
-                if let Ok(identity) = serde_json::from_value(row["override"].clone()) {
-                    client.management.show_identity(row["project"].as_str().unwrap_or_default().into(), identity);
-                }
+            if ui.add_enabled(enabled, egui::Button::new("Change…")).clicked()
+                && let Ok(identity) = serde_json::from_value(row["override"].clone())
+            {
+                client.management.show_identity(row["project"].as_str().unwrap_or_default().into(), identity);
             }
         });
     }

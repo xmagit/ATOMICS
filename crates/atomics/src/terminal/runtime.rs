@@ -470,7 +470,7 @@ impl Terminal {
             libc::kill(-leader, libc::SIGSTOP);
         }
         if !self.exited()
-            && let Ok(output) = std::process::Command::new("/bin/ps").args(["-axo", "pid=,ppid=,pgid="]).output()
+            && let Ok(output) = std::process::Command::new("ps").args(["-axo", "pid=,ppid=,pgid="]).output()
             && output.status.success()
         {
             let rows: Vec<Vec<i32>> = String::from_utf8_lossy(&output.stdout)
@@ -867,13 +867,20 @@ mod tests {
                 Terminal::spawn(
                     crate::host::Wake::default(),
                     Vec::new(),
-                    "/bin/sh".into(),
+                    crate::test_support::program("bash"),
                     vec![
+                        "--noprofile".into(),
+                        "--norc".into(),
                         if job_control { "-imc" } else { "-c" }.into(),
                         "trap '' HUP TERM; sleep 60 & echo $! > child; wait".into(),
                     ],
                     dir.path(),
-                    HashMap::new(),
+                    [
+                        ("HOME".into(), dir.path().display().to_string()),
+                        ("ENV".into(), "/dev/null".into()),
+                        ("BASH_ENV".into(), "/dev/null".into()),
+                    ]
+                    .into(),
                     100,
                 )
                 .unwrap()
