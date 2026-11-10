@@ -19,6 +19,9 @@
       vmWithHost = vm.extendModules {
         modules = [ { atomics.vm.host.enable = true; } ];
       };
+      vmWithEgress = vm.extendModules {
+        modules = [ { atomics.vm = { hardened = true; egress.enable = true; }; } ];
+      };
     in
     {
       packages = forAllSystems (system:
@@ -70,6 +73,8 @@
           atomics-vm-generic = vmRelease.config.system.build.toplevel;
           atomics-vm-generic-mac = vmRelease.config.programs.atomics.macDesktop.bundle;
           atomics-vm-with-host = vmWithHost.config.system.build.toplevel;
+          # Builds the enforcing ruleset too, including NixOS's nft --check validation.
+          atomics-vm-egress = vmWithEgress.config.system.build.toplevel;
           atomics-vm-host = import ./nix/tests/vm-host.nix {
             pkgs = import nixpkgs { inherit system; };
             vm = vmWithHost.config;

@@ -49,6 +49,10 @@ in
       autoSubUidGidRange = true;
     };
 
+    # The daemon fetches as root and builds fixed-output derivations with network access. Agents
+    # use the installed toolchains; system builds and updates go through the admin account.
+    nix.settings.allowed-users = lib.mkForce [ "root" cfg.adminUser ];
+
     # cloud-init writes Lima's user data on every boot, and that gives the VM's user passwordless sudo
     # (/etc/sudoers.d/90-cloud-init-users). This removes it again before the host starts, and gives the admin
     # the same Lima key, from the cidata disk the VM only reads.

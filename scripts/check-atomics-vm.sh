@@ -2,6 +2,46 @@
 # Run in the guest, with the host's ATOMICS QA queue holding the slot (see docs/nixos-vm.md).
 set -euo pipefail
 
+# Read the generated rules, rather than requiring root to list the live firewall. This also detects
+# the policy on older guests, so the sub-UID regression fails on images made before the fix.
+check_egress() {
+  local rules status
+  rules=$(systemctl cat nftables.service 2>/dev/null | sed -n 's|^ExecStart=\(/nix/store/[^ ]*-nftables-rules\)$|\1|p') || true
+  if [ -z "$rules" ] || ! grep -q 'table inet atomics_egress' "$rules"; then
+    printf 'egress: disabled, skipped\n'
+    return
+  fi
+  if ! grep -q 'reject with tcp reset' "$rules"; then
+    printf 'egress: logging only, skipped\n'
+    return
+  fi
+
+  # Exit 7 means the TCP connection was refused. A timeout, failed namespace setup or TLS error must
+  # fail this check too: none proves the policy blocked the connection. Ignore proxy environment.
+  status=0
+  curl --noproxy '*' --silent --show-error --insecure --output /dev/null \
+    --connect-timeout 5 --max-time 10 https://1.1.1.1/ || status=$?
+  if [ "$status" -ne 7 ]; then
+    printf 'egress: ordinary UID was not refused (curl exit %s)\n' "$status" >&2
+    return 1
+  fi
+  status=0
+  unshare --user --map-users=auto --setuid 0 \
+    curl --noproxy '*' --silent --show-error --insecure --output /dev/null \
+      --connect-timeout 5 --max-time 10 https://1.1.1.1/ || status=$?
+  if [ "$status" -ne 7 ]; then
+    printf 'egress: subordinate UID was not refused (unshare/curl exit %s)\n' "$status" >&2
+    return 1
+  fi
+  printf 'egress: ordinary and subordinate UIDs refused\n'
+}
+
+check_egress
+# Run just the read-only network probe when diagnosing an existing guest.
+if [ "${1-}" = --egress-only ]; then
+  exit 0
+fi
+
 test "$(uname -m)" = aarch64
 test "$(findmnt -n -o FSTYPE /)" = btrfs
 grep -q 'flags: .*F' /proc/sys/fs/binfmt_misc/rosetta
