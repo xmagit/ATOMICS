@@ -610,9 +610,7 @@ fn ticket_preview(ctx: &egui::Context, lane: &mut Lane) {
             if let Some(state) = &card.link.state {
                 ui.label(state);
             }
-            if let Some(url) =
-                card.link.url.as_deref().filter(|u| u.starts_with("https://") || u.starts_with("http://"))
-            {
+            if let Some(url) = card.link.url.as_deref().and_then(crate::markdown::web_url) {
                 ui.hyperlink_to("Open in browser ↗", url);
             }
             egui::ScrollArea::vertical().show(ui, |ui| {

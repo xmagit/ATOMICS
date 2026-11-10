@@ -387,7 +387,7 @@ fn updates(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, update
     if let Some(detail) = &update.detail {
         note(ui, &p, detail.clone());
     }
-    if let Some(url) = &update.notes {
+    if let Some(url) = update.notes.as_deref().and_then(crate::markdown::web_url) {
         ui.hyperlink_to("Release notes", url);
     }
     match &update.phase {

@@ -395,6 +395,9 @@ fn client_hello(host: &str) -> Vec<u8> {
 }
 
 pub fn open_browser(url: &str) -> io::Result<()> {
+    let url = atomics_ui::markdown::web_url(url).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "only http:// and https:// addresses can be opened")
+    })?;
     #[cfg(target_os = "macos")]
     let program = "open";
     #[cfg(not(target_os = "macos"))]
@@ -408,6 +411,13 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+
+    #[test]
+    fn preview_browser_refuses_external_protocols() {
+        for url in ["file:///tmp/test", "javascript:alert(1)", "httpx://example.com"] {
+            assert_eq!(open_browser(url).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        }
+    }
 
     /// A one-connection server that reads the first bytes, then answers `reply` and hangs up.
     fn serve(reply: &'static [u8]) -> u16 {

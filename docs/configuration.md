@@ -61,6 +61,14 @@ A main, host or workspace file that does not parse leaves ATOMICS on the last co
 The top bar or toast says so, and `atomics doctor` names the file. A broken repository config is ignored
 with a warning; see [Repository workflows](repo-workflow.md).
 
+## Terminal clipboard
+
+`[terminal] clipboard = "focused"` (the default) lets a terminal program write the host clipboard
+with OSC 52 only while its tile or editor has keyboard focus in the focused desktop window. A short
+notice names the source of each write. Background and sandboxed sessions cannot write the clipboard;
+rejected writes are discarded. Set `clipboard = "off"` to disable OSC 52 writes entirely. This setting
+does not affect copying selected text yourself. Terminals cannot read the host clipboard with OSC 52.
+
 ## Plans and report evidence
 
 Every plan ends with a final review. With both Claude and Codex configured, ATOMICS chooses the other
