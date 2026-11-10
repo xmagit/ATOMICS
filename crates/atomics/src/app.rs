@@ -381,8 +381,8 @@ struct StatusEvent {
     at: u64,
     plan: Option<String>,
     task: Option<String>,
-    /// Set for a `atomics_report` from the agent: (status, summary, task).
-    report: Option<(String, String, Option<String>)>,
+    /// Set for a `atomics_report` from the agent: (status, summary, task, agent).
+    report: Option<(String, String, Option<String>, String)>,
     /// The pending request the event is about, with its id (`approval_json`).
     approval: Option<serde_json::Value>,
     findings: Option<Vec<atomics_core::heartbeat::Finding>>,
@@ -425,8 +425,9 @@ impl StatusEvent {
         let mut value = json!({ "seq": self.seq, "session": self.session, "title": self.title, "status": self.kind(), "at": self.at });
         value["plan"] = json!(self.plan);
         value["task"] = json!(self.task);
-        if let Some((status, summary, task)) = &self.report {
-            value["report"] = json!({ "status": status, "summary": summary, "task": task });
+        if let Some((status, summary, task, agent)) = &self.report {
+            value["report"] = json!({ "status": status, "summary": summary, "task": task,
+                "provenance": plan::agent_provenance("report", task.as_deref(), agent, self.at) });
         }
         if let Some(findings) = &self.findings {
             value["findings"] = json!(findings);

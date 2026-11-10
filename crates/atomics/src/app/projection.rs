@@ -415,6 +415,7 @@ impl State {
         self.plans
             .iter()
             .map(|p| PlanInfo {
+                notebook: p.notebook.clone(),
                 ticket_tree: self.ticket_tree(p),
                 id: p.id.clone(),
                 status: p.status,

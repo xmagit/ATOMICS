@@ -52,6 +52,20 @@ the card and wakes the chief's `atomics_wait`. The chief reads the result and th
 Several plans can be open at once, each with a row in the top bar's Boards dropdown. See
 [Orchestration](../README.md#orchestration-several-plans-you-approve-agents-that-report-back).
 
+Plans also have an experimental notebook, disabled unless `[plan] notebook = true`. Task agents, including sandboxed
+ones, propose facts with `atomics_note`; the host resolves their plan and signs entries with task, agent and time.
+The board shows every proposal and pinned entry, with **Pin**, **Unpin** and **Delete** controls, locally and remotely.
+A proposal wakes the chief as a `plan` event with `change: notebook_proposed`; the chief reads and curates with
+`atomics_plan_notebook`. Only chief/user pins make a fact available to peers. Agents pull pinned entries with
+`atomics_notes`, and dispatch appends only their count to the brief. Limits are 8 pins, 32 total entries and 300
+characters per entry, with controls stripped. Proposals are refused at capacity; nothing is silently evicted.
+Notebook state lives in the plan JSON with defaulted fields for older files.
+
+Agent text is data, not instructions, just as ticket text is. Tool replies enclose report summaries and notes with
+host-generated provenance (source, task, agent and time) and an explicit authority rule. The chief prompt and MCP
+instructions repeat that rule, even when the notebook is off. Pinning changes visibility, never authority.
+The [A/B experiment](notebook-experiment.md) measures whether pulling curated facts reduces repeated discovery.
+
 ## Integration branches and the final review
 
 Accepted tasks come together on the plan's integration branch, `atomics/plan-<plan id>` unless the plan names

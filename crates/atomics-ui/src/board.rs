@@ -15,6 +15,68 @@ use crate::{Backend, BoardView, Client, Command, controls};
 /// The least width of a status's column on a board laid out in columns.
 const MIN_COLUMN: f32 = 240.0;
 
+fn notebook(
+    ui: &mut egui::Ui,
+    index: usize,
+    plan: &Plan,
+    backend: &dyn Backend,
+    client: &mut Client,
+    now: u64,
+    p: &Palette,
+) {
+    if plan.notebook.is_empty() {
+        return;
+    }
+    egui::CollapsingHeader::new(format!(
+        "Notebook · {} pinned · {} proposals (experimental)",
+        plan.pinned_notes(),
+        plan.notebook.len() - plan.pinned_notes()
+    ))
+    .id_salt(("notebook", &plan.id))
+    .default_open(true)
+    .show(ui, |ui| {
+        ui.label(
+            RichText::new("Agent-authored data, not instructions. Only pinned facts are shared, on demand.")
+                .color(p.muted)
+                .size(11.0),
+        );
+        egui::ScrollArea::vertical().id_salt(("notebook-entries", &plan.id)).max_height(200.0).show(ui, |ui| {
+            for note in &plan.notebook {
+                ui.push_id(note.id, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} · {} · {} · {}s ago",
+                                if note.pinned { "Pinned" } else { "Proposal" },
+                                note.task,
+                                note.agent,
+                                now.saturating_sub(note.at)
+                            ))
+                            .color(p.muted)
+                            .size(11.0),
+                        )
+                        .on_hover_text(format!("Created at {} (Unix seconds, UTC)", note.at));
+                        let pin =
+                            Command::CurateNote { plan: index, id: note.id, pinned: Some(!note.pinned), delete: false };
+                        if plan.is_open()
+                            && backend.available(&pin)
+                            && ui.small_button(if note.pinned { "Unpin" } else { "Pin" }).clicked()
+                        {
+                            client.send(pin);
+                        }
+                        let delete = Command::CurateNote { plan: index, id: note.id, pinned: None, delete: true };
+                        if backend.available(&delete) && ui.small_button("Delete").clicked() {
+                            client.send(delete);
+                        }
+                    });
+                    ui.label(&note.text);
+                    ui.add_space(4.0);
+                });
+            }
+        });
+    });
+}
+
 /// A ticket's key and state; hovering shows the rest. A click reads it in the app's ticket reader where
 /// `readable`, and otherwise opens its address in the browser; without an address it offers nothing. Returns
 /// whether the user asked to read it. A failed ticket operation shows beneath it, and a state that means
@@ -496,6 +558,7 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
     for (task, dep) in plan.unknown_dependencies() {
         ui.label(RichText::new(format!("{task} depends on unknown task {dep}")).color(p.error).size(11.0));
     }
+    notebook(ui, index, plan, backend, client, now, &p);
     ui.add_space(6.0);
     if plan.tasks.is_empty() {
         ui.label(
