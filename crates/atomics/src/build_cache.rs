@@ -1,7 +1,7 @@
 //! Filesystem operations for cache links and disposable worktree output.
 mod output;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
@@ -252,8 +252,12 @@ pub fn link(home: &Path, worktree: &Path, config: &CacheConfig, domain: Domain) 
             (path != root && path.starts_with(&root)).then_some(path)
         })
         .collect();
+    let mut locations = config.shared.clone();
+    locations.extend(atomics_core::cache::REPO_SHARED.iter().map(|path| (*path).to_owned()));
+    locations.sort();
+    locations.dedup();
     let mut setup = CacheSetup {
-        skipped: output::repair_links(&root, &protected, |target| forbidden_store(home, target, domain))?,
+        skipped: output::repair_links(&root, &locations, &protected, |target| forbidden_store(home, target, domain))?,
     };
     for folder in &config.shared {
         if !relative(folder) {
@@ -331,30 +335,87 @@ pub fn stores(home: &Path, worktree: &Path, config: &CacheConfig, domain: Domain
         .collect()
 }
 
-fn disposable(root: &Path, folder: &str) -> bool {
+/// Git must ignore the directory itself using a repository-owned rule. Below an
+/// already ignored directory Git never consults nested .gitignore files.
+fn ignore_provenance(root: &Path, folder: &str) -> Result<()> {
+    // A trailing slash alone is insufficient: target/* also matches target/,
+    // although Git still enters target and reads target/.gitignore. Check both
+    // spellings to prove the directory itself is excluded from traversal.
+    let listed = git::git_input(
+        root,
+        &["-c", "core.excludesFile=/dev/null", "check-ignore", "-v", "--no-index", "-z", "--stdin"],
+        format!("{folder}/\0{folder}\0").as_bytes(),
+    )
+    .context("output directory is not ignored by a repository rule")?;
+    let fields: Vec<_> = listed.split('\0').collect();
+    ensure!(
+        fields.len() == 9 && fields[8].is_empty() && fields[3] == format!("{folder}/") && fields[7] == folder,
+        "output directory itself has no verified ignore rule"
+    );
+    let exclude = git::git(root, &["rev-parse", "--path-format=absolute", "--git-path", "info/exclude"])?;
+    let exclude = Path::new(exclude.strip_suffix('\n').context("missing info/exclude path terminator")?);
+    for rule in fields[..8].as_chunks::<4>().0 {
+        ensure!(!rule[2].starts_with('!'), "output directory is not ignored");
+        let source = Path::new(rule[0]);
+        let source = if source.is_absolute() { source.to_path_buf() } else { root.join(source) };
+        if source == exclude {
+            ensure!(source.symlink_metadata()?.file_type().is_file(), "info/exclude is not a regular file");
+            continue;
+        }
+        let relative = source.strip_prefix(root).context("ignore rule is outside the worktree")?;
+        ensure!(
+            relative.file_name().is_some_and(|name| name == ".gitignore")
+                && root.join(folder).starts_with(source.parent().context("ignore rule has no parent")?),
+            "ignore rule is not at or above the output"
+        );
+        let relative = relative.to_str().context("ignore rule path is not UTF-8")?;
+        ensure!(
+            inside(root, relative).as_ref() == Some(&source) && source.symlink_metadata()?.file_type().is_file(),
+            "ignore rule is not a regular worktree file"
+        );
+        // Exact index spelling matters: an untracked .gitignore must not borrow
+        // the identity of a tracked .GitIgnore on case-sensitive filesystems.
+        let tracked = git::git(root, &["--literal-pathspecs", "ls-files", "-z", "--", relative])?;
+        ensure!(
+            tracked.split('\0').any(|path| path == relative),
+            "output is hidden by an untracked ignore file: {relative}"
+        );
+    }
+    Ok(())
+}
+
+fn ensure_disposable(root: &Path, folder: &str) -> Result<()> {
     // Git's icase pathspecs do not fold every Unicode case alias. Keep such
     // outputs rather than risk missing a differently cased index entry.
-    if !folder.is_ascii() {
-        return false;
-    }
-    // Disk names and index names can differ by case. Per-pathspec magic combines
-    // literal matching with case-insensitive protection of indexed sources.
+    ensure!(folder.is_ascii(), "Git cannot verify Unicode case aliases");
     let pathspec = format!(":(literal,icase){folder}");
-    [
-        vec!["-c", "core.excludesFile=/dev/null", "ls-files", "--", &pathspec],
-        vec![
-            "-c",
-            "core.excludesFile=/dev/null",
-            "status",
-            "--porcelain",
-            "--untracked-files=all",
-            "--ignored=no",
-            "--",
-            &pathspec,
-        ],
-    ]
-    .iter()
-    .all(|args| git::git(root, args).is_ok_and(|files| files.is_empty()))
+    ensure!(
+        git::git(root, &["-c", "core.excludesFile=/dev/null", "ls-files", "--", &pathspec])?.is_empty(),
+        "output contains tracked files"
+    );
+    ensure!(
+        git::git(
+            root,
+            &[
+                "-c",
+                "core.excludesFile=/dev/null",
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+                "--ignored=no",
+                "--",
+                &pathspec
+            ]
+        )?
+        .is_empty(),
+        "output contains non-ignored work"
+    );
+    ignore_provenance(root, folder)
+}
+
+#[cfg(test)]
+fn disposable(root: &Path, folder: &str) -> bool {
+    ensure_disposable(root, folder).is_ok()
 }
 
 fn registered_worktrees(main: &Path) -> Result<Vec<PathBuf>> {
@@ -397,43 +458,96 @@ fn checked_output(root: &Path, folder: &str) -> Result<output::Output> {
     Ok(output)
 }
 
-fn output_paths(root: &Path, config: &CacheConfig) -> Vec<PathBuf> {
+fn candidate_paths(root: &Path, config: &CacheConfig) -> Vec<PathBuf> {
     let mut folders = config.outputs.clone();
     if root.join("Cargo.toml").is_file() {
-        folders.insert(0, "target".into());
+        folders.push("target".into());
     }
-    let mut found: Vec<PathBuf> = Vec::new();
-    for folder in folders {
-        // A configured shared folder and anything in it belongs to the store, never cleanup.
-        if config.shared.iter().any(|shared| {
-            relative(shared) && (Path::new(&folder).starts_with(shared) || Path::new(shared).starts_with(&folder))
-        }) {
-            continue;
-        }
-        let Some(path) = inside(root, &folder) else { continue };
-        if !path.is_dir() || found.iter().any(|parent| path.starts_with(parent)) {
-            continue;
-        }
-        // Refuse a folder with even one tracked file, including sparse and deleted tracked files.
-        if !disposable(root, &folder) || checked_output(root, &folder).is_err() {
-            continue;
-        }
-        found.retain(|child| !child.starts_with(&path));
-        found.push(path);
-    }
+    let mut found: Vec<_> = folders
+        .into_iter()
+        .filter(|folder| relative(folder))
+        .map(|folder| root.join(folder))
+        .filter(|path| path.symlink_metadata().is_ok_and(|meta| meta.is_dir() || meta.is_symlink()))
+        .collect();
+    found.sort();
+    found.dedup();
     found
 }
 
-pub fn inventory(worktree: &Path, config: &CacheConfig) -> Vec<BuildOutput> {
+fn outermost(found: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut parents: Vec<PathBuf> = Vec::new();
+    for path in found {
+        if !parents.iter().any(|parent| path.starts_with(parent)) {
+            parents.push(path);
+        }
+    }
+    parents
+}
+
+fn eligible_output(root: &Path, folder: &str, config: &CacheConfig) -> Result<output::Output> {
+    ensure!(
+        !config.shared.iter().any(|shared| relative(shared)
+            && (Path::new(folder).starts_with(shared) || Path::new(shared).starts_with(folder))),
+        "output overlaps a shared cache store"
+    );
+    ensure_disposable(root, folder)?;
+    checked_output(root, folder)
+}
+
+fn output_paths(root: &Path, config: &CacheConfig) -> Vec<PathBuf> {
+    outermost(
+        candidate_paths(root, config)
+            .into_iter()
+            .filter(|path| {
+                path.strip_prefix(root)
+                    .ok()
+                    .and_then(Path::to_str)
+                    .is_some_and(|folder| eligible_output(root, folder, config).is_ok())
+            })
+            .collect(),
+    )
+}
+
+/// Share file identities across all candidates and worktrees in one inventory.
+pub fn inventories(worktrees: &[(PathBuf, CacheConfig)]) -> Vec<BuildOutput> {
+    let mut seen = HashSet::new();
+    worktrees.iter().flat_map(|(worktree, config)| inventory_with_seen(worktree, config, &mut seen)).collect()
+}
+
+fn inventory_with_seen(
+    worktree: &Path,
+    config: &CacheConfig,
+    seen: &mut HashSet<output::Identity>,
+) -> Vec<BuildOutput> {
     let Ok((root, _)) = linked_worktree(worktree) else { return Vec::new() };
-    output_paths(&root, config)
+    outermost(candidate_paths(&root, config))
         .into_iter()
-        .filter_map(|path| {
-            let folder = path.strip_prefix(&root).ok()?.to_str()?;
-            let bytes = checked_output(&root, folder).ok()?.inspect().ok()?;
-            Some(BuildOutput { bytes, path: path.to_string_lossy().into_owned() })
+        .map(|path| {
+            let folder = path.strip_prefix(&root).unwrap().to_string_lossy();
+            let mut reason = eligible_output(&root, &folder, config).err().map(|error| format!("{error:#}"));
+            // A refused output stays visible. Measurement uses the same no-follow,
+            // repository and mount guards, but requires no write access.
+            let measured = output::Output::open(&root, &folder).and_then(|output| output.measure(seen));
+            let bytes = match measured {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    let detail = format!("size unavailable: {error:#}");
+                    reason = Some(reason.map_or_else(|| detail.clone(), |reason| format!("{reason}; {detail}")));
+                    0
+                }
+            };
+            BuildOutput { bytes, path: path.to_string_lossy().into_owned(), reason }
         })
         .collect()
+}
+
+#[cfg(test)]
+fn inventory(worktree: &Path, config: &CacheConfig) -> Vec<BuildOutput> {
+    inventory_with_seen(worktree, config, &mut HashSet::new())
+}
+
+pub fn partial_removal(error: &anyhow::Error) -> Option<String> {
+    error.downcast_ref::<output::PartialRemoval>().map(ToString::to_string)
 }
 
 pub fn clean(worktree: &Path, config: &CacheConfig) -> Result<Vec<String>> {
@@ -450,7 +564,7 @@ pub fn clean(worktree: &Path, config: &CacheConfig) -> Result<Vec<String>> {
         ensure!(users.is_empty(), "worktree in use: {}", users.join(", "));
         checked_output(&root, &folder)?.remove_if(|| {
             no_nested_worktrees(&root, &path)?;
-            ensure!(disposable(&root, &folder), "output contains tracked or non-ignored work");
+            ensure_disposable(&root, &folder)?;
             Ok(())
         })?;
         notes.push(format!("Removed build output {}", path.display()));
@@ -523,7 +637,7 @@ mod tests {
         assert!(work.join("target/new.rs").is_file());
         assert!(work.join("dist/artifact").is_file());
         std::fs::remove_file(work.join("target/new.rs")).unwrap();
-        assert!(disposable(&work, "target"));
+        assert!(!disposable(&work, "target"));
         std::fs::write(work.join("target/new.rs"), "new source").unwrap();
         assert!(!disposable(&work, "target"));
     }
@@ -576,7 +690,7 @@ mod tests {
                 outputs: vec![nested.join("out").strip_prefix(&work).unwrap().to_string_lossy().into_owned()],
                 ..Default::default()
             };
-            assert!(inventory(&work, &config).is_empty());
+            assert!(inventory(&work, &config).iter().all(|output| output.reason.is_some()));
             assert!(clean(&work, &config).unwrap().is_empty());
             assert!(nested.join("out/new.rs").is_file());
             assert_eq!(std::fs::read_to_string(nested.join("new.rs")).unwrap(), "uncommitted source", "{kind}");
@@ -614,11 +728,129 @@ mod tests {
         assert!(clean(&work, &config).unwrap().is_empty());
         assert!(work.join("src/bin/artifact").is_file());
         // Even ignored ignore-files must not hide new source under an output.
+        output(&work, "build/out");
+        std::fs::write(work.join("build/.gitignore"), "*\n").unwrap();
+        assert!(!disposable(&work, "build/out"));
+        let config = CacheConfig { outputs: vec!["build/out".into()], ..Default::default() };
+        assert!(clean(&work, &config).unwrap().is_empty());
+        assert!(work.join("build/out/artifact").is_file());
+    }
+
+    #[test]
+    fn nested_ignore_files_below_an_ignored_output_do_not_block_cleanup() {
+        let (_dir, _main, work) = project();
+        output(&work, "target/debug/build/vendor/out/source");
+        std::fs::write(work.join("target/debug/build/vendor/out/source/.gitignore"), "*\n").unwrap();
+        std::fs::write(work.join("target/.gitignore"), "*\n").unwrap();
+        let outputs = inventory(&work, &CacheConfig::default());
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].reason, None);
+        assert!(outputs[0].bytes > 0);
+        assert_eq!(clean(&work, &CacheConfig::default()).unwrap().len(), 1);
+        assert!(!work.join("target").exists());
+    }
+
+    #[test]
+    fn ignoring_only_output_contents_does_not_trust_a_nested_untracked_ignore_file() {
+        let (_dir, _main, work) = project();
+        std::fs::write(work.join(".gitignore"), "target/*\n!target/new.rs\n").unwrap();
         output(&work, "target");
         std::fs::write(work.join("target/.gitignore"), "*\n").unwrap();
-        assert!(disposable(&work, "target"));
+        std::fs::write(work.join("target/new.rs"), "untracked source").unwrap();
+        assert!(
+            git::git(&work, &["status", "--porcelain", "--untracked-files=all", "--ignored=no", "--", "target"])
+                .unwrap()
+                .is_empty(),
+            "status alone cannot see the source"
+        );
+        assert!(!disposable(&work, "target"));
         assert!(clean(&work, &CacheConfig::default()).unwrap().is_empty());
-        assert!(work.join("target/artifact").is_file());
+        assert_eq!(std::fs::read_to_string(work.join("target/new.rs")).unwrap(), "untracked source");
+        assert!(inventory(&work, &CacheConfig::default())[0].reason.is_some());
+    }
+
+    #[test]
+    fn inventory_and_warning_explain_an_untracked_ancestor_ignore_rule() {
+        let (_dir, _main, work) = project();
+        output(&work, "build/out");
+        std::fs::write(work.join("build/.gitignore"), "*\n").unwrap();
+        let config = CacheConfig { outputs: vec!["build/out".into()], ..Default::default() };
+        let outputs = inventory(&work, &config);
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs[0].bytes > 0, "refusal must not hide allocated bytes");
+        assert!(outputs[0].reason.as_ref().unwrap().contains("untracked ignore file"));
+        let warning = atomics_core::machine::DiskWarning { largest: outputs, ..Default::default() }.message();
+        assert!(warning.contains("build/out") && warning.contains("untracked ignore file"));
+        assert!(clean(&work, &config).unwrap().is_empty());
+        assert!(work.join("build/out/artifact").is_file());
+    }
+
+    #[test]
+    fn output_ignore_provenance_accepts_info_exclude_but_not_a_case_alias() {
+        let (_dir, main, work) = project();
+        std::fs::write(main.join(".git/info/exclude"), "dist/\n").unwrap();
+        output(&work, "dist");
+        let config = CacheConfig { outputs: vec!["dist".into()], ..Default::default() };
+        assert_eq!(clean(&work, &config).unwrap().len(), 1);
+        // A differently spelled tracked file is not the untracked ignore file.
+        output(&work, "build/out");
+        std::fs::write(work.join("build/.GitIgnore"), "tracked source").unwrap();
+        git::git(&work, &["add", "build/.GitIgnore"]).unwrap();
+        std::fs::write(work.join("build/.gitignore"), "*\n").unwrap();
+        assert!(!disposable(&work, "build/out"));
+    }
+
+    #[test]
+    fn cache_link_repair_visits_only_configured_or_allowlisted_paths() {
+        let (dir, _main, work) = project();
+        let home = dir.path().join("state");
+        let legacy = home.join("build-caches/repos/old/cache");
+        output(&legacy, "");
+        for folder in ["target/debug/unrelated", "custom/cache", ".cache/pip"] {
+            let path = work.join(folder);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&legacy, path).unwrap();
+        }
+        let first = link(&home, &work, &CacheConfig::default(), Domain::Host).unwrap();
+        assert_eq!(first.skipped, [work.canonicalize().unwrap().join(".cache/pip")]);
+        assert!(work.join("target/debug/unrelated").symlink_metadata().unwrap().is_symlink());
+        assert!(work.join("custom/cache").symlink_metadata().unwrap().is_symlink());
+        let config = CacheConfig { shared: vec!["custom/cache".into()], ..Default::default() };
+        let second = link(&home, &work, &config, Domain::Host).unwrap();
+        assert_eq!(second.skipped, [work.canonicalize().unwrap().join("custom/cache")]);
+        assert!(work.join("target/debug/unrelated").symlink_metadata().unwrap().is_symlink());
+        assert_eq!(std::fs::read_to_string(legacy.join("artifact")).unwrap(), "compiled");
+    }
+
+    #[test]
+    fn inventory_counts_hard_linked_blocks_once_across_outputs_and_worktrees() {
+        use std::os::unix::fs::MetadataExt;
+        let (dir, main, one) = project();
+        let two = dir.path().join("two");
+        git::add_worktree(&main, &two, "two", "main").unwrap();
+        for path in [one.join("target"), one.join("custom-output"), two.join("target")] {
+            std::fs::create_dir(&path).unwrap();
+        }
+        let artifact = one.join("target/binary");
+        std::fs::write(&artifact, vec![1; 65536]).unwrap();
+        for path in [one.join("target/alias"), one.join("custom-output/binary"), two.join("target/binary")] {
+            std::fs::hard_link(&artifact, path).unwrap();
+        }
+        let directory_bytes: u64 = [one.join("target"), one.join("custom-output"), two.join("target")]
+            .iter()
+            .map(|path| path.metadata().unwrap().blocks() * 512)
+            .sum();
+        let expected = artifact.metadata().unwrap().blocks() * 512 + directory_bytes;
+        let config = CacheConfig { outputs: vec!["custom-output".into()], ..Default::default() };
+        let outputs = inventories(&[(one.clone(), config.clone()), (two.clone(), config.clone())]);
+        assert_eq!(outputs.len(), 3);
+        assert!(outputs.iter().all(|output| output.reason.is_none()));
+        assert_eq!(outputs.iter().map(|output| output.bytes).sum::<u64>(), expected);
+        // Removing these names must still preserve links outside the outputs.
+        std::fs::hard_link(&artifact, dir.path().join("keep")).unwrap();
+        clean(&one, &config).unwrap();
+        clean(&two, &config).unwrap();
+        assert_eq!(std::fs::read(dir.path().join("keep")).unwrap(), vec![1; 65536]);
     }
 
     #[test]
@@ -804,7 +1036,7 @@ mod tests {
         link(&dir.path().join("state"), &work, &config, Domain::Host).unwrap();
         std::fs::write(work.join(".cache/sccache/cached"), "shared").unwrap();
         let inventory = inventory(&work, &config);
-        assert_eq!(inventory.len(), 2);
+        assert_eq!(inventory.iter().filter(|output| output.reason.is_none()).count(), 2);
         assert!(clean(&main, &config).is_err());
         clean(&work, &config).unwrap();
         assert!(!work.join("target").exists() && !work.join("custom-output").exists());

@@ -52,6 +52,9 @@ pub const CLEAN_BUILD_CACHES: &str = "Clean build caches of idle worktrees";
 pub struct BuildOutput {
     pub path: String,
     pub bytes: u64,
+    /// Why cleanup refuses this output; absent for eligible folders.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,7 +83,15 @@ impl DiskWarning {
         } else {
             self.largest
                 .iter()
-                .map(|folder| format!("{} ({:.2} GiB)", folder.path, folder.bytes as f64 / 1024f64.powi(3)))
+                .map(|folder| {
+                    let size = if folder.bytes == 0 && folder.reason.is_some() {
+                        String::new()
+                    } else {
+                        format!(" ({:.2} GiB)", folder.bytes as f64 / 1024f64.powi(3))
+                    };
+                    let reason = folder.reason.as_ref().map(|reason| format!("; kept: {reason}")).unwrap_or_default();
+                    format!("{}{size}{reason}", folder.path)
+                })
                 .collect::<Vec<_>>()
                 .join(", ")
         };
@@ -139,7 +150,7 @@ mod tests {
         let warning = DiskWarning::of(
             &disk(9),
             &config,
-            vec![BuildOutput { path: "/worktrees/task/target".into(), bytes: 1024u64.pow(3) }],
+            vec![BuildOutput { path: "/worktrees/task/target".into(), bytes: 1024u64.pow(3), reason: None }],
         )
         .unwrap();
         assert!(warning.blocked);

@@ -59,7 +59,17 @@ fn outputs_for_device(
     let mut matching: Vec<_> =
         outputs.iter().filter(|output| device.is_some() && device_of(&output.path) == device).cloned().collect();
     matching.sort_by_key(|output| std::cmp::Reverse(output.bytes));
-    matching.truncate(5);
+    // Always expose refused folders and their reasons, including unmeasurable
+    // ones, alongside the five largest eligible outputs.
+    let mut eligible = 0;
+    matching.retain(|output| {
+        if output.reason.is_some() {
+            true
+        } else {
+            eligible += 1;
+            eligible <= 5
+        }
+    });
     matching
 }
 
@@ -218,11 +228,8 @@ impl State {
                     .filter_map(|path| crate::build_cache::disk(path))
                     .collect();
                 let low = disks.iter().any(|disk| DiskWarning::of(disk, &config.resources, vec![]).is_some());
-                let mut largest: Vec<_> = if low && inventory_due {
-                    worktrees.iter().flat_map(|(path, cache)| crate::build_cache::inventory(path, cache)).collect()
-                } else {
-                    previous
-                };
+                let mut largest: Vec<_> =
+                    if low && inventory_due { crate::build_cache::inventories(&worktrees) } else { previous };
                 largest.sort_by_key(|folder| std::cmp::Reverse(folder.bytes));
                 largest.dedup_by(|a, b| a.path == b.path);
                 let warnings = disks
@@ -287,6 +294,7 @@ impl State {
                 move || {
                     let mut cleaned = HashSet::new();
                     let mut retries = HashMap::new();
+                    let mut partial = Vec::new();
                     for (path, config, pending) in targets {
                         crate::lifecycle::wait_for(&jobs, None, Some(&path));
                         if crate::sandbox::installed(&sbx)
@@ -307,7 +315,12 @@ impl State {
                                 }
                             }
                             Err(error) => {
-                                eprintln!("ATOMICS: kept build output in {}: {error:#}", path.display());
+                                if let Some(notice) = crate::build_cache::partial_removal(&error) {
+                                    eprintln!("ATOMICS: {notice}");
+                                    partial.push(notice);
+                                } else {
+                                    eprintln!("ATOMICS: kept build output in {}: {error:#}", path.display());
+                                }
                                 if error.to_string().contains("in use") {
                                     if pending.manual {
                                         skipped.push(path);
@@ -333,6 +346,9 @@ impl State {
                             skipped.sort();
                             skipped.dedup();
                             state.toast(cleanup_notice(&skipped));
+                        }
+                        if !partial.is_empty() {
+                            state.toast(partial.join("; "));
                         }
                         // Automatic cleanup refreshes free space, keeping the 120 s tree-walk
                         // limit. Only a manual request asks for a fresh folder inventory.
@@ -581,8 +597,9 @@ mod tests {
 
     #[test]
     fn disk_warning_folders_are_sorted_and_limited_per_filesystem() {
-        let mut outputs: Vec<_> = (0..8).map(|i| BuildOutput { path: format!("disk-a/{i}"), bytes: i }).collect();
-        outputs.push(BuildOutput { path: "disk-b/large".into(), bytes: 100 });
+        let mut outputs: Vec<_> =
+            (0..8).map(|i| BuildOutput { path: format!("disk-a/{i}"), bytes: i, reason: None }).collect();
+        outputs.push(BuildOutput { path: "disk-b/large".into(), bytes: 100, reason: None });
         let device = |path: &str| Some(if path.starts_with("disk-a/") { 1 } else { 2 });
         let a = outputs_for_device(&outputs, Some(1), device);
         assert_eq!(a.len(), 5);
@@ -590,6 +607,22 @@ mod tests {
         assert!(a.iter().all(|output| output.path.starts_with("disk-a/")));
         assert_eq!(outputs_for_device(&outputs, Some(2), device), [outputs[8].clone()]);
         assert!(outputs_for_device(&outputs, None, device).is_empty());
+    }
+
+    #[test]
+    fn disk_warning_keeps_refused_outputs_and_reasons_even_without_a_size() {
+        let mut outputs: Vec<_> =
+            (0..8).map(|i| BuildOutput { path: format!("work/target-{i}"), bytes: 100 + i, reason: None }).collect();
+        outputs.push(BuildOutput {
+            path: "work/target".into(),
+            bytes: 0,
+            reason: Some("output contains a nested repository; size unavailable".into()),
+        });
+        let folders = outputs_for_device(&outputs, Some(1), |_| Some(1));
+        assert_eq!(folders.len(), 6);
+        let warning = DiskWarning { largest: folders, ..Default::default() }.message();
+        assert!(warning.contains("work/target; kept: output contains a nested repository; size unavailable"));
+        assert!(!warning.contains("work/target (0.00 GiB)"));
     }
 
     #[test]
@@ -756,7 +789,11 @@ mod tests {
                 std::fs::write(work.join("target/artifact"), "compiled").unwrap();
                 app.runtime.repos = vec![repo.clone()];
                 app.runtime.config.resources.disk_min_gib = u64::MAX;
-                let cached = BuildOutput { path: repo.join("cached-only").to_string_lossy().into_owned(), bytes: 1024 };
+                let cached = BuildOutput {
+                    path: repo.join("cached-only").to_string_lossy().into_owned(),
+                    bytes: 1024,
+                    reason: None,
+                };
                 app.runtime.build_caches.largest = vec![cached.clone()];
                 app.runtime.build_caches.inventory_at = Some(Instant::now());
                 assert!(app.runtime.check_disk(&repo).unwrap_err().contains("cached-only"));

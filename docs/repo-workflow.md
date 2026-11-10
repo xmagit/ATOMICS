@@ -144,9 +144,14 @@ Repository `cache.env` accepts these variables only:
 `dist`, `.next`, or `out`. No globs are expanded. These names only make a folder eligible: cleanup still
 refuses tracked files (including index names with different case), non-ignored untracked work,
 case-mismatched or non-ASCII output paths, nested repositories/worktrees, mount/device boundaries, symlinks, shared caches
-and the main checkout. Cleanup disables global `core.excludesFile` rules and refuses any output containing
-a `.gitignore`, so an untracked ignore file cannot hide new work. Repository ignore rules still determine
-which remaining files are disposable. Worktrees with live sessions are protected; exiting processes get
+and the main checkout. Cleanup disables global `core.excludesFile` rules and verifies that the directory
+itself is ignored by a tracked `.gitignore` at or above it, or by `.git/info/exclude`, using
+`git check-ignore -v --no-index`. An untracked ignore file at or above it cannot hide new work and make it
+disposable. Nested `.gitignore` files inside an already-ignored output are allowed because Git does not
+consult them for the output. Refused outputs remain visible in the disk inventory and warning with their
+reason. Preflight checks write/search permissions before removal; unexpected failures after deletion
+starts report partial removal and the remaining size. Linux cleanup requires `STATX_MNT_ID` (Linux 5.8 or
+newer); kernels without it refuse all cleanup. Worktrees with live sessions are protected; exiting processes get
 bounded automatic retries, while manual cleanup skips busy worktrees and names them in the toast.
 Your own config can name other relative output folders or shared folders and any environment variable;
 known unsafe sharing choices produce Settings and doctor warnings.
