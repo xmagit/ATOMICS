@@ -138,8 +138,10 @@ answered, withdrawn, replaced and queued requests cannot be replayed as actionab
 Cursor advancement and event pagination still include skipped historical events. Existing ctl
 requests need no changes; ctl can opt in with `{"cmd":"wait","compact":true}`.
 
-UI commands such as activate, resize-window and screenshot target a chosen client, with a clear error
-when none is attached; they do not acquire global focus or write arbitrary server-side screenshot paths.
+Local control commands `screenshot`, `resize` and `show_settings` target only the embedded desktop's
+local window. A headless host rejects them even with a client connected: these commands are not forwarded
+to clients. Use the connected client's UI for its window and Settings. `activate` changes the host's selected
+session; it does not focus a connected client's window or acquire its terminal lease.
 
 The host serializes state transitions and assigns a monotonic event cursor; per-entity revisions detect
 stale plan edits and reviews. Replies distinguish accepted work from a completed merge or delivered message.
@@ -627,9 +629,14 @@ another with `host_command`.
   to it; the headless host attaches none, so every repaint is a no-op and `ctl list` reports `window: null`.
   `Host::start`, `ipc::serve`, the governor and the usage pollers take the `Window`, and runtime methods no longer
   take an `egui::Context`. The palette is still loaded on the host for diff highlighting (moving it is slice S5).
-- **No client attached.** The runtime thread answers and drops client events nobody consumes (a screenshot
-  reply gets an error), so they never accumulate. `screenshot`, `resize` and `show_settings` fail with "no window";
+- **Local window commands.** The runtime thread answers and drops local desktop events nobody consumes (a screenshot
+  reply gets an error), so they never accumulate. `screenshot`, `resize` and `show_settings` fail with
+  "no local window" and explain that commands are not forwarded to connected clients, even when one is attached;
   `restart` is refused, since a service manager restarts the host. Notices the desktop shows as toasts go to stderr.
+- **Chief control without a window.** `atomics ctl '{"cmd":"start_chief"}'` starts the configured chief if needed
+  and returns its session. `atomics ctl '{"cmd":"send","session":"chief","text":"Plan the next task"}'`
+  starts it with that first prompt when none is running, or delivers to the existing chief with the usual permission
+  holds and delivery confirmation. Neither command opens a window. Raw key sends do not start the chief.
 - **One owner per home.** `instance.lock` in `ATOMICS_HOME`, by `flock`: the host holds it exclusively and records
   its pid, and every desktop holds it shared. A host refuses a home a desktop or another host is using, and a desktop
   refuses a home a host is using; desktops still start side by side (the second runs without the socket, as before).

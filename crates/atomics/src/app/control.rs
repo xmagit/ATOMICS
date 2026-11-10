@@ -752,6 +752,29 @@ impl State {
                     Err(err) => done(ControlResponse::error(err)),
                 }
             }
+            ControlRequest::StartChief => {
+                let started = match self.sessions.iter().find(|s| s.chief && s.can_receive()) {
+                    Some(chief) => Ok(chief.id.clone()),
+                    None => {
+                        self.sessions.retain(|s| !s.chief);
+                        self.start_chief(None)
+                    }
+                };
+                done(match started {
+                    Ok(id) => ControlResponse::ok(self.describe(self.find(&id).expect("chief just started"))),
+                    Err(error) => ControlResponse::error(error),
+                })
+            }
+            ControlRequest::Send { session, text, raw: false } if session.trim().eq_ignore_ascii_case("chief") => {
+                done(match self.chief_delivery(&text) {
+                    Ok(delivery) => {
+                        let index = self.sessions.iter().position(|s| s.chief).expect("chief just delivered to");
+                        let Some(response) = self.control_delivery(index, delivery, &reply) else { return };
+                        response
+                    }
+                    Err(error) => ControlResponse::error(error),
+                })
+            }
             ControlRequest::Send { session, text, raw } => match self.find(&session) {
                 None => missing(&session),
                 // Only while atomics_approve can answer: any other menu takes keys.
@@ -765,27 +788,11 @@ impl State {
                     }
                     None => done(ControlResponse::error("raw keys need a session running inside ATOMICS")),
                 },
-                Some(index) => done(match self.deliver(index, &text) {
-                    Delivery::Pending => {
-                        self.sessions[index].pending.as_mut().expect("pending delivery").reply = Some(reply);
-                        return;
-                    }
-                    Delivery::Held => {
-                        let reason = if self.sessions[index].approval_hold || !self.sessions[index].approvals.is_empty()
-                        {
-                            "permission answered"
-                        } else {
-                            "previous delivery confirmed"
-                        };
-                        ControlResponse::ok(json!({"sent":false, "held":true, "held_until":reason}))
-                    }
-                    Delivery::Sent | Delivery::Queued => ControlResponse::ok(
-                        json!({"sent":true, "queued_until_next_hook":self.sessions[index].terminal.is_none()}),
-                    ),
-                    Delivery::Unavailable => {
-                        ControlResponse::error("message not delivered: session exited or another delivery is pending")
-                    }
-                }),
+                Some(index) => {
+                    let delivery = self.deliver(index, &text);
+                    let Some(response) = self.control_delivery(index, delivery, &reply) else { return };
+                    done(response)
+                }
             },
             ControlRequest::Read { session, lines } => match self.find(&session) {
                 None => missing(&session),
@@ -863,6 +870,35 @@ impl State {
             }
         };
         let _ = reply.send(outcome);
+    }
+
+    /// Chief and session sends share the same delivery confirmation and permission holds.
+    fn control_delivery(
+        &mut self,
+        index: usize,
+        delivery: Delivery,
+        reply: &Sender<ControlOutcome>,
+    ) -> Option<ControlResponse> {
+        Some(match delivery {
+            Delivery::Pending => {
+                self.sessions[index].pending.as_mut().expect("pending delivery").reply = Some(reply.clone());
+                return None;
+            }
+            Delivery::Held => {
+                let reason = if self.sessions[index].approval_hold || !self.sessions[index].approvals.is_empty() {
+                    "permission answered"
+                } else {
+                    "previous delivery confirmed"
+                };
+                ControlResponse::ok(json!({"sent":false, "held":true, "held_until":reason}))
+            }
+            Delivery::Sent | Delivery::Queued => ControlResponse::ok(
+                json!({"sent":true, "queued_until_next_hook":self.sessions[index].terminal.is_none()}),
+            ),
+            Delivery::Unavailable => {
+                ControlResponse::error("message not delivered: session exited or another delivery is pending")
+            }
+        })
     }
 
     /// `atomics_exec`: a command for a sandboxed session's sandbox, in its worktree, which the socket

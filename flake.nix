@@ -26,7 +26,9 @@
           pkgs = import nixpkgs { inherit system; };
         in
         {
-          atomics = pkgs.callPackage ./nix/atomics.nix { };
+          atomics = pkgs.callPackage ./nix/atomics.nix {
+            buildRevision = self.shortRev or self.dirtyShortRev or null;
+          };
           atomics-onboard = pkgs.callPackage ./nix/vm/onboard.nix { };
           default = self.packages.${system}.atomics;
         } // nixpkgs.lib.optionalAttrs (system == "aarch64-linux") {
