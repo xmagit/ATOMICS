@@ -230,6 +230,8 @@ mod tests {
                 let (tx, rx) = channel();
                 app.runtime.control(
                     ControlRequest::Wait {
+                        compact: false,
+                        full_sessions: false,
                         sessions: vec![],
                         statuses: vec!["heartbeat".into()],
                         after: Some(0),
@@ -287,6 +289,8 @@ mod tests {
                 let (tx, rx) = channel();
                 app.runtime.control(
                     ControlRequest::Wait {
+                        compact: false,
+                        full_sessions: false,
                         sessions: vec!["gone".into()],
                         statuses: vec!["heartbeat".into()],
                         after: Some(0),

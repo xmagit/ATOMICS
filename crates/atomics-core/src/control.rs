@@ -183,6 +183,12 @@ pub enum ControlRequest {
         after: Option<u64>,
         #[serde(default)]
         timeout_secs: Option<u64>,
+        /// Compact events and only sessions with status changes. MCP enables this; ctl keeps its legacy default.
+        #[serde(default)]
+        compact: bool,
+        /// Include every session even in a compact answer.
+        #[serde(default)]
+        full_sessions: bool,
     },
     /// What a session produced: status, last prompt, final message, screen tail, diff size.
     Result {

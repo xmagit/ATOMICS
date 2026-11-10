@@ -264,7 +264,7 @@ impl State {
                     done(ControlResponse::ok(json!({ "editing": path, "line": line })))
                 }
             },
-            ControlRequest::Wait { sessions, statuses, after, timeout_secs } => {
+            ControlRequest::Wait { sessions, statuses, after, timeout_secs, compact, full_sessions } => {
                 let mut ids = Vec::new();
                 for reference in &sessions {
                     match self.find(reference) {
@@ -286,6 +286,8 @@ impl State {
                     sessions: ids,
                     statuses,
                     after: after.unwrap_or(self.event_seq),
+                    compact,
+                    full_sessions,
                     deadline: Instant::now() + timeout,
                     reply,
                 });
@@ -920,6 +922,7 @@ impl State {
         let now = Instant::now();
         let mut pending = Vec::new();
         for waiter in std::mem::take(&mut self.waiters) {
+            let mut approvals = HashSet::new();
             let mut matching: Vec<(u64, serde_json::Value)> = self
                 .events
                 .iter()
@@ -933,7 +936,33 @@ impl State {
                         || waiter.sessions.contains(&e.session)
                 })
                 .filter(|e| waiter.statuses.iter().any(|s| s == e.kind()))
-                .map(|e| (e.seq, e.to_json()))
+                // Historical permission events are actionable only for the session's current request.
+                // This also excludes queued requests until they become the first pending request.
+                .filter(|e| {
+                    e.approval.as_ref().is_none_or(|approval| {
+                        let id = approval["id"].as_str();
+                        id.is_some()
+                            && self.sessions.iter().find(|s| s.id == e.session).is_some_and(|s| {
+                                s.approvals.first().is_some_and(|pending| Some(pending.id.as_str()) == id)
+                            })
+                    })
+                })
+                .filter(|e| {
+                    !waiter.compact
+                        || e.approval.as_ref().is_none_or(|approval| {
+                            approval["id"].as_str().is_none_or(|id| approvals.insert(id.to_string()))
+                        })
+                })
+                .map(|e| {
+                    let mut event = e.to_json();
+                    if waiter.compact {
+                        event["title"] = json!(self.wait_title(&e.session, &e.title));
+                        if let Some(approval) = event.get_mut("approval") {
+                            compact_approval(approval);
+                        }
+                    }
+                    (e.seq, event)
+                })
                 .collect();
             // Deliver the handoff even with a cursor from the previous process.
             if let Some(event) = self.restart_event.take() {
@@ -958,23 +987,64 @@ impl State {
                 read_to = read_to.max(seq);
                 events.push(event);
             }
+            let cursor = if more { read_to } else { self.event_seq };
+            // Include all status changes read by this cursor, even when the wake-up filters name
+            // other statuses. Reports, heartbeats and plan changes do not mark a session changed.
+            let changed: HashSet<_> = self
+                .events
+                .iter()
+                .filter(|e| e.seq > waiter.after && e.seq <= cursor && e.kind() == e.status.label())
+                .map(|e| e.session.as_str())
+                .collect();
+            let unchanged = self.sessions.iter().filter(|s| !changed.contains(s.id.as_str())).count();
             let sessions: Vec<_> = self
                 .sessions
                 .iter()
-                .map(|s| json!({ "id": s.id, "title": clip(&s.title, 120), "status": s.status.label() }))
+                .filter(|s| !waiter.compact || waiter.full_sessions || changed.contains(s.id.as_str()))
+                .map(|s| {
+                    let title = if waiter.compact { self.wait_title(&s.id, &s.title) } else { clip(&s.title, 120) };
+                    json!({ "id": s.id, "title": title, "status": s.status.label() })
+                })
                 .collect();
             let mut response = json!({
                 "events": events,
-                "cursor": if more { read_to } else { self.event_seq },
+                "cursor": cursor,
                 "timed_out": events.is_empty(),
                 "sessions": sessions,
             });
+            if waiter.compact {
+                response["sessions_unchanged"] = json!(unchanged);
+                response["sessions_summary"] = json!(format!("{unchanged} sessions unchanged."));
+            }
             if more {
                 response["more"] = json!("More events wait: call atomics_wait again with this cursor.");
             }
             let _ = waiter.reply.send(ControlOutcome::Done(ControlResponse::ok(response)));
         }
         self.waiters = pending;
+    }
+
+    fn wait_title(&self, session: &str, fallback: &str) -> String {
+        match self.plans.iter().flat_map(|p| &p.tasks).find(|t| t.session.as_deref() == Some(session)) {
+            Some(task) => clip(&format!("{}: {}", task.id, task.title), 120),
+            None => clip(fallback, 120),
+        }
+    }
+}
+
+/// Keep tool-specific arguments, but show a command and its explanation only once.
+fn compact_approval(approval: &mut serde_json::Value) {
+    let command = approval.get("command").cloned();
+    let reason = approval.get("reason").cloned();
+    if let Some(input) = approval.get_mut("input").and_then(serde_json::Value::as_object_mut) {
+        input.retain(|key, value| match key.as_str() {
+            "command" => Some(&*value) != command.as_ref(),
+            "reason" | "description" | "justification" => Some(&*value) != reason.as_ref(),
+            _ => true,
+        });
+        if input.is_empty() {
+            approval.as_object_mut().expect("approval object").remove("input");
+        }
     }
 }
 
@@ -1027,5 +1097,252 @@ fn headless_refusal(request: &ControlRequest) -> Option<&'static str> {
             Some("the headless host does not restart itself; restart it with its service manager (systemctl restart)")
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::tests::{request, session, with_app};
+    use atomics_core::control::shown_len;
+
+    fn approval(id: &str, command: &str) -> PendingApproval {
+        PendingApproval {
+            id: id.into(),
+            request: ApprovalRequest {
+                tool: "Bash".into(),
+                command: Some(command.into()),
+                cwd: "/fleet".into(),
+                reason: Some("Run the task's focused checks".into()),
+                input: json!({"command":command, "description":"Run the task's focused checks", "timeout":600}),
+                warning: None,
+            },
+            reply: Some(Arc::new(ipc::ApprovalReply::default())),
+            native: None,
+            stash: approvals::StashPins::default(),
+        }
+    }
+
+    #[test]
+    fn compact_wait_six_session_fleet_stays_under_budget() {
+        with_app("app::control::tests::compact_wait_six_session_fleet_stays_under_budget", |app, _| {
+            app.runtime.sessions = (1..=6)
+                .map(|i| {
+                    let mut s = session(&format!("worker-{i}"), AgentKind::Generic, AgentStatus::Working, Path::new("/fleet"));
+                    s.title = format!("atomics/plan-fleet-review-the-full-integration-task-with-permission-requests-and-extra-context-worker-{i}");
+                    s
+                })
+                .collect();
+            app.runtime.plans = vec![Plan {
+                id: "fleet".into(),
+                tasks: (1..=6)
+                    .map(|i| Task {
+                        id: format!("t{i}"),
+                        title: format!("Check component {i}"),
+                        session: Some(format!("worker-{i}")),
+                        ..Task::default()
+                    })
+                    .collect(),
+                ..Plan::default()
+            }];
+            app.runtime.record_events();
+            let after = app.runtime.event_seq;
+            for i in 0..2 {
+                let command =
+                    format!("nix develop .#default --command cargo test -p fleet-component-{} -- --nocapture", i + 1);
+                app.runtime.sessions[i].approvals.push(approval(&format!("request-{i}"), &command));
+                app.runtime.sessions[i].status = AgentStatus::NeedsInput;
+            }
+            app.runtime.record_events();
+            // Fixed timestamps and paths keep the measurement reproducible across machines.
+            for event in &mut app.runtime.events {
+                event.at = 1_700_000_000;
+            }
+            let legacy = request(app, json!({"cmd":"wait", "after":after, "timeout_secs":0}));
+            let compact = request(app, json!({"cmd":"wait", "after":after, "timeout_secs":0, "compact":true}));
+            let before = shown_len(&legacy.result);
+            let after_size = shown_len(&compact.result);
+            println!("six-session wait: before={before} bytes, after={after_size} bytes (pretty JSON)");
+            assert!(after_size < 1500, "before={before}, after={after_size}, budget=1500 bytes");
+            assert!(after_size < before, "{before} -> {after_size}");
+            assert_eq!(legacy.result["sessions"].as_array().unwrap().len(), 6);
+            assert!(legacy.result["events"][0]["approval"]["input"]["command"].is_string());
+            assert!(legacy.result.get("sessions_summary").is_none(), "ctl's default shape stays unchanged");
+            assert_eq!(compact.result["sessions"].as_array().unwrap().len(), 2);
+            assert_eq!(compact.result["sessions_unchanged"], 4);
+            assert_eq!(compact.result["sessions"][0]["title"], "t1: Check component 1");
+            let events = compact.result["events"].as_array().unwrap();
+            assert_eq!(events.len(), 2);
+            for (i, event) in events.iter().enumerate() {
+                assert_eq!(event["task"], format!("t{}", i + 1));
+                assert_eq!(event["title"], format!("t{}: Check component {}", i + 1, i + 1));
+                assert_eq!(event["approval"]["input"], json!({"timeout":600}));
+            }
+
+            // Recording the same permission again still shows that request once per answer.
+            app.runtime.last_status.remove("worker-1");
+            app.runtime.record_events();
+            let duplicate = request(app, json!({"cmd":"wait", "after":after, "timeout_secs":0, "compact":true}));
+            assert_eq!(duplicate.result["events"].as_array().unwrap().len(), 2);
+            assert_eq!(duplicate.result["cursor"], app.runtime.event_seq);
+
+            let cursor = app.runtime.event_seq;
+            let unchanged = request(app, json!({"cmd":"wait", "after":cursor, "timeout_secs":0, "compact":true}));
+            println!(
+                "unchanged fleet: before={} bytes, after={} bytes (pretty JSON)",
+                shown_len(&request(app, json!({"cmd":"wait", "after":cursor, "timeout_secs":0})).result),
+                shown_len(&unchanged.result)
+            );
+            assert_eq!(unchanged.result["sessions"], json!([]));
+            assert_eq!(unchanged.result["sessions_summary"], "6 sessions unchanged.");
+            assert_eq!(unchanged.result["timed_out"], true);
+            assert!(shown_len(&unchanged.result) < 200);
+            let full = request(
+                app,
+                json!({"cmd":"wait", "after":cursor, "timeout_secs":0, "compact":true, "full_sessions":true}),
+            );
+            assert_eq!(full.result["sessions"].as_array().unwrap().len(), 6);
+            assert_eq!(full.result["sessions_unchanged"], 6);
+            assert_eq!(full.result["sessions"][0]["title"], "t1: Check component 1");
+        });
+    }
+
+    #[test]
+    fn wait_omits_answered_replaced_and_removed_permission_requests() {
+        with_app("app::control::tests::wait_omits_answered_replaced_and_removed_permission_requests", |app, _| {
+            app.runtime.sessions =
+                vec![session("worker", AgentKind::Generic, AgentStatus::NeedsInput, Path::new("/fleet"))];
+            app.runtime.sessions[0].approvals.push(approval("old", "cargo test"));
+            app.runtime.record_events();
+            let answered =
+                request(app, json!({"cmd":"approve", "session":"worker", "request":"old", "decision":"allow"}));
+            assert!(answered.ok, "{answered:?}");
+            app.runtime.record_events();
+            for compact in [false, true] {
+                let answer = request(
+                    app,
+                    json!({"cmd":"wait", "after":0, "statuses":["needs you"], "timeout_secs":0, "compact":compact}),
+                );
+                assert_eq!(answer.result["events"], json!([]));
+                assert_eq!(answer.result["cursor"], app.runtime.event_seq);
+                assert_eq!(answer.result["timed_out"], true);
+            }
+            // A replacement with the same command has its own id; the old event must stay hidden.
+            app.runtime.sessions[0].approvals.push(approval("replacement", "cargo test"));
+            app.runtime.sessions[0].status = AgentStatus::NeedsInput;
+            app.runtime.record_events();
+            app.runtime.sessions[0].approvals[0].id = "current".into();
+            app.runtime.last_status.remove("worker");
+            app.runtime.record_events();
+            for compact in [false, true] {
+                let answer = request(
+                    app,
+                    json!({"cmd":"wait", "after":0, "statuses":["needs you"], "timeout_secs":0, "compact":compact}),
+                );
+                assert_eq!(answer.result["events"].as_array().unwrap().len(), 1);
+                assert_eq!(answer.result["events"][0]["approval"]["id"], "current");
+            }
+            // Withdrawing a request, or closing its session, makes its permission event stale too.
+            app.runtime.sessions[0].approvals.clear();
+            let withdrawn = request(
+                app,
+                json!({"cmd":"wait", "after":0, "statuses":["needs you"], "timeout_secs":0, "compact":true}),
+            );
+            assert_eq!(withdrawn.result["events"], json!([]));
+            app.runtime.sessions.clear();
+            let removed = request(
+                app,
+                json!({"cmd":"wait", "after":0, "statuses":["needs you"], "timeout_secs":0, "compact":true}),
+            );
+            assert_eq!(removed.result["events"], json!([]));
+        });
+    }
+
+    #[test]
+    fn wait_delivers_a_queued_permission_when_it_becomes_current() {
+        with_app("app::control::tests::wait_delivers_a_queued_permission_when_it_becomes_current", |app, _| {
+            app.runtime.sessions =
+                vec![session("worker", AgentKind::Generic, AgentStatus::Working, Path::new("/fleet"))];
+            for command in ["touch first", "touch second"] {
+                app.runtime.on_hook(HookMessage {
+                    pane: Some("worker".into()),
+                    ancestors: vec![],
+                    delivered: 0,
+                    approval_reply: Some(Arc::new(ipc::ApprovalReply::default())),
+                    event: atomics_core::hook::HookEvent::from_payload(&json!({
+                        "hook_event_name":"PermissionRequest", "session_id":"worker", "cwd":"/fleet",
+                        "tool_name":"Bash", "tool_input":{"command":command}
+                    }))
+                    .unwrap(),
+                });
+            }
+            let answer = request(app, json!({"cmd":"wait", "after":0, "timeout_secs":0, "compact":true}));
+            assert_eq!(answer.result["events"].as_array().unwrap().len(), 1);
+            assert_eq!(answer.result["events"][0]["approval"]["command"], "touch first");
+            let id = answer.result["events"][0]["approval"]["id"].clone();
+            let after = answer.result["cursor"].clone();
+            assert!(request(app, json!({"cmd":"approve", "session":"worker", "request":id, "decision":"allow"})).ok);
+            app.runtime.record_events();
+            let next = request(app, json!({"cmd":"wait", "after":after, "timeout_secs":0, "compact":true}));
+            assert_eq!(next.result["events"].as_array().unwrap().len(), 1);
+            assert_eq!(next.result["events"][0]["approval"]["command"], "touch second");
+            assert_eq!(next.result["events"][0]["approval"]["id"], app.runtime.sessions[0].approvals[0].id);
+            assert_eq!(next.result["events"][0]["status"], "needs you");
+        });
+    }
+
+    #[test]
+    fn compact_wait_sessions_follow_the_paginated_cursor() {
+        with_app("app::control::tests::compact_wait_sessions_follow_the_paginated_cursor", |app, _| {
+            app.runtime.sessions = ["first", "last"]
+                .iter()
+                .map(|id| session(id, AgentKind::Generic, AgentStatus::Idle, Path::new("/fleet")))
+                .collect();
+            app.runtime.record_events();
+            let after = app.runtime.event_seq;
+            app.runtime.sessions[0].status = AgentStatus::Working;
+            app.runtime.record_events();
+            for _ in 0..5 {
+                assert!(
+                    request(
+                        app,
+                        json!({"cmd":"report", "pane":"gone", "status":"progress", "summary":"word ".repeat(1800)})
+                    )
+                    .ok
+                );
+            }
+            app.runtime.sessions[1].status = AgentStatus::Working;
+            app.runtime.record_events();
+            let first = request(app, json!({"cmd":"wait", "after":after, "statuses":["reported"], "compact":true}));
+            assert!(first.result.get("more").is_some());
+            assert_eq!(first.result["sessions"], json!([{"id":"first", "title":"first", "status":"working"}]));
+            assert_eq!(first.result["sessions_unchanged"], 1);
+            let last = request(
+                app,
+                json!({"cmd":"wait", "after":first.result["cursor"], "statuses":["reported"], "compact":true}),
+            );
+            assert!(last.result.get("more").is_none());
+            assert_eq!(last.result["sessions"], json!([{"id":"last", "title":"last", "status":"working"}]));
+            assert_eq!(last.result["cursor"], app.runtime.event_seq);
+            assert_eq!(
+                first.result["events"].as_array().unwrap().len() + last.result["events"].as_array().unwrap().len(),
+                5
+            );
+        });
+    }
+
+    #[test]
+    fn compact_approval_keeps_distinct_arguments() {
+        let mut value = json!({"command":"run", "reason":"check", "input":{"command":"run", "reason":"check", "description":"check", "justification":"check", "path":"file"}});
+        compact_approval(&mut value);
+        assert_eq!(value["input"], json!({"path":"file"}));
+        let mut distinct =
+            json!({"command":"run", "reason":"check", "input":{"command":"other", "description":"extra context"}});
+        let original = distinct.clone();
+        compact_approval(&mut distinct);
+        assert_eq!(distinct, original);
+        let mut empty = json!({"command":"run", "reason":"check", "input":{"command":"run", "description":"check"}});
+        compact_approval(&mut empty);
+        assert!(empty.get("input").is_none());
     }
 }

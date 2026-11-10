@@ -1379,6 +1379,8 @@ mod tests {
                 let (tx, rx) = std::sync::mpsc::channel();
                 app.runtime.control(
                     ControlRequest::Wait {
+                        compact: false,
+                        full_sessions: false,
                         sessions: vec![],
                         statuses: statuses.iter().map(|s| s.to_string()).collect(),
                         after: Some(app.runtime.event_seq),
