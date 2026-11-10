@@ -1391,21 +1391,6 @@ exec {} "$@"
                 let (_dir2, repo2) = repository();
                 let started = dir1.path().join("started");
                 let release = dir1.path().join("release");
-                let hook = repo1.join(".git/hooks/pre-commit");
-                // The hook holds the first integration until `release` exists. It must never outlive
-                // the test: a failed test drops its folder (often before the hook sees `release`), so
-                // the hook also stops when the folder is gone, and after a few minutes at most.
-                // Otherwise every failure would leave a loop starting processes and loading the machine.
-                crate::test_support::write_program(
-                    &hook,
-                    format!(
-                        "#!/bin/sh\ntouch '{}'\nattempts=0\nwhile [ ! -f '{}' ]; do\n  [ -d '{}' ] || exit 1\n  \
-                         attempts=$((attempts + 1))\n  [ \"$attempts\" -lt 6000 ] || exit 1\n  sleep 0.02\ndone\n",
-                        started.display(),
-                        release.display(),
-                        dir1.path().display()
-                    ),
-                );
                 app.runtime.config.worktree_path = "{repo_parent}/{slug}".into();
                 let mut indices = Vec::new();
                 for (goal, repo) in [("One", &repo1), ("Two", &repo2)] {
@@ -1422,6 +1407,20 @@ exec {} "$@"
                     app.runtime.plans[index].tasks[0].status = TaskStatus::Done;
                     indices.push(index);
                 }
+                // Plumbing commits bypass pre-commit. Pause the ref transaction instead, installing
+                // the hook after branch creation so only integration is held. It must never outlive
+                // the test: stop when the fixture disappears, or after a few minutes at most.
+                crate::test_support::write_program(
+                    repo1.join(".git/hooks/reference-transaction"),
+                    format!(
+                        "#!/bin/sh\n[ \"$1\" = prepared ] || exit 0\ntouch '{}'\nattempts=0\nwhile [ ! -f '{}' ]; do\n  \
+                         [ -d '{}' ] || exit 1\n  attempts=$((attempts + 1))\n  [ \"$attempts\" -lt 6000 ] || exit 1\n  \
+                         sleep 0.02\ndone\n",
+                        started.display(),
+                        release.display(),
+                        dir1.path().display()
+                    ),
+                );
                 // The first integration cannot finish before `release` exists, so a second integration
                 // that waited for it would never arrive in time. The bound only has to outlast a loaded
                 // machine: while the whole suite runs, a single git call can take half a second.
