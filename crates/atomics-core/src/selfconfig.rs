@@ -190,8 +190,8 @@ pub fn source_of(layers: &[Layer], path: &[String]) -> Source {
             return Source::Default;
         }
     }
-    // A workspace's [isolation] merges key by key over the main and host files'.
-    if path.first().is_some_and(|name| name == "isolation")
+    // Workspace isolation and identity merge key by key over the main and host files'.
+    if path.first().is_some_and(|name| matches!(name.as_str(), "isolation" | "identity"))
         && layers.iter().rev().any(|layer| layer.source == Source::Workspace && defines(&layer.table, path))
     {
         return Source::Workspace;
@@ -497,12 +497,14 @@ pub fn propose(scope: Scope, layers: &[Layer], fragment: &str, remove: &[String]
         Scope::Workspace => {
             if let Some(change) = changes.iter().find(|change| !workspace_setting(&change.key)) {
                 return Err(format!(
-                    "a workspace file takes only [tickets], [workflow], [isolation] and [chief] prompt; {} belongs in the main or host config",
+                    "a workspace file takes only [tickets], [workflow], [isolation], [identity] and [chief] prompt; {} belongs in the main or host config",
                     change.key
                 ));
             }
             load::<crate::workspace::Workspace>(&table, "")
-                .map_err(|e| format!("the workspace file would not load: {e}"))?;
+                .map_err(|e| format!("the workspace file would not load: {e}"))?
+                .identity()
+                .map_err(|_| "the workspace identity would not load".to_string())?;
             if let Some(prompt) = lookup(&table, &["chief", "prompt"]).filter(|prompt| !prompt.is_str()) {
                 return Err(format!("chief.prompt must be text, not {}", prompt.type_str()));
             }
@@ -527,13 +529,16 @@ pub fn propose(scope: Scope, layers: &[Layer], fragment: &str, remove: &[String]
             let invalid = |e: String| format!("the config would not load: {e}");
             // The main file is shared: it must load on a machine without this host's overrides too.
             if scope == Scope::Main {
-                load::<Config>(&table, "").map_err(invalid)?.workflow.validate()?;
+                let config = load::<Config>(&table, "").map_err(invalid)?;
+                config.workflow.validate()?;
+                config.identity.validate()?;
             }
             let tables = layers
                 .iter()
                 .filter(|layer| matches!(layer.source, Source::Main | Source::Host))
                 .map(|layer| if Some(layer.source) == scope.source() { table.clone() } else { layer.table.clone() });
             let config = load::<Config>(&Config::merged(tables), "").map_err(invalid)?;
+            config.identity.validate()?;
             config.workflow.validate()?;
             warnings = warnings_for(scope, layers, &config, &changes);
         }
@@ -667,6 +672,18 @@ pub fn load_error(layers: &[Layer]) -> Option<String> {
     if let Err(error) = load::<Config>(&merged, "") {
         return Some(format!("the config does not load: {error}"));
     }
+    if let Ok(config) = load::<Config>(&merged, "")
+        && let Err(error) = config.identity.validate()
+    {
+        return Some(error);
+    }
+    for layer in layers.iter().filter(|layer| layer.source == Source::Workspace) {
+        if let Ok(workspace) = load::<crate::workspace::Workspace>(&layer.table, "")
+            && workspace.identity().is_err()
+        {
+            return Some("the workspace's [identity] does not load".into());
+        }
+    }
     if let Some(workflow) =
         layers.iter().filter(|layer| layer.source == Source::Workspace).find_map(|l| l.table.get("workflow"))
     {
@@ -688,7 +705,7 @@ pub fn load_error(layers: &[Layer]) -> Option<String> {
 
 /// The settings a workspace file carries.
 fn workspace_setting(key: &str) -> bool {
-    ["tickets", "workflow", "isolation"]
+    ["tickets", "workflow", "isolation", "identity"]
         .iter()
         .any(|section| key == *section || key.strip_prefix(section).is_some_and(|rest| rest.starts_with('.')))
         || key == "chief.prompt"
@@ -955,6 +972,36 @@ mod tests {
         }
         let error = propose(Scope::Theme, &[], "accent = \"#e0a458\"", &[]).unwrap_err();
         assert!(error.contains("names its theme"), "{error}");
+    }
+
+    #[test]
+    fn identity_proposals_validate_workspace_settings_and_preserve_project_paths() {
+        let layers = [layer(Source::Main, ""), layer(Source::Workspace, "projects = []\n")];
+        let proposal = propose(
+            Scope::Workspace,
+            &layers,
+            "[identity]\nname = 'Workspace Example'\nemail = 'workspace@example.com'\nforbidden_words = ['contoso']",
+            &[],
+        )
+        .unwrap();
+        let workspace: crate::workspace::Workspace = toml::from_str(&proposal.after).unwrap();
+        assert_eq!(workspace.identity().unwrap().unwrap().email.as_deref(), Some("workspace@example.com"));
+        assert!(propose(Scope::Workspace, &layers, "[identity]\nemail = ''", &[]).is_err());
+        assert!(
+            propose(Scope::Workspace, &layers, "[identity.projects.'~/app']\nemail = 'project@example.com'", &[])
+                .is_err()
+        );
+        let project = propose(
+            Scope::Main,
+            &layers,
+            "[identity.projects.'~/app']\nname = 'Project Example'\nemail = 'project@example.com'",
+            &[],
+        )
+        .unwrap();
+        let config: Config = toml::from_str(&project.after).unwrap();
+        assert_eq!(config.identity.projects["~/app"].email.as_deref(), Some("project@example.com"));
+        let layers = [layers[0].clone(), layer(Source::Workspace, &proposal.after)];
+        assert_eq!(source_of(&layers, &["identity".into(), "email".into()]), Source::Workspace);
     }
 
     #[test]
@@ -1325,7 +1372,7 @@ children = [{ auth = { header = "object-secret" }, label = "public" }]
         let workspace = layer(Source::Workspace, "projects = ['~/repos/app']\n");
         let layers = [layers[0].clone(), layers[1].clone(), workspace];
         let error = propose(Scope::Workspace, &layers, "[layout]\nsidebar_width = 1.0", &[]).unwrap_err();
-        assert!(error.contains("only [tickets], [workflow], [isolation] and [chief] prompt"), "{error}");
+        assert!(error.contains("only [tickets], [workflow], [isolation], [identity] and [chief] prompt"), "{error}");
         assert!(propose(Scope::Workspace, &layers, "projects = []", &[]).is_err());
         let error = propose(Scope::Workspace, &layers, "[isolation]\nmode = 'open'", &[]).unwrap_err();
         assert!(error.starts_with("[isolation] would not load: isolation.mode: unknown variant"), "{error}");

@@ -81,6 +81,8 @@ pub struct ReportInfo {
     pub status: String,
     pub summary: String,
     pub at: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<crate::plan::Check>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,6 +91,8 @@ pub struct TaskInfo {
     pub title: String,
     pub status: TaskStatus,
     pub agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_reason: Option<String>,
     pub depends_on: Vec<String>,
     pub session: Option<String>,
     pub branch: Option<String>,
@@ -103,6 +107,8 @@ pub struct TaskInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanInfo {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notebook: Vec<crate::plan::NotebookEntry>,
     /// Full safe links for the shared ticket sidebar, chunked with their plan.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ticket_tree: Option<crate::ticket_ui::TicketTree>,
