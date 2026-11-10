@@ -1,14 +1,13 @@
 //! The Settings window. What people change comes first, in plain sections that read what they show as they open;
 //! what can be undone acts at once, and only what cannot asks first. The raw configuration is under Advanced.
 use super::*;
-use crate::keys::shortcut_label;
 use crate::status::{Mark, paint_mark};
 use crate::theme::{Palette, lerp, parse_hex};
 use crate::touch;
 use atomics_core::ops::SettingsTool;
 use atomics_core::projection::{ThemeChoice, UpdateInfo, UpdatePhase};
-use egui::text::LayoutJob;
-use egui::{Align, Color32, FontSelection, Rect, Sense, Stroke, Vec2};
+use egui::{Color32, Rect, Sense, Stroke, Vec2};
+use std::collections::BTreeMap;
 
 /// What Settings asks about first, because it cannot be undone.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,10 +73,62 @@ const SHORTCUTS: [(&str, &str); 16] = [
     ("keys.forward", "forward again"),
 ];
 
-pub(super) fn draw(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, info: &ManagementInfo) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum Section {
+    #[default]
+    Agents,
+    Chief,
+    Identity,
+    Connections,
+    Credentials,
+    Remote,
+    Shortcuts,
+    Theme,
+    Updates,
+    GettingStarted,
+    Advanced,
+}
+
+impl Section {
+    const ALL: [Self; 11] = [
+        Self::Agents,
+        Self::Chief,
+        Self::Identity,
+        Self::Connections,
+        Self::Credentials,
+        Self::Remote,
+        Self::Shortcuts,
+        Self::Theme,
+        Self::Updates,
+        Self::GettingStarted,
+        Self::Advanced,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Agents => AGENTS,
+            Self::Chief => "Chief",
+            Self::Identity => "Identity",
+            Self::Connections => "Connections",
+            Self::Credentials => "Credentials",
+            Self::Remote => "Remote devices",
+            Self::Shortcuts => "Shortcuts",
+            Self::Theme => "Theme",
+            Self::Updates => "Updates",
+            Self::GettingStarted => "Getting started",
+            Self::Advanced => "Advanced",
+        }
+    }
+}
+
+pub(super) fn draw(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, info: &ManagementInfo, height: f32) {
     let p = client.palette.clone();
-    let forced = client.management.open_section.take();
-    let forced = forced.as_deref();
+    if let Some(forced) = client.management.open_section.take()
+        && let Some(section) = Section::ALL.into_iter().find(|section| section.name() == forced)
+    {
+        client.management.section = section;
+        client.management.section_list = false;
+    }
     let enabled = allowed(backend, &HostAction::SettingsTool { tool: SettingsTool::CheckSandbox });
     if !enabled {
         ui.colored_label(p.warning, "View only: settings changes require the host grant.");
@@ -85,60 +136,98 @@ pub(super) fn draw(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
     if let Some(problem) = info.config["load_error"].as_str() {
         ui.colored_label(p.warning, problem);
     }
-    // A window on the host says nothing while nothing is new; a client always shows which version the host runs.
-    // One id either way, a scope's or a skipped one, so that the section appearing leaves a field below it the keyboard.
-    if let Some(update) = backend.update().filter(|update| update.has_news() || !backend.available(&Command::Update)) {
-        let summary = update_summary(&update);
-        ui.scope(|ui| {
-            section(ui, &p, forced, "Updates", &summary, update.has_news(), |ui| updates(ui, backend, client, &update));
-        });
+    let height = height - ui.min_size().y;
+    if ui.available_width() < 600.0 {
+        if client.management.section_list {
+            section_list(ui, client, height);
+        } else {
+            if button(ui, client, "‹ Back to sections").clicked() {
+                client.management.section_list = true;
+            }
+            section_content(ui, backend, client, enabled, info, height - 40.0);
+        }
     } else {
-        ui.skip_ahead_auto_ids(1);
+        let height = height.min(680.0);
+        ui.horizontal_top(|ui| {
+            ui.set_max_height(height);
+            ui.vertical(|ui| {
+                ui.set_width(154.0);
+                section_list(ui, client, height);
+            });
+            ui.separator();
+            ui.vertical(|ui| {
+                ui.set_width(ui.available_width());
+                section_content(ui, backend, client, enabled, info, height);
+            });
+        });
     }
-    let selected = info.themes.choices.iter().find(|choice| choice.selected).map_or("", |choice| &choice.name);
-    section(ui, &p, forced, "Theme", selected, true, |ui| theme(ui, backend, client, info));
-    section(ui, &p, forced, "Shortcuts", "", false, |ui| shortcuts(ui, backend, client, info));
-    section(ui, &p, forced, "Identity", "", false, |ui| identity(ui, backend, client, enabled, info));
-    section(ui, &p, forced, AGENTS, &agents_summary(info), false, |ui| agents(ui, client, enabled, info));
-    section(ui, &p, forced, "Getting started", "", false, |ui| getting_started(ui, client));
-    section(ui, &p, forced, "Connections", &connections_summary(info), false, |ui| {
-        connections(ui, backend, client, enabled, info)
-    });
-    section(ui, &p, forced, "Remote devices", &remote_summary(info), false, |ui| {
-        remote::draw(ui, backend, client, info)
-    });
-    section(ui, &p, forced, "Credentials", &credentials_summary(info), false, |ui| {
-        credentials(ui, client, enabled, info)
-    });
-    section(ui, &p, forced, "Advanced", "", false, |ui| advanced(ui, backend, client, enabled, info));
-    // The VM panel can be inserted as another Settings section without changing the shell.
 }
 
-/// A section's row, which opens it whole, and what shows once it is open. The summary says what is in it meanwhile.
-fn section(
-    ui: &mut egui::Ui,
-    p: &Palette,
-    forced: Option<&str>,
-    title: &str,
-    summary: &str,
-    open: bool,
-    body: impl FnOnce(&mut egui::Ui),
-) {
-    let mut label = LayoutJob::default();
-    let style = ui.style().clone();
-    let add = |label: &mut LayoutJob, text: RichText| {
-        text.append_to(label, &style, FontSelection::Default, Align::Center);
-    };
-    add(&mut label, RichText::new(title).strong().size(14.0).color(p.foreground));
-    if !summary.is_empty() {
-        add(&mut label, RichText::new(format!("  ·  {summary}")).size(12.0).color(p.muted));
-    }
-    let header = egui::CollapsingHeader::new(label).id_salt(title).default_open(open);
-    let header = if forced == Some(title) { header.open(Some(true)) } else { header };
-    header.show(ui, |ui| {
-        body(ui);
-        ui.add_space(6.0);
+fn section_list(ui: &mut egui::Ui, client: &mut Client, height: f32) {
+    egui::ScrollArea::vertical().id_salt("settings-sections").max_height(height).show(ui, |ui| {
+        for section in Section::ALL {
+            let response = ui.add(touch::sized(
+                egui::Button::new(section.name()).selected(client.management.section == section).frame(false),
+                client.touch,
+            ));
+            if response.clicked() {
+                client.management.section = section;
+                client.management.section_list = false;
+            }
+        }
     });
+}
+
+fn section_content(
+    ui: &mut egui::Ui,
+    backend: &dyn Backend,
+    client: &mut Client,
+    enabled: bool,
+    info: &ManagementInfo,
+    height: f32,
+) {
+    let section = client.management.section;
+    ui.heading(section.name());
+    egui::ScrollArea::vertical()
+        .id_salt(("settings-content", section.name()))
+        .max_height((height - 32.0).max(60.0))
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+            match section {
+                Section::Agents => {
+                    note(ui, &client.palette, agents_summary(info));
+                    agents(ui, client, enabled, info);
+                }
+                Section::Chief => chief(ui, client, enabled, info),
+                Section::Identity => identity(ui, backend, client, enabled, info),
+                Section::Connections => {
+                    note(ui, &client.palette, connections_summary(info));
+                    connections(ui, backend, client, enabled, info);
+                }
+                Section::Credentials => {
+                    note(ui, &client.palette, credentials_summary(info));
+                    credentials(ui, client, enabled, info);
+                }
+                Section::Remote => {
+                    note(ui, &client.palette, remote_summary(info));
+                    remote::draw(ui, backend, client, info);
+                }
+                Section::Shortcuts => shortcuts(ui, backend, client, info),
+                Section::Theme => theme(ui, backend, client, info),
+                Section::Updates => {
+                    if let Some(update) = backend.update() {
+                        note(ui, &client.palette, update_summary(&update));
+                        updates(ui, backend, client, &update);
+                    } else {
+                        note(ui, &client.palette, "No update information from the host yet.");
+                    }
+                }
+                Section::GettingStarted => getting_started(ui, client),
+                Section::Advanced => advanced(ui, backend, client, enabled, info),
+            }
+        });
 }
 
 /// What a section's row and text say beside its controls.
@@ -521,26 +610,122 @@ fn theme_row(ui: &mut egui::Ui, p: &Palette, choice: &ThemeChoice, enabled: bool
 
 // ── Shortcuts ────────────────────────────────────────────────────────────────────────────────────────
 
+pub(super) struct ShortcutForm {
+    original: BTreeMap<String, serde_json::Value>,
+    bindings: BTreeMap<String, String>,
+    scope: Scope,
+}
+
+impl ShortcutForm {
+    fn values(info: &ManagementInfo) -> BTreeMap<String, serde_json::Value> {
+        let defaults = serde_json::to_value(atomics_core::config::KeyConfig::default()).unwrap();
+        SHORTCUTS
+            .iter()
+            .map(|(key, _)| {
+                let value = info.config["values"][*key]["value"]
+                    .as_str()
+                    .or_else(|| defaults[key.strip_prefix("keys.").unwrap()].as_str())
+                    .unwrap_or_default();
+                ((*key).into(), value.into())
+            })
+            .collect()
+    }
+
+    fn new(original: BTreeMap<String, serde_json::Value>) -> Self {
+        let bindings =
+            original.iter().map(|(key, value)| (key.clone(), value.as_str().unwrap_or_default().into())).collect();
+        Self { original, bindings, scope: Scope::Main }
+    }
+
+    fn problems(&self, os: egui::os::OperatingSystem) -> Vec<String> {
+        let mut used = Vec::new();
+        let mut problems = Vec::new();
+        for (key, what) in SHORTCUTS {
+            let text = &self.bindings[key];
+            if text.trim().is_empty() {
+                continue;
+            }
+            let Some(chord) = crate::keys::shortcut_for_os(text, os) else {
+                problems.push(format!("Invalid shortcut for {what}: {text}"));
+                continue;
+            };
+            // Check the actual client modifiers: cmd and ctrl+shift alias each other on Linux/Windows.
+            if let Some((_, other)) = used.iter().find(|(seen, _)| *seen == chord) {
+                problems.push(format!("Conflict: {what} and {other} use the same shortcut"));
+            }
+            used.push((chord, what));
+            let reserved_agent = crate::keys::is_digit(chord.logical_key)
+                && chord.logical_key != egui::Key::Num0
+                && chord.modifiers == crate::window_keys::agent_modifiers(os);
+            let reserved_nav = matches!(chord.logical_key, egui::Key::ArrowUp | egui::Key::ArrowDown)
+                && chord.modifiers == egui::Modifiers::SHIFT;
+            if reserved_agent
+                || reserved_nav
+                || chord.logical_key == egui::Key::Escape && chord.modifiers.is_none()
+                || matches!(chord.logical_key, egui::Key::PageUp | egui::Key::PageDown) && chord.modifiers.is_none()
+            {
+                problems.push(format!("Conflict: {what} uses a fixed navigation shortcut"));
+            }
+        }
+        problems
+    }
+
+    fn proposal(&self, os: egui::os::OperatingSystem) -> Option<HostAction> {
+        if !self.problems(os).is_empty() {
+            return None;
+        }
+        let values = self.bindings.iter().map(|(key, text)| (key.clone(), text.clone().into())).collect();
+        form_proposal(self.scope, &self.original, &values, "Update keyboard shortcuts")
+    }
+}
+
+/// The forms send only edited fields, leaving inherited settings and custom arguments intact.
+fn form_proposal(
+    scope: Scope,
+    original: &BTreeMap<String, serde_json::Value>,
+    values: &BTreeMap<String, serde_json::Value>,
+    reason: &str,
+) -> Option<HostAction> {
+    let mut toml = String::new();
+    let mut remove = Vec::new();
+    for (key, value) in values {
+        if original.get(key) == Some(value) {
+            continue;
+        }
+        if value.is_null() {
+            remove.push(key.clone());
+        } else {
+            toml.push_str(&format!("{key} = {value}\n"));
+        }
+    }
+    (!toml.is_empty() || !remove.is_empty()).then(|| HostAction::ConfigPropose {
+        scope,
+        toml,
+        remove,
+        theme: None,
+        reason: Some(reason.into()),
+    })
+}
+
+fn save_scope(ui: &mut egui::Ui, scope: &mut Scope) {
+    egui::ComboBox::from_label("Save to").selected_text(scope.name()).show_ui(ui, |ui| {
+        for target in [Scope::Main, Scope::Host] {
+            ui.selectable_value(scope, target, target.name());
+        }
+    });
+}
+
 fn shortcuts(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, info: &ManagementInfo) {
     let p = client.palette.clone();
-    let values = &info.config["values"];
     let everywhere = [
         (crate::window_keys::agents_label(ui.ctx()), "that agent, with its diff"),
         ("Shift+Up/Down".to_string(), "previous or next changed file"),
         ("PageUp/PageDown".to_string(), "previous or next hunk, while the diff has the keyboard"),
         ("Esc".to_string(), "close the window on top"),
     ];
-    let configured: Vec<_> = SHORTCUTS
-        .iter()
-        .filter_map(|(key, what)| Some((shortcut_label(ui.ctx(), values[*key]["value"].as_str()?), *what)))
-        .collect();
-    let width = everywhere.iter().chain(&configured).map(|(chord, _)| chord.chars().count()).max().unwrap_or(0);
-    let list = |ui: &mut egui::Ui, lines: &[(String, &str)]| {
-        for (chord, what) in lines {
-            ui.label(RichText::new(format!("{chord:<width$}  {what}")).monospace().size(12.0));
-        }
-    };
-    list(ui, &everywhere);
+    for (chord, what) in everywhere {
+        ui.add(egui::Label::new(format!("{chord}  {what}")).wrap());
+    }
     if !backend.has_shortcuts() {
         note(
             ui,
@@ -548,8 +733,222 @@ fn shortcuts(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, info
             "The desktop app on the host also has these. This client leaves them to the terminal, or to the browser:",
         );
     }
-    list(ui, &configured);
-    note(ui, &p, "Change the configured ones under [keys] in the config: see Advanced.");
+    let values = ShortcutForm::values(info);
+    if client.management.shortcuts.as_ref().is_none_or(|form| form.original != values) {
+        client.management.shortcuts = Some(ShortcutForm::new(values));
+    }
+    let enabled = allowed(backend, &HostAction::SettingsTool { tool: SettingsTool::CheckSandbox });
+    let mut proposal = None;
+    ui.add_enabled_ui(enabled, |ui| {
+        let form = client.management.shortcuts.as_mut().unwrap();
+        save_scope(ui, &mut form.scope);
+        for (key, what) in SHORTCUTS {
+            ui.label(what);
+            ui.add(
+                crate::controls::single_line(form.bindings.get_mut(key).unwrap())
+                    .id_salt(key)
+                    .desired_width(ui.available_width()),
+            );
+        }
+        for problem in form.problems(ui.ctx().os()) {
+            ui.add(egui::Label::new(RichText::new(problem).color(p.warning)).wrap());
+        }
+        let change = form.proposal(ui.ctx().os());
+        if ui.add_enabled(change.is_some(), egui::Button::new("Review shortcut changes")).clicked() {
+            proposal = change;
+        }
+    });
+    if let Some(proposal) = proposal {
+        client.send(Command::Manage(proposal));
+    }
+    note(
+        ui,
+        &p,
+        "Use cmd, primary, ctrl, alt and shift, joined with + and a key. Blank disables a binding. Conflicts use this window's operating system. Review and Apply saves the shortcuts on the host.",
+    );
+}
+
+// ── Chief ────────────────────────────────────────────────────────────────────────────────────────────
+
+pub(super) struct ChiefForm {
+    snapshot: serde_json::Value,
+    original: BTreeMap<String, serde_json::Value>,
+    model: Option<String>,
+    legacy: bool,
+    command: Vec<String>,
+    dock: String,
+    autostart: bool,
+    heartbeat: u64,
+    wake: u64,
+    prefer: String,
+    minimums: [f64; 2],
+    scope: Scope,
+}
+
+impl ChiefForm {
+    fn snapshot(info: &ManagementInfo) -> serde_json::Value {
+        info.config["values"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(key, _)| {
+                matches!(
+                    key.as_str(),
+                    "chief.model"
+                        | "chief.args"
+                        | "chief.command"
+                        | "chief.dock"
+                        | "chief.autostart"
+                        | "chief.heartbeat_secs"
+                        | "chief.wake_secs"
+                        | "chief.prefer"
+                ) || key.starts_with("chief.min_left_percent.")
+            })
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    }
+
+    fn new(snapshot: serde_json::Value) -> Self {
+        let value = |key: &str| &snapshot[key]["value"];
+        let strings = |key| {
+            value(key)
+                .as_array()
+                .map(|words| words.iter().filter_map(|word| word.as_str().map(str::to_string)).collect::<Vec<_>>())
+        };
+        let command = strings("chief.command").unwrap_or_else(|| vec!["claude".into()]);
+        let args = strings("chief.args").unwrap_or_default();
+        let legacy = atomics_core::config::ChiefConfig::legacy_model(&args);
+        let model = value("chief.model").as_str().map(str::to_string);
+        let mut form = Self {
+            original: BTreeMap::new(),
+            model,
+            legacy,
+            command,
+            dock: value("chief.dock").as_str().unwrap_or("floating").into(),
+            autostart: value("chief.autostart").as_bool().unwrap_or(false),
+            heartbeat: value("chief.heartbeat_secs").as_u64().unwrap_or(300),
+            wake: value("chief.wake_secs").as_u64().unwrap_or(180),
+            prefer: strings("chief.prefer").unwrap_or_else(|| vec!["codex".into(), "claude".into()]).join(", "),
+            minimums: [
+                value("chief.min_left_percent.codex").as_f64().unwrap_or(0.0),
+                value("chief.min_left_percent.claude").as_f64().unwrap_or(0.0),
+            ],
+            snapshot,
+            scope: Scope::Main,
+        };
+        form.original = form.values();
+        form
+    }
+
+    fn values(&self) -> BTreeMap<String, serde_json::Value> {
+        use serde_json::json;
+        BTreeMap::from([
+            ("chief.model".into(), json!(self.model)),
+            ("chief.dock".into(), json!(self.dock)),
+            ("chief.autostart".into(), json!(self.autostart)),
+            ("chief.heartbeat_secs".into(), json!(self.heartbeat)),
+            ("chief.wake_secs".into(), json!(self.wake)),
+            (
+                "chief.prefer".into(),
+                json!(self.prefer.split(',').map(str::trim).filter(|s| !s.is_empty()).collect::<Vec<_>>()),
+            ),
+            ("chief.min_left_percent.codex".into(), json!(self.minimums[0])),
+            ("chief.min_left_percent.claude".into(), json!(self.minimums[1])),
+        ])
+    }
+
+    fn proposal(&self) -> Option<HostAction> {
+        if self.wake != 0 && self.wake < 30 || self.model.as_ref().is_some_and(|m| m.trim().is_empty()) {
+            return None;
+        }
+        form_proposal(self.scope, &self.original, &self.values(), "Update chief settings")
+    }
+}
+
+fn chief(ui: &mut egui::Ui, client: &mut Client, enabled: bool, info: &ManagementInfo) {
+    let p = client.palette.clone();
+    let snapshot = ChiefForm::snapshot(info);
+    if client.management.chief.as_ref().is_none_or(|form| form.snapshot != snapshot) {
+        client.management.chief = Some(ChiefForm::new(snapshot));
+    }
+    let mut proposal = None;
+    ui.add_enabled_ui(enabled, |ui| {
+        let form = client.management.chief.as_mut().unwrap();
+        save_scope(ui, &mut form.scope);
+        let choices = atomics_core::config::ChiefConfig::model_choices(&form.command);
+        let selected = form
+            .model
+            .clone()
+            .unwrap_or_else(|| if form.legacy { "Custom (args)".into() } else { "Command default".into() });
+        ui.label("Model");
+        egui::ComboBox::from_id_salt("chief-model")
+            .selected_text(selected)
+            .width(ui.available_width().min(240.0))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut form.model, None, if form.legacy { "Custom (args)" } else { "Command default" });
+                for model in choices {
+                    ui.selectable_value(&mut form.model, Some((*model).into()), *model);
+                }
+                if ui
+                    .selectable_label(
+                        form.model.as_ref().is_some_and(|model| !choices.contains(&model.as_str())),
+                        "Custom model…",
+                    )
+                    .clicked()
+                {
+                    form.model = Some(String::new());
+                }
+            });
+        if let Some(model) = &mut form.model
+            && !choices.contains(&model.as_str())
+        {
+            ui.add(
+                crate::controls::single_line(model)
+                    .hint_text("Full model name accepted by the command")
+                    .desired_width(ui.available_width()),
+            );
+        }
+        if form.legacy && form.model.is_none() {
+            note(ui, &p, "Custom model from chief.args. Choosing a model overrides only its model argument at launch.");
+        }
+        egui::ComboBox::from_label("Dock").selected_text(&form.dock).show_ui(ui, |ui| {
+            for dock in ["floating", "docked"] {
+                ui.selectable_value(&mut form.dock, dock.into(), dock);
+            }
+        });
+        ui.checkbox(&mut form.autostart, "Start chief when ATOMICS starts");
+        ui.label("Heartbeat interval (seconds)");
+        ui.add(egui::DragValue::new(&mut form.heartbeat).range(1..=u64::MAX).clamp_existing_to_range(false));
+        ui.label("Wake interval (seconds; 0 turns wakes off)");
+        ui.add(egui::DragValue::new(&mut form.wake).range(0..=u64::MAX));
+        if form.wake != 0 && form.wake < 30 {
+            note(ui, &p, "Wake interval must be 0 or at least 30 seconds.");
+        }
+        subheading(ui, &p, "Chief's task agent preference");
+        ui.add(
+            crate::controls::single_line(&mut form.prefer)
+                .hint_text("Agent names, in order, separated by commas")
+                .desired_width(ui.available_width()),
+        );
+        note(ui, &p, "An empty preference leaves the choice to task fit.");
+        for (index, provider) in ["codex", "claude"].into_iter().enumerate() {
+            ui.label(format!("{provider} quota minimum"));
+            ui.add(egui::DragValue::new(&mut form.minimums[index]).range(0.0..=100.0).suffix("% left"));
+        }
+        note(ui, &p, "Minimums apply to session and weekly quota left; 0 means no minimum. Plans below them warn and can still be saved.");
+        let change = form.proposal();
+        if ui.add_enabled(change.is_some(), egui::Button::new("Review chief changes")).clicked() {
+            proposal = change;
+        }
+    });
+    if let Some(proposal) = proposal {
+        client.send(Command::Manage(proposal));
+    }
+    note(
+        ui,
+        &p,
+        "Review the diff, then Apply saves these settings. Model and autostart take effect the next time the chief starts; intervals apply while it runs.",
+    );
 }
 
 // ── Agents ───────────────────────────────────────────────────────────────────────────────────────────
@@ -605,27 +1004,6 @@ fn agents(ui: &mut egui::Ui, client: &mut Client, enabled: bool, info: &Manageme
         }
     }
     note(ui, &p, "Agents are the [[agents]] entries in the config: see Advanced.");
-    subheading(ui, &p, "Chief's task agent preference");
-    let values = &info.config["values"];
-    if let Some(prefer) = values["chief.prefer"]["value"].as_array() {
-        let names: Vec<_> = prefer.iter().filter_map(|name| name.as_str()).collect();
-        ui.label(if names.is_empty() { "No preference; choose by task fit".into() } else { names.join(", then ") });
-    }
-    let minimums: Vec<_> = values
-        .as_object()
-        .into_iter()
-        .flatten()
-        .filter_map(|(key, entry)| {
-            let provider = key.strip_prefix("chief.min_left_percent.")?;
-            Some(format!("{provider}: {}% left", entry["value"]))
-        })
-        .collect();
-    note(ui, &p, if minimums.is_empty() { "No quota minimums configured".into() } else { minimums.join(" · ") });
-    note(
-        ui,
-        &p,
-        "Minimums apply to session and weekly quota left. Plans below them warn and can still be saved. Change [chief] prefer and min_left_percent in the config: see Advanced.",
-    );
     subheading(ui, &p, "What they need");
     super::setup::programs(ui, client, enabled, &info.setup);
     subheading(ui, &p, "Docker Sandboxes");
@@ -1150,6 +1528,106 @@ fn advanced(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, enabl
             client.send(Command::Manage(action));
         }
     });
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::*;
+    use egui::os::OperatingSystem;
+
+    #[test]
+    fn section_order_and_selection_live_with_each_window() {
+        assert_eq!(
+            Section::ALL.map(Section::name),
+            [
+                "Agents",
+                "Chief",
+                "Identity",
+                "Connections",
+                "Credentials",
+                "Remote devices",
+                "Shortcuts",
+                "Theme",
+                "Updates",
+                "Getting started",
+                "Advanced"
+            ]
+        );
+        let mut first = State { section: Section::Chief, section_list: true, ..Default::default() };
+        first.forget_settings();
+        assert_eq!(first.section, Section::Chief);
+        assert!(!first.section_list);
+        assert_eq!(State::default().section, Section::Agents);
+    }
+
+    #[test]
+    fn chief_form_proposes_only_edits_and_keeps_custom_args() {
+        let snapshot = serde_json::json!({
+            "chief.args": {"value":["--model", "old-model", "--verbose"]},
+            "chief.min_left_percent.codex": {"value":10.0},
+        });
+        let mut form = ChiefForm::new(snapshot);
+        assert!(form.legacy && form.model.is_none());
+        assert!(form.proposal().is_none());
+        form.model = Some("sonnet".into());
+        form.dock = "docked".into();
+        form.autostart = true;
+        form.heartbeat = 120;
+        form.wake = 30;
+        form.prefer = "claude, codex".into();
+        form.minimums[1] = 25.0;
+        let HostAction::ConfigPropose { scope, toml, remove, .. } = form.proposal().unwrap() else {
+            panic!("proposal")
+        };
+        assert_eq!(scope, Scope::Main);
+        assert!(remove.is_empty());
+        assert!(!toml.contains("args") && !toml.contains("min_left_percent.codex"));
+        let layer = atomics_core::selfconfig::Layer::new(
+            atomics_core::selfconfig::Source::Main,
+            "config.toml",
+            Some("[chief]\nargs = ['--model', 'old-model', '--verbose']\nmin_left_percent = { codex = 10 }\n".into()),
+        );
+        let proposal = atomics_core::selfconfig::propose(scope, &[layer], &toml, &remove).unwrap();
+        assert!(proposal.warnings.is_empty(), "{:?}", proposal.warnings);
+        let config = atomics_core::config::Config::from_tables([proposal.after.parse().unwrap()]).unwrap();
+        assert_eq!(config.chief.launch_args(), ["--verbose", "--model", "sonnet"]);
+        assert_eq!(config.chief.wake_secs, 30);
+        assert_eq!(config.chief.heartbeat_secs, 120);
+        assert!(config.chief.autostart);
+        assert_eq!(config.chief.dock, atomics_core::config::ChiefDock::Docked);
+        assert_eq!(config.chief.prefer, ["claude", "codex"]);
+        assert_eq!(config.chief.min_left_percent["codex"], 10.0);
+        assert_eq!(config.chief.min_left_percent["claude"], 25.0);
+        form.wake = 1;
+        assert!(form.proposal().is_none());
+        form.wake = 0;
+        assert!(form.proposal().is_some());
+    }
+
+    #[test]
+    fn shortcut_form_detects_client_aliases_fixed_keys_and_invalid_chords() {
+        let mut values = ShortcutForm::values(&ManagementInfo::default());
+        values.insert("keys.quick_open".into(), " cmd+p ".into());
+        let mut form = ShortcutForm::new(values);
+        assert!(form.proposal(OperatingSystem::Nix).is_none(), "opening the form preserves existing whitespace");
+        assert!(form.problems(OperatingSystem::Mac).is_empty());
+        assert!(form.problems(OperatingSystem::Nix).is_empty());
+        form.bindings.insert("keys.quick_open".into(), "ctrl+shift+d".into());
+        assert!(form.problems(OperatingSystem::Nix).iter().any(|p| p.contains("Conflict")));
+        assert!(form.problems(OperatingSystem::Mac).is_empty(), "cmd differs on a Mac");
+        assert!(form.proposal(OperatingSystem::Nix).is_none());
+        form.bindings.insert("keys.quick_open".into(), "primary+1".into());
+        assert!(form.problems(OperatingSystem::Mac).iter().any(|p| p.contains("fixed navigation")));
+        form.bindings.insert("keys.quick_open".into(), "ctrl+a+b".into());
+        assert!(form.problems(OperatingSystem::Mac).iter().any(|p| p.contains("Invalid")));
+        form.bindings.insert("keys.quick_open".into(), String::new());
+        let HostAction::ConfigPropose { toml, remove, .. } = form.proposal(OperatingSystem::Nix).unwrap() else {
+            panic!("proposal")
+        };
+        assert_eq!(toml, "keys.quick_open = \"\"\n");
+        assert!(remove.is_empty());
+        assert!(atomics_core::selfconfig::edit("", &toml, &remove).is_ok());
+    }
 }
 
 #[cfg(test)]

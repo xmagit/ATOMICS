@@ -310,7 +310,7 @@ impl State {
     }
 
     pub(super) fn chief_author(&self) -> Author {
-        Author::Chief(ticket::model_label("claude", &self.config.chief.args))
+        Author::Chief(ticket::model_label("claude", &self.config.chief.launch_args()))
     }
 
     /// The chief's prompt with the configured ticket workflow added, then the user's own

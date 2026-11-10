@@ -570,6 +570,10 @@ impl State {
                     }
                 }
                 let github_changed = config.github != self.config.github;
+                if config.chief.dock != self.config.chief.dock {
+                    self.store.chief_dock = None;
+                    self.save_chief_preferences();
+                }
                 self.config = config;
                 self.config_error = None;
                 self.config_problems = github::config_problems(&self.config);

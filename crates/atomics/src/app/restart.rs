@@ -261,7 +261,7 @@ impl State {
     pub(super) fn resume_record(&mut self, record: SessionRecord) {
         let handoff = self.restart_event.is_some();
         let selection = (self.active.clone(), self.diff_root.clone(), self.focus_terminal.clone());
-        let args = if record.chief { self.config.chief.args.clone() } else { Vec::new() };
+        let args = if record.chief { self.config.chief.launch_args() } else { Vec::new() };
         // A prompt starts a new chief turn, so it can call atomics_wait immediately.
         let prompt = (record.chief && handoff)
             .then(|| "ATOMICS restarted. Call atomics_wait to receive the restart event, then carry on.".into());

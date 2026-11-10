@@ -909,7 +909,7 @@ mod tests {
                 }
                 click(app, ctx, width, "+ New");
                 assert!(app.client.new_dialog.is_some(), "width={width}: new action");
-                for (action, entry) in [("Project", "Open project…"), ("Settings", "Shortcuts")] {
+                for (action, entry) in [("Project", "Open project…"), ("Settings", "Where agents run")] {
                     if collapsed {
                         click(app, ctx, width, "Actions");
                     }

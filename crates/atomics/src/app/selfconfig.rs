@@ -468,6 +468,33 @@ mod tests {
     }
 
     #[test]
+    fn chief_settings_proposal_reloads_model_intervals_and_saved_dock() {
+        with_app("app::selfconfig::tests::chief_settings_proposal_reloads_model_intervals_and_saved_dock", |app, _| {
+            let main = app.runtime.config_path.clone();
+            std::fs::write(&main, "[isolation]\nmode = 'bare'\n[chief]\nargs = ['--model', 'custom-chief', '--verbose']\ndock = 'floating'\n").unwrap();
+            app.runtime.reload_config();
+            app.runtime.store.chief_dock = Some(atomics_core::config::ChiefDock::Floating);
+            let proposed = app.runtime.propose_config(ProposedChange {
+                scope: Scope::Main,
+                toml: "[chief]\nmodel = 'sonnet'\ndock = 'docked'\nautostart = true\nheartbeat_secs = 120\nwake_secs = 60\n",
+                remove: &[], theme: None,
+            }, None, None).unwrap();
+            assert_eq!(
+                app.runtime.config.chief.launch_args(),
+                ["--model", "custom-chief", "--verbose"],
+                "a proposal waits for Apply"
+            );
+            app.runtime.apply_proposal(proposed["proposal"].as_str().unwrap(), String::new());
+            assert_eq!(app.runtime.config.chief.launch_args(), ["--verbose", "--model", "sonnet"]);
+            assert_eq!(app.runtime.config.chief.heartbeat_secs, 120);
+            assert_eq!(app.runtime.config.chief.wake_secs, 60);
+            assert!(app.runtime.config.chief.autostart);
+            assert_eq!(app.runtime.store.chief_dock, None);
+            assert_eq!(app.runtime.chief_dock(), atomics_core::config::ChiefDock::Docked);
+        });
+    }
+
+    #[test]
     fn config_get_exposes_project_settings_and_workflow_sources() {
         with_app("app::selfconfig::tests::config_get_exposes_project_settings_and_workflow_sources", |app, _| {
             let (_dir, repo) = super::super::tests::repository();
