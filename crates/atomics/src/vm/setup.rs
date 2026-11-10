@@ -287,14 +287,21 @@ pub fn config(apply: bool) -> Result<()> {
         return Ok(());
     }
     print!("{}", proposal.diff);
-    let file = atomics_core::paths::expand(&proposal.file);
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    let backup = selfconfig::write(&file, proposal.before.as_deref(), &proposal.after, stamp)?;
-    match backup {
-        Some(backup) => println!("Wrote {} (the old file is {})", file.display(), backup.display()),
-        None => println!("Wrote {}", file.display()),
-    }
+    println!("{}", apply_config(&proposal, stamp)?);
     Ok(())
+}
+
+fn apply_config(proposal: &Proposal, stamp: u64) -> Result<String> {
+    let file = atomics_core::paths::expand(&proposal.file);
+    let backup = selfconfig::write(&file, proposal.before.as_deref(), &proposal.after, stamp)?;
+    Ok(if proposal.before.as_deref() == Some(proposal.after.as_str()) {
+        format!("No changes to {}.", file.display())
+    } else if let Some(backup) = backup {
+        format!("Wrote {} (the old file is {})", file.display(), backup.display())
+    } else {
+        format!("Wrote {}", file.display())
+    })
 }
 
 /// The installed bundle, for the commands after setup.

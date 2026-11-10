@@ -3230,6 +3230,17 @@ pub fn model_label(agent: &str, args: &[String]) -> String {
 
 /// "gpt-6.1-sol" → "GPT-6.1 Sol", "claude-opus-5-5" → "Claude Opus 5.5".
 pub fn pretty_model(model: &str) -> String {
+    let alias = match model.to_ascii_lowercase().as_str() {
+        "opus" => Some("Opus"),
+        "sonnet" => Some("Sonnet"),
+        "haiku" => Some("Haiku"),
+        "fable" => Some("Fable"),
+        _ => None,
+    };
+    if let Some(family) = alias {
+        // The provider resolves aliases at launch; an exact version cannot be inferred from the alias alone.
+        return format!("Claude {family} (alias)");
+    }
     let mut words: Vec<String> = Vec::new();
     for token in model.split(['-', '_', ' ']).filter(|t| !t.is_empty()) {
         let numeric = token.chars().all(|c| c.is_ascii_digit() || c == '.');
@@ -4626,6 +4637,19 @@ arguments = {{ key = "{{nonce}}", nested = ["{{nonce}}", "{{body}}"] }}"#
         assert_eq!(model_label("codex", &[]), "Codex");
         assert_eq!(model_label("", &[]), "Claude");
         assert_eq!(pretty_model("gpt-6.1-terra"), "GPT-6.1 Terra");
+    }
+
+    #[test]
+    fn model_alias_signatures_name_the_provider_family_and_alias() {
+        for (model, label) in [
+            ("opus", "Claude Opus (alias)"),
+            ("sonnet", "Claude Sonnet (alias)"),
+            ("fable", "Claude Fable (alias)"),
+            ("haiku", "Claude Haiku (alias)"),
+        ] {
+            assert_eq!(pretty_model(model), label);
+            assert_eq!(model_label("claude", &["--model".into(), model.into()]), label);
+        }
     }
 
     #[test]
