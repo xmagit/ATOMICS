@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::approvals::Decision;
-use crate::plan::{Task, TaskStatus};
+use crate::plan::{TaskInput, TaskStatus};
 use crate::wire::{ErrorCode, MAX_ID_BYTES, Message, Revision, WireError};
 
 /// The longest text a mutation carries: a steering message, a comment, a note or a goal.
@@ -89,7 +89,7 @@ pub enum PlanAction {
     /// only if its approval scope is unchanged.
     Set {
         goal: String,
-        tasks: Vec<Task>,
+        tasks: Vec<TaskInput>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         integration: Option<String>,
     },
@@ -803,7 +803,7 @@ mod tests {
             digest: None,
             action: PlanAction::Set {
                 goal: "g".into(),
-                tasks: vec![Task::default(); MAX_TASKS + 1],
+                tasks: vec![TaskInput::default(); MAX_TASKS + 1],
                 integration: None,
             },
         });

@@ -364,7 +364,8 @@ impl State {
                     done(ControlResponse::ok(result))
                 }
             },
-            ControlRequest::PlanSet { plan, goal, mut tasks, integration, ticket } => {
+            ControlRequest::PlanSet { plan, goal, tasks, integration, ticket } => {
+                let mut tasks: Vec<Task> = tasks.into_iter().map(Into::into).collect();
                 // Ids first: they must be unique, and newer links supersede pending creates of the slots
                 // tasks will have, not of the ids sent.
                 Plan::assign_task_ids(&mut tasks);
@@ -830,7 +831,7 @@ impl State {
                 Some(index) => {
                     let root = self.sessions[index].root();
                     self.diffs.entry(root.clone()).or_default().mark_dirty();
-                    let base_ref = self.project_config(&root).base_ref;
+                    let base_ref = self.diff_base_ref(&root);
                     ControlOutcome::Diff { root, base_ref, patch, path, session: json!(self.sessions[index].id) }
                 }
             },

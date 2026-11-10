@@ -203,7 +203,7 @@ pub enum ControlRequest {
         #[serde(default)]
         plan: Option<String>,
         goal: String,
-        tasks: Vec<crate::plan::Task>,
+        tasks: Vec<crate::plan::TaskInput>,
         /// Branch the tasks are merged into; kept unless explicitly overridden.
         #[serde(default)]
         integration: Option<String>,

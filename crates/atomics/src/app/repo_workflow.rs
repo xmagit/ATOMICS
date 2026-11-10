@@ -33,6 +33,22 @@ impl State {
         }
     }
 
+    /// Task branches can include integrated dependencies. Their own diff starts at the commit
+    /// recorded on dispatch, even after the integration branch moves on.
+    pub(super) fn diff_base_ref(&self, root: &Path) -> String {
+        self.plans
+            .iter()
+            .flat_map(|plan| &plan.tasks)
+            .find_map(|task| {
+                let matches = task.worktree.as_deref() == Some(root)
+                    || task.session.as_ref().is_some_and(|id| {
+                        self.sessions.iter().any(|session| &session.id == id && session.root() == root)
+                    });
+                matches.then(|| task.start_commit.clone()).flatten()
+            })
+            .unwrap_or_else(|| self.project_base_ref(root))
+    }
+
     pub(super) fn project_config(&self, repo: &Path) -> Config {
         let mut config = self.effective_config();
         config.identity.default = self.project_identity(repo);
@@ -186,6 +202,66 @@ impl State {
 mod tests {
     use super::super::tests::{repository, with_app};
     use super::*;
+
+    #[test]
+    fn audit_p7_stacked_task_diffs_start_at_dispatch_for_the_board_and_control_socket() {
+        with_app(
+            "app::repo_workflow::tests::audit_p7_stacked_task_diffs_start_at_dispatch_for_the_board_and_control_socket",
+            |app, _| {
+                let (_dir, repo) = repository();
+                git::git(&repo, &["switch", "-qc", "integration"]).unwrap();
+                std::fs::write(repo.join("dependency"), "dependency change\n").unwrap();
+                git::git(&repo, &["add", "dependency"]).unwrap();
+                git::git(&repo, &["commit", "-qm", "Dependency"]).unwrap();
+                let start = git::commit_of(&repo, "HEAD").unwrap().unwrap();
+                let worktree = repo.parent().unwrap().join("stacked");
+                git::add_worktree(&repo, &worktree, "stacked-task", "integration").unwrap();
+                let worktree = worktree.canonicalize().unwrap();
+                std::fs::write(worktree.join("own-commit"), "committed change\n").unwrap();
+                git::git(&worktree, &["add", "own-commit"]).unwrap();
+                git::git(&worktree, &["commit", "-qm", "Task change"]).unwrap();
+                std::fs::write(worktree.join("own-commit"), "also unstaged\n").unwrap();
+                std::fs::write(worktree.join("own-untracked"), "untracked change\n").unwrap();
+                app.runtime.plans = vec![Plan {
+                    tasks: vec![Task {
+                        id: "stacked".into(),
+                        session: Some("stacked-session".into()),
+                        worktree: Some(worktree.clone()),
+                        start_commit: Some(start.clone()),
+                        ..Task::default()
+                    }],
+                    ..Plan::default()
+                }];
+                app.runtime.sessions = vec![super::super::tests::session(
+                    "stacked-session",
+                    AgentKind::Generic,
+                    AgentStatus::Idle,
+                    &worktree,
+                )];
+                app.runtime.config.base_ref = "main".into();
+                assert_eq!(app.runtime.diff_base_ref(&worktree), start);
+                assert_eq!(app.runtime.diff_base_ref(&repo), "main");
+                let (tx, rx) = std::sync::mpsc::channel();
+                app.runtime
+                    .control(ControlRequest::Diff { session: "stacked-session".into(), patch: true, path: None }, tx);
+                let ControlOutcome::Diff { base_ref, root, .. } = rx.recv().unwrap() else {
+                    panic!("expected diff work")
+                };
+                assert_eq!(base_ref, start);
+                let diff = git::diff_against_base(&root, &base_ref, None).unwrap();
+                assert_eq!(diff.base, start);
+                assert_eq!(
+                    diff.files.iter().map(|file| file.path()).collect::<Vec<_>>(),
+                    ["own-commit", "own-untracked"]
+                );
+                // A rewritten task branch still compares to the exact starting commit.
+                git::git(&worktree, &["reset", "--hard", "main"]).unwrap();
+                let diff = git::diff_against_base(&root, &base_ref, None).unwrap();
+                assert_eq!(diff.base, start);
+                assert!(diff.files.iter().any(|file| file.path() == "dependency"));
+            },
+        );
+    }
 
     #[test]
     fn repo_settings_override_workspace_and_gate_only_their_project() {

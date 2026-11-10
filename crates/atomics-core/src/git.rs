@@ -540,9 +540,14 @@ const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 /// Everything this worktree changes relative to where it branched off `base_ref`:
 /// commits, staged and unstaged edits, and untracked files. With `untracked_budget`,
-/// untracked content beyond that many bytes is counted but left out.
+/// untracked content beyond that many bytes is counted but left out. A full commit id anchors
+/// the comparison to that exact commit, rather than a merge-base or a fallback branch.
 pub fn diff_against_base(root: &Path, base_ref: &str, untracked_budget: Option<u64>) -> Result<WorktreeDiff> {
-    let (resolved_ref, base) = merge_base(root, base_ref)?;
+    let (resolved_ref, base) = if matches!(base_ref.len(), 40 | 64) && base_ref.bytes().all(|b| b.is_ascii_hexdigit()) {
+        (base_ref.to_string(), commit_of(root, base_ref)?.context("the diff's starting commit is missing")?)
+    } else {
+        merge_base(root, base_ref)?
+    };
     let patch = git(
         root,
         &["diff", "--no-color", "--no-ext-diff", "--find-renames", "--src-prefix=a/", "--dst-prefix=b/", &base],

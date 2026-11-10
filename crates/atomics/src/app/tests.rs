@@ -887,7 +887,7 @@ fn plan_set_resolves_cached_worktree_projects(app: &mut Desktop<'_>) {
             ticket: None,
             plan: None,
             goal: "ship".into(),
-            tasks: vec![Task { id: "a".into(), repo: Some("/worktree/src".into()), ..Task::default() }],
+            tasks: vec![plan::TaskInput { id: "a".into(), repo: Some("/worktree/src".into()), ..Default::default() }],
             integration: None,
         },
         tx,

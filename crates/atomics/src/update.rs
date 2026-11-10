@@ -41,6 +41,7 @@ const NO_KEY: &str = "This build has no release signing key, so it cannot check 
 
 /// The folders an update unpacks into, beside what it replaces. One left by a crash goes with the next update.
 pub(crate) const STAGING: &str = ".atomics-update-";
+const ROLLBACK_ASIDE: &str = ".atomics-rollback-";
 /// Where a bundle's previous version is kept: not an `.app`, so that macOS offers no second ATOMICS.
 const PREVIOUS_BUNDLE: &str = ".atomics-previous";
 /// What a program's previous version is called, beside it.
@@ -509,10 +510,13 @@ pub(crate) fn on_disk(path: &Path) -> std::io::Result<()> {
     std::fs::File::open(path)?.sync_all()
 }
 
-/// With the update's lock held, whatever an earlier one left is a crash's.
+/// With the update's lock held, discard abandoned downloads. A rollback aside can hold the only
+/// recoverable install after a crash, including ones named with the older shared staging prefix.
 fn remove_stale_staging(parent: &Path) {
     for entry in std::fs::read_dir(parent).into_iter().flatten().flatten() {
-        if entry.file_name().to_string_lossy().starts_with(STAGING) {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(STAGING) && !name.starts_with(&format!("{STAGING}rollback-")) {
             let _ = std::fs::remove_dir_all(entry.path());
         }
     }
@@ -672,7 +676,7 @@ pub fn rollback(executable: &Path, macos: bool) -> Result<String> {
         .and_then(|output| reported_version(&output).map(str::to_string))
         .unwrap_or_else(|| "the previous version".into());
     let parent = target.path().parent().context("the install has no folder")?;
-    let aside = parent.join(format!("{STAGING}rollback-{}", std::process::id()));
+    let aside = parent.join(format!("{ROLLBACK_ASIDE}{}", uuid::Uuid::new_v4().simple()));
     trade_places(&previous, target.path(), &aside)
         .with_context(|| format!("Could not swap {} and {}", previous.display(), target.path().display()))?;
     let _ = std::fs::File::open(parent).and_then(|folder| folder.sync_all());

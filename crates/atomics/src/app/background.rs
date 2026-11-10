@@ -520,7 +520,7 @@ impl State {
         for root in &roots {
             self.resolve_project_root(root);
         }
-        let bases: HashMap<_, _> = roots.into_iter().map(|root| (root.clone(), self.project_base_ref(&root))).collect();
+        let bases: HashMap<_, _> = roots.into_iter().map(|root| (root.clone(), self.diff_base_ref(&root))).collect();
         for (root, state) in &mut self.diffs {
             // The diff on screen follows every change; the others at most every few seconds,
             // with only some of their untracked content.
