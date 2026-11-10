@@ -957,6 +957,7 @@ impl State {
         if !self.plans[index].approved {
             return Err("The plan is not approved yet: the user approves it on the plan board.".into());
         }
+        self.plans[index].select_review_agent(&self.config);
         self.pin_ticket_integration(index)?;
         self.refresh_integrations();
         let skipped = self.skip_empty_review(index);
@@ -1168,6 +1169,20 @@ impl State {
     /// A sub-agent's `atomics_report`: attach it to its task, move the task along, and
     /// wake anyone waiting.
     pub(super) fn report(&mut self, pane: Option<&str>, status: &str, summary: &str) -> Option<String> {
+        self.report_with_checks(pane, status, summary, Vec::new())
+    }
+
+    pub(super) fn report_with_checks(
+        &mut self,
+        pane: Option<&str>,
+        status: &str,
+        summary: &str,
+        checks: Vec<plan::Check>,
+    ) -> Option<String> {
+        let report =
+            Report { status: status.into(), summary: summary.into(), at: atomics_core::store::now(), checks }.bounded();
+        let status = report.status.as_str();
+        let summary = report.summary.as_str();
         let found = pane.and_then(|p| self.sessions.iter().position(|s| s.id == p));
         if let Some(found) = found {
             self.sessions[found].activity.last_event = atomics_core::store::now();
@@ -1201,11 +1216,7 @@ impl State {
         let plan_id = owner.as_ref().map(|(index, _)| self.plans[*index].id.clone());
         if let Some((index, id)) = &owner {
             let task = self.plans[*index].task_mut(id).expect("task owner");
-            task.report = Some(Report {
-                status: status.to_string(),
-                summary: summary.to_string(),
-                at: atomics_core::store::now(),
-            });
+            task.report = Some(report.clone());
             if matches!(status, "progress" | "done") {
                 task.ref_alert = None;
             }
@@ -1303,6 +1314,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn plan_set_selects_cross_provider_review_and_applies_override() {
+        with_app("app::plans::tests::plan_set_selects_cross_provider_review_and_applies_override", |app, _| {
+            for (author, expected) in [("claude", "codex"), ("codex", "claude")] {
+                app.runtime.config.plan.review_agent = None;
+                let set = request(
+                    app,
+                    json!({"cmd":"plan_set", "goal":"Review selection", "tasks":[{"id":"a", "agent":author}]}),
+                );
+                assert!(set.ok, "{set:?}");
+                let id = set.result["plan"].as_str().unwrap().to_string();
+                let index = app.runtime.plans.iter().position(|p| p.id == id).unwrap();
+                let review = app.runtime.plans[index].tasks.last().unwrap();
+                assert_eq!(review.agent, expected);
+                assert!(review.reviewer_reason.as_ref().unwrap().contains("other provider"));
+                app.runtime.config.plan.review_agent = Some(author.into());
+                app.runtime.apply_config();
+                assert_eq!(app.runtime.plans[index].tasks.last().unwrap().agent, author);
+                let updated = request(
+                    app,
+                    json!({"cmd":"plan_set", "plan":id, "goal":"Review selection", "tasks":[{"id":"a", "agent":author}]}),
+                );
+                assert!(updated.ok, "{updated:?}");
+                let review = app.runtime.plans[index].tasks.last().unwrap();
+                assert_eq!(review.agent, author);
+                assert!(review.reviewer_reason.as_ref().unwrap().contains("override"));
+                let saved = Plan::load(&paths::atomics_home().join("plans").join(format!("{id}.json"))).unwrap();
+                assert_eq!(saved.tasks.last().unwrap().reviewer_reason, review.reviewer_reason);
+            }
+        });
+    }
+
+    #[test]
     fn list_exposes_provider_quota_left_age_and_chief_budget() {
         with_app("app::plans::tests::list_exposes_provider_quota_left_age_and_chief_budget", |app, _| {
             use atomics_core::usage::{Usage, Window};
@@ -1367,7 +1410,7 @@ mod tests {
                 let saved = request(app, json!({"cmd":"plan_set","goal":"Budget-aware plan","tasks":tasks}));
                 assert!(saved.ok, "{:?}", saved.error);
                 let warnings = saved.result["warnings"].as_array().unwrap();
-                assert_eq!(warnings.len(), 2, "{warnings:?}");
+                assert_eq!(warnings.len(), 3, "{warnings:?}");
                 assert!(
                     warnings[0]
                         .as_str()
@@ -1381,9 +1424,11 @@ mod tests {
                         .contains("Task design: agent claude-small uses claude, whose weekly quota has 19.5% left")
                 );
                 assert!(warnings[0].as_str().unwrap().contains("reading 2m ago; resets_at"));
+                assert!(warnings[2].as_str().unwrap().contains("Task review: agent codex uses codex"));
                 let id = saved.result["plan"].as_str().unwrap();
                 let stored = Plan::load(&paths::atomics_home().join("plans").join(format!("{id}.json"))).unwrap();
                 assert_eq!(stored.tasks.len(), 4, "a warning still saves the entire plan");
+                assert_eq!(stored.tasks.last().unwrap().agent, "codex", "warn about the selected reviewer");
 
                 app.runtime.usage.codex.session.as_mut().unwrap().resets_at = now - 1;
                 app.runtime.usage.claude = Usage::default();
@@ -2628,7 +2673,12 @@ mod tests {
                         id: "task".into(),
                         repo: Some(repo.to_string_lossy().into_owned()),
                         session: Some("old".into()),
-                        report: Some(Report { status: "blocked".into(), summary: "old".into(), at: 0 }),
+                        report: Some(Report {
+                            status: "blocked".into(),
+                            summary: "old".into(),
+                            at: 0,
+                            checks: Vec::new(),
+                        }),
                         status: TaskStatus::Planned,
                         ..Task::default()
                     }],
@@ -2708,7 +2758,7 @@ mod tests {
                 let index = app.runtime.selected_plan;
                 app.runtime.plans[index].tasks[0].notes = vec!["old note".into(); 1000];
                 app.runtime.plans[index].tasks[0].report =
-                    Some(Report { status: "done".into(), summary: brief.clone(), at: 1 });
+                    Some(Report { status: "done".into(), summary: brief.clone(), at: 1, checks: Vec::new() });
                 let update = request(
                     app,
                     json!({
@@ -3136,7 +3186,12 @@ mod tests {
                     task.branch = Some(format!("atomics/existing-{}", task.id));
                     task.repo = Some("/project".into());
                     task.notes = vec!["Existing note".into()];
-                    task.report = Some(Report { status: "progress".into(), summary: "Existing report".into(), at: 42 });
+                    task.report = Some(Report {
+                        status: "progress".into(),
+                        summary: "Existing report".into(),
+                        at: 42,
+                        checks: Vec::new(),
+                    });
                     task.integrated = legacy.integration.clone();
                 }
                 legacy.save(&paths::plan_file()).unwrap();

@@ -431,6 +431,7 @@ impl State {
                         title: t.title.clone(),
                         status: t.status,
                         agent: t.agent.clone(),
+                        reviewer_reason: t.reviewer_reason.clone(),
                         depends_on: t.depends_on.clone(),
                         session: t.session.clone(),
                         branch: t.branch.clone(),
@@ -441,6 +442,7 @@ impl State {
                             status: r.status.clone(),
                             summary: r.summary.clone(),
                             at: r.at,
+                            checks: r.checks.clone(),
                         }),
                         ticket: t.ticket.as_ref().map(|ticket| ticket.label().to_string()),
                     })
@@ -668,8 +670,23 @@ mod tests {
                         "task report",
                         change(|s| {
                             s.plans[0].tasks[1].report =
-                                Some(Report { status: "done".into(), summary: "ok".into(), at: 1 })
+                                Some(Report { status: "done".into(), summary: "ok".into(), at: 1, checks: Vec::new() })
                         }),
+                    ),
+                    (
+                        "task report checks",
+                        change(|s| {
+                            s.plans[0].tasks[1].report.as_mut().unwrap().checks.push(atomics_core::plan::Check {
+                                check: "Tests pass".into(),
+                                command: "cargo test".into(),
+                                exit: Some(0),
+                                output_tail: "passed".into(),
+                            });
+                        }),
+                    ),
+                    (
+                        "reviewer selection reason",
+                        change(|s| s.plans[0].tasks[1].reviewer_reason = Some("Other provider".into())),
                     ),
                     ("task session (a session's task link)", change(|s| s.plans[0].tasks[0].session = None)),
                     ("task added", change(|s| s.plans[0].tasks.push(task("t3", None)))),
@@ -736,7 +753,12 @@ mod tests {
                         .map(|t| {
                             let mut task = task(&format!("t{t}"), (t == 0).then(|| format!("s{p}")).as_deref());
                             task.brief = "x".repeat(400);
-                            task.report = Some(Report { status: "progress".into(), summary: "y".repeat(200), at: 1 });
+                            task.report = Some(Report {
+                                status: "progress".into(),
+                                summary: "y".repeat(200),
+                                at: 1,
+                                checks: Vec::new(),
+                            });
                             task
                         })
                         .collect(),

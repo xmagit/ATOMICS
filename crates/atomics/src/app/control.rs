@@ -380,6 +380,7 @@ impl State {
                     self.plans[target].clone()
                 };
                 candidate.replace(goal.clone(), tasks.clone());
+                candidate.select_review_agent(&self.config);
                 if integration.is_some() {
                     candidate.integration = integration.clone();
                 }
@@ -414,6 +415,7 @@ impl State {
                     self.plans[index].reopen();
                 }
                 self.plans[index].replace(goal, tasks);
+                self.plans[index].select_review_agent(&self.config);
                 let ticket = self.stamp_system(ticket);
                 if ticket
                     .as_ref()
@@ -666,9 +668,9 @@ impl State {
                     Err(error) => done(ControlResponse::error(error)),
                 }
             }
-            ControlRequest::Report { pane, status, summary } => {
+            ControlRequest::Report { pane, status, summary, checks } => {
                 let pane = self.pane_session(pane);
-                let task = self.report(pane.as_deref(), &status, &summary);
+                let task = self.report_with_checks(pane.as_deref(), &status, &summary, checks);
                 done(ControlResponse::ok(json!({ "recorded": true, "task": task })))
             }
             ControlRequest::InlayHints { session } => match self.find(&session) {

@@ -61,6 +61,21 @@ A main, host or workspace file that does not parse leaves ATOMICS on the last co
 The top bar or toast says so, and `atomics doctor` names the file. A broken repository config is ignored
 with a warning; see [Repository workflows](repo-workflow.md).
 
+## Plans and report evidence
+
+Every plan ends with a final review. With both Claude and Codex configured, ATOMICS chooses the other
+provider from the one assigned most of the plan's tasks (excluding the review). A tie chooses Codex.
+If the other provider is unavailable, it uses a configured coding agent. Set `[plan] review_agent = "codex"`
+(or another configured agent name) in the main or host config to override this choice. The review card
+explains the selection; a review that has already started keeps its agent.
+
+Agents can attach acceptance evidence to `atomics_report` using optional
+`checks: [{check, command, exit, output_tail}]`. `exit` is an integer or `null` when unavailable.
+Cards show checks in a collapsed section; `atomics_plan_get` includes compact evidence marked as
+untrusted agent data. Reports retain at most 12 checks, 240 characters per check label, 512 per command,
+2048 at the end of each output, and 8000 in the summary. Terminal control characters are stripped,
+with line breaks and tabs kept. Reports saved before checks were introduced still load.
+
 ## Commit identity and word guard
 
 Set a default in your main config (or its host override):

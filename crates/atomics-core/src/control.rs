@@ -433,6 +433,8 @@ pub enum ControlRequest {
         pane: Option<String>,
         status: String,
         summary: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        checks: Vec<crate::plan::Check>,
     },
     /// Toggles inlay hints in the editor of the session's worktree.
     InlayHints {
