@@ -38,9 +38,14 @@ impl Docker {
         self.collect_using(|args, timeout| output(executable, args, timeout))
     }
 
-    fn collect_using(
+    fn collect_using(&mut self, run: impl FnMut(&[&str], Duration) -> io::Result<String>) -> Option<Vec<Container>> {
+        self.collect_with_clock(run, Instant::now)
+    }
+
+    fn collect_with_clock(
         &mut self,
         mut run: impl FnMut(&[&str], Duration) -> io::Result<String>,
+        now: impl FnOnce() -> Instant,
     ) -> Option<Vec<Container>> {
         self.timed_out = false;
         let ps = match run(&["ps", "--format", "{{json .}}"], self.ps_timeout) {
@@ -52,8 +57,9 @@ impl Docker {
             }
         };
         let mut containers = parse_ps(&ps)?;
-        if self.checked.is_none_or(|at| at.elapsed() >= Duration::from_secs(10)) {
-            self.checked = Some(Instant::now());
+        let now = now();
+        if self.checked.is_none_or(|at| now.saturating_duration_since(at) >= Duration::from_secs(10)) {
+            self.checked = Some(now);
             self.stats = run(&["stats", "--no-stream", "--format", "{{json .}}"], self.stats_timeout)
                 .ok()
                 .and_then(|s| parse_stats(&s))
@@ -253,13 +259,36 @@ mod tests {
         (dir, path)
     }
 
+    fn fixture_sample(docker: &mut Docker, program: &str, now: Instant) -> Option<Vec<Container>> {
+        let guard = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(60));
+        let mut expired = false;
+        let sample = docker.collect_with_clock(
+            |args, timeout| {
+                output_with_elapsed(program, args, timeout, |_| {
+                    if Instant::now() >= guard {
+                        expired = true;
+                        Err(io::Error::other("fake Docker did not finish"))
+                    } else {
+                        Ok(Duration::ZERO)
+                    }
+                })
+            },
+            || now,
+        );
+        assert!(!expired, "the fake command must finish before its fixture hang guard");
+        sample
+    }
+
     #[test]
     fn missing_failing_and_timed_out_docker_have_distinct_status() {
+        let now = Instant::now();
         let dir = crate::test_support::tempdir().unwrap();
-        assert!(Docker::default().collect_with(dir.path().join("missing").to_str().unwrap()).is_none());
+        let mut missing = Docker::default();
+        assert!(fixture_sample(&mut missing, dir.path().join("missing").to_str().unwrap(), now).is_none());
+        assert!(!missing.timed_out);
         let (_dir, path) = executable("exit 1");
         let mut failed = Docker::default();
-        assert!(failed.collect_with(&path).is_none());
+        assert!(fixture_sample(&mut failed, &path, now).is_none());
         assert!(!failed.timed_out);
         // The fake cannot finish on its own. Advance only the collector's clock, after
         // the child has started, so scheduling delays cannot change which status wins.
@@ -295,7 +324,7 @@ while [ ! -e "$dir/release" ]; do sleep 0.01; done"#,
         assert_eq!(unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) }, -1);
         assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
         let (_dir, path) = executable("exit 0");
-        assert_eq!(hung.collect_with(&path), Some(Vec::new()));
+        assert_eq!(fixture_sample(&mut hung, &path, now), Some(Vec::new()));
         assert!(!hung.timed_out);
     }
 
@@ -309,17 +338,18 @@ printf '%s\n' '{"Names":"web-1","Image":"app.example/web:1","State":"running","S
 fi"#,
         );
         let mut docker = Docker::default();
-        assert_eq!(docker.collect_with(&path).unwrap()[0].cpu_percent, Some(3.0));
+        let now = Instant::now();
+        assert_eq!(fixture_sample(&mut docker, &path, now).unwrap()[0].cpu_percent, Some(3.0));
         let at = docker.checked;
         let (_dir, path) = executable(
             r#"[ "$1" = stats ] && exit 1
 printf '%s\n' '{"Names":"web-1","Image":"app.example/web:2","State":"running","Status":"Up","Ports":""}'"#,
         );
-        let fresh = docker.collect_with(&path).unwrap();
+        let fresh = fixture_sample(&mut docker, &path, now + Duration::from_millis(9999)).unwrap();
         assert_eq!(fresh[0].image, "app.example/web:2");
         assert_eq!(fresh[0].cpu_percent, Some(3.0));
         assert_eq!(docker.checked, at);
-        docker.checked = Some(Instant::now() - Duration::from_secs(10));
-        assert_eq!(docker.collect_with(&path).unwrap()[0].cpu_percent, None);
+        assert_eq!(fixture_sample(&mut docker, &path, now + Duration::from_secs(10)).unwrap()[0].cpu_percent, None);
+        assert_eq!(docker.checked, Some(now + Duration::from_secs(10)));
     }
 }
