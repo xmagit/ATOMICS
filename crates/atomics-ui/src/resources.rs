@@ -75,16 +75,19 @@ pub fn load(ui: &mut egui::Ui, backend: &dyn Backend, p: &Palette, in_menu: bool
     };
     let label = state.load.map_or_else(|| "load —".into(), |load| format!("load {load:.1}"));
     let details = load_details(&state);
-    let sense = if backend.machine_available() { Sense::click() } else { Sense::hover() };
-    let response = ui.add(egui::Label::new(RichText::new(label).color(color).size(12.0)).sense(sense)).on_hover_text(
-        if backend.machine_available() { format!("{details}\nClick to open Machine") } else { details.clone() },
-    );
+    let response = load_button(ui, &label, color, backend.machine_available(), &details);
     crate::topbar::record_item(ui, "load", &response);
     let response = if backend.machine_available() { crate::touch::reach(ui, response) } else { response };
     if in_menu {
         ui.label(RichText::new(details).font(p.ui(10.5)).color(p.muted));
     }
     backend.machine_available() && response.clicked()
+}
+
+fn load_button(ui: &mut egui::Ui, label: &str, color: Color32, available: bool, details: &str) -> egui::Response {
+    ui.add_enabled(available, egui::Button::new(RichText::new(label).color(color).size(12.0)))
+        .on_hover_text(format!("Open Machine\n{details}"))
+        .on_disabled_hover_text(format!("Machine is unavailable from this host\n{details}"))
 }
 
 fn load_details(state: &ResourceInfo) -> String {
@@ -105,6 +108,44 @@ fn load_details(state: &ResourceInfo) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn load_gauge_has_a_button_frame_hover_and_load_colors() {
+        let p = Palette::new(&Default::default(), Default::default());
+        for color in [p.muted, p.warning, p.error] {
+            let ctx = egui::Context::default();
+            let mut rect = egui::Rect::NOTHING;
+            for hovered in [false, true] {
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(250.0, 100.0))),
+                        events: if hovered { vec![egui::Event::PointerMoved(rect.center())] } else { vec![] },
+                        ..Default::default()
+                    },
+                    |ui| {
+                        let response = load_button(ui, "load 1.0", color, true, "Load details");
+                        assert!(response.sense.senses_click());
+                        assert_eq!(response.hovered(), hovered);
+                        rect = response.rect;
+                    },
+                );
+                assert!(
+                    output.shapes.iter().any(|shape| matches!(&shape.shape,
+                        egui::Shape::Rect(frame) if frame.rect == rect && frame.fill != Color32::TRANSPARENT
+                    )),
+                    "the load control must paint its button frame"
+                );
+                assert!(
+                    output.shapes.iter().any(|shape| matches!(&shape.shape,
+                        egui::Shape::Text(text) if text.galley.job.text == "load 1.0"
+                            && text.galley.job.sections.iter().all(|section| section.format.color == color)
+                    )),
+                    "button text must retain the load color"
+                );
+                output.drop_without_applying_deltas();
+            }
+        }
+    }
 
     #[test]
     fn panel_accepts_latest_account_reports_and_draws_expired_windows_as_missing() {

@@ -4869,6 +4869,8 @@ fn machine_panel_draws_resources_containers_ports_and_agent_previews_at_narrow_w
         let snapshot = Machine {
             sampled_at: 1,
             truncated: false,
+            host_name: "test-host".into(),
+            containers_timed_out: false,
             cores: 8,
             load: Some([1.5, 1.2, 0.9]),
             cpu_busy: Some(25.0),
@@ -4918,7 +4920,9 @@ fn machine_panel_draws_resources_containers_ports_and_agent_previews_at_narrow_w
             ));
             shown.extend(settled(&ctx, &mut world, &mut client, &mut view, size));
         }
-        for label in ["Machine", "Resources", "Containers", "web-1", "Ports", "8080", "Agent previews", "Preview"] {
+        for label in
+            ["Machine · test-host", "Resources", "Containers", "web-1", "Ports", "8080", "Agent previews", "Preview"]
+        {
             assert!(has(&shown, label), "{label} missing at {size:?}: {shown:?}");
         }
         // The window stays inside the screen, with horizontal table scrolling at narrow widths.

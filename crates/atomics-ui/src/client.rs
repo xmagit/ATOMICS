@@ -19,6 +19,8 @@ use crate::touch::Touch;
 /// the desktop's client as the draw code that uses them moves into this crate.
 pub struct Client {
     pub machine_open: bool,
+    /// The same agent location shown by the client in its top bar.
+    pub machine_place: Option<String>,
     pub tickets: crate::tickets::Tickets,
     pub pr_target: Option<(Option<String>, Option<PathBuf>)>,
     pub pr_view: Option<(String, DiffState)>,
@@ -88,6 +90,7 @@ impl Default for Client {
         let tokens = atomics_core::theme::builtin(atomics_core::theme::DEFAULT).expect("the default theme is built in");
         Self {
             machine_open: false,
+            machine_place: None,
             pr_target: None,
             pr_view: None,
             editor_id: None,
