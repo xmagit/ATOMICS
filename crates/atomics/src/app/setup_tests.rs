@@ -20,6 +20,17 @@ fn frame(app: &mut Desktop<'_>, ctx: &egui::Context, events: Vec<egui::Event>) -
         |ui| app.paint(ui),
     );
     app.runtime.drain_actions();
+    let visible: Texts = output
+        .shapes
+        .iter()
+        .filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if shape.clip_rect.contains_rect(text.visual_bounding_rect()) => {
+                Some((text.galley.text().to_string(), text.visual_bounding_rect().center()))
+            }
+            _ => None,
+        })
+        .collect();
+    ctx.data_mut(|data| data.insert_temp(egui::Id::NULL.with("visible-setup-text"), visible));
     let texts = output
         .shapes
         .iter()
@@ -65,15 +76,34 @@ fn click(app: &mut Desktop<'_>, ctx: &egui::Context, label: &str) -> Texts {
 
 /// The text `label` on the row of `row`.
 fn click_beside(app: &mut Desktop<'_>, ctx: &egui::Context, row: &str, label: &str) -> Texts {
-    let shown = settle(app, ctx);
-    let y = shown.iter().find(|(text, _)| text == row).unwrap_or_else(|| panic!("{row} in {shown:?}")).1.y;
-    let pos = shown
-        .iter()
-        .filter(|(text, _)| text == label)
-        .min_by(|a, b| (a.1.y - y).abs().total_cmp(&(b.1.y - y).abs()))
-        .unwrap_or_else(|| panic!("{label} in {shown:?}"))
-        .1;
-    click_at(app, ctx, pos)
+    for _ in 0..24 {
+        settle(app, ctx);
+        let visible =
+            ctx.data(|data| data.get_temp::<Texts>(egui::Id::NULL.with("visible-setup-text"))).unwrap_or_default();
+        if let Some((_, at)) = visible.iter().find(|(text, _)| text == row)
+            && let Some((_, pos)) = visible
+                .iter()
+                .filter(|(text, _)| text == label)
+                .min_by(|a, b| (a.1.y - at.y).abs().total_cmp(&(b.1.y - at.y).abs()))
+        {
+            return click_at(app, ctx, *pos);
+        }
+        frame(
+            app,
+            ctx,
+            vec![
+                egui::Event::PointerMoved(pos2(700.0, 500.0)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: vec2(0.0, -100.0),
+                    source: egui::MouseWheelSource::Wheel,
+                    phase: egui::TouchPhase::Move,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+    }
+    panic!("{label} beside {row} is not visible: {:?}", settle(app, ctx));
 }
 
 /// The window's own control requests, as `App` hands them to the host, with the replies a window applies.

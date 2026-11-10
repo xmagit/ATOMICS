@@ -1148,6 +1148,10 @@ fn settings_opened_by_its_button_leaves_the_terminal_ready_when_escape_closes_it
             let dir = crate::test_support::tempdir().unwrap();
             agent(app, dir.path(), "agent");
             app.runtime.active = Some("agent".into());
+            // Remember a static section so discovery's spinner does not keep this keyboard-only test drawing.
+            click_on(app, ctx, "Settings");
+            click_on(app, ctx, "Theme");
+            press(app, ctx, Key::Escape, NONE);
             at_the_terminal(app, ctx);
             only_asked(app, ctx, vec![]);
             click_alone(app, ctx, "Settings", 0.0);
