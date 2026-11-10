@@ -71,6 +71,8 @@ in {
       requires = [ "atomics-secret-broker.service" ];
       after = [ "atomics-secret-broker.service" ];
       environment.ATOMICS_SECRET_BROKER_SOCKET = "${runtime}/use.sock";
+      # Change the host unit too, so a live upgrade gives its process the new access group.
+      serviceConfig.SupplementaryGroups = [ useGroup ];
     };
   };
 }

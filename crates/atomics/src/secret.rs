@@ -71,17 +71,11 @@ pub fn run(command: Command) -> Result<()> {
             let stdin = std::io::stdin();
             eprint!("Secret value (stdin only): ");
             std::io::stderr().flush()?;
-            let echo = crate::sandbox::setup::Echo::hide(stdin.is_terminal())?;
-            let mut value = zeroize::Zeroizing::new(String::new());
-            stdin.lock().take(8194).read_line(&mut value)?;
+            let terminal = stdin.is_terminal();
+            let echo = crate::sandbox::setup::Echo::hide(terminal)?;
+            let value = read_value(stdin.lock(), terminal)?;
             drop(echo);
             eprintln!();
-            if value.ends_with('\n') {
-                value.pop();
-                if value.ends_with('\r') {
-                    value.pop();
-                }
-            }
             if vm_client {
                 store.add_secret_rule(spec, &value)?;
             } else {
@@ -127,4 +121,56 @@ fn sync_vm() -> Result<()> {
         crate::vm::secrets::push(&info)?;
     }
     Ok(())
+}
+
+fn read_value(reader: impl BufRead, terminal: bool) -> Result<zeroize::Zeroizing<String>> {
+    const MAX_VALUE: u64 = 8192;
+    // Keep room for CRLF and one extra byte, so overlong input cannot be silently truncated.
+    let mut reader = reader.take(MAX_VALUE + 3);
+    let mut value = zeroize::Zeroizing::new(String::new());
+    if terminal {
+        reader.read_line(&mut value)?;
+    } else {
+        reader.read_to_string(&mut value)?;
+    }
+    if value.ends_with('\n') {
+        value.pop();
+        if value.ends_with('\r') {
+            value.pop();
+        }
+    }
+    anyhow::ensure!(value.len() <= MAX_VALUE as usize, "Secret value exceeds 8192 bytes (contents hidden)");
+    Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn piped_secret_preserves_all_lines_and_trims_only_one_trailing_newline() {
+        for (input, expected) in [
+            (
+                "-----BEGIN PRIVATE KEY-----\ncanary-first\ncanary-second\n-----END PRIVATE KEY-----\n",
+                "-----BEGIN PRIVATE KEY-----\ncanary-first\ncanary-second\n-----END PRIVATE KEY-----",
+            ),
+            ("line one\nline two\r\n", "line one\nline two"),
+            ("line one\n\n", "line one\n"),
+            ("line one\nline two", "line one\nline two"),
+        ] {
+            assert_eq!(read_value(input.as_bytes(), false).unwrap().as_str(), expected);
+        }
+        assert_eq!(read_value(b"first\nsecond\n".as_slice(), true).unwrap().as_str(), "first");
+    }
+
+    #[test]
+    fn piped_secret_rejects_oversized_values_without_truncating_them() {
+        let boundary = "x".repeat(8192);
+        assert_eq!(read_value(format!("{boundary}\r\n").as_bytes(), false).unwrap().as_str(), boundary);
+        for extra in ["x", "x\n", "x\r\n", "\ncanary-hidden-tail"] {
+            let error = read_value(format!("{boundary}{extra}").as_bytes(), false).unwrap_err().to_string();
+            assert!(error.contains("exceeds 8192 bytes"));
+            assert!(!error.contains("canary"));
+        }
+    }
 }

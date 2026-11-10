@@ -11,6 +11,7 @@ assert service.NoNewPrivileges;
 assert lib.elem "atomics-secret-use" service.SupplementaryGroups;
 assert lib.elem "atomics-secret-use" vm.users.users.${vm.atomics.vm.user}.extraGroups;
 assert lib.elem "atomics-secret-use" vm.users.users.${vm.atomics.vm.adminUser}.extraGroups;
+assert lib.elem "atomics-secret-use" vm.systemd.services.atomics-host.serviceConfig.SupplementaryGroups;
 assert service.User != vm.atomics.vm.user;
 assert !lib.elem "wheel" vm.users.users.${vm.atomics.vm.user}.extraGroups;
 assert !lib.elem "docker" vm.users.users.${vm.atomics.vm.user}.extraGroups;
